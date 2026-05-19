@@ -1,8 +1,16 @@
 //! Orphan checkpoint scan · port of Bun's `runOrphanScan` (orphan-scan.ts).
 
-use crate::frontmatter::parse_frontmatter;
+use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
+
+use chrono::{DateTime, Datelike, Local};
+use serde::Serialize;
+
+use crate::frontmatter::parse_frontmatter;
+use onebrain_core::{load_vault_config_at, CoreError};
 
 /// Parse a checkpoint filename of the form `YYYY-MM-DD-{token}-checkpoint-NN.md`.
 /// Returns `(date, token)` or `None` if the shape doesn't match.
@@ -200,12 +208,6 @@ mod manual_log_tests {
     }
 }
 
-use chrono::{DateTime, Datelike, Local};
-use serde::Serialize;
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::time::UNIX_EPOCH;
-
 /// Result of an orphan scan — matches Bun v2.3.3 JSON shape byte-for-byte.
 #[derive(Debug, Serialize)]
 pub struct OrphanScanResult {
@@ -325,9 +327,6 @@ pub(crate) fn get_newest_mtime_ms(paths: &[PathBuf]) -> Option<u64> {
     }
     Some(newest)
 }
-
-use onebrain_core::{load_vault_config_at, CoreError};
-use std::io::Write;
 
 const MIN_GUARD_MINUTES: u64 = 60;
 const DEFAULT_ACTIVE_SESSION_GUARD_MS: u64 = 60 * 60 * 1000;
@@ -450,8 +449,8 @@ mod guard_threshold_tests {
 
 #[cfg(test)]
 mod active_predicate_tests {
-    use super::*;
     use super::guard_threshold_tests::MIN_GUARD_MS;
+    use super::*;
     use std::fs;
     use std::time::{Duration, SystemTime};
     use tempfile::tempdir;
@@ -542,11 +541,14 @@ mod active_predicate_tests {
         let dir = tempdir().unwrap();
         let f = write_with_mtime(dir.path(), "a.md", 3600); // exactly 1 hour ago
         let guard = MIN_GUARD_MS; // exactly 60 min
-        // age_ms ≈ 3_600_000 · guard_ms = 3_600_000 · NOT strictly less than → counted
-        // Note: timing precision may make age_ms slightly > guard_ms; either way it must NOT skip.
+                                  // age_ms ≈ 3_600_000 · guard_ms = 3_600_000 · NOT strictly less than → counted
+                                  // Note: timing precision may make age_ms slightly > guard_ms; either way it must NOT skip.
         let now_ms_val = now_ms();
         let result = is_group_active_or_ambiguous(&[f], now_ms_val, guard);
-        assert!(!result, "exactly-at-boundary age must NOT be treated as active");
+        assert!(
+            !result,
+            "exactly-at-boundary age must NOT be treated as active"
+        );
     }
 }
 

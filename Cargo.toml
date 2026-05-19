@@ -31,9 +31,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 # Filesystem (Slice 1 partial · used by count_unembedded)
 walkdir   = "2"
-filetime  = "0.2"
 
 # Test infrastructure
+filetime          = "0.2"
 tempfile          = "3"
 insta             = { version = "1", features = ["json"] }
 assert_cmd        = "2"
