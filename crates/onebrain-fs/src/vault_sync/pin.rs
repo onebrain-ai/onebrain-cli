@@ -377,6 +377,7 @@ mod tests {
         assert_eq!(got, PathBuf::from(expected));
     }
 
+    #[cfg(unix)]
     #[test]
     fn normalize_preserves_root_separator() {
         let got = normalize_path(Path::new("/"));
