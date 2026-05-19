@@ -184,10 +184,7 @@ fn sigterm_maps_to_143() {
     let vault = d.path().join("vault");
     fs::create_dir_all(&vault).unwrap();
     write_minimal_vault(&vault);
-    let mock = write_mock_claude(
-        d.path(),
-        "#!/bin/bash\nkill -TERM $$\nsleep 5\nexit 0\n",
-    );
+    let mock = write_mock_claude(d.path(), "#!/bin/bash\nkill -TERM $$\nsleep 5\nexit 0\n");
     Command::cargo_bin("onebrain")
         .unwrap()
         .args([
