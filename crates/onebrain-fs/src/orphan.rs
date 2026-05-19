@@ -6,7 +6,6 @@ use std::path::Path;
 
 /// Parse a checkpoint filename of the form `YYYY-MM-DD-{token}-checkpoint-NN.md`.
 /// Returns `(date, token)` or `None` if the shape doesn't match.
-#[allow(dead_code)] // used by upcoming orphan-scan tasks in this slice
 pub(crate) fn parse_checkpoint_filename(name: &str) -> Option<(&str, &str)> {
     // YYYY-MM-DD prefix — exactly 10 chars (4-2-2 with dashes at idx 4 and 7)
     if name.len() < 11 {
@@ -37,7 +36,6 @@ pub(crate) fn parse_checkpoint_filename(name: &str) -> Option<(&str, &str)> {
 /// NOT a `-checkpoint-` blacklist · the logs folder also contains update/weekly logs).
 /// "Manual" means: frontmatter missing OR frontmatter present but `auto-saved` is
 /// false / absent / not a recognised truthy value. Reading errors → file skipped.
-#[allow(dead_code)] // used by upcoming collect_candidate_groups in Task 8
 pub(crate) fn has_manual_session_log(month_dir: &Path, date: &str) -> bool {
     let entries = match fs::read_dir(month_dir) {
         Ok(e) => e,
@@ -202,8 +200,64 @@ mod manual_log_tests {
     }
 }
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
+
+/// Collect checkpoint files into per-token groups, applying the today / current-token
+/// / manual-log filters. Returns `HashMap<token, [absolute_paths]>`.
+#[allow(dead_code)] // used by upcoming scan_orphans in Task 9
+pub(crate) fn collect_candidate_groups(
+    checkpoint_dir: &Path,
+    session_dir: &Path,
+    current_token: &str,
+    today: &str,
+) -> HashMap<String, Vec<PathBuf>> {
+    let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let mut manual_log_cache: HashMap<String, bool> = HashMap::new();
+
+    let entries = match fs::read_dir(checkpoint_dir) {
+        Ok(e) => e,
+        Err(_) => return groups,
+    };
+
+    for entry in entries.flatten() {
+        let name_os = entry.file_name();
+        let name = match name_os.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        if !name.ends_with(".md") {
+            continue;
+        }
+        let (date, token) = match parse_checkpoint_filename(name) {
+            Some(t) => t,
+            None => continue,
+        };
+        if date == today {
+            continue;
+        }
+        if token == current_token {
+            continue;
+        }
+        // Manual log check with per-date cache
+        let manual = *manual_log_cache.entry(date.to_string()).or_insert_with(|| {
+            let year = &date[..4];
+            let month = &date[5..7];
+            let month_dir = session_dir.join(year).join(month);
+            has_manual_session_log(&month_dir, date)
+        });
+        if manual {
+            continue;
+        }
+        groups
+            .entry(token.to_string())
+            .or_default()
+            .push(entry.path());
+    }
+
+    groups
+}
 
 /// File mtime as milliseconds since UNIX epoch · None on any error.
 pub(crate) fn get_mtime_ms(path: &Path) -> Option<u64> {
@@ -475,5 +529,106 @@ mod mtime_tests {
         let b = dir.path().join("does_not_exist.md");
         fs::write(&a, "x").unwrap();
         assert_eq!(get_newest_mtime_ms(&[a, b]), None);
+    }
+}
+
+#[cfg(test)]
+mod collect_groups_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn touch(dir: &Path, rel: &str, content: &str) {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn empty_checkpoint_dir_returns_empty_map() {
+        let dir = tempdir().unwrap();
+        let cp = dir.path().join("checkpoint");
+        fs::create_dir_all(&cp).unwrap();
+        let sess = dir.path().join("session");
+        let groups = collect_candidate_groups(&cp, &sess, "abc12345", "2026-05-19");
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn skips_current_session_token() {
+        let dir = tempdir().unwrap();
+        let cp = dir.path().join("checkpoint");
+        let sess = dir.path().join("session");
+        touch(&cp, "2026-05-18-abc12345-checkpoint-01.md", "x");
+        let groups = collect_candidate_groups(&cp, &sess, "abc12345", "2026-05-19");
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn skips_today_files() {
+        let dir = tempdir().unwrap();
+        let cp = dir.path().join("checkpoint");
+        let sess = dir.path().join("session");
+        touch(&cp, "2026-05-19-other-checkpoint-01.md", "x");
+        let groups = collect_candidate_groups(&cp, &sess, "abc12345", "2026-05-19");
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn skips_date_with_manual_session_log() {
+        let dir = tempdir().unwrap();
+        let cp = dir.path().join("checkpoint");
+        let sess = dir.path().join("session");
+        touch(&cp, "2026-05-18-stale-checkpoint-01.md", "x");
+        touch(
+            &sess,
+            "2026/05/2026-05-18-session-01.md",
+            "---\nauto-saved: false\n---\nwrapup",
+        );
+        let groups = collect_candidate_groups(&cp, &sess, "abc12345", "2026-05-19");
+        assert!(
+            groups.is_empty(),
+            "manual log for 2026-05-18 should suppress the stale checkpoint"
+        );
+    }
+
+    #[test]
+    fn groups_multiple_checkpoints_under_same_token() {
+        let dir = tempdir().unwrap();
+        let cp = dir.path().join("checkpoint");
+        let sess = dir.path().join("session");
+        touch(&cp, "2026-05-17-tokA-checkpoint-01.md", "x");
+        touch(&cp, "2026-05-17-tokA-checkpoint-02.md", "x");
+        touch(&cp, "2026-05-17-tokA-checkpoint-03.md", "x");
+        let groups = collect_candidate_groups(&cp, &sess, "abc12345", "2026-05-19");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups.get("tokA").map(|v| v.len()), Some(3));
+    }
+
+    #[test]
+    fn groups_distinct_tokens_separately() {
+        let dir = tempdir().unwrap();
+        let cp = dir.path().join("checkpoint");
+        let sess = dir.path().join("session");
+        touch(&cp, "2026-05-17-tokA-checkpoint-01.md", "x");
+        touch(&cp, "2026-05-17-tokB-checkpoint-01.md", "x");
+        let groups = collect_candidate_groups(&cp, &sess, "abc12345", "2026-05-19");
+        assert_eq!(groups.len(), 2);
+        assert!(groups.contains_key("tokA"));
+        assert!(groups.contains_key("tokB"));
+    }
+
+    #[test]
+    fn ignores_files_with_bad_filename_shape() {
+        let dir = tempdir().unwrap();
+        let cp = dir.path().join("checkpoint");
+        let sess = dir.path().join("session");
+        touch(&cp, "random_file.md", "x");
+        touch(&cp, "2026-05-18-no-cp-marker-01.md", "x");
+        touch(&cp, "not-even-a-date.md", "x");
+        let groups = collect_candidate_groups(&cp, &sess, "abc12345", "2026-05-19");
+        assert!(groups.is_empty());
     }
 }
