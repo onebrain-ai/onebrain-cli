@@ -1,0 +1,17 @@
+[package]
+name = "onebrain-fs"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+publish.workspace    = true
+
+[dependencies]
+onebrain-core = { workspace = true }
+thiserror     = { workspace = true }
+# walkdir + chrono return in Slice 2 when scan helpers land.
+
+[dev-dependencies]
+tempfile          = { workspace = true }
+pretty_assertions = { workspace = true }

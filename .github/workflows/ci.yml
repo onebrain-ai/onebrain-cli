@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --no-fail-fast
+
+  parity:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Download pinned Bun v2.3.3 binary
+        run: |
+          curl -fsSL \
+            https://github.com/onebrain-ai/onebrain/releases/download/v2.3.3/onebrain-linux-x64.tar.gz \
+            -o /tmp/onebrain-v2.3.3.tar.gz
+          tar -xzf /tmp/onebrain-v2.3.3.tar.gz -C /tmp/
+          chmod +x /tmp/onebrain
+          mv /tmp/onebrain /tmp/onebrain-bun-v2.3.3
+      - name: Build Rust release binary
+        run: cargo build --release -p onebrain-cli
+      - name: Run parity suite
+        env:
+          BUN_BINARY: /tmp/onebrain-bun-v2.3.3
+          RUST_BINARY: ${{ github.workspace }}/target/release/onebrain
+        run: cargo test -p parity --release
