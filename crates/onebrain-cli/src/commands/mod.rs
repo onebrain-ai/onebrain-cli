@@ -10,3 +10,4 @@ pub mod register_schedule;
 pub mod run_skill;
 pub mod session_init;
 pub mod update;
+pub mod vault_sync;

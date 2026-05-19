@@ -166,7 +166,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Cmd::RunSkill { vault, skill, args } => {
             std::process::exit(commands::run_skill::run(&vault, &skill, &args)?)
         }
-        Cmd::VaultSync => todo!("Slice 13"),
+        Cmd::VaultSync => std::process::exit(commands::vault_sync::run()?),
     }
 }
 
