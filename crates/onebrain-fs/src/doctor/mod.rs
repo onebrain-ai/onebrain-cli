@@ -22,15 +22,16 @@ pub mod folders;
 pub mod orphans;
 pub mod plugin;
 pub mod qmd;
+pub mod settings_hooks;
 pub mod vault_yml;
 pub mod vault_yml_keys;
-// pub mod settings_hooks; // Task 10
 // pub mod marketplace;    // Task 11
 
 pub use folders::FoldersCheck;
 pub use orphans::OrphanCheckpointsCheck;
 pub use plugin::PluginFilesCheck;
 pub use qmd::QmdEmbeddingsCheck;
+pub use settings_hooks::SettingsHooksCheck;
 pub use vault_yml::VaultYmlCheck;
 pub use vault_yml_keys::VaultYmlKeysCheck;
 
@@ -46,6 +47,7 @@ pub fn run_all_checks(vault_root: &Path, config: &VaultConfig) -> Vec<DoctorResu
         Box::new(OrphanCheckpointsCheck),
         Box::new(QmdEmbeddingsCheck),
         Box::new(PluginFilesCheck),
+        Box::new(SettingsHooksCheck),
     ];
     checks
         .iter()
