@@ -9,6 +9,7 @@ pub mod doctor;
 pub mod error;
 pub(crate) mod frontmatter;
 pub mod harness;
+pub mod init;
 pub mod migrate;
 pub mod orphan;
 pub mod register_hooks;
@@ -18,6 +19,7 @@ pub mod vault_sync;
 
 pub use error::{FsError, Result};
 pub use harness::{detect_harness, detect_harnesses};
+pub use init::{run_init, InitOptions, InitResult, ScheduleEntry, SchedulePreset};
 pub use migrate::{run_backfill_recapped, MigrateResult};
 pub use orphan::{scan_orphans, OrphanScanResult};
 pub use run_skill::{build_prompt, resolve_claude_bin, ClaudeBinResolution, RunSkillError};

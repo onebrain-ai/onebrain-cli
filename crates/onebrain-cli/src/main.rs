@@ -161,7 +161,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             cutoff,
             vault,
         } => commands::migrate::run(&name, cutoff.as_deref(), vault.as_deref()),
-        Cmd::Init { .. } => todo!("Slice 10"),
+        Cmd::Init { yes } => std::process::exit(commands::init::run(yes)?),
         Cmd::Update { check } => std::process::exit(commands::update::run(check)?),
         Cmd::RunSkill { vault, skill, args } => {
             std::process::exit(commands::run_skill::run(&vault, &skill, &args)?)
