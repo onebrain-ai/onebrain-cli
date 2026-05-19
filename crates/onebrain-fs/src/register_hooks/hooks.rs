@@ -51,10 +51,7 @@ impl HookSpec {
 
 /// `entry` matches `spec` in canonical or legacy shell form.
 pub(crate) fn matches_spec(entry: &Value, spec: &HookSpec) -> bool {
-    let cmd = entry
-        .get("command")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let cmd = entry.get("command").and_then(|v| v.as_str()).unwrap_or("");
     let args = entry.get("args").and_then(|v| v.as_array());
 
     if cmd == spec.command {
@@ -117,10 +114,7 @@ pub(crate) fn check_hook_presence(groups: &[Value], spec: &HookSpec) -> Presence
             if matches_spec(entry, spec) {
                 return Presence::Found;
             }
-            let cmd = entry
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let cmd = entry.get("command").and_then(|v| v.as_str()).unwrap_or("");
             if cmd.contains("checkpoint-hook.sh") {
                 saw_migrate = true;
             }
@@ -157,9 +151,7 @@ impl HookStatus {
 /// Register the Stop hook and remove stale onebrain entries from
 /// non-allowed events.
 pub(crate) fn apply_hooks(settings: &mut Value) -> Vec<(&'static str, HookStatus)> {
-    let root = settings
-        .as_object_mut()
-        .expect("settings is a JSON object");
+    let root = settings.as_object_mut().expect("settings is a JSON object");
     let hooks_val = root
         .entry("hooks".to_string())
         .or_insert_with(|| Value::Object(Map::new()));
@@ -184,10 +176,7 @@ pub(crate) fn apply_hooks(settings: &mut Value) -> Vec<(&'static str, HookStatus
             for g in groups.iter_mut() {
                 if let Some(h) = g.get_mut("hooks").and_then(|v| v.as_array_mut()) {
                     h.retain(|entry| {
-                        let cmd = entry
-                            .get("command")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                        let cmd = entry.get("command").and_then(|v| v.as_str()).unwrap_or("");
                         !cmd.contains("onebrain")
                     });
                 }
@@ -255,10 +244,7 @@ pub(crate) fn apply_hooks(settings: &mut Value) -> Vec<(&'static str, HookStatus
                                 .to_string();
                             if cmd.contains("checkpoint-hook.sh") {
                                 let obj = h.as_object_mut().unwrap();
-                                obj.insert(
-                                    "command".into(),
-                                    Value::String(spec.command.into()),
-                                );
+                                obj.insert("command".into(), Value::String(spec.command.into()));
                                 let args: Vec<Value> = spec
                                     .args
                                     .iter()
@@ -306,10 +292,7 @@ pub(crate) fn strip_onebrain_hooks(settings: &mut Value) {
             for g in groups.iter_mut() {
                 if let Some(arr) = g.get_mut("hooks").and_then(|v| v.as_array_mut()) {
                     arr.retain(|h| {
-                        let cmd = h
-                            .get("command")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                        let cmd = h.get("command").and_then(|v| v.as_str()).unwrap_or("");
                         !cmd.contains("onebrain")
                     });
                 }
@@ -406,7 +389,10 @@ mod tests {
         let groups = vec![json!({
             "hooks": [{"command": "onebrain", "args": ["checkpoint", "stop"]}]
         })];
-        assert_eq!(check_hook_presence(&groups, &HookSpec::STOP), Presence::Found);
+        assert_eq!(
+            check_hook_presence(&groups, &HookSpec::STOP),
+            Presence::Found
+        );
     }
 
     #[test]
@@ -437,7 +423,10 @@ mod tests {
                 {"command": "onebrain", "args": ["checkpoint", "stop"]},
             ]
         })];
-        assert_eq!(check_hook_presence(&groups, &HookSpec::STOP), Presence::Found);
+        assert_eq!(
+            check_hook_presence(&groups, &HookSpec::STOP),
+            Presence::Found
+        );
     }
 
     #[test]
@@ -588,7 +577,10 @@ mod tests {
             }
         });
         strip_onebrain_hooks(&mut s);
-        assert!(s.get("hooks").is_none(), "hooks object should be dropped when empty");
+        assert!(
+            s.get("hooks").is_none(),
+            "hooks object should be dropped when empty"
+        );
     }
 
     #[test]

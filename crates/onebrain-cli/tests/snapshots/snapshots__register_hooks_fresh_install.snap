@@ -1,0 +1,41 @@
+---
+source: crates/onebrain-cli/tests/snapshots.rs
+expression: text
+---
+{
+    "hooks": {
+        "Stop": [
+            {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "onebrain",
+                        "args": [
+                            "checkpoint",
+                            "stop"
+                        ]
+                    }
+                ]
+            }
+        ]
+    },
+    "permissions": {
+        "allow": [
+            "Read",
+            "Write",
+            "Edit",
+            "Glob",
+            "Grep",
+            "Bash(git *)",
+            "Bash(bun *)",
+            "Bash(gh *)",
+            "Bash(node *)",
+            "Bash(onebrain *)",
+            "Bash(bun install -g @onebrain-ai/cli*)",
+            "Bash(npm install -g @onebrain-ai/cli*)",
+            "WebFetch",
+            "WebSearch"
+        ]
+    }
+}

@@ -141,8 +141,7 @@ mod tests {
     }
 
     fn read_back(vault: &std::path::Path) -> serde_json::Value {
-        let text =
-            fs::read_to_string(vault.join(".claude").join("settings.json")).unwrap();
+        let text = fs::read_to_string(vault.join(".claude").join("settings.json")).unwrap();
         serde_json::from_str(&text).unwrap()
     }
 
@@ -307,7 +306,10 @@ mod tests {
         .unwrap();
         let after = read_back(v.path());
         assert_eq!(after["hooks"]["Stop"][0]["comment"], "preserve me");
-        assert_eq!(after["hooks"]["Stop"][0]["hooks"][0]["userMetadata"]["k"], 1);
+        assert_eq!(
+            after["hooks"]["Stop"][0]["hooks"][0]["userMetadata"]["k"],
+            1
+        );
         // And the migration happened
         assert_eq!(
             after["hooks"]["Stop"][0]["hooks"][0]["args"],

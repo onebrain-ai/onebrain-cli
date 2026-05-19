@@ -24,9 +24,7 @@ pub(crate) const PERMISSIONS_TO_ADD: &[&str] = &[
 /// `settings.permissions.allow`. Returns the list of entries appended (empty
 /// on idempotent re-run).
 pub(crate) fn apply_permissions(settings: &mut Value) -> Vec<String> {
-    let root = settings
-        .as_object_mut()
-        .expect("settings is a JSON object");
+    let root = settings.as_object_mut().expect("settings is a JSON object");
     let permissions = root
         .entry("permissions".to_string())
         .or_insert_with(|| Value::Object(Map::new()));

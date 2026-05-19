@@ -22,9 +22,7 @@ pub(crate) fn read_settings(path: &Path) -> Result<Value> {
             path: path.to_path_buf(),
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
         }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(Value::Object(Default::default()))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Object(Default::default())),
         Err(e) => Err(FsError::Io {
             path: path.to_path_buf(),
             source: e,

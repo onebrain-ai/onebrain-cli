@@ -1,0 +1,57 @@
+---
+source: crates/onebrain-cli/tests/snapshots.rs
+expression: text
+---
+{
+    "theme": "dark",
+    "hooks": {
+        "Stop": [
+            {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "command": "onebrain",
+                        "args": [
+                            "checkpoint",
+                            "stop"
+                        ],
+                        "type": "command"
+                    }
+                ]
+            }
+        ],
+        "PostToolUse": [
+            {
+                "matcher": "Write|Edit",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "onebrain",
+                        "args": [
+                            "qmd-reindex"
+                        ]
+                    }
+                ]
+            }
+        ]
+    },
+    "permissions": {
+        "allow": [
+            "Bash(my-script *)",
+            "Read",
+            "Write",
+            "Edit",
+            "Glob",
+            "Grep",
+            "Bash(git *)",
+            "Bash(bun *)",
+            "Bash(gh *)",
+            "Bash(node *)",
+            "Bash(onebrain *)",
+            "Bash(bun install -g @onebrain-ai/cli*)",
+            "Bash(npm install -g @onebrain-ai/cli*)",
+            "WebFetch",
+            "WebSearch"
+        ]
+    }
+}

@@ -36,7 +36,11 @@ fn print_summary<W: Write>(result: &RegisterHooksResult, mut w: W) -> Result<()>
         writeln!(
             w,
             "{prefix} {}",
-            if result.wrote { "done" } else { "dry-run · no changes written" }
+            if result.wrote {
+                "done"
+            } else {
+                "dry-run · no changes written"
+            }
         )?;
         return Ok(());
     }
@@ -54,7 +58,11 @@ fn print_summary<W: Write>(result: &RegisterHooksResult, mut w: W) -> Result<()>
     writeln!(
         w,
         "{prefix} {}",
-        if result.wrote { "done" } else { "dry-run · no changes written" }
+        if result.wrote {
+            "done"
+        } else {
+            "dry-run · no changes written"
+        }
     )?;
     Ok(())
 }
