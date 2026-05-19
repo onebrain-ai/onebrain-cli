@@ -171,6 +171,18 @@ mod entry_tests {
     }
 
     #[test]
+    fn no_spawn_when_qmd_collection_is_empty_string() {
+        // Bun parity: `if (!collection)` treats empty string as falsy → no spawn.
+        // Rust's `.filter(|s| !s.is_empty())` mirrors this · pin the contract.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("vault.yml"), "qmd_collection: \"\"\n").unwrap();
+        let rec = Recorder::new();
+        let result = qmd_reindex(dir.path(), SpawnOs::Unix, |args| rec.spawn(args));
+        assert!(result.is_ok());
+        assert_eq!(rec.call_count(), 0);
+    }
+
+    #[test]
     fn spawns_with_correct_args_unix() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
