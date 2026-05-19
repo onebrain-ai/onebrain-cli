@@ -1,0 +1,9 @@
+---
+source: crates/onebrain-cli/tests/snapshots.rs
+expression: normalize_volatile(raw)
+---
+{
+  "datetime": "<NORMALIZED>",
+  "qmd_unembedded": 0,
+  "session_token": "<NORMALIZED>"
+}

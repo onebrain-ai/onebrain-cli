@@ -1,0 +1,8 @@
+---
+source: crates/onebrain-cli/tests/snapshots.rs
+expression: normalize_volatile(raw)
+---
+{
+  "decision": "block",
+  "reason": "onebrain-init-required"
+}
