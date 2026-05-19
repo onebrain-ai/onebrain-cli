@@ -11,8 +11,10 @@ pub(crate) mod frontmatter;
 pub mod harness;
 pub mod migrate;
 pub mod orphan;
+pub mod run_skill;
 
 pub use error::{FsError, Result};
 pub use harness::{detect_harness, detect_harnesses};
 pub use migrate::{run_backfill_recapped, MigrateResult};
 pub use orphan::{scan_orphans, OrphanScanResult};
+pub use run_skill::{build_prompt, resolve_claude_bin, ClaudeBinResolution, RunSkillError};
