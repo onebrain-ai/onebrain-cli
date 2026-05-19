@@ -9,6 +9,7 @@ publish.workspace    = true
 
 [dependencies]
 onebrain-core = { workspace = true }
+serde_yaml    = { workspace = true }
 thiserror     = { workspace = true }
 # walkdir + chrono return in Slice 2 when scan helpers land.
 
