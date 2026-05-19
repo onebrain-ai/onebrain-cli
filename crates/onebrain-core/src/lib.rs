@@ -8,7 +8,9 @@ pub mod error;
 pub mod path;
 pub mod types;
 
-pub use config::{load_vault_config, load_vault_config_at, CheckpointPolicy, VaultConfig};
+pub use config::{
+    load_vault_config, load_vault_config_at, CheckpointPolicy, VaultConfig, VaultFolders,
+};
 pub use error::{CoreError, Result};
 pub use path::{find_vault_root, VaultRoot};
 pub use types::SessionToken;

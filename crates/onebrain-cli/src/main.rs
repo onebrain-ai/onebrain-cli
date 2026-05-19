@@ -30,10 +30,10 @@ enum Cmd {
     /// Rebuild the qmd search index (Slice 3).
     QmdReindex,
 
-    /// Write a checkpoint file from a Stop hook reason (Slice 4).
+    /// Handle checkpoint lifecycle (stop | reset) · called by Claude Code Stop hook.
     Checkpoint {
-        #[arg(long)]
-        reason: String,
+        /// Mode · `stop` or `reset`.
+        mode: String,
     },
 
     /// Print harness detection result (internal).
@@ -101,7 +101,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             session_token,
         } => commands::orphan_scan::run(&logs_folder, &session_token),
         Cmd::QmdReindex => commands::qmd_reindex::run(),
-        Cmd::Checkpoint { .. } => todo!("Slice 4"),
+        Cmd::Checkpoint { mode } => commands::checkpoint::run(&mode),
         Cmd::Harness => todo!("Slice 5"),
         Cmd::Doctor { .. } => todo!("Slice 6"),
         Cmd::RegisterHooks => todo!("Slice 7"),
