@@ -486,6 +486,8 @@ mod tests {
         assert!(extract_frontmatter("# Just a heading\n").is_none());
     }
 
+    // POSIX-only: uses `/bin/sh` which doesn't exist on Windows.
+    #[cfg(unix)]
     #[test]
     fn resolve_absolute_path_that_exists_returns_as_is() {
         // /bin/sh exists on every POSIX system the test matrix touches.
@@ -493,6 +495,8 @@ mod tests {
         assert_eq!(p, "/bin/sh");
     }
 
+    // POSIX-only: error message wording matches Unix `/...` absolute paths.
+    #[cfg(unix)]
     #[test]
     fn resolve_absolute_path_missing_throws() {
         let err = resolve_command_binary("/nonexistent/binary/xyz", None).unwrap_err();
@@ -501,6 +505,8 @@ mod tests {
             .contains("Command not found at absolute path"));
     }
 
+    // POSIX-only: relies on `ls` being on PATH with a `/ls` suffix.
+    #[cfg(unix)]
     #[test]
     fn resolve_bare_name_in_path_returns_absolute() {
         // `ls` is on every POSIX system — its path varies (/bin/ls vs

@@ -76,6 +76,10 @@ fn status_lists_entries_with_cron_tag() {
 /// `--remove` deletes the plist files for entries in vault.yml. Run
 /// `--dry-run` is NOT used here — we actually write to a tempdir HOME and
 /// verify the file disappears.
+///
+/// macOS/Unix-only: launchd is macOS-only, so the plist write path is
+/// gated to Unix-style HOME layouts.
+#[cfg(unix)]
 #[test]
 fn remove_deletes_plists_from_launch_agents() {
     let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n");
@@ -128,6 +132,9 @@ fn resume_clears_paused_marker_file() {
 
 /// Skill+command collision (same basename) is rejected with the verbatim
 /// Bun error string.
+///
+/// Unix-only: relies on `/bin/echo` existing.
+#[cfg(unix)]
 #[test]
 fn collision_skill_and_command_with_same_basename_fails() {
     let v = tempdir().unwrap();
@@ -151,6 +158,9 @@ fn collision_skill_and_command_with_same_basename_fails() {
 
 /// Recurring command-mode entry produces a hook-style argv plist (no
 /// `--skill` / `--vault` / `run-skill`).
+///
+/// Unix-only: relies on `/bin/echo` existing.
+#[cfg(unix)]
 #[test]
 fn command_mode_dry_run_produces_hook_style_argv() {
     let v = tempdir().unwrap();
