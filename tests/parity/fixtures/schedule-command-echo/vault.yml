@@ -1,0 +1,5 @@
+schedule:
+  - cron: "0 3 * * 0"
+    command: /bin/echo
+    args:
+      - hello

@@ -1,0 +1,570 @@
+//! Launchd plist emitter. Mirrors Bun `src/lib/scheduler/launchd.ts`
+//! byte-for-byte — every newline and indent space must match for the
+//! Layer-4 parity test against the Bun v2.3.3 binary.
+//!
+//! Implementation is **string templating, not `quick-xml`.** A round-trip
+//! through `quick-xml` would re-format whitespace, breaking the byte
+//! contract. The escape helper [`xml_escape`] mirrors Bun's exact
+//! `.replace(/&/g, '&amp;')...` chain.
+
+use crate::scheduler::cron_parse::{at_to_launchd, cron_fields_to_launchd};
+use crate::scheduler::entry::{is_command_mode, is_one_shot};
+use crate::scheduler::types::{Args, ScheduleEntry};
+use std::path::{Path, PathBuf};
+
+/// Context required to emit a single plist — paths, the CLI binary path
+/// that launchd should exec, and the user's UID for `launchctl bootout`.
+pub struct LaunchdContext {
+    /// Absolute path to the vault root (passed as `--vault` in skill-mode plists).
+    pub vault_path: PathBuf,
+
+    /// Absolute path to the `onebrain` binary launchd should exec.
+    pub skill_cli_path: String,
+
+    /// Absolute path to `07-logs/scheduler` (or vault-yml-overridden equivalent).
+    pub log_base_path: PathBuf,
+
+    /// User homedir (drives `~/Library/LaunchAgents/<label>.plist`).
+    pub homedir: PathBuf,
+
+    /// User's effective UID (drives `launchctl bootout gui/<uid>/<label>`).
+    pub uid: u32,
+}
+
+/// Escape XML-sensitive chars in attribute and text-content positions.
+///
+/// Mirrors Bun's chain `.replace(/&/, '&amp;').replace(/</, '&lt;')
+/// .replace(/>/, '&gt;').replace(/"/, '&quot;')`. Order matters — `&` first
+/// so the literal ampersand in `&amp;` is not double-escaped.
+pub fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Derive the launchd label suffix from an entry.
+///
+/// Command-mode label uses the basename of `entry.command` so
+/// `command: onebrain` and `command: /opt/homebrew/bin/onebrain` produce
+/// the same plist file path (the collision detector relies on this).
+/// Skill-mode strips the leading `/`. Non-`[a-zA-Z0-9-]` chars become `-`.
+pub fn label_for_entry(entry: &ScheduleEntry) -> String {
+    let raw = if is_command_mode(entry) {
+        let cmd = entry.command.as_deref().unwrap_or("");
+        Path::new(cmd)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(cmd)
+            .to_string()
+    } else {
+        entry
+            .skill
+            .as_deref()
+            .unwrap_or("")
+            .trim_start_matches('/')
+            .to_string()
+    };
+    sanitize_label(&raw)
+}
+
+fn sanitize_label(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Compute the on-disk plist path for a skill or label string.
+///
+/// Accepts either a leading-slash skill name (`/daily`) or a pre-stripped
+/// label (`daily`) — same dual-input shape as Bun. Non-`[a-zA-Z0-9-]` are
+/// replaced with `-`.
+pub fn plist_path(skill_or_label: &str, homedir: &Path) -> PathBuf {
+    let stripped = skill_or_label.trim_start_matches('/');
+    let label_safe = sanitize_label(stripped);
+    homedir
+        .join("Library/LaunchAgents")
+        .join(format!("com.onebrain.{label_safe}.plist"))
+}
+
+/// Build the `<ProgramArguments>` body for a recurring skill-mode entry.
+fn recurring_skill_block(entry: &ScheduleEntry, ctx: &LaunchdContext) -> String {
+    let mut out = format!(
+        "        <string>{}</string>\n\
+         \x20       <string>run-skill</string>\n\
+         \x20       <string>--vault</string>\n\
+         \x20       <string>{}</string>\n\
+         \x20       <string>--skill</string>\n\
+         \x20       <string>{}</string>",
+        xml_escape(&ctx.skill_cli_path),
+        xml_escape(&ctx.vault_path.to_string_lossy()),
+        xml_escape(entry.skill.as_deref().unwrap_or("")),
+    );
+    if let Some(Args::Map(map)) = &entry.args {
+        for (k, v) in map.iter() {
+            out.push('\n');
+            out.push_str("        <string>--arg</string>\n        <string>");
+            out.push_str(&xml_escape(&format!("{k}={v}")));
+            out.push_str("</string>");
+        }
+    }
+    out
+}
+
+/// Build the `<ProgramArguments>` body for a recurring command-mode entry.
+/// Each argv element becomes a `<string>` line.
+fn recurring_command_block(entry: &ScheduleEntry) -> String {
+    let cmd = entry.command.as_deref().unwrap_or("");
+    let mut lines: Vec<String> = vec![format!("        <string>{}</string>", xml_escape(cmd))];
+    if let Some(Args::List(argv)) = &entry.args {
+        for a in argv {
+            lines.push(format!("        <string>{}</string>", xml_escape(a)));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Build the `<ProgramArguments>` body for a one-shot skill-mode entry —
+/// wraps a self-deleting shell command for launchctl bootout + rm.
+fn one_shot_skill_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &str) -> String {
+    let plist_file = format!(
+        "{}/Library/LaunchAgents/{label}.plist",
+        ctx.homedir.to_string_lossy()
+    );
+    let args_flags: String = match &entry.args {
+        Some(Args::Map(map)) if !map.is_empty() => {
+            let parts: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("--arg=\"{k}={v}\""))
+                .collect();
+            format!(" {}", parts.join(" "))
+        }
+        _ => String::new(),
+    };
+    let shell = format!(
+        "\"{}\" run-skill --vault=\"{}\" --skill=\"{}\"{}; launchctl bootout gui/{}/{}; rm -f \"{}\"",
+        ctx.skill_cli_path,
+        ctx.vault_path.to_string_lossy(),
+        entry.skill.as_deref().unwrap_or(""),
+        args_flags,
+        ctx.uid,
+        label,
+        plist_file,
+    );
+    format!(
+        "        <string>/bin/sh</string>\n\
+         \x20       <string>-c</string>\n\
+         \x20       <string>{}</string>",
+        xml_escape(&shell)
+    )
+}
+
+/// Build the `<ProgramArguments>` body for a one-shot command-mode entry.
+fn one_shot_command_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &str) -> String {
+    let plist_file = format!(
+        "{}/Library/LaunchAgents/{label}.plist",
+        ctx.homedir.to_string_lossy()
+    );
+    let quoted_args: String = match &entry.args {
+        Some(Args::List(argv)) if !argv.is_empty() => {
+            let parts: Vec<String> = argv.iter().map(|a| format!("\"{a}\"")).collect();
+            format!(" {}", parts.join(" "))
+        }
+        _ => String::new(),
+    };
+    let inner = format!(
+        "\"{}\"{}",
+        entry.command.as_deref().unwrap_or(""),
+        quoted_args
+    );
+    let shell = format!(
+        "{}; launchctl bootout gui/{}/{}; rm -f \"{}\"",
+        inner, ctx.uid, label, plist_file
+    );
+    format!(
+        "        <string>/bin/sh</string>\n\
+         \x20       <string>-c</string>\n\
+         \x20       <string>{}</string>",
+        xml_escape(&shell)
+    )
+}
+
+/// Build the `<StartCalendarInterval>` body — cron emits any non-wildcard
+/// fields in (Minute, Hour, Day, Month, Weekday) insertion order; one-shot
+/// emits all five (Year, Month, Day, Hour, Minute).
+fn calendar_block(entry: &ScheduleEntry) -> String {
+    if is_one_shot(entry) {
+        let f = at_to_launchd(entry.at.as_deref().unwrap());
+        format!(
+            "        <key>Year</key>\n\
+             \x20       <integer>{}</integer>\n\
+             \x20       <key>Month</key>\n\
+             \x20       <integer>{}</integer>\n\
+             \x20       <key>Day</key>\n\
+             \x20       <integer>{}</integer>\n\
+             \x20       <key>Hour</key>\n\
+             \x20       <integer>{}</integer>\n\
+             \x20       <key>Minute</key>\n\
+             \x20       <integer>{}</integer>",
+            f.year, f.month, f.day, f.hour, f.minute
+        )
+    } else {
+        let f = cron_fields_to_launchd(entry.cron.as_deref().unwrap());
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(m) = f.minute {
+            parts.push(format!(
+                "        <key>Minute</key>\n        <integer>{m}</integer>"
+            ));
+        }
+        if let Some(h) = f.hour {
+            parts.push(format!(
+                "        <key>Hour</key>\n        <integer>{h}</integer>"
+            ));
+        }
+        if let Some(d) = f.day {
+            parts.push(format!(
+                "        <key>Day</key>\n        <integer>{d}</integer>"
+            ));
+        }
+        if let Some(mo) = f.month {
+            parts.push(format!(
+                "        <key>Month</key>\n        <integer>{mo}</integer>"
+            ));
+        }
+        if let Some(w) = f.weekday {
+            parts.push(format!(
+                "        <key>Weekday</key>\n        <integer>{w}</integer>"
+            ));
+        }
+        parts.join("\n")
+    }
+}
+
+/// Emit a complete launchd plist for the given entry. Byte parity with Bun
+/// is mandatory — adjust whitespace only with the parity test running.
+pub fn generate_plist(entry: &ScheduleEntry, ctx: &LaunchdContext) -> String {
+    let label_safe = label_for_entry(entry);
+    let label = format!("com.onebrain.{label_safe}");
+
+    let calendar = calendar_block(entry);
+    let program_args = match (is_one_shot(entry), is_command_mode(entry)) {
+        (true, true) => one_shot_command_block(entry, ctx, &label),
+        (true, false) => one_shot_skill_block(entry, ctx, &label),
+        (false, true) => recurring_command_block(entry),
+        (false, false) => recurring_skill_block(entry, ctx),
+    };
+
+    let log_base = ctx.log_base_path.to_string_lossy();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n\
+         \x20   <key>Label</key>\n\
+         \x20   <string>{}</string>\n\
+         \x20   <key>ProgramArguments</key>\n\
+         \x20   <array>\n\
+         {}\n\
+         \x20   </array>\n\
+         \x20   <key>StartCalendarInterval</key>\n\
+         \x20   <dict>\n\
+         {}\n\
+         \x20   </dict>\n\
+         \x20   <key>StandardOutPath</key>\n\
+         \x20   <string>{}/onebrain-{}.stdout</string>\n\
+         \x20   <key>StandardErrorPath</key>\n\
+         \x20   <string>{}/onebrain-{}.stderr</string>\n\
+         \x20   <key>RunAtLoad</key>\n\
+         \x20   <false/>\n\
+         </dict>\n\
+         </plist>",
+        xml_escape(&label),
+        program_args,
+        calendar,
+        xml_escape(&log_base),
+        label_safe,
+        xml_escape(&log_base),
+        label_safe,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indexmap::IndexMap;
+
+    fn test_ctx() -> LaunchdContext {
+        LaunchdContext {
+            vault_path: PathBuf::from("/Users/test/vault"),
+            skill_cli_path: "/opt/homebrew/bin/onebrain".into(),
+            log_base_path: PathBuf::from("/Users/test/vault/07-logs/scheduler/2026/05"),
+            homedir: PathBuf::from("/Users/test"),
+            uid: 501,
+        }
+    }
+
+    fn skill_entry(skill: &str, cron: &str) -> ScheduleEntry {
+        ScheduleEntry {
+            cron: Some(cron.into()),
+            skill: Some(skill.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn xml_escape_handles_all_four_chars() {
+        assert_eq!(
+            xml_escape("a & b < c > d \"e\""),
+            "a &amp; b &lt; c &gt; d &quot;e&quot;"
+        );
+    }
+
+    #[test]
+    fn xml_escape_amp_not_double_escaped() {
+        // If we replaced '<' before '&', "&lt;" would become "&amp;lt;".
+        assert_eq!(xml_escape("&"), "&amp;");
+    }
+
+    #[test]
+    fn label_for_skill_strips_leading_slash() {
+        let e = skill_entry("/daily", "0 9 * * *");
+        assert_eq!(label_for_entry(&e), "daily");
+    }
+
+    #[test]
+    fn label_for_command_uses_basename() {
+        let e = ScheduleEntry {
+            cron: Some("0 3 * * 0".into()),
+            command: Some("/opt/homebrew/bin/onebrain".into()),
+            ..Default::default()
+        };
+        assert_eq!(label_for_entry(&e), "onebrain");
+    }
+
+    #[test]
+    fn label_replaces_non_alphanum_with_dash() {
+        // hypothetical skill with `.` — must be sanitized
+        let e = skill_entry("/foo.bar", "0 9 * * *");
+        assert_eq!(label_for_entry(&e), "foo-bar");
+    }
+
+    #[test]
+    fn plist_path_returns_launch_agents_path() {
+        let p = plist_path("/daily", Path::new("/Users/test"));
+        assert_eq!(
+            p,
+            PathBuf::from("/Users/test/Library/LaunchAgents/com.onebrain.daily.plist")
+        );
+    }
+
+    #[test]
+    fn plist_path_handles_pre_stripped_label() {
+        let p = plist_path("daily", Path::new("/Users/test"));
+        assert_eq!(
+            p,
+            PathBuf::from("/Users/test/Library/LaunchAgents/com.onebrain.daily.plist")
+        );
+    }
+
+    #[test]
+    fn recurring_skill_emits_run_skill_subcommand() {
+        let out = generate_plist(&skill_entry("/daily", "0 9 * * *"), &test_ctx());
+        assert!(out.contains("<string>com.onebrain.daily</string>"));
+        assert!(
+            out.contains("<key>Hour</key>\n        <integer>9</integer>"),
+            "out:\n{out}"
+        );
+        assert!(out.contains("<string>/opt/homebrew/bin/onebrain</string>"));
+        assert!(out.contains("<string>run-skill</string>"));
+        assert!(out.contains("<string>--vault</string>"));
+        assert!(out.contains("<string>/Users/test/vault</string>"));
+        assert!(out.contains("<string>--skill</string>"));
+        assert!(out.contains("<string>/daily</string>"));
+        // Pre-v2.3.3 contract used --headless. Verify it's gone.
+        assert!(!out.contains("<string>--headless</string>"));
+    }
+
+    #[test]
+    fn recurring_skill_with_args_emits_arg_kv_pairs() {
+        let mut e = skill_entry("/distill", "0 12 * * 0");
+        let mut map = IndexMap::new();
+        map.insert("topic".into(), "this-week".into());
+        e.args = Some(Args::Map(map));
+        let out = generate_plist(&e, &test_ctx());
+        assert!(out.contains("<string>--arg</string>"));
+        assert!(
+            out.contains("<string>topic=this-week</string>"),
+            "out:\n{out}"
+        );
+    }
+
+    #[test]
+    fn recurring_skill_escapes_xml_special_chars_in_arg_values() {
+        let mut e = skill_entry("/echo", "0 9 * * *");
+        let mut map = IndexMap::new();
+        map.insert("msg".into(), "a & b < c".into());
+        e.args = Some(Args::Map(map));
+        let out = generate_plist(&e, &test_ctx());
+        assert!(
+            out.contains("<string>msg=a &amp; b &lt; c</string>"),
+            "out:\n{out}"
+        );
+        // Raw chars must not appear in the output anywhere.
+        assert!(!out.contains("msg=a & b"));
+    }
+
+    #[test]
+    fn recurring_skill_no_blank_line_when_args_absent() {
+        let out = generate_plist(&skill_entry("/daily", "0 9 * * *"), &test_ctx());
+        // Bun guarantees a tight `<string>/daily</string>\n    </array>` join.
+        assert!(!out.contains("<string>/daily</string>\n\n"), "out:\n{out}");
+    }
+
+    #[test]
+    fn one_shot_skill_emits_year_month_day_hour_minute() {
+        let e = ScheduleEntry {
+            at: Some("2026-05-13 14:30".into()),
+            skill: Some("/reminder".into()),
+            ..Default::default()
+        };
+        let out = generate_plist(&e, &test_ctx());
+        assert!(out.contains("<key>Year</key>\n        <integer>2026</integer>"));
+        assert!(out.contains("<key>Month</key>\n        <integer>5</integer>"));
+        assert!(out.contains("<key>Day</key>\n        <integer>13</integer>"));
+        assert!(out.contains("<key>Hour</key>\n        <integer>14</integer>"));
+        assert!(out.contains("<key>Minute</key>\n        <integer>30</integer>"));
+    }
+
+    #[test]
+    fn one_shot_skill_shell_wrapper_invokes_run_skill_and_self_deletes() {
+        let e = ScheduleEntry {
+            at: Some("2026-05-13 14:30".into()),
+            skill: Some("/reminder".into()),
+            ..Default::default()
+        };
+        let out = generate_plist(&e, &test_ctx());
+        assert!(out.contains("<string>/bin/sh</string>"));
+        assert!(out.contains("<string>-c</string>"));
+        assert!(out.contains("run-skill"));
+        assert!(out.contains("--vault=&quot;/Users/test/vault&quot;"));
+        assert!(out.contains("--skill=&quot;/reminder&quot;"));
+        assert!(out.contains("launchctl bootout gui/501/com.onebrain.reminder"));
+        assert!(out.contains("rm -f"));
+        assert!(!out.contains("--headless"));
+    }
+
+    #[test]
+    fn one_shot_skill_args_use_arg_quoted_form_inside_wrapper() {
+        let mut e = ScheduleEntry {
+            at: Some("2026-05-13 14:30".into()),
+            skill: Some("/echo".into()),
+            ..Default::default()
+        };
+        let mut map = IndexMap::new();
+        map.insert("msg".into(), "hello".into());
+        e.args = Some(Args::Map(map));
+        let out = generate_plist(&e, &test_ctx());
+        assert!(out.contains("--arg=&quot;msg=hello&quot;"));
+    }
+
+    #[test]
+    fn recurring_command_emits_hook_style_program_arguments() {
+        let e = ScheduleEntry {
+            cron: Some("0 3 * * 0".into()),
+            command: Some("/opt/homebrew/bin/onebrain".into()),
+            args: Some(Args::List(vec!["qmd-reindex".into()])),
+            ..Default::default()
+        };
+        let out = generate_plist(&e, &test_ctx());
+        assert!(out.contains("<string>/opt/homebrew/bin/onebrain</string>"));
+        assert!(out.contains("<string>qmd-reindex</string>"));
+        assert!(!out.contains("<string>--skill</string>"));
+        assert!(!out.contains("<string>--vault</string>"));
+        assert!(!out.contains("<string>run-skill</string>"));
+    }
+
+    #[test]
+    fn command_label_consistent_between_absolute_and_bare_form() {
+        let bare = ScheduleEntry {
+            cron: Some("0 3 * * 0".into()),
+            command: Some("onebrain".into()),
+            args: Some(Args::List(vec!["qmd-reindex".into()])),
+            ..Default::default()
+        };
+        let abs = ScheduleEntry {
+            cron: Some("0 3 * * 0".into()),
+            command: Some("/opt/homebrew/bin/onebrain".into()),
+            args: Some(Args::List(vec!["qmd-reindex".into()])),
+            ..Default::default()
+        };
+        let out_bare = generate_plist(&bare, &test_ctx());
+        let out_abs = generate_plist(&abs, &test_ctx());
+        assert!(out_bare.contains("<string>com.onebrain.onebrain</string>"));
+        assert!(out_abs.contains("<string>com.onebrain.onebrain</string>"));
+    }
+
+    #[test]
+    fn one_shot_command_wraps_in_self_delete_shell() {
+        let e = ScheduleEntry {
+            at: Some("2026-05-13 14:30".into()),
+            command: Some("/opt/homebrew/bin/onebrain".into()),
+            args: Some(Args::List(vec!["qmd-reindex".into()])),
+            ..Default::default()
+        };
+        let out = generate_plist(&e, &test_ctx());
+        assert!(out.contains("<string>/bin/sh</string>"));
+        assert!(out.contains("&quot;/opt/homebrew/bin/onebrain&quot; &quot;qmd-reindex&quot;"));
+        assert!(out.contains("launchctl bootout gui/501/com.onebrain.onebrain"));
+        assert!(out.contains("rm -f"));
+    }
+
+    #[test]
+    fn command_with_no_args_produces_single_element_argv() {
+        let e = ScheduleEntry {
+            cron: Some("0 3 * * 0".into()),
+            command: Some("/usr/bin/true".into()),
+            ..Default::default()
+        };
+        let out = generate_plist(&e, &test_ctx());
+        assert!(out.contains("<string>/usr/bin/true</string>"));
+    }
+
+    #[test]
+    fn command_with_non_onebrain_binary_works() {
+        let e = ScheduleEntry {
+            cron: Some("0 5 * * *".into()),
+            command: Some("/usr/bin/rsync".into()),
+            args: Some(Args::List(vec!["-av".into(), "/src".into(), "/dst".into()])),
+            ..Default::default()
+        };
+        let out = generate_plist(&e, &test_ctx());
+        assert!(out.contains("<string>/usr/bin/rsync</string>"));
+        assert!(out.contains("<string>-av</string>"));
+    }
+
+    #[test]
+    fn command_mode_args_xml_escaped() {
+        let e = ScheduleEntry {
+            cron: Some("0 5 * * *".into()),
+            command: Some("/usr/local/bin/rclone".into()),
+            args: Some(Args::List(vec!["--exclude".into(), "a & b".into()])),
+            ..Default::default()
+        };
+        let out = generate_plist(&e, &test_ctx());
+        assert!(out.contains("<string>--exclude</string>"));
+        assert!(out.contains("<string>a &amp; b</string>"));
+        assert!(!out.contains("<string>a & b</string>"));
+    }
+
+    #[test]
+    fn generate_plist_snapshot_recurring_skill() {
+        let out = generate_plist(&skill_entry("/daily", "0 9 * * *"), &test_ctx());
+        insta::assert_snapshot!(out);
+    }
+}
