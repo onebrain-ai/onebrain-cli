@@ -1,4 +1,5 @@
 pub mod checkpoint;
+pub mod doctor;
 pub mod harness;
 pub mod orphan_scan;
 pub mod qmd_reindex;
