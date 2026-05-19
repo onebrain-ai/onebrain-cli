@@ -32,11 +32,23 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # Filesystem (Slice 1 partial · used by count_unembedded)
 walkdir   = "2"
 
-# Binary lookup (used by doctor qmd check to mirror Bun.which fallback to ~/.bun/bin)
+# Binary lookup (used by doctor qmd check + scheduler command-mode binary resolution)
 which     = "8"
 
 # HTTP client (Slice 11 · update · GitHub releases API)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+
+# Regex (Slice 8 scheduler · cron + at field validation · pre-compiled with OnceLock)
+regex     = "1"
+
+# Order-preserving map (Slice 8 scheduler · YAML insertion order for skill-mode args)
+indexmap  = { version = "2", features = ["serde"] }
+
+# Portable homedir resolution (Slice 8 scheduler plist path · std::env::home_dir is deprecated)
+dirs      = "5"
+
+# Direct getuid() on Unix for launchd plist UID field (Slice 8)
+libc      = "0.2"
 
 # Test infrastructure
 filetime          = "0.2"

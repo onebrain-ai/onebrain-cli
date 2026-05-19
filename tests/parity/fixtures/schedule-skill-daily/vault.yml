@@ -1,0 +1,3 @@
+schedule:
+  - cron: "0 9 * * *"
+    skill: /daily

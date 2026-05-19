@@ -60,8 +60,24 @@ enum Cmd {
 
     /// Install OS-level scheduler entries from vault.yml (Slice 8).
     RegisterSchedule {
+        /// Print the plists that would be written without touching disk.
+        #[arg(long)]
+        dry_run: bool,
+        /// Remove all plists for entries currently in vault.yml.
+        #[arg(long)]
+        remove: bool,
+        /// Re-emit plists with the current vault path (logs a notice).
+        #[arg(long)]
+        refresh: bool,
+        /// Clear the .paused marker for the given skill.
         #[arg(long)]
         resume: Option<String>,
+        /// Print a status report (which entries are installed).
+        #[arg(long)]
+        status: bool,
+        /// Fire a scheduled skill once for testing (deferred to Slice 12).
+        #[arg(long)]
+        test: Option<String>,
     },
 
     /// Run a one-shot vault migration (Slice 9).
@@ -132,7 +148,14 @@ fn dispatch(cli: Cli) -> Result<()> {
             dry_run,
             remove,
         } => std::process::exit(commands::register_hooks::run(vault, dry_run, remove)?),
-        Cmd::RegisterSchedule { .. } => todo!("Slice 8"),
+        Cmd::RegisterSchedule {
+            dry_run,
+            remove,
+            refresh,
+            resume,
+            status,
+            test,
+        } => commands::register_schedule::run(dry_run, remove, refresh, resume, status, test),
         Cmd::Migrate {
             name,
             cutoff,
