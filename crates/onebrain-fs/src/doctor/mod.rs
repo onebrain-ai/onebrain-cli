@@ -19,15 +19,16 @@ pub trait Check {
 
 // Per-check modules — populated in subsequent tasks.
 pub mod folders;
+pub mod orphans;
 pub mod vault_yml;
 pub mod vault_yml_keys;
-// pub mod orphans;        // Task 7
 // pub mod qmd;            // Task 8
 // pub mod plugin;         // Task 9
 // pub mod settings_hooks; // Task 10
 // pub mod marketplace;    // Task 11
 
 pub use folders::FoldersCheck;
+pub use orphans::OrphanCheckpointsCheck;
 pub use vault_yml::VaultYmlCheck;
 pub use vault_yml_keys::VaultYmlKeysCheck;
 
@@ -40,6 +41,7 @@ pub fn run_all_checks(vault_root: &Path, config: &VaultConfig) -> Vec<DoctorResu
         Box::new(VaultYmlCheck),
         Box::new(VaultYmlKeysCheck),
         Box::new(FoldersCheck),
+        Box::new(OrphanCheckpointsCheck),
     ];
     checks
         .iter()
