@@ -16,8 +16,10 @@ thiserror     = { workspace = true }
 chrono        = { workspace = true }
 walkdir       = { workspace = true }
 which         = { workspace = true }
+reqwest       = { workspace = true }
 
 [dev-dependencies]
 tempfile          = { workspace = true }
 pretty_assertions = { workspace = true }
 filetime          = { workspace = true }
+mockito           = { workspace = true }
