@@ -118,4 +118,21 @@ mod tests {
         assert!(s.contains("1 warning(s)"));
         assert!(s.contains("fix before using"));
     }
+
+    #[test]
+    fn print_report_snapshot_mixed_statuses() {
+        let results = vec![
+            DoctorResult::ok("vault.yml", "valid").with_details(vec!["qmd: ob-1".into()]),
+            DoctorResult::warn("settings-hooks", "2 issue(s)")
+                .with_hint("Run onebrain doctor --fix to repair hooks")
+                .with_details(vec!["Stop hook missing".into()]),
+            DoctorResult::error("folders", "7/8 present")
+                .with_hint("Missing: 01-projects")
+                .with_details(vec!["missing: 01-projects".into()]),
+        ];
+        let mut buf = Vec::new();
+        print_report(&results, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        insta::assert_snapshot!(output);
+    }
 }
