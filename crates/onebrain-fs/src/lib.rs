@@ -9,8 +9,10 @@ pub mod doctor;
 pub mod error;
 pub(crate) mod frontmatter;
 pub mod harness;
+pub mod migrate;
 pub mod orphan;
 
 pub use error::{FsError, Result};
 pub use harness::{detect_harness, detect_harnesses};
+pub use migrate::{run_backfill_recapped, MigrateResult};
 pub use orphan::{scan_orphans, OrphanScanResult};
