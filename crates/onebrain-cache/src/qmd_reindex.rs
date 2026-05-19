@@ -14,7 +14,6 @@ pub enum SpawnOs {
 
 impl SpawnOs {
     /// Resolve from `std::env::consts::OS` ("linux", "macos", "windows", etc.).
-    #[allow(dead_code)] // used by upcoming commands::qmd_reindex in Task 3
     pub fn from_env() -> Self {
         match std::env::consts::OS {
             "windows" => SpawnOs::Windows,

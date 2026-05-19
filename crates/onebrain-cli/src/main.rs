@@ -100,7 +100,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             logs_folder,
             session_token,
         } => commands::orphan_scan::run(&logs_folder, &session_token),
-        Cmd::QmdReindex => todo!("Slice 3"),
+        Cmd::QmdReindex => commands::qmd_reindex::run(),
         Cmd::Checkpoint { .. } => todo!("Slice 4"),
         Cmd::Harness => todo!("Slice 5"),
         Cmd::Doctor { .. } => todo!("Slice 6"),
