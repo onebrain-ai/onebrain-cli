@@ -1,5 +1,6 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "tests/parity"]
+default-members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
