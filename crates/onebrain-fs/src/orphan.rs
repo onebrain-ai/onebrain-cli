@@ -206,7 +206,6 @@ use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 
 /// File mtime as milliseconds since UNIX epoch · None on any error.
-#[allow(dead_code)] // used by upcoming is_group_active_or_ambiguous in Task 7
 pub(crate) fn get_mtime_ms(path: &Path) -> Option<u64> {
     let meta = fs::metadata(path).ok()?;
     let mtime = meta.modified().ok()?;
@@ -216,7 +215,6 @@ pub(crate) fn get_mtime_ms(path: &Path) -> Option<u64> {
 
 /// Newest mtime across a file list · None if the list is empty OR any stat fails
 /// (fail-safe propagation — one ambiguous file forces the whole group ambiguous).
-#[allow(dead_code)] // used by upcoming is_group_active_or_ambiguous in Task 7
 pub(crate) fn get_newest_mtime_ms(paths: &[PathBuf]) -> Option<u64> {
     if paths.is_empty() {
         return None;
@@ -266,6 +264,29 @@ pub(crate) fn active_session_guard_ms(vault_root: &Path) -> u64 {
     }
 }
 
+/// Whether a group of checkpoint files should be skipped (active in another harness
+/// or otherwise ambiguous). Returns `true` → caller must NOT count this group.
+///
+/// Fail-safe: any uncertainty (empty group · stat failure · future mtime · zero
+/// guard) returns `true` so the group is skipped. Bun symmetry: `/wrapup` uses
+/// the same predicate, so any "skip here" lines up with "wrapup also skips."
+#[allow(dead_code)] // used by upcoming scan_orphans in Task 9
+pub(crate) fn is_group_active_or_ambiguous(paths: &[PathBuf], now_ms: u64, guard_ms: u64) -> bool {
+    if guard_ms == 0 {
+        return true;
+    }
+    let newest = match get_newest_mtime_ms(paths) {
+        Some(n) => n,
+        None => return true,
+    };
+    if newest > now_ms {
+        // Future mtime / clock skew → fail-safe ambiguous
+        return true;
+    }
+    let age_ms = now_ms - newest;
+    age_ms < guard_ms
+}
+
 #[cfg(test)]
 mod guard_threshold_tests {
     use super::*;
@@ -309,6 +330,93 @@ mod guard_threshold_tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("vault.yml"), "not: : valid").unwrap();
         assert_eq!(active_session_guard_ms(dir.path()), MIN_GUARD_MS);
+    }
+}
+
+#[cfg(test)]
+mod active_predicate_tests {
+    use super::*;
+    use std::fs;
+    use std::time::{Duration, SystemTime};
+    use tempfile::tempdir;
+
+    fn write_with_mtime(
+        dir: &std::path::Path,
+        name: &str,
+        secs_before_now: u64,
+    ) -> std::path::PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, "x").unwrap();
+        let when = SystemTime::now() - Duration::from_secs(secs_before_now);
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(when)).unwrap();
+        path
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    #[test]
+    fn group_under_guard_is_active() {
+        let dir = tempdir().unwrap();
+        let f = write_with_mtime(dir.path(), "a.md", 60); // 1 min ago
+        let guard = 60 * 60 * 1000; // 60 min
+        assert!(is_group_active_or_ambiguous(&[f], now_ms(), guard));
+    }
+
+    #[test]
+    fn group_well_over_guard_is_counted() {
+        let dir = tempdir().unwrap();
+        let f = write_with_mtime(dir.path(), "a.md", 2 * 3600); // 2 hours ago
+        let guard = 60 * 60 * 1000;
+        assert!(!is_group_active_or_ambiguous(&[f], now_ms(), guard));
+    }
+
+    #[test]
+    fn empty_group_is_ambiguous() {
+        assert!(is_group_active_or_ambiguous(&[], now_ms(), 60 * 60 * 1000));
+    }
+
+    #[test]
+    fn group_with_missing_file_is_ambiguous() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("does_not_exist.md");
+        assert!(is_group_active_or_ambiguous(
+            &[missing],
+            now_ms(),
+            60 * 60 * 1000
+        ));
+    }
+
+    #[test]
+    fn future_mtime_clock_skew_is_ambiguous() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("future.md");
+        fs::write(&f, "x").unwrap();
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        filetime::set_file_mtime(&f, filetime::FileTime::from_system_time(future)).unwrap();
+        // ageMs negative → ambiguous (skip)
+        assert!(is_group_active_or_ambiguous(&[f], now_ms(), 60 * 60 * 1000));
+    }
+
+    #[test]
+    fn zero_guard_ms_is_ambiguous() {
+        let dir = tempdir().unwrap();
+        let f = write_with_mtime(dir.path(), "a.md", 3600);
+        assert!(is_group_active_or_ambiguous(&[f], now_ms(), 0));
+    }
+
+    #[test]
+    fn newest_mtime_decides_for_mixed_age_group() {
+        let dir = tempdir().unwrap();
+        let old = write_with_mtime(dir.path(), "old.md", 7200);
+        let fresh = write_with_mtime(dir.path(), "fresh.md", 60);
+        let guard = 60 * 60 * 1000;
+        // newest is `fresh` → 1 min ago → under guard → active
+        assert!(is_group_active_or_ambiguous(&[old, fresh], now_ms(), guard));
     }
 }
 
