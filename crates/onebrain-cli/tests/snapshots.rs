@@ -236,5 +236,4 @@ fn vault_sync_happy_path_stdout_snapshot() {
         .unwrap();
     let stdout = String::from_utf8(out.stdout).unwrap();
     insta::assert_snapshot!("vault_sync_happy_stdout", stdout);
->>>>>>> f557773 (test(slice-13): assert_cmd integration + insta snapshot + parity scaffold)
 }
