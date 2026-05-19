@@ -6,6 +6,32 @@ pub struct VaultConfig {
     /// Optional qmd MCP collection name · None disables semantic search wiring.
     #[serde(default)]
     pub qmd_collection: Option<String>,
+
+    /// Checkpoint policy (Stop hook thresholds). Defaults supplied by `CheckpointPolicy::default`.
+    #[serde(default)]
+    pub checkpoint: CheckpointPolicy,
+}
+
+/// Checkpoint policy fields parsed from `vault.yml`'s `checkpoint:` block.
+///
+/// Defaults match Bun v2.3.3 (`DEFAULT_CHECKPOINT` in `src/lib/parser.ts`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointPolicy {
+    /// Minutes between Stop hook checkpoint emissions. Default 30.
+    #[serde(default = "default_checkpoint_minutes")]
+    pub minutes: u32,
+}
+
+fn default_checkpoint_minutes() -> u32 {
+    30
+}
+
+impl Default for CheckpointPolicy {
+    fn default() -> Self {
+        Self {
+            minutes: default_checkpoint_minutes(),
+        }
+    }
 }
 
 /// Read and parse `<root>/vault.yml`. Returns [`CoreError::VaultYamlMissing`]
@@ -61,5 +87,26 @@ mod tests {
         std::fs::remove_file(root.join("vault.yml")).unwrap();
         let err = load_vault_config(&root).unwrap_err();
         assert!(matches!(err, CoreError::VaultYamlMissing { .. }));
+    }
+
+    #[test]
+    fn loads_checkpoint_minutes_from_vault_yml() {
+        let (_dir, root) = write_vault("checkpoint:\n  minutes: 45\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.checkpoint.minutes, 45);
+    }
+
+    #[test]
+    fn missing_checkpoint_defaults_to_30() {
+        let (_dir, root) = write_vault("# no checkpoint config\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.checkpoint.minutes, 30);
+    }
+
+    #[test]
+    fn partial_checkpoint_uses_default_for_missing_minutes() {
+        let (_dir, root) = write_vault("checkpoint:\n  messages: 10\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.checkpoint.minutes, 30);
     }
 }
