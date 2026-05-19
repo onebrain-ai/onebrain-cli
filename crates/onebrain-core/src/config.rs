@@ -51,9 +51,50 @@ impl Default for CheckpointPolicy {
 /// Defaults match Bun v2.3.3 (`DEFAULT_FOLDERS` in `src/lib/parser.ts`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultFolders {
-    /// Logs folder name (default `07-logs`).
+    #[serde(default = "default_folders_inbox")]
+    pub inbox: String,
+    #[serde(default = "default_folders_projects")]
+    pub projects: String,
+    #[serde(default = "default_folders_areas")]
+    pub areas: String,
+    #[serde(default = "default_folders_knowledge")]
+    pub knowledge: String,
+    #[serde(default = "default_folders_resources")]
+    pub resources: String,
+    #[serde(default = "default_folders_agent")]
+    pub agent: String,
+    #[serde(default = "default_folders_archive")]
+    pub archive: String,
     #[serde(default = "default_folders_logs")]
     pub logs: String,
+}
+
+fn default_folders_inbox() -> String {
+    "00-inbox".to_string()
+}
+
+fn default_folders_projects() -> String {
+    "01-projects".to_string()
+}
+
+fn default_folders_areas() -> String {
+    "02-areas".to_string()
+}
+
+fn default_folders_knowledge() -> String {
+    "03-knowledge".to_string()
+}
+
+fn default_folders_resources() -> String {
+    "04-resources".to_string()
+}
+
+fn default_folders_agent() -> String {
+    "05-agent".to_string()
+}
+
+fn default_folders_archive() -> String {
+    "06-archive".to_string()
 }
 
 fn default_folders_logs() -> String {
@@ -63,6 +104,13 @@ fn default_folders_logs() -> String {
 impl Default for VaultFolders {
     fn default() -> Self {
         Self {
+            inbox: default_folders_inbox(),
+            projects: default_folders_projects(),
+            areas: default_folders_areas(),
+            knowledge: default_folders_knowledge(),
+            resources: default_folders_resources(),
+            agent: default_folders_agent(),
+            archive: default_folders_archive(),
             logs: default_folders_logs(),
         }
     }
@@ -185,5 +233,26 @@ mod tests {
         let (_dir, root) = write_vault("# empty\n");
         let cfg = load_vault_config(&root).unwrap();
         assert_eq!(cfg.folders.logs, "07-logs");
+    }
+
+    #[test]
+    fn folders_default_is_8_standard_keys() {
+        let f = VaultFolders::default();
+        assert_eq!(f.inbox, "00-inbox");
+        assert_eq!(f.projects, "01-projects");
+        assert_eq!(f.areas, "02-areas");
+        assert_eq!(f.knowledge, "03-knowledge");
+        assert_eq!(f.resources, "04-resources");
+        assert_eq!(f.agent, "05-agent");
+        assert_eq!(f.archive, "06-archive");
+        assert_eq!(f.logs, "07-logs");
+    }
+
+    #[test]
+    fn folders_partial_override_keeps_defaults() {
+        let (_dir, root) = write_vault("folders:\n  inbox: my-inbox\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.folders.inbox, "my-inbox");
+        assert_eq!(cfg.folders.projects, "01-projects"); // default preserved
     }
 }
