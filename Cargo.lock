@@ -540,6 +540,7 @@ dependencies = [
 name = "parity"
 version = "3.0.0"
 dependencies = [
+ "filetime",
  "pretty_assertions",
  "serde_json",
  "tempfile",
