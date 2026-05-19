@@ -1,5 +1,6 @@
 //! Session token resolution · launchd plist generation · qmd index query / reindex · checkpoint state.
 
+pub mod checkpoint;
 pub mod error;
 pub mod qmd;
 pub mod qmd_reindex;
