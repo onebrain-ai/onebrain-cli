@@ -11,6 +11,10 @@ pub struct VaultConfig {
     /// Checkpoint policy (Stop hook thresholds). Defaults supplied by `CheckpointPolicy::default`.
     #[serde(default)]
     pub checkpoint: CheckpointPolicy,
+
+    /// Folder layout · defaults supplied by `VaultFolders::default`.
+    #[serde(default)]
+    pub folders: VaultFolders,
 }
 
 /// Checkpoint policy fields parsed from `vault.yml`'s `checkpoint:` block.
@@ -21,16 +25,45 @@ pub struct CheckpointPolicy {
     /// Minutes between Stop hook checkpoint emissions. Default 30.
     #[serde(default = "default_checkpoint_minutes")]
     pub minutes: u32,
+    /// Message-count threshold for Stop hook checkpoint emission. Default 15.
+    #[serde(default = "default_checkpoint_messages")]
+    pub messages: u32,
 }
 
 fn default_checkpoint_minutes() -> u32 {
     30
 }
 
+fn default_checkpoint_messages() -> u32 {
+    15
+}
+
 impl Default for CheckpointPolicy {
     fn default() -> Self {
         Self {
             minutes: default_checkpoint_minutes(),
+            messages: default_checkpoint_messages(),
+        }
+    }
+}
+
+/// Vault folder layout parsed from `vault.yml`'s `folders:` block.
+/// Defaults match Bun v2.3.3 (`DEFAULT_FOLDERS` in `src/lib/parser.ts`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultFolders {
+    /// Logs folder name (default `07-logs`).
+    #[serde(default = "default_folders_logs")]
+    pub logs: String,
+}
+
+fn default_folders_logs() -> String {
+    "07-logs".to_string()
+}
+
+impl Default for VaultFolders {
+    fn default() -> Self {
+        Self {
+            logs: default_folders_logs(),
         }
     }
 }
@@ -124,5 +157,33 @@ mod tests {
         let (_dir, root) = write_vault("checkpoint:\n  messages: 10\n");
         let cfg = load_vault_config(&root).unwrap();
         assert_eq!(cfg.checkpoint.minutes, 30);
+    }
+
+    #[test]
+    fn loads_checkpoint_messages_from_vault_yml() {
+        let (_dir, root) = write_vault("checkpoint:\n  messages: 20\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.checkpoint.messages, 20);
+    }
+
+    #[test]
+    fn missing_checkpoint_messages_defaults_to_15() {
+        let (_dir, root) = write_vault("# empty\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.checkpoint.messages, 15);
+    }
+
+    #[test]
+    fn loads_folders_logs_from_vault_yml() {
+        let (_dir, root) = write_vault("folders:\n  logs: custom-logs\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.folders.logs, "custom-logs");
+    }
+
+    #[test]
+    fn missing_folders_logs_defaults_to_07_logs() {
+        let (_dir, root) = write_vault("# empty\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.folders.logs, "07-logs");
     }
 }
