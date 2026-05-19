@@ -47,6 +47,23 @@ impl ParityRunner {
         String::from_utf8(output.stdout).expect("non-utf8 stdout")
     }
 
+    /// Assert that both binaries produce empty stdout (typical for fire-and-forget
+    /// commands like qmd-reindex that exit immediately with no output).
+    pub fn assert_parity_empty_stdout(&self, args: &[&str], fixture: &Path) {
+        let bun_raw = self.run(&self.bun_binary, args, fixture);
+        let rust_raw = self.run(&self.rust_binary, args, fixture);
+        pretty_assertions::assert_eq!(
+            bun_raw.trim(),
+            "",
+            "Bun stdout was not empty for cmd={args:?}: {bun_raw:?}"
+        );
+        pretty_assertions::assert_eq!(
+            rust_raw.trim(),
+            "",
+            "Rust stdout was not empty for cmd={args:?}: {rust_raw:?}"
+        );
+    }
+
     pub fn assert_parity(&self, args: &[&str], fixture: &Path) {
         let bun_raw = self.run(&self.bun_binary, args, fixture);
         let rust_raw = self.run(&self.rust_binary, args, fixture);
