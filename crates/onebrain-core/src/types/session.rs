@@ -18,8 +18,29 @@ impl SessionToken {
         }
     }
 
+    /// Build a token from an arbitrary string by stripping all non-alphanumeric chars,
+    /// then truncating to at most `max_len` chars.
+    ///
+    /// Mirrors Bun v2.3.3's `.replace(/[^a-zA-Z0-9]/g, '').slice(0, 8)` — strip first,
+    /// then cap. Returns `None` if the result would be empty.
+    pub fn sanitize_truncated(raw: &str, max_len: usize) -> Option<Self> {
+        let cleaned: String = raw
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(max_len)
+            .collect();
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(SessionToken(cleaned))
+        }
+    }
+
     /// Build a token from an already-sanitized literal · panics if invalid.
-    /// Use only for tests and the random-fallback path.
+    ///
+    /// Internal API — intended only for tests and the random-fallback path in
+    /// `onebrain-cache`. Prefer [`Self::sanitize`] or [`Self::sanitize_truncated`]
+    /// at API boundaries.
     pub fn from_clean(s: String) -> Self {
         assert!(
             s.chars().all(|c| c.is_ascii_alphanumeric()),
@@ -31,6 +52,12 @@ impl SessionToken {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl std::fmt::Display for SessionToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -65,5 +92,29 @@ mod tests {
     #[should_panic(expected = "non-alphanumeric")]
     fn from_clean_panics_on_dash() {
         let _ = SessionToken::from_clean("ab-cd".to_string());
+    }
+
+    #[test]
+    fn sanitize_truncated_strips_then_caps_to_max_len() {
+        // Bun: `"abc-12345678".replace(/[^a-zA-Z0-9]/g, '').slice(0, 8)` = "abc12345"
+        let t = SessionToken::sanitize_truncated("abc-12345678", 8).unwrap();
+        assert_eq!(t.as_str(), "abc12345");
+    }
+
+    #[test]
+    fn sanitize_truncated_returns_none_if_empty_after_strip() {
+        assert!(SessionToken::sanitize_truncated("---", 8).is_none());
+    }
+
+    #[test]
+    fn sanitize_truncated_preserves_when_shorter_than_cap() {
+        let t = SessionToken::sanitize_truncated("ab", 8).unwrap();
+        assert_eq!(t.as_str(), "ab");
+    }
+
+    #[test]
+    fn display_renders_inner_str() {
+        let t = SessionToken::sanitize("abc123").unwrap();
+        assert_eq!(format!("{t}"), "abc123");
     }
 }

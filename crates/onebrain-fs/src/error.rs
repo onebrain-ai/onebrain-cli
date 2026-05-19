@@ -6,11 +6,11 @@ pub enum FsError {
     #[error(transparent)]
     Core(#[from] onebrain_core::CoreError),
 
-    #[error("vault walk failed at {path}")]
-    WalkFailed {
+    #[error("filesystem I/O error at {path}")]
+    Io {
         path: PathBuf,
         #[source]
-        source: walkdir::Error,
+        source: std::io::Error,
     },
 }
 

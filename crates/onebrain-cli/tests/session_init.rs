@@ -36,14 +36,18 @@ fn session_init_emits_block_outside_vault() {
         ));
 }
 
+/// Bun parity: malformed vault.yml does NOT crash — it emits the block JSON
+/// (exit 0) so SessionStart can prompt the user to run `/onboarding`.
 #[test]
-fn session_init_exits_65_on_invalid_yaml() {
+fn session_init_emits_block_on_malformed_vault_yml() {
     Command::cargo_bin("onebrain")
         .unwrap()
         .arg("session-init")
         .current_dir(fixture("malformed_vault"))
         .assert()
-        .failure()
-        .code(65)
-        .stderr(predicate::str::contains("invalid syntax"));
+        .success()
+        .stdout(predicate::str::contains("\"decision\":\"block\""))
+        .stdout(predicate::str::contains(
+            "\"reason\":\"onebrain-init-required\"",
+        ));
 }

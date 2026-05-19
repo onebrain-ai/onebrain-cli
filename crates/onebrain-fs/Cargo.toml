@@ -9,9 +9,8 @@ publish.workspace    = true
 
 [dependencies]
 onebrain-core = { workspace = true }
-walkdir       = { workspace = true }
 thiserror     = { workspace = true }
-chrono        = { workspace = true }
+# walkdir + chrono return in Slice 2 when scan helpers land.
 
 [dev-dependencies]
 tempfile          = { workspace = true }
