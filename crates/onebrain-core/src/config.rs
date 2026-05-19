@@ -8,6 +8,8 @@ pub struct VaultConfig {
     pub qmd_collection: Option<String>,
 }
 
+/// Read and parse `<root>/vault.yml`. Returns [`CoreError::VaultYamlMissing`]
+/// when the file does not exist and [`CoreError::InvalidYaml`] on parse errors.
 pub fn load_vault_config(root: &VaultRoot) -> Result<VaultConfig> {
     let path = root.join("vault.yml");
     let content = std::fs::read_to_string(&path).map_err(|source| CoreError::VaultYamlMissing {

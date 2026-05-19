@@ -113,13 +113,18 @@ fn dispatch(cli: Cli) -> Result<()> {
 
 fn classify_exit_code(e: &anyhow::Error) -> i32 {
     use onebrain_core::CoreError;
-    if let Some(core_err) = e.downcast_ref::<CoreError>() {
-        return match core_err {
-            CoreError::VaultYamlMissing { .. } => 64, // EX_USAGE-ish
-            CoreError::InvalidYaml(_) => 65,          // EX_DATAERR
-            CoreError::NotAVault { .. } => 64,
-        };
+    // Walk the full anyhow chain so CoreError wrapped inside FsError /
+    // CacheError still yields its specific exit code (round-1 finding).
+    for cause in e.chain() {
+        if let Some(core_err) = cause.downcast_ref::<CoreError>() {
+            return match core_err {
+                CoreError::VaultYamlMissing { .. } => 64, // EX_USAGE-ish
+                CoreError::InvalidYaml(_) => 65,          // EX_DATAERR
+                CoreError::NotAVault { .. } => 64,
+            };
+        }
     }
+    // No CoreError anywhere in the chain — classify by the root wrapper.
     if e.downcast_ref::<onebrain_fs::FsError>().is_some() {
         return 66;
     }

@@ -13,6 +13,8 @@ impl VaultRoot {
     }
 }
 
+/// Walk up from `start` looking for the nearest directory containing a
+/// `vault.yml`. Returns `None` if none is found before the filesystem root.
 pub fn find_vault_root(start: &Path) -> Option<VaultRoot> {
     let mut current = start.to_path_buf();
     loop {
