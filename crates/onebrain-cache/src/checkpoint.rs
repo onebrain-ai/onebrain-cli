@@ -63,7 +63,14 @@ pub fn handle_stop(
     let mut state = read_state(token, tmp_dir);
 
     // SKIP_WINDOW: count=0 + last_ts>0 + within 60s → silent (post-reset window)
-    if state.count == 0 && state.last_ts > 0 && now.saturating_sub(state.last_ts) < SKIP_WINDOW {
+    // `now >= state.last_ts` guard: if clock went backward (NTP jump), elapsed would be
+    // negative in signed arithmetic → not < 60 → must NOT skip. saturating_sub would silently
+    // return 0 (< 60) and trigger skip incorrectly. Match Bun's signed-subtraction behavior.
+    if state.count == 0
+        && state.last_ts > 0
+        && now >= state.last_ts
+        && (now - state.last_ts) < SKIP_WINDOW
+    {
         return;
     }
 
@@ -99,9 +106,15 @@ pub fn handle_stop(
         return;
     }
 
-    // Derive NN from disk · format date from `now`
+    // Derive NN from disk · format date from `now` in local timezone.
+    // Bun uses `new Date(epochSeconds * 1000).getDate()` etc which returns Local TZ values;
+    // converting to Local here keeps filename date parity for users in non-UTC timezones.
     let date = chrono::DateTime::from_timestamp(now as i64, 0)
-        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d")
+                .to_string()
+        })
         .unwrap_or_else(|| "1970-01-01".to_string());
     let max_nn = max_checkpoint_nn(vault_root, &logs_folder, &date, token);
     let next_nn = format!("{:02}", max_nn + 1);
@@ -277,8 +290,10 @@ mod stop_tests {
         let (_vd, vault) = make_vault(30, 15);
         let dir = tempdir().unwrap();
         let now = 1_700_001_000;
+        // Use Local TZ to match handle_stop's date formatting (matches Bun's Local TZ behavior).
         let date = chrono::DateTime::from_timestamp(now as i64, 0)
             .unwrap()
+            .with_timezone(&chrono::Local)
             .format("%Y-%m-%d")
             .to_string();
         let cp_dir = vault.join("07-logs").join("checkpoint");
@@ -318,6 +333,58 @@ mod stop_tests {
         assert_eq!(stdout, "");
         let s = read_state("tok", dir.path());
         assert_eq!(s.count, 4);
+    }
+
+    #[test]
+    fn skip_window_at_exact_60s_boundary_does_not_fire() {
+        // Bun semantics: `now - last_ts < SKIP_WINDOW` strict less-than ·
+        // age == 60 is NOT skipped · falls through to normal increment.
+        let (_vd, vault) = make_vault(30, 15);
+        let dir = tempdir().unwrap();
+        write_state(
+            "tok",
+            &CheckpointState {
+                count: 0,
+                last_ts: 1_700_000_000,
+                last_stop_nn: "00".to_string(),
+            },
+            dir.path(),
+        );
+        let now = 1_700_000_060; // exactly 60s after last_ts
+        let stdout = capture_stdout(|buf| handle_stop("tok", &vault, now, dir.path(), buf));
+        assert_eq!(stdout, "");
+        // Below messages threshold · time elapsed exactly 60s < 30min · no block
+        // But count should be incremented (count=1) since SKIP_WINDOW did NOT fire
+        let s = read_state("tok", dir.path());
+        assert_eq!(
+            s.count, 1,
+            "SKIP_WINDOW must NOT fire at exact 60s boundary"
+        );
+    }
+
+    #[test]
+    fn skip_window_does_not_fire_on_backward_clock_skew() {
+        // NTP backward jump: now < last_ts · SKIP_WINDOW must NOT fire silently ·
+        // matches Bun's signed-subtraction behavior (negative is not < 60).
+        let (_vd, vault) = make_vault(30, 15);
+        let dir = tempdir().unwrap();
+        write_state(
+            "tok",
+            &CheckpointState {
+                count: 0,
+                last_ts: 1_700_000_100,
+                last_stop_nn: "00".to_string(),
+            },
+            dir.path(),
+        );
+        let now = 1_700_000_050; // 50s BEFORE last_ts (clock went backward)
+        let stdout = capture_stdout(|buf| handle_stop("tok", &vault, now, dir.path(), buf));
+        assert_eq!(stdout, "");
+        let s = read_state("tok", dir.path());
+        assert_eq!(
+            s.count, 1,
+            "backward clock skew must NOT trigger SKIP_WINDOW"
+        );
     }
 
     #[test]
