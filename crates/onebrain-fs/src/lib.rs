@@ -9,3 +9,4 @@ pub mod frontmatter;
 pub mod orphan;
 
 pub use error::{FsError, Result};
+pub use orphan::{scan_orphans, OrphanScanResult};

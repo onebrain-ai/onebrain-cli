@@ -8,8 +8,6 @@ use serde_yaml::Value;
 /// only if the frontmatter parses successfully AND is a YAML mapping. Returns `None`
 /// for any other shape, missing delimiters, or parse errors — callers treat None as
 /// "no frontmatter / unparseable" rather than as an error.
-// used by upcoming has_manual_session_log in Task 4
-#[allow(dead_code)]
 pub fn parse_frontmatter(raw_text: &str) -> Option<Value> {
     let text = raw_text.replace("\r\n", "\n");
     let after_open = text.strip_prefix("---\n")?;

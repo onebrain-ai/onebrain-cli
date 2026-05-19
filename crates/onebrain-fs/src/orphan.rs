@@ -200,13 +200,56 @@ mod manual_log_tests {
     }
 }
 
+use chrono::{DateTime, Datelike, Local};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 
+/// Result of an orphan scan — matches Bun v2.3.3 JSON shape byte-for-byte.
+#[derive(Debug, Serialize)]
+pub struct OrphanScanResult {
+    pub orphan_count: usize,
+}
+
+/// Scan `logs_folder/checkpoint/` for unmerged checkpoint files (orphans).
+///
+/// An orphan is a checkpoint whose date is not today, whose token != `session_token`,
+/// whose date has no manual session log, AND whose group's newest mtime exceeds the
+/// Active-Session Guard (derived from `vault_root/vault.yml`'s `checkpoint.minutes`,
+/// floored at 60 min).
+///
+/// Returns `OrphanScanResult { orphan_count: N }` · always Ok (errors are folded
+/// into safe defaults · the CLI command never exits non-zero).
+pub fn scan_orphans(
+    logs_folder: &Path,
+    session_token: &str,
+    now: DateTime<Local>,
+    vault_root: &Path,
+) -> crate::Result<OrphanScanResult> {
+    let today = format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day());
+    let checkpoint_dir = logs_folder.join("checkpoint");
+    let session_dir = logs_folder.join("session");
+
+    let groups = collect_candidate_groups(&checkpoint_dir, &session_dir, session_token, &today);
+
+    let guard_ms = active_session_guard_ms(vault_root);
+    let now_ms = now.timestamp_millis() as u64;
+
+    let mut count = 0usize;
+    for (_token, files) in groups {
+        if is_group_active_or_ambiguous(&files, now_ms, guard_ms) {
+            continue;
+        }
+        count += 1;
+    }
+    Ok(OrphanScanResult {
+        orphan_count: count,
+    })
+}
+
 /// Collect checkpoint files into per-token groups, applying the today / current-token
 /// / manual-log filters. Returns `HashMap<token, [absolute_paths]>`.
-#[allow(dead_code)] // used by upcoming scan_orphans in Task 9
 pub(crate) fn collect_candidate_groups(
     checkpoint_dir: &Path,
     session_dir: &Path,
@@ -294,7 +337,6 @@ const DEFAULT_ACTIVE_SESSION_GUARD_MS: u64 = 60 * 60 * 1000;
 ///
 /// Fail-safe: returns 60min on missing/malformed vault.yml. Expected absence
 /// (ENOENT-equivalent) is silent · real malformations emit a stderr warning.
-#[allow(dead_code)] // used by upcoming scan_orphans in Task 9
 pub(crate) fn active_session_guard_ms(vault_root: &Path) -> u64 {
     match load_vault_config_at(vault_root) {
         Ok(config) => {
@@ -324,7 +366,6 @@ pub(crate) fn active_session_guard_ms(vault_root: &Path) -> u64 {
 /// Fail-safe: any uncertainty (empty group · stat failure · future mtime · zero
 /// guard) returns `true` so the group is skipped. Bun symmetry: `/wrapup` uses
 /// the same predicate, so any "skip here" lines up with "wrapup also skips."
-#[allow(dead_code)] // used by upcoming scan_orphans in Task 9
 pub(crate) fn is_group_active_or_ambiguous(paths: &[PathBuf], now_ms: u64, guard_ms: u64) -> bool {
     if guard_ms == 0 {
         return true;
@@ -529,6 +570,177 @@ mod mtime_tests {
         let b = dir.path().join("does_not_exist.md");
         fs::write(&a, "x").unwrap();
         assert_eq!(get_newest_mtime_ms(&[a, b]), None);
+    }
+}
+
+#[cfg(test)]
+mod scan_orphans_tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use std::fs;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    fn pinned_now() -> chrono::DateTime<chrono::Local> {
+        // 2099-01-15T12:00:00 UTC, converted to Local
+        Utc.with_ymd_and_hms(2099, 1, 15, 12, 0, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+    }
+
+    fn set_age(path: &Path, secs_before_now: u64) {
+        // Set mtime relative to pinned_now() so guard comparisons are consistent.
+        let pinned_secs = pinned_now().timestamp() as u64;
+        let when = UNIX_EPOCH + Duration::from_secs(pinned_secs - secs_before_now);
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(when)).unwrap();
+    }
+
+    fn touch(dir: &Path, rel: &str, content: &str) -> PathBuf {
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn empty_logs_dir_returns_zero() {
+        let dir = tempdir().unwrap();
+        let logs = dir.path().join("07-logs");
+        fs::create_dir_all(logs.join("checkpoint")).unwrap();
+        let result = scan_orphans(&logs, "abc12345", pinned_now(), dir.path()).unwrap();
+        assert_eq!(result.orphan_count, 0);
+    }
+
+    #[test]
+    fn missing_logs_folder_returns_zero() {
+        let dir = tempdir().unwrap();
+        let result = scan_orphans(
+            &dir.path().join("nope"),
+            "abc12345",
+            pinned_now(),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(result.orphan_count, 0);
+    }
+
+    #[test]
+    fn counts_single_stale_orphan() {
+        let dir = tempdir().unwrap();
+        let logs = dir.path().join("07-logs");
+        let cp = touch(&logs, "checkpoint/2099-01-01-stale-checkpoint-01.md", "x");
+        set_age(&cp, 2 * 3600);
+        let result = scan_orphans(&logs, "abc12345", pinned_now(), dir.path()).unwrap();
+        assert_eq!(result.orphan_count, 1);
+    }
+
+    #[test]
+    fn skips_active_session_within_guard() {
+        let dir = tempdir().unwrap();
+        let logs = dir.path().join("07-logs");
+        let cp = touch(&logs, "checkpoint/2099-01-01-active-checkpoint-01.md", "x");
+        set_age(&cp, 60);
+        let result = scan_orphans(&logs, "abc12345", pinned_now(), dir.path()).unwrap();
+        assert_eq!(result.orphan_count, 0);
+    }
+
+    #[test]
+    fn multiple_checkpoints_same_token_count_as_one() {
+        let dir = tempdir().unwrap();
+        let logs = dir.path().join("07-logs");
+        for nn in 1..=3 {
+            let cp = touch(
+                &logs,
+                &format!("checkpoint/2099-01-01-tok-checkpoint-{nn:02}.md"),
+                "x",
+            );
+            set_age(&cp, 7200);
+        }
+        let result = scan_orphans(&logs, "abc12345", pinned_now(), dir.path()).unwrap();
+        assert_eq!(result.orphan_count, 1);
+    }
+
+    #[test]
+    fn distinct_tokens_count_separately() {
+        let dir = tempdir().unwrap();
+        let logs = dir.path().join("07-logs");
+        for token in &["a", "b", "c"] {
+            let cp = touch(
+                &logs,
+                &format!("checkpoint/2099-01-01-{token}-checkpoint-01.md"),
+                "x",
+            );
+            set_age(&cp, 7200);
+        }
+        let result = scan_orphans(&logs, "abc12345", pinned_now(), dir.path()).unwrap();
+        assert_eq!(result.orphan_count, 3);
+    }
+
+    #[test]
+    fn skips_token_matching_current_session() {
+        let dir = tempdir().unwrap();
+        let logs = dir.path().join("07-logs");
+        let cp = touch(
+            &logs,
+            "checkpoint/2099-01-01-abc12345-checkpoint-01.md",
+            "x",
+        );
+        set_age(&cp, 7200);
+        let result = scan_orphans(&logs, "abc12345", pinned_now(), dir.path()).unwrap();
+        assert_eq!(result.orphan_count, 0);
+    }
+
+    #[test]
+    fn skips_date_with_manual_session_log() {
+        let dir = tempdir().unwrap();
+        let logs = dir.path().join("07-logs");
+        let cp = touch(&logs, "checkpoint/2099-01-01-tok-checkpoint-01.md", "x");
+        set_age(&cp, 7200);
+        touch(
+            &logs,
+            "session/2099/01/2099-01-01-session-01.md",
+            "---\nauto-saved: false\n---\nwrapup",
+        );
+        let result = scan_orphans(&logs, "abc12345", pinned_now(), dir.path()).unwrap();
+        assert_eq!(result.orphan_count, 0);
+    }
+
+    #[test]
+    fn does_not_skip_when_only_auto_saved_log_present() {
+        let dir = tempdir().unwrap();
+        let logs = dir.path().join("07-logs");
+        let cp = touch(&logs, "checkpoint/2099-01-01-tok-checkpoint-01.md", "x");
+        set_age(&cp, 7200);
+        touch(
+            &logs,
+            "session/2099/01/2099-01-01-session-01.md",
+            "---\nauto-saved: true\n---\nbody",
+        );
+        let result = scan_orphans(&logs, "abc12345", pinned_now(), dir.path()).unwrap();
+        assert_eq!(result.orphan_count, 1);
+    }
+
+    #[test]
+    fn skips_today_filenames() {
+        let dir = tempdir().unwrap();
+        let logs = dir.path().join("07-logs");
+        let cp = touch(&logs, "checkpoint/2099-01-15-tok-checkpoint-01.md", "x");
+        set_age(&cp, 7200);
+        let result = scan_orphans(&logs, "abc12345", pinned_now(), dir.path()).unwrap();
+        assert_eq!(result.orphan_count, 0);
+    }
+
+    #[test]
+    fn checkpoint_minutes_60_raises_guard_so_90_min_old_still_skipped() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("vault.yml"), "checkpoint:\n  minutes: 60\n").unwrap();
+        let logs = dir.path().join("07-logs");
+        let cp = touch(&logs, "checkpoint/2099-01-01-tok-checkpoint-01.md", "x");
+        set_age(&cp, 90 * 60); // 90 min old · within 120 min raised guard
+        let result = scan_orphans(&logs, "abc12345", pinned_now(), dir.path()).unwrap();
+        assert_eq!(result.orphan_count, 0);
     }
 }
 
