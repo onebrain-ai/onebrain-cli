@@ -34,4 +34,6 @@ assert_cmd        = { workspace = true }
 predicates        = { workspace = true }
 insta             = { workspace = true }
 pretty_assertions = { workspace = true }
+flate2            = { workspace = true }
+tar               = { workspace = true }
 mockito           = { workspace = true }
