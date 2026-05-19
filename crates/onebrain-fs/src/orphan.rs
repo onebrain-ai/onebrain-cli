@@ -201,3 +201,90 @@ mod manual_log_tests {
         assert!(has_manual_session_log(dir.path(), "2026-05-19"));
     }
 }
+
+use std::path::PathBuf;
+use std::time::UNIX_EPOCH;
+
+/// File mtime as milliseconds since UNIX epoch · None on any error.
+#[allow(dead_code)] // used by upcoming is_group_active_or_ambiguous in Task 7
+pub(crate) fn get_mtime_ms(path: &Path) -> Option<u64> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    let dur = mtime.duration_since(UNIX_EPOCH).ok()?;
+    Some(dur.as_millis() as u64)
+}
+
+/// Newest mtime across a file list · None if the list is empty OR any stat fails
+/// (fail-safe propagation — one ambiguous file forces the whole group ambiguous).
+#[allow(dead_code)] // used by upcoming is_group_active_or_ambiguous in Task 7
+pub(crate) fn get_newest_mtime_ms(paths: &[PathBuf]) -> Option<u64> {
+    if paths.is_empty() {
+        return None;
+    }
+    let mut newest: u64 = 0;
+    for p in paths {
+        let m = get_mtime_ms(p)?;
+        if m > newest {
+            newest = m;
+        }
+    }
+    Some(newest)
+}
+
+#[cfg(test)]
+mod mtime_tests {
+    use super::*;
+    use std::fs;
+    use std::time::{Duration, SystemTime};
+    use tempfile::tempdir;
+
+    fn set_mtime(path: &std::path::Path, secs_before_now: u64) {
+        let when = SystemTime::now() - Duration::from_secs(secs_before_now);
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(when))
+            .expect("setting mtime failed");
+    }
+
+    #[test]
+    fn get_mtime_ms_returns_some_for_existing_file() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("a.md");
+        fs::write(&f, "x").unwrap();
+        assert!(get_mtime_ms(&f).is_some());
+    }
+
+    #[test]
+    fn get_mtime_ms_returns_none_for_missing_file() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("missing.md");
+        assert_eq!(get_mtime_ms(&f), None);
+    }
+
+    #[test]
+    fn newest_mtime_returns_none_for_empty_input() {
+        let files: Vec<std::path::PathBuf> = vec![];
+        assert_eq!(get_newest_mtime_ms(&files), None);
+    }
+
+    #[test]
+    fn newest_mtime_picks_largest_value() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        fs::write(&a, "x").unwrap();
+        fs::write(&b, "y").unwrap();
+        set_mtime(&a, 3600); // 1 hour old
+        set_mtime(&b, 60); // 1 min old
+        let newest = get_newest_mtime_ms(&[a.clone(), b.clone()]).unwrap();
+        let b_mtime = get_mtime_ms(&b).unwrap();
+        assert_eq!(newest, b_mtime);
+    }
+
+    #[test]
+    fn newest_mtime_returns_none_if_any_file_missing() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("does_not_exist.md");
+        fs::write(&a, "x").unwrap();
+        assert_eq!(get_newest_mtime_ms(&[a, b]), None);
+    }
+}

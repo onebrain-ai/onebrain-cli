@@ -11,8 +11,10 @@ publish.workspace    = true
 onebrain-core = { workspace = true }
 serde_yaml    = { workspace = true }
 thiserror     = { workspace = true }
-# walkdir + chrono return in Slice 2 when scan helpers land.
+chrono        = { workspace = true }
+# walkdir returns in Slice 2 when scan helpers land.
 
 [dev-dependencies]
 tempfile          = { workspace = true }
 pretty_assertions = { workspace = true }
+filetime          = { workspace = true }
