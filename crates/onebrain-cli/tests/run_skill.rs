@@ -282,6 +282,44 @@ fn malformed_arg_returns_error() {
 
 #[cfg(unix)]
 #[test]
+fn argv_snapshot_canonical_invocation() {
+    // Insta snapshot of the exact argv passed to claude · gives a reviewable
+    // diff if anyone changes the spawn shape (arg order, flag names, prompt
+    // construction). Vault path is stripped to keep the snapshot deterministic.
+    let d = tempdir().unwrap();
+    let vault = d.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    write_minimal_vault(&vault);
+    let mock = write_mock_claude(d.path(), ARGV_LOG_SCRIPT);
+    let argv_log = d.path().join("argv.log");
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args([
+            "run-skill",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--skill",
+            "/distill",
+            "--arg",
+            "topic=this-week",
+            "--arg",
+            "depth=2",
+        ])
+        .env("CLAUDE_BIN", &mock)
+        .env("ARGV_LOG", &argv_log)
+        .assert()
+        .success();
+
+    let logged = fs::read_to_string(&argv_log).unwrap();
+    // Replace the absolute vault path with a stable placeholder.
+    let vault_str = vault.to_str().unwrap();
+    let normalized = logged.replace(vault_str, "<VAULT>");
+    insta::assert_snapshot!("run_skill_argv_canonical", normalized);
+}
+
+#[cfg(unix)]
+#[test]
 fn claude_bin_env_missing_emits_warning() {
     let d = tempdir().unwrap();
     let vault = d.path().join("vault");

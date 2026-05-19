@@ -1,0 +1,8 @@
+---
+source: crates/onebrain-cli/tests/run_skill.rs
+expression: normalized
+---
+-p
+/onebrain:distill topic=this-week depth=2
+--add-dir
+<VAULT>
