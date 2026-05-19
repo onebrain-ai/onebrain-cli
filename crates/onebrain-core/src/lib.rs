@@ -4,5 +4,7 @@
 //! and parsing. Imported by every other onebrain-* crate.
 
 pub mod error;
+pub mod path;
 
 pub use error::{CoreError, Result};
+pub use path::{find_vault_root, VaultRoot};
