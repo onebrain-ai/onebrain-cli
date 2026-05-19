@@ -1,38 +1,36 @@
-# Changelog
+---
+latest_version: 3.0.0-alpha.0
+released: 2026-05-19
+---
 
-All notable changes to OneBrain CLI v3.x are documented in this file.
+# OneBrain CLI Changelog (v3.x · Rust)
 
-Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) · this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rewrite.
+Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+
+> **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). First user-facing alpha is `v3.0.0-alpha.1` (planned 2026-06-02 per spec §7.1) — `v3.0.0-alpha.0` is an internal milestone marker without binary artifacts.
 
 ## [Unreleased]
 
-### Added
+- `orphan-scan` subcommand with Active-Session Guard (mtime-driven cross-harness live-session detection) and manual session log skip · `CheckpointPolicy { minutes: u32 }` field on `VaultConfig` drives the `max(60min, 2 * cp.minutes)` guard threshold · 38 unit tests + 3 Layer 2 integration + 1 Layer 3 snapshot + 2 Layer 4 parity (PR #3)
+- New `onebrain-fs::orphan` module composes 5 internal helpers (`parse_checkpoint_filename`, `parse_frontmatter`, `has_manual_session_log`, `get_newest_mtime_ms`, `is_group_active_or_ambiguous`) with fail-safe propagation: any I/O ambiguity → group skipped rather than counted (Bun symmetry with `/wrapup`) (PR #3)
+- `onebrain-core::load_vault_config_at(&Path)` helper for direct-path vault.yml loading without the `VaultRoot` invariant · used by Active-Session Guard threshold derivation (PR #3)
+- `.github/workflows/release.yml` 7-platform release pipeline (darwin-{arm64,x64} · linux-{arm64,x64,musl-x64} · win-{x64,arm64}) · tar.gz / zip + sha256 · auto-detects prerelease from `-alpha`/`-beta`/`-rc` tag suffix · user-controlled inputs route through `env:` vars (PR #2)
+- README clarifies `onebrain-cli` is the crate name; the produced binary is `onebrain` per `[[bin]]` in `crates/onebrain-cli/Cargo.toml` (PR #2)
+- Post-merge fix-ups on PR #3: differentiate ENOENT from EACCES/EIO when reading vault.yml (silent vs stderr warning) · `frontmatter` module made `pub(crate)` to prevent visibility leak · scattered imports consolidated to top of `orphan.rs` · boundary tests added (`age == guard` counted · `minutes: 0` falls back to floor) · `.gitkeep` so empty parity fixtures survive git clone
+- `CHANGELOG.md` reformatted to onebrain repo's compact style — frontmatter (`latest_version`, `released`) · conventional-commit-style per-version titles · flat detailed bullets ≤ 8 per version (PR #5 reformats PR #4's initial)
+- GitHub repo metadata: description set · homepage `https://onebrain.run` · topics (rust, cli, obsidian, onebrain, ai-agent, claude-code) · main branch ruleset (5 required checks · squash-only · linear history · resolve threads · dismiss stale reviews)
 
-- `orphan-scan` subcommand with Active-Session Guard (mtime-driven live-session detection) and manual session log skip · full Bun v2.3.3 parity (PR #3)
-- `CheckpointPolicy { minutes: u32 }` field on `VaultConfig` (default 30) driving the guard threshold (PR #3)
-- `onebrain-core::load_vault_config_at(&Path)` helper for direct-path vault.yml loading without `VaultRoot` invariant (PR #3)
-- `onebrain-fs::orphan` module: 5 helpers + `scan_orphans` entry · 38 unit tests · `OrphanScanResult` type (PR #3)
-- `onebrain-fs::frontmatter::parse_frontmatter` · CRLF-aware YAML mapping extractor (crate-private · PR #3)
-- `.github/workflows/release.yml` · 7-platform release pipeline (darwin-{arm64,x64} · linux-{arm64,x64,musl-x64} · win-{x64,arm64}) · auto-detects prerelease from tag suffix (PR #2)
+## v3.0.0-alpha.0 — feat(slice-1): session-init + 4-crate workspace foundation
 
-### Changed
-
-- README clarifies that the `onebrain-cli` crate produces the `onebrain` binary (PR #2)
-
-## [v3.0.0-alpha.0] — 2026-05-19
-
-First milestone marker · Slice 1 foundation. Pre-release tag; no public binary artifacts yet (next user-facing alpha will be `v3.0.0-alpha.1` per spec §7.1).
-
-### Added
-
-- 4-crate Cargo workspace: `onebrain-core` (types/config/path) · `onebrain-fs` (vault walks) · `onebrain-cache` (session token/qmd status) · `onebrain-cli` (binary)
-- `session-init` subcommand: 8-layer session token resolution including `findClaudeAncestorPid` walk-up · 8-char env truncation · `$TMPDIR/onebrain-day-YYYYMMDD.token` day-scoped cache · 5-digit numeric random fallback · full Bun v2.3.3 parity
-- `clap` derive dispatch with all 13 subcommands scaffolded · 12 still `todo!()`
-- 4-layer test pyramid: inline unit + `assert_cmd` integration + `insta` snapshots + golden-master parity vs Bun v2.3.3
-- CI workflow: fmt + clippy + 3-platform test matrix · `concurrency` block (cancel outdated runs) · `permissions: contents: read` hardening
-- Error model split: `thiserror` typed errors per library crate + `anyhow` propagation in binary
-- Forward-compat `tokio` scaffold (`tokio_helper::run_async`) ready for v3.1 server mode
-- AGPL-3.0-only license · `publish = false` workspace-wide · 46 tests · byte-identical parity with Bun v2.3.3 locally
+- 4-crate Cargo workspace: `onebrain-core` (types/config/path) · `onebrain-fs` (vault walks) · `onebrain-cache` (session token, qmd status) · `onebrain-cli` (binary · clap dispatch with all 13 subcommands scaffolded · 12 still `todo!()`) · workspace inheritance via `*.workspace = true` discipline · `publish = false` workspace-wide
+- `session-init` subcommand with 8-layer session token resolution (Bun v2.3.3 parity): WT_SESSION → TMUX_PANE → TERM_SESSION_ID env vars (stripped + truncated to 8 chars) → `findClaudeAncestorPid` walk-up via `ps -o ppid=,comm=` (12-hop cap · Unix only) → `$TMPDIR/onebrain-day-YYYYMMDD.token` day-scoped cache → process ppid → PowerShell parent PID (Windows stub) → 5-digit numeric random fallback
+- `qmd_unembedded` count sourced from spawning `qmd status --json` (matches Bun) instead of the originally-specced filesystem-walk approach · 2-second timeout · returns 0 on any failure · caught during PR #1 fix-up after 3-round review found 7 behavioral divergences from Bun
+- Block path: BOTH `find_vault_root` returning `None` AND `load_vault_config` returning `Err` emit `{"decision":"block","reason":"onebrain-init-required"}` · session-init never exits non-zero (matches Bun contract for the Claude Code SessionStart hook)
+- 4-layer test pyramid: inline unit + `assert_cmd` integration + `insta` snapshots + golden-master parity vs Bun v2.3.3 (verified byte-identical locally with `BUN_BINARY=~/projects/onebrain/dist/onebrain` · CI parity job fails until v2.3.3 release artifact is uploaded upstream)
+- Error model split: `thiserror` typed errors per library crate (`CoreError` / `FsError` / `CacheError`) + `anyhow` propagation in binary with `.context()` chains · `classify_exit_code` walks `anyhow::chain()` to extract wrapped `CoreError` variants for sysexits.h-aligned exit codes (64/65/66/67)
+- CI workflow: fmt + clippy + 3-platform test matrix (ubuntu/macos/windows) · `concurrency` block cancels outdated PR runs · `permissions: contents: read` hardening
+- AGPL-3.0-only license · Windows ARM64 added to release matrix as the 7th platform per 2026-05-19 decision · forward-compat `tokio` scaffold (`tokio_helper::run_async` with `#[allow(dead_code)]`) ready for v3.1 server mode without restructuring main.rs · 46 tests passing
 
 [Unreleased]: https://github.com/onebrain-ai/onebrain-cli/compare/v3.0.0-alpha.0...HEAD
 [v3.0.0-alpha.0]: https://github.com/onebrain-ai/onebrain-cli/releases/tag/v3.0.0-alpha.0
