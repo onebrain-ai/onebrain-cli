@@ -14,6 +14,7 @@ pub mod orphan;
 pub mod register_hooks;
 pub mod run_skill;
 pub mod update;
+pub mod vault_sync;
 
 pub use error::{FsError, Result};
 pub use harness::{detect_harness, detect_harnesses};
@@ -21,3 +22,7 @@ pub use migrate::{run_backfill_recapped, MigrateResult};
 pub use orphan::{scan_orphans, OrphanScanResult};
 pub use run_skill::{build_prompt, resolve_claude_bin, ClaudeBinResolution, RunSkillError};
 pub use update::{run_update, UpdateOptions, UpdateResult};
+pub use vault_sync::{
+    build_tar_spawn_overrides, normalize_path, resolve_branch, run_vault_sync, VaultSyncOptions,
+    VaultSyncResult,
+};
