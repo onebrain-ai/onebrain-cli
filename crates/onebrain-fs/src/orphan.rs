@@ -344,12 +344,22 @@ pub(crate) fn active_session_guard_ms(vault_root: &Path) -> u64 {
             let minutes = MIN_GUARD_MINUTES.max(2 * cp_minutes);
             minutes * 60 * 1000
         }
-        Err(CoreError::VaultYamlMissing { .. }) => {
-            // Expected absence — silent fallback.
-            DEFAULT_ACTIVE_SESSION_GUARD_MS
+        Err(CoreError::VaultYamlMissing { source, .. }) => {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                // Expected absence — silent fallback.
+                DEFAULT_ACTIVE_SESSION_GUARD_MS
+            } else {
+                // Real I/O error (EACCES, EIO, etc.) — emit stderr warning, then fall back.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "onebrain orphan-scan: vault.yml unreadable, using {}-min Active-Session Guard default ({source})",
+                    MIN_GUARD_MINUTES
+                );
+                DEFAULT_ACTIVE_SESSION_GUARD_MS
+            }
         }
         Err(other) => {
-            // Real malformation — emit warning to stderr (best-effort, never panic).
+            // Real malformation (e.g. InvalidYaml) — emit warning to stderr (best-effort, never panic).
             let _ = writeln!(
                 std::io::stderr(),
                 "onebrain orphan-scan: vault.yml unreadable, using {}-min Active-Session Guard default ({other})",
@@ -388,7 +398,7 @@ mod guard_threshold_tests {
     use std::fs;
     use tempfile::tempdir;
 
-    const MIN_GUARD_MS: u64 = 60 * 60 * 1000;
+    pub(super) const MIN_GUARD_MS: u64 = MIN_GUARD_MINUTES * 60 * 1000;
 
     #[test]
     fn falls_back_to_60_min_when_vault_yml_missing() {
@@ -426,11 +436,22 @@ mod guard_threshold_tests {
         fs::write(dir.path().join("vault.yml"), "not: : valid").unwrap();
         assert_eq!(active_session_guard_ms(dir.path()), MIN_GUARD_MS);
     }
+
+    #[test]
+    fn explicit_zero_minutes_uses_60_min_default_via_max_floor() {
+        // Bun explicitly short-circuits cpMinutes <= 0 to DEFAULT.
+        // Rust: u32 can be 0 · max(60, 0*2=0) = 60 · same result by coincidence.
+        // This test pins the contract so a future change to MIN_GUARD_MINUTES doesn't break it.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("vault.yml"), "checkpoint:\n  minutes: 0\n").unwrap();
+        assert_eq!(active_session_guard_ms(dir.path()), MIN_GUARD_MS);
+    }
 }
 
 #[cfg(test)]
 mod active_predicate_tests {
     use super::*;
+    use super::guard_threshold_tests::MIN_GUARD_MS;
     use std::fs;
     use std::time::{Duration, SystemTime};
     use tempfile::tempdir;
@@ -512,6 +533,20 @@ mod active_predicate_tests {
         let guard = 60 * 60 * 1000;
         // newest is `fresh` → 1 min ago → under guard → active
         assert!(is_group_active_or_ambiguous(&[old, fresh], now_ms(), guard));
+    }
+
+    #[test]
+    fn group_exactly_at_guard_boundary_is_counted() {
+        // `age_ms < guard_ms` is strict less-than · age == guard means NOT skipped.
+        // Bun has the same boundary semantics (orphan-scan.ts:230).
+        let dir = tempdir().unwrap();
+        let f = write_with_mtime(dir.path(), "a.md", 3600); // exactly 1 hour ago
+        let guard = MIN_GUARD_MS; // exactly 60 min
+        // age_ms ≈ 3_600_000 · guard_ms = 3_600_000 · NOT strictly less than → counted
+        // Note: timing precision may make age_ms slightly > guard_ms; either way it must NOT skip.
+        let now_ms_val = now_ms();
+        let result = is_group_active_or_ambiguous(&[f], now_ms_val, guard);
+        assert!(!result, "exactly-at-boundary age must NOT be treated as active");
     }
 }
 
