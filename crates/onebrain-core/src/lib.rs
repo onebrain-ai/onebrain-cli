@@ -13,4 +13,4 @@ pub use config::{
 };
 pub use error::{CoreError, Result};
 pub use path::{find_vault_root, VaultRoot};
-pub use types::SessionToken;
+pub use types::{Harness, SessionToken};

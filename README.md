@@ -44,7 +44,7 @@ cargo insta review          # interactive approve/reject
 - `onebrain-core` — types, config parsing, path resolution (zero filesystem deps)
 - `onebrain-fs` — vault walks, frontmatter scans
 - `onebrain-cache` — session token resolution, plist generation, qmd status
-- `onebrain-cli` — binary crate · produces the **`onebrain`** binary · clap dispatch · 13 subcommands (`session-init` + `orphan-scan` + `qmd-reindex` + `checkpoint` wired in v3.0 Slices 1-4)
+- `onebrain-cli` — binary crate · produces the **`onebrain`** binary · clap dispatch · 13 subcommands (`session-init` + `orphan-scan` + `qmd-reindex` + `checkpoint` + `harness` wired in v3.0 Slices 1-5)
 
 See `01-projects/onebrain/shared/2026-05-14-rust-cli-rewrite-design.md` for the full design rationale (OneBrain vault).
 
