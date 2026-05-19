@@ -1,0 +1,11 @@
+---
+source: crates/onebrain-cli/tests/snapshots.rs
+assertion_line: 117
+expression: stdout
+---
+vault-sync: Downloading
+vault-sync: Syncing files
+vault-sync: Updating harness
+vault-sync: Pinning to vault
+vault-sync: Cleaning cache
+vault-sync: done

@@ -170,3 +170,71 @@ fn register_hooks_merge_legacy_snapshot() {
     let text = fs::read_to_string(d.path().join(".claude").join("settings.json")).unwrap();
     assert_snapshot!("register_hooks_merge_legacy", text);
 }
+
+#[test]
+fn vault_sync_happy_path_stdout_snapshot() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    let tmp = tempfile::tempdir().unwrap();
+    let vault = tmp.path().join("vault");
+    std::fs::create_dir_all(vault.join(".claude")).unwrap();
+    std::fs::write(
+        vault.join("vault.yml"),
+        "update_channel: stable\nfolders:\n  inbox: 00-inbox\n  logs: 07-logs\n",
+    )
+    .unwrap();
+
+    let mut buf = Vec::new();
+    {
+        let enc = GzEncoder::new(&mut buf, Compression::default());
+        let mut b = tar::Builder::new(enc);
+        let prefix = "onebrain-ai-onebrain-snap";
+        for (path, content) in [
+            (
+                format!("{prefix}/.claude/plugins/onebrain/.claude-plugin/plugin.json"),
+                serde_json::json!({"id":"onebrain","version":"1.11.0"}).to_string(),
+            ),
+            (format!("{prefix}/CONTRIBUTING.md"), "# c\n".into()),
+            (
+                format!("{prefix}/CLAUDE.md"),
+                "@.claude/plugins/onebrain/INSTRUCTIONS.md\n".into(),
+            ),
+            (
+                format!("{prefix}/GEMINI.md"),
+                "@.claude/plugins/onebrain/INSTRUCTIONS.md\n".into(),
+            ),
+            (
+                format!("{prefix}/AGENTS.md"),
+                "@.claude/plugins/onebrain/INSTRUCTIONS.md\n".into(),
+            ),
+        ] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(content.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, &path, content.as_bytes()).unwrap();
+        }
+        b.finish().unwrap();
+    }
+    let tarball_path = tmp.path().join("fixture.tar.gz");
+    std::fs::write(&tarball_path, &buf).unwrap();
+    let isolated = vault.join(".isolated-installed_plugins.json");
+
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .arg("vault-sync")
+        .current_dir(&vault)
+        .env(
+            "ONEBRAIN_VAULT_SYNC_FIXTURE",
+            tarball_path.to_string_lossy().to_string(),
+        )
+        .env(
+            "ONEBRAIN_INSTALLED_PLUGINS_PATH",
+            isolated.to_string_lossy().to_string(),
+        )
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    insta::assert_snapshot!("vault_sync_happy_stdout", stdout);
+>>>>>>> f557773 (test(slice-13): assert_cmd integration + insta snapshot + parity scaffold)
+}
