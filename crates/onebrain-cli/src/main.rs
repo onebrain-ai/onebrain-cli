@@ -103,7 +103,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Cmd::QmdReindex => commands::qmd_reindex::run(),
         Cmd::Checkpoint { mode } => commands::checkpoint::run(&mode),
         Cmd::Harness => commands::harness::run(),
-        Cmd::Doctor { .. } => todo!("Slice 6"),
+        Cmd::Doctor { fix } => std::process::exit(commands::doctor::run(fix)?),
         Cmd::RegisterHooks => todo!("Slice 7"),
         Cmd::RegisterSchedule { .. } => todo!("Slice 8"),
         Cmd::Migrate => todo!("Slice 9"),

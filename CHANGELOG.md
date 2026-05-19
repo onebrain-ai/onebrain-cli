@@ -12,6 +12,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+- `doctor` subcommand with 8 read-only health checks behind `Box<dyn Check>` trait object: vault.yml · vault.yml-keys (required/soft/deprecated schema) · folders (8 PARA dirs) · plugin-files (.claude/plugins/onebrain integrity + stale .sh detection) · settings-hooks (Stop + PostToolUse exec/legacy/absent form + Bash(onebrain *) permission) · orphan-checkpoints · qmd-embeddings (3s timeout, non-fatal) · claude-settings (stale marketplace repo) · 41 unit tests + 7 Layer 2 integration + 1 Layer 3 snapshot + 1 Layer 4 parity scaffold (PR TBD)
+- `VaultFolders` extended from 1 (`logs`) to all 8 standard keys (inbox · projects · areas · knowledge · resources · agent · archive · logs) with per-key serde defaults matching Bun `DEFAULT_FOLDERS` (PR TBD)
+- `--fix` auto-repair deferred to v3.0.1 patch per spec §7.10 slip-handling — flag is parsed but emits a stub stderr message; doctor must be parity-green before GA but fix logic can ship in patch
 - `orphan-scan` subcommand with Active-Session Guard (mtime-driven cross-harness live-session detection) and manual session log skip · `CheckpointPolicy { minutes: u32 }` field on `VaultConfig` drives the `max(60min, 2 * cp.minutes)` guard threshold · 38 unit tests + 3 Layer 2 integration + 1 Layer 3 snapshot + 2 Layer 4 parity (PR #3)
 - New `onebrain-fs::orphan` module composes 5 internal helpers (`parse_checkpoint_filename`, `parse_frontmatter`, `has_manual_session_log`, `get_newest_mtime_ms`, `is_group_active_or_ambiguous`) with fail-safe propagation: any I/O ambiguity → group skipped rather than counted (Bun symmetry with `/wrapup`) (PR #3)
 - `onebrain-core::load_vault_config_at(&Path)` helper for direct-path vault.yml loading without the `VaultRoot` invariant · used by Active-Session Guard threshold derivation (PR #3)

@@ -5,6 +5,7 @@
 //! The `orphan` module composes 5 internal helpers; the `frontmatter` module
 //! is crate-private (used transitively by orphan-scan).
 
+pub mod doctor;
 pub mod error;
 pub(crate) mod frontmatter;
 pub mod harness;
