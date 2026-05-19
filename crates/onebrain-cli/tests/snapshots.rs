@@ -58,3 +58,62 @@ fn orphan_scan_empty_logs_snapshot() {
     );
     assert_json_snapshot!("orphan_scan_empty_logs", raw);
 }
+
+// ---------------------------------------------------------------------------
+// `update` non-TTY plain-text snapshots (Slice 11)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn update_check_dry_run_snapshot() {
+    use onebrain_fs::update::{run_update, CurrentVersion, ReleaseInfo, UpdateOptions};
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let lines_c = lines.clone();
+    let opts = UpdateOptions {
+        check: true,
+        fetch_fn: Some(Box::new(|| {
+            Ok(ReleaseInfo {
+                version: "v9.9.9".to_string(),
+                published_at: None,
+            })
+        })),
+        current_version_fn: Some(Box::new(|| CurrentVersion {
+            version: "v1.10.18".to_string(),
+            published_at: None,
+        })),
+        stdout_lines: Some(Box::new(move |s| {
+            lines_c.lock().unwrap().push(s.to_string());
+        })),
+        ..Default::default()
+    };
+    let _ = run_update(opts);
+    let joined = lines.lock().unwrap().join("\n");
+    insta::assert_snapshot!("update_check_dry_run", joined);
+}
+
+#[test]
+fn update_full_upgrade_success_snapshot() {
+    use onebrain_fs::update::{run_update, CurrentVersion, ReleaseInfo, UpdateOptions};
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let lines_c = lines.clone();
+    let opts = UpdateOptions {
+        fetch_fn: Some(Box::new(|| {
+            Ok(ReleaseInfo {
+                version: "v2.0.0".to_string(),
+                published_at: None,
+            })
+        })),
+        install_fn: Some(Box::new(|_| Ok(()))),
+        validate_fn: Some(Box::new(|| true)),
+        current_version_fn: Some(Box::new(|| CurrentVersion {
+            version: "v1.10.18".to_string(),
+            published_at: None,
+        })),
+        stdout_lines: Some(Box::new(move |s| {
+            lines_c.lock().unwrap().push(s.to_string());
+        })),
+        ..Default::default()
+    };
+    let _ = run_update(opts);
+    let joined = lines.lock().unwrap().join("\n");
+    insta::assert_snapshot!("update_full_upgrade_success", joined);
+}

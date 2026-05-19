@@ -12,9 +12,11 @@ pub mod harness;
 pub mod migrate;
 pub mod orphan;
 pub mod run_skill;
+pub mod update;
 
 pub use error::{FsError, Result};
 pub use harness::{detect_harness, detect_harnesses};
 pub use migrate::{run_backfill_recapped, MigrateResult};
 pub use orphan::{scan_orphans, OrphanScanResult};
 pub use run_skill::{build_prompt, resolve_claude_bin, ClaudeBinResolution, RunSkillError};
+pub use update::{run_update, UpdateOptions, UpdateResult};

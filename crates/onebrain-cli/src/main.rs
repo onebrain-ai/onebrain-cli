@@ -73,7 +73,11 @@ enum Cmd {
     },
 
     /// Update OneBrain system files from GitHub (Slice 11).
-    Update,
+    Update {
+        /// Dry run · report what would change without installing.
+        #[arg(long)]
+        check: bool,
+    },
 
     /// Run a OneBrain skill in headless mode (Slice 12).
     RunSkill {
@@ -121,7 +125,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             vault,
         } => commands::migrate::run(&name, cutoff.as_deref(), vault.as_deref()),
         Cmd::Init { .. } => todo!("Slice 10"),
-        Cmd::Update => todo!("Slice 11"),
+        Cmd::Update { check } => std::process::exit(commands::update::run(check)?),
         Cmd::RunSkill { vault, skill, args } => {
             std::process::exit(commands::run_skill::run(&vault, &skill, &args)?)
         }

@@ -1,0 +1,9 @@
+---
+source: crates/onebrain-cli/tests/snapshots.rs
+expression: joined
+---
+OneBrain Update
+current: v1.10.18
+latest: v2.0.0
+upgrading: @onebrain-ai/cli v2.0.0 installed
+done: run /update in Claude to sync vault files

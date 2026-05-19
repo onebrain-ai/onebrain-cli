@@ -35,6 +35,9 @@ walkdir   = "2"
 # Binary lookup (used by doctor qmd check to mirror Bun.which fallback to ~/.bun/bin)
 which     = "8"
 
+# HTTP client (Slice 11 · update · GitHub releases API)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+
 # Test infrastructure
 filetime          = "0.2"
 tempfile          = "3"
@@ -42,6 +45,7 @@ insta             = { version = "1", features = ["json"] }
 assert_cmd        = "2"
 predicates        = "3"
 pretty_assertions = "1"
+mockito           = "1"
 
 [profile.release]
 strip       = "symbols"
