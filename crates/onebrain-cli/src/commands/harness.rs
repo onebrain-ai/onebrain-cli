@@ -8,6 +8,12 @@ struct HarnessOutput {
     harnesses: Vec<String>,
 }
 
+/// Run the `harness` diagnostic · emits JSON listing detected harnesses.
+///
+/// Uses `cwd` as the vault root (no walk-up) · matches the contract for all
+/// other internal subcommands that read vault.yml: invoked from vault root by
+/// the agent / SessionStart hook. Add `find_vault_root` walk-up if a future
+/// invocation pattern needs it (Slice 7 register-hooks should pin this).
 pub fn run() -> Result<()> {
     let cwd = env::current_dir().context("read current directory")?;
     let harnesses = detect_harnesses(&cwd);

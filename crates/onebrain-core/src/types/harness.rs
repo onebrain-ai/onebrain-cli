@@ -1,9 +1,9 @@
 //! Harness identifier · which AI runtime is in use.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// AI runtime harness identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Harness {
     Claude,
