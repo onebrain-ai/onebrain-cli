@@ -9,10 +9,16 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn run_json(cmd: &str, dir: &std::path::Path) -> Value {
+fn fixture_orphan(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/orphan_scan")
+        .join(name)
+}
+
+fn run_json(args: &[&str], dir: &std::path::Path) -> Value {
     let output = Command::cargo_bin("onebrain")
         .unwrap()
-        .arg(cmd)
+        .args(args)
         .current_dir(dir)
         .output()
         .expect("spawn failed");
@@ -34,12 +40,21 @@ fn normalize_volatile(mut v: Value) -> Value {
 
 #[test]
 fn session_init_minimal_vault_snapshot() {
-    let raw = run_json("session-init", &fixture("minimal_vault"));
+    let raw = run_json(&["session-init"], &fixture("minimal_vault"));
     assert_json_snapshot!("session_init_minimal_vault", normalize_volatile(raw));
 }
 
 #[test]
 fn session_init_block_snapshot() {
-    let raw = run_json("session-init", &fixture("empty_vault"));
+    let raw = run_json(&["session-init"], &fixture("empty_vault"));
     assert_json_snapshot!("session_init_block", normalize_volatile(raw));
+}
+
+#[test]
+fn orphan_scan_empty_logs_snapshot() {
+    let raw = run_json(
+        &["orphan-scan", ".", "abc12345"],
+        &fixture_orphan("empty_logs"),
+    );
+    assert_json_snapshot!("orphan_scan_empty_logs", raw);
 }
