@@ -1,0 +1,7 @@
+---
+source: crates/onebrain-cli/tests/snapshots.rs
+expression: raw
+---
+{
+  "orphan_count": 0
+}

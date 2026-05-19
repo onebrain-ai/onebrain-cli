@@ -96,7 +96,10 @@ fn main() {
 fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Cmd::SessionInit => commands::session_init::run(),
-        Cmd::OrphanScan { .. } => todo!("Slice 2"),
+        Cmd::OrphanScan {
+            logs_folder,
+            session_token,
+        } => commands::orphan_scan::run(&logs_folder, &session_token),
         Cmd::QmdReindex => todo!("Slice 3"),
         Cmd::Checkpoint { .. } => todo!("Slice 4"),
         Cmd::Harness => todo!("Slice 5"),
