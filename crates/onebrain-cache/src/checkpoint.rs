@@ -5,7 +5,6 @@ use std::path::Path;
 
 /// Scan `vault_root/logs_folder/checkpoint/` for files matching `{date}-{token}-checkpoint-NN.md`
 /// · return the highest NN. Returns 0 if dir missing or no matching files.
-#[allow(dead_code)] // used by upcoming handle_stop in Task 5
 pub(crate) fn max_checkpoint_nn(
     vault_root: &Path,
     logs_folder: &str,
@@ -43,7 +42,87 @@ pub(crate) fn max_checkpoint_nn(
     max
 }
 
-use crate::state::{write_state, CheckpointState};
+use crate::state::{read_state, write_state, CheckpointState};
+use std::io::Write;
+
+const SKIP_WINDOW: u64 = 60;
+const MIN_ACTIVITY: u32 = 2;
+
+/// Stop hook: increment message count, check thresholds, emit block JSON if needed.
+/// Sync · always succeeds (errors are folded into safe defaults).
+///
+/// `stdout` is injected so tests can capture the emitted block JSON.
+#[allow(dead_code)] // used by CLI dispatch in Task 6
+pub fn handle_stop(
+    token: &str,
+    vault_root: &Path,
+    now: u64,
+    tmp_dir: &Path,
+    mut stdout: impl Write,
+) {
+    let mut state = read_state(token, tmp_dir);
+
+    // SKIP_WINDOW: count=0 + last_ts>0 + within 60s → silent (post-reset window)
+    if state.count == 0 && state.last_ts > 0 && now.saturating_sub(state.last_ts) < SKIP_WINDOW {
+        return;
+    }
+
+    state.count += 1;
+
+    // Load thresholds from vault.yml · fall back to defaults
+    let (messages_threshold, minutes_threshold, logs_folder) =
+        match onebrain_core::load_vault_config_at(vault_root) {
+            Ok(cfg) => (
+                cfg.checkpoint.messages,
+                cfg.checkpoint.minutes,
+                cfg.folders.logs.clone(),
+            ),
+            Err(_) => (15u32, 30u32, "07-logs".to_string()),
+        };
+    let time_threshold = (minutes_threshold as u64) * 60;
+    let elapsed = if state.last_ts == 0 {
+        0
+    } else {
+        now.saturating_sub(state.last_ts)
+    };
+
+    let threshold_met = state.count >= messages_threshold || elapsed >= time_threshold;
+
+    if !threshold_met {
+        write_state(token, &state, tmp_dir);
+        return;
+    }
+
+    if state.count < MIN_ACTIVITY {
+        // Threshold fired but not enough activity · preserve last_ts
+        write_state(token, &state, tmp_dir);
+        return;
+    }
+
+    // Derive NN from disk · format date from `now`
+    let date = chrono::DateTime::from_timestamp(now as i64, 0)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "1970-01-01".to_string());
+    let max_nn = max_checkpoint_nn(vault_root, &logs_folder, &date, token);
+    let next_nn = format!("{:02}", max_nn + 1);
+    let since = if max_nn == 0 {
+        " since start".to_string()
+    } else {
+        format!(" since checkpoint-{:02}", max_nn)
+    };
+    let reason = format!("{next_nn}{since}");
+    let _ = writeln!(stdout, r#"{{"decision":"block","reason":"{reason}"}}"#);
+
+    write_state(
+        token,
+        &CheckpointState {
+            count: 0,
+            last_ts: now,
+            last_stop_nn: next_nn,
+        },
+        tmp_dir,
+    );
+}
 
 /// Reset checkpoint state · write `0:<now>:00` to state file.
 /// Called by the agent after a session log is written via `/wrapup`.
@@ -58,6 +137,203 @@ pub fn handle_reset(token: &str, now: u64, tmp_dir: &Path) {
         },
         tmp_dir,
     );
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn make_vault(
+        checkpoint_minutes: u32,
+        checkpoint_messages: u32,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        fs::write(
+            root.join("vault.yml"),
+            format!(
+                "checkpoint:\n  minutes: {checkpoint_minutes}\n  messages: {checkpoint_messages}\n"
+            ),
+        )
+        .unwrap();
+        (dir, root)
+    }
+
+    fn capture_stdout(closure: impl FnOnce(&mut Vec<u8>)) -> String {
+        let mut buf = Vec::new();
+        closure(&mut buf);
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn skip_window_returns_silently_within_60s_post_reset() {
+        let (_vd, vault) = make_vault(30, 15);
+        let dir = tempdir().unwrap();
+        write_state(
+            "tok",
+            &CheckpointState {
+                count: 0,
+                last_ts: 1_700_000_000,
+                last_stop_nn: "00".to_string(),
+            },
+            dir.path(),
+        );
+        let now = 1_700_000_030; // 30s after last_ts
+        let stdout = capture_stdout(|buf| handle_stop("tok", &vault, now, dir.path(), buf));
+        assert_eq!(stdout, "");
+        let s = read_state("tok", dir.path());
+        assert_eq!(s.count, 0); // unchanged
+    }
+
+    #[test]
+    fn increments_count_below_threshold() {
+        let (_vd, vault) = make_vault(30, 15);
+        let dir = tempdir().unwrap();
+        write_state(
+            "tok",
+            &CheckpointState {
+                count: 3,
+                last_ts: 1_700_000_000,
+                last_stop_nn: "00".to_string(),
+            },
+            dir.path(),
+        );
+        let stdout =
+            capture_stdout(|buf| handle_stop("tok", &vault, 1_700_000_060, dir.path(), buf));
+        assert_eq!(stdout, "");
+        let s = read_state("tok", dir.path());
+        assert_eq!(s.count, 4);
+        assert_eq!(s.last_ts, 1_700_000_000); // preserved
+    }
+
+    #[test]
+    fn emits_block_when_messages_threshold_met() {
+        let (_vd, vault) = make_vault(30, 15);
+        let dir = tempdir().unwrap();
+        write_state(
+            "tok",
+            &CheckpointState {
+                count: 14,
+                last_ts: 1_700_000_000,
+                last_stop_nn: "00".to_string(),
+            },
+            dir.path(),
+        );
+        let now = 1_700_001_000;
+        let stdout = capture_stdout(|buf| handle_stop("tok", &vault, now, dir.path(), buf));
+        assert!(stdout.contains("\"decision\":\"block\""));
+        assert!(stdout.contains("\"reason\":\"01 since start\""));
+        let s = read_state("tok", dir.path());
+        assert_eq!(s.count, 0);
+        assert_eq!(s.last_stop_nn, "01");
+        assert_eq!(s.last_ts, now);
+    }
+
+    #[test]
+    fn emits_block_when_minutes_threshold_met() {
+        let (_vd, vault) = make_vault(30, 15);
+        let dir = tempdir().unwrap();
+        let last_ts = 1_700_000_000;
+        let now = last_ts + 31 * 60; // > 30 min
+        write_state(
+            "tok",
+            &CheckpointState {
+                count: 5,
+                last_ts,
+                last_stop_nn: "00".to_string(),
+            },
+            dir.path(),
+        );
+        let stdout = capture_stdout(|buf| handle_stop("tok", &vault, now, dir.path(), buf));
+        assert!(stdout.contains("\"decision\":\"block\""));
+        assert!(stdout.contains("01 since start"));
+    }
+
+    #[test]
+    fn min_activity_floor_prevents_block_at_count_1() {
+        let (_vd, vault) = make_vault(30, 15);
+        let dir = tempdir().unwrap();
+        let last_ts = 1_700_000_000;
+        let now = last_ts + 31 * 60;
+        write_state(
+            "tok",
+            &CheckpointState {
+                count: 0,
+                last_ts,
+                last_stop_nn: "00".to_string(),
+            },
+            dir.path(),
+        );
+        let stdout = capture_stdout(|buf| handle_stop("tok", &vault, now, dir.path(), buf));
+        assert_eq!(stdout, "");
+        let s = read_state("tok", dir.path());
+        assert_eq!(s.count, 1);
+        assert_eq!(s.last_ts, last_ts); // preserved
+    }
+
+    #[test]
+    fn nn_derived_from_existing_files() {
+        let (_vd, vault) = make_vault(30, 15);
+        let dir = tempdir().unwrap();
+        let now = 1_700_001_000;
+        let date = chrono::DateTime::from_timestamp(now as i64, 0)
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string();
+        let cp_dir = vault.join("07-logs").join("checkpoint");
+        fs::create_dir_all(&cp_dir).unwrap();
+        fs::write(cp_dir.join(format!("{date}-tok-checkpoint-01.md")), "x").unwrap();
+        fs::write(cp_dir.join(format!("{date}-tok-checkpoint-02.md")), "x").unwrap();
+
+        write_state(
+            "tok",
+            &CheckpointState {
+                count: 14,
+                last_ts: now - 1,
+                last_stop_nn: "02".to_string(),
+            },
+            dir.path(),
+        );
+        let stdout = capture_stdout(|buf| handle_stop("tok", &vault, now, dir.path(), buf));
+        assert!(stdout.contains("\"reason\":\"03 since checkpoint-02\""));
+    }
+
+    #[test]
+    fn skip_window_only_applies_when_count_zero() {
+        // count > 0 + within 60s = NOT skip-window · normal increment
+        let (_vd, vault) = make_vault(30, 15);
+        let dir = tempdir().unwrap();
+        write_state(
+            "tok",
+            &CheckpointState {
+                count: 3,
+                last_ts: 1_700_000_000,
+                last_stop_nn: "00".to_string(),
+            },
+            dir.path(),
+        );
+        let stdout =
+            capture_stdout(|buf| handle_stop("tok", &vault, 1_700_000_010, dir.path(), buf));
+        assert_eq!(stdout, "");
+        let s = read_state("tok", dir.path());
+        assert_eq!(s.count, 4);
+    }
+
+    #[test]
+    fn fresh_state_elapsed_treated_as_zero() {
+        // last_ts == 0 (fresh state sentinel) → elapsed=0 not "now seconds"
+        let (_vd, vault) = make_vault(30, 15);
+        let dir = tempdir().unwrap();
+        // No state file written · fresh state
+        let stdout =
+            capture_stdout(|buf| handle_stop("tok", &vault, 1_700_000_000, dir.path(), buf));
+        // count=1 after increment · below 15 · elapsed=0 below 30min · no block
+        assert_eq!(stdout, "");
+        let s = read_state("tok", dir.path());
+        assert_eq!(s.count, 1);
+        assert_eq!(s.last_ts, 0); // preserved
+    }
 }
 
 #[cfg(test)]

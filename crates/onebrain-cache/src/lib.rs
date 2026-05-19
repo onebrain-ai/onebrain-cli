@@ -7,7 +7,7 @@ pub mod qmd_reindex;
 pub mod session_token;
 pub mod state;
 
-pub use checkpoint::handle_reset;
+pub use checkpoint::{handle_reset, handle_stop};
 pub use error::{CacheError, Result};
 pub use qmd::query_unembedded_count;
 pub use qmd_reindex::{build_qmd_spawn_args, qmd_reindex, SpawnOs};
