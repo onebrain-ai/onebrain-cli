@@ -25,7 +25,6 @@ impl CheckpointState {
 
 const FRESH_STATE_DISK: &str = "0:0:00";
 
-#[allow(dead_code)] // used by upcoming checkpoint module in Task 4
 pub(crate) fn state_file_path(token: &str, tmp_dir: &Path) -> PathBuf {
     tmp_dir.join(format!("onebrain-{token}.state"))
 }
@@ -33,7 +32,6 @@ pub(crate) fn state_file_path(token: &str, tmp_dir: &Path) -> PathBuf {
 /// Read state from `$tmpDir/onebrain-{token}.state`. Returns fresh state if
 /// the file is missing or malformed (and eagerly rewrites to fresh-on-disk
 /// so subsequent reads short-circuit cleanly · matches Bun behavior).
-#[allow(dead_code)] // used by upcoming checkpoint module in Task 4
 pub fn read_state(token: &str, tmp_dir: &Path) -> CheckpointState {
     let path = state_file_path(token, tmp_dir);
     let parsed = fs::read_to_string(&path)
@@ -67,7 +65,6 @@ fn parse_state(raw: &str) -> Option<CheckpointState> {
 
 /// Write state via atomic write-then-rename (pid-suffixed temp file → POSIX rename).
 /// Errors logged to stderr. Sync.
-#[allow(dead_code)] // used by upcoming checkpoint module in Task 4
 pub fn write_state(token: &str, state: &CheckpointState, tmp_dir: &Path) {
     let path = state_file_path(token, tmp_dir);
     let tmp_path = tmp_dir.join(format!("onebrain-{token}.state.tmp.{}", std::process::id()));

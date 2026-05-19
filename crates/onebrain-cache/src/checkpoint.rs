@@ -52,7 +52,6 @@ const MIN_ACTIVITY: u32 = 2;
 /// Sync · always succeeds (errors are folded into safe defaults).
 ///
 /// `stdout` is injected so tests can capture the emitted block JSON.
-#[allow(dead_code)] // used by CLI dispatch in Task 6
 pub fn handle_stop(
     token: &str,
     vault_root: &Path,
@@ -137,9 +136,8 @@ pub fn handle_stop(
     );
 }
 
-/// Reset checkpoint state · write `0:<now>:00` to state file.
-/// Called by the agent after a session log is written via `/wrapup`.
-#[allow(dead_code)] // used by CLI dispatch in Task 6
+/// Reset checkpoint state · writes `{count: 0, last_ts: now, last_stop_nn: "00"}` ·
+/// 3-field on-disk format `0:<now>:00`. Called by the agent after `/wrapup`.
 pub fn handle_reset(token: &str, now: u64, tmp_dir: &Path) {
     write_state(
         token,
