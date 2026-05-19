@@ -43,6 +43,59 @@ pub(crate) fn max_checkpoint_nn(
     max
 }
 
+use crate::state::{write_state, CheckpointState};
+
+/// Reset checkpoint state · write `0:<now>:00` to state file.
+/// Called by the agent after a session log is written via `/wrapup`.
+#[allow(dead_code)] // used by CLI dispatch in Task 6
+pub fn handle_reset(token: &str, now: u64, tmp_dir: &Path) {
+    write_state(
+        token,
+        &CheckpointState {
+            count: 0,
+            last_ts: now,
+            last_stop_nn: "00".to_string(),
+        },
+        tmp_dir,
+    );
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+    use crate::state::read_state;
+    use tempfile::tempdir;
+
+    #[test]
+    fn reset_writes_count_zero_with_now_ts() {
+        let dir = tempdir().unwrap();
+        handle_reset("tok", 1_700_000_500, dir.path());
+        let s = read_state("tok", dir.path());
+        assert_eq!(s.count, 0);
+        assert_eq!(s.last_ts, 1_700_000_500);
+        assert_eq!(s.last_stop_nn, "00");
+    }
+
+    #[test]
+    fn reset_overwrites_existing_state() {
+        let dir = tempdir().unwrap();
+        write_state(
+            "tok",
+            &CheckpointState {
+                count: 7,
+                last_ts: 1_000,
+                last_stop_nn: "05".to_string(),
+            },
+            dir.path(),
+        );
+        handle_reset("tok", 1_700_000_500, dir.path());
+        let s = read_state("tok", dir.path());
+        assert_eq!(s.count, 0);
+        assert_eq!(s.last_ts, 1_700_000_500);
+        assert_eq!(s.last_stop_nn, "00");
+    }
+}
+
 #[cfg(test)]
 mod max_nn_tests {
     use super::*;
