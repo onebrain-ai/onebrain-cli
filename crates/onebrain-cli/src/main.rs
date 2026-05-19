@@ -54,8 +54,17 @@ enum Cmd {
         resume: Option<String>,
     },
 
-    /// Migrate vault structure to current version (Slice 9).
-    Migrate,
+    /// Run a one-shot vault migration (Slice 9).
+    Migrate {
+        /// Migration name (currently: `backfill-recapped`).
+        name: String,
+        /// Skip session logs whose ISO date prefix is strictly greater than this cutoff (inclusive lower bound).
+        #[arg(long)]
+        cutoff: Option<String>,
+        /// Vault directory override (default: walk up from cwd).
+        #[arg(long)]
+        vault: Option<String>,
+    },
 
     /// Initialize a new vault (Slice 10).
     Init {
@@ -106,7 +115,11 @@ fn dispatch(cli: Cli) -> Result<()> {
         Cmd::Doctor { fix } => std::process::exit(commands::doctor::run(fix)?),
         Cmd::RegisterHooks => todo!("Slice 7"),
         Cmd::RegisterSchedule { .. } => todo!("Slice 8"),
-        Cmd::Migrate => todo!("Slice 9"),
+        Cmd::Migrate {
+            name,
+            cutoff,
+            vault,
+        } => commands::migrate::run(&name, cutoff.as_deref(), vault.as_deref()),
         Cmd::Init { .. } => todo!("Slice 10"),
         Cmd::Update => todo!("Slice 11"),
         Cmd::RunSkill { .. } => todo!("Slice 12"),

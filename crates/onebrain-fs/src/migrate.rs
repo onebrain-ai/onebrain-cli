@@ -64,10 +64,7 @@ fn parse_frontmatter_with_rest(raw: &str) -> Option<(Mapping, String)> {
             }
             Some(b'\n') => {
                 let body_start = after_dashes + 1;
-                break (
-                    &after_open[..abs],
-                    after_open[body_start..].to_string(),
-                );
+                break (&after_open[..abs], after_open[body_start..].to_string());
             }
             _ => {
                 // Not a bare closer (e.g. `---some-separator`). Advance past
@@ -144,9 +141,12 @@ pub fn run_backfill_recapped(
                     // YYYY-MM-DD prefix; lexical compare is correct.
                     if fname.len() >= 10 {
                         let prefix = &fname[..10];
-                        if prefix.as_bytes().iter().take(10).all(|b| {
-                            b.is_ascii_digit() || *b == b'-'
-                        }) && prefix > cutoff
+                        if prefix
+                            .as_bytes()
+                            .iter()
+                            .take(10)
+                            .all(|b| b.is_ascii_digit() || *b == b'-')
+                            && prefix > cutoff
                         {
                             continue;
                         }
@@ -236,9 +236,11 @@ mod tests {
 
     #[test]
     fn parse_fm_crlf_normalises() {
-        let (m, rest) =
-            parse_frontmatter_with_rest("---\r\nkey: val\r\n---\r\nbody\r\n").unwrap();
-        assert_eq!(m.get(Value::String("key".into())).and_then(Value::as_str), Some("val"));
+        let (m, rest) = parse_frontmatter_with_rest("---\r\nkey: val\r\n---\r\nbody\r\n").unwrap();
+        assert_eq!(
+            m.get(Value::String("key".into())).and_then(Value::as_str),
+            Some("val")
+        );
         assert!(rest.starts_with("body"));
     }
 
@@ -246,7 +248,10 @@ mod tests {
     fn parse_fm_eof_close_no_body() {
         // Closing `\n---` at end of file with no trailing newline.
         let (m, rest) = parse_frontmatter_with_rest("---\nkey: val\n---").unwrap();
-        assert_eq!(m.get(Value::String("key".into())).and_then(Value::as_str), Some("val"));
+        assert_eq!(
+            m.get(Value::String("key".into())).and_then(Value::as_str),
+            Some("val")
+        );
         assert_eq!(rest, "");
     }
 
@@ -254,7 +259,10 @@ mod tests {
     fn parse_fm_body_dash_separator_not_a_closer() {
         let raw = "---\nkey: val\n---\n\n---some-separator\n\nMore body.\n";
         let (m, rest) = parse_frontmatter_with_rest(raw).unwrap();
-        assert_eq!(m.get(Value::String("key".into())).and_then(Value::as_str), Some("val"));
+        assert_eq!(
+            m.get(Value::String("key".into())).and_then(Value::as_str),
+            Some("val")
+        );
         assert!(rest.contains("---some-separator"));
     }
 
@@ -282,7 +290,13 @@ mod tests {
         let logs = d.path().join("07-logs");
         fs::create_dir_all(&logs).unwrap();
         let r = run_backfill_recapped(&logs, None, "2026-05-20", no_warn());
-        assert_eq!(r, MigrateResult { backfilled: 0, skipped: 0 });
+        assert_eq!(
+            r,
+            MigrateResult {
+                backfilled: 0,
+                skipped: 0
+            }
+        );
     }
 
     #[test]
@@ -290,7 +304,13 @@ mod tests {
         let d = tempdir().unwrap();
         let logs = d.path().join("does-not-exist");
         let r = run_backfill_recapped(&logs, None, "2026-05-20", no_warn());
-        assert_eq!(r, MigrateResult { backfilled: 0, skipped: 0 });
+        assert_eq!(
+            r,
+            MigrateResult {
+                backfilled: 0,
+                skipped: 0
+            }
+        );
     }
 
     #[test]
@@ -304,7 +324,13 @@ mod tests {
             "tags: checkpoint\ncheckpoint: '01'\nrecapped: false\n",
         );
         let r = run_backfill_recapped(&logs, None, "2026-05-20", no_warn());
-        assert_eq!(r, MigrateResult { backfilled: 0, skipped: 0 });
+        assert_eq!(
+            r,
+            MigrateResult {
+                backfilled: 0,
+                skipped: 0
+            }
+        );
     }
 
     #[test]
@@ -318,7 +344,13 @@ mod tests {
             "tags: session-log\nrecapped: '2026-04-20'\n",
         );
         let r = run_backfill_recapped(&logs, None, "2026-05-20", no_warn());
-        assert_eq!(r, MigrateResult { backfilled: 0, skipped: 0 });
+        assert_eq!(
+            r,
+            MigrateResult {
+                backfilled: 0,
+                skipped: 0
+            }
+        );
     }
 
     #[test]
@@ -332,7 +364,13 @@ mod tests {
             "tags: session-log\nrecapped: false\n",
         );
         let r = run_backfill_recapped(&logs, None, "2026-05-20", no_warn());
-        assert_eq!(r, MigrateResult { backfilled: 0, skipped: 0 });
+        assert_eq!(
+            r,
+            MigrateResult {
+                backfilled: 0,
+                skipped: 0
+            }
+        );
     }
 
     #[test]
@@ -346,9 +384,14 @@ mod tests {
             "tags: session-log\ndate: '2026-04-20'\n",
         );
         let r = run_backfill_recapped(&logs, None, "2026-05-20", no_warn());
-        assert_eq!(r, MigrateResult { backfilled: 1, skipped: 0 });
-        let after =
-            fs::read_to_string(m.join("2026-04-20-session-01.md")).unwrap();
+        assert_eq!(
+            r,
+            MigrateResult {
+                backfilled: 1,
+                skipped: 0
+            }
+        );
+        let after = fs::read_to_string(m.join("2026-04-20-session-01.md")).unwrap();
         assert!(after.contains("recapped: '2026-05-20'") || after.contains("recapped: 2026-05-20"));
     }
 
@@ -364,12 +407,9 @@ mod tests {
         )
         .unwrap();
         let mut warnings = Vec::new();
-        let r = run_backfill_recapped(
-            &logs,
-            None,
-            "2026-05-20",
-            |msg| warnings.push(msg.to_string()),
-        );
+        let r = run_backfill_recapped(&logs, None, "2026-05-20", |msg| {
+            warnings.push(msg.to_string())
+        });
         assert!(r.skipped > 0);
         assert!(warnings.iter().any(|w| w.contains("malformed frontmatter")));
     }
@@ -396,7 +436,13 @@ mod tests {
             "tags: session-log\ndate: '2026-04-19'\nrecapped: '2026-04-19'\n",
         );
         let r = run_backfill_recapped(&logs, None, "2026-05-20", no_warn());
-        assert_eq!(r, MigrateResult { backfilled: 2, skipped: 0 });
+        assert_eq!(
+            r,
+            MigrateResult {
+                backfilled: 2,
+                skipped: 0
+            }
+        );
     }
 
     #[test]
@@ -410,7 +456,13 @@ mod tests {
         )
         .unwrap();
         let r = run_backfill_recapped(&logs, None, "2026-05-20", no_warn());
-        assert_eq!(r, MigrateResult { backfilled: 0, skipped: 1 });
+        assert_eq!(
+            r,
+            MigrateResult {
+                backfilled: 0,
+                skipped: 1
+            }
+        );
     }
 
     #[test]
@@ -433,9 +485,14 @@ mod tests {
         .join("\n");
         fs::write(m.join("2026-04-20-session-01.md"), content).unwrap();
         let r = run_backfill_recapped(&logs, None, "2026-05-20", no_warn());
-        assert_eq!(r, MigrateResult { backfilled: 1, skipped: 0 });
-        let after =
-            fs::read_to_string(m.join("2026-04-20-session-01.md")).unwrap();
+        assert_eq!(
+            r,
+            MigrateResult {
+                backfilled: 1,
+                skipped: 0
+            }
+        );
+        let after = fs::read_to_string(m.join("2026-04-20-session-01.md")).unwrap();
         assert!(after.contains("---some-separator"));
         assert!(after.contains("recapped:"));
     }
@@ -451,9 +508,14 @@ mod tests {
             "tags: session-log\ndate: '2026-04-20'\nfoo: bar\n",
         );
         let r = run_backfill_recapped(&logs, None, "2026-05-20", no_warn());
-        assert_eq!(r, MigrateResult { backfilled: 1, skipped: 0 });
-        let after =
-            fs::read_to_string(m.join("2026-04-20-session-01.md")).unwrap();
+        assert_eq!(
+            r,
+            MigrateResult {
+                backfilled: 1,
+                skipped: 0
+            }
+        );
+        let after = fs::read_to_string(m.join("2026-04-20-session-01.md")).unwrap();
         // `serde_yaml::to_string` normalises scalar quoting (matches Bun's
         // `yaml.stringify`) — assert on the key=value semantics, not the
         // exact quoting style.
@@ -487,12 +549,9 @@ mod tests {
         fs::set_permissions(&file2, perms).unwrap();
 
         let mut warnings = Vec::new();
-        let r = run_backfill_recapped(
-            &logs,
-            None,
-            "2026-05-20",
-            |msg| warnings.push(msg.to_string()),
-        );
+        let r = run_backfill_recapped(&logs, None, "2026-05-20", |msg| {
+            warnings.push(msg.to_string())
+        });
 
         // Restore so tempdir cleanup works.
         let mut perms = fs::metadata(&file2).unwrap().permissions();
@@ -501,7 +560,9 @@ mod tests {
 
         assert_eq!(r.backfilled, 1);
         assert_eq!(r.skipped, 1);
-        assert!(warnings.iter().any(|w| w.starts_with("migrate: error processing")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.starts_with("migrate: error processing")));
     }
 
     #[test]
@@ -523,10 +584,8 @@ mod tests {
         assert_eq!(r.backfilled, 1);
         assert_eq!(r.skipped, 0);
 
-        let older =
-            fs::read_to_string(m.join("2026-04-20-session-01.md")).unwrap();
-        let newer =
-            fs::read_to_string(m.join("2026-04-25-session-01.md")).unwrap();
+        let older = fs::read_to_string(m.join("2026-04-20-session-01.md")).unwrap();
+        let newer = fs::read_to_string(m.join("2026-04-25-session-01.md")).unwrap();
         assert!(older.contains("recapped:"));
         assert!(!newer.contains("recapped:"));
     }
@@ -556,8 +615,20 @@ mod tests {
             "tags: session-log\ndate: '2026-04-20'\n",
         );
         let r1 = run_backfill_recapped(&logs, None, "2026-05-20", no_warn());
-        assert_eq!(r1, MigrateResult { backfilled: 1, skipped: 0 });
+        assert_eq!(
+            r1,
+            MigrateResult {
+                backfilled: 1,
+                skipped: 0
+            }
+        );
         let r2 = run_backfill_recapped(&logs, None, "2026-05-20", no_warn());
-        assert_eq!(r2, MigrateResult { backfilled: 0, skipped: 0 });
+        assert_eq!(
+            r2,
+            MigrateResult {
+                backfilled: 0,
+                skipped: 0
+            }
+        );
     }
 }
