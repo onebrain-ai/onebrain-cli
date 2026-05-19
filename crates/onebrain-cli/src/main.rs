@@ -102,7 +102,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         } => commands::orphan_scan::run(&logs_folder, &session_token),
         Cmd::QmdReindex => commands::qmd_reindex::run(),
         Cmd::Checkpoint { mode } => commands::checkpoint::run(&mode),
-        Cmd::Harness => todo!("Slice 5"),
+        Cmd::Harness => commands::harness::run(),
         Cmd::Doctor { .. } => todo!("Slice 6"),
         Cmd::RegisterHooks => todo!("Slice 7"),
         Cmd::RegisterSchedule { .. } => todo!("Slice 8"),
