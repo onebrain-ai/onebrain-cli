@@ -122,7 +122,11 @@ fn dispatch(cli: Cli) -> Result<()> {
         } => commands::migrate::run(&name, cutoff.as_deref(), vault.as_deref()),
         Cmd::Init { .. } => todo!("Slice 10"),
         Cmd::Update => todo!("Slice 11"),
-        Cmd::RunSkill { .. } => todo!("Slice 12"),
+        Cmd::RunSkill {
+            vault,
+            skill,
+            args,
+        } => std::process::exit(commands::run_skill::run(&vault, &skill, &args)?),
         Cmd::VaultSync => todo!("Slice 13"),
     }
 }
