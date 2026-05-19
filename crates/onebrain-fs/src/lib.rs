@@ -5,5 +5,6 @@
 //! scan, tree counts, etc.) arrive in Slice 2.
 
 pub mod error;
+pub mod orphan;
 
 pub use error::{FsError, Result};
