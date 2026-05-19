@@ -6,7 +6,9 @@
 pub mod config;
 pub mod error;
 pub mod path;
+pub mod types;
 
 pub use config::{load_vault_config, VaultConfig};
 pub use error::{CoreError, Result};
 pub use path::{find_vault_root, VaultRoot};
+pub use types::SessionToken;
