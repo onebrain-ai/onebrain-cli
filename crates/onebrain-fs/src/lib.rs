@@ -11,6 +11,7 @@ pub(crate) mod frontmatter;
 pub mod harness;
 pub mod migrate;
 pub mod orphan;
+pub mod register_hooks;
 pub mod run_skill;
 pub mod update;
 

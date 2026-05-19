@@ -1,7 +1,9 @@
 use assert_cmd::Command;
-use insta::assert_json_snapshot;
+use insta::{assert_json_snapshot, assert_snapshot};
 use serde_json::Value;
+use std::fs;
 use std::path::PathBuf;
+use tempfile::tempdir;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -116,4 +118,55 @@ fn update_full_upgrade_success_snapshot() {
     let _ = run_update(opts);
     let joined = lines.lock().unwrap().join("\n");
     insta::assert_snapshot!("update_full_upgrade_success", joined);
+}
+
+#[test]
+fn register_hooks_fresh_install_snapshot() {
+    // Snapshot the on-disk settings.json produced from a fresh vault.
+    let d = tempdir().unwrap();
+    fs::create_dir_all(d.path().join(".claude")).unwrap();
+    fs::write(d.path().join("vault.yml"), "method: onebrain\n").unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-hooks", "--vault", d.path().to_str().unwrap()])
+        .assert()
+        .success();
+    let text = fs::read_to_string(d.path().join(".claude").join("settings.json")).unwrap();
+    assert_snapshot!("register_hooks_fresh_install", text);
+}
+
+#[test]
+fn register_hooks_merge_legacy_snapshot() {
+    // Snapshot the on-disk settings.json after migrating a vault that has:
+    // - legacy shell-form Stop hook
+    // - legacy `qmd update -c foo` PostToolUse hook
+    // - a user-added Bash() permission
+    // - an unknown top-level key (theme)
+    // - qmd_collection set in vault.yml
+    let d = tempdir().unwrap();
+    fs::create_dir_all(d.path().join(".claude")).unwrap();
+    fs::write(d.path().join("vault.yml"), "qmd_collection: foo\n").unwrap();
+    fs::write(
+        d.path().join(".claude").join("settings.json"),
+        serde_json::to_string(&serde_json::json!({
+            "theme": "dark",
+            "hooks": {
+                "Stop": [{"matcher": "", "hooks": [{"command": "onebrain checkpoint stop"}]}],
+                "PostToolUse": [{
+                    "matcher": "Write|Edit",
+                    "hooks": [{"type": "command", "command": "qmd update -c foo"}],
+                }],
+            },
+            "permissions": {"allow": ["Bash(my-script *)"]},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-hooks", "--vault", d.path().to_str().unwrap()])
+        .assert()
+        .success();
+    let text = fs::read_to_string(d.path().join(".claude").join("settings.json")).unwrap();
+    assert_snapshot!("register_hooks_merge_legacy", text);
 }
