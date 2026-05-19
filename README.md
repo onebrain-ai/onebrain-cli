@@ -13,8 +13,8 @@ v3.0 development · GA target 2026-06-30. See design spec in the OneBrain vault.
 ```bash
 git clone https://github.com/onebrain-ai/onebrain-cli
 cd onebrain-cli
-cargo build --release -p onebrain-cli
-# Binary at target/release/onebrain
+cargo build --release -p onebrain-cli   # builds the onebrain-cli crate
+# → target/release/onebrain                (binary name set via [[bin]] in crates/onebrain-cli/Cargo.toml)
 ```
 
 ## Development
@@ -44,7 +44,7 @@ cargo insta review          # interactive approve/reject
 - `onebrain-core` — types, config parsing, path resolution (zero filesystem deps)
 - `onebrain-fs` — vault walks, frontmatter scans
 - `onebrain-cache` — session token resolution, plist generation, qmd status
-- `onebrain-cli` — binary · clap dispatch · 13 subcommands (only `session-init` wired in v3.0 Slice 1)
+- `onebrain-cli` — binary crate · produces the **`onebrain`** binary · clap dispatch · 13 subcommands (only `session-init` wired in v3.0 Slice 1)
 
 See `01-projects/onebrain/shared/2026-05-14-rust-cli-rewrite-design.md` for the full design rationale (OneBrain vault).
 
