@@ -139,7 +139,10 @@ impl Check for SettingsHooksCheck {
         let settings: Value = match serde_json::from_str(&text) {
             Ok(v) => v,
             Err(_) => {
-                return DoctorResult::error("settings-hooks", "settings.json contains invalid JSON");
+                return DoctorResult::error(
+                    "settings-hooks",
+                    "settings.json contains invalid JSON",
+                );
             }
         };
 
@@ -258,7 +261,11 @@ mod tests {
     fn write_settings(root: &Path, value: &Value) {
         let dir = root.join(".claude");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("settings.json"), serde_json::to_string(value).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::to_string(value).unwrap(),
+        )
+        .unwrap();
     }
 
     fn write_settings_raw(root: &Path, text: &str) {

@@ -15,8 +15,8 @@ use std::io::Write;
 /// produced `DoctorStatus::Error`. `--fix` is reserved for v3.0.1.
 pub fn run(fix: bool) -> Result<i32> {
     let cwd = env::current_dir().context("read current directory")?;
-    let vault_root = find_vault_root(&cwd)
-        .ok_or_else(|| anyhow!("not inside a vault (no vault.yml found)"))?;
+    let vault_root =
+        find_vault_root(&cwd).ok_or_else(|| anyhow!("not inside a vault (no vault.yml found)"))?;
 
     // Best-effort config load — on error, fall back to defaults so doctor can
     // still report what it sees (matches Bun behavior: stderr warning + defaults).

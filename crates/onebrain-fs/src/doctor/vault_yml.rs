@@ -16,9 +16,7 @@ impl Check for VaultYmlCheck {
             Err(_) => {
                 return DoctorResult::error("vault.yml", "vault.yml not found")
                     .with_hint("Run onebrain init to create vault.yml")
-                    .with_details(vec![
-                        "Run onebrain init to create vault.yml".to_string()
-                    ]);
+                    .with_details(vec!["Run onebrain init to create vault.yml".to_string()]);
             }
         };
         let parsed: serde_yaml::Value = match serde_yaml::from_str(&content) {
@@ -86,6 +84,9 @@ mod tests {
         let r = VaultYmlCheck.run(d.path(), &cfg());
         assert_eq!(r.status, DoctorStatus::Ok);
         assert!(r.details.iter().any(|d| d.contains("qmd: ob-1")));
-        assert!(r.details.iter().any(|d| d.contains("update_channel: stable")));
+        assert!(r
+            .details
+            .iter()
+            .any(|d| d.contains("update_channel: stable")));
     }
 }

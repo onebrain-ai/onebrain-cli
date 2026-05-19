@@ -38,26 +38,18 @@ impl QmdEmbeddingsCheck {
     {
         // 1. Config-level guard · qmd_collection missing is a warn (matches Bun).
         let Some(collection) = &config.qmd_collection else {
-            return DoctorResult::warn(
-                "qmd-embeddings",
-                "qmd_collection not set in vault.yml",
-            )
-            .with_hint("Run /qmd to set up search index")
-            .with_details(vec!["Run /qmd to set up search index".to_string()]);
+            return DoctorResult::warn("qmd-embeddings", "qmd_collection not set in vault.yml")
+                .with_hint("Run /qmd to set up search index")
+                .with_details(vec!["Run /qmd to set up search index".to_string()]);
         };
 
         // 2. Probe (real call or test stub) · everything else is non-fatal.
         match probe() {
-            QmdProbe::NotFound => {
-                DoctorResult::ok("qmd-embeddings", "qmd not found in PATH")
+            QmdProbe::NotFound => DoctorResult::ok("qmd-embeddings", "qmd not found in PATH"),
+            QmdProbe::Timeout => {
+                DoctorResult::ok("qmd-embeddings", "qmd status unavailable (timeout)")
             }
-            QmdProbe::Timeout => DoctorResult::ok(
-                "qmd-embeddings",
-                "qmd status unavailable (timeout)",
-            ),
-            QmdProbe::Error => {
-                DoctorResult::ok("qmd-embeddings", "qmd status unavailable")
-            }
+            QmdProbe::Error => DoctorResult::ok("qmd-embeddings", "qmd status unavailable"),
             QmdProbe::Stdout(stdout) => parse_qmd_status(&stdout, collection),
         }
     }
@@ -125,11 +117,7 @@ fn real_qmd_probe() -> QmdProbe {
     };
 
     // 2. Spawn with stdio piped.
-    let mut child = match command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+    let mut child = match command.stdout(Stdio::piped()).stderr(Stdio::null()).spawn() {
         Ok(c) => c,
         Err(_) => return QmdProbe::Error,
     };

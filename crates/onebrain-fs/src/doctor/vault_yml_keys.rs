@@ -135,10 +135,7 @@ impl Check for VaultYmlKeysCheck {
             .get(Value::String("runtime".to_string()))
             .and_then(|v| v.as_mapping())
         {
-            if runtime
-                .get(Value::String("harness".to_string()))
-                .is_some()
-            {
+            if runtime.get(Value::String("harness".to_string())).is_some() {
                 warnings.push("deprecated key: runtime.harness (safe to remove)".to_string());
             }
         }
@@ -170,7 +167,9 @@ impl Check for VaultYmlKeysCheck {
         // Warnings branch
         if !warnings.is_empty() {
             let has_deprecated = warnings.iter().any(|w| {
-                w.contains("onebrain_version") || w.contains("method") || w.contains("runtime.harness")
+                w.contains("onebrain_version")
+                    || w.contains("method")
+                    || w.contains("runtime.harness")
             });
             let has_missing_soft_key = warnings.iter().any(|w| w.starts_with("missing key:"));
             let hint: Option<&str> = if has_missing_soft_key && has_deprecated {
@@ -391,10 +390,7 @@ mod tests {
         );
         let r = VaultYmlKeysCheck.run(d.path(), &cfg());
         assert_eq!(r.status, DoctorStatus::Warn);
-        assert!(r
-            .details
-            .iter()
-            .any(|x| x == "missing key: update_channel"));
+        assert!(r.details.iter().any(|x| x == "missing key: update_channel"));
         assert_eq!(
             r.hint.as_deref(),
             Some("Run onebrain doctor --fix to backfill defaults")

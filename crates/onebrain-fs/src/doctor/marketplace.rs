@@ -86,11 +86,10 @@ mod tests {
         let r = ClaudeSettingsCheck.run(d.path(), &cfg());
         assert_eq!(r.message, "stale marketplace repo");
         assert!(r.hint.is_some());
-        assert!(
-            r.details
-                .iter()
-                .any(|d| d.contains("kengio/onebrain → onebrain-ai/onebrain"))
-        );
+        assert!(r
+            .details
+            .iter()
+            .any(|d| d.contains("kengio/onebrain → onebrain-ai/onebrain")));
     }
 
     #[test]

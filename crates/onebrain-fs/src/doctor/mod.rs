@@ -50,8 +50,5 @@ pub fn run_all_checks(vault_root: &Path, config: &VaultConfig) -> Vec<DoctorResu
         Box::new(QmdEmbeddingsCheck),
         Box::new(ClaudeSettingsCheck),
     ];
-    checks
-        .iter()
-        .map(|c| c.run(vault_root, config))
-        .collect()
+    checks.iter().map(|c| c.run(vault_root, config)).collect()
 }
