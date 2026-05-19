@@ -20,7 +20,7 @@ pub trait Check {
 // Per-check modules — populated in subsequent tasks.
 pub mod folders;
 pub mod vault_yml;
-// pub mod vault_yml_keys; // Task 6
+pub mod vault_yml_keys;
 // pub mod orphans;        // Task 7
 // pub mod qmd;            // Task 8
 // pub mod plugin;         // Task 9
@@ -29,13 +29,18 @@ pub mod vault_yml;
 
 pub use folders::FoldersCheck;
 pub use vault_yml::VaultYmlCheck;
+pub use vault_yml_keys::VaultYmlKeysCheck;
 
 /// Run every check in declaration order and return all results.
 pub fn run_all_checks(vault_root: &Path, config: &VaultConfig) -> Vec<DoctorResult> {
     // Order matches Bun output: vault.yml, vault.yml-keys, folders, plugin-files,
     // settings-hooks, orphan-checkpoints, qmd-embeddings, claude-settings.
-    // Tasks 6-11 will insert checks at the correct positions.
-    let checks: Vec<Box<dyn Check>> = vec![Box::new(VaultYmlCheck), Box::new(FoldersCheck)];
+    // Tasks 7-11 will insert remaining checks at the correct positions.
+    let checks: Vec<Box<dyn Check>> = vec![
+        Box::new(VaultYmlCheck),
+        Box::new(VaultYmlKeysCheck),
+        Box::new(FoldersCheck),
+    ];
     checks
         .iter()
         .map(|c| c.run(vault_root, config))
