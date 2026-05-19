@@ -231,6 +231,87 @@ pub(crate) fn get_newest_mtime_ms(paths: &[PathBuf]) -> Option<u64> {
     Some(newest)
 }
 
+use onebrain_core::{load_vault_config_at, CoreError};
+use std::io::Write;
+
+const MIN_GUARD_MINUTES: u64 = 60;
+const DEFAULT_ACTIVE_SESSION_GUARD_MS: u64 = 60 * 60 * 1000;
+
+/// Resolve the Active-Session Guard threshold in milliseconds from `vault.yml`'s
+/// `checkpoint.minutes`. Policy: `max(60min, 2 * checkpoint.minutes)` minutes.
+///
+/// Fail-safe: returns 60min on missing/malformed vault.yml. Expected absence
+/// (ENOENT-equivalent) is silent · real malformations emit a stderr warning.
+#[allow(dead_code)] // used by upcoming scan_orphans in Task 9
+pub(crate) fn active_session_guard_ms(vault_root: &Path) -> u64 {
+    match load_vault_config_at(vault_root) {
+        Ok(config) => {
+            let cp_minutes = config.checkpoint.minutes as u64;
+            let minutes = MIN_GUARD_MINUTES.max(2 * cp_minutes);
+            minutes * 60 * 1000
+        }
+        Err(CoreError::VaultYamlMissing { .. }) => {
+            // Expected absence — silent fallback.
+            DEFAULT_ACTIVE_SESSION_GUARD_MS
+        }
+        Err(other) => {
+            // Real malformation — emit warning to stderr (best-effort, never panic).
+            let _ = writeln!(
+                std::io::stderr(),
+                "onebrain orphan-scan: vault.yml unreadable, using {}-min Active-Session Guard default ({other})",
+                MIN_GUARD_MINUTES
+            );
+            DEFAULT_ACTIVE_SESSION_GUARD_MS
+        }
+    }
+}
+
+#[cfg(test)]
+mod guard_threshold_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    const MIN_GUARD_MS: u64 = 60 * 60 * 1000;
+
+    #[test]
+    fn falls_back_to_60_min_when_vault_yml_missing() {
+        let dir = tempdir().unwrap();
+        // No vault.yml inside
+        assert_eq!(active_session_guard_ms(dir.path()), MIN_GUARD_MS);
+    }
+
+    #[test]
+    fn uses_60_min_default_when_checkpoint_block_absent() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("vault.yml"), "# no checkpoint key\n").unwrap();
+        // checkpoint.minutes defaults to 30 → max(60, 60) = 60 min
+        assert_eq!(active_session_guard_ms(dir.path()), MIN_GUARD_MS);
+    }
+
+    #[test]
+    fn checkpoint_minutes_60_yields_120_min_threshold() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("vault.yml"), "checkpoint:\n  minutes: 60\n").unwrap();
+        assert_eq!(active_session_guard_ms(dir.path()), 120 * 60 * 1000);
+    }
+
+    #[test]
+    fn checkpoint_minutes_15_clamps_to_60_min_floor() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("vault.yml"), "checkpoint:\n  minutes: 15\n").unwrap();
+        // max(60, 2*15=30) = 60
+        assert_eq!(active_session_guard_ms(dir.path()), MIN_GUARD_MS);
+    }
+
+    #[test]
+    fn malformed_vault_yml_falls_back_to_60_min() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("vault.yml"), "not: : valid").unwrap();
+        assert_eq!(active_session_guard_ms(dir.path()), MIN_GUARD_MS);
+    }
+}
+
 #[cfg(test)]
 mod mtime_tests {
     use super::*;

@@ -1,5 +1,6 @@
 use crate::{CoreError, Result, VaultRoot};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultConfig {
@@ -40,6 +41,21 @@ pub fn load_vault_config(root: &VaultRoot) -> Result<VaultConfig> {
     let path = root.join("vault.yml");
     let content = std::fs::read_to_string(&path).map_err(|source| CoreError::VaultYamlMissing {
         path: path.clone(),
+        source,
+    })?;
+    let config: VaultConfig = serde_yaml::from_str(&content)?;
+    Ok(config)
+}
+
+/// Load `vault.yml` from an arbitrary directory path (no `VaultRoot` invariant).
+///
+/// Use this when the caller has a raw path that *may or may not* be a vault root
+/// (e.g., the Active-Session Guard threshold derivation reads vault.yml from a
+/// best-effort location and falls back on any error).
+pub fn load_vault_config_at(path: &Path) -> Result<VaultConfig> {
+    let yml = path.join("vault.yml");
+    let content = std::fs::read_to_string(&yml).map_err(|source| CoreError::VaultYamlMissing {
+        path: yml.clone(),
         source,
     })?;
     let config: VaultConfig = serde_yaml::from_str(&content)?;
