@@ -46,7 +46,17 @@ enum Cmd {
     },
 
     /// Install Claude Code hooks for this vault (Slice 7).
-    RegisterHooks,
+    RegisterHooks {
+        /// Vault root · defaults to current working directory.
+        #[arg(long)]
+        vault: Option<std::path::PathBuf>,
+        /// Compute changes but do not write settings.json.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Uninstall OneBrain hooks + permission entries from settings.json.
+        #[arg(long)]
+        remove: bool,
+    },
 
     /// Install OS-level scheduler entries from vault.yml (Slice 8).
     RegisterSchedule {
@@ -117,7 +127,11 @@ fn dispatch(cli: Cli) -> Result<()> {
         Cmd::Checkpoint { mode } => commands::checkpoint::run(&mode),
         Cmd::Harness => commands::harness::run(),
         Cmd::Doctor { fix } => std::process::exit(commands::doctor::run(fix)?),
-        Cmd::RegisterHooks => todo!("Slice 7"),
+        Cmd::RegisterHooks {
+            vault,
+            dry_run,
+            remove,
+        } => std::process::exit(commands::register_hooks::run(vault, dry_run, remove)?),
         Cmd::RegisterSchedule { .. } => todo!("Slice 8"),
         Cmd::Migrate {
             name,
