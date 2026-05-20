@@ -20,6 +20,8 @@
 //! v3.0 ships non-TTY output only — TTY spinner / colored output is deferred
 //! to v3.0.1 (no `picocolors` / `cli-banner` equivalent in tree yet).
 
+mod install;
+
 use chrono::{DateTime, Datelike, Utc};
 use std::path::PathBuf;
 use std::process::Command;
@@ -93,6 +95,7 @@ pub struct UpdateOptions {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum UpdateError {
     #[error("GitHub API returned HTTP {0}")]
     GithubStatus(u16),
@@ -105,6 +108,14 @@ pub enum UpdateError {
 
     #[error("decode: {0}")]
     Decode(String),
+
+    /// Filesystem / OS errors during the install path (write, rename, chmod,
+    /// missing parent dir, target-triple resolution, unsupported platform).
+    /// Separated from `Network` so user-facing messages like "Binary install
+    /// failed: install: rename …" no longer mislead operators into thinking
+    /// the network is at fault.
+    #[error("install: {0}")]
+    Install(String),
 
     #[error("Binary install failed (exit {exit_code}): {stderr}")]
     InstallBinary { exit_code: i32, stderr: String },
@@ -341,36 +352,33 @@ pub fn parse_release_payload(json: &serde_json::Value) -> Result<ReleaseInfo, Up
     })
 }
 
-/// Real `defaultInstallBinary` — `bun install -g @onebrain-ai/cli@<v>` on
-/// Unix; PowerShell-wrapped `npm install -g '@onebrain-ai/cli@<v>'` on
-/// Windows.
+/// Install the v3 Rust binary by fetching the release tarball directly from
+/// GitHub and swapping the running binary in place.
+///
+/// This replaces the pre-alpha.9 `bun install -g @onebrain-ai/cli@<v>` /
+/// `npm install -g …` path, which only worked for the v2.x (Bun) cycle
+/// because the v3 Rust binary was never published to npm — leaving every
+/// real-world `onebrain update` on v3 broken from alpha.1 through alpha.8.
+///
+/// Flow:
+///   1. Resolve the target triple of the *running* binary via `cfg!`
+///      macros. The triple of the running process is also the triple we
+///      need to fetch (same machine, same OS, same libc on Linux).
+///   2. Build the release URL:
+///      `{RELEASES_BASE_DOWNLOAD_URL}/v{version}/onebrain-{triple}.{ext}`
+///      (where `ext = tar.gz` on Unix, `zip` on Windows).
+///   3. Download with a long-ish HTTP timeout (binaries can be ~5 MB; slow
+///      links need more than the API-fetch 15 s budget).
+///   4. Extract the `onebrain` (or `onebrain.exe`) entry into a tempfile
+///      alongside the running binary.
+///   5. Atomic swap. On Unix `rename` over the live exe is allowed. On
+///      Windows the running .exe is locked — we rename it to `.old` first,
+///      then move the new binary into place (mirrors how rustup self-
+///      updates).
 pub fn default_install_binary(version: &str) -> Result<(), UpdateError> {
-    let cmd = build_install_command(version, cfg!(windows));
-    run_subprocess(&cmd, /*install*/ true)
-}
-
-/// Pull command construction out so tests can verify the argv shape on
-/// every platform without actually executing it.
-pub(crate) fn build_install_command(version: &str, is_windows: bool) -> Vec<String> {
-    if is_windows {
-        // Escape any single quotes for the PowerShell literal string. Semver
-        // tags will never contain `'` but mirror Bun's escape pass for
-        // safety.
-        let safe = version.replace('\'', "''");
-        vec![
-            windows_shell().to_string(),
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
-            format!("npm install -g '@onebrain-ai/cli@{safe}'"),
-        ]
-    } else {
-        vec![
-            "bun".to_string(),
-            "install".to_string(),
-            "-g".to_string(),
-            format!("@onebrain-ai/cli@{version}"),
-        ]
-    }
+    let current_exe = std::env::current_exe()
+        .map_err(|e| UpdateError::Install(format!("could not resolve current binary path: {e}")))?;
+    install::fetch_and_swap_binary(version, &current_exe)
 }
 
 /// Semver-aware comparison: returns `true` when `current >= candidate`,
@@ -391,31 +399,6 @@ pub fn version_at_least(current: &str, candidate: &str) -> bool {
         (Ok(curr), Ok(cand)) => curr >= cand,
         _ => current == candidate,
     }
-}
-
-fn run_subprocess(argv: &[String], is_install: bool) -> Result<(), UpdateError> {
-    let mut iter = argv.iter();
-    let program = iter.next().expect("argv non-empty");
-    let output = Command::new(program)
-        .args(iter)
-        .output()
-        .map_err(|e| UpdateError::Spawn {
-            cmd: program.clone(),
-            source: e,
-        })?;
-    if !output.status.success() {
-        let exit_code = output.status.code().unwrap_or(-1);
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return if is_install {
-            Err(UpdateError::InstallBinary { exit_code, stderr })
-        } else {
-            Err(UpdateError::Spawn {
-                cmd: program.clone(),
-                source: std::io::Error::other(format!("exit {exit_code}")),
-            })
-        };
-    }
-    Ok(())
 }
 
 /// Real `defaultValidateBinary` — spawn `onebrain --version`, expect a match
@@ -964,31 +947,6 @@ mod tests {
             parse_release_payload(&json2),
             Err(UpdateError::MissingTag)
         ));
-    }
-
-    #[test]
-    fn install_command_unix_uses_bun() {
-        let argv = build_install_command("v2.0.0", false);
-        assert_eq!(
-            argv,
-            vec!["bun", "install", "-g", "@onebrain-ai/cli@v2.0.0"]
-        );
-    }
-
-    #[test]
-    fn install_command_windows_uses_powershell_with_npm() {
-        let argv = build_install_command("v2.0.0", true);
-        assert_eq!(argv.len(), 4);
-        assert!(argv[0] == "pwsh" || argv[0] == "powershell.exe");
-        assert_eq!(argv[1], "-NoProfile");
-        assert_eq!(argv[2], "-Command");
-        assert_eq!(argv[3], "npm install -g '@onebrain-ai/cli@v2.0.0'");
-    }
-
-    #[test]
-    fn install_command_windows_escapes_single_quotes() {
-        let argv = build_install_command("v'2.0.0", true);
-        assert_eq!(argv[3], "npm install -g '@onebrain-ai/cli@v''2.0.0'");
     }
 
     #[test]

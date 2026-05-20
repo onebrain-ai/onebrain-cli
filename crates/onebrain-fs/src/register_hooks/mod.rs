@@ -34,7 +34,14 @@ pub struct RegisterHooksOptions {
 }
 
 /// Summary of what `run` did, for CLI printing.
+///
+/// `#[non_exhaustive]` — fields evolve across CLI versions (alpha.9 added
+/// `direct_mode`). Out-of-tree consumers should construct via `..Default::default()`
+/// pattern-style updates so a v3.0.x patch can introduce additional fields
+/// without breaking downstream builds. The constructor is hidden behind
+/// `run(...)` anyway; pattern-match consumers are expected to use `..` arms.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct RegisterHooksResult {
     /// True when the run completed (no parse/IO errors).
     pub ok: bool,
@@ -55,10 +62,23 @@ pub struct RegisterHooksResult {
     pub claude_harness: bool,
     /// True when --remove mode was used.
     pub remove_mode: bool,
+    /// True when the vault is in direct mode (no harness). In this state
+    /// `register-hooks` is a no-op by design: direct invocation calls the
+    /// `onebrain` binary from the user's shell and needs no settings.json
+    /// hook plumbing. CLI surfaces this so the user gets a clear message
+    /// instead of silent success.
+    pub direct_mode: bool,
 }
 
-/// Run the register-hooks workflow. Single-harness (claude) only; gemini is a
-/// no-op (Bun parity), direct is deferred to v3.0.1.
+/// Run the register-hooks workflow. Harness-aware:
+/// - `Claude` → write Stop + PostToolUse hooks and 14 permissions to
+///   `.claude/settings.json` (the Bun-parity behavior).
+/// - `Gemini` → no-op (Bun parity — Gemini harness doesn't ship a hooks
+///   integration yet).
+/// - `Direct` → no-op with `direct_mode = true` on the result so the CLI
+///   can emit a clear "nothing to register in direct mode" message. Direct
+///   invocations call `onebrain` from the user's shell; there is no
+///   harness-side settings file to mutate.
 pub fn run(opts: RegisterHooksOptions) -> Result<RegisterHooksResult> {
     let vault_dir = opts
         .vault_dir
@@ -71,8 +91,17 @@ pub fn run(opts: RegisterHooksOptions) -> Result<RegisterHooksResult> {
     };
 
     let harnesses = detect_harnesses(&vault_dir);
+    // `detect_harnesses` only returns `[Direct]` as a fallback when no
+    // harness directory was found AND no env override was set — Direct is
+    // never combined with Claude/Gemini. So this exact-match check is
+    // sufficient and the previous `Direct && !Claude` form was redundant.
+    if harnesses == [Harness::Direct] {
+        result.direct_mode = true;
+        result.ok = true;
+        return Ok(result);
+    }
     if !harnesses.contains(&Harness::Claude) {
-        // No claude harness — Bun's claude branch never runs; nothing to do.
+        // Gemini-only — Bun's claude branch never runs; nothing to do.
         result.ok = true;
         return Ok(result);
     }

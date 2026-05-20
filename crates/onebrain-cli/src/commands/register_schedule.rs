@@ -485,10 +485,77 @@ fn print_status(vault: &Path) -> Result<()> {
     Ok(())
 }
 
-fn test_run(_vault: &Path, skill: &str) -> Result<()> {
-    println!("Testing scheduled invocation of {skill}...");
-    println!("(Spawns `onebrain run-skill` which shells out to Claude Code.)");
-    eprintln!("--test is not yet implemented in v3.0 · deferred");
+/// `--test <skill>` — fire a scheduled skill one-shot, exactly the way launchd
+/// would invoke it on schedule firing. Used to validate that a `vault.yml`
+/// schedule entry actually works end-to-end (claude binary on PATH, vault
+/// path correct, args parsed) before committing to a recurring cron line.
+///
+/// Implementation: walk vault.yml to find the entry matching `skill`, build
+/// the same argv the launchd plist would emit (`onebrain run-skill --vault
+/// <path> --skill <name> [--arg key=value ...]` for skill-mode entries, or
+/// the raw `command + args[]` for command-mode entries), spawn it
+/// synchronously with the parent process's env, and stream stdout/stderr.
+/// Exit code is propagated.
+fn test_run(vault: &Path, skill: &str) -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    let config = read_vault_config(vault)?;
+    let target = config
+        .schedule
+        .iter()
+        .find(|e| {
+            // Match by skill name (with or without leading slash) for skill
+            // mode, or by command + first-arg for command mode (a label hack
+            // — see `label_for_entry` for the canonical mapping).
+            if is_skill_mode(e) {
+                let raw = e.skill.as_deref().unwrap_or("");
+                let cleaned = raw.trim_start_matches('/');
+                let asked = skill.trim_start_matches('/');
+                cleaned == asked
+            } else {
+                false
+            }
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "no `schedule:` entry matching skill `{skill}` in vault.yml — \
+                 run `onebrain register-schedule --status` to list entries"
+            )
+        })?;
+
+    let exe = env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "onebrain".to_string());
+
+    let skill_name = target.skill.as_deref().unwrap_or("");
+    let mut cmd = Command::new(&exe);
+    cmd.arg("run-skill")
+        .arg("--vault")
+        .arg(vault.as_os_str())
+        .arg("--skill")
+        .arg(skill_name);
+    if let Some(Args::Map(map)) = target.args.as_ref() {
+        for (key, value) in map {
+            // Same shape launchd emits: `--arg key=value` per pair.
+            cmd.arg("--arg").arg(format!("{key}={value}"));
+        }
+    }
+    cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+
+    println!(
+        "--test: invoking {exe} run-skill --vault {} --skill {skill_name}",
+        vault.display()
+    );
+    let status = cmd
+        .status()
+        .with_context(|| format!("spawn `{exe} run-skill` for test invocation"))?;
+    if !status.success() {
+        let code = status.code().unwrap_or(-1);
+        eprintln!("--test: skill `{skill_name}` exited with code {code}");
+        return Err(anyhow!("test invocation of `{skill_name}` failed"));
+    }
+    println!("--test: completed successfully");
     Ok(())
 }
 
