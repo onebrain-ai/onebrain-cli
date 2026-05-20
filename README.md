@@ -32,13 +32,13 @@ Pick the binary that matches your machine, untar/unzip, and put `onebrain` on yo
 
 | Platform | Architecture | File |
 |---|---|---|
-| 🍎 macOS | Apple Silicon (M1–M5) | `onebrain-aarch64-apple-darwin.tar.gz` |
-| 🍎 macOS | Intel | `onebrain-x86_64-apple-darwin.tar.gz` |
-| 🐧 Linux (glibc) | ARM64 | `onebrain-aarch64-unknown-linux-gnu.tar.gz` |
-| 🐧 Linux (glibc) | x86_64 | `onebrain-x86_64-unknown-linux-gnu.tar.gz` |
-| 🐧 Linux (musl / Alpine / static) | x86_64 | `onebrain-x86_64-unknown-linux-musl.tar.gz` |
-| 🪟 Windows | ARM64 | `onebrain-aarch64-pc-windows-msvc.zip` |
-| 🪟 Windows | x86_64 | `onebrain-x86_64-pc-windows-msvc.zip` |
+| ![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white&style=flat) | Apple Silicon (M1–M5) | `onebrain-aarch64-apple-darwin.tar.gz` |
+| ![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white&style=flat) | Intel | `onebrain-x86_64-apple-darwin.tar.gz` |
+| ![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat) (glibc) | ARM64 | `onebrain-aarch64-unknown-linux-gnu.tar.gz` |
+| ![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat) (glibc) | x86_64 | `onebrain-x86_64-unknown-linux-gnu.tar.gz` |
+| ![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat) (musl / Alpine / static) | x86_64 | `onebrain-x86_64-unknown-linux-musl.tar.gz` |
+| ![Windows](https://img.shields.io/badge/Windows-0078D4?logo=windows&logoColor=white&style=flat) | ARM64 | `onebrain-aarch64-pc-windows-msvc.zip` |
+| ![Windows](https://img.shields.io/badge/Windows-0078D4?logo=windows&logoColor=white&style=flat) | x86_64 | `onebrain-x86_64-pc-windows-msvc.zip` |
 
 Filenames use canonical Rust target triples for tooling compatibility (`cargo-binstall`, custom installer scripts). Every release also publishes a `.sha256` next to each archive.
 
