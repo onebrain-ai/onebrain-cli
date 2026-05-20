@@ -51,27 +51,32 @@ pub fn run(fix: bool) -> Result<i32> {
     let mut results = run_all_checks(vault_root.as_path(), &config);
     print_report(&results, std::io::stdout())?;
 
+    let mut any_recipe_failed = false;
     if fix {
         let warnings: Vec<&DoctorResult> = results
             .iter()
             .filter(|r| r.status == DoctorStatus::Warn)
             .collect();
         if warnings.is_empty() {
-            println!("\nFix: nothing to do — no warnings.");
+            println!("\nFix · nothing to do — no warnings.");
         } else {
             println!(
-                "\nFix: attempting recipes for {} warning(s)...",
+                "\nFix · attempting recipes for {} warning(s)",
                 warnings.len()
             );
             let outcomes: Vec<(String, FixOutcome)> = warnings
                 .iter()
                 .map(|r| (r.check.clone(), attempt_fix(r, vault_root.as_path())))
                 .collect();
+            any_recipe_failed = outcomes
+                .iter()
+                .any(|(_, o)| matches!(o, FixOutcome::Failed(_)));
             print_fix_summary(&outcomes);
             // Re-run checks so the final exit code + report reflects the
-            // post-fix state. Users see two reports back-to-back, but the
-            // second one is the source of truth.
-            println!("\nDoctor (post-fix):");
+            // post-fix state. `print_report` carries its own banner so we
+            // skip a duplicate "Doctor (post-fix):" header — a single
+            // blank line is enough to separate the two reports.
+            println!();
             results = run_all_checks(vault_root.as_path(), &config);
             print_report(&results, std::io::stdout())?;
         }
@@ -81,22 +86,48 @@ pub fn run(fix: bool) -> Result<i32> {
         .iter()
         .filter(|r| r.status == DoctorStatus::Error)
         .count();
-    Ok(if error_count == 0 { 0 } else { 1 })
+    // Exit non-zero on any post-fix error OR any failed recipe — so the
+    // caller's shell-level `if $? -ne 0` catches both check escalations
+    // and dispatched-recipe failures.
+    Ok(if error_count == 0 && !any_recipe_failed {
+        0
+    } else {
+        1
+    })
 }
 
-/// Dispatch the warning to the matching fix recipe. Unmapped checks fall
-/// through to `FixOutcome::Manual` so the user knows what to do.
+/// Dispatch the warning to the matching fix recipe. The match keys on
+/// `result.check` AND the message content because some check names cover
+/// multiple sub-conditions with different fix recipes — e.g.
+/// `qmd-embeddings` fires for both "N unembedded" (real recipe: `qmd
+/// embed`) and "qmd_collection not set in vault.yml" (no automated
+/// recipe — user must edit the vault config). Hidden hints that say
+/// "Run onebrain doctor --fix to ..." are silently rewritten to a
+/// non-circular message when no recipe maps.
 fn attempt_fix(result: &DoctorResult, _vault_root: &Path) -> FixOutcome {
     match result.check.as_str() {
-        "qmd-embeddings" => fix_qmd_embeddings(),
-        other => FixOutcome::Manual(format!(
-            "no automated recipe for `{other}` · {}",
-            result
-                .hint
-                .as_deref()
-                .unwrap_or("see check details for next step")
-        )),
+        // Only the "N unembedded" variant is auto-fixable. The
+        // "qmd_collection not set" variant goes to Manual because
+        // `qmd embed` without a configured collection is meaningless.
+        "qmd-embeddings" if result.message.contains("unembedded") => fix_qmd_embeddings(),
+        _ => FixOutcome::Manual(manual_message(result)),
     }
+}
+
+/// Compose the per-warning Manual message. Strips any circular
+/// "Run onebrain doctor --fix to ..." phrasing from the original hint
+/// so users don't get pointed back at the command they just ran.
+fn manual_message(result: &DoctorResult) -> String {
+    let raw_hint = result.hint.as_deref().unwrap_or("");
+    let cleaned =
+        if raw_hint.contains("doctor --fix") || raw_hint.contains("Run onebrain doctor --fix") {
+            "recipe not yet implemented for this check"
+        } else if raw_hint.is_empty() {
+            "see check details for next step"
+        } else {
+            raw_hint
+        };
+    format!("no automated recipe for `{}` · {cleaned}", result.check)
 }
 
 /// Recipe — `qmd-embeddings` warning means N files need embedding. Spawn
@@ -113,7 +144,7 @@ fn fix_qmd_embeddings() -> FixOutcome {
             )
         }
     };
-    println!("  ▸ running: qmd embed");
+    println!("  · running: qmd embed");
     let status = Command::new(qmd).arg("embed").status();
     match status {
         Ok(s) if s.success() => FixOutcome::Fixed("qmd embed completed".to_string()),

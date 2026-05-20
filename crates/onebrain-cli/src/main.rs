@@ -48,6 +48,7 @@ enum Cmd {
 
     /// Run health checks against the current vault.
     Doctor {
+        /// Attempt auto-repair recipes for any warnings, then re-run the checks.
         #[arg(long)]
         fix: bool,
     },
