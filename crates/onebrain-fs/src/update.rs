@@ -260,9 +260,14 @@ pub fn default_fetch_latest_release(fresh: bool) -> Result<ReleaseInfo, UpdateEr
     Ok(info)
 }
 
-/// Cache file path: `$XDG_CACHE_HOME/onebrain/latest-release.json` (Unix
-/// default `~/.cache/onebrain/latest-release.json`). Returns `None` if no
-/// home/cache dir is resolvable, which disables caching gracefully.
+/// Cache file path resolved via `dirs::cache_dir()`:
+///
+/// - Linux: `$XDG_CACHE_HOME/onebrain/latest-release.json` (default `~/.cache/onebrain/latest-release.json`)
+/// - macOS: `~/Library/Caches/onebrain/latest-release.json`
+/// - Windows: `%LOCALAPPDATA%\onebrain\latest-release.json`
+///
+/// Returns `None` if no home/cache dir is resolvable, which disables
+/// caching gracefully.
 fn release_cache_path() -> Option<PathBuf> {
     if let Ok(override_path) = std::env::var("ONEBRAIN_RELEASE_CACHE") {
         return Some(PathBuf::from(override_path));
@@ -597,8 +602,17 @@ pub fn run_update(mut opts: UpdateOptions) -> UpdateResult {
     write_stdout(&mut opts, &format!("latest: {}", release.version));
     result.latest_version = Some(release.version.clone());
 
-    // --check dry-run
+    // --check dry-run. Emit the up-to-date verdict here too so the user
+    // sees what the install path would decide, not just the raw "current vs
+    // latest" pair (reviewer B caught the gap: alpha users running --check
+    // saw `latest: v2.3.3` with no hint that the install would refuse).
     if opts.check {
+        if version_at_least(&current.version, &release.version) {
+            write_stdout(
+                &mut opts,
+                &format!("already up to date: @onebrain-ai/cli {}", current.version),
+            );
+        }
         write_stdout(&mut opts, "done: dry run complete — no changes made");
         result.ok = true;
         result.exit_code = 0;
@@ -612,6 +626,13 @@ pub fn run_update(mut opts: UpdateOptions) -> UpdateResult {
     // refuse to "update" when `current >= release` — either we're already
     // on the latest, or we're ahead of it (prerelease that hasn't been
     // promoted to stable yet). Both produce the same user-visible message.
+    //
+    // Caveat — the upstream endpoint `/releases?per_page=1` orders by
+    // `published_at` desc, not semver. A re-released older version could
+    // surface as "latest"; `version_at_least` still blocks the downgrade,
+    // but the "latest: …" line on `--check` can show the older tag. If
+    // this ever bites in practice, fetch `per_page=20` and pick max-by-
+    // semver — tracked as a follow-up.
     if version_at_least(&current.version, &release.version) {
         write_stdout(
             &mut opts,
@@ -1158,6 +1179,31 @@ mod tests {
         assert!(version_at_least("not-a-version", "not-a-version"));
         assert!(!version_at_least("not-a-version", "v1.0.0"));
         assert!(!version_at_least("v1.0.0", "not-a-version"));
+    }
+
+    #[test]
+    fn version_at_least_numeric_prerelease_counter_orders_correctly() {
+        // semver-spec lexicographic-vs-numeric rule: alpha.10 > alpha.9 by
+        // numeric pre-release ordering, NOT by string ordering (which would
+        // sort "10" < "9"). This is exactly the protection the helper
+        // provides during the alpha cycle, so pin it with an explicit
+        // regression test (reviewer A flagged the gap).
+        assert!(version_at_least("v1.0.0-alpha.10", "v1.0.0-alpha.9"));
+        assert!(!version_at_least("v1.0.0-alpha.9", "v1.0.0-alpha.10"));
+    }
+
+    #[test]
+    fn version_at_least_tolerates_build_metadata_suffix() {
+        // semver spec says build metadata is ignored for precedence
+        // (`1.0.0+a == 1.0.0+b` for ordering). The Rust `semver` crate
+        // diverges and orders on the metadata string itself — benign in
+        // practice (no false downgrade), but worth pinning so a future
+        // crate upgrade is detected loudly rather than silently changing
+        // the install path. If this test ever breaks, audit the install
+        // command (`build_install_command`) — npm/bun may 404 on a
+        // `+build.N` suffixed tag.
+        assert!(version_at_least("1.0.0+build.42", "1.0.0"));
+        assert!(version_at_least("1.0.0+build.42", "1.0.0+build.41"));
     }
 
     #[test]

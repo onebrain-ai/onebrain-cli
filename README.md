@@ -1,7 +1,10 @@
+<!-- Banner pinned to a plugin-repo commit SHA (not the mutable `main` branch)
+     so a future asset restructure on onebrain-ai/onebrain can't silently
+     404 this image. Bump the SHA when refreshing the brand assets. -->
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/onebrain-ai/onebrain/main/assets/header-dark.png">
-    <img alt="OneBrain — Your AI Thinking Partner" src="https://raw.githubusercontent.com/onebrain-ai/onebrain/main/assets/header-light.png" width="640">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/onebrain-ai/onebrain/200f113b27d3354f4a274c5d8aed1ba3b7c689cb/assets/header-dark.png">
+    <img alt="OneBrain — Your AI Thinking Partner" src="https://raw.githubusercontent.com/onebrain-ai/onebrain/200f113b27d3354f4a274c5d8aed1ba3b7c689cb/assets/header-light.png" width="640">
   </picture>
 </p>
 
@@ -21,7 +24,7 @@ Personal AI OS CLI for Obsidian — Rust rewrite of v2.3.3 (TypeScript/Bun).
 
 ## Status
 
-**v3.0.0-alpha.6** — all 13 Bun-parity slices shipped + perf hardening + auto-fix recipes. Feature-complete vs v2.3.3; pre-GA polish (npm wrapper + Homebrew tap) in progress. See [latest release](https://github.com/onebrain-ai/onebrain-cli/releases/latest) for downloads.
+**v3.0.0-alpha.6** — all 13 Bun-parity slices shipped + perf hardening + auto-fix recipes + self-update now targets the CLI repo (no more silent downgrades). Feature-complete vs v2.3.3; pre-GA polish (npm wrapper + Homebrew tap) in progress. See [latest release](https://github.com/onebrain-ai/onebrain-cli/releases/latest) for downloads.
 
 ## Install
 
