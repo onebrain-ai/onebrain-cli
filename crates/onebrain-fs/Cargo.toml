@@ -16,6 +16,7 @@ thiserror     = { workspace = true }
 chrono        = { workspace = true }
 walkdir       = { workspace = true }
 which         = { workspace = true }
+wait-timeout  = { workspace = true }
 reqwest       = { workspace = true }
 indexmap      = { workspace = true }
 inquire       = { workspace = true }

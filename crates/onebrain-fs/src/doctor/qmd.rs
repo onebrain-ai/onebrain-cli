@@ -102,6 +102,11 @@ fn extract_count(stdout: &str, prefix: &str) -> Option<u64> {
 /// Real probe — spawn `qmd status` with 3-second timeout. On any failure
 /// returns the matching `QmdProbe` variant. NEVER panics.
 ///
+/// v3 perf rec #2: uses `wait-timeout` to block on the child instead of
+/// polling `try_wait()` every 100 ms. Saves up to a full poll-tick of jitter
+/// per call (30–100 ms) — the old polling loop could sleep past completion
+/// before noticing the child had exited.
+///
 /// PATH lookup mirrors Bun.which: first standard PATH, then a fallback that
 /// augments PATH with `$HOME/.bun/bin` (where `bun install -g qmd` lands by
 /// default). On Windows we delegate to `powershell.exe` so the user's profile
@@ -109,6 +114,7 @@ fn extract_count(stdout: &str, prefix: &str) -> Option<u64> {
 fn real_qmd_probe() -> QmdProbe {
     use std::io::Read;
     use std::process::Stdio;
+    use wait_timeout::ChildExt;
 
     // 1. Resolve `qmd` binary.
     let mut command = match build_qmd_command() {
@@ -122,28 +128,26 @@ fn real_qmd_probe() -> QmdProbe {
         Err(_) => return QmdProbe::Error,
     };
 
-    // 3. Poll try_wait with 100 ms sleeps · 30 iterations = 3 s total.
-    let tick = Duration::from_millis(100);
-    for _ in 0..30 {
-        match child.try_wait() {
-            Ok(Some(_status)) => {
-                let mut stdout = String::new();
-                if let Some(mut s) = child.stdout.take() {
-                    if s.read_to_string(&mut stdout).is_err() {
-                        return QmdProbe::Error;
-                    }
+    // 3. Block on the child with a hard 3-second deadline (replaces the old
+    //    30 × 100 ms poll). On exit, drain stdout and return. On timeout,
+    //    kill + reap.
+    match child.wait_timeout(Duration::from_secs(3)) {
+        Ok(Some(_status)) => {
+            let mut stdout = String::new();
+            if let Some(mut s) = child.stdout.take() {
+                if s.read_to_string(&mut stdout).is_err() {
+                    return QmdProbe::Error;
                 }
-                return QmdProbe::Stdout(stdout);
             }
-            Ok(None) => std::thread::sleep(tick),
-            Err(_) => return QmdProbe::Error,
+            QmdProbe::Stdout(stdout)
         }
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            QmdProbe::Timeout
+        }
+        Err(_) => QmdProbe::Error,
     }
-
-    // 4. Timeout · kill child and reap.
-    let _ = child.kill();
-    let _ = child.wait();
-    QmdProbe::Timeout
 }
 
 /// Build the platform-appropriate `qmd status` `Command`. Returns `None` when

@@ -21,9 +21,10 @@
 //! to v3.0.1 (no `picocolors` / `cli-banner` equivalent in tree yet).
 
 use chrono::{DateTime, Datelike, Utc};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -74,6 +75,9 @@ pub struct CurrentVersion {
 pub struct UpdateOptions {
     /// Dry-run · fetch latest version and report, do not install.
     pub check: bool,
+    /// Force a fresh network fetch even when the on-disk cache is still warm.
+    /// `update --check --fresh` is the user-facing knob.
+    pub fresh: bool,
     pub fetch_fn: Option<FetchFn>,
     pub install_fn: Option<InstallFn>,
     pub validate_fn: Option<ValidateFn>,
@@ -123,6 +127,11 @@ const DEFAULT_GITHUB_RELEASES_URL: &str =
 const GITHUB_ENV_OVERRIDE: &str = "ONEBRAIN_GITHUB_RELEASES_URL";
 
 const HTTP_TIMEOUT_SECS: u64 = 15;
+
+/// On-disk cache TTL for the GitHub `releases/latest` payload (1 h). Warm
+/// `update --check` returns from this file instead of hitting GitHub, cutting
+/// the call from ~200 ms to ~5 ms.
+const RELEASE_CACHE_TTL: Duration = Duration::from_secs(3600);
 
 /// User-Agent. reqwest requires a non-empty UA for the GitHub API otherwise
 /// the API returns 403. Use a stable string the v3 release pipeline can
@@ -180,9 +189,19 @@ pub fn format_release_date(date: DateTime<Utc>) -> String {
 // Defaults
 // ---------------------------------------------------------------------------
 
-/// Real `fetchLatestRelease` — calls GitHub releases/latest with the v3
-/// JSON Accept header and a User-Agent (mandatory · 403 otherwise).
-pub fn default_fetch_latest_release() -> Result<ReleaseInfo, UpdateError> {
+/// Real `fetchLatestRelease` — cache-aware. Reads
+/// `~/.cache/onebrain/latest-release.json` when the file is younger than
+/// `RELEASE_CACHE_TTL`; otherwise calls GitHub releases/latest with the v3
+/// JSON Accept header and a User-Agent (mandatory · 403 otherwise), then
+/// writes the payload to disk for the next call.
+///
+/// Set `fresh = true` to skip the cache read (still writes after fetching).
+pub fn default_fetch_latest_release(fresh: bool) -> Result<ReleaseInfo, UpdateError> {
+    if !fresh {
+        if let Some(cached) = read_release_cache() {
+            return Ok(cached);
+        }
+    }
     let url = std::env::var(GITHUB_ENV_OVERRIDE)
         .unwrap_or_else(|_| DEFAULT_GITHUB_RELEASES_URL.to_string());
     let client = reqwest::blocking::Client::builder()
@@ -201,7 +220,64 @@ pub fn default_fetch_latest_release() -> Result<ReleaseInfo, UpdateError> {
     let json: serde_json::Value = resp
         .json()
         .map_err(|e| UpdateError::Decode(e.to_string()))?;
-    parse_release_payload(&json)
+    let info = parse_release_payload(&json)?;
+    // Best-effort persist — cache write failure is silently ignored (the
+    // next call just re-fetches).
+    let _ = write_release_cache(&info);
+    Ok(info)
+}
+
+/// Cache file path: `$XDG_CACHE_HOME/onebrain/latest-release.json` (Unix
+/// default `~/.cache/onebrain/latest-release.json`). Returns `None` if no
+/// home/cache dir is resolvable, which disables caching gracefully.
+fn release_cache_path() -> Option<PathBuf> {
+    if let Ok(override_path) = std::env::var("ONEBRAIN_RELEASE_CACHE") {
+        return Some(PathBuf::from(override_path));
+    }
+    let dir = dirs::cache_dir()?.join("onebrain");
+    Some(dir.join("latest-release.json"))
+}
+
+/// Try to read the cache. Returns `Some(info)` only when:
+///   - `ONEBRAIN_GITHUB_RELEASES_URL` is NOT set (presence signals a test or
+///     dev override — the user's intent is "hit this URL", not the cache),
+///   - the file exists,
+///   - its mtime is within `RELEASE_CACHE_TTL` (1 h),
+///   - the JSON parses, and
+///   - the parsed payload has the expected shape.
+///
+/// Any other condition silently falls through to the network path.
+fn read_release_cache() -> Option<ReleaseInfo> {
+    if std::env::var_os(GITHUB_ENV_OVERRIDE).is_some() {
+        return None;
+    }
+    let path = release_cache_path()?;
+    let meta = std::fs::metadata(&path).ok()?;
+    let mtime = meta.modified().ok()?;
+    let age = SystemTime::now().duration_since(mtime).ok()?;
+    if age > RELEASE_CACHE_TTL {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    parse_release_payload(&json).ok()
+}
+
+/// Write the latest release payload to the cache, creating the parent dir if
+/// needed. Failures are silently swallowed by the caller (best-effort cache).
+fn write_release_cache(info: &ReleaseInfo) -> std::io::Result<()> {
+    let path = match release_cache_path() {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let payload = serde_json::json!({
+        "tag_name": info.version,
+        "published_at": info.published_at.map(|d| d.to_rfc3339()),
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&payload)?)
 }
 
 /// Pure parser broken out of `default_fetch_latest_release` for unit testing
@@ -290,18 +366,22 @@ pub fn default_validate_binary() -> bool {
         .unwrap_or(false)
 }
 
-/// Real `defaultCurrentVersion` — spawn `onebrain --version`, regex-parse
-/// out `v[\d.]+` and an ISO-style `released YYYY-MM-DD` substring. Failure
-/// returns `{ version: "unknown", published_at: None }`.
+/// Real `defaultCurrentVersion` — returns the in-process version via the
+/// compile-time `CARGO_PKG_VERSION` constant. v3 perf rec #5: this used to
+/// spawn `onebrain --version`, which cost ~10 ms per invocation AND added a
+/// PATH dependency (if the binary on PATH was a different install, the
+/// reported version would be wrong).
+///
+/// `parse_current_version_output` is still exported for the rare case where
+/// a caller actually wants to interrogate a different binary, but no default
+/// code path spawns anymore.
 pub fn default_current_version() -> CurrentVersion {
-    let cmd = build_version_command(cfg!(windows));
-    let Ok(stdout) = spawn_version_command(&cmd) else {
-        return CurrentVersion {
-            version: "unknown".to_string(),
-            published_at: None,
-        };
-    };
-    parse_current_version_output(&stdout)
+    CurrentVersion {
+        // Cargo strips any leading "v"; prepend it back so the output format
+        // matches Bun's `v\d+\.\d+` shape exactly.
+        version: format!("v{}", env!("CARGO_PKG_VERSION")),
+        published_at: None,
+    }
 }
 
 /// Pure parser shared by `default_current_version` and unit tests.
@@ -444,10 +524,12 @@ pub fn run_update(mut opts: UpdateOptions) -> UpdateResult {
     result.current_version = Some(current.version.clone());
     write_stdout(&mut opts, &format!("current: {}", current.version));
 
-    // Step 2 — fetch latest release
+    // Step 2 — fetch latest release. `fresh` skips the cache file; we
+    // capture it before the partial move into `opts.fetch_fn`.
+    let fresh = opts.fresh;
     let release = match opts.fetch_fn.as_ref().map(|f| f()) {
         Some(r) => r,
-        None => default_fetch_latest_release(),
+        None => default_fetch_latest_release(fresh),
     };
     let release = match release {
         Ok(r) => r,
@@ -862,5 +944,91 @@ mod tests {
         let cv = parse_current_version_output("garbage");
         assert_eq!(cv.version, "unknown");
         assert!(cv.published_at.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // v3 perf rec #5 — current-version constant
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn default_current_version_uses_cargo_pkg_version_constant() {
+        let cv = default_current_version();
+        let expected = format!("v{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(cv.version, expected);
+        // The compile-time constant has no `released YYYY-MM-DD`, so the
+        // date is always `None` on the in-process path.
+        assert!(cv.published_at.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // v3 perf rec #4 — release-info on-disk cache
+    // -----------------------------------------------------------------
+
+    // Serialize all cache tests — they share `ONEBRAIN_RELEASE_CACHE` env
+    // state and would race under cargo's default parallel test runner.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn with_cache_path<F: FnOnce()>(body: F) {
+        // Poisoning is fine — another test panicked but the lock semantics
+        // are intact, so just ignore the poison and proceed.
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("latest-release.json");
+        std::env::set_var("ONEBRAIN_RELEASE_CACHE", &path);
+        body();
+        std::env::remove_var("ONEBRAIN_RELEASE_CACHE");
+    }
+
+    #[test]
+    fn cache_write_then_read_round_trips() {
+        with_cache_path(|| {
+            let info = ReleaseInfo {
+                version: "v9.9.9".to_string(),
+                published_at: None,
+            };
+            write_release_cache(&info).unwrap();
+            let cached = read_release_cache().expect("cache must be readable");
+            assert_eq!(cached.version, "v9.9.9");
+        });
+    }
+
+    #[test]
+    fn cache_miss_when_file_absent_returns_none() {
+        with_cache_path(|| {
+            assert!(read_release_cache().is_none());
+        });
+    }
+
+    #[test]
+    fn cache_stale_when_mtime_exceeds_ttl_returns_none() {
+        with_cache_path(|| {
+            let info = ReleaseInfo {
+                version: "v9.9.9".to_string(),
+                published_at: None,
+            };
+            write_release_cache(&info).unwrap();
+            // Force mtime to two hours in the past — well past the 1-hour TTL.
+            let path = release_cache_path().unwrap();
+            let stale = SystemTime::now() - Duration::from_secs(7200);
+            let stale_ft = filetime::FileTime::from_system_time(stale);
+            filetime::set_file_mtime(&path, stale_ft).unwrap();
+            assert!(
+                read_release_cache().is_none(),
+                "stale cache (>1h) must miss"
+            );
+        });
+    }
+
+    #[test]
+    fn cache_corrupt_json_returns_none() {
+        with_cache_path(|| {
+            let path = release_cache_path().unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"not json").unwrap();
+            assert!(read_release_cache().is_none());
+        });
     }
 }

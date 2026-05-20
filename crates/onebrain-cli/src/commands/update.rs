@@ -9,9 +9,13 @@ use onebrain_fs::update::{run_update, UpdateOptions};
 
 /// Run `onebrain update`. Returns the exit code; the caller is responsible
 /// for `std::process::exit`. Mirrors the `doctor` pattern from Slice 6.
-pub fn run(check: bool) -> Result<i32> {
+///
+/// `fresh = true` skips the 1-hour on-disk release-info cache so the user
+/// always hits GitHub. Defaults to `false` (perf rec #4).
+pub fn run(check: bool, fresh: bool) -> Result<i32> {
     let opts = UpdateOptions {
         check,
+        fresh,
         ..Default::default()
     };
     let result = run_update(opts);
