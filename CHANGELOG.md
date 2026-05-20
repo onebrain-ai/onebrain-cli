@@ -1,5 +1,5 @@
 ---
-latest_version: 3.0.0-alpha.6
+latest_version: 3.0.0-alpha.7
 released: 2026-05-20
 ---
 
@@ -11,6 +11,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## v3.0.0-alpha.7 — feat(doctor): four new `--fix` recipes (settings-hooks · plugin-files · vault.yml-keys · claude-settings)
+
+- **`doctor --fix` now repairs four more check types** beyond the `qmd-embeddings` recipe that shipped in alpha.5: (a) `settings-hooks` re-runs `register-hooks` idempotently (restores Stop hook + qmd PostToolUse hook + `Bash(onebrain *)` permission); (b) `plugin-files` re-overlays the plugin folder via `vault-sync` (brings INSTRUCTIONS.md / agents/ / skills/ / .claude-plugin/ back if missing); (c) `vault.yml-keys` backfills missing standard folder keys + `update_channel` default (additive merge — never overwrites user values); (d) `claude-settings` strips the stale `extraKnownMarketplaces.onebrain` block from `.claude/settings.json`.
+- **`orphan-checkpoints` routes to Manual** with a clearer hint: "run `/wrapup` in Claude to consolidate orphan checkpoints into a session log". Auto-deletion is intentionally off the table — orphans may still need to land in a session log, so we steer the user there rather than risking silent data loss.
+- Five recipes total now ship with the auto-fix flow: `qmd-embeddings` (alpha.5) + the four new ones above. Three check types still route to Manual: `vault.yml` (missing/invalid file — user must restore manually), `folders` (missing PARA folder — user creates), and the `qmd-collection-not-set` variant of `qmd-embeddings` (user edits vault.yml).
 
 ## v3.0.0-alpha.6 — fix(update): target CLI repo + prerelease-safe · ci: GHA Node 24 · docs: README hero + badges
 
