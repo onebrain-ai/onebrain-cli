@@ -4,7 +4,7 @@ default-members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "3.0.0-alpha.3"
+version = "3.0.0-alpha.4"
 edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["OneBrain Contributors"]
@@ -34,6 +34,9 @@ walkdir   = "2"
 
 # Binary lookup (used by doctor qmd check + scheduler command-mode binary resolution)
 which     = "8"
+
+# Bounded child-process wait (v3 perf rec #2 — replaces 100 ms try_wait poll in doctor qmd check)
+wait-timeout = "0.2"
 
 # HTTP client (Slice 11 · update · GitHub releases API · Slice 13 · vault-sync tarball)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }

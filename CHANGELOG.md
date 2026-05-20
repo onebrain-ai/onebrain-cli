@@ -1,5 +1,5 @@
 ---
-latest_version: 3.0.0-alpha.3
+latest_version: 3.0.0-alpha.4
 released: 2026-05-20
 ---
 
@@ -11,6 +11,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## v3.0.0-alpha.4 — perf: faster doctor + warm-cache update --check
+
+- **`update --check` warm-path: 480 ms → 10 ms (~48× faster)** via on-disk JSON cache at `$XDG_CACHE_HOME/onebrain/latest-release.json` with a 1-hour TTL. First call hits GitHub as before; subsequent calls within the hour read the cache instead. New `--fresh` flag bypasses the cache for users who want to force a re-fetch. `ONEBRAIN_RELEASE_CACHE` env var overrides the path for tests.
+- **`doctor` wall time: ~980 ms → ~890 ms (~90 ms)** by running the `qmd-embeddings` probe on a background thread while the other 7 cheap checks run serially. Output order is preserved (Bun parity); the win scales as the cheap-check set grows.
+- **`qmd-embeddings` probe jitter eliminated** by replacing the 100 ms `try_wait()` poll loop with `wait-timeout`'s blocking `wait_timeout` — the previous loop could sleep past child-exit by up to a full tick.
+- **`onebrain update` no longer spawns `onebrain --version` for the current version**, using `env!("CARGO_PKG_VERSION")` instead. Saves ~10 ms per call and removes a PATH dependency (the wrong binary on PATH could previously report a misleading "current" version).
+- New unit/integration tests cover the cache hit/miss/staleness paths and the in-process version constant.
 
 ## v3.0.0-alpha.3 — fix(parity): close all 6 Bun-CLI argv gaps + init becomes one-step + safety + friendlier release notes
 

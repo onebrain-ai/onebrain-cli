@@ -125,6 +125,10 @@ enum Cmd {
         /// Dry run · report what would change without installing.
         #[arg(long)]
         check: bool,
+        /// Skip reading the 1-hour release-info cache · always refetch from
+        /// GitHub (the cache is still updated with the fresh response).
+        #[arg(long)]
+        fresh: bool,
     },
 
     /// Run a OneBrain skill in headless mode (Slice 12).
@@ -206,7 +210,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             force,
             no_sync,
         } => std::process::exit(commands::init::run(yes, vault_dir, force, no_sync)?),
-        Cmd::Update { check } => std::process::exit(commands::update::run(check)?),
+        Cmd::Update { check, fresh } => std::process::exit(commands::update::run(check, fresh)?),
         Cmd::RunSkill { vault, skill, args } => {
             std::process::exit(commands::run_skill::run(&vault, &skill, &args)?)
         }
