@@ -86,7 +86,7 @@ fn build_tty_options(dry_run: bool, fresh: bool) -> UpdateOptions {
     let pb_for_stdout = Arc::clone(&pb_cell);
     let stdout_sink: Box<dyn FnMut(&str) + Send> = Box::new(move |line: &str| {
         let colored = colorize_update_line(line);
-        let guard = pb_for_stdout.lock().expect("pb mutex poisoned");
+        let guard = pb_for_stdout.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
             Some(pb) => pb.println(colored),
             None => println!("{colored}"),
@@ -98,7 +98,7 @@ fn build_tty_options(dry_run: bool, fresh: bool) -> UpdateOptions {
     let pb_for_stderr = Arc::clone(&pb_cell);
     let stderr_sink: Box<dyn FnMut(&str) + Send> = Box::new(move |line: &str| {
         let colored = format!("{ANSI_RED}{line}{ANSI_RESET}");
-        let guard = pb_for_stderr.lock().expect("pb mutex poisoned");
+        let guard = pb_for_stderr.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
             Some(pb) => {
                 // indicatif has no eprintln equivalent; suspend the spinner
@@ -120,14 +120,14 @@ fn build_tty_options(dry_run: bool, fresh: bool) -> UpdateOptions {
         pb.set_message(format!("downloading onebrain {version}…"));
         pb.enable_steady_tick(Duration::from_millis(80));
         // Hand the spinner to the sinks while install runs.
-        *pb_for_install.lock().expect("pb mutex poisoned") = Some(pb.clone());
+        *pb_for_install.lock().unwrap_or_else(|e| e.into_inner()) = Some(pb.clone());
 
         let result = default_install_binary(version);
 
         // Release the spinner before the orchestrator's next stdout line
         // so the install summary line ("done: …") doesn't fight for the
         // cursor with finish_with_message.
-        *pb_for_install.lock().expect("pb mutex poisoned") = None;
+        *pb_for_install.lock().unwrap_or_else(|e| e.into_inner()) = None;
         match &result {
             Ok(_) => pb.finish_and_clear(),
             Err(_) => pb.abandon(),
@@ -229,16 +229,23 @@ fn build_json_document(
         // Enumerate the placeholders so callers don't have to guess the
         // published target set. Each entry pairs a target triple with the
         // archive extension that triple ships with.
+        //
+        // Windows triples are intentionally omitted in v3.0.0 GA: the
+        // self-update path is unix-only this cycle (zip extraction lands in
+        // v3.0.1). Releases still publish Windows .zip archives for manual
+        // download, but `--plan` only advertises auto-installable targets —
+        // otherwise a Windows user running --plan would see their triple
+        // listed and then hit a confusing error on actual install
+        // (Reviewer A-H1, alpha.9).
         obj.insert(
             "binary_targets".to_string(),
             serde_json::json!([
-                {"triple": "aarch64-apple-darwin",        "ext": "tar.gz"},
-                {"triple": "x86_64-apple-darwin",         "ext": "tar.gz"},
-                {"triple": "aarch64-unknown-linux-gnu",   "ext": "tar.gz"},
-                {"triple": "x86_64-unknown-linux-gnu",    "ext": "tar.gz"},
-                {"triple": "x86_64-unknown-linux-musl",   "ext": "tar.gz"},
-                {"triple": "aarch64-pc-windows-msvc",     "ext": "zip"},
-                {"triple": "x86_64-pc-windows-msvc",      "ext": "zip"},
+                {"triple": "aarch64-apple-darwin",      "ext": "tar.gz"},
+                {"triple": "x86_64-apple-darwin",       "ext": "tar.gz"},
+                {"triple": "aarch64-unknown-linux-gnu", "ext": "tar.gz"},
+                {"triple": "x86_64-unknown-linux-gnu",  "ext": "tar.gz"},
+                {"triple": "aarch64-unknown-linux-musl","ext": "tar.gz"},
+                {"triple": "x86_64-unknown-linux-musl", "ext": "tar.gz"},
             ]),
         );
     }

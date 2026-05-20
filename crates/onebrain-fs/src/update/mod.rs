@@ -95,6 +95,7 @@ pub struct UpdateOptions {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum UpdateError {
     #[error("GitHub API returned HTTP {0}")]
     GithubStatus(u16),
@@ -107,6 +108,14 @@ pub enum UpdateError {
 
     #[error("decode: {0}")]
     Decode(String),
+
+    /// Filesystem / OS errors during the install path (write, rename, chmod,
+    /// missing parent dir, target-triple resolution, unsupported platform).
+    /// Separated from `Network` so user-facing messages like "Binary install
+    /// failed: install: rename …" no longer mislead operators into thinking
+    /// the network is at fault.
+    #[error("install: {0}")]
+    Install(String),
 
     #[error("Binary install failed (exit {exit_code}): {stderr}")]
     InstallBinary { exit_code: i32, stderr: String },
@@ -368,7 +377,7 @@ pub fn parse_release_payload(json: &serde_json::Value) -> Result<ReleaseInfo, Up
 ///      updates).
 pub fn default_install_binary(version: &str) -> Result<(), UpdateError> {
     let current_exe = std::env::current_exe()
-        .map_err(|e| UpdateError::Network(format!("could not resolve current binary path: {e}")))?;
+        .map_err(|e| UpdateError::Install(format!("could not resolve current binary path: {e}")))?;
     install::fetch_and_swap_binary(version, &current_exe)
 }
 

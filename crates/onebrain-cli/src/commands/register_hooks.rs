@@ -81,18 +81,16 @@ mod tests {
     use std::path::PathBuf;
 
     fn fake_result() -> RegisterHooksResult {
-        RegisterHooksResult {
-            ok: true,
-            stop: Some(HookStatus::Added),
-            qmd: None,
-            permissions_added: vec!["Read".into(), "Write".into()],
-            permissions_removed: vec![],
-            wrote: true,
-            vault_dir: PathBuf::from("/tmp/v"),
-            claude_harness: true,
-            remove_mode: false,
-            direct_mode: false,
-        }
+        // `RegisterHooksResult` is `#[non_exhaustive]` — cross-crate
+        // construction must go through `Default` + field assignment.
+        let mut r = RegisterHooksResult::default();
+        r.ok = true;
+        r.stop = Some(HookStatus::Added);
+        r.permissions_added = vec!["Read".into(), "Write".into()];
+        r.wrote = true;
+        r.vault_dir = PathBuf::from("/tmp/v");
+        r.claude_harness = true;
+        r
     }
 
     #[test]

@@ -35,7 +35,7 @@ const DOWNLOAD_ENV_OVERRIDE: &str = "ONEBRAIN_GITHUB_RELEASES_DOWNLOAD_URL";
 /// only on next invocation). On any failure the current binary is left
 /// untouched — including the case where the rename of the new binary into
 /// place itself fails after the .old rename succeeded (we roll back).
-pub(super) fn fetch_and_swap_binary(version: &str, current_exe: &Path) -> Result<(), UpdateError> {
+pub(crate) fn fetch_and_swap_binary(version: &str, current_exe: &Path) -> Result<(), UpdateError> {
     let asset = AssetInfo::for_running_target()?;
     let tag = if version.starts_with('v') {
         version.to_string()
@@ -110,6 +110,16 @@ impl AssetInfo {
                 extension: "tar.gz",
                 binary_name: "onebrain",
             }
+        } else if cfg!(all(
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_env = "musl"
+        )) {
+            AssetInfo {
+                triple: "aarch64-unknown-linux-musl",
+                extension: "tar.gz",
+                binary_name: "onebrain",
+            }
         } else if cfg!(all(target_arch = "aarch64", target_os = "windows")) {
             AssetInfo {
                 triple: "aarch64-pc-windows-msvc",
@@ -123,12 +133,23 @@ impl AssetInfo {
                 binary_name: "onebrain.exe",
             }
         } else {
-            return Err(UpdateError::Network(format!(
+            // Include `target_env` (libc family on Linux) so musl-on-novel-
+            // arch users know to file the right issue. `FAMILY` returns
+            // "unix" / "windows" which obscured musl vs gnu in the alpha.9
+            // initial cut (Reviewer A-M3).
+            let env_hint = if cfg!(target_env = "musl") {
+                "musl"
+            } else if cfg!(target_env = "gnu") {
+                "gnu"
+            } else {
+                std::env::consts::FAMILY
+            };
+            return Err(UpdateError::Install(format!(
                 "no published binary for target arch={} os={} env={} — \
                  build from source or open an issue requesting this triple",
                 std::env::consts::ARCH,
                 std::env::consts::OS,
-                std::env::consts::FAMILY,
+                env_hint,
             )));
         };
         Ok(info)
@@ -138,9 +159,14 @@ impl AssetInfo {
         if self.extension == "tar.gz" {
             extract_tar_gz(archive_bytes, self.binary_name)
         } else {
-            Err(UpdateError::Network(format!(
-                "zip extraction not yet wired (alpha.9 ships unix-only swap; \
-                 windows users: download {} manually for now)",
+            // Windows path: zip extraction is intentionally not wired for
+            // v3.0.0 GA. The `binary_targets[]` listing in `update --plan`
+            // excludes Windows triples to match, so users running --plan
+            // never see Windows advertised + then fail at install time
+            // (Reviewer A-H1).
+            Err(UpdateError::Install(format!(
+                "zip extraction not yet wired (v3.0.0 ships unix-only update; \
+                 windows users: download {} manually until v3.0.1)",
                 self.binary_name
             )))
         }
@@ -174,6 +200,15 @@ fn extract_tar_gz(archive_bytes: &[u8], target_name: &str) -> Result<Vec<u8>, Up
         .map_err(|e| UpdateError::Decode(format!("tar entries: {e}")))?
     {
         let mut entry = entry.map_err(|e| UpdateError::Decode(format!("tar entry: {e}")))?;
+        // Defense-in-depth: reject anything that isn't a regular file. A
+        // malicious tar entry could otherwise be a symlink or directory
+        // named `onebrain`; `read_to_end` would return linkname bytes (or
+        // zero for dirs) which `swap_binary` would then chmod 0755 and
+        // rename over the live binary. Real release pipelines emit regular
+        // files, so this guard is purely belt-and-braces (Reviewer A-M2).
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
         let path = entry
             .path()
             .map_err(|e| UpdateError::Decode(format!("tar path: {e}")))?;
@@ -202,9 +237,9 @@ fn extract_tar_gz(archive_bytes: &[u8], target_name: &str) -> Result<Vec<u8>, Up
 /// then move the new binary into place. The `.old` file is left behind for
 /// the OS to clean up on next reboot (rustup uses the same pattern).
 fn swap_binary(current_exe: &Path, new_bytes: &[u8]) -> Result<(), UpdateError> {
-    let parent = current_exe
+    let _parent = current_exe
         .parent()
-        .ok_or_else(|| UpdateError::Network("current binary has no parent dir".to_string()))?;
+        .ok_or_else(|| UpdateError::Install("current binary has no parent dir".to_string()))?;
     let new_path: PathBuf = {
         let mut p = current_exe.to_path_buf();
         let name = current_exe
@@ -230,37 +265,53 @@ fn swap_binary(current_exe: &Path, new_bytes: &[u8]) -> Result<(), UpdateError> 
         // Rename live exe out of the way (allowed on Windows even when locked).
         if let Err(e) = fs::rename(current_exe, &old_path) {
             let _ = fs::remove_file(&new_path);
-            return Err(UpdateError::Network(format!(
+            return Err(UpdateError::Install(format!(
                 "windows: rename live binary to .old: {e}"
             )));
         }
         if let Err(e) = fs::rename(&new_path, current_exe) {
             // Try to roll back the .old → live rename so the user isn't left
-            // with a broken install.
-            let _ = fs::rename(&old_path, current_exe);
-            return Err(UpdateError::Network(format!(
+            // with a broken install. Surface the rollback outcome to stderr
+            // so the user has a paper trail if the rollback itself failed —
+            // alpha.9 review C-S5 / A-L6: previously both branches silently
+            // suppressed the rollback error.
+            match fs::rename(&old_path, current_exe) {
+                Ok(_) => {
+                    eprintln!(
+                        "onebrain update: rolled back to previous binary after install failed"
+                    );
+                }
+                Err(rollback_err) => {
+                    eprintln!(
+                        "onebrain update: ROLLBACK FAILED — binary may be missing at {} \
+                         (rollback error: {rollback_err}); previous binary saved at {}",
+                        current_exe.display(),
+                        old_path.display(),
+                    );
+                }
+            }
+            // Clean up the .new file we couldn't install.
+            let _ = fs::remove_file(&new_path);
+            return Err(UpdateError::Install(format!(
                 "windows: rename new binary into place: {e}"
             )));
         }
-    } else {
-        if let Err(e) = fs::rename(&new_path, current_exe) {
-            let _ = fs::remove_file(&new_path);
-            return Err(UpdateError::Network(format!(
-                "unix: rename new binary into place: {e}"
-            )));
-        }
+    } else if let Err(e) = fs::rename(&new_path, current_exe) {
+        let _ = fs::remove_file(&new_path);
+        return Err(UpdateError::Install(format!(
+            "unix: rename new binary into place: {e}"
+        )));
     }
-    let _ = parent;
     Ok(())
 }
 
 fn write_binary(path: &Path, bytes: &[u8]) -> Result<(), UpdateError> {
     let mut f = fs::File::create(path)
-        .map_err(|e| UpdateError::Network(format!("create {}: {e}", path.display())))?;
+        .map_err(|e| UpdateError::Install(format!("create {}: {e}", path.display())))?;
     f.write_all(bytes)
-        .map_err(|e| UpdateError::Network(format!("write {}: {e}", path.display())))?;
+        .map_err(|e| UpdateError::Install(format!("write {}: {e}", path.display())))?;
     f.sync_all()
-        .map_err(|e| UpdateError::Network(format!("sync {}: {e}", path.display())))?;
+        .map_err(|e| UpdateError::Install(format!("sync {}: {e}", path.display())))?;
     Ok(())
 }
 
@@ -268,11 +319,11 @@ fn write_binary(path: &Path, bytes: &[u8]) -> Result<(), UpdateError> {
 fn set_executable(path: &Path) -> Result<(), UpdateError> {
     use std::os::unix::fs::PermissionsExt;
     let mut perms = fs::metadata(path)
-        .map_err(|e| UpdateError::Network(format!("stat {}: {e}", path.display())))?
+        .map_err(|e| UpdateError::Install(format!("stat {}: {e}", path.display())))?
         .permissions();
     perms.set_mode(0o755);
     fs::set_permissions(path, perms)
-        .map_err(|e| UpdateError::Network(format!("chmod {}: {e}", path.display())))?;
+        .map_err(|e| UpdateError::Install(format!("chmod {}: {e}", path.display())))?;
     Ok(())
 }
 
