@@ -2,17 +2,36 @@
 //! report. Mirrors Bun's `printNonTtyOutput` byte-for-byte (icons, layout,
 //! summary line) so cross-implementation parity tests stay green.
 //!
-//! `--fix` is parsed (wired through `Cmd::Doctor`) but auto-repair lands in
-//! v3.0.1 — for now we emit a deferral stub on stderr.
+//! `--fix` attempts targeted auto-repair recipes for each fixable warning,
+//! then re-runs the checks so the user sees the result in a single
+//! invocation. The recipes are deliberately narrow (one well-understood
+//! action per check); anything ambiguous is reported as "untouched · run
+//! the listed command yourself".
 
 use anyhow::{anyhow, Context, Result};
 use onebrain_core::{find_vault_root, load_vault_config, DoctorResult, DoctorStatus};
 use onebrain_fs::doctor::run_all_checks;
 use std::env;
 use std::io::Write;
+use std::path::Path;
+
+/// Outcome of a single fix attempt — printed as part of the `--fix`
+/// summary so the user can see what changed (or didn't).
+enum FixOutcome {
+    /// Fix ran cleanly and the underlying issue should be resolved.
+    Fixed(String),
+    /// Fix was attempted but did not finish (subprocess failed, timed out,
+    /// etc.). The message explains why.
+    Failed(String),
+    /// No automated recipe exists for this warning — the user must take
+    /// the action manually. Message is the suggested command.
+    Manual(String),
+}
 
 /// Entry point — returns `Ok(0)` on no errors, `Ok(1)` when any check
-/// produced `DoctorStatus::Error`. `--fix` is reserved for v3.0.1.
+/// produced `DoctorStatus::Error`. With `--fix`, the run is two-pass:
+/// initial check, fix attempts on each warning, then a final re-check
+/// whose result drives the exit code.
 pub fn run(fix: bool) -> Result<i32> {
     let cwd = env::current_dir().context("read current directory")?;
     let vault_root =
@@ -29,21 +48,135 @@ pub fn run(fix: bool) -> Result<i32> {
         }
     });
 
-    let results = run_all_checks(vault_root.as_path(), &config);
-
+    let mut results = run_all_checks(vault_root.as_path(), &config);
     print_report(&results, std::io::stdout())?;
+
+    let mut any_recipe_failed = false;
+    if fix {
+        let warnings: Vec<&DoctorResult> = results
+            .iter()
+            .filter(|r| r.status == DoctorStatus::Warn)
+            .collect();
+        if warnings.is_empty() {
+            println!("\nFix · nothing to do — no warnings.");
+        } else {
+            println!(
+                "\nFix · attempting recipes for {} warning(s)",
+                warnings.len()
+            );
+            let outcomes: Vec<(String, FixOutcome)> = warnings
+                .iter()
+                .map(|r| (r.check.clone(), attempt_fix(r, vault_root.as_path())))
+                .collect();
+            any_recipe_failed = outcomes
+                .iter()
+                .any(|(_, o)| matches!(o, FixOutcome::Failed(_)));
+            print_fix_summary(&outcomes);
+            // Re-run checks so the final exit code + report reflects the
+            // post-fix state. `print_report` carries its own banner so we
+            // skip a duplicate "Doctor (post-fix):" header — a single
+            // blank line is enough to separate the two reports.
+            println!();
+            results = run_all_checks(vault_root.as_path(), &config);
+            print_report(&results, std::io::stdout())?;
+        }
+    }
 
     let error_count = results
         .iter()
         .filter(|r| r.status == DoctorStatus::Error)
         .count();
-    let exit_code = if error_count == 0 { 0 } else { 1 };
+    // Exit non-zero on any post-fix error OR any failed recipe — so the
+    // caller's shell-level `if $? -ne 0` catches both check escalations
+    // and dispatched-recipe failures.
+    Ok(if error_count == 0 && !any_recipe_failed {
+        0
+    } else {
+        1
+    })
+}
 
-    if fix {
-        eprintln!("doctor: --fix not yet implemented in v3.0 · deferred to v3.0.1");
+/// Dispatch the warning to the matching fix recipe. The match keys on
+/// `result.check` AND the message content because some check names cover
+/// multiple sub-conditions with different fix recipes — e.g.
+/// `qmd-embeddings` fires for both "N unembedded" (real recipe: `qmd
+/// embed`) and "qmd_collection not set in vault.yml" (no automated
+/// recipe — user must edit the vault config). Hidden hints that say
+/// "Run onebrain doctor --fix to ..." are silently rewritten to a
+/// non-circular message when no recipe maps.
+fn attempt_fix(result: &DoctorResult, _vault_root: &Path) -> FixOutcome {
+    match result.check.as_str() {
+        // Only the "N unembedded" variant is auto-fixable. The
+        // "qmd_collection not set" variant goes to Manual because
+        // `qmd embed` without a configured collection is meaningless.
+        "qmd-embeddings" if result.message.contains("unembedded") => fix_qmd_embeddings(),
+        _ => FixOutcome::Manual(manual_message(result)),
     }
+}
 
-    Ok(exit_code)
+/// Compose the per-warning Manual message. Strips any circular
+/// "Run onebrain doctor --fix to ..." phrasing from the original hint
+/// so users don't get pointed back at the command they just ran.
+fn manual_message(result: &DoctorResult) -> String {
+    let raw_hint = result.hint.as_deref().unwrap_or("");
+    let cleaned =
+        if raw_hint.contains("doctor --fix") || raw_hint.contains("Run onebrain doctor --fix") {
+            "recipe not yet implemented for this check"
+        } else if raw_hint.is_empty() {
+            "see check details for next step"
+        } else {
+            raw_hint
+        };
+    format!("no automated recipe for `{}` · {cleaned}", result.check)
+}
+
+/// Recipe — `qmd-embeddings` warning means N files need embedding. Spawn
+/// `qmd embed` and wait for it to finish; report success/failure based on
+/// the exit code. The user sees full `qmd embed` output streamed to their
+/// terminal in real time (we inherit stdio rather than capturing it).
+fn fix_qmd_embeddings() -> FixOutcome {
+    use std::process::Command;
+    let qmd = match which::which("qmd") {
+        Ok(p) => p,
+        Err(_) => {
+            return FixOutcome::Failed(
+                "qmd binary not on PATH · install qmd then re-run".to_string(),
+            )
+        }
+    };
+    println!("  · running: qmd embed");
+    let status = Command::new(qmd).arg("embed").status();
+    match status {
+        Ok(s) if s.success() => FixOutcome::Fixed("qmd embed completed".to_string()),
+        Ok(s) => FixOutcome::Failed(format!(
+            "qmd embed exited with code {}",
+            s.code().unwrap_or(-1)
+        )),
+        Err(e) => FixOutcome::Failed(format!("spawn qmd embed: {e}")),
+    }
+}
+
+fn print_fix_summary(outcomes: &[(String, FixOutcome)]) {
+    let mut fixed = 0;
+    let mut failed = 0;
+    let mut manual = 0;
+    for (check, outcome) in outcomes {
+        match outcome {
+            FixOutcome::Fixed(msg) => {
+                fixed += 1;
+                println!("  ✓ {check}: {msg}");
+            }
+            FixOutcome::Failed(msg) => {
+                failed += 1;
+                println!("  ✗ {check}: {msg}");
+            }
+            FixOutcome::Manual(msg) => {
+                manual += 1;
+                println!("  · {check}: {msg}");
+            }
+        }
+    }
+    println!("\nFix summary: {fixed} fixed · {failed} failed · {manual} manual",);
 }
 
 fn print_report<W: Write>(results: &[DoctorResult], mut w: W) -> Result<()> {

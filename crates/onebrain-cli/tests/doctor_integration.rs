@@ -110,17 +110,45 @@ fn doctor_missing_vault_yml_errors_out() {
         .stderr(predicate::str::contains("not inside a vault"));
 }
 
+/// `--fix` on a vault where the only warning is "qmd_collection not set"
+/// (the minimal vault used by these integration tests) — the recipe
+/// dispatcher must route this to `Manual` rather than spawning `qmd
+/// embed`, because no real qmd collection exists to embed against. The
+/// test runs with a scrubbed PATH so that even if dispatch is wrong the
+/// child can't accidentally execute a real `qmd` on the developer's box.
 #[test]
-fn doctor_fix_flag_emits_deferred_stub() {
+fn doctor_fix_qmd_collection_not_set_routes_to_manual() {
     let d = tempdir().unwrap();
     write_minimal_vault(d.path());
-    Command::cargo_bin("onebrain")
+    let assert = Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(d.path())
+        // Scrub PATH so `which::which("qmd")` returns NotFound even on
+        // developer machines where `qmd` is on the global PATH — this
+        // test must NOT spawn real qmd. The `/usr/bin:/bin` floor keeps
+        // basic POSIX utilities available in case any other code path
+        // needs them.
+        .env("PATH", "/usr/bin:/bin")
         .args(["doctor", "--fix"])
         .assert()
-        .success()
-        .stderr(predicate::str::contains("deferred to v3.0.1"));
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default();
+    // The Fix block must appear (proves the new pass ran).
+    assert!(
+        stdout.contains("Fix · attempting") || stdout.contains("Fix · nothing"),
+        "expected the Fix block in stdout · got: {stdout}"
+    );
+    // Manual outcome should fire — no `running: qmd embed` line.
+    assert!(
+        !stdout.contains("running: qmd embed"),
+        "qmd embed should NOT spawn for the 'qmd_collection not set' variant · got: {stdout}"
+    );
+    // No "deferred to v3.0.1" stub anymore — that was the alpha.4 placeholder.
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap_or_default();
+    assert!(
+        !stderr.contains("deferred to v3.0.1"),
+        "stub message should be gone in alpha.5"
+    );
 }
 
 #[test]
