@@ -1105,7 +1105,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onebrain-cache"
-version = "3.0.0-alpha.7"
+version = "3.0.0-alpha.8"
 dependencies = [
  "chrono",
  "onebrain-core",
@@ -1117,7 +1117,7 @@ dependencies = [
 
 [[package]]
 name = "onebrain-cli"
-version = "3.0.0-alpha.7"
+version = "3.0.0-alpha.8"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1144,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "onebrain-core"
-version = "3.0.0-alpha.7"
+version = "3.0.0-alpha.8"
 dependencies = [
  "chrono",
  "indexmap",
@@ -1160,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "onebrain-fs"
-version = "3.0.0-alpha.7"
+version = "3.0.0-alpha.8"
 dependencies = [
  "chrono",
  "dirs",
@@ -1195,7 +1195,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "parity"
-version = "3.0.0-alpha.7"
+version = "3.0.0-alpha.8"
 dependencies = [
  "filetime",
  "pretty_assertions",

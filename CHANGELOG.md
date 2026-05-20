@@ -1,5 +1,5 @@
 ---
-latest_version: 3.0.0-alpha.7
+latest_version: 3.0.0-alpha.8
 released: 2026-05-20
 ---
 
@@ -11,6 +11,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## v3.0.0-alpha.8 — feat: JSON output modes for `doctor` + `update` · cosmetic
+
+- **`onebrain doctor --json`** emits a single JSON document with `{ok, summary, checks[]}` instead of the plain-text report. `summary.passing` is the count of OK checks (deliberately not `summary.ok` to avoid confusion with the top-level `ok` boolean). Combines with `--fix` — the JSON reflects the post-fix state plus a `fix[]` array of `{check, outcome, message}` per attempted recipe. `fix[]` is always present when `--fix` is requested (even if empty), so consumers can distinguish "user didn't ask to fix" from "user asked but nothing to fix". In JSON mode the recipe status lines and any subprocess output route to stderr — stdout is reserved exclusively for the JSON document, so `cmd 2>/dev/null` always yields parseable JSON. Schema stable for v3.x.
+- **`onebrain doctor --json` outside a vault** now emits a JSON failure envelope (`{ok: false, error: "not_in_vault", message: ...}`) on stdout with exit code 1, instead of an anyhow plain-text error.
+- **`onebrain update --check --json`** emits `{ok, current, latest, update_available, released_at?}` (plus `error` on failure). `update_available` is `null` (JSON) when the remote fetch failed — consumers should not interpret missing-latest as "no update". `released_at` is RFC-3339 when the GitHub release payload carried it.
+- **`onebrain update --plan`** is `--check --json` plus `release_url` and `binary_url_template` fields when an update is available — designed for the `/update` plugin skill. `--plan` implies dry-run (mutually exclusive with `--check` to avoid an ambiguous flag combo).
+- **`onebrain vault-sync --vault-dir <path>`** flag-form alternative to the positional `vault_root` argument (mutually exclusive). Matches the `--vault-dir` pattern used across other OneBrain subcommands.
+- **`register-schedule` resolves `folders.logs` from vault.yml** instead of hardcoding `07-logs/scheduler/...`. Closes two TODOs. Defense-in-depth: refuses absolute paths or `..` traversals (a malicious vault.yml could otherwise put launchd log files outside the vault); falls back to `07-logs` for any rejection. Falls back to `07-logs` when vault.yml is missing/invalid (operational metadata shouldn't block plist emission).
+- 3-round review consensus fix-pass: `version_at_least` promoted from `pub(crate)` to `pub` in onebrain-fs and re-used by the CLI (was duplicated); `progress_writer` option added to `VaultSyncOptions` so doctor's `--fix` can route vault-sync's status lines to stderr; +5 unit tests for `released_at` emission, `update_available: null` on fetch failure, and the path-traversal guard. 662 tests total · clippy clean.
 
 ## v3.0.0-alpha.7 — feat(doctor): four new `--fix` recipes (settings-hooks · plugin-files · vault.yml-keys · claude-settings)
 

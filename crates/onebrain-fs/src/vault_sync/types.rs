@@ -44,6 +44,12 @@ pub struct VaultSyncOptions {
     pub embedded: bool,
     /// Injectable clock — defaults to `Utc::now`.
     pub now_fn: Option<NowFn>,
+    /// Redirect non-TTY `PlainProgress` output away from stdout. When `Some`,
+    /// status lines route to the provided writer; used by `doctor --json` to
+    /// keep the JSON document as the sole stdout payload. Forces
+    /// `PlainProgress` (no TTY spinner) regardless of `is_tty`. Has no effect
+    /// on TTY mode (spinner) — that path always uses real stdout.
+    pub progress_writer: Option<Box<dyn std::io::Write + Send>>,
 }
 
 /// Result of a vault-sync invocation. Serialized verbatim for `--json` output

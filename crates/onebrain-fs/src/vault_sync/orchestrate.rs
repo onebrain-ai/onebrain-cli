@@ -50,7 +50,14 @@ pub fn run_vault_sync(vault_root: &Path, opts: VaultSyncOptions) -> VaultSyncRes
     let harness = detect_harness(vault_root);
 
     let mut result = VaultSyncResult::pending(branch.clone());
-    let mut progress = build_progress(is_tty, opts.embedded);
+    let mut progress = match opts.progress_writer {
+        // Caller-supplied writer forces `PlainProgress` regardless of TTY
+        // state — used by `doctor --json` to keep stdout reserved for the
+        // JSON document.
+        Some(writer) => Box::new(crate::vault_sync::progress::PlainProgress::new(writer))
+            as Box<dyn crate::vault_sync::progress::Progress>,
+        None => build_progress(is_tty, opts.embedded),
+    };
     progress.intro("OneBrain Vault Sync");
 
     // Holds the temp dir until end of function — drop() removes it.
