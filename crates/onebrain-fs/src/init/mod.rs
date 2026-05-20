@@ -181,6 +181,22 @@ pub fn run_init(mut opts: InitOptions) -> Result<InitResult, FsError> {
         result.preset_installed = Some(preset);
     }
 
+    // ── Step 6b: create .claude/ harness directory ─────────────────────────
+    // Bun init creates .claude/ implicitly during vault-sync (download plugin
+    // files). The Rust port has not yet ported the vault-sync step inside
+    // init, so without an explicit mkdir here register-hooks falls through
+    // its `detect_harnesses` check and silently no-ops — reporting "hooks: ok"
+    // without ever writing settings.json. Bias toward the claude harness
+    // because that's the universal default for OneBrain installs; users on
+    // gemini or direct can re-run register-hooks themselves.
+    let claude_dir = vault_dir.join(".claude");
+    if !claude_dir.exists() {
+        std::fs::create_dir_all(&claude_dir).map_err(|e| FsError::Io {
+            path: claude_dir.clone(),
+            source: e,
+        })?;
+    }
+
     // ── Step 7: register-hooks (best-effort) ───────────────────────────────
     let hooks_ok = match opts.register_hooks_fn.as_mut() {
         Some(f) => f(&vault_dir),
@@ -297,12 +313,49 @@ mod tests {
         }
         assert!(d.path().join("00-inbox").join("imports").is_dir());
         assert!(d.path().join("vault.yml").is_file());
+        // .claude/ must exist so register-hooks has a target on its next run.
+        assert!(
+            d.path().join(".claude").is_dir(),
+            ".claude/ not created by init"
+        );
 
         let lines = stdout_buf.lock().unwrap();
         assert_eq!(lines[0], "OneBrain Init");
         assert!(lines.iter().any(|l| l == "vault.yml: written"));
         assert!(lines.iter().any(|l| l == "folders: 9 created"));
         assert!(lines.iter().any(|l| l.contains("done")));
+    }
+
+    /// Regression: with the real register-hooks (no stub), init must populate
+    /// `.claude/settings.json` with the Stop hook. Before the fix, init would
+    /// skip claude detection (no `.claude/` dir yet) and exit reporting
+    /// "hooks: ok" without writing anything.
+    #[test]
+    fn fresh_vault_real_register_hooks_writes_settings_json() {
+        let d = tempdir().unwrap();
+        let (stdout_sink, _stdout_buf) = capture_sink();
+        let opts = InitOptions {
+            vault_dir: Some(d.path().to_path_buf()),
+            yes: true,
+            stdout_lines: Some(stdout_sink),
+            // No register_hooks_fn override → exercises the real lib.
+            ..Default::default()
+        };
+        let r = run_init(opts).unwrap();
+        assert!(r.ok);
+        assert!(r.hooks_registered, "register-hooks reported no-op");
+
+        let settings_path = d.path().join(".claude").join("settings.json");
+        assert!(
+            settings_path.is_file(),
+            "settings.json missing — register-hooks no-oped"
+        );
+        let text = std::fs::read_to_string(&settings_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            v["hooks"]["Stop"].is_array(),
+            "Stop hook missing from settings.json: {text}"
+        );
     }
 
     #[test]

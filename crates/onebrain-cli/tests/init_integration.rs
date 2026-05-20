@@ -109,3 +109,33 @@ fn cli_yes_run_twice_second_fails_without_force() {
         .assert()
         .failure();
 }
+
+/// Regression: `onebrain init --yes` in an empty directory must populate
+/// `.claude/settings.json` with the Stop hook. Before the fix, init's
+/// best-effort register-hooks call no-oped because `.claude/` did not exist
+/// yet, so it printed "hooks: ok" without writing settings.json.
+#[test]
+fn cli_yes_populates_claude_settings_json_with_stop_hook() {
+    let d = tempdir().unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes"])
+        .current_dir(d.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hooks: ok"));
+
+    let settings_path = d.path().join(".claude").join("settings.json");
+    assert!(
+        settings_path.is_file(),
+        ".claude/settings.json missing after init"
+    );
+    let text = fs::read_to_string(&settings_path).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).expect("settings.json is valid JSON");
+    let stop = v
+        .get("hooks")
+        .and_then(|h| h.get("Stop"))
+        .and_then(|s| s.as_array())
+        .expect("hooks.Stop array missing");
+    assert!(!stop.is_empty(), "hooks.Stop is empty: {text}");
+}

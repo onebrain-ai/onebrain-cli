@@ -174,6 +174,49 @@ fn download_failure_exits_non_zero() {
         .output()
         .unwrap();
     assert!(!out.status.success(), "should exit non-zero on bad tarball");
+    assert_eq!(out.status.code(), Some(1), "exit code must be exactly 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("vault-sync:") && stderr.contains("failed"),
+        "stderr missing failure message: {stderr}"
+    );
+}
+
+/// Regression: a missing fixture file (representative of any IO-level fetch
+/// failure) must exit with code 1 AND surface the underlying cause on
+/// stderr. Schedulers and CI rely on the non-zero exit to detect a sync miss.
+#[test]
+fn missing_fixture_path_exits_one_with_stderr_message() {
+    let dir = tempdir().unwrap();
+    let vault = make_vault(dir.path());
+    let isolated = vault.join(".isolated-installed_plugins.json");
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .arg("vault-sync")
+        .current_dir(&vault)
+        .env("ONEBRAIN_VAULT_SYNC_FIXTURE", "/this/does/not/exist.tar.gz")
+        .env(
+            "ONEBRAIN_INSTALLED_PLUGINS_PATH",
+            isolated.to_string_lossy().to_string(),
+        )
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected exit 1, got {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("vault-sync: download failed"),
+        "stderr missing 'vault-sync: download failed': {stderr}"
+    );
+    // Final summary line must also fire so scheduler logs can grep for it.
+    assert!(
+        stderr.contains("vault-sync: failed:"),
+        "stderr missing summary 'vault-sync: failed:': {stderr}"
+    );
 }
 
 #[test]
