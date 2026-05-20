@@ -7,7 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn run(mode: &str, vault_dir: Option<PathBuf>) -> Result<()> {
     // Bun parity: `--vault-dir <path>` overrides the cwd-based auto-detect.
-    let cwd = match vault_dir {
+    // `vault_root` is the directory `handle_stop` will walk up from to find
+    // `vault.yml`; it equals the supplied override when present, else cwd.
+    let vault_root = match vault_dir {
         Some(dir) => dir,
         None => env::current_dir().context("read current directory")?,
     };
@@ -20,7 +22,13 @@ pub fn run(mode: &str, vault_dir: Option<PathBuf>) -> Result<()> {
         .unwrap_or(0);
 
     match mode {
-        "stop" => handle_stop(token.as_str(), &cwd, now, &cache_dir, std::io::stdout()),
+        "stop" => handle_stop(
+            token.as_str(),
+            &vault_root,
+            now,
+            &cache_dir,
+            std::io::stdout(),
+        ),
         "reset" => handle_reset(token.as_str(), now, &cache_dir),
         other => {
             let _ = writeln!(std::io::stderr(), "checkpoint: unknown mode '{other}'");

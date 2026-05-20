@@ -12,7 +12,7 @@ use onebrain_fs::init::{
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-pub fn run(yes: bool, vault_dir: Option<PathBuf>, force: bool) -> Result<i32> {
+pub fn run(yes: bool, vault_dir: Option<PathBuf>, force: bool, no_sync: bool) -> Result<i32> {
     let opts = if yes {
         // Non-interactive — no prompts, Essentials preset. `--force` still
         // controls the existing-vault.yml guard so CI runs can opt in.
@@ -20,6 +20,7 @@ pub fn run(yes: bool, vault_dir: Option<PathBuf>, force: bool) -> Result<i32> {
             yes: true,
             vault_dir,
             force,
+            skip_vault_sync: no_sync,
             ..InitOptions::default()
         }
     } else {
@@ -28,6 +29,7 @@ pub fn run(yes: bool, vault_dir: Option<PathBuf>, force: bool) -> Result<i32> {
             preset_fn: Some(real_preset_fn()),
             vault_dir,
             force,
+            skip_vault_sync: no_sync,
             ..InitOptions::default()
         }
     };

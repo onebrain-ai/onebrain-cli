@@ -55,7 +55,7 @@ enum Cmd {
     /// Install Claude Code hooks for this vault (Slice 7).
     RegisterHooks {
         /// Vault root · defaults to current working directory · accepts `--vault-dir` (Bun v2.3.3 parity).
-        #[arg(long, alias = "vault-dir")]
+        #[arg(long, visible_alias = "vault-dir")]
         vault: Option<std::path::PathBuf>,
         /// Compute changes but do not write settings.json.
         #[arg(long = "dry-run")]
@@ -67,8 +67,8 @@ enum Cmd {
 
     /// Install OS-level scheduler entries from vault.yml (Slice 8).
     RegisterSchedule {
-        /// Vault root directory · defaults to current working directory (Bun v2.3.3 parity).
-        #[arg(long)]
+        /// Vault root directory · defaults to current working directory · accepts `--vault-dir` (Bun v2.3.3 parity).
+        #[arg(long, visible_alias = "vault-dir")]
         vault: Option<std::path::PathBuf>,
         /// Print the plists that would be written without touching disk.
         #[arg(long)]
@@ -94,13 +94,13 @@ enum Cmd {
     Migrate {
         /// Migration name (currently: `backfill-recapped`).
         name: String,
-        /// ISO date cutoff (YYYY-MM-DD) · Bun v2.3.3 positional form · skip logs newer than this date.
+        /// ISO date cutoff (YYYY-MM-DD) · Bun v2.3.3 positional form · conflicts with `--cutoff`.
         cutoff_date: Option<String>,
-        /// Skip session logs whose ISO date prefix is strictly greater than this cutoff · Rust-form alternative to the positional argument.
-        #[arg(long)]
+        /// ISO date cutoff (YYYY-MM-DD) · Rust-form alternative · conflicts with the positional argument.
+        #[arg(long, conflicts_with = "cutoff_date")]
         cutoff: Option<String>,
-        /// Vault directory override (default: walk up from cwd).
-        #[arg(long)]
+        /// Vault directory override (default: walk up from cwd) · accepts `--vault-dir` (Bun v2.3.3 parity).
+        #[arg(long, visible_alias = "vault-dir")]
         vault: Option<String>,
     },
 
@@ -115,6 +115,9 @@ enum Cmd {
         /// Overwrite an existing vault.yml without prompting (Bun v2.3.3 parity).
         #[arg(long)]
         force: bool,
+        /// Skip the embedded vault-sync step (offline init · scaffold only · re-run `onebrain vault-sync` later to install plugin files).
+        #[arg(long = "no-sync")]
+        no_sync: bool,
     },
 
     /// Update OneBrain system files from GitHub (Slice 11).
@@ -126,7 +129,8 @@ enum Cmd {
 
     /// Run a OneBrain skill in headless mode (Slice 12).
     RunSkill {
-        #[arg(long)]
+        /// Vault root directory · accepts `--vault-dir` (Bun v2.3.3 parity).
+        #[arg(long, visible_alias = "vault-dir")]
         vault: String,
         #[arg(long)]
         skill: String,
@@ -190,8 +194,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             cutoff,
             vault,
         } => {
-            // Positional `cutoff_date` wins (Bun v2.3.3 form); `--cutoff` is the
-            // Rust-form alternative that the original Rust port introduced.
+            // clap `conflicts_with = "cutoff_date"` enforces that at most one of
+            // them is set, so `.or(...)` is just selecting whichever the user
+            // chose. No silent precedence ambiguity.
             let resolved = cutoff_date.or(cutoff);
             commands::migrate::run(&name, resolved.as_deref(), vault.as_deref())
         }
@@ -199,7 +204,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             yes,
             vault_dir,
             force,
-        } => std::process::exit(commands::init::run(yes, vault_dir, force)?),
+            no_sync,
+        } => std::process::exit(commands::init::run(yes, vault_dir, force, no_sync)?),
         Cmd::Update { check } => std::process::exit(commands::update::run(check)?),
         Cmd::RunSkill { vault, skill, args } => {
             std::process::exit(commands::run_skill::run(&vault, &skill, &args)?)

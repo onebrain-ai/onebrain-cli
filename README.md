@@ -37,13 +37,11 @@ cargo build --release -p onebrain-cli   # builds the onebrain-cli crate
 
 ```bash
 mkdir my-vault && cd my-vault
-onebrain init --yes                    # creates vault.yml, PARA folders, hooks, schedule preset
-onebrain vault-sync                    # downloads plugin tarball + populates .claude/plugins/onebrain/
-                                       # use --branch next to track the prerelease channel
+onebrain init --yes                    # scaffold + auto vault-sync (downloads plugin tarball)
 # Open the directory in Claude Code, then run /onboarding to finish setup.
 ```
 
-`init` and `vault-sync` are two steps for now (Bun's `init` ran `vault-sync` as a sub-operation; the Rust port hasn't ported that yet — tracked for a post-v3.0.0 patch).
+`init` runs the embedded `vault-sync` step automatically; if it fails (no network, GitHub down), the scaffold (vault.yml, PARA folders, Stop hook, schedule preset) is still intact and the binary prints a clear "re-run `onebrain vault-sync`" hint. Pass `--no-sync` to skip the network step for offline / CI scaffolding.
 
 ## Development
 

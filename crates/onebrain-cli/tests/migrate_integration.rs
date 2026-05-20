@@ -38,6 +38,49 @@ fn migrate_empty_logs_outputs_zero_summary() {
         .stdout("backfilled: 0 files, skipped: 0\n");
 }
 
+/// Bun v2.3.3 positional `<cutoff_date>` argument is accepted and used as the
+/// inclusive cutoff (mirrors the Rust-form `--cutoff <date>` flag).
+#[test]
+fn migrate_accepts_positional_cutoff_date() {
+    let d = tempdir().unwrap();
+    write_minimal_vault(d.path());
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(d.path())
+        .args(["migrate", "backfill-recapped", "2026-01-01"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("backfilled:"));
+}
+
+/// clap `conflicts_with = "cutoff_date"` rejects the user supplying both
+/// positional `<cutoff_date>` AND `--cutoff <date>` so neither value is
+/// silently dropped.
+#[test]
+fn migrate_rejects_both_positional_and_flag_cutoff() {
+    let d = tempdir().unwrap();
+    write_minimal_vault(d.path());
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(d.path())
+        .args([
+            "migrate",
+            "backfill-recapped",
+            "2026-01-01",
+            "--cutoff",
+            "2026-06-01",
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap_or_default();
+    assert!(
+        stderr.contains("cannot be used")
+            || stderr.contains("conflicts")
+            || stderr.contains("the argument"),
+        "stderr must explain the conflict · got: {stderr}"
+    );
+}
+
 #[test]
 fn migrate_backfills_session_log_missing_recapped() {
     let d = tempdir().unwrap();

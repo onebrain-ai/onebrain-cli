@@ -34,6 +34,7 @@ pub use presets::{ScheduleEntry, SchedulePreset};
 
 use crate::error::FsError;
 use crate::register_hooks::{self, RegisterHooksOptions};
+use crate::vault_sync::{run_vault_sync, VaultSyncOptions};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -47,6 +48,10 @@ pub type PresetFn = Box<dyn FnMut() -> SchedulePreset + Send>;
 /// Closure: invoke `register-hooks` for the given vault. Returns `true` on
 /// success, `false` on warning (non-fatal).
 pub type RegisterHooksFn = Box<dyn FnMut(&Path) -> bool + Send>;
+/// Closure: invoke `vault-sync` for the given vault. Returns `true` on
+/// success, `false` on warning (non-fatal — init still exits 0). Tests
+/// inject a stub that returns true without hitting the network.
+pub type VaultSyncFn = Box<dyn FnMut(&Path) -> bool + Send>;
 /// Line-oriented sink — receives one line per call without trailing newline.
 type LineSink = Box<dyn FnMut(&str) + Send>;
 
@@ -66,6 +71,11 @@ pub struct InitOptions {
     pub preset_fn: Option<PresetFn>,
     /// Injectable register-hooks runner. `None` = call the real lib.
     pub register_hooks_fn: Option<RegisterHooksFn>,
+    /// Injectable vault-sync runner. `None` = call the real lib. Tests should
+    /// inject a closure that returns true without hitting the network.
+    pub vault_sync_fn: Option<VaultSyncFn>,
+    /// Skip the vault-sync sub-step entirely (offline init or test runs).
+    pub skip_vault_sync: bool,
     /// Optional stdout sink — defaults to real stdout when `None`.
     pub stdout_lines: Option<LineSink>,
     /// Optional stderr sink — defaults to real stderr when `None`.
@@ -84,6 +94,10 @@ pub struct InitResult {
     pub vault_yml_written: bool,
     pub preset_installed: Option<SchedulePreset>,
     pub hooks_registered: bool,
+    /// True when the embedded vault-sync sub-call ran AND succeeded · the
+    /// fresh vault has plugin files installed. False when skipped, failed, or
+    /// not attempted (offline init).
+    pub vault_sync_ok: bool,
     /// True when the user declined an interactive prompt and we exited
     /// cleanly (exit 0, no changes).
     pub aborted: bool,
@@ -212,11 +226,41 @@ pub fn run_init(mut opts: InitOptions) -> Result<InitResult, FsError> {
         }
     ));
 
+    // ── Step 8: vault-sync (best-effort) ───────────────────────────────────
+    // Downloads the upstream tarball + populates `.claude/plugins/onebrain/`,
+    // CLAUDE.md/GEMINI.md/AGENTS.md, root markdown files, etc. — collapses
+    // the previous 2-step bootstrap (`init` then `vault-sync`) into one.
+    //
+    // Failure is non-fatal: warn the user + tell them to re-run `vault-sync`
+    // manually. Init still exits 0 because the scaffold (vault.yml + folders
+    // + hooks + schedule preset) is intact and the user can recover.
+    let vault_sync_ok = if opts.skip_vault_sync {
+        false
+    } else {
+        match opts.vault_sync_fn.as_mut() {
+            Some(f) => f(&vault_dir),
+            None => default_vault_sync(&vault_dir, &mut stdout, &mut stderr),
+        }
+    };
+    result.vault_sync_ok = vault_sync_ok;
+
     // ── Done ───────────────────────────────────────────────────────────────
-    // Init writes vault.yml + folders + .claude/ + hooks + schedule preset only.
-    // The vault-sync sub-call (download plugin tarball from GitHub) is not yet
-    // ported from Bun's init, so explicitly tell the user the 2-step bootstrap.
-    stdout("done: run `onebrain vault-sync` to install plugin files, then `/onboarding` in Claude");
+    if vault_sync_ok {
+        // One-step bootstrap — vault is fully populated, user can jump to
+        // `/onboarding` immediately.
+        stdout("done: run `/onboarding` in Claude to finish setup");
+    } else if opts.skip_vault_sync {
+        // Caller deliberately opted out — surface the next step explicitly.
+        stdout(
+            "done: run `onebrain vault-sync` to install plugin files, then `/onboarding` in Claude",
+        );
+    } else {
+        // vault-sync attempted but failed (network, GitHub down, etc.). The
+        // scaffold is still intact; tell the user how to recover.
+        stdout(
+            "done (partial): vault-sync failed — re-run `onebrain vault-sync`, then `/onboarding` in Claude",
+        );
+    }
     result.ok = true;
     result.exit_code = 0;
     Ok(result)
@@ -258,6 +302,31 @@ fn default_register_hooks(vault_dir: &Path, stderr: &mut dyn FnMut(&str)) -> boo
     }
 }
 
+fn default_vault_sync(
+    vault_dir: &Path,
+    _stdout: &mut dyn FnMut(&str),
+    stderr: &mut dyn FnMut(&str),
+) -> bool {
+    // `embedded: true` suppresses the framing banner so the output reads as
+    // a sub-step of init rather than a top-level command. The orchestrator
+    // still prints `▸ Downloading` / `▸ Syncing files` / etc. on its own
+    // stdout, which is what the user expects.
+    let opts = VaultSyncOptions {
+        embedded: true,
+        ..Default::default()
+    };
+    let result = run_vault_sync(vault_dir, opts);
+    if result.ok {
+        return true;
+    }
+    if let Some(err) = result.error.as_ref() {
+        stderr(&format!("init: vault-sync warning: {err}"));
+    } else {
+        stderr("init: vault-sync warning (no error detail captured)");
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Re-export wizard fns for the CLI binary
 // ---------------------------------------------------------------------------
@@ -286,13 +355,15 @@ mod tests {
     }
 
     /// Helper: build an `InitOptions` for tests that skips register-hooks
-    /// entirely (otherwise the lib hits the harness detector on real disk).
+    /// AND vault-sync entirely (the real lib would otherwise hit the harness
+    /// detector and the GitHub releases endpoint).
     fn test_opts(vault_dir: &Path) -> (InitOptions, Arc<Mutex<Vec<String>>>) {
         let (stdout_sink, stdout_buf) = capture_sink();
         let opts = InitOptions {
             vault_dir: Some(vault_dir.to_path_buf()),
             stdout_lines: Some(stdout_sink),
             register_hooks_fn: Some(Box::new(|_dir: &Path| true)),
+            vault_sync_fn: Some(Box::new(|_dir: &Path| true)),
             ..Default::default()
         };
         (opts, stdout_buf)
@@ -483,6 +554,9 @@ mod tests {
             stdout_lines: Some(stdout_sink),
             stderr_lines: Some(stderr_sink),
             register_hooks_fn: Some(Box::new(|_dir: &Path| false)),
+            // Mock vault-sync as success so we isolate the register-hooks
+            // failure path under test.
+            vault_sync_fn: Some(Box::new(|_dir: &Path| true)),
             ..Default::default()
         };
 

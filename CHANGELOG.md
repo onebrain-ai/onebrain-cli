@@ -12,16 +12,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-## v3.0.0-alpha.3 — fix(parity): close all 6 Bun-CLI argv gaps + init 2-step bootstrap + friendly release notes
+## v3.0.0-alpha.3 — fix(parity): close all 6 Bun-CLI argv gaps + init becomes one-step + safety + friendlier release notes
 
-- Restore `--branch <branch>` CLI flag on `vault-sync` (Bun v2.3.3 parity) — flag was dropped in the Rust port but `skills/update/SKILL.md` invokes `onebrain vault-sync --branch {branch}` mid-flow; library field `VaultSyncOptions::branch` was always wired, only the clap surface was missing
-- Close 5 more Bun-parity gaps: `session-init --vault-dir`, `checkpoint --vault-dir`, `register-schedule --vault`, `init --vault-dir + --force`, `vault-sync [vault_root]` positional. None of these were used by skills, but external CLI scripts that worked on Bun v2.3.3 would have broken
-- `register-hooks` accepts `--vault-dir` as an alias for `--vault` (Rust renamed it for consistency with `run-skill --vault`; alias preserves Bun-script compat)
-- `migrate <name> [cutoff_date]` now accepts the Bun positional form alongside the existing `--cutoff` flag; positional wins if both are provided
-- `init` final stdout now explicitly tells the user the 2-step bootstrap: ``done: run `onebrain vault-sync` to install plugin files, then `/onboarding` in Claude`` — pre-v3 Bun's `init` ran `vault-sync` as a sub-operation; the Rust port hasn't ported that yet, so the explicit instruction prevents users running `init --yes` on a fresh machine from getting a half-bootstrapped vault
-- GitHub Release body now renders a friendly platform table (macOS Apple Silicon / Intel · Linux ARM64 / x86_64 glibc / x86_64 musl · Windows ARM64 / x86_64) so non-Rust users can pick the right download without parsing target triples — asset filenames keep their canonical Rust triples for `cargo-binstall` and custom installer scripts
-- README rewritten with the platform table and explicit 2-step quickstart; CONTRIBUTING.md added covering dev setup, PR conventions (worktree, version bump, English-only, 3-round review), and security-issue channel
-- 2 new integration tests covering `vault-sync --branch next` happy-path + clap-level missing-value rejection · existing 626-test suite remains green
+- **`init` now runs `vault-sync` automatically** — collapses the previous 2-step bootstrap (`init` then manual `vault-sync`) into one. Failure is non-fatal: init still exits 0 with a clear "re-run `onebrain vault-sync`" hint. `--no-sync` flag skips the embedded step for offline / CI use
+- Close 6 Bun-CLI argv gaps that the Rust port had dropped: `vault-sync --branch <branch>` (was used by `/update` skill mid-flow), `vault-sync [vault_root]` positional, `session-init --vault-dir`, `checkpoint --vault-dir`, `register-schedule --vault`, `init --vault-dir + --force`, `migrate <name> [cutoff_date]` positional (alongside `--cutoff` flag)
+- Unify flag surface — every `--vault` flag now accepts `--vault-dir` as a visible clap alias (eliminates "which name does this command use?" footgun)
+- `vault-sync` refuses to write at filesystem root (`/`) or `$HOME` literal — defensive guard against `onebrain vault-sync ~` foot-cannons. Arbitrary subdirectories still work, including bootstrap-from-empty-dir
+- `migrate <name>` rejects supplying both positional `[cutoff_date]` AND `--cutoff <date>` (clap `conflicts_with` — no more silent precedence)
+- GitHub Release body now renders a friendly platform table (macOS Apple Silicon / Intel · Linux ARM64 / x86_64 glibc / x86_64 musl · Windows ARM64 / x86_64) so non-Rust users can pick the right download without parsing target triples. Asset filenames keep their canonical Rust triples for `cargo-binstall` and custom installer scripts
+- README rewritten with the platform table + one-step quickstart; CONTRIBUTING.md added covering dev setup, PR conventions (worktree, version bump, English-only, 3-round review), and security-issue channel
+- 9 new integration tests covering the new code paths (vault-sync `--branch`, init `--force` / `--vault-dir`, migrate positional / conflicts, register-hooks `--vault-dir` alias) · suite now at 634 passing, 1 ignored, 0 failed
 
 ## v3.0.0-alpha.2 — fix(release): Windows TARGET expansion in release pipeline
 

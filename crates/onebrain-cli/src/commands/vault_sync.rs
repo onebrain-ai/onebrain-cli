@@ -2,11 +2,11 @@
 //! tarball and overlay the bundled plugin / harness / docs onto the current
 //! vault. Mirrors Bun's `vaultSyncCommand`: exit 1 on `!result.ok`, otherwise 0.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use onebrain_core::find_vault_root;
 use onebrain_fs::{run_vault_sync, VaultSyncOptions};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Entry point — returns `Ok(0)` on success, `Ok(1)` on any critical failure.
 /// Side-effects: writes to the vault filesystem; prints `vault-sync: …` lines
@@ -40,6 +40,13 @@ pub fn run(vault_root_override: Option<PathBuf>, branch: Option<String>) -> Resu
         }
     };
 
+    // Safety guard — vault-sync writes destructively into the target directory
+    // (`.claude/plugins/onebrain/`, root markdown files, etc.). Refusing the
+    // obvious foot-cannons (`/`, `$HOME`) prevents accidental splattering when
+    // a user runs `onebrain vault-sync ~` by mistake. The list is deliberately
+    // narrow — any other path is the caller's responsibility.
+    refuse_dangerous_vault_path(&vault_root_path)?;
+
     let result = run_vault_sync(
         vault_root_path.as_path(),
         VaultSyncOptions {
@@ -59,4 +66,54 @@ pub fn run(vault_root_override: Option<PathBuf>, branch: Option<String>) -> Resu
         return Ok(1);
     }
     Ok(0)
+}
+
+/// Refuse the obvious "I did not mean to write here" paths. Currently:
+///   - filesystem root (`/`)
+///   - `$HOME` itself (literal match against the resolved home dir)
+///
+/// Anything else (including arbitrary subdirectories of `$HOME` and `/tmp/...`)
+/// is allowed — vault-sync's bootstrap-from-empty-dir behavior matches Bun and
+/// is intentional. Callers wanting to override this for tests can bypass via
+/// the lower-level `run_vault_sync(...)` library entry point.
+fn refuse_dangerous_vault_path(p: &Path) -> Result<()> {
+    let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    if canonical.as_os_str() == "/" {
+        bail!("refusing to vault-sync at filesystem root '/' — pass an explicit vault directory");
+    }
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        let canonical_home = home.canonicalize().unwrap_or(home);
+        if canonical == canonical_home {
+            bail!(
+                "refusing to vault-sync at $HOME ({}) — create a dedicated vault directory first",
+                canonical.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_filesystem_root() {
+        let err = refuse_dangerous_vault_path(Path::new("/")).unwrap_err();
+        assert!(err.to_string().contains("filesystem root"));
+    }
+
+    #[test]
+    fn refuses_home_directory() {
+        // Use a stub HOME so the test doesn't depend on the runner's real home.
+        std::env::set_var("HOME", "/tmp");
+        let err = refuse_dangerous_vault_path(Path::new("/tmp")).unwrap_err();
+        assert!(err.to_string().contains("$HOME"));
+    }
+
+    #[test]
+    fn allows_dedicated_subdirectory() {
+        std::env::set_var("HOME", "/tmp");
+        assert!(refuse_dangerous_vault_path(Path::new("/tmp/my-vault")).is_ok());
+    }
 }
