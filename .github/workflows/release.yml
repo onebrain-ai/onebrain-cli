@@ -71,14 +71,17 @@ jobs:
           } >> .cargo/config.toml
 
       - name: Build release binary
+        shell: bash
         run: cargo build --release --target "$TARGET" -p onebrain-cli
 
       - name: Strip binary (native Unix)
         if: matrix.archive == 'tar.gz' && !matrix.cross
+        shell: bash
         run: strip "target/$TARGET/release/onebrain"
 
       - name: Strip aarch64 linux binary
         if: matrix.cross
+        shell: bash
         run: aarch64-linux-gnu-strip "target/$TARGET/release/onebrain"
 
       - name: Package tar.gz + sha256
