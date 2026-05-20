@@ -9,14 +9,14 @@ use serde_json::{ser::PrettyFormatter, Serializer, Value};
 use std::path::{Path, PathBuf};
 
 /// Conventional location of the Claude Code harness settings file.
-pub(crate) fn settings_path(vault_root: &Path) -> PathBuf {
+pub fn settings_path(vault_root: &Path) -> PathBuf {
     vault_root.join(".claude").join("settings.json")
 }
 
 /// Read settings.json as a `serde_json::Value`. A missing file is treated as
 /// an empty object (matches Bun's `readSettings` ENOENT branch); any other
 /// I/O or JSON-parse failure surfaces as `FsError::Io`.
-pub(crate) fn read_settings(path: &Path) -> Result<Value> {
+pub fn read_settings(path: &Path) -> Result<Value> {
     match std::fs::read_to_string(path) {
         Ok(text) => serde_json::from_str(&text).map_err(|e| FsError::Io {
             path: path.to_path_buf(),
@@ -51,7 +51,7 @@ use serde::Serialize;
 
 /// Atomic write: pretty-print + write to `.tmp` + rename. Creates parent dirs
 /// as needed.
-pub(crate) fn write_settings(path: &Path, value: &Value) -> Result<()> {
+pub fn write_settings(path: &Path, value: &Value) -> Result<()> {
     let parent = path
         .parent()
         .expect("settings.json path always has a parent");

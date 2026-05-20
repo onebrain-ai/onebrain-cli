@@ -13,13 +13,14 @@
 mod hooks;
 mod permissions;
 mod qmd;
-mod settings;
+pub mod settings;
 
 use crate::{harness::detect_harnesses, Result};
 use onebrain_core::{find_vault_root, load_vault_config, Harness};
 use std::path::PathBuf;
 
 pub use hooks::HookStatus;
+pub use settings::{read_settings, settings_path, write_settings};
 
 /// CLI options forwarded from `onebrain register-hooks`.
 #[derive(Debug, Clone, Default)]

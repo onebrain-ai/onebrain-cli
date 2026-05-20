@@ -32,9 +32,9 @@ impl Check for ClaudeSettingsCheck {
             .and_then(|v| v.as_str());
         if repo == Some(STALE_MARKETPLACE_REPO) {
             return DoctorResult::warn("claude-settings", "stale marketplace repo")
-                .with_hint("Run onebrain doctor --fix to rewrite to onebrain-ai/onebrain")
+                .with_hint("Run onebrain doctor --fix to remove the stale marketplace entry")
                 .with_details(vec![format!(
-                    "stale extraKnownMarketplaces.onebrain.source.repo: {} → {}",
+                    "stale extraKnownMarketplaces.onebrain.source.repo: {} (plugin now loads via enabledPlugins; canonical repo is {})",
                     STALE_MARKETPLACE_REPO, CANONICAL_MARKETPLACE_REPO
                 )]);
         }
@@ -85,11 +85,14 @@ mod tests {
         std::fs::write(d.path().join(".claude/settings.json"), body.to_string()).unwrap();
         let r = ClaudeSettingsCheck.run(d.path(), &cfg());
         assert_eq!(r.message, "stale marketplace repo");
-        assert!(r.hint.is_some());
+        assert_eq!(
+            r.hint.as_deref(),
+            Some("Run onebrain doctor --fix to remove the stale marketplace entry")
+        );
         assert!(r
             .details
             .iter()
-            .any(|d| d.contains("kengio/onebrain → onebrain-ai/onebrain")));
+            .any(|d| d.contains("kengio/onebrain") && d.contains("enabledPlugins")));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 ---
-latest_version: 3.0.0-alpha.6
+latest_version: 3.0.0-alpha.7
 released: 2026-05-20
 ---
 
@@ -11,6 +11,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## v3.0.0-alpha.7 — feat(doctor): four new `--fix` recipes (settings-hooks · plugin-files · vault.yml-keys · claude-settings)
+
+- **`doctor --fix` now repairs four more check types** beyond the `qmd-embeddings` recipe that shipped in alpha.5: (a) `settings-hooks` re-runs `register-hooks` idempotently (restores Stop hook + qmd PostToolUse hook + `Bash(onebrain *)` permission); (b) `plugin-files` re-overlays the plugin folder via `vault-sync` (brings INSTRUCTIONS.md / agents/ / skills/ / .claude-plugin/ back if missing); (c) `vault.yml-keys` backfills missing standard folder keys + `update_channel`, **strips deprecated keys** (`onebrain_version`, `method`, `runtime.harness`), and **repairs non-positive** `checkpoint.messages` / `checkpoint.minutes` (resets to 15 / 30); (d) `claude-settings` strips the stale `extraKnownMarketplaces.onebrain` block from `.claude/settings.json`.
+- **Dispatch widened to Warn AND Error** so the "missing INSTRUCTIONS.md" / "missing `folders:` block" failure modes — emitted as Error by their respective checks — are now repaired by `--fix` instead of being silently bypassed. Recipes that don't apply to a given error fall through to a Manual message with the original hint.
+- **Atomic writes everywhere**: vault.yml and settings.json mutations now go through `.tmp + rename` (matching `register_hooks::write_settings`) so a crash mid-write can't leave a truncated config file. The `claude-settings` recipe also routes through the canonical 4-space JSON formatter, eliminating the indent churn that previously appeared in `git diff` when `--fix` and `register-hooks` ran back-to-back.
+- **`fix_plugin_files` now respects the same `refuse_dangerous_vault_path` guard** as `onebrain vault-sync` (extracted into a shared `safety` module), so the recipe cannot accidentally vault-sync into `/` or `$HOME` via a misconfigured `vault.yml`.
+- **`orphan-checkpoints` routes to Manual** with a clearer hint: "run `/wrapup` in Claude to consolidate orphan checkpoints into a session log". Auto-deletion is intentionally off the table — orphans may still need to land in a session log, so we steer the user there rather than risking silent data loss.
+- Five recipes total now ship with the auto-fix flow. The `vault.yml-keys` Fixed message also calls out "YAML comments not preserved" so users know what changed besides keys (serde_yaml has no comment-preservation mode).
 
 ## v3.0.0-alpha.6 — fix(update): target CLI repo + prerelease-safe · ci: GHA Node 24 · docs: README hero + badges
 

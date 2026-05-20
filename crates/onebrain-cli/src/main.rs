@@ -1,5 +1,6 @@
 mod commands;
 mod output;
+mod safety;
 mod tokio_helper;
 
 use anyhow::Result;
