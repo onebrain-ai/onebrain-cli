@@ -139,7 +139,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release (auto-generated notes)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.meta.outputs.version }}
@@ -154,3 +154,35 @@ jobs:
             --generate-notes \
             "${ARGS[@]}" \
             artifacts/*
+
+      # Prepend a friendly platform-downloads table so non-Rust users can pick the
+      # right asset without decoding Rust target triples. Asset filenames keep
+      # their canonical triples (cargo-binstall + custom installer scripts parse
+      # them automatically). Only env-injected vars are used in run scripts — no
+      # untrusted user input is interpolated.
+      - name: Prepend platform downloads table to release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          ORIGINAL=$(gh release view "$VERSION" --json body --jq .body)
+          {
+            echo "## Downloads"
+            echo
+            echo "| Platform | Architecture | File |"
+            echo "|---|---|---|"
+            echo "| 🍎 macOS | Apple Silicon (M1/M2/M3/M4) | \`onebrain-aarch64-apple-darwin.tar.gz\` |"
+            echo "| 🍎 macOS | Intel | \`onebrain-x86_64-apple-darwin.tar.gz\` |"
+            echo "| 🐧 Linux (glibc) | ARM64 | \`onebrain-aarch64-unknown-linux-gnu.tar.gz\` |"
+            echo "| 🐧 Linux (glibc) | x86_64 | \`onebrain-x86_64-unknown-linux-gnu.tar.gz\` |"
+            echo "| 🐧 Linux (musl / Alpine / static) | x86_64 | \`onebrain-x86_64-unknown-linux-musl.tar.gz\` |"
+            echo "| 🪟 Windows | ARM64 | \`onebrain-aarch64-pc-windows-msvc.zip\` |"
+            echo "| 🪟 Windows | x86_64 | \`onebrain-x86_64-pc-windows-msvc.zip\` |"
+            echo
+            echo "Each binary ships with a matching \`.sha256\` checksum. Filenames use canonical Rust target triples — \`cargo-binstall\` and other tooling auto-parse them."
+            echo
+            echo "---"
+            echo
+            echo "$ORIGINAL"
+          } > /tmp/release-body.md
+          gh release edit "$VERSION" --notes-file /tmp/release-body.md

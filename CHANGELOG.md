@@ -1,5 +1,5 @@
 ---
-latest_version: 3.0.0-alpha.1
+latest_version: 3.0.0-alpha.3
 released: 2026-05-20
 ---
 
@@ -11,6 +11,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## v3.0.0-alpha.3 — fix(parity): close all 6 Bun-CLI argv gaps + init becomes one-step + safety + friendlier release notes
+
+- **`init` now runs `vault-sync` automatically** — collapses the previous 2-step bootstrap (`init` then manual `vault-sync`) into one. Failure is non-fatal: init still exits 0 with a clear "re-run `onebrain vault-sync`" hint. `--no-sync` flag skips the embedded step for offline / CI use
+- Close 6 Bun-CLI argv gaps that the Rust port had dropped: `vault-sync --branch <branch>` (was used by `/update` skill mid-flow), `vault-sync [vault_root]` positional, `session-init --vault-dir`, `checkpoint --vault-dir`, `register-schedule --vault`, `init --vault-dir + --force`, `migrate <name> [cutoff_date]` positional (alongside `--cutoff` flag)
+- Unify flag surface — every `--vault` flag now accepts `--vault-dir` as a visible clap alias (eliminates "which name does this command use?" footgun)
+- `vault-sync` refuses to write at filesystem root (`/`) or `$HOME` literal — defensive guard against `onebrain vault-sync ~` foot-cannons. Arbitrary subdirectories still work, including bootstrap-from-empty-dir
+- `migrate <name>` rejects supplying both positional `[cutoff_date]` AND `--cutoff <date>` (clap `conflicts_with` — no more silent precedence)
+- GitHub Release body now renders a friendly platform table (macOS Apple Silicon / Intel · Linux ARM64 / x86_64 glibc / x86_64 musl · Windows ARM64 / x86_64) so non-Rust users can pick the right download without parsing target triples. Asset filenames keep their canonical Rust triples for `cargo-binstall` and custom installer scripts
+- README rewritten with the platform table + one-step quickstart; CONTRIBUTING.md added covering dev setup, PR conventions (worktree, version bump, English-only, 3-round review), and security-issue channel
+- 9 new integration tests covering the new code paths (vault-sync `--branch`, init `--force` / `--vault-dir`, migrate positional / conflicts, register-hooks `--vault-dir` alias) · suite now at 634 passing, 1 ignored, 0 failed
+
+## v3.0.0-alpha.2 — fix(release): Windows TARGET expansion in release pipeline
+
+- Add `shell: bash` to Build/Strip steps so `$TARGET` expands on Windows runners (pwsh default treats it as `$Target:` PowerShell variable namespace) · unblocks 7/7 platform builds (PR #20)
 
 ## v3.0.0-alpha.1 — feat(slices-7-13): Bun parity port + 2 v3.0.1 fixes
 

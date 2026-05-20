@@ -25,7 +25,11 @@ use std::path::{Path, PathBuf};
 
 /// Entry point dispatched from `main.rs`. Returns the standard `anyhow`
 /// error which `classify_exit_code` maps to an exit code.
+///
+/// `vault` mirrors Bun v2.3.3's `--vault <path>` flag — when present, it
+/// supplies the vault root directly without walking up from cwd.
 pub fn run(
+    vault: Option<PathBuf>,
     dry_run: bool,
     remove: bool,
     refresh: bool,
@@ -33,8 +37,13 @@ pub fn run(
     status: bool,
     test: Option<String>,
 ) -> Result<()> {
-    let cwd = env::current_dir().context("read current directory")?;
-    let vault = resolve_vault_root(&cwd)?;
+    let vault = match vault {
+        Some(path) => path,
+        None => {
+            let cwd = env::current_dir().context("read current directory")?;
+            resolve_vault_root(&cwd)?
+        }
+    };
 
     if remove {
         return remove_all(&vault);

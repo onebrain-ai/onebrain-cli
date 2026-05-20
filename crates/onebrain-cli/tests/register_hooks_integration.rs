@@ -177,3 +177,22 @@ fn cli_qmd_collection_set_adds_post_tool_use() {
     assert!(s["hooks"]["PostToolUse"].is_array());
     assert_eq!(s["hooks"]["PostToolUse"][0]["matcher"], "Write|Edit");
 }
+
+/// `--vault-dir` is a Bun v2.3.3-parity alias for `--vault` — same behavior.
+#[test]
+fn cli_vault_dir_alias_resolves_to_vault() {
+    let d = tempdir().unwrap();
+    write_vault(d.path(), true, None);
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args([
+            "register-hooks",
+            "--vault-dir",
+            d.path().to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Stop"))
+        .stdout(predicate::str::contains("dry-run"));
+}

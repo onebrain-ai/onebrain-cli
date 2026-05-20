@@ -13,7 +13,7 @@ fn cli_yes_fresh_vault_writes_files_and_emits_header() {
     let d = tempdir().unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
-        .args(["init", "--yes"])
+        .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
         .success()
@@ -51,7 +51,7 @@ fn cli_yes_existing_vault_yml_returns_non_zero() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
-        .args(["init", "--yes"])
+        .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
         .failure()
@@ -70,7 +70,7 @@ fn cli_yes_creates_schedule_block_with_essentials_entries() {
     let d = tempdir().unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
-        .args(["init", "--yes"])
+        .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
         .success();
@@ -86,7 +86,7 @@ fn cli_yes_emits_essentials_preset_line() {
     let d = tempdir().unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
-        .args(["init", "--yes"])
+        .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
         .success()
@@ -98,13 +98,13 @@ fn cli_yes_run_twice_second_fails_without_force() {
     let d = tempdir().unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
-        .args(["init", "--yes"])
+        .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
         .success();
     Command::cargo_bin("onebrain")
         .unwrap()
-        .args(["init", "--yes"])
+        .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
         .failure();
@@ -119,7 +119,7 @@ fn cli_yes_populates_claude_settings_json_with_stop_hook() {
     let d = tempdir().unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
-        .args(["init", "--yes"])
+        .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
         .success()
@@ -138,4 +138,48 @@ fn cli_yes_populates_claude_settings_json_with_stop_hook() {
         .and_then(|s| s.as_array())
         .expect("hooks.Stop array missing");
     assert!(!stop.is_empty(), "hooks.Stop is empty: {text}");
+}
+
+/// Bun v2.3.3-parity: `--force` overrides the existing-vault.yml guard so
+/// the run succeeds and the file is rewritten without prompting.
+#[test]
+fn cli_yes_force_overwrites_existing_vault_yml() {
+    let d = tempdir().unwrap();
+    fs::write(d.path().join("vault.yml"), "old: value\n").unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes", "--force", "--no-sync"])
+        .current_dir(d.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("vault.yml: written"));
+    let content = fs::read_to_string(d.path().join("vault.yml")).unwrap();
+    assert!(
+        content.contains("update_channel"),
+        "vault.yml should have been overwritten with the fresh template",
+    );
+}
+
+/// Bun v2.3.3-parity: `--vault-dir <path>` targets a directory other than
+/// cwd. The binary should write the vault scaffold into that directory.
+#[test]
+fn cli_yes_vault_dir_targets_explicit_path() {
+    let d = tempdir().unwrap();
+    let target = d.path().join("nested-vault");
+    fs::create_dir_all(&target).unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args([
+            "init",
+            "--yes",
+            "--no-sync",
+            "--vault-dir",
+            target.to_str().unwrap(),
+        ])
+        .current_dir(d.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("done"));
+    assert!(target.join("vault.yml").is_file());
+    assert!(target.join("07-logs").is_dir());
 }

@@ -4,11 +4,27 @@ Personal AI OS CLI for Obsidian — Rust rewrite of v2.3.3 (TypeScript/Bun).
 
 ## Status
 
-v3.0 development · GA target 2026-06-30. See design spec in the OneBrain vault.
+**v3.0.0-alpha.3** — all 13 Bun-parity slices shipped. Feature-complete vs v2.3.3; pre-GA hardening + npm wrapper + Homebrew tap in progress. See [latest release](https://github.com/onebrain-ai/onebrain-cli/releases/latest) for downloads.
 
 ## Install
 
-> First user-facing prerelease: [`v3.0.0-alpha.1`](https://github.com/onebrain-ai/onebrain-cli/releases/tag/v3.0.0-alpha.1) — 7-platform binaries (darwin arm64/x64 · linux arm64/x64/musl-x64 · windows x64/arm64) attached to the GitHub Release. Build from source remains supported for development.
+Pick the binary that matches your machine, untar/unzip, and put `onebrain` on your PATH:
+
+| Platform | Architecture | File |
+|---|---|---|
+| 🍎 macOS | Apple Silicon (M1/M2/M3/M4) | `onebrain-aarch64-apple-darwin.tar.gz` |
+| 🍎 macOS | Intel | `onebrain-x86_64-apple-darwin.tar.gz` |
+| 🐧 Linux (glibc) | ARM64 | `onebrain-aarch64-unknown-linux-gnu.tar.gz` |
+| 🐧 Linux (glibc) | x86_64 | `onebrain-x86_64-unknown-linux-gnu.tar.gz` |
+| 🐧 Linux (musl / Alpine / static) | x86_64 | `onebrain-x86_64-unknown-linux-musl.tar.gz` |
+| 🪟 Windows | ARM64 | `onebrain-aarch64-pc-windows-msvc.zip` |
+| 🪟 Windows | x86_64 | `onebrain-x86_64-pc-windows-msvc.zip` |
+
+Filenames use canonical Rust target triples for tooling compatibility (`cargo-binstall`, custom installer scripts). Every release also publishes a `.sha256` next to each archive.
+
+npm wrapper (`@onebrain-ai/cli`) and Homebrew tap (`onebrain-ai/onebrain`) ship alongside the v3.0.0 GA release.
+
+### Build from source
 
 ```bash
 git clone https://github.com/onebrain-ai/onebrain-cli
@@ -16,6 +32,16 @@ cd onebrain-cli
 cargo build --release -p onebrain-cli   # builds the onebrain-cli crate
 # → target/release/onebrain                (binary name set via [[bin]] in crates/onebrain-cli/Cargo.toml)
 ```
+
+## Quickstart — bootstrap a new vault
+
+```bash
+mkdir my-vault && cd my-vault
+onebrain init --yes                    # scaffold + auto vault-sync (downloads plugin tarball)
+# Open the directory in Claude Code, then run /onboarding to finish setup.
+```
+
+`init` runs the embedded `vault-sync` step automatically; if it fails (no network, GitHub down), the scaffold (vault.yml, PARA folders, Stop hook, schedule preset) is still intact and the binary prints a clear "re-run `onebrain vault-sync`" hint. Pass `--no-sync` to skip the network step for offline / CI scaffolding.
 
 ## Development
 
@@ -42,12 +68,18 @@ cargo insta review          # interactive approve/reject
 4-crate Cargo workspace:
 
 - `onebrain-core` — types, config parsing, path resolution (zero filesystem deps)
-- `onebrain-fs` — vault walks, frontmatter scans
+- `onebrain-fs` — vault walks, frontmatter scans, plugin tarball overlay, init bootstrap
 - `onebrain-cache` — session token resolution, plist generation, qmd status
-- `onebrain-cli` — binary crate · produces the **`onebrain`** binary · clap dispatch · 13 subcommands (`session-init` + `orphan-scan` + `qmd-reindex` + `checkpoint` + `harness` wired in v3.0 Slices 1-5)
+- `onebrain-cli` — binary crate · produces the **`onebrain`** binary · clap dispatch over 13 subcommands (all Bun-parity ported · slices 1–13 shipped)
 
-See `01-projects/onebrain/shared/2026-05-14-rust-cli-rewrite-design.md` for the full design rationale (OneBrain vault).
+Subcommands: `session-init` · `orphan-scan` · `qmd-reindex` · `checkpoint` · `harness` · `doctor` · `register-hooks` · `register-schedule` · `migrate` · `init` · `update` · `run-skill` · `vault-sync`.
+
+`CHANGELOG.md` tracks slice-by-slice port progress.
+
+## Contributing
+
+PRs welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for dev setup, build + test commands, PR conventions (worktree, version bump, English-only, 3-round review floor), and the security-issue reporting channel.
 
 ## License
 
-AGPL-3.0-only · see `LICENSE`. Trademark "OneBrain" pending (USPTO 2026-06-30).
+AGPL-3.0-only · see `LICENSE`.
