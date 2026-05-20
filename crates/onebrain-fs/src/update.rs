@@ -117,12 +117,25 @@ pub enum UpdateError {
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Source of truth for the GitHub releases URL. The env var
-/// `ONEBRAIN_GITHUB_RELEASES_URL` overrides at runtime so mockito-backed
-/// integration tests can redirect the request without faking the entire
-/// HTTP client.
+/// Source of truth for the GitHub releases URL. Points at the **CLI** repo
+/// (not the plugin repo) so `onebrain update` actually self-updates the
+/// `onebrain` binary instead of downgrading users to whatever the plugin
+/// repo's last stable release happens to be. Prior to v3.0.0-alpha.6 this
+/// targeted `onebrain-ai/onebrain` (plugin), which made alpha CLI users see
+/// `latest: v2.3.3` (the last Bun binary on the plugin repo) — and the
+/// post-fetch string-equality check could not distinguish that downgrade
+/// from a genuine update.
+///
+/// `/releases?per_page=1` returns the most recent release **including
+/// prereleases** (ordered by publish date, descending). The previous
+/// `/releases/latest` endpoint only returns non-prerelease releases, which
+/// makes the CLI's own alpha cycle invisible to itself.
+///
+/// The env var `ONEBRAIN_GITHUB_RELEASES_URL` overrides at runtime so
+/// mockito-backed integration tests can redirect the request without
+/// faking the entire HTTP client.
 const DEFAULT_GITHUB_RELEASES_URL: &str =
-    "https://api.github.com/repos/onebrain-ai/onebrain/releases/latest";
+    "https://api.github.com/repos/onebrain-ai/onebrain-cli/releases?per_page=1";
 
 const GITHUB_ENV_OVERRIDE: &str = "ONEBRAIN_GITHUB_RELEASES_URL";
 
@@ -224,7 +237,15 @@ pub fn default_fetch_latest_release(fresh: bool) -> Result<ReleaseInfo, UpdateEr
     let json: serde_json::Value = resp
         .json()
         .map_err(|e| UpdateError::Decode(e.to_string()))?;
-    let info = parse_release_payload(&json)?;
+    // The CLI repo endpoint returns an array (`/releases?per_page=1`) where
+    // the previous plugin-repo endpoint returned an object (`/releases/latest`).
+    // Accept both shapes so the env-override path still works against either
+    // form (mockito fixtures may use either, and the function is a public API).
+    let payload = match &json {
+        serde_json::Value::Array(arr) => arr.first().cloned().unwrap_or(serde_json::Value::Null),
+        _ => json.clone(),
+    };
+    let info = parse_release_payload(&payload)?;
     // Best-effort persist — cache write failure is silently ignored (the
     // next call just re-fetches).
     //
@@ -340,6 +361,26 @@ pub(crate) fn build_install_command(version: &str, is_windows: bool) -> Vec<Stri
             "-g".to_string(),
             format!("@onebrain-ai/cli@{version}"),
         ]
+    }
+}
+
+/// Semver-aware comparison: returns `true` when `current >= candidate`,
+/// i.e. when the locally-installed version is the same as or newer than
+/// the remote candidate. Used by `run_update` to refuse downgrades —
+/// without this an alpha user (`v3.0.0-alpha.5`) would be auto-bumped
+/// down to a stable release with lower semver (`v2.3.3`).
+///
+/// Both inputs may carry the leading `v` prefix that `release.tag_name`
+/// publishes; we strip it before parsing. If either input fails to parse,
+/// fall back to string-equality (the worst case is that we proceed with
+/// the install — the existing Bun behavior — rather than locking the user
+/// out of legitimate updates).
+pub(crate) fn version_at_least(current: &str, candidate: &str) -> bool {
+    let c = current.trim_start_matches('v');
+    let r = candidate.trim_start_matches('v');
+    match (semver::Version::parse(c), semver::Version::parse(r)) {
+        (Ok(curr), Ok(cand)) => curr >= cand,
+        _ => current == candidate,
     }
 }
 
@@ -564,11 +605,17 @@ pub fn run_update(mut opts: UpdateOptions) -> UpdateResult {
         return result;
     }
 
-    // Already up to date?
-    if current.version == release.version {
+    // Already up to date — semver-aware so an alpha user (e.g.
+    // `v3.0.0-alpha.5`) isn't auto-downgraded if the remote endpoint
+    // happens to advertise a lower-semver release (`v2.3.3`). The string-
+    // equality check we ported from Bun cannot tell the difference; we now
+    // refuse to "update" when `current >= release` — either we're already
+    // on the latest, or we're ahead of it (prerelease that hasn't been
+    // promoted to stable yet). Both produce the same user-visible message.
+    if version_at_least(&current.version, &release.version) {
         write_stdout(
             &mut opts,
-            &format!("already up to date: @onebrain-ai/cli {}", release.version),
+            &format!("already up to date: @onebrain-ai/cli {}", current.version),
         );
         write_stdout(&mut opts, "done: nothing to do");
         result.ok = true;
@@ -1072,6 +1119,47 @@ mod tests {
     /// overwrite `~/.cache/onebrain/latest-release.json` with the test
     /// version, and the next real `--check` would report the wrong value
     /// for up to a full TTL.
+    // -----------------------------------------------------------------
+    // v3.0.0-alpha.6 — semver-aware version comparison
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn version_at_least_refuses_downgrade_to_lower_stable() {
+        // The regression that motivated this whole helper: an alpha user on
+        // `v3.0.0-alpha.5` must NOT be auto-downgraded to `v2.3.3` (the
+        // plugin repo's last stable Bun binary, advertised by the previous
+        // endpoint).
+        assert!(version_at_least("v3.0.0-alpha.5", "v2.3.3"));
+        assert!(version_at_least("3.0.0-alpha.5", "v2.3.3"));
+        assert!(version_at_least("v3.0.0-alpha.5", "2.3.3"));
+    }
+
+    #[test]
+    fn version_at_least_progresses_through_prerelease_counter() {
+        // alpha.5 → alpha.6 IS an update; alpha.5 → alpha.4 is NOT.
+        assert!(!version_at_least("v3.0.0-alpha.5", "v3.0.0-alpha.6"));
+        assert!(version_at_least("v3.0.0-alpha.5", "v3.0.0-alpha.4"));
+        assert!(version_at_least("v3.0.0-alpha.5", "v3.0.0-alpha.5"));
+    }
+
+    #[test]
+    fn version_at_least_alpha_is_older_than_stable_of_same_triple() {
+        // semver invariant: 3.0.0-alpha.5 < 3.0.0 — so an alpha user
+        // running `onebrain update` against a stable release of the same
+        // triple SHOULD proceed (returns false → not at-least-current).
+        assert!(!version_at_least("v3.0.0-alpha.5", "v3.0.0"));
+        assert!(version_at_least("v3.0.0", "v3.0.0-alpha.5"));
+    }
+
+    #[test]
+    fn version_at_least_unparseable_falls_back_to_string_eq() {
+        // Defensive: if either input fails semver parse, compare as
+        // strings. Equality → at-least-current; anything else → false.
+        assert!(version_at_least("not-a-version", "not-a-version"));
+        assert!(!version_at_least("not-a-version", "v1.0.0"));
+        assert!(!version_at_least("v1.0.0", "not-a-version"));
+    }
+
     #[test]
     fn cache_skipped_when_github_url_override_is_set() {
         with_cache_path(|| {

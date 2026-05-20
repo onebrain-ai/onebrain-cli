@@ -45,7 +45,7 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -106,7 +106,7 @@ jobs:
           "$hash  $archive" | Out-File -Encoding ascii "dist/$archive.sha256"
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: onebrain-${{ matrix.target }}
           path: dist/
@@ -118,9 +118,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -171,7 +171,7 @@ jobs:
             echo
             echo "| Platform | Architecture | File |"
             echo "|---|---|---|"
-            echo "| 🍎 macOS | Apple Silicon (M1/M2/M3/M4) | \`onebrain-aarch64-apple-darwin.tar.gz\` |"
+            echo "| 🍎 macOS | Apple Silicon (M1–M5) | \`onebrain-aarch64-apple-darwin.tar.gz\` |"
             echo "| 🍎 macOS | Intel | \`onebrain-x86_64-apple-darwin.tar.gz\` |"
             echo "| 🐧 Linux (glibc) | ARM64 | \`onebrain-aarch64-unknown-linux-gnu.tar.gz\` |"
             echo "| 🐧 Linux (glibc) | x86_64 | \`onebrain-x86_64-unknown-linux-gnu.tar.gz\` |"

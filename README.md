@@ -1,10 +1,27 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/onebrain-ai/onebrain/main/assets/header-dark.png">
+    <img alt="OneBrain — Your AI Thinking Partner" src="https://raw.githubusercontent.com/onebrain-ai/onebrain/main/assets/header-light.png" width="640">
+  </picture>
+</p>
+
+<p align="center">
+  <a href="https://onebrain.run"><img alt="Website" src="https://img.shields.io/badge/onebrain.run-0a0a14?style=for-the-badge&labelColor=ff2d92"></a>
+  <a href="https://x.com/onebrain_run"><img alt="@onebrain_run on X" src="https://img.shields.io/badge/follow-@onebrain__run-000000?style=for-the-badge&logo=x&logoColor=white"></a>
+  <a href="https://github.com/onebrain-ai/onebrain-cli/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/onebrain-ai/onebrain-cli?style=for-the-badge&color=00f3ff&logo=github"></a>
+</p>
+<p align="center">
+  <a href="https://github.com/onebrain-ai/onebrain-cli/releases/latest"><img alt="onebrain-cli release" src="https://img.shields.io/github/v/release/onebrain-ai/onebrain-cli?include_prereleases&style=for-the-badge&logo=rust&color=cb3837&label=onebrain-cli"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-AGPL--3.0-7c3aed?style=for-the-badge"></a>
+</p>
+
 # OneBrain CLI
 
 Personal AI OS CLI for Obsidian — Rust rewrite of v2.3.3 (TypeScript/Bun).
 
 ## Status
 
-**v3.0.0-alpha.3** — all 13 Bun-parity slices shipped. Feature-complete vs v2.3.3; pre-GA hardening + npm wrapper + Homebrew tap in progress. See [latest release](https://github.com/onebrain-ai/onebrain-cli/releases/latest) for downloads.
+**v3.0.0-alpha.6** — all 13 Bun-parity slices shipped + perf hardening + auto-fix recipes. Feature-complete vs v2.3.3; pre-GA polish (npm wrapper + Homebrew tap) in progress. See [latest release](https://github.com/onebrain-ai/onebrain-cli/releases/latest) for downloads.
 
 ## Install
 
@@ -12,7 +29,7 @@ Pick the binary that matches your machine, untar/unzip, and put `onebrain` on yo
 
 | Platform | Architecture | File |
 |---|---|---|
-| 🍎 macOS | Apple Silicon (M1/M2/M3/M4) | `onebrain-aarch64-apple-darwin.tar.gz` |
+| 🍎 macOS | Apple Silicon (M1–M5) | `onebrain-aarch64-apple-darwin.tar.gz` |
 | 🍎 macOS | Intel | `onebrain-x86_64-apple-darwin.tar.gz` |
 | 🐧 Linux (glibc) | ARM64 | `onebrain-aarch64-unknown-linux-gnu.tar.gz` |
 | 🐧 Linux (glibc) | x86_64 | `onebrain-x86_64-unknown-linux-gnu.tar.gz` |
