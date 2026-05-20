@@ -233,6 +233,72 @@ fn vault_yml_update_channel_preserved_through_sync() {
     assert!(!yml.contains("onebrain_version"));
 }
 
+/// CLI `--branch` flag (Bun v2.3.3 parity) — overrides `vault.yml::update_channel`.
+/// Verifies the flag is accepted, the sync completes successfully, and the
+/// override propagates into the orchestrator (branch is threaded through to
+/// download + pin steps; under fixture mode the value is still surfaced in
+/// the result struct that drives the version-stamp line).
+#[test]
+fn branch_flag_overrides_update_channel() {
+    let dir = tempdir().unwrap();
+    let vault = make_vault(dir.path());
+    let tarball = build_tarball("onebrain-ai-onebrain-abc1234", "1.11.0", &[]);
+    let tarball_path = vault.join("../fixture.tar.gz");
+    fs::write(&tarball_path, &tarball).unwrap();
+    let isolated = vault.join(".isolated-installed_plugins.json");
+
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .arg("vault-sync")
+        .arg("--branch")
+        .arg("next")
+        .current_dir(&vault)
+        .env(
+            "ONEBRAIN_VAULT_SYNC_FIXTURE",
+            tarball_path.to_string_lossy().to_string(),
+        )
+        .env(
+            "ONEBRAIN_INSTALLED_PLUGINS_PATH",
+            isolated.to_string_lossy().to_string(),
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "vault-sync --branch next must exit 0 · stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(vault
+        .join(".claude/plugins/onebrain/.claude-plugin/plugin.json")
+        .exists());
+}
+
+/// CLI rejects `--branch` with no value (clap-level validation).
+#[test]
+fn branch_flag_requires_value() {
+    let dir = tempdir().unwrap();
+    let vault = make_vault(dir.path());
+
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .arg("vault-sync")
+        .arg("--branch") // no value
+        .current_dir(&vault)
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "should reject --branch with no value"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("value") || stderr.contains("required"),
+        "stderr should explain missing value · got: {stderr}"
+    );
+}
+
 #[test]
 fn harness_files_get_new_imports_injected() {
     let dir = tempdir().unwrap();

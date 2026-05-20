@@ -213,7 +213,10 @@ pub fn run_init(mut opts: InitOptions) -> Result<InitResult, FsError> {
     ));
 
     // ── Done ───────────────────────────────────────────────────────────────
-    stdout("done: run /onboarding in Claude to finish setup");
+    // Init writes vault.yml + folders + .claude/ + hooks + schedule preset only.
+    // The vault-sync sub-call (download plugin tarball from GitHub) is not yet
+    // ported from Bun's init, so explicitly tell the user the 2-step bootstrap.
+    stdout("done: run `onebrain vault-sync` to install plugin files, then `/onboarding` in Claude");
     result.ok = true;
     result.exit_code = 0;
     Ok(result)

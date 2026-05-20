@@ -5,12 +5,16 @@ use onebrain_cache::{
 };
 use onebrain_core::{find_vault_root, load_vault_config};
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-pub fn run() -> Result<()> {
-    let cwd = env::current_dir().context("read current directory")?;
-    let line = build_output(&cwd)?;
+pub fn run(vault_dir: Option<PathBuf>) -> Result<()> {
+    // Bun parity: `--vault-dir <path>` overrides the cwd-based auto-detect.
+    let start = match vault_dir {
+        Some(dir) => dir,
+        None => env::current_dir().context("read current directory")?,
+    };
+    let line = build_output(&start)?;
     println!("{line}");
     Ok(())
 }
