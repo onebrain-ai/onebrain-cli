@@ -125,7 +125,8 @@ enum Cmd {
         /// Dry run · report what would change without installing.
         #[arg(long)]
         check: bool,
-        /// Skip the 1-hour release-info cache and always hit GitHub.
+        /// Skip reading the 1-hour release-info cache · always refetch from
+        /// GitHub (the cache is still updated with the fresh response).
         #[arg(long)]
         fresh: bool,
     },

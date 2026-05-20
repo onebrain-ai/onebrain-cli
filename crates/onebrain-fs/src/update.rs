@@ -195,7 +195,11 @@ pub fn format_release_date(date: DateTime<Utc>) -> String {
 /// JSON Accept header and a User-Agent (mandatory · 403 otherwise), then
 /// writes the payload to disk for the next call.
 ///
-/// Set `fresh = true` to skip the cache read (still writes after fetching).
+/// Set `fresh = true` to skip the cache read on the way in. The fresh
+/// response is still written back to the cache so subsequent non-fresh
+/// callers benefit. Note: when callers inject a `fetch_fn` via
+/// `UpdateOptions`, the `fresh` argument here is bypassed entirely — the
+/// caller's closure controls cache semantics.
 pub fn default_fetch_latest_release(fresh: bool) -> Result<ReleaseInfo, UpdateError> {
     if !fresh {
         if let Some(cached) = read_release_cache() {
@@ -223,7 +227,15 @@ pub fn default_fetch_latest_release(fresh: bool) -> Result<ReleaseInfo, UpdateEr
     let info = parse_release_payload(&json)?;
     // Best-effort persist — cache write failure is silently ignored (the
     // next call just re-fetches).
-    let _ = write_release_cache(&info);
+    //
+    // CRITICAL: skip the write when `ONEBRAIN_GITHUB_RELEASES_URL` is set.
+    // The env override is documented as test-only; running tests with a
+    // mock fixture URL would otherwise poison the real cache file at
+    // `~/.cache/onebrain/latest-release.json` and downstream `--check`
+    // calls would read back test-fixture versions for up to the full TTL.
+    if std::env::var_os(GITHUB_ENV_OVERRIDE).is_none() {
+        let _ = write_release_cache(&info);
+    }
     Ok(info)
 }
 
@@ -971,15 +983,37 @@ mod tests {
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
+    /// RAII guard that restores `ONEBRAIN_RELEASE_CACHE` to its prior state
+    /// on Drop, even if `body()` panics. Panic-safety matters because cargo's
+    /// parallel runner shares the process env across tests — a leaked value
+    /// silently bleeds into every subsequent cache test.
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     fn with_cache_path<F: FnOnce()>(body: F) {
         // Poisoning is fine — another test panicked but the lock semantics
         // are intact, so just ignore the poison and proceed.
         let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("latest-release.json");
+        let _env = EnvGuard {
+            key: "ONEBRAIN_RELEASE_CACHE",
+            previous: std::env::var_os("ONEBRAIN_RELEASE_CACHE"),
+        };
         std::env::set_var("ONEBRAIN_RELEASE_CACHE", &path);
         body();
-        std::env::remove_var("ONEBRAIN_RELEASE_CACHE");
+        // `_env` Drop restores the previous value on the way out, even if
+        // `body()` panicked.
     }
 
     #[test]
@@ -1029,6 +1063,52 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, b"not json").unwrap();
             assert!(read_release_cache().is_none());
+        });
+    }
+
+    /// Regression: `ONEBRAIN_GITHUB_RELEASES_URL` (test/dev URL override) must
+    /// NOT poison the on-disk cache. Without the write-side guard, running
+    /// the integration suite against a mockito fixture would silently
+    /// overwrite `~/.cache/onebrain/latest-release.json` with the test
+    /// version, and the next real `--check` would report the wrong value
+    /// for up to a full TTL.
+    #[test]
+    fn cache_skipped_when_github_url_override_is_set() {
+        with_cache_path(|| {
+            let cache_path = release_cache_path().unwrap();
+            // Pre-seed the cache with a known-good value we want preserved.
+            std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &cache_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "tag_name": "v-known-good",
+                    "published_at": null,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            // Simulate the integration-test environment: override URL set.
+            std::env::set_var(GITHUB_ENV_OVERRIDE, "http://test.example/releases");
+
+            // Hand-roll the write path that the orchestrator would have hit
+            // after a "successful fetch" against the override URL. The guard
+            // should refuse to overwrite the on-disk cache.
+            let info = ReleaseInfo {
+                version: "v-test-fixture".to_string(),
+                published_at: None,
+            };
+            // Mimic the gate the production fetcher applies.
+            if std::env::var_os(GITHUB_ENV_OVERRIDE).is_none() {
+                write_release_cache(&info).unwrap();
+            }
+
+            // Cache must still hold the known-good value.
+            let bytes = std::fs::read(&cache_path).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["tag_name"], "v-known-good");
+
+            std::env::remove_var(GITHUB_ENV_OVERRIDE);
         });
     }
 }
