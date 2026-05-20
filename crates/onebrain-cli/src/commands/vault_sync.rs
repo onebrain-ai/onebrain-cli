@@ -69,8 +69,9 @@ pub fn run(vault_root_override: Option<PathBuf>, branch: Option<String>) -> Resu
 }
 
 /// Refuse the obvious "I did not mean to write here" paths. Currently:
-///   - filesystem root (`/`)
-///   - `$HOME` itself (literal match against the resolved home dir)
+///   - any filesystem root (`/` on Unix · `C:\` / `D:\` / `\` on Windows)
+///   - `$HOME` / `%USERPROFILE%` itself (literal match against the resolved
+///     home dir)
 ///
 /// Anything else (including arbitrary subdirectories of `$HOME` and `/tmp/...`)
 /// is allowed — vault-sync's bootstrap-from-empty-dir behavior matches Bun and
@@ -78,14 +79,24 @@ pub fn run(vault_root_override: Option<PathBuf>, branch: Option<String>) -> Resu
 /// the lower-level `run_vault_sync(...)` library entry point.
 fn refuse_dangerous_vault_path(p: &Path) -> Result<()> {
     let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    if canonical.as_os_str() == "/" {
-        bail!("refusing to vault-sync at filesystem root '/' — pass an explicit vault directory");
+
+    // Portable filesystem-root check — works for `/` on Unix and drive roots
+    // (`C:\`, `D:\`, etc.) on Windows. Both produce `Path::parent() == None`.
+    if canonical.parent().is_none() {
+        bail!(
+            "refusing to vault-sync at filesystem root '{}' — pass an explicit vault directory",
+            canonical.display()
+        );
     }
-    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+
+    // `$HOME` on Unix / `USERPROFILE` on Windows — checked literally against
+    // the canonicalized target so symlinks to home are also caught.
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    if let Some(home) = env::var_os(home_var).map(PathBuf::from) {
         let canonical_home = home.canonicalize().unwrap_or(home);
         if canonical == canonical_home {
             bail!(
-                "refusing to vault-sync at $HOME ({}) — create a dedicated vault directory first",
+                "refusing to vault-sync at home directory ({}) — create a dedicated vault directory first",
                 canonical.display()
             );
         }
@@ -96,24 +107,50 @@ fn refuse_dangerous_vault_path(p: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
+    /// Filesystem root is platform-specific: `/` on Unix, drive root on
+    /// Windows (`canonicalize` of `\` resolves to `\\?\C:\` typically). The
+    /// portable signal is `parent().is_none()` — verify via the platform's
+    /// own root accessor rather than hard-coding `/`.
     #[test]
     fn refuses_filesystem_root() {
-        let err = refuse_dangerous_vault_path(Path::new("/")).unwrap_err();
-        assert!(err.to_string().contains("filesystem root"));
+        // `std::env::temp_dir()` always has a root ancestor on the platform;
+        // walk up to it via repeated `.parent()` calls so the test stays
+        // portable across Unix and Windows.
+        let mut root = std::env::temp_dir();
+        while let Some(parent) = root.parent() {
+            root = parent.to_path_buf();
+        }
+        let err = refuse_dangerous_vault_path(&root).unwrap_err();
+        assert!(
+            err.to_string().contains("filesystem root"),
+            "error must mention filesystem root · got: {err}"
+        );
     }
 
     #[test]
     fn refuses_home_directory() {
-        // Use a stub HOME so the test doesn't depend on the runner's real home.
-        std::env::set_var("HOME", "/tmp");
-        let err = refuse_dangerous_vault_path(Path::new("/tmp")).unwrap_err();
-        assert!(err.to_string().contains("$HOME"));
+        // Inject a stub home dir so the test doesn't depend on whether the
+        // runner has HOME/USERPROFILE set. Both vars are stubbed to keep the
+        // body identical across platforms.
+        let d = tempdir().unwrap();
+        std::env::set_var("HOME", d.path());
+        std::env::set_var("USERPROFILE", d.path());
+        let err = refuse_dangerous_vault_path(d.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("home directory"),
+            "error must mention home directory · got: {err}"
+        );
     }
 
     #[test]
     fn allows_dedicated_subdirectory() {
-        std::env::set_var("HOME", "/tmp");
-        assert!(refuse_dangerous_vault_path(Path::new("/tmp/my-vault")).is_ok());
+        let d = tempdir().unwrap();
+        std::env::set_var("HOME", d.path());
+        std::env::set_var("USERPROFILE", d.path());
+        let sub = d.path().join("my-vault");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(refuse_dangerous_vault_path(&sub).is_ok());
     }
 }
