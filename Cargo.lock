@@ -1133,7 +1133,6 @@ dependencies = [
  "onebrain-fs",
  "predicates",
  "pretty_assertions",
- "semver",
  "serde",
  "serde_json",
  "serde_yaml",

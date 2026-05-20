@@ -338,11 +338,52 @@ fn build_launchd_context(vault: &Path) -> Result<LaunchdContext> {
 /// to the OneBrain default `"07-logs"` when the config can't be loaded — the
 /// scheduler's log path is operational metadata, so a missing/invalid vault.yml
 /// shouldn't block plist emission entirely.
+///
+/// Defense-in-depth: `folders.logs` is owner-supplied via vault.yml, so a
+/// malicious or copy-pasted vault could set it to `"../../etc"` or an
+/// absolute path. Joining either into `vault.join(folder)` could put the
+/// launchd `StandardOutPath` outside the vault — file clobbering at user
+/// uid. We reject any path containing `..` segments OR starting with `/`
+/// (or a Windows drive prefix) and fall back to the default.
 fn resolve_logs_folder(vault: &Path) -> String {
-    onebrain_core::find_vault_root(vault)
+    let raw = onebrain_core::find_vault_root(vault)
         .and_then(|root| onebrain_core::load_vault_config(&root).ok())
         .map(|cfg| cfg.folders.logs)
-        .unwrap_or_else(|| "07-logs".to_string())
+        .unwrap_or_else(|| "07-logs".to_string());
+    if is_safe_relative_folder(&raw) {
+        raw
+    } else {
+        eprintln!(
+            "register-schedule: refusing unsafe folders.logs value '{raw}' (must be a relative \
+             path with no `..` segments) — falling back to '07-logs'"
+        );
+        "07-logs".to_string()
+    }
+}
+
+/// True when `s` is a relative path containing no `..` parent traversals.
+/// Uses `std::path::Component` to handle both Unix and Windows path
+/// separators portably (a literal `..` in the string and a `ParentDir`
+/// component are not the same on Windows where `\` is the separator).
+fn is_safe_relative_folder(s: &str) -> bool {
+    let p = std::path::Path::new(s);
+    if p.is_absolute() {
+        return false;
+    }
+    for component in p.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return false;
+        }
+        // RootDir / Prefix would have triggered `is_absolute()` already,
+        // but be defensive — anything other than CurDir / Normal is rejected.
+        if !matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::Normal(_)
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(unix)]

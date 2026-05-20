@@ -42,8 +42,24 @@ enum FixOutcome {
 /// so the entire command produces exactly one JSON document.
 pub fn run(fix: bool, json: bool) -> Result<i32> {
     let cwd = env::current_dir().context("read current directory")?;
-    let vault_root =
-        find_vault_root(&cwd).ok_or_else(|| anyhow!("not inside a vault (no vault.yml found)"))?;
+    let vault_root = match find_vault_root(&cwd) {
+        Some(r) => r,
+        None => {
+            // In JSON mode, emit a structured failure envelope on stdout so
+            // scripted consumers don't have to parse anyhow text from stderr.
+            // Plain-text mode keeps the existing anyhow flow.
+            if json {
+                let doc = serde_json::json!({
+                    "ok": false,
+                    "error": "not_in_vault",
+                    "message": "not inside a vault (no vault.yml found)",
+                });
+                println!("{}", serde_json::to_string(&doc)?);
+                return Ok(1);
+            }
+            return Err(anyhow!("not inside a vault (no vault.yml found)"));
+        }
+    };
 
     // Best-effort config load — on error, fall back to defaults so doctor can
     // still report what it sees (matches Bun behavior: stderr warning + defaults).
@@ -84,7 +100,7 @@ pub fn run(fix: bool, json: bool) -> Result<i32> {
             }
             let outcomes: Vec<(String, FixOutcome)> = issues
                 .iter()
-                .map(|r| (r.check.clone(), attempt_fix(r, vault_root.as_path())))
+                .map(|r| (r.check.clone(), attempt_fix(r, vault_root.as_path(), json)))
                 .collect();
             any_recipe_failed = outcomes
                 .iter()
@@ -122,7 +138,10 @@ pub fn run(fix: bool, json: bool) -> Result<i32> {
         .filter(|r| r.status == DoctorStatus::Error)
         .count();
     if json {
-        print_report_json(&results, fix_outcomes_json, std::io::stdout())?;
+        // Always emit `fix[]` when --fix was requested so consumers can
+        // distinguish "user didn't ask to fix" (key absent) from "user asked
+        // but nothing to fix" (key present, empty array). Schema stability.
+        print_report_json(&results, fix, fix_outcomes_json, std::io::stdout())?;
     }
     // Exit non-zero on any post-fix error OR any failed recipe — so the
     // caller's shell-level `if $? -ne 0` catches both check escalations
@@ -137,8 +156,19 @@ pub fn run(fix: bool, json: bool) -> Result<i32> {
 /// Render `results` + optional fix outcomes as a single JSON document.
 /// Field shape is documented inline; callers (the `/doctor` plugin skill,
 /// CI consumers) treat the schema as stable for v3.x.
+///
+/// `fix_requested` is true when `--fix` was passed — the `fix[]` key is
+/// emitted whenever this is true (even if empty), so consumers can
+/// distinguish "user didn't ask to fix" (key absent) from "user asked but
+/// nothing needed fixing" (key present, empty).
+///
+/// Naming note: `summary.passing` is the count of OK checks (not a boolean
+/// — top-level `ok` is the boolean). The two fields are deliberately named
+/// differently to prevent the `summary.ok` count-vs-boolean confusion that
+/// the first draft of this code had.
 fn print_report_json<W: Write>(
     results: &[DoctorResult],
+    fix_requested: bool,
     fix_outcomes: Vec<serde_json::Value>,
     mut w: W,
 ) -> Result<()> {
@@ -151,18 +181,18 @@ fn print_report_json<W: Write>(
         .iter()
         .filter(|r| r.status == DoctorStatus::Warn)
         .count();
-    let ok_count = total - errors - warnings;
+    let passing = total - errors - warnings;
     let mut doc = serde_json::json!({
         "ok": errors == 0,
         "summary": {
             "total": total,
             "errors": errors,
             "warnings": warnings,
-            "ok": ok_count,
+            "passing": passing,
         },
         "checks": results,
     });
-    if !fix_outcomes.is_empty() {
+    if fix_requested {
         doc.as_object_mut()
             .expect("doctor json root is object")
             .insert("fix".to_string(), serde_json::Value::Array(fix_outcomes));
@@ -179,28 +209,28 @@ fn print_report_json<W: Write>(
 /// recipe — user must edit the vault config). Hidden hints that say
 /// "Run onebrain doctor --fix to ..." are silently rewritten to a
 /// non-circular message when no recipe maps.
-fn attempt_fix(result: &DoctorResult, vault_root: &Path) -> FixOutcome {
+fn attempt_fix(result: &DoctorResult, vault_root: &Path, json: bool) -> FixOutcome {
     match result.check.as_str() {
         // Only the "N unembedded" variant is auto-fixable. The
         // "qmd_collection not set" variant goes to Manual because
         // `qmd embed` without a configured collection is meaningless.
-        "qmd-embeddings" if result.message.contains("unembedded") => fix_qmd_embeddings(),
+        "qmd-embeddings" if result.message.contains("unembedded") => fix_qmd_embeddings(json),
         // Re-run register-hooks idempotently. Repairs missing Stop hook,
         // missing PostToolUse qmd hook (when qmd_collection is set), AND
         // missing `Bash(onebrain *)` permission entry. The lib already
         // handles all three cases as one atomic settings.json write.
-        "settings-hooks" => fix_settings_hooks(vault_root),
+        "settings-hooks" => fix_settings_hooks(vault_root, json),
         // Re-overlay plugin files from the upstream tarball. Idempotent;
         // brings INSTRUCTIONS.md / agents/ / skills/ / .claude-plugin/
         // back if they were deleted or never synced.
-        "plugin-files" => fix_plugin_files(vault_root),
+        "plugin-files" => fix_plugin_files(vault_root, json),
         // Backfill missing standard folder keys + default `update_channel`
         // in vault.yml. Safe (additive) — never overwrites user values.
-        "vault.yml-keys" => fix_vault_yml_keys(vault_root),
+        "vault.yml-keys" => fix_vault_yml_keys(vault_root, json),
         // Strip the stale `extraKnownMarketplaces.onebrain` entry from
         // `.claude/settings.json`. Cosmetic config cleanup; no behavioral
         // change at runtime (the plugin is enabled via `enabledPlugins`).
-        "claude-settings" => fix_claude_settings(vault_root),
+        "claude-settings" => fix_claude_settings(vault_root, json),
         // Orphan checkpoints can't be auto-deleted safely — the user may
         // still want to consolidate them via `/wrapup`. Steer them there
         // explicitly rather than risk silent data loss.
@@ -228,12 +258,25 @@ fn manual_message(result: &DoctorResult) -> String {
     format!("no automated recipe for `{}` · {cleaned}", result.check)
 }
 
+/// Status-line emitter shared across recipes. In plain-text mode the line
+/// goes to stdout (human-friendly inline with the fix summary); in JSON
+/// mode it goes to stderr so the JSON document remains the only stdout
+/// payload (consumer-friendly: `cmd 2>/dev/null` gives clean JSON).
+fn status_line(json: bool, msg: &str) {
+    if json {
+        eprintln!("  · {msg}");
+    } else {
+        println!("  · {msg}");
+    }
+}
+
 /// Recipe — `qmd-embeddings` warning means N files need embedding. Spawn
 /// `qmd embed` and wait for it to finish; report success/failure based on
-/// the exit code. The user sees full `qmd embed` output streamed to their
-/// terminal in real time (we inherit stdio rather than capturing it).
-fn fix_qmd_embeddings() -> FixOutcome {
-    use std::process::Command;
+/// the exit code. In plain-text mode `qmd embed` output is inherited (user
+/// sees the embedder's progress). In JSON mode it's captured to /dev/null
+/// to keep stdout reserved for the doctor JSON document.
+fn fix_qmd_embeddings(json: bool) -> FixOutcome {
+    use std::process::{Command, Stdio};
     let qmd = match which::which("qmd") {
         Ok(p) => p,
         Err(_) => {
@@ -242,8 +285,13 @@ fn fix_qmd_embeddings() -> FixOutcome {
             )
         }
     };
-    println!("  · running: qmd embed");
-    let status = Command::new(qmd).arg("embed").status();
+    status_line(json, "running: qmd embed");
+    let mut cmd = Command::new(qmd);
+    cmd.arg("embed");
+    if json {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    let status = cmd.status();
     match status {
         Ok(s) if s.success() => FixOutcome::Fixed("qmd embed completed".to_string()),
         Ok(s) => FixOutcome::Failed(format!(
@@ -258,9 +306,9 @@ fn fix_qmd_embeddings() -> FixOutcome {
 /// qmd hook, or `Bash(onebrain *)` permission entry is missing or wrong.
 /// Re-running `register-hooks` is fully idempotent (Bun parity) and
 /// repairs all three in one atomic settings.json write.
-fn fix_settings_hooks(vault_root: &Path) -> FixOutcome {
+fn fix_settings_hooks(vault_root: &Path, json: bool) -> FixOutcome {
     use onebrain_fs::register_hooks::{run, RegisterHooksOptions};
-    println!("  · running: register-hooks");
+    status_line(json, "running: register-hooks");
     let opts = RegisterHooksOptions {
         vault_dir: Some(vault_root.to_path_buf()),
         ..Default::default()
@@ -280,7 +328,7 @@ fn fix_settings_hooks(vault_root: &Path) -> FixOutcome {
 /// Recipe — `plugin-files` warning means INSTRUCTIONS.md / agents/ /
 /// skills/ / .claude-plugin/ is missing or incomplete. Re-overlay from
 /// the upstream tarball via the existing vault-sync orchestrator.
-fn fix_plugin_files(vault_root: &Path) -> FixOutcome {
+fn fix_plugin_files(vault_root: &Path, json: bool) -> FixOutcome {
     use onebrain_fs::{run_vault_sync, VaultSyncOptions};
     // Mirror the safety guard from `onebrain vault-sync` so the recipe
     // cannot accidentally splatter the filesystem root or $HOME on a
@@ -288,8 +336,19 @@ fn fix_plugin_files(vault_root: &Path) -> FixOutcome {
     if let Err(e) = refuse_dangerous_vault_path(vault_root) {
         return FixOutcome::Failed(e.to_string());
     }
-    println!("  · running: vault-sync");
-    let result = run_vault_sync(vault_root, VaultSyncOptions::default());
+    status_line(json, "running: vault-sync");
+    // In JSON mode route vault-sync's PlainProgress to stderr so stdout
+    // remains reserved for the JSON document (B-H1 fix).
+    let opts = if json {
+        VaultSyncOptions {
+            is_tty: Some(false),
+            progress_writer: Some(Box::new(std::io::stderr())),
+            ..Default::default()
+        }
+    } else {
+        VaultSyncOptions::default()
+    };
+    let result = run_vault_sync(vault_root, opts);
     if result.ok {
         FixOutcome::Fixed("plugin files re-overlaid from upstream".to_string())
     } else {
@@ -312,8 +371,8 @@ fn fix_plugin_files(vault_root: &Path) -> FixOutcome {
 /// The recipe handles all four. YAML comments are not preserved (serde_yaml
 /// re-serializes from the parsed model) — the Fixed message calls this out
 /// so the user knows what changed besides the keys.
-fn fix_vault_yml_keys(vault_root: &Path) -> FixOutcome {
-    println!("  · running: backfill vault.yml");
+fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
+    status_line(json, "running: backfill vault.yml");
     let path = vault_root.join("vault.yml");
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -464,9 +523,9 @@ fn fix_vault_yml_keys(vault_root: &Path) -> FixOutcome {
 ///
 /// Writes via `register_hooks::write_settings` for atomic tmp+rename and the
 /// canonical 4-space indent (matches register-hooks output byte-for-byte).
-fn fix_claude_settings(vault_root: &Path) -> FixOutcome {
+fn fix_claude_settings(vault_root: &Path, json: bool) -> FixOutcome {
     use onebrain_fs::register_hooks::{settings_path, write_settings};
-    println!("  · running: clean settings.json");
+    status_line(json, "running: clean settings.json");
     let path = settings_path(vault_root);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -646,7 +705,7 @@ mod tests {
     fn fix_vault_yml_keys_backfills_missing_keys() {
         let d = tempdir().unwrap();
         fs::write(d.path().join("vault.yml"), "qmd_collection: foo\n").unwrap();
-        let outcome = fix_vault_yml_keys(d.path());
+        let outcome = fix_vault_yml_keys(d.path(), false);
         match outcome {
             FixOutcome::Fixed(msg) => {
                 assert!(msg.contains("update_channel"), "msg: {msg}");
@@ -672,7 +731,7 @@ mod tests {
             "update_channel: stable\nfolders: null\n",
         )
         .unwrap();
-        let outcome = fix_vault_yml_keys(d.path());
+        let outcome = fix_vault_yml_keys(d.path(), false);
         match outcome {
             FixOutcome::Fixed(msg) => assert!(msg.contains("inbox"), "msg: {msg}"),
             other => panic!("expected Fixed, got: {other:?}"),
@@ -694,7 +753,7 @@ mod tests {
              folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n",
         )
         .unwrap();
-        let outcome = fix_vault_yml_keys(d.path());
+        let outcome = fix_vault_yml_keys(d.path(), false);
         match outcome {
             FixOutcome::Fixed(msg) => {
                 assert!(msg.contains("onebrain_version"), "msg: {msg}");
@@ -719,7 +778,7 @@ mod tests {
              folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n",
         )
         .unwrap();
-        let outcome = fix_vault_yml_keys(d.path());
+        let outcome = fix_vault_yml_keys(d.path(), false);
         match outcome {
             FixOutcome::Fixed(msg) => assert!(msg.contains("checkpoint"), "msg: {msg}"),
             other => panic!("expected Fixed, got: {other:?}"),
@@ -735,7 +794,7 @@ mod tests {
         let clean = "update_channel: stable\n\
                      folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n";
         fs::write(d.path().join("vault.yml"), clean).unwrap();
-        let outcome = fix_vault_yml_keys(d.path());
+        let outcome = fix_vault_yml_keys(d.path(), false);
         match outcome {
             FixOutcome::Fixed(msg) => assert!(msg.contains("already"), "msg: {msg}"),
             other => panic!("expected Fixed (no-op), got: {other:?}"),
@@ -759,7 +818,7 @@ mod tests {
             serde_json::to_string_pretty(&original).unwrap(),
         )
         .unwrap();
-        let outcome = fix_claude_settings(d.path());
+        let outcome = fix_claude_settings(d.path(), false);
         match outcome {
             FixOutcome::Fixed(msg) => assert!(msg.contains("removed"), "msg: {msg}"),
             other => panic!("expected Fixed, got: {other:?}"),
@@ -784,7 +843,7 @@ mod tests {
             r#"{"permissions": {}}"#,
         )
         .unwrap();
-        let outcome = fix_claude_settings(d.path());
+        let outcome = fix_claude_settings(d.path(), false);
         match outcome {
             FixOutcome::Fixed(msg) => assert!(msg.contains("already clean"), "msg: {msg}"),
             other => panic!("expected Fixed (no-op), got: {other:?}"),
@@ -797,7 +856,7 @@ mod tests {
         while let Some(parent) = root.parent() {
             root = parent.to_path_buf();
         }
-        let outcome = fix_plugin_files(&root);
+        let outcome = fix_plugin_files(&root, false);
         match outcome {
             FixOutcome::Failed(msg) => assert!(msg.contains("filesystem root"), "msg: {msg}"),
             other => panic!("expected Failed (safety guard), got: {other:?}"),

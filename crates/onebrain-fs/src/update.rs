@@ -44,6 +44,10 @@ pub struct UpdateResult {
     pub latest_version: Option<String>,
     pub current_version: Option<String>,
     pub error: Option<String>,
+    /// RFC-3339 timestamp from the GitHub release `published_at` field, when
+    /// the upstream payload included it. Used by `onebrain update --json`
+    /// to expose `released_at` in the document.
+    pub latest_published_at: Option<DateTime<Utc>>,
 }
 
 /// Release info parsed from the GitHub `releases/latest` payload.
@@ -380,7 +384,7 @@ pub(crate) fn build_install_command(version: &str, is_windows: bool) -> Vec<Stri
 /// fall back to string-equality (the worst case is that we proceed with
 /// the install — the existing Bun behavior — rather than locking the user
 /// out of legitimate updates).
-pub(crate) fn version_at_least(current: &str, candidate: &str) -> bool {
+pub fn version_at_least(current: &str, candidate: &str) -> bool {
     let c = current.trim_start_matches('v');
     let r = candidate.trim_start_matches('v');
     match (semver::Version::parse(c), semver::Version::parse(r)) {
@@ -601,6 +605,7 @@ pub fn run_update(mut opts: UpdateOptions) -> UpdateResult {
     };
     write_stdout(&mut opts, &format!("latest: {}", release.version));
     result.latest_version = Some(release.version.clone());
+    result.latest_published_at = release.published_at;
 
     // --check dry-run. Emit the up-to-date verdict here too so the user
     // sees what the install path would decide, not just the raw "current vs

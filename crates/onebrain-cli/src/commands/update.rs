@@ -57,36 +57,55 @@ pub fn run(check: bool, fresh: bool, json: bool, plan: bool) -> Result<i32> {
 /// Build the JSON document for `--json` / `--plan`. The plan variant adds
 /// `release_url` and `binary_url_template` fields that the `/update` skill
 /// uses to present the release notes + a copy-paste download link.
+///
+/// Schema notes:
+/// - `update_available` is `null` (JSON) when the remote fetch failed —
+///   consumers must not interpret missing-latest as "no update".
+/// - `released_at` is emitted as RFC-3339 when the GitHub release payload
+///   carried `published_at`; absent otherwise.
 fn build_json_document(
     result: &onebrain_fs::update::UpdateResult,
     plan: bool,
 ) -> serde_json::Value {
     let current = result.current_version.as_deref().unwrap_or("");
     let latest = result.latest_version.as_deref().unwrap_or("");
-    let update_available = !current.is_empty()
-        && !latest.is_empty()
-        && !version_at_least_str(current, latest);
+    // When fetch failed, `latest` is empty — emit JSON null so consumers
+    // can distinguish "fetch failed" from "you're current".
+    let update_available_value = if latest.is_empty() {
+        serde_json::Value::Null
+    } else if current.is_empty() {
+        // No local version detected — treat as "available" to be safe.
+        serde_json::Value::Bool(true)
+    } else {
+        serde_json::Value::Bool(!onebrain_fs::update::version_at_least(current, latest))
+    };
+    let update_available_bool = matches!(update_available_value, serde_json::Value::Bool(true));
     let mut doc = serde_json::json!({
         "ok": result.ok,
         "current": current,
         "latest": latest,
-        "update_available": update_available,
+        "update_available": update_available_value,
     });
+    if let Some(ts) = result.latest_published_at {
+        doc.as_object_mut().unwrap().insert(
+            "released_at".to_string(),
+            serde_json::Value::String(ts.to_rfc3339()),
+        );
+    }
     if let Some(err) = &result.error {
         doc.as_object_mut()
             .unwrap()
             .insert("error".to_string(), serde_json::Value::String(err.clone()));
     }
-    if plan && update_available && !latest.is_empty() {
+    if plan && update_available_bool {
         let tag = if latest.starts_with('v') {
             latest.to_string()
         } else {
             format!("v{latest}")
         };
         let release_url = format!("{RELEASES_BASE_URL}/tag/{tag}");
-        let binary_url_template = format!(
-            "{RELEASES_BASE_URL}/download/{tag}/onebrain-<TRIPLE>.<EXT>"
-        );
+        let binary_url_template =
+            format!("{RELEASES_BASE_URL}/download/{tag}/onebrain-<TRIPLE>.<EXT>");
         doc.as_object_mut().unwrap().insert(
             "release_url".to_string(),
             serde_json::Value::String(release_url),
@@ -97,20 +116,6 @@ fn build_json_document(
         );
     }
     doc
-}
-
-/// Local copy of `update::version_at_least` for the JSON output. We
-/// duplicate the semver comparison here (instead of re-exporting from
-/// onebrain-fs) so the JSON shape stays decoupled from the orchestrator's
-/// internal logic — the CLI-side meaning of "update available" is exactly
-/// "remote semver > local semver".
-fn version_at_least_str(current: &str, candidate: &str) -> bool {
-    let c = current.trim_start_matches('v');
-    let r = candidate.trim_start_matches('v');
-    match (semver::Version::parse(c), semver::Version::parse(r)) {
-        (Ok(curr), Ok(cand)) => curr >= cand,
-        _ => current == candidate,
-    }
 }
 
 #[cfg(test)]
@@ -125,6 +130,7 @@ mod tests {
             current_version: Some(current.to_string()),
             latest_version: Some(latest.to_string()),
             error: None,
+            latest_published_at: None,
         }
     }
 
@@ -182,9 +188,31 @@ mod tests {
             current_version: Some("3.0.0-alpha.7".into()),
             latest_version: None,
             error: Some("Fetch failed: network".into()),
+            latest_published_at: None,
         };
         let doc = build_json_document(&r, false);
         assert_eq!(doc["ok"], false);
         assert_eq!(doc["error"], "Fetch failed: network");
+        // When fetch fails the latest version is unknown → emit JSON null
+        // (not false) so consumers don't read it as "you're current".
+        assert!(doc["update_available"].is_null());
+    }
+
+    #[test]
+    fn json_doc_emits_released_at_when_present() {
+        use chrono::TimeZone;
+        let mut r = result("3.0.0-alpha.7", "3.0.0-alpha.8", true);
+        r.latest_published_at = Some(chrono::Utc.with_ymd_and_hms(2026, 5, 21, 10, 0, 0).unwrap());
+        let doc = build_json_document(&r, false);
+        let released_at = doc["released_at"].as_str().unwrap();
+        // RFC-3339 with explicit timezone — chrono renders Utc as "+00:00".
+        assert!(released_at.starts_with("2026-05-21T10:00:00"));
+    }
+
+    #[test]
+    fn json_doc_omits_released_at_when_absent() {
+        let r = result("3.0.0-alpha.7", "3.0.0-alpha.8", true);
+        let doc = build_json_document(&r, false);
+        assert!(doc.get("released_at").is_none());
     }
 }
