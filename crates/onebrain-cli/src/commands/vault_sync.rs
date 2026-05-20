@@ -10,6 +10,16 @@ use std::env;
 /// Entry point — returns `Ok(0)` on success, `Ok(1)` on any critical failure.
 /// Side-effects: writes to the vault filesystem; prints `vault-sync: …` lines
 /// to stdout in non-TTY mode (Bun parity).
+///
+/// The orchestrator already prints one of `vault-sync: download failed: …` /
+/// `vault-sync: plugin sync failed: …` / `vault-sync: harness merge failed:
+/// …` / `vault-sync: vault.yml update failed: …` to stderr on every known
+/// failure path, so the handler keeps its own output minimal (Bun's
+/// `vaultSyncCommand` does `process.exit(1)` with no extra logging). We
+/// still re-print `result.error` as a defensive backstop for any future
+/// failure path that sets `result.error` without logging to stderr — better
+/// to occasionally duplicate one line than leave the user with a silent
+/// non-zero exit.
 pub fn run() -> Result<i32> {
     let cwd = env::current_dir().context("read current directory")?;
     let vault_root =
@@ -20,6 +30,10 @@ pub fn run() -> Result<i32> {
     if !result.ok {
         if let Some(err) = result.error.as_ref() {
             eprintln!("vault-sync: failed: {err}");
+        } else {
+            // No structured error captured — still surface non-zero with a
+            // generic hint so schedulers/CI can see something happened.
+            eprintln!("vault-sync: failed (no error detail captured)");
         }
         return Ok(1);
     }
