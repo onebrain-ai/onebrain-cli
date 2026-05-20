@@ -1,5 +1,5 @@
 ---
-latest_version: 3.0.0-alpha.5
+latest_version: 3.0.0-alpha.6
 released: 2026-05-20
 ---
 
@@ -11,6 +11,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## v3.0.0-alpha.6 — fix(update): target CLI repo + prerelease-safe · ci: GHA Node 24 · docs: README hero + badges
+
+- **`onebrain update` now targets the CLI repo** (`onebrain-ai/onebrain-cli`) instead of the plugin repo (`onebrain-ai/onebrain`). Prior to alpha.6 the endpoint advertised `latest: v2.3.3` (the plugin repo's last Bun binary) for every alpha CLI user — and the non-`--check` form would happily downgrade users from `v3.0.0-alpha.5` to `v2.3.3`. The endpoint also switches from `/releases/latest` (stable-only) to `/releases?per_page=1` (most recent including prereleases) so the CLI's own alpha cycle is visible to itself.
+- **Semver-aware version comparison** via the `semver` crate replaces the string equality check the Bun port carried over. `version_at_least(current, candidate)` refuses to install when the local version is already at or ahead of the remote — same user-visible message ("already up to date"), no more silent downgrades.
+- **GitHub Actions Node 24 bump**: `actions/checkout@v4` → `@v6`, `actions/upload-artifact@v4` → `@v7`, `actions/download-artifact@v4` → `@v8` across both `ci.yml` and `release.yml`. Clears the 8 deprecation warnings GHA emits for every workflow run ahead of the June 2nd 2026 forced cutover. `Swatinem/rust-cache@v2` stays — upstream maintains v2.x on Node 24.
+- **README hero/banner + CLI-only badges**: aligned with the plugin repo's brand presentation (banner asset, brand link, X follow, GitHub stars) but the version badge now tracks `onebrain-ai/onebrain-cli` releases (with `include_prereleases`) rather than the plugin's `@onebrain-ai/cli` npm tag. License badge updated to AGPL-3.0 to match the CLI's actual license.
 
 ## v3.0.0-alpha.5 — feat: doctor --fix lands · cleaner --help output
 
