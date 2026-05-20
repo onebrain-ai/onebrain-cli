@@ -68,10 +68,7 @@ pub fn run(fix: bool) -> Result<i32> {
         if issues.is_empty() {
             println!("\nFix · nothing to do — no issues.");
         } else {
-            println!(
-                "\nFix · attempting recipes for {} issue(s)",
-                issues.len()
-            );
+            println!("\nFix · attempting recipes for {} issue(s)", issues.len());
             let outcomes: Vec<(String, FixOutcome)> = issues
                 .iter()
                 .map(|r| (r.check.clone(), attempt_fix(r, vault_root.as_path())))

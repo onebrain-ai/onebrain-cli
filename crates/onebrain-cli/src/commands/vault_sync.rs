@@ -68,4 +68,3 @@ pub fn run(vault_root_override: Option<PathBuf>, branch: Option<String>) -> Resu
     }
     Ok(0)
 }
-
