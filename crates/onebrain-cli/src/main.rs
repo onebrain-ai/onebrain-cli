@@ -25,13 +25,13 @@ enum Cmd {
         vault_dir: Option<std::path::PathBuf>,
     },
 
-    /// Scan for orphan checkpoint files in 07-logs/checkpoint/ (Slice 2).
+    /// Scan for orphan checkpoint files in 07-logs/checkpoint/.
     OrphanScan {
         logs_folder: String,
         session_token: String,
     },
 
-    /// Rebuild the qmd search index (Slice 3).
+    /// Rebuild the qmd search index.
     QmdReindex,
 
     /// Handle checkpoint lifecycle (stop | reset) · called by Claude Code Stop hook.
@@ -46,13 +46,13 @@ enum Cmd {
     /// Print harness detection result (internal).
     Harness,
 
-    /// Run health checks against the current vault (Slice 6).
+    /// Run health checks against the current vault.
     Doctor {
         #[arg(long)]
         fix: bool,
     },
 
-    /// Install Claude Code hooks for this vault (Slice 7).
+    /// Install Claude Code hooks for this vault.
     RegisterHooks {
         /// Vault root · defaults to current working directory · accepts `--vault-dir` (Bun v2.3.3 parity).
         #[arg(long, visible_alias = "vault-dir")]
@@ -65,7 +65,7 @@ enum Cmd {
         remove: bool,
     },
 
-    /// Install OS-level scheduler entries from vault.yml (Slice 8).
+    /// Install OS-level scheduler entries from vault.yml.
     RegisterSchedule {
         /// Vault root directory · defaults to current working directory · accepts `--vault-dir` (Bun v2.3.3 parity).
         #[arg(long, visible_alias = "vault-dir")]
@@ -85,12 +85,12 @@ enum Cmd {
         /// Print a status report (which entries are installed).
         #[arg(long)]
         status: bool,
-        /// Fire a scheduled skill once for testing (deferred to Slice 12).
+        /// Fire a scheduled skill once for testing (deferred).
         #[arg(long)]
         test: Option<String>,
     },
 
-    /// Run a one-shot vault migration (Slice 9).
+    /// Run a one-shot vault migration.
     Migrate {
         /// Migration name (currently: `backfill-recapped`).
         name: String,
@@ -104,7 +104,7 @@ enum Cmd {
         vault: Option<String>,
     },
 
-    /// Initialize a new vault (Slice 10).
+    /// Initialize a new vault.
     Init {
         /// Skip all prompts and install the Essentials schedule preset (non-interactive · CI-friendly).
         #[arg(long)]
@@ -120,7 +120,7 @@ enum Cmd {
         no_sync: bool,
     },
 
-    /// Update OneBrain system files from GitHub (Slice 11).
+    /// Update OneBrain system files from GitHub.
     Update {
         /// Dry run · report what would change without installing.
         #[arg(long)]
@@ -131,7 +131,7 @@ enum Cmd {
         fresh: bool,
     },
 
-    /// Run a OneBrain skill in headless mode (Slice 12).
+    /// Run a OneBrain skill in headless mode.
     RunSkill {
         /// Vault root directory · accepts `--vault-dir` (Bun v2.3.3 parity).
         #[arg(long, visible_alias = "vault-dir")]
@@ -143,7 +143,7 @@ enum Cmd {
         args: Vec<String>,
     },
 
-    /// Sync vault between local and Cloud (Slice 13).
+    /// Sync vault between local and Cloud.
     VaultSync {
         /// Optional vault root · defaults to walk-up from cwd (Bun v2.3.3 parity).
         vault_root: Option<std::path::PathBuf>,

@@ -110,17 +110,34 @@ fn doctor_missing_vault_yml_errors_out() {
         .stderr(predicate::str::contains("not inside a vault"));
 }
 
+/// `--fix` on a vault with no warnings (the minimal vault used by these
+/// integration tests has qmd_collection unset, but our patch reports
+/// "qmd_collection not set" as warn) — we just verify the fix-summary
+/// block appears in stdout. The full fix recipes (e.g. spawning qmd embed)
+/// are exercised by unit tests of `fix_qmd_embeddings`, not here.
 #[test]
-fn doctor_fix_flag_emits_deferred_stub() {
+fn doctor_fix_flag_runs_fix_pass() {
     let d = tempdir().unwrap();
     write_minimal_vault(d.path());
-    Command::cargo_bin("onebrain")
+    let assert = Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(d.path())
         .args(["doctor", "--fix"])
         .assert()
-        .success()
-        .stderr(predicate::str::contains("deferred to v3.0.1"));
+        .success();
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default();
+    assert!(
+        stdout.contains("Fix:") || stdout.contains("Fix summary"),
+        "expected the Fix block in stdout · got: {stdout}"
+    );
+    // No "deferred to v3.0.1" stub anymore — that was the alpha.4 placeholder.
+    let stderr =
+        String::from_utf8(assert.get_output().stderr.clone()).unwrap_or_default();
+    assert!(
+        !stderr.contains("deferred to v3.0.1"),
+        "stub message should be gone in alpha.5"
+    );
 }
 
 #[test]

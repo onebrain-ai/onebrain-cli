@@ -1,5 +1,5 @@
 ---
-latest_version: 3.0.0-alpha.4
+latest_version: 3.0.0-alpha.5
 released: 2026-05-20
 ---
 
@@ -11,6 +11,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## v3.0.0-alpha.5 — feat: doctor --fix lands · cleaner --help output
+
+- **`onebrain doctor --fix` now actually attempts repair** instead of emitting a "deferred to v3.0.1" stub. First recipe is `qmd-embeddings` → spawns `qmd embed` and waits for it, streaming the embedder's output. After the fix pass, doctor re-runs all checks and prints a post-fix report so the user sees the new state in a single invocation. Untyped warnings degrade to "manual" with the hint message attached.
+- **Removed `(Slice N)` markers from every subcommand description.** They were internal porting bookkeeping and showed up in `--help` (e.g. `Initialize a new vault (Slice 10)`). User-facing strings now drop the parenthetical; internal source comments that reference slice numbers are left as historical context.
+- New `FixOutcome { Fixed, Failed, Manual }` enum + summary block ("Fix summary: N fixed · M failed · K manual") so the user can quickly read what actually changed.
 
 ## v3.0.0-alpha.4 — perf: faster doctor + warm-cache update --check
 

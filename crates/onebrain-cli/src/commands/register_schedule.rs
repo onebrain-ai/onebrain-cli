@@ -438,7 +438,7 @@ fn print_status(vault: &Path) -> Result<()> {
 fn test_run(_vault: &Path, skill: &str) -> Result<()> {
     println!("Testing scheduled invocation of {skill}...");
     println!("(Spawns `onebrain run-skill` which shells out to Claude Code.)");
-    eprintln!("--test is not yet implemented in v3.0 · deferred to Slice 12 (run-skill)");
+    eprintln!("--test is not yet implemented in v3.0 · deferred");
     Ok(())
 }
 
