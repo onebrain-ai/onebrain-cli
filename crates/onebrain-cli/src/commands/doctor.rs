@@ -698,6 +698,79 @@ mod tests {
         assert!(s.contains("fix before using"));
     }
 
+    #[test]
+    fn print_report_json_emits_summary_and_top_level_ok() {
+        let results = vec![
+            DoctorResult::ok("a", "good"),
+            DoctorResult::ok("b", "good"),
+            DoctorResult::warn("c", "iffy"),
+        ];
+        let mut buf = Vec::new();
+        print_report_json(&results, false, vec![], &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+        // Top-level `ok` is boolean (no errors → true even with warnings).
+        assert_eq!(doc["ok"], true);
+        // `summary.passing` is the OK count — not boolean.
+        assert_eq!(doc["summary"]["passing"], 2);
+        assert_eq!(doc["summary"]["warnings"], 1);
+        assert_eq!(doc["summary"]["errors"], 0);
+        assert_eq!(doc["summary"]["total"], 3);
+        // `fix` key absent when not requested.
+        assert!(doc.get("fix").is_none());
+    }
+
+    #[test]
+    fn print_report_json_ok_false_when_any_error() {
+        let results = vec![DoctorResult::error("a", "broken")];
+        let mut buf = Vec::new();
+        print_report_json(&results, false, vec![], &mut buf).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(doc["ok"], false);
+        assert_eq!(doc["summary"]["errors"], 1);
+    }
+
+    #[test]
+    fn print_report_json_emits_empty_fix_array_when_requested_with_no_issues() {
+        // The A-H2 regression case from the alpha.8 review: `fix[]` must
+        // appear (even empty) so consumers can distinguish "user didn't
+        // ask" from "user asked but nothing to fix".
+        let results = vec![DoctorResult::ok("vault.yml", "valid")];
+        let mut buf = Vec::new();
+        print_report_json(&results, true, vec![], &mut buf).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert!(doc.get("fix").is_some());
+        assert_eq!(doc["fix"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn print_report_json_carries_fix_outcomes_through() {
+        let results = vec![DoctorResult::ok("vault.yml", "valid")];
+        let outcomes = vec![serde_json::json!({
+            "check": "qmd-embeddings",
+            "outcome": "fixed",
+            "message": "qmd embed completed",
+        })];
+        let mut buf = Vec::new();
+        print_report_json(&results, true, outcomes, &mut buf).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(doc["fix"][0]["outcome"], "fixed");
+        assert_eq!(doc["fix"][0]["check"], "qmd-embeddings");
+    }
+
+    #[test]
+    fn print_report_json_serializes_check_hint_and_details() {
+        let results = vec![DoctorResult::warn("c", "iffy")
+            .with_hint("Try X")
+            .with_details(vec!["d1".into(), "d2".into()])];
+        let mut buf = Vec::new();
+        print_report_json(&results, false, vec![], &mut buf).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(doc["checks"][0]["status"], "warn");
+        assert_eq!(doc["checks"][0]["hint"], "Try X");
+        assert_eq!(doc["checks"][0]["details"][1], "d2");
+    }
+
     use std::fs;
     use tempfile::tempdir;
 

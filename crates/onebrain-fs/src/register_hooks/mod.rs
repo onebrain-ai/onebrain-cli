@@ -55,10 +55,23 @@ pub struct RegisterHooksResult {
     pub claude_harness: bool,
     /// True when --remove mode was used.
     pub remove_mode: bool,
+    /// True when the vault is in direct mode (no harness). In this state
+    /// `register-hooks` is a no-op by design: direct invocation calls the
+    /// `onebrain` binary from the user's shell and needs no settings.json
+    /// hook plumbing. CLI surfaces this so the user gets a clear message
+    /// instead of silent success.
+    pub direct_mode: bool,
 }
 
-/// Run the register-hooks workflow. Single-harness (claude) only; gemini is a
-/// no-op (Bun parity), direct is deferred to v3.0.1.
+/// Run the register-hooks workflow. Harness-aware:
+/// - `Claude` → write Stop + PostToolUse hooks and 14 permissions to
+///   `.claude/settings.json` (the Bun-parity behavior).
+/// - `Gemini` → no-op (Bun parity — Gemini harness doesn't ship a hooks
+///   integration yet).
+/// - `Direct` → no-op with `direct_mode = true` on the result so the CLI
+///   can emit a clear "nothing to register in direct mode" message. Direct
+///   invocations call `onebrain` from the user's shell; there is no
+///   harness-side settings file to mutate.
 pub fn run(opts: RegisterHooksOptions) -> Result<RegisterHooksResult> {
     let vault_dir = opts
         .vault_dir
@@ -71,8 +84,16 @@ pub fn run(opts: RegisterHooksOptions) -> Result<RegisterHooksResult> {
     };
 
     let harnesses = detect_harnesses(&vault_dir);
+    if harnesses.contains(&Harness::Direct) && !harnesses.contains(&Harness::Claude) {
+        // Direct mode only — nothing to register but signal it explicitly so
+        // the CLI can print a clear message rather than silent success.
+        result.direct_mode = true;
+        result.ok = true;
+        return Ok(result);
+    }
     if !harnesses.contains(&Harness::Claude) {
-        // No claude harness — Bun's claude branch never runs; nothing to do.
+        // Gemini-only (or no harness directories at all and no env override)
+        // — Bun's claude branch never runs; nothing to do.
         result.ok = true;
         return Ok(result);
     }

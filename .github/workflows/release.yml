@@ -36,7 +36,7 @@ jobs:
             archive: tar.gz
             apt: musl-tools
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
+            os: windows-2025
             archive: zip
           - target: aarch64-pc-windows-msvc
             os: windows-11-arm

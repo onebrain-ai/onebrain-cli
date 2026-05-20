@@ -151,7 +151,12 @@ fn cli_remove_strips_state() {
 }
 
 #[test]
-fn cli_no_claude_dir_is_noop() {
+fn cli_no_claude_dir_falls_into_direct_mode() {
+    // With no harness dirs present, detect_harnesses() now returns
+    // [Direct] (alpha.9: direct harness landed as a first-class no-op
+    // branch instead of falling through to the "no claude harness"
+    // gemini-style message). Either way the test's invariant — no
+    // settings.json written — still holds.
     let d = tempdir().unwrap();
     write_vault(d.path(), false, None);
     Command::cargo_bin("onebrain")
@@ -159,7 +164,7 @@ fn cli_no_claude_dir_is_noop() {
         .args(["register-hooks", "--vault", d.path().to_str().unwrap()])
         .assert()
         .success()
-        .stdout(predicate::str::contains("no claude harness"));
+        .stdout(predicate::str::contains("direct mode"));
     assert!(!d.path().join(".claude").join("settings.json").exists());
 }
 

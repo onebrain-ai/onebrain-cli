@@ -1,14 +1,30 @@
 //! `onebrain update` — thin wiring around `onebrain_fs::update::run_update`.
 //!
-//! v3.0 ships non-TTY plain-text output by default. `--json` and `--plan`
-//! emit machine-readable documents instead (intended for scripts and the
-//! `/update` plugin skill). TTY pretty-printing (spinners, color, ascii
-//! banner) is tracked for alpha.9 → GA.
+//! Three output modes:
+//! - **JSON** (`--json` / `--plan`): single machine-readable document
+//!   suppressing all orchestrator log lines.
+//! - **TTY** (interactive terminal, non-JSON): colorized status lines + an
+//!   `indicatif` spinner for the install phase (download takes a few seconds
+//!   on slow links; silent stdout would feel like a hang).
+//! - **Plain** (non-TTY, non-JSON — CI, redirected output): unchanged
+//!   line-by-line output, no ANSI escapes, no spinner.
 
 use anyhow::Result;
-use onebrain_fs::update::{run_update, UpdateOptions};
+use indicatif::{ProgressBar, ProgressStyle};
+use is_terminal::IsTerminal;
+use onebrain_fs::update::{default_install_binary, run_update, UpdateError, UpdateOptions};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const RELEASES_BASE_URL: &str = "https://github.com/onebrain-ai/onebrain-cli/releases";
+
+// ANSI escape codes — kept inline rather than pulling a `colored`-style dep
+// for ~5 distinct color uses.
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_BOLD_CYAN: &str = "\x1b[1;36m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_RED: &str = "\x1b[31m";
+const ANSI_DIM: &str = "\x1b[2m";
 
 /// Run `onebrain update`. Returns the exit code; the caller is responsible
 /// for `std::process::exit`.
@@ -25,6 +41,7 @@ pub fn run(check: bool, fresh: bool, json: bool, plan: bool) -> Result<i32> {
     // dry-run on.
     let dry_run = check || plan;
     let want_json = json || plan;
+    let want_tty = !want_json && std::io::stdout().is_terminal();
 
     let opts = if want_json {
         // Suppress the orchestrator's plain-text log lines — JSON mode
@@ -36,6 +53,8 @@ pub fn run(check: bool, fresh: bool, json: bool, plan: bool) -> Result<i32> {
             stderr_lines: Some(Box::new(|_| {})),
             ..Default::default()
         }
+    } else if want_tty {
+        build_tty_options(dry_run, fresh)
     } else {
         UpdateOptions {
             check: dry_run,
@@ -52,6 +71,98 @@ pub fn run(check: bool, fresh: bool, json: bool, plan: bool) -> Result<i32> {
     }
 
     Ok(result.exit_code)
+}
+
+/// TTY-mode `UpdateOptions`: colorized line output via an `indicatif`-aware
+/// sink + a spinner that ticks during the install download. The spinner is
+/// shared between the sink (so `pb.println` interleaves correctly) and the
+/// `install_fn` wrapper (so we can `start`/`finish_with_message` around the
+/// real install). Both use an `Arc<Mutex<Option<ProgressBar>>>`.
+fn build_tty_options(dry_run: bool, fresh: bool) -> UpdateOptions {
+    let pb_cell: Arc<Mutex<Option<ProgressBar>>> = Arc::new(Mutex::new(None));
+
+    // stdout sink — color the well-known phase lines, route everything via
+    // the spinner's `println` when one is active so output doesn't trample.
+    let pb_for_stdout = Arc::clone(&pb_cell);
+    let stdout_sink: Box<dyn FnMut(&str) + Send> = Box::new(move |line: &str| {
+        let colored = colorize_update_line(line);
+        let guard = pb_for_stdout.lock().expect("pb mutex poisoned");
+        match guard.as_ref() {
+            Some(pb) => pb.println(colored),
+            None => println!("{colored}"),
+        }
+    });
+
+    // stderr sink — same pattern, but errors always go to stderr (matches
+    // the non-TTY behavior the orchestrator already has).
+    let pb_for_stderr = Arc::clone(&pb_cell);
+    let stderr_sink: Box<dyn FnMut(&str) + Send> = Box::new(move |line: &str| {
+        let colored = format!("{ANSI_RED}{line}{ANSI_RESET}");
+        let guard = pb_for_stderr.lock().expect("pb mutex poisoned");
+        match guard.as_ref() {
+            Some(pb) => {
+                // indicatif has no eprintln equivalent; suspend the spinner
+                // briefly so the error line lands on stderr without scramble.
+                pb.suspend(|| eprintln!("{colored}"));
+            }
+            None => eprintln!("{colored}"),
+        }
+    });
+
+    // install_fn wrapper — start the spinner, run the real install, stop.
+    let pb_for_install = Arc::clone(&pb_cell);
+    let install_fn: InstallFn = Box::new(move |version: &str| {
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        pb.set_message(format!("downloading onebrain {version}…"));
+        pb.enable_steady_tick(Duration::from_millis(80));
+        // Hand the spinner to the sinks while install runs.
+        *pb_for_install.lock().expect("pb mutex poisoned") = Some(pb.clone());
+
+        let result = default_install_binary(version);
+
+        // Release the spinner before the orchestrator's next stdout line
+        // so the install summary line ("done: …") doesn't fight for the
+        // cursor with finish_with_message.
+        *pb_for_install.lock().expect("pb mutex poisoned") = None;
+        match &result {
+            Ok(_) => pb.finish_and_clear(),
+            Err(_) => pb.abandon(),
+        }
+        result
+    });
+
+    UpdateOptions {
+        check: dry_run,
+        fresh,
+        stdout_lines: Some(stdout_sink),
+        stderr_lines: Some(stderr_sink),
+        install_fn: Some(install_fn),
+        ..Default::default()
+    }
+}
+
+/// Local alias for the install closure type — clippy complains about the
+/// raw `Box<dyn Fn(...) + Send + Sync>` shape inline. The orchestrator's
+/// `UpdateOptions::install_fn` field is identically shaped, so the alias is
+/// purely a readability win.
+type InstallFn = Box<dyn Fn(&str) -> Result<(), UpdateError> + Send + Sync>;
+
+/// Map known orchestrator log-line prefixes to ANSI-colored variants. Lines
+/// that don't match a known prefix are passed through untouched.
+fn colorize_update_line(line: &str) -> String {
+    if line == "OneBrain Update" {
+        format!("{ANSI_BOLD_CYAN}{line}{ANSI_RESET}")
+    } else if line.starts_with("done:") {
+        format!("{ANSI_GREEN}{line}{ANSI_RESET}")
+    } else if line.starts_with("already up to date") {
+        format!("{ANSI_DIM}{line}{ANSI_RESET}")
+    } else {
+        line.to_string()
+    }
 }
 
 /// Build the JSON document for `--json` / `--plan`. The plan variant adds
@@ -106,13 +217,29 @@ fn build_json_document(
         let release_url = format!("{RELEASES_BASE_URL}/tag/{tag}");
         let binary_url_template =
             format!("{RELEASES_BASE_URL}/download/{tag}/onebrain-<TRIPLE>.<EXT>");
-        doc.as_object_mut().unwrap().insert(
+        let obj = doc.as_object_mut().unwrap();
+        obj.insert(
             "release_url".to_string(),
             serde_json::Value::String(release_url),
         );
-        doc.as_object_mut().unwrap().insert(
+        obj.insert(
             "binary_url_template".to_string(),
             serde_json::Value::String(binary_url_template),
+        );
+        // Enumerate the placeholders so callers don't have to guess the
+        // published target set. Each entry pairs a target triple with the
+        // archive extension that triple ships with.
+        obj.insert(
+            "binary_targets".to_string(),
+            serde_json::json!([
+                {"triple": "aarch64-apple-darwin",        "ext": "tar.gz"},
+                {"triple": "x86_64-apple-darwin",         "ext": "tar.gz"},
+                {"triple": "aarch64-unknown-linux-gnu",   "ext": "tar.gz"},
+                {"triple": "x86_64-unknown-linux-gnu",    "ext": "tar.gz"},
+                {"triple": "x86_64-unknown-linux-musl",   "ext": "tar.gz"},
+                {"triple": "aarch64-pc-windows-msvc",     "ext": "zip"},
+                {"triple": "x86_64-pc-windows-msvc",      "ext": "zip"},
+            ]),
         );
     }
     doc

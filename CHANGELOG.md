@@ -1,5 +1,5 @@
 ---
-latest_version: 3.0.0-alpha.8
+latest_version: 3.0.0-alpha.9
 released: 2026-05-20
 ---
 
@@ -11,6 +11,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## v3.0.0-alpha.9 — GA candidate: fix `onebrain update` install path · TTY spinner · direct harness · real `--test` · Windows pin
+
+- **`onebrain update` install path rewritten to fetch directly from GitHub Release.** The alpha.1 → alpha.8 builds shelled out to `bun install -g @onebrain-ai/cli@<v>` (Unix) / `npm install -g …` (Windows), but the v3.x Rust binary was never published to npm — every real-world `onebrain update` from alpha.1 through alpha.8 failed with "package exists but version not found." The new path resolves the target triple at runtime via `cfg!` macros, downloads the GitHub Release tarball over HTTPS, extracts the `onebrain` binary, and atomically replaces the running binary via tmp + rename (Windows path uses the rustup-style `.old` rename trick because the live .exe is locked). Real-world updates are now functional. Windows zip extraction is still stubbed — Windows users get a clear error pointing at the manual download for one more cycle.
+- **TTY spinner + colorized output for `onebrain update`.** Interactive terminals get an `indicatif` spinner during the download phase + ANSI color on the well-known phase lines ("OneBrain Update" cyan-bold, "done:" green, "already up to date" dim, errors red). Non-TTY output (CI, pipes, redirects) keeps the existing plain-text format byte-for-byte. `--json` continues to suppress all log output for the single-document contract.
+- **`direct` harness lands in `register-hooks` as a first-class no-op.** Previously vaults without a `.claude/` dir hit the gemini-only "no claude harness" message; now `Direct` mode (no harness dirs detected, or `ONEBRAIN_HARNESS=direct`) prints "direct mode · no hooks to register (run `onebrain` from your shell directly)" and the new `direct_mode` flag on `RegisterHooksResult` lets callers programmatically branch.
+- **`register-schedule --test <skill>` is now a real implementation.** Replaces the "deferred" stderr stub: walks vault.yml for the matching skill entry, builds the same argv launchd would emit (`onebrain run-skill --vault <path> --skill <name> [--arg key=value ...]`), spawns it synchronously with the parent env, streams stdout/stderr, and propagates the exit code. Lets users validate scheduled skill invocations end-to-end before committing the recurring cron line.
+- **Windows GHA runner pinned** to `windows-2025` (was `windows-latest`) ahead of the 2026-06-15 auto-migration to `windows-2025-vs2026`. Eliminates the migration warning on every CI run.
+- **`update --plan` JSON now includes `binary_targets[]`** enumerating the seven published `(triple, ext)` pairs, so consumers don't have to guess what the `<TRIPLE>` and `<EXT>` placeholders in `binary_url_template` can be.
+- +6 unit tests for `print_report_json` (top-level `ok` boolean vs `summary.passing` count, empty `fix[]` when requested, hint/details round-trip) + +5 tests in `update/install.rs` for the tar.gz extraction and atomic swap.
+- Legacy `build_install_command` + `run_subprocess` (the dead bun/npm code path) deleted along with their 3 tests. 670 tests passing · clippy + fmt clean.
 
 ## v3.0.0-alpha.8 — feat: JSON output modes for `doctor` + `update` · cosmetic
 

@@ -23,6 +23,13 @@ pub fn run(vault: Option<PathBuf>, dry_run: bool, remove: bool) -> Result<i32> {
 
 fn print_summary<W: Write>(result: &RegisterHooksResult, mut w: W) -> Result<()> {
     let prefix = "register-hooks:";
+    if result.direct_mode {
+        writeln!(
+            w,
+            "{prefix} direct mode · no hooks to register (run `onebrain` from your shell directly)"
+        )?;
+        return Ok(());
+    }
     if !result.claude_harness {
         writeln!(w, "{prefix} no claude harness detected · nothing to do")?;
         return Ok(());
@@ -84,7 +91,20 @@ mod tests {
             vault_dir: PathBuf::from("/tmp/v"),
             claude_harness: true,
             remove_mode: false,
+            direct_mode: false,
         }
+    }
+
+    #[test]
+    fn print_summary_direct_mode() {
+        let mut r = fake_result();
+        r.claude_harness = false;
+        r.direct_mode = true;
+        let mut buf = Vec::new();
+        print_summary(&r, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("direct mode"));
+        assert!(s.contains("no hooks to register"));
     }
 
     #[test]
