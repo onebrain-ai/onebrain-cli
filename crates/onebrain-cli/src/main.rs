@@ -52,6 +52,12 @@ enum Cmd {
         /// Attempt auto-repair recipes for any warnings, then re-run the checks.
         #[arg(long)]
         fix: bool,
+        /// Emit the report as a single JSON document instead of the plain-text
+        /// formatter. Intended for programmatic consumption (CI scripts, the
+        /// `/doctor` plugin skill, etc.). Combines cleanly with `--fix` — the
+        /// JSON reflects the post-fix state.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Install Claude Code hooks for this vault.
@@ -131,6 +137,17 @@ enum Cmd {
         /// GitHub (the cache is still updated with the fresh response).
         #[arg(long)]
         fresh: bool,
+        /// Emit a single JSON document with `current`, `latest`, `update_available`,
+        /// and (if reachable) `released_at`. Combines naturally with `--check`
+        /// (dry-run) for scripts that need the version delta without touching disk.
+        #[arg(long)]
+        json: bool,
+        /// Emit a richer "plan" JSON document including binary download URL +
+        /// release-notes URL. Implies `--check` (no install happens). Intended
+        /// for the `/update` plugin skill, which renders the plan to the user
+        /// before delegating the actual install back to the CLI.
+        #[arg(long, conflicts_with = "check")]
+        plan: bool,
     },
 
     /// Run a OneBrain skill in headless mode.
@@ -149,6 +166,11 @@ enum Cmd {
     VaultSync {
         /// Optional vault root · defaults to walk-up from cwd (Bun v2.3.3 parity).
         vault_root: Option<std::path::PathBuf>,
+        /// Vault root override · flag-form alternative to the positional `vault_root`
+        /// argument. Useful in scripted contexts where `--vault-dir <path>` is the
+        /// canonical pattern across all OneBrain subcommands.
+        #[arg(long = "vault-dir", conflicts_with = "vault_root")]
+        vault_dir: Option<std::path::PathBuf>,
         /// Override branch resolved from vault.yml::update_channel (e.g. `main` or `next`).
         #[arg(long)]
         branch: Option<String>,
@@ -177,7 +199,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Cmd::QmdReindex => commands::qmd_reindex::run(),
         Cmd::Checkpoint { mode, vault_dir } => commands::checkpoint::run(&mode, vault_dir),
         Cmd::Harness => commands::harness::run(),
-        Cmd::Doctor { fix } => std::process::exit(commands::doctor::run(fix)?),
+        Cmd::Doctor { fix, json } => std::process::exit(commands::doctor::run(fix, json)?),
         Cmd::RegisterHooks {
             vault,
             dry_run,
@@ -212,12 +234,25 @@ fn dispatch(cli: Cli) -> Result<()> {
             force,
             no_sync,
         } => std::process::exit(commands::init::run(yes, vault_dir, force, no_sync)?),
-        Cmd::Update { check, fresh } => std::process::exit(commands::update::run(check, fresh)?),
+        Cmd::Update {
+            check,
+            fresh,
+            json,
+            plan,
+        } => std::process::exit(commands::update::run(check, fresh, json, plan)?),
         Cmd::RunSkill { vault, skill, args } => {
             std::process::exit(commands::run_skill::run(&vault, &skill, &args)?)
         }
-        Cmd::VaultSync { vault_root, branch } => {
-            std::process::exit(commands::vault_sync::run(vault_root, branch)?)
+        Cmd::VaultSync {
+            vault_root,
+            vault_dir,
+            branch,
+        } => {
+            // `--vault-dir` and positional `vault_root` are mutually exclusive
+            // (enforced by clap's `conflicts_with`); coalesce here so the rest
+            // of the command sees a single resolved path.
+            let root = vault_root.or(vault_dir);
+            std::process::exit(commands::vault_sync::run(root, branch)?)
         }
     }
 }

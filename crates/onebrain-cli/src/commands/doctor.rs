@@ -34,7 +34,13 @@ enum FixOutcome {
 /// produced `DoctorStatus::Error`. With `--fix`, the run is two-pass:
 /// initial check, fix attempts on each warning, then a final re-check
 /// whose result drives the exit code.
-pub fn run(fix: bool) -> Result<i32> {
+///
+/// `json` switches output from the plain-text formatter to a single JSON
+/// document on stdout (for scripts / the `/doctor` plugin skill). In
+/// JSON mode the initial report is suppressed and `--fix` outcomes are
+/// captured into the wrapper instead of being printed line-by-line —
+/// so the entire command produces exactly one JSON document.
+pub fn run(fix: bool, json: bool) -> Result<i32> {
     let cwd = env::current_dir().context("read current directory")?;
     let vault_root =
         find_vault_root(&cwd).ok_or_else(|| anyhow!("not inside a vault (no vault.yml found)"))?;
@@ -51,9 +57,12 @@ pub fn run(fix: bool) -> Result<i32> {
     });
 
     let mut results = run_all_checks(vault_root.as_path(), &config);
-    print_report(&results, std::io::stdout())?;
+    if !json {
+        print_report(&results, std::io::stdout())?;
+    }
 
     let mut any_recipe_failed = false;
+    let mut fix_outcomes_json: Vec<serde_json::Value> = Vec::new();
     if fix {
         // Dispatch on both Warn and Error: some checks (plugin-files,
         // vault.yml-keys) emit Error for the very failure modes the recipes
@@ -66,9 +75,13 @@ pub fn run(fix: bool) -> Result<i32> {
             .filter(|r| matches!(r.status, DoctorStatus::Warn | DoctorStatus::Error))
             .collect();
         if issues.is_empty() {
-            println!("\nFix · nothing to do — no issues.");
+            if !json {
+                println!("\nFix · nothing to do — no issues.");
+            }
         } else {
-            println!("\nFix · attempting recipes for {} issue(s)", issues.len());
+            if !json {
+                println!("\nFix · attempting recipes for {} issue(s)", issues.len());
+            }
             let outcomes: Vec<(String, FixOutcome)> = issues
                 .iter()
                 .map(|r| (r.check.clone(), attempt_fix(r, vault_root.as_path())))
@@ -76,14 +89,31 @@ pub fn run(fix: bool) -> Result<i32> {
             any_recipe_failed = outcomes
                 .iter()
                 .any(|(_, o)| matches!(o, FixOutcome::Failed(_)));
-            print_fix_summary(&outcomes);
-            // Re-run checks so the final exit code + report reflects the
-            // post-fix state. `print_report` carries its own banner so we
-            // skip a duplicate "Doctor (post-fix):" header — a single
-            // blank line is enough to separate the two reports.
-            println!();
+            if json {
+                fix_outcomes_json = outcomes
+                    .iter()
+                    .map(|(check, o)| {
+                        let (outcome, message) = match o {
+                            FixOutcome::Fixed(m) => ("fixed", m.as_str()),
+                            FixOutcome::Failed(m) => ("failed", m.as_str()),
+                            FixOutcome::Manual(m) => ("manual", m.as_str()),
+                        };
+                        serde_json::json!({
+                            "check": check,
+                            "outcome": outcome,
+                            "message": message,
+                        })
+                    })
+                    .collect();
+            } else {
+                print_fix_summary(&outcomes);
+                // Blank line separates the fix summary from the post-fix report.
+                println!();
+            }
             results = run_all_checks(vault_root.as_path(), &config);
-            print_report(&results, std::io::stdout())?;
+            if !json {
+                print_report(&results, std::io::stdout())?;
+            }
         }
     }
 
@@ -91,6 +121,9 @@ pub fn run(fix: bool) -> Result<i32> {
         .iter()
         .filter(|r| r.status == DoctorStatus::Error)
         .count();
+    if json {
+        print_report_json(&results, fix_outcomes_json, std::io::stdout())?;
+    }
     // Exit non-zero on any post-fix error OR any failed recipe — so the
     // caller's shell-level `if $? -ne 0` catches both check escalations
     // and dispatched-recipe failures.
@@ -99,6 +132,43 @@ pub fn run(fix: bool) -> Result<i32> {
     } else {
         1
     })
+}
+
+/// Render `results` + optional fix outcomes as a single JSON document.
+/// Field shape is documented inline; callers (the `/doctor` plugin skill,
+/// CI consumers) treat the schema as stable for v3.x.
+fn print_report_json<W: Write>(
+    results: &[DoctorResult],
+    fix_outcomes: Vec<serde_json::Value>,
+    mut w: W,
+) -> Result<()> {
+    let total = results.len();
+    let errors = results
+        .iter()
+        .filter(|r| r.status == DoctorStatus::Error)
+        .count();
+    let warnings = results
+        .iter()
+        .filter(|r| r.status == DoctorStatus::Warn)
+        .count();
+    let ok_count = total - errors - warnings;
+    let mut doc = serde_json::json!({
+        "ok": errors == 0,
+        "summary": {
+            "total": total,
+            "errors": errors,
+            "warnings": warnings,
+            "ok": ok_count,
+        },
+        "checks": results,
+    });
+    if !fix_outcomes.is_empty() {
+        doc.as_object_mut()
+            .expect("doctor json root is object")
+            .insert("fix".to_string(), serde_json::Value::Array(fix_outcomes));
+    }
+    writeln!(w, "{}", serde_json::to_string(&doc)?)?;
+    Ok(())
 }
 
 /// Dispatch the warning to the matching fix recipe. The match keys on

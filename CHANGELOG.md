@@ -1,5 +1,5 @@
 ---
-latest_version: 3.0.0-alpha.7
+latest_version: 3.0.0-alpha.8
 released: 2026-05-20
 ---
 
@@ -11,6 +11,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## v3.0.0-alpha.8 — feat: JSON output modes for `doctor` + `update` · cosmetic
+
+- **`onebrain doctor --json`** emits a single JSON document with `{ok, summary, checks[]}` instead of the plain-text report. Combines with `--fix` — the JSON reflects the post-fix state plus a `fix[]` array of `{check, outcome, message}` per attempted recipe. Intended for scripts and the `/doctor` plugin skill; schema is stable for v3.x.
+- **`onebrain update --check --json`** emits `{ok, current, latest, update_available}` (plus `error` on failure) for scripts that need the version delta without parsing log lines. `--json` without `--check` reports the same shape post-install.
+- **`onebrain update --plan`** is `--check --json` plus `release_url` and `binary_url_template` fields when an update is available — designed for the `/update` plugin skill, which renders the plan and the changelog link to the user before delegating the install back to the CLI. `--plan` implies dry-run (mutually exclusive with `--check` to avoid an ambiguous flag combo).
+- **`onebrain vault-sync --vault-dir <path>`** flag-form alternative to the positional `vault_root` argument (mutually exclusive). Matches the `--vault-dir` pattern used across all other OneBrain subcommands; scripted callers no longer need a special case for vault-sync.
+- **`register-schedule` now reads `folders.logs` from vault.yml** instead of hardcoding `07-logs/scheduler/...`. Affects both the launchd log-base path and the `--resume` paused-marker path. Falls back to `07-logs` when vault.yml is missing/invalid (operational metadata shouldn't block plist emission).
+- +6 unit tests for the update JSON document (update-available / no-update / ahead-of-remote / plan URLs / error field).
 
 ## v3.0.0-alpha.7 — feat(doctor): four new `--fix` recipes (settings-hooks · plugin-files · vault.yml-keys · claude-settings)
 

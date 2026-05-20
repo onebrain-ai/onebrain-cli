@@ -328,12 +328,21 @@ fn build_launchd_context(vault: &Path) -> Result<LaunchdContext> {
     Ok(LaunchdContext {
         vault_path: vault.to_path_buf(),
         skill_cli_path,
-        // TODO: read folders.logs from vault.yml instead of hardcoding '07-logs'
-        // — for vaults using a non-default logs folder. Tracked for follow-up.
-        log_base_path: vault.join("07-logs/scheduler"),
+        log_base_path: vault.join(resolve_logs_folder(vault)).join("scheduler"),
         homedir,
         uid: current_uid(),
     })
+}
+
+/// Resolve the vault's logs folder from `vault.yml::folders.logs`. Falls back
+/// to the OneBrain default `"07-logs"` when the config can't be loaded — the
+/// scheduler's log path is operational metadata, so a missing/invalid vault.yml
+/// shouldn't block plist emission entirely.
+fn resolve_logs_folder(vault: &Path) -> String {
+    onebrain_core::find_vault_root(vault)
+        .and_then(|root| onebrain_core::load_vault_config(&root).ok())
+        .map(|cfg| cfg.folders.logs)
+        .unwrap_or_else(|| "07-logs".to_string())
 }
 
 #[cfg(unix)]
@@ -443,10 +452,11 @@ fn test_run(_vault: &Path, skill: &str) -> Result<()> {
 }
 
 fn resume_skill(vault: &Path, skill: &str) -> Result<()> {
-    // TODO: read folders.logs from vault.yml instead of hardcoding '07-logs'.
     let skill_safe = skill.trim_start_matches('/');
+    let logs_folder = resolve_logs_folder(vault);
     let marker = vault
-        .join("07-logs/scheduler/.paused")
+        .join(&logs_folder)
+        .join("scheduler/.paused")
         .join(format!("{skill_safe}.txt"));
     if marker.exists() {
         std::fs::remove_file(&marker)
