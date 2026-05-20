@@ -1,6 +1,6 @@
 ---
-latest_version: 3.0.0-alpha.0
-released: 2026-05-19
+latest_version: 3.0.0-alpha.1
+released: 2026-05-20
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -8,9 +8,11 @@ released: 2026-05-19
 All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rewrite.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-> **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). First user-facing alpha is `v3.0.0-alpha.1` (planned 2026-06-02 per spec §7.1) — `v3.0.0-alpha.0` is an internal milestone marker without binary artifacts.
+> **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## v3.0.0-alpha.1 — feat(slices-7-13): Bun parity port + 2 v3.0.1 fixes
 
 - Fix `init` reporting `hooks: ok` while `.claude/settings.json` is never written — init now creates `.claude/` before invoking `register-hooks`, so the harness detector finds a claude target and actually writes the Stop hook + 14 permission entries (slice 10 · adds 1 unit + 1 integration regression test)
 - Fix `vault-sync` silent non-zero exit when `result.error` is `None` — CLI handler now always prints a `vault-sync: failed:` summary on `!result.ok` (covers any future failure path that forgets to log) and the integration test pins the exit code to exactly `1` rather than just non-zero (slice 13 · adds 1 integration regression test)
@@ -50,5 +52,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - CI workflow: fmt + clippy + 3-platform test matrix (ubuntu/macos/windows) · `concurrency` block cancels outdated PR runs · `permissions: contents: read` hardening
 - AGPL-3.0-only license · Windows ARM64 added to release matrix as the 7th platform per 2026-05-19 decision · forward-compat `tokio` scaffold (`tokio_helper::run_async` with `#[allow(dead_code)]`) ready for v3.1 server mode without restructuring main.rs · 46 tests passing
 
-[Unreleased]: https://github.com/onebrain-ai/onebrain-cli/compare/v3.0.0-alpha.0...HEAD
+[Unreleased]: https://github.com/onebrain-ai/onebrain-cli/compare/v3.0.0-alpha.1...HEAD
+[v3.0.0-alpha.1]: https://github.com/onebrain-ai/onebrain-cli/releases/tag/v3.0.0-alpha.1
 [v3.0.0-alpha.0]: https://github.com/onebrain-ai/onebrain-cli/releases/tag/v3.0.0-alpha.0

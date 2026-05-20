@@ -8,7 +8,7 @@ v3.0 development · GA target 2026-06-30. See design spec in the OneBrain vault.
 
 ## Install
 
-> Binaries not yet published. Build from source until v3.0.0-alpha.1 (2026-06-02).
+> First user-facing prerelease: [`v3.0.0-alpha.1`](https://github.com/onebrain-ai/onebrain-cli/releases/tag/v3.0.0-alpha.1) — 7-platform binaries (darwin arm64/x64 · linux arm64/x64/musl-x64 · windows x64/arm64) attached to the GitHub Release. Build from source remains supported for development.
 
 ```bash
 git clone https://github.com/onebrain-ai/onebrain-cli
