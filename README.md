@@ -101,13 +101,13 @@ onebrain update --plan         # machine-readable JSON plan
 
 The install path resolves the current target triple at runtime, downloads the matching GitHub Release tarball over HTTPS (rustls TLS), and atomically swaps the running binary (Unix single-rename; Windows rustup-style two-step with rollback on failure). No package-manager middleware.
 
-### Other channels (planned)
+### Other channels
 
-- **npm wrapper** — `@onebrain-ai/cli@3.0.0` on npm. Targets v3.0.x.
-- **Homebrew tap** — `onebrain-ai/homebrew-onebrain` for `brew install onebrain`. Targets v3.0.x.
-- **`cargo-binstall`** — works today (canonical Rust target triples in the GitHub Release assets).
+- **npm wrapper** — `npm install -g @onebrain-ai/cli` (source at [`npm-wrapper/`](npm-wrapper/); CI publishes on every stable tag via npm Trusted Publishers + `--provenance`).
+- **Homebrew tap** — `brew install onebrain-ai/onebrain/onebrain` (formula at [`onebrain-ai/homebrew-onebrain`](https://github.com/onebrain-ai/homebrew-onebrain), bumped on each tag).
+- **`cargo-binstall`** — works today via the canonical Rust target triples in the GitHub Release assets.
 
-Neither npm nor Homebrew is published at GA — use `onebrain update` or download manually until those land.
+All four paths (self-update, npm, Homebrew, `cargo-binstall`) resolve to the same per-platform binary published in the matching GitHub Release.
 
 ### Security / trust model
 
