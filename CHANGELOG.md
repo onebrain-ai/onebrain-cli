@@ -1,6 +1,6 @@
 ---
-latest_version: 3.0.0-alpha.9
-released: 2026-05-20
+latest_version: 3.0.0
+released: 2026-05-22
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -11,6 +11,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## v3.0.0 — Rust rewrite GA · 7-platform release pipeline · stable JSON contracts
+
+- **Complete Rust rewrite of OneBrain CLI** — replaces v2.x TypeScript/Bun implementation. 4-crate workspace (`onebrain-core`, `onebrain-fs`, `onebrain-cache`, `onebrain-cli`) with all 13 subcommands ported. ~10× less private memory (~21 → ~2 MB per call), 92% smaller binary (57.8 → 4.6 MB stripped), startup within 10 ms of Bun on warm cache. Vault format, `vault.yml` schema, plugin contract, and slash-command surface unchanged from v2.x.
+- **7-platform release pipeline** — macOS Apple Silicon + Intel · Linux ARM64 + x86_64 (glibc + musl) · Windows ARM64 + x86_64 binaries published to GitHub Releases per tag. `cargo-binstall`-ready (canonical Rust target triples in asset names) plus human-friendly platform badge table in the release body.
+- **`onebrain update` install path** fetches binaries directly from GitHub Releases over HTTPS (rustls TLS), extracts the tarball, and atomically swaps the running binary (Unix single-rename · Windows rustup-style two-step rename + rollback). No npm/bun shell-out anywhere in the v3.x install path.
+- **Stable JSON output contracts for v3.x** — `doctor --json`, `update --check --json`, and `update --plan` carry frozen schemas (boolean `ok` + numeric `summary.passing`; `update_available: null` on fetch failure; `fix[]` always present when `--fix` requested; `binary_targets[]` enumerates published `(triple, ext)` pairs). Stability covers v3.x; v4 may break.
+- **Trust model** — downloaded binaries authenticated solely by GitHub's TLS chain. No SHA-256/cosign verification at GA (matches the rustup/deno/bun baseline); checksum verification is tracked for v3.0.x security hardening. Users on networks with corporate MITM proxies should be aware that the trust boundary is whatever cert the proxy presents.
+- **Skill + scheduler ecosystem wired end-to-end** — `register-hooks`, `register-schedule`, and `run-skill` round-trip with the plugin's Stop / PostToolUse hooks, scheduled-skill launchd plists, and headless Claude Code invocations. Plist generation is byte-identical to Bun v2.3.3 for both recurring (`cron:`) and one-shot (`at:`) entries.
+- **`doctor`** ships 8 read-only checks (vault.yml · vault.yml-keys · folders · plugin-files · settings-hooks · orphan-checkpoints · qmd-embeddings · claude-settings) and 5 `--fix` recipes (settings-hooks · plugin-files · vault.yml-keys · claude-settings · qmd). Remaining `--fix` recipes + Windows zip extraction in the install path are deferred to v3.0.1.
+- **Distribution at GA**: GitHub Releases + `onebrain update` self-install. npm-wrapper (`@onebrain-ai/cli@3.0.0` on npm) and Homebrew tap (`onebrain-ai/homebrew-onebrain`) land in the following days; legacy `npm install -g @onebrain-ai/cli@<3.0.0` versions will be flagged with `npm deprecate` post-publish (Bun-era v2.x stays installed for the ~1049 weekly downloaders on pinned versions).
 
 ## v3.0.0-alpha.9 — GA candidate: fix `onebrain update` install path · TTY spinner · direct harness · real `--test` · Windows pin
 
@@ -120,6 +131,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - CI workflow: fmt + clippy + 3-platform test matrix (ubuntu/macos/windows) · `concurrency` block cancels outdated PR runs · `permissions: contents: read` hardening
 - AGPL-3.0-only license · Windows ARM64 added to release matrix as the 7th platform per 2026-05-19 decision · forward-compat `tokio` scaffold (`tokio_helper::run_async` with `#[allow(dead_code)]`) ready for v3.1 server mode without restructuring main.rs · 46 tests passing
 
-[Unreleased]: https://github.com/onebrain-ai/onebrain-cli/compare/v3.0.0-alpha.1...HEAD
+[Unreleased]: https://github.com/onebrain-ai/onebrain-cli/compare/v3.0.0...HEAD
+[v3.0.0]: https://github.com/onebrain-ai/onebrain-cli/releases/tag/v3.0.0
 [v3.0.0-alpha.1]: https://github.com/onebrain-ai/onebrain-cli/releases/tag/v3.0.0-alpha.1
 [v3.0.0-alpha.0]: https://github.com/onebrain-ai/onebrain-cli/releases/tag/v3.0.0-alpha.0
