@@ -8,6 +8,8 @@
   </picture>
 </p>
 
+<p align="center"><em>Your AI Thinking Partner</em></p>
+
 <p align="center">
   <strong>Local-first Rust CLI that powers the OneBrain personal AI OS for Obsidian.</strong><br>
   <sub>Vault scaffolding · plugin sync · scheduled skills · diagnostics · self-update — across Claude Code, Gemini CLI, Codex, and Qwen.</sub>
@@ -176,7 +178,7 @@ onebrain-cli         Binary crate — clap dispatch over 13 subcommands
   └─ onebrain-core   Types · config parsing · path resolution (zero filesystem deps)
 ```
 
-Workspace inheritance keeps `[workspace.package]` fields (`version`, `edition`, `license`, `repository`) in one place. All four internal crates carry `publish = false` — only the binary ships.
+Workspace inheritance keeps `[workspace.package]` fields (`version`, `edition`, `license`, `repository`) in one place. The workspace root sets `publish = false`; all four crates inherit it via `publish.workspace = true` — only the compiled binary ships.
 
 Test pyramid (4 layers): inline unit + `assert_cmd` integration + `insta` snapshots + Layer 4 golden-master parity vs Bun v2.3.3. 670 tests passing at GA, gating CI on fmt + clippy `-D warnings` + a 3-platform test matrix (Ubuntu, macOS, Windows).
 
@@ -214,4 +216,4 @@ PRs welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup, 
 
 ## License
 
-[AGPL-3.0-only](LICENSE). If you build a hosted service on top of OneBrain CLI, you must release your modifications under the same license. For commercial licensing inquiries, contact [hello@onebrain.run](mailto:hello@onebrain.run).
+[AGPL-3.0-only](LICENSE). If you make a modified version of OneBrain CLI available to users over a network (AGPL §13 — including SaaS, internal APIs, and any networked interaction), you must release your modifications under the same license. For commercial licensing inquiries, contact [hello@onebrain.run](mailto:hello@onebrain.run).
