@@ -186,3 +186,51 @@ jobs:
             echo "$ORIGINAL"
           } > /tmp/release-body.md
           gh release edit "$VERSION" --notes-file /tmp/release-body.md
+
+  npm-publish:
+    name: Publish npm wrapper
+    needs: release
+    runs-on: ubuntu-latest
+    # Skip prereleases — only stable `vMAJOR.MINOR.PATCH` tags get published to
+    # the npm registry. Any tag with `-` in the version is considered a
+    # prerelease (semver convention covers `-alpha.N`, `-beta.N`, `-rc.N`,
+    # `-canary`, `-dev`, `-next`, `-preview`, `-snapshot`, etc. with a single
+    # rule). Prereleases still produce GitHub Release artifacts so users on
+    # `cargo binstall` / brew tap / direct download paths can pick them up;
+    # the npm wrapper just doesn't track them.
+    if: ${{ !contains(github.ref, '-') }}
+    permissions:
+      contents: read
+      # Required for npm Trusted Publishers (OIDC). With the matching
+      # publisher configured on npmjs.com (one-time UI setup against this
+      # repo + workflow), `npm publish --provenance` exchanges a short-lived
+      # OIDC token for publish rights — no long-lived NPM_TOKEN secret to
+      # rotate. The publish attestation also gets recorded by Sigstore.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Single source of version truth = the git tag. The committed
+      # `npm-wrapper/package.json` version is a placeholder for local dev
+      # (`npm pack`, `npm install ./npm-wrapper`) and is rewritten in CI
+      # before publish so the wrapper version always equals the binary
+      # release version. `--allow-same-version` lets the first publish at a
+      # given tag succeed even if the checked-in value already matches.
+      # `github.ref` is read via env (safe pattern — never interpolated
+      # directly into run scripts).
+      - name: Sync wrapper version to git tag
+        working-directory: npm-wrapper
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          VERSION="${REF#refs/tags/v}"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: Publish to npm with provenance
+        working-directory: npm-wrapper
+        run: npm publish --access public --provenance

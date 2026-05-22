@@ -12,6 +12,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+- **npm wrapper source landed in-repo at `npm-wrapper/`** — recovered from the published `@onebrain-ai/cli@3.0.0` tarball after the original `/tmp/`-only source was lost. Files: `package.json`, `postinstall.js`, `bin/onebrain.js`, `README.md`, `LICENSE`. Wrapper `engines.node` raised to `>=20` (Node 18 EOL). Version stays at 3.0.0 to match the live npm package; the next v3 patch will bump together with the binary.
+- **CI auto-publishes the npm wrapper on each stable tag** via a new `npm-publish` job in `release.yml`. Uses npm Trusted Publishers (OIDC, `id-token: write`) plus `--provenance` for Sigstore attestation; no long-lived `NPM_TOKEN` secret. `npm version "$VERSION" --no-git-tag-version --allow-same-version` in CI keeps the wrapper version aligned with the git tag. Any tag containing `-` is treated as a prerelease and skipped.
+- **postinstall verifies SHA256** against the `.sha256` published alongside each release asset before extracting — closes the supply-chain gap between OIDC-attested wrapper publish and binary download integrity. The wrapper now also wraps extract in `try/finally` so partial archives don't linger in `node_modules/`.
+- **bin shim re-raises signal terminations** (`128 + signum`) so Ctrl-C / SIGTERM through the shim is distinguishable from a real error in CI; missing-binary recovery hint now covers both local and global installs.
+- **README + CONTRIBUTING signpost the new layout** — wrapper source lives at `npm-wrapper/`, publish is CI-only via Trusted Publishers (no local `npm publish`), Node 18 EOL noted. Root README install table promotes npm + Homebrew out of "planned" since both are live since v3.0.0 GA (2026-05-22).
+
 ## v3.0.0 — Rust rewrite GA · 7-platform release pipeline · stable JSON contracts
 
 - **Complete Rust rewrite of OneBrain CLI** — replaces v2.x TypeScript/Bun implementation. 4-crate workspace (`onebrain-core`, `onebrain-fs`, `onebrain-cache`, `onebrain-cli`) with all 13 subcommands ported. ~10× less private memory (~21 → ~2 MB per call), 92% smaller binary (57.8 → 4.6 MB stripped), startup within 10 ms of Bun on warm cache. Vault format, `vault.yml` schema, plugin contract, and slash-command surface unchanged from v2.x.

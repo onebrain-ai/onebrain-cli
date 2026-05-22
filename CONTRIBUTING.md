@@ -77,6 +77,10 @@ cd .worktree/my-feature
 - Update `CHANGELOG.md`: add a new `## vX.Y.Z — <subject>` entry above the previous version. Keep entries to **max ~8 bullet lines** per version; one tight line per substantive change. Reference PR numbers (`(PR #NN)`) where it adds context.
 - Update the frontmatter `latest_version:` + `released:` at the top of `CHANGELOG.md`.
 
+### npm wrapper version
+
+The npm wrapper source lives at [`npm-wrapper/`](npm-wrapper/). Its `package.json` `version` field is a local-dev placeholder — CI rewrites it on tag push (`Sync wrapper version to git tag` step in `.github/workflows/release.yml`) so the wrapper version always equals the binary release version. Keep the checked-in value in step with the most recent stable tag, but **never run `npm publish` from a local clone**: the `npm-publish` job uses npm Trusted Publishers (OIDC) and is the only authorized publisher — no `NPM_TOKEN` is configured for human use. Editing wrapper source in a temp directory and publishing manually is the exact foot-gun that lost the original `/tmp/` source before this PR.
+
 ### English-only in repo files
 
 All committed text — source code, comments, docs, commit messages, PR descriptions, CHANGELOG entries — must be in English. Local/private notes can use any language; once it lands in this repo, it's English.
