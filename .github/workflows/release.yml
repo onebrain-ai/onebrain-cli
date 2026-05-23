@@ -24,10 +24,24 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: tar.gz
+          # Linux cross-compile: matrix value `cross_prefix` is the toolchain
+          # triple used to derive (a) the apt package `gcc-${cross_prefix}`,
+          # (b) the linker `${cross_prefix}-gcc`, and (c) the strip binary
+          # `${cross_prefix}-strip`. cross_prefix matches the GNU toolchain
+          # naming, NOT the Rust target triple. Only matrix-controlled values
+          # are interpolated; no untrusted input flows into the run scripts.
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
-            cross: true
+            cross_prefix: aarch64-linux-gnu
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            archive: tar.gz
+            cross_prefix: arm-linux-gnueabihf
+          - target: arm-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            archive: tar.gz
+            cross_prefix: arm-linux-gnueabihf
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
@@ -59,15 +73,18 @@ jobs:
           APT_PACKAGES: ${{ matrix.apt }}
         run: sudo apt-get update && sudo apt-get install -y "$APT_PACKAGES"
 
-      - name: Install aarch64 linux cross-compiler
-        if: matrix.cross
+      - name: Install Linux cross-compiler
+        if: matrix.cross_prefix
+        env:
+          CROSS_PREFIX: ${{ matrix.cross_prefix }}
+          TARGET: ${{ matrix.target }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y "gcc-${CROSS_PREFIX}"
           mkdir -p .cargo
           {
-            echo '[target.aarch64-unknown-linux-gnu]'
-            echo 'linker = "aarch64-linux-gnu-gcc"'
+            echo "[target.${TARGET}]"
+            echo "linker = \"${CROSS_PREFIX}-gcc\""
           } >> .cargo/config.toml
 
       - name: Build release binary
@@ -75,14 +92,18 @@ jobs:
         run: cargo build --release --target "$TARGET" -p onebrain-cli
 
       - name: Strip binary (native Unix)
-        if: matrix.archive == 'tar.gz' && !matrix.cross
+        if: matrix.archive == 'tar.gz' && !matrix.cross_prefix
         shell: bash
         run: strip "target/$TARGET/release/onebrain"
 
-      - name: Strip aarch64 linux binary
-        if: matrix.cross
+      - name: Strip cross-compiled Linux binary
+        if: matrix.cross_prefix
+        env:
+          CROSS_PREFIX: ${{ matrix.cross_prefix }}
+          TARGET: ${{ matrix.target }}
         shell: bash
-        run: aarch64-linux-gnu-strip "target/$TARGET/release/onebrain"
+        run: |
+          "${CROSS_PREFIX}-strip" "target/${TARGET}/release/onebrain"
 
       - name: Package tar.gz + sha256
         if: matrix.archive == 'tar.gz'
@@ -173,7 +194,9 @@ jobs:
             echo "|---|---|---|"
             echo "| ![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white&style=flat) | Apple Silicon (M1–M5) | \`onebrain-aarch64-apple-darwin.tar.gz\` |"
             echo "| ![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white&style=flat) | Intel | \`onebrain-x86_64-apple-darwin.tar.gz\` |"
-            echo "| ![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat) | ARM64 (glibc) | \`onebrain-aarch64-unknown-linux-gnu.tar.gz\` |"
+            echo "| ![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat) | ARM64 (glibc · Pi 3/4/5 64-bit OS · Pi Zero 2 W) | \`onebrain-aarch64-unknown-linux-gnu.tar.gz\` |"
+            echo "| ![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat) | ARMv7 32-bit (Pi 2 v1.1+ · Pi 3/4/5 32-bit OS) | \`onebrain-armv7-unknown-linux-gnueabihf.tar.gz\` |"
+            echo "| ![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat) | ARMv6 32-bit (Pi 1 · Pi Zero · Pi Zero W) | \`onebrain-arm-unknown-linux-gnueabihf.tar.gz\` |"
             echo "| ![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat) | x86_64 (glibc) | \`onebrain-x86_64-unknown-linux-gnu.tar.gz\` |"
             echo "| ![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat) | x86_64 (musl / Alpine / static) | \`onebrain-x86_64-unknown-linux-musl.tar.gz\` |"
             echo "| ![Windows](https://img.shields.io/badge/Windows-0078D4?logo=windows&logoColor=white&style=flat) | ARM64 | \`onebrain-aarch64-pc-windows-msvc.zip\` |"
