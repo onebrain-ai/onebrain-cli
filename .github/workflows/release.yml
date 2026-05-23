@@ -80,7 +80,11 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y "gcc-${CROSS_PREFIX}"
+          # gcc-* installs the compiler. binutils-* installs ld + strip + ar.
+          # Don't drop binutils — gcc-arm-linux-gnueabihf in particular does
+          # NOT depend on its matching binutils, and the strip step below
+          # would fail with command-not-found on a fresh runner image.
+          sudo apt-get install -y "gcc-${CROSS_PREFIX}" "binutils-${CROSS_PREFIX}"
           mkdir -p .cargo
           {
             echo "[target.${TARGET}]"

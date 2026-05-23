@@ -120,10 +120,14 @@ downloadFile(url, archivePath).then(async () => {
     console.error(`[@onebrain-ai/cli] Binary installed but failed to run: ${err.message}`);
     console.error('This usually means the wrong libc/arch variant was selected for your host.');
     console.error('Override with one of:');
-    console.error('  ONEBRAIN_CLI_LIBC=musl npm install @onebrain-ai/cli');
-    console.error('  ONEBRAIN_CLI_LIBC=glibc npm install @onebrain-ai/cli');
-    console.error('  ONEBRAIN_CLI_ARM=v6 npm install @onebrain-ai/cli   # for older ARM (Pi 1 / Pi Zero)');
-    console.error('  ONEBRAIN_CLI_ARM=v7 npm install @onebrain-ai/cli   # for 32-bit Pi 2/3/4');
+    if (process.platform === 'linux' && process.arch === 'arm') {
+      console.error('  ONEBRAIN_CLI_ARM=v6 npm install @onebrain-ai/cli   # for older ARM (Pi 1 / Pi Zero)');
+      console.error('  ONEBRAIN_CLI_ARM=v7 npm install @onebrain-ai/cli   # for 32-bit Pi 2/3/4');
+    } else if (process.platform === 'linux') {
+      console.error('  ONEBRAIN_CLI_LIBC=musl npm install @onebrain-ai/cli');
+      console.error('  ONEBRAIN_CLI_LIBC=glibc npm install @onebrain-ai/cli');
+    }
+    console.error('Set ONEBRAIN_CLI_DEBUG=1 to see which detector path fired.');
     process.exit(1);
   }
 }).catch((err) => {
@@ -229,15 +233,19 @@ function resolveArmTriple() {
   if (armVersion === '7') return 'armv7-unknown-linux-gnueabihf';
   if (armVersion === '6') return 'arm-unknown-linux-gnueabihf';
 
-  // Fall back to /proc/cpuinfo — "CPU architecture: 7" / "CPU architecture: 6"
-  // or model strings like "ARMv7 Processor".
+  // Fall back to /proc/cpuinfo. CHECK ORDER MATTERS: the kernel reports
+  // `CPU architecture: 7` even on Pi 1 / Pi Zero (ARM1176 cores) because the
+  // chip supports VMSAv7 (virtual memory arch) despite the instruction-set
+  // being ARMv6. So the `CPU architecture` line cannot be trusted on its own.
+  // The `model name` line ("ARMv6-compatible processor" on Pi Zero) is the
+  // reliable signal, and we check it FIRST.
   try {
     const cpuinfo = fs.readFileSync('/proc/cpuinfo', 'utf8');
-    if (/CPU architecture:\s*7/m.test(cpuinfo) || /ARMv7/.test(cpuinfo)) {
-      return 'armv7-unknown-linux-gnueabihf';
-    }
-    if (/CPU architecture:\s*[56]/m.test(cpuinfo) || /ARMv6/.test(cpuinfo)) {
+    if (/ARMv6|ARM1176|ARM11\b/i.test(cpuinfo)) {
       return 'arm-unknown-linux-gnueabihf';
+    }
+    if (/ARMv7|Cortex-A[789]|Cortex-A1[5-7]/i.test(cpuinfo) || /CPU architecture:\s*7/m.test(cpuinfo)) {
+      return 'armv7-unknown-linux-gnueabihf';
     }
   } catch (err) {
     if (DEBUG) console.warn(`[@onebrain-ai/cli] arm probe (cpuinfo): ${err.message}`);
