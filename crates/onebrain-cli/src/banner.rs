@@ -52,19 +52,23 @@ const ANSI_PINK_FG: &str = "\x1b[38;2;255;45;146m";
 const ANSI_DIM: &str = "\x1b[2m";
 const ANSI_RESET: &str = "\x1b[0m";
 
-/// 6-step vertical gradient applied across the 6-line ANSI Shadow wordmark.
-/// Lighter at the top (highlight) → primary in the middle → darker at the
-/// bottom (shadow), giving the block letters a soft 3D feel like a printed
-/// gradient. All shades are tints/shades of OneBrain primary `#ff2d92`.
-///
-/// Indexes map 1:1 to the 6 art lines (top → bottom).
-const BANNER_GRADIENT: [&str; 6] = [
-    "\x1b[38;2;255;138;195m", // #ff8ac3 · lightest tint
-    "\x1b[38;2;255;92;171m",  // #ff5cab · light tint
-    "\x1b[38;2;255;45;146m",  // #ff2d92 · primary brand
-    "\x1b[38;2;224;30;126m",  // #e01e7e · mid shade
-    "\x1b[38;2;186;22;105m",  // #ba1669 · deep shade
-    "\x1b[38;2;148;17;84m",   // #941154 · darkest shadow
+/// 4-step gradient applied to the BRAIN half of the wordmark · top to
+/// bottom. All shades are tints/shades of OneBrain primary `#ff2d92`.
+const BANNER_BRAIN_GRADIENT: [&str; 4] = [
+    "\x1b[38;2;255;128;186m", // light tint · top
+    "\x1b[38;2;255;76;161m",  // mid tint
+    "\x1b[38;2;255;45;146m",  // primary brand
+    "\x1b[38;2;186;22;105m",  // deep shade · bottom
+];
+
+/// Single muted gray for the ONE half · OpenCode-style "secondary word"
+/// treatment that lets BRAIN read as the visual focus. Slight gradient via
+/// 4 shades top→bottom for depth match with BRAIN.
+const BANNER_ONE_GRADIENT: [&str; 4] = [
+    "\x1b[38;2;160;160;160m", // light gray · top
+    "\x1b[38;2;128;128;128m",
+    "\x1b[38;2;96;96;96m",
+    "\x1b[38;2;72;72;72m", // dark gray · bottom
 ];
 
 /// Should the banner render for this invocation? Pure decision function over
@@ -106,23 +110,26 @@ fn is_hook_protocol(cmd: &Cmd) -> bool {
     }
 }
 
-/// "ANSI Shadow" rendering of the wordmark `OneBrain`. Six lines of Unicode
-/// block-with-shadow characters · ~64 chars wide. Each art line is stored
-/// without trailing whitespace so the rendered banner survives terminals
-/// that highlight trailing spaces (and so the snapshot is stable regardless
-/// of editor whitespace settings).
-const BANNER_ART: &str = r" ██████╗ ███╗   ██╗███████╗██████╗ ██████╗  █████╗ ██╗███╗   ██╗
-██╔═══██╗████╗  ██║██╔════╝██╔══██╗██╔══██╗██╔══██╗██║████╗  ██║
-██║   ██║██╔██╗ ██║█████╗  ██████╔╝██████╔╝███████║██║██╔██╗ ██║
-██║   ██║██║╚██╗██║██╔══╝  ██╔══██╗██╔══██╗██╔══██║██║██║╚██╗██║
-╚██████╔╝██║ ╚████║███████╗██████╔╝██║  ██║██║  ██║██║██║ ╚████║
- ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝";
+/// FIGlet "chunky" rendering of the wordmark `OneBrain`. Four lines of
+/// pixel-block characters · 53 chars wide · OpenCode-inspired compact
+/// style. Each line is split at [`BRAIN_START_COL`] so the `One` half can
+/// be colored differently from the `Brain` half (Brain = primary brand
+/// focus · One = muted secondary).
+const BANNER_ART: [&str; 4] = [
+    r" _______               ______              __        ",
+    r"|       |.-----.-----.|   __ \.----.---.-.|__|.-----.",
+    r"|   -   ||     |  -__||   __ <|   _|  _  ||  ||     |",
+    r"|_______||__|__|_____||______/|__| |___._||__||__|__|",
+];
+
+/// Byte column where the `Brain` half starts in [`BANNER_ART`]. The art is
+/// ASCII so byte position = monospace column. Bisecting at this column
+/// gives a clean `One` / `Brain` split for the two-tone color treatment.
+const BRAIN_START_COL: usize = 22;
 
 /// Visual width (in monospace columns) of every line in [`BANNER_ART`].
-/// Hard-coded for the current ANSI Shadow rendering — every glyph is a
-/// single-column Unicode box-drawing or block character, so the column
-/// width equals `chars().count()` of any art line.
-const BANNER_VISUAL_WIDTH: usize = 64;
+/// Hard-coded · the chunky rendering is uniform width across all 4 lines.
+const BANNER_VISUAL_WIDTH: usize = 53;
 
 /// Build the banner string (no I/O). Seven lines total:
 ///   6 × pink ASCII-art lines (ANSI Shadow rendering of `OneBrain`)
@@ -137,17 +144,23 @@ const BANNER_VISUAL_WIDTH: usize = 64;
 /// line between the banner and whatever help body follows.
 pub fn render_banner() -> String {
     let version = env!("CARGO_PKG_VERSION");
-    let mut out = String::with_capacity(BANNER_ART.len() + 256);
-    for (i, line) in BANNER_ART.lines().enumerate() {
-        // Saturating index so future art changes can't index out of bounds
-        // — the last gradient stop is reused if the art ever grows beyond 6
-        // lines. (Today the art is exactly 6 lines and this never triggers.)
-        let shade = BANNER_GRADIENT
+    let mut out = String::with_capacity(512);
+    for (i, line) in BANNER_ART.iter().enumerate() {
+        let one_shade = BANNER_ONE_GRADIENT
             .get(i)
             .copied()
-            .unwrap_or(*BANNER_GRADIENT.last().unwrap());
-        out.push_str(shade);
-        out.push_str(line);
+            .unwrap_or(*BANNER_ONE_GRADIENT.last().unwrap());
+        let brain_shade = BANNER_BRAIN_GRADIENT
+            .get(i)
+            .copied()
+            .unwrap_or(*BANNER_BRAIN_GRADIENT.last().unwrap());
+        // ASCII art · byte-position split is column-position split.
+        let (one_half, brain_half) = line.split_at(BRAIN_START_COL.min(line.len()));
+        out.push_str(one_shade);
+        out.push_str(one_half);
+        out.push_str(ANSI_RESET);
+        out.push_str(brain_shade);
+        out.push_str(brain_half);
         out.push_str(ANSI_RESET);
         out.push('\n');
     }
@@ -553,10 +566,11 @@ mod tests {
     #[test]
     fn banner_text_contains_brand_and_version() {
         let s = render_banner();
-        // The wordmark is now ASCII art — the literal string `OneBrain` no
-        // longer appears, but the ANSI Shadow art is recognisable via its
-        // characteristic Unicode block-with-shadow glyphs.
-        assert!(s.contains("██████"), "missing ASCII art glyphs: {s:?}");
+        // The wordmark is now FIGlet "chunky" ASCII art — the literal string
+        // `OneBrain` no longer appears, but the art is recognisable via its
+        // characteristic pixel-block underscores + pipes (the `_______`
+        // top-line motif is unique to chunky among the fonts we'd ever swap to).
+        assert!(s.contains("_______"), "missing ASCII art glyphs: {s:?}");
         // Version comes from CARGO_PKG_VERSION — always present at compile
         // time. Check the literal `v` prefix the format emits.
         let version = env!("CARGO_PKG_VERSION");
@@ -575,27 +589,34 @@ mod tests {
     }
 
     #[test]
-    fn banner_renders_6_line_art_plus_tagline() {
-        // 8 lines: 6 art + 1 tagline + 1 blank-line spacer between banner
+    fn banner_renders_4_line_art_plus_tagline() {
+        // 6 lines: 4 art + 1 tagline + 1 blank-line spacer between banner
         // and help body. `render_banner` ends with two trailing newlines so
-        // `str::lines()` yields 8 elements (7 content + 1 empty).
+        // `str::lines()` yields 6 elements (5 content + 1 empty).
         let s = render_banner();
         let lines: Vec<&str> = s.lines().collect();
-        assert_eq!(lines.len(), 8, "expected 8 banner lines, got {lines:?}");
-        let art_lines: Vec<&str> = BANNER_ART.lines().collect();
-        assert_eq!(art_lines.len(), 6, "art block should be 6 lines");
-        for (i, art_line) in art_lines.iter().enumerate() {
+        assert_eq!(lines.len(), 6, "expected 6 banner lines, got {lines:?}");
+        assert_eq!(BANNER_ART.len(), 4, "art block should be 4 lines");
+        // Each rendered art line should contain both halves of the matching
+        // BANNER_ART line (split + recolored at BRAIN_START_COL).
+        for (i, art_line) in BANNER_ART.iter().enumerate() {
+            let (one_half, brain_half) = art_line.split_at(BRAIN_START_COL.min(art_line.len()));
             assert!(
-                lines[i].contains(art_line),
-                "rendered line {i} ({:?}) missing art line ({art_line:?})",
+                lines[i].contains(one_half),
+                "rendered line {i} ({:?}) missing One half ({one_half:?})",
+                lines[i]
+            );
+            assert!(
+                lines[i].contains(brain_half),
+                "rendered line {i} ({:?}) missing Brain half ({brain_half:?})",
                 lines[i]
             );
         }
-        // Tagline on line 7 (index 6).
+        // Tagline on line 5 (index 4).
         assert!(
-            lines[6].contains("Your AI Thinking Partner"),
-            "expected tagline on line 7, got {:?}",
-            lines[6]
+            lines[4].contains("Your AI Thinking Partner"),
+            "expected tagline on line 5, got {:?}",
+            lines[4]
         );
     }
 
@@ -881,10 +902,10 @@ mod tests {
         std::env::remove_var("ONEBRAIN_FORCE_BANNER");
         assert!(!buf.is_empty(), "expected banner emission");
         let out = String::from_utf8(buf).unwrap();
-        // The ASCII art's block-with-shadow glyph (`██████`) is the cheapest
-        // stable brand-presence check — the literal word `OneBrain` no longer
-        // appears anywhere in the rendered banner.
-        assert!(out.contains("██████"), "missing ASCII art: {out:?}");
+        // The ASCII art's chunky-font `_______` top-line motif is the
+        // cheapest stable brand-presence check — the literal word `OneBrain`
+        // no longer appears anywhere in the rendered banner.
+        assert!(out.contains("_______"), "missing ASCII art: {out:?}");
         assert!(
             out.contains("Your AI Thinking Partner"),
             "missing tagline: {out:?}"
