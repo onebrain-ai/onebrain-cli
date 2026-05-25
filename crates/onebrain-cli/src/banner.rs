@@ -42,12 +42,30 @@ use crate::output::OutputMode;
 use std::io::Write;
 
 /// OneBrain primary brand colour `#ff2d92` as a 24-bit ANSI foreground escape.
-/// Truecolor is universal on every terminal that survives the TTY gate (the
-/// gate excludes `TERM=dumb` and CI lines), so we don't need to fall back to
-/// 256-colour or basic 16-colour.
+/// Kept as a named constant so tests can pin "brand pink is present" without
+/// reaching into [`BANNER_GRADIENT`] by index. Truecolor is universal on
+/// every terminal that survives the TTY gate (the gate excludes `TERM=dumb`
+/// and CI lines), so we don't need to fall back to 256-colour or basic
+/// 16-colour.
+#[cfg_attr(not(test), allow(dead_code))]
 const ANSI_PINK_FG: &str = "\x1b[38;2;255;45;146m";
 const ANSI_DIM: &str = "\x1b[2m";
 const ANSI_RESET: &str = "\x1b[0m";
+
+/// 6-step vertical gradient applied across the 6-line ANSI Shadow wordmark.
+/// Lighter at the top (highlight) → primary in the middle → darker at the
+/// bottom (shadow), giving the block letters a soft 3D feel like a printed
+/// gradient. All shades are tints/shades of OneBrain primary `#ff2d92`.
+///
+/// Indexes map 1:1 to the 6 art lines (top → bottom).
+const BANNER_GRADIENT: [&str; 6] = [
+    "\x1b[38;2;255;138;195m", // #ff8ac3 · lightest tint
+    "\x1b[38;2;255;92;171m",  // #ff5cab · light tint
+    "\x1b[38;2;255;45;146m",  // #ff2d92 · primary brand
+    "\x1b[38;2;224;30;126m",  // #e01e7e · mid shade
+    "\x1b[38;2;186;22;105m",  // #ba1669 · deep shade
+    "\x1b[38;2;148;17;84m",   // #941154 · darkest shadow
+];
 
 /// Should the banner render for this invocation? Pure decision function over
 /// the parsed CLI + resolved [`OutputMode`] — no env / stdio access here.
@@ -111,15 +129,24 @@ const TAGLINE_INDENT: &str = "        ";
 ///   1 × dim `Your AI Thinking Partner · vX.Y.Z` tagline, indented to centre
 ///       under the art block.
 ///
-/// Each art line is wrapped in `ANSI_PINK_FG ... ANSI_RESET` and the tagline
-/// in `ANSI_DIM ... ANSI_RESET` so the terminal state is always clean after
-/// the banner. Trailing newline included so the caller can `write_all`
-/// directly and the help body starts on a fresh line below.
+/// Each art line is wrapped in its gradient-step escape from
+/// [`BANNER_GRADIENT`] (light at the top → dark at the bottom) followed by
+/// `ANSI_RESET`. The tagline is wrapped in `ANSI_DIM ... ANSI_RESET` so the
+/// terminal state is always clean after the banner. Two trailing newlines
+/// are appended — one terminates the tagline line, the second adds a blank
+/// line between the banner and whatever help body follows.
 pub fn render_banner() -> String {
     let version = env!("CARGO_PKG_VERSION");
-    let mut out = String::with_capacity(BANNER_ART.len() + 128);
-    for line in BANNER_ART.lines() {
-        out.push_str(ANSI_PINK_FG);
+    let mut out = String::with_capacity(BANNER_ART.len() + 256);
+    for (i, line) in BANNER_ART.lines().enumerate() {
+        // Saturating index so future art changes can't index out of bounds
+        // — the last gradient stop is reused if the art ever grows beyond 6
+        // lines. (Today the art is exactly 6 lines and this never triggers.)
+        let shade = BANNER_GRADIENT
+            .get(i)
+            .copied()
+            .unwrap_or(*BANNER_GRADIENT.last().unwrap());
+        out.push_str(shade);
         out.push_str(line);
         out.push_str(ANSI_RESET);
         out.push('\n');
@@ -129,6 +156,8 @@ pub fn render_banner() -> String {
     out.push_str("Your AI Thinking Partner · v");
     out.push_str(version);
     out.push_str(ANSI_RESET);
+    out.push('\n');
+    // Blank line between banner and the help body (clap's `Usage:` etc.).
     out.push('\n');
     out
 }
@@ -505,12 +534,12 @@ mod tests {
 
     #[test]
     fn banner_renders_6_line_art_plus_tagline() {
-        // Exactly 7 lines: 6 art + 1 tagline. `render_banner` ends with a
-        // trailing newline so `split('\n')` yields 8 elements (7 lines + the
-        // empty tail). Each art line must appear verbatim in order.
+        // 8 lines: 6 art + 1 tagline + 1 blank-line spacer between banner
+        // and help body. `render_banner` ends with two trailing newlines so
+        // `str::lines()` yields 8 elements (7 content + 1 empty).
         let s = render_banner();
         let lines: Vec<&str> = s.lines().collect();
-        assert_eq!(lines.len(), 7, "expected 7 banner lines, got {lines:?}");
+        assert_eq!(lines.len(), 8, "expected 8 banner lines, got {lines:?}");
         let art_lines: Vec<&str> = BANNER_ART.lines().collect();
         assert_eq!(art_lines.len(), 6, "art block should be 6 lines");
         for (i, art_line) in art_lines.iter().enumerate() {
@@ -520,7 +549,7 @@ mod tests {
                 lines[i]
             );
         }
-        // Last rendered line is the tagline.
+        // Tagline on line 7 (index 6).
         assert!(
             lines[6].contains("Your AI Thinking Partner"),
             "expected tagline on line 7, got {:?}",
