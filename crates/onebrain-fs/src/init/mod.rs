@@ -24,7 +24,9 @@
 //!   - `stdout_lines` / `stderr_lines`: line-oriented output sinks (mirrors
 //!     Slice 11's `update.rs`). When `None`, writes to real stdout/stderr.
 
+mod enable_plugin;
 mod folders;
+mod marketplace;
 mod presets;
 mod vault_yml;
 mod wizard;
@@ -33,8 +35,10 @@ pub use folders::{INBOX_IMPORTS_SUBDIR, STANDARD_FOLDERS};
 pub use presets::{ScheduleEntry, SchedulePreset};
 
 use crate::error::FsError;
+use crate::harness::detect_harnesses;
 use crate::register_hooks::{self, RegisterHooksOptions};
 use crate::vault_sync::{run_vault_sync, VaultSyncOptions};
+use onebrain_core::Harness;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -98,6 +102,14 @@ pub struct InitResult {
     /// fresh vault has plugin files installed. False when skipped, failed, or
     /// not attempted (offline init).
     pub vault_sync_ok: bool,
+    /// True when `<vault>/.claude-plugin/marketplace.json` was newly written
+    /// by this run. False on re-init (file pre-existed) or non-Claude harness
+    /// (gemini/direct — manifest not needed).
+    pub marketplace_written: bool,
+    /// True when `enabledPlugins.onebrain@onebrain` was newly inserted/updated
+    /// in `.claude/settings.json`. False on re-init (key already true) or
+    /// non-Claude harness.
+    pub plugin_enabled: bool,
     /// True when the user declined an interactive prompt and we exited
     /// cleanly (exit 0, no changes).
     pub aborted: bool,
@@ -225,6 +237,50 @@ pub fn run_init(mut opts: InitOptions) -> Result<InitResult, FsError> {
             "warning — run onebrain register-hooks to retry"
         }
     ));
+
+    // ── Step 7b: register plugin with Claude Code ──────────────────────────
+    // Without these two writes, Claude Code never loads the plugin even
+    // though `.claude/plugins/onebrain/` is on disk — /onboarding and every
+    // OneBrain skill silently fail at session start. Only emitted on the
+    // claude harness; gemini/direct have no equivalent surface.
+    if detect_harnesses(&vault_dir).contains(&Harness::Claude) {
+        match marketplace::write_marketplace_json(&vault_dir) {
+            Ok(wrote) => {
+                result.marketplace_written = wrote;
+                stdout(&format!(
+                    "marketplace.json: {}",
+                    if wrote {
+                        "written"
+                    } else {
+                        "ok (pre-existing)"
+                    }
+                ));
+            }
+            Err(e) => {
+                stderr(&format!("init: marketplace.json warning: {e}"));
+            }
+        }
+        match enable_plugin::enable_onebrain_plugin(&vault_dir) {
+            Ok(wrote) => {
+                result.plugin_enabled = true;
+                stdout(&format!(
+                    "plugin: {}",
+                    if wrote {
+                        "enabled"
+                    } else {
+                        "ok (already enabled)"
+                    }
+                ));
+            }
+            Err(e) => {
+                // Hard fail this one — malformed pre-existing settings.json
+                // shouldn't be silently overwritten, and the surrounding
+                // FsError already encodes enough context for the caller to
+                // map an exit code.
+                return Err(e);
+            }
+        }
+    }
 
     // ── Step 8: vault-sync (best-effort) ───────────────────────────────────
     // Downloads the upstream tarball + populates `.claude/plugins/onebrain/`,

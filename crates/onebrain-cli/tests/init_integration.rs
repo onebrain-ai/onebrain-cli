@@ -160,6 +160,197 @@ fn cli_yes_force_overwrites_existing_vault_yml() {
     );
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Plugin registration (marketplace.json + enabledPlugins)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Without `.claude-plugin/marketplace.json`, Claude Code never discovers
+/// the vault-bundled plugin. Fresh init must always write this file.
+#[test]
+fn init_creates_marketplace_json_at_vault_root() {
+    let d = tempdir().unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes", "--no-sync"])
+        .current_dir(d.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("marketplace.json: written"));
+
+    let path = d.path().join(".claude-plugin").join("marketplace.json");
+    assert!(path.is_file(), ".claude-plugin/marketplace.json missing");
+    let text = fs::read_to_string(&path).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).expect("marketplace.json valid JSON");
+    assert_eq!(v["name"], "onebrain");
+    assert_eq!(v["plugins"][0]["source"], "./.claude/plugins/onebrain");
+    assert!(v["plugins"][0]["description"]
+        .as_str()
+        .unwrap()
+        .contains("Your AI Thinking Partner"));
+}
+
+/// Without `enabledPlugins.onebrain@onebrain = true` in settings.json, the
+/// plugin shows up in the marketplace browser but stays dormant. Fresh
+/// init must inject the key alongside the existing hooks/permissions block.
+#[test]
+fn init_adds_enabled_plugins_to_settings() {
+    let d = tempdir().unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes", "--no-sync"])
+        .current_dir(d.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("plugin: enabled"));
+
+    let settings_path = d.path().join(".claude").join("settings.json");
+    let text = fs::read_to_string(&settings_path).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).expect("settings.json valid JSON");
+    assert_eq!(
+        v["enabledPlugins"]["onebrain@onebrain"],
+        serde_json::Value::Bool(true),
+        "enabledPlugins.onebrain@onebrain missing: {text}"
+    );
+    // Coexist with the register-hooks-managed keys
+    assert!(v["hooks"]["Stop"].is_array(), "hooks.Stop missing: {text}");
+    assert!(
+        v["permissions"]["allow"].is_array(),
+        "permissions.allow missing: {text}"
+    );
+}
+
+/// User-customized marketplace.json must survive `--force` re-init — we
+/// only write the manifest when it doesn't already exist.
+#[test]
+fn init_is_idempotent_marketplace_json_not_overwritten() {
+    let d = tempdir().unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes", "--no-sync"])
+        .current_dir(d.path())
+        .assert()
+        .success();
+
+    // Modify the manifest as a user would
+    let path = d.path().join(".claude-plugin").join("marketplace.json");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text = text.replace(
+        "Your AI Thinking Partner (vault-bundled plugin)",
+        "Your AI Thinking Partner (CUSTOMIZED BY USER)",
+    );
+    fs::write(&path, &text).unwrap();
+
+    // Re-init with --force (existing vault.yml guard requires it)
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes", "--force", "--no-sync"])
+        .current_dir(d.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "marketplace.json: ok (pre-existing)",
+        ));
+
+    let after = fs::read_to_string(&path).unwrap();
+    assert!(
+        after.contains("CUSTOMIZED BY USER"),
+        "user customization clobbered: {after}"
+    );
+}
+
+/// Pre-existing settings.json (e.g., from a Claude Code session that ran
+/// in this dir before OneBrain init) must keep every key — we only insert
+/// `enabledPlugins.onebrain@onebrain`, no other mutation.
+#[test]
+fn init_preserves_existing_settings_keys() {
+    let d = tempdir().unwrap();
+    fs::create_dir_all(d.path().join(".claude")).unwrap();
+    let settings_path = d.path().join(".claude").join("settings.json");
+    let custom = serde_json::json!({
+        "permissions": { "allow": ["Bash(custom *)"] },
+        "model": "claude-sonnet",
+        "theme": "dark"
+    });
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&custom).unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes", "--no-sync"])
+        .current_dir(d.path())
+        .assert()
+        .success();
+
+    let text = fs::read_to_string(&settings_path).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["enabledPlugins"]["onebrain@onebrain"], true);
+    assert_eq!(v["model"], "claude-sonnet");
+    assert_eq!(v["theme"], "dark");
+    // register-hooks merges its 14 allow entries in alongside the custom one
+    let allow = v["permissions"]["allow"].as_array().expect("allow array");
+    assert!(
+        allow.iter().any(|x| x == "Bash(custom *)"),
+        "custom permission lost: {text}"
+    );
+}
+
+/// Re-init when enabledPlugins is already true is a no-op for settings —
+/// register-hooks still runs (idempotent) but the enable step shouldn't
+/// re-write the file. The previous "plugin: enabled" line becomes
+/// "plugin: ok (already enabled)".
+#[test]
+fn init_skips_when_already_enabled() {
+    let d = tempdir().unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes", "--no-sync"])
+        .current_dir(d.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("plugin: enabled"));
+
+    // Run again with --force; key already true → "ok (already enabled)"
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes", "--force", "--no-sync"])
+        .current_dir(d.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("plugin: ok (already enabled)"));
+
+    let v: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(d.path().join(".claude").join("settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(v["enabledPlugins"]["onebrain@onebrain"], true);
+}
+
+/// Pre-existing malformed settings.json must surface as a hard error
+/// (FsError → exit 66 / E_FS_ERROR) rather than silently overwriting the
+/// user's data.
+#[test]
+fn init_fails_on_malformed_settings_json() {
+    let d = tempdir().unwrap();
+    fs::create_dir_all(d.path().join(".claude")).unwrap();
+    let settings_path = d.path().join(".claude").join("settings.json");
+    fs::write(&settings_path, "{not valid json").unwrap();
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes", "--no-sync"])
+        .current_dir(d.path())
+        .assert()
+        .failure();
+
+    // Existing file untouched (atomic write means the malformed contents
+    // are preserved on the failure path)
+    let after = fs::read_to_string(&settings_path).unwrap();
+    assert_eq!(after, "{not valid json");
+}
+
 /// Bun v2.3.3-parity: `--vault-dir <path>` targets a directory other than
 /// cwd. The binary should write the vault scaffold into that directory.
 #[test]
