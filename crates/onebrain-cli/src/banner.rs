@@ -214,8 +214,8 @@ pub fn argv_requests_help(args: &[String]) -> bool {
                 let _ = iter.next();
             }
             // Global boolean flags — skip and continue scanning.
-            "--json" | "--yaml" | "--pretty" | "--no-color" | "-q" | "--quiet"
-            | "--version" | "-V" => {}
+            "--json" | "--yaml" | "--pretty" | "--no-color" | "-q" | "--quiet" | "--version"
+            | "-V" => {}
             // Anything else is a subcommand (or unknown · clap will error,
             // but that error message is itself a usage screen, not a help
             // screen, so we don't want the banner there).

@@ -78,6 +78,13 @@ fn real_confirm_fn() -> ConfirmFn {
             // Fallback — just emit the same question via inquire.
             onebrain_fs::init::ask_initialize_here(Path::new("."))
         } else {
+            // B3 (SF-H5): a future prompt string added in `init/mod.rs`
+            // without a matching arm here would silently abort init.
+            // Surface it loudly in dev builds (debug_assert) and emit a
+            // stderr warning in release builds so the user sees the drift
+            // instead of an unexplained "init declined".
+            debug_assert!(false, "unhandled init prompt: {question}");
+            eprintln!("init: unrecognized prompt — treating as no: {question}");
             false
         }
     })
@@ -91,12 +98,16 @@ fn real_preset_fn() -> PresetFn {
 mod tests {
     use super::*;
 
+    /// B3 (SF-H5): unknown prompt strings now trip a debug_assert in dev
+    /// builds (catches drift between mod.rs question text + this dispatcher
+    /// in CI) and emit a stderr warning in release builds (users see the
+    /// issue instead of an unexplained "init declined").
     #[test]
-    fn real_confirm_fn_routes_overwrite_question() {
-        // We can't actually drive inquire from a unit test (no TTY) — but we
-        // can at least construct the closure and verify it answers `false`
-        // on an unknown question.
+    #[should_panic(expected = "unhandled init prompt")]
+    fn confirm_fn_warns_on_unknown_prompt() {
         let mut f = real_confirm_fn();
-        assert!(!f("something totally unrelated"));
+        // Trip debug_assert! in dev/test builds. Release builds would just
+        // see the stderr warning + a `false` return.
+        let _ = f("something totally unrelated");
     }
 }

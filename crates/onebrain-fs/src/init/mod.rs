@@ -147,23 +147,27 @@ pub fn run_init(mut opts: InitOptions) -> Result<InitResult, FsError> {
     // emit (immediately after the safety check passes).
 
     // ── Step 0: target-directory safety check ──────────────────────────────
-    // Guards against running `onebrain init` in the wrong directory. Skipped
-    // when --force is set (caller knows what they're doing); short-circuits
-    // when the directory already contains vault.yml (delegates to Step 1's
-    // existing vault.yml guard); creates the directory when missing.
-    if !opts.force {
-        match safety::classify(&vault_dir)? {
-            safety::DirState::Missing => {
-                std::fs::create_dir_all(&vault_dir).map_err(|e| FsError::Io {
-                    path: vault_dir.clone(),
-                    source: e,
-                })?;
-            }
-            safety::DirState::Empty | safety::DirState::OneBrainVault => {
-                // Empty: nothing to guard. OneBrainVault: vault.yml present,
-                // hand off to Step 1's overwrite logic.
-            }
-            safety::DirState::NonEmptyNonVault { summary } => {
+    // Guards against running `onebrain init` in the wrong directory. Always
+    // runs safety::classify so permission errors / "target is a file" /
+    // missing-parent paths surface as a proper FsError BEFORE any partial
+    // writes. `--force` only suppresses the interactive PROMPT (B2 / SF-H4);
+    // it does not bypass the classification itself.
+    match safety::classify(&vault_dir)? {
+        safety::DirState::Missing => {
+            std::fs::create_dir_all(&vault_dir).map_err(|e| FsError::Io {
+                path: vault_dir.clone(),
+                source: e,
+            })?;
+        }
+        safety::DirState::Empty | safety::DirState::OneBrainVault => {
+            // Empty: nothing to guard. OneBrainVault: vault.yml present,
+            // hand off to Step 1's overwrite logic.
+        }
+        safety::DirState::NonEmptyNonVault { summary } => {
+            if opts.force {
+                // --force: classification succeeded, skip the prompt and
+                // proceed (caller knows what they're doing).
+            } else {
                 let target_display = vault_dir.display().to_string();
                 if opts.structured_output {
                     // Machine consumer can't respond to a TTY prompt —
@@ -194,13 +198,6 @@ pub fn run_init(mut opts: InitOptions) -> Result<InitResult, FsError> {
                 }
             }
         }
-    } else if !vault_dir.exists() {
-        // --force: still create the directory if it doesn't exist so
-        // downstream writes (vault.yml, folders, settings.json) succeed.
-        std::fs::create_dir_all(&vault_dir).map_err(|e| FsError::Io {
-            path: vault_dir.clone(),
-            source: e,
-        })?;
     }
 
     // Safety check passed — emit the text-mode header now. Structured-output
@@ -333,12 +330,17 @@ pub fn run_init(mut opts: InitOptions) -> Result<InitResult, FsError> {
             }
         };
         stdout(line);
-        match enable_plugin::enable_onebrain_plugin(&vault_dir) {
-            Ok(wrote) => {
+        match enable_plugin::enable_onebrain_plugin_with_force(&vault_dir, opts.force) {
+            Ok(outcome) => {
+                if let Some(warning) = outcome.warning.as_deref() {
+                    // B1 (SF-H3): surface the clobber warning so the user
+                    // sees what --force just replaced.
+                    stderr(warning);
+                }
                 result.plugin_enabled = true;
                 stdout(&format!(
                     "plugin: {}",
-                    if wrote {
+                    if outcome.wrote {
                         "enabled"
                     } else {
                         "ok (already enabled)"
@@ -347,9 +349,9 @@ pub fn run_init(mut opts: InitOptions) -> Result<InitResult, FsError> {
             }
             Err(e) => {
                 // Hard fail this one — malformed pre-existing settings.json
-                // shouldn't be silently overwritten, and the surrounding
+                // OR a non-bool clobber refusal (B1 / SF-H3); the surrounding
                 // FsError already encodes enough context for the caller to
-                // map an exit code.
+                // map an exit code (75 for InitTargetNotEmpty).
                 return Err(e);
             }
         }
@@ -725,6 +727,68 @@ mod tests {
         let lines = stdout_buf.lock().unwrap();
         assert!(!lines.is_empty());
         assert_eq!(lines[0], "OneBrain Init");
+    }
+
+    /// B2 (SF-H4): `--force` must still run `safety::classify`. Pre-fix the
+    /// classify call was guarded by `if !opts.force` so an unreadable target
+    /// (EACCES on read_dir, target is a regular file, …) under `--force`
+    /// fell through to mid-write garbage. Now classify always runs; only
+    /// the PROMPT is suppressed under --force.
+    #[test]
+    #[cfg(unix)]
+    fn force_still_classifies_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir().unwrap();
+        let target = d.path().join("locked");
+        std::fs::create_dir_all(&target).unwrap();
+        // Make the dir unreadable so read_dir() returns EACCES.
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (opts, _stdout_buf) = test_opts(&target);
+        let mut opts = opts;
+        opts.force = true;
+
+        let result = run_init(opts);
+        // Restore perms so tempdir cleanup works.
+        let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755));
+
+        let err = result.expect_err("expected EACCES to surface as FsError");
+        match err {
+            FsError::Io { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+        // No partial state written — vault.yml absent under the locked dir.
+        // (Can't easily inspect without restoring perms first; the EACCES
+        // surface from classify is the contract we care about here.)
+    }
+
+    /// B2 follow-up: `--force` against a target path that's a regular file
+    /// (not a directory) surfaces as a proper FsError via classify rather
+    /// than mid-write garbage. classify reports NonEmptyNonVault with the
+    /// "not a directory" summary; --force then short-circuits the prompt
+    /// and lets the downstream writes fail with their own FsError when they
+    /// try to create_dir_all on the regular-file path.
+    #[test]
+    fn force_still_classifies_target_is_regular_file() {
+        let d = tempdir().unwrap();
+        let target = d.path().join("regular-file");
+        std::fs::write(&target, "ok").unwrap();
+
+        let (opts, _stdout_buf) = test_opts(&target);
+        let mut opts = opts;
+        opts.force = true;
+
+        let err = run_init(opts).expect_err("expected error for file-as-vault");
+        // Either classify caught it via NonEmptyNonVault (then a downstream
+        // create_dir_all fails) or the downstream write surfaces FsError.
+        // Either way it's an Err, not a partial-write success.
+        match err {
+            FsError::Io { .. } | FsError::Core(_) => {}
+        }
+        // The regular file content is preserved (no clobber).
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "ok");
     }
 
     #[test]
