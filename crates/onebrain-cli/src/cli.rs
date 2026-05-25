@@ -80,23 +80,37 @@ pub enum Cmd {
     // are marked `hide = true` so they don't clutter `onebrain --help`. The
     // tree shape stays locked per spec §2.4 — typed commands still parse and
     // dispatch (returning exit 72), they just don't advertise in help.
+    #[command(hide = true)]
     Avatar(AvatarCmd),
+    #[command(hide = true)]
     Bookmark(BookmarkCmd),
+    #[command(hide = true)]
     Bundle(BundleCmd),
     #[command(display_order = 12)]
     Checkpoint(CheckpointCmd),
+    #[command(hide = true)]
     Config(ConfigCmd),
+    #[command(hide = true)]
     Daemon(DaemonCmd),
+    #[command(hide = true)]
     Date(DateCmd),
+    #[command(hide = true)]
     Dream(DreamCmd),
+    #[command(hide = true)]
     Frontmatter(FrontmatterCmd),
+    #[command(hide = true)]
     Gateway(GatewayCmd),
     #[command(display_order = 13)]
     Harness(HarnessCmd),
+    #[command(hide = true)]
     Inbox(InboxCmd),
+    #[command(hide = true)]
     Log(LogCmd),
+    #[command(hide = true)]
     Memory(MemoryCmd),
+    #[command(hide = true)]
     Note(NoteCmd),
+    #[command(hide = true)]
     Pause(PauseCmd),
     #[command(display_order = 20)]
     Plugin(PluginCmd),
@@ -104,11 +118,13 @@ pub enum Cmd {
     Qmd(QmdCmd),
     #[command(display_order = 21)]
     Schedule(ScheduleCmd),
+    #[command(hide = true)]
     Serve(ServeCmd),
     #[command(display_order = 11)]
     Session(SessionCmd),
     #[command(display_order = 23)]
     Skill(SkillCmd),
+    #[command(hide = true)]
     Task(TaskCmd),
     #[command(display_order = 10)]
     Vault(VaultCmd),

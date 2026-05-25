@@ -52,22 +52,19 @@ const ANSI_PINK_FG: &str = "\x1b[38;2;255;45;146m";
 const ANSI_DIM: &str = "\x1b[2m";
 const ANSI_RESET: &str = "\x1b[0m";
 
-/// 4-step gradient applied to the BRAIN half of the wordmark · top to
+/// 3-step gradient applied to the BRAIN half of the wordmark · top to
 /// bottom. All shades are tints/shades of OneBrain primary `#ff2d92`.
-const BANNER_BRAIN_GRADIENT: [&str; 4] = [
+const BANNER_BRAIN_GRADIENT: [&str; 3] = [
     "\x1b[38;2;255;128;186m", // light tint · top
-    "\x1b[38;2;255;76;161m",  // mid tint
     "\x1b[38;2;255;45;146m",  // primary brand
     "\x1b[38;2;186;22;105m",  // deep shade · bottom
 ];
 
-/// Single muted gray for the ONE half · OpenCode-style "secondary word"
-/// treatment that lets BRAIN read as the visual focus. Slight gradient via
-/// 4 shades top→bottom for depth match with BRAIN.
-const BANNER_ONE_GRADIENT: [&str; 4] = [
+/// Muted gray gradient for the ONE half · OpenCode-style "secondary word"
+/// treatment that lets BRAIN read as the visual focus.
+const BANNER_ONE_GRADIENT: [&str; 3] = [
     "\x1b[38;2;160;160;160m", // light gray · top
-    "\x1b[38;2;128;128;128m",
-    "\x1b[38;2;96;96;96m",
+    "\x1b[38;2;112;112;112m",
     "\x1b[38;2;72;72;72m", // dark gray · bottom
 ];
 
@@ -110,26 +107,23 @@ fn is_hook_protocol(cmd: &Cmd) -> bool {
     }
 }
 
-/// FIGlet "chunky" rendering of the wordmark `OneBrain`. Four lines of
-/// pixel-block characters · 53 chars wide · OpenCode-inspired compact
-/// style. Each line is split at [`BRAIN_START_COL`] so the `One` half can
-/// be colored differently from the `Brain` half (Brain = primary brand
-/// focus · One = muted secondary).
-const BANNER_ART: [&str; 4] = [
-    r" _______               ______              __        ",
-    r"|       |.-----.-----.|   __ \.----.---.-.|__|.-----.",
-    r"|   -   ||     |  -__||   __ <|   _|  _  ||  ||     |",
-    r"|_______||__|__|_____||______/|__| |___._||__||__|__|",
+/// Unicode block-shaded rendering of the wordmark `ONEBRAIN`. Three lines
+/// of pixel-art letters using full-block (`█`), half-block (`▀`), and
+/// shaded-block (`░`) characters · 32 cols wide. Split into ONE / BRAIN
+/// halves so each can carry its own gradient (BRAIN = primary brand focus
+/// · ONE = muted secondary). Each letter is 4 chars wide; ONE = 3 letters
+/// (cols 0-11) · BRAIN = 5 letters (cols 12-31).
+const BANNER_ONE_ART: [&str; 3] = ["░█▀█░█▀█░█▀▀", "░█░█░█░█░█▀▀", " ▀▀▀ ▀ ▀ ▀▀▀"];
+
+const BANNER_BRAIN_ART: [&str; 3] = [
+    "░█▀▄░█▀▄░█▀█░▀█▀░█▀█",
+    "░█▀▄░█▀▄░█▀█░░█░░█░█",
+    " ▀▀  ▀ ▀ ▀ ▀ ▀▀▀ ▀ ▀",
 ];
 
-/// Byte column where the `Brain` half starts in [`BANNER_ART`]. The art is
-/// ASCII so byte position = monospace column. Bisecting at this column
-/// gives a clean `One` / `Brain` split for the two-tone color treatment.
-const BRAIN_START_COL: usize = 22;
-
-/// Visual width (in monospace columns) of every line in [`BANNER_ART`].
-/// Hard-coded · the chunky rendering is uniform width across all 4 lines.
-const BANNER_VISUAL_WIDTH: usize = 53;
+/// Visual width (in monospace columns) of every rendered line. Used for
+/// centering the tagline. 8 letters × 4 cols = 32.
+const BANNER_VISUAL_WIDTH: usize = 32;
 
 /// Build the banner string (no I/O). Seven lines total:
 ///   6 × pink ASCII-art lines (ANSI Shadow rendering of `OneBrain`)
@@ -144,8 +138,8 @@ const BANNER_VISUAL_WIDTH: usize = 53;
 /// line between the banner and whatever help body follows.
 pub fn render_banner() -> String {
     let version = env!("CARGO_PKG_VERSION");
-    let mut out = String::with_capacity(512);
-    for (i, line) in BANNER_ART.iter().enumerate() {
+    let mut out = String::with_capacity(1024);
+    for i in 0..BANNER_ONE_ART.len() {
         let one_shade = BANNER_ONE_GRADIENT
             .get(i)
             .copied()
@@ -154,13 +148,11 @@ pub fn render_banner() -> String {
             .get(i)
             .copied()
             .unwrap_or(*BANNER_BRAIN_GRADIENT.last().unwrap());
-        // ASCII art · byte-position split is column-position split.
-        let (one_half, brain_half) = line.split_at(BRAIN_START_COL.min(line.len()));
         out.push_str(one_shade);
-        out.push_str(one_half);
+        out.push_str(BANNER_ONE_ART[i]);
         out.push_str(ANSI_RESET);
         out.push_str(brain_shade);
-        out.push_str(brain_half);
+        out.push_str(BANNER_BRAIN_ART[i]);
         out.push_str(ANSI_RESET);
         out.push('\n');
     }
@@ -570,7 +562,7 @@ mod tests {
         // `OneBrain` no longer appears, but the art is recognisable via its
         // characteristic pixel-block underscores + pipes (the `_______`
         // top-line motif is unique to chunky among the fonts we'd ever swap to).
-        assert!(s.contains("_______"), "missing ASCII art glyphs: {s:?}");
+        assert!(s.contains("█"), "missing ASCII art glyphs: {s:?}");
         // Version comes from CARGO_PKG_VERSION — always present at compile
         // time. Check the literal `v` prefix the format emits.
         let version = env!("CARGO_PKG_VERSION");
@@ -589,34 +581,39 @@ mod tests {
     }
 
     #[test]
-    fn banner_renders_4_line_art_plus_tagline() {
-        // 6 lines: 4 art + 1 tagline + 1 blank-line spacer between banner
+    fn banner_renders_3_line_art_plus_tagline() {
+        // 5 lines: 3 art + 1 tagline + 1 blank-line spacer between banner
         // and help body. `render_banner` ends with two trailing newlines so
-        // `str::lines()` yields 6 elements (5 content + 1 empty).
+        // `str::lines()` yields 5 elements (4 content + 1 empty).
         let s = render_banner();
         let lines: Vec<&str> = s.lines().collect();
-        assert_eq!(lines.len(), 6, "expected 6 banner lines, got {lines:?}");
-        assert_eq!(BANNER_ART.len(), 4, "art block should be 4 lines");
-        // Each rendered art line should contain both halves of the matching
-        // BANNER_ART line (split + recolored at BRAIN_START_COL).
-        for (i, art_line) in BANNER_ART.iter().enumerate() {
-            let (one_half, brain_half) = art_line.split_at(BRAIN_START_COL.min(art_line.len()));
+        assert_eq!(lines.len(), 5, "expected 5 banner lines, got {lines:?}");
+        assert_eq!(BANNER_ONE_ART.len(), 3, "ONE art block should be 3 lines");
+        assert_eq!(
+            BANNER_BRAIN_ART.len(),
+            3,
+            "BRAIN art block should be 3 lines"
+        );
+        // Each rendered art line should contain both halves recolored.
+        for i in 0..3 {
             assert!(
-                lines[i].contains(one_half),
-                "rendered line {i} ({:?}) missing One half ({one_half:?})",
-                lines[i]
+                lines[i].contains(BANNER_ONE_ART[i]),
+                "rendered line {i} ({:?}) missing ONE half ({:?})",
+                lines[i],
+                BANNER_ONE_ART[i]
             );
             assert!(
-                lines[i].contains(brain_half),
-                "rendered line {i} ({:?}) missing Brain half ({brain_half:?})",
-                lines[i]
+                lines[i].contains(BANNER_BRAIN_ART[i]),
+                "rendered line {i} ({:?}) missing BRAIN half ({:?})",
+                lines[i],
+                BANNER_BRAIN_ART[i]
             );
         }
-        // Tagline on line 5 (index 4).
+        // Tagline on line 4 (index 3).
         assert!(
-            lines[4].contains("Your AI Thinking Partner"),
-            "expected tagline on line 5, got {:?}",
-            lines[4]
+            lines[3].contains("Your AI Thinking Partner"),
+            "expected tagline on line 4, got {:?}",
+            lines[3]
         );
     }
 
@@ -905,7 +902,7 @@ mod tests {
         // The ASCII art's chunky-font `_______` top-line motif is the
         // cheapest stable brand-presence check — the literal word `OneBrain`
         // no longer appears anywhere in the rendered banner.
-        assert!(out.contains("_______"), "missing ASCII art: {out:?}");
+        assert!(out.contains("█"), "missing ASCII art: {out:?}");
         assert!(
             out.contains("Your AI Thinking Partner"),
             "missing tagline: {out:?}"

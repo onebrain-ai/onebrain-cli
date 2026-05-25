@@ -90,11 +90,13 @@ fn root_help_hides_v30_aliases() {
 }
 
 #[test]
-fn top_level_help_shows_all_24_groups_and_3_root_verbs() {
-    // v3.1.0 surface: all 24 resource groups + 3 root verbs are visible in
-    // `onebrain --help` (user-decided 2026-05-25 to make every command
-    // discoverable, even stubs · users can probe with `--help` to see what's
-    // there). Hidden v3.0 aliases stay hidden (see `root_help_hides_v30_aliases`).
+fn top_level_help_hides_stub_groups() {
+    // v3.1.0 final UX (user-decided 2026-05-25): only groups with ≥1 real
+    // user-facing verb are visible at root `--help`. Stub-only groups
+    // (`avatar`, `bookmark`, `bundle`, `config`, `daemon`, `date`, `dream`,
+    // `frontmatter`, `gateway`, `inbox`, `log`, `memory`, `note`, `pause`,
+    // `serve`, `task`) are hidden — they still parse + dispatch (see
+    // `hidden_stub_still_dispatches`), they just don't clutter the help.
     let out = Command::cargo_bin("onebrain")
         .unwrap()
         .arg("--help")
@@ -102,41 +104,46 @@ fn top_level_help_shows_all_24_groups_and_3_root_verbs() {
         .success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
 
-    // 3 root verbs + 24 groups + the clap `help` meta = 28 visible entries.
     for visible in [
-        // root verbs
         "init",
         "update",
         "doctor",
-        // 24 groups (alphabetical · per spec §2.4)
+        "vault",
+        "session",
+        "checkpoint",
+        "harness",
+        "plugin",
+        "schedule",
+        "skill",
+        "qmd",
+    ] {
+        assert!(
+            stdout.contains(&format!("  {visible} ")) || stdout.contains(&format!("  {visible}  ")),
+            "expected visible command `{visible}` in --help. Got:\n{stdout}"
+        );
+    }
+
+    for stub in [
         "avatar",
         "bookmark",
         "bundle",
-        "checkpoint",
         "config",
         "daemon",
         "date",
         "dream",
         "frontmatter",
         "gateway",
-        "harness",
         "inbox",
         "log",
         "memory",
         "note",
         "pause",
-        "plugin",
-        "qmd",
-        "schedule",
         "serve",
-        "session",
-        "skill",
         "task",
-        "vault",
     ] {
         assert!(
-            stdout.contains(&format!("  {visible} ")) || stdout.contains(&format!("  {visible}  ")),
-            "expected visible command `{visible}` in --help. Got:\n{stdout}"
+            !stdout.contains(&format!("  {stub}  ")) && !stdout.contains(&format!("  {stub} ")),
+            "stub group `{stub}` leaked into top-level --help. Got:\n{stdout}"
         );
     }
 }
