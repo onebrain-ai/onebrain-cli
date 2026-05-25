@@ -200,7 +200,11 @@ pub fn run_vault_sync(vault_root: &Path, opts: VaultSyncOptions) -> VaultSyncRes
 }
 
 fn read_update_channel(vault_root: &Path) -> Option<String> {
-    let text = fs::read_to_string(vault_root.join("vault.yml")).ok()?;
+    // Honour the canonical config filename first (v3.1+ `onebrain.yml`), fall
+    // back to legacy `vault.yml` so already-migrated vaults still resolve the
+    // configured channel during vault-sync.
+    let config_path = onebrain_core::find_config_file(vault_root)?;
+    let text = fs::read_to_string(config_path).ok()?;
     let v: serde_yaml::Value = serde_yaml::from_str(&text).ok()?;
     v.get("update_channel")
         .and_then(|x| x.as_str())

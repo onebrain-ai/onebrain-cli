@@ -288,3 +288,71 @@ fn doctor_fix_migrates_vault_yml_with_vault_flag() {
         "rename must preserve file content byte-for-byte"
     );
 }
+
+/// Regression — when `doctor --fix` runs both the `vault-config-migration`
+/// recipe AND the `plugin-files` recipe (because the vault is missing
+/// plugin files), vault-sync's "Step 7 update_vault_yml" must not
+/// resurrect a legacy `vault.yml` after migration renamed it away.
+///
+/// Pre-fix bug: the recipes ran in declaration order — migration renamed
+/// `vault.yml` → `onebrain.yml`, then plugin-files' vault-sync wrote
+/// `update_channel` into a hardcoded `vault.yml` path, leaving BOTH files
+/// at vault root.
+///
+/// Skipped on hosts without network — vault-sync downloads the upstream
+/// plugin tarball. The repro runs locally via the worktree's debug binary
+/// and CI has full internet.
+#[test]
+#[ignore = "requires network for vault-sync plugin tarball download"]
+fn doctor_fix_does_not_resurrect_vault_yml_after_migration() {
+    let vault = tempdir().unwrap();
+    // Bare-bones legacy vault: no plugin files (forces plugin-files recipe
+    // to spawn vault-sync), legacy vault.yml present (forces migration
+    // recipe to run).
+    std::fs::write(
+        vault.path().join("vault.yml"),
+        "update_channel: stable\n\
+         folders:\n  \
+           inbox: 00-inbox\n  \
+           projects: 01-projects\n  \
+           areas: 02-areas\n  \
+           knowledge: 03-knowledge\n  \
+           resources: 04-resources\n  \
+           agent: 05-agent\n  \
+           archive: 06-archive\n  \
+           logs: 07-logs\n",
+    )
+    .unwrap();
+    for f in [
+        "00-inbox",
+        "01-projects",
+        "02-areas",
+        "03-knowledge",
+        "04-resources",
+        "05-agent",
+        "06-archive",
+        "07-logs",
+        ".claude",
+    ] {
+        std::fs::create_dir_all(vault.path().join(f)).unwrap();
+    }
+
+    let _ = Command::cargo_bin("onebrain")
+        .unwrap()
+        .env("PATH", "/usr/bin:/bin")
+        .args(["doctor", "--fix", "--vault"])
+        .arg(vault.path())
+        .assert();
+
+    assert!(
+        vault.path().join("onebrain.yml").is_file(),
+        "expected onebrain.yml at {}",
+        vault.path().display()
+    );
+    assert!(
+        !vault.path().join("vault.yml").exists(),
+        "REGRESSION — vault-sync resurrected vault.yml after migration recipe \
+         renamed it away. Step 7 must write to onebrain.yml when canonical \
+         is present."
+    );
+}
