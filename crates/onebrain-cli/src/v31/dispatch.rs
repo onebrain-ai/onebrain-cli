@@ -212,7 +212,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             VaultVerb::Verify => {
                 stubs::not_implemented_vault_required(vault_flag.clone(), "vault verify")
             }
-            VaultVerb::Current => vault_current::run(vault_flag, &mode),
+            // R2-M1: use `.clone()` for symmetry with the sibling arms
+            // above. `vault_flag` would otherwise be moved here, but it's
+            // never read after the match — so functionally identical;
+            // matches house style.
+            VaultVerb::Current => vault_current::run(vault_flag.clone(), &mode),
         },
 
         // ───── Skill ────────────────────────────────────────────────
@@ -485,6 +489,21 @@ fn emit_plugin_update_summary(
     report: &plugin_update::PluginUpdateReport,
     mode: &OutputMode,
 ) -> Result<()> {
+    emit_plugin_update_summary_to(report, mode, std::io::stdout().lock())
+}
+
+/// Same as [`emit_plugin_update_summary`] but with an injectable writer for
+/// unit tests. R2-M4: the broken-pipe regression test feeds a writer that
+/// always returns `io::ErrorKind::BrokenPipe`; the function must surface
+/// the failure as `Err` so `exit::exit_code_for` can classify it to 0 (the
+/// POSIX-correct exit when downstream hung up). Previously the production
+/// code used `let _ = emit(...)` and the integration smoke-test couldn't
+/// observe propagation deterministically (OS pipe buffer size varies).
+pub(crate) fn emit_plugin_update_summary_to<W: std::io::Write>(
+    report: &plugin_update::PluginUpdateReport,
+    mode: &OutputMode,
+    writer: W,
+) -> Result<()> {
     use crate::output::{emit, Envelope, ErrorInfo};
     use anyhow::Context;
     use serde::Serialize;
@@ -534,7 +553,7 @@ fn emit_plugin_update_summary(
         env = env.with_warning(w.code.clone(), w.message.clone());
     }
 
-    emit(&env, mode, std::io::stdout().lock(), |e| {
+    emit(&env, mode, writer, |e| {
         let d = e.data.as_ref().unwrap();
         let mut s = String::from("plugin update:\n");
         s.push_str(&format!(
@@ -566,4 +585,60 @@ fn emit_plugin_update_summary(
     })
     .context("plugin update: render summary failed")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, Write};
+
+    /// Writer that returns `BrokenPipe` on every write. Mirrors a downstream
+    /// `head -c 0` / `| less` quit pattern where the consumer hangs up
+    /// immediately.
+    struct BrokenPipeWriter;
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    #[test]
+    fn broken_pipe_writer_propagates_through_emit_helper_and_classifies_to_zero() {
+        // R2-M4: PROVE the wiring. The previous integration smoke test
+        // discarded the exit code; this unit test directly asserts the
+        // function returns Err on a BrokenPipe writer AND that
+        // `exit::exit_code_for` classifies the resulting anyhow error to
+        // EXIT_OK (POSIX-correct behaviour for downstream-hung-up pipes).
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: true,
+            vault_synced: false,
+            hooks_rewritten: 0,
+            plists_rewritten: false,
+            partial_failure: None,
+            warnings: Vec::new(),
+        };
+        let mode = OutputMode::Json { pretty: false };
+        let err = emit_plugin_update_summary_to(&report, &mode, BrokenPipeWriter)
+            .expect_err("BrokenPipe writer must surface as Err, not be swallowed");
+        // BrokenPipe must classify to EXIT_OK so `onebrain ... | head` etc.
+        // don't show an error.
+        assert_eq!(crate::exit::exit_code_for(&err), crate::exit::EXIT_OK);
+    }
+
+    #[test]
+    fn already_reported_sentinel_downcasts_from_anyhow_context() {
+        // Defensive: regression-guard for the anyhow-context downcast
+        // quirk that bit R2-H3. If anyhow ever changes how `.context(C)`
+        // is exposed, this test surfaces it before main::render_error
+        // silently regresses.
+        let inner = anyhow::anyhow!("inner err");
+        let wrapped: anyhow::Error = inner.context(AlreadyReported);
+        assert!(
+            wrapped.downcast_ref::<AlreadyReported>().is_some(),
+            "anyhow::Error::downcast_ref must locate `.context()`-attached AlreadyReported"
+        );
+    }
 }

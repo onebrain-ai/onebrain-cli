@@ -848,3 +848,269 @@ fn plugin_update_does_not_touch_cli_binary() {
         binaries_dir.display()
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// R2-M2 · parametric hidden alias coverage
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Build a vault sufficient for register-hooks / register-schedule / migrate
+/// to dispatch cleanly. `vault.yml` has no schedule entries (empty list →
+/// register-schedule exits 0 with "Nothing to register"). The .claude/
+/// subdir is created so register-hooks can write into it on --dry-run.
+fn make_alias_vault() -> tempfile::TempDir {
+    let v = tempdir().unwrap();
+    fs::write(v.path().join("vault.yml"), "method: onebrain\n").unwrap();
+    fs::create_dir_all(v.path().join(".claude")).unwrap();
+    v
+}
+
+#[test]
+fn all_hidden_aliases_dispatch_and_warn() {
+    // R2-M2: every v3.0 alias must (a) dispatch successfully, (b) emit the
+    // migration notice on stderr the first time it runs, and (c) record
+    // itself in the state file so subsequent invocations stay silent.
+    //
+    // Coverage table — each entry pairs the alias name with the minimal
+    // valid argv. Exit code expectations vary per command (some are
+    // hook-protocol exit-0-on-block; vault-sync exits 1 on a bad fixture;
+    // run-skill exits 78 on missing vault.yml) — we don't assert a
+    // specific code, only that the migration arm fired.
+    let cases: &[(&str, &[&str], Option<i32>)] = &[
+        // (alias name, extra-args, optional expected exit code)
+        ("session-init", &[], None),
+        ("orphan-scan", &[".", "tokABC"], None),
+        ("qmd-reindex", &[], None),
+        // register-hooks: vault-required, but `--vault` lets us point at a
+        // tempdir. With --dry-run + an empty vault, exit 0.
+        ("register-hooks", &["--dry-run"], None),
+        // register-schedule: vault.yml has no `schedule:` block so it
+        // prints "Nothing to register" + exits 0.
+        ("register-schedule", &["--dry-run"], None),
+        // migrate: handler always exits 0 (internal-command contract).
+        ("migrate", &["unknown-migration"], Some(0)),
+        // run-skill: exits 78 when vault.yml is absent. We give a vault
+        // dir without vault.yml so we hit the 78 path quickly.
+        ("run-skill", &["--skill", "noop"], Some(78)),
+        // vault-sync: pointed at a missing fixture path → exit 1.
+        ("vault-sync", &[], Some(1)),
+    ];
+
+    for (alias, extra, want_exit) in cases.iter() {
+        let vault = make_alias_vault();
+        let home = tempdir().unwrap();
+        let cache = home.path().join("cache");
+        let mut args: Vec<String> = vec![alias.to_string()];
+        // For aliases that need a vault, supply --vault via the alias' own
+        // flag. session-init / qmd-reindex / orphan-scan are
+        // hook-protocol-style and read cwd directly.
+        let vault_str = vault.path().to_string_lossy().to_string();
+        if matches!(*alias, "register-hooks" | "register-schedule" | "run-skill") {
+            args.push("--vault".into());
+            args.push(vault_str.clone());
+        }
+        if *alias == "run-skill" {
+            // Force vault.yml absence by pointing at a fresh tempdir
+            // (no vault.yml). Skip the make_alias_vault path's vault.yml.
+            let fresh = tempdir().unwrap();
+            args = vec![
+                alias.to_string(),
+                "--vault".into(),
+                fresh.path().to_string_lossy().to_string(),
+            ];
+            for e in extra.iter() {
+                args.push((*e).to_string());
+            }
+            let out = Command::cargo_bin("onebrain")
+                .unwrap()
+                .args(&args)
+                .env("HOME", home.path())
+                .env("XDG_CACHE_HOME", &cache)
+                .env_remove("ONEBRAIN_VAULT")
+                .env_remove("ONEBRAIN_QUIET_MIGRATION")
+                .output()
+                .unwrap();
+            assert_alias_warned(alias, &out, *want_exit);
+            // Keep the fresh tempdir alive past assertions.
+            drop(fresh);
+            continue;
+        }
+        for e in extra.iter() {
+            args.push((*e).to_string());
+        }
+
+        let mut cmd = Command::cargo_bin("onebrain").unwrap();
+        cmd.args(&args)
+            .current_dir(vault.path())
+            .env("HOME", home.path())
+            .env("XDG_CACHE_HOME", &cache)
+            .env_remove("ONEBRAIN_VAULT")
+            .env_remove("ONEBRAIN_QUIET_MIGRATION");
+        if *alias == "vault-sync" {
+            cmd.env(
+                "ONEBRAIN_VAULT_SYNC_FIXTURE",
+                "/this/path/does/not/exist.tar.gz",
+            );
+        }
+        let out = cmd.output().unwrap();
+        assert_alias_warned(alias, &out, *want_exit);
+
+        // Subsequent invocation: same HOME + cache, so state file is
+        // sticky → notice MUST stay silent.
+        let out2 = Command::cargo_bin("onebrain")
+            .unwrap()
+            .args(&args)
+            .current_dir(vault.path())
+            .env("HOME", home.path())
+            .env("XDG_CACHE_HOME", &cache)
+            .env_remove("ONEBRAIN_VAULT")
+            .env_remove("ONEBRAIN_QUIET_MIGRATION")
+            .env_remove("ONEBRAIN_VAULT_SYNC_FIXTURE")
+            .output()
+            .unwrap();
+        let stderr2 = String::from_utf8_lossy(&out2.stderr);
+        assert!(
+            !(stderr2.contains("v3.1:") && stderr2.contains(*alias)),
+            "alias `{alias}` re-emitted migration notice on second run · stderr: {stderr2:?}"
+        );
+    }
+}
+
+fn assert_alias_warned(alias: &str, out: &std::process::Output, want_exit: Option<i32>) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("v3.1") && stderr.contains(alias),
+        "alias `{alias}` did NOT emit migration notice · stderr: {stderr:?}"
+    );
+    if let Some(code) = want_exit {
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "alias `{alias}` wrong exit code · stderr: {stderr:?}",
+        );
+    }
+}
+
+#[test]
+fn migration_notice_fires_exactly_once_across_processes() {
+    // R2-M2 sub-test: with a shared state-file path (same HOME + cache
+    // across invocations), the migration notice MUST fire once and stay
+    // silent on every subsequent call. This proves the "sticky" guarantee
+    // documented in migration.rs. (A single-process double-call is not
+    // expressible via the clap CLI which is one-shot per invocation; the
+    // realistic contract is the cross-process state file.)
+    let home = tempdir().unwrap();
+    let cache = home.path().join("cache");
+    let vault = make_alias_vault();
+
+    let run = || -> (String, std::process::ExitStatus) {
+        let out = Command::cargo_bin("onebrain")
+            .unwrap()
+            .current_dir(vault.path())
+            .env("HOME", home.path())
+            .env("XDG_CACHE_HOME", &cache)
+            .env_remove("ONEBRAIN_VAULT")
+            .env_remove("ONEBRAIN_QUIET_MIGRATION")
+            .args(["session-init"])
+            .output()
+            .unwrap();
+        (String::from_utf8_lossy(&out.stderr).to_string(), out.status)
+    };
+
+    let (e1, _) = run();
+    let (e2, _) = run();
+    let (e3, _) = run();
+
+    assert!(
+        e1.contains("v3.1") && e1.contains("session-init"),
+        "first invocation must emit notice · stderr: {e1:?}"
+    );
+    for (i, e) in [&e2, &e3].iter().enumerate() {
+        assert!(
+            !(e.contains("v3.1") && e.contains("session-init")),
+            "invocation #{} must stay silent · stderr: {e:?}",
+            i + 2
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// R2-M3 · --vault flag position matrix
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn vault_flag_accepted_post_subcommand() {
+    // R2-M3: clap `global = true` makes `--vault` accepted at any
+    // position. Verify it parses + resolves when placed AFTER the
+    // subcommand chain.
+    let dir = tempdir().unwrap();
+    make_vault(dir.path());
+    let other = tempdir().unwrap();
+
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(other.path())
+        .env_remove("ONEBRAIN_VAULT")
+        .args([
+            "vault",
+            "current",
+            "--vault",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["data"]["detected"], true);
+    assert_eq!(v["data"]["source"], "--vault flag");
+}
+
+#[test]
+fn vault_env_overridden_by_flag() {
+    // R2-M3: `--vault` has higher priority than `ONEBRAIN_VAULT`.
+    let good = tempdir().unwrap();
+    make_vault(good.path());
+    let bad = tempdir().unwrap(); // NO vault.yml — would fail if env wins
+
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(tempdir().unwrap().path())
+        .env("ONEBRAIN_VAULT", bad.path())
+        .args([
+            "--vault",
+            good.path().to_str().unwrap(),
+            "vault",
+            "current",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["data"]["detected"], true);
+    assert_eq!(v["data"]["source"], "--vault flag");
+    assert_eq!(
+        v["data"]["path"].as_str().unwrap_or(""),
+        good.path().to_string_lossy()
+    );
+}
+
+#[test]
+fn vault_env_only_when_no_flag() {
+    // R2-M3: with no `--vault` flag, `ONEBRAIN_VAULT` is honoured.
+    let dir = tempdir().unwrap();
+    make_vault(dir.path());
+    let elsewhere = tempdir().unwrap();
+
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(elsewhere.path())
+        .env("ONEBRAIN_VAULT", dir.path())
+        .args(["vault", "current", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["data"]["detected"], true);
+    assert_eq!(v["data"]["source"], "ONEBRAIN_VAULT env");
+}

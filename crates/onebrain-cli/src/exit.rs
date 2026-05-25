@@ -80,6 +80,21 @@ pub fn exit_code_for(err: &anyhow::Error) -> i32 {
                 _ => {}
             }
         }
+        // R2-M4: serde_json::Error wraps the underlying io::Error in its
+        // own enum (its source() returns None), so the plain
+        // `downcast_ref::<io::Error>` walk misses it. Use
+        // `io_error_kind()` to recover the original ErrorKind. Without
+        // this, `onebrain ... --json | head -1` would surface exit 1
+        // (generic failure) instead of the POSIX-correct 0.
+        if let Some(json_err) = cause.downcast_ref::<serde_json::Error>() {
+            if let Some(kind) = json_err.io_error_kind() {
+                match kind {
+                    std::io::ErrorKind::BrokenPipe => return EXIT_OK,
+                    std::io::ErrorKind::PermissionDenied => return EXIT_FS_ERROR,
+                    _ => {}
+                }
+            }
+        }
     }
     EXIT_GENERIC
 }
@@ -198,5 +213,30 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "EACCES");
         let e: anyhow::Error = anyhow::Error::from(io_err);
         assert_eq!(exit_code_for(&e), EXIT_FS_ERROR);
+    }
+
+    #[test]
+    fn serde_json_broken_pipe_classifies_to_zero() {
+        // R2-M4: serde_json wraps the io::Error in its own enum so the
+        // plain io::Error chain walk misses it; io_error_kind() recovers
+        // the original kind. Without this an `onebrain … --json | head -1`
+        // pipeline would surface exit 1 instead of POSIX-correct 0.
+        struct BrokenWriter;
+        impl std::io::Write for BrokenWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+        }
+        let json_err: serde_json::Error =
+            serde_json::to_writer(BrokenWriter, &serde_json::json!({"x":1})).unwrap_err();
+        assert_eq!(
+            json_err.io_error_kind(),
+            Some(std::io::ErrorKind::BrokenPipe)
+        );
+        let e: anyhow::Error = anyhow::Error::from(json_err);
+        assert_eq!(exit_code_for(&e), EXIT_OK);
     }
 }
