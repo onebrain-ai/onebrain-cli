@@ -1,9 +1,11 @@
 //! Migration notice — print v3.0→v3.1 rename guidance once per command.
 //!
-//! State file: `~/.cache/onebrain/migration-shown.txt` (one alias name per
-//! line). On first invocation of each v3.0 alias we append the name and print
-//! a stderr notice; subsequent invocations within or across processes find
-//! the name in the file and stay silent.
+//! State file: `migration-shown.txt` under the platform cache dir
+//! (`~/Library/Caches/onebrain/` on macOS · `$XDG_CACHE_HOME/onebrain/` or
+//! `~/.cache/onebrain/` on Linux · `%LOCALAPPDATA%\onebrain\` on Windows),
+//! one alias name per line. On first invocation of each v3.0 alias we
+//! append the name and print a stderr notice; subsequent invocations
+//! within or across processes find the name in the file and stay silent.
 //!
 //! Power users can suppress entirely via `ONEBRAIN_QUIET_MIGRATION=1`.
 
@@ -83,7 +85,9 @@ fn warn_persist_failure(state_file: &std::path::Path, err: &std::io::Error) {
     }
 }
 
-/// Default state directory: `~/.cache/onebrain/`.
+/// Default state directory: `~/Library/Caches/onebrain/` on macOS ·
+/// `$XDG_CACHE_HOME/onebrain/` or `~/.cache/onebrain/` on Linux ·
+/// `%LOCALAPPDATA%\onebrain\` on Windows.
 pub fn default_state_dir() -> PathBuf {
     dirs::cache_dir()
         .map(|d| d.join("onebrain"))

@@ -45,13 +45,13 @@ fn main() {
 /// consumers always see one well-formed JSON document per invocation.
 ///
 /// R2-H2: structured-mode error envelopes are always rendered as JSON
-/// regardless of the requested format. `--output table` and `--output tsv`
-/// have no columnar slots for `code`/`message`/`version` — the generic
-/// fallback in `output::dispatcher::emit` produces empty / header-only
-/// output in those modes, so a machine consumer reading stdout sees no
-/// error signal. Forcing JSON guarantees a lossless canonical envelope on
-/// every structured invocation. `--yaml` is also forced to JSON for the
-/// error path so consumers don't need a format-switch on the error branch.
+/// regardless of the requested format. Tsv and Table modes have no
+/// columnar slots for nested error fields (no `error.code` /
+/// `error.message` / `version` columns), so error envelopes are forced to
+/// Json regardless of requested mode. Forcing JSON guarantees a lossless
+/// canonical envelope on every structured invocation. `--yaml` is also
+/// forced to JSON for the error path so consumers don't need a
+/// format-switch on the error branch.
 ///
 /// R2-H3: when the error chain carries the `AlreadyReported` sentinel the
 /// envelope has been emitted already (e.g. `plugin update`'s partial

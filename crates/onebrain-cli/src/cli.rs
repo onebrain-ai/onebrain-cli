@@ -20,16 +20,7 @@ use std::path::PathBuf;
 )]
 pub struct Cli {
     /// Override vault root (highest priority · beats ONEBRAIN_VAULT and walk-up).
-    ///
-    /// Global: accepted both before and after the subcommand:
-    /// `onebrain --vault X foo bar` or `onebrain foo bar --vault X`.
-    /// `ONEBRAIN_VAULT` env var is honoured by the vault resolver
-    /// (`onebrain_core::path::resolve_vault`) — read in
-    /// `vault_ctx::snapshot_inputs` rather than via clap's `env =`
-    /// attribute because clap 4.6 silently drops env-attribute help text
-    /// for nested subcommands when combined with `global = true`. No
-    /// legacy command uses `visible_alias = "vault"` (legacy args use
-    /// `--vault-dir` as the alias), so `global = true` is safe.
+    /// Global: accepted pre- or post-subcommand.
     #[arg(long, global = true, value_name = "PATH")]
     pub vault: Option<PathBuf>,
 

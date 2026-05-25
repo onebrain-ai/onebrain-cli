@@ -13,11 +13,10 @@
 //!    `CI=true`/`--no-color` all drop colour and therefore drop the banner.
 //! 3. Hook-protocol commands (`session init`, `checkpoint stop/reset/orphans`,
 //!    `qmd reindex`, and their hidden v3.0 aliases `session-init`/
-//!    `orphan-scan`/`qmd-reindex`) MUST keep stdout free of any
-//!    pre-subcommand bytes. They are suppressed even though their stdout is
-//!    the machine JSON path — the banner would emit to stderr, but
-//!    consumers parse stderr too on some shells, so the cleanest contract is
-//!    "no banner at all for hook commands".
+//!    `orphan-scan`/`qmd-reindex`) need deterministic stderr because Claude
+//!    Code's Stop hook surfaces stderr to the user. Banner output would
+//!    pollute the error UI, so the cleanest contract is "no banner at all
+//!    for hook commands".
 //! 4. `--help` and `--version` are handled by clap before dispatch is even
 //!    called, so no extra gating is required (the function is never invoked
 //!    for those paths).

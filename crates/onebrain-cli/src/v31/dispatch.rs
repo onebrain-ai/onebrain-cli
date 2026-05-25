@@ -212,10 +212,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             VaultVerb::Verify => {
                 stubs::not_implemented_vault_required(vault_flag.clone(), "vault verify")
             }
-            // R2-M1: use `.clone()` for symmetry with the sibling arms
-            // above. `vault_flag` would otherwise be moved here, but it's
-            // never read after the match — so functionally identical;
-            // matches house style.
             VaultVerb::Current => vault_current::run(vault_flag.clone(), &mode),
         },
 
@@ -640,5 +636,15 @@ mod tests {
             wrapped.downcast_ref::<AlreadyReported>().is_some(),
             "anyhow::Error::downcast_ref must locate `.context()`-attached AlreadyReported"
         );
+    }
+
+    #[test]
+    fn plain_error_does_not_downcast_as_already_reported() {
+        let plain: anyhow::Error = anyhow::anyhow!("plain error without sentinel");
+        assert!(plain.downcast_ref::<AlreadyReported>().is_none());
+
+        // also verify .context-wrapping with a different type doesn't false-positive
+        let other: anyhow::Error = anyhow::anyhow!("base").context("unrelated context string");
+        assert!(other.downcast_ref::<AlreadyReported>().is_none());
     }
 }

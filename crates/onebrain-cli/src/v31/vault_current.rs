@@ -4,9 +4,10 @@
 //! (`--vault` flag, `ONEBRAIN_VAULT` env, or walk-up from cwd). Designed for
 //! both humans (text mode) and skills/scripts (`--json`).
 //!
-//! Vault-free in the sense that it does NOT error when no vault is found;
-//! it instead reports `detected: false`. This matches the design's "show
-//! resolution source even if nothing resolved" intent.
+//! Soft-fails (never returns Err) but DOES validate vault.yml — surfaces
+//! resolution path even when YAML is broken via the envelope's error field.
+//! This matches the design's "show resolution source even if nothing
+//! resolved" intent.
 
 use crate::output::{emit, Envelope, ErrorInfo, OutputMode, VaultInfo};
 use crate::vault_ctx;

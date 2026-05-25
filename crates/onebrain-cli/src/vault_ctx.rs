@@ -38,11 +38,8 @@ pub fn resolve(flag: Option<PathBuf>) -> Result<Option<ResolvedVault>> {
     Ok(resolve_vault(&inputs)?)
 }
 
-/// Vault-required. Returns `CoreError::VaultNotFound` (exit 64) when no
-/// vault discovered. Use for `task *`, `memory *`, `note *`, etc. v3.1
-/// stubs out those commands at `not_implemented`; v3.2+ commands wire
-/// through this helper.
-#[allow(dead_code)]
+/// Resolve a vault, failing with E_VAULT_NOT_FOUND (exit 64) if no vault is
+/// found. Used by plugin_update and vault-required stub commands.
 pub fn require(flag: Option<PathBuf>) -> Result<ResolvedVault> {
     let inputs = snapshot_inputs(flag)?;
     Ok(require_vault(&inputs)?)
