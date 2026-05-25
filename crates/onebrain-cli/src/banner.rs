@@ -118,11 +118,11 @@ const BANNER_ART: &str = r" ██████╗ ███╗   ██╗██
 ╚██████╔╝██║ ╚████║███████╗██████╔╝██║  ██║██║  ██║██║██║ ╚████║
  ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝";
 
-/// Leading indent for the tagline so it sits visually under the art block.
-/// The tagline (`Your AI Thinking Partner · vX.Y.Z`) is ~33 chars; with 8
-/// spaces of leading indent it visually balances under the ~64-char-wide
-/// ANSI Shadow art block.
-const TAGLINE_INDENT: &str = "        ";
+/// Visual width (in monospace columns) of every line in [`BANNER_ART`].
+/// Hard-coded for the current ANSI Shadow rendering — every glyph is a
+/// single-column Unicode box-drawing or block character, so the column
+/// width equals `chars().count()` of any art line.
+const BANNER_VISUAL_WIDTH: usize = 64;
 
 /// Build the banner string (no I/O). Seven lines total:
 ///   6 × pink ASCII-art lines (ANSI Shadow rendering of `OneBrain`)
@@ -151,10 +151,17 @@ pub fn render_banner() -> String {
         out.push_str(ANSI_RESET);
         out.push('\n');
     }
+    // Compute tagline indent dynamically so it stays centred under the art
+    // block even when the version string grows (e.g., `v3.10.0` adds a char).
+    // `chars().count()` is correct here because every char in the tagline is
+    // a single column (ASCII + the U+00B7 separator which renders 1 col).
+    let tagline_body = format!("Your AI Thinking Partner · v{version}");
+    let tagline_indent = BANNER_VISUAL_WIDTH.saturating_sub(tagline_body.chars().count()) / 2;
     out.push_str(ANSI_DIM);
-    out.push_str(TAGLINE_INDENT);
-    out.push_str("Your AI Thinking Partner · v");
-    out.push_str(version);
+    for _ in 0..tagline_indent {
+        out.push(' ');
+    }
+    out.push_str(&tagline_body);
     out.push_str(ANSI_RESET);
     out.push('\n');
     // Blank line between banner and the help body (clap's `Usage:` etc.).
