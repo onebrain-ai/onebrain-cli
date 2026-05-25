@@ -28,6 +28,7 @@ mod enable_plugin;
 mod folders;
 mod marketplace;
 mod presets;
+mod safety;
 mod vault_yml;
 mod wizard;
 
@@ -38,7 +39,7 @@ use crate::error::FsError;
 use crate::harness::detect_harnesses;
 use crate::register_hooks::{self, RegisterHooksOptions};
 use crate::vault_sync::{run_vault_sync, VaultSyncOptions};
-use onebrain_core::Harness;
+use onebrain_core::{CoreError, Harness};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -80,6 +81,11 @@ pub struct InitOptions {
     pub vault_sync_fn: Option<VaultSyncFn>,
     /// Skip the vault-sync sub-step entirely (offline init or test runs).
     pub skip_vault_sync: bool,
+    /// Structured-output mode (json/yaml/table/tsv). When `true`, the
+    /// non-empty-directory safety check refuses to prompt interactively and
+    /// instead returns a [`CoreError::InitTargetNotEmpty`] error so the
+    /// envelope renderer surfaces a canonical machine-readable error.
+    pub structured_output: bool,
     /// Optional stdout sink — defaults to real stdout when `None`.
     pub stdout_lines: Option<LineSink>,
     /// Optional stderr sink — defaults to real stderr when `None`.
@@ -136,6 +142,63 @@ pub fn run_init(mut opts: InitOptions) -> Result<InitResult, FsError> {
     let mut stderr = take_stderr_sink(&mut opts.stderr_lines);
 
     stdout("OneBrain Init");
+
+    // ── Step 0: target-directory safety check ──────────────────────────────
+    // Guards against running `onebrain init` in the wrong directory. Skipped
+    // when --force is set (caller knows what they're doing); short-circuits
+    // when the directory already contains vault.yml (delegates to Step 1's
+    // existing vault.yml guard); creates the directory when missing.
+    if !opts.force {
+        match safety::classify(&vault_dir)? {
+            safety::DirState::Missing => {
+                std::fs::create_dir_all(&vault_dir).map_err(|e| FsError::Io {
+                    path: vault_dir.clone(),
+                    source: e,
+                })?;
+            }
+            safety::DirState::Empty | safety::DirState::OneBrainVault => {
+                // Empty: nothing to guard. OneBrainVault: vault.yml present,
+                // hand off to Step 1's overwrite logic.
+            }
+            safety::DirState::NonEmptyNonVault { summary } => {
+                let target_display = vault_dir.display().to_string();
+                if opts.structured_output {
+                    // Machine consumer can't respond to a TTY prompt —
+                    // surface the canonical error envelope so the caller
+                    // gets `E_INIT_TARGET_NOT_EMPTY` exit 75 + a message
+                    // pointing at `--force`.
+                    return Err(FsError::Core(CoreError::InitTargetNotEmpty(format!(
+                        "target is not empty ({summary}) at {target_display} · pass --force to proceed"
+                    ))));
+                }
+                if let Some(confirm) = opts.confirm_fn.as_mut() {
+                    let q = format!(
+                        "Target directory is not empty:\n    {target_display}\n    Contents: {summary}\n\nOneBrain will create folders (00-inbox/, 01-projects/, …) and files (vault.yml, .claude/, .claude-plugin/) here.\nExisting files will NOT be deleted, but OneBrain structure will be merged in.\n\nContinue?"
+                    );
+                    if !confirm(&q) {
+                        return Err(FsError::Core(CoreError::InitTargetNotEmpty(format!(
+                            "init declined by user ({summary}) · re-run with --force to skip confirmation"
+                        ))));
+                    }
+                } else {
+                    // No prompt available (--yes without --force on a
+                    // non-empty dir, or pure non-interactive call from a
+                    // script). Fail closed: surface E_INIT_TARGET_NOT_EMPTY
+                    // so the user has to consciously opt in via --force.
+                    return Err(FsError::Core(CoreError::InitTargetNotEmpty(format!(
+                        "target is not empty ({summary}) at {target_display} · pass --force to proceed"
+                    ))));
+                }
+            }
+        }
+    } else if !vault_dir.exists() {
+        // --force: still create the directory if it doesn't exist so
+        // downstream writes (vault.yml, folders, settings.json) succeed.
+        std::fs::create_dir_all(&vault_dir).map_err(|e| FsError::Io {
+            path: vault_dir.clone(),
+            source: e,
+        })?;
+    }
 
     // ── Step 1: vault.yml guard ────────────────────────────────────────────
     let vault_yml_path = vault_dir.join("vault.yml");
@@ -387,7 +450,9 @@ fn default_vault_sync(
 // Re-export wizard fns for the CLI binary
 // ---------------------------------------------------------------------------
 
-pub use wizard::{ask_initialize_here, ask_overwrite_vault_yml, ask_schedule_preset};
+pub use wizard::{
+    ask_continue_nonempty, ask_initialize_here, ask_overwrite_vault_yml, ask_schedule_preset,
+};
 
 // ---------------------------------------------------------------------------
 // Tests

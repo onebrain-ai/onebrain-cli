@@ -31,6 +31,20 @@ pub fn ask_overwrite_vault_yml() -> bool {
     default_confirm("vault.yml already exists. Overwrite?")
 }
 
+/// Non-empty-directory safety prompt. The caller prints the multi-line
+/// context block to stderr (so the user sees the target path and a summary
+/// of what's already there); this helper reads the y/N answer with the
+/// default set to "no" so a stray Enter keypress aborts.
+pub fn ask_continue_nonempty(context: &str) -> bool {
+    // Emit the multi-line context above the y/N prompt so the user reviews
+    // it before answering. Stderr keeps stdout reserved for the envelope.
+    eprintln!("⚠️  {context}");
+    Confirm::new("Continue?")
+        .with_default(false)
+        .prompt()
+        .unwrap_or(false)
+}
+
 /// Schedule preset picker — defaults to Essentials. Returns `Skip` on any
 /// failure to read stdin (defensive: never auto-install a schedule a user
 /// didn't actively accept).

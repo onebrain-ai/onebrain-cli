@@ -1,0 +1,175 @@
+//! Target-directory safety check for `onebrain init`.
+//!
+//! Without this guard, `onebrain init` in the wrong directory (cwd is a
+//! random project, the user's home dir, an existing codebase) pollutes the
+//! tree with `00-inbox/`, `01-projects/`, …, `vault.yml`, `.claude/`, and
+//! friends. The user can't easily undo it.
+//!
+//! Detection logic (run BEFORE the existing vault.yml guard so we exit
+//! before any vault.yml-related write):
+//!
+//! 1. Target does not exist → caller will create it; proceed.
+//! 2. Target exists and is empty (zero entries) → proceed.
+//! 3. Target contains `vault.yml` (existing or partial OneBrain vault) →
+//!    delegate to the existing vault.yml guard; safety check is a no-op.
+//! 4. Target contains other files / hidden files (e.g. `README.md`, `.git/`,
+//!    `.DS_Store`, `node_modules/`) → request confirmation. If `--force` is
+//!    set OR structured output mode is active, do not prompt.
+//!
+//! Edge cases:
+//!   - Permission denied while reading the directory bubbles up via
+//!     `FsError::Io` (mapped to `EXIT_FS_ERROR` 66 in the CLI binary).
+//!   - Symlinks are resolved by the OS — we don't traverse, only enumerate
+//!     top-level entries.
+//!   - The check is intentionally NOT recursive: presence of any entry at
+//!     the top level is enough to trigger.
+
+use crate::{FsError, Result};
+use std::path::Path;
+
+/// Classification of a target directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DirState {
+    /// Target does not exist on disk; caller will create it.
+    Missing,
+    /// Target exists with zero entries.
+    Empty,
+    /// Target exists and contains `vault.yml` — treat as a (possibly partial)
+    /// OneBrain vault and let the existing guard handle it.
+    OneBrainVault,
+    /// Target exists with at least one entry and no `vault.yml`. Holds a
+    /// short summary (count + sample entries) for the prompt text.
+    NonEmptyNonVault { summary: String },
+}
+
+/// Inspect the target directory and return its [`DirState`].
+pub(crate) fn classify(vault_dir: &Path) -> Result<DirState> {
+    let meta = match std::fs::symlink_metadata(vault_dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(DirState::Missing),
+        Err(e) => {
+            return Err(FsError::Io {
+                path: vault_dir.to_path_buf(),
+                source: e,
+            });
+        }
+    };
+    if !meta.is_dir() {
+        // A regular file at the target path: treat as a non-empty non-vault
+        // path. The downstream write attempts will fail with a sensible
+        // FsError; here we just return a meaningful state for the prompt.
+        return Ok(DirState::NonEmptyNonVault {
+            summary: "target exists but is not a directory".to_string(),
+        });
+    }
+
+    let entries = std::fs::read_dir(vault_dir).map_err(|e| FsError::Io {
+        path: vault_dir.to_path_buf(),
+        source: e,
+    })?;
+
+    let mut names: Vec<String> = Vec::new();
+    let mut count = 0_usize;
+    let mut folder_count = 0_usize;
+    let mut has_vault_yml = false;
+    for entry in entries {
+        let entry = entry.map_err(|e| FsError::Io {
+            path: vault_dir.to_path_buf(),
+            source: e,
+        })?;
+        count += 1;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == "vault.yml" {
+            has_vault_yml = true;
+        }
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            folder_count += 1;
+        }
+        if names.len() < 3 {
+            names.push(name);
+        }
+    }
+
+    if count == 0 {
+        return Ok(DirState::Empty);
+    }
+    if has_vault_yml {
+        return Ok(DirState::OneBrainVault);
+    }
+    let file_count = count - folder_count;
+    let summary = format!(
+        "{file_count} file(s), {folder_count} folder(s) (e.g., {})",
+        names.join(", ")
+    );
+    Ok(DirState::NonEmptyNonVault { summary })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn missing_dir_returns_missing() {
+        let d = tempdir().unwrap();
+        let target = d.path().join("does-not-exist");
+        assert_eq!(classify(&target).unwrap(), DirState::Missing);
+    }
+
+    #[test]
+    fn empty_dir_returns_empty() {
+        let d = tempdir().unwrap();
+        assert_eq!(classify(d.path()).unwrap(), DirState::Empty);
+    }
+
+    #[test]
+    fn dir_with_vault_yml_returns_onebrain_vault() {
+        let d = tempdir().unwrap();
+        std::fs::write(d.path().join("vault.yml"), "ok").unwrap();
+        assert_eq!(classify(d.path()).unwrap(), DirState::OneBrainVault);
+    }
+
+    #[test]
+    fn dir_with_files_no_vault_yml_returns_nonempty() {
+        let d = tempdir().unwrap();
+        std::fs::write(d.path().join("README.md"), "hi").unwrap();
+        std::fs::create_dir_all(d.path().join("src")).unwrap();
+        match classify(d.path()).unwrap() {
+            DirState::NonEmptyNonVault { summary } => {
+                assert!(
+                    summary.contains("1 file(s)") && summary.contains("1 folder(s)"),
+                    "unexpected summary: {summary}"
+                );
+                // At least one of the entries should appear
+                assert!(summary.contains("README.md") || summary.contains("src"));
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hidden_files_are_not_ignored() {
+        // .DS_Store / .git / similar hidden files still count as "not empty"
+        // — the safety check should not be clever about which dotfiles are
+        // safe to overlay onto.
+        let d = tempdir().unwrap();
+        std::fs::write(d.path().join(".DS_Store"), "").unwrap();
+        match classify(d.path()).unwrap() {
+            DirState::NonEmptyNonVault { .. } => {}
+            other => panic!("hidden file not counted as non-empty: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn regular_file_at_target_returns_nonempty_with_message() {
+        let d = tempdir().unwrap();
+        let target = d.path().join("regular-file");
+        std::fs::write(&target, "ok").unwrap();
+        match classify(&target).unwrap() {
+            DirState::NonEmptyNonVault { summary } => {
+                assert!(summary.contains("not a directory"), "got: {summary}");
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
+    }
+}

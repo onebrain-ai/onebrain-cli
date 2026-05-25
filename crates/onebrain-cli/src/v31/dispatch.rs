@@ -59,7 +59,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         // ───── Root verbs ────────────────────────────────────────────
         Cmd::Init(a) => {
-            let code = commands::init::run(a.yes, a.vault_dir, a.force, a.no_sync)?;
+            let code =
+                commands::init::run(a.yes, a.vault_dir, a.force, a.no_sync, mode.is_structured())?;
             std::process::exit(code);
         }
         Cmd::Update(a) => {

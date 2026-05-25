@@ -68,6 +68,13 @@ pub enum CoreError {
     /// RPC auth token missing or wrong. Exit 74.
     #[error("RPC auth failed: {0}")]
     AuthFailed(String),
+
+    /// `onebrain init` aborted because the target directory is not empty
+    /// and `--force` was not passed (or the user declined the interactive
+    /// prompt). Exit 75. The wrapped string holds a user-facing message
+    /// summarising the target contents.
+    #[error("init: {0}")]
+    InitTargetNotEmpty(String),
 }
 
 impl CoreError {
@@ -87,6 +94,7 @@ impl CoreError {
             Self::NotImplemented(_) => "E_NOT_IMPLEMENTED",
             Self::RpcHandshake(_) => "E_RPC_HANDSHAKE",
             Self::AuthFailed(_) => "E_AUTH_FAILED",
+            Self::InitTargetNotEmpty(_) => "E_INIT_TARGET_NOT_EMPTY",
         }
     }
 }
@@ -141,6 +149,10 @@ mod tests {
         assert_eq!(
             CoreError::AuthFailed("no token".into()).error_code(),
             "E_AUTH_FAILED"
+        );
+        assert_eq!(
+            CoreError::InitTargetNotEmpty("3 files, 2 folders".into()).error_code(),
+            "E_INIT_TARGET_NOT_EMPTY"
         );
     }
 }

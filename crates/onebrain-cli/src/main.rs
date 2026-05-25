@@ -114,6 +114,13 @@ fn error_code_and_message(e: &anyhow::Error) -> (&'static str, String) {
         if let Some(core) = cause.downcast_ref::<CoreError>() {
             return (core.error_code(), e.to_string());
         }
+        // Mirror the exit-code probe — `FsError::Core(CoreError)` doesn't
+        // expose the inner CoreError through anyhow's chain() walk (see
+        // exit.rs for the full reasoning), so pattern-match for it here.
+        if let Some(onebrain_fs::FsError::Core(core)) = cause.downcast_ref::<onebrain_fs::FsError>()
+        {
+            return (core.error_code(), e.to_string());
+        }
     }
     if e.downcast_ref::<onebrain_fs::FsError>().is_some() {
         return ("E_FS_ERROR", e.to_string());

@@ -260,7 +260,9 @@ fn init_is_idempotent_marketplace_json_not_overwritten() {
 
 /// Pre-existing settings.json (e.g., from a Claude Code session that ran
 /// in this dir before OneBrain init) must keep every key — we only insert
-/// `enabledPlugins.onebrain@onebrain`, no other mutation.
+/// `enabledPlugins.onebrain@onebrain`, no other mutation. `--force` is
+/// required because the pre-existing `.claude/` makes the target dir
+/// non-empty (the safety guard would otherwise prompt).
 #[test]
 fn init_preserves_existing_settings_keys() {
     let d = tempdir().unwrap();
@@ -279,7 +281,7 @@ fn init_preserves_existing_settings_keys() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
-        .args(["init", "--yes", "--no-sync"])
+        .args(["init", "--yes", "--force", "--no-sync"])
         .current_dir(d.path())
         .assert()
         .success();
@@ -330,7 +332,8 @@ fn init_skips_when_already_enabled() {
 
 /// Pre-existing malformed settings.json must surface as a hard error
 /// (FsError → exit 66 / E_FS_ERROR) rather than silently overwriting the
-/// user's data.
+/// user's data. `--force` skips the non-empty safety check so we actually
+/// exercise the read-settings.json code path under test.
 #[test]
 fn init_fails_on_malformed_settings_json() {
     let d = tempdir().unwrap();
@@ -340,7 +343,7 @@ fn init_fails_on_malformed_settings_json() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
-        .args(["init", "--yes", "--no-sync"])
+        .args(["init", "--yes", "--force", "--no-sync"])
         .current_dir(d.path())
         .assert()
         .failure();
@@ -373,4 +376,165 @@ fn cli_yes_vault_dir_targets_explicit_path() {
         .stdout(predicate::str::contains("done"));
     assert!(target.join("vault.yml").is_file());
     assert!(target.join("07-logs").is_dir());
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Folder-not-empty safety check (Item H)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Empty dir is the happy path — no prompt, no error, no `--force` needed.
+#[test]
+fn init_empty_dir_succeeds_silently() {
+    let d = tempdir().unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes", "--no-sync"])
+        .current_dir(d.path())
+        .assert()
+        .success();
+    assert!(d.path().join("vault.yml").is_file());
+}
+
+/// Missing dir: classify=Missing → init creates it + proceeds. No `--force`
+/// needed because there's nothing to overwrite.
+#[test]
+fn init_nonexistent_dir_creates_and_succeeds() {
+    let d = tempdir().unwrap();
+    let target = d.path().join("brand-new").join("nested");
+    assert!(!target.exists());
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args([
+            "init",
+            "--yes",
+            "--no-sync",
+            "--vault-dir",
+            target.to_str().unwrap(),
+        ])
+        .current_dir(d.path())
+        .assert()
+        .success();
+    assert!(target.is_dir());
+    assert!(target.join("vault.yml").is_file());
+    assert!(target.join("07-logs").is_dir());
+}
+
+/// Dir with non-OneBrain files + no vault.yml + no --force in non-interactive
+/// mode → exit 75 (E_INIT_TARGET_NOT_EMPTY) without prompting.
+#[test]
+fn init_nonempty_dir_yes_without_force_errors_with_exit_75() {
+    let d = tempdir().unwrap();
+    fs::write(d.path().join("README.md"), "hi").unwrap();
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes", "--no-sync"])
+        .current_dir(d.path())
+        .assert()
+        .failure();
+    // Exit code 75 = E_INIT_TARGET_NOT_EMPTY (skill-alignment §4.8)
+    out.code(75)
+        .stderr(predicate::str::contains("target is not empty"))
+        .stderr(predicate::str::contains("--force"));
+
+    // README.md preserved, no vault structure created
+    assert!(d.path().join("README.md").is_file());
+    assert!(!d.path().join("vault.yml").exists());
+    assert!(!d.path().join("00-inbox").exists());
+}
+
+/// `--force` on a non-empty dir bypasses the safety prompt entirely.
+/// Existing files are preserved (we only add, never delete).
+#[test]
+fn init_nonempty_dir_force_flag_proceeds() {
+    let d = tempdir().unwrap();
+    fs::write(d.path().join("README.md"), "hi").unwrap();
+    fs::create_dir_all(d.path().join("src")).unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes", "--force", "--no-sync"])
+        .current_dir(d.path())
+        .assert()
+        .success();
+    // Existing files preserved
+    assert!(d.path().join("README.md").is_file());
+    assert!(d.path().join("src").is_dir());
+    // OneBrain structure created
+    assert!(d.path().join("vault.yml").is_file());
+    assert!(d.path().join("00-inbox").is_dir());
+}
+
+/// `--json` mode on a non-empty dir without `--force` emits a canonical
+/// Envelope::err with `error.code = E_INIT_TARGET_NOT_EMPTY` to stdout.
+#[test]
+fn init_json_mode_nonempty_errors_without_prompt() {
+    let d = tempdir().unwrap();
+    fs::write(d.path().join("file.txt"), "x").unwrap();
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes", "--no-sync", "--json"])
+        .current_dir(d.path())
+        .assert()
+        .failure();
+    let output = assert.code(75).get_output().clone();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout is a JSON document");
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "E_INIT_TARGET_NOT_EMPTY");
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("target is not empty"));
+    // No prompt was attempted — file.txt still intact
+    assert_eq!(fs::read_to_string(d.path().join("file.txt")).unwrap(), "x");
+}
+
+/// `--json --force` overrides the safety check just like in text mode.
+#[test]
+fn init_json_mode_nonempty_with_force_succeeds() {
+    let d = tempdir().unwrap();
+    fs::write(d.path().join("file.txt"), "x").unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes", "--force", "--no-sync", "--json"])
+        .current_dir(d.path())
+        .assert()
+        .success();
+    assert!(d.path().join("vault.yml").is_file());
+    assert!(d.path().join("file.txt").is_file());
+}
+
+/// Dotfile-only dirs (.DS_Store, .git, etc.) still count as non-empty —
+/// the safety check intentionally does not whitelist any pattern.
+#[test]
+fn init_dotfile_only_dir_still_triggers_safety_check() {
+    let d = tempdir().unwrap();
+    fs::write(d.path().join(".DS_Store"), "").unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes", "--no-sync"])
+        .current_dir(d.path())
+        .assert()
+        .failure()
+        .code(75);
+}
+
+/// Re-init on an existing OneBrain vault (vault.yml present) hits the
+/// existing vault.yml guard BEFORE the safety check — the message reflects
+/// vault.yml-exists, not target-not-empty.
+#[test]
+fn init_existing_vault_yml_skips_safety_check() {
+    let d = tempdir().unwrap();
+    fs::write(d.path().join("vault.yml"), "old: value\n").unwrap();
+    // Also drop a sibling file so the dir is clearly "non-empty" — proves
+    // the safety check defers to the existing guard when vault.yml is
+    // present, regardless of other entries.
+    fs::write(d.path().join("README.md"), "hi").unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes", "--no-sync"])
+        .current_dir(d.path())
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("vault.yml exists"));
 }

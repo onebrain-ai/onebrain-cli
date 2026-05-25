@@ -29,6 +29,7 @@ pub const EXIT_INVALID_TARGET: i32 = 71;
 pub const EXIT_NOT_IMPLEMENTED: i32 = 72;
 pub const EXIT_RPC_HANDSHAKE: i32 = 73;
 pub const EXIT_AUTH_FAILED: i32 = 74;
+pub const EXIT_INIT_TARGET_NOT_EMPTY: i32 = 75;
 
 /// Map a `CoreError` directly to its stable exit code.
 pub fn exit_code_for_core(err: &CoreError) -> i32 {
@@ -45,6 +46,7 @@ pub fn exit_code_for_core(err: &CoreError) -> i32 {
         CoreError::NotImplemented(_) => EXIT_NOT_IMPLEMENTED,
         CoreError::RpcHandshake(_) => EXIT_RPC_HANDSHAKE,
         CoreError::AuthFailed(_) => EXIT_AUTH_FAILED,
+        CoreError::InitTargetNotEmpty(_) => EXIT_INIT_TARGET_NOT_EMPTY,
     }
 }
 
@@ -56,6 +58,18 @@ pub fn exit_code_for_core(err: &CoreError) -> i32 {
 pub fn exit_code_for(err: &anyhow::Error) -> i32 {
     for cause in err.chain() {
         if let Some(core) = cause.downcast_ref::<CoreError>() {
+            return exit_code_for_core(core);
+        }
+        // `#[error(transparent)]` on `FsError::Core` delegates Display
+        // through, but anyhow's `chain()` walks `std::error::Error::source()`
+        // which thiserror only wires up for explicit `#[source]` fields —
+        // not for transparent passthrough. So a `FsError::Core(CoreError)`
+        // shows up in the chain as `FsError` but its inner `CoreError` is
+        // never iterated. Probe for that pattern here so the specific
+        // exit code (e.g. 75 for E_INIT_TARGET_NOT_EMPTY) wins over the
+        // generic EXIT_FS_ERROR catch-all.
+        if let Some(onebrain_fs::FsError::Core(core)) = cause.downcast_ref::<onebrain_fs::FsError>()
+        {
             return exit_code_for_core(core);
         }
     }
@@ -175,6 +189,25 @@ mod tests {
     #[test]
     fn auth_failed_maps_to_74() {
         assert_eq!(exit_code_for_core(&CoreError::AuthFailed("no".into())), 74);
+    }
+
+    #[test]
+    fn init_target_not_empty_maps_to_75() {
+        assert_eq!(
+            exit_code_for_core(&CoreError::InitTargetNotEmpty("contents".into())),
+            75
+        );
+    }
+
+    #[test]
+    fn init_target_not_empty_wrapped_in_fs_error_still_maps_to_75() {
+        // Real-world path: run_init returns FsError::Core(InitTargetNotEmpty).
+        // The exit-code walker must reach the wrapped CoreError, not fall
+        // through to the FsError generic mapping (which would emit 66).
+        let fs_err: onebrain_fs::FsError =
+            onebrain_fs::FsError::Core(CoreError::InitTargetNotEmpty("non-empty".into()));
+        let e: anyhow::Error = anyhow::Error::from(fs_err);
+        assert_eq!(exit_code_for(&e), 75);
     }
 
     #[test]
