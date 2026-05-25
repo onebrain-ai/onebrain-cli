@@ -168,3 +168,87 @@ fn session_init_json_envelope_snapshot_outside_vault() {
     // Block shape has no volatile fields — pin verbatim.
     assert_json_snapshot!("session_init_envelope_outside_vault", v);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// R2-H4 · hook-protocol byte-shape snapshots
+//
+// These commands run on the hook-protocol contract (raw JSON object, not
+// the v3.1 envelope) — `{"orphan_count":N}` and
+// `{"decision":"block","reason":"NN since <context>"}`. The hook-protocol
+// shape is consumed by Claude Code's SessionStart/Stop hooks; any field
+// rename would break the live consumer silently. Pin the shape here.
+//
+// `qmd reindex` is intentionally skipped — its current implementation
+// emits no stable JSON output (returns immediately, prints a status line).
+// When/if it gains a stable shape, add a snapshot here.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn checkpoint_orphans_envelope_snapshot() {
+    // `checkpoint orphans <logs_folder> <session_token>` is the hook-protocol
+    // command behind the SessionStart orphan-count probe. Empty checkpoint
+    // dir → `{"orphan_count": 0}`.
+    let dir = tempdir().unwrap();
+    make_vault(dir.path());
+    // Pre-create an empty checkpoint folder so the scanner doesn't return
+    // an error path; the shape is the same either way but this matches the
+    // production "fresh vault" state.
+    std::fs::create_dir_all(dir.path().join("checkpoint")).unwrap();
+    let v = run_json(&["checkpoint", "orphans", ".", "tokABC123"], dir.path());
+    assert_json_snapshot!("checkpoint_orphans_envelope", v);
+}
+
+#[test]
+fn checkpoint_stop_envelope_when_threshold_hit() {
+    // `checkpoint stop` is the hook-protocol Stop-hook command. When the
+    // message-count threshold is met it emits
+    // `{"decision":"block","reason":"NN since start"}` — pin this shape.
+    //
+    // Driving: vault.yml sets messages=2; pre-write the state file with
+    // count=2 in an isolated TMPDIR so the increment-to-3 fires the
+    // threshold. Empty logs folder → NN = "01" → reason "01 since start".
+    let tmpdir = tempdir().unwrap(); // overrides std::env::temp_dir() via TMPDIR
+    let vault_dir = tempdir().unwrap();
+
+    std::fs::write(
+        vault_dir.path().join("vault.yml"),
+        "checkpoint:\n  messages: 2\n  minutes: 30\nfolders:\n  logs: 07-logs\n",
+    )
+    .unwrap();
+
+    // WT_SESSION → deterministic session token (sanitised to alphanumeric,
+    // truncated to 8 chars). "tkn12345" stays verbatim.
+    let token = "tkn12345";
+    let state_path = tmpdir.path().join(format!("onebrain-{token}.state"));
+    // Format: "count:last_ts:nn" — count=2 means handle_stop increments to
+    // 3 which is >= messages_threshold (2) and >= MIN_ACTIVITY (2), so it
+    // emits the block JSON.
+    std::fs::write(&state_path, "2:0:00").unwrap();
+
+    let output = assert_cmd::Command::cargo_bin("onebrain")
+        .unwrap()
+        .args([
+            "checkpoint",
+            "stop",
+            "--vault-dir",
+            vault_dir.path().to_str().unwrap(),
+        ])
+        .env("TMPDIR", tmpdir.path())
+        .env("WT_SESSION", token)
+        // Defensively clear lower-priority token sources so WT_SESSION wins.
+        .env("TMUX_PANE", "")
+        .env_remove("TERM_SESSION_ID")
+        .output()
+        .expect("spawn failed");
+    let stdout = String::from_utf8(output.stdout).expect("non-utf8 stdout");
+    let trimmed = stdout.trim();
+    assert!(
+        !trimmed.is_empty(),
+        "expected block JSON on stdout · stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: Value = serde_json::from_str(trimmed).expect("not valid JSON");
+
+    // Pin the byte shape — no volatile fields in the block JSON.
+    assert_json_snapshot!("checkpoint_stop_block_envelope", v);
+}

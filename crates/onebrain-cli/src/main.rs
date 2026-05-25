@@ -64,7 +64,11 @@ fn render_error(e: &anyhow::Error, mode: &OutputMode) {
     }
 
     // R2-H3: dispatcher already emitted the canonical envelope. Skip.
-    if e.chain().any(|c| c.is::<v31::dispatch::AlreadyReported>()) {
+    // NOTE: anyhow stores `.context(C)` in a private wrapper type — walking
+    // `chain()` and matching `c.is::<C>()` does NOT pierce that wrapper. Use
+    // `anyhow::Error::downcast_ref::<C>()` directly, which IS plumbed for
+    // context-as-error retrieval.
+    if e.downcast_ref::<v31::dispatch::AlreadyReported>().is_some() {
         return;
     }
 

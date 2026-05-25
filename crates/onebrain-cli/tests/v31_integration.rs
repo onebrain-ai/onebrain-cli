@@ -571,3 +571,280 @@ fn hook_protocol_session_init_keeps_stderr_clean() {
         "hook stderr leaked banner: {stderr:?}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// R2-B1 · partial-failure E2E
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Build a minimal valid tarball fixture for `vault-sync` so step 2 of
+/// `plugin update` succeeds. Matches the shape used in `tests/vault_sync.rs`.
+fn build_plugin_tarball(version: &str) -> Vec<u8> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    let mut buf = Vec::new();
+    let prefix = "onebrain-ai-onebrain-abc1234";
+    {
+        let enc = GzEncoder::new(&mut buf, Compression::default());
+        let mut b = tar::Builder::new(enc);
+        let files: Vec<(String, String)> = vec![
+            (
+                format!("{prefix}/.claude/plugins/onebrain/.claude-plugin/plugin.json"),
+                serde_json::json!({"id":"onebrain","version":version,"name":"OneBrain"})
+                    .to_string(),
+            ),
+            (
+                format!("{prefix}/.claude/plugins/onebrain/INSTRUCTIONS.md"),
+                "# OneBrain Instructions\n".into(),
+            ),
+            (
+                format!("{prefix}/CONTRIBUTING.md"),
+                "# Contributing\n".into(),
+            ),
+            (format!("{prefix}/CHANGELOG.md"), "# Changelog\n".into()),
+            (
+                format!("{prefix}/CLAUDE.md"),
+                "@.claude/plugins/onebrain/INSTRUCTIONS.md\n".into(),
+            ),
+            (
+                format!("{prefix}/GEMINI.md"),
+                "@.claude/plugins/onebrain/INSTRUCTIONS.md\n".into(),
+            ),
+            (
+                format!("{prefix}/AGENTS.md"),
+                "@.claude/plugins/onebrain/INSTRUCTIONS.md\n".into(),
+            ),
+        ];
+        for (path, content) in &files {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(content.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, path, content.as_bytes()).unwrap();
+        }
+        b.finish().unwrap();
+    }
+    buf
+}
+
+#[test]
+fn plugin_update_partial_failure_emits_partial_envelope() {
+    // R2-B1 (Blocker): the partial-failure envelope contract.
+    //
+    // Trigger: vault.yml has an INVALID cron schedule (`* *` — too few
+    // fields) so step 4 (`schedule register`) fails after step 3 (hook
+    // rewrite) has already mutated `.claude/settings.json` on disk.
+    //
+    // Expected envelope:
+    //   - exactly ONE JSON document on stdout (no double-emit)
+    //   - `ok == false`
+    //   - `error.code == "E_PLUGIN_UPDATE_PARTIAL"`
+    //   - `data.hooks_rewritten >= 1` (the rewriter did its job)
+    //   - `data.plists_rewritten == false`
+    //   - exit code != 0
+
+    let dir = tempdir().unwrap();
+    let vault = dir.path();
+    fs::create_dir_all(vault.join(".claude")).unwrap();
+
+    // vault.yml: valid YAML BUT contains a malformed cron expression. The
+    // register-schedule validate pass rejects it, returning Err after the
+    // hook rewriter has already succeeded.
+    fs::write(
+        vault.join("vault.yml"),
+        "update_channel: stable\nschedule:\n  - cron: \"* *\"\n    command: /bin/echo\n    args: [hi]\n",
+    )
+    .unwrap();
+
+    // .claude/settings.json with one v3.0 hook entry the rewriter will flip.
+    let v30_settings = serde_json::json!({
+        "hooks": {
+            "SessionStart": [
+                {
+                    "hooks": [
+                        { "type": "command", "command": "onebrain", "args": ["session-init"] }
+                    ]
+                }
+            ]
+        }
+    });
+    fs::write(
+        vault.join(".claude/settings.json"),
+        serde_json::to_string_pretty(&v30_settings).unwrap(),
+    )
+    .unwrap();
+
+    // Steer vault-sync's network fetch to a local tarball fixture.
+    let tarball = build_plugin_tarball("1.11.0");
+    let tarball_path = dir.path().join("fixture.tar.gz");
+    fs::write(&tarball_path, &tarball).unwrap();
+    let isolated = vault.join(".isolated-installed_plugins.json");
+    // Isolate HOME so register-schedule's plist path doesn't touch the real
+    // ~/Library/LaunchAgents (defensive — invalid cron should fail BEFORE
+    // any plist write, but we keep HOME isolated anyway).
+    let home = tempdir().unwrap();
+
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["plugin", "update", "--json"])
+        .current_dir(vault)
+        .env("HOME", home.path())
+        .env(
+            "ONEBRAIN_VAULT_SYNC_FIXTURE",
+            tarball_path.to_string_lossy().to_string(),
+        )
+        .env(
+            "ONEBRAIN_INSTALLED_PLUGINS_PATH",
+            isolated.to_string_lossy().to_string(),
+        )
+        .env("ONEBRAIN_QUIET_MIGRATION", "1")
+        .output()
+        .expect("spawn failed");
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    // ── Exactly one JSON document on stdout (no double-emit, R2-H3). ──
+    //
+    // vault-sync prints progress lines BEFORE the JSON envelope, so we can't
+    // parse-from-start. Filter to lines that start with `{` and assert
+    // exactly one such line. (Each JSON envelope is one line in compact
+    // mode; double-emit would produce two.)
+    let json_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.trim_start().starts_with('{'))
+        .collect();
+    assert_eq!(
+        json_lines.len(),
+        1,
+        "expected exactly one JSON envelope on stdout (R2-H3 guard); got {} · stdout: {stdout:?} · stderr: {stderr:?}",
+        json_lines.len()
+    );
+    let v: serde_json::Value = serde_json::from_str(json_lines[0]).expect("valid JSON");
+
+    // ── Envelope contract: partial-failure shape. ──
+    assert_eq!(v["ok"], false, "envelope ok must be false on partial");
+    assert_eq!(
+        v["error"]["code"], "E_PLUGIN_UPDATE_PARTIAL",
+        "wrong error code · got: {v:#?}"
+    );
+    assert!(v["error"]["message"].is_string());
+    assert_eq!(v["version"], "1");
+
+    // ── Step progress preserved in data. ──
+    assert!(
+        v["data"]["hooks_rewritten"].as_u64().unwrap_or(0) >= 1,
+        "hooks_rewritten must reflect on-disk progress · got: {v:#?}"
+    );
+    assert_eq!(
+        v["data"]["plists_rewritten"], false,
+        "plists_rewritten must be false on partial failure"
+    );
+
+    // ── Exit code is non-zero. ──
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "partial failure must surface non-zero exit · stderr: {stderr:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// R2-H5 · semantic swap contract pins
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn root_update_does_not_rewrite_hooks_or_plists() {
+    // The v3.1 semantic swap: `onebrain update` is now self-update of the
+    // CLI binary; hook/plist rewriting moved under `onebrain plugin update`.
+    //
+    // Contract pin: running `onebrain update --check --json` (which calls
+    // the version-check path, not the hook rewriter) must NOT touch
+    // .claude/settings.json. This is a STRUCTURAL guarantee independent of
+    // whether the network fetch succeeds — the update orchestrator never
+    // touches the vault filesystem on the dry-run path.
+    let dir = tempdir().unwrap();
+    let vault = dir.path();
+    fs::create_dir_all(vault.join(".claude")).unwrap();
+
+    // A v3.0-shape settings.json that the v3.1 hook rewriter WOULD modify
+    // if it ran. If `onebrain update` accidentally invoked the rewriter,
+    // the args would flip from ["session-init"] to ["session","init"].
+    let v30 = serde_json::json!({
+        "hooks": {
+            "SessionStart": [
+                {
+                    "hooks": [
+                        { "type": "command", "command": "onebrain", "args": ["session-init"] }
+                    ]
+                }
+            ]
+        }
+    });
+    let settings_path = vault.join(".claude/settings.json");
+    let original_bytes = serde_json::to_string_pretty(&v30).unwrap();
+    fs::write(&settings_path, &original_bytes).unwrap();
+    fs::write(vault.join("vault.yml"), "method: onebrain\n").unwrap();
+    let home = tempdir().unwrap();
+
+    // Run with --check --json. Network may or may not be reachable in CI;
+    // either way, the contract is that settings.json is untouched. We let
+    // the binary exit with whatever code it returns (0 on success, 1 on
+    // fetch failure) — we only care about the on-disk side-effect.
+    let _ = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault)
+        .env("HOME", home.path())
+        .args(["update", "--check", "--json"])
+        .output()
+        .expect("spawn failed");
+
+    let after_bytes = fs::read(&settings_path).expect("settings.json must still exist");
+    assert_eq!(
+        after_bytes,
+        original_bytes.as_bytes(),
+        "onebrain update must NOT rewrite .claude/settings.json"
+    );
+}
+
+#[test]
+fn plugin_update_does_not_touch_cli_binary() {
+    // The dual contract pin: `onebrain plugin update` must never download
+    // or replace the CLI binary. v3.0 conflated both paths under one
+    // `update` verb; v3.1 split them. If a future refactor accidentally
+    // wires the binary-fetch path back in, this test catches it.
+    let dir = tempdir().unwrap();
+    let vault = dir.path();
+    fs::create_dir_all(vault.join(".claude")).unwrap();
+    fs::write(vault.join("vault.yml"), "method: onebrain\n").unwrap();
+    fs::write(
+        vault.join(".claude/settings.json"),
+        serde_json::to_string_pretty(&serde_json::json!({"hooks": {}})).unwrap(),
+    )
+    .unwrap();
+
+    // Isolated cache + HOME so any rogue binary write lands in the
+    // tempdir, not the real ~/.cache/onebrain.
+    let home = tempdir().unwrap();
+    let cache_home = home.path().join("cache");
+    let cache_dir = cache_home.join("onebrain");
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["plugin", "update", "--dry-run"])
+        .current_dir(vault)
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", &cache_home)
+        .env("ONEBRAIN_QUIET_MIGRATION", "1")
+        .assert()
+        .success();
+
+    // Nothing under the binaries subdirectory. We don't assert the cache
+    // root is absent (some unrelated subsystem may create it), only that
+    // no binary downloads happened.
+    let binaries_dir = cache_dir.join("binaries");
+    assert!(
+        !binaries_dir.exists(),
+        "plugin update must NOT create a binaries cache dir (got: {})",
+        binaries_dir.display()
+    );
+}
