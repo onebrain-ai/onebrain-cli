@@ -82,7 +82,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
         // ───── Session ──────────────────────────────────────────────
         Cmd::Session(SessionCmd { verb }) => match verb {
-            SessionVerb::Init { vault_dir } => commands::session_init::run(vault_dir),
+            SessionVerb::Init { vault_dir } => commands::session_init::run(vault_dir, &mode),
             SessionVerb::Current => stubs::not_implemented("session current"),
             SessionVerb::List => stubs::not_implemented("session list"),
             SessionVerb::Get { .. } => stubs::not_implemented("session get"),
@@ -95,7 +95,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             CheckpointVerb::Orphans {
                 logs_folder,
                 session_token,
-            } => commands::orphan_scan::run(&logs_folder, &session_token),
+            } => commands::orphan_scan::run(&logs_folder, &session_token, &mode),
         },
 
         // ───── Qmd ──────────────────────────────────────────────────
@@ -433,11 +433,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         // ───── Hidden v3.0 aliases — emit migration notice + dispatch ─
         Cmd::SessionInitAlias(a) => {
             migration::print_once("session-init", "session init");
-            commands::session_init::run(a.vault_dir)
+            commands::session_init::run(a.vault_dir, &mode)
         }
         Cmd::OrphanScanAlias(a) => {
             migration::print_once("orphan-scan", "checkpoint orphans");
-            commands::orphan_scan::run(&a.logs_folder, &a.session_token)
+            commands::orphan_scan::run(&a.logs_folder, &a.session_token, &mode)
         }
         Cmd::QmdReindexAlias => {
             migration::print_once("qmd-reindex", "qmd reindex");

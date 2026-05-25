@@ -4,5 +4,5 @@ expression: normalize_volatile(raw)
 ---
 {
   "decision": "block",
-  "reason": "onebrain-init-required"
+  "reason": "onebrain-vault-not-found"
 }

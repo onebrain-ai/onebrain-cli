@@ -398,7 +398,57 @@ fn session_init_emits_block_json_outside_vault() {
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(v["decision"], "block");
-    assert_eq!(v["reason"], "onebrain-init-required");
+    assert_eq!(v["reason"], "onebrain-vault-not-found");
+}
+
+/// v3.1: `--yaml` flips the hook-protocol block to YAML. Default stays JSON
+/// (verified above). Same shape, different serialiser.
+#[test]
+fn session_init_yaml_flag_emits_yaml_block_outside_vault() {
+    let no_vault = tempdir().unwrap();
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(no_vault.path())
+        .args(["session", "init", "--yaml"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    // Parse the YAML to assert structure rather than string-matching the
+    // emitter's whitespace (serde_yaml formatting is implementation-defined).
+    let v: serde_yaml::Value = serde_yaml::from_str(&stdout).unwrap();
+    assert_eq!(
+        v.get("decision").and_then(|d| d.as_str()),
+        Some("block"),
+        "yaml block missing decision; got: {stdout}"
+    );
+    assert_eq!(
+        v.get("reason").and_then(|r| r.as_str()),
+        Some("onebrain-vault-not-found"),
+        "yaml block missing reason; got: {stdout}"
+    );
+    // Negative · no JSON braces (defensive — confirms we actually flipped).
+    assert!(
+        !stdout.trim_start().starts_with('{'),
+        "expected YAML, got JSON-shaped output: {stdout}"
+    );
+}
+
+#[test]
+fn session_init_output_yaml_alias_works() {
+    let no_vault = tempdir().unwrap();
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(no_vault.path())
+        .args(["session", "init", "--output", "yaml"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let v: serde_yaml::Value = serde_yaml::from_str(&stdout).unwrap();
+    assert_eq!(v.get("decision").and_then(|d| d.as_str()), Some("block"));
+    assert!(
+        !stdout.trim_start().starts_with('{'),
+        "expected YAML, got JSON-shaped output: {stdout}"
+    );
 }
 
 #[test]
