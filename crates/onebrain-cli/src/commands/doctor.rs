@@ -9,12 +9,12 @@
 //! the listed command yourself".
 
 use crate::safety::refuse_dangerous_vault_path;
-use anyhow::{anyhow, Context, Result};
-use onebrain_core::{find_vault_root, load_vault_config, DoctorResult, DoctorStatus};
+use crate::vault_ctx;
+use anyhow::{anyhow, Result};
+use onebrain_core::{load_vault_config, DoctorResult, DoctorStatus};
 use onebrain_fs::doctor::run_all_checks;
-use std::env;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Outcome of a single fix attempt — printed as part of the `--fix`
 /// summary so the user can see what changed (or didn't).
@@ -40,10 +40,15 @@ enum FixOutcome {
 /// JSON mode the initial report is suppressed and `--fix` outcomes are
 /// captured into the wrapper instead of being printed line-by-line —
 /// so the entire command produces exactly one JSON document.
-pub fn run(fix: bool, json: bool) -> Result<i32> {
-    let cwd = env::current_dir().context("read current directory")?;
-    let vault_root = match find_vault_root(&cwd) {
-        Some(r) => r,
+///
+/// `vault_flag` carries the global `--vault <PATH>` value (if any). The
+/// vault is resolved through the canonical chain: flag > `ONEBRAIN_VAULT`
+/// env > walk-up from cwd. This matches `vault current` / every other
+/// v3.1 vault-aware command so `onebrain doctor --vault PATH` works from
+/// outside the vault directory.
+pub fn run(fix: bool, json: bool, vault_flag: Option<PathBuf>) -> Result<i32> {
+    let vault_root = match vault_ctx::resolve(vault_flag)? {
+        Some(r) => r.root,
         None => {
             // In JSON mode, emit a structured failure envelope on stdout so
             // scripted consumers don't have to parse anyhow text from stderr.

@@ -199,3 +199,92 @@ fn doctor_stale_marketplace_warns() {
         .success() // warn-only
         .stdout(predicate::str::contains("stale marketplace repo"));
 }
+
+/// Regression — `onebrain doctor --vault PATH` from outside the vault must
+/// scan the supplied PATH, not the cwd. The original v3.0 / early-v3.1
+/// implementation used `find_vault_root(cwd)` only, so passing `--vault`
+/// from anywhere except inside the vault produced
+/// `{"error":"not_in_vault",...}`. Vault resolution now goes through the
+/// canonical chain (flag > env > walk-up) shared with `vault current`.
+#[test]
+fn doctor_honors_vault_flag() {
+    let vault = tempdir().unwrap();
+    write_minimal_vault(vault.path());
+    // Deliberately run from a DIFFERENT directory that has no vault — if
+    // the flag isn't honoured, walk-up fails and the smoke-test envelope
+    // (`error: not_in_vault`) is what we'll see.
+    let elsewhere = tempdir().unwrap();
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(elsewhere.path())
+        .args(["doctor", "--vault"])
+        .arg(vault.path())
+        .arg("--json")
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default();
+    let doc: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("doctor must emit a JSON envelope on stdout");
+    // Smoke-test failure mode emitted `{"ok":false,"error":"not_in_vault",...}`
+    // with no `checks` array — guard against that shape here.
+    assert!(
+        doc.get("error").is_none(),
+        "must not be the not_in_vault envelope · got: {doc}"
+    );
+    assert!(
+        doc.get("checks").is_some(),
+        "must include the checks array · got: {doc}"
+    );
+    // The vault.yml check should report ok against the minimal fixture
+    // (which writes the canonical `update_channel` + folder block).
+    let checks = doc["checks"].as_array().expect("checks is array");
+    let vault_yml = checks
+        .iter()
+        .find(|c| c["check"] == "vault.yml")
+        .expect("vault.yml check must be present");
+    assert_eq!(vault_yml["status"], "ok", "vault.yml check should be ok");
+}
+
+/// Regression — `onebrain doctor --fix --vault PATH` must run the
+/// `vault-config-migration` recipe against the supplied PATH (not cwd).
+/// The fixture writes legacy `vault.yml`; after `--fix` the canonical
+/// `onebrain.yml` should exist with the same content and `vault.yml`
+/// should be gone.
+#[test]
+fn doctor_fix_migrates_vault_yml_with_vault_flag() {
+    let vault = tempdir().unwrap();
+    write_minimal_vault(vault.path());
+    // Sanity: fixture writes legacy filename.
+    assert!(vault.path().join("vault.yml").is_file());
+    assert!(!vault.path().join("onebrain.yml").exists());
+    let original = std::fs::read_to_string(vault.path().join("vault.yml")).unwrap();
+    let elsewhere = tempdir().unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(elsewhere.path())
+        // Scrub PATH so `which::which("qmd")` returns NotFound — the
+        // minimal fixture omits qmd_collection so the recipe must NOT
+        // spawn real qmd on the developer's machine.
+        .env("PATH", "/usr/bin:/bin")
+        .args(["doctor", "--fix", "--vault"])
+        .arg(vault.path())
+        .assert()
+        // `--fix` exit code mirrors post-fix check status; the minimal
+        // fixture has no Error checks, so it returns 0.
+        .success();
+    // Migration recipe should have renamed legacy → canonical.
+    assert!(
+        vault.path().join("onebrain.yml").is_file(),
+        "expected onebrain.yml at {}",
+        vault.path().display()
+    );
+    assert!(
+        !vault.path().join("vault.yml").exists(),
+        "expected vault.yml to be gone after --fix"
+    );
+    let after = std::fs::read_to_string(vault.path().join("onebrain.yml")).unwrap();
+    assert_eq!(
+        after, original,
+        "rename must preserve file content byte-for-byte"
+    );
+}

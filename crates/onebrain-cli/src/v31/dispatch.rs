@@ -76,7 +76,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             std::process::exit(code);
         }
         Cmd::Doctor(a) => {
-            let code = commands::doctor::run(a.fix, a.json)?;
+            let code = commands::doctor::run(a.fix, a.json, vault_flag.clone())?;
             std::process::exit(code);
         }
 
