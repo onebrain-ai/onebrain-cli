@@ -729,6 +729,67 @@ mod tests {
         assert_eq!(lines[0], "OneBrain Init");
     }
 
+    /// C3 (T-M1): the safety-prompt branch in `ask_continue_nonempty` has
+    /// no end-to-end coverage at the run_init level — only safety::classify
+    /// and the CLI dispatcher have unit tests for it. Drive an injected
+    /// confirm_fn through the full init path so the "yes" branch lands on
+    /// vault.yml creation with existing files preserved.
+    #[test]
+    fn nonempty_dir_confirm_yes_proceeds() {
+        let d = tempdir().unwrap();
+        std::fs::write(d.path().join("README.md"), "hi").unwrap();
+        let (mut opts, _stdout_buf) = test_opts(d.path());
+
+        // Confirm "yes" for the non-empty-directory prompt; the second
+        // prompt (Initialize here?) also gets "yes" so init proceeds.
+        opts.confirm_fn = Some(Box::new(|q: &str| {
+            q.starts_with("Target directory is not empty")
+                || q.starts_with("Initialize OneBrain vault here?")
+        }));
+
+        let r = run_init(opts).unwrap();
+        assert!(r.ok);
+        assert_eq!(r.exit_code, 0);
+        // OneBrain structure created
+        assert!(d.path().join("vault.yml").is_file());
+        assert!(d.path().join("00-inbox").is_dir());
+        // Existing file preserved (no clobber)
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("README.md")).unwrap(),
+            "hi"
+        );
+    }
+
+    /// C3 (T-M1) negative: the "no" branch surfaces InitTargetNotEmpty and
+    /// leaves the existing files untouched.
+    #[test]
+    fn nonempty_dir_confirm_no_returns_init_target_not_empty() {
+        let d = tempdir().unwrap();
+        std::fs::write(d.path().join("README.md"), "hi").unwrap();
+        let (mut opts, _stdout_buf) = test_opts(d.path());
+
+        opts.confirm_fn = Some(Box::new(|q: &str| {
+            // Decline the non-empty-directory prompt; never reaches the
+            // "Initialize here?" prompt.
+            !q.starts_with("Target directory is not empty")
+        }));
+
+        let err = run_init(opts).expect_err("expected E_INIT_TARGET_NOT_EMPTY");
+        match err {
+            FsError::Core(CoreError::InitTargetNotEmpty(msg)) => {
+                assert!(msg.contains("declined") || msg.contains("not empty"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+        // Existing file preserved + no vault structure created
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("README.md")).unwrap(),
+            "hi"
+        );
+        assert!(!d.path().join("vault.yml").exists());
+        assert!(!d.path().join("00-inbox").exists());
+    }
+
     /// B2 (SF-H4): `--force` must still run `safety::classify`. Pre-fix the
     /// classify call was guarded by `if !opts.force` so an unreadable target
     /// (EACCES on read_dir, target is a regular file, …) under `--force`

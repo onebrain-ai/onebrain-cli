@@ -6,6 +6,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+use std::time::Duration;
 use tempfile::tempdir;
 
 #[test]
@@ -537,4 +538,31 @@ fn init_existing_vault_yml_skips_safety_check() {
         .assert()
         .failure()
         .stdout(predicate::str::contains("vault.yml exists"));
+}
+
+/// C4 (T-M2): a non-interactive call with CLOSED stdin against a non-empty
+/// directory must NOT hang the process (waiting for an inquire response on
+/// stdin that will never come). Pins the contract: closed-stdin interactive
+/// path fails closed with exit 75 (E_INIT_TARGET_NOT_EMPTY), never blocks.
+///
+/// Drops `--yes` so the binary enters the interactive code path; with stdin
+/// piped+closed inquire returns immediately with an error, and the dispatcher
+/// surfaces E_INIT_TARGET_NOT_EMPTY (default=no for safety).
+#[test]
+fn init_nonempty_closed_stdin_does_not_hang() {
+    let d = tempdir().unwrap();
+    fs::write(d.path().join("README.md"), "hi").unwrap();
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--no-sync"])
+        .current_dir(d.path())
+        .write_stdin("")
+        .timeout(Duration::from_secs(5))
+        .assert()
+        .failure();
+    // Exit 75 = E_INIT_TARGET_NOT_EMPTY · default=no semantics on stuck stdin
+    assert.code(75);
+    // README.md preserved
+    assert!(d.path().join("README.md").is_file());
+    assert!(!d.path().join("vault.yml").exists());
 }
