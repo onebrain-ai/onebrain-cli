@@ -11,16 +11,16 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "onebrain", version)]
 pub struct Cli {
-    /// Override vault root (highest priority · beats ONEBRAIN_VAULT and walk-up).
-    /// Global: accepted pre- or post-subcommand.
-    ///
-    /// On `init`: target directory for the NEW vault (defaults to cwd).
-    /// Walk-up discovery is skipped — init creates a vault, doesn't consume one.
+    // `vault` doc is a single line so `--help` (long) renders identically to
+    // `-h` (short) — clap's default expand-paragraphs-on-long behaviour would
+    // otherwise diverge the two help screens. On `init`, this flag is the
+    // target directory for the NEW vault (defaults to cwd) and walk-up
+    // discovery is skipped — init creates a vault, doesn't consume one.
+    /// Override vault root (highest priority · beats ONEBRAIN_VAULT and walk-up). Global: accepted pre- or post-subcommand.
     #[arg(long, global = true, value_name = "PATH")]
     pub vault: Option<PathBuf>,
 
-    /// Output format. Default `text` is TTY-friendly; pipe-detected calls
-    /// drop color/pretty automatically.
+    /// Output format. Default `text` is TTY-friendly; pipe-detected calls drop color/pretty automatically.
     #[arg(
         short = 'o',
         long,
