@@ -1,0 +1,17 @@
+---
+source: crates/onebrain-cli/tests/v31_envelope_snapshots.rs
+expression: v
+---
+{
+  "version": "1",
+  "command": "plugin.update",
+  "ok": true,
+  "data": {
+    "vault_synced": false,
+    "hooks_rewritten": 0,
+    "plists_rewritten": false,
+    "dry_run": true,
+    "note": "dry-run · no changes written"
+  },
+  "warnings": []
+}

@@ -1,0 +1,21 @@
+---
+source: crates/onebrain-cli/tests/v31_envelope_snapshots.rs
+expression: v
+---
+{
+  "version": "1",
+  "command": "vault.current",
+  "ok": true,
+  "vault": {
+    "name": "<VAULT_NAME>",
+    "path": "<VAULT_PATH>"
+  },
+  "data": {
+    "detected": true,
+    "name": "<VAULT_NAME>",
+    "path": "<VAULT_PATH>",
+    "source": "walk-up",
+    "cwd": "<VAULT_PATH>"
+  },
+  "warnings": []
+}

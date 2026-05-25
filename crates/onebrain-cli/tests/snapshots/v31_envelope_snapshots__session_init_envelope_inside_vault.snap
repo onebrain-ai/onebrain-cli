@@ -1,0 +1,9 @@
+---
+source: crates/onebrain-cli/tests/v31_envelope_snapshots.rs
+expression: v
+---
+{
+  "datetime": "<DATETIME>",
+  "session_token": "<SESSION_TOKEN>",
+  "qmd_unembedded": 0
+}
