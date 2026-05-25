@@ -48,12 +48,7 @@ enum FixOutcome {
 /// env > walk-up from cwd. This matches `vault current` / every other
 /// v3.1 vault-aware command so `onebrain doctor --vault PATH` works from
 /// outside the vault directory.
-pub fn run(
-    fix: bool,
-    json: bool,
-    vault_flag: Option<PathBuf>,
-    mode: &OutputMode,
-) -> Result<i32> {
+pub fn run(fix: bool, json: bool, vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<i32> {
     // v3.1: structured output is triggered by EITHER the local `--json`
     // flag (back-compat with v3.0 callers) OR any global format flag
     // (`--yaml`, `--output yaml`, …). `mode.is_structured()` catches every
@@ -938,15 +933,8 @@ mod tests {
     fn print_report_structured_yaml_mode_emits_yaml_not_json() {
         let results = vec![DoctorResult::ok("a", "good")];
         let mut buf = Vec::new();
-        print_report_structured(
-            &results,
-            false,
-            vec![],
-            false,
-            &OutputMode::Yaml,
-            &mut buf,
-        )
-        .unwrap();
+        print_report_structured(&results, false, vec![], false, &OutputMode::Yaml, &mut buf)
+            .unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(
             !s.trim_start().starts_with('{'),

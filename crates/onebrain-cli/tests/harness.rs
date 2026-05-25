@@ -86,8 +86,14 @@ fn pretty_json_is_indented_multiline() {
         .assert()
         .success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-    assert!(stdout.contains('\n'), "pretty JSON must be multi-line: {stdout}");
-    assert!(stdout.contains("  "), "pretty JSON must be indented: {stdout}");
+    assert!(
+        stdout.contains('\n'),
+        "pretty JSON must be multi-line: {stdout}"
+    );
+    assert!(
+        stdout.contains("  "),
+        "pretty JSON must be indented: {stdout}"
+    );
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert!(parsed.get("harnesses").is_some());
 }

@@ -80,7 +80,10 @@ mod tests {
     #[test]
     fn text_mode_empty_harness_list_says_none() {
         let out = HarnessOutput { harnesses: vec![] };
-        assert_eq!(format_output(&out, &text_mode()), "No agent harness detected");
+        assert_eq!(
+            format_output(&out, &text_mode()),
+            "No agent harness detected"
+        );
     }
 
     #[test]
