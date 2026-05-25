@@ -1,0 +1,5 @@
+---
+source: crates/onebrain-cli/src/banner.rs
+expression: normalised
+---
+[38;2;255;45;146mOneBrain CLI[0m  [2mPersonal AI OS · v<VERSION>[0m

@@ -14,7 +14,7 @@
 use crate::cli::*;
 use crate::output::{resolve_output_mode, OutputMode, TtyInputs};
 use crate::v31::{plugin_update, stubs, vault_current};
-use crate::{commands, migration};
+use crate::{banner, commands, migration};
 use anyhow::Result;
 
 /// Resolve the output mode for the current invocation. Wraps
@@ -28,6 +28,11 @@ pub fn output_mode(cli: &Cli) -> OutputMode {
 /// that the main fn maps to an exit code via `exit::exit_code_for`.
 pub fn dispatch(cli: Cli) -> Result<()> {
     let mode = output_mode(&cli);
+    // R1 branded banner — silently no-ops for hook-protocol commands,
+    // structured output, --quiet, and any non-colour text mode (piped,
+    // NO_COLOR, CI, TERM=dumb). See `banner::should_show_banner` for the
+    // full gating table.
+    banner::emit_banner(std::io::stderr().lock(), &cli, &mode);
     let vault_flag = cli.vault.clone();
 
     match cli.command {

@@ -3,6 +3,7 @@
 //! All command surface is declared in [`cli`]; dispatch lives in
 //! [`v31::dispatch`]. Exit-code mapping is centralised in [`exit`].
 
+mod banner;
 mod cli;
 mod commands;
 mod exit;

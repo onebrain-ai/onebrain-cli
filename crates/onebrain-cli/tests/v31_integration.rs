@@ -358,3 +358,75 @@ fn harness_detect_explicit_works() {
         .assert()
         .success();
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// R1 branded banner — emission is gated by colour-TTY. In `assert_cmd`
+// child processes stdout/stderr are pipes (no TTY), so the banner is
+// suppressed and these tests verify the absence on the machine-output path.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn json_output_never_contains_banner_on_stdout() {
+    // Even if a future regression accidentally piped the banner to stdout
+    // in `--json` mode, this test catches it.
+    let dir = tempdir().unwrap();
+    make_vault(dir.path());
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["vault", "current", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    // Pink ANSI escape or brand text would indicate banner leaked.
+    assert!(
+        !stdout.contains("OneBrain CLI"),
+        "JSON stdout leaked banner text: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("\x1b[38;2;255;45;146m"),
+        "JSON stdout leaked banner ANSI escape: {stdout:?}"
+    );
+}
+
+#[test]
+fn piped_text_output_never_emits_banner_on_stdout() {
+    // Default text mode + piped stdout (assert_cmd is a pipe) → no banner.
+    let dir = tempdir().unwrap();
+    make_vault(dir.path());
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["vault", "current"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(
+        !stdout.contains("OneBrain CLI"),
+        "piped text stdout leaked banner: {stdout:?}"
+    );
+}
+
+#[test]
+fn hook_protocol_session_init_keeps_stderr_clean() {
+    // Hook commands MUST keep both stdout and stderr free of any banner
+    // bytes — even if a developer accidentally turns colour on in CI.
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("vault.yml"), "qmd_collection: x\n").unwrap();
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["session", "init"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        !stdout.contains("OneBrain CLI"),
+        "hook stdout leaked banner: {stdout:?}"
+    );
+    assert!(
+        !stderr.contains("OneBrain CLI"),
+        "hook stderr leaked banner: {stderr:?}"
+    );
+}
