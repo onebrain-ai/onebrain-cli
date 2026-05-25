@@ -17,16 +17,31 @@ pub struct SessionInitOutput {
 /// `--yaml` / `--output yaml` flips to YAML; every other mode (text · table
 /// · tsv · default json) keeps JSON because the hook-protocol block has no
 /// sensible columnar form and downstream tooling depends on the JSON shape.
+///
+/// `pretty = true` (`--pretty` flag · or any text mode with pretty enabled)
+/// emits indented multi-line JSON instead of the compact single-line form.
+/// Hook consumers (Claude Code) parse both shapes identically; the indented
+/// form is for humans reading the output in a terminal.
 pub fn serialize_for_mode<T: Serialize>(value: &T, mode: &OutputMode) -> String {
+    let pretty = matches!(mode, OutputMode::Text { pretty: true, .. });
     match mode {
         OutputMode::Yaml => {
             // `serde_yaml` always succeeds for our static block shapes (no
             // exotic types), but if it ever did fail the fallback to JSON
-            // keeps the hook contract honest rather than panicking.
-            serde_yaml::to_string(value)
-                .unwrap_or_else(|_| serde_json::to_string(value).unwrap_or_else(|_| String::new()))
+            // keeps the hook contract honest rather than panicking. YAML is
+            // already multi-line / "pretty" by construction, so the `pretty`
+            // flag has no additional effect here.
+            serde_yaml::to_string(value).unwrap_or_else(|_| serialize_json(value, pretty))
         }
-        _ => serde_json::to_string(value).unwrap_or_else(|_| String::new()),
+        _ => serialize_json(value, pretty),
+    }
+}
+
+fn serialize_json<T: Serialize>(value: &T, pretty: bool) -> String {
+    if pretty {
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| String::new())
+    } else {
+        serde_json::to_string(value).unwrap_or_else(|_| String::new())
     }
 }
 
