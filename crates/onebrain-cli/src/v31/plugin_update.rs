@@ -6,7 +6,7 @@
 //! v3.1 split: `onebrain update` now means "self-update the CLI binary",
 //! while `onebrain plugin update` is the plugin-side workflow.
 
-use crate::v31::hook_rewriter;
+use crate::v31::hook_rewriter::{self, RewriteWarning};
 use anyhow::{Context, Result};
 use onebrain_fs::register_hooks::settings::settings_path;
 use std::path::PathBuf;
@@ -22,6 +22,13 @@ pub struct PluginUpdateReport {
     /// partial-report envelope with `ok: false` + error code
     /// `E_PLUGIN_UPDATE_PARTIAL`.
     pub partial_failure: Option<String>,
+    /// Soft warnings surfaced by the hook rewriter (e.g.
+    /// `W_MALFORMED_HOOK_ENTRY` for entries the rewriter had to skip). The
+    /// dispatcher appends these to the envelope's `warnings[]` array so
+    /// machine consumers and humans both see them. R2-H1: the rewriter has
+    /// always populated these, but they used to be dropped on the floor
+    /// before reaching the user.
+    pub warnings: Vec<RewriteWarning>,
 }
 
 /// Run the v3.1 plugin update workflow.
@@ -70,6 +77,10 @@ pub fn run(
     let rewrite_report = hook_rewriter::rewrite_settings_file(&settings, dry_run)
         .context("plugin update: hook rewrite failed")?;
     report.hooks_rewritten = rewrite_report.total;
+    // R2-H1: surface any soft warnings from the rewriter (e.g. malformed
+    // hook entries that were skipped). Previously these were silently
+    // dropped before reaching the envelope.
+    report.warnings = rewrite_report.warnings;
 
     // 4. Re-register launchd plists.
     //    register_schedule's `--refresh` flag re-emits plists with the
@@ -116,6 +127,7 @@ mod tests {
         assert!(!r.plists_rewritten);
         assert!(!r.dry_run);
         assert!(r.partial_failure.is_none());
+        assert!(r.warnings.is_empty());
     }
 
     #[test]
@@ -129,10 +141,49 @@ mod tests {
             hooks_rewritten: 3,
             plists_rewritten: false,
             partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
+            warnings: Vec::new(),
         };
         assert_eq!(r.hooks_rewritten, 3);
         assert!(r.vault_synced);
         assert!(!r.plists_rewritten);
         assert!(r.partial_failure.as_deref().unwrap().contains("launchctl"));
+    }
+
+    #[test]
+    fn rewriter_warnings_plumbed_into_report() {
+        // R2-H1: a malformed `.claude/settings.json` hook entry should
+        // surface as a W_MALFORMED_HOOK_ENTRY warning inside the report's
+        // `warnings` vec, so the dispatcher can append it to the envelope.
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("vault.yml"), "method: onebrain\n").unwrap();
+        let claude = dir.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        // Malformed: `command` is an array (skill-alignment §4.5 expects a
+        // string). The rewriter must skip it and emit W_MALFORMED_HOOK_ENTRY.
+        let body = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "hooks": [
+                            { "type": "command", "command": ["onebrain", "session-init"] }
+                        ]
+                    }
+                ]
+            }
+        });
+        fs::write(
+            claude.join("settings.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+        // dry_run=true to avoid the network vault-sync + schedule-register.
+        let report = run(Some(dir.path().to_path_buf()), None, true).unwrap();
+        assert_eq!(
+            report.warnings.len(),
+            1,
+            "expected one rewriter warning to plumb through to the report"
+        );
+        assert_eq!(report.warnings[0].code, "W_MALFORMED_HOOK_ENTRY");
     }
 }

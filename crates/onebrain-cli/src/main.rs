@@ -43,9 +43,28 @@ fn main() {
 /// (`--json` / `--yaml` / `--output table|tsv`) build a canonical envelope
 /// (`ok: false`, `error: {code, message}`) and emit it on stdout so machine
 /// consumers always see one well-formed JSON document per invocation.
+///
+/// R2-H2: structured-mode error envelopes are always rendered as JSON
+/// regardless of the requested format. `--output table` and `--output tsv`
+/// have no columnar slots for `code`/`message`/`version` — the generic
+/// fallback in `output::dispatcher::emit` produces empty / header-only
+/// output in those modes, so a machine consumer reading stdout sees no
+/// error signal. Forcing JSON guarantees a lossless canonical envelope on
+/// every structured invocation. `--yaml` is also forced to JSON for the
+/// error path so consumers don't need a format-switch on the error branch.
+///
+/// R2-H3: when the error chain carries the `AlreadyReported` sentinel the
+/// envelope has been emitted already (e.g. `plugin update`'s partial
+/// envelope) — skip the duplicate emission but let `exit_code_for`
+/// propagate the exit code unchanged.
 fn render_error(e: &anyhow::Error, mode: &OutputMode) {
     if !mode.is_structured() {
         eprintln!("Error: {e:#}");
+        return;
+    }
+
+    // R2-H3: dispatcher already emitted the canonical envelope. Skip.
+    if e.chain().any(|c| c.is::<v31::dispatch::AlreadyReported>()) {
         return;
     }
 
@@ -54,10 +73,17 @@ fn render_error(e: &anyhow::Error, mode: &OutputMode) {
     // always machine-routable.
     let (code, message) = error_code_and_message(e);
     let env: Envelope<()> = Envelope::err("onebrain.error", None, ErrorInfo::new(code, message));
+    // Force JSON for the error envelope regardless of the requested
+    // structured mode (R2-H2). Pretty-print only if the requested mode was
+    // already pretty JSON; otherwise compact.
+    let pretty = matches!(mode, OutputMode::Json { pretty: true });
+    let error_mode = OutputMode::Json { pretty };
     // Best-effort emit — if even this fails (e.g., broken pipe), fall
     // through to the exit code. Don't try to write a stderr fallback in
     // structured mode because the consumer is parsing stdout only.
-    let _ = emit(&env, mode, std::io::stdout().lock(), |_| String::new());
+    let _ = emit(&env, &error_mode, std::io::stdout().lock(), |_| {
+        String::new()
+    });
 }
 
 /// Walk the anyhow chain looking for a `CoreError` to grab its stable code.

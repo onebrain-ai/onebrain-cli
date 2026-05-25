@@ -17,6 +17,27 @@ use crate::v31::{plugin_update, stubs, vault_current};
 use crate::{banner, commands, migration};
 use anyhow::Result;
 
+/// Sentinel attached as `anyhow::Context` to errors from commands that have
+/// ALREADY emitted their canonical envelope to stdout. `main::render_error`
+/// checks the error chain for this marker and skips emitting a duplicate
+/// envelope; `main::exit::exit_code_for` is unaffected (the inner error
+/// chain still drives the exit code).
+///
+/// R2-H3: previously `plugin update`'s partial-failure path emitted both
+/// `Envelope::partial` (from `emit_plugin_update_summary`) AND a second
+/// `Envelope::err` (from `render_error`), giving structured-mode consumers
+/// two JSON documents on stdout for a single invocation.
+#[derive(Debug)]
+pub struct AlreadyReported;
+
+impl std::fmt::Display for AlreadyReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "envelope already emitted to stdout")
+    }
+}
+
+impl std::error::Error for AlreadyReported {}
+
 /// Resolve the output mode for the current invocation. Wraps
 /// `TtyInputs::from_env` + `resolve_output_mode` so callers stay declarative.
 pub fn output_mode(cli: &Cli) -> OutputMode {
@@ -140,11 +161,17 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 // Partial failure: hooks were rewritten but plists weren't
                 // (or some other mid-flight step bailed). Surface a
                 // canonical exit so callers don't treat this as success.
+                // We've ALREADY emitted the partial-envelope to stdout via
+                // `emit_plugin_update_summary` above, so attach the
+                // `AlreadyReported` sentinel — `main::render_error` will
+                // skip the duplicate envelope but still propagate the
+                // exit code (R2-H3).
                 if report.partial_failure.is_some() {
                     return Err(anyhow::anyhow!(
                         "plugin update completed only partially: {}",
                         report.partial_failure.as_deref().unwrap_or("")
-                    ));
+                    )
+                    .context(AlreadyReported));
                 }
                 Ok(())
             }
@@ -487,7 +514,7 @@ fn emit_plugin_update_summary(
         partial_failure: report.partial_failure.as_deref(),
     };
 
-    let env = if let Some(reason) = report.partial_failure.as_deref() {
+    let mut env = if let Some(reason) = report.partial_failure.as_deref() {
         // Partial-failure envelope: ok=false, but data is preserved so the
         // caller can see exactly which steps succeeded.
         Envelope::partial(
@@ -499,6 +526,13 @@ fn emit_plugin_update_summary(
     } else {
         Envelope::ok("plugin.update", None, data)
     };
+
+    // R2-H1: plumb rewriter soft-warnings (e.g. W_MALFORMED_HOOK_ENTRY) into
+    // the envelope so machine + human consumers both see them. Empty when
+    // settings.json is well-formed (Vec<Warning> serialises as []).
+    for w in &report.warnings {
+        env = env.with_warning(w.code.clone(), w.message.clone());
+    }
 
     emit(&env, mode, std::io::stdout().lock(), |e| {
         let d = e.data.as_ref().unwrap();
@@ -521,6 +555,12 @@ fn emit_plugin_update_summary(
         }
         if let Some(reason) = d.partial_failure {
             s.push_str(&format!("  partial failure  : {reason}\n"));
+        }
+        // R2-H1: render soft-warnings under the summary so text-mode users
+        // can see them too. Format: one line per warning, prefixed with the
+        // warning sigil.
+        for w in &e.warnings {
+            s.push_str(&format!("  ⚠ {}: {}\n", w.code, w.message));
         }
         s
     })
