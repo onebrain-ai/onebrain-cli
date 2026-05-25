@@ -315,22 +315,24 @@ pub fn run_init(mut opts: InitOptions) -> Result<InitResult, FsError> {
     // OneBrain skill silently fail at session start. Only emitted on the
     // claude harness; gemini/direct have no equivalent surface.
     if detect_harnesses(&vault_dir).contains(&Harness::Claude) {
-        match marketplace::write_marketplace_json(&vault_dir) {
-            Ok(wrote) => {
-                result.marketplace_written = wrote;
-                stdout(&format!(
-                    "marketplace.json: {}",
-                    if wrote {
-                        "written"
-                    } else {
-                        "ok (pre-existing)"
-                    }
-                ));
+        // A1 (SF-B1): marketplace.json write failure must propagate as an
+        // error, symmetric with enable_plugin below. Pre-fix it was demoted
+        // to a stderr "warning" and execution fell through — leaving
+        // enabledPlugins=true with no manifest, which is the exact bug v3.1
+        // set out to fix.
+        let outcome = marketplace::write_marketplace_json_with_force(&vault_dir, opts.force)?;
+        result.marketplace_written = !matches!(outcome, marketplace::MarketplaceOutcome::Skipped);
+        let line = match outcome {
+            marketplace::MarketplaceOutcome::Written => "marketplace.json: written",
+            marketplace::MarketplaceOutcome::Skipped => "marketplace.json: ok (pre-existing)",
+            marketplace::MarketplaceOutcome::Repaired => {
+                // A2 (SF-B2): visible warning so the user knows --force just
+                // rewrote a malformed/wrong-shape manifest.
+                stderr("init: marketplace.json repaired (was malformed or wrong-shape)");
+                "marketplace.json: repaired"
             }
-            Err(e) => {
-                stderr(&format!("init: marketplace.json warning: {e}"));
-            }
-        }
+        };
+        stdout(line);
         match enable_plugin::enable_onebrain_plugin(&vault_dir) {
             Ok(wrote) => {
                 result.plugin_enabled = true;
