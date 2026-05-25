@@ -1,7 +1,7 @@
 use crate::legacy_output::serialize_for_mode;
 use crate::output::OutputMode;
 use anyhow::{Context, Result};
-use onebrain_fs::scan_orphans;
+use onebrain_fs::{scan_orphans, OrphanScanResult};
 use std::env;
 use std::path::Path;
 
@@ -20,7 +20,26 @@ fn build_output(
 ) -> Result<String> {
     let result = scan_orphans(logs_folder, session_token, chrono::Local::now(), vault_root)
         .context("scan orphan checkpoint files")?;
-    Ok(serialize_for_mode(&result, mode))
+    Ok(format_output(&result, mode))
+}
+
+/// Render `result` for the requested output mode.
+///
+/// v3.1: text is the default. Machine consumers (Claude Code SessionStart
+/// hook) must pass `--json` (or `--yaml`) explicitly to get the structured
+/// envelope. The hook rewriter adds `--json` so existing installs migrate.
+fn format_output(result: &OrphanScanResult, mode: &OutputMode) -> String {
+    if let OutputMode::Text { .. } = mode {
+        return render_text(result);
+    }
+    serialize_for_mode(result, mode)
+}
+
+fn render_text(result: &OrphanScanResult) -> String {
+    match result.orphan_count {
+        0 => "0 orphan checkpoints found".to_string(),
+        n => format!("{n} orphan checkpoints found · run /wrapup to synthesize"),
+    }
 }
 
 #[cfg(test)]
@@ -32,8 +51,15 @@ mod tests {
         OutputMode::Json { pretty: false }
     }
 
+    fn text_mode() -> OutputMode {
+        OutputMode::Text {
+            color: false,
+            pretty: false,
+        }
+    }
+
     #[test]
-    fn empty_logs_emits_zero_count() {
+    fn empty_logs_emits_zero_count_in_json() {
         let dir = tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("checkpoint")).unwrap();
         let line = build_output(dir.path(), "abc12345", dir.path(), &json_mode()).unwrap();
@@ -59,6 +85,42 @@ mod tests {
         assert!(
             !line.trim_start().starts_with('{'),
             "expected YAML, got JSON-shaped output: {line}"
+        );
+    }
+
+    // ── v3.1: text is the new default ────────────────────────────────────
+
+    #[test]
+    fn default_emits_text_not_json() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("checkpoint")).unwrap();
+        let line = build_output(dir.path(), "abc12345", dir.path(), &text_mode()).unwrap();
+        assert!(
+            !line.trim_start().starts_with('{'),
+            "default mode must NOT emit JSON braces; got: {line}"
+        );
+        assert!(
+            line.contains("orphan checkpoint"),
+            "expected human marker; got: {line}"
+        );
+    }
+
+    #[test]
+    fn json_pretty_indents() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("checkpoint")).unwrap();
+        let line = build_output(
+            dir.path(),
+            "abc12345",
+            dir.path(),
+            &OutputMode::Json { pretty: true },
+        )
+        .unwrap();
+        // Pretty JSON adds newlines + 2-space indent.
+        assert!(line.contains('\n'), "expected multi-line; got: {line}");
+        assert!(
+            line.contains("  \"orphan_count\""),
+            "expected 2-space indent on `orphan_count`; got: {line}"
         );
     }
 }

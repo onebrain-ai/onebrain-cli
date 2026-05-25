@@ -12,28 +12,38 @@ pub struct SessionInitOutput {
 /// Serialize a hook-protocol block / output to the wire format for the given
 /// output mode.
 ///
-/// **Default = JSON** to preserve back-compat with Claude Code's SessionStart
-/// hook parser (which expects JSON unconditionally). Only an explicit
-/// `--yaml` / `--output yaml` flips to YAML; every other mode (text · table
-/// · tsv · default json) keeps JSON because the hook-protocol block has no
-/// sensible columnar form and downstream tooling depends on the JSON shape.
+/// **v3.1 behaviour:** default (`OutputMode::Text { .. }`) renderers live
+/// next to each command's body — text formatting is shape-specific (a session
+/// metadata line vs. a "no vault found" message vs. an orphan-count line) so
+/// the generic serializer here does NOT attempt a generic text fallback.
+/// Callers must dispatch on `OutputMode::Text { .. }` before invoking this
+/// function. For the structured branches (`Json` / `Yaml` / `Table` / `Tsv`)
+/// this function is the single emit point; it keeps the JSON shape rules
+/// (compact vs. pretty) in one place and falls back to compact JSON if YAML
+/// emission ever fails (defensive — `serde_yaml` doesn't fail for our static
+/// shapes today).
 ///
-/// `pretty = true` (`--pretty` flag · or any text mode with pretty enabled)
-/// emits indented multi-line JSON instead of the compact single-line form.
-/// Hook consumers (Claude Code) parse both shapes identically; the indented
-/// form is for humans reading the output in a terminal.
+/// `--pretty` flag is honoured for explicit JSON mode (`OutputMode::Json
+/// { pretty: true }`). YAML is already multi-line / "pretty" by construction.
+///
+/// **Hook-protocol contract:** machine consumers (Claude Code SessionStart /
+/// Stop hooks) must pass `--json` explicitly in v3.1+. The hook rewriter
+/// adds the flag during `onebrain plugin update`; fresh installs scaffold
+/// it directly. See `v31/hook_rewriter.rs` + `register_hooks/hooks.rs`.
 pub fn serialize_for_mode<T: Serialize>(value: &T, mode: &OutputMode) -> String {
-    let pretty = matches!(mode, OutputMode::Text { pretty: true, .. });
     match mode {
         OutputMode::Yaml => {
-            // `serde_yaml` always succeeds for our static block shapes (no
-            // exotic types), but if it ever did fail the fallback to JSON
-            // keeps the hook contract honest rather than panicking. YAML is
-            // already multi-line / "pretty" by construction, so the `pretty`
-            // flag has no additional effect here.
-            serde_yaml::to_string(value).unwrap_or_else(|_| serialize_json(value, pretty))
+            serde_yaml::to_string(value).unwrap_or_else(|_| serialize_json(value, false))
         }
-        _ => serialize_json(value, pretty),
+        OutputMode::Json { pretty } => serialize_json(value, *pretty),
+        // Table / Tsv have no columnar slot for hook-protocol blocks. Fall
+        // back to compact JSON so the consumer still gets parseable output;
+        // commands that care about text rendering branch on
+        // `OutputMode::Text { .. }` before calling this function.
+        OutputMode::Table | OutputMode::Tsv => serialize_json(value, false),
+        // Text mode shouldn't reach here — callers handle text rendering
+        // themselves. Defensive: emit compact JSON if it does (no panic).
+        OutputMode::Text { pretty, .. } => serialize_json(value, *pretty),
     }
 }
 

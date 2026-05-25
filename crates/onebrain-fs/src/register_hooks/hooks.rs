@@ -13,14 +13,19 @@ pub(crate) struct HookSpec {
 }
 
 impl HookSpec {
+    // v3.1: hook-protocol commands default to text output for interactive
+    // use; machine consumers (Claude Code Stop / PostToolUse hooks) need
+    // `--json` to keep getting the structured envelope they parse. Fresh
+    // installs scaffold this directly; existing installs are auto-migrated
+    // by `crate::v31::hook_rewriter`.
     pub(crate) const STOP: HookSpec = HookSpec {
         command: "onebrain",
-        args: &["checkpoint", "stop"],
+        args: &["checkpoint", "stop", "--json"],
     };
 
     pub(crate) const QMD: HookSpec = HookSpec {
         command: "onebrain",
-        args: &["qmd-reindex"],
+        args: &["qmd-reindex", "--json"],
     };
 
     /// Shell-form representation: e.g. `"onebrain checkpoint stop"`.
@@ -50,6 +55,13 @@ impl HookSpec {
 }
 
 /// `entry` matches `spec` in canonical or legacy shell form.
+///
+/// v3.1 contract: matches the canonical args[] (with trailing `--json`),
+/// the v3.0 canonical (same args[] minus `--json`), and either of the
+/// shell-form spellings ("onebrain checkpoint stop" or
+/// "onebrain checkpoint stop --json"). Used everywhere we ask "is this
+/// already the OneBrain Stop / qmd hook?". The in-place migration helper
+/// `append_json_if_needed` upgrades the v3.0 canonical to the v3.1 shape.
 pub(crate) fn matches_spec(entry: &Value, spec: &HookSpec) -> bool {
     let cmd = entry.get("command").and_then(|v| v.as_str()).unwrap_or("");
     let args = entry.get("args").and_then(|v| v.as_array());
@@ -57,19 +69,89 @@ pub(crate) fn matches_spec(entry: &Value, spec: &HookSpec) -> bool {
     if cmd == spec.command {
         if let Some(args) = args {
             let got: Vec<&str> = args.iter().filter_map(|v| v.as_str()).collect();
+            // v3.1 canonical OR v3.0 canonical (== spec.args minus trailing
+            // --json). Strict equality only.
             if got == spec.args {
                 return true;
             }
+            if let Some(head) = spec_args_without_json(spec) {
+                if got == head {
+                    return true;
+                }
+            }
         }
     }
-    if cmd == spec.full_cmd() && args.is_none() {
+    // Shell-form: "onebrain checkpoint stop --json" or the v3.0 form
+    // "onebrain checkpoint stop". Both count as a match; the migration
+    // pass in `apply_hooks` converts shell→exec AND ensures --json.
+    if args.is_none() && (cmd == spec.full_cmd() || matches_pre_json_full_cmd(cmd, spec)) {
         return true;
     }
     false
 }
 
+/// Helper: `spec.args` minus the trailing `--json` flag, when present.
+fn spec_args_without_json(spec: &HookSpec) -> Option<&[&'static str]> {
+    if spec.args.last().copied() == Some("--json") {
+        Some(&spec.args[..spec.args.len() - 1])
+    } else {
+        None
+    }
+}
+
+/// Helper: does `cmd` look like the v3.0 shell form (spec without --json)?
+fn matches_pre_json_full_cmd(cmd: &str, spec: &HookSpec) -> bool {
+    let Some(head) = spec_args_without_json(spec) else {
+        return false;
+    };
+    let mut s = String::with_capacity(spec.command.len() + 16);
+    s.push_str(spec.command);
+    for a in head {
+        s.push(' ');
+        s.push_str(a);
+    }
+    cmd == s
+}
+
+/// `entry` matches the v3.0 / pre-v3.1 version of `spec` — same positional
+/// args but missing the trailing `--json` flag. Returned true entries are
+/// candidates for in-place flag-append (handled by `apply_hooks`).
+pub(crate) fn matches_spec_pre_json(entry: &Value, spec: &HookSpec) -> bool {
+    let Some(head) = spec_args_without_json(spec) else {
+        return false;
+    };
+    let cmd = entry.get("command").and_then(|v| v.as_str()).unwrap_or("");
+    if cmd != spec.command {
+        return false;
+    }
+    let Some(args) = entry.get("args").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    let got: Vec<&str> = args.iter().filter_map(|v| v.as_str()).collect();
+    got == head
+}
+
+/// Append `--json` to `entry.args` if `spec.args` ends with `--json` AND
+/// the entry currently doesn't have it. Returns true on append.
+pub(crate) fn append_json_if_needed(entry: &mut Value, spec: &HookSpec) -> bool {
+    if !matches_spec_pre_json(entry, spec) {
+        return false;
+    }
+    let Some(args) = entry.get_mut("args").and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+    args.push(Value::String("--json".to_string()));
+    true
+}
+
 /// If `entry` is the legacy shell form of `spec`, rewrite it to canonical.
 /// Returns true on rewrite.
+///
+/// v3.1 contract: accepts either the v3.1 shell form
+/// (`"onebrain checkpoint stop --json"`) OR the v3.0 shell form
+/// (`"onebrain checkpoint stop"`). Either way the rewritten entry lands on
+/// the v3.1 canonical args[] (with `--json`) so machine consumers keep
+/// getting structured output now that text is the new default.
 pub(crate) fn rewrite_if_shell_form(entry: &mut Value, spec: &HookSpec) -> bool {
     let cmd = entry
         .get("command")
@@ -77,7 +159,10 @@ pub(crate) fn rewrite_if_shell_form(entry: &mut Value, spec: &HookSpec) -> bool 
         .unwrap_or("")
         .to_string();
     let has_args = entry.get("args").and_then(|v| v.as_array()).is_some();
-    if cmd != spec.full_cmd() || has_args {
+    if has_args {
+        return false;
+    }
+    if cmd != spec.full_cmd() && !matches_pre_json_full_cmd(&cmd, spec) {
         return false;
     }
     let Some(obj) = entry.as_object_mut() else {
@@ -219,6 +304,19 @@ pub(crate) fn apply_hooks(settings: &mut Value) -> Vec<(&'static str, HookStatus
             }
         }
 
+        // Pass 1b: v3.1 — append `--json` to entries that match the spec
+        // minus the trailing flag (pre-v3.1 installs). Counts as a migrate
+        // because the on-disk shape changed.
+        for g in groups.iter_mut() {
+            if let Some(hs) = g.get_mut("hooks").and_then(|v| v.as_array_mut()) {
+                for h in hs.iter_mut() {
+                    if append_json_if_needed(h, spec) {
+                        rewrote_shell = true;
+                    }
+                }
+            }
+        }
+
         let presence = check_hook_presence(groups, spec);
         let status = match presence {
             Presence::Found => {
@@ -320,14 +418,28 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn matches_spec_canonical_form() {
+    fn matches_spec_canonical_form_v31() {
+        let entry = json!({"command": "onebrain", "args": ["checkpoint", "stop", "--json"]});
+        assert!(matches_spec(&entry, &HookSpec::STOP));
+    }
+
+    #[test]
+    fn matches_spec_canonical_form_v30_pre_json() {
+        // v3.0 canonical (no --json) still recognised so apply_hooks can
+        // migrate it in place by appending the flag.
         let entry = json!({"command": "onebrain", "args": ["checkpoint", "stop"]});
         assert!(matches_spec(&entry, &HookSpec::STOP));
     }
 
     #[test]
-    fn matches_spec_legacy_shell_form() {
+    fn matches_spec_legacy_shell_form_v30() {
         let entry = json!({"command": "onebrain checkpoint stop"});
+        assert!(matches_spec(&entry, &HookSpec::STOP));
+    }
+
+    #[test]
+    fn matches_spec_legacy_shell_form_v31() {
+        let entry = json!({"command": "onebrain checkpoint stop --json"});
         assert!(matches_spec(&entry, &HookSpec::STOP));
     }
 
@@ -350,17 +462,25 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_if_shell_form_rewrites_legacy_in_place() {
+    fn rewrite_if_shell_form_rewrites_v30_legacy_in_place() {
         let mut entry = json!({"command": "onebrain checkpoint stop"});
         assert!(rewrite_if_shell_form(&mut entry, &HookSpec::STOP));
         assert_eq!(entry["command"], "onebrain");
-        assert_eq!(entry["args"], json!(["checkpoint", "stop"]));
+        assert_eq!(entry["args"], json!(["checkpoint", "stop", "--json"]));
         assert_eq!(entry["type"], "command");
     }
 
     #[test]
+    fn rewrite_if_shell_form_rewrites_v31_shell_in_place() {
+        let mut entry = json!({"command": "onebrain checkpoint stop --json"});
+        assert!(rewrite_if_shell_form(&mut entry, &HookSpec::STOP));
+        assert_eq!(entry["command"], "onebrain");
+        assert_eq!(entry["args"], json!(["checkpoint", "stop", "--json"]));
+    }
+
+    #[test]
     fn rewrite_if_shell_form_leaves_canonical_alone() {
-        let mut entry = json!({"command": "onebrain", "args": ["checkpoint", "stop"]});
+        let mut entry = json!({"command": "onebrain", "args": ["checkpoint", "stop", "--json"]});
         assert!(!rewrite_if_shell_form(&mut entry, &HookSpec::STOP));
     }
 
@@ -385,7 +505,33 @@ mod tests {
     }
 
     #[test]
-    fn check_hook_presence_found() {
+    fn append_json_if_needed_v30_canonical() {
+        let mut entry = json!({"command": "onebrain", "args": ["checkpoint", "stop"]});
+        assert!(append_json_if_needed(&mut entry, &HookSpec::STOP));
+        assert_eq!(entry["args"], json!(["checkpoint", "stop", "--json"]));
+    }
+
+    #[test]
+    fn append_json_if_needed_already_v31_noop() {
+        let mut entry = json!({"command": "onebrain", "args": ["checkpoint", "stop", "--json"]});
+        assert!(!append_json_if_needed(&mut entry, &HookSpec::STOP));
+    }
+
+    #[test]
+    fn check_hook_presence_found_v31() {
+        let groups = vec![json!({
+            "hooks": [{"command": "onebrain", "args": ["checkpoint", "stop", "--json"]}]
+        })];
+        assert_eq!(
+            check_hook_presence(&groups, &HookSpec::STOP),
+            Presence::Found
+        );
+    }
+
+    #[test]
+    fn check_hook_presence_found_v30_canonical() {
+        // Pre-v3.1 canonical also counts as "found" — apply_hooks migrates
+        // it in place by appending --json.
         let groups = vec![json!({
             "hooks": [{"command": "onebrain", "args": ["checkpoint", "stop"]}]
         })];
@@ -420,7 +566,7 @@ mod tests {
         let groups = vec![json!({
             "hooks": [
                 {"command": "/x/checkpoint-hook.sh stop"},
-                {"command": "onebrain", "args": ["checkpoint", "stop"]},
+                {"command": "onebrain", "args": ["checkpoint", "stop", "--json"]},
             ]
         })];
         assert_eq!(
@@ -437,7 +583,10 @@ mod tests {
         let entries = s["hooks"]["Stop"][0]["hooks"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["checkpoint", "stop"]));
+        // v3.1: fresh installs scaffold the --json flag so machine
+        // consumers (Claude Code Stop hook) get JSON now that text is the
+        // new default.
+        assert_eq!(entries[0]["args"], json!(["checkpoint", "stop", "--json"]));
         assert_eq!(entries[0]["type"], "command");
         assert_eq!(s["hooks"]["Stop"][0]["matcher"], "");
     }
@@ -467,7 +616,29 @@ mod tests {
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["args"], json!(["checkpoint", "stop"]));
+        assert_eq!(entries[0]["args"], json!(["checkpoint", "stop", "--json"]));
+    }
+
+    #[test]
+    fn apply_hooks_v30_exec_form_migrates_with_json_flag() {
+        // v3.0 canonical args (no --json) get the flag appended in-place.
+        let mut s = json!({
+            "hooks": {
+                "Stop": [{"matcher": "", "hooks": [{
+                    "command": "onebrain", "args": ["checkpoint", "stop"]
+                }]}],
+            }
+        });
+        let r = apply_hooks(&mut s);
+        assert_eq!(r, vec![("Stop", HookStatus::Migrated)]);
+        let entries: Vec<_> = s["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["args"], json!(["checkpoint", "stop", "--json"]));
     }
 
     #[test]
@@ -494,7 +665,7 @@ mod tests {
         assert_eq!(r, vec![("Stop", HookStatus::Migrated)]);
         let entry = &s["hooks"]["Stop"][0]["hooks"][0];
         assert_eq!(entry["command"], "onebrain");
-        assert_eq!(entry["args"], json!(["checkpoint", "stop"]));
+        assert_eq!(entry["args"], json!(["checkpoint", "stop", "--json"]));
         assert_eq!(entry["type"], "command");
         assert_eq!(s["hooks"]["Stop"][0]["matcher"], "");
     }

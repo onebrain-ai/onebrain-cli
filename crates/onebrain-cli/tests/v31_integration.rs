@@ -359,10 +359,11 @@ fn session_init_alias_dispatches_to_session_init() {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("vault.yml"), "qmd_collection: x\n").unwrap();
 
+    // v3.1: pass --json to assert parity on the structured envelope.
     let out_alias = Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(dir.path())
-        .args(["session-init"])
+        .args(["session-init", "--json"])
         .assert()
         .success();
     let s_alias = String::from_utf8_lossy(&out_alias.get_output().stdout).to_string();
@@ -370,7 +371,7 @@ fn session_init_alias_dispatches_to_session_init() {
     let out_new = Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(dir.path())
-        .args(["session", "init"])
+        .args(["session", "init", "--json"])
         .assert()
         .success();
     let s_new = String::from_utf8_lossy(&out_new.get_output().stdout).to_string();
@@ -391,7 +392,8 @@ fn session_init_emits_block_json_outside_vault() {
     let out = Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(no_vault.path())
-        .args(["session", "init"])
+        // v3.1: machine consumers must opt into JSON explicitly.
+        .args(["session", "init", "--json"])
         // Hook protocol: graceful exit 0 with block JSON.
         .assert()
         .success();
@@ -457,10 +459,11 @@ fn orphan_scan_alias_dispatches_to_checkpoint_orphans() {
     make_vault(dir.path());
     // No checkpoint files: count should be 0.
 
+    // v3.1: explicit --json so the schema check below holds.
     let out_alias = Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(dir.path())
-        .args(["orphan-scan", "07-logs", "tokABC"])
+        .args(["orphan-scan", "07-logs", "tokABC", "--json"])
         .assert()
         .success();
     let s_alias = String::from_utf8_lossy(&out_alias.get_output().stdout).to_string();
@@ -468,7 +471,7 @@ fn orphan_scan_alias_dispatches_to_checkpoint_orphans() {
     let out_new = Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(dir.path())
-        .args(["checkpoint", "orphans", "07-logs", "tokABC"])
+        .args(["checkpoint", "orphans", "07-logs", "tokABC", "--json"])
         .assert()
         .success();
     let s_new = String::from_utf8_lossy(&out_new.get_output().stdout).to_string();

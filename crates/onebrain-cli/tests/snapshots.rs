@@ -42,20 +42,21 @@ fn normalize_volatile(mut v: Value) -> Value {
 
 #[test]
 fn session_init_minimal_vault_snapshot() {
-    let raw = run_json(&["session-init"], &fixture("minimal_vault"));
+    // v3.1: explicit --json so the snapshot stays JSON-shape stable.
+    let raw = run_json(&["session-init", "--json"], &fixture("minimal_vault"));
     assert_json_snapshot!("session_init_minimal_vault", normalize_volatile(raw));
 }
 
 #[test]
 fn session_init_block_snapshot() {
-    let raw = run_json(&["session-init"], &fixture("empty_vault"));
+    let raw = run_json(&["session-init", "--json"], &fixture("empty_vault"));
     assert_json_snapshot!("session_init_block", normalize_volatile(raw));
 }
 
 #[test]
 fn orphan_scan_empty_logs_snapshot() {
     let raw = run_json(
-        &["orphan-scan", ".", "abc12345"],
+        &["orphan-scan", ".", "abc12345", "--json"],
         &fixture_orphan("empty_logs"),
     );
     assert_json_snapshot!("orphan_scan_empty_logs", raw);

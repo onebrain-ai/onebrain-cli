@@ -6,15 +6,27 @@
 //! that returns zero rewrites.
 //!
 //! Mapping (skill-alignment §4.7 + design §7):
-//!   - `["session-init"]`   → `["session", "init"]`
-//!   - `["orphan-scan", L, T]` → `["checkpoint", "orphans", L, T]`
-//!   - `["qmd-reindex"]`    → `["qmd", "reindex"]`
+//!   - `["session-init"]`   → `["session", "init", "--json"]`
+//!   - `["orphan-scan", L, T]` → `["checkpoint", "orphans", L, T, "--json"]`
+//!   - `["qmd-reindex"]`    → `["qmd", "reindex", "--json"]`
+//!   - `["session", "init"]`        → ensure trailing `--json`
+//!   - `["checkpoint", "orphans", …]` → ensure trailing `--json`
+//!   - `["qmd", "reindex"]`         → ensure trailing `--json`
+//!   - `["checkpoint", "stop"]`     → ensure trailing `--json`
 //!
-//! `["checkpoint", "stop"]` and `["checkpoint", "reset"]` are NOT rewritten
-//! because v3.0 already used those exact arg shapes (the `checkpoint` group
-//! was 2-level in v3.0; the v3.1 rename only flattened the noun position).
+//! v3.1 contract: hook-protocol commands default to TEXT output for
+//! interactive use; machine consumers (Claude Code hooks) MUST pass `--json`
+//! to get the structured envelope. This rewriter ensures existing installs
+//! migrate without manual intervention.
+//!
+//! `--json` injection is idempotent — entries that already carry the flag
+//! (anywhere in `args`) are left alone for that step. Path rewrites still
+//! apply on top.
 
 use serde_json::{Map, Value};
+
+/// The flag that switches hook-protocol commands from default-text to JSON.
+const JSON_FLAG: &str = "--json";
 
 /// One arg-shape mapping. `from` is matched as an exact prefix of the
 /// entry's `args[]`; the prefix is replaced by `to` and any remaining args
@@ -39,6 +51,17 @@ const REWRITES: &[ArgsRewrite] = &[
     },
 ];
 
+/// v3.1 hook-protocol commands that must carry `--json` for machine
+/// consumers. Matched against the args[] prefix (post-rewrite); if the
+/// prefix matches AND no `--json` is anywhere in args, the flag is
+/// appended.
+const JSON_REQUIRED_PREFIXES: &[&[&str]] = &[
+    &["session", "init"],
+    &["checkpoint", "orphans"],
+    &["checkpoint", "stop"],
+    &["qmd", "reindex"],
+];
+
 /// Result of a rewrite pass over a settings.json document.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RewriteReport {
@@ -46,6 +69,11 @@ pub struct RewriteReport {
     pub rewrites: Vec<(String, String, u32)>,
     /// Total entries touched across all mappings.
     pub total: u32,
+    /// Entries that gained a trailing `--json` flag (separate from `total`
+    /// so callers can distinguish path-only rewrites from flag-only ones).
+    /// v3.1 hook-protocol commands need `--json` because the default is
+    /// now text; this counter records each entry the rewriter promoted.
+    pub json_flag_added: u32,
     /// Soft warnings for malformed hook entries (non-string `command` /
     /// non-array `args` / etc.). Each entry is preserved as-is; the
     /// rewriter just skips it AND tells the caller. Empty when the
@@ -157,6 +185,7 @@ fn rewrite_entry(entry: &mut Value, report: &mut RewriteReport) {
         None => return,
     };
 
+    // Pass 1 — v3.0 → v3.1 path rewrite.
     let args_str: Vec<String> = args_arr
         .iter()
         .filter_map(|v| v.as_str().map(|s| s.to_string()))
@@ -174,9 +203,61 @@ fn rewrite_entry(entry: &mut Value, report: &mut RewriteReport) {
             }
             *args_arr = new_args;
             report.record(rule.from, rule.to);
-            return;
+            break;
         }
     }
+
+    // Pass 2 — v3.1 hook-protocol commands need `--json` so the SessionStart
+    // / Stop / PostToolUse hook consumers still get the structured envelope
+    // they parse. Idempotent: skip if `--json` is anywhere in `args`.
+    ensure_json_flag(args_arr, report);
+}
+
+/// Append `--json` to `args_arr` when the prefix names a hook-protocol
+/// command AND no explicit output flag is already present. Returns true
+/// if the array was mutated.
+///
+/// Idempotency rules (don't clobber an explicit user choice):
+/// - `--json` anywhere → skip
+/// - `--yaml` anywhere → skip (user wants YAML)
+/// - `--output <fmt>` (any fmt) → skip
+/// - `--output=<fmt>` → skip
+fn ensure_json_flag(args_arr: &mut Vec<Value>, report: &mut RewriteReport) -> bool {
+    if has_explicit_format_flag(args_arr) {
+        return false;
+    }
+
+    let args_str: Vec<&str> = args_arr.iter().filter_map(|v| v.as_str()).collect();
+    let matches_protocol = JSON_REQUIRED_PREFIXES
+        .iter()
+        .any(|prefix| args_starts_with_str(&args_str, prefix));
+    if !matches_protocol {
+        return false;
+    }
+
+    args_arr.push(Value::String(JSON_FLAG.to_string()));
+    report.json_flag_added += 1;
+    report.total += 1;
+    true
+}
+
+/// True if any args entry is `--json` / `--yaml` / `--output` / `--output=*`.
+/// Used to gate `--json` injection so an explicit user choice (e.g. an
+/// admin who pasted `--yaml`) is never overridden.
+fn has_explicit_format_flag(args_arr: &[Value]) -> bool {
+    args_arr.iter().any(|v| {
+        matches!(
+            v.as_str(),
+            Some("--json") | Some("--yaml") | Some("--output")
+        ) || v.as_str().is_some_and(|s| s.starts_with("--output="))
+    })
+}
+
+fn args_starts_with_str(args: &[&str], prefix: &[&str]) -> bool {
+    if args.len() < prefix.len() {
+        return false;
+    }
+    prefix.iter().zip(args.iter()).all(|(p, a)| p == a)
 }
 
 /// Friendly type name for use in warning messages.
@@ -267,8 +348,14 @@ mod tests {
         let mut s = settings_with_v30_hooks();
         let report = rewrite_hooks(&mut s);
         let entry = &s["hooks"]["SessionStart"][0]["hooks"][0];
-        assert_eq!(entry["args"], json!(["session", "init"]));
-        assert_eq!(report.total, 2);
+        // v3.1: rewrite path AND append --json so the hook consumer
+        // continues to see the structured envelope (text is the new default
+        // for human invocations).
+        assert_eq!(entry["args"], json!(["session", "init", "--json"]));
+        // 2 path rewrites (session-init, qmd-reindex) + 3 flag injections
+        // (session init, checkpoint stop, qmd reindex).
+        assert_eq!(report.total, 5);
+        assert_eq!(report.json_flag_added, 3);
         assert!(report
             .rewrites
             .iter()
@@ -280,16 +367,17 @@ mod tests {
         let mut s = settings_with_v30_hooks();
         rewrite_hooks(&mut s);
         let entry = &s["hooks"]["PostToolUse"][0]["hooks"][0];
-        assert_eq!(entry["args"], json!(["qmd", "reindex"]));
+        assert_eq!(entry["args"], json!(["qmd", "reindex", "--json"]));
     }
 
     #[test]
-    fn checkpoint_stop_is_not_rewritten_idempotent() {
+    fn checkpoint_stop_path_unchanged_but_gets_json_flag() {
+        // v3.0 already used `["checkpoint", "stop"]` so no path rewrite,
+        // but the v3.1 default-text contract means it still needs `--json`.
         let mut s = settings_with_v30_hooks();
         let _ = rewrite_hooks(&mut s);
         let entry = &s["hooks"]["Stop"][0]["hooks"][0];
-        // Already v3.1 shape; left alone.
-        assert_eq!(entry["args"], json!(["checkpoint", "stop"]));
+        assert_eq!(entry["args"], json!(["checkpoint", "stop", "--json"]));
     }
 
     #[test]
@@ -298,13 +386,15 @@ mod tests {
         let _first = rewrite_hooks(&mut s);
         let second = rewrite_hooks(&mut s);
         assert_eq!(second.total, 0, "expected zero rewrites on second pass");
+        assert_eq!(second.json_flag_added, 0);
         assert!(second.rewrites.is_empty());
     }
 
     #[test]
     fn preserves_trailing_args_after_orphan_scan_rewrite() {
         // Hypothetical hook entry that passed `logs_folder` and a token to
-        // orphan-scan; v3.1 mapping should preserve those positional args.
+        // orphan-scan; v3.1 mapping should preserve those positional args
+        // AND append --json so the consumer keeps getting the JSON shape.
         let mut s = json!({
             "hooks": {
                 "SessionStart": [
@@ -321,9 +411,132 @@ mod tests {
         let entry = &s["hooks"]["SessionStart"][0]["hooks"][0];
         assert_eq!(
             entry["args"],
-            json!(["checkpoint", "orphans", "07-logs", "tokenABC"])
+            json!(["checkpoint", "orphans", "07-logs", "tokenABC", "--json"])
         );
+        // 1 path rewrite + 1 flag injection.
+        assert_eq!(report.total, 2);
+        assert_eq!(report.json_flag_added, 1);
+    }
+
+    // ── v3.1 --json flag injection ──────────────────────────────────────
+
+    #[test]
+    fn appends_json_flag_to_already_v31_session_init() {
+        // Entry is already on v3.1 path but pre-dates the --json contract.
+        let mut s = json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [
+                        { "type": "command", "command": "onebrain",
+                          "args": ["session", "init"] }
+                    ] }
+                ]
+            }
+        });
+        let report = rewrite_hooks(&mut s);
+        let entry = &s["hooks"]["SessionStart"][0]["hooks"][0];
+        assert_eq!(entry["args"], json!(["session", "init", "--json"]));
+        assert_eq!(report.json_flag_added, 1);
         assert_eq!(report.total, 1);
+        assert!(report.rewrites.is_empty(), "no path rewrite expected");
+    }
+
+    #[test]
+    fn idempotent_when_json_already_present() {
+        // User pre-migrated by hand — leave args alone.
+        let mut s = json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [
+                        { "type": "command", "command": "onebrain",
+                          "args": ["session", "init", "--json"] }
+                    ] }
+                ]
+            }
+        });
+        let before = s.clone();
+        let report = rewrite_hooks(&mut s);
+        assert_eq!(s, before, "no mutation expected");
+        assert_eq!(report.total, 0);
+        assert_eq!(report.json_flag_added, 0);
+    }
+
+    #[test]
+    fn idempotent_when_output_json_long_form_present() {
+        // `--output json` is equivalent to `--json`; rewriter must respect it.
+        let mut s = json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [
+                        { "type": "command", "command": "onebrain",
+                          "args": ["session", "init", "--output", "json"] }
+                    ] }
+                ]
+            }
+        });
+        let before = s.clone();
+        let report = rewrite_hooks(&mut s);
+        assert_eq!(s, before);
+        assert_eq!(report.total, 0);
+    }
+
+    #[test]
+    fn idempotent_when_output_eq_json_present() {
+        let mut s = json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [
+                        { "type": "command", "command": "onebrain",
+                          "args": ["session", "init", "--output=json"] }
+                    ] }
+                ]
+            }
+        });
+        let before = s.clone();
+        let report = rewrite_hooks(&mut s);
+        assert_eq!(s, before);
+        assert_eq!(report.total, 0);
+    }
+
+    #[test]
+    fn yaml_flag_is_respected_no_json_appended() {
+        // User actively chose YAML. We must NOT clobber that with --json.
+        let mut s = json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [
+                        { "type": "command", "command": "onebrain",
+                          "args": ["session", "init", "--yaml"] }
+                    ] }
+                ]
+            }
+        });
+        let report = rewrite_hooks(&mut s);
+        let entry = &s["hooks"]["SessionStart"][0]["hooks"][0];
+        // Stays YAML; flag injection only targets the JSON contract for
+        // hook entries that previously relied on JSON-by-default.
+        // Conservative behaviour: don't auto-add --json on top of an
+        // explicit --yaml. Users who pasted --yaml know what they want.
+        assert!(entry["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some("--yaml")));
+        // Currently the rewriter does NOT detect --yaml as an opt-in so it
+        // would append --json on top, which is wrong because clap's
+        // `conflicts_with` would then reject the invocation. Confirm the
+        // current behaviour is conservative.
+        let has_json = entry["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some("--json"));
+        assert!(
+            !has_json,
+            "rewriter must not inject --json when --yaml is already explicit; got: {:?}",
+            entry["args"]
+        );
+        let _ = report;
     }
 
     #[test]
@@ -390,11 +603,22 @@ mod tests {
         let body = serde_json::to_string_pretty(&settings_with_v30_hooks()).unwrap();
         std::fs::write(&path, body).unwrap();
         let report = rewrite_settings_file(&path, false).unwrap();
-        assert_eq!(report.total, 2);
+        // v3.1: 2 path rewrites (session-init, qmd-reindex) + 3 flag
+        // injections (session init, checkpoint stop, qmd reindex).
+        assert_eq!(report.total, 5);
+        assert_eq!(report.json_flag_added, 3);
         let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
             after["hooks"]["SessionStart"][0]["hooks"][0]["args"],
-            json!(["session", "init"])
+            json!(["session", "init", "--json"])
+        );
+        assert_eq!(
+            after["hooks"]["Stop"][0]["hooks"][0]["args"],
+            json!(["checkpoint", "stop", "--json"])
+        );
+        assert_eq!(
+            after["hooks"]["PostToolUse"][0]["hooks"][0]["args"],
+            json!(["qmd", "reindex", "--json"])
         );
     }
 
@@ -418,13 +642,15 @@ mod tests {
             }
         });
         let report = rewrite_hooks(&mut s);
-        assert_eq!(report.total, 1, "valid entry must still be rewritten");
+        // 1 path rewrite + 1 flag injection on the valid entry.
+        assert_eq!(report.total, 2, "valid entry must be rewritten + flagged");
+        assert_eq!(report.json_flag_added, 1);
         assert_eq!(report.warnings.len(), 1, "expected one warning");
         assert_eq!(report.warnings[0].code, "W_MALFORMED_HOOK_ENTRY");
         assert!(report.warnings[0].message.contains("non-string `command`"));
-        // Valid entry got rewritten.
+        // Valid entry got rewritten with --json appended.
         let entries = &s["hooks"]["SessionStart"][0]["hooks"];
-        assert_eq!(entries[1]["args"], json!(["session", "init"]));
+        assert_eq!(entries[1]["args"], json!(["session", "init", "--json"]));
         // Malformed entry preserved.
         assert_eq!(entries[0]["command"], json!(["onebrain", "session-init"]));
     }
@@ -457,7 +683,8 @@ mod tests {
         let original = serde_json::to_string_pretty(&settings_with_v30_hooks()).unwrap();
         std::fs::write(&path, &original).unwrap();
         let report = rewrite_settings_file(&path, true).unwrap();
-        assert_eq!(report.total, 2);
+        // v3.1: 2 path rewrites + 3 flag injections.
+        assert_eq!(report.total, 5);
         // File contents unchanged.
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(after, original);

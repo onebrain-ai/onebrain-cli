@@ -9,6 +9,13 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// Result of `session init` — either the happy-path metadata or one of two
+/// block variants. Kept private; rendering goes through `format_output`.
+enum SessionInitResult {
+    Ok(SessionInitOutput),
+    Block(SessionInitBlock),
+}
+
 pub fn run(vault_dir: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
     // Bun parity: `--vault-dir <path>` overrides the cwd-based auto-detect.
     let start = match vault_dir {
@@ -21,10 +28,13 @@ pub fn run(vault_dir: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
 }
 
 fn build_output(cwd: &Path, mode: &OutputMode) -> Result<String> {
+    Ok(format_output(&compute_result(cwd)?, mode))
+}
+
+fn compute_result(cwd: &Path) -> Result<SessionInitResult> {
     // R1 C2: distinct block reasons for missing-vault vs malformed-yaml.
     let Some(vault_root) = find_vault_root(cwd) else {
-        let block = SessionInitBlock::init_required();
-        return Ok(serialize_for_mode(&block, mode));
+        return Ok(SessionInitResult::Block(SessionInitBlock::init_required()));
     };
 
     if let Err(err) = load_vault_config(&vault_root) {
@@ -37,7 +47,7 @@ fn build_output(cwd: &Path, mode: &OutputMode) -> Result<String> {
             // the SessionStart hook's current handling.
             _ => SessionInitBlock::init_required(),
         };
-        return Ok(serialize_for_mode(&block, mode));
+        return Ok(SessionInitResult::Block(block));
     }
 
     // Approximate the process start time before any subprocess work.
@@ -59,12 +69,57 @@ fn build_output(cwd: &Path, mode: &OutputMode) -> Result<String> {
         .format("%a · %d %b %Y · %H:%M")
         .to_string();
 
-    let output = SessionInitOutput {
+    Ok(SessionInitResult::Ok(SessionInitOutput {
         datetime,
         session_token: token.to_string(),
         qmd_unembedded,
-    };
-    Ok(serialize_for_mode(&output, mode))
+    }))
+}
+
+/// Render `result` for the requested output mode.
+///
+/// v3.1: text is the default. Machine consumers (Claude Code SessionStart
+/// hook) must pass `--json` (or `--yaml` / `--output <fmt>`) explicitly to
+/// get the structured envelope. The hook rewriter + init scaffold both add
+/// `--json` so existing installs migrate automatically.
+fn format_output(result: &SessionInitResult, mode: &OutputMode) -> String {
+    if let OutputMode::Text { .. } = mode {
+        return render_text(result);
+    }
+    match result {
+        SessionInitResult::Ok(out) => serialize_for_mode(out, mode),
+        SessionInitResult::Block(block) => serialize_for_mode(block, mode),
+    }
+}
+
+fn render_text(result: &SessionInitResult) -> String {
+    match result {
+        SessionInitResult::Ok(out) => {
+            // Single-line happy path → keep tight; multi-line metadata risks
+            // pushing useful info offscreen on narrow terminals.
+            format!(
+                "Session ready · token={token} · datetime={datetime}\nqmd index: {qmd} unembedded",
+                token = out.session_token,
+                datetime = out.datetime,
+                qmd = out.qmd_unembedded,
+            )
+        }
+        SessionInitResult::Block(block) => match block.reason {
+            "onebrain-vault-not-found" => {
+                let cwd = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "<cwd>".to_string());
+                format!("⚠ No OneBrain vault found at {cwd}\n→ Run `onebrain init` to create one")
+            }
+            "onebrain-vault-malformed" => {
+                let detail = block.error_detail.as_deref().unwrap_or("(no detail)");
+                format!(
+                    "⚠ OneBrain vault config is malformed: {detail}\n→ Run `onebrain doctor --fix` to attempt auto-repair, or edit onebrain.yml manually"
+                )
+            }
+            other => format!("⚠ Session init blocked: {other}"),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -72,10 +127,17 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// Default JSON mode — matches what every test below used to assert
-    /// against before the `--yaml` toggle was added (v3.1).
+    /// Explicit JSON mode — what hook consumers see when they pass `--json`
+    /// (or v3.0 callers via the auto-migrated settings.json).
     fn json_mode() -> OutputMode {
         OutputMode::Json { pretty: false }
+    }
+
+    fn text_mode() -> OutputMode {
+        OutputMode::Text {
+            color: false,
+            pretty: false,
+        }
     }
 
     #[test]
@@ -201,5 +263,70 @@ mod tests {
             !line.trim_start().starts_with('{'),
             "expected YAML, got JSON-shaped output: {line}"
         );
+    }
+
+    // ── v3.1: text is the new default ────────────────────────────────────
+
+    #[test]
+    fn default_outside_vault_emits_text_not_json() {
+        let dir = tempdir().unwrap();
+        let line = build_output(dir.path(), &text_mode()).unwrap();
+        assert!(
+            !line.trim_start().starts_with('{'),
+            "default mode must NOT emit JSON braces; got: {line}"
+        );
+        assert!(
+            line.contains("No OneBrain vault found"),
+            "expected human-readable not-found marker; got: {line}"
+        );
+        assert!(
+            line.contains("onebrain init"),
+            "expected init suggestion; got: {line}"
+        );
+    }
+
+    #[test]
+    fn default_inside_vault_emits_text_success() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("vault.yml"), "qmd_collection: ob-1\n").unwrap();
+        let line = build_output(dir.path(), &text_mode()).unwrap();
+        assert!(
+            !line.trim_start().starts_with('{'),
+            "default mode must NOT emit JSON braces; got: {line}"
+        );
+        assert!(
+            line.contains("Session ready"),
+            "expected `Session ready` marker; got: {line}"
+        );
+        assert!(line.contains("token="), "expected token field; got: {line}");
+    }
+
+    #[test]
+    fn default_on_malformed_vault_emits_text() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("vault.yml"), "not: : valid\n").unwrap();
+        let line = build_output(dir.path(), &text_mode()).unwrap();
+        assert!(!line.trim_start().starts_with('{'), "got: {line}");
+        assert!(line.contains("malformed"), "got: {line}");
+        assert!(line.contains("onebrain doctor"), "got: {line}");
+    }
+
+    #[test]
+    fn json_pretty_emits_indented_multiline() {
+        let dir = tempdir().unwrap();
+        // Block path is simplest — no volatile fields to assert against.
+        let line = build_output(dir.path(), &OutputMode::Json { pretty: true }).unwrap();
+        // Pretty JSON contains newlines + 2-space indent.
+        assert!(
+            line.contains('\n'),
+            "expected multi-line indented JSON; got: {line}"
+        );
+        assert!(
+            line.contains("  \"decision\""),
+            "expected 2-space indent on `decision`; got: {line}"
+        );
+        // Still parseable.
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["reason"], "onebrain-vault-not-found");
     }
 }

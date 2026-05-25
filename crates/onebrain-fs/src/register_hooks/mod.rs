@@ -340,10 +340,11 @@ mod tests {
             after["hooks"]["Stop"][0]["hooks"][0]["userMetadata"]["k"],
             1
         );
-        // And the migration happened
+        // And the migration happened (v3.1: includes --json so machine
+        // consumers keep getting JSON envelope now that text is default).
         assert_eq!(
             after["hooks"]["Stop"][0]["hooks"][0]["args"],
-            json!(["checkpoint", "stop"])
+            json!(["checkpoint", "stop", "--json"])
         );
     }
 

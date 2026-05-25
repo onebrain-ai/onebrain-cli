@@ -148,7 +148,9 @@ fn session_init_json_envelope_snapshot_inside_vault() {
     // present so the qmd_unembedded probe runs (returns 0 with no qmd
     // binary installed in the test env).
     fs::write(dir.path().join("vault.yml"), "qmd_collection: x\n").unwrap();
-    let mut v = run_json(&["session", "init"], dir.path());
+    // v3.1: machine consumers must opt into JSON explicitly now that text
+    // is the default for interactive use.
+    let mut v = run_json(&["session", "init", "--json"], dir.path());
 
     // Volatile fields per the hook contract.
     normalise_key(&mut v, "datetime", "<DATETIME>");
@@ -163,8 +165,9 @@ fn session_init_json_envelope_snapshot_inside_vault() {
 #[test]
 fn session_init_json_envelope_snapshot_outside_vault() {
     let no_vault = tempdir().unwrap();
-    // No vault.yml — hook protocol emits the block JSON + exit 0.
-    let v = run_json(&["session", "init"], no_vault.path());
+    // No vault.yml — hook protocol emits the block JSON + exit 0. v3.1:
+    // explicit --json since default is now text.
+    let v = run_json(&["session", "init", "--json"], no_vault.path());
     // Block shape has no volatile fields — pin verbatim.
     assert_json_snapshot!("session_init_envelope_outside_vault", v);
 }
@@ -194,7 +197,11 @@ fn checkpoint_orphans_envelope_snapshot() {
     // an error path; the shape is the same either way but this matches the
     // production "fresh vault" state.
     std::fs::create_dir_all(dir.path().join("checkpoint")).unwrap();
-    let v = run_json(&["checkpoint", "orphans", ".", "tokABC123"], dir.path());
+    // v3.1: explicit --json since default is now text.
+    let v = run_json(
+        &["checkpoint", "orphans", ".", "tokABC123", "--json"],
+        dir.path(),
+    );
     assert_json_snapshot!("checkpoint_orphans_envelope", v);
 }
 
