@@ -1,10 +1,11 @@
 //! R1 branded banner — TTY-only OneBrain wordmark.
 //!
-//! Folded into v3.1.0 per the design's "R1 fold-in" decision: render a small
-//! `OneBrain CLI · vX.Y.Z` line in OneBrain primary pink (`#ff2d92`) when
-//! stdout is a colourful TTY, suppress entirely otherwise. The banner exists
-//! to make interactive sessions feel branded; it never appears in machine
-//! output or hook-protocol invocations.
+//! Folded into v3.1.0 per the design's "R1 fold-in" decision: render a 5-line
+//! FIGlet "Slant" ASCII-art `OneBrain` wordmark in OneBrain primary pink
+//! (`#ff2d92`) followed by a dim `Your AI Thinking Partner · vX.Y.Z` tagline
+//! when stdout is a colourful TTY, suppress entirely otherwise. The banner
+//! exists to make interactive sessions feel branded; it never appears in
+//! machine output or hook-protocol invocations.
 //!
 //! Gating rules (see [`should_show_banner`]):
 //! 1. `--quiet` always suppresses.
@@ -87,22 +88,46 @@ fn is_hook_protocol(cmd: &Cmd) -> bool {
     }
 }
 
-/// Build the banner string (no I/O). One line:
-///   `OneBrain CLI` (pink, bold) + `Your AI Thinking Partner · vX.Y.Z` (dim)
+/// FIGlet "Slant" rendering of the wordmark `OneBrain`. Each art line is
+/// stored without trailing whitespace so the rendered banner survives
+/// terminals that highlight trailing spaces (and so the snapshot is stable
+/// regardless of editor whitespace settings).
+const BANNER_ART: &str = r"   ____             ___              _
+  / __ \ ____  ___ / __ )_________ _(_)___
+ / / / // __ \/ _ \/ __  / ___/ __ `/ // __ \
+/ /_/ // / / /  __/ /_/ / /  / /_/ / // / / /
+\____//_/ /_/\___/_____/_/   \__,_/_//_/ /_/";
+
+/// Leading indent for the tagline so it sits visually under the centre of the
+/// 44-char-wide art block. The tagline (`Your AI Thinking Partner · vX.Y.Z`)
+/// is ~32 chars, so 10 spaces of leading indent puts its midpoint near col 26.
+const TAGLINE_INDENT: &str = "          ";
+
+/// Build the banner string (no I/O). Six lines total:
+///   5 × pink ASCII-art lines (FIGlet "Slant" rendering of `OneBrain`)
+///   1 × dim `Your AI Thinking Partner · vX.Y.Z` tagline, indented to centre
+///       under the art block.
 ///
-/// Tagline updated 2026-05-25: was "Personal AI OS"; the brand line is now
-/// "Your AI Thinking Partner" — same emit path, same gating, same writer.
-///
-/// Trailing newline included so the caller can `write_all` directly.
+/// Each art line is wrapped in `ANSI_PINK_FG ... ANSI_RESET` and the tagline
+/// in `ANSI_DIM ... ANSI_RESET` so the terminal state is always clean after
+/// the banner. Trailing newline included so the caller can `write_all`
+/// directly and the help body starts on a fresh line below.
 pub fn render_banner() -> String {
     let version = env!("CARGO_PKG_VERSION");
-    format!(
-        "{pink}OneBrain CLI{reset}  {dim}Your AI Thinking Partner · v{version}{reset}\n",
-        pink = ANSI_PINK_FG,
-        dim = ANSI_DIM,
-        reset = ANSI_RESET,
-        version = version,
-    )
+    let mut out = String::with_capacity(BANNER_ART.len() + 128);
+    for line in BANNER_ART.lines() {
+        out.push_str(ANSI_PINK_FG);
+        out.push_str(line);
+        out.push_str(ANSI_RESET);
+        out.push('\n');
+    }
+    out.push_str(ANSI_DIM);
+    out.push_str(TAGLINE_INDENT);
+    out.push_str("Your AI Thinking Partner · v");
+    out.push_str(version);
+    out.push_str(ANSI_RESET);
+    out.push('\n');
+    out
 }
 
 /// Emit the banner to `writer` (typically stderr). No-op when
@@ -454,7 +479,10 @@ mod tests {
     #[test]
     fn banner_text_contains_brand_and_version() {
         let s = render_banner();
-        assert!(s.contains("OneBrain"), "missing brand text: {s:?}");
+        // The wordmark is now ASCII art — the literal string `OneBrain` no
+        // longer appears, but the FIGlet "Slant" art is recognisable via its
+        // characteristic underscore baseline + first-line `____`.
+        assert!(s.contains("____"), "missing ASCII art baseline: {s:?}");
         // Version comes from CARGO_PKG_VERSION — always present at compile
         // time. Check the literal `v` prefix the format emits.
         let version = env!("CARGO_PKG_VERSION");
@@ -473,13 +501,71 @@ mod tests {
     }
 
     #[test]
+    fn banner_renders_5_line_art_plus_tagline() {
+        // Exactly 6 lines: 5 art + 1 tagline. `render_banner` ends with a
+        // trailing newline so `split('\n')` yields 7 elements (6 lines + the
+        // empty tail). Each art line must appear verbatim in order.
+        let s = render_banner();
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines.len(), 6, "expected 6 banner lines, got {lines:?}");
+        let art_lines: Vec<&str> = BANNER_ART.lines().collect();
+        assert_eq!(art_lines.len(), 5, "art block should be 5 lines");
+        for (i, art_line) in art_lines.iter().enumerate() {
+            assert!(
+                lines[i].contains(art_line),
+                "rendered line {i} ({:?}) missing art line ({art_line:?})",
+                lines[i]
+            );
+        }
+        // Last rendered line is the tagline.
+        assert!(
+            lines[5].contains("Your AI Thinking Partner"),
+            "expected tagline on line 6, got {:?}",
+            lines[5]
+        );
+    }
+
+    #[test]
+    fn banner_tagline_includes_version() {
+        // Tagline must pull the version dynamically from CARGO_PKG_VERSION —
+        // a hard-coded `v3.0.0` would silently drift on every bump.
+        let s = render_banner();
+        let version = env!("CARGO_PKG_VERSION");
+        let tagline_line = s
+            .lines()
+            .find(|l| l.contains("Your AI Thinking Partner"))
+            .expect("tagline line present");
+        assert!(
+            tagline_line.contains(&format!("v{version}")),
+            "tagline {tagline_line:?} missing dynamic v{version}"
+        );
+    }
+
+    #[test]
+    fn banner_art_uses_pink_color_when_enabled() {
+        // Every art line is wrapped in the pink truecolor escape. If a
+        // future refactor drops the wrapper, the art renders monochrome and
+        // the brand presence collapses.
+        let s = render_banner();
+        assert!(
+            s.contains(ANSI_PINK_FG),
+            "missing pink truecolor escape: {s:?}"
+        );
+        // And the dim escape for the tagline.
+        assert!(
+            s.contains(ANSI_DIM),
+            "missing dim escape for tagline: {s:?}"
+        );
+    }
+
+    #[test]
     fn emit_banner_writes_to_buffer_when_gated_on() {
         let cli = parse(&["onebrain", "vault", "current"]);
         let mut buf: Vec<u8> = Vec::new();
         emit_banner(&mut buf, &cli, &color_text_mode());
         assert!(!buf.is_empty());
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("OneBrain"));
+        assert!(s.contains("Your AI Thinking Partner"));
     }
 
     #[test]
@@ -721,7 +807,10 @@ mod tests {
         std::env::remove_var("ONEBRAIN_FORCE_BANNER");
         assert!(!buf.is_empty(), "expected banner emission");
         let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains("OneBrain"), "missing brand line: {out:?}");
+        // The ASCII art's first-line baseline (`____`) is the cheapest stable
+        // brand-presence check — the literal word `OneBrain` no longer
+        // appears anywhere in the rendered banner.
+        assert!(out.contains("____"), "missing ASCII art: {out:?}");
         assert!(
             out.contains("Your AI Thinking Partner"),
             "missing tagline: {out:?}"

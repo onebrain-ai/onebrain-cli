@@ -186,10 +186,14 @@ fn top_level_help_is_production_grade() {
         .success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
 
-    // Item D: clean heading · no dev-log preamble.
+    // Item D: clean heading · no dev-log preamble. As of the FIGlet banner
+    // upgrade, the duplicate `about` line was stripped from clap — the brand
+    // presence now comes from the stderr ASCII-art banner alone, and the
+    // help stdout body starts straight at `Usage:`. This test asserts the
+    // about line is NOT present in stdout (the banner lives on stderr).
     assert!(
-        stdout.contains("OneBrain CLI — Your AI Thinking Partner"),
-        "expected production heading. Got:\n{stdout}"
+        !stdout.contains("OneBrain CLI — Your AI Thinking Partner"),
+        "duplicate clap `about` brand line leaked back into --help stdout. Got:\n{stdout}"
     );
     assert!(
         !stdout.contains("Consistency Standard"),
@@ -257,6 +261,34 @@ fn top_level_help_is_production_grade() {
         "plugin/schedule/skill cluster mis-ordered"
     );
     assert!(skill < qmd, "qmd should come last in clusters");
+}
+
+#[test]
+fn help_no_longer_has_about_line() {
+    // After the 2026-05-25 FIGlet banner upgrade, the duplicate clap `about`
+    // brand line (`OneBrain CLI — Your AI Thinking Partner`) was stripped to
+    // eliminate the visible duplicate beneath the stderr banner. This test
+    // pins that removal — if a future refactor adds `about` back, the help
+    // body will once again carry two stacked brand lines.
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .env_remove("NO_COLOR")
+        .env_remove("CI")
+        .env("TERM", "xterm-256color")
+        .args(["--help", "--pretty"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(
+        !stdout.contains("OneBrain CLI — Your AI Thinking Partner"),
+        "duplicate clap `about` line is back in --help stdout. Got:\n{stdout}"
+    );
+    // The actual help body (`Usage:` line) must still be present — we don't
+    // want to accidentally suppress the entire help output.
+    assert!(
+        stdout.contains("Usage:") || stdout.contains("USAGE:"),
+        "help body missing from stdout. Got:\n{stdout}"
+    );
 }
 
 #[test]
@@ -677,10 +709,10 @@ fn json_output_never_contains_banner_on_stdout() {
         .assert()
         .success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
-    // Pink ANSI escape or brand text would indicate banner leaked.
+    // Tagline text or pink ANSI escape would indicate the banner leaked.
     assert!(
-        !stdout.contains("OneBrain CLI"),
-        "JSON stdout leaked banner text: {stdout:?}"
+        !stdout.contains("Your AI Thinking Partner"),
+        "JSON stdout leaked banner tagline: {stdout:?}"
     );
     assert!(
         !stdout.contains("\x1b[38;2;255;45;146m"),
@@ -701,8 +733,8 @@ fn piped_text_output_never_emits_banner_on_stdout() {
         .success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
     assert!(
-        !stdout.contains("OneBrain CLI"),
-        "piped text stdout leaked banner: {stdout:?}"
+        !stdout.contains("Your AI Thinking Partner"),
+        "piped text stdout leaked banner tagline: {stdout:?}"
     );
 }
 
@@ -721,11 +753,11 @@ fn hook_protocol_session_init_keeps_stderr_clean() {
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
     assert!(
-        !stdout.contains("OneBrain CLI"),
-        "hook stdout leaked banner: {stdout:?}"
+        !stdout.contains("Your AI Thinking Partner"),
+        "hook stdout leaked banner tagline: {stdout:?}"
     );
     assert!(
-        !stderr.contains("OneBrain CLI"),
+        !stderr.contains("Your AI Thinking Partner"),
         "hook stderr leaked banner: {stderr:?}"
     );
 }
@@ -1289,7 +1321,10 @@ fn vault_env_only_when_no_flag() {
 // rendered banner — any future palette / wording drift breaks the snapshot
 // test first, then surfaces here.
 
-const BRAND_MARK: &str = "OneBrain CLI";
+// Stable substring of the rendered banner. Was `OneBrain CLI` until the
+// 2026-05-25 FIGlet "Slant" banner upgrade — the literal wordmark is now
+// ASCII art and the only deterministic text string is the tagline.
+const BRAND_MARK: &str = "Your AI Thinking Partner";
 
 #[test]
 fn help_top_level_emits_banner_to_stderr_when_pretty() {

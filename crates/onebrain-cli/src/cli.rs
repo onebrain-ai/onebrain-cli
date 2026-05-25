@@ -9,11 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "onebrain",
-    version,
-    about = "OneBrain CLI — Your AI Thinking Partner"
-)]
+#[command(name = "onebrain", version)]
 pub struct Cli {
     /// Override vault root (highest priority · beats ONEBRAIN_VAULT and walk-up).
     /// Global: accepted pre- or post-subcommand.
