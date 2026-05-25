@@ -180,15 +180,50 @@ pub fn emit_banner<W: Write>(mut writer: W, cli: &Cli, mode: &OutputMode) {
     let _ = writer.write_all(render_banner().as_bytes());
 }
 
-/// True when argv signals a help intent (`--help`, `-h`, or the `help`
-/// subcommand keyword). Used by `main` to decide whether to emit the banner
-/// BEFORE handing argv to clap (which prints help and exits in-process).
+/// True when argv signals a help intent — clap will print help output in any
+/// of these cases:
+///   1. Explicit `--help`, `-h`, or the `help` subcommand keyword
+///   2. No subcommand at all (`onebrain` bare, or with only global flags) —
+///      clap defaults to printing top-level help when the subcommand is
+///      missing
+///
+/// Used by `main` to decide whether to emit the banner BEFORE handing argv
+/// to clap (which prints help and exits in-process). The actual color/mode
+/// gating still happens inside `should_show_banner_for_help` — this function
+/// only answers "will clap print a help screen?"
 pub fn argv_requests_help(args: &[String]) -> bool {
     // Skip the binary name (`args[0]`) so we don't accidentally match
     // `/path/to/help-runner/onebrain` or similar.
-    args.iter()
-        .skip(1)
-        .any(|a| a == "--help" || a == "-h" || a == "help")
+    let after_binary: Vec<&String> = args.iter().skip(1).collect();
+
+    // (1) Explicit help keywords.
+    if after_binary
+        .iter()
+        .any(|a| a.as_str() == "--help" || a.as_str() == "-h" || a.as_str() == "help")
+    {
+        return true;
+    }
+
+    // (2) No subcommand: walk argv looking for the first non-global-flag
+    // token. If we never find one, clap will print top-level help.
+    let mut iter = after_binary.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            // Global value-flags — consume the next arg as their value.
+            "--vault" | "-o" | "--output" => {
+                let _ = iter.next();
+            }
+            // Global boolean flags — skip and continue scanning.
+            "--json" | "--yaml" | "--pretty" | "--no-color" | "-q" | "--quiet"
+            | "--version" | "-V" => {}
+            // Anything else is a subcommand (or unknown · clap will error,
+            // but that error message is itself a usage screen, not a help
+            // screen, so we don't want the banner there).
+            _ => return false,
+        }
+    }
+    // Exhausted argv without finding a subcommand → help screen incoming.
+    true
 }
 
 /// True when argv signals a version-only intent (`--version` or `-V`). Used
