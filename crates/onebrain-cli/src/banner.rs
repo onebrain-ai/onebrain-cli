@@ -43,10 +43,10 @@ use std::io::Write;
 
 /// OneBrain primary brand colour `#ff2d92` as a 24-bit ANSI foreground escape.
 /// Kept as a named constant so tests can pin "brand pink is present" without
-/// reaching into [`BANNER_GRADIENT`] by index. Truecolor is universal on
-/// every terminal that survives the TTY gate (the gate excludes `TERM=dumb`
-/// and CI lines), so we don't need to fall back to 256-colour or basic
-/// 16-colour.
+/// reaching into [`BANNER_BRAIN_GRADIENT`] / [`BANNER_ONE_GRADIENT`] by index.
+/// Truecolor is universal on every terminal that survives the TTY gate (the
+/// gate excludes `TERM=dumb` and CI lines), so we don't need to fall back to
+/// 256-colour or basic 16-colour.
 #[cfg_attr(not(test), allow(dead_code))]
 const ANSI_PINK_FG: &str = "\x1b[38;2;255;45;146m";
 const ANSI_DIM: &str = "\x1b[2m";
@@ -125,19 +125,22 @@ const BANNER_BRAIN_ART: [&str; 3] = [
 /// centering the tagline. 8 letters × 4 cols = 32.
 const BANNER_VISUAL_WIDTH: usize = 32;
 
-/// Build the banner string (no I/O). Seven lines total:
-///   6 × pink ASCII-art lines (ANSI Shadow rendering of `OneBrain`)
+/// Build the banner string (no I/O). Five rendered content lines total:
+///   3 × dual-gradient ASCII-art lines (custom block-shaded `OneBrain`
+///       wordmark — ONE in gray via [`BANNER_ONE_GRADIENT`], BRAIN in pink
+///       via [`BANNER_BRAIN_GRADIENT`])
 ///   1 × dim `Your AI Thinking Partner · vX.Y.Z` tagline, indented to centre
 ///       under the art block.
+///   plus 1 leading + 1 trailing blank line for breathing room — so
+///   `str::lines()` yields 6 elements total.
 ///
-/// Each art line is wrapped in its gradient-step escape from
-/// [`BANNER_GRADIENT`] (light at the top → dark at the bottom) followed by
-/// `ANSI_RESET`. The tagline is wrapped in `ANSI_DIM ... ANSI_RESET` so the
-/// terminal state is always clean after the banner. One leading newline
-/// separates the banner from the previous shell prompt so it doesn't crowd
-/// the user's command line; two trailing newlines — one terminates the
-/// tagline line, the second adds a blank line between the banner and
-/// whatever help body follows.
+/// Each art line is wrapped in its gradient-step escape (light at the top →
+/// dark at the bottom) followed by `ANSI_RESET`. The tagline is wrapped in
+/// `ANSI_DIM ... ANSI_RESET` so the terminal state is always clean after
+/// the banner. The leading newline separates the banner from the previous
+/// shell prompt so it doesn't crowd the user's command line; the trailing
+/// newlines terminate the tagline and add a blank line between the banner
+/// and whatever help body follows.
 pub fn render_banner() -> String {
     let version = env!("CARGO_PKG_VERSION");
     let mut out = String::with_capacity(1024);

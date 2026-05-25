@@ -15,13 +15,23 @@ pub struct SessionInitOutput {
 /// **v3.1 behaviour:** default (`OutputMode::Text { .. }`) renderers live
 /// next to each command's body — text formatting is shape-specific (a session
 /// metadata line vs. a "no vault found" message vs. an orphan-count line) so
-/// the generic serializer here does NOT attempt a generic text fallback.
-/// Callers must dispatch on `OutputMode::Text { .. }` before invoking this
-/// function. For the structured branches (`Json` / `Yaml` / `Table` / `Tsv`)
-/// this function is the single emit point; it keeps the JSON shape rules
-/// (compact vs. pretty) in one place and falls back to compact JSON if YAML
-/// emission ever fails (defensive — `serde_yaml` doesn't fail for our static
-/// shapes today).
+/// this generic serializer does NOT render text. For text mode, callers
+/// must dispatch on `OutputMode::Text { .. }` and render themselves; the
+/// Text arm here is a last-resort fallback that emits compact JSON rather
+/// than panicking — but the output is incorrect for text-mode consumers,
+/// so fix the caller. `debug_assert!` catches the contract violation in
+/// debug builds.
+///
+/// For the structured branches (`Json` / `Yaml` / `Table` / `Tsv`) this
+/// function is the single emit point; it keeps the JSON shape rules
+/// (compact vs. pretty) in one place.
+///
+/// **Error handling:** serialisation failures are surfaced via a stderr
+/// warning AND the function returns whatever string emerged (typically
+/// empty for the failed mode, or the fallback JSON form for YAML
+/// downgrades). Silent empty stdout would mimic the v3.0 regression the
+/// release is named after, so failures are now LOUD on stderr. Static
+/// shapes don't fail today, but every future field is one breakage away.
 ///
 /// `--pretty` flag is honoured for explicit JSON mode (`OutputMode::Json
 /// { pretty: true }`). YAML is already multi-line / "pretty" by construction.
@@ -32,32 +42,58 @@ pub struct SessionInitOutput {
 /// it directly. See `v31/hook_rewriter.rs` + `register_hooks/hooks.rs`.
 pub fn serialize_for_mode<T: Serialize>(value: &T, mode: &OutputMode) -> String {
     match mode {
-        OutputMode::Yaml => {
-            serde_yaml::to_string(value).unwrap_or_else(|_| serialize_json(value, false))
-        }
+        OutputMode::Yaml => match serde_yaml::to_string(value) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "onebrain: yaml serialisation failed ({e}); falling back to compact JSON"
+                );
+                serialize_json(value, false)
+            }
+        },
         OutputMode::Json { pretty } => serialize_json(value, *pretty),
         // Table / Tsv have no columnar slot for hook-protocol blocks. Fall
         // back to compact JSON so the consumer still gets parseable output;
         // commands that care about text rendering branch on
         // `OutputMode::Text { .. }` before calling this function.
         OutputMode::Table | OutputMode::Tsv => serialize_json(value, false),
-        // Text mode shouldn't reach here — callers handle text rendering
-        // themselves. Defensive: emit compact JSON if it does (no panic).
-        OutputMode::Text { pretty, .. } => serialize_json(value, *pretty),
+        // Text-mode arrival is a caller bug — the per-command text renderer
+        // should have absorbed this. Loud in debug, compact-JSON fallback in
+        // release (compact, not pretty, because pretty-text-via-JSON would
+        // be a stranger output than compact-text-via-JSON).
+        OutputMode::Text { .. } => {
+            debug_assert!(
+                false,
+                "serialize_for_mode invoked with Text mode — caller must dispatch first"
+            );
+            serialize_json(value, false)
+        }
     }
 }
 
+/// Serialise `value` as JSON (compact or pretty). Surfaces serde failures
+/// to stderr so silent empty stdout cannot recreate the v3.0 regression
+/// class — empty stdout from a hook-protocol command is parsed by Claude
+/// Code as malformed JSON and triggers the "vault not initialised" path
+/// with no clue why.
 fn serialize_json<T: Serialize>(value: &T, pretty: bool) -> String {
-    if pretty {
-        serde_json::to_string_pretty(value).unwrap_or_else(|_| String::new())
+    let result = if pretty {
+        serde_json::to_string_pretty(value)
     } else {
-        serde_json::to_string(value).unwrap_or_else(|_| String::new())
+        serde_json::to_string(value)
+    };
+    match result {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("onebrain: json serialisation failed ({e})");
+            String::new()
+        }
     }
 }
 
 /// Block output emitted when session-init can't proceed.
 ///
-/// Two reasons (R1 C2):
+/// Two reasons:
 /// - `onebrain-vault-not-found` — no `vault.yml` / `onebrain.yml` found
 ///   anywhere up from cwd. Renamed in v3.1 from the v3.0 spelling
 ///   `onebrain-init-required` (clearer · brand-prefixed).

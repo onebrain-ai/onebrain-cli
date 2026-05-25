@@ -522,10 +522,10 @@ mod tests {
             .unwrap()
             .iter()
             .any(|v| v.as_str() == Some("--yaml")));
-        // Currently the rewriter does NOT detect --yaml as an opt-in so it
-        // would append --json on top, which is wrong because clap's
-        // `conflicts_with` would then reject the invocation. Confirm the
-        // current behaviour is conservative.
+        // `has_explicit_format_flag` matches `--yaml` alongside `--json` /
+        // `--output`, so the rewriter never stacks `--json` on top of an
+        // explicit YAML choice (clap's `conflicts_with` would otherwise
+        // reject the invocation at parse time).
         let has_json = entry["args"]
             .as_array()
             .unwrap()
@@ -624,9 +624,8 @@ mod tests {
 
     #[test]
     fn malformed_hook_entry_emits_warning_and_preserves_valid_entries() {
-        // R1 B4: a non-string `command` (here: an array) used to be silently
-        // skipped. Now we emit W_MALFORMED_HOOK_ENTRY into the report, leave
-        // the entry as-is, and continue rewriting siblings.
+        // Non-string `command` (e.g. array): emit W_MALFORMED_HOOK_ENTRY,
+        // preserve the entry as-is, continue rewriting siblings.
         let mut s = json!({
             "hooks": {
                 "SessionStart": [

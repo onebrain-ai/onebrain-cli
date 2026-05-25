@@ -32,7 +32,8 @@ fn build_output(cwd: &Path, mode: &OutputMode) -> Result<String> {
 }
 
 fn compute_result(cwd: &Path) -> Result<SessionInitResult> {
-    // R1 C2: distinct block reasons for missing-vault vs malformed-yaml.
+    // Distinct block reasons for missing-vault vs malformed-yaml — the
+    // SessionStart hook routes each to a different recovery path.
     let Some(vault_root) = find_vault_root(cwd) else {
         return Ok(SessionInitResult::Block(SessionInitBlock::init_required()));
     };
@@ -174,9 +175,8 @@ mod tests {
 
     #[test]
     fn block_path_when_vault_yml_malformed() {
-        // R1 C2: malformed YAML now reports a distinct `onebrain-vault-malformed`
-        // reason so SessionStart consumers can route to "fix your vault.yml"
-        // instead of "/onboarding".
+        // Malformed YAML reports `onebrain-vault-malformed` so SessionStart
+        // consumers route to "fix your onebrain.yml" instead of "/onboarding".
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "not: : valid\n").unwrap();
 
@@ -198,8 +198,9 @@ mod tests {
 
     #[test]
     fn block_path_when_no_vault_yml_omits_error_detail() {
-        // Counterpart to the previous test: missing vault.yml keeps the
-        // legacy `init-required` reason and skips the `error_detail` field.
+        // Counterpart to the previous test: missing vault.yml emits the
+        // `onebrain-vault-not-found` reason (renamed from `init-required`
+        // in v3.1) and skips the `error_detail` field.
         let dir = tempdir().unwrap();
         let line = build_output(dir.path(), &json_mode()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();

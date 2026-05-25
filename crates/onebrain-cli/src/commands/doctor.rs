@@ -243,6 +243,12 @@ fn print_report_structured<W: Write>(
 ///   the same dispatcher.
 /// - Bare `--json` (legacy `json: bool`, no global format flag) → compact
 ///   JSON byte-identical to v3.0 output so scripted consumers don't drift.
+///
+/// Contract: caller invokes this only when `want_structured = json ||
+/// mode.is_structured()` is true; the third arm here is therefore
+/// unreachable from production code paths. `debug_assert!` makes any
+/// future caller-side drift loud during testing; the compact-JSON
+/// fallback prevents a prod panic if drift ships anyway.
 fn emit_structured(
     doc: &serde_json::Value,
     legacy_json_flag: bool,
@@ -253,9 +259,10 @@ fn emit_structured(
     } else if legacy_json_flag {
         Ok(serde_json::to_string(doc)?)
     } else {
-        // Caller only invokes this when `want_structured` is true, so one
-        // of the two branches above always wins. Defensive: fall back to
-        // compact JSON rather than panicking on an unreachable arm.
+        debug_assert!(
+            false,
+            "emit_structured invoked without structured mode or legacy_json_flag"
+        );
         Ok(serde_json::to_string(doc)?)
     }
 }
@@ -402,7 +409,7 @@ fn fix_plugin_files(vault_root: &Path, json: bool) -> FixOutcome {
     }
     status_line(json, "running: vault-sync");
     // In JSON mode route vault-sync's PlainProgress to stderr so stdout
-    // remains reserved for the JSON document (B-H1 fix).
+    // remains reserved for the JSON document.
     let opts = if json {
         VaultSyncOptions {
             is_tty: Some(false),
@@ -862,9 +869,9 @@ mod tests {
 
     #[test]
     fn print_report_structured_emits_empty_fix_array_when_requested_with_no_issues() {
-        // The A-H2 regression case from the alpha.8 review: `fix[]` must
-        // appear (even empty) so consumers can distinguish "user didn't
-        // ask" from "user asked but nothing to fix".
+        // `fix[]` must appear (even empty) so consumers can distinguish
+        // "user didn't ask to fix" from "user asked but nothing to fix" —
+        // schema stability.
         let results = vec![DoctorResult::ok("vault.yml", "valid")];
         let mut buf = Vec::new();
         print_report_structured(
