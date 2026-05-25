@@ -59,8 +59,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         // ───── Root verbs ────────────────────────────────────────────
         Cmd::Init(a) => {
-            let code =
-                commands::init::run(a.yes, a.vault_dir, a.force, a.no_sync, mode.is_structured())?;
+            // Item D: `init` uses the global `--vault` flag for target dir
+            // (was `--vault-dir` as an init-specific arg). Walk-up discovery
+            // doesn't apply — init creates a vault, doesn't consume one.
+            let code = commands::init::run(
+                a.yes,
+                vault_flag.clone(),
+                a.force,
+                a.no_sync,
+                mode.is_structured(),
+            )?;
             std::process::exit(code);
         }
         Cmd::Update(a) => {

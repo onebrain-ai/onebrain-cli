@@ -355,21 +355,22 @@ fn init_fails_on_malformed_settings_json() {
     assert_eq!(after, "{not valid json");
 }
 
-/// Bun v2.3.3-parity: `--vault-dir <path>` targets a directory other than
-/// cwd. The binary should write the vault scaffold into that directory.
+/// Item D: `onebrain init --vault <path>` targets a directory other than cwd.
+/// The init-specific `--vault-dir` flag was dropped in favor of the global
+/// `--vault` flag in v3.1 (kept on hidden v3.0 aliases for back-compat).
 #[test]
-fn cli_yes_vault_dir_targets_explicit_path() {
+fn init_target_directory_via_vault_flag() {
     let d = tempdir().unwrap();
     let target = d.path().join("nested-vault");
     fs::create_dir_all(&target).unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
         .args([
+            "--vault",
+            target.to_str().unwrap(),
             "init",
             "--yes",
             "--no-sync",
-            "--vault-dir",
-            target.to_str().unwrap(),
         ])
         .current_dir(d.path())
         .assert()
@@ -377,6 +378,25 @@ fn cli_yes_vault_dir_targets_explicit_path() {
         .stdout(predicate::str::contains("done"));
     assert!(target.join("vault.yml").is_file());
     assert!(target.join("07-logs").is_dir());
+}
+
+/// Item D follow-up: the dropped `--vault-dir` flag on `init` now errors at
+/// clap parse time. Pins the surface so a future regression doesn't silently
+/// re-introduce the duplicate.
+#[test]
+fn init_rejects_vault_dir_flag() {
+    let d = tempdir().unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args([
+            "init",
+            "--yes",
+            "--no-sync",
+            "--vault-dir",
+            d.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -406,11 +426,11 @@ fn init_nonexistent_dir_creates_and_succeeds() {
     Command::cargo_bin("onebrain")
         .unwrap()
         .args([
+            "--vault",
+            target.to_str().unwrap(),
             "init",
             "--yes",
             "--no-sync",
-            "--vault-dir",
-            target.to_str().unwrap(),
         ])
         .current_dir(d.path())
         .assert()

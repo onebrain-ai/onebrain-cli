@@ -13,6 +13,9 @@ use std::path::PathBuf;
 pub struct Cli {
     /// Override vault root (highest priority · beats ONEBRAIN_VAULT and walk-up).
     /// Global: accepted pre- or post-subcommand.
+    ///
+    /// On `init`: target directory for the NEW vault (defaults to cwd).
+    /// Walk-up discovery is skipped — init creates a vault, doesn't consume one.
     #[arg(long, global = true, value_name = "PATH")]
     pub vault: Option<PathBuf>,
 
@@ -154,9 +157,6 @@ pub struct InitArgs {
     /// Skip prompts · install the Essentials schedule preset (CI-friendly).
     #[arg(long)]
     pub yes: bool,
-    /// Vault root directory · defaults to cwd.
-    #[arg(long = "vault-dir", value_name = "PATH")]
-    pub vault_dir: Option<PathBuf>,
     /// Overwrite an existing vault.yml without prompting.
     #[arg(long)]
     pub force: bool,
