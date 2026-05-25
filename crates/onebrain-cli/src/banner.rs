@@ -92,11 +92,11 @@ fn is_hook_protocol(cmd: &Cmd) -> bool {
 /// stored without trailing whitespace so the rendered banner survives
 /// terminals that highlight trailing spaces (and so the snapshot is stable
 /// regardless of editor whitespace settings).
-const BANNER_ART: &str = r"   ____             ___              _
-  / __ \ ____  ___ / __ )_________ _(_)___
- / / / // __ \/ _ \/ __  / ___/ __ `/ // __ \
-/ /_/ // / / /  __/ /_/ / /  / /_/ / // / / /
-\____//_/ /_/\___/_____/_/   \__,_/_//_/ /_/";
+const BANNER_ART: &str = r"   ____             ____             _
+  / __ \____  ___  / __ )_________ _(_)___
+ / / / / __ \/ _ \/ __  / ___/ __ `/ / __ \
+/ /_/ / / / /  __/ /_/ / /  / /_/ / / / / /
+\____/_/ /_/\___/_____/_/   \__,_/_/_/ /_/";
 
 /// Leading indent for the tagline so it sits visually under the centre of the
 /// 44-char-wide art block. The tagline (`Your AI Thinking Partner · vX.Y.Z`)
