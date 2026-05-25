@@ -240,22 +240,39 @@ fn orphan_scan_alias_dispatches_to_checkpoint_orphans() {
 }
 
 #[test]
-fn vault_required_command_exits_72_for_unimplemented_stub() {
-    // `task list` is a stub in v3.1 — it should hit E_NOT_IMPLEMENTED
-    // before the vault check (the dispatcher routes to stubs::not_implemented
-    // directly). This verifies the error code mapping is wired correctly.
+fn vault_required_stub_returns_64_outside_vault_or_72_inside() {
+    // R1 C3: vault-required group stubs (task, memory, note, inbox, pause,
+    // bookmark, dream, frontmatter, log, qmd non-reindex, schedule
+    // non-protocol, vault non-current/sync) must check vault BEFORE
+    // short-circuiting on E_NOT_IMPLEMENTED. Two paths:
+    //
+    //   1. Inside a vault   → exit 72 (E_NOT_IMPLEMENTED) — the stub fires.
+    //   2. Outside any vault → exit 64 (E_VAULT_NOT_FOUND) — vault check fails.
+
+    // Path 1: inside a vault → 72.
     let dir = tempdir().unwrap();
     make_vault(dir.path());
-
     Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(dir.path())
+        .env_remove("ONEBRAIN_VAULT")
         .args(["task", "list"])
         .assert()
         .failure()
         .code(72)
         .stderr(predicate::str::contains("not implemented"))
         .stderr(predicate::str::contains("task list"));
+
+    // Path 2: outside any vault → 64.
+    let no_vault = tempdir().unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(no_vault.path())
+        .env_remove("ONEBRAIN_VAULT")
+        .args(["task", "list"])
+        .assert()
+        .failure()
+        .code(64);
 }
 
 #[test]

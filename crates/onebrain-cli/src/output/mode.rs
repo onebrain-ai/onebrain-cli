@@ -60,7 +60,10 @@ pub struct TtyInputs {
     pub no_color_env: bool,
     /// `TERM` env var value.
     pub term_env: Option<String>,
-    /// `CI` env var value (truthy values: `true`, `1`).
+    /// `CI` env var value. Any non-empty string is treated as truthy to
+    /// match `is-ci` / `ci-info` and most CI providers' convention
+    /// (`CI=true`, `CI=1`, `CI=yes`, `CI=on` all flip into CI mode).
+    /// `CI=` (empty) or unset leaves CI mode off.
     pub ci_env: Option<String>,
 }
 
@@ -111,11 +114,12 @@ pub fn resolve_output_mode(i: &TtyInputs) -> OutputMode {
         "table" => OutputMode::Table,
         "tsv" => OutputMode::Tsv,
         _ => {
-            // text — apply the 6-rule chain.
+            // text — apply the 6-rule chain. CI is "any non-empty value" per
+            // is-ci / ci-info convention (R1 C4).
             let force_mono = i.no_color
                 || i.no_color_env
                 || i.term_env.as_deref() == Some("dumb")
-                || matches!(i.ci_env.as_deref(), Some("true") | Some("1"))
+                || matches!(i.ci_env.as_deref(), Some(s) if !s.is_empty())
                 || !i.stdout_is_tty;
             OutputMode::Text {
                 color: !force_mono && (i.stdout_is_tty || i.pretty),
@@ -225,20 +229,41 @@ mod tests {
 
     #[test]
     fn ci_true_drops_color() {
+        // R1 C4: any non-empty CI value is treated as truthy per the
+        // is-ci / ci-info convention; empty / unset leaves CI mode off.
+        for truthy in ["true", "1", "yes", "on"] {
+            let mut i = base();
+            i.ci_env = Some(truthy.into());
+            assert_eq!(
+                resolve_output_mode(&i),
+                OutputMode::Text {
+                    color: false,
+                    pretty: true
+                },
+                "CI={truthy} should force monochrome",
+            );
+        }
+    }
+
+    #[test]
+    fn ci_empty_or_unset_keeps_color() {
+        // `CI=` (empty) is NOT truthy — common in shell `export CI=` to
+        // clear the variable without unsetting it.
         let mut i = base();
-        i.ci_env = Some("true".into());
+        i.ci_env = Some("".into());
         assert_eq!(
             resolve_output_mode(&i),
             OutputMode::Text {
-                color: false,
+                color: true,
                 pretty: true
             }
         );
-        i.ci_env = Some("1".into());
+        // Unset (None) also leaves CI off.
+        i.ci_env = None;
         assert_eq!(
             resolve_output_mode(&i),
             OutputMode::Text {
-                color: false,
+                color: true,
                 pretty: true
             }
         );

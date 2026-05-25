@@ -69,12 +69,23 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         },
 
         // ───── Qmd ──────────────────────────────────────────────────
+        // Reindex is a hook-protocol command (handles vault check itself);
+        // the other verbs are vault-required and must exit 64 outside a
+        // vault before reporting E_NOT_IMPLEMENTED (R1 C3).
         Cmd::Qmd(QmdCmd { verb }) => match verb {
             QmdVerb::Reindex => commands::qmd_reindex::run(),
-            QmdVerb::Setup => stubs::not_implemented("qmd setup"),
-            QmdVerb::Embed => stubs::not_implemented("qmd embed"),
-            QmdVerb::Status => stubs::not_implemented("qmd status"),
-            QmdVerb::Search { .. } => stubs::not_implemented("qmd search"),
+            QmdVerb::Setup => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "qmd setup")
+            }
+            QmdVerb::Embed => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "qmd embed")
+            }
+            QmdVerb::Status => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "qmd status")
+            }
+            QmdVerb::Search { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "qmd search")
+            }
         },
 
         // ───── Schedule ─────────────────────────────────────────────
@@ -91,10 +102,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 let v = vault.or(vault_flag.clone());
                 commands::register_schedule::run(v, dry_run, remove, refresh, resume, status, test)
             }
-            ScheduleVerb::List => stubs::not_implemented("schedule list"),
-            ScheduleVerb::Add { .. } => stubs::not_implemented("schedule add"),
-            ScheduleVerb::Remove { .. } => stubs::not_implemented("schedule remove"),
-            ScheduleVerb::Status => stubs::not_implemented("schedule status"),
+            // Non-protocol verbs are vault-required (need to know which
+            // vault's plists to list / which YAML to modify).
+            ScheduleVerb::List => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "schedule list")
+            }
+            ScheduleVerb::Add { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "schedule add")
+            }
+            ScheduleVerb::Remove { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "schedule remove")
+            }
+            ScheduleVerb::Status => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "schedule status")
+            }
         },
 
         // ───── Plugin ───────────────────────────────────────────────
@@ -152,9 +173,18 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 let code = commands::vault_sync::run(root, branch)?;
                 std::process::exit(code);
             }
-            VaultVerb::Scan => stubs::not_implemented("vault scan"),
-            VaultVerb::Stats => stubs::not_implemented("vault stats"),
-            VaultVerb::Verify => stubs::not_implemented("vault verify"),
+            // Scan / stats / verify need to know which vault — gate on vault
+            // presence so the stub returns 64 outside (R1 C3). `current` is
+            // intentionally vault-free (it reports detected:false instead).
+            VaultVerb::Scan => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "vault scan")
+            }
+            VaultVerb::Stats => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "vault stats")
+            }
+            VaultVerb::Verify => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "vault verify")
+            }
             VaultVerb::Current => vault_current::run(vault_flag, &mode),
         },
 
@@ -190,9 +220,15 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             AvatarVerb::Doctor => stubs::not_implemented("avatar doctor"),
         },
         Cmd::Bookmark(BookmarkCmd { verb }) => match verb {
-            BookmarkVerb::List => stubs::not_implemented("bookmark list"),
-            BookmarkVerb::Get { .. } => stubs::not_implemented("bookmark get"),
-            BookmarkVerb::Import { .. } => stubs::not_implemented("bookmark import"),
+            BookmarkVerb::List => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "bookmark list")
+            }
+            BookmarkVerb::Get { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "bookmark get")
+            }
+            BookmarkVerb::Import { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "bookmark import")
+            }
         },
         Cmd::Bundle(BundleCmd { verb }) => match verb {
             BundleVerb::Install { .. } => stubs::not_implemented("bundle install"),
@@ -222,56 +258,124 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             DateVerb::Parse { .. } => stubs::not_implemented("date parse"),
         },
         Cmd::Dream(DreamCmd { verb }) => match verb {
-            DreamVerb::List => stubs::not_implemented("dream list"),
-            DreamVerb::Tick { .. } => stubs::not_implemented("dream tick"),
-            DreamVerb::Done { .. } => stubs::not_implemented("dream done"),
-            DreamVerb::Snooze { .. } => stubs::not_implemented("dream snooze"),
+            DreamVerb::List => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "dream list")
+            }
+            DreamVerb::Tick { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "dream tick")
+            }
+            DreamVerb::Done { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "dream done")
+            }
+            DreamVerb::Snooze { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "dream snooze")
+            }
         },
         Cmd::Frontmatter(FrontmatterCmd { verb }) => match verb {
-            FrontmatterVerb::Parse { .. } => stubs::not_implemented("frontmatter parse"),
-            FrontmatterVerb::Extract { .. } => stubs::not_implemented("frontmatter extract"),
-            FrontmatterVerb::Update { .. } => stubs::not_implemented("frontmatter update"),
+            FrontmatterVerb::Parse { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "frontmatter parse")
+            }
+            FrontmatterVerb::Extract { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "frontmatter extract")
+            }
+            FrontmatterVerb::Update { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "frontmatter update")
+            }
         },
         Cmd::Gateway(GatewayCmd { verb }) => match verb {
             GatewayVerb::Telegram => stubs::not_implemented("gateway telegram"),
             GatewayVerb::Mcp => stubs::not_implemented("gateway mcp"),
         },
         Cmd::Inbox(InboxCmd { verb }) => match verb {
-            InboxVerb::List => stubs::not_implemented("inbox list"),
-            InboxVerb::Next => stubs::not_implemented("inbox next"),
-            InboxVerb::Process { .. } => stubs::not_implemented("inbox process"),
+            InboxVerb::List => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "inbox list")
+            }
+            InboxVerb::Next => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "inbox next")
+            }
+            InboxVerb::Process { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "inbox process")
+            }
         },
         Cmd::Log(LogCmd { verb }) => match verb {
-            LogVerb::Query { .. } => stubs::not_implemented("log query"),
-            LogVerb::Append { .. } => stubs::not_implemented("log append"),
-            LogVerb::Rotate => stubs::not_implemented("log rotate"),
-            LogVerb::Stats => stubs::not_implemented("log stats"),
+            LogVerb::Query { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "log query")
+            }
+            LogVerb::Append { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "log append")
+            }
+            LogVerb::Rotate => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "log rotate")
+            }
+            LogVerb::Stats => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "log stats")
+            }
         },
         Cmd::Memory(MemoryCmd { verb }) => match verb {
-            MemoryVerb::List => stubs::not_implemented("memory list"),
-            MemoryVerb::Add { .. } => stubs::not_implemented("memory add"),
-            MemoryVerb::Update { .. } => stubs::not_implemented("memory update"),
-            MemoryVerb::Remove { .. } => stubs::not_implemented("memory remove"),
-            MemoryVerb::Promote { .. } => stubs::not_implemented("memory promote"),
-            MemoryVerb::Index => stubs::not_implemented("memory index"),
+            MemoryVerb::List => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "memory list")
+            }
+            MemoryVerb::Add { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "memory add")
+            }
+            MemoryVerb::Update { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "memory update")
+            }
+            MemoryVerb::Remove { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "memory remove")
+            }
+            MemoryVerb::Promote { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "memory promote")
+            }
+            MemoryVerb::Index => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "memory index")
+            }
         },
         Cmd::Note(NoteCmd { verb }) => match verb {
-            NoteVerb::Search { .. } => stubs::not_implemented("note search"),
-            NoteVerb::List => stubs::not_implemented("note list"),
-            NoteVerb::Find { .. } => stubs::not_implemented("note find"),
-            NoteVerb::Read { .. } => stubs::not_implemented("note read"),
-            NoteVerb::Append { .. } => stubs::not_implemented("note append"),
-            NoteVerb::New { .. } => stubs::not_implemented("note new"),
-            NoteVerb::Move { .. } => stubs::not_implemented("note move"),
-            NoteVerb::Archive { .. } => stubs::not_implemented("note archive"),
-            NoteVerb::Backlinks { .. } => stubs::not_implemented("note backlinks"),
-            NoteVerb::Orphans => stubs::not_implemented("note orphans"),
-            NoteVerb::Stat { .. } => stubs::not_implemented("note stat"),
+            NoteVerb::Search { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "note search")
+            }
+            NoteVerb::List => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "note list")
+            }
+            NoteVerb::Find { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "note find")
+            }
+            NoteVerb::Read { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "note read")
+            }
+            NoteVerb::Append { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "note append")
+            }
+            NoteVerb::New { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "note new")
+            }
+            NoteVerb::Move { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "note move")
+            }
+            NoteVerb::Archive { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "note archive")
+            }
+            NoteVerb::Backlinks { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "note backlinks")
+            }
+            NoteVerb::Orphans => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "note orphans")
+            }
+            NoteVerb::Stat { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "note stat")
+            }
         },
         Cmd::Pause(PauseCmd { verb }) => match verb {
-            PauseVerb::List => stubs::not_implemented("pause list"),
-            PauseVerb::Snapshot { .. } => stubs::not_implemented("pause snapshot"),
-            PauseVerb::Resume { .. } => stubs::not_implemented("pause resume"),
+            PauseVerb::List => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "pause list")
+            }
+            PauseVerb::Snapshot { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "pause snapshot")
+            }
+            PauseVerb::Resume { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "pause resume")
+            }
         },
         Cmd::Serve(ServeCmd { verb }) => match verb {
             ServeVerb::Start => stubs::not_implemented("serve start"),
@@ -279,9 +383,15 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             ServeVerb::Status => stubs::not_implemented("serve status"),
         },
         Cmd::Task(TaskCmd { verb }) => match verb {
-            TaskVerb::List => stubs::not_implemented("task list"),
-            TaskVerb::Add { .. } => stubs::not_implemented("task add"),
-            TaskVerb::Done { .. } => stubs::not_implemented("task done"),
+            TaskVerb::List => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "task list")
+            }
+            TaskVerb::Add { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "task add")
+            }
+            TaskVerb::Done { .. } => {
+                stubs::not_implemented_vault_required(vault_flag.clone(), "task done")
+            }
         },
 
         // ───── Hidden v3.0 aliases — emit migration notice + dispatch ─
@@ -380,18 +490,12 @@ fn emit_plugin_update_summary(
     let env = if let Some(reason) = report.partial_failure.as_deref() {
         // Partial-failure envelope: ok=false, but data is preserved so the
         // caller can see exactly which steps succeeded.
-        let mut e = Envelope {
-            version: crate::output::envelope::ENVELOPE_VERSION,
-            command: "plugin.update".to_string(),
-            ok: false,
-            vault: None,
-            data: Some(data),
-            warnings: Vec::new(),
-            error: Some(ErrorInfo::new("E_PLUGIN_UPDATE_PARTIAL", reason)),
-        };
-        // No warnings yet, but preserve the field shape.
-        e.warnings.clear();
-        e
+        Envelope::partial(
+            "plugin.update",
+            None,
+            data,
+            ErrorInfo::new("E_PLUGIN_UPDATE_PARTIAL", reason),
+        )
     } else {
         Envelope::ok("plugin.update", None, data)
     };

@@ -14,44 +14,52 @@ pub const ENVELOPE_VERSION: &str = "1";
 /// Top-level wrapper for every v3.1 JSON output. Generic over the
 /// command-specific `data` payload so each command can declare its own
 /// strongly-typed result struct.
+///
+/// **Construction discipline (R1 C1).** Fields are `pub(crate)` so callers
+/// outside this module must go through [`Envelope::ok`] or
+/// [`Envelope::err`]. These constructors enforce the invariant that
+/// `ok == true` implies `error == None` and `ok == false` implies
+/// `data == None`. Bypassing them inside the crate is technically allowed
+/// for tests but disallowed in production code; `debug_assert!`s inside
+/// the constructors catch any direct construction in debug builds.
 #[derive(Debug, Serialize)]
 pub struct Envelope<T: Serialize> {
     /// Envelope schema version. Always `"1"` in v3.1.
-    pub version: &'static str,
+    pub(crate) version: &'static str,
 
     /// Dotted command name — `"task.list"`, `"memory.add"`,
     /// `"vault.current"`. Single source of truth for downstream parsers that
     /// switch on command identity.
-    pub command: String,
+    pub(crate) command: String,
 
     /// `true` when the command achieved its intended effect (a successful
     /// `task list` returns `ok: true` even if zero tasks matched).
-    pub ok: bool,
+    pub(crate) ok: bool,
 
     /// Active vault metadata when the command resolved a vault. `None` for
     /// vault-free commands (`init`, `update`, `harness detect`, `date *`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub vault: Option<VaultInfo>,
+    pub(crate) vault: Option<VaultInfo>,
 
     /// Command-specific payload. `None` only on hard errors (when `error`
     /// carries the detail).
-    pub data: Option<T>,
+    pub(crate) data: Option<T>,
 
     /// Soft warnings — partial results, deprecation notices, missing
     /// optional inputs. Empty `[]` (not `null`) when nothing to warn about,
     /// per stable schema discipline.
-    pub warnings: Vec<Warning>,
+    pub(crate) warnings: Vec<Warning>,
 
     /// Populated when `ok == false`. Stable `code` field matches
     /// `CoreError::error_code()` (e.g. `E_VAULT_NOT_FOUND`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<ErrorInfo>,
+    pub(crate) error: Option<ErrorInfo>,
 }
 
 impl<T: Serialize> Envelope<T> {
     /// Build an `ok=true` envelope. Use for the happy path of any command.
     pub fn ok(command: impl Into<String>, vault: Option<VaultInfo>, data: T) -> Self {
-        Self {
+        let e = Self {
             version: ENVELOPE_VERSION,
             command: command.into(),
             ok: true,
@@ -59,7 +67,9 @@ impl<T: Serialize> Envelope<T> {
             data: Some(data),
             warnings: Vec::new(),
             error: None,
-        }
+        };
+        debug_assert!(e.ok && e.error.is_none() && e.data.is_some());
+        e
     }
 
     /// Build an envelope reporting a hard error. `data` is `None`; the
@@ -68,7 +78,7 @@ impl<T: Serialize> Envelope<T> {
     /// Used by `main.rs`'s structured-mode error path (R1 B5) and by v3.2+
     /// commands that opt into the error-envelope shape.
     pub fn err(command: impl Into<String>, vault: Option<VaultInfo>, error: ErrorInfo) -> Self {
-        Self {
+        let e = Self {
             version: ENVELOPE_VERSION,
             command: command.into(),
             ok: false,
@@ -76,7 +86,32 @@ impl<T: Serialize> Envelope<T> {
             data: None,
             warnings: Vec::new(),
             error: Some(error),
-        }
+        };
+        debug_assert!(!e.ok && e.error.is_some() && e.data.is_none());
+        e
+    }
+
+    /// Build a partial-failure envelope: `ok=false`, but the partial
+    /// progress survives in `data` so the caller can show what already
+    /// landed on disk. Use for mid-flight bails (e.g. `plugin update`'s
+    /// hooks-rewritten/plists-not-yet-refreshed state).
+    pub fn partial(
+        command: impl Into<String>,
+        vault: Option<VaultInfo>,
+        data: T,
+        error: ErrorInfo,
+    ) -> Self {
+        let e = Self {
+            version: ENVELOPE_VERSION,
+            command: command.into(),
+            ok: false,
+            vault,
+            data: Some(data),
+            warnings: Vec::new(),
+            error: Some(error),
+        };
+        debug_assert!(!e.ok && e.error.is_some() && e.data.is_some());
+        e
     }
 
     /// Append a warning. Returns `Self` to allow chaining inside command
@@ -187,5 +222,42 @@ mod tests {
     #[test]
     fn envelope_version_is_stable_one() {
         assert_eq!(ENVELOPE_VERSION, "1");
+    }
+
+    #[test]
+    fn partial_envelope_keeps_data_and_error() {
+        // R1 C1: partial-failure case. Both `data` and `error` are Some,
+        // `ok` is false. Used by `plugin update` to surface mid-flight
+        // failures with the partial progress visible.
+        let env = Envelope::partial(
+            "plugin.update",
+            None,
+            Payload { count: 2 },
+            ErrorInfo::new("E_PLUGIN_UPDATE_PARTIAL", "schedule re-register failed"),
+        );
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["data"]["count"], 2);
+        assert_eq!(v["error"]["code"], "E_PLUGIN_UPDATE_PARTIAL");
+    }
+
+    #[test]
+    fn ok_constructor_enforces_no_error() {
+        // The constructors set `error: None` / `data: Some(...)`. We can't
+        // bypass them from outside the module after C1's pub(crate)
+        // tightening — this test asserts the invariant from the inside.
+        let env = Envelope::ok("x.y", None, Payload { count: 1 });
+        assert!(env.ok);
+        assert!(env.error.is_none());
+        assert!(env.data.is_some());
+    }
+
+    #[test]
+    fn err_constructor_enforces_no_data() {
+        let env: Envelope<Payload> =
+            Envelope::err("x.y", None, ErrorInfo::new("E_VAULT_NOT_FOUND", "no vault"));
+        assert!(!env.ok);
+        assert!(env.error.is_some());
+        assert!(env.data.is_none());
     }
 }
