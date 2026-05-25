@@ -652,6 +652,7 @@ fn migration_notice_prints_to_stderr_first_time() {
         .current_dir(dir.path())
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("ONEBRAIN_CACHE_DIR", home.path().join("cache"))
         .args(["qmd-reindex"])
         .assert();
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
@@ -671,6 +672,7 @@ fn migration_notice_suppressed_by_env_var() {
         .current_dir(dir.path())
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("ONEBRAIN_CACHE_DIR", home.path().join("cache"))
         .env("ONEBRAIN_QUIET_MIGRATION", "1")
         .args(["qmd-reindex"])
         .assert();
@@ -1076,6 +1078,7 @@ fn plugin_update_does_not_touch_cli_binary() {
         .current_dir(vault)
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", &cache_home)
+        .env("ONEBRAIN_CACHE_DIR", &cache_home)
         .env("ONEBRAIN_QUIET_MIGRATION", "1")
         .assert()
         .success();
@@ -1096,12 +1099,17 @@ fn plugin_update_does_not_touch_cli_binary() {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Build a vault sufficient for register-hooks / register-schedule / migrate
-/// to dispatch cleanly. `vault.yml` has no schedule entries (empty list →
-/// register-schedule exits 0 with "Nothing to register"). The .claude/
-/// subdir is created so register-hooks can write into it on --dry-run.
+/// to dispatch cleanly. `onebrain.yml` (the canonical v3.1 name) has no
+/// schedule entries (empty list → register-schedule exits 0 with "Nothing
+/// to register"). The .claude/ subdir is created so register-hooks can
+/// write into it on --dry-run. Using `onebrain.yml` instead of `vault.yml`
+/// keeps stderr clean of the `vault.yml is deprecated` warning, which
+/// would otherwise interleave with the migration-notice assertions and
+/// mask real regressions (notably on Windows where stream ordering
+/// differs).
 fn make_alias_vault() -> tempfile::TempDir {
     let v = tempdir().unwrap();
-    fs::write(v.path().join("vault.yml"), "method: onebrain\n").unwrap();
+    fs::write(v.path().join("onebrain.yml"), "method: onebrain\n").unwrap();
     fs::create_dir_all(v.path().join(".claude")).unwrap();
     v
 }
@@ -1167,6 +1175,7 @@ fn all_hidden_aliases_dispatch_and_warn() {
                 .args(&args)
                 .env("HOME", home.path())
                 .env("XDG_CACHE_HOME", &cache)
+                .env("ONEBRAIN_CACHE_DIR", &cache)
                 .env_remove("ONEBRAIN_VAULT")
                 .env_remove("ONEBRAIN_QUIET_MIGRATION")
                 .output()
@@ -1185,6 +1194,7 @@ fn all_hidden_aliases_dispatch_and_warn() {
             .current_dir(vault.path())
             .env("HOME", home.path())
             .env("XDG_CACHE_HOME", &cache)
+            .env("ONEBRAIN_CACHE_DIR", &cache)
             .env_remove("ONEBRAIN_VAULT")
             .env_remove("ONEBRAIN_QUIET_MIGRATION");
         if *alias == "vault-sync" {
@@ -1204,6 +1214,7 @@ fn all_hidden_aliases_dispatch_and_warn() {
             .current_dir(vault.path())
             .env("HOME", home.path())
             .env("XDG_CACHE_HOME", &cache)
+            .env("ONEBRAIN_CACHE_DIR", &cache)
             .env_remove("ONEBRAIN_VAULT")
             .env_remove("ONEBRAIN_QUIET_MIGRATION")
             .env_remove("ONEBRAIN_VAULT_SYNC_FIXTURE")
@@ -1250,6 +1261,7 @@ fn migration_notice_fires_exactly_once_across_processes() {
             .current_dir(vault.path())
             .env("HOME", home.path())
             .env("XDG_CACHE_HOME", &cache)
+            .env("ONEBRAIN_CACHE_DIR", &cache)
             .env_remove("ONEBRAIN_VAULT")
             .env_remove("ONEBRAIN_QUIET_MIGRATION")
             .args(["session-init"])

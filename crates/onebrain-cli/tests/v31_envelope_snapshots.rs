@@ -214,11 +214,14 @@ fn checkpoint_stop_envelope_when_threshold_hit() {
     // Driving: vault.yml sets messages=2; pre-write the state file with
     // count=2 in an isolated TMPDIR so the increment-to-3 fires the
     // threshold. Empty logs folder → NN = "01" → reason "01 since start".
-    let tmpdir = tempdir().unwrap(); // overrides std::env::temp_dir() via TMPDIR
+    let tmpdir = tempdir().unwrap(); // overrides std::env::temp_dir() via TMPDIR/TMP/TEMP
     let vault_dir = tempdir().unwrap();
 
+    // v3.1: use canonical `onebrain.yml` name so the legacy-vault.yml
+    // deprecation warning doesn't pollute stderr (only matters on Windows
+    // where stream interleaving can mask the panic context).
     std::fs::write(
-        vault_dir.path().join("vault.yml"),
+        vault_dir.path().join("onebrain.yml"),
         "checkpoint:\n  messages: 2\n  minutes: 30\nfolders:\n  logs: 07-logs\n",
     )
     .unwrap();
@@ -240,7 +243,14 @@ fn checkpoint_stop_envelope_when_threshold_hit() {
             "--vault-dir",
             vault_dir.path().to_str().unwrap(),
         ])
+        // `std::env::temp_dir()` reads `TMPDIR` on Unix, `TMP`/`TEMP` on
+        // Windows. Set all three so the pre-written state file at
+        // `tmpdir/onebrain-{token}.state` is found cross-platform — without
+        // the Windows variants, the binary would look at `%LOCALAPPDATA%\Temp`
+        // instead and start state.count from 0 (block JSON never fires).
         .env("TMPDIR", tmpdir.path())
+        .env("TMP", tmpdir.path())
+        .env("TEMP", tmpdir.path())
         .env("WT_SESSION", token)
         // Defensively clear lower-priority token sources so WT_SESSION wins.
         .env("TMUX_PANE", "")

@@ -88,7 +88,17 @@ fn warn_persist_failure(state_file: &std::path::Path, err: &std::io::Error) {
 /// Default state directory: `~/Library/Caches/onebrain/` on macOS ·
 /// `$XDG_CACHE_HOME/onebrain/` or `~/.cache/onebrain/` on Linux ·
 /// `%LOCALAPPDATA%\onebrain\` on Windows.
+///
+/// **Test override:** `ONEBRAIN_CACHE_DIR` env var, when set, replaces the
+/// `dirs::cache_dir()` lookup entirely. Cross-platform — `HOME` /
+/// `XDG_CACHE_HOME` don't influence `dirs::cache_dir()` on Windows (which
+/// reads `%LOCALAPPDATA%` via the Known Folders API), so tests need an
+/// explicit knob to redirect state into a tempdir. Production should never
+/// set this.
 pub fn default_state_dir() -> PathBuf {
+    if let Some(override_dir) = std::env::var_os("ONEBRAIN_CACHE_DIR") {
+        return PathBuf::from(override_dir);
+    }
     dirs::cache_dir()
         .map(|d| d.join("onebrain"))
         .unwrap_or_else(|| PathBuf::from("/tmp/onebrain"))

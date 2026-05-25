@@ -97,6 +97,11 @@ fn parent_pid() -> Option<u32> {
 
 /// Compute the basename of a `comm` value as `ps -o comm=` returns it
 /// (which may be a full path on Linux/macOS and may end in `.exe` on Windows).
+///
+/// Production callsite is `#[cfg(unix)]` (line 174) — Windows has no `ps`
+/// so the function is only reachable from unit tests there. `dead_code`
+/// would otherwise fire on non-unix prod builds.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn comm_basename_of(raw: &str) -> String {
     let trimmed = raw.trim();
     // Strip everything up to and including the last `/` or `\`.
