@@ -1,7 +1,7 @@
 //! R1 branded banner — TTY-only OneBrain wordmark.
 //!
-//! Folded into v3.1.0 per the design's "R1 fold-in" decision: render a 5-line
-//! FIGlet "Slant" ASCII-art `OneBrain` wordmark in OneBrain primary pink
+//! Folded into v3.1.0 per the design's "R1 fold-in" decision: render a 6-line
+//! "ANSI Shadow" block-with-shadow `OneBrain` wordmark in OneBrain primary pink
 //! (`#ff2d92`) followed by a dim `Your AI Thinking Partner · vX.Y.Z` tagline
 //! when stdout is a colourful TTY, suppress entirely otherwise. The banner
 //! exists to make interactive sessions feel branded; it never appears in
@@ -88,23 +88,26 @@ fn is_hook_protocol(cmd: &Cmd) -> bool {
     }
 }
 
-/// FIGlet "Slant" rendering of the wordmark `OneBrain`. Each art line is
-/// stored without trailing whitespace so the rendered banner survives
-/// terminals that highlight trailing spaces (and so the snapshot is stable
-/// regardless of editor whitespace settings).
-const BANNER_ART: &str = r"   ____             ____             _
-  / __ \____  ___  / __ )_________ _(_)___
- / / / / __ \/ _ \/ __  / ___/ __ `/ / __ \
-/ /_/ / / / /  __/ /_/ / /  / /_/ / / / / /
-\____/_/ /_/\___/_____/_/   \__,_/_/_/ /_/";
+/// "ANSI Shadow" rendering of the wordmark `OneBrain`. Six lines of Unicode
+/// block-with-shadow characters · ~64 chars wide. Each art line is stored
+/// without trailing whitespace so the rendered banner survives terminals
+/// that highlight trailing spaces (and so the snapshot is stable regardless
+/// of editor whitespace settings).
+const BANNER_ART: &str = r" ██████╗ ███╗   ██╗███████╗██████╗ ██████╗  █████╗ ██╗███╗   ██╗
+██╔═══██╗████╗  ██║██╔════╝██╔══██╗██╔══██╗██╔══██╗██║████╗  ██║
+██║   ██║██╔██╗ ██║█████╗  ██████╔╝██████╔╝███████║██║██╔██╗ ██║
+██║   ██║██║╚██╗██║██╔══╝  ██╔══██╗██╔══██╗██╔══██║██║██║╚██╗██║
+╚██████╔╝██║ ╚████║███████╗██████╔╝██║  ██║██║  ██║██║██║ ╚████║
+ ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝";
 
-/// Leading indent for the tagline so it sits visually under the centre of the
-/// 44-char-wide art block. The tagline (`Your AI Thinking Partner · vX.Y.Z`)
-/// is ~32 chars, so 10 spaces of leading indent puts its midpoint near col 26.
-const TAGLINE_INDENT: &str = "          ";
+/// Leading indent for the tagline so it sits visually under the art block.
+/// The tagline (`Your AI Thinking Partner · vX.Y.Z`) is ~33 chars; with 8
+/// spaces of leading indent it visually balances under the ~64-char-wide
+/// ANSI Shadow art block.
+const TAGLINE_INDENT: &str = "        ";
 
-/// Build the banner string (no I/O). Six lines total:
-///   5 × pink ASCII-art lines (FIGlet "Slant" rendering of `OneBrain`)
+/// Build the banner string (no I/O). Seven lines total:
+///   6 × pink ASCII-art lines (ANSI Shadow rendering of `OneBrain`)
 ///   1 × dim `Your AI Thinking Partner · vX.Y.Z` tagline, indented to centre
 ///       under the art block.
 ///
@@ -480,9 +483,9 @@ mod tests {
     fn banner_text_contains_brand_and_version() {
         let s = render_banner();
         // The wordmark is now ASCII art — the literal string `OneBrain` no
-        // longer appears, but the FIGlet "Slant" art is recognisable via its
-        // characteristic underscore baseline + first-line `____`.
-        assert!(s.contains("____"), "missing ASCII art baseline: {s:?}");
+        // longer appears, but the ANSI Shadow art is recognisable via its
+        // characteristic Unicode block-with-shadow glyphs.
+        assert!(s.contains("██████"), "missing ASCII art glyphs: {s:?}");
         // Version comes from CARGO_PKG_VERSION — always present at compile
         // time. Check the literal `v` prefix the format emits.
         let version = env!("CARGO_PKG_VERSION");
@@ -501,15 +504,15 @@ mod tests {
     }
 
     #[test]
-    fn banner_renders_5_line_art_plus_tagline() {
-        // Exactly 6 lines: 5 art + 1 tagline. `render_banner` ends with a
-        // trailing newline so `split('\n')` yields 7 elements (6 lines + the
+    fn banner_renders_6_line_art_plus_tagline() {
+        // Exactly 7 lines: 6 art + 1 tagline. `render_banner` ends with a
+        // trailing newline so `split('\n')` yields 8 elements (7 lines + the
         // empty tail). Each art line must appear verbatim in order.
         let s = render_banner();
         let lines: Vec<&str> = s.lines().collect();
-        assert_eq!(lines.len(), 6, "expected 6 banner lines, got {lines:?}");
+        assert_eq!(lines.len(), 7, "expected 7 banner lines, got {lines:?}");
         let art_lines: Vec<&str> = BANNER_ART.lines().collect();
-        assert_eq!(art_lines.len(), 5, "art block should be 5 lines");
+        assert_eq!(art_lines.len(), 6, "art block should be 6 lines");
         for (i, art_line) in art_lines.iter().enumerate() {
             assert!(
                 lines[i].contains(art_line),
@@ -519,9 +522,9 @@ mod tests {
         }
         // Last rendered line is the tagline.
         assert!(
-            lines[5].contains("Your AI Thinking Partner"),
-            "expected tagline on line 6, got {:?}",
-            lines[5]
+            lines[6].contains("Your AI Thinking Partner"),
+            "expected tagline on line 7, got {:?}",
+            lines[6]
         );
     }
 
@@ -807,10 +810,10 @@ mod tests {
         std::env::remove_var("ONEBRAIN_FORCE_BANNER");
         assert!(!buf.is_empty(), "expected banner emission");
         let out = String::from_utf8(buf).unwrap();
-        // The ASCII art's first-line baseline (`____`) is the cheapest stable
-        // brand-presence check — the literal word `OneBrain` no longer
+        // The ASCII art's block-with-shadow glyph (`██████`) is the cheapest
+        // stable brand-presence check — the literal word `OneBrain` no longer
         // appears anywhere in the rendered banner.
-        assert!(out.contains("____"), "missing ASCII art: {out:?}");
+        assert!(out.contains("██████"), "missing ASCII art: {out:?}");
         assert!(
             out.contains("Your AI Thinking Partner"),
             "missing tagline: {out:?}"
