@@ -1,4 +1,4 @@
-use crate::output::{SessionInitBlock, SessionInitOutput};
+use crate::legacy_output::{SessionInitBlock, SessionInitOutput};
 use anyhow::{Context, Result};
 use onebrain_cache::{
     clean_stale_state_file, query_unembedded_count, resolve_session_token, ResolveInputs,

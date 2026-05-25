@@ -24,7 +24,7 @@ serde_json  = { version = "1", features = ["preserve_order"] }
 thiserror   = "1"
 anyhow      = "1"
 chrono      = { version = "0.4", features = ["serde"] }
-clap        = { version = "4", features = ["derive"] }
+clap        = { version = "4", features = ["derive", "env"] }
 
 # v3.1 forward-compat (binary only)
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

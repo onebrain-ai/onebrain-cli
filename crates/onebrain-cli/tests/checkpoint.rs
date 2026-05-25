@@ -20,14 +20,21 @@ fn reset_emits_no_stdout() {
 }
 
 #[test]
-fn unknown_mode_emits_stderr_warning() {
+fn unknown_mode_is_rejected_by_clap_in_v31() {
+    // v3.0 used a positional `mode` argument and emitted an "unknown mode"
+    // stderr warning at exit 0 for an unrecognized value. v3.1 promotes
+    // `stop` / `reset` / `orphans` to proper clap subcommands, so an
+    // unknown verb now fails at parse time with clap's standard exit 2.
+    // This is the correct, tighter semantic for the v3.1 consistency
+    // standard.
     Command::cargo_bin("onebrain")
         .unwrap()
         .args(["checkpoint", "xyzbadmode"])
         .current_dir(fixture("empty_vault"))
         .assert()
-        .success()
-        .stderr(predicate::str::contains("unknown mode"));
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains("unrecognized subcommand"));
 }
 
 #[test]
