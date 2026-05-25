@@ -117,4 +117,22 @@ mod tests {
         assert!(!r.dry_run);
         assert!(r.partial_failure.is_none());
     }
+
+    #[test]
+    fn partial_failure_field_is_settable_and_preserves_progress() {
+        // R1 B3: when step 4 (schedule re-register) fails after step 3
+        // (hook rewriter) succeeded, the report MUST preserve the
+        // hooks_rewritten count so the user knows what's already on disk.
+        let r = PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 3,
+            plists_rewritten: false,
+            partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
+        };
+        assert_eq!(r.hooks_rewritten, 3);
+        assert!(r.vault_synced);
+        assert!(!r.plists_rewritten);
+        assert!(r.partial_failure.as_deref().unwrap().contains("launchctl"));
+    }
 }

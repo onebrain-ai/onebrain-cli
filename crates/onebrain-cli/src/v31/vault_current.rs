@@ -8,15 +8,19 @@
 //! it instead reports `detected: false`. This matches the design's "show
 //! resolution source even if nothing resolved" intent.
 
-use crate::output::{emit, Envelope, OutputMode, VaultInfo};
+use crate::output::{emit, Envelope, ErrorInfo, OutputMode, VaultInfo};
 use crate::vault_ctx;
 use anyhow::Result;
+use onebrain_core::load_vault_config;
 use serde::Serialize;
 use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Default)]
 pub struct VaultCurrentData {
-    /// True when a vault was located by the resolver chain.
+    /// True when a vault was located AND `vault.yml` parsed successfully.
+    /// A walk-up hit on an unreadable / malformed `vault.yml` sets this to
+    /// `false` and populates `error` so callers can distinguish "no vault
+    /// at all" from "vault present but broken".
     pub detected: bool,
     /// Basename of the vault directory (e.g. `ob-1`). `None` when not detected.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -30,31 +34,63 @@ pub struct VaultCurrentData {
     pub source: Option<String>,
     /// Current working directory (always present; useful for walk-up debug).
     pub cwd: PathBuf,
+    /// Populated when the resolver found a vault directory but
+    /// `load_vault_config` failed (broken symlink, malformed YAML,
+    /// permission denied). `detected` is `false` in this case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorInfo>,
 }
 
 pub fn run(flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let resolved = vault_ctx::resolve(flag)?;
 
-    let data = match resolved.as_ref() {
-        Some(r) => VaultCurrentData {
-            detected: true,
-            name: Some(r.root.name()),
-            path: Some(r.root.as_path().to_path_buf()),
-            source: Some(r.source.label().to_string()),
-            cwd: cwd.clone(),
-        },
-        None => VaultCurrentData {
-            detected: false,
-            cwd: cwd.clone(),
-            ..Default::default()
-        },
+    let (data, vault_info) = match resolved.as_ref() {
+        Some(r) => {
+            // R1 B1: gate `detected` on successful vault.yml parse so a
+            // broken symlink or malformed YAML doesn't claim "detected".
+            match load_vault_config(&r.root) {
+                Ok(_) => {
+                    let info = VaultInfo {
+                        name: r.root.name(),
+                        path: r.root.as_path().to_path_buf(),
+                    };
+                    let d = VaultCurrentData {
+                        detected: true,
+                        name: Some(r.root.name()),
+                        path: Some(r.root.as_path().to_path_buf()),
+                        source: Some(r.source.label().to_string()),
+                        cwd: cwd.clone(),
+                        error: None,
+                    };
+                    (d, Some(info))
+                }
+                Err(e) => {
+                    let d = VaultCurrentData {
+                        detected: false,
+                        // Surface path/source so the user knows WHICH vault.yml
+                        // was rejected, but flag detected=false so consumers
+                        // don't accidentally trust the path.
+                        name: Some(r.root.name()),
+                        path: Some(r.root.as_path().to_path_buf()),
+                        source: Some(r.source.label().to_string()),
+                        cwd: cwd.clone(),
+                        error: Some(ErrorInfo::new(e.error_code(), e.to_string())),
+                    };
+                    (d, None)
+                }
+            }
+        }
+        None => {
+            let d = VaultCurrentData {
+                detected: false,
+                cwd: cwd.clone(),
+                ..Default::default()
+            };
+            (d, None)
+        }
     };
 
-    let vault_info = resolved.as_ref().map(|r| VaultInfo {
-        name: r.root.name(),
-        path: r.root.as_path().to_path_buf(),
-    });
     let envelope = Envelope::ok("vault.current", vault_info, data);
 
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
@@ -76,6 +112,17 @@ fn render_text(env: &Envelope<VaultCurrentData>) -> String {
         out.push_str(&format!("vault: {name}\n"));
         out.push_str(&format!("path:  {path}\n"));
         out.push_str(&format!("via:   {source}\n"));
+    } else if let Some(err) = d.error.as_ref() {
+        // Resolved a directory but failed to validate vault.yml. Surface
+        // the path so the user can fix the bad file.
+        let path = d
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "?".into());
+        out.push_str("vault: (resolved but invalid)\n");
+        out.push_str(&format!("path:  {path}\n"));
+        out.push_str(&format!("error: {} · {}\n", err.code, err.message));
     } else {
         out.push_str("vault: (none detected)\n");
         out.push_str(&format!("cwd:   {}\n", d.cwd.display()));
@@ -107,6 +154,7 @@ mod tests {
             },
             source: source.map(|s| s.to_string()),
             cwd: PathBuf::from("/tmp"),
+            error: None,
         }
     }
 
@@ -133,12 +181,33 @@ mod tests {
     fn data_skips_none_fields_in_json() {
         let data = make_data(false, None);
         let v = serde_json::to_value(&data).unwrap();
-        // detected and cwd are always present; name/path/source are omitted
-        // when None thanks to the `skip_serializing_if` annotations.
+        // detected and cwd are always present; name/path/source/error are
+        // omitted when None thanks to `skip_serializing_if`.
         assert!(v.get("name").is_none());
         assert!(v.get("path").is_none());
         assert!(v.get("source").is_none());
+        assert!(v.get("error").is_none());
         assert!(v.get("detected").is_some());
         assert!(v.get("cwd").is_some());
+    }
+
+    #[test]
+    fn text_render_invalid_vault_yml_shows_error_block() {
+        let data = VaultCurrentData {
+            detected: false,
+            name: Some("ob-1".into()),
+            path: Some(PathBuf::from("/tmp/ob-1")),
+            source: Some("walk-up".into()),
+            cwd: PathBuf::from("/tmp"),
+            error: Some(ErrorInfo::new(
+                "E_INVALID_YAML",
+                "vault.yml has invalid syntax",
+            )),
+        };
+        let env = Envelope::ok("vault.current", None, data);
+        let s = render_text(&env);
+        assert!(s.contains("(resolved but invalid)"));
+        assert!(s.contains("E_INVALID_YAML"));
+        assert!(s.contains("/tmp/ob-1"));
     }
 }

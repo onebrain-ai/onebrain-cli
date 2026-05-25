@@ -50,7 +50,9 @@ pub fn exit_code_for_core(err: &CoreError) -> i32 {
 
 /// Walk the full `anyhow` error chain, classify by the first known error
 /// type encountered. Falls back to wrapper-specific codes for legacy crate
-/// errors (`FsError` / `CacheError`).
+/// errors (`FsError` / `CacheError`), then probes for a bare
+/// `std::io::Error` (broken pipe / permission denied get specific exits),
+/// then finally collapses to `EXIT_GENERIC`.
 pub fn exit_code_for(err: &anyhow::Error) -> i32 {
     for cause in err.chain() {
         if let Some(core) = cause.downcast_ref::<CoreError>() {
@@ -64,6 +66,20 @@ pub fn exit_code_for(err: &anyhow::Error) -> i32 {
     }
     if err.downcast_ref::<onebrain_cache::CacheError>().is_some() {
         return EXIT_CACHE_ERROR;
+    }
+    // Walk for a bare std::io::Error in the chain. Broken pipe is the
+    // POSIX-correct "the consumer hung up" — treat as exit 0 so
+    // `onebrain ... | head -1` doesn't show an error. Permission denied
+    // maps to EXIT_FS_ERROR (66) per skill-alignment §4.8 (E_FS_ERROR is
+    // already the bucket for EACCES). Everything else falls through.
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            match io_err.kind() {
+                std::io::ErrorKind::BrokenPipe => return EXIT_OK,
+                std::io::ErrorKind::PermissionDenied => return EXIT_FS_ERROR,
+                _ => {}
+            }
+        }
     }
     EXIT_GENERIC
 }
@@ -161,5 +177,26 @@ mod tests {
     fn anyhow_chain_falls_back_to_generic() {
         let e: anyhow::Error = anyhow::anyhow!("some random error");
         assert_eq!(exit_code_for(&e), 1);
+    }
+
+    #[test]
+    fn broken_pipe_classifies_to_zero() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "downstream closed");
+        let e: anyhow::Error = anyhow::Error::from(io_err);
+        assert_eq!(exit_code_for(&e), EXIT_OK);
+    }
+
+    #[test]
+    fn broken_pipe_wrapped_in_context_still_classifies_to_zero() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "downstream closed");
+        let e: anyhow::Error = anyhow::Error::from(io_err).context("rendering envelope");
+        assert_eq!(exit_code_for(&e), EXIT_OK);
+    }
+
+    #[test]
+    fn permission_denied_classifies_to_fs_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "EACCES");
+        let e: anyhow::Error = anyhow::Error::from(io_err);
+        assert_eq!(exit_code_for(&e), EXIT_FS_ERROR);
     }
 }

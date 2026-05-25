@@ -40,6 +40,20 @@ impl VaultRoot {
 
 /// Walk up from `start` looking for the nearest directory containing a
 /// `vault.yml`. Returns `None` if none is found before the filesystem root.
+///
+/// **Resolution ≠ validation.** This function only checks that
+/// `vault.yml` exists as a file (`Path::is_file()` returns true for
+/// readable regular files and follows symlinks to a regular file). It does
+/// NOT parse the file or verify it's valid YAML. Broken symlinks,
+/// permission-denied reads, and malformed YAML are all the caller's
+/// responsibility:
+///
+/// - Hook-protocol commands (`session init`) already pattern-match
+///   `load_vault_config` errors and emit a `decision:"block"` JSON.
+/// - Vault-required commands run `load_vault_config` separately and let
+///   the resulting `CoreError::InvalidYaml` exit 65.
+/// - `vault current` validates by calling `load_vault_config` and
+///   gates its `detected: true` envelope field on success.
 pub fn find_vault_root(start: &Path) -> Option<VaultRoot> {
     let mut current = start.to_path_buf();
     loop {

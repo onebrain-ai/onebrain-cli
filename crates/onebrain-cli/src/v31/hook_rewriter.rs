@@ -46,6 +46,21 @@ pub struct RewriteReport {
     pub rewrites: Vec<(String, String, u32)>,
     /// Total entries touched across all mappings.
     pub total: u32,
+    /// Soft warnings for malformed hook entries (non-string `command` /
+    /// non-array `args` / etc.). Each entry is preserved as-is; the
+    /// rewriter just skips it AND tells the caller. Empty when the
+    /// settings.json is well-formed.
+    pub warnings: Vec<RewriteWarning>,
+}
+
+/// Per-entry soft warning emitted by the rewriter when a hook entry has
+/// an unexpected shape. The `code` field uses the canonical `W_*` prefix
+/// from skill-alignment §4.5 so the envelope's `warnings[]` array stays
+/// machine-readable.
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
+pub struct RewriteWarning {
+    pub code: String,
+    pub message: String,
 }
 
 impl RewriteReport {
@@ -59,6 +74,13 @@ impl RewriteReport {
             self.rewrites.push((from_s, to_s, 1));
         }
         self.total += 1;
+    }
+
+    fn warn(&mut self, code: &str, message: impl Into<String>) {
+        self.warnings.push(RewriteWarning {
+            code: code.to_string(),
+            message: message.into(),
+        });
     }
 }
 
@@ -96,17 +118,45 @@ fn rewrite_entry(entry: &mut Value, report: &mut RewriteReport) {
     let Some(obj) = entry.as_object_mut() else {
         return;
     };
-    let cmd = obj
-        .get("command")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if cmd != "onebrain" {
-        return;
+
+    // `command` shape check. Missing is fine (shell-form entries set the
+    // full command in a single string under "command" without an args
+    // array — handled by the register-hooks migrator, not us). But if
+    // `command` is present and non-string (number/null/array/object), we
+    // can't reason about it; surface a warning and skip.
+    match obj.get("command") {
+        Some(Value::String(s)) if s == "onebrain" => { /* fall through to args */ }
+        Some(Value::String(_)) => return, // some other binary (bash, python, etc.)
+        Some(other) => {
+            report.warn(
+                "W_MALFORMED_HOOK_ENTRY",
+                format!(
+                    "hook entry has non-string `command` field (got {}); skipped",
+                    json_type_name(other)
+                ),
+            );
+            return;
+        }
+        None => return,
     }
-    let Some(args_arr) = obj.get_mut("args").and_then(|v| v.as_array_mut()) else {
-        return;
+
+    // `args` shape check. Missing or non-array → can't rewrite; warn if
+    // present-but-non-array, otherwise silently skip (shell-form).
+    let args_arr = match obj.get_mut("args") {
+        Some(Value::Array(a)) => a,
+        Some(other) => {
+            report.warn(
+                "W_MALFORMED_HOOK_ENTRY",
+                format!(
+                    "hook entry has non-array `args` field (got {}); skipped",
+                    json_type_name(other)
+                ),
+            );
+            return;
+        }
+        None => return,
     };
+
     let args_str: Vec<String> = args_arr
         .iter()
         .filter_map(|v| v.as_str().map(|s| s.to_string()))
@@ -126,6 +176,18 @@ fn rewrite_entry(entry: &mut Value, report: &mut RewriteReport) {
             report.record(rule.from, rule.to);
             return;
         }
+    }
+}
+
+/// Friendly type name for use in warning messages.
+fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -334,6 +396,58 @@ mod tests {
             after["hooks"]["SessionStart"][0]["hooks"][0]["args"],
             json!(["session", "init"])
         );
+    }
+
+    #[test]
+    fn malformed_hook_entry_emits_warning_and_preserves_valid_entries() {
+        // R1 B4: a non-string `command` (here: an array) used to be silently
+        // skipped. Now we emit W_MALFORMED_HOOK_ENTRY into the report, leave
+        // the entry as-is, and continue rewriting siblings.
+        let mut s = json!({
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "hooks": [
+                            // Malformed: `command` is an array.
+                            { "type": "command", "command": ["onebrain", "session-init"] },
+                            // Valid v3.0 entry alongside.
+                            { "type": "command", "command": "onebrain", "args": ["session-init"] }
+                        ]
+                    }
+                ]
+            }
+        });
+        let report = rewrite_hooks(&mut s);
+        assert_eq!(report.total, 1, "valid entry must still be rewritten");
+        assert_eq!(report.warnings.len(), 1, "expected one warning");
+        assert_eq!(report.warnings[0].code, "W_MALFORMED_HOOK_ENTRY");
+        assert!(report.warnings[0].message.contains("non-string `command`"));
+        // Valid entry got rewritten.
+        let entries = &s["hooks"]["SessionStart"][0]["hooks"];
+        assert_eq!(entries[1]["args"], json!(["session", "init"]));
+        // Malformed entry preserved.
+        assert_eq!(entries[0]["command"], json!(["onebrain", "session-init"]));
+    }
+
+    #[test]
+    fn malformed_args_field_emits_warning() {
+        // `args` present but not an array (here: a string).
+        let mut s = json!({
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            { "type": "command", "command": "onebrain", "args": "session-init" }
+                        ]
+                    }
+                ]
+            }
+        });
+        let report = rewrite_hooks(&mut s);
+        assert_eq!(report.total, 0);
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].code, "W_MALFORMED_HOOK_ENTRY");
+        assert!(report.warnings[0].message.contains("non-array `args`"));
     }
 
     #[test]

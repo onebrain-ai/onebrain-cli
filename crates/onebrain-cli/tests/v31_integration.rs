@@ -316,6 +316,73 @@ fn plugin_update_broken_pipe_does_not_silently_succeed() {
 }
 
 #[test]
+fn json_error_path_emits_canonical_envelope_on_stdout() {
+    // R1 B5: --json mode must always emit one well-formed envelope on
+    // stdout, even on the error path. Previously errors went to stderr
+    // as `Error: ...` regardless of mode, breaking machine consumers.
+    let bogus = tempdir().unwrap(); // no vault.yml here
+
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        // Use --vault pointing at a non-vault path so we hit NotAVault
+        // (deterministic; doesn't depend on cwd or env).
+        .args([
+            "--vault",
+            bogus.path().to_str().unwrap(),
+            "--json",
+            "vault",
+            "current",
+        ])
+        .env_remove("ONEBRAIN_VAULT")
+        .assert()
+        .failure();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+
+    // stdout has the canonical envelope.
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be one canonical JSON document");
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "E_VAULT_NOT_FOUND");
+    assert!(v["error"]["message"].is_string());
+    assert_eq!(v["version"], "1");
+
+    // stderr stays clean of `Error: ...` lines in structured mode (machine
+    // consumers should not have to filter stderr).
+    assert!(
+        !stderr.contains("Error:"),
+        "stderr leaked human error line in --json mode: {stderr:?}"
+    );
+
+    // Exit code reflects the underlying error.
+    out.code(64);
+}
+
+#[test]
+fn text_error_path_keeps_legacy_stderr_format() {
+    // Confirm the text-mode error path is unchanged: still writes
+    // `Error: <msg>` to stderr (humans expect this).
+    let bogus = tempdir().unwrap();
+
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .args([
+            "--vault",
+            bogus.path().to_str().unwrap(),
+            "vault",
+            "current",
+        ])
+        .env_remove("ONEBRAIN_VAULT")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("Error:"),
+        "text-mode error stderr missing legacy format: {stderr:?}"
+    );
+}
+
+#[test]
 fn migration_notice_prints_to_stderr_first_time() {
     let dir = tempdir().unwrap();
     make_vault(dir.path());

@@ -13,11 +13,11 @@ pub mod envelope;
 pub mod mode;
 
 pub use dispatcher::emit;
-// `ErrorInfo` / `Warning` are part of the v3.1 envelope public surface —
-// re-exported so the v3.2+ commands consuming this module don't need to
-// reach into `envelope::` directly. They are currently used only by the
-// envelope's internal tests, which is intentional: command bodies build
-// them via `Envelope::with_warning` / `Envelope::err` helpers.
+// `ErrorInfo` / `Warning` are part of the v3.1 envelope public surface.
+// `ErrorInfo` is consumed by `main.rs`'s structured-mode error renderer
+// (R1 B5) and by command bodies that build error envelopes directly.
+// `Warning` is reserved for v3.2+ commands building partial-success
+// reports (the `Envelope::with_warning` helper appends them by code/msg).
 #[allow(unused_imports)]
 pub use envelope::{Envelope, ErrorInfo, VaultInfo, Warning};
 pub use mode::{resolve_output_mode, OutputMode, TtyInputs};

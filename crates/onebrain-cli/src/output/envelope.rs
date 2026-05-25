@@ -65,11 +65,8 @@ impl<T: Serialize> Envelope<T> {
     /// Build an envelope reporting a hard error. `data` is `None`; the
     /// caller's error code + message goes in `error`.
     ///
-    /// Part of the v3.1 stable envelope API. v3.1 commands return errors
-    /// via `anyhow::Error → exit::exit_code_for` so they don't construct
-    /// envelopes for the failure path; v3.2+ commands that opt into the
-    /// error-envelope shape will call this directly.
-    #[allow(dead_code)]
+    /// Used by `main.rs`'s structured-mode error path (R1 B5) and by v3.2+
+    /// commands that opt into the error-envelope shape.
     pub fn err(command: impl Into<String>, vault: Option<VaultInfo>, error: ErrorInfo) -> Self {
         Self {
             version: ENVELOPE_VERSION,
@@ -118,9 +115,9 @@ pub struct ErrorInfo {
 }
 
 impl ErrorInfo {
-    /// Convenience constructor. Used by `Envelope::err` and command bodies
-    /// that build error envelopes manually (v3.2+).
-    #[allow(dead_code)]
+    /// Convenience constructor. Used by `Envelope::err`, the main fn's
+    /// structured-mode error path (R1 B5), and v3.2+ command bodies that
+    /// build error envelopes manually.
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),

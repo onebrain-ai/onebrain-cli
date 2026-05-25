@@ -30,12 +30,10 @@ pub enum OutputMode {
 }
 
 impl OutputMode {
-    /// True when the mode is structured (JSON/YAML/TSV/table) — `--json`
-    /// callers suppress info-level human chatter on stderr because the
-    /// caller is parsing the output programmatically. v3.1's commands
-    /// don't yet emit info chatter; v3.2 `vault sync` is the first
-    /// expected consumer.
-    #[allow(dead_code)]
+    /// True when the mode is structured (JSON/YAML/TSV/table). Used by
+    /// `main.rs`'s error-path renderer (R1 B5) to decide between the
+    /// human-readable `Error: <msg>` line on stderr and the canonical
+    /// JSON envelope on stdout.
     pub fn is_structured(&self) -> bool {
         !matches!(self, OutputMode::Text { .. })
     }
