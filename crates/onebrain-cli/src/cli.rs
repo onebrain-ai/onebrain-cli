@@ -12,7 +12,7 @@ use std::path::PathBuf;
 #[command(
     name = "onebrain",
     version,
-    about = "OneBrain CLI — Personal AI OS for Obsidian"
+    about = "OneBrain CLI — Your AI Thinking Partner"
 )]
 pub struct Cli {
     /// Override vault root (highest priority · beats ONEBRAIN_VAULT and walk-up).

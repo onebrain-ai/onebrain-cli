@@ -188,7 +188,7 @@ fn top_level_help_is_production_grade() {
 
     // Item D: clean heading · no dev-log preamble.
     assert!(
-        stdout.contains("OneBrain CLI — Personal AI OS for Obsidian"),
+        stdout.contains("OneBrain CLI — Your AI Thinking Partner"),
         "expected production heading. Got:\n{stdout}"
     );
     assert!(
@@ -1271,4 +1271,188 @@ fn vault_env_only_when_no_flag() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["data"]["detected"], true);
     assert_eq!(v["data"]["source"], "ONEBRAIN_VAULT env");
+}
+
+// ─── Help-banner integration (v3.1.0 Item G) ──────────────────────────────
+//
+// The banner historically rendered only inside `dispatch::dispatch`. Clap
+// prints `--help` output and exits BEFORE dispatch runs, so help screens were
+// unbranded. These tests pin the pre-parse banner pass that emits the brand
+// line above every `--help` / `-h` / `help` invocation — top-level, group, or
+// verb — while keeping it OUT of machine-output and version-only paths.
+//
+// `assert_cmd::Command` pipes stdout/stderr, so the live TTY is gone. The
+// help-banner path's gate would normally fall through to "stderr not a tty,
+// no banner"; we flip that with `ONEBRAIN_FORCE_BANNER=1`, the test-only
+// override documented in `banner::stderr_is_tty_or_test_forced`. Production
+// code never sets that var. `BRAND_MARK` is the stable substring of the
+// rendered banner — any future palette / wording drift breaks the snapshot
+// test first, then surfaces here.
+
+const BRAND_MARK: &str = "OneBrain CLI";
+
+#[test]
+fn help_top_level_emits_banner_to_stderr_when_pretty() {
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .env_remove("NO_COLOR")
+        .env_remove("CI")
+        .env("TERM", "xterm-256color")
+        .env("ONEBRAIN_FORCE_BANNER", "1")
+        .args(["--help", "--pretty"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(
+        stderr.contains(BRAND_MARK),
+        "expected banner on stderr above --help. stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Your AI Thinking Partner"),
+        "expected tagline on stderr. stderr=\n{stderr}"
+    );
+    // Help payload still lands on stdout — banner must not displace it.
+    assert!(
+        stdout.contains("Usage:") || stdout.contains("USAGE:"),
+        "help body missing from stdout. stdout=\n{stdout}"
+    );
+}
+
+#[test]
+fn help_subcommand_emits_banner() {
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .env_remove("NO_COLOR")
+        .env_remove("CI")
+        .env("TERM", "xterm-256color")
+        .env("ONEBRAIN_FORCE_BANNER", "1")
+        .args(["plugin", "--help", "--pretty"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        stderr.contains(BRAND_MARK),
+        "expected banner on stderr for `plugin --help`. stderr=\n{stderr}"
+    );
+}
+
+#[test]
+fn help_verb_emits_banner() {
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .env_remove("NO_COLOR")
+        .env_remove("CI")
+        .env("TERM", "xterm-256color")
+        .env("ONEBRAIN_FORCE_BANNER", "1")
+        .args(["vault", "current", "--help", "--pretty"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        stderr.contains(BRAND_MARK),
+        "expected banner above verb-level --help. stderr=\n{stderr}"
+    );
+}
+
+#[test]
+fn help_with_json_flag_no_banner() {
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .env_remove("NO_COLOR")
+        .env_remove("CI")
+        .env("TERM", "xterm-256color")
+        .env("ONEBRAIN_FORCE_BANNER", "1")
+        .args(["--help", "--json"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        !stderr.contains(BRAND_MARK),
+        "banner leaked into structured-mode --help. stderr=\n{stderr}"
+    );
+}
+
+#[test]
+fn help_with_quiet_flag_no_banner() {
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .env_remove("NO_COLOR")
+        .env_remove("CI")
+        .env("TERM", "xterm-256color")
+        .env("ONEBRAIN_FORCE_BANNER", "1")
+        .args(["--help", "--quiet"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        !stderr.contains(BRAND_MARK),
+        "banner leaked through --quiet. stderr=\n{stderr}"
+    );
+}
+
+#[test]
+fn version_no_banner() {
+    // `onebrain --version --pretty` is still version-only intent — the
+    // banner must NOT prepend a brand line above the bare version string.
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .env_remove("NO_COLOR")
+        .env_remove("CI")
+        .env("TERM", "xterm-256color")
+        .env("ONEBRAIN_FORCE_BANNER", "1")
+        .args(["--version", "--pretty"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        !stderr.contains(BRAND_MARK),
+        "banner leaked into --version. stderr=\n{stderr}"
+    );
+}
+
+#[test]
+fn help_no_color_env_no_banner() {
+    // `NO_COLOR` set ⇒ banner suppressed even on `--help`. Encodes the
+    // colour-text-only gate at the integration level so future regressions
+    // (e.g. an emit_help_banner path that bypasses mode resolution) get
+    // caught. We set `ONEBRAIN_FORCE_BANNER=1` too so the suppression we
+    // observe can only come from the NO_COLOR check, not from stderr being
+    // a pipe in assert_cmd.
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .env("NO_COLOR", "1")
+        .env_remove("CI")
+        .env("TERM", "xterm-256color")
+        .env("ONEBRAIN_FORCE_BANNER", "1")
+        .args(["--help", "--pretty"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        !stderr.contains(BRAND_MARK),
+        "banner leaked under NO_COLOR. stderr=\n{stderr}"
+    );
+}
+
+#[test]
+fn help_keyword_subcommand_emits_banner() {
+    // `onebrain plugin help` — clap's `help` keyword form. `--pretty` is a
+    // global flag and must sit pre-subcommand here because clap's auto-
+    // generated `help` subcommand doesn't accept globals as positional
+    // overrides.
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .env_remove("NO_COLOR")
+        .env_remove("CI")
+        .env("TERM", "xterm-256color")
+        .env("ONEBRAIN_FORCE_BANNER", "1")
+        .args(["--pretty", "plugin", "help"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        stderr.contains(BRAND_MARK),
+        "expected banner above `plugin help`. stderr=\n{stderr}"
+    );
 }

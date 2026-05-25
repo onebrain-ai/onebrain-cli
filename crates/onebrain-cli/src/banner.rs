@@ -18,8 +18,12 @@
 //!    pollute the error UI, so the cleanest contract is "no banner at all
 //!    for hook commands".
 //! 4. `--help` and `--version` are handled by clap before dispatch is even
-//!    called, so no extra gating is required (the function is never invoked
-//!    for those paths).
+//!    called. The dispatch-time `should_show_banner` therefore never fires
+//!    for those paths; the pre-parse `should_show_banner_for_help` (called
+//!    from `main` BEFORE `Cli::parse()`) covers the `--help` surface so
+//!    every help screen — top-level, group, verb — carries the brand line.
+//!    `--version` is intentionally excluded from the pre-parse path so the
+//!    `-V` output stays a single line (machine-friendly).
 //!
 //! Banner emission target: **stderr**. Stdout stays untouched so that any
 //! command piped through `| jq` / `| less` keeps a clean payload even in the
@@ -83,15 +87,17 @@ fn is_hook_protocol(cmd: &Cmd) -> bool {
     }
 }
 
-/// Build the banner string (no I/O). Two lines:
-///   `OneBrain CLI` (pink, bold)
-///   `Personal AI OS · vX.Y.Z` (dim)
+/// Build the banner string (no I/O). One line:
+///   `OneBrain CLI` (pink, bold) + `Your AI Thinking Partner · vX.Y.Z` (dim)
+///
+/// Tagline updated 2026-05-25: was "Personal AI OS"; the brand line is now
+/// "Your AI Thinking Partner" — same emit path, same gating, same writer.
 ///
 /// Trailing newline included so the caller can `write_all` directly.
 pub fn render_banner() -> String {
     let version = env!("CARGO_PKG_VERSION");
     format!(
-        "{pink}OneBrain CLI{reset}  {dim}Personal AI OS · v{version}{reset}\n",
+        "{pink}OneBrain CLI{reset}  {dim}Your AI Thinking Partner · v{version}{reset}\n",
         pink = ANSI_PINK_FG,
         dim = ANSI_DIM,
         reset = ANSI_RESET,
@@ -108,6 +114,190 @@ pub fn emit_banner<W: Write>(mut writer: W, cli: &Cli, mode: &OutputMode) {
     }
     // Best-effort write — banner failures must never abort the actual command.
     let _ = writer.write_all(render_banner().as_bytes());
+}
+
+/// True when argv signals a help intent (`--help`, `-h`, or the `help`
+/// subcommand keyword). Used by `main` to decide whether to emit the banner
+/// BEFORE handing argv to clap (which prints help and exits in-process).
+pub fn argv_requests_help(args: &[String]) -> bool {
+    // Skip the binary name (`args[0]`) so we don't accidentally match
+    // `/path/to/help-runner/onebrain` or similar.
+    args.iter()
+        .skip(1)
+        .any(|a| a == "--help" || a == "-h" || a == "help")
+}
+
+/// True when argv signals a version-only intent (`--version` or `-V`). Used
+/// to suppress the help banner when version is also present (`-V` wins).
+pub fn argv_requests_version(args: &[String]) -> bool {
+    args.iter().skip(1).any(|a| a == "--version" || a == "-V")
+}
+
+/// Env snapshot passed to [`should_show_banner_for_help`] so the function
+/// stays pure over its inputs (test-friendly, no process-env reads).
+#[derive(Debug, Clone, Default)]
+pub struct HelpBannerEnv {
+    pub no_color: bool,
+    pub term_dumb: bool,
+    pub ci_truthy: bool,
+}
+
+impl HelpBannerEnv {
+    /// Snapshot the live env. Mirrors the colour-suppression subset of the
+    /// 6-rule chain in [`crate::output::mode::resolve_output_mode`].
+    pub fn from_env() -> Self {
+        let no_color = std::env::var_os("NO_COLOR").is_some();
+        let term_dumb = std::env::var("TERM").ok().as_deref() == Some("dumb");
+        let ci_truthy = std::env::var("CI").ok().is_some_and(|v| !v.is_empty());
+        Self {
+            no_color,
+            term_dumb,
+            ci_truthy,
+        }
+    }
+
+    fn forces_mono(&self) -> bool {
+        self.no_color || self.term_dumb || self.ci_truthy
+    }
+}
+
+/// Decide whether to emit the banner specifically for `--help` invocations.
+/// Pure function over its arguments — no env / stdio access. Called from
+/// `main` BEFORE clap parses, so we work off raw `std::env::args()`, a
+/// pre-resolved `OutputMode` (built from env + a lightweight argv scan by
+/// [`tty_inputs_for_help`]), and a snapshot of the colour-relevant env
+/// (`NO_COLOR` / `TERM=dumb` / `CI=<truthy>`) via [`HelpBannerEnv`].
+///
+/// Suppression precedence (any one disqualifies):
+/// 1. `--version` / `-V` — version-only intent, no banner.
+/// 2. `--quiet` / `-q` — explicit silence.
+/// 3. `--json` / `--yaml` / `--output <json|yaml|table|tsv>` — machine consumer.
+/// 4. `--no-color` flag — explicit colour suppression.
+/// 5. Env says monochrome (`NO_COLOR` / `TERM=dumb` / `CI=<truthy>`).
+/// 6. Mode is not `Text { .. }` (Json/Yaml/Table/Tsv).
+///
+/// The colour bit on the resolved mode is NOT checked: `assert_cmd` pipes
+/// stdout in tests, which collapses the colour bit to `false`. Forcing
+/// `color: true` here would make every integration test for this path
+/// silently skip. The real-world "is the terminal alive?" check happens
+/// at emit time via [`stderr_is_tty_or_test_forced`].
+pub fn should_show_banner_for_help(
+    mode: &OutputMode,
+    args: &[String],
+    env: &HelpBannerEnv,
+) -> bool {
+    if argv_requests_version(args) {
+        return false;
+    }
+    if args.iter().skip(1).any(|a| a == "--quiet" || a == "-q") {
+        return false;
+    }
+    if args.iter().skip(1).any(|a| a == "--json" || a == "--yaml") {
+        return false;
+    }
+    // `--output <fmt>` / `-o <fmt>` where fmt ∈ {json,yaml,table,tsv}.
+    let mut iter = args.iter().skip(1).peekable();
+    while let Some(a) = iter.next() {
+        if a == "-o" || a == "--output" {
+            if let Some(val) = iter.peek() {
+                if matches!(val.as_str(), "json" | "yaml" | "table" | "tsv") {
+                    return false;
+                }
+            }
+        } else if let Some(val) = a
+            .strip_prefix("--output=")
+            .or_else(|| a.strip_prefix("-o="))
+        {
+            if matches!(val, "json" | "yaml" | "table" | "tsv") {
+                return false;
+            }
+        }
+    }
+    if args.iter().skip(1).any(|a| a == "--no-color") {
+        return false;
+    }
+    if env.forces_mono() {
+        return false;
+    }
+    matches!(mode, OutputMode::Text { .. })
+}
+
+/// True when stderr is a TTY, OR when an explicit override env var is set.
+/// The env override (`ONEBRAIN_FORCE_BANNER=1`) exists exclusively so
+/// integration tests can exercise the banner path under `assert_cmd`'s
+/// piped IO; production code never sets it.
+fn stderr_is_tty_or_test_forced() -> bool {
+    use std::io::IsTerminal;
+    if std::env::var_os("ONEBRAIN_FORCE_BANNER").is_some() {
+        return true;
+    }
+    std::io::stderr().is_terminal()
+}
+
+/// Emit the help banner to `writer` (typically stderr). No-op when
+/// [`should_show_banner_for_help`] returns false OR when stderr is not a
+/// real terminal (i.e. `onebrain --help 2>file` would otherwise spill raw
+/// ANSI escape sequences into the file). Used by `main` BEFORE `Cli::parse()`
+/// so the banner sits above clap's help screen at every level of the
+/// subcommand tree.
+///
+/// The `ONEBRAIN_FORCE_BANNER=1` env var lifts the stderr-tty gate; it
+/// exists exclusively so integration tests under `assert_cmd` (which pipes
+/// stderr by default) can exercise this path. Production callers never set
+/// it.
+pub fn emit_help_banner<W: Write>(
+    mut writer: W,
+    mode: &OutputMode,
+    args: &[String],
+    env: &HelpBannerEnv,
+) {
+    if !should_show_banner_for_help(mode, args, env) {
+        return;
+    }
+    if !stderr_is_tty_or_test_forced() {
+        return;
+    }
+    let _ = writer.write_all(render_banner().as_bytes());
+}
+
+/// Build the `TtyInputs` the help-banner path needs from a lightweight argv
+/// scan. Avoids invoking clap (which would print + exit on `--help`).
+///
+/// Only inspects flags relevant to colour/mode resolution: `--json`, `--yaml`,
+/// `--output <fmt>` / `-o <fmt>`, `--pretty`, `--no-color`. Subcommand-scoped
+/// duplicates of those globals are also caught because the global flags accept
+/// both pre- and post-subcommand positions in clap.
+pub fn tty_inputs_for_help(args: &[String]) -> crate::output::TtyInputs {
+    let mut output_flag = "text".to_string();
+    let mut json_shortcut = false;
+    let mut yaml_shortcut = false;
+    let mut pretty = false;
+    let mut no_color = false;
+
+    let mut iter = args.iter().skip(1).peekable();
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "--json" => json_shortcut = true,
+            "--yaml" => yaml_shortcut = true,
+            "--pretty" => pretty = true,
+            "--no-color" => no_color = true,
+            "-o" | "--output" => {
+                if let Some(val) = iter.next() {
+                    output_flag = val.clone();
+                }
+            }
+            other => {
+                if let Some(val) = other
+                    .strip_prefix("--output=")
+                    .or_else(|| other.strip_prefix("-o="))
+                {
+                    output_flag = val.to_string();
+                }
+            }
+        }
+    }
+
+    crate::output::TtyInputs::from_env(&output_flag, json_shortcut, yaml_shortcut, pretty, no_color)
 }
 
 #[cfg(test)]
@@ -298,6 +488,261 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         emit_banner(&mut buf, &cli, &color_text_mode());
         assert!(buf.is_empty());
+    }
+
+    // ── Help-banner gating (pre-parse path) ──────────────────────────────
+    //
+    // The help-banner path runs in `main` BEFORE `Cli::parse()` because clap
+    // prints `--help` output and exits in-process. These tests pin the argv
+    // scanner's decision table directly — no clap involved.
+
+    fn s(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn should_show_banner_for_help_top_level_text_color() {
+        let args = s(&["onebrain", "--help"]);
+        assert!(should_show_banner_for_help(
+            &color_text_mode(),
+            &args,
+            &HelpBannerEnv::default()
+        ));
+        assert!(argv_requests_help(&args));
+    }
+
+    #[test]
+    fn should_show_banner_for_help_with_subcommand() {
+        let args = s(&["onebrain", "plugin", "--help"]);
+        assert!(should_show_banner_for_help(
+            &color_text_mode(),
+            &args,
+            &HelpBannerEnv::default()
+        ));
+    }
+
+    #[test]
+    fn should_show_banner_for_help_with_help_keyword() {
+        // `onebrain plugin help` — clap's `help` subcommand keyword.
+        let args = s(&["onebrain", "plugin", "help"]);
+        assert!(should_show_banner_for_help(
+            &color_text_mode(),
+            &args,
+            &HelpBannerEnv::default()
+        ));
+        assert!(argv_requests_help(&args));
+    }
+
+    #[test]
+    fn should_show_banner_for_help_with_short_h() {
+        let args = s(&["onebrain", "-h"]);
+        assert!(should_show_banner_for_help(
+            &color_text_mode(),
+            &args,
+            &HelpBannerEnv::default()
+        ));
+        assert!(argv_requests_help(&args));
+    }
+
+    #[test]
+    fn should_show_banner_for_help_version_takes_priority() {
+        let args = s(&["onebrain", "--version"]);
+        assert!(!should_show_banner_for_help(
+            &color_text_mode(),
+            &args,
+            &HelpBannerEnv::default()
+        ));
+        assert!(argv_requests_version(&args));
+    }
+
+    #[test]
+    fn should_show_banner_for_help_version_with_help_combo() {
+        // `--version` wins even when `--help` is also present.
+        let args = s(&["onebrain", "--version", "--help"]);
+        assert!(!should_show_banner_for_help(
+            &color_text_mode(),
+            &args,
+            &HelpBannerEnv::default()
+        ));
+    }
+
+    #[test]
+    fn should_show_banner_for_help_quiet_suppresses() {
+        let args = s(&["onebrain", "--help", "--quiet"]);
+        assert!(!should_show_banner_for_help(
+            &color_text_mode(),
+            &args,
+            &HelpBannerEnv::default()
+        ));
+        let args2 = s(&["onebrain", "--help", "-q"]);
+        assert!(!should_show_banner_for_help(
+            &color_text_mode(),
+            &args2,
+            &HelpBannerEnv::default()
+        ));
+    }
+
+    #[test]
+    fn should_show_banner_for_help_json_suppresses() {
+        let args = s(&["onebrain", "--help", "--json"]);
+        assert!(!should_show_banner_for_help(
+            &color_text_mode(),
+            &args,
+            &HelpBannerEnv::default()
+        ));
+        let args2 = s(&["onebrain", "--help", "--yaml"]);
+        assert!(!should_show_banner_for_help(
+            &color_text_mode(),
+            &args2,
+            &HelpBannerEnv::default()
+        ));
+    }
+
+    #[test]
+    fn should_show_banner_for_help_output_json_suppresses() {
+        let args = s(&["onebrain", "--help", "--output", "json"]);
+        assert!(!should_show_banner_for_help(
+            &color_text_mode(),
+            &args,
+            &HelpBannerEnv::default()
+        ));
+        let args2 = s(&["onebrain", "--help", "-o", "yaml"]);
+        assert!(!should_show_banner_for_help(
+            &color_text_mode(),
+            &args2,
+            &HelpBannerEnv::default()
+        ));
+        let args3 = s(&["onebrain", "--help", "--output=table"]);
+        assert!(!should_show_banner_for_help(
+            &color_text_mode(),
+            &args3,
+            &HelpBannerEnv::default()
+        ));
+        let args4 = s(&["onebrain", "--help", "-o=tsv"]);
+        assert!(!should_show_banner_for_help(
+            &color_text_mode(),
+            &args4,
+            &HelpBannerEnv::default()
+        ));
+    }
+
+    #[test]
+    fn should_show_banner_for_help_accepts_mono_text_mode() {
+        // The help-banner gate intentionally accepts both colour AND mono
+        // text modes — colour decisions land at the `emit_help_banner` /
+        // `stderr_is_tty_or_test_forced` layer instead, so the pure
+        // decision function stays deterministic across test harnesses
+        // (which collapse colour to false). The integration tests cover
+        // the real-world "is colour available?" path end-to-end.
+        let args = s(&["onebrain", "--help"]);
+        assert!(should_show_banner_for_help(
+            &mono_text_mode(),
+            &args,
+            &HelpBannerEnv::default()
+        ));
+    }
+
+    #[test]
+    fn should_show_banner_for_help_structured_mode_suppresses() {
+        // Even if argv has no structured flag, OutputMode could already be
+        // structured (e.g. consumer-side mode override) — the gate also
+        // suppresses for Json/Yaml/Table/Tsv modes.
+        let args = s(&["onebrain", "--help"]);
+        for mode in [
+            OutputMode::Json { pretty: true },
+            OutputMode::Yaml,
+            OutputMode::Table,
+            OutputMode::Tsv,
+        ] {
+            assert!(
+                !should_show_banner_for_help(&mode, &args, &HelpBannerEnv::default()),
+                "expected suppression for {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_show_banner_for_help_no_color_env_suppresses() {
+        let args = s(&["onebrain", "--help"]);
+        let env = HelpBannerEnv {
+            no_color: true,
+            ..Default::default()
+        };
+        assert!(!should_show_banner_for_help(
+            &color_text_mode(),
+            &args,
+            &env
+        ));
+    }
+
+    #[test]
+    fn should_show_banner_for_help_ci_env_suppresses() {
+        let args = s(&["onebrain", "--help"]);
+        let env = HelpBannerEnv {
+            ci_truthy: true,
+            ..Default::default()
+        };
+        assert!(!should_show_banner_for_help(
+            &color_text_mode(),
+            &args,
+            &env
+        ));
+    }
+
+    #[test]
+    fn should_show_banner_for_help_term_dumb_suppresses() {
+        let args = s(&["onebrain", "--help"]);
+        let env = HelpBannerEnv {
+            term_dumb: true,
+            ..Default::default()
+        };
+        assert!(!should_show_banner_for_help(
+            &color_text_mode(),
+            &args,
+            &env
+        ));
+    }
+
+    #[test]
+    fn emit_help_banner_writes_to_buffer_when_gated_on() {
+        // `cargo test`'s harness pipes stderr, so the stderr-tty gate would
+        // suppress emission. Lift it the same way integration tests do.
+        // Env mutation is intentionally scoped to this test; sibling tests
+        // either don't read the var or wrap their own scoped set/remove.
+        std::env::set_var("ONEBRAIN_FORCE_BANNER", "1");
+        let args = s(&["onebrain", "--help"]);
+        let mut buf: Vec<u8> = Vec::new();
+        emit_help_banner(
+            &mut buf,
+            &color_text_mode(),
+            &args,
+            &HelpBannerEnv::default(),
+        );
+        std::env::remove_var("ONEBRAIN_FORCE_BANNER");
+        assert!(!buf.is_empty(), "expected banner emission");
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("OneBrain"), "missing brand line: {out:?}");
+        assert!(
+            out.contains("Your AI Thinking Partner"),
+            "missing tagline: {out:?}"
+        );
+    }
+
+    #[test]
+    fn emit_help_banner_writes_nothing_when_version_present() {
+        // Force the stderr-tty gate ON so the suppression we observe can
+        // only come from the `--version` short-circuit.
+        std::env::set_var("ONEBRAIN_FORCE_BANNER", "1");
+        let args = s(&["onebrain", "--version"]);
+        let mut buf: Vec<u8> = Vec::new();
+        emit_help_banner(
+            &mut buf,
+            &color_text_mode(),
+            &args,
+            &HelpBannerEnv::default(),
+        );
+        std::env::remove_var("ONEBRAIN_FORCE_BANNER");
+        assert!(buf.is_empty(), "expected no banner for --version path");
     }
 
     // ── Snapshot ─────────────────────────────────────────────────────────

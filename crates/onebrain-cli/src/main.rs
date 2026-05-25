@@ -21,6 +21,23 @@ use onebrain_core::CoreError;
 use output::{emit, Envelope, ErrorInfo, OutputMode};
 
 fn main() {
+    // Pre-parse help-banner pass. Clap renders `--help` / `-h` / `help <verb>`
+    // output and exits in-process, BEFORE `dispatch::dispatch` would otherwise
+    // emit the banner. Emit it here so every help screen — top-level, group,
+    // verb — carries the brand line. Gating mirrors `should_show_banner` minus
+    // the parsed-CLI-only checks (hook-protocol gate isn't relevant for help).
+    let raw_args: Vec<String> = std::env::args().collect();
+    let pre_parse_mode = output::resolve_output_mode(&banner::tty_inputs_for_help(&raw_args));
+    let pre_parse_env = banner::HelpBannerEnv::from_env();
+    if banner::argv_requests_help(&raw_args) {
+        banner::emit_help_banner(
+            std::io::stderr().lock(),
+            &pre_parse_mode,
+            &raw_args,
+            &pre_parse_env,
+        );
+    }
+
     let cli = Cli::parse();
     // Capture the resolved output mode BEFORE dispatching so we can render a
     // canonical envelope on the error path. dispatch() also resolves it
