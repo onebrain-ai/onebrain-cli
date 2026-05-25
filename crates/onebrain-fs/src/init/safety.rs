@@ -10,8 +10,9 @@
 //!
 //! 1. Target does not exist → caller will create it; proceed.
 //! 2. Target exists and is empty (zero entries) → proceed.
-//! 3. Target contains `vault.yml` (existing or partial OneBrain vault) →
-//!    delegate to the existing vault.yml guard; safety check is a no-op.
+//! 3. Target contains `onebrain.yml` or legacy `vault.yml` (existing or
+//!    partial OneBrain vault) → delegate to the existing config guard;
+//!    safety check is a no-op.
 //! 4. Target contains other files / hidden files (e.g. `README.md`, `.git/`,
 //!    `.DS_Store`, `node_modules/`) → request confirmation. If `--force` is
 //!    set OR structured output mode is active, do not prompt.
@@ -25,6 +26,7 @@
 //!     the top level is enough to trigger.
 
 use crate::{FsError, Result};
+use onebrain_core::{CONFIG_FILENAME, LEGACY_CONFIG_FILENAME};
 use std::path::Path;
 
 /// Classification of a target directory.
@@ -34,8 +36,9 @@ pub(crate) enum DirState {
     Missing,
     /// Target exists with zero entries.
     Empty,
-    /// Target exists and contains `vault.yml` — treat as a (possibly partial)
-    /// OneBrain vault and let the existing guard handle it.
+    /// Target exists and contains an OneBrain config file (canonical
+    /// `onebrain.yml` or legacy `vault.yml`) — treat as a (possibly
+    /// partial) OneBrain vault and let the existing guard handle it.
     OneBrainVault,
     /// Target exists with at least one entry and no `vault.yml`. Holds a
     /// short summary (count + sample entries) for the prompt text.
@@ -71,7 +74,7 @@ pub(crate) fn classify(vault_dir: &Path) -> Result<DirState> {
     let mut names: Vec<String> = Vec::new();
     let mut count = 0_usize;
     let mut folder_count = 0_usize;
-    let mut has_vault_yml = false;
+    let mut has_config = false;
     for entry in entries {
         let entry = entry.map_err(|e| FsError::Io {
             path: vault_dir.to_path_buf(),
@@ -79,8 +82,8 @@ pub(crate) fn classify(vault_dir: &Path) -> Result<DirState> {
         })?;
         count += 1;
         let name = entry.file_name().to_string_lossy().to_string();
-        if name == "vault.yml" {
-            has_vault_yml = true;
+        if name == CONFIG_FILENAME || name == LEGACY_CONFIG_FILENAME {
+            has_config = true;
         }
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             folder_count += 1;
@@ -93,7 +96,7 @@ pub(crate) fn classify(vault_dir: &Path) -> Result<DirState> {
     if count == 0 {
         return Ok(DirState::Empty);
     }
-    if has_vault_yml {
+    if has_config {
         return Ok(DirState::OneBrainVault);
     }
     let file_count = count - folder_count;
@@ -123,7 +126,17 @@ mod tests {
     }
 
     #[test]
-    fn dir_with_vault_yml_returns_onebrain_vault() {
+    fn dir_with_onebrain_yml_returns_onebrain_vault() {
+        let d = tempdir().unwrap();
+        std::fs::write(d.path().join("onebrain.yml"), "ok").unwrap();
+        assert_eq!(classify(d.path()).unwrap(), DirState::OneBrainVault);
+    }
+
+    #[test]
+    fn dir_with_legacy_vault_yml_returns_onebrain_vault() {
+        // Back-compat: legacy `vault.yml` still marks the dir as a OneBrain
+        // vault so init delegates to the overwrite guard (and doctor
+        // migrates the file).
         let d = tempdir().unwrap();
         std::fs::write(d.path().join("vault.yml"), "ok").unwrap();
         assert_eq!(classify(d.path()).unwrap(), DirState::OneBrainVault);

@@ -35,7 +35,7 @@ pub fn run(vault_root_override: Option<PathBuf>, branch: Option<String>) -> Resu
         None => {
             let cwd = env::current_dir().context("read current directory")?;
             find_vault_root(&cwd)
-                .ok_or_else(|| anyhow!("not inside a vault (no vault.yml found)"))?
+                .ok_or_else(|| anyhow!("not inside a vault (no onebrain.yml or vault.yml found)"))?
                 .as_path()
                 .to_path_buf()
         }

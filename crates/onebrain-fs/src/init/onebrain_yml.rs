@@ -1,17 +1,24 @@
-//! `vault.yml` generation.
+//! `onebrain.yml` generation (v3.1+ canonical filename · renamed from
+//! `vault.yml`).
 //!
 //! Mirrors `VAULT_YML_DEFAULTS` from
 //! `~/projects/onebrain/src/commands/init.ts` plus an optional `schedule:`
 //! block populated from the user's chosen [`SchedulePreset`]. Serialization
 //! goes through `serde_yaml` so the resulting file parses back cleanly.
+//!
+//! v3.1 dual-read transition: this writer ALWAYS emits `onebrain.yml`. The
+//! init runner (`super::run_init`) skips writing if either filename already
+//! exists, so a legacy `vault.yml`-only vault is left untouched here —
+//! `onebrain doctor --fix` performs the atomic rename instead.
 
 use crate::error::FsError;
 use crate::init::presets::{ScheduleEntry, SchedulePreset};
+use onebrain_core::CONFIG_FILENAME;
 use serde::Serialize;
 use std::path::Path;
 
 #[derive(Serialize)]
-struct VaultYml {
+struct OnebrainYml {
     update_channel: &'static str,
     folders: Folders,
     checkpoint: Checkpoint,
@@ -61,37 +68,37 @@ impl Default for Checkpoint {
     }
 }
 
-/// Build the vault.yml text content for the given preset. Pure function —
+/// Build the onebrain.yml text content for the given preset. Pure function —
 /// useful for unit testing without touching the filesystem.
-pub fn render_vault_yml(preset: SchedulePreset) -> Result<String, FsError> {
-    let doc = VaultYml {
+pub fn render_onebrain_yml(preset: SchedulePreset) -> Result<String, FsError> {
+    let doc = OnebrainYml {
         update_channel: "stable",
         folders: Folders::default(),
         checkpoint: Checkpoint::default(),
         schedule: preset.entries(),
     };
     serde_yaml::to_string(&doc).map_err(|e| FsError::Io {
-        path: std::path::PathBuf::from("vault.yml"),
+        path: std::path::PathBuf::from(CONFIG_FILENAME),
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
     })
 }
 
-/// Write `vault.yml` into `vault_dir` with the chosen preset's schedule
+/// Write `onebrain.yml` into `vault_dir` with the chosen preset's schedule
 /// entries. Overwrites unconditionally — the guard belongs in
 /// [`super::run_init`].
-pub fn write_vault_yml(vault_dir: &Path, preset: SchedulePreset) -> Result<(), FsError> {
-    let path = vault_dir.join("vault.yml");
-    let content = render_vault_yml(preset)?;
+pub fn write_onebrain_yml(vault_dir: &Path, preset: SchedulePreset) -> Result<(), FsError> {
+    let path = vault_dir.join(CONFIG_FILENAME);
+    let content = render_onebrain_yml(preset)?;
     std::fs::write(&path, content).map_err(|e| FsError::Io {
         path: path.clone(),
         source: e,
     })
 }
 
-/// Convenience: parse a vault.yml string back into a dynamic `serde_yaml::Value`
+/// Convenience: parse an onebrain.yml string back into a dynamic `serde_yaml::Value`
 /// (used in tests to assert round-trip integrity).
 #[allow(dead_code)]
-pub(crate) fn parse_vault_yml(content: &str) -> Result<serde_yaml::Value, serde_yaml::Error> {
+pub(crate) fn parse_onebrain_yml(content: &str) -> Result<serde_yaml::Value, serde_yaml::Error> {
     serde_yaml::from_str(content)
 }
 
@@ -103,7 +110,7 @@ mod tests {
 
     #[test]
     fn render_skip_preset_omits_schedule_key() {
-        let yaml = render_vault_yml(SchedulePreset::Skip).unwrap();
+        let yaml = render_onebrain_yml(SchedulePreset::Skip).unwrap();
         assert!(
             !yaml.contains("schedule"),
             "Skip preset should not write a schedule: key, got:\n{yaml}"
@@ -113,7 +120,7 @@ mod tests {
 
     #[test]
     fn render_essentials_preset_writes_three_entries() {
-        let yaml = render_vault_yml(SchedulePreset::Essentials).unwrap();
+        let yaml = render_onebrain_yml(SchedulePreset::Essentials).unwrap();
         assert!(yaml.contains("schedule:"));
         // /daily, /weekly, /recap
         assert!(yaml.contains("/daily"));
@@ -123,7 +130,7 @@ mod tests {
 
     #[test]
     fn round_trip_preserves_update_channel_and_folders() {
-        let yaml = render_vault_yml(SchedulePreset::Essentials).unwrap();
+        let yaml = render_onebrain_yml(SchedulePreset::Essentials).unwrap();
         let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(
             parsed.get("update_channel").and_then(|v| v.as_str()),
@@ -142,7 +149,7 @@ mod tests {
 
     #[test]
     fn round_trip_preserves_checkpoint_defaults() {
-        let yaml = render_vault_yml(SchedulePreset::Minimal).unwrap();
+        let yaml = render_onebrain_yml(SchedulePreset::Minimal).unwrap();
         let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         let cp = parsed.get("checkpoint").unwrap();
         assert_eq!(cp.get("messages").and_then(|v| v.as_u64()), Some(15));
@@ -150,17 +157,19 @@ mod tests {
     }
 
     #[test]
-    fn write_creates_file_on_disk() {
+    fn write_creates_onebrain_yml_on_disk() {
         let d = tempdir().unwrap();
-        write_vault_yml(d.path(), SchedulePreset::Skip).unwrap();
-        assert!(d.path().join("vault.yml").is_file());
-        let content = std::fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        write_onebrain_yml(d.path(), SchedulePreset::Skip).unwrap();
+        // Canonical filename — NOT vault.yml.
+        assert!(d.path().join("onebrain.yml").is_file());
+        assert!(!d.path().join("vault.yml").exists());
+        let content = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert!(content.starts_with("update_channel:"));
     }
 
     #[test]
     fn maintenance_plus_writes_six_entries() {
-        let yaml = render_vault_yml(SchedulePreset::MaintenancePlus).unwrap();
+        let yaml = render_onebrain_yml(SchedulePreset::MaintenancePlus).unwrap();
         // Count `cron:` occurrences — each entry has one.
         let n = yaml.matches("cron:").count();
         assert_eq!(n, 6, "Maintenance Plus should write 6 schedule entries");

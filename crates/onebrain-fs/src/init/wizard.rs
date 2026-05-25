@@ -26,9 +26,11 @@ pub fn ask_initialize_here(vault_dir: &Path) -> bool {
     default_confirm(&q)
 }
 
-/// "vault.yml already exists. Overwrite?"
+/// "onebrain.yml already exists. Overwrite?" (function name kept stable
+/// for binary-crate callers; the prompt text now reflects the canonical
+/// filename).
 pub fn ask_overwrite_vault_yml() -> bool {
-    default_confirm("vault.yml already exists. Overwrite?")
+    default_confirm("onebrain.yml already exists. Overwrite?")
 }
 
 /// Non-empty-directory safety prompt. The caller prints the multi-line

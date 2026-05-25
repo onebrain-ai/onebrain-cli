@@ -19,13 +19,14 @@ fn cli_yes_fresh_vault_writes_files_and_emits_header() {
         .assert()
         .success()
         .stdout(predicate::str::contains("OneBrain Init"))
-        .stdout(predicate::str::contains("vault.yml: written"))
+        .stdout(predicate::str::contains("onebrain.yml: written"))
         .stdout(predicate::str::contains("folders:"))
         .stdout(predicate::str::contains("done"));
 
-    // vault.yml created
-    assert!(d.path().join("vault.yml").is_file());
-    let content = fs::read_to_string(d.path().join("vault.yml")).unwrap();
+    // Canonical filename written · legacy vault.yml NOT created
+    assert!(d.path().join("onebrain.yml").is_file());
+    assert!(!d.path().join("vault.yml").exists());
+    let content = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
     assert!(content.contains("update_channel: stable"));
     assert!(content.contains("schedule:"));
 
@@ -46,9 +47,32 @@ fn cli_yes_fresh_vault_writes_files_and_emits_header() {
 }
 
 #[test]
-fn cli_yes_existing_vault_yml_returns_non_zero() {
+fn cli_yes_existing_onebrain_yml_returns_non_zero() {
     let d = tempdir().unwrap();
-    fs::write(d.path().join("vault.yml"), "old: value\n").unwrap();
+    fs::write(d.path().join("onebrain.yml"), "old: value\n").unwrap();
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes", "--no-sync"])
+        .current_dir(d.path())
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("onebrain.yml exists"))
+        .stdout(predicate::str::contains("--force"));
+
+    // Original content preserved
+    let content = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    assert_eq!(content, "old: value\n");
+    // No folders created
+    assert!(!d.path().join("00-inbox").exists());
+}
+
+/// Back-compat: legacy `vault.yml`-only vault still hits the existing-config
+/// guard. Init does NOT auto-migrate · `onebrain doctor --fix` does.
+#[test]
+fn cli_yes_existing_legacy_vault_yml_returns_non_zero() {
+    let d = tempdir().unwrap();
+    fs::write(d.path().join("vault.yml"), "old: legacy\n").unwrap();
 
     Command::cargo_bin("onebrain")
         .unwrap()
@@ -59,10 +83,10 @@ fn cli_yes_existing_vault_yml_returns_non_zero() {
         .stdout(predicate::str::contains("vault.yml exists"))
         .stdout(predicate::str::contains("--force"));
 
-    // Original content preserved
+    // Legacy file untouched · canonical not written
     let content = fs::read_to_string(d.path().join("vault.yml")).unwrap();
-    assert_eq!(content, "old: value\n");
-    // No folders created
+    assert_eq!(content, "old: legacy\n");
+    assert!(!d.path().join("onebrain.yml").exists());
     assert!(!d.path().join("00-inbox").exists());
 }
 
@@ -76,7 +100,7 @@ fn cli_yes_creates_schedule_block_with_essentials_entries() {
         .assert()
         .success();
 
-    let content = fs::read_to_string(d.path().join("vault.yml")).unwrap();
+    let content = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
     assert!(content.contains("/daily"));
     assert!(content.contains("/weekly"));
     assert!(content.contains("/recap"));
@@ -141,23 +165,23 @@ fn cli_yes_populates_claude_settings_json_with_stop_hook() {
     assert!(!stop.is_empty(), "hooks.Stop is empty: {text}");
 }
 
-/// Bun v2.3.3-parity: `--force` overrides the existing-vault.yml guard so
+/// Bun v2.3.3-parity: `--force` overrides the existing-config guard so
 /// the run succeeds and the file is rewritten without prompting.
 #[test]
-fn cli_yes_force_overwrites_existing_vault_yml() {
+fn cli_yes_force_overwrites_existing_onebrain_yml() {
     let d = tempdir().unwrap();
-    fs::write(d.path().join("vault.yml"), "old: value\n").unwrap();
+    fs::write(d.path().join("onebrain.yml"), "old: value\n").unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
         .args(["init", "--yes", "--force", "--no-sync"])
         .current_dir(d.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("vault.yml: written"));
-    let content = fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        .stdout(predicate::str::contains("onebrain.yml: written"));
+    let content = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
     assert!(
         content.contains("update_channel"),
-        "vault.yml should have been overwritten with the fresh template",
+        "onebrain.yml should have been overwritten with the fresh template",
     );
 }
 
@@ -241,7 +265,7 @@ fn init_is_idempotent_marketplace_json_not_overwritten() {
     );
     fs::write(&path, &text).unwrap();
 
-    // Re-init with --force (existing vault.yml guard requires it)
+    // Re-init with --force (existing onebrain.yml guard requires it)
     Command::cargo_bin("onebrain")
         .unwrap()
         .args(["init", "--yes", "--force", "--no-sync"])
@@ -376,7 +400,7 @@ fn init_target_directory_via_vault_flag() {
         .assert()
         .success()
         .stdout(predicate::str::contains("done"));
-    assert!(target.join("vault.yml").is_file());
+    assert!(target.join("onebrain.yml").is_file());
     assert!(target.join("07-logs").is_dir());
 }
 
@@ -413,7 +437,7 @@ fn init_empty_dir_succeeds_silently() {
         .current_dir(d.path())
         .assert()
         .success();
-    assert!(d.path().join("vault.yml").is_file());
+    assert!(d.path().join("onebrain.yml").is_file());
 }
 
 /// Missing dir: classify=Missing → init creates it + proceeds. No `--force`
@@ -436,11 +460,11 @@ fn init_nonexistent_dir_creates_and_succeeds() {
         .assert()
         .success();
     assert!(target.is_dir());
-    assert!(target.join("vault.yml").is_file());
+    assert!(target.join("onebrain.yml").is_file());
     assert!(target.join("07-logs").is_dir());
 }
 
-/// Dir with non-OneBrain files + no vault.yml + no --force in non-interactive
+/// Dir with non-OneBrain files + no config + no --force in non-interactive
 /// mode → exit 75 (E_INIT_TARGET_NOT_EMPTY) without prompting.
 #[test]
 fn init_nonempty_dir_yes_without_force_errors_with_exit_75() {
@@ -459,6 +483,7 @@ fn init_nonempty_dir_yes_without_force_errors_with_exit_75() {
 
     // README.md preserved, no vault structure created
     assert!(d.path().join("README.md").is_file());
+    assert!(!d.path().join("onebrain.yml").exists());
     assert!(!d.path().join("vault.yml").exists());
     assert!(!d.path().join("00-inbox").exists());
 }
@@ -480,7 +505,7 @@ fn init_nonempty_dir_force_flag_proceeds() {
     assert!(d.path().join("README.md").is_file());
     assert!(d.path().join("src").is_dir());
     // OneBrain structure created
-    assert!(d.path().join("vault.yml").is_file());
+    assert!(d.path().join("onebrain.yml").is_file());
     assert!(d.path().join("00-inbox").is_dir());
 }
 
@@ -521,7 +546,7 @@ fn init_json_mode_nonempty_with_force_succeeds() {
         .current_dir(d.path())
         .assert()
         .success();
-    assert!(d.path().join("vault.yml").is_file());
+    assert!(d.path().join("onebrain.yml").is_file());
     assert!(d.path().join("file.txt").is_file());
 }
 
@@ -540,15 +565,15 @@ fn init_dotfile_only_dir_still_triggers_safety_check() {
         .code(75);
 }
 
-/// Re-init on an existing OneBrain vault (vault.yml present) hits the
-/// existing vault.yml guard BEFORE the safety check — the message reflects
-/// vault.yml-exists, not target-not-empty.
+/// Re-init on an existing OneBrain vault (onebrain.yml present) hits the
+/// existing-config guard BEFORE the safety check — the message reflects
+/// onebrain.yml-exists, not target-not-empty.
 #[test]
-fn init_existing_vault_yml_skips_safety_check() {
+fn init_existing_onebrain_yml_skips_safety_check() {
     let d = tempdir().unwrap();
-    fs::write(d.path().join("vault.yml"), "old: value\n").unwrap();
+    fs::write(d.path().join("onebrain.yml"), "old: value\n").unwrap();
     // Also drop a sibling file so the dir is clearly "non-empty" — proves
-    // the safety check defers to the existing guard when vault.yml is
+    // the safety check defers to the existing guard when a config file is
     // present, regardless of other entries.
     fs::write(d.path().join("README.md"), "hi").unwrap();
     Command::cargo_bin("onebrain")
@@ -557,7 +582,7 @@ fn init_existing_vault_yml_skips_safety_check() {
         .current_dir(d.path())
         .assert()
         .failure()
-        .stdout(predicate::str::contains("vault.yml exists"));
+        .stdout(predicate::str::contains("onebrain.yml exists"));
 }
 
 /// C4 (T-M2): a non-interactive call with CLOSED stdin against a non-empty
@@ -584,5 +609,6 @@ fn init_nonempty_closed_stdin_does_not_hang() {
     assert.code(75);
     // README.md preserved
     assert!(d.path().join("README.md").is_file());
+    assert!(!d.path().join("onebrain.yml").exists());
     assert!(!d.path().join("vault.yml").exists());
 }

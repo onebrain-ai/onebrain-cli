@@ -1,4 +1,4 @@
-use crate::{CoreError, Result, VaultRoot};
+use crate::{find_config_file, CoreError, Result, VaultRoot, CONFIG_FILENAME};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -17,7 +17,7 @@ pub struct VaultConfig {
     pub folders: VaultFolders,
 }
 
-/// Checkpoint policy fields parsed from `vault.yml`'s `checkpoint:` block.
+/// Checkpoint policy fields parsed from the config's `checkpoint:` block.
 ///
 /// Defaults match Bun v2.3.3 (`DEFAULT_CHECKPOINT` in `src/lib/parser.ts`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,7 +47,7 @@ impl Default for CheckpointPolicy {
     }
 }
 
-/// Vault folder layout parsed from `vault.yml`'s `folders:` block.
+/// Vault folder layout parsed from the config's `folders:` block.
 /// Defaults match Bun v2.3.3 (`DEFAULT_FOLDERS` in `src/lib/parser.ts`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultFolders {
@@ -116,10 +116,12 @@ impl Default for VaultFolders {
     }
 }
 
-/// Read and parse `<root>/vault.yml`. Returns [`CoreError::VaultYamlMissing`]
-/// when the file does not exist and [`CoreError::InvalidYaml`] on parse errors.
+/// Read and parse the active vault config (`onebrain.yml` preferred,
+/// legacy `vault.yml` as fallback with one-time deprecation warning).
+/// Returns [`CoreError::VaultYamlMissing`] when neither file exists and
+/// [`CoreError::InvalidYaml`] on parse errors.
 pub fn load_vault_config(root: &VaultRoot) -> Result<VaultConfig> {
-    let path = root.join("vault.yml");
+    let path = find_config_file(root.as_path()).unwrap_or_else(|| root.join(CONFIG_FILENAME));
     let content = std::fs::read_to_string(&path).map_err(|source| CoreError::VaultYamlMissing {
         path: path.clone(),
         source,
@@ -128,13 +130,15 @@ pub fn load_vault_config(root: &VaultRoot) -> Result<VaultConfig> {
     Ok(config)
 }
 
-/// Load `vault.yml` from an arbitrary directory path (no `VaultRoot` invariant).
+/// Load the active vault config from an arbitrary directory path (no
+/// `VaultRoot` invariant). Same dual-read semantics as
+/// [`load_vault_config`].
 ///
 /// Use this when the caller has a raw path that *may or may not* be a vault root
-/// (e.g., the Active-Session Guard threshold derivation reads vault.yml from a
+/// (e.g., the Active-Session Guard threshold derivation reads the config from a
 /// best-effort location and falls back on any error).
 pub fn load_vault_config_at(path: &Path) -> Result<VaultConfig> {
-    let yml = path.join("vault.yml");
+    let yml = find_config_file(path).unwrap_or_else(|| path.join(CONFIG_FILENAME));
     let content = std::fs::read_to_string(&yml).map_err(|source| CoreError::VaultYamlMissing {
         path: yml.clone(),
         source,
@@ -150,8 +154,20 @@ mod tests {
 
     fn write_vault(content: &str) -> (tempfile::TempDir, VaultRoot) {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("vault.yml"), content).unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILENAME), content).unwrap();
         let root = crate::find_vault_root(dir.path()).unwrap();
+        (dir, root)
+    }
+
+    fn write_legacy_vault(content: &str) -> (tempfile::TempDir, VaultRoot) {
+        // Quiet the deprecation warning when the test fixture is the legacy
+        // filename. Tests that want to observe the warning toggle the env
+        // var off themselves via `path::reset_legacy_warning_for_test`.
+        std::env::set_var("ONEBRAIN_QUIET_VAULT_YML_DEPRECATION", "1");
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(crate::LEGACY_CONFIG_FILENAME), content).unwrap();
+        let root = crate::find_vault_root(dir.path()).unwrap();
+        std::env::remove_var("ONEBRAIN_QUIET_VAULT_YML_DEPRECATION");
         (dir, root)
     }
 
@@ -179,11 +195,19 @@ mod tests {
     #[test]
     fn vault_yml_missing_returns_vault_yaml_missing_variant() {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("vault.yml"), "").unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILENAME), "").unwrap();
         let root = crate::find_vault_root(dir.path()).unwrap();
-        std::fs::remove_file(root.join("vault.yml")).unwrap();
+        std::fs::remove_file(root.join(CONFIG_FILENAME)).unwrap();
         let err = load_vault_config(&root).unwrap_err();
         assert!(matches!(err, CoreError::VaultYamlMissing { .. }));
+    }
+
+    #[test]
+    fn load_vault_config_reads_legacy_vault_yml() {
+        // Back-compat read: vault.yml-only vault still loads cleanly.
+        let (_dir, root) = write_legacy_vault("qmd_collection: legacy-ob\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.qmd_collection.as_deref(), Some("legacy-ob"));
     }
 
     #[test]

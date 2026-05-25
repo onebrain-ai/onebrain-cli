@@ -39,27 +39,32 @@ impl Check for VaultYmlKeysCheck {
     }
 
     fn run(&self, vault_root: &Path, _config: &VaultConfig) -> DoctorResult {
-        let path = vault_root.join("vault.yml");
+        // Schema-validate whichever config file is present — canonical
+        // `onebrain.yml` preferred, legacy `vault.yml` fallback. The
+        // separate `vault-config-migration` check surfaces the filename
+        // issue; this check focuses on schema only.
+        let path = onebrain_core::find_config_file(vault_root)
+            .unwrap_or_else(|| vault_root.join("onebrain.yml"));
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(_) => {
                 // Bun parity: no `details` field on the missing-file branch.
-                return DoctorResult::error(CHECK_NAME, "vault.yml not found")
-                    .with_hint("Run onebrain init to create vault.yml");
+                return DoctorResult::error(CHECK_NAME, "onebrain.yml not found")
+                    .with_hint("Run onebrain init to create onebrain.yml");
             }
         };
 
         let parsed: Value = match serde_yaml::from_str(&text) {
             Ok(v) => v,
             Err(_) => {
-                return DoctorResult::error(CHECK_NAME, "vault.yml contains invalid YAML");
+                return DoctorResult::error(CHECK_NAME, "onebrain.yml contains invalid YAML");
             }
         };
 
         let raw = match parsed.as_mapping() {
             Some(m) => m,
             None => {
-                return DoctorResult::error(CHECK_NAME, "vault.yml is not a valid YAML mapping");
+                return DoctorResult::error(CHECK_NAME, "onebrain.yml is not a valid YAML mapping");
             }
         };
 
@@ -144,7 +149,7 @@ impl Check for VaultYmlKeysCheck {
         if !errors.is_empty() {
             let has_missing_key = errors.iter().any(|e| e.starts_with("missing key:"));
             let hint = if has_missing_key {
-                Some("Run onebrain init --force to recreate vault.yml")
+                Some("Run onebrain init --force to recreate onebrain.yml")
             } else {
                 None
             };
@@ -173,7 +178,7 @@ impl Check for VaultYmlKeysCheck {
             });
             let has_missing_soft_key = warnings.iter().any(|w| w.starts_with("missing key:"));
             let hint: Option<&str> = if has_missing_soft_key && has_deprecated {
-                Some("Run onebrain doctor --fix to repair vault.yml")
+                Some("Run onebrain doctor --fix to repair onebrain.yml")
             } else if has_missing_soft_key {
                 Some("Run onebrain doctor --fix to backfill defaults")
             } else if has_deprecated {
@@ -253,6 +258,12 @@ mod tests {
     }
 
     fn write_yaml(dir: &Path, content: &str) {
+        fs::write(dir.join("onebrain.yml"), content).unwrap();
+    }
+
+    /// Same helper, but writes the legacy filename — used by the
+    /// back-compat read test below.
+    fn write_legacy_yaml(dir: &Path, content: &str) {
         fs::write(dir.join("vault.yml"), content).unwrap();
     }
 
@@ -276,10 +287,10 @@ mod tests {
         let d = tempdir().unwrap();
         let r = VaultYmlKeysCheck.run(d.path(), &cfg());
         assert_eq!(r.status, DoctorStatus::Error);
-        assert_eq!(r.message, "vault.yml not found");
+        assert_eq!(r.message, "onebrain.yml not found");
         assert_eq!(
             r.hint.as_deref(),
-            Some("Run onebrain init to create vault.yml")
+            Some("Run onebrain init to create onebrain.yml")
         );
         // Bun parity: no details on the missing-file branch.
         assert!(r.details.is_empty());
@@ -291,7 +302,7 @@ mod tests {
         write_yaml(d.path(), "- just\n- a\n- list\n");
         let r = VaultYmlKeysCheck.run(d.path(), &cfg());
         assert_eq!(r.status, DoctorStatus::Error);
-        assert_eq!(r.message, "vault.yml is not a valid YAML mapping");
+        assert_eq!(r.message, "onebrain.yml is not a valid YAML mapping");
     }
 
     #[test]
@@ -300,7 +311,19 @@ mod tests {
         write_yaml(d.path(), "not: : valid");
         let r = VaultYmlKeysCheck.run(d.path(), &cfg());
         assert_eq!(r.status, DoctorStatus::Error);
-        assert_eq!(r.message, "vault.yml contains invalid YAML");
+        assert_eq!(r.message, "onebrain.yml contains invalid YAML");
+    }
+
+    /// Back-compat read: legacy `vault.yml`-only vault still passes the
+    /// schema check (lookup falls back via `find_config_file`).
+    #[test]
+    fn legacy_vault_yml_still_passes_schema_check() {
+        std::env::set_var("ONEBRAIN_QUIET_VAULT_YML_DEPRECATION", "1");
+        let d = tempdir().unwrap();
+        write_legacy_yaml(d.path(), valid_schema());
+        let r = VaultYmlKeysCheck.run(d.path(), &cfg());
+        std::env::remove_var("ONEBRAIN_QUIET_VAULT_YML_DEPRECATION");
+        assert_eq!(r.status, DoctorStatus::Ok);
     }
 
     #[test]
@@ -314,12 +337,12 @@ mod tests {
         assert!(r.details.iter().any(|x| x == "missing key: folders"));
         assert_eq!(
             r.hint.as_deref(),
-            Some("Run onebrain init --force to recreate vault.yml")
+            Some("Run onebrain init --force to recreate onebrain.yml")
         );
         // Last details entry should be the hint mirror per Bun.
         assert_eq!(
             r.details.last().map(String::as_str),
-            Some("Run onebrain init --force to recreate vault.yml")
+            Some("Run onebrain init --force to recreate onebrain.yml")
         );
     }
 
@@ -482,7 +505,7 @@ mod tests {
         assert_eq!(r.status, DoctorStatus::Warn);
         assert_eq!(
             r.hint.as_deref(),
-            Some("Run onebrain doctor --fix to repair vault.yml")
+            Some("Run onebrain doctor --fix to repair onebrain.yml")
         );
     }
 }

@@ -47,8 +47,8 @@ pub fn run(
 }
 
 /// Real confirm closure — dispatches between "initialize here?",
-/// "vault.yml overwrite?", and the new "target not empty" safety prompt
-/// based on the question text. All prompts are surfaced via
+/// "{onebrain,vault}.yml overwrite?", and the new "target not empty" safety
+/// prompt based on the question text. All prompts are surfaced via
 /// `inquire::Confirm`; an unparseable answer counts as "no".
 fn real_confirm_fn() -> ConfirmFn {
     // Track which question we're on so we can pick the right helper.
@@ -57,7 +57,9 @@ fn real_confirm_fn() -> ConfirmFn {
     Box::new(move |question: &str| {
         let mut n = state.borrow_mut();
         *n += 1;
-        if question.starts_with("vault.yml already exists") {
+        if question.starts_with("onebrain.yml already exists")
+            || question.starts_with("vault.yml already exists")
+        {
             ask_overwrite_vault_yml()
         } else if question.starts_with("Target directory is not empty") {
             // The library passes the full multi-line context block as the

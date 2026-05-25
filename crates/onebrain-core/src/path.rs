@@ -1,5 +1,85 @@
 use crate::error::CoreError;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Canonical OneBrain config filename (v3.1+).
+pub const CONFIG_FILENAME: &str = "onebrain.yml";
+/// Legacy OneBrain config filename (v3.0 and earlier). Still readable for
+/// back-compat in v3.1.x · removed in v4.0.0.
+pub const LEGACY_CONFIG_FILENAME: &str = "vault.yml";
+
+/// Suppress the legacy-filename deprecation warning. Honoured by
+/// `deprecation_warning_once`.
+const ENV_QUIET_DEPRECATION: &str = "ONEBRAIN_QUIET_VAULT_YML_DEPRECATION";
+
+/// Process-global flag — guarantees the deprecation warning fires at most
+/// once per process even when many subsystems traverse `find_config_file`.
+static LEGACY_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
+
+/// Locate the active config file in `dir`. Prefers the canonical
+/// `onebrain.yml`; falls back to legacy `vault.yml` and emits a one-time
+/// stderr deprecation warning. Returns `None` when neither is present.
+///
+/// Centralises every `<dir>/vault.yml` lookup the CLI used to perform
+/// inline. Callers that need the in-memory parse should still use
+/// [`crate::load_vault_config`] / [`crate::load_vault_config_at`] which
+/// both route through this helper.
+pub fn find_config_file(dir: &Path) -> Option<PathBuf> {
+    let canonical = dir.join(CONFIG_FILENAME);
+    if canonical.is_file() {
+        return Some(canonical);
+    }
+    let legacy = dir.join(LEGACY_CONFIG_FILENAME);
+    if legacy.is_file() {
+        emit_legacy_deprecation_warning_once();
+        return Some(legacy);
+    }
+    None
+}
+
+/// Emit the `vault.yml` deprecation warning to stderr — at most once per
+/// process. Suppressed entirely when `ONEBRAIN_QUIET_VAULT_YML_DEPRECATION=1`.
+///
+/// Library-side warning so every consumer (CLI, cache crate, fs crate)
+/// gets the same single emission point. CLI envelope/JSON modes that want
+/// to surface the warning structurally can check
+/// [`legacy_warning_was_emitted`] and emit a `Warning { code:
+/// W_VAULT_YML_DEPRECATED }` themselves; the stderr line is just the
+/// human-mode fallback.
+pub fn emit_legacy_deprecation_warning_once() {
+    if std::env::var(ENV_QUIET_DEPRECATION)
+        .ok()
+        .as_deref()
+        .is_some_and(|v| v == "1" || v == "true")
+    {
+        // Still mark as emitted so structured-output callers can pick it
+        // up via `legacy_warning_was_emitted` without a parallel state
+        // variable. The user asked to quiet the stderr line, not to hide
+        // the underlying signal.
+        LEGACY_WARNING_EMITTED.store(true, Ordering::Relaxed);
+        return;
+    }
+    if !LEGACY_WARNING_EMITTED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "warning: vault.yml is deprecated — run `onebrain doctor --fix` to migrate to onebrain.yml (removed in v4.0.0)"
+        );
+    }
+}
+
+/// True when [`emit_legacy_deprecation_warning_once`] has fired in this
+/// process. Used by structured-output callers to surface a `W_VAULT_YML_DEPRECATED`
+/// warning in their envelope alongside (or in place of) the stderr line.
+pub fn legacy_warning_was_emitted() -> bool {
+    LEGACY_WARNING_EMITTED.load(Ordering::Relaxed)
+}
+
+/// Test-only reset of the deprecation-warning sentinel. Lets unit tests
+/// observe the "fires exactly once" contract without leaking state across
+/// `#[test]` runs.
+#[doc(hidden)]
+pub fn reset_legacy_warning_for_test() {
+    LEGACY_WARNING_EMITTED.store(false, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultRoot(PathBuf);
@@ -24,11 +104,20 @@ impl VaultRoot {
             .unwrap_or_else(|| self.0.display().to_string())
     }
 
+    /// Path to the active config file (`onebrain.yml` preferred, else
+    /// `vault.yml`). Returns `None` when neither exists, which only
+    /// happens if the file was deleted after `from_path` / `find_vault_root`
+    /// succeeded.
+    pub fn config_path(&self) -> Option<PathBuf> {
+        find_config_file(&self.0)
+    }
+
     /// Construct a `VaultRoot` from an explicit path. Validates that
-    /// `vault.yml` exists in the directory. Returns
+    /// either `onebrain.yml` or `vault.yml` exists in the directory.
+    /// Emits a one-time deprecation warning on legacy hit. Returns
     /// [`CoreError::NotAVault`] when the path is not a vault root.
     pub fn from_path(path: &Path) -> crate::error::Result<Self> {
-        if path.join("vault.yml").is_file() {
+        if find_config_file(path).is_some() {
             Ok(Self(path.to_path_buf()))
         } else {
             Err(CoreError::NotAVault {
@@ -38,15 +127,16 @@ impl VaultRoot {
     }
 }
 
-/// Walk up from `start` looking for the nearest directory containing a
-/// `vault.yml`. Returns `None` if none is found before the filesystem root.
+/// Walk up from `start` looking for the nearest directory containing
+/// either `onebrain.yml` (canonical) or `vault.yml` (legacy, with
+/// deprecation warning). Returns `None` if none is found before the
+/// filesystem root.
 ///
-/// **Resolution ≠ validation.** This function only checks that
-/// `vault.yml` exists as a file (`Path::is_file()` returns true for
-/// readable regular files and follows symlinks to a regular file). It does
-/// NOT parse the file or verify it's valid YAML. Broken symlinks,
-/// permission-denied reads, and malformed YAML are all the caller's
-/// responsibility:
+/// **Resolution ≠ validation.** This function only checks that the file
+/// exists (`Path::is_file()` returns true for readable regular files and
+/// follows symlinks to a regular file). It does NOT parse the file or
+/// verify it's valid YAML. Broken symlinks, permission-denied reads, and
+/// malformed YAML are all the caller's responsibility:
 ///
 /// - Hook-protocol commands (`session init`) already pattern-match
 ///   `load_vault_config` errors and emit a `decision:"block"` JSON.
@@ -57,7 +147,7 @@ impl VaultRoot {
 pub fn find_vault_root(start: &Path) -> Option<VaultRoot> {
     let mut current = start.to_path_buf();
     loop {
-        if current.join("vault.yml").is_file() {
+        if find_config_file(&current).is_some() {
             return Some(VaultRoot(current));
         }
         if !current.pop() {
@@ -75,7 +165,8 @@ pub enum VaultSource {
     Flag,
     /// Resolved from the `ONEBRAIN_VAULT` environment variable.
     Env,
-    /// Resolved by walking up from `$PWD` finding `vault.yml`.
+    /// Resolved by walking up from `$PWD` finding `onebrain.yml` (or
+    /// legacy `vault.yml`).
     WalkUp,
 }
 
@@ -123,11 +214,12 @@ pub struct VaultResolveInputs {
 /// translate this to a `{"decision":"block"}` JSON; vault-required commands
 /// translate it to [`CoreError::VaultNotFound`].
 ///
-/// When a flag/env path is supplied but doesn't contain a vault.yml, returns
-/// [`CoreError::NotAVault`] — explicit "I told you to use this vault but it's
-/// not actually one" rather than silently falling through to walk-up. This
-/// avoids the surprise where a user typos `--vault /tmp/wrong` and ends up
-/// operating on whatever vault happens to be above cwd.
+/// When a flag/env path is supplied but doesn't contain an `onebrain.yml`
+/// (or legacy `vault.yml`), returns [`CoreError::NotAVault`] — explicit
+/// "I told you to use this vault but it's not actually one" rather than
+/// silently falling through to walk-up. This avoids the surprise where a
+/// user typos `--vault /tmp/wrong` and ends up operating on whatever
+/// vault happens to be above cwd.
 pub fn resolve_vault(inputs: &VaultResolveInputs) -> crate::error::Result<Option<ResolvedVault>> {
     if let Some(path) = &inputs.flag {
         let root = VaultRoot::from_path(path)?;
@@ -166,7 +258,11 @@ mod tests {
     use tempfile::tempdir;
 
     fn make_vault(dir: &Path) {
-        std::fs::write(dir.join("vault.yml"), "").unwrap();
+        std::fs::write(dir.join(CONFIG_FILENAME), "").unwrap();
+    }
+
+    fn make_legacy_vault(dir: &Path) {
+        std::fs::write(dir.join(LEGACY_CONFIG_FILENAME), "").unwrap();
     }
 
     #[test]
@@ -272,7 +368,7 @@ mod tests {
     #[test]
     fn resolver_returns_none_when_nothing_anywhere() {
         let cwd_dir = tempdir().unwrap();
-        // No vault.yml anywhere.
+        // No vault config (neither onebrain.yml nor vault.yml) anywhere.
         let resolved = resolve_vault(&VaultResolveInputs {
             flag: None,
             env: None,
@@ -298,7 +394,7 @@ mod tests {
     #[test]
     fn resolver_rejects_explicit_flag_when_not_a_vault() {
         let bogus = tempdir().unwrap();
-        // No vault.yml at the flag path.
+        // No vault config at the flag path.
         let cwd_dir = tempdir().unwrap();
         let err = resolve_vault(&VaultResolveInputs {
             flag: Some(bogus.path().to_path_buf()),
@@ -314,5 +410,68 @@ mod tests {
         assert_eq!(VaultSource::Flag.label(), "--vault flag");
         assert_eq!(VaultSource::Env.label(), "ONEBRAIN_VAULT env");
         assert_eq!(VaultSource::WalkUp.label(), "walk-up");
+    }
+
+    // ─── v3.1 dual-read transition ─────────────────────────────────────────
+
+    #[test]
+    fn find_vault_root_prefers_onebrain_yml_over_vault_yml() {
+        let dir = tempdir().unwrap();
+        // Both files present — onebrain.yml wins.
+        std::fs::write(dir.path().join(CONFIG_FILENAME), "").unwrap();
+        std::fs::write(dir.path().join(LEGACY_CONFIG_FILENAME), "").unwrap();
+
+        let root = find_vault_root(dir.path()).unwrap();
+        // VaultRoot's `config_path` MUST report the canonical filename when
+        // both exist — proves the preference, not just that the walk-up
+        // hit the directory.
+        let cfg = root.config_path().unwrap();
+        assert_eq!(cfg.file_name().unwrap(), CONFIG_FILENAME);
+    }
+
+    #[test]
+    fn find_vault_root_falls_back_to_vault_yml_with_warning() {
+        reset_legacy_warning_for_test();
+        let dir = tempdir().unwrap();
+        make_legacy_vault(dir.path());
+
+        // Suppress the stderr line in tests; the sentinel still flips so
+        // we can assert the fallback fired.
+        std::env::set_var(ENV_QUIET_DEPRECATION, "1");
+        let root = find_vault_root(dir.path()).unwrap();
+        let cfg = root.config_path().unwrap();
+        std::env::remove_var(ENV_QUIET_DEPRECATION);
+
+        assert_eq!(cfg.file_name().unwrap(), LEGACY_CONFIG_FILENAME);
+        assert!(
+            legacy_warning_was_emitted(),
+            "deprecation sentinel did not flip on legacy fallback"
+        );
+    }
+
+    #[test]
+    fn deprecation_warning_emits_once_per_process() {
+        reset_legacy_warning_for_test();
+        let dir = tempdir().unwrap();
+        make_legacy_vault(dir.path());
+
+        // Quiet the stderr line — we only care about the sentinel + that
+        // it's idempotent across multiple resolution attempts.
+        std::env::set_var(ENV_QUIET_DEPRECATION, "1");
+        let _ = find_vault_root(dir.path()).unwrap();
+        assert!(legacy_warning_was_emitted());
+        // Second call must not toggle the sentinel back off; the
+        // `swap` inside `emit_legacy_deprecation_warning_once` makes the
+        // first emit set it to true and subsequent calls observe true and
+        // return without re-emitting.
+        let _ = find_vault_root(dir.path()).unwrap();
+        assert!(legacy_warning_was_emitted());
+        std::env::remove_var(ENV_QUIET_DEPRECATION);
+    }
+
+    #[test]
+    fn find_config_file_returns_none_when_neither_present() {
+        let dir = tempdir().unwrap();
+        assert!(find_config_file(dir.path()).is_none());
     }
 }

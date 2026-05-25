@@ -52,19 +52,21 @@ pub fn run(fix: bool, json: bool) -> Result<i32> {
                 let doc = serde_json::json!({
                     "ok": false,
                     "error": "not_in_vault",
-                    "message": "not inside a vault (no vault.yml found)",
+                    "message": "not inside a vault (no onebrain.yml or vault.yml found)",
                 });
                 println!("{}", serde_json::to_string(&doc)?);
                 return Ok(1);
             }
-            return Err(anyhow!("not inside a vault (no vault.yml found)"));
+            return Err(anyhow!(
+                "not inside a vault (no onebrain.yml or vault.yml found)"
+            ));
         }
     };
 
     // Best-effort config load — on error, fall back to defaults so doctor can
     // still report what it sees (matches Bun behavior: stderr warning + defaults).
     let config = load_vault_config(&vault_root).unwrap_or_else(|err| {
-        eprintln!("doctor: vault.yml load warning: {err}");
+        eprintln!("doctor: config load warning: {err}");
         onebrain_core::VaultConfig {
             qmd_collection: None,
             checkpoint: Default::default(),
@@ -231,6 +233,11 @@ fn attempt_fix(result: &DoctorResult, vault_root: &Path, json: bool) -> FixOutco
         // `.claude/settings.json`. Cosmetic config cleanup; no behavioral
         // change at runtime (the plugin is enabled via `enabledPlugins`).
         "claude-settings" => fix_claude_settings(vault_root, json),
+        // Migrate legacy `vault.yml` → canonical `onebrain.yml` via a
+        // single atomic `fs::rename`. Idempotent: drops legacy if both
+        // exist (canonical wins); reports already-clean when only the
+        // canonical filename is present.
+        "vault-config-migration" => fix_vault_config_migration(vault_root, json),
         // Orphan checkpoints can't be auto-deleted safely — the user may
         // still want to consolidate them via `/wrapup`. Steer them there
         // explicitly rather than risk silent data loss.
@@ -372,19 +379,28 @@ fn fix_plugin_files(vault_root: &Path, json: bool) -> FixOutcome {
 /// re-serializes from the parsed model) — the Fixed message calls this out
 /// so the user knows what changed besides the keys.
 fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
-    status_line(json, "running: backfill vault.yml");
-    let path = vault_root.join("vault.yml");
+    use onebrain_core::{find_config_file, CONFIG_FILENAME};
+    // Operate on whichever config file is present — canonical preferred,
+    // legacy fallback. The `vault-config-migration` recipe rename runs
+    // separately; this recipe is filename-agnostic.
+    let path = find_config_file(vault_root).unwrap_or_else(|| vault_root.join(CONFIG_FILENAME));
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(CONFIG_FILENAME)
+        .to_string();
+    status_line(json, &format!("running: backfill {filename}"));
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
-        Err(e) => return FixOutcome::Failed(format!("read vault.yml: {e}")),
+        Err(e) => return FixOutcome::Failed(format!("read {filename}: {e}")),
     };
     let mut yaml: serde_yaml::Value = match serde_yaml::from_str(&text) {
         Ok(v) => v,
-        Err(e) => return FixOutcome::Failed(format!("parse vault.yml: {e}")),
+        Err(e) => return FixOutcome::Failed(format!("parse {filename}: {e}")),
     };
     let mapping = match yaml.as_mapping_mut() {
         Some(m) => m,
-        None => return FixOutcome::Failed("vault.yml root is not a mapping".to_string()),
+        None => return FixOutcome::Failed(format!("{filename} root is not a mapping")),
     };
 
     let mut added: Vec<&'static str> = Vec::new();
@@ -481,15 +497,15 @@ fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
     }
 
     if added.is_empty() && removed.is_empty() && repaired.is_empty() {
-        return FixOutcome::Fixed("vault.yml already in expected shape".to_string());
+        return FixOutcome::Fixed(format!("{filename} already in expected shape"));
     }
 
     let serialized = match serde_yaml::to_string(&yaml) {
         Ok(s) => s,
-        Err(e) => return FixOutcome::Failed(format!("serialize vault.yml: {e}")),
+        Err(e) => return FixOutcome::Failed(format!("serialize {filename}: {e}")),
     };
     if let Err(e) = atomic_write_text(&path, &serialized) {
-        return FixOutcome::Failed(format!("write vault.yml: {e}"));
+        return FixOutcome::Failed(format!("write {filename}: {e}"));
     }
 
     let mut parts = Vec::new();
@@ -561,6 +577,39 @@ fn fix_claude_settings(vault_root: &Path, json: bool) -> FixOutcome {
         return FixOutcome::Failed(format!("write settings.json: {e}"));
     }
     FixOutcome::Fixed("removed stale extraKnownMarketplaces.onebrain".to_string())
+}
+
+/// Recipe — `vault-config-migration` warning means the vault uses the
+/// legacy `vault.yml` filename. Atomic single-syscall rename to canonical
+/// `onebrain.yml`. When both files exist (split state), drop the legacy
+/// one — the canonical filename takes precedence at runtime so the
+/// legacy file is already ignored; removing it eliminates the source of
+/// future drift.
+fn fix_vault_config_migration(vault_root: &Path, json: bool) -> FixOutcome {
+    use onebrain_core::{CONFIG_FILENAME, LEGACY_CONFIG_FILENAME};
+    status_line(json, "running: migrate vault.yml → onebrain.yml");
+    let canonical = vault_root.join(CONFIG_FILENAME);
+    let legacy = vault_root.join(LEGACY_CONFIG_FILENAME);
+    let canonical_exists = canonical.is_file();
+    let legacy_exists = legacy.is_file();
+
+    match (canonical_exists, legacy_exists) {
+        (true, false) | (false, false) => {
+            // Already on canonical (or no config at all — VaultYmlCheck
+            // surfaces that error). Idempotent no-op.
+            FixOutcome::Fixed("onebrain.yml in use — nothing to migrate".to_string())
+        }
+        (false, true) => match std::fs::rename(&legacy, &canonical) {
+            Ok(()) => FixOutcome::Fixed("renamed vault.yml → onebrain.yml".to_string()),
+            Err(e) => FixOutcome::Failed(format!("rename vault.yml: {e}")),
+        },
+        (true, true) => match std::fs::remove_file(&legacy) {
+            Ok(()) => FixOutcome::Fixed(
+                "removed stale vault.yml (onebrain.yml already present)".to_string(),
+            ),
+            Err(e) => FixOutcome::Failed(format!("remove vault.yml: {e}")),
+        },
+    }
 }
 
 /// Match Bun's `typeof value === 'number' && value > 0` for YAML values.
@@ -777,7 +826,7 @@ mod tests {
     #[test]
     fn fix_vault_yml_keys_backfills_missing_keys() {
         let d = tempdir().unwrap();
-        fs::write(d.path().join("vault.yml"), "qmd_collection: foo\n").unwrap();
+        fs::write(d.path().join("onebrain.yml"), "qmd_collection: foo\n").unwrap();
         let outcome = fix_vault_yml_keys(d.path(), false);
         match outcome {
             FixOutcome::Fixed(msg) => {
@@ -786,7 +835,7 @@ mod tests {
             }
             other => panic!("expected Fixed, got: {other:?}"),
         }
-        let after = fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert!(after.contains("update_channel: stable"));
         assert!(after.contains("inbox: 00-inbox"));
         assert!(after.contains("logs: 07-logs"));
@@ -800,7 +849,7 @@ mod tests {
         // recipe to silently skip the 8 sub-key inserts.
         let d = tempdir().unwrap();
         fs::write(
-            d.path().join("vault.yml"),
+            d.path().join("onebrain.yml"),
             "update_channel: stable\nfolders: null\n",
         )
         .unwrap();
@@ -809,7 +858,7 @@ mod tests {
             FixOutcome::Fixed(msg) => assert!(msg.contains("inbox"), "msg: {msg}"),
             other => panic!("expected Fixed, got: {other:?}"),
         }
-        let after = fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert!(after.contains("inbox: 00-inbox"));
         assert!(after.contains("logs: 07-logs"));
     }
@@ -818,7 +867,7 @@ mod tests {
     fn fix_vault_yml_keys_strips_deprecated_keys() {
         let d = tempdir().unwrap();
         fs::write(
-            d.path().join("vault.yml"),
+            d.path().join("onebrain.yml"),
             "update_channel: stable\n\
              onebrain_version: \"2.1.0\"\n\
              method: legacy\n\
@@ -835,7 +884,7 @@ mod tests {
             }
             other => panic!("expected Fixed, got: {other:?}"),
         }
-        let after = fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert!(!after.contains("onebrain_version"), "{after}");
         assert!(!after.contains("method: legacy"), "{after}");
         assert!(!after.contains("harness"), "{after}");
@@ -845,7 +894,7 @@ mod tests {
     fn fix_vault_yml_keys_repairs_checkpoint_nums() {
         let d = tempdir().unwrap();
         fs::write(
-            d.path().join("vault.yml"),
+            d.path().join("onebrain.yml"),
             "update_channel: stable\n\
              checkpoint:\n  messages: 0\n  minutes: -5\n\
              folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n",
@@ -856,7 +905,7 @@ mod tests {
             FixOutcome::Fixed(msg) => assert!(msg.contains("checkpoint"), "msg: {msg}"),
             other => panic!("expected Fixed, got: {other:?}"),
         }
-        let after = fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert!(after.contains("messages: 15"));
         assert!(after.contains("minutes: 30"));
     }
@@ -866,13 +915,13 @@ mod tests {
         let d = tempdir().unwrap();
         let clean = "update_channel: stable\n\
                      folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n";
-        fs::write(d.path().join("vault.yml"), clean).unwrap();
+        fs::write(d.path().join("onebrain.yml"), clean).unwrap();
         let outcome = fix_vault_yml_keys(d.path(), false);
         match outcome {
             FixOutcome::Fixed(msg) => assert!(msg.contains("already"), "msg: {msg}"),
             other => panic!("expected Fixed (no-op), got: {other:?}"),
         }
-        let after = fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert_eq!(after, clean, "file untouched when nothing to do");
     }
 
@@ -921,6 +970,56 @@ mod tests {
             FixOutcome::Fixed(msg) => assert!(msg.contains("already clean"), "msg: {msg}"),
             other => panic!("expected Fixed (no-op), got: {other:?}"),
         }
+    }
+
+    /// v3.1 dual-read transition · `vault-config-migration` recipe must
+    /// atomically rename `vault.yml` → `onebrain.yml` and leave the rest
+    /// of the vault untouched.
+    #[test]
+    fn fix_vault_config_migration_renames_legacy_to_canonical() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("vault.yml"), "qmd_collection: legacy\n").unwrap();
+        let outcome = fix_vault_config_migration(d.path(), false);
+        match outcome {
+            FixOutcome::Fixed(msg) => assert!(msg.contains("renamed"), "msg: {msg}"),
+            other => panic!("expected Fixed, got: {other:?}"),
+        }
+        assert!(d.path().join("onebrain.yml").is_file());
+        assert!(!d.path().join("vault.yml").exists());
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after, "qmd_collection: legacy\n");
+    }
+
+    #[test]
+    fn fix_vault_config_migration_idempotent_when_only_canonical_exists() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("onebrain.yml"), "qmd_collection: ob\n").unwrap();
+        let outcome = fix_vault_config_migration(d.path(), false);
+        match outcome {
+            FixOutcome::Fixed(msg) => {
+                assert!(msg.contains("nothing to migrate"), "msg: {msg}")
+            }
+            other => panic!("expected Fixed (no-op), got: {other:?}"),
+        }
+        assert!(d.path().join("onebrain.yml").is_file());
+        assert!(!d.path().join("vault.yml").exists());
+    }
+
+    #[test]
+    fn fix_vault_config_migration_when_both_exist_keeps_canonical() {
+        // Split state: canonical wins, legacy removed.
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("onebrain.yml"), "canonical: yes\n").unwrap();
+        fs::write(d.path().join("vault.yml"), "legacy: yes\n").unwrap();
+        let outcome = fix_vault_config_migration(d.path(), false);
+        match outcome {
+            FixOutcome::Fixed(msg) => assert!(msg.contains("removed stale"), "msg: {msg}"),
+            other => panic!("expected Fixed, got: {other:?}"),
+        }
+        // Canonical preserved verbatim · legacy gone.
+        let canonical = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(canonical, "canonical: yes\n");
+        assert!(!d.path().join("vault.yml").exists());
     }
 
     #[test]
