@@ -27,6 +27,11 @@ struct Cmd<'a> {
     /// (`{"orphan_count":N}` or `{"decision":"block",...}`). False for
     /// commands that emit the canonical v3.1 envelope.
     hook_protocol_shape: bool,
+    /// True when the matrix entry deliberately exercises an error path
+    /// (e.g. `doctor` outside a vault) where the binary exits non-zero but
+    /// the stdout payload is still the structured failure envelope we care
+    /// about. Without this, `run()` would panic on `assert!(success)`.
+    allow_nonzero_exit: bool,
 }
 
 fn no_setup(_: &std::path::Path) {}
@@ -47,18 +52,39 @@ const COMMANDS: &[Cmd<'static>] = &[
         args: &["session", "init"],
         cwd_setup: no_setup,
         hook_protocol_shape: true,
+        allow_nonzero_exit: false,
     },
     Cmd {
         name: "session init · inside vault",
         args: &["session", "init"],
         cwd_setup: write_vault_yml,
         hook_protocol_shape: true,
+        allow_nonzero_exit: false,
     },
     Cmd {
         name: "checkpoint orphans · empty",
         args: &["checkpoint", "orphans", ".", "tokABC123"],
         cwd_setup: write_checkpoint_dir,
         hook_protocol_shape: true,
+        allow_nonzero_exit: false,
+    },
+    Cmd {
+        name: "harness · empty dir",
+        args: &["harness"],
+        // No setup — empty cwd → `direct` harness detected.
+        cwd_setup: no_setup,
+        hook_protocol_shape: true,
+        allow_nonzero_exit: false,
+    },
+    Cmd {
+        name: "doctor · no vault (error path)",
+        args: &["doctor"],
+        // No vault → exits 1 with structured error envelope; matrix's
+        // `run` tolerates non-success when output is the structured
+        // failure shape (see allow_nonzero_exit below).
+        cwd_setup: no_setup,
+        hook_protocol_shape: false,
+        allow_nonzero_exit: true,
     },
 ];
 
@@ -194,14 +220,28 @@ fn run(c: &Cmd<'_>, format_flags: &[&str]) -> String {
         .env("NO_COLOR", "1")
         .output()
         .expect("spawn failed");
-    assert!(
-        output.status.success(),
-        "[{} {:?}] non-zero exit: {:?}\nstderr: {}",
-        c.name,
-        format_flags,
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
+    if !c.allow_nonzero_exit {
+        assert!(
+            output.status.success(),
+            "[{} {:?}] non-zero exit: {:?}\nstderr: {}",
+            c.name,
+            format_flags,
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    } else {
+        // Error-path entries (e.g. doctor outside a vault) must still
+        // emit *something* on stdout — silent non-zero defeats the
+        // structured-error promise.
+        assert!(
+            !output.stdout.is_empty()
+                || matches!(format_flags, &[] | &["--pretty"]),
+            "[{} {:?}] non-zero exit with empty stdout — structured error envelope expected\nstderr: {}",
+            c.name,
+            format_flags,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     String::from_utf8(output.stdout).expect("non-utf8 stdout")
 }
 

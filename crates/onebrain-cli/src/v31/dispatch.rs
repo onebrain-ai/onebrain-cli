@@ -72,11 +72,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             std::process::exit(code);
         }
         Cmd::Update(a) => {
-            let code = commands::update::run(a.check, a.fresh, a.json, a.plan)?;
+            let code = commands::update::run(a.check, a.fresh, a.json, a.plan, &mode)?;
             std::process::exit(code);
         }
         Cmd::Doctor(a) => {
-            let code = commands::doctor::run(a.fix, a.json, vault_flag.clone())?;
+            let code = commands::doctor::run(a.fix, a.json, vault_flag.clone(), &mode)?;
             std::process::exit(code);
         }
 
@@ -244,7 +244,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         // (`onebrain harness` with no verb was the only v3.0 flat invocation
         // remaining after the v3.1 tree rename).
         Cmd::Harness(HarnessCmd { verb }) => match verb.unwrap_or(HarnessVerb::Detect) {
-            HarnessVerb::Detect => commands::harness::run(),
+            HarnessVerb::Detect => commands::harness::run(&mode),
         },
 
         // ───── Stub-only resource groups ────────────────────────────

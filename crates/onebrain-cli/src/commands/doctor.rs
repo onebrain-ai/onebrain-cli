@@ -8,6 +8,8 @@
 //! action per check); anything ambiguous is reported as "untouched · run
 //! the listed command yourself".
 
+use crate::legacy_output::serialize_for_mode;
+use crate::output::OutputMode;
 use crate::safety::refuse_dangerous_vault_path;
 use crate::vault_ctx;
 use anyhow::{anyhow, Result};
@@ -46,20 +48,30 @@ enum FixOutcome {
 /// env > walk-up from cwd. This matches `vault current` / every other
 /// v3.1 vault-aware command so `onebrain doctor --vault PATH` works from
 /// outside the vault directory.
-pub fn run(fix: bool, json: bool, vault_flag: Option<PathBuf>) -> Result<i32> {
+pub fn run(
+    fix: bool,
+    json: bool,
+    vault_flag: Option<PathBuf>,
+    mode: &OutputMode,
+) -> Result<i32> {
+    // v3.1: structured output is triggered by EITHER the local `--json`
+    // flag (back-compat with v3.0 callers) OR any global format flag
+    // (`--yaml`, `--output yaml`, …). `mode.is_structured()` catches every
+    // non-text variant so `--yaml` no longer silently emits text.
+    let want_structured = json || mode.is_structured();
     let vault_root = match vault_ctx::resolve(vault_flag)? {
         Some(r) => r.root,
         None => {
-            // In JSON mode, emit a structured failure envelope on stdout so
-            // scripted consumers don't have to parse anyhow text from stderr.
-            // Plain-text mode keeps the existing anyhow flow.
-            if json {
+            // In structured mode, emit a failure envelope on stdout so
+            // scripted consumers don't have to parse anyhow text from
+            // stderr. Plain-text mode keeps the existing anyhow flow.
+            if want_structured {
                 let doc = serde_json::json!({
                     "ok": false,
                     "error": "not_in_vault",
                     "message": "not inside a vault (no onebrain.yml or vault.yml found)",
                 });
-                println!("{}", serde_json::to_string(&doc)?);
+                println!("{}", emit_structured(&doc, json, mode)?);
                 return Ok(1);
             }
             return Err(anyhow!(
@@ -80,7 +92,7 @@ pub fn run(fix: bool, json: bool, vault_flag: Option<PathBuf>) -> Result<i32> {
     });
 
     let mut results = run_all_checks(vault_root.as_path(), &config);
-    if !json {
+    if !want_structured {
         print_report(&results, std::io::stdout())?;
     }
 
@@ -98,21 +110,26 @@ pub fn run(fix: bool, json: bool, vault_flag: Option<PathBuf>) -> Result<i32> {
             .filter(|r| matches!(r.status, DoctorStatus::Warn | DoctorStatus::Error))
             .collect();
         if issues.is_empty() {
-            if !json {
+            if !want_structured {
                 println!("\nFix · nothing to do — no issues.");
             }
         } else {
-            if !json {
+            if !want_structured {
                 println!("\nFix · attempting recipes for {} issue(s)", issues.len());
             }
             let outcomes: Vec<(String, FixOutcome)> = issues
                 .iter()
-                .map(|r| (r.check.clone(), attempt_fix(r, vault_root.as_path(), json)))
+                .map(|r| {
+                    (
+                        r.check.clone(),
+                        attempt_fix(r, vault_root.as_path(), want_structured),
+                    )
+                })
                 .collect();
             any_recipe_failed = outcomes
                 .iter()
                 .any(|(_, o)| matches!(o, FixOutcome::Failed(_)));
-            if json {
+            if want_structured {
                 fix_outcomes_json = outcomes
                     .iter()
                     .map(|(check, o)| {
@@ -134,7 +151,7 @@ pub fn run(fix: bool, json: bool, vault_flag: Option<PathBuf>) -> Result<i32> {
                 println!();
             }
             results = run_all_checks(vault_root.as_path(), &config);
-            if !json {
+            if !want_structured {
                 print_report(&results, std::io::stdout())?;
             }
         }
@@ -144,11 +161,18 @@ pub fn run(fix: bool, json: bool, vault_flag: Option<PathBuf>) -> Result<i32> {
         .iter()
         .filter(|r| r.status == DoctorStatus::Error)
         .count();
-    if json {
+    if want_structured {
         // Always emit `fix[]` when --fix was requested so consumers can
         // distinguish "user didn't ask to fix" (key absent) from "user asked
         // but nothing to fix" (key present, empty array). Schema stability.
-        print_report_json(&results, fix, fix_outcomes_json, std::io::stdout())?;
+        print_report_structured(
+            &results,
+            fix,
+            fix_outcomes_json,
+            json,
+            mode,
+            std::io::stdout(),
+        )?;
     }
     // Exit non-zero on any post-fix error OR any failed recipe — so the
     // caller's shell-level `if $? -ne 0` catches both check escalations
@@ -173,10 +197,12 @@ pub fn run(fix: bool, json: bool, vault_flag: Option<PathBuf>) -> Result<i32> {
 /// — top-level `ok` is the boolean). The two fields are deliberately named
 /// differently to prevent the `summary.ok` count-vs-boolean confusion that
 /// the first draft of this code had.
-fn print_report_json<W: Write>(
+fn print_report_structured<W: Write>(
     results: &[DoctorResult],
     fix_requested: bool,
     fix_outcomes: Vec<serde_json::Value>,
+    legacy_json_flag: bool,
+    mode: &OutputMode,
     mut w: W,
 ) -> Result<()> {
     let total = results.len();
@@ -204,8 +230,34 @@ fn print_report_json<W: Write>(
             .expect("doctor json root is object")
             .insert("fix".to_string(), serde_json::Value::Array(fix_outcomes));
     }
-    writeln!(w, "{}", serde_json::to_string(&doc)?)?;
+    writeln!(w, "{}", emit_structured(&doc, legacy_json_flag, mode)?)?;
     Ok(())
+}
+
+/// Render `doc` for the active structured-output mode.
+///
+/// v3.1 contract:
+/// - `--yaml` / `--output yaml` (`mode.is_structured()` AND mode is YAML) →
+///   YAML serialisation via [`serialize_for_mode`].
+/// - `--json --pretty` / `--output json` with pretty → indented JSON via
+///   the same dispatcher.
+/// - Bare `--json` (legacy `json: bool`, no global format flag) → compact
+///   JSON byte-identical to v3.0 output so scripted consumers don't drift.
+fn emit_structured(
+    doc: &serde_json::Value,
+    legacy_json_flag: bool,
+    mode: &OutputMode,
+) -> Result<String> {
+    if mode.is_structured() {
+        Ok(serialize_for_mode(doc, mode))
+    } else if legacy_json_flag {
+        Ok(serde_json::to_string(doc)?)
+    } else {
+        // Caller only invokes this when `want_structured` is true, so one
+        // of the two branches above always wins. Defensive: fall back to
+        // compact JSON rather than panicking on an unreachable arm.
+        Ok(serde_json::to_string(doc)?)
+    }
 }
 
 /// Dispatch the warning to the matching fix recipe. The match keys on
@@ -752,15 +804,31 @@ mod tests {
         assert!(s.contains("fix before using"));
     }
 
+    /// Compact-JSON mode (v3.0 back-compat shape) used by `--json` callers.
+    fn legacy_json_compat_mode() -> OutputMode {
+        OutputMode::Text {
+            color: false,
+            pretty: false,
+        }
+    }
+
     #[test]
-    fn print_report_json_emits_summary_and_top_level_ok() {
+    fn print_report_structured_emits_summary_and_top_level_ok() {
         let results = vec![
             DoctorResult::ok("a", "good"),
             DoctorResult::ok("b", "good"),
             DoctorResult::warn("c", "iffy"),
         ];
         let mut buf = Vec::new();
-        print_report_json(&results, false, vec![], &mut buf).unwrap();
+        print_report_structured(
+            &results,
+            false,
+            vec![],
+            true,
+            &legacy_json_compat_mode(),
+            &mut buf,
+        )
+        .unwrap();
         let s = String::from_utf8(buf).unwrap();
         let doc: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
         // Top-level `ok` is boolean (no errors → true even with warnings).
@@ -775,30 +843,46 @@ mod tests {
     }
 
     #[test]
-    fn print_report_json_ok_false_when_any_error() {
+    fn print_report_structured_ok_false_when_any_error() {
         let results = vec![DoctorResult::error("a", "broken")];
         let mut buf = Vec::new();
-        print_report_json(&results, false, vec![], &mut buf).unwrap();
+        print_report_structured(
+            &results,
+            false,
+            vec![],
+            true,
+            &legacy_json_compat_mode(),
+            &mut buf,
+        )
+        .unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(doc["ok"], false);
         assert_eq!(doc["summary"]["errors"], 1);
     }
 
     #[test]
-    fn print_report_json_emits_empty_fix_array_when_requested_with_no_issues() {
+    fn print_report_structured_emits_empty_fix_array_when_requested_with_no_issues() {
         // The A-H2 regression case from the alpha.8 review: `fix[]` must
         // appear (even empty) so consumers can distinguish "user didn't
         // ask" from "user asked but nothing to fix".
         let results = vec![DoctorResult::ok("vault.yml", "valid")];
         let mut buf = Vec::new();
-        print_report_json(&results, true, vec![], &mut buf).unwrap();
+        print_report_structured(
+            &results,
+            true,
+            vec![],
+            true,
+            &legacy_json_compat_mode(),
+            &mut buf,
+        )
+        .unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert!(doc.get("fix").is_some());
         assert_eq!(doc["fix"].as_array().unwrap().len(), 0);
     }
 
     #[test]
-    fn print_report_json_carries_fix_outcomes_through() {
+    fn print_report_structured_carries_fix_outcomes_through() {
         let results = vec![DoctorResult::ok("vault.yml", "valid")];
         let outcomes = vec![serde_json::json!({
             "check": "qmd-embeddings",
@@ -806,23 +890,85 @@ mod tests {
             "message": "qmd embed completed",
         })];
         let mut buf = Vec::new();
-        print_report_json(&results, true, outcomes, &mut buf).unwrap();
+        print_report_structured(
+            &results,
+            true,
+            outcomes,
+            true,
+            &legacy_json_compat_mode(),
+            &mut buf,
+        )
+        .unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(doc["fix"][0]["outcome"], "fixed");
         assert_eq!(doc["fix"][0]["check"], "qmd-embeddings");
     }
 
     #[test]
-    fn print_report_json_serializes_check_hint_and_details() {
+    fn print_report_structured_serializes_check_hint_and_details() {
         let results = vec![DoctorResult::warn("c", "iffy")
             .with_hint("Try X")
             .with_details(vec!["d1".into(), "d2".into()])];
         let mut buf = Vec::new();
-        print_report_json(&results, false, vec![], &mut buf).unwrap();
+        print_report_structured(
+            &results,
+            false,
+            vec![],
+            true,
+            &legacy_json_compat_mode(),
+            &mut buf,
+        )
+        .unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(doc["checks"][0]["status"], "warn");
         assert_eq!(doc["checks"][0]["hint"], "Try X");
         assert_eq!(doc["checks"][0]["details"][1], "d2");
+    }
+
+    /// v3.1 regression guard: doctor must honor `--yaml` and emit YAML, not
+    /// the bare JSON envelope (the bug the user found in alpha smoke).
+    #[test]
+    fn print_report_structured_yaml_mode_emits_yaml_not_json() {
+        let results = vec![DoctorResult::ok("a", "good")];
+        let mut buf = Vec::new();
+        print_report_structured(
+            &results,
+            false,
+            vec![],
+            false,
+            &OutputMode::Yaml,
+            &mut buf,
+        )
+        .unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            !s.trim_start().starts_with('{'),
+            "yaml mode emitted JSON braces: {s}"
+        );
+        let v: serde_yaml::Value =
+            serde_yaml::from_str(&s).expect("yaml mode output must parse as YAML");
+        assert!(v.is_mapping(), "yaml root must be a mapping, got {v:?}");
+    }
+
+    /// v3.1 regression guard: doctor must honor `--json --pretty` and indent.
+    #[test]
+    fn print_report_structured_pretty_json_is_multiline_indented() {
+        let results = vec![DoctorResult::ok("a", "good")];
+        let mut buf = Vec::new();
+        print_report_structured(
+            &results,
+            false,
+            vec![],
+            false,
+            &OutputMode::Json { pretty: true },
+            &mut buf,
+        )
+        .unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains('\n'), "pretty JSON must be multiline: {s}");
+        assert!(s.contains("  "), "pretty JSON must be indented: {s}");
+        let _v: serde_json::Value =
+            serde_json::from_str(s.trim()).expect("still parseable as JSON");
     }
 
     use std::fs;

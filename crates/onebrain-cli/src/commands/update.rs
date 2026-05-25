@@ -9,6 +9,8 @@
 //! - **Plain** (non-TTY, non-JSON — CI, redirected output): unchanged
 //!   line-by-line output, no ANSI escapes, no spinner.
 
+use crate::legacy_output::serialize_for_mode;
+use crate::output::OutputMode;
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use is_terminal::IsTerminal;
@@ -34,18 +36,22 @@ const ANSI_DIM: &str = "\x1b[2m";
 /// document with the version delta. `plan = true` implies dry-run mode and
 /// emits a richer plan document (release URL + binary URL) suitable for the
 /// `/update` plugin skill — no install happens.
-pub fn run(check: bool, fresh: bool, json: bool, plan: bool) -> Result<i32> {
+pub fn run(check: bool, fresh: bool, json: bool, plan: bool, mode: &OutputMode) -> Result<i32> {
     // `--plan` implies dry-run — never install when the caller asked for a
     // plan document. `clap`'s `conflicts_with = "check"` blocks the user
     // from setting both flags, so this is the only place `--plan` can flip
     // dry-run on.
     let dry_run = check || plan;
-    let want_json = json || plan;
-    let want_tty = !want_json && std::io::stdout().is_terminal();
+    // v3.1: structured output is triggered by EITHER the local `--json`/
+    // `--plan` flags (back-compat with v3.0 callers) OR any global format
+    // flag (`--yaml`, `--output yaml`, …). `mode.is_structured()` catches
+    // every non-text variant so `--yaml` no longer silently emits text.
+    let want_structured = json || plan || mode.is_structured();
+    let want_tty = !want_structured && std::io::stdout().is_terminal();
 
-    let opts = if want_json {
-        // Suppress the orchestrator's plain-text log lines — JSON mode
-        // produces exactly one document on stdout.
+    let opts = if want_structured {
+        // Suppress the orchestrator's plain-text log lines — structured
+        // mode produces exactly one document on stdout.
         UpdateOptions {
             check: dry_run,
             fresh,
@@ -65,9 +71,18 @@ pub fn run(check: bool, fresh: bool, json: bool, plan: bool) -> Result<i32> {
 
     let result = run_update(opts);
 
-    if want_json {
+    if want_structured {
         let doc = build_json_document(&result, plan);
-        println!("{}", serde_json::to_string(&doc)?);
+        // When the only signal was the local `--json` / `--plan` flag, fall
+        // back to compact JSON so v3.0 callers see byte-identical output.
+        // Global format flags (`--yaml`, `--pretty`, …) go through the
+        // canonical dispatcher.
+        let rendered = if mode.is_structured() {
+            serialize_for_mode(&doc, mode)
+        } else {
+            serde_json::to_string(&doc)?
+        };
+        println!("{}", rendered);
     }
 
     Ok(result.exit_code)

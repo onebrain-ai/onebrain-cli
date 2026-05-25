@@ -133,12 +133,17 @@ const BANNER_VISUAL_WIDTH: usize = 32;
 /// Each art line is wrapped in its gradient-step escape from
 /// [`BANNER_GRADIENT`] (light at the top → dark at the bottom) followed by
 /// `ANSI_RESET`. The tagline is wrapped in `ANSI_DIM ... ANSI_RESET` so the
-/// terminal state is always clean after the banner. Two trailing newlines
-/// are appended — one terminates the tagline line, the second adds a blank
-/// line between the banner and whatever help body follows.
+/// terminal state is always clean after the banner. One leading newline
+/// separates the banner from the previous shell prompt so it doesn't crowd
+/// the user's command line; two trailing newlines — one terminates the
+/// tagline line, the second adds a blank line between the banner and
+/// whatever help body follows.
 pub fn render_banner() -> String {
     let version = env!("CARGO_PKG_VERSION");
     let mut out = String::with_capacity(1024);
+    // Breathing room above the banner so it doesn't visually butt up against
+    // the prompt line that invoked it.
+    out.push('\n');
     for i in 0..BANNER_ONE_ART.len() {
         let one_shade = BANNER_ONE_GRADIENT
             .get(i)
@@ -582,12 +587,19 @@ mod tests {
 
     #[test]
     fn banner_renders_3_line_art_plus_tagline() {
-        // 5 lines: 3 art + 1 tagline + 1 blank-line spacer between banner
-        // and help body. `render_banner` ends with two trailing newlines so
-        // `str::lines()` yields 5 elements (4 content + 1 empty).
+        // 6 lines: 1 leading blank spacer + 3 art + 1 tagline + 1 trailing
+        // blank spacer between banner and help body. `render_banner` starts
+        // with a newline (breathing room above) and ends with two trailing
+        // newlines, so `str::lines()` yields 6 elements (1 leading empty + 4
+        // content + 1 trailing empty).
         let s = render_banner();
         let lines: Vec<&str> = s.lines().collect();
-        assert_eq!(lines.len(), 5, "expected 5 banner lines, got {lines:?}");
+        assert_eq!(lines.len(), 6, "expected 6 banner lines, got {lines:?}");
+        assert_eq!(
+            lines[0], "",
+            "expected blank leading spacer, got {:?}",
+            lines[0]
+        );
         assert_eq!(BANNER_ONE_ART.len(), 3, "ONE art block should be 3 lines");
         assert_eq!(
             BANNER_BRAIN_ART.len(),
@@ -595,25 +607,29 @@ mod tests {
             "BRAIN art block should be 3 lines"
         );
         // Each rendered art line should contain both halves recolored.
+        // Art lives on lines 1..=3 (after the leading blank).
         for i in 0..3 {
+            let rendered = lines[i + 1];
             assert!(
-                lines[i].contains(BANNER_ONE_ART[i]),
-                "rendered line {i} ({:?}) missing ONE half ({:?})",
-                lines[i],
+                rendered.contains(BANNER_ONE_ART[i]),
+                "rendered line {} ({:?}) missing ONE half ({:?})",
+                i + 1,
+                rendered,
                 BANNER_ONE_ART[i]
             );
             assert!(
-                lines[i].contains(BANNER_BRAIN_ART[i]),
-                "rendered line {i} ({:?}) missing BRAIN half ({:?})",
-                lines[i],
+                rendered.contains(BANNER_BRAIN_ART[i]),
+                "rendered line {} ({:?}) missing BRAIN half ({:?})",
+                i + 1,
+                rendered,
                 BANNER_BRAIN_ART[i]
             );
         }
-        // Tagline on line 4 (index 3).
+        // Tagline on line 5 (index 4).
         assert!(
-            lines[3].contains("Your AI Thinking Partner"),
-            "expected tagline on line 4, got {:?}",
-            lines[3]
+            lines[4].contains("Your AI Thinking Partner"),
+            "expected tagline on line 5, got {:?}",
+            lines[4]
         );
     }
 

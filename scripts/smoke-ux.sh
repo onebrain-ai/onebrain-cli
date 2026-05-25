@@ -5,16 +5,26 @@
 # matters for human + machine consumers. Capture the output and paste it
 # into the PR / release notes for review.
 #
-# Override the binary path with ONEBRAIN_BIN=… (default: ./target/debug/onebrain).
+# Override the binary path with ONEBRAIN_BIN=… (default: pick release if
+# present, else debug; build debug as a last resort).
 
 set -euo pipefail
 
-BIN="${ONEBRAIN_BIN:-./target/debug/onebrain}"
+if [[ -n "${ONEBRAIN_BIN:-}" ]]; then
+    BIN="$ONEBRAIN_BIN"
+elif [[ -x ./target/release/onebrain ]]; then
+    BIN=./target/release/onebrain
+else
+    BIN=./target/debug/onebrain
+fi
 
 if [[ ! -x "$BIN" ]]; then
     echo "Building $BIN..." >&2
     cargo build --bin onebrain >&2
 fi
+
+# Absolute path so subshells that `cd` elsewhere can still find the binary.
+BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
 
 run() {
     echo
@@ -42,6 +52,7 @@ run plugin --help
 # come back?" — review by eye.
 run session init
 run checkpoint orphans . tokSMOKE
+run harness
 
 # ── Structured-output modes ────────────────────────────────────────────────
 run session init --json
@@ -51,6 +62,18 @@ run session init --output json
 run session init --output yaml
 run checkpoint orphans . tokSMOKE --json
 run checkpoint orphans . tokSMOKE --yaml
+run harness --json
+run harness --yaml
+run harness --json --pretty
+
+# ── Doctor + update · honor every format flag (v3.1 regression check) ──────
+# Run from /tmp so doctor takes the no-vault error path (structured envelope).
+(cd /tmp && "$BIN" doctor --json 2>&1 | head -3 || true)
+(cd /tmp && "$BIN" doctor --yaml 2>&1 | head -5 || true)
+(cd /tmp && "$BIN" doctor --json --pretty 2>&1 | head -8 || true)
+run update --json
+run update --yaml
+run update --json --pretty
 
 # ── Error paths · text vs JSON ─────────────────────────────────────────────
 # Run from /tmp explicitly — guaranteed no-vault.
