@@ -80,37 +80,23 @@ pub enum Cmd {
     // are marked `hide = true` so they don't clutter `onebrain --help`. The
     // tree shape stays locked per spec §2.4 — typed commands still parse and
     // dispatch (returning exit 72), they just don't advertise in help.
-    #[command(hide = true)]
     Avatar(AvatarCmd),
-    #[command(hide = true)]
     Bookmark(BookmarkCmd),
-    #[command(hide = true)]
     Bundle(BundleCmd),
     #[command(display_order = 12)]
     Checkpoint(CheckpointCmd),
-    #[command(hide = true)]
     Config(ConfigCmd),
-    #[command(hide = true)]
     Daemon(DaemonCmd),
-    #[command(hide = true)]
     Date(DateCmd),
-    #[command(hide = true)]
     Dream(DreamCmd),
-    #[command(hide = true)]
     Frontmatter(FrontmatterCmd),
-    #[command(hide = true)]
     Gateway(GatewayCmd),
     #[command(display_order = 13)]
     Harness(HarnessCmd),
-    #[command(hide = true)]
     Inbox(InboxCmd),
-    #[command(hide = true)]
     Log(LogCmd),
-    #[command(hide = true)]
     Memory(MemoryCmd),
-    #[command(hide = true)]
     Note(NoteCmd),
-    #[command(hide = true)]
     Pause(PauseCmd),
     #[command(display_order = 20)]
     Plugin(PluginCmd),
@@ -118,13 +104,11 @@ pub enum Cmd {
     Qmd(QmdCmd),
     #[command(display_order = 21)]
     Schedule(ScheduleCmd),
-    #[command(hide = true)]
     Serve(ServeCmd),
     #[command(display_order = 11)]
     Session(SessionCmd),
     #[command(display_order = 23)]
     Skill(SkillCmd),
-    #[command(hide = true)]
     Task(TaskCmd),
     #[command(display_order = 10)]
     Vault(VaultCmd),
@@ -202,10 +186,15 @@ pub struct AvatarCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum AvatarVerb {
+    /// Start the avatar mesh (not yet implemented · v3.x roadmap).
     Start,
+    /// Pair with another avatar node (not yet implemented · v3.x roadmap).
     Pair,
+    /// Show avatar status (not yet implemented · v3.x roadmap).
     Status,
+    /// Revoke an existing avatar pairing (not yet implemented · v3.x roadmap).
     Revoke,
+    /// Run avatar diagnostics (not yet implemented · v3.x roadmap).
     Doctor,
 }
 
@@ -220,8 +209,11 @@ pub struct BookmarkCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum BookmarkVerb {
+    /// List saved bookmarks (not yet implemented · v3.x roadmap).
     List,
+    /// Get a bookmark by id (not yet implemented · v3.x roadmap).
     Get { id: String },
+    /// Import a bookmark file (not yet implemented · v3.x roadmap).
     Import { source: PathBuf },
 }
 
@@ -237,13 +229,21 @@ pub struct BundleCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum BundleVerb {
+    /// Install a bundle (not yet implemented · v3.x roadmap).
     Install { name: String },
+    /// Print bundle help text (not yet implemented · v3.x roadmap).
     Help { name: String },
+    /// Print bundle metadata (not yet implemented · v3.x roadmap).
     Info { name: String },
+    /// Scaffold a new bundle (not yet implemented · v3.x roadmap).
     Init { name: String },
+    /// Lint a bundle (not yet implemented · v3.x roadmap).
     Lint { name: String },
+    /// Update a bundle (not yet implemented · v3.x roadmap).
     Update { name: String },
+    /// Remove an installed bundle (not yet implemented · v3.x roadmap).
     Remove { name: String },
+    /// Run bundle diagnostics (not yet implemented · v3.x roadmap).
     Doctor,
 }
 
@@ -259,19 +259,19 @@ pub struct CheckpointCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum CheckpointVerb {
-    /// Write a checkpoint file for the current session (Stop hook).
+    /// Auto-save checkpoint metadata · used by Claude Code's Stop hook.
     Stop {
         /// Vault root override.
         #[arg(long = "vault-dir", value_name = "PATH")]
         vault_dir: Option<PathBuf>,
     },
-    /// Reset checkpoint counter (Stop hook reset).
+    /// Reset the checkpoint cadence counter · used by /wrapup skill.
     Reset {
         /// Vault root override.
         #[arg(long = "vault-dir", value_name = "PATH")]
         vault_dir: Option<PathBuf>,
     },
-    /// Scan for orphan checkpoint files (replaces v3.0 `orphan-scan`).
+    /// Find orphan checkpoints needing /wrapup synthesis · used by SessionStart hook.
     Orphans {
         /// 07-logs/ folder path inside the vault.
         logs_folder: String,
@@ -291,9 +291,13 @@ pub struct ConfigCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum ConfigVerb {
+    /// Read a config value (not yet implemented · v3.x roadmap).
     Get { key: String },
+    /// Write a config value (not yet implemented · v3.x roadmap).
     Set { key: String, value: String },
+    /// List all config keys (not yet implemented · v3.x roadmap).
     List,
+    /// Initialize a default config (not yet implemented · v3.x roadmap).
     Init,
 }
 
@@ -308,8 +312,11 @@ pub struct DaemonCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum DaemonVerb {
+    /// Start the OneBrain daemon (not yet implemented · v3.x roadmap).
     Start,
+    /// Stop the running daemon (not yet implemented · v3.x roadmap).
     Stop,
+    /// Report daemon status (not yet implemented · v3.x roadmap).
     Status,
 }
 
@@ -324,9 +331,13 @@ pub struct DateCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum DateVerb {
+    /// Print today's date (not yet implemented · v3.x roadmap).
     Today,
+    /// Print the current datetime (not yet implemented · v3.x roadmap).
     Now,
+    /// Format a datetime string (not yet implemented · v3.x roadmap).
     Format { input: String, fmt: String },
+    /// Parse a datetime string (not yet implemented · v3.x roadmap).
     Parse { input: String },
 }
 
@@ -341,9 +352,13 @@ pub struct DreamCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum DreamVerb {
+    /// List active dreams (not yet implemented · v3.x roadmap).
     List,
+    /// Tick a dream forward (not yet implemented · v3.x roadmap).
     Tick { id: String },
+    /// Mark a dream done (not yet implemented · v3.x roadmap).
     Done { id: String },
+    /// Snooze a dream until a date (not yet implemented · v3.x roadmap).
     Snooze { id: String, until: String },
 }
 
@@ -358,13 +373,11 @@ pub struct FrontmatterCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum FrontmatterVerb {
-    Parse {
-        path: PathBuf,
-    },
-    Extract {
-        path: PathBuf,
-        key: String,
-    },
+    /// Parse and print a note's frontmatter (not yet implemented · v3.x roadmap).
+    Parse { path: PathBuf },
+    /// Extract a single frontmatter key (not yet implemented · v3.x roadmap).
+    Extract { path: PathBuf, key: String },
+    /// Update a frontmatter key (not yet implemented · v3.x roadmap).
     Update {
         path: PathBuf,
         key: String,
@@ -383,7 +396,9 @@ pub struct GatewayCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum GatewayVerb {
+    /// Telegram gateway (not yet implemented · v3.x roadmap).
     Telegram,
+    /// MCP gateway (not yet implemented · v3.x roadmap).
     Mcp,
 }
 
@@ -419,8 +434,11 @@ pub struct InboxCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum InboxVerb {
+    /// List inbox items (not yet implemented · v3.x roadmap).
     List,
+    /// Show the next inbox item to process (not yet implemented · v3.x roadmap).
     Next,
+    /// Process an inbox item (not yet implemented · v3.x roadmap).
     Process { id: Option<String> },
 }
 
@@ -435,15 +453,13 @@ pub struct LogCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum LogVerb {
-    Query {
-        pattern: String,
-    },
-    #[command(hide = true)]
-    Append {
-        entry: String,
-    },
-    #[command(hide = true)]
+    /// Query session/skill logs (not yet implemented · v3.x roadmap).
+    Query { pattern: String },
+    /// Append a log entry (not yet implemented · v3.x roadmap).
+    Append { entry: String },
+    /// Rotate log files (not yet implemented · v3.x roadmap).
     Rotate,
+    /// Print log statistics (not yet implemented · v3.x roadmap).
     Stats,
 }
 
@@ -458,11 +474,17 @@ pub struct MemoryCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum MemoryVerb {
+    /// List memory entries (not yet implemented · v3.x roadmap).
     List,
+    /// Add a memory entry (not yet implemented · v3.x roadmap).
     Add { topic: String, content: String },
+    /// Update a memory entry (not yet implemented · v3.x roadmap).
     Update { id: String, content: String },
+    /// Remove a memory entry (not yet implemented · v3.x roadmap).
     Remove { id: String },
+    /// Promote a session insight into memory/ (not yet implemented · v3.x roadmap).
     Promote { id: String },
+    /// Rebuild the MEMORY-INDEX.md (not yet implemented · v3.x roadmap).
     Index,
 }
 
@@ -477,16 +499,27 @@ pub struct NoteCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum NoteVerb {
+    /// Search notes by content (not yet implemented · v3.x roadmap).
     Search { pattern: String },
+    /// List notes (not yet implemented · v3.x roadmap).
     List,
+    /// Find notes by filename pattern (not yet implemented · v3.x roadmap).
     Find { pattern: String },
+    /// Read a note's contents (not yet implemented · v3.x roadmap).
     Read { path: PathBuf },
+    /// Append content to a note (not yet implemented · v3.x roadmap).
     Append { path: PathBuf, content: String },
+    /// Create a new note (not yet implemented · v3.x roadmap).
     New { title: String },
+    /// Move a note (not yet implemented · v3.x roadmap).
     Move { from: PathBuf, to: PathBuf },
+    /// Archive a note (not yet implemented · v3.x roadmap).
     Archive { path: PathBuf },
+    /// List backlinks to a note (not yet implemented · v3.x roadmap).
     Backlinks { path: PathBuf },
+    /// List orphan notes (not yet implemented · v3.x roadmap).
     Orphans,
+    /// Print note statistics (not yet implemented · v3.x roadmap).
     Stat { path: PathBuf },
 }
 
@@ -501,8 +534,11 @@ pub struct PauseCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum PauseVerb {
+    /// List pause snapshots (not yet implemented · v3.x roadmap).
     List,
+    /// Write a pause snapshot for the active thread (not yet implemented · v3.x roadmap).
     Snapshot { slug: String },
+    /// Resume a paused thread (not yet implemented · v3.x roadmap).
     Resume { slug: Option<String> },
 }
 
@@ -518,8 +554,7 @@ pub struct PluginCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum PluginVerb {
-    /// Install plugin into vault (hidden · called by `init`/`plugin update`).
-    #[command(hide = true)]
+    /// Install plugin into the current vault · called by `init` and `plugin update`.
     Install {
         /// Optional vault root override.
         #[arg(long = "vault-dir", value_name = "PATH")]
@@ -528,8 +563,7 @@ pub enum PluginVerb {
         #[arg(long)]
         branch: Option<String>,
     },
-    /// Uninstall plugin (placeholder · not yet implemented).
-    #[command(hide = true)]
+    /// Uninstall plugin (not yet implemented · v3.x roadmap).
     Uninstall,
     /// Pull plugin from GitHub · rewrite hooks · rebind launchd plists.
     Update {
@@ -543,8 +577,7 @@ pub enum PluginVerb {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Run a one-shot vault migration (hidden · called by `plugin update`).
-    #[command(hide = true)]
+    /// Run a one-shot vault migration · called by `plugin update`.
     Migrate {
         name: String,
         cutoff_date: Option<String>,
@@ -553,11 +586,9 @@ pub enum PluginVerb {
         #[arg(long = "vault-dir")]
         vault: Option<PathBuf>,
     },
-    /// Plugin status (placeholder).
-    #[command(hide = true)]
+    /// Plugin install status (not yet implemented · v3.x roadmap).
     Status,
-    /// Verify plugin install (placeholder).
-    #[command(hide = true)]
+    /// Verify plugin install integrity (not yet implemented · v3.x roadmap).
     Verify,
 }
 
@@ -573,17 +604,15 @@ pub struct QmdCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum QmdVerb {
-    #[command(hide = true)]
+    /// Initial qmd setup wizard (not yet implemented · v3.x roadmap).
     Setup,
-    /// Re-embed documents (hidden · auto-fired by indexer hook).
-    #[command(hide = true)]
+    /// Re-embed documents (called by indexer hook · users can invoke manually).
     Embed,
-    #[command(hide = true)]
+    /// qmd index status (not yet implemented · v3.x roadmap).
     Status,
-    /// Rebuild the qmd search index (replaces v3.0 `qmd-reindex`).
-    #[command(hide = true)]
+    /// Rebuild the qmd search index · called by PostToolUse hook on vault writes (replaces v3.0 `qmd-reindex`).
     Reindex,
-    #[command(hide = true)]
+    /// Search the qmd index from CLI (not yet implemented · v3.x roadmap · use the MCP `query` tool meanwhile).
     Search { query: String },
 }
 
@@ -599,14 +628,13 @@ pub struct ScheduleCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum ScheduleVerb {
-    #[command(hide = true)]
+    /// List scheduled skills (not yet implemented · v3.x roadmap).
     List,
-    #[command(hide = true)]
+    /// Add a scheduled skill (not yet implemented · v3.x roadmap · edit `vault.yml` directly meanwhile).
     Add { skill: String },
-    #[command(hide = true)]
+    /// Remove a scheduled skill (not yet implemented · v3.x roadmap · edit `vault.yml` directly meanwhile).
     Remove { skill: String },
-    /// Re-write launchd plists (hidden · called by `plugin update`).
-    #[command(hide = true)]
+    /// Re-write launchd plists from `vault.yml` (or `onebrain.yml`) schedule block · called by `plugin update`.
     Register {
         /// Vault root override.
         #[arg(long = "vault-dir")]
@@ -630,7 +658,7 @@ pub enum ScheduleVerb {
         #[arg(long)]
         test: Option<String>,
     },
-    #[command(hide = true)]
+    /// Schedule status (not yet implemented · v3.x roadmap).
     Status,
 }
 
@@ -645,8 +673,11 @@ pub struct ServeCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum ServeVerb {
+    /// Start the HTTP server (not yet implemented · v3.x roadmap).
     Start,
+    /// Stop the running HTTP server (not yet implemented · v3.x roadmap).
     Stop,
+    /// Report HTTP server status (not yet implemented · v3.x roadmap).
     Status,
 }
 
@@ -662,18 +693,17 @@ pub struct SessionCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum SessionVerb {
-    /// Print session metadata as JSON (hidden · SessionStart hook).
-    #[command(hide = true)]
+    /// Print session metadata as JSON (called by Claude Code's SessionStart hook · users can invoke manually).
     Init {
         /// Vault root directory · defaults to auto-detect from cwd.
         #[arg(long = "vault-dir", value_name = "PATH")]
         vault_dir: Option<PathBuf>,
     },
-    #[command(hide = true)]
+    /// Print the active session token (not yet implemented · v3.x roadmap).
     Current,
-    #[command(hide = true)]
+    /// List recent sessions (not yet implemented · v3.x roadmap).
     List,
-    #[command(hide = true)]
+    /// Get session by id (not yet implemented · v3.x roadmap).
     Get { id: String },
 }
 
@@ -689,7 +719,7 @@ pub struct SkillCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum SkillVerb {
-    #[command(hide = true)]
+    /// List installed skills (not yet implemented · v3.x roadmap).
     List,
     /// Run a skill in headless mode (replaces v3.0 `run-skill`).
     Run {
@@ -702,12 +732,11 @@ pub enum SkillVerb {
         #[arg(long = "arg")]
         args: Vec<String>,
     },
-    /// Bootstrap a skill (hidden · called by skills internally).
-    #[command(hide = true)]
+    /// Bootstrap a skill's state files · called by skills internally.
     Bootstrap { name: String },
-    #[command(hide = true)]
+    /// Print a skill's help text · convenience for skill scripting.
     Help { name: String },
-    #[command(hide = true)]
+    /// Print skill metadata as JSON · convenience for skill scripting.
     Info { name: String },
 }
 
@@ -722,8 +751,11 @@ pub struct TaskCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum TaskVerb {
+    /// List tasks (not yet implemented · v3.x roadmap).
     List,
+    /// Add a task (not yet implemented · v3.x roadmap).
     Add { content: String },
+    /// Mark a task done (not yet implemented · v3.x roadmap).
     Done { id: String },
 }
 
@@ -739,8 +771,7 @@ pub struct VaultCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum VaultVerb {
-    /// Pull plugin tarball into the current vault (hidden · called by `plugin update`).
-    #[command(hide = true)]
+    /// Pull plugin tarball into the current vault · called by `plugin update`.
     Sync {
         /// Optional positional vault root · defaults to walk-up from cwd.
         vault_root: Option<PathBuf>,
@@ -751,11 +782,11 @@ pub enum VaultVerb {
         #[arg(long)]
         branch: Option<String>,
     },
-    #[command(hide = true)]
+    /// Scan vault for issues (not yet implemented · v3.x roadmap).
     Scan,
-    #[command(hide = true)]
+    /// Vault statistics (not yet implemented · v3.x roadmap).
     Stats,
-    #[command(hide = true)]
+    /// Verify vault integrity (not yet implemented · v3.x roadmap).
     Verify,
     /// Print active vault + resolution source (new in v3.1).
     Current,
