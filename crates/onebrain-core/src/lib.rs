@@ -13,5 +13,8 @@ pub use config::{
     load_vault_config, load_vault_config_at, CheckpointPolicy, VaultConfig, VaultFolders,
 };
 pub use error::{CoreError, Result};
-pub use path::{find_vault_root, VaultRoot};
+pub use path::{
+    find_vault_root, require_vault, resolve_vault, ResolvedVault, VaultResolveInputs, VaultRoot,
+    VaultSource,
+};
 pub use types::{DoctorResult, DoctorStatus, Harness, SessionToken};
