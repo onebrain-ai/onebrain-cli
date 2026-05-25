@@ -26,7 +26,11 @@ fn make_vault(dir: &std::path::Path) {
 }
 
 #[test]
-fn root_help_shows_3_root_verbs_and_24_groups() {
+fn root_help_shows_3_root_verbs_and_visible_groups() {
+    // v3.1.0 UX polish: only groups with ≥1 user-facing implemented verb are
+    // advertised at root `--help`. The full 24-group tree shape is still
+    // present in the parser (verified by `unimplemented_groups_still_parse`
+    // and `hidden_stub_still_dispatches`); they're just hidden from help.
     let out = Command::cargo_bin("onebrain")
         .unwrap()
         .arg("--help")
@@ -41,31 +45,15 @@ fn root_help_shows_3_root_verbs_and_24_groups() {
             "root verb `{v}` missing from --help. Got:\n{stdout}"
         );
     }
-    // All 24 groups.
+    // Visible groups only.
     for g in [
-        "avatar",
-        "bookmark",
-        "bundle",
         "checkpoint",
-        "config",
-        "daemon",
-        "date",
-        "dream",
-        "frontmatter",
-        "gateway",
         "harness",
-        "inbox",
-        "log",
-        "memory",
-        "note",
-        "pause",
         "plugin",
         "qmd",
         "schedule",
-        "serve",
         "session",
         "skill",
-        "task",
         "vault",
     ] {
         assert!(
@@ -99,6 +87,176 @@ fn root_help_hides_v30_aliases() {
             "hidden alias `{alias}` leaked into top-level --help"
         );
     }
+}
+
+#[test]
+fn top_level_help_hides_stub_groups() {
+    // v3.1.0 UX polish: groups whose verbs are all `E_NOT_IMPLEMENTED`
+    // stubs are hidden from `onebrain --help`. The tree shape stays locked
+    // (typed commands still parse + dispatch — see `hidden_stub_still_dispatches`),
+    // they just don't clutter the help screen.
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+
+    // Visible: 3 root verbs + groups with at least one real, user-facing verb.
+    for visible in [
+        "init",
+        "update",
+        "doctor",
+        "checkpoint",
+        "qmd",
+        "plugin",
+        "vault",
+        "session",
+        "schedule",
+        "harness",
+        "skill",
+    ] {
+        assert!(
+            stdout.contains(&format!("  {visible} ")) || stdout.contains(&format!("  {visible}  ")),
+            "expected visible command `{visible}` in --help. Got:\n{stdout}"
+        );
+    }
+
+    // Hidden: stub-only groups. Assert no command entry line (two-space
+    // prefix) — same convention as `root_help_hides_v30_aliases`.
+    for stub in [
+        "avatar",
+        "bookmark",
+        "bundle",
+        "config",
+        "daemon",
+        "date",
+        "dream",
+        "frontmatter",
+        "gateway",
+        "inbox",
+        "log",
+        "memory",
+        "note",
+        "pause",
+        "serve",
+        "task",
+    ] {
+        assert!(
+            !stdout.contains(&format!("  {stub}  ")) && !stdout.contains(&format!("  {stub} ")),
+            "stub group `{stub}` leaked into top-level --help. Got:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn hidden_stub_still_dispatches() {
+    // `#[command(hide = true)]` is purely a help-display flag — the parser
+    // still accepts hidden commands and the dispatcher still routes them.
+    // A hidden stub group + verb must produce exit 72 with the canonical
+    // `not implemented: <group> <verb>` error message.
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["avatar", "pair"])
+        .assert()
+        .failure()
+        .code(72)
+        .get_output()
+        .clone();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("not implemented: avatar pair"),
+        "expected canonical not-implemented message. Got:\n{combined}"
+    );
+}
+
+#[test]
+fn top_level_help_is_production_grade() {
+    // v3.1.0 production polish (Item D + E + F): heading is user-facing,
+    // long_about dev-log preamble is stripped, visible groups carry one-line
+    // `about` descriptions, and commands appear in domain-clustered order.
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+
+    // Item D: clean heading · no dev-log preamble.
+    assert!(
+        stdout.contains("OneBrain CLI — Personal AI OS for Obsidian"),
+        "expected production heading. Got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Consistency Standard"),
+        "dev-log label `Consistency Standard` leaked into --help"
+    );
+    assert!(
+        !stdout.contains("24 resource groups"),
+        "internal-architecture preamble leaked into --help"
+    );
+
+    // Item F: visible groups have one-line `about` descriptions (no blank
+    // description column). Each phrase below is the unique `about` text.
+    for desc in [
+        "Vault operations (sync · current)",
+        "Session lifecycle (init)",
+        "Auto-save management (stop · reset · orphans)",
+        "Detect Claude Code runtime",
+        "Plugin lifecycle + hook rewriter",
+        "launchd schedule management",
+        "Skill invocation",
+        "Vault search index",
+    ] {
+        assert!(
+            stdout.contains(desc),
+            "expected `about` line `{desc}` in --help. Got:\n{stdout}"
+        );
+    }
+
+    // Item E: domain-clustered ordering via `display_order`. Find the byte
+    // offset of each command-line entry in the rendered help and assert the
+    // cluster boundaries.
+    fn offset_of(haystack: &str, needle: &str) -> usize {
+        haystack
+            .find(needle)
+            .unwrap_or_else(|| panic!("expected `{needle}` in --help"))
+    }
+    // System cluster (1-3).
+    let init = offset_of(&stdout, "  init ");
+    let update = offset_of(&stdout, "  update ");
+    let doctor = offset_of(&stdout, "  doctor ");
+    // Vault & session cluster (10-13).
+    let vault = offset_of(&stdout, "  vault ");
+    let session = offset_of(&stdout, "  session ");
+    let checkpoint = offset_of(&stdout, "  checkpoint ");
+    let harness = offset_of(&stdout, "  harness ");
+    // Config & maintenance cluster (20-23).
+    let plugin = offset_of(&stdout, "  plugin ");
+    let schedule = offset_of(&stdout, "  schedule ");
+    let skill = offset_of(&stdout, "  skill ");
+    // Search cluster (30).
+    let qmd = offset_of(&stdout, "  qmd ");
+
+    assert!(
+        init < update && update < doctor,
+        "system cluster mis-ordered"
+    );
+    assert!(doctor < vault, "doctor should precede vault cluster");
+    assert!(
+        vault < session && session < checkpoint && checkpoint < harness,
+        "vault/session cluster mis-ordered"
+    );
+    assert!(harness < plugin, "harness should precede plugin cluster");
+    assert!(
+        plugin < schedule && schedule < skill,
+        "plugin/schedule/skill cluster mis-ordered"
+    );
+    assert!(skill < qmd, "qmd should come last in clusters");
 }
 
 #[test]

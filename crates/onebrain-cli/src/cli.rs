@@ -12,11 +12,7 @@ use std::path::PathBuf;
 #[command(
     name = "onebrain",
     version,
-    about = "OneBrain CLI — personal AI OS for Obsidian",
-    long_about = "OneBrain CLI · v3.1 Consistency Standard\n\n\
-        3 root verbs (init · update · doctor) + 24 resource groups. \
-        All paths are `onebrain <noun> <verb>` 2-level. See \
-        `onebrain <noun> --help` for per-group verbs."
+    about = "OneBrain CLI — Personal AI OS for Obsidian"
 )]
 pub struct Cli {
     /// Override vault root (highest priority · beats ONEBRAIN_VAULT and walk-up).
@@ -63,37 +59,75 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
     // ───── Root verbs (3 · frozen) ─────────────────────────────────────
+    // `display_order` clusters commands by domain in `--help`:
+    //   1-3  · system / lifecycle (init, update, doctor)
+    //   10-13 · vault & session ops (vault, session, checkpoint, harness)
+    //   20-23 · config & maintenance (plugin, schedule, config, skill)
+    //   30   · search/index (qmd)
+    //   99   · clap-managed `help` meta
+    //
     /// Initialize a new vault (interactive setup).
+    #[command(display_order = 1)]
     Init(InitArgs),
     /// Self-update the CLI binary (auto-detects install channel).
+    #[command(display_order = 2)]
     Update(UpdateArgs),
     /// Diagnose system (vault + plugin + CLI · includes harness).
+    #[command(display_order = 3)]
     Doctor(DoctorArgs),
 
     // ───── Resource groups (24 · alphabetical) ─────────────────────────
+    // v3.1.0 UX: groups whose every verb still returns `E_NOT_IMPLEMENTED`
+    // are marked `hide = true` so they don't clutter `onebrain --help`. The
+    // tree shape stays locked per spec §2.4 — typed commands still parse and
+    // dispatch (returning exit 72), they just don't advertise in help.
+    #[command(hide = true)]
     Avatar(AvatarCmd),
+    #[command(hide = true)]
     Bookmark(BookmarkCmd),
+    #[command(hide = true)]
     Bundle(BundleCmd),
+    #[command(display_order = 12)]
     Checkpoint(CheckpointCmd),
+    #[command(hide = true)]
     Config(ConfigCmd),
+    #[command(hide = true)]
     Daemon(DaemonCmd),
+    #[command(hide = true)]
     Date(DateCmd),
+    #[command(hide = true)]
     Dream(DreamCmd),
+    #[command(hide = true)]
     Frontmatter(FrontmatterCmd),
+    #[command(hide = true)]
     Gateway(GatewayCmd),
+    #[command(display_order = 13)]
     Harness(HarnessCmd),
+    #[command(hide = true)]
     Inbox(InboxCmd),
+    #[command(hide = true)]
     Log(LogCmd),
+    #[command(hide = true)]
     Memory(MemoryCmd),
+    #[command(hide = true)]
     Note(NoteCmd),
+    #[command(hide = true)]
     Pause(PauseCmd),
+    #[command(display_order = 20)]
     Plugin(PluginCmd),
+    #[command(display_order = 30)]
     Qmd(QmdCmd),
+    #[command(display_order = 21)]
     Schedule(ScheduleCmd),
+    #[command(hide = true)]
     Serve(ServeCmd),
+    #[command(display_order = 11)]
     Session(SessionCmd),
+    #[command(display_order = 23)]
     Skill(SkillCmd),
+    #[command(hide = true)]
     Task(TaskCmd),
+    #[command(display_order = 10)]
     Vault(VaultCmd),
 
     // ───── Hidden v3.0 aliases (back-compat · removed v3.5) ────────────
@@ -222,6 +256,7 @@ pub enum BundleVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(about = "Auto-save management (stop · reset · orphans)")]
 pub struct CheckpointCmd {
     #[command(subcommand)]
     pub verb: CheckpointVerb,
@@ -361,6 +396,7 @@ pub enum GatewayVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(about = "Detect Claude Code runtime")]
 pub struct HarnessCmd {
     /// `detect` is the only verb. Made optional so v3.0's flat
     /// `onebrain harness` invocation (no verb) still works — that path is
@@ -479,6 +515,7 @@ pub enum PauseVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(about = "Plugin lifecycle + hook rewriter")]
 pub struct PluginCmd {
     #[command(subcommand)]
     pub verb: PluginVerb,
@@ -496,6 +533,7 @@ pub enum PluginVerb {
         branch: Option<String>,
     },
     /// Uninstall plugin (placeholder · not yet implemented).
+    #[command(hide = true)]
     Uninstall,
     /// Pull plugin from GitHub · rewrite hooks · rebind launchd plists.
     Update {
@@ -520,8 +558,10 @@ pub enum PluginVerb {
         vault: Option<PathBuf>,
     },
     /// Plugin status (placeholder).
+    #[command(hide = true)]
     Status,
     /// Verify plugin install (placeholder).
+    #[command(hide = true)]
     Verify,
 }
 
@@ -530,23 +570,25 @@ pub enum PluginVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(about = "Vault search index")]
 pub struct QmdCmd {
     #[command(subcommand)]
     pub verb: QmdVerb,
 }
 #[derive(Subcommand, Debug)]
 pub enum QmdVerb {
+    #[command(hide = true)]
     Setup,
     /// Re-embed documents (hidden · auto-fired by indexer hook).
     #[command(hide = true)]
     Embed,
+    #[command(hide = true)]
     Status,
     /// Rebuild the qmd search index (replaces v3.0 `qmd-reindex`).
     #[command(hide = true)]
     Reindex,
-    Search {
-        query: String,
-    },
+    #[command(hide = true)]
+    Search { query: String },
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -554,19 +596,19 @@ pub enum QmdVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(about = "launchd schedule management")]
 pub struct ScheduleCmd {
     #[command(subcommand)]
     pub verb: ScheduleVerb,
 }
 #[derive(Subcommand, Debug)]
 pub enum ScheduleVerb {
+    #[command(hide = true)]
     List,
-    Add {
-        skill: String,
-    },
-    Remove {
-        skill: String,
-    },
+    #[command(hide = true)]
+    Add { skill: String },
+    #[command(hide = true)]
+    Remove { skill: String },
     /// Re-write launchd plists (hidden · called by `plugin update`).
     #[command(hide = true)]
     Register {
@@ -592,6 +634,7 @@ pub enum ScheduleVerb {
         #[arg(long)]
         test: Option<String>,
     },
+    #[command(hide = true)]
     Status,
 }
 
@@ -616,6 +659,7 @@ pub enum ServeVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(about = "Session lifecycle (init)")]
 pub struct SessionCmd {
     #[command(subcommand)]
     pub verb: SessionVerb,
@@ -629,11 +673,12 @@ pub enum SessionVerb {
         #[arg(long = "vault-dir", value_name = "PATH")]
         vault_dir: Option<PathBuf>,
     },
+    #[command(hide = true)]
     Current,
+    #[command(hide = true)]
     List,
-    Get {
-        id: String,
-    },
+    #[command(hide = true)]
+    Get { id: String },
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -641,13 +686,14 @@ pub enum SessionVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
-#[command(disable_help_subcommand = true)]
+#[command(disable_help_subcommand = true, about = "Skill invocation")]
 pub struct SkillCmd {
     #[command(subcommand)]
     pub verb: SkillVerb,
 }
 #[derive(Subcommand, Debug)]
 pub enum SkillVerb {
+    #[command(hide = true)]
     List,
     /// Run a skill in headless mode (replaces v3.0 `run-skill`).
     Run {
@@ -662,15 +708,11 @@ pub enum SkillVerb {
     },
     /// Bootstrap a skill (hidden · called by skills internally).
     #[command(hide = true)]
-    Bootstrap {
-        name: String,
-    },
-    Help {
-        name: String,
-    },
-    Info {
-        name: String,
-    },
+    Bootstrap { name: String },
+    #[command(hide = true)]
+    Help { name: String },
+    #[command(hide = true)]
+    Info { name: String },
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -694,6 +736,7 @@ pub enum TaskVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(about = "Vault operations (sync · current)")]
 pub struct VaultCmd {
     #[command(subcommand)]
     pub verb: VaultVerb,
@@ -712,8 +755,11 @@ pub enum VaultVerb {
         #[arg(long)]
         branch: Option<String>,
     },
+    #[command(hide = true)]
     Scan,
+    #[command(hide = true)]
     Stats,
+    #[command(hide = true)]
     Verify,
     /// Print active vault + resolution source (new in v3.1).
     Current,
@@ -808,38 +854,24 @@ mod tests {
     }
 
     #[test]
-    fn root_help_advertises_three_verbs_and_groups() {
+    fn root_help_advertises_three_verbs_and_visible_groups() {
+        // v3.1.0 UX polish: stub-only groups are hidden from root `--help`.
+        // Only groups with at least one user-facing real verb are shown.
         let mut cmd = Cli::command();
         let help = cmd.render_long_help().to_string();
         // 3 root verbs.
         assert!(help.contains("init"), "init missing from help");
         assert!(help.contains("update"), "update missing from help");
         assert!(help.contains("doctor"), "doctor missing from help");
-        // A sample of the 24 groups.
+        // Visible groups (have at least one implemented verb).
         for g in [
-            "avatar",
-            "bookmark",
-            "bundle",
             "checkpoint",
-            "config",
-            "daemon",
-            "date",
-            "dream",
-            "frontmatter",
-            "gateway",
             "harness",
-            "inbox",
-            "log",
-            "memory",
-            "note",
-            "pause",
             "plugin",
             "qmd",
             "schedule",
-            "serve",
             "session",
             "skill",
-            "task",
             "vault",
         ] {
             assert!(help.contains(g), "group `{g}` missing from root --help");
