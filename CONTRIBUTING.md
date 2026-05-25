@@ -31,13 +31,6 @@ cd onebrain-cli
 cargo build --workspace
 ```
 
-Optional but recommended:
-
-```bash
-# Bun v2.3.3 binary for Layer-4 parity tests
-export BUN_BINARY=/path/to/onebrain-v2.3.3
-```
-
 ## Build + test
 
 The full suite matches CI:

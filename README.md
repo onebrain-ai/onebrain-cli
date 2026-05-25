@@ -180,7 +180,7 @@ onebrain-cli         Binary crate — clap dispatch over 13 subcommands
 
 Workspace inheritance keeps `[workspace.package]` fields (`version`, `edition`, `license`, `repository`) in one place. The workspace root sets `publish = false`; all four crates inherit it via `publish.workspace = true` — only the compiled binary ships.
 
-Test pyramid (4 layers): inline unit + `assert_cmd` integration + `insta` snapshots + Layer 4 golden-master parity vs Bun v2.3.3. 670 tests passing at GA, gating CI on fmt + clippy `-D warnings` + a 3-platform test matrix (Ubuntu, macOS, Windows).
+Test pyramid (3 layers as of v3.1.0): inline unit + `assert_cmd` integration + `insta` snapshots. 950+ tests passing, gating CI on fmt + clippy `-D warnings` + a 3-platform test matrix (Ubuntu, macOS, Windows). Layer 4 (Bun v2.3.3 golden-master parity) was retired in v3.1.0 along with the Bun reference binary — the v3.1 Envelope shape + output-format matrix now own the canonical-contract role.
 
 ## Development
 
