@@ -43,30 +43,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --no-fail-fast
-
-  parity:
-    runs-on: ubuntu-latest
-    needs: test
-    if: github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Download pinned Bun v2.3.3 binary
-        # Upstream publishes a raw single-file binary, not a tarball — earlier
-        # config asked for `.tar.gz` and got a 404 on every PR. The v2.3.3
-        # release on onebrain-ai/onebrain has assets like onebrain-linux-x64
-        # (no extension); curl it directly + chmod +x. No untrusted input is
-        # interpolated into this run script.
-        run: |
-          curl -fsSL \
-            https://github.com/onebrain-ai/onebrain/releases/download/v2.3.3/onebrain-linux-x64 \
-            -o /tmp/onebrain-bun-v2.3.3
-          chmod +x /tmp/onebrain-bun-v2.3.3
-      - name: Build Rust release binary
-        run: cargo build --release -p onebrain-cli
-      - name: Run parity suite
-        env:
-          BUN_BINARY: /tmp/onebrain-bun-v2.3.3
-          RUST_BINARY: ${{ github.workspace }}/target/release/onebrain
-        run: cargo test -p parity --release
+  # NOTE: the `parity` job (byte-for-byte stdout comparison between the v2.x
+  # Bun reference binary and the v3.x Rust port) was retired in v3.1.0.
+  # v3.0.0 shipped GA 2026-05-22; the Bun-era release binaries are no longer
+  # published on github.com/onebrain-ai/onebrain — only the npm package
+  # `@onebrain-ai/cli@2.4.x` remains, marked deprecated. The Rust port has
+  # its own canonical contract (Envelope shape · snapshot tests in
+  # `tests/v31_envelope_snapshots.rs` · `tests/output_format_matrix.rs`);
+  # regressions against the v2 wire format are no longer the active concern.
