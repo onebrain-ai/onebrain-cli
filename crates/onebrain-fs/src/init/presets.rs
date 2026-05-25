@@ -20,7 +20,7 @@ pub enum SchedulePreset {
     /// Essentials plus `/doctor` monthly, `/tasks` daily, `qmd-reindex`
     /// Sunday (command-mode entry).
     MaintenancePlus,
-    /// No entries — leaves `schedule:` out of vault.yml entirely.
+    /// No entries — leaves `schedule:` out of onebrain.yml entirely.
     Skip,
 }
 
@@ -36,9 +36,9 @@ impl SchedulePreset {
         }
     }
 
-    /// Entries to write under `schedule:` in vault.yml. `Skip` returns an
-    /// empty vec — the caller is responsible for omitting the key entirely
-    /// in that case.
+    /// Entries to write under `schedule:` in onebrain.yml. `Skip` returns
+    /// an empty vec — the caller is responsible for omitting the key
+    /// entirely in that case.
     pub fn entries(&self) -> Vec<ScheduleEntry> {
         match self {
             Self::Minimal => vec![ScheduleEntry::skill("0 9 * * *", "/daily")],
@@ -77,7 +77,7 @@ impl fmt::Display for SchedulePreset {
 }
 
 /// One entry under `schedule:` — either a skill-mode invocation or a raw
-/// command-mode invocation. Shape matches the vault.yml schema documented
+/// command-mode invocation. Shape matches the onebrain.yml schema documented
 /// in `INSTRUCTIONS.md` (`schedule:` block).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]

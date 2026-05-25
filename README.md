@@ -180,7 +180,7 @@ onebrain-cli         Binary crate — clap dispatch over 13 subcommands
 
 Workspace inheritance keeps `[workspace.package]` fields (`version`, `edition`, `license`, `repository`) in one place. The workspace root sets `publish = false`; all four crates inherit it via `publish.workspace = true` — only the compiled binary ships.
 
-Test pyramid (4 layers): inline unit + `assert_cmd` integration + `insta` snapshots + Layer 4 golden-master parity vs Bun v2.3.3. 670 tests passing at GA, gating CI on fmt + clippy `-D warnings` + a 3-platform test matrix (Ubuntu, macOS, Windows).
+Test pyramid (3 layers as of v3.1.0): inline unit + `assert_cmd` integration + `insta` snapshots. 950+ tests passing, gating CI on fmt + clippy `-D warnings` + a 3-platform test matrix (Ubuntu, macOS, Windows). Layer 4 (Bun v2.3.3 golden-master parity) was retired in v3.1.0 along with the Bun reference binary — the v3.1 Envelope shape + output-format matrix now own the canonical-contract role.
 
 ## Development
 
@@ -193,14 +193,12 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
-# Layer 4 parity vs Bun v2.3.3 (needs the Bun artifact)
-export BUN_BINARY=/path/to/onebrain-v2.3.3
-cargo test -p parity --release
-
 # Snapshot workflow (insta)
 cargo test                  # tests fail on snapshot mismatch
 cargo insta review          # interactive approve/reject
 ```
+
+The v2.x Bun parity suite was retired in v3.1.0 (the Bun reference binary is no longer published). Output contract is now pinned by `crates/onebrain-cli/tests/v31_envelope_snapshots.rs` (Envelope shape · insta), `tests/output_format_matrix.rs` (default / `--json` / `--json --pretty` / `--yaml` matrix), `tests/user_flows.rs` (new-user / hook-consumer / error-recovery), and `tests/v31_integration.rs` (v3.0 alias migration).
 
 PR conventions: feature branch → git worktree → 3-round parallel review (correctness / behavior / security) → squash-merge with `--delete-branch`. English-only repo (no Thai or other non-English text in committed files). One version bump per PR. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full workflow.
 

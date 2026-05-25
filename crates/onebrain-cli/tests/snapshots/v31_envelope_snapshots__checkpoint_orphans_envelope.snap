@@ -1,0 +1,7 @@
+---
+source: crates/onebrain-cli/tests/v31_envelope_snapshots.rs
+expression: v
+---
+{
+  "orphan_count": 0
+}

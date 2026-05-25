@@ -4,19 +4,19 @@
 //! Steps performed (in order):
 //!
 //! 1. Resolve `vault_dir` (default = current working directory).
-//! 2. Guard against an existing `vault.yml` (unless `--force` or interactive
-//!    overwrite confirmation).
+//! 2. Guard against an existing config file (`onebrain.yml` or legacy
+//!    `vault.yml`) unless `--force` or interactive overwrite confirmation.
 //! 3. (Interactive only) prompt "Initialize here?".
 //! 4. (Interactive only) pick a [`SchedulePreset`].
-//! 5. Write `vault.yml`.
+//! 5. Write `onebrain.yml`.
 //! 6. Create 8 PARA folders + `00-inbox/imports/`.
 //! 7. Call `register-hooks` (best-effort — failure is warned, never fatal).
 //! 8. Emit summary lines.
 //!
 //! All four IO surfaces are injectable through [`InitOptions`]:
-//!   - `confirm_fn`: guards against vault.yml overwrites + "init here?" prompt.
+//!   - `confirm_fn`: guards against config-file overwrites + "init here?" prompt.
 //!     When `None`, the wizard runs non-interactively (errors out on existing
-//!     vault.yml without `--force`).
+//!     config file without `--force`).
 //!   - `preset_fn`: returns the chosen [`SchedulePreset`]. When `None`,
 //!     defaults to [`SchedulePreset::Skip`].
 //!   - `register_hooks_fn`: hook into Slice 7's register-hooks library. When
@@ -24,17 +24,22 @@
 //!   - `stdout_lines` / `stderr_lines`: line-oriented output sinks (mirrors
 //!     Slice 11's `update.rs`). When `None`, writes to real stdout/stderr.
 
+mod enable_plugin;
 mod folders;
+mod marketplace;
+mod onebrain_yml;
 mod presets;
-mod vault_yml;
+mod safety;
 mod wizard;
 
 pub use folders::{INBOX_IMPORTS_SUBDIR, STANDARD_FOLDERS};
 pub use presets::{ScheduleEntry, SchedulePreset};
 
 use crate::error::FsError;
+use crate::harness::detect_harnesses;
 use crate::register_hooks::{self, RegisterHooksOptions};
 use crate::vault_sync::{run_vault_sync, VaultSyncOptions};
+use onebrain_core::{CoreError, Harness, CONFIG_FILENAME, LEGACY_CONFIG_FILENAME};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -61,7 +66,8 @@ type LineSink = Box<dyn FnMut(&str) + Send>;
 pub struct InitOptions {
     /// Vault root. Defaults to `std::env::current_dir()`.
     pub vault_dir: Option<PathBuf>,
-    /// Overwrite existing `vault.yml` without prompting.
+    /// Overwrite existing `onebrain.yml` (or legacy `vault.yml`) without
+    /// prompting.
     pub force: bool,
     /// Non-interactive: accept all defaults (preset = Essentials, no prompts).
     pub yes: bool,
@@ -76,6 +82,11 @@ pub struct InitOptions {
     pub vault_sync_fn: Option<VaultSyncFn>,
     /// Skip the vault-sync sub-step entirely (offline init or test runs).
     pub skip_vault_sync: bool,
+    /// Structured-output mode (json/yaml/table/tsv). When `true`, the
+    /// non-empty-directory safety check refuses to prompt interactively and
+    /// instead returns a [`CoreError::InitTargetNotEmpty`] error so the
+    /// envelope renderer surfaces a canonical machine-readable error.
+    pub structured_output: bool,
     /// Optional stdout sink — defaults to real stdout when `None`.
     pub stdout_lines: Option<LineSink>,
     /// Optional stderr sink — defaults to real stderr when `None`.
@@ -98,6 +109,14 @@ pub struct InitResult {
     /// fresh vault has plugin files installed. False when skipped, failed, or
     /// not attempted (offline init).
     pub vault_sync_ok: bool,
+    /// True when `<vault>/.claude-plugin/marketplace.json` was newly written
+    /// by this run. False on re-init (file pre-existed) or non-Claude harness
+    /// (gemini/direct — manifest not needed).
+    pub marketplace_written: bool,
+    /// True when `enabledPlugins.onebrain@onebrain` was newly inserted/updated
+    /// in `.claude/settings.json`. False on re-init (key already true) or
+    /// non-Claude harness.
+    pub plugin_enabled: bool,
     /// True when the user declined an interactive prompt and we exited
     /// cleanly (exit 0, no changes).
     pub aborted: bool,
@@ -123,25 +142,103 @@ pub fn run_init(mut opts: InitOptions) -> Result<InitResult, FsError> {
     let mut stdout = take_stdout_sink(&mut opts.stdout_lines);
     let mut stderr = take_stderr_sink(&mut opts.stderr_lines);
 
+    // The "OneBrain Init" header lands on stdout AFTER the structured-output
+    // safety check so a `--json` failure leaves stdout as a single
+    // canonical envelope. Text-mode runs still see the header on the next
+    // emit (immediately after the safety check passes).
+
+    // ── Step 0: target-directory safety check ──────────────────────────────
+    // Guards against running `onebrain init` in the wrong directory. Always
+    // runs safety::classify so permission errors / "target is a file" /
+    // missing-parent paths surface as a proper FsError BEFORE any partial
+    // writes. `--force` only suppresses the interactive PROMPT (B2 / SF-H4);
+    // it does not bypass the classification itself.
+    match safety::classify(&vault_dir)? {
+        safety::DirState::Missing => {
+            std::fs::create_dir_all(&vault_dir).map_err(|e| FsError::Io {
+                path: vault_dir.clone(),
+                source: e,
+            })?;
+        }
+        safety::DirState::Empty | safety::DirState::OneBrainVault => {
+            // Empty: nothing to guard. OneBrainVault: vault.yml present,
+            // hand off to Step 1's overwrite logic.
+        }
+        safety::DirState::NonEmptyNonVault { summary } => {
+            if opts.force {
+                // --force: classification succeeded, skip the prompt and
+                // proceed (caller knows what they're doing).
+            } else {
+                let target_display = vault_dir.display().to_string();
+                if opts.structured_output {
+                    // Machine consumer can't respond to a TTY prompt —
+                    // surface the canonical error envelope so the caller
+                    // gets `E_INIT_TARGET_NOT_EMPTY` exit 75 + a message
+                    // pointing at `--force`.
+                    return Err(FsError::Core(CoreError::InitTargetNotEmpty(format!(
+                        "target is not empty ({summary}) at {target_display} · pass --force to proceed"
+                    ))));
+                }
+                if let Some(confirm) = opts.confirm_fn.as_mut() {
+                    let q = format!(
+                        "Target directory is not empty:\n    {target_display}\n    Contents: {summary}\n\nOneBrain will create folders (00-inbox/, 01-projects/, …) and files (onebrain.yml, .claude/, .claude-plugin/) here.\nExisting files will NOT be deleted, but OneBrain structure will be merged in.\n\nContinue?"
+                    );
+                    if !confirm(&q) {
+                        return Err(FsError::Core(CoreError::InitTargetNotEmpty(format!(
+                            "init declined by user ({summary}) · re-run with --force to skip confirmation"
+                        ))));
+                    }
+                } else {
+                    // No prompt available (--yes without --force on a
+                    // non-empty dir, or pure non-interactive call from a
+                    // script). Fail closed: surface E_INIT_TARGET_NOT_EMPTY
+                    // so the user has to consciously opt in via --force.
+                    return Err(FsError::Core(CoreError::InitTargetNotEmpty(format!(
+                        "target is not empty ({summary}) at {target_display} · pass --force to proceed"
+                    ))));
+                }
+            }
+        }
+    }
+
+    // Safety check passed — emit the text-mode header now. Structured-output
+    // mode still gets it on stdout (existing CLI integration tests assert
+    // its presence), but only after we've cleared the safety guard.
     stdout("OneBrain Init");
 
-    // ── Step 1: vault.yml guard ────────────────────────────────────────────
-    let vault_yml_path = vault_dir.join("vault.yml");
-    let vault_yml_exists = vault_yml_path.exists();
+    // ── Step 1: config-file guard ──────────────────────────────────────────
+    // Idempotency: if either the canonical `onebrain.yml` or the legacy
+    // `vault.yml` already exists, the dir is an existing OneBrain vault
+    // and init must not silently re-write it. We deliberately leave a
+    // legacy-only vault on disk (no auto-migration here) — the guard
+    // surfaces `vault.yml exists` so the user runs `onebrain doctor --fix`
+    // and gets a controlled migration with a doctor-log entry.
+    let canonical_path = vault_dir.join(CONFIG_FILENAME);
+    let legacy_path = vault_dir.join(LEGACY_CONFIG_FILENAME);
+    let canonical_exists = canonical_path.exists();
+    let legacy_exists = legacy_path.exists();
+    let config_exists = canonical_exists || legacy_exists;
+    let existing_filename: &str = if canonical_exists {
+        CONFIG_FILENAME
+    } else if legacy_exists {
+        LEGACY_CONFIG_FILENAME
+    } else {
+        CONFIG_FILENAME
+    };
 
-    if vault_yml_exists && !opts.force {
+    if config_exists && !opts.force {
         // Interactive: ask the user. Non-interactive: error out.
         if let Some(confirm) = opts.confirm_fn.as_mut() {
-            let overwrite = confirm("vault.yml already exists. Overwrite?");
+            let overwrite = confirm(&format!("{existing_filename} already exists. Overwrite?"));
             if !overwrite {
                 result.ok = true;
                 result.exit_code = 0;
                 result.aborted = true;
-                stdout("aborted: vault.yml left unchanged");
+                stdout(&format!("aborted: {existing_filename} left unchanged"));
                 return Ok(result);
             }
         } else {
-            let msg = "vault.yml exists. Re-run with --force to overwrite.".to_string();
+            let msg = format!("{existing_filename} exists. Re-run with --force to overwrite.");
             stdout(&msg);
             result.ok = false;
             result.exit_code = 1;
@@ -175,10 +272,10 @@ pub fn run_init(mut opts: InitOptions) -> Result<InitResult, FsError> {
         SchedulePreset::Skip
     };
 
-    // ── Step 4: write vault.yml ────────────────────────────────────────────
-    vault_yml::write_vault_yml(&vault_dir, preset)?;
+    // ── Step 4: write onebrain.yml ─────────────────────────────────────────
+    onebrain_yml::write_onebrain_yml(&vault_dir, preset)?;
     result.vault_yml_written = true;
-    stdout("vault.yml: written");
+    stdout(&format!("{CONFIG_FILENAME}: written"));
 
     // ── Step 5: folders ────────────────────────────────────────────────────
     let n = folders::create_folders(&vault_dir)?;
@@ -225,6 +322,57 @@ pub fn run_init(mut opts: InitOptions) -> Result<InitResult, FsError> {
             "warning — run onebrain register-hooks to retry"
         }
     ));
+
+    // ── Step 7b: register plugin with Claude Code ──────────────────────────
+    // Without these two writes, Claude Code never loads the plugin even
+    // though `.claude/plugins/onebrain/` is on disk — /onboarding and every
+    // OneBrain skill silently fail at session start. Only emitted on the
+    // claude harness; gemini/direct have no equivalent surface.
+    if detect_harnesses(&vault_dir).contains(&Harness::Claude) {
+        // A1 (SF-B1): marketplace.json write failure must propagate as an
+        // error, symmetric with enable_plugin below. Pre-fix it was demoted
+        // to a stderr "warning" and execution fell through — leaving
+        // enabledPlugins=true with no manifest, which is the exact bug v3.1
+        // set out to fix.
+        let outcome = marketplace::write_marketplace_json_with_force(&vault_dir, opts.force)?;
+        result.marketplace_written = !matches!(outcome, marketplace::MarketplaceOutcome::Skipped);
+        let line = match outcome {
+            marketplace::MarketplaceOutcome::Written => "marketplace.json: written",
+            marketplace::MarketplaceOutcome::Skipped => "marketplace.json: ok (pre-existing)",
+            marketplace::MarketplaceOutcome::Repaired => {
+                // A2 (SF-B2): visible warning so the user knows --force just
+                // rewrote a malformed/wrong-shape manifest.
+                stderr("init: marketplace.json repaired (was malformed or wrong-shape)");
+                "marketplace.json: repaired"
+            }
+        };
+        stdout(line);
+        match enable_plugin::enable_onebrain_plugin_with_force(&vault_dir, opts.force) {
+            Ok(outcome) => {
+                if let Some(warning) = outcome.warning.as_deref() {
+                    // B1 (SF-H3): surface the clobber warning so the user
+                    // sees what --force just replaced.
+                    stderr(warning);
+                }
+                result.plugin_enabled = true;
+                stdout(&format!(
+                    "plugin: {}",
+                    if outcome.wrote {
+                        "enabled"
+                    } else {
+                        "ok (already enabled)"
+                    }
+                ));
+            }
+            Err(e) => {
+                // Hard fail this one — malformed pre-existing settings.json
+                // OR a non-bool clobber refusal (B1 / SF-H3); the surrounding
+                // FsError already encodes enough context for the caller to
+                // map an exit code (75 for InitTargetNotEmpty).
+                return Err(e);
+            }
+        }
+    }
 
     // ── Step 8: vault-sync (best-effort) ───────────────────────────────────
     // Downloads the upstream tarball + populates `.claude/plugins/onebrain/`,
@@ -331,7 +479,9 @@ fn default_vault_sync(
 // Re-export wizard fns for the CLI binary
 // ---------------------------------------------------------------------------
 
-pub use wizard::{ask_initialize_here, ask_overwrite_vault_yml, ask_schedule_preset};
+pub use wizard::{
+    ask_continue_nonempty, ask_initialize_here, ask_overwrite_vault_yml, ask_schedule_preset,
+};
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -370,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_vault_creates_folders_and_vault_yml() {
+    fn fresh_vault_creates_folders_and_onebrain_yml() {
         let d = tempdir().unwrap();
         let (opts, stdout_buf) = test_opts(d.path());
 
@@ -386,7 +536,9 @@ mod tests {
             assert!(d.path().join(folder).is_dir());
         }
         assert!(d.path().join("00-inbox").join("imports").is_dir());
-        assert!(d.path().join("vault.yml").is_file());
+        // Canonical filename (v3.1+) — NOT vault.yml.
+        assert!(d.path().join("onebrain.yml").is_file());
+        assert!(!d.path().join("vault.yml").exists());
         // .claude/ must exist so register-hooks has a target on its next run.
         assert!(
             d.path().join(".claude").is_dir(),
@@ -395,7 +547,7 @@ mod tests {
 
         let lines = stdout_buf.lock().unwrap();
         assert_eq!(lines[0], "OneBrain Init");
-        assert!(lines.iter().any(|l| l == "vault.yml: written"));
+        assert!(lines.iter().any(|l| l == "onebrain.yml: written"));
         assert!(lines.iter().any(|l| l == "folders: 9 created"));
         assert!(lines.iter().any(|l| l.contains("done")));
     }
@@ -433,35 +585,54 @@ mod tests {
     }
 
     #[test]
-    fn existing_vault_yml_no_force_no_confirm_returns_exit_1() {
+    fn existing_onebrain_yml_no_force_no_confirm_returns_exit_1() {
         let d = tempdir().unwrap();
-        std::fs::write(d.path().join("vault.yml"), "old: value\n").unwrap();
+        std::fs::write(d.path().join("onebrain.yml"), "old: value\n").unwrap();
         let (opts, _stdout_buf) = test_opts(d.path());
 
         let r = run_init(opts).unwrap();
         assert!(!r.ok);
         assert_eq!(r.exit_code, 1);
         let msg = r.message.unwrap();
-        assert!(msg.contains("vault.yml exists"));
+        assert!(msg.contains("onebrain.yml exists"));
         assert!(msg.contains("--force"));
 
         // Folders not created
         assert!(!d.path().join("00-inbox").is_dir());
-        // Original vault.yml not touched
-        let content = std::fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        // Original onebrain.yml not touched
+        let content = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert_eq!(content, "old: value\n");
     }
 
+    /// Idempotency back-compat: a legacy `vault.yml`-only vault must trigger
+    /// the same guard (init doesn't auto-migrate; doctor --fix does).
     #[test]
-    fn force_overwrites_existing_vault_yml() {
+    fn init_skips_if_legacy_vault_yml_exists() {
         let d = tempdir().unwrap();
-        std::fs::write(d.path().join("vault.yml"), "old: value\n").unwrap();
+        std::fs::write(d.path().join("vault.yml"), "old: legacy\n").unwrap();
+        let (opts, _stdout_buf) = test_opts(d.path());
+
+        let r = run_init(opts).unwrap();
+        assert!(!r.ok);
+        assert_eq!(r.exit_code, 1);
+        let msg = r.message.unwrap();
+        assert!(msg.contains("vault.yml exists"), "msg: {msg}");
+        // Legacy file untouched · canonical not written.
+        let legacy_content = std::fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        assert_eq!(legacy_content, "old: legacy\n");
+        assert!(!d.path().join("onebrain.yml").exists());
+    }
+
+    #[test]
+    fn force_overwrites_existing_onebrain_yml() {
+        let d = tempdir().unwrap();
+        std::fs::write(d.path().join("onebrain.yml"), "old: value\n").unwrap();
         let (mut opts, _stdout_buf) = test_opts(d.path());
         opts.force = true;
 
         let r = run_init(opts).unwrap();
         assert!(r.ok);
-        let content = std::fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        let content = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert!(content.contains("update_channel: stable"));
         assert!(!content.contains("old:"));
     }
@@ -476,7 +647,7 @@ mod tests {
         assert!(r.ok);
         assert_eq!(r.preset_installed, Some(SchedulePreset::Essentials));
 
-        let content = std::fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        let content = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert!(content.contains("schedule:"));
         assert!(content.contains("/daily"));
         assert!(content.contains("/weekly"));
@@ -486,7 +657,7 @@ mod tests {
     #[test]
     fn confirm_fn_overwrite_no_aborts_cleanly() {
         let d = tempdir().unwrap();
-        std::fs::write(d.path().join("vault.yml"), "old: value\n").unwrap();
+        std::fs::write(d.path().join("onebrain.yml"), "old: value\n").unwrap();
         let (mut opts, _stdout_buf) = test_opts(d.path());
         opts.confirm_fn = Some(Box::new(|_q: &str| false));
 
@@ -495,8 +666,8 @@ mod tests {
         assert_eq!(r.exit_code, 0);
         assert!(r.aborted);
 
-        // vault.yml not touched
-        let content = std::fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        // onebrain.yml not touched
+        let content = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert_eq!(content, "old: value\n");
         // Folders not created
         assert!(!d.path().join("00-inbox").is_dir());
@@ -522,9 +693,10 @@ mod tests {
         let r = run_init(opts).unwrap();
         assert!(r.ok);
         assert!(r.aborted);
+        assert!(!d.path().join("onebrain.yml").exists());
         assert!(!d.path().join("vault.yml").exists());
         assert!(!d.path().join("00-inbox").is_dir());
-        // Only the "initialize here?" prompt fires (no vault.yml so no
+        // Only the "initialize here?" prompt fires (no config file so no
         // overwrite prompt).
         assert_eq!(*counter.lock().unwrap(), 1);
     }
@@ -539,7 +711,7 @@ mod tests {
         assert!(r.ok);
         assert_eq!(r.preset_installed, Some(SchedulePreset::Minimal));
 
-        let content = std::fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        let content = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         let entries = content.matches("cron:").count();
         assert_eq!(entries, 1);
     }
@@ -573,7 +745,11 @@ mod tests {
         let d = tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("00-inbox")).unwrap();
         std::fs::create_dir_all(d.path().join("01-projects")).unwrap();
-        let (opts, _stdout_buf) = test_opts(d.path());
+        let (mut opts, _stdout_buf) = test_opts(d.path());
+        // The pre-created OneBrain folders make the target dir non-empty
+        // and without a vault.yml, so the Step 0 safety check would
+        // otherwise refuse to proceed. --force bypasses it.
+        opts.force = true;
 
         let r = run_init(opts).unwrap();
         assert!(r.ok);
@@ -590,6 +766,130 @@ mod tests {
         let lines = stdout_buf.lock().unwrap();
         assert!(!lines.is_empty());
         assert_eq!(lines[0], "OneBrain Init");
+    }
+
+    /// C3 (T-M1): the safety-prompt branch in `ask_continue_nonempty` has
+    /// no end-to-end coverage at the run_init level — only safety::classify
+    /// and the CLI dispatcher have unit tests for it. Drive an injected
+    /// confirm_fn through the full init path so the "yes" branch lands on
+    /// vault.yml creation with existing files preserved.
+    #[test]
+    fn nonempty_dir_confirm_yes_proceeds() {
+        let d = tempdir().unwrap();
+        std::fs::write(d.path().join("README.md"), "hi").unwrap();
+        let (mut opts, _stdout_buf) = test_opts(d.path());
+
+        // Confirm "yes" for the non-empty-directory prompt; the second
+        // prompt (Initialize here?) also gets "yes" so init proceeds.
+        opts.confirm_fn = Some(Box::new(|q: &str| {
+            q.starts_with("Target directory is not empty")
+                || q.starts_with("Initialize OneBrain vault here?")
+        }));
+
+        let r = run_init(opts).unwrap();
+        assert!(r.ok);
+        assert_eq!(r.exit_code, 0);
+        // OneBrain structure created — canonical filename
+        assert!(d.path().join("onebrain.yml").is_file());
+        assert!(d.path().join("00-inbox").is_dir());
+        // Existing file preserved (no clobber)
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("README.md")).unwrap(),
+            "hi"
+        );
+    }
+
+    /// C3 (T-M1) negative: the "no" branch surfaces InitTargetNotEmpty and
+    /// leaves the existing files untouched.
+    #[test]
+    fn nonempty_dir_confirm_no_returns_init_target_not_empty() {
+        let d = tempdir().unwrap();
+        std::fs::write(d.path().join("README.md"), "hi").unwrap();
+        let (mut opts, _stdout_buf) = test_opts(d.path());
+
+        opts.confirm_fn = Some(Box::new(|q: &str| {
+            // Decline the non-empty-directory prompt; never reaches the
+            // "Initialize here?" prompt.
+            !q.starts_with("Target directory is not empty")
+        }));
+
+        let err = run_init(opts).expect_err("expected E_INIT_TARGET_NOT_EMPTY");
+        match err {
+            FsError::Core(CoreError::InitTargetNotEmpty(msg)) => {
+                assert!(msg.contains("declined") || msg.contains("not empty"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+        // Existing file preserved + no vault structure created
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("README.md")).unwrap(),
+            "hi"
+        );
+        assert!(!d.path().join("onebrain.yml").exists());
+        assert!(!d.path().join("vault.yml").exists());
+        assert!(!d.path().join("00-inbox").exists());
+    }
+
+    /// B2 (SF-H4): `--force` must still run `safety::classify`. Pre-fix the
+    /// classify call was guarded by `if !opts.force` so an unreadable target
+    /// (EACCES on read_dir, target is a regular file, …) under `--force`
+    /// fell through to mid-write garbage. Now classify always runs; only
+    /// the PROMPT is suppressed under --force.
+    #[test]
+    #[cfg(unix)]
+    fn force_still_classifies_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir().unwrap();
+        let target = d.path().join("locked");
+        std::fs::create_dir_all(&target).unwrap();
+        // Make the dir unreadable so read_dir() returns EACCES.
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (opts, _stdout_buf) = test_opts(&target);
+        let mut opts = opts;
+        opts.force = true;
+
+        let result = run_init(opts);
+        // Restore perms so tempdir cleanup works.
+        let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755));
+
+        let err = result.expect_err("expected EACCES to surface as FsError");
+        match err {
+            FsError::Io { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+        // No partial state written — vault.yml absent under the locked dir.
+        // (Can't easily inspect without restoring perms first; the EACCES
+        // surface from classify is the contract we care about here.)
+    }
+
+    /// B2 follow-up: `--force` against a target path that's a regular file
+    /// (not a directory) surfaces as a proper FsError via classify rather
+    /// than mid-write garbage. classify reports NonEmptyNonVault with the
+    /// "not a directory" summary; --force then short-circuits the prompt
+    /// and lets the downstream writes fail with their own FsError when they
+    /// try to create_dir_all on the regular-file path.
+    #[test]
+    fn force_still_classifies_target_is_regular_file() {
+        let d = tempdir().unwrap();
+        let target = d.path().join("regular-file");
+        std::fs::write(&target, "ok").unwrap();
+
+        let (opts, _stdout_buf) = test_opts(&target);
+        let mut opts = opts;
+        opts.force = true;
+
+        let err = run_init(opts).expect_err("expected error for file-as-vault");
+        // Either classify caught it via NonEmptyNonVault (then a downstream
+        // create_dir_all fails) or the downstream write surfaces FsError.
+        // Either way it's an Err, not a partial-write success.
+        match err {
+            FsError::Io { .. } | FsError::Core(_) => {}
+        }
+        // The regular file content is preserved (no clobber).
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "ok");
     }
 
     #[test]

@@ -2,13 +2,22 @@
 //!
 //! Mirrors Bun `register-hooks.ts::applyQmdHook` and `migrateLegacyQmdEntries`.
 
-use super::hooks::{matches_spec, rewrite_if_shell_form, HookSpec, HookStatus};
+use super::hooks::{
+    append_json_if_needed, matches_spec, matches_spec_pre_json, rewrite_if_shell_form, HookSpec,
+    HookStatus,
+};
 use serde_json::{json, Map, Value};
 
 const QMD_MATCHER: &str = "Write|Edit";
 
 fn is_canonical_qmd_entry(entry: &Value) -> bool {
     matches_spec(entry, &HookSpec::QMD)
+}
+
+/// True when the entry is the pre-v3.1 (no `--json`) shape of the qmd hook.
+/// Used by strip_qmd_hook to clean both shapes.
+fn is_pre_json_qmd_entry(entry: &Value) -> bool {
+    matches_spec_pre_json(entry, &HookSpec::QMD)
 }
 
 /// Match legacy `qmd update <args>` patterns. Word-bounded so wrapped commands
@@ -89,7 +98,7 @@ pub(crate) fn migrate_legacy_qmd_entries(groups: &mut Vec<Value>, keep_canonical
             let before = hooks_arr.len();
             hooks_arr.retain(|h| {
                 let cmd = h.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                !is_legacy_qmd_cmd(cmd) && !is_canonical_qmd_entry(h)
+                !is_legacy_qmd_cmd(cmd) && !is_canonical_qmd_entry(h) && !is_pre_json_qmd_entry(h)
             });
             if hooks_arr.len() != before {
                 touched = true;
@@ -103,6 +112,18 @@ pub(crate) fn migrate_legacy_qmd_entries(groups: &mut Vec<Value>, keep_canonical
             if let Some(hooks_arr) = g.get_mut("hooks").and_then(|v| v.as_array_mut()) {
                 for entry in hooks_arr.iter_mut() {
                     if rewrite_if_shell_form(entry, &qmd) {
+                        touched = true;
+                    }
+                }
+            }
+        }
+        // Pass 2b: v3.1 — append `--json` flag to pre-v3.1 canonical entries
+        // (correct shape, but missing the JSON output flag now that text is
+        // the default).
+        for g in groups.iter_mut() {
+            if let Some(hooks_arr) = g.get_mut("hooks").and_then(|v| v.as_array_mut()) {
+                for entry in hooks_arr.iter_mut() {
+                    if append_json_if_needed(entry, &qmd) {
                         touched = true;
                     }
                 }
@@ -255,7 +276,7 @@ mod tests {
         assert_eq!(s["hooks"]["PostToolUse"][0]["matcher"], "Write|Edit");
         let entry = &s["hooks"]["PostToolUse"][0]["hooks"][0];
         assert_eq!(entry["command"], "onebrain");
-        assert_eq!(entry["args"], json!(["qmd-reindex"]));
+        assert_eq!(entry["args"], json!(["qmd-reindex", "--json"]));
         assert_eq!(entry["type"], "command");
     }
 
@@ -279,7 +300,7 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["qmd-reindex"]));
+        assert_eq!(entries[0]["args"], json!(["qmd-reindex", "--json"]));
     }
 
     #[test]
@@ -310,7 +331,10 @@ mod tests {
             "hooks": {
                 "PostToolUse": [{
                     "matcher": "Write|Edit",
-                    "hooks": [{"type": "command", "command": "onebrain", "args": ["qmd-reindex"]}],
+                    "hooks": [{
+                        "type": "command", "command": "onebrain",
+                        "args": ["qmd-reindex", "--json"]
+                    }],
                 }]
             }
         });
@@ -323,6 +347,27 @@ mod tests {
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn apply_qmd_hook_v30_canonical_args_migrate_with_json_flag() {
+        // v3.0 entry (no --json) gets the flag appended in place.
+        let mut s = json!({
+            "hooks": {
+                "PostToolUse": [{
+                    "matcher": "Write|Edit",
+                    "hooks": [{
+                        "type": "command", "command": "onebrain",
+                        "args": ["qmd-reindex"]
+                    }],
+                }]
+            }
+        });
+        let st = apply_qmd_hook(&mut s);
+        // Migrated because the args[] changed.
+        assert_eq!(st, HookStatus::Migrated);
+        let entry = &s["hooks"]["PostToolUse"][0]["hooks"][0];
+        assert_eq!(entry["args"], json!(["qmd-reindex", "--json"]));
     }
 
     #[test]
@@ -339,7 +384,7 @@ mod tests {
         assert_eq!(st, HookStatus::Migrated);
         let entry = &s["hooks"]["PostToolUse"][0]["hooks"][0];
         assert_eq!(entry["command"], "onebrain");
-        assert_eq!(entry["args"], json!(["qmd-reindex"]));
+        assert_eq!(entry["args"], json!(["qmd-reindex", "--json"]));
     }
 
     #[test]
@@ -364,7 +409,7 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["qmd-reindex"]));
+        assert_eq!(entries[0]["args"], json!(["qmd-reindex", "--json"]));
     }
 
     #[test]
@@ -384,7 +429,10 @@ mod tests {
             .iter()
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
-        let want_args = vec![Value::String("qmd-reindex".into())];
+        let want_args = vec![
+            Value::String("qmd-reindex".into()),
+            Value::String("--json".into()),
+        ];
         let canonical_count = entries
             .iter()
             .filter(|e| {
@@ -454,7 +502,7 @@ mod tests {
             .any(|e| e["command"] == "echo user-custom-hook"));
         assert!(entries
             .iter()
-            .any(|e| e["command"] == "onebrain" && e["args"] == json!(["qmd-reindex"])));
+            .any(|e| e["command"] == "onebrain" && e["args"] == json!(["qmd-reindex", "--json"])));
     }
 
     #[test]

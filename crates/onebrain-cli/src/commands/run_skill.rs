@@ -5,13 +5,14 @@
 //!
 //! Exit codes mirror Bun's `runSkillCommand`:
 //!
-//! - `78` (EX_CONFIG) — vault.yml missing
+//! - `78` (EX_CONFIG) — no OneBrain config (onebrain.yml / vault.yml) present
 //! - `127` — spawn failed (e.g. claude not on disk)
 //! - `128 + signal` — child terminated by signal (Unix only)
 //! - any other code — propagated from child verbatim
 //! - `1` — fallback when child exited with no code and no signal
 
 use anyhow::{anyhow, Context, Result};
+use onebrain_core::find_config_file;
 use onebrain_fs::{build_prompt, resolve_claude_bin};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,8 +21,8 @@ use std::process::Command;
 /// should call `std::process::exit` with.
 pub fn run(vault: &str, skill: &str, args: &[String]) -> Result<i32> {
     let vault_path = PathBuf::from(vault);
-    if !vault_path.join("vault.yml").is_file() {
-        eprintln!("Vault not found at {vault} (no vault.yml present)");
+    if find_config_file(&vault_path).is_none() {
+        eprintln!("Vault not found at {vault} (no onebrain.yml present)");
         return Ok(78); // EX_CONFIG (sysexits.h)
     }
 

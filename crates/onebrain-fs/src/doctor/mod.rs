@@ -24,6 +24,7 @@ pub mod orphans;
 pub mod plugin;
 pub mod qmd;
 pub mod settings_hooks;
+pub mod vault_config_migration;
 pub mod vault_yml;
 pub mod vault_yml_keys;
 
@@ -33,12 +34,17 @@ pub use orphans::OrphanCheckpointsCheck;
 pub use plugin::PluginFilesCheck;
 pub use qmd::QmdEmbeddingsCheck;
 pub use settings_hooks::SettingsHooksCheck;
+pub use vault_config_migration::VaultConfigMigrationCheck;
 pub use vault_yml::VaultYmlCheck;
 pub use vault_yml_keys::VaultYmlKeysCheck;
 
 /// Run every check and return results in the canonical Bun-parity order:
-/// vault.yml · vault.yml-keys · folders · plugin-files · settings-hooks ·
-/// orphan-checkpoints · qmd-embeddings · claude-settings.
+/// vault.yml · vault.yml-keys · **vault-config-migration** · folders ·
+/// plugin-files · settings-hooks · orphan-checkpoints · qmd-embeddings ·
+/// claude-settings.
+///
+/// `vault-config-migration` (v3.1 addition) sits between `vault.yml-keys`
+/// and `folders` so it lands near the other config-shape checks.
 ///
 /// Perf rec #1: `qmd-embeddings` spawns `qmd status`, which dominates the
 /// total runtime (~870 ms of doctor's ~930 ms wall time). Launch that probe
@@ -49,12 +55,13 @@ pub use vault_yml_keys::VaultYmlKeysCheck;
 pub fn run_all_checks(vault_root: &Path, config: &VaultConfig) -> Vec<DoctorResult> {
     /// Splice position of the qmd row in the final results vector. Must
     /// stay in sync with the canonical Bun-parity order (vault.yml ·
-    /// vault.yml-keys · folders · plugin-files · settings-hooks ·
-    /// orphan-checkpoints · **qmd-embeddings** · claude-settings) — adding
-    /// or reordering a check in `serial_checks` requires updating this
-    /// constant. The `debug_assert_eq!` below catches misalignment in CI.
-    const QMD_SPLICE_POSITION: usize = 6;
-    const EXPECTED_SERIAL_LEN: usize = 7;
+    /// vault.yml-keys · vault-config-migration · folders · plugin-files ·
+    /// settings-hooks · orphan-checkpoints · **qmd-embeddings** ·
+    /// claude-settings) — adding or reordering a check in `serial_checks`
+    /// requires updating this constant. The `debug_assert_eq!` below
+    /// catches misalignment in CI.
+    const QMD_SPLICE_POSITION: usize = 7;
+    const EXPECTED_SERIAL_LEN: usize = 8;
 
     let qmd_config = config.clone();
     let qmd_handle = std::thread::spawn(move || QmdEmbeddingsCheck.run(Path::new(""), &qmd_config));
@@ -62,6 +69,7 @@ pub fn run_all_checks(vault_root: &Path, config: &VaultConfig) -> Vec<DoctorResu
     let serial_checks: Vec<Box<dyn Check>> = vec![
         Box::new(VaultYmlCheck),
         Box::new(VaultYmlKeysCheck),
+        Box::new(VaultConfigMigrationCheck),
         Box::new(FoldersCheck),
         Box::new(PluginFilesCheck),
         Box::new(SettingsHooksCheck),

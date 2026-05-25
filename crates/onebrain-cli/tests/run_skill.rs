@@ -8,9 +8,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
-/// Build a minimal vault directory with just `vault.yml`.
+/// Build a minimal vault directory with just `onebrain.yml`.
 fn write_minimal_vault(dir: &Path) {
-    fs::write(dir.join("vault.yml"), "folders:\n  inbox: 00-inbox\n").unwrap();
+    fs::write(dir.join("onebrain.yml"), "folders:\n  inbox: 00-inbox\n").unwrap();
 }
 
 /// Write a mock `claude` shell script that logs its argv (one per line) to
@@ -41,7 +41,7 @@ exit "${MOCK_EXIT:-0}"
 "#;
 
 #[test]
-fn missing_vault_yml_exits_78() {
+fn missing_config_exits_78() {
     let d = tempdir().unwrap();
     let bogus = d.path().join("does-not-exist");
     Command::cargo_bin("onebrain")

@@ -8,13 +8,15 @@
 //! action per check); anything ambiguous is reported as "untouched · run
 //! the listed command yourself".
 
+use crate::legacy_output::serialize_for_mode;
+use crate::output::OutputMode;
 use crate::safety::refuse_dangerous_vault_path;
-use anyhow::{anyhow, Context, Result};
-use onebrain_core::{find_vault_root, load_vault_config, DoctorResult, DoctorStatus};
+use crate::vault_ctx;
+use anyhow::{anyhow, Result};
+use onebrain_core::{load_vault_config, DoctorResult, DoctorStatus};
 use onebrain_fs::doctor::run_all_checks;
-use std::env;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Outcome of a single fix attempt — printed as part of the `--fix`
 /// summary so the user can see what changed (or didn't).
@@ -40,31 +42,43 @@ enum FixOutcome {
 /// JSON mode the initial report is suppressed and `--fix` outcomes are
 /// captured into the wrapper instead of being printed line-by-line —
 /// so the entire command produces exactly one JSON document.
-pub fn run(fix: bool, json: bool) -> Result<i32> {
-    let cwd = env::current_dir().context("read current directory")?;
-    let vault_root = match find_vault_root(&cwd) {
-        Some(r) => r,
+///
+/// `vault_flag` carries the global `--vault <PATH>` value (if any). The
+/// vault is resolved through the canonical chain: flag > `ONEBRAIN_VAULT`
+/// env > walk-up from cwd. This matches `vault current` / every other
+/// v3.1 vault-aware command so `onebrain doctor --vault PATH` works from
+/// outside the vault directory.
+pub fn run(fix: bool, json: bool, vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<i32> {
+    // v3.1: structured output is triggered by EITHER the local `--json`
+    // flag (back-compat with v3.0 callers) OR any global format flag
+    // (`--yaml`, `--output yaml`, …). `mode.is_structured()` catches every
+    // non-text variant so `--yaml` no longer silently emits text.
+    let want_structured = json || mode.is_structured();
+    let vault_root = match vault_ctx::resolve(vault_flag)? {
+        Some(r) => r.root,
         None => {
-            // In JSON mode, emit a structured failure envelope on stdout so
-            // scripted consumers don't have to parse anyhow text from stderr.
-            // Plain-text mode keeps the existing anyhow flow.
-            if json {
+            // In structured mode, emit a failure envelope on stdout so
+            // scripted consumers don't have to parse anyhow text from
+            // stderr. Plain-text mode keeps the existing anyhow flow.
+            if want_structured {
                 let doc = serde_json::json!({
                     "ok": false,
                     "error": "not_in_vault",
-                    "message": "not inside a vault (no vault.yml found)",
+                    "message": "not inside a vault (no onebrain.yml or vault.yml found)",
                 });
-                println!("{}", serde_json::to_string(&doc)?);
+                println!("{}", emit_structured(&doc, json, mode)?);
                 return Ok(1);
             }
-            return Err(anyhow!("not inside a vault (no vault.yml found)"));
+            return Err(anyhow!(
+                "not inside a vault (no onebrain.yml or vault.yml found)"
+            ));
         }
     };
 
     // Best-effort config load — on error, fall back to defaults so doctor can
     // still report what it sees (matches Bun behavior: stderr warning + defaults).
     let config = load_vault_config(&vault_root).unwrap_or_else(|err| {
-        eprintln!("doctor: vault.yml load warning: {err}");
+        eprintln!("doctor: config load warning: {err}");
         onebrain_core::VaultConfig {
             qmd_collection: None,
             checkpoint: Default::default(),
@@ -73,7 +87,7 @@ pub fn run(fix: bool, json: bool) -> Result<i32> {
     });
 
     let mut results = run_all_checks(vault_root.as_path(), &config);
-    if !json {
+    if !want_structured {
         print_report(&results, std::io::stdout())?;
     }
 
@@ -91,21 +105,26 @@ pub fn run(fix: bool, json: bool) -> Result<i32> {
             .filter(|r| matches!(r.status, DoctorStatus::Warn | DoctorStatus::Error))
             .collect();
         if issues.is_empty() {
-            if !json {
+            if !want_structured {
                 println!("\nFix · nothing to do — no issues.");
             }
         } else {
-            if !json {
+            if !want_structured {
                 println!("\nFix · attempting recipes for {} issue(s)", issues.len());
             }
             let outcomes: Vec<(String, FixOutcome)> = issues
                 .iter()
-                .map(|r| (r.check.clone(), attempt_fix(r, vault_root.as_path(), json)))
+                .map(|r| {
+                    (
+                        r.check.clone(),
+                        attempt_fix(r, vault_root.as_path(), want_structured),
+                    )
+                })
                 .collect();
             any_recipe_failed = outcomes
                 .iter()
                 .any(|(_, o)| matches!(o, FixOutcome::Failed(_)));
-            if json {
+            if want_structured {
                 fix_outcomes_json = outcomes
                     .iter()
                     .map(|(check, o)| {
@@ -127,7 +146,7 @@ pub fn run(fix: bool, json: bool) -> Result<i32> {
                 println!();
             }
             results = run_all_checks(vault_root.as_path(), &config);
-            if !json {
+            if !want_structured {
                 print_report(&results, std::io::stdout())?;
             }
         }
@@ -137,11 +156,18 @@ pub fn run(fix: bool, json: bool) -> Result<i32> {
         .iter()
         .filter(|r| r.status == DoctorStatus::Error)
         .count();
-    if json {
+    if want_structured {
         // Always emit `fix[]` when --fix was requested so consumers can
         // distinguish "user didn't ask to fix" (key absent) from "user asked
         // but nothing to fix" (key present, empty array). Schema stability.
-        print_report_json(&results, fix, fix_outcomes_json, std::io::stdout())?;
+        print_report_structured(
+            &results,
+            fix,
+            fix_outcomes_json,
+            json,
+            mode,
+            std::io::stdout(),
+        )?;
     }
     // Exit non-zero on any post-fix error OR any failed recipe — so the
     // caller's shell-level `if $? -ne 0` catches both check escalations
@@ -166,10 +192,12 @@ pub fn run(fix: bool, json: bool) -> Result<i32> {
 /// — top-level `ok` is the boolean). The two fields are deliberately named
 /// differently to prevent the `summary.ok` count-vs-boolean confusion that
 /// the first draft of this code had.
-fn print_report_json<W: Write>(
+fn print_report_structured<W: Write>(
     results: &[DoctorResult],
     fix_requested: bool,
     fix_outcomes: Vec<serde_json::Value>,
+    legacy_json_flag: bool,
+    mode: &OutputMode,
     mut w: W,
 ) -> Result<()> {
     let total = results.len();
@@ -197,8 +225,41 @@ fn print_report_json<W: Write>(
             .expect("doctor json root is object")
             .insert("fix".to_string(), serde_json::Value::Array(fix_outcomes));
     }
-    writeln!(w, "{}", serde_json::to_string(&doc)?)?;
+    writeln!(w, "{}", emit_structured(&doc, legacy_json_flag, mode)?)?;
     Ok(())
+}
+
+/// Render `doc` for the active structured-output mode.
+///
+/// v3.1 contract:
+/// - `--yaml` / `--output yaml` (`mode.is_structured()` AND mode is YAML) →
+///   YAML serialisation via [`serialize_for_mode`].
+/// - `--json --pretty` / `--output json` with pretty → indented JSON via
+///   the same dispatcher.
+/// - Bare `--json` (legacy `json: bool`, no global format flag) → compact
+///   JSON byte-identical to v3.0 output so scripted consumers don't drift.
+///
+/// Contract: caller invokes this only when `want_structured = json ||
+/// mode.is_structured()` is true; the third arm here is therefore
+/// unreachable from production code paths. `debug_assert!` makes any
+/// future caller-side drift loud during testing; the compact-JSON
+/// fallback prevents a prod panic if drift ships anyway.
+fn emit_structured(
+    doc: &serde_json::Value,
+    legacy_json_flag: bool,
+    mode: &OutputMode,
+) -> Result<String> {
+    if mode.is_structured() {
+        Ok(serialize_for_mode(doc, mode))
+    } else if legacy_json_flag {
+        Ok(serde_json::to_string(doc)?)
+    } else {
+        debug_assert!(
+            false,
+            "emit_structured invoked without structured mode or legacy_json_flag"
+        );
+        Ok(serde_json::to_string(doc)?)
+    }
 }
 
 /// Dispatch the warning to the matching fix recipe. The match keys on
@@ -231,6 +292,11 @@ fn attempt_fix(result: &DoctorResult, vault_root: &Path, json: bool) -> FixOutco
         // `.claude/settings.json`. Cosmetic config cleanup; no behavioral
         // change at runtime (the plugin is enabled via `enabledPlugins`).
         "claude-settings" => fix_claude_settings(vault_root, json),
+        // Migrate legacy `vault.yml` → canonical `onebrain.yml` via a
+        // single atomic `fs::rename`. Idempotent: drops legacy if both
+        // exist (canonical wins); reports already-clean when only the
+        // canonical filename is present.
+        "vault-config-migration" => fix_vault_config_migration(vault_root, json),
         // Orphan checkpoints can't be auto-deleted safely — the user may
         // still want to consolidate them via `/wrapup`. Steer them there
         // explicitly rather than risk silent data loss.
@@ -338,7 +404,7 @@ fn fix_plugin_files(vault_root: &Path, json: bool) -> FixOutcome {
     }
     status_line(json, "running: vault-sync");
     // In JSON mode route vault-sync's PlainProgress to stderr so stdout
-    // remains reserved for the JSON document (B-H1 fix).
+    // remains reserved for the JSON document.
     let opts = if json {
         VaultSyncOptions {
             is_tty: Some(false),
@@ -372,19 +438,28 @@ fn fix_plugin_files(vault_root: &Path, json: bool) -> FixOutcome {
 /// re-serializes from the parsed model) — the Fixed message calls this out
 /// so the user knows what changed besides the keys.
 fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
-    status_line(json, "running: backfill vault.yml");
-    let path = vault_root.join("vault.yml");
+    use onebrain_core::{find_config_file, CONFIG_FILENAME};
+    // Operate on whichever config file is present — canonical preferred,
+    // legacy fallback. The `vault-config-migration` recipe rename runs
+    // separately; this recipe is filename-agnostic.
+    let path = find_config_file(vault_root).unwrap_or_else(|| vault_root.join(CONFIG_FILENAME));
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(CONFIG_FILENAME)
+        .to_string();
+    status_line(json, &format!("running: backfill {filename}"));
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
-        Err(e) => return FixOutcome::Failed(format!("read vault.yml: {e}")),
+        Err(e) => return FixOutcome::Failed(format!("read {filename}: {e}")),
     };
     let mut yaml: serde_yaml::Value = match serde_yaml::from_str(&text) {
         Ok(v) => v,
-        Err(e) => return FixOutcome::Failed(format!("parse vault.yml: {e}")),
+        Err(e) => return FixOutcome::Failed(format!("parse {filename}: {e}")),
     };
     let mapping = match yaml.as_mapping_mut() {
         Some(m) => m,
-        None => return FixOutcome::Failed("vault.yml root is not a mapping".to_string()),
+        None => return FixOutcome::Failed(format!("{filename} root is not a mapping")),
     };
 
     let mut added: Vec<&'static str> = Vec::new();
@@ -481,15 +556,15 @@ fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
     }
 
     if added.is_empty() && removed.is_empty() && repaired.is_empty() {
-        return FixOutcome::Fixed("vault.yml already in expected shape".to_string());
+        return FixOutcome::Fixed(format!("{filename} already in expected shape"));
     }
 
     let serialized = match serde_yaml::to_string(&yaml) {
         Ok(s) => s,
-        Err(e) => return FixOutcome::Failed(format!("serialize vault.yml: {e}")),
+        Err(e) => return FixOutcome::Failed(format!("serialize {filename}: {e}")),
     };
     if let Err(e) = atomic_write_text(&path, &serialized) {
-        return FixOutcome::Failed(format!("write vault.yml: {e}"));
+        return FixOutcome::Failed(format!("write {filename}: {e}"));
     }
 
     let mut parts = Vec::new();
@@ -561,6 +636,39 @@ fn fix_claude_settings(vault_root: &Path, json: bool) -> FixOutcome {
         return FixOutcome::Failed(format!("write settings.json: {e}"));
     }
     FixOutcome::Fixed("removed stale extraKnownMarketplaces.onebrain".to_string())
+}
+
+/// Recipe — `vault-config-migration` warning means the vault uses the
+/// legacy `vault.yml` filename. Atomic single-syscall rename to canonical
+/// `onebrain.yml`. When both files exist (split state), drop the legacy
+/// one — the canonical filename takes precedence at runtime so the
+/// legacy file is already ignored; removing it eliminates the source of
+/// future drift.
+fn fix_vault_config_migration(vault_root: &Path, json: bool) -> FixOutcome {
+    use onebrain_core::{CONFIG_FILENAME, LEGACY_CONFIG_FILENAME};
+    status_line(json, "running: migrate vault.yml → onebrain.yml");
+    let canonical = vault_root.join(CONFIG_FILENAME);
+    let legacy = vault_root.join(LEGACY_CONFIG_FILENAME);
+    let canonical_exists = canonical.is_file();
+    let legacy_exists = legacy.is_file();
+
+    match (canonical_exists, legacy_exists) {
+        (true, false) | (false, false) => {
+            // Already on canonical (or no config at all — VaultYmlCheck
+            // surfaces that error). Idempotent no-op.
+            FixOutcome::Fixed("onebrain.yml in use — nothing to migrate".to_string())
+        }
+        (false, true) => match std::fs::rename(&legacy, &canonical) {
+            Ok(()) => FixOutcome::Fixed("renamed vault.yml → onebrain.yml".to_string()),
+            Err(e) => FixOutcome::Failed(format!("rename vault.yml: {e}")),
+        },
+        (true, true) => match std::fs::remove_file(&legacy) {
+            Ok(()) => FixOutcome::Fixed(
+                "removed stale vault.yml (onebrain.yml already present)".to_string(),
+            ),
+            Err(e) => FixOutcome::Failed(format!("remove vault.yml: {e}")),
+        },
+    }
 }
 
 /// Match Bun's `typeof value === 'number' && value > 0` for YAML values.
@@ -698,15 +806,31 @@ mod tests {
         assert!(s.contains("fix before using"));
     }
 
+    /// Compact-JSON mode (v3.0 back-compat shape) used by `--json` callers.
+    fn legacy_json_compat_mode() -> OutputMode {
+        OutputMode::Text {
+            color: false,
+            pretty: false,
+        }
+    }
+
     #[test]
-    fn print_report_json_emits_summary_and_top_level_ok() {
+    fn print_report_structured_emits_summary_and_top_level_ok() {
         let results = vec![
             DoctorResult::ok("a", "good"),
             DoctorResult::ok("b", "good"),
             DoctorResult::warn("c", "iffy"),
         ];
         let mut buf = Vec::new();
-        print_report_json(&results, false, vec![], &mut buf).unwrap();
+        print_report_structured(
+            &results,
+            false,
+            vec![],
+            true,
+            &legacy_json_compat_mode(),
+            &mut buf,
+        )
+        .unwrap();
         let s = String::from_utf8(buf).unwrap();
         let doc: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
         // Top-level `ok` is boolean (no errors → true even with warnings).
@@ -721,30 +845,46 @@ mod tests {
     }
 
     #[test]
-    fn print_report_json_ok_false_when_any_error() {
+    fn print_report_structured_ok_false_when_any_error() {
         let results = vec![DoctorResult::error("a", "broken")];
         let mut buf = Vec::new();
-        print_report_json(&results, false, vec![], &mut buf).unwrap();
+        print_report_structured(
+            &results,
+            false,
+            vec![],
+            true,
+            &legacy_json_compat_mode(),
+            &mut buf,
+        )
+        .unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(doc["ok"], false);
         assert_eq!(doc["summary"]["errors"], 1);
     }
 
     #[test]
-    fn print_report_json_emits_empty_fix_array_when_requested_with_no_issues() {
-        // The A-H2 regression case from the alpha.8 review: `fix[]` must
-        // appear (even empty) so consumers can distinguish "user didn't
-        // ask" from "user asked but nothing to fix".
+    fn print_report_structured_emits_empty_fix_array_when_requested_with_no_issues() {
+        // `fix[]` must appear (even empty) so consumers can distinguish
+        // "user didn't ask to fix" from "user asked but nothing to fix" —
+        // schema stability.
         let results = vec![DoctorResult::ok("vault.yml", "valid")];
         let mut buf = Vec::new();
-        print_report_json(&results, true, vec![], &mut buf).unwrap();
+        print_report_structured(
+            &results,
+            true,
+            vec![],
+            true,
+            &legacy_json_compat_mode(),
+            &mut buf,
+        )
+        .unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert!(doc.get("fix").is_some());
         assert_eq!(doc["fix"].as_array().unwrap().len(), 0);
     }
 
     #[test]
-    fn print_report_json_carries_fix_outcomes_through() {
+    fn print_report_structured_carries_fix_outcomes_through() {
         let results = vec![DoctorResult::ok("vault.yml", "valid")];
         let outcomes = vec![serde_json::json!({
             "check": "qmd-embeddings",
@@ -752,23 +892,78 @@ mod tests {
             "message": "qmd embed completed",
         })];
         let mut buf = Vec::new();
-        print_report_json(&results, true, outcomes, &mut buf).unwrap();
+        print_report_structured(
+            &results,
+            true,
+            outcomes,
+            true,
+            &legacy_json_compat_mode(),
+            &mut buf,
+        )
+        .unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(doc["fix"][0]["outcome"], "fixed");
         assert_eq!(doc["fix"][0]["check"], "qmd-embeddings");
     }
 
     #[test]
-    fn print_report_json_serializes_check_hint_and_details() {
+    fn print_report_structured_serializes_check_hint_and_details() {
         let results = vec![DoctorResult::warn("c", "iffy")
             .with_hint("Try X")
             .with_details(vec!["d1".into(), "d2".into()])];
         let mut buf = Vec::new();
-        print_report_json(&results, false, vec![], &mut buf).unwrap();
+        print_report_structured(
+            &results,
+            false,
+            vec![],
+            true,
+            &legacy_json_compat_mode(),
+            &mut buf,
+        )
+        .unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(doc["checks"][0]["status"], "warn");
         assert_eq!(doc["checks"][0]["hint"], "Try X");
         assert_eq!(doc["checks"][0]["details"][1], "d2");
+    }
+
+    /// v3.1 regression guard: doctor must honor `--yaml` and emit YAML, not
+    /// the bare JSON envelope (the bug the user found in alpha smoke).
+    #[test]
+    fn print_report_structured_yaml_mode_emits_yaml_not_json() {
+        let results = vec![DoctorResult::ok("a", "good")];
+        let mut buf = Vec::new();
+        print_report_structured(&results, false, vec![], false, &OutputMode::Yaml, &mut buf)
+            .unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            !s.trim_start().starts_with('{'),
+            "yaml mode emitted JSON braces: {s}"
+        );
+        let v: serde_yaml::Value =
+            serde_yaml::from_str(&s).expect("yaml mode output must parse as YAML");
+        assert!(v.is_mapping(), "yaml root must be a mapping, got {v:?}");
+    }
+
+    /// v3.1 regression guard: doctor must honor `--json --pretty` and indent.
+    #[test]
+    fn print_report_structured_pretty_json_is_multiline_indented() {
+        let results = vec![DoctorResult::ok("a", "good")];
+        let mut buf = Vec::new();
+        print_report_structured(
+            &results,
+            false,
+            vec![],
+            false,
+            &OutputMode::Json { pretty: true },
+            &mut buf,
+        )
+        .unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains('\n'), "pretty JSON must be multiline: {s}");
+        assert!(s.contains("  "), "pretty JSON must be indented: {s}");
+        let _v: serde_json::Value =
+            serde_json::from_str(s.trim()).expect("still parseable as JSON");
     }
 
     use std::fs;
@@ -777,7 +972,7 @@ mod tests {
     #[test]
     fn fix_vault_yml_keys_backfills_missing_keys() {
         let d = tempdir().unwrap();
-        fs::write(d.path().join("vault.yml"), "qmd_collection: foo\n").unwrap();
+        fs::write(d.path().join("onebrain.yml"), "qmd_collection: foo\n").unwrap();
         let outcome = fix_vault_yml_keys(d.path(), false);
         match outcome {
             FixOutcome::Fixed(msg) => {
@@ -786,7 +981,7 @@ mod tests {
             }
             other => panic!("expected Fixed, got: {other:?}"),
         }
-        let after = fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert!(after.contains("update_channel: stable"));
         assert!(after.contains("inbox: 00-inbox"));
         assert!(after.contains("logs: 07-logs"));
@@ -800,7 +995,7 @@ mod tests {
         // recipe to silently skip the 8 sub-key inserts.
         let d = tempdir().unwrap();
         fs::write(
-            d.path().join("vault.yml"),
+            d.path().join("onebrain.yml"),
             "update_channel: stable\nfolders: null\n",
         )
         .unwrap();
@@ -809,7 +1004,7 @@ mod tests {
             FixOutcome::Fixed(msg) => assert!(msg.contains("inbox"), "msg: {msg}"),
             other => panic!("expected Fixed, got: {other:?}"),
         }
-        let after = fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert!(after.contains("inbox: 00-inbox"));
         assert!(after.contains("logs: 07-logs"));
     }
@@ -818,7 +1013,7 @@ mod tests {
     fn fix_vault_yml_keys_strips_deprecated_keys() {
         let d = tempdir().unwrap();
         fs::write(
-            d.path().join("vault.yml"),
+            d.path().join("onebrain.yml"),
             "update_channel: stable\n\
              onebrain_version: \"2.1.0\"\n\
              method: legacy\n\
@@ -835,7 +1030,7 @@ mod tests {
             }
             other => panic!("expected Fixed, got: {other:?}"),
         }
-        let after = fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert!(!after.contains("onebrain_version"), "{after}");
         assert!(!after.contains("method: legacy"), "{after}");
         assert!(!after.contains("harness"), "{after}");
@@ -845,7 +1040,7 @@ mod tests {
     fn fix_vault_yml_keys_repairs_checkpoint_nums() {
         let d = tempdir().unwrap();
         fs::write(
-            d.path().join("vault.yml"),
+            d.path().join("onebrain.yml"),
             "update_channel: stable\n\
              checkpoint:\n  messages: 0\n  minutes: -5\n\
              folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n",
@@ -856,7 +1051,7 @@ mod tests {
             FixOutcome::Fixed(msg) => assert!(msg.contains("checkpoint"), "msg: {msg}"),
             other => panic!("expected Fixed, got: {other:?}"),
         }
-        let after = fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert!(after.contains("messages: 15"));
         assert!(after.contains("minutes: 30"));
     }
@@ -866,13 +1061,13 @@ mod tests {
         let d = tempdir().unwrap();
         let clean = "update_channel: stable\n\
                      folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n";
-        fs::write(d.path().join("vault.yml"), clean).unwrap();
+        fs::write(d.path().join("onebrain.yml"), clean).unwrap();
         let outcome = fix_vault_yml_keys(d.path(), false);
         match outcome {
             FixOutcome::Fixed(msg) => assert!(msg.contains("already"), "msg: {msg}"),
             other => panic!("expected Fixed (no-op), got: {other:?}"),
         }
-        let after = fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert_eq!(after, clean, "file untouched when nothing to do");
     }
 
@@ -921,6 +1116,56 @@ mod tests {
             FixOutcome::Fixed(msg) => assert!(msg.contains("already clean"), "msg: {msg}"),
             other => panic!("expected Fixed (no-op), got: {other:?}"),
         }
+    }
+
+    /// v3.1 dual-read transition · `vault-config-migration` recipe must
+    /// atomically rename `vault.yml` → `onebrain.yml` and leave the rest
+    /// of the vault untouched.
+    #[test]
+    fn fix_vault_config_migration_renames_legacy_to_canonical() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("vault.yml"), "qmd_collection: legacy\n").unwrap();
+        let outcome = fix_vault_config_migration(d.path(), false);
+        match outcome {
+            FixOutcome::Fixed(msg) => assert!(msg.contains("renamed"), "msg: {msg}"),
+            other => panic!("expected Fixed, got: {other:?}"),
+        }
+        assert!(d.path().join("onebrain.yml").is_file());
+        assert!(!d.path().join("vault.yml").exists());
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after, "qmd_collection: legacy\n");
+    }
+
+    #[test]
+    fn fix_vault_config_migration_idempotent_when_only_canonical_exists() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("onebrain.yml"), "qmd_collection: ob\n").unwrap();
+        let outcome = fix_vault_config_migration(d.path(), false);
+        match outcome {
+            FixOutcome::Fixed(msg) => {
+                assert!(msg.contains("nothing to migrate"), "msg: {msg}")
+            }
+            other => panic!("expected Fixed (no-op), got: {other:?}"),
+        }
+        assert!(d.path().join("onebrain.yml").is_file());
+        assert!(!d.path().join("vault.yml").exists());
+    }
+
+    #[test]
+    fn fix_vault_config_migration_when_both_exist_keeps_canonical() {
+        // Split state: canonical wins, legacy removed.
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("onebrain.yml"), "canonical: yes\n").unwrap();
+        fs::write(d.path().join("vault.yml"), "legacy: yes\n").unwrap();
+        let outcome = fix_vault_config_migration(d.path(), false);
+        match outcome {
+            FixOutcome::Fixed(msg) => assert!(msg.contains("removed stale"), "msg: {msg}"),
+            other => panic!("expected Fixed, got: {other:?}"),
+        }
+        // Canonical preserved verbatim · legacy gone.
+        let canonical = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(canonical, "canonical: yes\n");
+        assert!(!d.path().join("vault.yml").exists());
     }
 
     #[test]

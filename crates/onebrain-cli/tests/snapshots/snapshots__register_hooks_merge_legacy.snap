@@ -13,7 +13,8 @@ expression: text
                         "command": "onebrain",
                         "args": [
                             "checkpoint",
-                            "stop"
+                            "stop",
+                            "--json"
                         ],
                         "type": "command"
                     }
@@ -28,7 +29,8 @@ expression: text
                         "type": "command",
                         "command": "onebrain",
                         "args": [
-                            "qmd-reindex"
+                            "qmd-reindex",
+                            "--json"
                         ]
                     }
                 ]

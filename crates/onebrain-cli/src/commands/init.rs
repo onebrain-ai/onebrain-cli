@@ -6,13 +6,19 @@
 
 use anyhow::Result;
 use onebrain_fs::init::{
-    ask_initialize_here, ask_overwrite_vault_yml, ask_schedule_preset, run_init, ConfirmFn,
-    InitOptions, PresetFn,
+    ask_continue_nonempty, ask_initialize_here, ask_overwrite_vault_yml, ask_schedule_preset,
+    run_init, ConfirmFn, InitOptions, PresetFn,
 };
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-pub fn run(yes: bool, vault_dir: Option<PathBuf>, force: bool, no_sync: bool) -> Result<i32> {
+pub fn run(
+    yes: bool,
+    vault_dir: Option<PathBuf>,
+    force: bool,
+    no_sync: bool,
+    structured_output: bool,
+) -> Result<i32> {
     let opts = if yes {
         // Non-interactive — no prompts, Essentials preset. `--force` still
         // controls the existing-vault.yml guard so CI runs can opt in.
@@ -21,6 +27,7 @@ pub fn run(yes: bool, vault_dir: Option<PathBuf>, force: bool, no_sync: bool) ->
             vault_dir,
             force,
             skip_vault_sync: no_sync,
+            structured_output,
             ..InitOptions::default()
         }
     } else {
@@ -30,6 +37,7 @@ pub fn run(yes: bool, vault_dir: Option<PathBuf>, force: bool, no_sync: bool) ->
             vault_dir,
             force,
             skip_vault_sync: no_sync,
+            structured_output,
             ..InitOptions::default()
         }
     };
@@ -38,9 +46,10 @@ pub fn run(yes: bool, vault_dir: Option<PathBuf>, force: bool, no_sync: bool) ->
     Ok(result.exit_code)
 }
 
-/// Real confirm closure — dispatches between "initialize here?" and
-/// "vault.yml overwrite?" based on the question text. Both prompts are
-/// surfaced via `inquire::Confirm`; an unparseable answer counts as "no".
+/// Real confirm closure — dispatches between "initialize here?",
+/// "{onebrain,vault}.yml overwrite?", and the new "target not empty" safety
+/// prompt based on the question text. All prompts are surfaced via
+/// `inquire::Confirm`; an unparseable answer counts as "no".
 fn real_confirm_fn() -> ConfirmFn {
     // Track which question we're on so we can pick the right helper.
     // `RefCell` is fine here — closure is `FnMut` so we own mutability.
@@ -48,8 +57,15 @@ fn real_confirm_fn() -> ConfirmFn {
     Box::new(move |question: &str| {
         let mut n = state.borrow_mut();
         *n += 1;
-        if question.starts_with("vault.yml already exists") {
+        if question.starts_with("onebrain.yml already exists")
+            || question.starts_with("vault.yml already exists")
+        {
             ask_overwrite_vault_yml()
+        } else if question.starts_with("Target directory is not empty") {
+            // The library passes the full multi-line context block as the
+            // question text; the wizard helper handles the printing +
+            // y/N prompt with default=no for safety.
+            ask_continue_nonempty(question)
         } else if question.starts_with("Initialize OneBrain vault here?") {
             // Pull the path out of the question text — defensive: the lib
             // formats it as "(path)" at the end. If we can't parse it, fall
@@ -64,6 +80,13 @@ fn real_confirm_fn() -> ConfirmFn {
             // Fallback — just emit the same question via inquire.
             onebrain_fs::init::ask_initialize_here(Path::new("."))
         } else {
+            // B3 (SF-H5): a future prompt string added in `init/mod.rs`
+            // without a matching arm here would silently abort init.
+            // Surface it loudly in dev builds (debug_assert) and emit a
+            // stderr warning in release builds so the user sees the drift
+            // instead of an unexplained "init declined".
+            debug_assert!(false, "unhandled init prompt: {question}");
+            eprintln!("init: unrecognized prompt — treating as no: {question}");
             false
         }
     })
@@ -77,12 +100,16 @@ fn real_preset_fn() -> PresetFn {
 mod tests {
     use super::*;
 
+    /// B3 (SF-H5): unknown prompt strings now trip a debug_assert in dev
+    /// builds (catches drift between mod.rs question text + this dispatcher
+    /// in CI) and emit a stderr warning in release builds (users see the
+    /// issue instead of an unexplained "init declined").
     #[test]
-    fn real_confirm_fn_routes_overwrite_question() {
-        // We can't actually drive inquire from a unit test (no TTY) — but we
-        // can at least construct the closure and verify it answers `false`
-        // on an unknown question.
+    #[should_panic(expected = "unhandled init prompt")]
+    fn confirm_fn_warns_on_unknown_prompt() {
         let mut f = real_confirm_fn();
-        assert!(!f("something totally unrelated"));
+        // Trip debug_assert! in dev/test builds. Release builds would just
+        // see the stderr warning + a `false` return.
+        let _ = f("something totally unrelated");
     }
 }

@@ -17,7 +17,7 @@ pub fn run(name: &str, cutoff: Option<&str>, vault: Option<&str>) -> Result<()> 
     let vault_root = match vault_root {
         Some(p) => p,
         None => {
-            eprintln!("migrate: not inside a vault (no vault.yml found)");
+            eprintln!("migrate: not inside a vault (no onebrain.yml or vault.yml found)");
             return Ok(());
         }
     };
@@ -25,7 +25,7 @@ pub fn run(name: &str, cutoff: Option<&str>, vault: Option<&str>) -> Result<()> 
     let config = match load_vault_config_at(&vault_root) {
         Ok(c) => c,
         Err(err) => {
-            eprintln!("migrate: vault.yml load failed: {err}");
+            eprintln!("migrate: config load failed: {err}");
             return Ok(());
         }
     };

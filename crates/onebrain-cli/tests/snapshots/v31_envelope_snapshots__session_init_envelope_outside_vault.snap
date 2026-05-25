@@ -1,0 +1,8 @@
+---
+source: crates/onebrain-cli/tests/v31_envelope_snapshots.rs
+expression: v
+---
+{
+  "decision": "block",
+  "reason": "onebrain-vault-not-found"
+}
