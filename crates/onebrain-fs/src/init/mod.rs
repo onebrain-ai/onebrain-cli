@@ -141,7 +141,10 @@ pub fn run_init(mut opts: InitOptions) -> Result<InitResult, FsError> {
     let mut stdout = take_stdout_sink(&mut opts.stdout_lines);
     let mut stderr = take_stderr_sink(&mut opts.stderr_lines);
 
-    stdout("OneBrain Init");
+    // The "OneBrain Init" header lands on stdout AFTER the structured-output
+    // safety check so a `--json` failure leaves stdout as a single
+    // canonical envelope. Text-mode runs still see the header on the next
+    // emit (immediately after the safety check passes).
 
     // ── Step 0: target-directory safety check ──────────────────────────────
     // Guards against running `onebrain init` in the wrong directory. Skipped
@@ -199,6 +202,11 @@ pub fn run_init(mut opts: InitOptions) -> Result<InitResult, FsError> {
             source: e,
         })?;
     }
+
+    // Safety check passed — emit the text-mode header now. Structured-output
+    // mode still gets it on stdout (existing CLI integration tests assert
+    // its presence), but only after we've cleared the safety guard.
+    stdout("OneBrain Init");
 
     // ── Step 1: vault.yml guard ────────────────────────────────────────────
     let vault_yml_path = vault_dir.join("vault.yml");
@@ -694,7 +702,11 @@ mod tests {
         let d = tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("00-inbox")).unwrap();
         std::fs::create_dir_all(d.path().join("01-projects")).unwrap();
-        let (opts, _stdout_buf) = test_opts(d.path());
+        let (mut opts, _stdout_buf) = test_opts(d.path());
+        // The pre-created OneBrain folders make the target dir non-empty
+        // and without a vault.yml, so the Step 0 safety check would
+        // otherwise refuse to proceed. --force bypasses it.
+        opts.force = true;
 
         let r = run_init(opts).unwrap();
         assert!(r.ok);
