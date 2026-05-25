@@ -8,7 +8,6 @@
 
 use crate::v31::hook_rewriter;
 use anyhow::{Context, Result};
-use onebrain_core::find_vault_root;
 use onebrain_fs::register_hooks::settings::settings_path;
 use std::path::PathBuf;
 
@@ -18,6 +17,11 @@ pub struct PluginUpdateReport {
     pub hooks_rewritten: u32,
     pub plists_rewritten: bool,
     pub dry_run: bool,
+    /// When `Some(reason)`, the run failed midway. Fields above reflect
+    /// whatever progress was made before the failure. The caller emits a
+    /// partial-report envelope with `ok: false` + error code
+    /// `E_PLUGIN_UPDATE_PARTIAL`.
+    pub partial_failure: Option<String>,
 }
 
 /// Run the v3.1 plugin update workflow.
@@ -29,6 +33,13 @@ pub struct PluginUpdateReport {
 /// 4. Re-run `schedule register` to refresh launchd plists.
 ///
 /// Idempotent — running twice does not duplicate hook entries or plists.
+///
+/// Partial-failure model: when step 3 succeeds but step 4 fails the
+/// returned report's `partial_failure` field is `Some(reason)`, the success
+/// fields reflect actual on-disk progress, and the function returns
+/// `Ok(report)` so the dispatcher can render the partial envelope. Earlier
+/// step failures (1, 2) bubble up as `Err`, since no on-disk state has
+/// changed yet from this command.
 pub fn run(
     vault_dir: Option<PathBuf>,
     branch: Option<String>,
@@ -39,20 +50,8 @@ pub fn run(
         ..Default::default()
     };
 
-    // 1. Resolve vault.
-    let cwd = std::env::current_dir().context("read current directory")?;
-    let resolved = crate::vault_ctx::resolve(vault_dir.clone())?.unwrap_or_else(|| {
-        // Tolerant: fall back to walking from cwd one more time so the
-        // error message is consistent with vault-required commands.
-        // In practice resolve() already does this — falling through here
-        // means truly no vault, so synthesize a not-found result.
-        onebrain_core::ResolvedVault {
-            root: find_vault_root(&cwd).unwrap_or_else(|| {
-                panic!("plugin update requires a vault — none found from {cwd:?}");
-            }),
-            source: onebrain_core::VaultSource::WalkUp,
-        }
-    });
+    // 1. Resolve vault — vault-required, errors with exit 64 when not found.
+    let resolved = crate::vault_ctx::require(vault_dir.clone())?;
     let vault_root = resolved.root.as_path().to_path_buf();
 
     // 2. Sync plugin tarball — same backend as v3.0 `vault-sync`.
@@ -74,9 +73,12 @@ pub fn run(
 
     // 4. Re-register launchd plists.
     //    register_schedule's `--refresh` flag re-emits plists with the
-    //    current vault path. It's idempotent.
+    //    current vault path. It's idempotent. A failure here leaves hooks
+    //    pointing at v3.1 paths while plists may still reference v3.0 —
+    //    we surface this as a partial failure rather than bubbling Err, so
+    //    the dispatcher can render the partial state in the envelope.
     if !dry_run {
-        crate::commands::register_schedule::run(
+        match crate::commands::register_schedule::run(
             Some(vault_root),
             /* dry_run    */ false,
             /* remove     */ false,
@@ -84,9 +86,14 @@ pub fn run(
             /* resume     */ None,
             /* status     */ false,
             /* test       */ None,
-        )
-        .context("plugin update: schedule re-register failed")?;
-        report.plists_rewritten = true;
+        ) {
+            Ok(()) => report.plists_rewritten = true,
+            Err(e) => {
+                report.partial_failure = Some(format!(
+                    "schedule re-register failed after hook rewrite: {e:#}"
+                ));
+            }
+        }
     }
 
     Ok(report)
@@ -108,5 +115,6 @@ mod tests {
         assert_eq!(r.hooks_rewritten, 0);
         assert!(!r.plists_rewritten);
         assert!(!r.dry_run);
+        assert!(r.partial_failure.is_none());
     }
 }

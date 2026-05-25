@@ -115,7 +115,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             } => {
                 let v = vault_dir.or(vault_flag.clone());
                 let report = plugin_update::run(v, branch, dry_run)?;
-                emit_plugin_update_summary(&report, &mode);
+                emit_plugin_update_summary(&report, &mode)?;
+                // Partial failure: hooks were rewritten but plists weren't
+                // (or some other mid-flight step bailed). Surface a
+                // canonical exit so callers don't treat this as success.
+                if report.partial_failure.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "plugin update completed only partially: {}",
+                        report.partial_failure.as_deref().unwrap_or("")
+                    ));
+                }
                 Ok(())
             }
             PluginVerb::Migrate {
@@ -329,8 +338,18 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
 /// Render a `plugin update` report to the user. JSON mode emits the
 /// canonical envelope; text mode emits a short bullet list.
-fn emit_plugin_update_summary(report: &plugin_update::PluginUpdateReport, mode: &OutputMode) {
-    use crate::output::{emit, Envelope};
+///
+/// On partial failure (mid-flight bail after some on-disk state changed),
+/// emits a partial-report envelope with `ok: false`, error code
+/// `E_PLUGIN_UPDATE_PARTIAL`, and the partial state visible in `data`. The
+/// caller in `dispatch` returns an error after this so the process exit
+/// code reflects the failure.
+fn emit_plugin_update_summary(
+    report: &plugin_update::PluginUpdateReport,
+    mode: &OutputMode,
+) -> Result<()> {
+    use crate::output::{emit, Envelope, ErrorInfo};
+    use anyhow::Context;
     use serde::Serialize;
 
     #[derive(Serialize)]
@@ -341,24 +360,43 @@ fn emit_plugin_update_summary(report: &plugin_update::PluginUpdateReport, mode: 
         dry_run: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         note: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partial_failure: Option<&'a str>,
     }
 
-    let env = Envelope::ok(
-        "plugin.update",
-        None,
-        Data {
-            vault_synced: report.vault_synced,
-            hooks_rewritten: report.hooks_rewritten,
-            plists_rewritten: report.plists_rewritten,
-            dry_run: report.dry_run,
-            note: if report.dry_run {
-                Some("dry-run · no changes written")
-            } else {
-                None
-            },
+    let data = Data {
+        vault_synced: report.vault_synced,
+        hooks_rewritten: report.hooks_rewritten,
+        plists_rewritten: report.plists_rewritten,
+        dry_run: report.dry_run,
+        note: if report.dry_run {
+            Some("dry-run · no changes written")
+        } else {
+            None
         },
-    );
-    let _ = emit(&env, mode, std::io::stdout().lock(), |e| {
+        partial_failure: report.partial_failure.as_deref(),
+    };
+
+    let env = if let Some(reason) = report.partial_failure.as_deref() {
+        // Partial-failure envelope: ok=false, but data is preserved so the
+        // caller can see exactly which steps succeeded.
+        let mut e = Envelope {
+            version: crate::output::envelope::ENVELOPE_VERSION,
+            command: "plugin.update".to_string(),
+            ok: false,
+            vault: None,
+            data: Some(data),
+            warnings: Vec::new(),
+            error: Some(ErrorInfo::new("E_PLUGIN_UPDATE_PARTIAL", reason)),
+        };
+        // No warnings yet, but preserve the field shape.
+        e.warnings.clear();
+        e
+    } else {
+        Envelope::ok("plugin.update", None, data)
+    };
+
+    emit(&env, mode, std::io::stdout().lock(), |e| {
         let d = e.data.as_ref().unwrap();
         let mut s = String::from("plugin update:\n");
         s.push_str(&format!(
@@ -377,6 +415,11 @@ fn emit_plugin_update_summary(report: &plugin_update::PluginUpdateReport, mode: 
         if d.dry_run {
             s.push_str("  (dry-run · no changes written)\n");
         }
+        if let Some(reason) = d.partial_failure {
+            s.push_str(&format!("  partial failure  : {reason}\n"));
+        }
         s
-    });
+    })
+    .context("plugin update: render summary failed")?;
+    Ok(())
 }

@@ -21,17 +21,16 @@ use std::path::PathBuf;
 pub struct Cli {
     /// Override vault root (highest priority · beats ONEBRAIN_VAULT and walk-up).
     ///
-    /// Position: type *before* the subcommand — `onebrain --vault X foo bar`.
-    /// Not `global = true` because clap 4.6 has two known quirks that
-    /// interact badly with the hidden v3.0 aliases — `global = true` +
-    /// `env =` silently stops propagating the flag to nested subcommands'
-    /// `--help`, and `global = true` + a subcommand using
-    /// `visible_alias = "vault"` panics at startup with "long option names
-    /// must be unique" even though the subcommand-local alias is what would
-    /// actually parse the post-subcommand `--vault`. `ONEBRAIN_VAULT` env
-    /// var is honoured by the vault resolver
-    /// (`onebrain_core::path::resolve_vault`) regardless of flag position.
-    #[arg(long, value_name = "PATH")]
+    /// Global: accepted both before and after the subcommand:
+    /// `onebrain --vault X foo bar` or `onebrain foo bar --vault X`.
+    /// `ONEBRAIN_VAULT` env var is honoured by the vault resolver
+    /// (`onebrain_core::path::resolve_vault`) — read in
+    /// `vault_ctx::snapshot_inputs` rather than via clap's `env =`
+    /// attribute because clap 4.6 silently drops env-attribute help text
+    /// for nested subcommands when combined with `global = true`. No
+    /// legacy command uses `visible_alias = "vault"` (legacy args use
+    /// `--vault-dir` as the alias), so `global = true` is safe.
+    #[arg(long, global = true, value_name = "PATH")]
     pub vault: Option<PathBuf>,
 
     /// Output format. Default `text` is TTY-friendly; pipe-detected calls
