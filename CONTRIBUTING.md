@@ -54,7 +54,7 @@ Snapshot tests use [`insta`](https://insta.rs/) — review mismatches interactiv
 cargo insta review   # approve or reject each diff
 ```
 
-Parity tests against the Bun v2.3.3 reference binary live in `tests/parity/`. They are off by default and require `BUN_BINARY` to be set.
+v3.x output contract is pinned by snapshot + parametric suites under `crates/onebrain-cli/tests/`: `v31_envelope_snapshots.rs` (canonical `Envelope` shape via insta), `output_format_matrix.rs` (every structured-output command × default/`--json`/`--json --pretty`/`--yaml`), `user_flows.rs` (end-to-end personas), `v31_integration.rs` (v3.0 alias migration). The legacy v2.x Bun parity suite was retired in v3.1.0 — the Bun reference binary is no longer published; only the deprecated `@onebrain-ai/cli@2.4.x` npm package remains.
 
 ## PR conventions
 
