@@ -164,7 +164,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub Release (auto-generated notes)
+      - name: Create or update GitHub Release (auto-generated notes)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.meta.outputs.version }}
@@ -174,11 +174,21 @@ jobs:
           if [ "$PRERELEASE" = "true" ]; then
             ARGS+=(--prerelease)
           fi
-          gh release create "$VERSION" \
-            --title "$VERSION" \
-            --generate-notes \
-            "${ARGS[@]}" \
-            artifacts/*
+          # Idempotent: a re-tag (delete + re-push the same vX.Y.Z to recover
+          # from a downstream job failure) re-runs this job against an already
+          # existing release. `gh release create` errors on an existing tag, so
+          # branch: upload-with-clobber when the release exists, create fresh
+          # otherwise. Asset filenames are stable so --clobber overwrites in
+          # place rather than duplicating.
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" artifacts/* --clobber
+          else
+            gh release create "$VERSION" \
+              --title "$VERSION" \
+              --generate-notes \
+              "${ARGS[@]}" \
+              artifacts/*
+          fi
 
       # Prepend a friendly platform-downloads table so non-Rust users can pick the
       # right asset without decoding Rust target triples. Asset filenames keep
@@ -241,6 +251,14 @@ jobs:
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
+
+      # OIDC Trusted Publishing requires npm CLI >= 11.5.1. Node 20 ships
+      # npm 10.8.x, which silently falls back to the setup-node placeholder
+      # `_authToken` in ~/.npmrc and gets a 404 on the scoped PUT — even with
+      # a correctly configured trusted publisher. Upgrading npm here is what
+      # actually activates the OIDC token exchange (id-token: write above).
+      - name: Upgrade npm to a version that supports OIDC trusted publishing
+        run: npm install -g npm@latest
 
       # Single source of version truth = the git tag. The committed
       # `npm-wrapper/package.json` version is a placeholder for local dev
