@@ -1,5 +1,5 @@
-//! `onebrain register-schedule` — emit launchd plists for each `vault.yml`
-//! `schedule:` entry. Mirrors Bun `src/commands/register-schedule.ts`.
+//! `onebrain schedule register` — emit launchd plists for each `onebrain.yml`
+//! (or legacy `vault.yml`) `schedule:` entry.
 //!
 //! Six operational flags route at the top of [`run`]:
 //! - `--remove` → delete each entry's plist
@@ -165,7 +165,14 @@ fn inner_reason(e: &SchedulerError) -> String {
 }
 
 fn read_vault_config(vault: &Path) -> Result<ScheduleConfig> {
-    let yaml_path = vault.join("vault.yml");
+    // Dual-read: canonical `onebrain.yml` preferred, legacy `vault.yml`
+    // fallback. Hardcoding `vault.yml` here made `schedule register` find no
+    // entries on v3.1 vaults (onebrain.yml only) — it silently refused to
+    // (re)register/refresh the user's schedule. `resolve_logs_folder` already
+    // dual-reads via `load_vault_config`; this is the matching fix for the
+    // schedule-entries reader (which parses the raw file into `ScheduleConfig`).
+    let yaml_path = onebrain_core::find_config_file(vault)
+        .unwrap_or_else(|| vault.join(onebrain_core::CONFIG_FILENAME));
     if !yaml_path.exists() {
         return Ok(ScheduleConfig::default());
     }
@@ -611,6 +618,44 @@ mod tests {
     #[test]
     fn extract_frontmatter_none_when_no_fences() {
         assert!(extract_frontmatter("# Just a heading\n").is_none());
+    }
+
+    #[test]
+    fn read_vault_config_reads_canonical_onebrain_yml() {
+        // Regression: `schedule register` must find entries in canonical
+        // onebrain.yml. v3.1 vaults have NO vault.yml, and the old hardcoded
+        // `vault.join("vault.yml")` silently returned 0 entries on them.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "schedule:\n- cron: \"0 9 * * *\"\n  skill: /daily\n",
+        )
+        .unwrap();
+        let cfg = read_vault_config(dir.path()).unwrap();
+        assert_eq!(
+            cfg.schedule.len(),
+            1,
+            "schedule must be read from onebrain.yml"
+        );
+    }
+
+    #[test]
+    fn read_vault_config_falls_back_to_legacy_vault_yml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("vault.yml"),
+            "schedule:\n- cron: \"0 9 * * *\"\n  skill: /weekly\n",
+        )
+        .unwrap();
+        let cfg = read_vault_config(dir.path()).unwrap();
+        assert_eq!(cfg.schedule.len(), 1, "legacy vault.yml read as fallback");
+    }
+
+    #[test]
+    fn read_vault_config_empty_when_no_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = read_vault_config(dir.path()).unwrap();
+        assert!(cfg.schedule.is_empty(), "no config → empty schedule");
     }
 
     // POSIX-only: uses `/bin/sh` which doesn't exist on Windows.

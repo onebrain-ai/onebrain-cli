@@ -1,5 +1,5 @@
 ---
-latest_version: 3.1.2
+latest_version: 3.1.3
 released: 2026-05-26
 ---
 
@@ -11,6 +11,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.1.3] — 2026-05-26 — `schedule register` reads `onebrain.yml`
+
+- **Fix: `onebrain schedule register` now dual-reads the config** (canonical `onebrain.yml` preferred, legacy `vault.yml` fallback). It hardcoded `vault.yml`, so on a v3.1 vault (onebrain.yml only) it found zero schedule entries and silently refused to (re)register/refresh launchd plists — `register`, `--refresh`, `--remove`, and `--status` all came up empty despite a populated `schedule:` block. Same class as the v3.1.1 onebrain.yml carry-through; `register_schedule`'s schedule-entries reader was the one spot still hardcoded (its `resolve_logs_folder` already dual-read via `load_vault_config`).
 
 ## [3.1.2] — 2026-05-26 — implement `qmd embed`
 
