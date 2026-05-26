@@ -36,13 +36,13 @@ pub enum SchedulerError {
     #[error("Arg value must not contain shell-special chars (\", $, `, \\): {0}")]
     ShellSpecialInOneShotArg(String),
 
-    #[error("Command not found at absolute path: {0}. Check the path in vault.yml — launchd will silently fail at run time if the binary is missing.")]
+    #[error("Command not found at absolute path: {0}. Check the path in onebrain.yml — launchd will silently fail at run time if the binary is missing.")]
     CommandNotFoundAbsolute(String),
 
     #[error("Command not found at relative path: {orig} (resolved: {resolved})")]
     CommandNotFoundRelative { orig: String, resolved: String },
 
-    #[error("Command \"{0}\" not found in PATH. Use an absolute path in vault.yml (launchd's PATH is restricted to /usr/bin:/bin:/usr/sbin:/sbin and won't find {0}).")]
+    #[error("Command \"{0}\" not found in PATH. Use an absolute path in onebrain.yml (launchd's PATH is restricted to /usr/bin:/bin:/usr/sbin:/sbin and won't find {0}).")]
     CommandNotFoundInPath(String),
 
     #[error("Conflict: {new} and {existing} normalize to the same plist path {path}")]

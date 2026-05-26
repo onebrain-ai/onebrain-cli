@@ -235,14 +235,15 @@ fn doctor_honors_vault_flag() {
         doc.get("checks").is_some(),
         "must include the checks array · got: {doc}"
     );
-    // The vault.yml check should report ok against the minimal fixture
-    // (which writes the canonical `update_channel` + folder block).
+    // The config check (named `onebrain.yml`) should report ok against the
+    // minimal fixture — even though the fixture writes the legacy `vault.yml`
+    // filename, the check reads it via fallback and reports the canonical name.
     let checks = doc["checks"].as_array().expect("checks is array");
     let vault_yml = checks
         .iter()
-        .find(|c| c["check"] == "vault.yml")
-        .expect("vault.yml check must be present");
-    assert_eq!(vault_yml["status"], "ok", "vault.yml check should be ok");
+        .find(|c| c["check"] == "onebrain.yml")
+        .expect("onebrain.yml check must be present");
+    assert_eq!(vault_yml["status"], "ok", "onebrain.yml check should be ok");
 }
 
 /// Regression — `onebrain doctor --fix --vault PATH` must run the

@@ -286,8 +286,8 @@ fn attempt_fix(result: &DoctorResult, vault_root: &Path, json: bool) -> FixOutco
         // back if they were deleted or never synced.
         "plugin-files" => fix_plugin_files(vault_root, json),
         // Backfill missing standard folder keys + default `update_channel`
-        // in vault.yml. Safe (additive) — never overwrites user values.
-        "vault.yml-keys" => fix_vault_yml_keys(vault_root, json),
+        // in onebrain.yml. Safe (additive) — never overwrites user values.
+        "onebrain.yml-keys" => fix_vault_yml_keys(vault_root, json),
         // Strip the stale `extraKnownMarketplaces.onebrain` entry from
         // `.claude/settings.json`. Cosmetic config cleanup; no behavioral
         // change at runtime (the plugin is enabled via `enabledPlugins`).
@@ -783,7 +783,7 @@ mod tests {
 
     #[test]
     fn print_report_all_ok() {
-        let results = vec![DoctorResult::ok("vault.yml", "valid")];
+        let results = vec![DoctorResult::ok("onebrain.yml", "valid")];
         let mut buf = Vec::new();
         print_report(&results, &mut buf).unwrap();
         let s = String::from_utf8(buf).unwrap();
@@ -867,7 +867,7 @@ mod tests {
         // `fix[]` must appear (even empty) so consumers can distinguish
         // "user didn't ask to fix" from "user asked but nothing to fix" —
         // schema stability.
-        let results = vec![DoctorResult::ok("vault.yml", "valid")];
+        let results = vec![DoctorResult::ok("onebrain.yml", "valid")];
         let mut buf = Vec::new();
         print_report_structured(
             &results,
@@ -885,7 +885,7 @@ mod tests {
 
     #[test]
     fn print_report_structured_carries_fix_outcomes_through() {
-        let results = vec![DoctorResult::ok("vault.yml", "valid")];
+        let results = vec![DoctorResult::ok("onebrain.yml", "valid")];
         let outcomes = vec![serde_json::json!({
             "check": "qmd-embeddings",
             "outcome": "fixed",
@@ -1184,7 +1184,7 @@ mod tests {
     #[test]
     fn print_report_snapshot_mixed_statuses() {
         let results = vec![
-            DoctorResult::ok("vault.yml", "valid").with_details(vec!["qmd: ob-1".into()]),
+            DoctorResult::ok("onebrain.yml", "valid").with_details(vec!["qmd: ob-1".into()]),
             DoctorResult::warn("settings-hooks", "2 issue(s)")
                 .with_hint("Run onebrain doctor --fix to repair hooks")
                 .with_details(vec!["Stop hook missing".into()]),

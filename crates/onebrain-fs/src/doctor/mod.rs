@@ -12,7 +12,7 @@ use std::path::Path;
 /// Sync trait — all I/O is direct filesystem reads or short-lived spawn
 /// (no async runtime · matches the rest of v3 CLI).
 pub trait Check {
-    /// Stable identifier matching Bun parity (e.g. `"vault.yml"`, `"folders"`).
+    /// Stable identifier surfaced in doctor output (e.g. `"onebrain.yml"`, `"folders"`).
     fn name(&self) -> &'static str;
     fn run(&self, vault_root: &Path, config: &VaultConfig) -> DoctorResult;
 }

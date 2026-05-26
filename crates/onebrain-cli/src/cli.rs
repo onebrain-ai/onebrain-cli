@@ -157,7 +157,7 @@ pub struct InitArgs {
     /// Skip prompts · install the Essentials schedule preset (CI-friendly).
     #[arg(long)]
     pub yes: bool,
-    /// Overwrite an existing vault.yml without prompting.
+    /// Overwrite an existing onebrain.yml without prompting.
     #[arg(long)]
     pub force: bool,
     /// Skip the embedded vault-sync step (scaffold only).
@@ -638,7 +638,7 @@ pub enum PluginVerb {
         /// Optional vault root override.
         #[arg(long = "vault-dir", value_name = "PATH")]
         vault_dir: Option<PathBuf>,
-        /// Override branch (defaults to vault.yml `update_channel`).
+        /// Override branch (defaults to onebrain.yml `update_channel`).
         #[arg(long)]
         branch: Option<String>,
     },
@@ -650,7 +650,7 @@ pub enum PluginVerb {
         /// Optional vault root override.
         #[arg(long = "vault-dir", value_name = "PATH")]
         vault_dir: Option<PathBuf>,
-        /// Override branch (defaults to vault.yml `update_channel`).
+        /// Override branch (defaults to onebrain.yml `update_channel`).
         #[arg(long)]
         branch: Option<String>,
         /// Show what would change without writing.
@@ -691,8 +691,7 @@ pub enum QmdVerb {
     Setup,
     /// Re-embed documents (called by indexer hook · users can invoke manually).
     Embed,
-    /// qmd index status (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
+    /// Report qmd index + embedding health (collection · indexed · embedded · pending).
     Status,
     /// Rebuild the qmd search index · called by PostToolUse hook on vault writes (replaces v3.0 `qmd-reindex`).
     Reindex,
@@ -716,13 +715,13 @@ pub enum ScheduleVerb {
     /// List scheduled skills (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     List,
-    /// Add a scheduled skill (not yet implemented · v3.x roadmap · edit `vault.yml` directly meanwhile).
+    /// Add a scheduled skill (not yet implemented · v3.x roadmap · edit `onebrain.yml` directly meanwhile).
     #[command(hide = true)]
     Add { skill: String },
-    /// Remove a scheduled skill (not yet implemented · v3.x roadmap · edit `vault.yml` directly meanwhile).
+    /// Remove a scheduled skill (not yet implemented · v3.x roadmap · edit `onebrain.yml` directly meanwhile).
     #[command(hide = true)]
     Remove { skill: String },
-    /// Re-write launchd plists from `vault.yml` (or `onebrain.yml`) schedule block · called by `plugin update`.
+    /// Re-write launchd plists from `onebrain.yml` (or legacy `vault.yml`) schedule block · called by `plugin update`.
     Register {
         /// Vault root override.
         #[arg(long = "vault-dir")]
@@ -730,7 +729,7 @@ pub enum ScheduleVerb {
         /// Print the plists that would be written without touching disk.
         #[arg(long)]
         dry_run: bool,
-        /// Remove all plists for entries currently in vault.yml.
+        /// Remove all plists for entries currently in onebrain.yml.
         #[arg(long)]
         remove: bool,
         /// Re-emit plists with the current vault path (logs a notice).
@@ -877,7 +876,7 @@ pub enum VaultVerb {
         /// Vault root override · flag-form.
         #[arg(long = "vault-dir", conflicts_with = "vault_root")]
         vault_dir: Option<PathBuf>,
-        /// Override branch resolved from vault.yml::update_channel.
+        /// Override branch resolved from onebrain.yml::update_channel.
         #[arg(long)]
         branch: Option<String>,
     },

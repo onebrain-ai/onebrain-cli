@@ -1,6 +1,6 @@
 ---
-latest_version: 3.0.0
-released: 2026-05-22
+latest_version: 3.1.1
+released: 2026-05-26
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -11,6 +11,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.1.1] — 2026-05-26 — doctor label rename · stale `vault.yml` cleanup · `qmd status`
+
+- **Fix: doctor check labels renamed `vault.yml` → `onebrain.yml`** — the config-validation and schema checks now surface `onebrain.yml` / `onebrain.yml-keys` (the canonical filename since v3.1.0), matching what the plugin `/doctor` skill already documents. The checks still dual-read (canonical preferred, legacy `vault.yml` fallback); only the displayed/JSON `check` name changed. The autofix dispatcher matches the new `onebrain.yml-keys` name.
+- **Fix: stale `vault.yml` in user-facing output → `onebrain.yml`** — the `qmd-embeddings` doctor message, `--help` text (`init --force`, `plugin install/update --branch`, `schedule add/remove/register`, `vault sync --branch`), `schedule register` stdout/error messages, and the launchd scheduler path errors all referenced the legacy filename. Migration-context strings (the `vault-config-migration` check, the deprecation warning) correctly keep `vault.yml`.
+- **Feat: `onebrain qmd status`** — reports index + embedding health (configured collection · documents indexed · vectors embedded · pending embedding · index size · last updated) in text (default), `--json`, and `--yaml`. Vault-required (exit 64 outside a vault); reports `qmd_available: false` when the `qmd` binary is missing or unresponsive (parses `qmd status` text since qmd ≤ 2.1.0 ignores `--json`).
 
 ## [3.1.0] — 2026-05-25 — Consistency Standard · locked command tree · canonical JSON envelope
 

@@ -38,7 +38,7 @@ impl QmdEmbeddingsCheck {
     {
         // 1. Config-level guard · qmd_collection missing is a warn (matches Bun).
         let Some(collection) = &config.qmd_collection else {
-            return DoctorResult::warn("qmd-embeddings", "qmd_collection not set in vault.yml")
+            return DoctorResult::warn("qmd-embeddings", "qmd_collection not set in onebrain.yml")
                 .with_hint("Run /qmd to set up search index")
                 .with_details(vec!["Run /qmd to set up search index".to_string()]);
         };
