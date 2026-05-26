@@ -1,5 +1,5 @@
 ---
-latest_version: 3.1.1
+latest_version: 3.1.2
 released: 2026-05-26
 ---
 
@@ -11,6 +11,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.1.2] — 2026-05-26 — implement `qmd embed`
+
+- **Feat: `onebrain qmd embed`** — was a `not_implemented` stub (exit 72), yet v3.1.1's `qmd status` told users to "run `onebrain qmd embed`" to clear pending docs. Now implemented: vault-required (exit 64 outside a vault), runs the underlying `qmd embed` in the foreground with inherited stdio so the user sees progress, and surfaces a non-zero `qmd` exit as an error. Completes the loop that `qmd status` points at.
 
 ## [3.1.1] — 2026-05-26 — config-loss fix + backups · doctor label rename + animated TTY · `qmd status`
 
