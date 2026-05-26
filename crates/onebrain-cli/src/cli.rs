@@ -576,9 +576,8 @@ pub enum NoteVerb {
     Append(NoteAppendArgs),
     /// Create a new note, optionally from a template, with inline frontmatter.
     New(NoteNewArgs),
-    /// Move a note (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Move { from: PathBuf, to: PathBuf },
+    /// Move/rename a note and rewrite every incoming wikilink.
+    Move(NoteMoveArgs),
     /// Archive a note into the dated archive bucket (`<root>/YYYY/MM/<file>`).
     Archive(NoteArchiveArgs),
     /// List every note that links to the target note.
@@ -678,6 +677,20 @@ pub struct NoteNewArgs {
     /// Overwrite the note if it already exists.
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteMoveArgs {
+    /// Source note path, relative to the vault root.
+    pub from: PathBuf,
+    /// Destination note path, relative to the vault root.
+    pub to: PathBuf,
+    /// Skip the wikilink rewrite — just move the file.
+    #[arg(long)]
+    pub no_link_update: bool,
+    /// Compute and print the plan as structured data; write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Debug)]
