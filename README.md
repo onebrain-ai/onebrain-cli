@@ -250,6 +250,7 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
 - [ ] Bundle CLI (`onebrain bundle install/list/info/lint/…`) · four first-party bundles (`dashboard` · `synthesis` · `research` · `scheduler`) · core skills slimmed 32 → 18 · `onebrain.run/bundles` portal.
 
 ### 🔭 Signal-driven (Tier 2/3)
+- [ ] Broader harness support — Codex, Qwen, and other agentic harnesses beyond today's Claude Code + Gemini CLI.
 - [ ] Tiered memory + behavior tracking · proactive surfacing · daemon background synthesis · Avatar Mesh (one agent identity across machines) · Telegram / MCP gateway · OneBrain Studio + [OneBrain Cloud](https://onebrain.run) federation.
 
 ### 🏁 v4.0 · breaking
