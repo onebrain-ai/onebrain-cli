@@ -656,6 +656,9 @@ pub struct NoteAppendArgs {
     /// (use `note new` to create one).
     pub path: PathBuf,
     /// Text to append, verbatim. No de-duplication is performed.
+    /// `allow_hyphen_values` so Markdown list/task lines (`- [ ] …`, `- item`)
+    /// parse as the content rather than being mistaken for a flag.
+    #[arg(allow_hyphen_values = true)]
     pub content: String,
     /// Append under this heading instead of at EOF. If the heading is absent,
     /// it is created as a level-2 heading (`## H`) at the end of the file.

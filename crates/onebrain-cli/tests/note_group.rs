@@ -429,9 +429,6 @@ fn orphans_lists_unlinked_excludes_linked_and_inbox_archive() {
 #[test]
 fn append_under_section_then_read_back() {
     let vault = build_fixture_vault();
-    // Content does NOT start with `-` — a leading dash is parsed by clap as a
-    // flag (the standard CLI convention), which is orthogonal to what this
-    // test verifies (section-targeted append placement).
     let env = run_note_json(
         vault.path(),
         &[
@@ -464,6 +461,38 @@ fn append_under_section_then_read_back() {
     let section = read_data["content"].as_str().unwrap();
     assert!(section.contains("freshly appended marker"));
     assert!(section.starts_with("## Section"));
+}
+
+#[test]
+fn append_accepts_leading_dash_task_line() {
+    // Regression: Markdown task/list lines start with `-`. `NoteAppendArgs.content`
+    // uses `allow_hyphen_values` so `note append <path> "- [ ] …"` parses the line
+    // as content instead of clap rejecting it as an unknown flag (the OneBrain
+    // agent appends task lines constantly).
+    let vault = build_fixture_vault();
+    let env = run_note_json(
+        vault.path(),
+        &[
+            "note",
+            "append",
+            "03-knowledge/alpha.md",
+            "- [ ] dash-led task appended verbatim",
+            "--section",
+            "Section",
+        ],
+    );
+    let data = assert_envelope(&env, "note.append");
+    assert!(data["bytes_appended"].as_u64().unwrap() > 0);
+
+    let read_env = run_note_json(
+        vault.path(),
+        &["note", "read", "03-knowledge/alpha.md", "--tasks-only"],
+    );
+    let tasks = assert_envelope(&read_env, "note.read");
+    let task_lines = tasks["tasks"].as_array().unwrap();
+    assert!(task_lines
+        .iter()
+        .any(|t| t.as_str() == Some("- [ ] dash-led task appended verbatim")));
 }
 
 // ─────────────────────────────────────────────────────────────────────────
