@@ -579,9 +579,8 @@ pub enum NoteVerb {
     /// Move a note (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     Move { from: PathBuf, to: PathBuf },
-    /// Archive a note (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Archive { path: PathBuf },
+    /// Archive a note into the dated archive bucket (`<root>/YYYY/MM/<file>`).
+    Archive(NoteArchiveArgs),
     /// List every note that links to the target note.
     Backlinks(NoteBacklinksArgs),
     /// List orphan notes — notes with zero incoming wikilinks.
@@ -679,6 +678,16 @@ pub struct NoteNewArgs {
     /// Overwrite the note if it already exists.
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteArchiveArgs {
+    /// Note to archive, relative to the vault root.
+    pub path: PathBuf,
+    /// Archive root, relative to the vault root. Destination is
+    /// `<archive-root>/YYYY/MM/<filename>` (current UTC date).
+    #[arg(long, default_value = "06-archive")]
+    pub archive_root: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -1220,6 +1229,39 @@ mod tests {
                 verb: PluginVerb::Update { dry_run, .. },
             }) => assert!(dry_run),
             _ => panic!("expected plugin update"),
+        }
+    }
+
+    #[test]
+    fn note_archive_parses_with_default_and_custom_root() {
+        // Default archive root.
+        let cli =
+            Cli::try_parse_from(["onebrain", "note", "archive", "01-projects/Old.md"]).unwrap();
+        match cli.command {
+            Cmd::Note(NoteCmd {
+                verb: NoteVerb::Archive(args),
+            }) => {
+                assert_eq!(args.path, PathBuf::from("01-projects/Old.md"));
+                assert_eq!(args.archive_root, PathBuf::from("06-archive"));
+            }
+            _ => panic!("expected Note/Archive"),
+        }
+
+        // Custom --archive-root.
+        let cli = Cli::try_parse_from([
+            "onebrain",
+            "note",
+            "archive",
+            "note.md",
+            "--archive-root",
+            "attic",
+        ])
+        .unwrap();
+        match cli.command {
+            Cmd::Note(NoteCmd {
+                verb: NoteVerb::Archive(args),
+            }) => assert_eq!(args.archive_root, PathBuf::from("attic")),
+            _ => panic!("expected Note/Archive"),
         }
     }
 

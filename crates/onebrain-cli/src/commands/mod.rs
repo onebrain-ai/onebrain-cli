@@ -4,6 +4,7 @@ pub mod harness;
 pub mod init;
 pub mod migrate;
 pub mod note_append;
+pub mod note_archive;
 pub mod note_backlinks;
 pub mod note_find;
 pub mod note_list;
