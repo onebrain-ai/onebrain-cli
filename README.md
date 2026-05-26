@@ -49,7 +49,7 @@ Point an AI agent at a vault and it improvises — a different pile of `grep` / 
 
 ## Status
 
-**v3.1.5 — stable & production-ready, in active maintenance.** GA since v3.0.0 (2026-05-22), shipping ~weekly themed minors. Version history + direction in the [Roadmap](#roadmap); full detail in [CHANGELOG.md](CHANGELOG.md).
+**v3.2.0 — stable & production-ready, in active maintenance.** GA since v3.0.0 (2026-05-22), shipping ~weekly themed minors. Version history + direction in the [Roadmap](#roadmap); full detail in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quickstart
 
@@ -240,7 +240,7 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
 - [x] **v3.1.5** — `onebrain update` validation fix: accepts clap's bare `--version` output (was a false "Binary validation failed" on every upgrade) and now confirms the on-PATH binary reports the just-installed version (catches no-op `brew upgrade` / PATH shadowing) with specific failure messages.
 
 ### 🚧 Phase 1 · perceptual speed + skill alignment (v3.2–v3.7)
-- [ ] **v3.2** — `note` resource group (`search` · `list` · `find` · `read` · `append` · `new` · `move` · `archive` · `backlinks` · `orphans` · `stat`) — native vault note ops that replace ad-hoc `grep` / `ls` / `find`.
+- [x] **v3.2.0** — `note` resource group (11 verbs: `search` · `list` · `find` · `read` · `stat` · `backlinks` · `orphans` · `append` · `new` · `archive` · `move`) — native vault note ops replacing ad-hoc `grep` / `ls` / `find` / `cat`; canonical `Envelope`, vault-required, transactional `move` with vault-wide wikilink rewrite.
 - [ ] **v3.3** — Daemon foundation: `onebrain daemon start/stop/status` + structured logging.
 - [ ] **v3.4** — RPC layer: stdio JSON-RPC 2.0 over a Unix socket with auto-spawn.
 - [ ] **v3.5** — Skill-speed rewrites (`/daily`, `/wrapup`) + `checkpoint recover`.

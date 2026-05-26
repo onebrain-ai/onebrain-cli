@@ -611,6 +611,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "globset"
+version = "0.4.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52dfc19153a48bde0cbd630453615c8151bce3a5adfac7a0aebfbf0a1e1f57e3"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "log",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1153,7 +1166,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onebrain-cache"
-version = "3.1.5"
+version = "3.2.0"
 dependencies = [
  "chrono",
  "onebrain-core",
@@ -1166,7 +1179,7 @@ dependencies = [
 
 [[package]]
 name = "onebrain-cli"
-version = "3.1.5"
+version = "3.2.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1195,7 +1208,7 @@ dependencies = [
 
 [[package]]
 name = "onebrain-core"
-version = "3.1.5"
+version = "3.2.0"
 dependencies = [
  "chrono",
  "indexmap",
@@ -1211,12 +1224,13 @@ dependencies = [
 
 [[package]]
 name = "onebrain-fs"
-version = "3.1.5"
+version = "3.2.0"
 dependencies = [
  "chrono",
  "dirs",
  "filetime",
  "flate2",
+ "globset",
  "indexmap",
  "indicatif",
  "inquire",
@@ -1224,6 +1238,7 @@ dependencies = [
  "mockito",
  "onebrain-core",
  "pretty_assertions",
+ "regex",
  "reqwest",
  "semver",
  "serde",

@@ -75,6 +75,15 @@ pub enum CoreError {
     /// summarising the target contents.
     #[error("init: {0}")]
     InitTargetNotEmpty(String),
+
+    /// A transactional operation failed AND its rollback also failed, so the
+    /// vault may be left in an inconsistent (half-rewritten) state. Exit 76.
+    /// The wrapped string names which files could not be restored. Distinct
+    /// from a clean rollback (which returns the original error unchanged) —
+    /// this variant signals the "left exactly as it started" guarantee was
+    /// broken.
+    #[error("rollback incomplete — vault may be inconsistent: {0}")]
+    RollbackIncomplete(String),
 }
 
 impl CoreError {
@@ -95,6 +104,7 @@ impl CoreError {
             Self::RpcHandshake(_) => "E_RPC_HANDSHAKE",
             Self::AuthFailed(_) => "E_AUTH_FAILED",
             Self::InitTargetNotEmpty(_) => "E_INIT_TARGET_NOT_EMPTY",
+            Self::RollbackIncomplete(_) => "E_ROLLBACK_INCOMPLETE",
         }
     }
 }
@@ -153,6 +163,10 @@ mod tests {
         assert_eq!(
             CoreError::InitTargetNotEmpty("3 files, 2 folders".into()).error_code(),
             "E_INIT_TARGET_NOT_EMPTY"
+        );
+        assert_eq!(
+            CoreError::RollbackIncomplete("could not restore a.md".into()).error_code(),
+            "E_ROLLBACK_INCOMPLETE"
         );
     }
 }

@@ -1,6 +1,6 @@
 ---
-latest_version: 3.1.5
-released: 2026-05-26
+latest_version: 3.2.0
+released: 2026-05-27
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -11,6 +11,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.0] — 2026-05-27 — `note` resource group (11 verbs)
+
+- **Feat: `onebrain note <verb>` — 11 native vault note operations** that replace ad-hoc `grep` / `ls` / `find` / `cat`: `search` (substring or `--mode regex`), `list` (metadata, sorted by name/mtime/created), `find` (glob + `--type` + Unix-style `--mtime`), `read` (`--section` / `--frontmatter-only` / `--tasks-only` / `--limit`), `stat` (line/word/link/task/heading counts), `backlinks`, `orphans`, `append` (section-aware), `new` (`--template` + inline `--frontmatter`), `archive` (dated `06-archive/YYYY/MM` bucket), and `move` (transactional vault-wide `[[wikilink]]` rewrite with rollback + `--dry-run`).
+- All verbs emit the canonical `Envelope<T>` (text/json/yaml), are vault-required (`E_VAULT_NOT_FOUND`, exit 64), and reject bad regex/glob input with `E_INVALID_TARGET`. Scan verbs report (rather than silently skip) unreadable notes via a warning; a failed `move` rollback surfaces `E_ROLLBACK_INCOMPLETE` (exit 76) naming the unrestored files. Backed by 100+ fs-layer + CLI unit tests plus a 22-case fixture-vault integration suite. No plugin/skill changes — skills adopt these verbs in a later release.
 
 ## [3.1.5] — 2026-05-26 — fix: `onebrain update` false-negative binary validation
 

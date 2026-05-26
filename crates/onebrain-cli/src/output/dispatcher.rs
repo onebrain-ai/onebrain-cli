@@ -56,6 +56,12 @@ where
             if !s.ends_with('\n') {
                 writeln!(writer)?;
             }
+            // Surface soft warnings in human modes — structured modes already
+            // carry them in the `warnings` array, but a text/table user would
+            // otherwise never see e.g. "N notes were unreadable and skipped".
+            for w in &envelope.warnings {
+                writeln!(writer, "⚠️  {}", w.message)?;
+            }
         }
     }
     Ok(())
@@ -155,6 +161,28 @@ mod tests {
         .unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert_eq!(s, "already-newlined\n");
+    }
+
+    #[test]
+    fn text_mode_renders_warnings_after_body() {
+        // Regression (round-2 fix): soft warnings must be visible to humans in
+        // text mode, not only in the JSON `warnings` array.
+        let env = Envelope::ok("note.search", None, P { n: 1 })
+            .with_warning("W_NOTES_SKIPPED", "2 note(s) unreadable and skipped");
+        let mut buf = Vec::new();
+        emit(
+            &env,
+            &OutputMode::Text {
+                color: false,
+                pretty: false,
+            },
+            &mut buf,
+            |_| "result body".into(),
+        )
+        .unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("result body"));
+        assert!(s.contains("2 note(s) unreadable and skipped"));
     }
 
     #[test]

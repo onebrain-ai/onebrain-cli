@@ -364,39 +364,23 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             }
         },
         Cmd::Note(NoteCmd { verb }) => match verb {
-            NoteVerb::Search { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "note search")
+            NoteVerb::Search(args) => commands::note_search::run(vault_flag.clone(), &mode, &args),
+            NoteVerb::List(args) => commands::note_list::run(vault_flag.clone(), &mode, &args),
+            NoteVerb::Find(args) => commands::note_find::run(vault_flag.clone(), &mode, &args),
+            NoteVerb::Read(args) => commands::note_read::run(vault_flag.clone(), &mode, &args),
+            NoteVerb::Append(args) => commands::note_append::run(vault_flag.clone(), &mode, &args),
+            NoteVerb::New(args) => commands::note_new::run(vault_flag.clone(), &mode, &args),
+            NoteVerb::Move(args) => commands::note_move::run(vault_flag.clone(), &mode, &args),
+            NoteVerb::Archive(args) => {
+                commands::note_archive::run(vault_flag.clone(), &mode, &args)
             }
-            NoteVerb::List => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "note list")
+            NoteVerb::Backlinks(args) => {
+                commands::note_backlinks::run(vault_flag.clone(), &mode, &args)
             }
-            NoteVerb::Find { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "note find")
+            NoteVerb::Orphans(args) => {
+                commands::note_orphans::run(vault_flag.clone(), &mode, &args)
             }
-            NoteVerb::Read { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "note read")
-            }
-            NoteVerb::Append { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "note append")
-            }
-            NoteVerb::New { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "note new")
-            }
-            NoteVerb::Move { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "note move")
-            }
-            NoteVerb::Archive { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "note archive")
-            }
-            NoteVerb::Backlinks { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "note backlinks")
-            }
-            NoteVerb::Orphans => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "note orphans")
-            }
-            NoteVerb::Stat { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "note stat")
-            }
+            NoteVerb::Stat(args) => commands::note_stat::run(vault_flag.clone(), &mode, &args),
         },
         Cmd::Pause(PauseCmd { verb }) => match verb {
             PauseVerb::List => {
@@ -576,12 +560,9 @@ pub(crate) fn emit_plugin_update_summary_to<W: std::io::Write>(
         if let Some(reason) = d.partial_failure {
             s.push_str(&format!("  partial failure  : {reason}\n"));
         }
-        // R2-H1: render soft-warnings under the summary so text-mode users
-        // can see them too. Format: one line per warning, prefixed with the
-        // warning sigil.
-        for w in &e.warnings {
-            s.push_str(&format!("  ⚠ {}: {}\n", w.code, w.message));
-        }
+        // Soft warnings are rendered uniformly by `emit` for all text/table
+        // commands (since v3.2.0) — don't re-render them here or they'd
+        // double-print.
         s
     })
     .context("plugin update: render summary failed")?;

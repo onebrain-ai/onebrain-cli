@@ -564,39 +564,171 @@ pub struct NoteCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum NoteVerb {
-    /// Search notes by content (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Search { pattern: String },
-    /// List notes (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    List,
-    /// Find notes by filename pattern (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Find { pattern: String },
-    /// Read a note's contents (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Read { path: PathBuf },
-    /// Append content to a note (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Append { path: PathBuf, content: String },
-    /// Create a new note (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    New { title: String },
-    /// Move a note (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Move { from: PathBuf, to: PathBuf },
-    /// Archive a note (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Archive { path: PathBuf },
-    /// List backlinks to a note (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Backlinks { path: PathBuf },
-    /// List orphan notes (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Orphans,
-    /// Print note statistics (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Stat { path: PathBuf },
+    /// Search note contents by substring (default) or regex.
+    Search(NoteSearchArgs),
+    /// List notes with metadata, sorted by name/mtime/created.
+    List(NoteListArgs),
+    /// Find files/folders by glob, optionally filtered by mtime.
+    Find(NoteFindArgs),
+    /// Read a note's contents: whole body, a section, frontmatter, or tasks.
+    Read(NoteReadArgs),
+    /// Append content to a note (at EOF, or under a `--section` heading).
+    Append(NoteAppendArgs),
+    /// Create a new note, optionally from a template, with inline frontmatter.
+    New(NoteNewArgs),
+    /// Move/rename a note and rewrite every incoming wikilink.
+    Move(NoteMoveArgs),
+    /// Archive a note into the dated archive bucket (`<root>/YYYY/MM/<file>`).
+    Archive(NoteArchiveArgs),
+    /// List every note that links to the target note.
+    Backlinks(NoteBacklinksArgs),
+    /// List orphan notes — notes with zero incoming wikilinks.
+    Orphans(NoteOrphansArgs),
+    /// Print note statistics (line/word/char counts, headings, links, tasks).
+    Stat(NoteStatArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct NoteSearchArgs {
+    /// Pattern to match (literal substring by default · regex with `--mode regex`).
+    pub pattern: String,
+    /// Scope the search to a subfolder (relative to the vault root).
+    #[arg(long)]
+    pub folder: Option<PathBuf>,
+    /// Maximum matches to return.
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+    /// Match mode: `lex` (literal substring) or `regex` (Rust regex).
+    #[arg(long, default_value = "lex", value_parser = ["lex", "regex"])]
+    pub mode: String,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteListArgs {
+    /// Scope the listing to a subfolder (relative to the vault root).
+    #[arg(long)]
+    pub folder: Option<PathBuf>,
+    /// Maximum notes to return.
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+    /// Sort order.
+    #[arg(long, default_value = "mtime", value_parser = ["name", "mtime", "created"])]
+    pub sort: String,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteFindArgs {
+    /// Glob pattern. No `/` → matches the basename (like `find -name`);
+    /// containing `/` → matches the vault-relative path (e.g. `**/topic-*.md`).
+    pub glob: String,
+    /// Restrict to files or folders.
+    #[arg(long = "type", value_parser = ["file", "folder"])]
+    pub r#type: Option<String>,
+    /// Day offset: `-N` = modified in the last N days · `0` = today · `+N` = older than N days.
+    #[arg(long)]
+    pub mtime: Option<i64>,
+    /// Maximum results to return.
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteReadArgs {
+    /// Note path, relative to the vault root.
+    pub path: PathBuf,
+    /// Extract only the content under this heading (matched by heading text).
+    #[arg(long, conflicts_with_all = ["frontmatter_only", "tasks_only"])]
+    pub section: Option<String>,
+    /// Emit only the parsed YAML frontmatter.
+    #[arg(long, conflicts_with_all = ["section", "tasks_only"])]
+    pub frontmatter_only: bool,
+    /// Emit only task lines (`- [ ]` / `- [x]`).
+    #[arg(long, conflicts_with_all = ["section", "frontmatter_only"])]
+    pub tasks_only: bool,
+    /// Max lines when reading the body (0 = unlimited).
+    #[arg(long, default_value_t = 0)]
+    pub limit: usize,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteAppendArgs {
+    /// Note path, relative to the vault root. The note must already exist
+    /// (use `note new` to create one).
+    pub path: PathBuf,
+    /// Text to append, verbatim. No de-duplication is performed.
+    /// `allow_hyphen_values` so Markdown list/task lines (`- [ ] …`, `- item`)
+    /// parse as the content rather than being mistaken for a flag.
+    #[arg(allow_hyphen_values = true)]
+    pub content: String,
+    /// Append under this heading instead of at EOF. If the heading is absent,
+    /// it is created as a level-2 heading (`## H`) at the end of the file.
+    #[arg(long)]
+    pub section: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteNewArgs {
+    /// New note path, relative to the vault root (e.g. `03-knowledge/ml/New Topic.md`).
+    pub path: PathBuf,
+    /// Template name. Resolves `.claude/plugins/onebrain/templates/<NAME>.md` and
+    /// substitutes `{{date}}`, `{{title}}`, `{{slug}}`.
+    #[arg(long)]
+    pub template: Option<String>,
+    /// Inline frontmatter pairs, `key=value`, comma-separated (e.g. `tags=ai,status=draft`).
+    #[arg(long, value_delimiter = ',')]
+    pub frontmatter: Vec<String>,
+    /// Overwrite the note if it already exists.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteMoveArgs {
+    /// Source note path, relative to the vault root.
+    pub from: PathBuf,
+    /// Destination note path, relative to the vault root.
+    pub to: PathBuf,
+    /// Skip the wikilink rewrite — just move the file.
+    #[arg(long)]
+    pub no_link_update: bool,
+    /// Compute and print the plan as structured data; write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteArchiveArgs {
+    /// Note to archive, relative to the vault root.
+    pub path: PathBuf,
+    /// Archive root, relative to the vault root. Destination is
+    /// `<archive-root>/YYYY/MM/<filename>` (current UTC date).
+    #[arg(long, default_value = "06-archive")]
+    pub archive_root: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteStatArgs {
+    /// Note path, relative to the vault root.
+    pub path: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteBacklinksArgs {
+    /// Target note path, relative to the vault root.
+    pub path: PathBuf,
+    /// Also scan notes under `06-archive` (excluded by default).
+    #[arg(long)]
+    pub include_archive: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteOrphansArgs {
+    /// Scope the scan to a subfolder (relative to the vault root).
+    #[arg(long)]
+    pub folder: Option<PathBuf>,
+    /// Maximum orphans to return.
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1113,6 +1245,39 @@ mod tests {
                 verb: PluginVerb::Update { dry_run, .. },
             }) => assert!(dry_run),
             _ => panic!("expected plugin update"),
+        }
+    }
+
+    #[test]
+    fn note_archive_parses_with_default_and_custom_root() {
+        // Default archive root.
+        let cli =
+            Cli::try_parse_from(["onebrain", "note", "archive", "01-projects/Old.md"]).unwrap();
+        match cli.command {
+            Cmd::Note(NoteCmd {
+                verb: NoteVerb::Archive(args),
+            }) => {
+                assert_eq!(args.path, PathBuf::from("01-projects/Old.md"));
+                assert_eq!(args.archive_root, PathBuf::from("06-archive"));
+            }
+            _ => panic!("expected Note/Archive"),
+        }
+
+        // Custom --archive-root.
+        let cli = Cli::try_parse_from([
+            "onebrain",
+            "note",
+            "archive",
+            "note.md",
+            "--archive-root",
+            "attic",
+        ])
+        .unwrap();
+        match cli.command {
+            Cmd::Note(NoteCmd {
+                verb: NoteVerb::Archive(args),
+            }) => assert_eq!(args.archive_root, PathBuf::from("attic")),
+            _ => panic!("expected Note/Archive"),
         }
     }
 

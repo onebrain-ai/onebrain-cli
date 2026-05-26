@@ -34,6 +34,20 @@ src/
 │   ├── presets.rs        SchedulePreset (Minimal/Essentials/MaintenancePlus/Skip) + ScheduleEntry
 │   ├── safety.rs         classify — target-directory safety check (DirState)
 │   └── wizard.rs         inquire-backed interactive prompts (default impls)
+├── note/                 vault note operations (v3.2.0 · `onebrain note <verb>`)
+│   ├── mod.rs            module root · re-exports the 11 verb fns + Options/Result types
+│   ├── walker.rs         walk_notes (skips tooling+archive) · walk_all · walk_notes_with_archive
+│   ├── search.rs         search_notes — substring / `--mode regex` line scan (size-capped regex)
+│   ├── list.rs           list_notes — metadata listing sorted by name/mtime/created
+│   ├── find.rs           find_notes — glob (basename or path) + --type + Unix --mtime
+│   ├── read.rs           read_note — --section / --frontmatter-only / --tasks-only / body(--limit)
+│   ├── stat.rs           stat_note — line/word/char/link/task/heading counts
+│   ├── backlinks.rs      backlinks — incoming [[wikilink]] scan (+ --include-archive)
+│   ├── orphans.rs        orphans — notes with zero incoming wikilinks (exclusion set)
+│   ├── append.rs         append_note — section-aware append (atomic tmp+rename)
+│   ├── new.rs            new_note — --template + inline --frontmatter (atomic write)
+│   ├── archive.rs        archive_note — move to <root>/YYYY/MM/ (date-injectable)
+│   └── move.rs           move_note — transactional vault-wide wikilink rewrite + rollback
 ├── register_hooks/       harness hook wiring
 │   ├── mod.rs            run + RegisterHooksOptions/Result + HookStatus
 │   ├── hooks.rs          HookSpec + Stop-hook apply/migrate/strip primitives
@@ -221,6 +235,11 @@ Target-directory safety check (runs before any write, even under `--force`).
 `inquire`-backed default prompts (replaced by injected closures in tests/headless).
 **Key functions** — `default_confirm` (non-TTY stdin → `false`), `ask_initialize_here`, `ask_overwrite_vault_yml`, `ask_continue_nonempty` (prints context to stderr), `ask_schedule_preset` (defaults to Essentials cursor; non-TTY → Skip).
 **Connections** — calls: `inquire::{Confirm,Select}`, `IsTerminal`; re-exported via `init::mod` for the CLI binary.
+
+## `note/` — vault note operations (v3.2.0)
+The `note` resource group: 11 `onebrain note <verb>` commands operating over an already-resolved vault root. This module is the pure fs-layer (vault-walking + text/IO); the CLI layer (`onebrain-cli/commands/note_*`) wraps each result in the canonical `Envelope<T>`. `mod.rs` re-exports every verb's fn plus its `Options`/`Result` types.
+**Key functions** — `walk_notes` (shared `.md` enumeration, skips tooling + `06-archive`; `walk_all` / `walk_notes_with_archive` variants serve `find` / `--include-archive`) feeds: `search_notes` (substring/regex), `list_notes` (sorted metadata), `find_notes` (glob + `--type` + `--mtime`), `read_note` (section/frontmatter/tasks/body), `stat_note` (counts), `backlinks`, `orphans`, and the write verbs `append_note` / `new_note` / `archive_note` / `move_note` — the last is transactional with a vault-wide `[[wikilink]]` rewrite + rollback + `--dry-run`. Bad regex/glob input → `CoreError::InvalidTarget` (exit 71).
+**Connections** — uses: `walkdir`, `regex`, `globset`, `crate::frontmatter::parse_frontmatter`, `chrono`; atomic writes via tmp+rename; called by: `onebrain-cli` `commands/note_*` handlers.
 
 ## `register_hooks/` — harness hook wiring
 Idempotent mutation of `.claude/settings.json` for the Claude harness: registers the Stop hook + (conditionally) the qmd PostToolUse hook + 14 permissions, migrates legacy shapes in place, and strips everything on `--remove`. Gemini/Direct harnesses are no-ops. All JSON goes through `serde_json::Value` so unknown keys survive round-trips.

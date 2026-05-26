@@ -30,6 +30,7 @@ pub const EXIT_NOT_IMPLEMENTED: i32 = 72;
 pub const EXIT_RPC_HANDSHAKE: i32 = 73;
 pub const EXIT_AUTH_FAILED: i32 = 74;
 pub const EXIT_INIT_TARGET_NOT_EMPTY: i32 = 75;
+pub const EXIT_ROLLBACK_INCOMPLETE: i32 = 76;
 
 /// Map a `CoreError` directly to its stable exit code.
 pub fn exit_code_for_core(err: &CoreError) -> i32 {
@@ -47,6 +48,7 @@ pub fn exit_code_for_core(err: &CoreError) -> i32 {
         CoreError::RpcHandshake(_) => EXIT_RPC_HANDSHAKE,
         CoreError::AuthFailed(_) => EXIT_AUTH_FAILED,
         CoreError::InitTargetNotEmpty(_) => EXIT_INIT_TARGET_NOT_EMPTY,
+        CoreError::RollbackIncomplete(_) => EXIT_ROLLBACK_INCOMPLETE,
     }
 }
 
@@ -197,6 +199,27 @@ mod tests {
             exit_code_for_core(&CoreError::InitTargetNotEmpty("contents".into())),
             75
         );
+    }
+
+    #[test]
+    fn rollback_incomplete_maps_to_76() {
+        assert_eq!(
+            exit_code_for_core(&CoreError::RollbackIncomplete(
+                "could not restore a.md".into()
+            )),
+            76
+        );
+    }
+
+    #[test]
+    fn rollback_incomplete_wrapped_in_fs_error_still_maps_to_76() {
+        // Real-world path: move_note returns FsError::Core(RollbackIncomplete).
+        // The exit-code walker must reach the wrapped CoreError, not fall
+        // through to the FsError generic mapping (which would emit 66).
+        let fs_err: onebrain_fs::FsError =
+            onebrain_fs::FsError::Core(CoreError::RollbackIncomplete("a.md".into()));
+        let e: anyhow::Error = anyhow::Error::from(fs_err);
+        assert_eq!(exit_code_for(&e), 76);
     }
 
     #[test]

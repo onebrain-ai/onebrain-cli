@@ -4,7 +4,7 @@ default-members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "3.1.5"
+version = "3.2.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["OneBrain Contributors"]
@@ -48,8 +48,11 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # SHA-256 verification of the self-update binary (v3.1.4 · onebrain-fs update install path)
 sha2 = "0.10"
 
-# Regex (Slice 8 scheduler · cron + at field validation · pre-compiled with OnceLock)
+# Regex (Slice 8 scheduler · cron + at field validation · pre-compiled with OnceLock · v3.2 note search --mode regex)
 regex     = "1"
+
+# Glob matching (v3.2 `note find` — path globs like `**/topic-*.md`)
+globset   = "0.4"
 
 # Order-preserving map (Slice 8 scheduler · YAML insertion order for skill-mode args)
 indexmap  = { version = "2", features = ["serde"] }
