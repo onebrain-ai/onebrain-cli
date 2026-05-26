@@ -279,3 +279,158 @@ jobs:
       - name: Publish to npm with provenance
         working-directory: npm-wrapper
         run: npm publish --access public --provenance
+
+  brew-bump:
+    name: Bump Homebrew formula
+    needs: release
+    runs-on: ubuntu-latest
+    # Stable tags only — prereleases don't update the brew tap (matches the
+    # npm-publish gate). Requires the `HOMEBREW_TAP_TOKEN` secret: a
+    # fine-grained PAT scoped to `onebrain-ai/homebrew-onebrain` with
+    # contents:read+write. GITHUB_TOKEN can't write to a sibling repo.
+    if: ${{ !contains(github.ref, '-') }}
+    permissions:
+      contents: read
+    steps:
+      - name: Regenerate + commit formula
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # `github.ref_name` is the bare tag (vX.Y.Z). Strip the leading v
+          # for the brew `version` (Homebrew also auto-derives it from the
+          # URL, but we keep the tag form for the download URLs).
+          VERSION="${TAG#v}"
+
+          # Pull the four brew-target checksums straight from the release the
+          # `release` job just published. gh follows the asset redirect; no
+          # hand-rolled curl URL to drift.
+          download_sha() {
+            gh release download "$TAG" \
+              --repo onebrain-ai/onebrain-cli \
+              --pattern "onebrain-$1.tar.gz.sha256" \
+              --output - | awk '{print $1}'
+          }
+          SHA_MAC_ARM="$(download_sha aarch64-apple-darwin)"
+          SHA_MAC_X86="$(download_sha x86_64-apple-darwin)"
+          SHA_LINUX_ARM="$(download_sha aarch64-unknown-linux-gnu)"
+          SHA_LINUX_X86="$(download_sha x86_64-unknown-linux-gnu)"
+
+          BASE="https://github.com/onebrain-ai/onebrain-cli/releases/download/${TAG}"
+
+          # Regenerate the formula from a fixed template — the target set is
+          # stable, so a full rewrite is less brittle than in-place seds.
+          # Heredoc lines sit at the run-block base indent so YAML's block
+          # scalar strips them to column 0 (valid Ruby), while shell still
+          # expands the ${...} vars. Ruby's #{...} has no $ so it stays literal.
+          mkdir -p Formula
+          cat > Formula/onebrain.rb <<FORMULA
+          class Onebrain < Formula
+            desc "Local-first Rust CLI for OneBrain — personal AI OS for Obsidian"
+            homepage "https://onebrain.run"
+            license "AGPL-3.0-only"
+
+            on_macos do
+              on_arm do
+                url "${BASE}/onebrain-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_ARM}"
+              end
+              on_intel do
+                url "${BASE}/onebrain-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_X86}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${BASE}/onebrain-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX_ARM}"
+              end
+              on_intel do
+                url "${BASE}/onebrain-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX_X86}"
+              end
+            end
+
+            def install
+              bin.install "onebrain"
+            end
+
+            test do
+              assert_match "onebrain #{version}", shell_output("#{bin}/onebrain --version")
+            end
+          end
+          FORMULA
+
+          # Commit straight to the tap's default branch via the Contents API
+          # (no local clone / credential helper needed). Look up the current
+          # blob SHA so the PUT is an update, not a create.
+          CONTENT="$(base64 -w0 Formula/onebrain.rb)"
+          CUR_SHA="$(gh api repos/onebrain-ai/homebrew-onebrain/contents/Formula/onebrain.rb --jq .sha)"
+          gh api -X PUT repos/onebrain-ai/homebrew-onebrain/contents/Formula/onebrain.rb \
+            -f message="onebrain ${VERSION}" \
+            -f content="${CONTENT}" \
+            -f sha="${CUR_SHA}"
+
+  website-deploy:
+    name: Trigger website redeploy
+    needs: npm-publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Stable tags only (npm-publish already skips prereleases, but gate
+    # explicitly so the job is self-documenting). Fires the Cloudflare deploy
+    # hook so onebrain.run rebuilds and picks up the new version — the site
+    # reads `onebrain-cli/releases/latest` at BUILD time (see website
+    # src/lib/version.ts), so a CLI release must re-trigger the build or the
+    # rendered version string stays stale.
+    #
+    # Secret `CF_WEBSITE_DEPLOY_HOOK`: the Cloudflare deploy-hook URL (the URL
+    # itself is the credential). This is the same hook + secret name the
+    # plugin repo used before v3.0.0 moved release ownership here; reuse the
+    # existing hook, just store the secret on onebrain-cli.
+    if: ${{ !contains(github.ref, '-') }}
+    steps:
+      - name: Trigger Cloudflare deploy hook
+        env:
+          DEPLOY_HOOK_URL: ${{ secrets.CF_WEBSITE_DEPLOY_HOOK }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          if [ -z "${DEPLOY_HOOK_URL}" ]; then
+            if [ "${GITHUB_REPOSITORY}" = "onebrain-ai/onebrain-cli" ]; then
+              echo "::error::CF_WEBSITE_DEPLOY_HOOK secret is required on the canonical repo"
+              exit 1
+            fi
+            echo "::warning::Skipping website rebuild on fork ${GITHUB_REPOSITORY} — secret not set"
+            exit 0
+          fi
+
+          echo "Triggering website rebuild for v${VERSION}..."
+          # --retry-connrefused (not --retry-all-errors): retry transient 5xx
+          # + connection-refused; do NOT mask permanent 4xx misconfig errors.
+          CURL_EXIT=0
+          HTTP_CODE=$(curl -X POST "${DEPLOY_HOOK_URL}" \
+            -sS \
+            -o response.txt \
+            -w "%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            --retry 3 --retry-delay 5 --retry-connrefused) || CURL_EXIT=$?
+
+          if [ "${CURL_EXIT}" -ne 0 ]; then
+            echo "::error::curl failed (exit ${CURL_EXIT}) — network/DNS/TLS issue, not an HTTP error"
+            exit 1
+          fi
+          if ! [[ "${HTTP_CODE}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Unexpected HTTP code value: '${HTTP_CODE}'"
+            exit 1
+          fi
+          if [ "${HTTP_CODE}" -ge 200 ] && [ "${HTTP_CODE}" -lt 300 ]; then
+            echo "Website rebuild triggered (HTTP ${HTTP_CODE}) — live within 1-2 min"
+          else
+            echo "::error::Deploy hook returned HTTP ${HTTP_CODE}"
+            [ -s response.txt ] && head -c 2000 response.txt
+            exit 1
+          fi
