@@ -37,11 +37,14 @@ The CLI is **cross-harness**: paired with the [OneBrain plugin](https://github.c
 
 ### Why OneBrain CLI
 
-- **Local-first** — Your vault, your data, your AI memory. No cloud round-trip required for any operation.
-- **Cross-harness** — One binary serves any agentic harness (Claude Code, Gemini CLI, Codex, Qwen) through a single plugin contract.
-- **Native Rust** — ~5 MB stripped static binary, ~2 MB private memory per call, sub-50 ms cold start, zero `unsafe` in OneBrain crates.
-- **Stable contracts** — Every command speaks a canonical `Envelope<T>` JSON/YAML shape with a frozen schema across v3.x, so hooks and scripts never guess at output.
-- **Trustworthy install** — Self-update fetches binaries straight from GitHub Releases over TLS; the npm wrapper verifies a published SHA-256 before extracting.
+Point an AI agent at a vault and ask it to "find my notes on X" or "process the inbox," and it improvises — a different pile of `grep` / `ls` / `find` / `sed` each time, behaving subtly differently on Claude Code vs Gemini vs Codex, and re-derived from scratch on every session. That's slow, token-hungry, non-portable, and occasionally wrong. **OneBrain CLI replaces that improvisation with one deterministic binary** — the vault's operations encoded as commands that behave identically on every harness, every run.
+
+- **Same behavior on every harness & model** — one binary, one result. Claude Code, Gemini CLI, Codex, and Qwen all run `onebrain <noun> <verb>` and get identical output, instead of each agent reinventing the shell pipeline its own way. Switch harness or model without re-testing how your vault gets touched.
+- **No re-deriving solved workflows** — search, capture, consolidate, checkpoint and friends are encoded in the binary, so the agent invokes one command instead of reasoning out the same multi-step recipe every session. Fewer tokens spent, fewer chances to drift off the known-good path.
+- **Deterministic & safe** — a typed command with a frozen `Envelope` contract can't half-finish or quietly do something different the way an ad-hoc `rm` / `sed` pipeline can. Same input, same output, same exit code — every time, scriptable by hooks without guessing.
+- **Fast where you feel it** — a compiled ~5 MB binary returns in well under 50 ms (~2 MB memory, zero `unsafe`), so the agent skips the latency of thinking through several tool calls for work that's already a single operation.
+- **Local-first** — your vault, your data, your AI memory. No cloud round-trip required for any operation.
+- **Trustworthy install** — self-update fetches binaries straight from GitHub Releases over TLS and verifies their SHA-256 before swapping; the npm wrapper checks the same checksum before extracting.
 
 ## Status
 
