@@ -440,6 +440,12 @@ pub(crate) enum InstallChannel {
 /// Classify the install by where `current_exe` resolves. We canonicalize
 /// first to follow brew's `bin/onebrain` symlink to its Cellar target, then
 /// hand off to the pure [`classify_path`].
+///
+/// If `canonicalize` fails (effectively never for a currently-running binary)
+/// we fall back to the raw path, which classifies as `Direct`. That's the safe
+/// direction: the worst case is an in-place swap of a still-SHA-256-verified
+/// binary (the old pre-3.1.4 behavior) — never a verification bypass, and never
+/// a spurious `Homebrew` that would skip the swap.
 pub(crate) fn detect_install_channel(current_exe: &Path) -> InstallChannel {
     let resolved = fs::canonicalize(current_exe).unwrap_or_else(|_| current_exe.to_path_buf());
     classify_path(&resolved)
@@ -449,6 +455,10 @@ pub(crate) fn detect_install_channel(current_exe: &Path) -> InstallChannel {
 /// `…/Cellar/onebrain/<version>/bin/onebrain` on `/opt/homebrew`,
 /// `/usr/local`, and Linuxbrew alike, so the `/Cellar/onebrain/` segment is
 /// the reliable signal. Split out so it's testable without a real filesystem.
+///
+/// brew is Unix-only, so the forward-slash literal is correct: a Windows path
+/// never matches and always resolves to `Direct` (the Windows update path is
+/// unwired anyway — see `AssetInfo::extract_binary`).
 fn classify_path(resolved: &Path) -> InstallChannel {
     if resolved.to_string_lossy().contains("/Cellar/onebrain/") {
         InstallChannel::Homebrew
