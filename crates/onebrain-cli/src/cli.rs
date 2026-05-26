@@ -574,9 +574,8 @@ pub enum NoteVerb {
     Read(NoteReadArgs),
     /// Append content to a note (at EOF, or under a `--section` heading).
     Append(NoteAppendArgs),
-    /// Create a new note (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    New { title: String },
+    /// Create a new note, optionally from a template, with inline frontmatter.
+    New(NoteNewArgs),
     /// Move a note (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     Move { from: PathBuf, to: PathBuf },
@@ -664,6 +663,22 @@ pub struct NoteAppendArgs {
     /// it is created as a level-2 heading (`## H`) at the end of the file.
     #[arg(long)]
     pub section: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteNewArgs {
+    /// New note path, relative to the vault root (e.g. `03-knowledge/ml/New Topic.md`).
+    pub path: PathBuf,
+    /// Template name. Resolves `.claude/plugins/onebrain/templates/<NAME>.md` and
+    /// substitutes `{{date}}`, `{{title}}`, `{{slug}}`.
+    #[arg(long)]
+    pub template: Option<String>,
+    /// Inline frontmatter pairs, `key=value`, comma-separated (e.g. `tags=ai,status=draft`).
+    #[arg(long, value_delimiter = ',')]
+    pub frontmatter: Vec<String>,
+    /// Overwrite the note if it already exists.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]

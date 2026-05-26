@@ -7,6 +7,7 @@ pub mod note_append;
 pub mod note_backlinks;
 pub mod note_find;
 pub mod note_list;
+pub mod note_new;
 pub mod note_orphans;
 pub mod note_read;
 pub mod note_search;
