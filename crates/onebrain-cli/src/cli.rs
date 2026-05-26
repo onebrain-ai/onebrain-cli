@@ -584,9 +584,8 @@ pub enum NoteVerb {
     /// Archive a note (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     Archive { path: PathBuf },
-    /// List backlinks to a note (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Backlinks { path: PathBuf },
+    /// List every note that links to the target note.
+    Backlinks(NoteBacklinksArgs),
     /// List orphan notes (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     Orphans,
@@ -660,6 +659,15 @@ pub struct NoteReadArgs {
 pub struct NoteStatArgs {
     /// Note path, relative to the vault root.
     pub path: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteBacklinksArgs {
+    /// Target note path, relative to the vault root.
+    pub path: PathBuf,
+    /// Also scan notes under `06-archive` (excluded by default).
+    #[arg(long)]
+    pub include_archive: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────

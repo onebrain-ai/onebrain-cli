@@ -36,6 +36,27 @@ pub fn walk_notes(vault_root: &Path, folder: Option<&Path>) -> Result<Vec<PathBu
     Ok(out)
 }
 
+/// Enumerate Markdown (`.md`) files under `vault_root` INCLUDING the archive
+/// bucket (`06-archive`), pruning only tooling dirs ([`TOOLING_DIRS`]) and
+/// binary attachments. Used by `note backlinks --include-archive`.
+///
+/// Note: [`walk_notes`] prunes any dir named `06-archive` at any depth — even
+/// when passed as the start dir — so it can't be used to include the archive.
+/// This walks everything via [`walk_all`] and filters down to `.md` files.
+pub(super) fn walk_notes_with_archive(vault_root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out: Vec<PathBuf> = walk_all(vault_root)?
+        .into_iter()
+        .filter(|(path, is_dir)| {
+            !is_dir
+                && path.extension().and_then(|s| s.to_str()) == Some("md")
+                && !path.components().any(|c| c.as_os_str() == "attachments")
+        })
+        .map(|(path, _)| path)
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
 /// Walk every file and directory under `vault_root`, pruning only tooling dirs
 /// ([`TOOLING_DIRS`]). Returns `(absolute_path, is_dir)` pairs (excluding the
 /// root itself), sorted. Used by `note find`, which — unlike [`walk_notes`] —
@@ -124,6 +145,23 @@ mod tests {
         assert_eq!(
             rel_strings(root, &got),
             vec!["03-knowledge/ml/note2.md", "note1.md"]
+        );
+    }
+
+    #[test]
+    fn walk_notes_with_archive_includes_archive_skips_attachments_and_nonmd() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        touch(root, "note1.md");
+        touch(root, "06-archive/2026/old.md");
+        touch(root, ".git/config.md"); // tooling pruned
+        touch(root, "attachments/scan.md"); // attachments pruned
+        touch(root, "notes.txt"); // non-md ignored
+
+        let got = walk_notes_with_archive(root).unwrap();
+        assert_eq!(
+            rel_strings(root, &got),
+            vec!["06-archive/2026/old.md", "note1.md"]
         );
     }
 
