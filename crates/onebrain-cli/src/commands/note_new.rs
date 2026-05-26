@@ -29,7 +29,7 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &NoteNewArgs) -
 
 fn render_text(env: &Envelope<NewResult>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
-    let path = d.path.display();
+    let path = &d.path;
     let verb = if d.overwritten {
         "Overwrote"
     } else {
@@ -50,7 +50,7 @@ mod tests {
             "note.new",
             None,
             NewResult {
-                path: PathBuf::from("03-knowledge/Note.md"),
+                path: "03-knowledge/Note.md".into(),
                 created: true,
                 overwritten,
                 template: template.map(str::to_string),

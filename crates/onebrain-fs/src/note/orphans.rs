@@ -9,25 +9,27 @@
 //! anything under `00-inbox/` or `07-logs/`, the archive bucket (already
 //! pruned by [`walk_notes`]), and top-level `TASKS.md` / `MOC.md`.
 
+use super::path_out::rel_slash;
 use super::walker::walk_notes;
 use crate::error::Result;
 use serde::Serialize;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// Result of [`orphans`]. `orphans` holds vault-relative paths (sorted),
-/// capped to the requested limit; `total` counts every orphan before the cap.
+/// Result of [`orphans`]. `orphans` holds vault-relative forward-slash paths
+/// (sorted), capped to the requested limit; `total` counts every orphan before
+/// the cap.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct OrphansData {
-    pub orphans: Vec<PathBuf>,
+    pub orphans: Vec<String>,
     pub total: usize,
     pub truncated: bool,
-    /// Vault-relative paths of notes that could not be read as UTF-8 text
-    /// while building the link set. Non-empty means a note here might hold the
-    /// ONLY inbound link to a candidate, so a result could be a FALSE orphan.
-    /// Omitted from JSON when empty.
+    /// Vault-relative forward-slash paths of notes that could not be read as
+    /// UTF-8 text while building the link set. Non-empty means a note here
+    /// might hold the ONLY inbound link to a candidate, so a result could be a
+    /// FALSE orphan. Omitted from JSON when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub skipped: Vec<PathBuf>,
+    pub skipped: Vec<String>,
 }
 
 /// Find notes (under `folder`, or the whole vault) that have no incoming
@@ -37,12 +39,12 @@ pub fn orphans(vault_root: &Path, folder: Option<&Path>, limit: usize) -> Result
     // 1. Build the LINK SET from every note in the vault.
     let all = walk_notes(vault_root, None)?;
     let mut linked: HashSet<String> = HashSet::new();
-    let mut skipped: Vec<PathBuf> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
     for file in &all {
         // Record unreadable files: one might hold the ONLY inbound link to a
         // candidate, which would otherwise be wrongly reported as an orphan.
         let Ok(content) = std::fs::read_to_string(file) else {
-            skipped.push(file.strip_prefix(vault_root).unwrap_or(file).to_path_buf());
+            skipped.push(rel_slash(vault_root, file));
             continue;
         };
         collect_link_targets(&content, &mut linked);
@@ -50,7 +52,7 @@ pub fn orphans(vault_root: &Path, folder: Option<&Path>, limit: usize) -> Result
 
     // 2. CANDIDATES = notes under `folder`, minus the exclusion set.
     let candidates = walk_notes(vault_root, folder)?;
-    let mut orphans: Vec<PathBuf> = Vec::new();
+    let mut orphans: Vec<String> = Vec::new();
     for file in &candidates {
         let rel = file.strip_prefix(vault_root).unwrap_or(file);
         if is_excluded(rel) {
@@ -62,7 +64,7 @@ pub fn orphans(vault_root: &Path, folder: Option<&Path>, limit: usize) -> Result
             .unwrap_or_default();
         // 3. Orphan = stem absent from the link set.
         if !linked.contains(&stem) {
-            orphans.push(rel.to_path_buf());
+            orphans.push(rel_slash(vault_root, file));
         }
     }
 
@@ -137,7 +139,7 @@ mod tests {
 
         let res = orphans(root, None, 50).unwrap();
         assert_eq!(res.total, 1);
-        assert_eq!(res.orphans, vec![PathBuf::from("lonely.md")]);
+        assert_eq!(res.orphans, vec!["lonely.md".to_string()]);
         assert!(!res.truncated);
     }
 
@@ -150,7 +152,7 @@ mod tests {
 
         let res = orphans(root, None, 50).unwrap();
         // `source.md` is the only orphan; `target.md` has a backlink.
-        assert_eq!(res.orphans, vec![PathBuf::from("source.md")]);
+        assert_eq!(res.orphans, vec!["source.md".to_string()]);
     }
 
     #[test]
@@ -161,7 +163,7 @@ mod tests {
         write(root, "source.md", "jump to [[target|the target]]\n");
 
         let res = orphans(root, None, 50).unwrap();
-        assert!(!res.orphans.contains(&PathBuf::from("target.md")));
+        assert!(!res.orphans.contains(&"target.md".to_string()));
     }
 
     #[test]
@@ -172,7 +174,7 @@ mod tests {
         write(root, "source.md", "deep [[target#Heading]]\n");
 
         let res = orphans(root, None, 50).unwrap();
-        assert!(!res.orphans.contains(&PathBuf::from("target.md")));
+        assert!(!res.orphans.contains(&"target.md".to_string()));
     }
 
     #[test]
@@ -186,7 +188,7 @@ mod tests {
         write(root, "real-orphan.md", "# Real\n");
 
         let res = orphans(root, None, 50).unwrap();
-        assert_eq!(res.orphans, vec![PathBuf::from("real-orphan.md")]);
+        assert_eq!(res.orphans, vec!["real-orphan.md".to_string()]);
         assert_eq!(res.total, 1);
     }
 
@@ -203,10 +205,7 @@ mod tests {
         assert_eq!(res.orphans.len(), 2);
         assert!(res.truncated);
         // Sorted by path → first two.
-        assert_eq!(
-            res.orphans,
-            vec![PathBuf::from("a.md"), PathBuf::from("b.md")]
-        );
+        assert_eq!(res.orphans, vec!["a.md".to_string(), "b.md".to_string()]);
     }
 
     #[test]
@@ -222,7 +221,7 @@ mod tests {
         write(root, "02-areas/elsewhere.md", "# Elsewhere\n");
 
         let res = orphans(root, Some(Path::new("03-knowledge")), 50).unwrap();
-        assert_eq!(res.orphans, vec![PathBuf::from("03-knowledge/solo.md")]);
+        assert_eq!(res.orphans, vec!["03-knowledge/solo.md".to_string()]);
     }
 
     #[test]
@@ -234,7 +233,7 @@ mod tests {
 
         let res = orphans(root, None, 50).unwrap();
         // walk_notes prunes 06-archive, so only `live.md` is a candidate.
-        assert_eq!(res.orphans, vec![PathBuf::from("live.md")]);
+        assert_eq!(res.orphans, vec!["live.md".to_string()]);
     }
 
     /// An unreadable note (which might hold the only inbound link to a
@@ -266,9 +265,9 @@ mod tests {
         // The unreadable file is named so the caller knows the orphan list may
         // contain false positives (here `target.md`, since its only linker was
         // unreadable).
-        assert_eq!(res.skipped, vec![PathBuf::from("linker.md")]);
+        assert_eq!(res.skipped, vec!["linker.md".to_string()]);
         assert!(
-            res.orphans.contains(&PathBuf::from("target.md")),
+            res.orphans.contains(&"target.md".to_string()),
             "with the linker unreadable, target appears as a (false) orphan: {:?}",
             res.orphans
         );

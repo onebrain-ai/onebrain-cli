@@ -15,6 +15,7 @@
 //! pattern used by [`super::append`] / [`super::new`].
 
 use super::io::atomic_write;
+use super::path_out::{rel_slash, to_slash};
 use super::walker::walk_notes;
 use crate::error::{FsError, Result};
 use onebrain_core::CoreError;
@@ -22,13 +23,13 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 /// Result of [`move_note`]. `from`/`to` and every entry of `updated_files` are
-/// vault-relative.
+/// vault-relative forward-slash strings.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct MoveResult {
-    /// Vault-relative path the note moved FROM.
-    pub from: PathBuf,
-    /// Vault-relative path the note moved TO.
-    pub to: PathBuf,
+    /// Vault-relative forward-slash path the note moved FROM.
+    pub from: String,
+    /// Vault-relative forward-slash path the note moved TO.
+    pub to: String,
     /// Total number of individual link occurrences that were (or would be)
     /// changed across all notes.
     pub links_rewritten: usize,
@@ -36,15 +37,15 @@ pub struct MoveResult {
     pub files_updated: usize,
     /// `true` when this was a `--dry-run`: nothing was written to disk.
     pub dry_run: bool,
-    /// Vault-relative paths of the notes whose links were (or would be)
-    /// rewritten. Sorted (inherits [`walk_notes`] ordering).
-    pub updated_files: Vec<PathBuf>,
-    /// Vault-relative paths of notes that could not be read as UTF-8 text
-    /// during the link scan and were therefore NOT rewritten. Non-empty means
-    /// such a note may still contain a now-dangling `[[old]]` link. Omitted
-    /// from JSON when empty.
+    /// Vault-relative forward-slash paths of the notes whose links were (or
+    /// would be) rewritten. Sorted (inherits [`walk_notes`] ordering).
+    pub updated_files: Vec<String>,
+    /// Vault-relative forward-slash paths of notes that could not be read as
+    /// UTF-8 text during the link scan and were therefore NOT rewritten.
+    /// Non-empty means such a note may still contain a now-dangling `[[old]]`
+    /// link. Omitted from JSON when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub skipped: Vec<PathBuf>,
+    pub skipped: Vec<String>,
 }
 
 /// A single planned rewrite: an absolute note path, its original content (for
@@ -110,21 +111,16 @@ pub fn move_note(
     };
 
     let links_rewritten: usize = edits.iter().map(|e| e.occurrences).sum();
-    let updated_files: Vec<PathBuf> = edits
+    let updated_files: Vec<String> = edits
         .iter()
-        .map(|e| {
-            e.abs_path
-                .strip_prefix(vault_root)
-                .unwrap_or(&e.abs_path)
-                .to_path_buf()
-        })
+        .map(|e| rel_slash(vault_root, &e.abs_path))
         .collect();
 
     // 3. Dry-run: report the plan, change nothing.
     if dry_run {
         return Ok(MoveResult {
-            from: from.to_path_buf(),
-            to: to.to_path_buf(),
+            from: to_slash(from),
+            to: to_slash(to),
             links_rewritten,
             files_updated: edits.len(),
             dry_run: true,
@@ -137,8 +133,8 @@ pub fn move_note(
     execute_plan(&from_abs, &to_abs, &edits)?;
 
     Ok(MoveResult {
-        from: from.to_path_buf(),
-        to: to.to_path_buf(),
+        from: to_slash(from),
+        to: to_slash(to),
         links_rewritten,
         files_updated: edits.len(),
         dry_run: false,
@@ -156,10 +152,10 @@ fn build_edit_plan(
     from_abs: &Path,
     old_basename: &str,
     new_basename: &str,
-) -> Result<(Vec<PlannedEdit>, Vec<PathBuf>)> {
+) -> Result<(Vec<PlannedEdit>, Vec<String>)> {
     let files = walk_notes(vault_root, None)?;
     let mut edits = Vec::new();
-    let mut skipped: Vec<PathBuf> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
     for file in files {
         if file == from_abs {
             continue; // never rewrite the note being moved
@@ -168,7 +164,7 @@ fn build_edit_plan(
         // them, since such a note may still hold a `[[old]]` link we can't
         // rewrite (it would dangle after the move).
         let Ok(original) = std::fs::read_to_string(&file) else {
-            skipped.push(file.strip_prefix(vault_root).unwrap_or(&file).to_path_buf());
+            skipped.push(rel_slash(vault_root, &file));
             continue;
         };
         let (new_content, occurrences) = rewrite_links(&original, old_basename, new_basename);
@@ -377,18 +373,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(res.from, PathBuf::from("old.md"));
-        assert_eq!(res.to, PathBuf::from("03-knowledge/new.md"));
+        assert_eq!(res.from, "old.md");
+        assert_eq!(res.to, "03-knowledge/new.md");
         assert_eq!(res.links_rewritten, 3);
         assert_eq!(res.files_updated, 3);
         assert!(!res.dry_run);
         assert_eq!(
             res.updated_files,
-            vec![
-                PathBuf::from("a.md"),
-                PathBuf::from("b.md"),
-                PathBuf::from("c.md"),
-            ]
+            vec!["a.md".to_string(), "b.md".to_string(), "c.md".to_string()]
         );
 
         // File physically moved.
@@ -466,7 +458,7 @@ mod tests {
         assert_eq!(res.files_updated, 2);
         assert_eq!(
             res.updated_files,
-            vec![PathBuf::from("a.md"), PathBuf::from("b.md")]
+            vec!["a.md".to_string(), "b.md".to_string()]
         );
 
         // NOTHING changed on disk.
@@ -822,6 +814,6 @@ mod tests {
         // The readable note was rewritten; the unreadable one is reported.
         assert_eq!(res.links_rewritten, 1, "only readable link rewritten");
         assert_eq!(read(root, "readable.md"), "see [[new]]\n");
-        assert_eq!(res.skipped, vec![PathBuf::from("blocked.md")]);
+        assert_eq!(res.skipped, vec!["blocked.md".to_string()]);
     }
 }

@@ -28,22 +28,13 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &NoteBacklinksA
 fn render_text(env: &Envelope<BacklinksData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     if d.backlinks.is_empty() {
-        return format!("No backlinks to {}.", d.target.display());
+        return format!("No backlinks to {}.", d.target);
     }
     let mut out = String::new();
     for b in &d.backlinks {
-        out.push_str(&format!(
-            "{}:{}: {}\n",
-            b.source.display(),
-            b.line,
-            b.context
-        ));
+        out.push_str(&format!("{}:{}: {}\n", b.source, b.line, b.context));
     }
-    out.push_str(&format!(
-        "\n{} backlink(s) to {}\n",
-        d.total,
-        d.target.display()
-    ));
+    out.push_str(&format!("\n{} backlink(s) to {}\n", d.total, d.target));
     out
 }
 
@@ -58,7 +49,7 @@ mod tests {
             "note.backlinks",
             None,
             BacklinksData {
-                target: PathBuf::from("MEMORY-INDEX.md"),
+                target: "MEMORY-INDEX.md".into(),
                 backlinks,
                 total,
                 skipped: Vec::new(),
@@ -70,12 +61,12 @@ mod tests {
     fn text_renders_source_line_context_and_count() {
         let e = env(vec![
             BacklinkEntry {
-                source: PathBuf::from("a.md"),
+                source: "a.md".into(),
                 line: 2,
                 context: "see [[MEMORY-INDEX]]".into(),
             },
             BacklinkEntry {
-                source: PathBuf::from("b.md"),
+                source: "b.md".into(),
                 line: 5,
                 context: "also [[MEMORY-INDEX|x]]".into(),
             },

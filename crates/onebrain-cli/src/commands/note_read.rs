@@ -62,7 +62,7 @@ mod tests {
             "note.read",
             None,
             ReadResult {
-                path: PathBuf::from("a.md"),
+                path: "a.md".into(),
                 mode,
                 content: content.map(str::to_string),
                 frontmatter,

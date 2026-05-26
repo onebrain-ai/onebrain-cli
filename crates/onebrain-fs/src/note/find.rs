@@ -5,12 +5,13 @@
 //! not restricted to `.md`. A glob with no `/` matches the basename (like
 //! `find -name`); a glob containing `/` matches the vault-relative path.
 
+use super::path_out::to_slash;
 use super::walker::walk_all;
 use crate::error::{FsError, Result};
 use globset::Glob;
 use onebrain_core::CoreError;
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
 
 const SECS_PER_DAY: i64 = 86_400;
@@ -32,10 +33,10 @@ pub struct FindOptions {
     pub limit: usize,
 }
 
-/// A single match. `path` is vault-relative.
+/// A single match. `path` is a vault-relative forward-slash string.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct FindEntry {
-    pub path: PathBuf,
+    pub path: String,
     pub is_dir: bool,
 }
 
@@ -86,7 +87,7 @@ pub fn find_notes(vault_root: &Path, opts: &FindOptions) -> Result<FindResult> {
         total += 1;
         if entries.len() < opts.limit {
             entries.push(FindEntry {
-                path: rel.to_path_buf(),
+                path: to_slash(rel),
                 is_dir,
             });
         }
@@ -123,6 +124,7 @@ mod tests {
     use super::*;
     use filetime::{set_file_mtime, FileTime};
     use std::fs;
+    use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::tempdir;
 
@@ -143,10 +145,8 @@ mod tests {
     }
 
     fn rel_paths(res: &FindResult) -> Vec<String> {
-        res.entries
-            .iter()
-            .map(|e| e.path.to_string_lossy().replace('\\', "/"))
-            .collect()
+        // `path` is already a vault-relative forward-slash string.
+        res.entries.iter().map(|e| e.path.clone()).collect()
     }
 
     #[test]

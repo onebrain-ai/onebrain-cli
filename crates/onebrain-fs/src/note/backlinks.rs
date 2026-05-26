@@ -5,15 +5,17 @@
 //! note containing a wikilink whose link target equals that basename:
 //! `[[MEMORY-INDEX]]`, `[[MEMORY-INDEX|alias]]`, `[[MEMORY-INDEX#section]]`.
 
+use super::path_out::{rel_slash, to_slash};
 use super::walker::{walk_notes, walk_notes_with_archive};
 use crate::error::Result;
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// A single matching line. `source` is vault-relative; `line` is 1-based.
+/// A single matching line. `source` is a vault-relative forward-slash string;
+/// `line` is 1-based.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct BacklinkEntry {
-    pub source: PathBuf,
+    pub source: String,
     pub line: usize,
     pub context: String,
 }
@@ -25,15 +27,15 @@ pub struct BacklinkEntry {
 /// returned.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct BacklinksData {
-    pub target: PathBuf,
+    pub target: String,
     pub backlinks: Vec<BacklinkEntry>,
     /// Count of all backlink occurrences (== `backlinks.len()`).
     pub total: usize,
-    /// Vault-relative paths of notes that could not be read as UTF-8 text and
-    /// were therefore excluded from the scan. Non-empty means the count may be
-    /// an undercount. Omitted from JSON when empty.
+    /// Vault-relative forward-slash paths of notes that could not be read as
+    /// UTF-8 text and were therefore excluded from the scan. Non-empty means
+    /// the count may be an undercount. Omitted from JSON when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub skipped: Vec<PathBuf>,
+    pub skipped: Vec<String>,
 }
 
 /// Find every note that links to `rel_target` (vault-relative path). When
@@ -53,7 +55,7 @@ pub fn backlinks(
 
     let target_abs = vault_root.join(rel_target);
     let mut entries = Vec::new();
-    let mut skipped: Vec<PathBuf> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
     for file in &files {
         // Don't count the target file linking to itself.
         if *file == target_abs {
@@ -63,10 +65,10 @@ pub fn backlinks(
         // aborting on one odd file — but RECORD them, since an unreadable file
         // could hold a backlink we'd otherwise undercount.
         let Ok(content) = std::fs::read_to_string(file) else {
-            skipped.push(file.strip_prefix(vault_root).unwrap_or(file).to_path_buf());
+            skipped.push(rel_slash(vault_root, file));
             continue;
         };
-        let rel = file.strip_prefix(vault_root).unwrap_or(file).to_path_buf();
+        let rel = rel_slash(vault_root, file);
         for (idx, line) in content.lines().enumerate() {
             if line_links_to(line, &target_basename) {
                 entries.push(BacklinkEntry {
@@ -80,7 +82,7 @@ pub fn backlinks(
 
     let total = entries.len();
     Ok(BacklinksData {
-        target: rel_target.to_path_buf(),
+        target: to_slash(rel_target),
         backlinks: entries,
         total,
         skipped,
@@ -140,9 +142,9 @@ mod tests {
 
         let res = backlinks(root, Path::new("MEMORY-INDEX.md"), false).unwrap();
         assert_eq!(res.total, 1);
-        assert_eq!(res.target, PathBuf::from("MEMORY-INDEX.md"));
+        assert_eq!(res.target, "MEMORY-INDEX.md");
         let e = &res.backlinks[0];
-        assert_eq!(e.source, PathBuf::from("a.md"));
+        assert_eq!(e.source, "a.md");
         assert_eq!(e.line, 1);
         assert_eq!(e.context, "see [[MEMORY-INDEX]] for more");
     }
@@ -156,7 +158,7 @@ mod tests {
 
         let res = backlinks(root, Path::new("MEMORY-INDEX.md"), false).unwrap();
         assert_eq!(res.total, 1);
-        assert_eq!(res.backlinks[0].source, PathBuf::from("a.md"));
+        assert_eq!(res.backlinks[0].source, "a.md");
     }
 
     #[test]
@@ -196,7 +198,7 @@ mod tests {
 
         let res = backlinks(root, Path::new("MEMORY-INDEX.md"), false).unwrap();
         assert_eq!(res.total, 1);
-        assert_eq!(res.backlinks[0].source, PathBuf::from("a.md"));
+        assert_eq!(res.backlinks[0].source, "a.md");
     }
 
     #[test]
@@ -227,10 +229,7 @@ mod tests {
 
         let res = backlinks(root, Path::new("MEMORY-INDEX.md"), true).unwrap();
         assert_eq!(res.total, 1);
-        assert_eq!(
-            res.backlinks[0].source,
-            PathBuf::from("06-archive/2026/old.md")
-        );
+        assert_eq!(res.backlinks[0].source, "06-archive/2026/old.md");
     }
 
     #[test]
@@ -274,7 +273,7 @@ mod tests {
 
         // Only the readable backlink is counted; the unreadable file is named.
         assert_eq!(res.total, 1, "only readable backlink counted");
-        assert_eq!(res.backlinks[0].source, PathBuf::from("readable.md"));
-        assert_eq!(res.skipped, vec![PathBuf::from("blocked.md")]);
+        assert_eq!(res.backlinks[0].source, "readable.md");
+        assert_eq!(res.skipped, vec!["blocked.md".to_string()]);
     }
 }

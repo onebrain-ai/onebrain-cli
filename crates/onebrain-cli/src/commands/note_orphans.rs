@@ -32,7 +32,7 @@ fn render_text(env: &Envelope<OrphansData>) -> String {
     }
     let mut out = String::new();
     for p in &d.orphans {
-        out.push_str(&format!("{}\n", p.display()));
+        out.push_str(&format!("{p}\n"));
     }
     if d.truncated {
         out.push_str(&format!(
@@ -55,7 +55,7 @@ mod tests {
             "note.orphans",
             None,
             OrphansData {
-                orphans: orphans.into_iter().map(PathBuf::from).collect(),
+                orphans: orphans.into_iter().map(String::from).collect(),
                 total,
                 truncated,
                 skipped: Vec::new(),

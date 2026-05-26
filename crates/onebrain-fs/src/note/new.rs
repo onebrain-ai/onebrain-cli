@@ -20,17 +20,18 @@
 //! pattern used by [`super::append`].
 
 use super::io::atomic_write;
+use super::path_out::to_slash;
 use crate::error::{FsError, Result};
 use chrono::Utc;
 use onebrain_core::CoreError;
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// Result of [`new_note`]. `path` is vault-relative.
+/// Result of [`new_note`]. `path` is a vault-relative forward-slash string.
 #[derive(Debug, Serialize, PartialEq)]
 pub struct NewResult {
-    /// Vault-relative path of the note that was created.
-    pub path: PathBuf,
+    /// Vault-relative forward-slash path of the note that was created.
+    pub path: String,
     /// `true` — a file was written (always true on success).
     pub created: bool,
     /// `true` if an existing file was overwritten (`--force`).
@@ -90,7 +91,7 @@ pub fn new_note(
     atomic_write(&abs, body.as_bytes())?;
 
     Ok(NewResult {
-        path: rel_path.to_path_buf(),
+        path: to_slash(rel_path),
         created: true,
         overwritten: exists,
         template: template.map(str::to_string),
@@ -309,7 +310,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(res.path, PathBuf::from("03-knowledge/ml/New Topic.md"));
+        assert_eq!(res.path, "03-knowledge/ml/New Topic.md");
         assert!(res.created);
         assert!(!res.overwritten);
         assert_eq!(res.template, None);

@@ -9,19 +9,22 @@
 //! regardless of folder and the basename never changes here, so no link
 //! rewriting is needed. (Contrast `note move`, which DOES rewrite links.)
 
+use super::path_out::to_slash;
 use crate::error::{FsError, Result};
 use chrono::{Datelike, Utc};
 use onebrain_core::CoreError;
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// Result of [`archive_note`]. Both paths are vault-relative.
+/// Result of [`archive_note`]. Both paths are vault-relative forward-slash
+/// strings.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct ArchiveResult {
-    /// Vault-relative path the note moved FROM.
-    pub from: PathBuf,
-    /// Vault-relative path the note moved TO (under the dated archive bucket).
-    pub to: PathBuf,
+    /// Vault-relative forward-slash path the note moved FROM.
+    pub from: String,
+    /// Vault-relative forward-slash path the note moved TO (under the dated
+    /// archive bucket).
+    pub to: String,
 }
 
 /// Archive the note at `rel_path` into `<archive_root>/YYYY/MM/<filename>`,
@@ -111,8 +114,8 @@ fn archive_note_at(
     }
 
     Ok(ArchiveResult {
-        from: rel_path.to_path_buf(),
-        to: rel_dest,
+        from: to_slash(rel_path),
+        to: to_slash(&rel_dest),
     })
 }
 
@@ -125,6 +128,7 @@ fn libc_exdev() -> i32 {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     fn write(root: &Path, rel: &str, body: &str) -> PathBuf {
@@ -149,8 +153,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(res.from, PathBuf::from("01-projects/Old Note.md"));
-        assert_eq!(res.to, PathBuf::from("06-archive/2026/05/Old Note.md"));
+        assert_eq!(res.from, "01-projects/Old Note.md");
+        assert_eq!(res.to, "06-archive/2026/05/Old Note.md");
         // Destination has the content; it really moved.
         assert_eq!(
             fs::read_to_string(root.join("06-archive/2026/05/Old Note.md")).unwrap(),
@@ -232,7 +236,7 @@ mod tests {
         let res =
             archive_note_at(root, Path::new("note.md"), Path::new("attic/old"), 2025, 11).unwrap();
 
-        assert_eq!(res.to, PathBuf::from("attic/old/2025/11/note.md"));
+        assert_eq!(res.to, "attic/old/2025/11/note.md");
         assert!(root.join("attic/old/2025/11/note.md").exists());
     }
 
@@ -247,11 +251,7 @@ mod tests {
         let res = archive_note(root, Path::new("live.md"), Path::new("06-archive")).unwrap();
 
         let now = Utc::now();
-        let expected = PathBuf::from(format!(
-            "06-archive/{:04}/{:02}/live.md",
-            now.year(),
-            now.month()
-        ));
+        let expected = format!("06-archive/{:04}/{:02}/live.md", now.year(), now.month());
         assert_eq!(res.to, expected);
         assert!(root.join(&expected).exists());
         assert!(!root.join("live.md").exists());

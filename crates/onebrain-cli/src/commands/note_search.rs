@@ -50,7 +50,7 @@ fn render_text(env: &Envelope<SearchResult>) -> String {
     }
     let mut out = String::new();
     for m in &d.matches {
-        out.push_str(&format!("{}:{}: {}\n", m.path.display(), m.line, m.context));
+        out.push_str(&format!("{}:{}: {}\n", m.path, m.line, m.context));
     }
     if d.truncated {
         out.push_str(&format!(
@@ -84,7 +84,7 @@ mod tests {
     fn text_renders_grep_style_lines() {
         let e = env(
             vec![NoteMatch {
-                path: PathBuf::from("a.md"),
+                path: "a.md".into(),
                 line: 2,
                 context: "some TODO here".into(),
                 title: Some("Alpha".into()),
@@ -101,7 +101,7 @@ mod tests {
     fn text_shows_truncation_footer() {
         let e = env(
             vec![NoteMatch {
-                path: PathBuf::from("a.md"),
+                path: "a.md".into(),
                 line: 1,
                 context: "x".into(),
                 title: None,

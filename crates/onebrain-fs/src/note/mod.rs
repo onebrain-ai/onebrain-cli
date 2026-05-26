@@ -13,6 +13,7 @@ mod list;
 mod r#move;
 mod new;
 mod orphans;
+mod path_out;
 mod read;
 mod search;
 mod stat;

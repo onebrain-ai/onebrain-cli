@@ -37,7 +37,7 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &NoteMoveArgs) 
 
 fn render_text(env: &Envelope<MoveResult>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
-    let move_line = format!("{} → {}", d.from.display(), d.to.display());
+    let move_line = format!("{} → {}", d.from, d.to);
     let links = format!(
         "{} link{} in {} file{}",
         d.links_rewritten,
@@ -61,8 +61,8 @@ mod tests {
             "note.move",
             None,
             MoveResult {
-                from: PathBuf::from("old.md"),
-                to: PathBuf::from("03-knowledge/new.md"),
+                from: "old.md".into(),
+                to: "03-knowledge/new.md".into(),
                 links_rewritten: links,
                 files_updated: files,
                 dry_run,

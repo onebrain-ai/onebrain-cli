@@ -26,7 +26,7 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &NoteArchiveArg
 
 fn render_text(env: &Envelope<ArchiveResult>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
-    format!("archived {} → {}", d.from.display(), d.to.display())
+    format!("archived {} → {}", d.from, d.to)
 }
 
 #[cfg(test)]
@@ -39,8 +39,8 @@ mod tests {
             "note.archive",
             None,
             ArchiveResult {
-                from: PathBuf::from("01-projects/Old Note.md"),
-                to: PathBuf::from("06-archive/2026/05/Old Note.md"),
+                from: "01-projects/Old Note.md".into(),
+                to: "06-archive/2026/05/Old Note.md".into(),
             },
         );
         assert_eq!(

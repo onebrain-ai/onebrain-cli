@@ -4,15 +4,16 @@
 //! counts (headings, wikilinks, tasks). Mirrors `list.rs` for the fs-metadata
 //! handling (size / created / modified).
 
+use super::path_out::to_slash;
 use crate::error::{FsError, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// Result of [`stat_note`]. `path` is vault-relative.
+/// Result of [`stat_note`]. `path` is a vault-relative forward-slash string.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct NoteStatData {
-    pub path: PathBuf,
+    pub path: String,
     pub lines: usize,
     pub words: usize,
     pub chars: usize,
@@ -52,7 +53,7 @@ pub fn stat_note(vault_root: &Path, rel_path: &Path) -> Result<NoteStatData> {
     let counts = count_content(&raw);
 
     Ok(NoteStatData {
-        path: rel_path.to_path_buf(),
+        path: to_slash(rel_path),
         lines: raw.lines().count(),
         words: raw.split_whitespace().count(),
         chars: raw.chars().count(),
@@ -183,7 +184,7 @@ plain [[Single Link]] line\n";
         assert_eq!(s.lines, 10, "line count");
         assert_eq!(s.words, FIXTURE.split_whitespace().count(), "word count");
         assert_eq!(s.chars, FIXTURE.chars().count(), "char count");
-        assert_eq!(s.path, PathBuf::from("a.md"));
+        assert_eq!(s.path, "a.md");
     }
 
     #[test]

@@ -37,7 +37,7 @@ fn render_text(env: &Envelope<NoteStatData>) -> String {
          tasks     : {total} ({done} done · {open} open)\n\
          created   : {created}\n\
          modified  : {modified}",
-        path = d.path.display(),
+        path = d.path,
         lines = d.lines,
         words = d.words,
         chars = d.chars,
@@ -62,7 +62,7 @@ mod tests {
             "note.stat",
             None,
             NoteStatData {
-                path: PathBuf::from("a.md"),
+                path: "a.md".into(),
                 lines: 10,
                 words: 42,
                 chars: 200,

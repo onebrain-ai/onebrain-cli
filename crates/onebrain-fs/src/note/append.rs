@@ -13,16 +13,17 @@
 //! pattern used by `init::marketplace` and `register_hooks::settings`.
 
 use super::io::atomic_write;
+use super::path_out::to_slash;
 use super::read::heading_parts;
 use crate::error::{FsError, Result};
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// Result of [`append_note`]. `path` is vault-relative.
+/// Result of [`append_note`]. `path` is a vault-relative forward-slash string.
 #[derive(Debug, Serialize, PartialEq)]
 pub struct AppendResult {
-    /// Vault-relative path of the note that was appended to.
-    pub path: PathBuf,
+    /// Vault-relative forward-slash path of the note that was appended to.
+    pub path: String,
     /// The section heading the content landed under, if `--section` was used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub section: Option<String>,
@@ -68,7 +69,7 @@ pub fn append_note(
     atomic_write(&abs, new_content.as_bytes())?;
 
     Ok(AppendResult {
-        path: rel_path.to_path_buf(),
+        path: to_slash(rel_path),
         section: section.map(str::to_string),
         bytes_appended: content.len(),
         created_section,
@@ -201,7 +202,7 @@ mod tests {
         write(root, "a.md", "line1\nline2\n");
 
         let res = append_note(root, Path::new("a.md"), "appended line", None).unwrap();
-        assert_eq!(res.path, PathBuf::from("a.md"));
+        assert_eq!(res.path, "a.md");
         assert_eq!(res.section, None);
         assert!(!res.created_section);
         assert_eq!(res.bytes_appended, "appended line".len());

@@ -3,10 +3,11 @@
 //! The model gets only what it asks for: the whole body (capped to `--limit`),
 //! a single heading section, the parsed frontmatter, or just the task lines.
 
+use super::path_out::to_slash;
 use crate::error::{FsError, Result};
 use crate::frontmatter::parse_frontmatter;
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Inputs for [`read_note`]. The three view selectors (`section`,
 /// `frontmatter_only`, `tasks_only`) are mutually exclusive — the CLI enforces
@@ -23,11 +24,12 @@ pub struct ReadOptions {
     pub limit: usize,
 }
 
-/// Result of [`read_note`]. `path` is vault-relative; exactly one of
-/// `content` / `frontmatter` / `tasks` is populated depending on `mode`.
+/// Result of [`read_note`]. `path` is a vault-relative forward-slash string;
+/// exactly one of `content` / `frontmatter` / `tasks` is populated depending on
+/// `mode`.
 #[derive(Debug, Serialize, PartialEq)]
 pub struct ReadResult {
-    pub path: PathBuf,
+    pub path: String,
     /// One of `"body"`, `"section"`, `"frontmatter"`, `"tasks"`.
     pub mode: &'static str,
     /// Body / section text (modes `body` and `section`).
@@ -61,7 +63,7 @@ pub fn read_note(vault_root: &Path, rel_path: &Path, opts: &ReadOptions) -> Resu
         path: abs.clone(),
         source,
     })?;
-    let path = rel_path.to_path_buf();
+    let path = to_slash(rel_path);
 
     if let Some(heading) = &opts.section {
         return Ok(ReadResult {
@@ -208,7 +210,7 @@ mod tests {
         assert_eq!(res.mode, "body");
         // limit=0 → verbatim file content (trailing newline preserved).
         assert_eq!(res.content.as_deref(), Some("line1\nline2\nline3\n"));
-        assert_eq!(res.path, PathBuf::from("a.md"));
+        assert_eq!(res.path, "a.md");
     }
 
     #[test]

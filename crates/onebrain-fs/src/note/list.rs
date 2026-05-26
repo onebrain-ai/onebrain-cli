@@ -1,5 +1,6 @@
 //! `note list` — enumerate notes with metadata, sorted.
 
+use super::path_out::rel_slash;
 use super::walker::walk_notes;
 use crate::error::{FsError, Result};
 use chrono::{DateTime, Utc};
@@ -24,11 +25,12 @@ pub struct ListOptions {
     pub sort: ListSort,
 }
 
-/// A note plus its filesystem metadata. `path` is vault-relative; `title` is
-/// the first `# H1` heading, falling back to the filename stem.
+/// A note plus its filesystem metadata. `path` is a vault-relative forward-
+/// slash string; `title` is the first `# H1` heading, falling back to the
+/// filename stem.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct NoteEntry {
-    pub path: PathBuf,
+    pub path: String,
     pub title: String,
     pub modified: DateTime<Utc>,
     pub created: Option<DateTime<Utc>>,
@@ -68,7 +70,7 @@ pub fn list_notes(vault_root: &Path, opts: &ListOptions) -> Result<ListResult> {
                     source: e,
                 })?;
         let created = meta.created().ok().map(DateTime::<Utc>::from);
-        let rel = file.strip_prefix(vault_root).unwrap_or(file).to_path_buf();
+        let rel = rel_slash(vault_root, file);
         entries.push(NoteEntry {
             title: title_for(file, &content),
             path: rel,
@@ -153,7 +155,7 @@ mod tests {
         let res = list_notes(root, &list_opts(ListSort::Mtime, 20)).unwrap();
         assert_eq!(res.total, 2);
         let order: Vec<_> = res.notes.iter().map(|n| n.path.clone()).collect();
-        assert_eq!(order, vec![PathBuf::from("b.md"), PathBuf::from("a.md")]);
+        assert_eq!(order, vec!["b.md".to_string(), "a.md".to_string()]);
     }
 
     #[test]
@@ -168,11 +170,7 @@ mod tests {
         let order: Vec<_> = res.notes.iter().map(|n| n.path.clone()).collect();
         assert_eq!(
             order,
-            vec![
-                PathBuf::from("a.md"),
-                PathBuf::from("b.md"),
-                PathBuf::from("c.md")
-            ]
+            vec!["a.md".to_string(), "b.md".to_string(), "c.md".to_string()]
         );
     }
 

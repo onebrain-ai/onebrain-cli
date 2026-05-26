@@ -47,7 +47,7 @@ fn render_text(env: &Envelope<FindResult>) -> String {
     let mut out = String::new();
     for e in &d.entries {
         let slash = if e.is_dir { "/" } else { "" };
-        out.push_str(&format!("{}{}\n", e.path.display(), slash));
+        out.push_str(&format!("{}{}\n", e.path, slash));
     }
     if d.truncated {
         out.push_str(&format!(
@@ -81,11 +81,11 @@ mod tests {
         let e = env(
             vec![
                 FindEntry {
-                    path: PathBuf::from("07-logs/x.md"),
+                    path: "07-logs/x.md".into(),
                     is_dir: false,
                 },
                 FindEntry {
-                    path: PathBuf::from("03-knowledge"),
+                    path: "03-knowledge".into(),
                     is_dir: true,
                 },
             ],
@@ -101,7 +101,7 @@ mod tests {
     fn text_shows_truncation_footer() {
         let e = env(
             vec![FindEntry {
-                path: PathBuf::from("a.md"),
+                path: "a.md".into(),
                 is_dir: false,
             }],
             42,

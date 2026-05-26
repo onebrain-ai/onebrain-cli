@@ -1,5 +1,6 @@
 //! `note search` — substring / regex scan across vault notes.
 
+use super::path_out::rel_slash;
 use super::walker::walk_notes;
 use crate::error::{FsError, Result};
 use onebrain_core::CoreError;
@@ -24,10 +25,11 @@ pub struct SearchOptions {
     pub mode: SearchMode,
 }
 
-/// A single matching line. `path` is vault-relative; `line` is 1-based.
+/// A single matching line. `path` is a vault-relative forward-slash string;
+/// `line` is 1-based.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct NoteMatch {
-    pub path: PathBuf,
+    pub path: String,
     pub line: usize,
     pub context: String,
     pub title: Option<String>,
@@ -39,11 +41,11 @@ pub struct SearchResult {
     pub matches: Vec<NoteMatch>,
     pub total_found: usize,
     pub truncated: bool,
-    /// Vault-relative paths of notes that could not be read as UTF-8 text and
-    /// were therefore excluded from the scan. Non-empty means results may be
-    /// incomplete. Omitted from JSON when empty.
+    /// Vault-relative forward-slash paths of notes that could not be read as
+    /// UTF-8 text and were therefore excluded from the scan. Non-empty means
+    /// results may be incomplete. Omitted from JSON when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub skipped: Vec<PathBuf>,
+    pub skipped: Vec<String>,
 }
 
 /// Scan every note under the vault (or `opts.folder`) for `opts.pattern`,
@@ -58,17 +60,17 @@ pub fn search_notes(vault_root: &Path, opts: &SearchOptions) -> Result<SearchRes
 
     let mut matches = Vec::new();
     let mut total_found = 0usize;
-    let mut skipped: Vec<PathBuf> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
     for file in &files {
         // Best-effort: skip notes that can't be read as UTF-8 text rather than
         // aborting a vault-wide search on one odd file — but RECORD them so the
         // CLI can warn that results may be incomplete.
         let Ok(content) = std::fs::read_to_string(file) else {
-            skipped.push(file.strip_prefix(vault_root).unwrap_or(file).to_path_buf());
+            skipped.push(rel_slash(vault_root, file));
             continue;
         };
         let title = first_h1(&content);
-        let rel = file.strip_prefix(vault_root).unwrap_or(file).to_path_buf();
+        let rel = rel_slash(vault_root, file);
         for (idx, line) in content.lines().enumerate() {
             let hit = match &re {
                 Some(re) => re.is_match(line),
@@ -145,7 +147,7 @@ mod tests {
         assert_eq!(res.total_found, 1);
         assert!(!res.truncated);
         let m = &res.matches[0];
-        assert_eq!(m.path, PathBuf::from("a.md"));
+        assert_eq!(m.path, "a.md");
         assert_eq!(m.line, 2);
         assert_eq!(m.context, "some TODO here");
         assert_eq!(m.title.as_deref(), Some("Alpha"));
@@ -227,8 +229,8 @@ mod tests {
 
         // Only the readable file contributes a match.
         assert_eq!(res.total_found, 1, "only readable note matched");
-        assert_eq!(res.matches[0].path, PathBuf::from("ok.md"));
+        assert_eq!(res.matches[0].path, "ok.md");
         // The unreadable file is recorded.
-        assert_eq!(res.skipped, vec![PathBuf::from("blocked.md")]);
+        assert_eq!(res.skipped, vec!["blocked.md".to_string()]);
     }
 }

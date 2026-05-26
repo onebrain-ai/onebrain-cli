@@ -28,7 +28,7 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &NoteAppendArgs
 
 fn render_text(env: &Envelope<AppendResult>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
-    let path = d.path.display();
+    let path = &d.path;
     match &d.section {
         Some(section) if d.created_section => format!(
             "Appended {} bytes to {} (created section \"{}\").",
@@ -58,7 +58,7 @@ mod tests {
             "note.append",
             None,
             AppendResult {
-                path: PathBuf::from("a.md"),
+                path: "a.md".into(),
                 section: section.map(str::to_string),
                 bytes_appended,
                 created_section,

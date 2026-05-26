@@ -48,7 +48,7 @@ fn render_text(env: &Envelope<ListResult>) -> String {
         out.push_str(&format!(
             "{}  {}  ({})\n",
             n.modified.format("%Y-%m-%d"),
-            n.path.display(),
+            n.path,
             n.title
         ));
     }
@@ -70,7 +70,7 @@ mod tests {
 
     fn entry(path: &str, title: &str) -> NoteEntry {
         NoteEntry {
-            path: PathBuf::from(path),
+            path: path.into(),
             title: title.into(),
             modified: Utc.with_ymd_and_hms(2026, 5, 26, 0, 0, 0).unwrap(),
             created: None,
