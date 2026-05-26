@@ -6,6 +6,7 @@ use crate::cli::NoteListArgs;
 use crate::output::{emit, Envelope, OutputMode};
 use crate::vault_ctx;
 use anyhow::Result;
+use onebrain_core::CoreError;
 use onebrain_fs::note::{list_notes, ListOptions, ListResult, ListSort};
 use std::path::PathBuf;
 
@@ -13,14 +14,22 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &NoteListArgs) 
     let resolved = vault_ctx::require(vault_flag)?;
     let vault_info = vault_ctx::info_from(&resolved);
 
+    // The clap `value_parser` whitelist already rejects anything outside
+    // {name, mtime, created}. The explicit error arm is defense-in-depth so a
+    // future whitelist value without a matching arm fails loudly rather than
+    // silently defaulting to mtime.
+    let sort = match args.sort.as_str() {
+        "name" => ListSort::Name,
+        "mtime" => ListSort::Mtime,
+        "created" => ListSort::Created,
+        other => {
+            return Err(CoreError::InvalidTarget(format!("unknown sort order: {other}")).into())
+        }
+    };
     let opts = ListOptions {
         folder: args.folder.clone(),
         limit: args.limit,
-        sort: match args.sort.as_str() {
-            "name" => ListSort::Name,
-            "created" => ListSort::Created,
-            _ => ListSort::Mtime,
-        },
+        sort,
     };
     let data = list_notes(resolved.root.as_path(), &opts)?;
 

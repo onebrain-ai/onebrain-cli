@@ -6,6 +6,7 @@ use crate::cli::NoteFindArgs;
 use crate::output::{emit, Envelope, OutputMode};
 use crate::vault_ctx;
 use anyhow::Result;
+use onebrain_core::CoreError;
 use onebrain_fs::note::{find_notes, FindOptions, FindResult, FindType};
 use std::path::PathBuf;
 
@@ -13,12 +14,21 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &NoteFindArgs) 
     let resolved = vault_ctx::require(vault_flag)?;
     let vault_info = vault_ctx::info_from(&resolved);
 
+    // The clap `value_parser` whitelist already rejects anything outside
+    // {file, folder}. The explicit error arm is defense-in-depth so a future
+    // whitelist value without a matching arm fails loudly rather than silently
+    // defaulting to File.
+    let type_filter = match args.r#type.as_deref() {
+        None => None,
+        Some("file") => Some(FindType::File),
+        Some("folder") => Some(FindType::Folder),
+        Some(other) => {
+            return Err(CoreError::InvalidTarget(format!("unknown find type: {other}")).into())
+        }
+    };
     let opts = FindOptions {
         glob: args.glob.clone(),
-        r#type: args.r#type.as_deref().map(|t| match t {
-            "folder" => FindType::Folder,
-            _ => FindType::File,
-        }),
+        r#type: type_filter,
         mtime: args.mtime,
         limit: args.limit,
     };

@@ -7,6 +7,7 @@ use crate::commands::note_common::{skipped_warning, W_NOTES_SKIPPED};
 use crate::output::{emit, Envelope, OutputMode};
 use crate::vault_ctx;
 use anyhow::Result;
+use onebrain_core::CoreError;
 use onebrain_fs::note::{search_notes, SearchMode, SearchOptions, SearchResult};
 use std::path::PathBuf;
 
@@ -14,15 +15,22 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &NoteSearchArgs
     let resolved = vault_ctx::require(vault_flag)?;
     let vault_info = vault_ctx::info_from(&resolved);
 
+    // The clap `value_parser` whitelist already rejects anything outside
+    // {lex, regex}. The explicit error arm is defense-in-depth: if a value is
+    // ever added to the whitelist without a matching arm here, fail loudly
+    // instead of silently picking the wrong default.
+    let search_mode = match args.mode.as_str() {
+        "lex" => SearchMode::Lex,
+        "regex" => SearchMode::Regex,
+        other => {
+            return Err(CoreError::InvalidTarget(format!("unknown search mode: {other}")).into())
+        }
+    };
     let opts = SearchOptions {
         pattern: args.pattern.clone(),
         folder: args.folder.clone(),
         limit: args.limit,
-        mode: if args.mode == "regex" {
-            SearchMode::Regex
-        } else {
-            SearchMode::Lex
-        },
+        mode: search_mode,
     };
     let data = search_notes(resolved.root.as_path(), &opts)?;
 
