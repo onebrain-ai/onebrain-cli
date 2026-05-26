@@ -229,10 +229,11 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
 
 **Shipped**
 - **v3.0** — Rust rewrite GA · 9-platform release pipeline · stable JSON contracts.
-- **v3.1** — Consistency standard: locked `<noun> <verb>` command tree · canonical `Envelope` output · branded banner · `vault.yml → onebrain.yml`.
-
-**Next · v3.1.4 — self-update hardening**
-- SHA-256 verification of the downloaded binary before swap · Homebrew-aware `onebrain update` (delegate to `brew upgrade` instead of swapping the brew-managed binary in place). Cosign/signature verification tracked as a follow-up.
+- **v3.1.0** — Consistency standard: locked `<noun> <verb>` command tree · canonical `Envelope` output · branded banner · `vault.yml → onebrain.yml`.
+- **v3.1.1** — Config-loss fix (`init --force` no longer clobbers config) + timestamped config backups · doctor `onebrain.yml` labels + animated TTY · `qmd status`.
+- **v3.1.2** — `onebrain qmd embed` implemented.
+- **v3.1.3** — `schedule register` dual-reads `onebrain.yml`.
+- **v3.1.4** — Self-update hardening: SHA-256 verification of the downloaded binary before swap + Homebrew-aware `onebrain update` (delegates to `brew upgrade`). Cosign/signature verification remains a follow-up.
 
 **Phase 1 · perceptual speed + skill alignment (v3.2–v3.7)**
 - **v3.2** — `note` resource group (`search` · `list` · `find` · `read` · `append` · `new` · `move` · `archive` · `backlinks` · `orphans` · `stat`) — native vault note ops that replace ad-hoc `grep` / `ls` / `find`.
