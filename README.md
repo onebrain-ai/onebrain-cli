@@ -45,7 +45,7 @@ The CLI is **cross-harness**: paired with the [OneBrain plugin](https://github.c
 
 ## Status
 
-**v3.1.2 — stable, in active maintenance** (released 2026-05-26). v3.1 locked the command tree into a singular-noun two-level grammar (`onebrain <noun> <verb>`), made human-readable `text` the default output with `--json` / `--yaml` opt-in, renamed the vault config `vault.yml → onebrain.yml` (dual-read for back-compat), and grew the release matrix to **9 platforms** (every Raspberry Pi from Pi 1 to Pi 5 now has a published binary). The full narrative lives in [CHANGELOG.md](CHANGELOG.md).
+**v3.1.3 — stable, in active maintenance** (released 2026-05-26). v3.1 locked the command tree into a singular-noun two-level grammar (`onebrain <noun> <verb>`), made human-readable `text` the default output with `--json` / `--yaml` opt-in, renamed the vault config `vault.yml → onebrain.yml` (dual-read for back-compat), and grew the release matrix to **9 platforms** (every Raspberry Pi from Pi 1 to Pi 5 now has a published binary). The full narrative lives in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quickstart
 
@@ -57,7 +57,7 @@ brew install onebrain-ai/onebrain/onebrain
 
 # 2. Verify
 onebrain --version
-# → onebrain 3.1.2
+# → onebrain 3.1.3
 
 # 3. Scaffold a vault and let init pull the OneBrain plugin
 mkdir my-vault && cd my-vault
