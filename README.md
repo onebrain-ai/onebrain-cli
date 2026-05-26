@@ -37,18 +37,18 @@ The CLI is **cross-harness**: paired with the [OneBrain plugin](https://github.c
 
 ### Why OneBrain CLI
 
-Point an AI agent at a vault and ask it to "find my notes on X" or "process the inbox," and it improvises — a different pile of `grep` / `ls` / `find` / `sed` each time, behaving subtly differently on Claude Code vs Gemini vs Codex, and re-derived from scratch on every session. That's slow, token-hungry, non-portable, and occasionally wrong. **OneBrain CLI replaces that improvisation with one deterministic binary** — the vault's operations encoded as commands that behave identically on every harness, every run.
+Point an AI agent at a vault and it improvises — a different pile of `grep` / `ls` / `find` / `sed` each time, behaving differently on each harness and re-derived every session: slow, token-hungry, non-portable, sometimes wrong. **OneBrain CLI replaces that improvisation with one deterministic binary.**
 
-- **Same behavior on every harness & model** — one binary, one result. Claude Code, Gemini CLI, Codex, and Qwen all run `onebrain <noun> <verb>` and get identical output, instead of each agent reinventing the shell pipeline its own way. Switch harness or model without re-testing how your vault gets touched.
-- **No re-deriving solved workflows** — search, capture, consolidate, checkpoint and friends are encoded in the binary, so the agent invokes one command instead of reasoning out the same multi-step recipe every session. Fewer tokens spent, fewer chances to drift off the known-good path.
-- **Deterministic & safe** — a typed command with a frozen `Envelope` contract can't half-finish or quietly do something different the way an ad-hoc `rm` / `sed` pipeline can. Same input, same output, same exit code — every time, scriptable by hooks without guessing.
-- **Fast where you feel it** — a compiled ~5 MB binary returns in well under 50 ms (~2 MB memory, zero `unsafe`), so the agent skips the latency of thinking through several tool calls for work that's already a single operation.
-- **Local-first** — your vault, your data, your AI memory. No cloud round-trip required for any operation.
-- **Trustworthy install** — self-update fetches binaries straight from GitHub Releases over TLS and verifies their SHA-256 before swapping; the npm wrapper checks the same checksum before extracting.
+- **Same behavior on every harness & model** — Claude Code, Gemini, Codex, and Qwen all run `onebrain <noun> <verb>` and get identical output; switch harness without re-testing how your vault gets touched.
+- **No re-deriving solved workflows** — search, capture, consolidate, checkpoint live in the binary, so the agent calls one command instead of re-reasoning the recipe each session. Fewer tokens, no drift.
+- **Deterministic & safe** — a typed command with a frozen `Envelope` can't half-finish or quietly differ like an ad-hoc `rm` / `sed` pipeline. Same input → same output, scriptable by hooks.
+- **Fast** — a ~5 MB binary returns in under 50 ms, skipping the latency of several tool calls for what's already one operation.
+- **Local-first** — your vault, your data, your AI memory; no cloud round-trip.
+- **Trustworthy install** — self-update verifies the binary's SHA-256 before swapping.
 
 ## Status
 
-**v3.1.3 — stable, in active maintenance** (released 2026-05-26). v3.1 locked the command tree into a singular-noun two-level grammar (`onebrain <noun> <verb>`), made human-readable `text` the default output with `--json` / `--yaml` opt-in, renamed the vault config `vault.yml → onebrain.yml` (dual-read for back-compat), and grew the release matrix to **9 platforms** (every Raspberry Pi from Pi 1 to Pi 5 now has a published binary). The full narrative lives in [CHANGELOG.md](CHANGELOG.md).
+**v3.1.4 — stable & production-ready, in active maintenance.** GA since v3.0.0 (2026-05-22), shipping ~weekly themed minors. Version history + direction in the [Roadmap](#roadmap); full detail in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quickstart
 
