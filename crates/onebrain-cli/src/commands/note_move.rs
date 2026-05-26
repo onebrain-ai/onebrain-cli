@@ -7,6 +7,7 @@
 //! Vault-required (exit 64 outside a vault). Emits the canonical `Envelope<T>`.
 
 use crate::cli::NoteMoveArgs;
+use crate::commands::note_common::{skipped_warning, W_NOTES_SKIPPED};
 use crate::output::{emit, Envelope, OutputMode};
 use crate::vault_ctx;
 use anyhow::Result;
@@ -25,7 +26,11 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &NoteMoveArgs) 
         args.dry_run,
     )?;
 
-    let envelope = Envelope::ok("note.move", Some(vault_info), data);
+    let warning = skipped_warning(&data.skipped);
+    let mut envelope = Envelope::ok("note.move", Some(vault_info), data);
+    if let Some(msg) = warning {
+        envelope = envelope.with_warning(W_NOTES_SKIPPED, msg);
+    }
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
 }
@@ -62,6 +67,7 @@ mod tests {
                 files_updated: files,
                 dry_run,
                 updated_files: Vec::new(),
+                skipped: Vec::new(),
             },
         )
     }

@@ -39,6 +39,12 @@ pub struct MoveResult {
     /// Vault-relative paths of the notes whose links were (or would be)
     /// rewritten. Sorted (inherits [`walk_notes`] ordering).
     pub updated_files: Vec<PathBuf>,
+    /// Vault-relative paths of notes that could not be read as UTF-8 text
+    /// during the link scan and were therefore NOT rewritten. Non-empty means
+    /// such a note may still contain a now-dangling `[[old]]` link. Omitted
+    /// from JSON when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<PathBuf>,
 }
 
 /// A single planned rewrite: an absolute note path, its original content (for
@@ -93,10 +99,10 @@ pub fn move_note(
     let old_basename = basename_no_ext(from);
     let new_basename = basename_no_ext(to);
 
-    let edits = if update_links && old_basename != new_basename {
+    let (edits, skipped) = if update_links && old_basename != new_basename {
         build_edit_plan(vault_root, &from_abs, &old_basename, &new_basename)?
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
 
     let links_rewritten: usize = edits.iter().map(|e| e.occurrences).sum();
@@ -119,6 +125,7 @@ pub fn move_note(
             files_updated: edits.len(),
             dry_run: true,
             updated_files,
+            skipped,
         });
     }
 
@@ -132,25 +139,32 @@ pub fn move_note(
         files_updated: edits.len(),
         dry_run: false,
         updated_files,
+        skipped,
     })
 }
 
 /// Scan every note (except the FROM file itself) and produce the set of edits
 /// whose link target equals `old_basename`, rewritten to `new_basename`.
+/// Returns `(edits, skipped)` where `skipped` holds the vault-relative paths of
+/// notes that could not be read (and so may keep a now-dangling `[[old]]`).
 fn build_edit_plan(
     vault_root: &Path,
     from_abs: &Path,
     old_basename: &str,
     new_basename: &str,
-) -> Result<Vec<PlannedEdit>> {
+) -> Result<(Vec<PlannedEdit>, Vec<PathBuf>)> {
     let files = walk_notes(vault_root, None)?;
     let mut edits = Vec::new();
+    let mut skipped: Vec<PathBuf> = Vec::new();
     for file in files {
         if file == from_abs {
             continue; // never rewrite the note being moved
         }
-        // Best-effort: skip notes that can't be read as UTF-8 text.
+        // Best-effort: skip notes that can't be read as UTF-8 text — but RECORD
+        // them, since such a note may still hold a `[[old]]` link we can't
+        // rewrite (it would dangle after the move).
         let Ok(original) = std::fs::read_to_string(&file) else {
+            skipped.push(file.strip_prefix(vault_root).unwrap_or(&file).to_path_buf());
             continue;
         };
         let (new_content, occurrences) = rewrite_links(&original, old_basename, new_basename);
@@ -163,7 +177,7 @@ fn build_edit_plan(
             });
         }
     }
-    Ok(edits)
+    Ok((edits, skipped))
 }
 
 /// Apply the move + rewrites atomically. On ANY failure, roll back everything
@@ -775,5 +789,35 @@ mod tests {
         let (out, n) = rewrite_links("[[old]] [[old|a]] [[old#s]] [[keep]]", "old", "new");
         assert_eq!(out, "[[new]] [[new|a]] [[new#s]] [[keep]]");
         assert_eq!(n, 3);
+    }
+
+    /// An unreadable note that might hold a `[[old]]` link is recorded in
+    /// `skipped` (it would dangle after the move) rather than silently dropped.
+    /// The move of readable notes still proceeds.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_note_is_skipped_and_reported() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "old.md", "# Old\n");
+        write(root, "readable.md", "see [[old]]\n");
+        write(root, "blocked.md", "also [[old]]\n");
+        let blocked = root.join("blocked.md");
+        let mut p = fs::metadata(&blocked).unwrap().permissions();
+        p.set_mode(0o000);
+        fs::set_permissions(&blocked, p).unwrap();
+
+        let res = move_note(root, Path::new("old.md"), Path::new("new.md"), true, false).unwrap();
+
+        let mut p = fs::metadata(&blocked).unwrap().permissions();
+        p.set_mode(0o644);
+        fs::set_permissions(&blocked, p).unwrap();
+
+        // The readable note was rewritten; the unreadable one is reported.
+        assert_eq!(res.links_rewritten, 1, "only readable link rewritten");
+        assert_eq!(read(root, "readable.md"), "see [[new]]\n");
+        assert_eq!(res.skipped, vec![PathBuf::from("blocked.md")]);
     }
 }

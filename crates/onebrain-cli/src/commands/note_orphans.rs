@@ -3,6 +3,7 @@
 //! Vault-required (exit 64 outside a vault). Emits the canonical `Envelope<T>`.
 
 use crate::cli::NoteOrphansArgs;
+use crate::commands::note_common::{skipped_warning, W_NOTES_SKIPPED};
 use crate::output::{emit, Envelope, OutputMode};
 use crate::vault_ctx;
 use anyhow::Result;
@@ -15,7 +16,11 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &NoteOrphansArg
 
     let data = orphans(resolved.root.as_path(), args.folder.as_deref(), args.limit)?;
 
-    let envelope = Envelope::ok("note.orphans", Some(vault_info), data);
+    let warning = skipped_warning(&data.skipped);
+    let mut envelope = Envelope::ok("note.orphans", Some(vault_info), data);
+    if let Some(msg) = warning {
+        envelope = envelope.with_warning(W_NOTES_SKIPPED, msg);
+    }
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
 }
@@ -53,6 +58,7 @@ mod tests {
                 orphans: orphans.into_iter().map(PathBuf::from).collect(),
                 total,
                 truncated,
+                skipped: Vec::new(),
             },
         )
     }

@@ -3,6 +3,7 @@
 //! Vault-required (exit 64 outside a vault). Emits the canonical `Envelope<T>`.
 
 use crate::cli::NoteBacklinksArgs;
+use crate::commands::note_common::{skipped_warning, W_NOTES_SKIPPED};
 use crate::output::{emit, Envelope, OutputMode};
 use crate::vault_ctx;
 use anyhow::Result;
@@ -15,7 +16,11 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &NoteBacklinksA
 
     let data = backlinks(resolved.root.as_path(), &args.path, args.include_archive)?;
 
-    let envelope = Envelope::ok("note.backlinks", Some(vault_info), data);
+    let warning = skipped_warning(&data.skipped);
+    let mut envelope = Envelope::ok("note.backlinks", Some(vault_info), data);
+    if let Some(msg) = warning {
+        envelope = envelope.with_warning(W_NOTES_SKIPPED, msg);
+    }
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
 }
@@ -36,7 +41,7 @@ fn render_text(env: &Envelope<BacklinksData>) -> String {
     }
     out.push_str(&format!(
         "\n{} backlink(s) to {}\n",
-        d.count,
+        d.total,
         d.target.display()
     ));
     out
@@ -48,14 +53,15 @@ mod tests {
     use onebrain_fs::note::BacklinkEntry;
 
     fn env(backlinks: Vec<BacklinkEntry>) -> Envelope<BacklinksData> {
-        let count = backlinks.len();
+        let total = backlinks.len();
         Envelope::ok(
             "note.backlinks",
             None,
             BacklinksData {
                 target: PathBuf::from("MEMORY-INDEX.md"),
                 backlinks,
-                count,
+                total,
+                skipped: Vec::new(),
             },
         )
     }

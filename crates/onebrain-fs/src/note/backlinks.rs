@@ -19,11 +19,21 @@ pub struct BacklinkEntry {
 }
 
 /// Result of [`backlinks`].
+///
+/// Backlinks is UNBOUNDED (there is no `--limit`), so `total` always equals
+/// `backlinks.len()` and there is no `truncated` flag — every incoming link is
+/// returned.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct BacklinksData {
     pub target: PathBuf,
     pub backlinks: Vec<BacklinkEntry>,
-    pub count: usize,
+    /// Count of all backlink occurrences (== `backlinks.len()`).
+    pub total: usize,
+    /// Vault-relative paths of notes that could not be read as UTF-8 text and
+    /// were therefore excluded from the scan. Non-empty means the count may be
+    /// an undercount. Omitted from JSON when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<PathBuf>,
 }
 
 /// Find every note that links to `rel_target` (vault-relative path). When
@@ -43,14 +53,17 @@ pub fn backlinks(
 
     let target_abs = vault_root.join(rel_target);
     let mut entries = Vec::new();
+    let mut skipped: Vec<PathBuf> = Vec::new();
     for file in &files {
         // Don't count the target file linking to itself.
         if *file == target_abs {
             continue;
         }
         // Best-effort: skip notes that can't be read as UTF-8 text rather than
-        // aborting on one odd file.
+        // aborting on one odd file — but RECORD them, since an unreadable file
+        // could hold a backlink we'd otherwise undercount.
         let Ok(content) = std::fs::read_to_string(file) else {
+            skipped.push(file.strip_prefix(vault_root).unwrap_or(file).to_path_buf());
             continue;
         };
         let rel = file.strip_prefix(vault_root).unwrap_or(file).to_path_buf();
@@ -65,11 +78,12 @@ pub fn backlinks(
         }
     }
 
-    let count = entries.len();
+    let total = entries.len();
     Ok(BacklinksData {
         target: rel_target.to_path_buf(),
         backlinks: entries,
-        count,
+        total,
+        skipped,
     })
 }
 
@@ -125,7 +139,7 @@ mod tests {
         write(root, "a.md", "see [[MEMORY-INDEX]] for more\n");
 
         let res = backlinks(root, Path::new("MEMORY-INDEX.md"), false).unwrap();
-        assert_eq!(res.count, 1);
+        assert_eq!(res.total, 1);
         assert_eq!(res.target, PathBuf::from("MEMORY-INDEX.md"));
         let e = &res.backlinks[0];
         assert_eq!(e.source, PathBuf::from("a.md"));
@@ -141,7 +155,7 @@ mod tests {
         write(root, "a.md", "jump to [[MEMORY-INDEX|the index]]\n");
 
         let res = backlinks(root, Path::new("MEMORY-INDEX.md"), false).unwrap();
-        assert_eq!(res.count, 1);
+        assert_eq!(res.total, 1);
         assert_eq!(res.backlinks[0].source, PathBuf::from("a.md"));
     }
 
@@ -153,7 +167,7 @@ mod tests {
         write(root, "a.md", "deep link [[MEMORY-INDEX#Topics]]\n");
 
         let res = backlinks(root, Path::new("MEMORY-INDEX.md"), false).unwrap();
-        assert_eq!(res.count, 1);
+        assert_eq!(res.total, 1);
     }
 
     #[test]
@@ -164,7 +178,7 @@ mod tests {
         write(root, "a.md", "unrelated [[other-note]] here\n");
 
         let res = backlinks(root, Path::new("MEMORY-INDEX.md"), false).unwrap();
-        assert_eq!(res.count, 0);
+        assert_eq!(res.total, 0);
         assert!(res.backlinks.is_empty());
     }
 
@@ -181,7 +195,7 @@ mod tests {
         write(root, "a.md", "external [[MEMORY-INDEX]]\n");
 
         let res = backlinks(root, Path::new("MEMORY-INDEX.md"), false).unwrap();
-        assert_eq!(res.count, 1);
+        assert_eq!(res.total, 1);
         assert_eq!(res.backlinks[0].source, PathBuf::from("a.md"));
     }
 
@@ -197,7 +211,7 @@ mod tests {
         );
 
         let res = backlinks(root, Path::new("MEMORY-INDEX.md"), false).unwrap();
-        assert_eq!(res.count, 0);
+        assert_eq!(res.total, 0);
     }
 
     #[test]
@@ -212,7 +226,7 @@ mod tests {
         );
 
         let res = backlinks(root, Path::new("MEMORY-INDEX.md"), true).unwrap();
-        assert_eq!(res.count, 1);
+        assert_eq!(res.total, 1);
         assert_eq!(
             res.backlinks[0].source,
             PathBuf::from("06-archive/2026/old.md")
@@ -231,7 +245,36 @@ mod tests {
         );
 
         let res = backlinks(root, Path::new("MEMORY-INDEX.md"), false).unwrap();
-        assert_eq!(res.count, 1);
+        assert_eq!(res.total, 1);
         assert_eq!(res.backlinks[0].line, 1);
+    }
+
+    /// An unreadable note that might contain a backlink is recorded in
+    /// `skipped` rather than silently dropped (which would undercount).
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_note_is_skipped_and_reported() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "MEMORY-INDEX.md", "# Index\n");
+        write(root, "readable.md", "see [[MEMORY-INDEX]]\n");
+        write(root, "blocked.md", "also [[MEMORY-INDEX]]\n");
+        let blocked = root.join("blocked.md");
+        let mut p = fs::metadata(&blocked).unwrap().permissions();
+        p.set_mode(0o000);
+        fs::set_permissions(&blocked, p).unwrap();
+
+        let res = backlinks(root, Path::new("MEMORY-INDEX.md"), false).unwrap();
+
+        let mut p = fs::metadata(&blocked).unwrap().permissions();
+        p.set_mode(0o644);
+        fs::set_permissions(&blocked, p).unwrap();
+
+        // Only the readable backlink is counted; the unreadable file is named.
+        assert_eq!(res.total, 1, "only readable backlink counted");
+        assert_eq!(res.backlinks[0].source, PathBuf::from("readable.md"));
+        assert_eq!(res.skipped, vec![PathBuf::from("blocked.md")]);
     }
 }

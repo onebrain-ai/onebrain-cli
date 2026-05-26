@@ -22,6 +22,12 @@ pub struct OrphansData {
     pub orphans: Vec<PathBuf>,
     pub total: usize,
     pub truncated: bool,
+    /// Vault-relative paths of notes that could not be read as UTF-8 text
+    /// while building the link set. Non-empty means a note here might hold the
+    /// ONLY inbound link to a candidate, so a result could be a FALSE orphan.
+    /// Omitted from JSON when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<PathBuf>,
 }
 
 /// Find notes (under `folder`, or the whole vault) that have no incoming
@@ -31,8 +37,12 @@ pub fn orphans(vault_root: &Path, folder: Option<&Path>, limit: usize) -> Result
     // 1. Build the LINK SET from every note in the vault.
     let all = walk_notes(vault_root, None)?;
     let mut linked: HashSet<String> = HashSet::new();
+    let mut skipped: Vec<PathBuf> = Vec::new();
     for file in &all {
+        // Record unreadable files: one might hold the ONLY inbound link to a
+        // candidate, which would otherwise be wrongly reported as an orphan.
         let Ok(content) = std::fs::read_to_string(file) else {
+            skipped.push(file.strip_prefix(vault_root).unwrap_or(file).to_path_buf());
             continue;
         };
         collect_link_targets(&content, &mut linked);
@@ -61,10 +71,12 @@ pub fn orphans(vault_root: &Path, folder: Option<&Path>, limit: usize) -> Result
     let total = orphans.len();
     let truncated = total > limit;
     orphans.truncate(limit);
+    skipped.sort();
     Ok(OrphansData {
         orphans,
         total,
         truncated,
+        skipped,
     })
 }
 
@@ -223,5 +235,42 @@ mod tests {
         let res = orphans(root, None, 50).unwrap();
         // walk_notes prunes 06-archive, so only `live.md` is a candidate.
         assert_eq!(res.orphans, vec![PathBuf::from("live.md")]);
+    }
+
+    /// An unreadable note (which might hold the only inbound link to a
+    /// candidate) is recorded in `skipped` rather than silently dropped. We
+    /// only assert the reporting — not which orphans result — because whether a
+    /// candidate is a false orphan depends on the unreadable file's contents.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_note_is_skipped_and_reported() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "target.md", "# Target\n");
+        // `linker.md` is the ONLY note linking `target` — but it's unreadable,
+        // so without the skipped record `target` would look like a false orphan.
+        write(root, "linker.md", "see [[target]]\n");
+        let blocked = root.join("linker.md");
+        let mut p = fs::metadata(&blocked).unwrap().permissions();
+        p.set_mode(0o000);
+        fs::set_permissions(&blocked, p).unwrap();
+
+        let res = orphans(root, None, 50).unwrap();
+
+        let mut p = fs::metadata(&blocked).unwrap().permissions();
+        p.set_mode(0o644);
+        fs::set_permissions(&blocked, p).unwrap();
+
+        // The unreadable file is named so the caller knows the orphan list may
+        // contain false positives (here `target.md`, since its only linker was
+        // unreadable).
+        assert_eq!(res.skipped, vec![PathBuf::from("linker.md")]);
+        assert!(
+            res.orphans.contains(&PathBuf::from("target.md")),
+            "with the linker unreadable, target appears as a (false) orphan: {:?}",
+            res.orphans
+        );
     }
 }

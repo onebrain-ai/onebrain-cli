@@ -345,7 +345,7 @@ fn backlinks_reports_incoming_link() {
     // beta.md is linked by alpha.md (`[[beta]]`), a live note.
     let env = run_note_json(vault.path(), &["note", "backlinks", "03-knowledge/beta.md"]);
     let data = assert_envelope(&env, "note.backlinks");
-    assert_eq!(data["count"], 1, "beta has one live backlink");
+    assert_eq!(data["total"], 1, "beta has one live backlink");
     assert_eq!(data["target"], "03-knowledge/beta.md");
     assert_eq!(data["backlinks"][0]["source"], "03-knowledge/alpha.md");
 }
@@ -361,7 +361,7 @@ fn backlinks_include_archive_toggle() {
     );
     let default_data = assert_envelope(&default_env, "note.backlinks");
     assert_eq!(
-        default_data["count"], 0,
+        default_data["total"], 0,
         "archive backlink hidden by default"
     );
 
@@ -375,7 +375,7 @@ fn backlinks_include_archive_toggle() {
         ],
     );
     let arch_data = assert_envelope(&arch_env, "note.backlinks");
-    assert_eq!(arch_data["count"], 1, "archive backlink revealed by flag");
+    assert_eq!(arch_data["total"], 1, "archive backlink revealed by flag");
     assert_eq!(
         arch_data["backlinks"][0]["source"],
         "06-archive/2026/old.md"
@@ -420,6 +420,54 @@ fn orphans_lists_unlinked_excludes_linked_and_inbox_archive() {
         "logs are excluded"
     );
     assert_eq!(data["total"], 2, "exactly two live orphans");
+}
+
+/// An unreadable note (perms 0o000) is RECORDED in `skipped` and surfaces as a
+/// soft envelope warning — not silently dropped. Exercises the full
+/// binary path for the scan verbs. Unix-only (perms-based).
+#[cfg(unix)]
+#[test]
+fn search_emits_skipped_warning_for_unreadable_note() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let vault = build_fixture_vault();
+    // Add a note that DOES contain the search term, then make it unreadable.
+    write(
+        vault.path(),
+        "03-knowledge/blocked.md",
+        "# Blocked\nthis companion note is unreadable\n",
+    );
+    let blocked = vault.path().join("03-knowledge/blocked.md");
+    let mut p = fs::metadata(&blocked).unwrap().permissions();
+    p.set_mode(0o000);
+    fs::set_permissions(&blocked, p).unwrap();
+
+    let env = run_note_json(vault.path(), &["note", "search", "companion"]);
+
+    // Restore perms so the TempDir can clean up.
+    let mut p = fs::metadata(&blocked).unwrap().permissions();
+    p.set_mode(0o644);
+    fs::set_permissions(&blocked, p).unwrap();
+
+    let data = assert_envelope(&env, "note.search");
+    // Still finds the two readable matches (alpha + beta).
+    assert_eq!(data["total_found"], 2);
+    // The unreadable note is reported in data.skipped …
+    let skipped: Vec<String> = data["skipped"]
+        .as_array()
+        .expect("skipped array present when a note was skipped")
+        .iter()
+        .map(|p| p.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(skipped, vec!["03-knowledge/blocked.md".to_string()]);
+    // … and surfaces as a soft envelope warning.
+    let warnings = env["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1, "exactly one skip warning");
+    assert_eq!(warnings[0]["code"], "W_NOTES_SKIPPED");
+    assert!(warnings[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("03-knowledge/blocked.md"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────

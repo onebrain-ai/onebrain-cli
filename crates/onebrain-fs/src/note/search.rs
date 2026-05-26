@@ -39,6 +39,11 @@ pub struct SearchResult {
     pub matches: Vec<NoteMatch>,
     pub total_found: usize,
     pub truncated: bool,
+    /// Vault-relative paths of notes that could not be read as UTF-8 text and
+    /// were therefore excluded from the scan. Non-empty means results may be
+    /// incomplete. Omitted from JSON when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<PathBuf>,
 }
 
 /// Scan every note under the vault (or `opts.folder`) for `opts.pattern`,
@@ -53,10 +58,13 @@ pub fn search_notes(vault_root: &Path, opts: &SearchOptions) -> Result<SearchRes
 
     let mut matches = Vec::new();
     let mut total_found = 0usize;
+    let mut skipped: Vec<PathBuf> = Vec::new();
     for file in &files {
         // Best-effort: skip notes that can't be read as UTF-8 text rather than
-        // aborting a vault-wide search on one odd file.
+        // aborting a vault-wide search on one odd file — but RECORD them so the
+        // CLI can warn that results may be incomplete.
         let Ok(content) = std::fs::read_to_string(file) else {
+            skipped.push(file.strip_prefix(vault_root).unwrap_or(file).to_path_buf());
             continue;
         };
         let title = first_h1(&content);
@@ -84,6 +92,7 @@ pub fn search_notes(vault_root: &Path, opts: &SearchOptions) -> Result<SearchRes
         matches,
         total_found,
         truncated,
+        skipped,
     })
 }
 
@@ -190,5 +199,36 @@ mod tests {
         write(root, "a.md", "a (unclosed paren\n");
         let res = search_notes(root, &opts("(unclosed", SearchMode::Lex, 20)).unwrap();
         assert_eq!(res.total_found, 1);
+    }
+
+    /// An unreadable note is recorded in `skipped` (not silently dropped), and
+    /// the scan still returns matches from the readable files.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_note_is_skipped_and_reported() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "ok.md", "has TODO here\n");
+        write(root, "blocked.md", "TODO unreadable\n");
+        // Strip all perms so read_to_string fails (EACCES).
+        let blocked = root.join("blocked.md");
+        let mut p = fs::metadata(&blocked).unwrap().permissions();
+        p.set_mode(0o000);
+        fs::set_permissions(&blocked, p).unwrap();
+
+        let res = search_notes(root, &opts("TODO", SearchMode::Lex, 20)).unwrap();
+
+        // Restore perms for cleanup.
+        let mut p = fs::metadata(&blocked).unwrap().permissions();
+        p.set_mode(0o644);
+        fs::set_permissions(&blocked, p).unwrap();
+
+        // Only the readable file contributes a match.
+        assert_eq!(res.total_found, 1, "only readable note matched");
+        assert_eq!(res.matches[0].path, PathBuf::from("ok.md"));
+        // The unreadable file is recorded.
+        assert_eq!(res.skipped, vec![PathBuf::from("blocked.md")]);
     }
 }

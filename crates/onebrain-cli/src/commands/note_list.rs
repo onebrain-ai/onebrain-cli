@@ -43,7 +43,7 @@ fn render_text(env: &Envelope<ListResult>) -> String {
             n.title
         ));
     }
-    if d.notes.len() < d.total {
+    if d.truncated {
         out.push_str(&format!(
             "\n… {} of {} notes shown · raise --limit for more\n",
             d.notes.len(),
@@ -77,6 +77,7 @@ mod tests {
             ListResult {
                 notes: vec![entry("a.md", "Alpha")],
                 total: 1,
+                truncated: false,
             },
         );
         let s = render_text(&e);
@@ -93,6 +94,7 @@ mod tests {
             ListResult {
                 notes: vec![entry("a.md", "A")],
                 total: 9,
+                truncated: true,
             },
         );
         assert!(render_text(&e).contains("1 of 9 notes shown"));
@@ -106,6 +108,7 @@ mod tests {
             ListResult {
                 notes: Vec::new(),
                 total: 0,
+                truncated: false,
             },
         );
         assert_eq!(render_text(&e), "No notes.");

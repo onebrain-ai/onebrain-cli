@@ -40,6 +40,9 @@ pub struct NoteEntry {
 pub struct ListResult {
     pub notes: Vec<NoteEntry>,
     pub total: usize,
+    /// `true` when `total` exceeds the returned `notes` (the `--limit` cap
+    /// dropped some). Parity with search/find/orphans.
+    pub truncated: bool,
 }
 
 /// List notes under the vault (or `opts.folder`), sorted per `opts.sort`,
@@ -89,10 +92,12 @@ pub fn list_notes(vault_root: &Path, opts: &ListOptions) -> Result<ListResult> {
         }
     }
     entries.truncate(opts.limit);
+    let truncated = total > entries.len();
 
     Ok(ListResult {
         notes: entries,
         total,
+        truncated,
     })
 }
 
@@ -181,6 +186,18 @@ mod tests {
         let res = list_notes(root, &list_opts(ListSort::Name, 2)).unwrap();
         assert_eq!(res.notes.len(), 2);
         assert_eq!(res.total, 3);
+        assert!(res.truncated, "limit dropped some notes");
+    }
+
+    #[test]
+    fn not_truncated_when_under_limit() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.md", "x");
+        write(root, "b.md", "x");
+        let res = list_notes(root, &list_opts(ListSort::Name, 20)).unwrap();
+        assert_eq!(res.total, 2);
+        assert!(!res.truncated);
     }
 
     #[test]

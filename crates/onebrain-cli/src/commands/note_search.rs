@@ -3,6 +3,7 @@
 //! Vault-required (exit 64 outside a vault). Emits the canonical `Envelope<T>`.
 
 use crate::cli::NoteSearchArgs;
+use crate::commands::note_common::{skipped_warning, W_NOTES_SKIPPED};
 use crate::output::{emit, Envelope, OutputMode};
 use crate::vault_ctx;
 use anyhow::Result;
@@ -25,7 +26,11 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &NoteSearchArgs
     };
     let data = search_notes(resolved.root.as_path(), &opts)?;
 
-    let envelope = Envelope::ok("note.search", Some(vault_info), data);
+    let warning = skipped_warning(&data.skipped);
+    let mut envelope = Envelope::ok("note.search", Some(vault_info), data);
+    if let Some(msg) = warning {
+        envelope = envelope.with_warning(W_NOTES_SKIPPED, msg);
+    }
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
 }
@@ -62,6 +67,7 @@ mod tests {
                 matches,
                 total_found: total,
                 truncated,
+                skipped: Vec::new(),
             },
         )
     }
