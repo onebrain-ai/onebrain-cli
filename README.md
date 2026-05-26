@@ -223,12 +223,30 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
 
 ## Roadmap
 
-> Directional, drawn from the CHANGELOG and known follow-ups — not a delivery commitment. The public roadmap lives at [onebrain.run](https://onebrain.run).
+> Directional — themes are committed, timing flexes with the weekly-minor cadence (≈ one themed minor per week). The live public roadmap is at [onebrain.run](https://onebrain.run).
 
-- **Now (v3.1.x)** — Locked command tree · canonical `Envelope` output · `onebrain.yml` config with timestamped backups · `qmd status`/`embed` · 9-platform release matrix.
-- **Next (v3.2+)** — Fill in stubbed verbs (`E_NOT_IMPLEMENTED` → real) under the locked grammar · SHA-256 / signature verification on the self-update binary · Homebrew-aware `onebrain update` (delegate to `brew upgrade` instead of swapping the brew binary in place).
-- **Later (v4.0)** — Drop `vault.yml` dual-read (canonical `onebrain.yml` only) · retire the hidden v3.0 flat aliases.
-- **Beyond** — [OneBrain Cloud](https://onebrain.run): hosted agent runtime + multi-device vault sync (planning phase, waitlist open).
+**Shipped**
+- **v3.0** — Rust rewrite GA · 9-platform release pipeline · stable JSON contracts.
+- **v3.1** — Consistency standard: locked `<noun> <verb>` command tree · canonical `Envelope` output · branded banner · `vault.yml → onebrain.yml`.
+
+**Phase 1 · perceptual speed + skill alignment (v3.2–v3.7)**
+- **v3.2** — `note` resource group (`search` · `list` · `find` · `read` · `append` · `new` · `move` · `archive` · `backlinks` · `orphans` · `stat`) — native vault note ops that replace ad-hoc `grep` / `ls` / `find`.
+- **v3.3** — Daemon foundation: `onebrain daemon start/stop/status` + structured logging.
+- **v3.4** — RPC layer: stdio JSON-RPC 2.0 over a Unix socket with auto-spawn.
+- **v3.5** — Skill-speed rewrites (`/daily`, `/wrapup`) + `checkpoint recover`.
+- **v3.6** — Capture pipeline (`/capture`, `/bookmark`, `/braindump`).
+- **v3.7** — Inbox + tasks pipeline + `/consolidate`.
+
+**Phase 2 · bundles (v3.8–v3.11)**
+- Bundle CLI (`onebrain bundle install/list/info/lint/…`) · four first-party bundles (`dashboard` · `synthesis` · `research` · `scheduler`) · core skills slimmed 32 → 18 · `onebrain.run/bundles` portal.
+
+**Signal-driven (Tier 2/3)**
+- Tiered memory + behavior tracking · proactive surfacing · daemon background synthesis · Avatar Mesh (one agent identity across machines) · Telegram / MCP gateway · OneBrain Studio + [OneBrain Cloud](https://onebrain.run) federation.
+
+**Ongoing hardening**
+- Self-update SHA-256 / signature verification on the downloaded binary · Homebrew-aware `onebrain update` (delegate to `brew upgrade`).
+
+**v4.0** — Drop `vault.yml` dual-read (canonical `onebrain.yml` only) · retire the hidden v3.0 aliases.
 
 ## Development
 
