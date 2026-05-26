@@ -40,6 +40,7 @@ The CLI is **cross-harness**: paired with the [OneBrain plugin](https://github.c
 Point an AI agent at a vault and it improvises — a different pile of `grep` / `ls` / `find` / `sed` each time, behaving differently on each harness and re-derived every session: slow, token-hungry, non-portable, sometimes wrong. **OneBrain CLI replaces that improvisation with one deterministic binary.**
 
 - **Same behavior on every harness & model** — Claude Code, Gemini, Codex, and Qwen all run `onebrain <noun> <verb>` and get identical output; switch harness without re-testing how your vault gets touched.
+- **Yours to extend, no waiting** — add a capability the harness/LLM doesn't have yet and every agent can use it immediately; they only learn the command, not implement the feature.
 - **No re-deriving solved workflows** — search, capture, consolidate, checkpoint live in the binary, so the agent calls one command instead of re-reasoning the recipe each session. Fewer tokens, no drift.
 - **Deterministic & safe** — a typed command with a frozen `Envelope` can't half-finish or quietly differ like an ad-hoc `rm` / `sed` pipeline. Same input → same output, scriptable by hooks.
 - **Fast** — a ~5 MB binary returns in under 50 ms, skipping the latency of several tool calls for what's already one operation.
