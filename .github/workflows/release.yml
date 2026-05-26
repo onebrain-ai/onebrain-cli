@@ -278,7 +278,20 @@ jobs:
 
       - name: Publish to npm with provenance
         working-directory: npm-wrapper
-        run: npm publish --access public --provenance
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          VERSION="${REF#refs/tags/v}"
+          # Idempotent: a recovery re-tag of an already-published version
+          # would otherwise hit npm's "cannot publish over existing version"
+          # (403) and fail the whole release. Skip cleanly if this exact
+          # version is already on the registry.
+          if npm view "@onebrain-ai/cli@${VERSION}" version >/dev/null 2>&1; then
+            echo "npm: @onebrain-ai/cli@${VERSION} already published — skipping"
+            exit 0
+          fi
+          npm publish --access public --provenance
 
   brew-bump:
     name: Bump Homebrew formula
@@ -294,7 +307,15 @@ jobs:
     steps:
       - name: Regenerate + commit formula
         env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          # Two-token split: the release lives on THIS repo (onebrain-cli),
+          # readable with the workflow's own GITHUB_TOKEN. The tap commit
+          # targets a SIBLING repo (homebrew-onebrain) which GITHUB_TOKEN
+          # can't write — that needs the fine-grained HOMEBREW_TAP_TOKEN.
+          # The tap token is scoped to homebrew-onebrain only, so reusing it
+          # for the cross-repo release read fails with "Resource not
+          # accessible by personal access token".
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -304,7 +325,8 @@ jobs:
           VERSION="${TAG#v}"
 
           # Pull the four brew-target checksums straight from the release the
-          # `release` job just published. gh follows the asset redirect; no
+          # `release` job just published. GH_TOKEN here is GITHUB_TOKEN —
+          # same-repo read access. gh follows the asset redirect; no
           # hand-rolled curl URL to drift.
           download_sha() {
             gh release download "$TAG" \
@@ -363,27 +385,32 @@ jobs:
           end
           FORMULA
 
-          # Commit straight to the tap's default branch via the Contents API
-          # (no local clone / credential helper needed). Look up the current
-          # blob SHA so the PUT is an update, not a create.
+          # Commit to the tap's default branch via the Contents API (no local
+          # clone / credential helper needed). These two calls hit the SIBLING
+          # repo, so they run under TAP_TOKEN (GH_TOKEN=GITHUB_TOKEN can't see
+          # homebrew-onebrain). Look up the current blob SHA so the PUT is an
+          # update, not a create.
           CONTENT="$(base64 -w0 Formula/onebrain.rb)"
-          CUR_SHA="$(gh api repos/onebrain-ai/homebrew-onebrain/contents/Formula/onebrain.rb --jq .sha)"
-          gh api -X PUT repos/onebrain-ai/homebrew-onebrain/contents/Formula/onebrain.rb \
+          CUR_SHA="$(GH_TOKEN="$TAP_TOKEN" gh api repos/onebrain-ai/homebrew-onebrain/contents/Formula/onebrain.rb --jq .sha)"
+          GH_TOKEN="$TAP_TOKEN" gh api -X PUT repos/onebrain-ai/homebrew-onebrain/contents/Formula/onebrain.rb \
             -f message="onebrain ${VERSION}" \
             -f content="${CONTENT}" \
             -f sha="${CUR_SHA}"
 
   website-deploy:
     name: Trigger website redeploy
-    needs: npm-publish
+    needs: release
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Stable tags only (npm-publish already skips prereleases, but gate
-    # explicitly so the job is self-documenting). Fires the Cloudflare deploy
-    # hook so onebrain.run rebuilds and picks up the new version — the site
-    # reads `onebrain-cli/releases/latest` at BUILD time (see website
-    # src/lib/version.ts), so a CLI release must re-trigger the build or the
-    # rendered version string stays stale.
+    # Depends on `release`, NOT `npm-publish`: the website reads the version
+    # from `onebrain-cli/releases/latest` (the GitHub Release), not from npm
+    # (see website src/lib/version.ts). Gating on npm-publish would skip the
+    # website rebuild whenever npm hiccups or no-ops on a recovery re-tag,
+    # even though the GitHub Release — the website's actual source — is live.
+    #
+    # Stable tags only (gate explicitly so the job is self-documenting).
+    # Fires the Cloudflare deploy hook so onebrain.run rebuilds and picks up
+    # the new version.
     #
     # Secret `CF_WEBSITE_DEPLOY_HOOK`: the Cloudflare deploy-hook URL (the URL
     # itself is the credential). This is the same hook + secret name the
