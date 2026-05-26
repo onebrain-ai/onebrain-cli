@@ -110,7 +110,10 @@ fn cap_lines(raw: &str, limit: usize) -> String {
 
 /// ATX heading level (number of leading `#`s) + trimmed title text, if `line`
 /// is a heading (`#`s followed by a space).
-fn heading_parts(line: &str) -> Option<(usize, &str)> {
+///
+/// Shared with `note::append` (`--section` placement reuses the same
+/// heading-detection rules so read/append agree on section boundaries).
+pub(super) fn heading_parts(line: &str) -> Option<(usize, &str)> {
     let hashes = line.chars().take_while(|&c| c == '#').count();
     if hashes == 0 {
         return None;

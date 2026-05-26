@@ -572,9 +572,8 @@ pub enum NoteVerb {
     Find(NoteFindArgs),
     /// Read a note's contents: whole body, a section, frontmatter, or tasks.
     Read(NoteReadArgs),
-    /// Append content to a note (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Append { path: PathBuf, content: String },
+    /// Append content to a note (at EOF, or under a `--section` heading).
+    Append(NoteAppendArgs),
     /// Create a new note (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     New { title: String },
@@ -652,6 +651,19 @@ pub struct NoteReadArgs {
     /// Max lines when reading the body (0 = unlimited).
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteAppendArgs {
+    /// Note path, relative to the vault root. The note must already exist
+    /// (use `note new` to create one).
+    pub path: PathBuf,
+    /// Text to append, verbatim. No de-duplication is performed.
+    pub content: String,
+    /// Append under this heading instead of at EOF. If the heading is absent,
+    /// it is created as a level-2 heading (`## H`) at the end of the file.
+    #[arg(long)]
+    pub section: Option<String>,
 }
 
 #[derive(Args, Debug)]

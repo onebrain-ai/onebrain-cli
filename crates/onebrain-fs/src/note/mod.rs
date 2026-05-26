@@ -4,6 +4,7 @@
 //! (`onebrain-cli`) parses args + emits the envelope; this module is pure
 //! filesystem/text logic over an already-resolved vault root.
 
+mod append;
 mod backlinks;
 mod find;
 mod list;
@@ -13,6 +14,7 @@ mod search;
 mod stat;
 mod walker;
 
+pub use append::{append_note, AppendResult};
 pub use backlinks::{backlinks, BacklinkEntry, BacklinksData};
 pub use find::{find_notes, FindEntry, FindOptions, FindResult, FindType};
 pub use list::{list_notes, ListOptions, ListResult, ListSort, NoteEntry};
