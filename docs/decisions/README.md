@@ -29,11 +29,11 @@ ADRs are immutable once accepted — if a decision changes, write a new ADR that
 | # | Decision | Status |
 |---|---|---|
 | [0001](0001-rust-rewrite.md) | Rust rewrite of the Bun/TS CLI | accepted |
-| _0002_ | Four-crate workspace split | _planned_ |
-| _0003_ | Direct-GitHub-Release self-update (not npm/bun) | _planned_ |
-| _0004_ | Canonical `Envelope<T>` output shape | _planned_ |
-| _0005_ | Text-default output · hooks inject `--json` | _planned_ |
-| _0006_ | Locked `<noun> <verb>` command tree | _planned_ |
-| _0007_ | Config rename `vault.yml → onebrain.yml` | _planned_ |
+| [0002](0002-four-crate-workspace.md) | Four-crate workspace split | accepted |
+| [0003](0003-direct-github-self-update.md) | Direct-GitHub-Release self-update (not npm/bun) | accepted |
+| [0004](0004-canonical-envelope.md) | Canonical `Envelope<T>` output shape | accepted |
+| [0005](0005-text-default-output.md) | Text-default output · hooks inject `--json` | accepted |
+| [0006](0006-locked-command-tree.md) | Locked `<noun> <verb>` command tree | accepted |
+| [0007](0007-config-rename.md) | Config rename `vault.yml → onebrain.yml` | accepted |
 
-> Entries in _italics_ are stubs to be filled in. The full rationale for each currently lives in the project's design notes; these ADRs distill the public-facing version.
+> These ADRs distill the public-facing rationale; the full design notes live in the project tracker.
