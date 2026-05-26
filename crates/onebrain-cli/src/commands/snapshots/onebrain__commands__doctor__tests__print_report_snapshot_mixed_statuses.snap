@@ -4,7 +4,7 @@ expression: output
 ---
 OneBrain Doctor
 
-  [✓] vault.yml            valid
+  [✓] onebrain.yml         valid
         · qmd: ob-1
   [!] settings-hooks       2 issue(s)
         → Run onebrain doctor --fix to repair hooks

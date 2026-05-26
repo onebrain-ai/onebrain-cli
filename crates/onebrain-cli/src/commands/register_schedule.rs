@@ -64,7 +64,7 @@ pub fn run(
     let config = read_vault_config(&vault)?;
     let entries = config.schedule;
     if entries.is_empty() {
-        println!("No schedule entries in vault.yml. Nothing to register.");
+        println!("No schedule entries in onebrain.yml. Nothing to register.");
         return Ok(());
     }
 
@@ -518,8 +518,8 @@ fn test_run(vault: &Path, skill: &str) -> Result<()> {
         })
         .ok_or_else(|| {
             anyhow!(
-                "no `schedule:` entry matching skill `{skill}` in vault.yml — \
-                 run `onebrain register-schedule --status` to list entries"
+                "no `schedule:` entry matching skill `{skill}` in onebrain.yml — \
+                 run `onebrain schedule register --status` to list entries"
             )
         })?;
 

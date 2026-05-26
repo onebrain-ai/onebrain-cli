@@ -12,7 +12,7 @@ use std::path::Path;
 /// Sync trait — all I/O is direct filesystem reads or short-lived spawn
 /// (no async runtime · matches the rest of v3 CLI).
 pub trait Check {
-    /// Stable identifier matching Bun parity (e.g. `"vault.yml"`, `"folders"`).
+    /// Stable identifier surfaced in doctor output (e.g. `"onebrain.yml"`, `"folders"`).
     fn name(&self) -> &'static str;
     fn run(&self, vault_root: &Path, config: &VaultConfig) -> DoctorResult;
 }
@@ -38,12 +38,12 @@ pub use vault_config_migration::VaultConfigMigrationCheck;
 pub use vault_yml::VaultYmlCheck;
 pub use vault_yml_keys::VaultYmlKeysCheck;
 
-/// Run every check and return results in the canonical Bun-parity order:
-/// vault.yml · vault.yml-keys · **vault-config-migration** · folders ·
+/// Run every check and return results in the canonical order:
+/// onebrain.yml · onebrain.yml-keys · **vault-config-migration** · folders ·
 /// plugin-files · settings-hooks · orphan-checkpoints · qmd-embeddings ·
 /// claude-settings.
 ///
-/// `vault-config-migration` (v3.1 addition) sits between `vault.yml-keys`
+/// `vault-config-migration` (v3.1 addition) sits between `onebrain.yml-keys`
 /// and `folders` so it lands near the other config-shape checks.
 ///
 /// Perf rec #1: `qmd-embeddings` spawns `qmd status`, which dominates the
@@ -54,8 +54,8 @@ pub use vault_yml_keys::VaultYmlKeysCheck;
 /// ~10 ms combined) but scales as the cheap-check set grows.
 pub fn run_all_checks(vault_root: &Path, config: &VaultConfig) -> Vec<DoctorResult> {
     /// Splice position of the qmd row in the final results vector. Must
-    /// stay in sync with the canonical Bun-parity order (vault.yml ·
-    /// vault.yml-keys · vault-config-migration · folders · plugin-files ·
+    /// stay in sync with the canonical order (onebrain.yml ·
+    /// onebrain.yml-keys · vault-config-migration · folders · plugin-files ·
     /// settings-hooks · orphan-checkpoints · **qmd-embeddings** ·
     /// claude-settings) — adding or reordering a check in `serial_checks`
     /// requires updating this constant. The `debug_assert_eq!` below

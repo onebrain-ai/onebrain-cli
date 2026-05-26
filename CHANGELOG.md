@@ -1,6 +1,6 @@
 ---
-latest_version: 3.0.0
-released: 2026-05-22
+latest_version: 3.1.1
+released: 2026-05-26
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -11,6 +11,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.1.1] — 2026-05-26 — config-loss fix + backups · doctor label rename + animated TTY · `qmd status`
+
+- **Fix (data loss): `onebrain init --force` no longer clobbers an existing config.** Re-init re-registers the plugin + completes the folder scaffold but the fresh template never modelled `qmd_collection` (or custom checkpoint/folders/schedule values), so overwriting silently dropped them. Re-init now preserves the config verbatim (`onebrain.yml: preserved`); missing keys are repaired by `doctor --fix`, not by re-init.
+- **Feat: timestamped config backups.** Every operation that overwrites/migrates/removes a config file (`doctor --fix` migration + key-backfill, `vault sync` Step 7) first copies it to `<vault>/.onebrain-backups/<file>.<YYYYMMDD-HHMMSS>.bak`. Backup is a hard precondition — the write is refused if the backup can't be made.
+- **Fix: doctor check labels renamed `vault.yml` → `onebrain.yml` / `onebrain.yml-keys`** — match the canonical filename (since v3.1.0) and what the plugin `/doctor` skill already documents. Checks still dual-read (canonical preferred, legacy fallback); only the displayed/JSON `check` name + autofix-dispatch string changed.
+- **Fix: stale `vault.yml` in user-facing output → `onebrain.yml`** — the `qmd-embeddings` message, `--help` text (`init --force`, `plugin/vault --branch`, `schedule add/remove/register`), `schedule register` + launchd scheduler errors, and the `vault sync` / orphan-scan stderr notices. Migration-context strings (the `vault-config-migration` check + deprecation warning) intentionally keep `vault.yml`.
+- **Feat: `onebrain qmd status`** — reports index + embedding health (collection · indexed · embedded · pending · size · updated) in text/`--json`/`--yaml`. Vault-required (exit 64 outside a vault); `qmd_available: false` when the binary is missing (parses `qmd status` text since qmd ≤ 2.1.0 ignores `--json`).
+- **Fix: `session init` unembedded count now works AND is vault-aware.** The v3.0 count went through `qmd status --json`, which qmd ignores → it always reported 0 on real installs. It now parses the text form (shared with `qmd status`) and is queried only when the vault sets `qmd_collection`, so a non-qmd vault reports 0 instead of leaking the global index's pending count.
+- **Feat: animated `doctor` on an interactive TTY** — checks reveal one at a time (`⋯ checking <name>…` → result) with a short per-step delay (override/disable via `ONEBRAIN_DOCTOR_STEP_MS`). Piped/non-TTY stdout and `--json`/`--yaml` keep the instant report.
 
 ## [3.1.0] — 2026-05-25 — Consistency Standard · locked command tree · canonical JSON envelope
 

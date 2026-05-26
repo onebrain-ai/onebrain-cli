@@ -165,23 +165,25 @@ fn cli_yes_populates_claude_settings_json_with_stop_hook() {
     assert!(!stop.is_empty(), "hooks.Stop is empty: {text}");
 }
 
-/// Bun v2.3.3-parity: `--force` overrides the existing-config guard so
-/// the run succeeds and the file is rewritten without prompting.
+/// Data-safety: `--force` overrides the existing-config *prompt* (runs without
+/// asking) but must NOT overwrite the config file — re-init preserves it
+/// verbatim so user keys like `qmd_collection` are never silently dropped.
 #[test]
-fn cli_yes_force_overwrites_existing_onebrain_yml() {
+fn cli_yes_force_preserves_existing_onebrain_yml() {
     let d = tempdir().unwrap();
-    fs::write(d.path().join("onebrain.yml"), "old: value\n").unwrap();
+    let original = "qmd_collection: ob-1-441565\nold: value\n";
+    fs::write(d.path().join("onebrain.yml"), original).unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
         .args(["init", "--yes", "--force", "--no-sync"])
         .current_dir(d.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("onebrain.yml: written"));
+        .stdout(predicate::str::contains("onebrain.yml: preserved"));
     let content = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
-    assert!(
-        content.contains("update_channel"),
-        "onebrain.yml should have been overwritten with the fresh template",
+    assert_eq!(
+        content, original,
+        "init --force must preserve the existing config, not overwrite it",
     );
 }
 

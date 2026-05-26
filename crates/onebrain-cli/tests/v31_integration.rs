@@ -1555,3 +1555,57 @@ fn help_keyword_subcommand_emits_banner() {
         "expected banner above `plugin help`. stderr=\n{stderr}"
     );
 }
+
+/// `qmd status` is vault-required: exit 64 outside a vault, and a clean exit 0
+/// report inside one (degrading gracefully to `qmd_available:false` when the
+/// qmd binary is absent). Regression guard for the verb graduating from a
+/// `not_implemented_vault_required` stub to a real handler in v3.1.1.
+#[test]
+fn qmd_status_requires_vault_and_reports_inside() {
+    // Outside any vault → exit 64 (E_VAULT_NOT_FOUND).
+    let no_vault = tempdir().unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(no_vault.path())
+        .env_remove("ONEBRAIN_VAULT")
+        .args(["qmd", "status"])
+        .assert()
+        .failure()
+        .code(64);
+
+    // Inside a vault → exit 0 with the status report. PATH is scrubbed so the
+    // qmd probe finds nothing and the command degrades instead of hanging.
+    let dir = tempdir().unwrap();
+    make_vault(dir.path());
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(dir.path())
+        .env_remove("ONEBRAIN_VAULT")
+        .env("PATH", "/usr/bin:/bin")
+        .args(["qmd", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("qmd index status"));
+}
+
+/// `qmd status --json` inside a vault emits a parseable object carrying the
+/// stable `qmd_available` flag — the machine-consumer contract.
+#[test]
+fn qmd_status_json_is_parseable_with_availability_flag() {
+    let dir = tempdir().unwrap();
+    make_vault(dir.path());
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(dir.path())
+        .env_remove("ONEBRAIN_VAULT")
+        .env("PATH", "/usr/bin:/bin")
+        .args(["qmd", "status", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert!(
+        v.get("qmd_available").is_some(),
+        "missing qmd_available: {v}"
+    );
+}

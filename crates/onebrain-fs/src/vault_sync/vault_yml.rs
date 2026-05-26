@@ -57,6 +57,10 @@ pub fn update_vault_yml(vault_root: &Path, update_channel: &str) -> std::io::Res
         serialized = stripped.to_string();
     }
 
+    // Defense-in-depth: back up the existing config before overwriting it.
+    // Hard precondition — if the backup can't be made, refuse the write.
+    crate::backup::backup_config_file(&config_path).map_err(io_err)?;
+
     atomic_write(&config_path, serialized.as_bytes())
 }
 

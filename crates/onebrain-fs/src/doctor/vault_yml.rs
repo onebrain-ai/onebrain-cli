@@ -5,21 +5,21 @@ use std::path::Path;
 pub struct VaultYmlCheck;
 
 impl Check for VaultYmlCheck {
-    /// Check name kept stable at "vault.yml" for Bun parity (CLI consumers
-    /// + plugin /doctor skill assert on this string).
+    /// Check name is the canonical config filename `onebrain.yml` (v3.1.1+).
+    /// Renamed from the legacy "vault.yml" label once Bun parity was dropped;
+    /// the plugin `/doctor` skill matches on this string.
     ///
-    /// Despite the name, the check now reads whichever config file is
-    /// present — canonical `onebrain.yml` preferred, legacy `vault.yml`
-    /// fallback.
+    /// The check still reads whichever config file is present — canonical
+    /// `onebrain.yml` preferred, legacy `vault.yml` fallback.
     fn name(&self) -> &'static str {
-        "vault.yml"
+        CONFIG_FILENAME
     }
 
     fn run(&self, vault_root: &Path, _config: &VaultConfig) -> DoctorResult {
         let path = match find_config_file(vault_root) {
             Some(p) => p,
             None => {
-                return DoctorResult::error("vault.yml", "onebrain.yml not found")
+                return DoctorResult::error(CONFIG_FILENAME, "onebrain.yml not found")
                     .with_hint("Run onebrain init to create onebrain.yml")
                     .with_details(vec!["Run onebrain init to create onebrain.yml".to_string()]);
             }
@@ -31,7 +31,7 @@ impl Check for VaultYmlCheck {
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(_) => {
-                return DoctorResult::error("vault.yml", format!("{filename} not found"))
+                return DoctorResult::error(CONFIG_FILENAME, format!("{filename} not found"))
                     .with_hint("Run onebrain init to create onebrain.yml")
                     .with_details(vec!["Run onebrain init to create onebrain.yml".to_string()]);
             }
@@ -40,7 +40,7 @@ impl Check for VaultYmlCheck {
             Ok(v) => v,
             Err(_) => {
                 return DoctorResult::error(
-                    "vault.yml",
+                    CONFIG_FILENAME,
                     format!("{filename} contains invalid YAML"),
                 )
                 .with_hint(format!("Check {filename} syntax"))
@@ -54,7 +54,7 @@ impl Check for VaultYmlCheck {
         if let Some(qc) = parsed.get("qmd_collection").and_then(|v| v.as_str()) {
             details.push(format!("qmd: {}", qc));
         }
-        let mut r = DoctorResult::ok("vault.yml", "valid");
+        let mut r = DoctorResult::ok(CONFIG_FILENAME, "valid");
         if !details.is_empty() {
             r = r.with_details(details);
         }

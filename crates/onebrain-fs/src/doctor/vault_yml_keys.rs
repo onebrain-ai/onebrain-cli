@@ -1,4 +1,5 @@
-//! VaultYmlKeysCheck — validates the schema of `vault.yml`.
+//! VaultYmlKeysCheck — validates the schema of `onebrain.yml`
+//! (legacy `vault.yml` fallback when canonical is absent).
 //!
 //! Port of Bun `checkVaultYmlKeys` (src/lib/validator.ts:374-515). Verifies:
 //! - required top-level keys (hard errors: `folders`)
@@ -18,7 +19,7 @@ use std::path::Path;
 
 pub struct VaultYmlKeysCheck;
 
-const CHECK_NAME: &str = "vault.yml-keys";
+const CHECK_NAME: &str = "onebrain.yml-keys";
 
 const REQUIRED_TOP_LEVEL: &[&str] = &["folders"];
 const SOFT_REQUIRED_TOP_LEVEL: &[&str] = &["update_channel"];

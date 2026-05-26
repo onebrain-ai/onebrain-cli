@@ -334,7 +334,7 @@ const DEFAULT_ACTIVE_SESSION_GUARD_MS: u64 = 60 * 60 * 1000;
 /// Resolve the Active-Session Guard threshold in milliseconds from `vault.yml`'s
 /// `checkpoint.minutes`. Policy: `max(60min, 2 * checkpoint.minutes)` minutes.
 ///
-/// Fail-safe: returns 60min on missing/malformed vault.yml. Expected absence
+/// Fail-safe: returns 60min on missing/malformed onebrain.yml. Expected absence
 /// (ENOENT-equivalent) is silent · real malformations emit a stderr warning.
 pub(crate) fn active_session_guard_ms(vault_root: &Path) -> u64 {
     match load_vault_config_at(vault_root) {
@@ -351,7 +351,7 @@ pub(crate) fn active_session_guard_ms(vault_root: &Path) -> u64 {
                 // Real I/O error (EACCES, EIO, etc.) — emit stderr warning, then fall back.
                 let _ = writeln!(
                     std::io::stderr(),
-                    "onebrain orphan-scan: vault.yml unreadable, using {}-min Active-Session Guard default ({source})",
+                    "onebrain checkpoint orphans: onebrain.yml unreadable, using {}-min Active-Session Guard default ({source})",
                     MIN_GUARD_MINUTES
                 );
                 DEFAULT_ACTIVE_SESSION_GUARD_MS
@@ -361,7 +361,7 @@ pub(crate) fn active_session_guard_ms(vault_root: &Path) -> u64 {
             // Real malformation (e.g. InvalidYaml) — emit warning to stderr (best-effort, never panic).
             let _ = writeln!(
                 std::io::stderr(),
-                "onebrain orphan-scan: vault.yml unreadable, using {}-min Active-Session Guard default ({other})",
+                "onebrain checkpoint orphans: onebrain.yml unreadable, using {}-min Active-Session Guard default ({other})",
                 MIN_GUARD_MINUTES
             );
             DEFAULT_ACTIVE_SESSION_GUARD_MS
