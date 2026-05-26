@@ -19,6 +19,7 @@
 //! Writes go through a temp file + atomic `rename`, matching the tmp+rename
 //! pattern used by [`super::append`].
 
+use super::io::atomic_write;
 use crate::error::{FsError, Result};
 use chrono::Utc;
 use onebrain_core::CoreError;
@@ -276,25 +277,6 @@ fn split_frontmatter(content: &str) -> Option<(Vec<(String, String)>, String)> {
         pairs.push((k.trim().to_string(), v.trim().to_string()));
     }
     Some((pairs, after.to_string()))
-}
-
-/// Atomic write via `{path}.tmp` + `rename`. Matches [`super::append`]'s pattern.
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut tmp = path.to_path_buf();
-    let new_ext = match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => format!("{ext}.tmp"),
-        None => "tmp".to_string(),
-    };
-    tmp.set_extension(new_ext);
-    std::fs::write(&tmp, bytes).map_err(|source| FsError::Io {
-        path: tmp.clone(),
-        source,
-    })?;
-    std::fs::rename(&tmp, path).map_err(|source| FsError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(())
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@
 //! Writes go through a temp file + atomic `rename`, matching the tmp+rename
 //! pattern used by `init::marketplace` and `register_hooks::settings`.
 
+use super::io::atomic_write;
 use super::read::heading_parts;
 use crate::error::{FsError, Result};
 use serde::Serialize;
@@ -175,27 +176,6 @@ fn insert_under_section(raw: &str, heading: &str, content: &str) -> (String, boo
     }
 
     (out, false)
-}
-
-/// Atomic write via `{path}.tmp` + `rename`. Matches the tmp+rename pattern in
-/// `init::marketplace::atomic_write_canonical`. Maps IO failures to
-/// [`FsError::Io`].
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut tmp = path.to_path_buf();
-    let new_ext = match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => format!("{ext}.tmp"),
-        None => "tmp".to_string(),
-    };
-    tmp.set_extension(new_ext);
-    std::fs::write(&tmp, bytes).map_err(|source| FsError::Io {
-        path: tmp.clone(),
-        source,
-    })?;
-    std::fs::rename(&tmp, path).map_err(|source| FsError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(())
 }
 
 #[cfg(test)]

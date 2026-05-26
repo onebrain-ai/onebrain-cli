@@ -8,6 +8,7 @@ mod append;
 mod archive;
 mod backlinks;
 mod find;
+mod io;
 mod list;
 mod r#move;
 mod new;
