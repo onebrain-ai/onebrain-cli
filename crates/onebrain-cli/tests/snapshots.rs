@@ -111,7 +111,7 @@ fn update_full_upgrade_success_snapshot() {
             })
         })),
         install_fn: Some(Box::new(|_| Ok(()))),
-        validate_fn: Some(Box::new(|| true)),
+        validate_fn: Some(Box::new(|_| Ok(()))),
         current_version_fn: Some(Box::new(|| CurrentVersion {
             version: "v1.10.18".to_string(),
             published_at: None,

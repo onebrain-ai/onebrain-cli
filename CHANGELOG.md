@@ -1,5 +1,5 @@
 ---
-latest_version: 3.1.4
+latest_version: 3.1.5
 released: 2026-05-26
 ---
 
@@ -11,6 +11,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.1.5] — 2026-05-26 — fix: `onebrain update` false-negative binary validation
+
+- **Fix: `onebrain update` no longer reports "Binary validation failed. Check PATH." after a successful upgrade.** The post-install validator matched Bun's `v`-prefixed `--version` shape (`/v\d+\.\d+/`), but the Rust/clap binary prints `onebrain 3.1.4` (no `v`), so every genuine version bump failed the gate even though the binary swap succeeded. Integration tests injected a mock validator, which is why the real format mismatch slipped through — added a regression test against the actual clap output.
+- **Hardening: the post-install gate now confirms the `onebrain` on PATH actually reports the just-installed version** (`>= expected`) instead of merely "runs and prints some version" — a no-op `brew upgrade`, or a PATH resolving a different install, no longer passes silently. Validation failures now surface the specific cause (spawn/exec error · unparseable output · stale version on PATH) instead of a blanket "Check PATH".
 
 ## [3.1.4] — 2026-05-26 — self-update hardening: SHA-256 verification + Homebrew-aware update
 
