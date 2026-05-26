@@ -383,8 +383,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             NoteVerb::Backlinks(args) => {
                 commands::note_backlinks::run(vault_flag.clone(), &mode, &args)
             }
-            NoteVerb::Orphans => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "note orphans")
+            NoteVerb::Orphans(args) => {
+                commands::note_orphans::run(vault_flag.clone(), &mode, &args)
             }
             NoteVerb::Stat(args) => commands::note_stat::run(vault_flag.clone(), &mode, &args),
         },

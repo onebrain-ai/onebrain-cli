@@ -7,6 +7,7 @@
 mod backlinks;
 mod find;
 mod list;
+mod orphans;
 mod read;
 mod search;
 mod stat;
@@ -15,6 +16,7 @@ mod walker;
 pub use backlinks::{backlinks, BacklinkEntry, BacklinksData};
 pub use find::{find_notes, FindEntry, FindOptions, FindResult, FindType};
 pub use list::{list_notes, ListOptions, ListResult, ListSort, NoteEntry};
+pub use orphans::{orphans, OrphansData};
 pub use read::{read_note, ReadOptions, ReadResult};
 pub use search::{search_notes, NoteMatch, SearchMode, SearchOptions, SearchResult};
 pub use stat::{stat_note, NoteStatData};

@@ -6,6 +6,7 @@ pub mod migrate;
 pub mod note_backlinks;
 pub mod note_find;
 pub mod note_list;
+pub mod note_orphans;
 pub mod note_read;
 pub mod note_search;
 pub mod note_stat;

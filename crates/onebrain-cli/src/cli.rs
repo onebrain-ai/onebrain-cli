@@ -586,9 +586,8 @@ pub enum NoteVerb {
     Archive { path: PathBuf },
     /// List every note that links to the target note.
     Backlinks(NoteBacklinksArgs),
-    /// List orphan notes (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Orphans,
+    /// List orphan notes — notes with zero incoming wikilinks.
+    Orphans(NoteOrphansArgs),
     /// Print note statistics (line/word/char counts, headings, links, tasks).
     Stat(NoteStatArgs),
 }
@@ -668,6 +667,16 @@ pub struct NoteBacklinksArgs {
     /// Also scan notes under `06-archive` (excluded by default).
     #[arg(long)]
     pub include_archive: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteOrphansArgs {
+    /// Scope the scan to a subfolder (relative to the vault root).
+    #[arg(long)]
+    pub folder: Option<PathBuf>,
+    /// Maximum orphans to return.
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
