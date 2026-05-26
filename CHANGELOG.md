@@ -1,5 +1,5 @@
 ---
-latest_version: 3.1.3
+latest_version: 3.1.4
 released: 2026-05-26
 ---
 
@@ -11,6 +11,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.1.4] — 2026-05-26 — self-update hardening: SHA-256 verification + Homebrew-aware update
+
+- **Feat: `onebrain update` verifies the downloaded binary's SHA-256** against the published `<archive>.sha256` before the swap. An unverifiable asset (missing/malformed checksum file, or a digest mismatch) is now a hard failure with the live binary left untouched — TLS previously authenticated only the transport, not the bytes. Cosign/signature verification remains a follow-up pending release-side signing.
+- **Feat: Homebrew-aware `onebrain update`.** A brew-managed install (binary resolves under `…/Cellar/onebrain/…`) now delegates to `brew upgrade onebrain` rather than swapping the Cellar binary in place, which desynced brew's metadata from disk (the dual-install divergence). Direct / `cargo-binstall` / manual installs keep the fetch-and-swap path; if `brew` isn't runnable the error points the user to run `brew upgrade onebrain` manually.
 
 ## [3.1.3] — 2026-05-26 — `schedule register` reads `onebrain.yml`
 

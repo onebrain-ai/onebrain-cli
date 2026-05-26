@@ -10,11 +10,21 @@
 //! + atomic binary swap.
 //!
 //! Trust model: the binary is fetched over HTTPS from
-//! `github.com/onebrain-ai/onebrain-cli/releases/download/...`. SHA-256
-//! verification is a defense-in-depth follow-up for post-GA (the GitHub TLS
-//! chain is the current authentication boundary).
+//! `github.com/onebrain-ai/onebrain-cli/releases/download/...` and verified
+//! against the published `<archive>.sha256` before the swap (v3.1.4). The
+//! GitHub TLS chain authenticates the transport; the checksum closes the gap
+//! where a corrupted or tampered asset would otherwise be installed. An
+//! unverifiable asset (missing/malformed `.sha256`, or a mismatch) is a hard
+//! failure — we never swap it in. Signature (cosign) verification remains a
+//! follow-up for once the release pipeline signs its artifacts.
+//!
+//! Install channel: a Homebrew-managed binary lives in the Cellar behind a
+//! `brew` symlink. Swapping it in place would desync brew's metadata, so
+//! [`detect_install_channel`] routes those installs to `brew upgrade` instead
+//! of the direct fetch + swap.
 
 use super::UpdateError;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -47,6 +57,9 @@ pub(crate) fn fetch_and_swap_binary(version: &str, current_exe: &Path) -> Result
     let url = format!("{base}/{tag}/onebrain-{}.{}", asset.triple, asset.extension);
 
     let archive_bytes = download_archive(&url)?;
+    // Verify against the published `<archive>.sha256` BEFORE we decode or
+    // swap. A failure here aborts the update with the live binary untouched.
+    verify_archive_checksum(&url, &archive_bytes)?;
     let new_binary_bytes = asset.extract_binary(&archive_bytes)?;
     swap_binary(current_exe, &new_binary_bytes)
 }
@@ -333,6 +346,144 @@ fn set_executable(_path: &Path) -> Result<(), UpdateError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// SHA-256 verification (v3.1.4)
+// ---------------------------------------------------------------------------
+
+/// Download the published `<archive>.sha256` sidecar and verify it against the
+/// archive bytes we just fetched. Network half — the parse + compare logic
+/// lives in [`verify_checksum`] so it can be unit-tested without HTTP.
+fn verify_archive_checksum(archive_url: &str, archive_bytes: &[u8]) -> Result<(), UpdateError> {
+    let sums_url = format!("{archive_url}.sha256");
+    let sums_text = download_text(&sums_url)?;
+    verify_checksum(&sums_text, archive_bytes)
+}
+
+/// Parse a `shasum -a 256` / `sha256sum` style checksum file and compare its
+/// digest against the SHA-256 of `archive_bytes`. A malformed file or a
+/// mismatch is a [`UpdateError::Checksum`] — pure, so it's the unit-test seam.
+fn verify_checksum(sums_file: &str, archive_bytes: &[u8]) -> Result<(), UpdateError> {
+    let expected = parse_sha256_line(sums_file).ok_or_else(|| {
+        UpdateError::Checksum(format!(
+            "no SHA-256 digest in checksum file (first line: {:?})",
+            sums_file.lines().next().unwrap_or("")
+        ))
+    })?;
+    let actual = sha256_hex(archive_bytes);
+    if actual.eq_ignore_ascii_case(&expected) {
+        Ok(())
+    } else {
+        Err(UpdateError::Checksum(format!(
+            "mismatch — expected {expected}, computed {actual} (refusing to install)"
+        )))
+    }
+}
+
+/// Extract the hex digest from a `<64-hex>  <filename>` line. Returns it only
+/// when the first whitespace-delimited token is exactly 64 hex chars, so a
+/// truncated or HTML (404 page) body is rejected rather than mis-parsed.
+fn parse_sha256_line(contents: &str) -> Option<String> {
+    let token = contents.split_whitespace().next()?;
+    (token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| token.to_ascii_lowercase())
+}
+
+/// Lowercase hex SHA-256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut acc, byte| {
+            let _ = write!(acc, "{byte:02x}");
+            acc
+        })
+}
+
+/// Like [`download_archive`] but returns the (small) body as text — for the
+/// `.sha256` sidecar. A missing sidecar is a `Checksum` error (we cannot
+/// verify, so we must refuse), not a generic network error.
+fn download_text(url: &str) -> Result<String, UpdateError> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
+        .user_agent("onebrain-cli-update")
+        .build()
+        .map_err(|e| UpdateError::Network(format!("build http client: {e}")))?;
+    let resp = client
+        .get(url)
+        .send()
+        .map_err(|e| UpdateError::Network(format!("GET {url}: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(UpdateError::Checksum(format!(
+            "checksum file unavailable at {url} (HTTP {})",
+            resp.status().as_u16()
+        )));
+    }
+    resp.text()
+        .map_err(|e| UpdateError::Network(format!("read checksum body: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// Install-channel detection + Homebrew delegation (v3.1.4)
+// ---------------------------------------------------------------------------
+
+/// How the running binary was installed — decides whether `onebrain update`
+/// swaps the binary itself or hands off to the package manager.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InstallChannel {
+    /// Homebrew-managed: lives in the Cellar behind a `brew` symlink.
+    Homebrew,
+    /// Direct download / `cargo-binstall` / manual — a file we own and can
+    /// safely swap in place.
+    Direct,
+}
+
+/// Classify the install by where `current_exe` resolves. We canonicalize
+/// first to follow brew's `bin/onebrain` symlink to its Cellar target, then
+/// hand off to the pure [`classify_path`].
+pub(crate) fn detect_install_channel(current_exe: &Path) -> InstallChannel {
+    let resolved = fs::canonicalize(current_exe).unwrap_or_else(|_| current_exe.to_path_buf());
+    classify_path(&resolved)
+}
+
+/// Pure path classifier. A Homebrew install canonicalizes into
+/// `…/Cellar/onebrain/<version>/bin/onebrain` on `/opt/homebrew`,
+/// `/usr/local`, and Linuxbrew alike, so the `/Cellar/onebrain/` segment is
+/// the reliable signal. Split out so it's testable without a real filesystem.
+fn classify_path(resolved: &Path) -> InstallChannel {
+    if resolved.to_string_lossy().contains("/Cellar/onebrain/") {
+        InstallChannel::Homebrew
+    } else {
+        InstallChannel::Direct
+    }
+}
+
+/// Delegate the update to Homebrew. `brew upgrade onebrain` refreshes the tap
+/// formula and is idempotent (a no-op when already current); stdio is
+/// inherited so the user sees brew's own output. We never swap a Cellar
+/// binary in place — that would leave brew's metadata pointing at a version
+/// it no longer manages.
+pub(crate) fn brew_upgrade() -> Result<(), UpdateError> {
+    use std::process::Command;
+    let status = Command::new("brew")
+        .args(["upgrade", "onebrain"])
+        .status()
+        .map_err(|e| {
+            UpdateError::Install(format!(
+                "Homebrew install detected but `brew` is not runnable ({e}). \
+                 Run `brew upgrade onebrain` manually."
+            ))
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(UpdateError::Install(format!(
+            "`brew upgrade onebrain` failed (exit {}). \
+             Try `brew update && brew upgrade onebrain`.",
+            status.code().unwrap_or(-1)
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,5 +559,110 @@ mod tests {
         let info = AssetInfo::for_running_target().unwrap();
         assert!(!info.triple.is_empty());
         assert!(info.extension == "tar.gz" || info.extension == "zip");
+    }
+
+    // -----------------------------------------------------------------
+    // v3.1.4 — SHA-256 verification
+    // -----------------------------------------------------------------
+
+    // SHA-256("abc") — the canonical NIST test vector.
+    const ABC_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    #[test]
+    fn sha256_hex_matches_known_vector() {
+        assert_eq!(sha256_hex(b"abc"), ABC_SHA256);
+        // Empty input → the well-known empty-string digest.
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn parse_sha256_line_accepts_shasum_format() {
+        // `shasum -a 256` / `sha256sum` emit `<hex>␠␠<filename>`.
+        let line = format!("{ABC_SHA256}  onebrain-aarch64-apple-darwin.tar.gz\n");
+        assert_eq!(parse_sha256_line(&line).as_deref(), Some(ABC_SHA256));
+        // Bare digest, no filename.
+        assert_eq!(parse_sha256_line(ABC_SHA256).as_deref(), Some(ABC_SHA256));
+        // Uppercase is normalized to lowercase.
+        assert_eq!(
+            parse_sha256_line(&ABC_SHA256.to_uppercase()).as_deref(),
+            Some(ABC_SHA256)
+        );
+    }
+
+    #[test]
+    fn parse_sha256_line_rejects_malformed() {
+        assert_eq!(parse_sha256_line(""), None);
+        assert_eq!(parse_sha256_line("deadbeef"), None); // too short
+        assert_eq!(parse_sha256_line(&"z".repeat(64)), None); // non-hex
+        assert_eq!(parse_sha256_line("<!DOCTYPE html><html>404"), None); // 404 page body
+    }
+
+    #[test]
+    fn verify_checksum_accepts_matching_digest() {
+        let sums = format!("{ABC_SHA256}  onebrain.tar.gz");
+        assert!(verify_checksum(&sums, b"abc").is_ok());
+    }
+
+    #[test]
+    fn verify_checksum_rejects_mismatch() {
+        let sums = format!("{ABC_SHA256}  onebrain.tar.gz");
+        let err = verify_checksum(&sums, b"tampered").unwrap_err();
+        assert!(matches!(err, UpdateError::Checksum(_)));
+        assert!(format!("{err}").contains("mismatch"));
+    }
+
+    #[test]
+    fn verify_checksum_rejects_unparseable_file() {
+        let err = verify_checksum("not a checksum", b"abc").unwrap_err();
+        assert!(matches!(err, UpdateError::Checksum(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // v3.1.4 — install-channel detection
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn classify_path_detects_homebrew_cellar() {
+        use std::path::Path;
+        // Apple Silicon brew prefix.
+        assert_eq!(
+            classify_path(Path::new(
+                "/opt/homebrew/Cellar/onebrain/3.1.4/bin/onebrain"
+            )),
+            InstallChannel::Homebrew
+        );
+        // Intel brew prefix.
+        assert_eq!(
+            classify_path(Path::new("/usr/local/Cellar/onebrain/3.1.4/bin/onebrain")),
+            InstallChannel::Homebrew
+        );
+        // Linuxbrew.
+        assert_eq!(
+            classify_path(Path::new(
+                "/home/linuxbrew/.linuxbrew/Cellar/onebrain/3.1.4/bin/onebrain"
+            )),
+            InstallChannel::Homebrew
+        );
+    }
+
+    #[test]
+    fn classify_path_treats_non_cellar_as_direct() {
+        use std::path::Path;
+        assert_eq!(
+            classify_path(Path::new("/usr/local/bin/onebrain")),
+            InstallChannel::Direct
+        );
+        assert_eq!(
+            classify_path(Path::new("/home/user/.local/bin/onebrain")),
+            InstallChannel::Direct
+        );
+        // A different formula's Cellar must not trip the onebrain matcher.
+        assert_eq!(
+            classify_path(Path::new("/opt/homebrew/Cellar/ripgrep/14.0/bin/onebrain")),
+            InstallChannel::Direct
+        );
     }
 }

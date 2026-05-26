@@ -19,6 +19,7 @@ which         = { workspace = true }
 wait-timeout  = { workspace = true }
 semver        = { workspace = true }
 reqwest       = { workspace = true }
+sha2          = { workspace = true }
 indexmap      = { workspace = true }
 inquire       = { workspace = true }
 # Slice 13 — vault-sync
