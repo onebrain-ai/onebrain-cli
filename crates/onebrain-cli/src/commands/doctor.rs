@@ -838,7 +838,7 @@ fn print_report_animated(results: &[DoctorResult]) -> Result<()> {
     writeln!(w)?;
     for r in results {
         // Transient progress line · cleared and replaced by the result block.
-        write!(w, "  \u{22ef} {}\u{2026}", r.check)?;
+        write!(w, "  \u{22ef} checking {}\u{2026}", r.check)?;
         w.flush()?;
         std::thread::sleep(step);
         write!(w, "\r\u{1b}[K")?; // carriage-return + clear-to-end-of-line

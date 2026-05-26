@@ -282,14 +282,16 @@ pub fn run_init(mut opts: InitOptions) -> Result<InitResult, FsError> {
     // vault missing required keys is repaired surgically by `doctor --fix`
     // (the `onebrain.yml-keys` recipe backfills without dropping keys).
     if config_exists {
+        // Preserved, not written — leave `vault_yml_written` false so the flag
+        // never claims a write that didn't happen.
         stdout(&format!(
             "{existing_filename}: preserved (existing config left untouched · run `onebrain doctor --fix` to backfill missing keys)"
         ));
     } else {
         onebrain_yml::write_onebrain_yml(&vault_dir, preset)?;
+        result.vault_yml_written = true;
         stdout(&format!("{CONFIG_FILENAME}: written"));
     }
-    result.vault_yml_written = true;
 
     // ── Step 5: folders ────────────────────────────────────────────────────
     let n = folders::create_folders(&vault_dir)?;

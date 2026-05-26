@@ -10,7 +10,13 @@
 
 use crate::error::{FsError, Result};
 use chrono::Local;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+
+/// Upper bound on the same-second `-N` uniquifier search. Generous enough that
+/// it can't be hit by real usage, but bounds the loop so a wedged backup dir
+/// can't spin forever.
+const MAX_BACKUP_ATTEMPTS: u32 = 10_000;
 
 /// Subdirectory (under the vault root) where config backups are kept. Hidden
 /// so it never clutters the vault root or shows up in the PARA folder listing.
@@ -20,16 +26,29 @@ pub const BACKUP_DIR: &str = ".onebrain-backups";
 /// `<vault>/.onebrain-backups/<filename>.<YYYYMMDD-HHMMSS>.bak` before it is
 /// overwritten or migrated.
 ///
-/// Returns `Ok(Some(backup_path))` on success, or `Ok(None)` when
-/// `config_path` does not exist (a fresh write has nothing to back up).
-/// Errors propagate so the caller can refuse to write when the backup can't
-/// be made.
+/// Returns `Ok(Some(backup_path))` on success, or `Ok(None)` ONLY when
+/// `config_path` is genuinely absent (a fresh write has nothing to back up).
+/// Any other stat failure — unreadable parent, EACCES, etc. — propagates so
+/// the caller refuses to write past a backup it couldn't make. (`is_file()`
+/// would mis-report all of those as "absent" and silently skip the backup,
+/// defeating the hard precondition.)
 ///
 /// Timestamp granularity is per-second; a second backup within the same
 /// second gets a `-N` uniquifier so no prior backup is ever overwritten.
 pub fn backup_config_file(config_path: &Path) -> Result<Option<PathBuf>> {
-    if !config_path.is_file() {
-        return Ok(None);
+    // Distinguish "truly absent" (skip) from "present-but-unreadable / symlink"
+    // (must back up — or surface the error). `symlink_metadata` doesn't follow
+    // links, so a broken symlink registers as present and the later `fs::copy`
+    // surfaces the real failure instead of being silently treated as absent.
+    match std::fs::symlink_metadata(config_path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(FsError::Io {
+                path: config_path.to_path_buf(),
+                source,
+            })
+        }
+        Ok(_) => {}
     }
     let vault_root = config_path.parent().unwrap_or_else(|| Path::new("."));
     let backup_dir = vault_root.join(BACKUP_DIR);
@@ -45,10 +64,19 @@ pub fn backup_config_file(config_path: &Path) -> Result<Option<PathBuf>> {
     let stamp = Local::now().format("%Y%m%d-%H%M%S");
 
     // Never overwrite an existing backup: append `-N` if this second already
-    // produced one.
+    // produced one. Bounded so a wedged backup dir can't spin forever.
     let mut target = backup_dir.join(format!("{filename}.{stamp}.bak"));
     let mut n = 1;
     while target.exists() {
+        if n > MAX_BACKUP_ATTEMPTS {
+            return Err(FsError::Io {
+                path: backup_dir.clone(),
+                source: std::io::Error::new(
+                    ErrorKind::AlreadyExists,
+                    format!("exhausted {MAX_BACKUP_ATTEMPTS} backup name slots for {filename}"),
+                ),
+            });
+        }
         target = backup_dir.join(format!("{filename}.{stamp}-{n}.bak"));
         n += 1;
     }
@@ -112,5 +140,20 @@ mod tests {
         let backup = backup_config_file(&cfg).unwrap().unwrap();
         let name = backup.file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with("vault.yml."), "name: {name}");
+    }
+
+    /// A present-but-uncopyable config (here: a broken symlink) must NOT be
+    /// silently treated as absent — that would skip the backup and let the
+    /// caller write past a precondition it never satisfied. It must error.
+    #[cfg(unix)]
+    #[test]
+    fn present_but_uncopyable_config_errors_not_skipped() {
+        let d = tempdir().unwrap();
+        let cfg = d.path().join("onebrain.yml");
+        std::os::unix::fs::symlink(d.path().join("does-not-exist.yml"), &cfg).unwrap();
+        // Broken symlink: `symlink_metadata` sees it (present), `fs::copy`
+        // then fails following it → Err, never Ok(None).
+        let r = backup_config_file(&cfg);
+        assert!(r.is_err(), "broken-symlink config must error, got {r:?}");
     }
 }
