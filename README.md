@@ -231,6 +231,9 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
 - **v3.0** — Rust rewrite GA · 9-platform release pipeline · stable JSON contracts.
 - **v3.1** — Consistency standard: locked `<noun> <verb>` command tree · canonical `Envelope` output · branded banner · `vault.yml → onebrain.yml`.
 
+**Next · v3.1.4 — self-update hardening**
+- SHA-256 verification of the downloaded binary before swap · Homebrew-aware `onebrain update` (delegate to `brew upgrade` instead of swapping the brew-managed binary in place). Cosign/signature verification tracked as a follow-up.
+
 **Phase 1 · perceptual speed + skill alignment (v3.2–v3.7)**
 - **v3.2** — `note` resource group (`search` · `list` · `find` · `read` · `append` · `new` · `move` · `archive` · `backlinks` · `orphans` · `stat`) — native vault note ops that replace ad-hoc `grep` / `ls` / `find`.
 - **v3.3** — Daemon foundation: `onebrain daemon start/stop/status` + structured logging.
@@ -244,9 +247,6 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
 
 **Signal-driven (Tier 2/3)**
 - Tiered memory + behavior tracking · proactive surfacing · daemon background synthesis · Avatar Mesh (one agent identity across machines) · Telegram / MCP gateway · OneBrain Studio + [OneBrain Cloud](https://onebrain.run) federation.
-
-**Ongoing hardening**
-- Self-update SHA-256 / signature verification on the downloaded binary · Homebrew-aware `onebrain update` (delegate to `brew upgrade`).
 
 **v4.0** — Drop `vault.yml` dual-read (canonical `onebrain.yml` only) · retire the hidden v3.0 aliases.
 
