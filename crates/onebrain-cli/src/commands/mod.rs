@@ -4,6 +4,7 @@ pub mod harness;
 pub mod init;
 pub mod migrate;
 pub mod orphan_scan;
+pub mod qmd_embed;
 pub mod qmd_reindex;
 pub mod qmd_status;
 pub mod register_hooks;

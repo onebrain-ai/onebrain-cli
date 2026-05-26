@@ -1609,3 +1609,36 @@ fn qmd_status_json_is_parseable_with_availability_flag() {
         "missing qmd_available: {v}"
     );
 }
+
+/// `qmd embed` is vault-required (exit 64 outside a vault) and, inside one,
+/// runs the foreground `qmd embed`. PATH is scrubbed so the probe fails fast
+/// with the install hint — proving the verb reaches the spawn (no longer the
+/// `not_implemented` stub) WITHOUT actually generating embeddings in the test.
+#[test]
+fn qmd_embed_requires_vault_then_invokes_qmd() {
+    // Outside any vault → exit 64.
+    let no_vault = tempdir().unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(no_vault.path())
+        .env_remove("ONEBRAIN_VAULT")
+        .args(["qmd", "embed"])
+        .assert()
+        .failure()
+        .code(64);
+
+    // Inside a vault, qmd scrubbed from PATH → reaches the spawn and fails with
+    // the install hint (NOT exit 64, NOT the not-implemented stub).
+    let dir = tempdir().unwrap();
+    make_vault(dir.path());
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(dir.path())
+        .env_remove("ONEBRAIN_VAULT")
+        .env("PATH", "/usr/bin:/bin")
+        .args(["qmd", "embed"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("qmd embed"))
+        .stderr(predicate::str::contains("installed").or(predicate::str::contains("PATH")));
+}

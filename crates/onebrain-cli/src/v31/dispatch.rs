@@ -107,9 +107,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             QmdVerb::Setup => {
                 stubs::not_implemented_vault_required(vault_flag.clone(), "qmd setup")
             }
-            QmdVerb::Embed => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "qmd embed")
-            }
+            QmdVerb::Embed => commands::qmd_embed::run(vault_flag.clone()),
             QmdVerb::Status => commands::qmd_status::run(vault_flag.clone(), &mode),
             QmdVerb::Search { .. } => {
                 stubs::not_implemented_vault_required(vault_flag.clone(), "qmd search")

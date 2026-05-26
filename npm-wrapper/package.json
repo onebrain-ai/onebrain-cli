@@ -1,6 +1,6 @@
 {
   "name": "@onebrain-ai/cli",
-  "version": "3.1.1",
+  "version": "3.1.2",
   "description": "Local-first Rust CLI for OneBrain — personal AI OS for Obsidian. Downloads the matching platform binary from GitHub Releases on install.",
   "keywords": [
     "onebrain",
