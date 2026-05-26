@@ -12,7 +12,7 @@
 
 <p align="center">
   <strong>The local-first Rust CLI that powers the OneBrain personal AI OS for Obsidian.</strong><br>
-  <sub>Vault scaffolding · plugin sync · scheduled skills · diagnostics · self-update — across Claude Code, Gemini CLI, Codex, and Qwen.</sub>
+  <sub>Vault scaffolding · plugin sync · scheduled skills · diagnostics · self-update — across Claude Code and Gemini CLI.</sub>
 </p>
 
 <p align="center">
@@ -33,13 +33,13 @@
 
 **`onebrain`** is the local-first Rust binary at the heart of [OneBrain](https://onebrain.run) — a personal AI operating system that lives in your Obsidian vault. It scaffolds new vaults, syncs the OneBrain plugin from GitHub, wires AI-harness hooks, runs scheduled skills through the OS scheduler, diagnoses vault health, and updates itself.
 
-The CLI is **cross-harness**: paired with the [OneBrain plugin](https://github.com/onebrain-ai/onebrain) (slash commands, skills, agents), it runs under Claude Code, Gemini CLI, Codex, and Qwen against the same vault contract.
+The CLI is **cross-harness**: paired with the [OneBrain plugin](https://github.com/onebrain-ai/onebrain) (slash commands, skills, agents), it runs under Claude Code and Gemini CLI against the same vault contract.
 
 ### Why OneBrain CLI
 
 Point an AI agent at a vault and it improvises — a different pile of `grep` / `ls` / `find` / `sed` each time, behaving differently on each harness and re-derived every session: slow, token-hungry, non-portable, sometimes wrong. **OneBrain CLI replaces that improvisation with one deterministic binary.**
 
-- **Same behavior on every harness & model** — Claude Code, Gemini, Codex, and Qwen all run `onebrain <noun> <verb>` and get identical output; switch harness without re-testing how your vault gets touched.
+- **Same behavior on every harness & model** — Claude Code and Gemini CLI both run `onebrain <noun> <verb>` and get identical output; switch harness without re-testing how your vault gets touched.
 - **Yours to extend, no waiting** — add a capability the harness/LLM doesn't have yet and every agent can use it immediately; they only learn the command, not implement the feature.
 - **No re-deriving solved workflows** — search, capture, consolidate, checkpoint live in the binary, so the agent calls one command instead of re-reasoning the recipe each session. Fewer tokens, no drift.
 - **Deterministic & safe** — a typed command with a frozen `Envelope` can't half-finish or quietly differ like an ad-hoc `rm` / `sed` pipeline. Same input → same output, scriptable by hooks.
@@ -61,7 +61,7 @@ brew install onebrain-ai/onebrain/onebrain
 
 # 2. Verify
 onebrain --version
-# → onebrain 3.1.3
+# → onebrain 3.1.4
 
 # 3. Scaffold a vault and let init pull the OneBrain plugin
 mkdir my-vault && cd my-vault
@@ -122,7 +122,7 @@ onebrain update --plan         # machine-readable JSON plan
 
 The install path resolves the current target triple at runtime, downloads the matching GitHub Release tarball over HTTPS (rustls TLS), and atomically swaps the running binary (Unix single-rename; Windows rustup-style two-step with rollback on failure). No package-manager middleware.
 
-> **Homebrew users:** prefer `brew upgrade onebrain` over `onebrain update` — `update` installs through npm and swaps the binary in place, which diverges from the brew-managed symlink. (Brew-aware delegation is on the [roadmap](#roadmap).)
+> **Homebrew users:** since v3.1.4, `onebrain update` auto-detects a brew-managed install (binary under the Cellar) and delegates to `brew upgrade onebrain`, so it stays in sync with brew's metadata — no manual step needed.
 
 ### Build from source
 
@@ -133,11 +133,11 @@ cargo build --release -p onebrain-cli
 # → target/release/onebrain
 ```
 
-Requires a recent stable Rust toolchain (`rustup default stable`). No `unsafe` blocks in OneBrain crates; the workspace builds cleanly on Linux, macOS, and Windows.
+Requires a recent stable Rust toolchain (`rustup default stable`). The only `unsafe` in OneBrain crates is a single `libc::getuid()` call (the launchd plist UID); the workspace otherwise builds cleanly on Linux, macOS, and Windows.
 
 ## Command surface
 
-v3.1 locks a singular-noun, two-level grammar — `onebrain <noun> <verb>` — so every command path is predictable. Three root verbs handle the common flow; ten resource groups cluster the rest.
+v3.1 locks a singular-noun, two-level grammar — `onebrain <noun> <verb>` — so every command path is predictable. Three root verbs handle the common flow; eight resource groups cluster the rest.
 
 ```text
 onebrain
@@ -182,7 +182,7 @@ onebrain qmd status --json | jq .data
 
 ## Security & trust model
 
-`onebrain update` authenticates downloaded binaries via **GitHub's TLS chain** (rustls validation, no opt-out). The CLI does not yet verify a SHA-256 checksum or cosign signature against the self-updated binary itself — this matches the rustup / deno / bun baseline. (The **npm wrapper** *does* verify the published `.sha256` before extracting.) Self-update checksum verification is tracked on the [roadmap](#roadmap).
+`onebrain update` authenticates downloaded binaries two ways: **GitHub's TLS chain** (rustls validation, no opt-out) secures the transport, and since v3.1.4 a **SHA-256 check** verifies the archive against its published `.sha256` *before* the swap — an unverifiable or mismatched asset is refused and the live binary is left untouched. The npm wrapper runs the same SHA-256 check before extracting. What's *not* yet done is cosign/signature verification: the checksum is an integrity check, not an authenticity one (an attacker who controls the serving origin could serve a matching archive + `.sha256` pair), so signing is tracked as a follow-up.
 
 On networks running a corporate MITM proxy, the trust boundary becomes whatever certificate the proxy presents. If that matters to your threat model, verify the published `.sha256` files manually after each update.
 

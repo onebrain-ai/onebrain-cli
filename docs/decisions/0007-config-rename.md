@@ -5,7 +5,7 @@
 
 ## Context
 
-The per-vault config file was named `vault.yml` — a generic name that says nothing about what owns it. As OneBrain grew a brand and other tools learned to coexist in the same vault, an unambiguous `onebrain.yml` reads far better. The user base was still small ("ยังไม่กระทบเยอะ"), so the migration cost of a rename was low — a good moment to do it before it gets expensive.
+The per-vault config file was named `vault.yml` — a generic name that says nothing about what owns it. As OneBrain grew a brand and other tools learned to coexist in the same vault, an unambiguous `onebrain.yml` reads far better. The user base was still small, so the migration cost of a rename was low — a good moment to do it before it gets expensive.
 
 ## Decision
 

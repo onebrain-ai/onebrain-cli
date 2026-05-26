@@ -1,6 +1,6 @@
 # 0003 — Direct-GitHub-Release self-update (not npm/bun)
 
-- **Status:** accepted
+- **Status:** accepted · revisited by [0008](0008-self-update-hardening.md) (v3.1.4)
 - **Date:** 2026-05-20
 
 ## Context
@@ -19,6 +19,6 @@ Fetch the binary directly from GitHub Releases and swap it in place, with no pac
 ## Consequences
 
 - **Self-update actually works**, on the same per-platform binary that brew, the npm wrapper, and direct download all resolve to.
-- **Trust boundary = GitHub's TLS chain** (rustls, no opt-out). At GA there is no SHA-256 or signature check of the asset itself — this matches the rustup/deno/bun baseline. SHA-256 verification is tracked for [v3.1.4](../../README.md#roadmap).
+- **Trust boundary = GitHub's TLS chain** (rustls, no opt-out). At GA there was no SHA-256 or signature check of the asset itself — matching the rustup/deno/bun baseline. SHA-256 verification of the asset later landed in v3.1.4 — see [0008](0008-self-update-hardening.md).
 - **Windows zip extraction was intentionally stubbed at v3.0.0** — `update --plan` omits Windows triples so a Windows user isn't told a target is auto-installable and then hits an error.
-- **Homebrew caveat:** because the swap rewrites `current_exe` in place, on a brew-managed install it diverges the Cellar binary from what brew recorded. Until brew-aware delegation lands (tracked v3.1.4), prefer `brew upgrade onebrain` on brew machines.
+- **Homebrew caveat (resolved in v3.1.4):** because the swap rewrites `current_exe` in place, on a brew-managed install it diverged the Cellar binary from what brew recorded. v3.1.4 made `onebrain update` detect a Cellar install and delegate to `brew upgrade` ([0008](0008-self-update-hardening.md)); before that, brew users reconciled manually.

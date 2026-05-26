@@ -27,7 +27,7 @@ onebrain-cli ──▶ onebrain-fs ──▶ onebrain-core
        └────────▶ onebrain-cache ─────┘
 ```
 
-- **`onebrain-core` depends on nothing in the workspace.** It holds the config types (`OnebrainYml`), the `Envelope<T>` shape, error types, and path resolution (`resolve_vault`). Because it touches no filesystem, its tests are fast and deterministic.
+- **`onebrain-core` depends on nothing in the workspace.** It holds the config types (`VaultConfig`), error types, and path/vault resolution (`resolve_vault`). Because it touches no filesystem, its tests are fast and deterministic. (The `Envelope<T>` output shape lives one layer up, in the `onebrain-cli` binary — see [How a command flows](#how-a-command-flows).)
 - **`onebrain-fs` and `onebrain-cache` depend only on `onebrain-core`.** They turn pure types into real effects (reading a vault, writing a plist, swapping a binary).
 - **`onebrain-cli` is the only crate that talks to the user.** clap parsing, output formatting, colors, and the `indicatif` spinner all live here. The library crates emit data; the binary decides how to render it.
 
@@ -39,7 +39,7 @@ Taking `onebrain doctor --json` as the worked example:
 
 1. **`onebrain-cli/src/main.rs`** parses argv with clap into the command tree (`<noun> <verb>`), resolves global flags (`--vault`, `--output`/`--json`/`--yaml`), and dispatches to `commands::doctor`.
 2. **`commands/doctor.rs`** resolves the vault root (via `onebrain-core`'s resolver), then asks **`onebrain-fs`** to run the checks.
-3. **`onebrain-fs/src/doctor/`** runs each `Box<dyn Check>` and returns plain data (`DoctorReport`) — no printing, no colors.
+3. **`onebrain-fs/src/doctor/`** runs each `Box<dyn Check>` and returns plain data (`Vec<DoctorResult>`) — no printing, no colors.
 4. Back in the binary, the report is wrapped in the canonical `Envelope<T>` and handed to `serialize_for_mode`, which renders text / JSON / YAML based on the resolved `OutputMode`.
 
 The same shape holds for every command: **parse → resolve → do work in a library crate → render in the binary.** The library never decides output format; the binary never decides business logic.
