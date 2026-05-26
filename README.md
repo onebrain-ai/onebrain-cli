@@ -221,6 +221,8 @@ Workspace inheritance keeps `[workspace.package]` fields (`version`, `edition`, 
 
 Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `insta` snapshots, 900+ tests passing. CI gates on `fmt` + `clippy -D warnings` + a 3-platform matrix (Ubuntu, macOS, Windows). The v2.x Bun golden-master parity layer was retired in v3.1.0; the v3.1 `Envelope` shape and the output-format matrix now own the canonical-contract role.
 
+> **Design notes & Rust patterns** → [`docs/`](docs/): an architecture deep-dive, decision records (ADRs), and a guided tour of the idiomatic Rust this codebase uses — written for contributors, people studying the source, and Rust learners.
+
 ## Roadmap
 
 > Directional — themes are committed, timing flexes with the weekly-minor cadence (≈ one themed minor per week). The live public roadmap is at [onebrain.run](https://onebrain.run).
