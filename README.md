@@ -29,15 +29,6 @@
 
 ---
 
-```text
-░█▀█░█▀█░█▀▀░█▀▄░█▀▄░█▀█░▀█▀░█▀█
-░█░█░█░█░█▀▀░█▀▄░█▀▄░█▀█░░█░░█░█
- ▀▀▀ ▀ ▀ ▀▀▀ ▀▀  ▀ ▀ ▀ ▀ ▀▀▀ ▀ ▀
-Your AI Thinking Partner · v3.1.2
-```
-
-`onebrain` is a single ~5 MB static binary. No runtime, no package-manager middleware, no cloud round-trip — your vault, your agent's memory, and your AI identity stay on your machine.
-
 ## What is OneBrain CLI?
 
 **`onebrain`** is the local-first Rust binary at the heart of [OneBrain](https://onebrain.run) — a personal AI operating system that lives in your Obsidian vault. It scaffolds new vaults, syncs the OneBrain plugin from GitHub, wires AI-harness hooks, runs scheduled skills through the OS scheduler, diagnoses vault health, and updates itself.
