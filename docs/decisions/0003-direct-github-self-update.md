@@ -18,7 +18,7 @@ Fetch the binary directly from GitHub Releases and swap it in place, with no pac
 
 ## Consequences
 
-- **Self-update actually works**, on the same per-platform binary that brew / npm-wrapper / `cargo-binstall` all resolve to.
+- **Self-update actually works**, on the same per-platform binary that brew, the npm wrapper, and direct download all resolve to.
 - **Trust boundary = GitHub's TLS chain** (rustls, no opt-out). At GA there is no SHA-256 or signature check of the asset itself — this matches the rustup/deno/bun baseline. SHA-256 verification is tracked for [v3.1.4](../../README.md#roadmap).
 - **Windows zip extraction was intentionally stubbed at v3.0.0** — `update --plan` omits Windows triples so a Windows user isn't told a target is auto-installable and then hits an error.
 - **Homebrew caveat:** because the swap rewrites `current_exe` in place, on a brew-managed install it diverges the Cellar binary from what brew recorded. Until brew-aware delegation lands (tracked v3.1.4), prefer `brew upgrade onebrain` on brew machines.
