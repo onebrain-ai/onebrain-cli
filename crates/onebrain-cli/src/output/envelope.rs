@@ -115,10 +115,9 @@ impl<T: Serialize> Envelope<T> {
     }
 
     /// Append a warning. Returns `Self` to allow chaining inside command
-    /// builders. v3.1's implemented commands don't emit warnings yet;
-    /// v3.2+ commands (e.g. `vault sync` with partial-success reports)
-    /// will call this.
-    #[allow(dead_code)]
+    /// builders. The v3.2 `note` scan verbs emit `W_NOTES_SKIPPED` through
+    /// this when a vault note can't be read; `emit` renders warnings in
+    /// human (text/table) modes and they ride the `warnings` array in JSON/YAML.
     pub fn with_warning(mut self, code: impl Into<String>, message: impl Into<String>) -> Self {
         self.warnings.push(Warning {
             code: code.into(),

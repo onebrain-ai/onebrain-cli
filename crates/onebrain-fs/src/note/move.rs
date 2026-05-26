@@ -66,8 +66,12 @@ struct PlannedEdit {
 /// - `update_links = false`: move the file only; skip the wikilink rewrite.
 ///
 /// Execution is transactional: if any write fails partway, every already-applied
-/// change (rewritten files + the file move) is rolled back so the vault is left
-/// exactly as it started, and the original error is returned.
+/// change (rewritten files + the file move) is rolled back. If the rollback
+/// itself succeeds, the vault is left exactly as it started and the original
+/// error is returned. If the rollback ALSO fails (e.g. disk full mid-restore),
+/// a [`CoreError::RollbackIncomplete`] is returned instead — naming the files
+/// that could not be restored — so the caller knows the vault may be
+/// inconsistent rather than wrongly assuming a clean revert.
 pub fn move_note(
     vault_root: &Path,
     from: &Path,
@@ -638,7 +642,7 @@ mod tests {
     /// the file was staged in a subdir that we lock only after staging.
     #[cfg(unix)]
     #[test]
-    fn rollback_failure_reports_inconsistent_vault() {
+    fn failed_rewrite_with_clean_rollback_returns_original_error() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempdir().unwrap();
