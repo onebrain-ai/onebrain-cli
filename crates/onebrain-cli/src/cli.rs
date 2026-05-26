@@ -570,9 +570,8 @@ pub enum NoteVerb {
     List(NoteListArgs),
     /// Find files/folders by glob, optionally filtered by mtime.
     Find(NoteFindArgs),
-    /// Read a note's contents (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Read { path: PathBuf },
+    /// Read a note's contents: whole body, a section, frontmatter, or tasks.
+    Read(NoteReadArgs),
     /// Append content to a note (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     Append { path: PathBuf, content: String },
@@ -637,6 +636,24 @@ pub struct NoteFindArgs {
     pub mtime: Option<i64>,
     /// Maximum results to return.
     #[arg(long, default_value_t = 50)]
+    pub limit: usize,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteReadArgs {
+    /// Note path, relative to the vault root.
+    pub path: PathBuf,
+    /// Extract only the content under this heading (matched by heading text).
+    #[arg(long, conflicts_with_all = ["frontmatter_only", "tasks_only"])]
+    pub section: Option<String>,
+    /// Emit only the parsed YAML frontmatter.
+    #[arg(long, conflicts_with_all = ["section", "tasks_only"])]
+    pub frontmatter_only: bool,
+    /// Emit only task lines (`- [ ]` / `- [x]`).
+    #[arg(long, conflicts_with_all = ["section", "frontmatter_only"])]
+    pub tasks_only: bool,
+    /// Max lines when reading the body (0 = unlimited).
+    #[arg(long, default_value_t = 0)]
     pub limit: usize,
 }
 

@@ -367,9 +367,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             NoteVerb::Search(args) => commands::note_search::run(vault_flag.clone(), &mode, &args),
             NoteVerb::List(args) => commands::note_list::run(vault_flag.clone(), &mode, &args),
             NoteVerb::Find(args) => commands::note_find::run(vault_flag.clone(), &mode, &args),
-            NoteVerb::Read { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "note read")
-            }
+            NoteVerb::Read(args) => commands::note_read::run(vault_flag.clone(), &mode, &args),
             NoteVerb::Append { .. } => {
                 stubs::not_implemented_vault_required(vault_flag.clone(), "note append")
             }
