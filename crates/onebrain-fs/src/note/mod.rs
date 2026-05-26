@@ -1,0 +1,15 @@
+//! `note` resource group — vault Markdown note operations (v3.2.0).
+//!
+//! Business logic for the `onebrain note <verb>` commands. The CLI layer
+//! (`onebrain-cli`) parses args + emits the envelope; this module is pure
+//! filesystem/text logic over an already-resolved vault root.
+
+mod find;
+mod list;
+mod search;
+mod walker;
+
+pub use find::{find_notes, FindEntry, FindOptions, FindResult, FindType};
+pub use list::{list_notes, ListOptions, ListResult, ListSort, NoteEntry};
+pub use search::{search_notes, NoteMatch, SearchMode, SearchOptions, SearchResult};
+pub use walker::walk_notes;
