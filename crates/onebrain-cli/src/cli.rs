@@ -564,15 +564,12 @@ pub struct NoteCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum NoteVerb {
-    /// Search notes by content (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Search { pattern: String },
-    /// List notes (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    List,
-    /// Find notes by filename pattern (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Find { pattern: String },
+    /// Search note contents by substring (default) or regex.
+    Search(NoteSearchArgs),
+    /// List notes with metadata, sorted by name/mtime/created.
+    List(NoteListArgs),
+    /// Find files/folders by glob, optionally filtered by mtime.
+    Find(NoteFindArgs),
     /// Read a note's contents (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     Read { path: PathBuf },
@@ -597,6 +594,50 @@ pub enum NoteVerb {
     /// Print note statistics (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     Stat { path: PathBuf },
+}
+
+#[derive(Args, Debug)]
+pub struct NoteSearchArgs {
+    /// Pattern to match (literal substring by default · regex with `--mode regex`).
+    pub pattern: String,
+    /// Scope the search to a subfolder (relative to the vault root).
+    #[arg(long)]
+    pub folder: Option<PathBuf>,
+    /// Maximum matches to return.
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+    /// Match mode: `lex` (literal substring) or `regex` (Rust regex).
+    #[arg(long, default_value = "lex", value_parser = ["lex", "regex"])]
+    pub mode: String,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteListArgs {
+    /// Scope the listing to a subfolder (relative to the vault root).
+    #[arg(long)]
+    pub folder: Option<PathBuf>,
+    /// Maximum notes to return.
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+    /// Sort order.
+    #[arg(long, default_value = "mtime", value_parser = ["name", "mtime", "created"])]
+    pub sort: String,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteFindArgs {
+    /// Glob pattern. No `/` → matches the basename (like `find -name`);
+    /// containing `/` → matches the vault-relative path (e.g. `**/topic-*.md`).
+    pub glob: String,
+    /// Restrict to files or folders.
+    #[arg(long = "type", value_parser = ["file", "folder"])]
+    pub r#type: Option<String>,
+    /// Day offset: `-N` = modified in the last N days · `0` = today · `+N` = older than N days.
+    #[arg(long)]
+    pub mtime: Option<i64>,
+    /// Maximum results to return.
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
 }
 
 // ─────────────────────────────────────────────────────────────────────────

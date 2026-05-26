@@ -364,15 +364,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             }
         },
         Cmd::Note(NoteCmd { verb }) => match verb {
-            NoteVerb::Search { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "note search")
-            }
-            NoteVerb::List => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "note list")
-            }
-            NoteVerb::Find { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "note find")
-            }
+            NoteVerb::Search(args) => commands::note_search::run(vault_flag.clone(), &mode, &args),
+            NoteVerb::List(args) => commands::note_list::run(vault_flag.clone(), &mode, &args),
+            NoteVerb::Find(args) => commands::note_find::run(vault_flag.clone(), &mode, &args),
             NoteVerb::Read { .. } => {
                 stubs::not_implemented_vault_required(vault_flag.clone(), "note read")
             }
