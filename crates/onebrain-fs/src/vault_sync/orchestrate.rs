@@ -144,9 +144,9 @@ pub fn run_vault_sync(vault_root: &Path, opts: VaultSyncOptions) -> VaultSyncRes
         progress.stop("harness files up-to-date");
     }
 
-    // ── Step 7 · vault.yml update ──────────────────────────────────────────
+    // ── Step 7 · onebrain.yml update ─────────────────────────────────────────
     if let Err(e) = update_vault_yml(vault_root, &update_channel) {
-        eprintln!("vault-sync: vault.yml update failed: {e}");
+        eprintln!("vault-sync: onebrain.yml update failed: {e}");
         result.error = Some(e.to_string());
         return result;
     }

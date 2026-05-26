@@ -1,6 +1,10 @@
-//! `onebrain doctor` — run all vault health checks and emit a plain-text
-//! report. Mirrors Bun's `printNonTtyOutput` byte-for-byte (icons, layout,
-//! summary line) so cross-implementation parity tests stay green.
+//! `onebrain doctor` — run all vault health checks and emit a report.
+//!
+//! On an interactive TTY (text mode) the checks are revealed one at a time
+//! with a short per-step delay so the run reads as sequential work; piped /
+//! non-TTY stdout and structured (`--json`/`--yaml`) modes get the instant
+//! plain report unchanged. The plain renderer keeps the original icon/layout/
+//! summary shape (`print_report`).
 //!
 //! `--fix` attempts targeted auto-repair recipes for each fixable warning,
 //! then re-runs the checks so the user sees the result in a single
@@ -15,7 +19,7 @@ use crate::vault_ctx;
 use anyhow::{anyhow, Result};
 use onebrain_core::{load_vault_config, DoctorResult, DoctorStatus};
 use onebrain_fs::doctor::run_all_checks;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 /// Outcome of a single fix attempt — printed as part of the `--fix`
@@ -88,14 +92,14 @@ pub fn run(fix: bool, json: bool, vault_flag: Option<PathBuf>, mode: &OutputMode
 
     let mut results = run_all_checks(vault_root.as_path(), &config);
     if !want_structured {
-        print_report(&results, std::io::stdout())?;
+        emit_text_report(&results)?;
     }
 
     let mut any_recipe_failed = false;
     let mut fix_outcomes_json: Vec<serde_json::Value> = Vec::new();
     if fix {
         // Dispatch on both Warn and Error: some checks (plugin-files,
-        // vault.yml-keys) emit Error for the very failure modes the recipes
+        // onebrain.yml-keys) emit Error for the very failure modes the recipes
         // are designed to repair additively (missing INSTRUCTIONS.md, missing
         // `folders` block). The dispatcher returns Manual for unrelated
         // checks, so unhandled errors are surfaced as text rather than
@@ -426,7 +430,7 @@ fn fix_plugin_files(vault_root: &Path, json: bool) -> FixOutcome {
     }
 }
 
-/// Recipe — `vault.yml-keys` warning means one or more of:
+/// Recipe — `onebrain.yml-keys` warning means one or more of:
 ///   - standard folder keys missing (`inbox` / `projects` / ...) or the
 ///     entire `folders:` block is missing/null
 ///   - `update_channel` not set
@@ -563,6 +567,11 @@ fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
         Ok(s) => s,
         Err(e) => return FixOutcome::Failed(format!("serialize {filename}: {e}")),
     };
+    // Defense-in-depth: back up the config before this re-serializing write
+    // (which drops comments). Hard precondition — no write without a backup.
+    if let Err(e) = onebrain_fs::backup_config_file(&path) {
+        return FixOutcome::Failed(format!("backup {filename} before write: {e}"));
+    }
     if let Err(e) = atomic_write_text(&path, &serialized) {
         return FixOutcome::Failed(format!("write {filename}: {e}"));
     }
@@ -658,16 +667,31 @@ fn fix_vault_config_migration(vault_root: &Path, json: bool) -> FixOutcome {
             // surfaces that error). Idempotent no-op.
             FixOutcome::Fixed("onebrain.yml in use — nothing to migrate".to_string())
         }
-        (false, true) => match std::fs::rename(&legacy, &canonical) {
-            Ok(()) => FixOutcome::Fixed("renamed vault.yml → onebrain.yml".to_string()),
-            Err(e) => FixOutcome::Failed(format!("rename vault.yml: {e}")),
-        },
-        (true, true) => match std::fs::remove_file(&legacy) {
-            Ok(()) => FixOutcome::Fixed(
-                "removed stale vault.yml (onebrain.yml already present)".to_string(),
-            ),
-            Err(e) => FixOutcome::Failed(format!("remove vault.yml: {e}")),
-        },
+        (false, true) => {
+            // Back up the legacy file before migrating, so the pre-rename
+            // state is always recoverable. Hard precondition.
+            if let Err(e) = onebrain_fs::backup_config_file(&legacy) {
+                return FixOutcome::Failed(format!("backup vault.yml before migrate: {e}"));
+            }
+            match std::fs::rename(&legacy, &canonical) {
+                Ok(()) => FixOutcome::Fixed("renamed vault.yml → onebrain.yml".to_string()),
+                Err(e) => FixOutcome::Failed(format!("rename vault.yml: {e}")),
+            }
+        }
+        (true, true) => {
+            // Back up the stale legacy file before removing it — never delete
+            // a config without a recoverable copy first.
+            if let Err(e) = onebrain_fs::backup_config_file(&legacy) {
+                return FixOutcome::Failed(format!("backup vault.yml before removal: {e}"));
+            }
+            match std::fs::remove_file(&legacy) {
+                Ok(()) => FixOutcome::Fixed(
+                    "removed stale vault.yml (onebrain.yml already present · backup kept)"
+                        .to_string(),
+                ),
+                Err(e) => FixOutcome::Failed(format!("remove vault.yml: {e}")),
+            }
+        }
     }
 }
 
@@ -733,24 +757,25 @@ fn print_fix_summary(outcomes: &[(String, FixOutcome)]) {
     println!("\nFix summary: {fixed} fixed · {failed} failed · {manual} manual",);
 }
 
-fn print_report<W: Write>(results: &[DoctorResult], mut w: W) -> Result<()> {
-    writeln!(w, "OneBrain Doctor")?;
-    writeln!(w)?;
-    for r in results {
-        let icon = match r.status {
-            DoctorStatus::Ok => "[\u{2713}]",
-            DoctorStatus::Warn => "[!]",
-            DoctorStatus::Error => "[\u{2717}]",
-        };
-        writeln!(w, "  {} {:<20} {}", icon, r.check, r.message)?;
-        if let Some(hint) = &r.hint {
-            writeln!(w, "        \u{2192} {hint}")?;
-        }
-        for d in &r.details {
-            writeln!(w, "        \u{00b7} {d}")?;
-        }
+/// Render a single check block: icon + status line, then any hint / details.
+fn write_check<W: Write>(w: &mut W, r: &DoctorResult) -> Result<()> {
+    let icon = match r.status {
+        DoctorStatus::Ok => "[\u{2713}]",
+        DoctorStatus::Warn => "[!]",
+        DoctorStatus::Error => "[\u{2717}]",
+    };
+    writeln!(w, "  {} {:<20} {}", icon, r.check, r.message)?;
+    if let Some(hint) = &r.hint {
+        writeln!(w, "        \u{2192} {hint}")?;
     }
-    writeln!(w)?;
+    for d in &r.details {
+        writeln!(w, "        \u{00b7} {d}")?;
+    }
+    Ok(())
+}
+
+/// Render the trailing one-line summary.
+fn write_summary<W: Write>(w: &mut W, results: &[DoctorResult]) -> Result<()> {
     let total = results.len();
     let errors = results
         .iter()
@@ -776,6 +801,65 @@ fn print_report<W: Write>(results: &[DoctorResult], mut w: W) -> Result<()> {
     Ok(())
 }
 
+/// Plain, instant text report — the canonical renderer. Used for piped /
+/// non-TTY stdout and by unit tests (writes to any `Write`, no timing).
+fn print_report<W: Write>(results: &[DoctorResult], mut w: W) -> Result<()> {
+    writeln!(w, "OneBrain Doctor")?;
+    writeln!(w)?;
+    for r in results {
+        write_check(&mut w, r)?;
+    }
+    writeln!(w)?;
+    write_summary(&mut w, results)
+}
+
+/// Per-step delay (ms) for the animated TTY report. Overridable via
+/// `ONEBRAIN_DOCTOR_STEP_MS`; `0` disables the animation (instant plain
+/// report) — handy for impatient users, demos, and deterministic tests.
+fn doctor_step_delay_ms() -> u64 {
+    std::env::var("ONEBRAIN_DOCTOR_STEP_MS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(90)
+}
+
+/// Animated text report for an interactive terminal: each check first shows a
+/// transient `⋯ checking <name>…` line, pauses briefly, then clears it and
+/// reveals the result — so the run reads as one-thing-at-a-time work instead
+/// of an instant wall of text. A `0` delay short-circuits to the plain report.
+fn print_report_animated(results: &[DoctorResult]) -> Result<()> {
+    let delay = doctor_step_delay_ms();
+    if delay == 0 {
+        return print_report(results, std::io::stdout());
+    }
+    let step = std::time::Duration::from_millis(delay);
+    let mut w = std::io::stdout();
+    writeln!(w, "OneBrain Doctor")?;
+    writeln!(w)?;
+    for r in results {
+        // Transient progress line · cleared and replaced by the result block.
+        write!(w, "  \u{22ef} {}\u{2026}", r.check)?;
+        w.flush()?;
+        std::thread::sleep(step);
+        write!(w, "\r\u{1b}[K")?; // carriage-return + clear-to-end-of-line
+        write_check(&mut w, r)?;
+        w.flush()?;
+    }
+    writeln!(w)?;
+    write_summary(&mut w, results)
+}
+
+/// Emit the text report to stdout, animating step-by-step on an interactive
+/// terminal and falling back to the instant plain report when stdout is piped
+/// / redirected / non-TTY (v3.1.1 doctor UX).
+fn emit_text_report(results: &[DoctorResult]) -> Result<()> {
+    if std::io::stdout().is_terminal() {
+        print_report_animated(results)
+    } else {
+        print_report(results, std::io::stdout())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,6 +873,24 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("[\u{2713}]"));
         assert!(s.contains("all passed"));
+    }
+
+    #[test]
+    fn doctor_step_delay_defaults_and_honors_env() {
+        // Sole reader of this env var in-process, so no parallel-test race.
+        std::env::remove_var("ONEBRAIN_DOCTOR_STEP_MS");
+        assert_eq!(doctor_step_delay_ms(), 90, "default");
+        std::env::set_var("ONEBRAIN_DOCTOR_STEP_MS", "0");
+        assert_eq!(doctor_step_delay_ms(), 0, "0 disables the animation");
+        std::env::set_var("ONEBRAIN_DOCTOR_STEP_MS", "250");
+        assert_eq!(doctor_step_delay_ms(), 250, "explicit override");
+        std::env::set_var("ONEBRAIN_DOCTOR_STEP_MS", "garbage");
+        assert_eq!(
+            doctor_step_delay_ms(),
+            90,
+            "unparseable falls back to default"
+        );
+        std::env::remove_var("ONEBRAIN_DOCTOR_STEP_MS");
     }
 
     #[test]

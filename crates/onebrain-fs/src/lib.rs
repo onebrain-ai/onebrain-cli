@@ -5,6 +5,7 @@
 //! The `orphan` module composes 5 internal helpers; the `frontmatter` module
 //! is crate-private (used transitively by orphan-scan).
 
+pub mod backup;
 pub mod doctor;
 pub mod error;
 pub(crate) mod frontmatter;
@@ -17,6 +18,7 @@ pub mod run_skill;
 pub mod update;
 pub mod vault_sync;
 
+pub use backup::backup_config_file;
 pub use error::{FsError, Result};
 pub use harness::{detect_harness, detect_harnesses};
 pub use init::{run_init, InitOptions, InitResult, ScheduleEntry, SchedulePreset};

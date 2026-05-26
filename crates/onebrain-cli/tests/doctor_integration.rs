@@ -12,7 +12,8 @@ use tempfile::tempdir;
 ///
 /// Includes:
 /// - `vault.yml` with all 8 folder keys + `update_channel: stable` (so the
-///   `vault.yml-keys` check has no soft-required warning).
+///   `onebrain.yml-keys` check has no soft-required warning). The fixture
+///   writes the legacy filename on purpose; the check reads it via fallback.
 /// - All 8 vault folders.
 /// - `.claude/plugins/onebrain/` with the required files + non-empty
 ///   `agents/` and `skills/foo/`.
@@ -356,4 +357,66 @@ fn doctor_fix_does_not_resurrect_vault_yml_after_migration() {
          renamed it away. Step 7 must write to onebrain.yml when canonical \
          is present."
     );
+}
+
+/// CRITICAL data-safety regression: `doctor --fix` must NEVER lose config
+/// keys. The vault carries a legacy `vault.yml` holding `qmd_collection` and a
+/// custom key but MISSING `update_channel`, so both the
+/// `vault-config-migration` rename AND the `onebrain.yml-keys` backfill fire.
+/// After --fix the config lives at canonical `onebrain.yml`, the
+/// `qmd_collection` and unknown custom key both survive the re-serialization,
+/// the missing `update_channel` is backfilled, and a timestamped backup was
+/// written before any destructive write. Also pins the `onebrain.yml-keys`
+/// fix-dispatch string (a one-sided rename would silently route to "no recipe"
+/// and skip the backfill).
+#[test]
+fn doctor_fix_preserves_custom_keys_and_backs_up() {
+    let vault = tempdir().unwrap();
+    write_minimal_vault(vault.path()); // folders + plugin files + (complete) vault.yml
+                                       // Replace the config: keep all folders, add qmd_collection + a custom key,
+                                       // drop update_channel so the keys-backfill recipe has work to do.
+    std::fs::write(
+        vault.path().join("vault.yml"),
+        "qmd_collection: ob-1-441565\n\
+         custom_key: keepme\n\
+         folders:\n  \
+           inbox: 00-inbox\n  \
+           projects: 01-projects\n  \
+           areas: 02-areas\n  \
+           knowledge: 03-knowledge\n  \
+           resources: 04-resources\n  \
+           agent: 05-agent\n  \
+           archive: 06-archive\n  \
+           logs: 07-logs\n",
+    )
+    .unwrap();
+    let elsewhere = tempdir().unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(elsewhere.path())
+        .env("PATH", "/usr/bin:/bin") // scrub qmd so the probe degrades
+        .args(["doctor", "--fix", "--vault"])
+        .arg(vault.path())
+        .assert()
+        .success();
+
+    let after = std::fs::read_to_string(vault.path().join("onebrain.yml"))
+        .expect("config migrated to canonical onebrain.yml");
+    assert!(
+        after.contains("qmd_collection: ob-1-441565"),
+        "qmd_collection must survive --fix · got:\n{after}"
+    );
+    assert!(
+        after.contains("custom_key: keepme"),
+        "unknown user keys must survive --fix · got:\n{after}"
+    );
+    assert!(
+        after.contains("update_channel"),
+        "missing required key should be backfilled (onebrain.yml-keys recipe ran) · got:\n{after}"
+    );
+    // A backup was taken before the destructive (rename + re-serialize) writes.
+    let backups = vault.path().join(".onebrain-backups");
+    assert!(backups.is_dir(), "expected .onebrain-backups/ to exist");
+    let count = std::fs::read_dir(&backups).unwrap().count();
+    assert!(count >= 1, "expected at least one timestamped backup");
 }

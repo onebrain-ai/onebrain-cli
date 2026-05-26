@@ -27,17 +27,28 @@ struct QmdStatusReport {
     index: QmdStatus,
 }
 
+impl QmdStatusReport {
+    /// Build a report from the configured collection and the result of
+    /// [`query_status`]. The single construction site that ties
+    /// `qmd_available` to index presence: `None` (qmd absent/unresponsive) ⟹
+    /// `qmd_available: false` + a default (all-`None`) index, so the
+    /// "available but populated" / "unavailable but populated" contradictions
+    /// can't be built.
+    fn from_query(collection: Option<String>, qmd: Option<QmdStatus>) -> Self {
+        Self {
+            collection,
+            qmd_available: qmd.is_some(),
+            index: qmd.unwrap_or_default(),
+        }
+    }
+}
+
 pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
     // Vault-required: exit 64 (E_VAULT_NOT_FOUND) outside a vault.
     let resolved = vault_ctx::require(vault_flag)?;
     let config = load_vault_config(&resolved.root).context("load vault config")?;
 
-    let qmd = query_status();
-    let report = QmdStatusReport {
-        collection: config.qmd_collection,
-        qmd_available: qmd.is_some(),
-        index: qmd.unwrap_or_default(),
-    };
+    let report = QmdStatusReport::from_query(config.qmd_collection, query_status());
 
     println!("{}", format_output(&report, mode));
     Ok(())
@@ -168,5 +179,38 @@ mod tests {
         let v: serde_yaml::Value = serde_yaml::from_str(&line).unwrap();
         assert_eq!(v["total_files"].as_u64(), Some(600));
         assert!(!line.trim_start().starts_with('{'), "expected YAML");
+    }
+
+    #[test]
+    fn from_query_none_yields_unavailable_empty_index() {
+        let r = QmdStatusReport::from_query(Some("ob-1".into()), None);
+        assert!(!r.qmd_available);
+        assert_eq!(r.index, QmdStatus::default());
+    }
+
+    #[test]
+    fn from_query_some_marks_available_and_keeps_index() {
+        let r = QmdStatusReport::from_query(
+            None,
+            Some(QmdStatus {
+                total_files: Some(5),
+                ..Default::default()
+            }),
+        );
+        assert!(r.qmd_available);
+        assert_eq!(r.index.total_files, Some(5));
+    }
+
+    #[test]
+    fn json_unavailable_qmd_emits_null_index_fields() {
+        // Machine-consumer contract: qmd absent ⇒ qmd_available:false with the
+        // flattened index fields present-but-null (not missing keys).
+        let report = QmdStatusReport::from_query(Some("ob-1".into()), None);
+        let line = format_output(&report, &OutputMode::Json { pretty: false });
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["qmd_available"], false);
+        assert_eq!(v["collection"], "ob-1");
+        assert!(v["total_files"].is_null());
+        assert!(v["pending_embedding"].is_null());
     }
 }

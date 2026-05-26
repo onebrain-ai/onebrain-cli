@@ -273,9 +273,23 @@ pub fn run_init(mut opts: InitOptions) -> Result<InitResult, FsError> {
     };
 
     // ── Step 4: write onebrain.yml ─────────────────────────────────────────
-    onebrain_yml::write_onebrain_yml(&vault_dir, preset)?;
+    // CRITICAL · never clobber an existing config. Re-init (--force or a
+    // confirmed overwrite) exists to (re)register the plugin + complete the
+    // folder/structure scaffold — NOT to reset the config file. Writing the
+    // fresh scaffold here would silently drop user keys the scaffold doesn't
+    // model (`qmd_collection`, custom `checkpoint`/`folders`/`schedule`
+    // values). So when a config already exists we preserve it verbatim; a
+    // vault missing required keys is repaired surgically by `doctor --fix`
+    // (the `onebrain.yml-keys` recipe backfills without dropping keys).
+    if config_exists {
+        stdout(&format!(
+            "{existing_filename}: preserved (existing config left untouched · run `onebrain doctor --fix` to backfill missing keys)"
+        ));
+    } else {
+        onebrain_yml::write_onebrain_yml(&vault_dir, preset)?;
+        stdout(&format!("{CONFIG_FILENAME}: written"));
+    }
     result.vault_yml_written = true;
-    stdout(&format!("{CONFIG_FILENAME}: written"));
 
     // ── Step 5: folders ────────────────────────────────────────────────────
     let n = folders::create_folders(&vault_dir)?;
@@ -624,17 +638,30 @@ mod tests {
     }
 
     #[test]
-    fn force_overwrites_existing_onebrain_yml() {
+    fn force_preserves_existing_onebrain_yml_config() {
+        // CRITICAL data-safety regression guard: `init --force` re-registers
+        // the plugin + completes the folder scaffold but must NEVER clobber an
+        // existing config. The fresh scaffold doesn't model `qmd_collection`
+        // (or custom checkpoint/folders/schedule values), so overwriting would
+        // silently drop them — exactly the bug that lost a user's
+        // `qmd_collection`. Re-init preserves the config verbatim; missing keys
+        // are repaired separately by `doctor --fix`.
         let d = tempdir().unwrap();
-        std::fs::write(d.path().join("onebrain.yml"), "old: value\n").unwrap();
+        let original = "qmd_collection: ob-1-441565\nold: value\n";
+        std::fs::write(d.path().join("onebrain.yml"), original).unwrap();
         let (mut opts, _stdout_buf) = test_opts(d.path());
         opts.force = true;
 
         let r = run_init(opts).unwrap();
         assert!(r.ok);
+        // Config preserved verbatim — custom keys survive.
         let content = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
-        assert!(content.contains("update_channel: stable"));
-        assert!(!content.contains("old:"));
+        assert_eq!(
+            content, original,
+            "init --force must not rewrite the config"
+        );
+        // ...while re-init still did its structural work.
+        assert!(d.path().join("00-inbox").is_dir());
     }
 
     #[test]

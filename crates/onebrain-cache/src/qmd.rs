@@ -1,7 +1,6 @@
 //! qmd MCP server query helpers.
 
 use serde::Serialize;
-use serde_json::Value;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -84,25 +83,21 @@ fn capture_qmd_stdout(args: &[&str], timeout_ms: u64) -> Option<String> {
     }
 }
 
-/// Query `qmd status --json` and extract the `unembedded` count.
+/// Count documents that still need embedding.
 ///
-/// Returns `0` on any error, timeout, missing binary, or unexpected output —
-/// matches Bun v2.3.3 `queryQmdUnembedded` (silent fallback so a missing or
-/// broken qmd never blocks session-init).
+/// Reads the `Pending: N need embedding` figure from `qmd status` via
+/// [`query_status`]. qmd ≤ 2.1.0 ignores `--json` and always prints the
+/// human-readable text, so the v3.0 `--json`-parsing path was effectively
+/// dead (always 0) on real installs; parsing the text form fixes that while
+/// keeping the silent fallback — returns `0` on any error, timeout, missing
+/// binary, or unparseable output so a missing/broken qmd never blocks
+/// session-init.
 ///
-/// Timeout: 2000ms.
+/// Timeout: 2000ms (via `query_status`).
 pub fn query_unembedded_count() -> usize {
-    let Some(stdout_str) = capture_qmd_stdout(&["status", "--json"], QMD_TIMEOUT_MS) else {
-        return 0;
-    };
-    let parsed: Value = match serde_json::from_str(&stdout_str) {
-        Ok(v) => v,
-        Err(_) => return 0,
-    };
-    match parsed.get("unembedded") {
-        Some(v) => v.as_u64().map(|n| n as usize).unwrap_or(0),
-        None => 0,
-    }
+    query_status()
+        .and_then(|s| s.pending_embedding)
+        .unwrap_or(0) as usize
 }
 
 /// Index + embedding health reported by `qmd status`, as parsed from the
@@ -151,17 +146,11 @@ fn non_empty(s: &str) -> Option<String> {
 
 /// Parse the text output of `qmd status` into a [`QmdStatus`].
 ///
-/// Matches on the `Total:` / `Vectors:` / `Pending:` / `Size:` / `Updated:`
-/// line prefixes under the `Documents` block. Defensive: any line that
-/// doesn't match leaves its field `None`.
+/// Matches the `Total:` / `Vectors:` / `Pending:` / `Updated:` prefixes under
+/// the `Documents` block, plus `Size:` under the top-level `Index` block.
+/// Defensive: any line that doesn't match leaves its field `None`.
 fn parse_status(text: &str) -> QmdStatus {
-    let mut status = QmdStatus {
-        total_files: None,
-        embedded_vectors: None,
-        pending_embedding: None,
-        index_size: None,
-        last_updated: None,
-    };
+    let mut status = QmdStatus::default();
     for line in text.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("Total:") {
@@ -194,6 +183,9 @@ mod tests {
         let _ = n;
     }
 
+    // Captured verbatim from `qmd status` on qmd 2.1.0 (the documented/installed
+    // version) — the line prefixes `parse_status` keys on. Re-capture if a future
+    // qmd changes this layout.
     const SAMPLE: &str = "QMD Status\n\
 \n\
 Index: /Users/x/.cache/qmd/index.sqlite\n\
