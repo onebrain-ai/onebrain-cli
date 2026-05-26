@@ -560,12 +560,9 @@ pub(crate) fn emit_plugin_update_summary_to<W: std::io::Write>(
         if let Some(reason) = d.partial_failure {
             s.push_str(&format!("  partial failure  : {reason}\n"));
         }
-        // R2-H1: render soft-warnings under the summary so text-mode users
-        // can see them too. Format: one line per warning, prefixed with the
-        // warning sigil.
-        for w in &e.warnings {
-            s.push_str(&format!("  ⚠ {}: {}\n", w.code, w.message));
-        }
+        // Soft warnings are rendered uniformly by `emit` for all text/table
+        // commands (since v3.2.0) — don't re-render them here or they'd
+        // double-print.
         s
     })
     .context("plugin update: render summary failed")?;
