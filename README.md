@@ -90,7 +90,7 @@ Pick the archive that matches your machine from the [latest release](https://git
 | [![Windows](https://img.shields.io/badge/Windows-0078D4?logo=windows&logoColor=white&style=flat)](https://github.com/onebrain-ai/onebrain-cli/releases/latest/download/onebrain-aarch64-pc-windows-msvc.zip) | ARM64 | `onebrain-aarch64-pc-windows-msvc.zip` |
 | [![Windows](https://img.shields.io/badge/Windows-0078D4?logo=windows&logoColor=white&style=flat)](https://github.com/onebrain-ai/onebrain-cli/releases/latest/download/onebrain-x86_64-pc-windows-msvc.zip) | x86_64 | `onebrain-x86_64-pc-windows-msvc.zip` |
 
-**Click a platform badge to download that file from the latest release.** Each archive ships with a matching `.sha256` for manual verification. Filenames use canonical Rust target triples, so `cargo-binstall` and custom installer scripts pick them up unmodified.
+**Click a platform badge to download that file from the latest release.** Each archive ships with a matching `.sha256` for manual verification. Filenames use canonical Rust target triples, so installer scripts can parse them unmodified.
 
 ```bash
 # Manual install (any Unix)
@@ -106,7 +106,6 @@ sudo install onebrain /usr/local/bin/
 |---|---|---|
 | **Homebrew** (macOS, canonical) | `brew install onebrain-ai/onebrain/onebrain` | Formula at [`onebrain-ai/homebrew-onebrain`](https://github.com/onebrain-ai/homebrew-onebrain), bumped on every tag. |
 | **npm wrapper** | `npm install -g @onebrain-ai/cli` | Source at [`npm-wrapper/`](npm-wrapper/); CI publishes on every stable tag via npm Trusted Publishers + `--provenance`. Verifies the release SHA-256 before extracting. |
-| **cargo-binstall** | `cargo binstall onebrain-cli` | Resolves the canonical target triple from the GitHub Release assets. |
 | **Direct download** | table above | Pick your triple, drop the binary on `PATH`. |
 
 All channels resolve to the same per-platform binary published in the matching GitHub Release.

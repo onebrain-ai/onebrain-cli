@@ -32,7 +32,7 @@ If auto-detection misfires, override it: `ONEBRAIN_CLI_LIBC=glibc|musl` or `ONEB
 ## Other install paths
 
 - **Homebrew** (macOS, canonical) — `brew install onebrain-ai/onebrain/onebrain`
-- **Direct download / `cargo-binstall`** — see the [latest release](https://github.com/onebrain-ai/onebrain-cli/releases/latest)
+- **Direct download** — grab the binary for your platform from the [latest release](https://github.com/onebrain-ai/onebrain-cli/releases/latest)
 - **Self-update** once installed — `onebrain update` (Homebrew installs delegate to `brew upgrade`)
 
 All paths resolve to the same per-platform binary — see the [repo README](https://github.com/onebrain-ai/onebrain-cli#install) for the full comparison.
