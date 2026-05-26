@@ -30,8 +30,8 @@
 ---
 
 ```text
-░█▀█░█▀█░█▀▀░█▀▄░█▀▄░█▀█░▀█▀░█▀█      One in gray, Brain in OneBrain pink (#ff2d92) —
-░█░█░█░█░█▀▀░█▀▄░█▀▄░█▀█░░█░░█░█      the wordmark that greets every interactive session.
+░█▀█░█▀█░█▀▀░█▀▄░█▀▄░█▀█░▀█▀░█▀█
+░█░█░█░█░█▀▀░█▀▄░█▀▄░█▀█░░█░░█░█
  ▀▀▀ ▀ ▀ ▀▀▀ ▀▀  ▀ ▀ ▀ ▀ ▀▀▀ ▀ ▀
 Your AI Thinking Partner · v3.1.2
 ```
@@ -85,17 +85,17 @@ Pick the archive that matches your machine from the [latest release](https://git
 
 | Platform | Architecture | File |
 |---|---|---|
-| ![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white&style=flat) | Apple Silicon (M1–M5) | `onebrain-aarch64-apple-darwin.tar.gz` |
-| ![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white&style=flat) | Intel | `onebrain-x86_64-apple-darwin.tar.gz` |
-| ![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat) | ARM64 (glibc · Pi 3/4/5 64-bit OS · Pi Zero 2 W) | `onebrain-aarch64-unknown-linux-gnu.tar.gz` |
-| ![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat) | ARMv7 32-bit (Pi 2 v1.1+ · Pi 3/4/5 32-bit OS) | `onebrain-armv7-unknown-linux-gnueabihf.tar.gz` |
-| ![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat) | ARMv6 32-bit (Pi 1 · Pi Zero · Pi Zero W) | `onebrain-arm-unknown-linux-gnueabihf.tar.gz` |
-| ![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat) | x86_64 (glibc) | `onebrain-x86_64-unknown-linux-gnu.tar.gz` |
-| ![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat) | x86_64 (musl / Alpine / static) | `onebrain-x86_64-unknown-linux-musl.tar.gz` |
-| ![Windows](https://img.shields.io/badge/Windows-0078D4?logo=windows&logoColor=white&style=flat) | ARM64 | `onebrain-aarch64-pc-windows-msvc.zip` |
-| ![Windows](https://img.shields.io/badge/Windows-0078D4?logo=windows&logoColor=white&style=flat) | x86_64 | `onebrain-x86_64-pc-windows-msvc.zip` |
+| [![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white&style=flat)](https://github.com/onebrain-ai/onebrain-cli/releases/latest/download/onebrain-aarch64-apple-darwin.tar.gz) | Apple Silicon (M1–M5) | `onebrain-aarch64-apple-darwin.tar.gz` |
+| [![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white&style=flat)](https://github.com/onebrain-ai/onebrain-cli/releases/latest/download/onebrain-x86_64-apple-darwin.tar.gz) | Intel | `onebrain-x86_64-apple-darwin.tar.gz` |
+| [![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat)](https://github.com/onebrain-ai/onebrain-cli/releases/latest/download/onebrain-aarch64-unknown-linux-gnu.tar.gz) | ARM64 (glibc · Pi 3/4/5 64-bit OS · Pi Zero 2 W) | `onebrain-aarch64-unknown-linux-gnu.tar.gz` |
+| [![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat)](https://github.com/onebrain-ai/onebrain-cli/releases/latest/download/onebrain-armv7-unknown-linux-gnueabihf.tar.gz) | ARMv7 32-bit (Pi 2 v1.1+ · Pi 3/4/5 32-bit OS) | `onebrain-armv7-unknown-linux-gnueabihf.tar.gz` |
+| [![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat)](https://github.com/onebrain-ai/onebrain-cli/releases/latest/download/onebrain-arm-unknown-linux-gnueabihf.tar.gz) | ARMv6 32-bit (Pi 1 · Pi Zero · Pi Zero W) | `onebrain-arm-unknown-linux-gnueabihf.tar.gz` |
+| [![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat)](https://github.com/onebrain-ai/onebrain-cli/releases/latest/download/onebrain-x86_64-unknown-linux-gnu.tar.gz) | x86_64 (glibc) | `onebrain-x86_64-unknown-linux-gnu.tar.gz` |
+| [![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black&style=flat)](https://github.com/onebrain-ai/onebrain-cli/releases/latest/download/onebrain-x86_64-unknown-linux-musl.tar.gz) | x86_64 (musl / Alpine / static) | `onebrain-x86_64-unknown-linux-musl.tar.gz` |
+| [![Windows](https://img.shields.io/badge/Windows-0078D4?logo=windows&logoColor=white&style=flat)](https://github.com/onebrain-ai/onebrain-cli/releases/latest/download/onebrain-aarch64-pc-windows-msvc.zip) | ARM64 | `onebrain-aarch64-pc-windows-msvc.zip` |
+| [![Windows](https://img.shields.io/badge/Windows-0078D4?logo=windows&logoColor=white&style=flat)](https://github.com/onebrain-ai/onebrain-cli/releases/latest/download/onebrain-x86_64-pc-windows-msvc.zip) | x86_64 | `onebrain-x86_64-pc-windows-msvc.zip` |
 
-Each archive ships with a matching `.sha256` for manual verification. Filenames use canonical Rust target triples, so `cargo-binstall` and custom installer scripts pick them up unmodified.
+**Click a platform badge to download that file from the latest release.** Each archive ships with a matching `.sha256` for manual verification. Filenames use canonical Rust target triples, so `cargo-binstall` and custom installer scripts pick them up unmodified.
 
 ```bash
 # Manual install (any Unix)
