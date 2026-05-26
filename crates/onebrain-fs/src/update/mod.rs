@@ -9,9 +9,10 @@
 //!      "nothing to do" non-TTY line.
 //!   4. Otherwise, install via `bun install -g @onebrain-ai/cli@<v>` (Unix)
 //!      or PowerShell-wrapped `npm install` (Windows).
-//!   5. Validate by spawning `onebrain --version` and checking the regex
-//!      `v\d+\.\d+` against stdout (ATOMIC GATE — install without validate
-//!      counts as failure).
+//!   5. Validate by spawning `onebrain --version` and confirming the binary on
+//!      PATH reports a version `>=` the one just installed (ATOMIC GATE —
+//!      install without a passing validate counts as failure). The reported
+//!      version may be bare (`onebrain 3.1.4`, clap) or `v`-prefixed (Bun-era).
 //!
 //! All four external IO surfaces are injectable through `UpdateOptions` so
 //! the unit + integration tests run offline. Defaults call out to the real
@@ -63,7 +64,10 @@ pub struct ReleaseInfo {
 /// `validateBinaryFn`, and `currentVersionFn` injection points.
 pub type FetchFn = Box<dyn Fn() -> Result<ReleaseInfo, UpdateError> + Send + Sync>;
 pub type InstallFn = Box<dyn Fn(&str) -> Result<(), UpdateError> + Send + Sync>;
-pub type ValidateFn = Box<dyn Fn() -> bool + Send + Sync>;
+/// Validates the post-install binary. Receives the just-installed version so it
+/// can confirm the `onebrain` on PATH actually reports it; returns `Err(reason)`
+/// with a specific, user-actionable failure message.
+pub type ValidateFn = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 pub type CurrentVersionFn = Box<dyn Fn() -> CurrentVersion + Send + Sync>;
 type LineSink = Box<dyn FnMut(&str) + Send>;
 
@@ -413,14 +417,53 @@ pub fn version_at_least(current: &str, candidate: &str) -> bool {
     }
 }
 
-/// Real `defaultValidateBinary` — spawn `onebrain --version`, expect a match
-/// against `v\d+\.\d+`. Any failure returns `false` (matches Bun's
-/// catch-all-and-return-false pattern).
-pub fn default_validate_binary() -> bool {
+/// Validate that the `onebrain` now on PATH is the version we just installed.
+///
+/// Spawns `onebrain --version` and parses the reported version (clap prints
+/// `onebrain X.Y.Z` — no `v` prefix; the Bun-era CLI printed `vX.Y.Z`). A bare
+/// "it runs and prints a version" check is insufficient: a no-op `brew upgrade`,
+/// or a PATH that resolves a *different* install than the one just swapped,
+/// would pass silently (the dual-install divergence). We therefore require the
+/// reported version to be `>= expected` — the release we just installed.
+///
+/// Returns `Err(reason)` with a specific, actionable message on any failure
+/// (spawn/exec error, unparseable output, or a stale version on PATH), so the
+/// caller can surface *why* instead of a blanket "Check PATH".
+pub fn default_validate_binary(expected: &str) -> Result<(), String> {
     let cmd = build_version_command(cfg!(windows));
-    spawn_version_command(&cmd)
-        .map(|stdout| version_regex_matches(stdout.trim()))
-        .unwrap_or(false)
+    let stdout = spawn_version_command(&cmd).map_err(|e| match e {
+        UpdateError::Spawn { source, .. } => format!(
+            "could not run `onebrain --version` after install ({source}) — is the new binary on your PATH?"
+        ),
+        other => format!("validation command failed: {other}"),
+    })?;
+    validate_reported(stdout.trim(), expected)
+}
+
+/// Pure core of [`default_validate_binary`]: confirm the trimmed `onebrain
+/// --version` output (`reported`) names a version `>= expected`. Split out so
+/// the stale / unparseable / mismatch branches are unit-testable without
+/// spawning a process.
+fn validate_reported(reported: &str, expected: &str) -> Result<(), String> {
+    // `expected` is the just-installed release tag. If it is not semver-shaped,
+    // `version_at_least` would silently fall back to string equality and weaken
+    // the gate — reject it loudly instead of degrading.
+    if semver::Version::parse(expected.trim_start_matches('v')).is_err() {
+        return Err(format!(
+            "internal: unparseable expected version {expected:?}"
+        ));
+    }
+    let found = extract_version_token(reported).ok_or_else(|| {
+        format!("`onebrain --version` printed no recognizable version: {reported:?}")
+    })?;
+    if version_at_least(&found, expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "PATH onebrain reports {found}, but {expected} was just installed — \
+             the upgrade may not have taken effect (check `which onebrain`)"
+        ))
+    }
 }
 
 /// Real `defaultCurrentVersion` — returns the in-process version via the
@@ -434,8 +477,9 @@ pub fn default_validate_binary() -> bool {
 /// code path spawns anymore.
 pub fn default_current_version() -> CurrentVersion {
     CurrentVersion {
-        // Cargo strips any leading "v"; prepend it back so the output format
-        // matches Bun's `v\d+\.\d+` shape exactly.
+        // Cargo strips any leading "v"; prepend it back for display
+        // consistency with the historical `vX.Y.Z` format. (The update
+        // validator accepts both `v`-prefixed and bare versions.)
         version: format!("v{}", env!("CARGO_PKG_VERSION")),
         published_at: None,
     }
@@ -483,32 +527,58 @@ fn spawn_version_command(argv: &[String]) -> Result<String, UpdateError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Bun regex `/v\d+\.\d+/` — anchor-free, matches mid-string.
-pub fn version_regex_matches(s: &str) -> bool {
+/// Extract the first `v?\d+\.\d+...` version token from `s`, returned verbatim
+/// (leading `v` kept if present — [`version_at_least`] strips it before
+/// semver-parsing). Unlike [`extract_version_prefix`] (Bun, requires a literal
+/// `v`), this accepts clap's bare `onebrain X.Y.Z` output.
+///
+/// The leading `v` is **optional** because the Rust/clap binary prints
+/// `onebrain 3.1.4` (no `v`), whereas the Bun-era CLI printed `v3.1.4`.
+/// Requiring the `v` is what made every genuine upgrade fail validation with
+/// "Binary validation failed. Check PATH." even though the install succeeded
+/// (fixed v3.1.5).
+pub fn extract_version_token(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'v' {
-            // require at least one digit, then '.', then at least one digit
-            let mut j = i + 1;
-            let start = j;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
+        let start = i;
+        let digits_start = if bytes[i] == b'v' { i + 1 } else { i };
+        let mut j = digits_start;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        // Anchor on `\d+\.\d` (at least major.minor).
+        if j > digits_start
+            && j + 1 < bytes.len()
+            && bytes[j] == b'.'
+            && bytes[j + 1].is_ascii_digit()
+        {
+            let mut k = j;
+            while k < bytes.len() && (bytes[k].is_ascii_digit() || bytes[k] == b'.') {
+                k += 1;
             }
-            if j > start && j < bytes.len() && bytes[j] == b'.' {
-                let after_dot = j + 1;
-                let mut k = after_dot;
-                while k < bytes.len() && bytes[k].is_ascii_digit() {
+            // Optional `-prerelease` / `+build` semver tail.
+            if k < bytes.len() && (bytes[k] == b'-' || bytes[k] == b'+') {
+                k += 1;
+                while k < bytes.len()
+                    && (bytes[k].is_ascii_alphanumeric() || matches!(bytes[k], b'.' | b'-' | b'+'))
+                {
                     k += 1;
                 }
-                if k > after_dot {
-                    return true;
-                }
             }
+            return Some(String::from_utf8_lossy(&bytes[start..k]).into_owned());
         }
         i += 1;
     }
-    false
+    None
+}
+
+/// True when `s` contains a `v?\d+\.\d+` version token (see
+/// [`extract_version_token`], the single source of truth for what counts as a
+/// version). The leading `v` is optional so clap's `onebrain X.Y.Z` output
+/// validates as well as the Bun-era `vX.Y.Z`.
+pub fn version_regex_matches(s: &str) -> bool {
+    extract_version_token(s).is_some()
 }
 
 /// Bun `/v[\d.]+/.exec(stdout)?.[0]` — first match. Match `v` followed by
@@ -661,13 +731,16 @@ pub fn run_update(mut opts: UpdateOptions) -> UpdateResult {
         &format!("upgrading: @onebrain-ai/cli {} installed", release.version),
     );
 
-    // Step 4 — atomic gate: validate
-    let valid = match opts.validate_fn.as_ref() {
-        Some(f) => f(),
-        None => default_validate_binary(),
+    // Step 4 — atomic gate: validate the binary now on PATH is the version we
+    // just installed. A bare "it runs and prints a version" check is not enough
+    // — a no-op `brew upgrade`, or a PATH resolving a *different* install, would
+    // otherwise pass silently (the dual-install divergence).
+    let validation = match opts.validate_fn.as_ref() {
+        Some(f) => f(&release.version),
+        None => default_validate_binary(&release.version),
     };
-    if !valid {
-        let msg = "Binary validation failed. Check PATH.".to_string();
+    if let Err(reason) = validation {
+        let msg = format!("Binary validation failed: {reason}");
         result.error = Some(msg.clone());
         result.exit_code = 1;
         write_stderr(&mut opts, &format!("update: {msg}"));
@@ -745,9 +818,9 @@ mod tests {
                 install_calls_c.lock().unwrap().push(v.to_string());
                 Ok(())
             })),
-            validate_fn: Some(Box::new(move || {
+            validate_fn: Some(Box::new(move |_| {
                 *validate_calls_c.lock().unwrap() += 1;
-                true
+                Ok(())
             })),
             current_version_fn: Some(current("v1.10.18")),
             stdout_lines: Some(stdout_sink),
@@ -781,9 +854,9 @@ mod tests {
                 *install_called_c.lock().unwrap() = true;
                 Ok(())
             })),
-            validate_fn: Some(Box::new(move || {
+            validate_fn: Some(Box::new(move |_| {
                 *validate_called_c.lock().unwrap() = true;
-                true
+                Ok(())
             })),
             current_version_fn: Some(current("v1.10.18")),
             ..Default::default()
@@ -806,7 +879,7 @@ mod tests {
                 *install_called_c.lock().unwrap() = true;
                 Ok(())
             })),
-            validate_fn: Some(Box::new(|| true)),
+            validate_fn: Some(Box::new(|_| Ok(()))),
             current_version_fn: Some(current("v2.0.0")),
             stdout_lines: Some(stdout_sink),
             ..Default::default()
@@ -856,11 +929,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_failure_exits_1_with_path_hint() {
+    fn validate_failure_exits_1_with_specific_reason() {
         let opts = UpdateOptions {
             fetch_fn: Some(mock_fetch("v2.0.0")),
             install_fn: Some(Box::new(|_| Ok(()))),
-            validate_fn: Some(Box::new(|| false)),
+            validate_fn: Some(Box::new(|_| Err("simulated stale binary".to_string()))),
             current_version_fn: Some(current("v1.10.18")),
             stderr_lines: Some(Box::new(|_| {})),
             ..Default::default()
@@ -870,7 +943,7 @@ mod tests {
         assert_eq!(result.exit_code, 1);
         assert_eq!(
             result.error.as_deref(),
-            Some("Binary validation failed. Check PATH.")
+            Some("Binary validation failed: simulated stale binary")
         );
     }
 
@@ -884,7 +957,7 @@ mod tests {
                 *install_called_c.lock().unwrap() = true;
                 Ok(())
             })),
-            validate_fn: Some(Box::new(|| true)),
+            validate_fn: Some(Box::new(|_| Ok(()))),
             current_version_fn: Some(Box::new(|| CurrentVersion {
                 version: "unknown".to_string(),
                 published_at: None,
@@ -908,9 +981,102 @@ mod tests {
             "OneBrain v2.0.7 — released 2026-04-26"
         ));
         assert!(version_regex_matches("v3.0"));
+        // Bare versions (no `v`) now match — this is the v3.1.5 fix: clap's
+        // `onebrain 3.1.4` output must validate.
+        assert!(version_regex_matches("2.0.7"));
+        // Still rejected: a single component (no `.minor`) and empty input.
         assert!(!version_regex_matches("v2"));
-        assert!(!version_regex_matches("2.0.7"));
+        assert!(!version_regex_matches("3"));
         assert!(!version_regex_matches(""));
+    }
+
+    #[test]
+    fn validates_clap_style_version_output() {
+        // Regression (v3.1.5): the Rust/clap binary prints `onebrain 3.1.4` —
+        // NO leading `v` — whereas the validator required Bun's `v`-prefixed
+        // shape. The mismatch made EVERY genuine upgrade report "Binary
+        // validation failed. Check PATH." even though the install succeeded.
+        assert!(version_regex_matches("onebrain 3.1.4"));
+        assert!(version_regex_matches("3.1.4"));
+        // A bare two-component version (what a future `--version` trim could
+        // yield) must also pass.
+        assert!(version_regex_matches("3.1"));
+    }
+
+    #[test]
+    fn extract_version_token_handles_clap_and_bun_output() {
+        // clap's bare `{bin} {version}` — the real post-install output.
+        assert_eq!(
+            extract_version_token("onebrain 3.1.5").as_deref(),
+            Some("3.1.5")
+        );
+        // Bun-era `v`-prefixed form still works.
+        assert_eq!(extract_version_token("v2.0.0").as_deref(), Some("v2.0.0"));
+        // Prerelease/build tail is captured (semver-comparable downstream).
+        assert_eq!(
+            extract_version_token("OneBrain v3.0.0-alpha.1 — released 2026-04-26").as_deref(),
+            Some("v3.0.0-alpha.1")
+        );
+        // No version-shaped token.
+        assert_eq!(extract_version_token("no version here"), None);
+        assert_eq!(extract_version_token("v2"), None);
+    }
+
+    #[test]
+    fn validate_reported_accepts_matching_or_newer() {
+        // clap's real output for the just-installed version.
+        assert!(validate_reported("onebrain 3.1.5", "v3.1.5").is_ok());
+        // A binary newer than the advertised release is fine (no downgrade).
+        assert!(validate_reported("onebrain 3.2.0", "v3.1.5").is_ok());
+        // The most common real shape — a patch bump.
+        assert!(validate_reported("onebrain 3.1.6", "v3.1.5").is_ok());
+    }
+
+    #[test]
+    fn validate_reported_rejects_stale_version_on_path() {
+        // The silent-pass case: install "succeeded" but PATH still resolves the
+        // old binary (no-op brew upgrade / shadowing install).
+        let err = validate_reported("onebrain 3.1.4", "v3.1.5").unwrap_err();
+        assert!(err.contains("3.1.4") && err.contains("3.1.5"), "{err}");
+        assert!(err.contains("which onebrain"), "{err}");
+    }
+
+    #[test]
+    fn validate_reported_rejects_unparseable_output() {
+        let err = validate_reported("totally not a version", "v3.1.5").unwrap_err();
+        assert!(err.contains("no recognizable version"), "{err}");
+    }
+
+    #[test]
+    fn validate_reported_rejects_unparseable_expected() {
+        // Guards against version_at_least silently degrading to string-equality
+        // when the release tag is malformed.
+        let err = validate_reported("onebrain 3.1.5", "latest").unwrap_err();
+        assert!(err.contains("expected version"), "{err}");
+    }
+
+    #[test]
+    fn gate_passes_just_installed_version_to_validator() {
+        // Wiring guard: the gate must hand the validator the version it just
+        // installed (`release.version`), not the current version — otherwise a
+        // no-op would validate against itself and pass. A regression swapping
+        // `&release.version` → `&current.version` would pass every other test.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let seen_c = seen.clone();
+        let opts = UpdateOptions {
+            fetch_fn: Some(mock_fetch("v2.0.0")),
+            install_fn: Some(Box::new(|_| Ok(()))),
+            validate_fn: Some(Box::new(move |expected| {
+                *seen_c.lock().unwrap() = Some(expected.to_string());
+                Ok(())
+            })),
+            current_version_fn: Some(current("v1.10.18")),
+            stderr_lines: Some(Box::new(|_| {})),
+            ..Default::default()
+        };
+        let result = run_update(opts);
+        assert!(result.ok);
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("v2.0.0"));
     }
 
     #[test]

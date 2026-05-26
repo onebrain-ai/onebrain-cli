@@ -142,3 +142,23 @@ fn update_network_unreachable_exits_1() {
         .code(1)
         .stderr(predicate::str::contains("Fetch failed"));
 }
+
+/// Regression guard for the v3.1.5 bug class: the original false-negative
+/// shipped because the real `onebrain --version` output (clap's `onebrain
+/// X.Y.Z`, no `v` prefix) was never run through the validator — only an
+/// injected mock was. Pin the real binary's output against the matcher so a
+/// future clap format drift fails loudly here instead of in users' updates.
+#[test]
+fn real_binary_version_output_passes_update_validator() {
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "`onebrain --version` exited non-zero");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        onebrain_fs::update::version_regex_matches(stdout.trim()),
+        "real `onebrain --version` output {stdout:?} no longer passes the update validator"
+    );
+}
