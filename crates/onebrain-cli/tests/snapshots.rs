@@ -21,6 +21,11 @@ fn run_json(args: &[&str], dir: &std::path::Path) -> Value {
     let output = Command::cargo_bin("onebrain")
         .unwrap()
         .args(args)
+        // Scrub PATH so the spawned `qmd` probe finds nothing → the unembedded
+        // count degrades to a deterministic 0. Without this the snapshot reads
+        // the dev machine's live qmd index (non-hermetic · fails wherever qmd
+        // is installed). Mirrors the qmd-scrub other binary tests already use.
+        .env("PATH", "/usr/bin:/bin")
         .current_dir(dir)
         .output()
         .expect("spawn failed");
