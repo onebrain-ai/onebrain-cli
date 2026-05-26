@@ -5,64 +5,50 @@ npm wrapper for the [OneBrain CLI](https://github.com/onebrain-ai/onebrain-cli) 
 ```bash
 npm install -g @onebrain-ai/cli
 onebrain --version
-# → onebrain 3.0.0
 ```
 
-## What this package does
+> **This package is a thin installer.** On install, `postinstall.js` downloads the matching platform-native binary from the corresponding [GitHub Release](https://github.com/onebrain-ai/onebrain-cli/releases), verifies its SHA-256, and stages it at `./bin/onebrain` (`onebrain.exe` on Windows); the `onebrain` command is a small Node shim that execs the native binary.
+>
+> 📖 **Full documentation** — install paths, the command tree, output modes, architecture, and roadmap — lives in the **[repo README](https://github.com/onebrain-ai/onebrain-cli#readme)**.
 
-On install, the `postinstall.js` script downloads the platform-native binary from the matching [GitHub Release](https://github.com/onebrain-ai/onebrain-cli/releases) and places it at `./bin/onebrain` (or `onebrain.exe` on Windows). The `onebrain` command is a thin Node shim that execs the native binary.
+## Supported platforms
 
-| Host | Binary downloaded |
+The postinstall auto-detects your host and pulls the matching binary. On Linux it detects libc (glibc vs musl) and 32-bit ARM version (ARMv6 vs ARMv7) at install time — every Raspberry Pi from Pi 1 to Pi 5 is covered.
+
+| Host | Binary |
 |---|---|
-| macOS Apple Silicon | `onebrain-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `onebrain-x86_64-apple-darwin.tar.gz` |
-| Linux ARM64 (glibc) | `onebrain-aarch64-unknown-linux-gnu.tar.gz` |
-| Linux x86_64 (glibc) | `onebrain-x86_64-unknown-linux-gnu.tar.gz` |
-| Windows ARM64 | `onebrain-aarch64-pc-windows-msvc.zip` |
-| Windows x86_64 | `onebrain-x86_64-pc-windows-msvc.zip` |
+| macOS · Apple Silicon (M1–M5) | `onebrain-aarch64-apple-darwin.tar.gz` |
+| macOS · Intel | `onebrain-x86_64-apple-darwin.tar.gz` |
+| Linux · ARM64 glibc (Pi 3/4/5 64-bit OS · Pi Zero 2 W) | `onebrain-aarch64-unknown-linux-gnu.tar.gz` |
+| Linux · ARMv7 32-bit (Pi 2 v1.1+ · Pi 3/4/5 32-bit OS) | `onebrain-armv7-unknown-linux-gnueabihf.tar.gz` |
+| Linux · ARMv6 32-bit (Pi 1 · Pi Zero · Pi Zero W) | `onebrain-arm-unknown-linux-gnueabihf.tar.gz` |
+| Linux · x86_64 glibc | `onebrain-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux · x86_64 musl / Alpine | `onebrain-x86_64-unknown-linux-musl.tar.gz` |
+| Windows · ARM64 | `onebrain-aarch64-pc-windows-msvc.zip` |
+| Windows · x86_64 | `onebrain-x86_64-pc-windows-msvc.zip` |
 
-Linux musl users — install directly from GitHub Releases (musl binary is published there but the npm wrapper currently maps glibc).
+If auto-detection misfires, override it: `ONEBRAIN_CLI_LIBC=glibc|musl` or `ONEBRAIN_CLI_ARM=v6|v7` before `npm install`. (Note: only `x86_64` musl is published — `arm64` musl hosts should use a glibc base or build from source.)
 
-## Alternative install paths
+## Other install paths
 
-```bash
-# Homebrew (macOS / Linux)
-brew tap onebrain-ai/onebrain
-brew install onebrain
+- **Homebrew** (macOS, canonical) — `brew install onebrain-ai/onebrain/onebrain`
+- **Direct download** — grab the binary for your platform from the [latest release](https://github.com/onebrain-ai/onebrain-cli/releases/latest)
+- **Self-update** once installed — `onebrain update` (Homebrew installs delegate to `brew upgrade`)
 
-# Direct GitHub Release download
-curl -L https://github.com/onebrain-ai/onebrain-cli/releases/latest
+All paths resolve to the same per-platform binary — see the [repo README](https://github.com/onebrain-ai/onebrain-cli#install) for the full comparison.
 
-# In-place self-update once installed
-onebrain update
-```
+## Skipping postinstall (CI)
 
-The npm wrapper, Homebrew formula, and direct GH Release download all converge on the same binary — pick the one that fits your environment.
-
-## Skipping postinstall
-
-For CI environments that supply the binary out-of-band, set `ONEBRAIN_CLI_SKIP_POSTINSTALL=1` before `npm install`:
+For environments that supply the binary out-of-band:
 
 ```bash
 ONEBRAIN_CLI_SKIP_POSTINSTALL=1 npm install -g @onebrain-ai/cli
 ```
 
-The shim still runs but exits with `command not found` (127) until the binary is staged at `node_modules/@onebrain-ai/cli/bin/onebrain`.
+The shim runs but exits `127` until the binary is staged at `node_modules/@onebrain-ai/cli/bin/onebrain`.
 
-## Migration from v2.x
+## Releasing & license
 
-This is the first v3 release on npm. v2.x was the TypeScript/Bun implementation and is now deprecated — use this v3 package going forward. See the [v3.0.0 CHANGELOG](https://github.com/onebrain-ai/onebrain-cli/blob/main/CHANGELOG.md) for the full migration story.
+Source lives at [`npm-wrapper/`](https://github.com/onebrain-ai/onebrain-cli/tree/main/npm-wrapper). CI publishes on each stable `vMAJOR.MINOR.PATCH` tag via npm Trusted Publishers (OIDC, no long-lived token) with `--provenance` for a Sigstore attestation — never published manually, and prerelease tags (containing `-`) are skipped. The wrapper version always equals the binary release version.
 
-## Releasing
-
-Source for this package lives at `npm-wrapper/` in the [`onebrain-ai/onebrain-cli`](https://github.com/onebrain-ai/onebrain-cli) repository. Publishes happen automatically from the `npm-publish` job in `.github/workflows/release.yml` whenever a stable `vMAJOR.MINOR.PATCH` tag is pushed:
-
-1. The job uses npm Trusted Publishers (OIDC `id-token: write`) — there is no long-lived `NPM_TOKEN` secret to rotate.
-2. `npm version "$VERSION" --no-git-tag-version --allow-same-version` rewrites `package.json` to match the git tag, so the wrapper version always equals the binary release version.
-3. `npm publish --access public --provenance` ships the package with a Sigstore attestation linking it to the exact workflow run and commit.
-
-Tags containing `-` (e.g. `v3.0.1-rc.1`) are treated as prereleases and skip the npm publish step. Do not publish this package manually from a local clone — the trusted-publisher policy only honors publishes that originate from this workflow.
-
-## License
-
-[AGPL-3.0-only](LICENSE) — matches the upstream CLI binary. If you make a modified version available to users over a network (AGPL §13 — SaaS, internal APIs, any networked interaction), you must release your modifications under the same license. For commercial licensing inquiries, contact [hello@onebrain.run](mailto:hello@onebrain.run).
+[AGPL-3.0-only](https://github.com/onebrain-ai/onebrain-cli/blob/main/LICENSE), matching the upstream CLI binary. For commercial licensing, contact [hello@onebrain.run](mailto:hello@onebrain.run).
