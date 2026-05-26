@@ -49,7 +49,7 @@ Point an AI agent at a vault and it improvises — a different pile of `grep` / 
 
 ## Status
 
-**v3.1.4 — stable & production-ready, in active maintenance.** GA since v3.0.0 (2026-05-22), shipping ~weekly themed minors. Version history + direction in the [Roadmap](#roadmap); full detail in [CHANGELOG.md](CHANGELOG.md).
+**v3.1.5 — stable & production-ready, in active maintenance.** GA since v3.0.0 (2026-05-22), shipping ~weekly themed minors. Version history + direction in the [Roadmap](#roadmap); full detail in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quickstart
 
@@ -61,7 +61,7 @@ brew install onebrain-ai/onebrain/onebrain
 
 # 2. Verify
 onebrain --version
-# → onebrain 3.1.4
+# → onebrain 3.1.5
 
 # 3. Scaffold a vault and let init pull the OneBrain plugin
 mkdir my-vault && cd my-vault
@@ -237,6 +237,7 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
 - [x] **v3.1.2** — `onebrain qmd embed` implemented.
 - [x] **v3.1.3** — `schedule register` dual-reads `onebrain.yml`.
 - [x] **v3.1.4** — Self-update hardening: SHA-256 verification of the downloaded binary before swap + Homebrew-aware `onebrain update` (delegates to `brew upgrade`). Cosign/signature verification remains a follow-up.
+- [x] **v3.1.5** — `onebrain update` validation fix: accepts clap's bare `--version` output (was a false "Binary validation failed" on every upgrade) and now confirms the on-PATH binary reports the just-installed version (catches no-op `brew upgrade` / PATH shadowing) with specific failure messages.
 
 ### 🚧 Phase 1 · perceptual speed + skill alignment (v3.2–v3.7)
 - [ ] **v3.2** — `note` resource group (`search` · `list` · `find` · `read` · `append` · `new` · `move` · `archive` · `backlinks` · `orphans` · `stat`) — native vault note ops that replace ad-hoc `grep` / `ls` / `find`.
