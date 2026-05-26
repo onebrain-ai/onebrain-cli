@@ -590,9 +590,8 @@ pub enum NoteVerb {
     /// List orphan notes (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     Orphans,
-    /// Print note statistics (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Stat { path: PathBuf },
+    /// Print note statistics (line/word/char counts, headings, links, tasks).
+    Stat(NoteStatArgs),
 }
 
 #[derive(Args, Debug)]
@@ -655,6 +654,12 @@ pub struct NoteReadArgs {
     /// Max lines when reading the body (0 = unlimited).
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteStatArgs {
+    /// Note path, relative to the vault root.
+    pub path: PathBuf,
 }
 
 // ─────────────────────────────────────────────────────────────────────────

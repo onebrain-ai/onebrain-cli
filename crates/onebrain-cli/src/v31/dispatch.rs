@@ -386,9 +386,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             NoteVerb::Orphans => {
                 stubs::not_implemented_vault_required(vault_flag.clone(), "note orphans")
             }
-            NoteVerb::Stat { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "note stat")
-            }
+            NoteVerb::Stat(args) => commands::note_stat::run(vault_flag.clone(), &mode, &args),
         },
         Cmd::Pause(PauseCmd { verb }) => match verb {
             PauseVerb::List => {

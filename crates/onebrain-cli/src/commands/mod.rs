@@ -7,6 +7,7 @@ pub mod note_find;
 pub mod note_list;
 pub mod note_read;
 pub mod note_search;
+pub mod note_stat;
 pub mod orphan_scan;
 pub mod qmd_embed;
 pub mod qmd_reindex;
