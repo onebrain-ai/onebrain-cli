@@ -4,7 +4,7 @@ default-members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "3.1.3"
+version = "3.1.4"
 edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["OneBrain Contributors"]
@@ -44,6 +44,9 @@ semver    = "1"
 
 # HTTP client (Slice 11 · update · GitHub releases API · Slice 13 · vault-sync tarball)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+
+# SHA-256 verification of the self-update binary (v3.1.4 · onebrain-fs update install path)
+sha2 = "0.10"
 
 # Regex (Slice 8 scheduler · cron + at field validation · pre-compiled with OnceLock)
 regex     = "1"

@@ -117,6 +117,12 @@ pub enum UpdateError {
     #[error("install: {0}")]
     Install(String),
 
+    /// The downloaded archive failed SHA-256 verification, or the published
+    /// `.sha256` could not be fetched/parsed. The binary is never swapped in
+    /// when this fires — an unverifiable asset is treated as a failed update.
+    #[error("checksum: {0}")]
+    Checksum(String),
+
     #[error("Binary install failed (exit {exit_code}): {stderr}")]
     InstallBinary { exit_code: i32, stderr: String },
 
@@ -378,7 +384,13 @@ pub fn parse_release_payload(json: &serde_json::Value) -> Result<ReleaseInfo, Up
 pub fn default_install_binary(version: &str) -> Result<(), UpdateError> {
     let current_exe = std::env::current_exe()
         .map_err(|e| UpdateError::Install(format!("could not resolve current binary path: {e}")))?;
-    install::fetch_and_swap_binary(version, &current_exe)
+    match install::detect_install_channel(&current_exe) {
+        // Homebrew-managed installs live in the Cellar behind a `brew` symlink.
+        // Swapping that file in place would desync brew's metadata from disk
+        // (the dual-install divergence), so hand off to `brew upgrade` instead.
+        install::InstallChannel::Homebrew => install::brew_upgrade(),
+        install::InstallChannel::Direct => install::fetch_and_swap_binary(version, &current_exe),
+    }
 }
 
 /// Semver-aware comparison: returns `true` when `current >= candidate`,
