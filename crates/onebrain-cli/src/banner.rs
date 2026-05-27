@@ -1,8 +1,9 @@
 //! R1 branded banner — TTY-only OneBrain wordmark.
 //!
 //! Folded into v3.1.0 per the design's "R1 fold-in" decision: render a 6-line
-//! "ANSI Shadow" block-with-shadow `OneBrain` wordmark in OneBrain primary pink
-//! (`#ff2d92`) followed by a dim `Your AI Thinking Partner · vX.Y.Z` tagline
+//! block-shaded `OneBrain` wordmark in a continuous horizontal cyan→purple→pink
+//! gradient (matching the brain logo; light→dark gray ramp as the non-truecolor
+//! fallback) followed by a dim `Your AI Thinking Partner · vX.Y.Z` tagline
 //! when stdout is a colourful TTY, suppress entirely otherwise. The banner
 //! exists to make interactive sessions feel branded; it never appears in
 //! machine output or hook-protocol invocations.
