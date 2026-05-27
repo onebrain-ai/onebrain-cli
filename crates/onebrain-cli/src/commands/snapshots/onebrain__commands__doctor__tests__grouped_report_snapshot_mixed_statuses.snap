@@ -1,0 +1,31 @@
+---
+source: crates/onebrain-cli/src/commands/doctor.rs
+expression: output
+---
+──────────────────────────────────────────
+ 🧠 OneBrain Doctor · ob-1
+──────────────────────────────────────────
+
+ Config
+  ✓ onebrain.yml       valid · stable · qmd ob-1
+  ✓ schema             all keys ok
+  ✓ config migration   onebrain.yml in use
+
+ Vault structure
+  ✗ folders            7/8 present
+     └ onebrain init --force
+  ✓ plugin files       complete
+
+ Integration
+  ⚠ hooks              PostToolUse (qmd) duplicated (×2)
+     └ onebrain doctor --fix
+  ✓ claude settings    ok
+
+ Index & state
+  ✓ checkpoints        0 orphans
+  ✓ qmd                602 indexed · 0 unembedded
+
+──────────────────────────────────────────
+ ✗  7 ok · 1 warnings · 1 fail        9 checks
+ →  onebrain doctor --fix  to auto-repair
+──────────────────────────────────────────

@@ -11,8 +11,14 @@
 pub mod dispatcher;
 pub mod envelope;
 pub mod mode;
+pub mod progress;
 
 pub use dispatcher::emit;
+// Progress primitive — braille spinner + grouped status rendering. Shared by
+// `doctor` (sectioned) and `update` (linear). Re-exported at the `output`
+// level so command modules use `output::progress::…` without the deep path.
+#[allow(unused_imports)]
+pub use progress::{should_animate, ProgressRenderer, Section, Step, StepStatus, SPINNER_FRAMES};
 // `ErrorInfo` / `Warning` are part of the v3.1 envelope public surface.
 // `ErrorInfo` is consumed by `main.rs`'s structured-mode error renderer
 // (R1 B5) and by command bodies that build error envelopes directly.

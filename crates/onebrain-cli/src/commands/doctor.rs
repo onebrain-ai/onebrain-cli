@@ -19,7 +19,7 @@ use crate::vault_ctx;
 use anyhow::{anyhow, Result};
 use onebrain_core::{load_vault_config, DoctorResult, DoctorStatus};
 use onebrain_fs::doctor::run_all_checks;
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Outcome of a single fix attempt — printed as part of the `--fix`
@@ -52,7 +52,13 @@ enum FixOutcome {
 /// env > walk-up from cwd. This matches `vault current` / every other
 /// v3.1 vault-aware command so `onebrain doctor --vault PATH` works from
 /// outside the vault directory.
-pub fn run(fix: bool, json: bool, vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<i32> {
+pub fn run(
+    fix: bool,
+    json: bool,
+    vault_flag: Option<PathBuf>,
+    mode: &OutputMode,
+    quiet: bool,
+) -> Result<i32> {
     // v3.1: structured output is triggered by EITHER the local `--json`
     // flag (back-compat with v3.0 callers) OR any global format flag
     // (`--yaml`, `--output yaml`, …). `mode.is_structured()` catches every
@@ -92,7 +98,7 @@ pub fn run(fix: bool, json: bool, vault_flag: Option<PathBuf>, mode: &OutputMode
 
     let mut results = run_all_checks(vault_root.as_path(), &config);
     if !want_structured {
-        emit_text_report(&results)?;
+        emit_text_report(&results, vault_root.as_path(), mode, quiet)?;
     }
 
     let mut any_recipe_failed = false;
@@ -151,7 +157,7 @@ pub fn run(fix: bool, json: bool, vault_flag: Option<PathBuf>, mode: &OutputMode
             }
             results = run_all_checks(vault_root.as_path(), &config);
             if !want_structured {
-                print_report(&results, std::io::stdout())?;
+                emit_text_report(&results, vault_root.as_path(), mode, quiet)?;
             }
         }
     }
@@ -757,25 +763,136 @@ fn print_fix_summary(outcomes: &[(String, FixOutcome)]) {
     println!("\nFix summary: {fixed} fixed · {failed} failed · {manual} manual",);
 }
 
-/// Render a single check block: icon + status line, then any hint / details.
-fn write_check<W: Write>(w: &mut W, r: &DoctorResult) -> Result<()> {
-    let icon = match r.status {
-        DoctorStatus::Ok => "[\u{2713}]",
-        DoctorStatus::Warn => "[!]",
-        DoctorStatus::Error => "[\u{2717}]",
+// ─────────────────────────────────────────────────────────────────────────
+// Grouped doctor report (v3.2.1) — checks bucketed into 4 sections and
+// rendered through the shared braille-spinner progress primitive. Passes are
+// quiet; warnings / fails are prominent with their hint as the indented `└`
+// line. Structured (`--json`/`--yaml`) output is unchanged — this is purely
+// the human text/TTY surface.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The approved 4-section grouping of the 9 checks, in display order. Each
+/// entry is `(section header, [check names in order])`. Check names are the
+/// stable `DoctorResult::check` identifiers produced by the check modules.
+const DOCTOR_SECTIONS: [(&str, &[&str]); 4] = [
+    (
+        "Config",
+        &[
+            "onebrain.yml",
+            "onebrain.yml-keys",
+            "vault-config-migration",
+        ],
+    ),
+    ("Vault structure", &["folders", "plugin-files"]),
+    ("Integration", &["settings-hooks", "claude-settings"]),
+    ("Index & state", &["orphan-checkpoints", "qmd-embeddings"]),
+];
+
+/// Short, scannable display label for a check name (matches the approved
+/// layout). Unknown checks fall back to their raw name so a future check
+/// still renders something sensible before its label is added here.
+fn display_label(check: &str) -> &str {
+    match check {
+        "onebrain.yml" => "onebrain.yml",
+        "onebrain.yml-keys" => "schema",
+        "vault-config-migration" => "config migration",
+        "folders" => "folders",
+        "plugin-files" => "plugin files",
+        "settings-hooks" => "hooks",
+        "claude-settings" => "claude settings",
+        "orphan-checkpoints" => "checkpoints",
+        "qmd-embeddings" => "qmd",
+        other => other,
+    }
+}
+
+/// Map a check's tri-state into the progress primitive's [`StepStatus`].
+fn step_status_of(status: DoctorStatus) -> crate::output::StepStatus {
+    use crate::output::StepStatus;
+    match status {
+        DoctorStatus::Ok => StepStatus::Ok,
+        DoctorStatus::Warn => StepStatus::Warn,
+        DoctorStatus::Error => StepStatus::Fail,
+    }
+}
+
+/// Bucket `results` into the 4 display sections as [`Section`]s of [`Step`]s.
+///
+/// - Detail = the check's `message` (the right-hand status text).
+/// - Hint = the check's `hint`, but only carried for warn / fail (passes stay
+///   quiet per the design; the primitive also drops hints on OK steps).
+/// - Any result whose check name isn't in [`DOCTOR_SECTIONS`] is appended to a
+///   trailing "Other" section so nothing is silently dropped — a defensive
+///   guard against a new check landing without a section assignment.
+fn build_sections(results: &[DoctorResult]) -> Vec<crate::output::Section> {
+    use crate::output::{Section, Step};
+
+    let to_step = |r: &DoctorResult| {
+        let hint = match r.status {
+            DoctorStatus::Ok => None,
+            _ => r.hint.clone(),
+        };
+        Step::new(
+            display_label(&r.check),
+            step_status_of(r.status),
+            Some(r.message.clone()),
+            hint,
+        )
     };
-    writeln!(w, "  {} {:<20} {}", icon, r.check, r.message)?;
-    if let Some(hint) = &r.hint {
-        writeln!(w, "        \u{2192} {hint}")?;
+
+    let mut sections: Vec<Section> = Vec::with_capacity(DOCTOR_SECTIONS.len());
+    let mut placed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for (header, checks) in DOCTOR_SECTIONS {
+        let mut steps = Vec::new();
+        for name in checks {
+            if let Some(r) = results.iter().find(|r| r.check == *name) {
+                steps.push(to_step(r));
+                placed.insert(*name);
+            }
+        }
+        if !steps.is_empty() {
+            sections.push(Section::new(header, steps));
+        }
     }
-    for d in &r.details {
-        writeln!(w, "        \u{00b7} {d}")?;
+
+    // Defensive: surface any unmapped check rather than dropping it.
+    let leftovers: Vec<Step> = results
+        .iter()
+        .filter(|r| !placed.contains(r.check.as_str()))
+        .map(to_step)
+        .collect();
+    if !leftovers.is_empty() {
+        sections.push(Section::new("Other", leftovers));
     }
+
+    sections
+}
+
+/// Width of the horizontal rule framing the header + footer. Matches the
+/// approved layout (a thin full-width divider).
+const RULE: &str = "──────────────────────────────────────────";
+
+/// Render the doctor header block: a rule, the `🧠 OneBrain Doctor · <vault>`
+/// title, then a rule + blank line. This is doctor's own header — distinct
+/// from the brand wordmark banner (emitted to stderr by the dispatch path).
+fn write_doctor_header<W: Write>(w: &mut W, vault_name: &str, color: bool) -> Result<()> {
+    let (dim, reset) = if color {
+        ("\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    writeln!(w, "{dim}{RULE}{reset}")?;
+    writeln!(w, " 🧠 OneBrain Doctor · {vault_name}")?;
+    writeln!(w, "{dim}{RULE}{reset}")?;
     Ok(())
 }
 
-/// Render the trailing one-line summary.
-fn write_summary<W: Write>(w: &mut W, results: &[DoctorResult]) -> Result<()> {
+/// Render the summary footer: a rule, the verdict line (overall glyph, the
+/// ok/warn/fail counts, and the total), an optional `--fix` next-action line
+/// when there are repairable issues, then a closing rule.
+fn write_summary_footer<W: Write>(w: &mut W, results: &[DoctorResult], color: bool) -> Result<()> {
+    use crate::output::StepStatus;
     let total = results.len();
     let errors = results
         .iter()
@@ -785,79 +902,103 @@ fn write_summary<W: Write>(w: &mut W, results: &[DoctorResult]) -> Result<()> {
         .iter()
         .filter(|r| r.status == DoctorStatus::Warn)
         .count();
-    if errors > 0 {
-        writeln!(
-            w,
-            "Summary: {total} checks · {errors} error(s) · {warnings} warning(s) — fix before using"
-        )?;
+    let passing = total - errors - warnings;
+
+    // Overall verdict glyph: fail dominates, then warn, then ok.
+    let verdict = if errors > 0 {
+        StepStatus::Fail
     } else if warnings > 0 {
-        writeln!(
-            w,
-            "Summary: {total} checks · {warnings} warning(s) — ok to run"
-        )?;
+        StepStatus::Warn
     } else {
-        writeln!(w, "Summary: {total} checks — all passed")?;
+        StepStatus::Ok
+    };
+    let (dim, reset) = if color {
+        ("\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    let glyph_prefix = verdict.ansi_prefix(color);
+    let glyph_reset = if color { "\x1b[0m" } else { "" };
+
+    writeln!(w)?;
+    writeln!(w, "{dim}{RULE}{reset}")?;
+    writeln!(
+        w,
+        " {glyph_prefix}{}{glyph_reset}  {passing} ok · {warnings} warnings · {errors} fail        {total} checks",
+        verdict.glyph(),
+    )?;
+    // `--fix` next-action — shown whenever there's a repairable issue. Both
+    // warn and error feed the fix dispatcher (`attempt_fix` matches on both),
+    // so any non-zero issue count gets the pointer.
+    if warnings + errors > 0 {
+        writeln!(w, " →  onebrain doctor --fix  to auto-repair")?;
     }
+    writeln!(w, "{dim}{RULE}{reset}")?;
     Ok(())
 }
 
-/// Plain, instant text report — the canonical renderer. Used for piped /
-/// non-TTY stdout and by unit tests (writes to any `Write`, no timing).
-fn print_report<W: Write>(results: &[DoctorResult], mut w: W) -> Result<()> {
-    writeln!(w, "OneBrain Doctor")?;
-    writeln!(w)?;
-    for r in results {
-        write_check(&mut w, r)?;
+/// Render the full grouped report to `w` via a [`ProgressRenderer`].
+///
+/// `force_static` drives the gating seam: when false the renderer is built
+/// from live stdout + `mode` + `quiet` (animates only for a colour TTY,
+/// non-quiet, text mode); when true it never animates (deterministic tests).
+/// `color` is the resolved colour bit (header/footer styling).
+///
+/// This is the single rendering entry point used for BOTH the initial report
+/// and the post-`--fix` re-render, so they share one layout.
+fn render_grouped_report<W: Write>(
+    mut w: W,
+    results: &[DoctorResult],
+    vault_name: &str,
+    color: bool,
+    animate: bool,
+) -> Result<()> {
+    use crate::output::ProgressRenderer;
+    write_doctor_header(&mut w, vault_name, color)?;
+    let sections = build_sections(results);
+    {
+        // force_static = !animate.
+        let mut renderer = ProgressRenderer::with_writer(&mut w, !animate, color);
+        for section in &sections {
+            renderer.render_section(section)?;
+        }
     }
-    writeln!(w)?;
-    write_summary(&mut w, results)
+    write_summary_footer(&mut w, results, color)?;
+    Ok(())
 }
 
-/// Per-step delay (ms) for the animated TTY report. Overridable via
-/// `ONEBRAIN_DOCTOR_STEP_MS`; `0` disables the animation (instant plain
-/// report) — handy for impatient users, demos, and deterministic tests.
-fn doctor_step_delay_ms() -> u64 {
-    std::env::var("ONEBRAIN_DOCTOR_STEP_MS")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(90)
+/// Derive the human vault name from its root path (the final path component),
+/// falling back to "vault" for an unnamed root.
+fn vault_display_name(vault_root: &Path) -> String {
+    vault_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("vault")
+        .to_string()
 }
 
-/// Animated text report for an interactive terminal: each check first shows a
-/// transient `⋯ checking <name>…` line, pauses briefly, then clears it and
-/// reveals the result — so the run reads as one-thing-at-a-time work instead
-/// of an instant wall of text. A `0` delay short-circuits to the plain report.
-fn print_report_animated(results: &[DoctorResult]) -> Result<()> {
-    let delay = doctor_step_delay_ms();
-    if delay == 0 {
-        return print_report(results, std::io::stdout());
-    }
-    let step = std::time::Duration::from_millis(delay);
-    let mut w = std::io::stdout();
-    writeln!(w, "OneBrain Doctor")?;
-    writeln!(w)?;
-    for r in results {
-        // Transient progress line · cleared and replaced by the result block.
-        write!(w, "  \u{22ef} checking {}\u{2026}", r.check)?;
-        w.flush()?;
-        std::thread::sleep(step);
-        write!(w, "\r\u{1b}[K")?; // carriage-return + clear-to-end-of-line
-        write_check(&mut w, r)?;
-        w.flush()?;
-    }
-    writeln!(w)?;
-    write_summary(&mut w, results)
-}
-
-/// Emit the text report to stdout, animating step-by-step on an interactive
-/// terminal and falling back to the instant plain report when stdout is piped
-/// / redirected / non-TTY (v3.1.1 doctor UX).
-fn emit_text_report(results: &[DoctorResult]) -> Result<()> {
-    if std::io::stdout().is_terminal() {
-        print_report_animated(results)
-    } else {
-        print_report(results, std::io::stdout())
-    }
+/// Emit the grouped text report to stdout. Animates step-by-step only on a
+/// colour, non-quiet, interactive terminal (the [`ProgressRenderer`] gate);
+/// piped / non-TTY / structured / `--no-color` / `--quiet` get the instant
+/// static layout.
+///
+/// The gating decision (and colour bit) are derived from the production
+/// [`ProgressRenderer::new`] constructor so doctor and any future caller
+/// (e.g. `update`) share one source of truth for "should this animate?".
+fn emit_text_report(
+    results: &[DoctorResult],
+    vault_root: &Path,
+    mode: &OutputMode,
+    quiet: bool,
+) -> Result<()> {
+    use crate::output::ProgressRenderer;
+    // Build the production renderer once to read the frozen gating decision
+    // (TTY + colour + quiet) — then drive the report with a stdout handle.
+    let gate = ProgressRenderer::new(mode, quiet);
+    let animate = gate.is_animated();
+    let color = matches!(mode, OutputMode::Text { color: true, .. });
+    let name = vault_display_name(vault_root);
+    render_grouped_report(std::io::stdout(), results, &name, color, animate)
 }
 
 #[cfg(test)]
@@ -865,47 +1006,216 @@ mod tests {
     use super::*;
     use onebrain_core::DoctorResult;
 
-    #[test]
-    fn print_report_all_ok() {
-        let results = vec![DoctorResult::ok("onebrain.yml", "valid")];
-        let mut buf = Vec::new();
-        print_report(&results, &mut buf).unwrap();
-        let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("[\u{2713}]"));
-        assert!(s.contains("all passed"));
+    /// Build the canonical 9-check fixture in the real check-name order, with
+    /// a couple of warnings/fails so grouping + footer logic is exercised.
+    fn nine_check_results() -> Vec<DoctorResult> {
+        vec![
+            DoctorResult::ok("onebrain.yml", "valid · stable · qmd ob-1"),
+            DoctorResult::ok("onebrain.yml-keys", "all keys ok"),
+            DoctorResult::ok("vault-config-migration", "onebrain.yml in use"),
+            DoctorResult::ok("folders", "8/8 present"),
+            DoctorResult::ok("plugin-files", "complete"),
+            DoctorResult::warn("settings-hooks", "PostToolUse (qmd) duplicated (×2)")
+                .with_hint("onebrain doctor --fix"),
+            DoctorResult::ok("claude-settings", "ok"),
+            DoctorResult::ok("orphan-checkpoints", "0 orphans"),
+            DoctorResult::warn("qmd-embeddings", "3 unembedded").with_hint("qmd embed"),
+        ]
     }
 
+    fn render_static_report(results: &[DoctorResult], color: bool) -> String {
+        let mut buf = Vec::new();
+        render_grouped_report(&mut buf, results, "ob-1", color, false).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    // ── Section grouping ─────────────────────────────────────────────────
+
     #[test]
-    fn doctor_step_delay_defaults_and_honors_env() {
-        // Sole reader of this env var in-process, so no parallel-test race.
-        std::env::remove_var("ONEBRAIN_DOCTOR_STEP_MS");
-        assert_eq!(doctor_step_delay_ms(), 90, "default");
-        std::env::set_var("ONEBRAIN_DOCTOR_STEP_MS", "0");
-        assert_eq!(doctor_step_delay_ms(), 0, "0 disables the animation");
-        std::env::set_var("ONEBRAIN_DOCTOR_STEP_MS", "250");
-        assert_eq!(doctor_step_delay_ms(), 250, "explicit override");
-        std::env::set_var("ONEBRAIN_DOCTOR_STEP_MS", "garbage");
+    fn build_sections_assigns_each_check_to_its_section() {
+        let results = nine_check_results();
+        let sections = build_sections(&results);
+        assert_eq!(sections.len(), 4, "expected 4 sections");
+        let by_header: std::collections::HashMap<&str, Vec<&str>> = sections
+            .iter()
+            .map(|s| {
+                (
+                    s.header.as_str(),
+                    s.steps.iter().map(|st| st.label.as_str()).collect(),
+                )
+            })
+            .collect();
         assert_eq!(
-            doctor_step_delay_ms(),
-            90,
-            "unparseable falls back to default"
+            by_header["Config"],
+            vec!["onebrain.yml", "schema", "config migration"]
         );
-        std::env::remove_var("ONEBRAIN_DOCTOR_STEP_MS");
+        assert_eq!(
+            by_header["Vault structure"],
+            vec!["folders", "plugin files"]
+        );
+        assert_eq!(by_header["Integration"], vec!["hooks", "claude settings"]);
+        assert_eq!(by_header["Index & state"], vec!["checkpoints", "qmd"]);
     }
 
     #[test]
-    fn print_report_summarizes_errors_and_warnings() {
+    fn build_sections_surfaces_unmapped_check_in_other() {
+        let mut results = nine_check_results();
+        results.push(DoctorResult::warn("brand-new-check", "hmm"));
+        let sections = build_sections(&results);
+        let other = sections.iter().find(|s| s.header == "Other");
+        assert!(other.is_some(), "unmapped check must land in Other");
+        assert_eq!(other.unwrap().steps[0].label, "brand-new-check");
+    }
+
+    #[test]
+    fn build_sections_carries_hint_only_for_non_ok() {
         let results = vec![
-            DoctorResult::error("a", "broken"),
-            DoctorResult::warn("b", "iffy"),
-            DoctorResult::ok("c", "good"),
+            DoctorResult::ok("onebrain.yml", "valid").with_hint("ignored on ok"),
+            DoctorResult::warn("settings-hooks", "dup").with_hint("onebrain doctor --fix"),
         ];
-        let mut buf = Vec::new();
-        print_report(&results, &mut buf).unwrap();
-        let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("1 error(s)"));
-        assert!(s.contains("1 warning(s)"));
-        assert!(s.contains("fix before using"));
+        let sections = build_sections(&results);
+        let ok_step = &sections
+            .iter()
+            .flat_map(|s| &s.steps)
+            .find(|st| st.label == "onebrain.yml")
+            .unwrap();
+        assert!(ok_step.hint.is_none(), "OK steps must not carry a hint");
+        let warn_step = sections
+            .iter()
+            .flat_map(|s| &s.steps)
+            .find(|st| st.label == "hooks")
+            .unwrap();
+        assert_eq!(warn_step.hint.as_deref(), Some("onebrain doctor --fix"));
+    }
+
+    // ── Static rendered output: glyphs / labels / hints ──────────────────
+
+    #[test]
+    fn static_report_shows_header_section_labels_and_glyphs() {
+        let out = render_static_report(&nine_check_results(), false);
+        // Doctor's own header (distinct from the brand banner).
+        assert!(out.contains("🧠 OneBrain Doctor · ob-1"), "header: {out:?}");
+        // Section headers.
+        for header in ["Config", "Vault structure", "Integration", "Index & state"] {
+            assert!(out.contains(header), "section {header}: {out:?}");
+        }
+        // OK glyph + short label + detail.
+        assert!(out.contains("✓ onebrain.yml"), "ok line: {out:?}");
+        assert!(out.contains("✓ schema"), "schema line: {out:?}");
+        // Warn glyph + label + the indented hint line.
+        assert!(out.contains("⚠ hooks"), "warn line: {out:?}");
+        assert!(
+            out.contains("└ onebrain doctor --fix"),
+            "warn hint line: {out:?}"
+        );
+        assert!(out.contains("└ qmd embed"), "qmd hint line: {out:?}");
+    }
+
+    #[test]
+    fn static_report_passes_have_no_hint_line() {
+        // A pass that happens to carry a hint must stay quiet.
+        let results = vec![DoctorResult::ok("onebrain.yml", "valid").with_hint("never-shown-hint")];
+        let out = render_static_report(&results, false);
+        assert!(
+            !out.contains("never-shown-hint"),
+            "pass hint leaked: {out:?}"
+        );
+        assert!(!out.contains("└"), "pass must not show └ line: {out:?}");
+    }
+
+    #[test]
+    fn static_report_emits_no_spinner_or_carriage_return() {
+        let out = render_static_report(&nine_check_results(), true);
+        assert!(!out.contains('\r'), "static must not redraw: {out:?}");
+        for f in crate::output::SPINNER_FRAMES {
+            assert!(!out.contains(f), "static must not paint spinner: {out:?}");
+        }
+    }
+
+    // ── Summary footer: counts + verdict + --fix action ──────────────────
+
+    #[test]
+    fn footer_counts_and_warn_verdict_with_fix_action() {
+        let out = render_static_report(&nine_check_results(), false);
+        // 7 ok · 2 warnings · 0 fail · 9 checks (matches the approved layout).
+        assert!(
+            out.contains("7 ok · 2 warnings · 0 fail"),
+            "counts: {out:?}"
+        );
+        assert!(out.contains("9 checks"), "total: {out:?}");
+        // Warn verdict glyph present.
+        assert!(out.contains("⚠"), "verdict glyph: {out:?}");
+        // Fixable issues → --fix next-action shown.
+        assert!(
+            out.contains("onebrain doctor --fix  to auto-repair"),
+            "fix action: {out:?}"
+        );
+    }
+
+    #[test]
+    fn footer_all_ok_shows_check_verdict_and_no_fix_action() {
+        let results: Vec<DoctorResult> = nine_check_results()
+            .into_iter()
+            .map(|r| DoctorResult::ok(r.check, "ok"))
+            .collect();
+        let out = render_static_report(&results, false);
+        assert!(
+            out.contains("9 ok · 0 warnings · 0 fail"),
+            "counts: {out:?}"
+        );
+        // All-clean → no --fix pointer.
+        assert!(
+            !out.contains("to auto-repair"),
+            "clean run must not show --fix action: {out:?}"
+        );
+    }
+
+    #[test]
+    fn footer_fail_verdict_when_any_error() {
+        let mut results = nine_check_results();
+        results[3] =
+            DoctorResult::error("folders", "0/8 present").with_hint("onebrain init --force");
+        let out = render_static_report(&results, false);
+        assert!(out.contains("✗ folders"), "fail line: {out:?}");
+        assert!(out.contains("· 1 fail"), "fail count: {out:?}");
+        assert!(out.contains("✗"), "fail verdict glyph: {out:?}");
+        assert!(
+            out.contains("to auto-repair"),
+            "fix action still shown: {out:?}"
+        );
+    }
+
+    // ── TTY-gating decision (doctor's emit path) ─────────────────────────
+
+    #[test]
+    fn doctor_animates_only_for_color_tty_non_quiet() {
+        use crate::output::should_animate;
+        let color_tty = OutputMode::Text {
+            color: true,
+            pretty: true,
+        };
+        assert!(
+            should_animate(&color_tty, true, false),
+            "color TTY non-quiet"
+        );
+        assert!(!should_animate(&color_tty, true, true), "quiet off");
+        assert!(!should_animate(&color_tty, false, false), "non-tty off");
+        let mono = OutputMode::Text {
+            color: false,
+            pretty: true,
+        };
+        assert!(!should_animate(&mono, true, false), "no-color off");
+        for structured in [
+            OutputMode::Json { pretty: true },
+            OutputMode::Yaml,
+            OutputMode::Tsv,
+            OutputMode::Table,
+        ] {
+            assert!(
+                !should_animate(&structured, true, false),
+                "structured {structured:?} off"
+            );
+        }
     }
 
     /// Compact-JSON mode (v3.0 back-compat shape) used by `--json` callers.
@@ -1283,19 +1593,25 @@ mod tests {
         }
     }
 
+    /// Lock the full grouped (static, monochrome) layout so any drift in
+    /// header / section grouping / glyphs / footer surfaces in
+    /// `cargo insta review`. Monochrome so the snapshot has no ANSI noise.
     #[test]
-    fn print_report_snapshot_mixed_statuses() {
+    fn grouped_report_snapshot_mixed_statuses() {
         let results = vec![
-            DoctorResult::ok("onebrain.yml", "valid").with_details(vec!["qmd: ob-1".into()]),
-            DoctorResult::warn("settings-hooks", "2 issue(s)")
-                .with_hint("Run onebrain doctor --fix to repair hooks")
-                .with_details(vec!["Stop hook missing".into()]),
-            DoctorResult::error("folders", "7/8 present")
-                .with_hint("Missing: 01-projects")
-                .with_details(vec!["missing: 01-projects".into()]),
+            DoctorResult::ok("onebrain.yml", "valid · stable · qmd ob-1"),
+            DoctorResult::ok("onebrain.yml-keys", "all keys ok"),
+            DoctorResult::ok("vault-config-migration", "onebrain.yml in use"),
+            DoctorResult::error("folders", "7/8 present").with_hint("onebrain init --force"),
+            DoctorResult::ok("plugin-files", "complete"),
+            DoctorResult::warn("settings-hooks", "PostToolUse (qmd) duplicated (×2)")
+                .with_hint("onebrain doctor --fix"),
+            DoctorResult::ok("claude-settings", "ok"),
+            DoctorResult::ok("orphan-checkpoints", "0 orphans"),
+            DoctorResult::ok("qmd-embeddings", "602 indexed · 0 unembedded"),
         ];
         let mut buf = Vec::new();
-        print_report(&results, &mut buf).unwrap();
+        render_grouped_report(&mut buf, &results, "ob-1", false, false).unwrap();
         let output = String::from_utf8(buf).unwrap();
         insta::assert_snapshot!(output);
     }
