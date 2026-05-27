@@ -55,6 +55,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     // full gating table.
     banner::emit_banner(std::io::stderr().lock(), &cli, &mode);
     let vault_flag = cli.vault.clone();
+    let quiet = cli.quiet;
 
     match cli.command {
         // ───── Root verbs ────────────────────────────────────────────
@@ -76,7 +77,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             std::process::exit(code);
         }
         Cmd::Doctor(a) => {
-            let code = commands::doctor::run(a.fix, a.json, vault_flag.clone(), &mode)?;
+            let code = commands::doctor::run(a.fix, a.json, vault_flag.clone(), &mode, quiet)?;
             std::process::exit(code);
         }
 

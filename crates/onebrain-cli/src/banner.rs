@@ -1,8 +1,9 @@
 //! R1 branded banner — TTY-only OneBrain wordmark.
 //!
 //! Folded into v3.1.0 per the design's "R1 fold-in" decision: render a 6-line
-//! "ANSI Shadow" block-with-shadow `OneBrain` wordmark in OneBrain primary pink
-//! (`#ff2d92`) followed by a dim `Your AI Thinking Partner · vX.Y.Z` tagline
+//! block-shaded `OneBrain` wordmark in a continuous horizontal cyan→purple→pink
+//! gradient (matching the brain logo; light→dark gray ramp as the non-truecolor
+//! fallback) followed by a dim `Your AI Thinking Partner · vX.Y.Z` tagline
 //! when stdout is a colourful TTY, suppress entirely otherwise. The banner
 //! exists to make interactive sessions feel branded; it never appears in
 //! machine output or hook-protocol invocations.
@@ -42,31 +43,52 @@ use crate::output::OutputMode;
 use std::io::Write;
 
 /// OneBrain primary brand colour `#ff2d92` as a 24-bit ANSI foreground escape.
-/// Kept as a named constant so tests can pin "brand pink is present" without
-/// reaching into [`BANNER_BRAIN_GRADIENT`] / [`BANNER_ONE_GRADIENT`] by index.
-/// Truecolor is universal on every terminal that survives the TTY gate (the
-/// gate excludes `TERM=dumb` and CI lines), so we don't need to fall back to
-/// 256-colour or basic 16-colour.
+/// Kept as a named constant so tests can pin "brand pink is present" — it is
+/// the right edge of the wordmark gradient (see [`gradient_fg`] / [`GRAD_PINK`]).
 #[cfg_attr(not(test), allow(dead_code))]
 const ANSI_PINK_FG: &str = "\x1b[38;2;255;45;146m";
 const ANSI_DIM: &str = "\x1b[2m";
 const ANSI_RESET: &str = "\x1b[0m";
 
-/// 3-step gradient applied to the BRAIN half of the wordmark · top to
-/// bottom. All shades are tints/shades of OneBrain primary `#ff2d92`.
-const BANNER_BRAIN_GRADIENT: [&str; 3] = [
-    "\x1b[38;2;255;128;186m", // light tint · top
-    "\x1b[38;2;255;45;146m",  // primary brand
-    "\x1b[38;2;186;22;105m",  // deep shade · bottom
-];
+/// Wordmark gradient anchors — cyan → purple → pink, left to right across the
+/// whole wordmark, matching the brain logo's node gradient.
+const GRAD_CYAN: (u8, u8, u8) = (34, 211, 238);
+const GRAD_PURPLE: (u8, u8, u8) = (168, 85, 247);
+const GRAD_PINK: (u8, u8, u8) = (255, 45, 146);
 
-/// Muted gray gradient for the ONE half · OpenCode-style "secondary word"
-/// treatment that lets BRAIN read as the visual focus.
-const BANNER_ONE_GRADIENT: [&str; 3] = [
-    "\x1b[38;2;160;160;160m", // light gray · top
-    "\x1b[38;2;112;112;112m",
-    "\x1b[38;2;72;72;72m", // dark gray · bottom
-];
+/// Linear-interpolate two RGB triples at `t` (0.0..=1.0).
+fn lerp_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    (mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
+}
+
+/// ANSI foreground escape for the wordmark gradient at horizontal position `t`
+/// (0.0 = left edge .. 1.0 = right edge). Truecolor terminals get the
+/// cyan→purple→pink logo gradient; everyone else falls back to a light→dark
+/// gray ramp via xterm-256 grayscale (the muted "ONE"-style treatment, so the
+/// wordmark still renders cleanly instead of raw 24-bit escapes).
+fn gradient_fg(t: f32, truecolor: bool) -> String {
+    if truecolor {
+        let (r, g, b) = if t < 0.5 {
+            lerp_rgb(GRAD_CYAN, GRAD_PURPLE, t * 2.0)
+        } else {
+            lerp_rgb(GRAD_PURPLE, GRAD_PINK, (t - 0.5) * 2.0)
+        };
+        format!("\x1b[38;2;{r};{g};{b}m")
+    } else {
+        // xterm-256 grayscale ramp: 252 (light) → 240 (mid-gray).
+        let level = 252 - (t * 12.0).round() as u8;
+        format!("\x1b[38;5;{level}m")
+    }
+}
+
+/// Truecolor (24-bit) support — `COLORTERM` is the de-facto signal terminals
+/// set (`truecolor` / `24bit`). Absent → gray fallback ramp.
+fn supports_truecolor() -> bool {
+    std::env::var("COLORTERM")
+        .map(|v| v.contains("truecolor") || v.contains("24bit"))
+        .unwrap_or(false)
+}
 
 /// Should the banner render for this invocation? Pure decision function over
 /// the parsed CLI + resolved [`OutputMode`] — no env / stdio access here.
@@ -110,9 +132,10 @@ fn is_hook_protocol(cmd: &Cmd) -> bool {
 /// Unicode block-shaded rendering of the wordmark `ONEBRAIN`. Three lines
 /// of pixel-art letters using full-block (`█`), half-block (`▀`), and
 /// shaded-block (`░`) characters · 32 cols wide. Split into ONE / BRAIN
-/// halves so each can carry its own gradient (BRAIN = primary brand focus
-/// · ONE = muted secondary). Each letter is 4 chars wide; ONE = 3 letters
-/// (cols 0-11) · BRAIN = 5 letters (cols 12-31).
+/// halves that `build_banner` joins into one row, then colors per-column by
+/// horizontal position for a continuous gradient across the whole wordmark.
+/// Each letter is 4 chars wide; ONE = 3 letters (cols 0-11) · BRAIN = 5
+/// letters (cols 12-31).
 const BANNER_ONE_ART: [&str; 3] = ["░█▀█░█▀█░█▀▀", "░█░█░█░█░█▀▀", " ▀▀▀ ▀ ▀ ▀▀▀"];
 
 const BANNER_BRAIN_ART: [&str; 3] = [
@@ -126,41 +149,47 @@ const BANNER_BRAIN_ART: [&str; 3] = [
 const BANNER_VISUAL_WIDTH: usize = 32;
 
 /// Build the banner string (no I/O). Five rendered content lines total:
-///   3 × dual-gradient ASCII-art lines (custom block-shaded `OneBrain`
-///       wordmark — ONE in gray via [`BANNER_ONE_GRADIENT`], BRAIN in pink
-///       via [`BANNER_BRAIN_GRADIENT`])
+///   3 × ASCII-art lines (custom block-shaded `OneBrain` wordmark) colored
+///       with a continuous horizontal gradient — cyan → purple → pink in
+///       truecolor (matching the logo), or a light→dark gray ramp as the
+///       non-truecolor fallback (see [`gradient_fg`]).
 ///   1 × dim `Your AI Thinking Partner · vX.Y.Z` tagline, indented to centre
 ///       under the art block.
 ///   plus 1 leading + 1 trailing blank line for breathing room — so
 ///   `str::lines()` yields 6 elements total.
 ///
-/// Each art line is wrapped in its gradient-step escape (light at the top →
-/// dark at the bottom) followed by `ANSI_RESET`. The tagline is wrapped in
+/// Each art line colors every column by its horizontal position (one escape
+/// per glyph), then emits `ANSI_RESET` at line end. The tagline is wrapped in
 /// `ANSI_DIM ... ANSI_RESET` so the terminal state is always clean after
 /// the banner. The leading newline separates the banner from the previous
 /// shell prompt so it doesn't crowd the user's command line; the trailing
 /// newlines terminate the tagline and add a blank line between the banner
 /// and whatever help body follows.
 pub fn render_banner() -> String {
-    let version = env!("CARGO_PKG_VERSION");
+    build_banner(env!("CARGO_PKG_VERSION"), supports_truecolor())
+}
+
+/// Pure banner builder (no I/O, no env). `truecolor` picks the logo gradient
+/// vs the gray fallback — split out so tests pin both color paths
+/// deterministically.
+fn build_banner(version: &str, truecolor: bool) -> String {
     let mut out = String::with_capacity(1024);
     // Breathing room above the banner so it doesn't visually butt up against
     // the prompt line that invoked it.
     out.push('\n');
     for i in 0..BANNER_ONE_ART.len() {
-        let one_shade = BANNER_ONE_GRADIENT
-            .get(i)
-            .copied()
-            .unwrap_or(*BANNER_ONE_GRADIENT.last().unwrap());
-        let brain_shade = BANNER_BRAIN_GRADIENT
-            .get(i)
-            .copied()
-            .unwrap_or(*BANNER_BRAIN_GRADIENT.last().unwrap());
-        out.push_str(one_shade);
-        out.push_str(BANNER_ONE_ART[i]);
-        out.push_str(ANSI_RESET);
-        out.push_str(brain_shade);
-        out.push_str(BANNER_BRAIN_ART[i]);
+        // Join the ONE+BRAIN halves into one row, then color each column by its
+        // horizontal position so the gradient flows continuously across the
+        // whole wordmark (cyan → purple → pink), matching the logo. A per-column
+        // escape overrides the previous fg, so one trailing reset per line is
+        // enough.
+        let row: String = format!("{}{}", BANNER_ONE_ART[i], BANNER_BRAIN_ART[i]);
+        let last_col = row.chars().count().saturating_sub(1).max(1);
+        for (col, ch) in row.chars().enumerate() {
+            let t = col as f32 / last_col as f32;
+            out.push_str(&gradient_fg(t, truecolor));
+            out.push(ch);
+        }
         out.push_str(ANSI_RESET);
         out.push('\n');
     }
@@ -418,6 +447,10 @@ mod tests {
     use crate::cli::*;
     use clap::Parser;
 
+    /// Serialises tests that mutate the process-global `ONEBRAIN_FORCE_BANNER`
+    /// env var, which would otherwise race under parallel test threads.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).unwrap()
     }
@@ -609,23 +642,35 @@ mod tests {
             3,
             "BRAIN art block should be 3 lines"
         );
-        // Each rendered art line should contain both halves recolored.
-        // Art lives on lines 1..=3 (after the leading blank).
+        // The wordmark is colored per-column (a gradient escape before each
+        // glyph), so strip ANSI first, then assert the visible glyphs equal the
+        // combined ONE+BRAIN row. Art lives on lines 1..=3 (after the blank).
+        let strip_ansi = |s: &str| -> String {
+            let mut out = String::new();
+            let mut it = s.chars();
+            while let Some(c) = it.next() {
+                if c == '\x1b' {
+                    for e in it.by_ref() {
+                        if e == 'm' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
         for i in 0..3 {
-            let rendered = lines[i + 1];
-            assert!(
-                rendered.contains(BANNER_ONE_ART[i]),
-                "rendered line {} ({:?}) missing ONE half ({:?})",
+            let visible = strip_ansi(lines[i + 1]);
+            let expected = format!("{}{}", BANNER_ONE_ART[i], BANNER_BRAIN_ART[i]);
+            assert_eq!(
+                visible,
+                expected,
+                "rendered line {} visible glyphs {:?} != combined art {:?}",
                 i + 1,
-                rendered,
-                BANNER_ONE_ART[i]
-            );
-            assert!(
-                rendered.contains(BANNER_BRAIN_ART[i]),
-                "rendered line {} ({:?}) missing BRAIN half ({:?})",
-                i + 1,
-                rendered,
-                BANNER_BRAIN_ART[i]
+                visible,
+                expected
             );
         }
         // Tagline on line 5 (index 4).
@@ -653,16 +698,37 @@ mod tests {
     }
 
     #[test]
-    fn banner_art_uses_pink_color_when_enabled() {
-        // Every art line is wrapped in the pink truecolor escape. If a
-        // future refactor drops the wrapper, the art renders monochrome and
-        // the brand presence collapses.
-        let s = render_banner();
+    fn banner_art_uses_logo_gradient_when_truecolor() {
+        // Truecolor path: the cyan→purple→pink logo gradient. Cyan anchors the
+        // left edge, pink (brand) the right. Dropping the wrapper collapses the
+        // brand presence to monochrome.
+        let s = build_banner(env!("CARGO_PKG_VERSION"), true);
+        assert!(
+            s.contains("\x1b[38;2;34;211;238m"),
+            "missing cyan (gradient left edge): {s:?}"
+        );
         assert!(
             s.contains(ANSI_PINK_FG),
-            "missing pink truecolor escape: {s:?}"
+            "missing pink (gradient right edge): {s:?}"
         );
-        // And the dim escape for the tagline.
+        assert!(
+            s.contains(ANSI_DIM),
+            "missing dim escape for tagline: {s:?}"
+        );
+    }
+
+    #[test]
+    fn banner_art_falls_back_to_gray_without_truecolor() {
+        // Non-truecolor terminals get a 256-color gray ramp — no 24-bit color.
+        let s = build_banner(env!("CARGO_PKG_VERSION"), false);
+        assert!(
+            s.contains("\x1b[38;5;"),
+            "missing 256-color gray ramp: {s:?}"
+        );
+        assert!(
+            !s.contains(ANSI_PINK_FG),
+            "fallback must not emit truecolor pink: {s:?}"
+        );
         assert!(
             s.contains(ANSI_DIM),
             "missing dim escape for tagline: {s:?}"
@@ -904,8 +970,9 @@ mod tests {
     fn emit_help_banner_writes_to_buffer_when_gated_on() {
         // `cargo test`'s harness pipes stderr, so the stderr-tty gate would
         // suppress emission. Lift it the same way integration tests do.
-        // Env mutation is intentionally scoped to this test; sibling tests
-        // either don't read the var or wrap their own scoped set/remove.
+        // Hold ENV_LOCK for the whole env-mutation window so this can't race
+        // the sibling test that toggles the same var under parallel threads.
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("ONEBRAIN_FORCE_BANNER", "1");
         let args = s(&["onebrain", "--help"]);
         let mut buf: Vec<u8> = Vec::new();
@@ -931,7 +998,9 @@ mod tests {
     #[test]
     fn emit_help_banner_writes_nothing_when_version_present() {
         // Force the stderr-tty gate ON so the suppression we observe can
-        // only come from the `--version` short-circuit.
+        // only come from the `--version` short-circuit. Hold ENV_LOCK for the
+        // whole env-mutation window (see the sibling test) to avoid a race.
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("ONEBRAIN_FORCE_BANNER", "1");
         let args = s(&["onebrain", "--version"]);
         let mut buf: Vec<u8> = Vec::new();
@@ -952,8 +1021,10 @@ mod tests {
     /// normalised so a routine version bump doesn't force a snapshot update.
     #[test]
     fn banner_text_snapshot() {
-        let raw = render_banner();
         let version = env!("CARGO_PKG_VERSION");
+        // Pin the truecolor banner deterministically — independent of the test
+        // host's COLORTERM. Gray-fallback rendering is covered by unit tests.
+        let raw = build_banner(version, true);
         let normalised = raw.replace(&format!("v{version}"), "v<VERSION>");
         insta::assert_snapshot!("banner_text", normalised);
     }

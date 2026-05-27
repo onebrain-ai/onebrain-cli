@@ -29,21 +29,31 @@ const REQUIRED_HOOKS: &[(&str, &str)] = &[("Stop", "onebrain checkpoint stop")];
 /// SessionStart, etc.) is stale and must be removed.
 const ALLOWED_HOOK_EVENTS: &[&str] = &["Stop", "PostToolUse"];
 
-const QMD_HOOK_SUBSTRING: &str = "onebrain qmd-reindex";
+/// Canonical NEW qmd hook form (v3.2+): the real subcommand `qmd reindex`.
+const QMD_HOOK_SUBSTRING_NEW: &str = "onebrain qmd reindex";
+/// Legacy v3.0/v3.1 hidden alias `qmd-reindex` (hyphen). doctor must still
+/// recognize this so it can advise migrating to the new form via `--fix`.
+const QMD_HOOK_SUBSTRING_LEGACY: &str = "onebrain qmd-reindex";
 const ONEBRAIN_COMMAND_SUBSTRING: &str = "onebrain";
 const REQUIRED_PERMISSION: &str = "Bash(onebrain *)";
 const STALE_HOOK_SUBSTRINGS: &[&str] = &["checkpoint-hook.sh", "session-init.sh"];
 const CANONICAL_HOOK_COMMAND: &str = "onebrain";
 
 /// Form of the matching hook entry, if any:
-/// - `Exec`   — canonical exec form: `{ command: "onebrain", args: [...] }`
-/// - `Legacy` — any matching entry not in canonical exec form (shell-form,
-///   wrapper like `bash -c …`, missing args[], etc.).
-/// - `Absent` — no entry matches the substring.
+/// - `Exec`        — canonical exec form: `{ command: "onebrain", args: [...] }`
+/// - `LegacyShell` — exactly one matching entry, not in canonical exec form
+///   (shell-form, wrapper like `bash -c …`, missing args[], etc.).
+/// - `LegacyAlias` — exactly one matching entry in exec form but using the
+///   v3.0/v3.1 hidden alias (`qmd-reindex` hyphen) instead of the canonical
+///   subcommand (`qmd reindex` space). qmd-specific.
+/// - `Duplicate(n)` — `n >= 2` matching entries (any mix of forms).
+/// - `Absent`      — no entry matches.
 #[derive(Debug, PartialEq, Eq)]
 enum HookForm {
     Exec,
-    Legacy,
+    LegacyShell,
+    LegacyAlias,
+    Duplicate(usize),
     Absent,
 }
 
@@ -116,9 +126,63 @@ fn detect_hook_form(settings: &Value, event: &str, substring: &str) -> HookForm 
         }
     }
     if saw_legacy {
-        HookForm::Legacy
+        HookForm::LegacyShell
     } else {
         HookForm::Absent
+    }
+}
+
+/// Classify the PostToolUse qmd hook by counting EVERY entry whose effective
+/// command matches the new (`onebrain qmd reindex`) OR the legacy alias
+/// (`onebrain qmd-reindex`) form. Unlike `detect_hook_form` (which short-
+/// circuits on the first canonical match), this counts all matches so a
+/// duplicated hook is reported as such rather than silently passing.
+///
+/// Returns:
+/// - `Absent`        — 0 matches
+/// - `Duplicate(n)`  — n >= 2 matches (any mix of forms)
+/// - `Exec`          — exactly 1, new canonical exec form (`qmd reindex`)
+/// - `LegacyAlias`   — exactly 1, exec form using the hyphen alias
+/// - `LegacyShell`   — exactly 1, shell form (command string, no args[])
+fn detect_qmd_hook_form(settings: &Value) -> HookForm {
+    // (is_exec, is_new_form) for each matching entry.
+    let mut matches: Vec<(bool, bool)> = Vec::new();
+    if let Some(groups) = settings
+        .pointer("/hooks/PostToolUse")
+        .and_then(|v| v.as_array())
+    {
+        for g in groups {
+            let Some(hooks) = g.get("hooks").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for h in hooks {
+                let cmd = effective_command(h);
+                let is_new = cmd.contains(QMD_HOOK_SUBSTRING_NEW);
+                let is_legacy = cmd.contains(QMD_HOOK_SUBSTRING_LEGACY);
+                if !is_new && !is_legacy {
+                    continue;
+                }
+                // `is_canonical` only checks command=="onebrain" + non-empty
+                // args[]; pair it with the form flag so we can tell the new
+                // exec form apart from the hyphen-alias exec form.
+                matches.push((is_canonical(h), is_new));
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => HookForm::Absent,
+        1 => {
+            let (is_exec, is_new) = matches[0];
+            if !is_exec {
+                HookForm::LegacyShell
+            } else if is_new {
+                HookForm::Exec
+            } else {
+                HookForm::LegacyAlias
+            }
+        }
+        n => HookForm::Duplicate(n),
     }
 }
 
@@ -154,22 +218,35 @@ impl Check for SettingsHooksCheck {
         for (event, cmd_substring) in REQUIRED_HOOKS {
             match detect_hook_form(&settings, event, cmd_substring) {
                 HookForm::Exec => confirmed_hooks.push(format!("{} ✓", event)),
-                HookForm::Legacy => warnings.push(format!(
+                HookForm::LegacyShell => warnings.push(format!(
                     "{} hook in legacy shell form — --fix will migrate to exec form",
                     event
                 )),
                 HookForm::Absent => warnings.push(format!("{} hook missing", event)),
+                // detect_hook_form (Stop) never yields these; covered for
+                // exhaustiveness only.
+                HookForm::LegacyAlias | HookForm::Duplicate(_) => {
+                    warnings.push(format!("{} hook needs repair", event))
+                }
             }
         }
 
-        // PostToolUse (qmd) — conditional on qmd_collection
+        // PostToolUse (qmd) — conditional on qmd_collection. Recognizes BOTH
+        // the new `qmd reindex` form and the legacy `qmd-reindex` alias.
         if config.qmd_collection.is_some() {
-            match detect_hook_form(&settings, "PostToolUse", QMD_HOOK_SUBSTRING) {
+            match detect_qmd_hook_form(&settings) {
                 HookForm::Exec => confirmed_hooks.push("PostToolUse ✓".to_string()),
-                HookForm::Legacy => warnings.push(
+                HookForm::LegacyAlias => warnings.push(
+                    "PostToolUse (qmd) hook uses legacy form (qmd-reindex) — run onebrain doctor --fix to migrate"
+                        .to_string(),
+                ),
+                HookForm::LegacyShell => warnings.push(
                     "PostToolUse (qmd) hook in legacy shell form — --fix will migrate to exec form"
                         .to_string(),
                 ),
+                HookForm::Duplicate(n) => warnings.push(format!(
+                    "PostToolUse (qmd) hook duplicated (×{n}) — run onebrain doctor --fix"
+                )),
                 HookForm::Absent => warnings.push("PostToolUse (qmd) hook missing".to_string()),
             }
         }
@@ -509,7 +586,9 @@ mod tests {
                     {
                         "matcher": "Write|Edit",
                         "hooks": [
-                            { "command": "onebrain", "args": ["qmd-reindex"] }
+                            // Canonical NEW form: `qmd reindex` (space), not the
+                            // legacy `qmd-reindex` alias.
+                            { "command": "onebrain", "args": ["qmd", "reindex", "--json"] }
                         ]
                     }
                 ]
@@ -531,6 +610,157 @@ mod tests {
             .details
             .iter()
             .any(|s| s.contains("permissions: Bash(onebrain *) ✓")));
+    }
+
+    /// New canonical exec form `qmd reindex` → ✓ ok (regression for the
+    /// v3.1 false-positive: doctor used to only match the hyphen form).
+    #[test]
+    fn qmd_new_exec_form_reports_ok() {
+        let d = tempdir().unwrap();
+        let s = json!({
+            "hooks": {
+                "Stop": [
+                    { "matcher": "", "hooks": [
+                        { "command": "onebrain", "args": ["checkpoint", "stop"] }
+                    ] }
+                ],
+                "PostToolUse": [
+                    { "matcher": "Write|Edit", "hooks": [
+                        { "command": "onebrain", "args": ["qmd", "reindex", "--json"] }
+                    ] }
+                ]
+            },
+            "permissions": { "allow": ["Bash(onebrain *)"] }
+        });
+        write_settings(d.path(), &s);
+        let r = SettingsHooksCheck.run(d.path(), &cfg(Some("ob-1")));
+        assert_eq!(r.status, DoctorStatus::Ok, "details: {:?}", r.details);
+        let hooks_detail = r
+            .details
+            .iter()
+            .find(|s| s.starts_with("hooks:"))
+            .expect("hooks detail present");
+        assert!(hooks_detail.contains("PostToolUse ✓"));
+    }
+
+    /// Single legacy-alias exec form `qmd-reindex` → advisory to migrate.
+    #[test]
+    fn qmd_legacy_alias_exec_form_is_advisory() {
+        let d = tempdir().unwrap();
+        let s = json!({
+            "hooks": {
+                "Stop": [
+                    { "matcher": "", "hooks": [
+                        { "command": "onebrain", "args": ["checkpoint", "stop"] }
+                    ] }
+                ],
+                "PostToolUse": [
+                    { "matcher": "Write|Edit", "hooks": [
+                        { "command": "onebrain", "args": ["qmd-reindex", "--json"] }
+                    ] }
+                ]
+            },
+            "permissions": { "allow": ["Bash(onebrain *)"] }
+        });
+        write_settings(d.path(), &s);
+        let r = SettingsHooksCheck.run(d.path(), &cfg(Some("ob-1")));
+        assert_eq!(r.status, DoctorStatus::Warn, "details: {:?}", r.details);
+        assert!(r.details.iter().any(|s| s.contains(
+            "PostToolUse (qmd) hook uses legacy form (qmd-reindex) — run onebrain doctor --fix to migrate"
+        )), "details: {:?}", r.details);
+    }
+
+    /// Duplicated qmd hook (×2) → duplicated warning.
+    #[test]
+    fn qmd_duplicate_reports_duplicated() {
+        let d = tempdir().unwrap();
+        let s = json!({
+            "hooks": {
+                "Stop": [
+                    { "matcher": "", "hooks": [
+                        { "command": "onebrain", "args": ["checkpoint", "stop"] }
+                    ] }
+                ],
+                "PostToolUse": [
+                    { "matcher": "Write|Edit", "hooks": [
+                        { "command": "onebrain", "args": ["qmd", "reindex", "--json"] }
+                    ] },
+                    { "matcher": "Write|Edit", "hooks": [
+                        { "command": "onebrain", "args": ["qmd", "reindex", "--json"] }
+                    ] }
+                ]
+            },
+            "permissions": { "allow": ["Bash(onebrain *)"] }
+        });
+        write_settings(d.path(), &s);
+        let r = SettingsHooksCheck.run(d.path(), &cfg(Some("ob-1")));
+        assert_eq!(r.status, DoctorStatus::Warn, "details: {:?}", r.details);
+        assert!(
+            r.details.iter().any(|s| s
+                .contains("PostToolUse (qmd) hook duplicated (×2) — run onebrain doctor --fix")),
+            "details: {:?}",
+            r.details
+        );
+    }
+
+    /// Mixed legacy + new duplicate (×2 across forms) → duplicated warning
+    /// (duplicate detection counts BOTH forms).
+    #[test]
+    fn qmd_mixed_legacy_and_new_reports_duplicated() {
+        let d = tempdir().unwrap();
+        let s = json!({
+            "hooks": {
+                "Stop": [
+                    { "matcher": "", "hooks": [
+                        { "command": "onebrain", "args": ["checkpoint", "stop"] }
+                    ] }
+                ],
+                "PostToolUse": [
+                    { "matcher": "Write|Edit", "hooks": [
+                        { "command": "onebrain", "args": ["qmd-reindex", "--json"] },
+                        { "command": "onebrain", "args": ["qmd", "reindex", "--json"] }
+                    ] }
+                ]
+            },
+            "permissions": { "allow": ["Bash(onebrain *)"] }
+        });
+        write_settings(d.path(), &s);
+        let r = SettingsHooksCheck.run(d.path(), &cfg(Some("ob-1")));
+        assert_eq!(r.status, DoctorStatus::Warn, "details: {:?}", r.details);
+        assert!(
+            r.details.iter().any(|s| s
+                .contains("PostToolUse (qmd) hook duplicated (×2) — run onebrain doctor --fix")),
+            "details: {:?}",
+            r.details
+        );
+    }
+
+    /// Single shell-form qmd hook → legacy shell warning (existing behavior).
+    #[test]
+    fn qmd_shell_form_is_legacy_shell_warning() {
+        let d = tempdir().unwrap();
+        let s = json!({
+            "hooks": {
+                "Stop": [
+                    { "matcher": "", "hooks": [
+                        { "command": "onebrain", "args": ["checkpoint", "stop"] }
+                    ] }
+                ],
+                "PostToolUse": [
+                    { "matcher": "Write|Edit", "hooks": [
+                        { "command": "onebrain qmd reindex" }
+                    ] }
+                ]
+            },
+            "permissions": { "allow": ["Bash(onebrain *)"] }
+        });
+        write_settings(d.path(), &s);
+        let r = SettingsHooksCheck.run(d.path(), &cfg(Some("ob-1")));
+        assert_eq!(r.status, DoctorStatus::Warn, "details: {:?}", r.details);
+        assert!(r
+            .details
+            .iter()
+            .any(|s| s.contains("PostToolUse (qmd) hook in legacy shell form")));
     }
 
     #[test]

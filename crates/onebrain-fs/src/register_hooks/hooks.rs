@@ -23,9 +23,12 @@ impl HookSpec {
         args: &["checkpoint", "stop", "--json"],
     };
 
+    // v3.2: canonical form is the real subcommand `qmd reindex` (space).
+    // The v3.0/v3.1 hidden alias `qmd-reindex` (hyphen) is recognized as a
+    // legacy form and migrated to this one by `migrate_legacy_qmd_entries`.
     pub(crate) const QMD: HookSpec = HookSpec {
         command: "onebrain",
-        args: &["qmd-reindex", "--json"],
+        args: &["qmd", "reindex", "--json"],
     };
 
     /// Shell-form representation: e.g. `"onebrain checkpoint stop"`.

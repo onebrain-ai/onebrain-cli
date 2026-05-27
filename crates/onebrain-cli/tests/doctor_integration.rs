@@ -70,17 +70,18 @@ fn doctor_clean_vault_exits_0() {
     // Exit code 0 means no `Error` status emerged from any check.
     // Note: this fixture omits `qmd_collection` (matching the plan), so the
     // qmd-embeddings check returns Warn per Bun parity. That keeps the exit
-    // code at 0 but means the summary line will be "warning(s) — ok to run"
-    // rather than "all passed". The test asserts the no-error invariant by
-    // checking that no `[✗]` row is rendered.
+    // code at 0 but means the verdict will be the ⚠ glyph (warnings present,
+    // 0 fail) rather than ✓. The test asserts the no-error invariant by
+    // checking that no fail (`✗`) glyph row is rendered and the footer
+    // reports "0 fail" (v3.2.1 grouped layout).
     Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(d.path())
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("[\u{2717}]").not())
-        .stdout(predicate::str::contains("ok to run").or(predicate::str::contains("all passed")));
+        .stdout(predicate::str::contains("\u{2717}").not())
+        .stdout(predicate::str::contains("0 fail"));
 }
 
 #[test]
@@ -95,7 +96,9 @@ fn doctor_missing_folder_exits_1() {
         .assert()
         .failure()
         .code(1)
-        .stdout(predicate::str::contains("[\u{2717}]"))
+        // v3.2.1 grouped layout: fail glyph `✗` on the folders row, with the
+        // check's hint surfaced on the indented `└` line.
+        .stdout(predicate::str::contains("\u{2717} folders"))
         .stdout(predicate::str::contains("Missing: 01-projects"));
 }
 

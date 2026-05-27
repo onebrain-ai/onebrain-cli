@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.0
+latest_version: 3.2.1
 released: 2026-05-27
 ---
 
@@ -11,6 +11,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.1] — 2026-05-27 — doctor grouped UX + braille spinner · qmd-hook fix · logo banner gradient
+
+- **Feat: `onebrain doctor` redesign** — the 9 checks are grouped into 4 sections (Config · Vault structure · Integration · Index & state) under a `🧠 OneBrain Doctor · <vault>` header, rendered via a new reusable braille-spinner progress primitive. Passes stay quiet (`✓`); warnings/fails are prominent (`⚠`/`✗`) with the check's hint on an indented `└` line; a summary footer shows the verdict, `N ok · N warnings · N fail`, the total, and the `--fix` next-action. Spinner + per-step pacing gate to a colour, non-quiet, interactive TTY only — piped/`--json`/`--yaml`/`--no-color`/`--quiet` get the instant static layout; `--json`/`--yaml` shape is byte-identical (presentation-only).
+- **Fix: `doctor` qmd-hook false "missing"** — the detector now recognizes both the canonical `qmd reindex` form (✓) and the legacy `qmd-reindex` alias (⚠ → advise `--fix`), and flags duplicate hooks; `--fix` migrates legacy→canonical and dedups (register-hooks now writes the canonical form). The qmd-hook check stays gated on `qmd_collection`.
+- **Feat: banner wordmark gradient** — a continuous horizontal cyan→purple→pink gradient across `ONEBRAIN` (matching the brain logo) in truecolor; non-truecolor terminals fall back to a light→dark gray ramp.
+- **Polish:** `onebrain update`'s post-update hint now names the direct `onebrain plugin update` path alongside `/update` (no need to open Claude just to sync the plugin).
 
 ## [3.2.0] — 2026-05-27 — `note` resource group (11 verbs)
 
