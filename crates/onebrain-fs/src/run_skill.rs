@@ -15,11 +15,11 @@ pub enum RunSkillError {
     EmptySkill,
 }
 
-/// Result of resolving the `claude` binary. `warning` is non-empty when
-/// `CLAUDE_BIN` was set but pointed to a missing path — the handler logs it
-/// to stderr (matching Bun's `pc.yellow(...)` warning).
+/// Result of resolving a harness binary (`claude` / `gemini`). `warning` is
+/// non-empty when the binary's env override (`CLAUDE_BIN` / `GEMINI_BIN`) was
+/// set but pointed to a missing path — the handler logs it to stderr.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClaudeBinResolution {
+pub struct HarnessBinResolution {
     pub path: PathBuf,
     pub warning: Option<String>,
 }
@@ -54,62 +54,102 @@ pub fn build_prompt(skill: &str, args: &[(String, String)]) -> Result<String, Ru
     Ok(format!("{slash} {}", tokens.join(" ")))
 }
 
-/// Resolve which `claude` binary to invoke. Matches Bun's `resolveClaudeBin`
-/// priority list:
-///
-/// 1. explicit caller `override_path` (test seam) — used as-is
-/// 2. `CLAUDE_BIN` env var if set AND path exists
-/// 3. `CLAUDE_BIN` set but path missing → emit `warning` and fall through
-/// 4. `$HOME/.local/bin/claude` if exists
-/// 5. `/opt/homebrew/bin/claude` if exists
-/// 6. `/usr/local/bin/claude` if exists
-/// 7. bare `claude` (rely on PATH lookup at spawn time)
-///
-/// Closures (`env_lookup`, `path_exists`, `home`) keep this function
-/// deterministic and avoid global env mutation in tests.
+/// Resolve which `claude` binary to invoke. Thin wrapper over [`resolve_bin`]
+/// — see it for the priority list. Kept as a named entry point for the claude
+/// path (and its existing test coverage).
 pub fn resolve_claude_bin(
     override_path: Option<&Path>,
     env_lookup: impl Fn(&str) -> Option<String>,
     path_exists: impl Fn(&Path) -> bool,
     home: Option<&str>,
-) -> ClaudeBinResolution {
+) -> HarnessBinResolution {
+    resolve_bin(
+        "claude",
+        "CLAUDE_BIN",
+        override_path,
+        env_lookup,
+        path_exists,
+        home,
+    )
+}
+
+/// Resolve which `gemini` binary to invoke — mirror of [`resolve_claude_bin`]
+/// with the `GEMINI_BIN` env override and `gemini` probe paths.
+pub fn resolve_gemini_bin(
+    override_path: Option<&Path>,
+    env_lookup: impl Fn(&str) -> Option<String>,
+    path_exists: impl Fn(&Path) -> bool,
+    home: Option<&str>,
+) -> HarnessBinResolution {
+    resolve_bin(
+        "gemini",
+        "GEMINI_BIN",
+        override_path,
+        env_lookup,
+        path_exists,
+        home,
+    )
+}
+
+/// Resolve a harness binary by name, using a per-binary env override and the
+/// shared probe order:
+///
+/// 1. explicit caller `override_path` (test seam) — used as-is
+/// 2. `{env_var}` if set AND the path exists
+/// 3. `{env_var}` set but path missing → emit `warning` and fall through
+/// 4. `$HOME/.local/bin/{bin}` if exists
+/// 5. `/opt/homebrew/bin/{bin}` if exists
+/// 6. `/usr/local/bin/{bin}` if exists
+/// 7. bare `{bin}` (rely on PATH lookup at spawn time)
+///
+/// Closures (`env_lookup`, `path_exists`, `home`) keep this deterministic and
+/// avoid global env mutation in tests.
+pub fn resolve_bin(
+    bin: &str,
+    env_var: &str,
+    override_path: Option<&Path>,
+    env_lookup: impl Fn(&str) -> Option<String>,
+    path_exists: impl Fn(&Path) -> bool,
+    home: Option<&str>,
+) -> HarnessBinResolution {
     if let Some(p) = override_path {
-        return ClaudeBinResolution {
+        return HarnessBinResolution {
             path: p.to_path_buf(),
             warning: None,
         };
     }
 
     let mut warning: Option<String> = None;
-    if let Some(from_env) = env_lookup("CLAUDE_BIN") {
+    if let Some(from_env) = env_lookup(env_var) {
         let candidate = PathBuf::from(&from_env);
         if path_exists(&candidate) {
-            return ClaudeBinResolution {
+            return HarnessBinResolution {
                 path: candidate,
                 warning: None,
             };
         }
-        // Mirror Bun's warning exactly so users grepping logs find the same string.
+        // Keep this string stable (parameterized only by env_var) so users
+        // grepping logs find the same message Bun emitted.
         warning = Some(format!(
-            "CLAUDE_BIN points to a missing file: {from_env} — ignoring and probing defaults"
+            "{env_var} points to a missing file: {from_env} — ignoring and probing defaults"
         ));
     }
 
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(h) = home {
-        candidates.push(PathBuf::from(h).join(".local/bin/claude"));
+        candidates.push(PathBuf::from(h).join(format!(".local/bin/{bin}")));
     }
-    candidates.push(PathBuf::from("/opt/homebrew/bin/claude"));
-    candidates.push(PathBuf::from("/usr/local/bin/claude"));
+    candidates.push(PathBuf::from(format!("/opt/homebrew/bin/{bin}")));
+    candidates.push(PathBuf::from(format!("/usr/local/bin/{bin}")));
 
     for c in candidates {
         if path_exists(&c) {
-            return ClaudeBinResolution { path: c, warning };
+            return HarnessBinResolution { path: c, warning };
         }
     }
 
-    ClaudeBinResolution {
-        path: PathBuf::from("claude"),
+    HarnessBinResolution {
+        path: PathBuf::from(bin),
         warning,
     }
 }
@@ -285,5 +325,56 @@ mod tests {
             result.path,
             PathBuf::from("/Users/example/.local/bin/claude")
         );
+    }
+
+    // ---- resolve_gemini_bin ----
+
+    #[test]
+    fn resolve_gemini_bin_honors_env_when_path_exists() {
+        let result = resolve_gemini_bin(
+            None,
+            |k| (k == "GEMINI_BIN").then(|| "/bin/sh".to_string()),
+            |p| p == Path::new("/bin/sh"),
+            Some("/Users/example"),
+        );
+        assert_eq!(result.path, PathBuf::from("/bin/sh"));
+        assert!(result.warning.is_none());
+    }
+
+    #[test]
+    fn resolve_gemini_bin_warns_on_missing_env_and_probes_homebrew() {
+        // Real machine: gemini lives at /opt/homebrew/bin/gemini (no ~/.local one).
+        let result = resolve_gemini_bin(
+            None,
+            |k| (k == "GEMINI_BIN").then(|| "/definitely/missing".to_string()),
+            |p| p == Path::new("/opt/homebrew/bin/gemini"),
+            Some("/Users/example"),
+        );
+        assert_eq!(result.path, PathBuf::from("/opt/homebrew/bin/gemini"));
+        let warning = result.warning.expect("expected warning for missing env");
+        assert!(
+            warning.contains("GEMINI_BIN points to a missing file"),
+            "was: {warning}"
+        );
+        assert!(warning.contains("/definitely/missing"));
+    }
+
+    #[test]
+    fn resolve_gemini_bin_returns_bare_gemini_when_nothing_exists() {
+        let result = resolve_gemini_bin(None, |_| None, |_| false, Some("/Users/example"));
+        assert_eq!(result.path, PathBuf::from("gemini"));
+        assert!(result.warning.is_none());
+    }
+
+    #[test]
+    fn resolve_gemini_bin_uses_explicit_override_unconditionally() {
+        let result = resolve_gemini_bin(
+            Some(Path::new("/some/test/gemini")),
+            |_| panic!("env should not be consulted when override is set"),
+            |_| panic!("path_exists should not be called when override is set"),
+            None,
+        );
+        assert_eq!(result.path, PathBuf::from("/some/test/gemini"));
+        assert!(result.warning.is_none());
     }
 }

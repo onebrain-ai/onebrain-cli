@@ -25,7 +25,9 @@ pub use harness::{detect_harness, detect_harnesses};
 pub use init::{run_init, InitOptions, InitResult, ScheduleEntry, SchedulePreset};
 pub use migrate::{run_backfill_recapped, MigrateResult};
 pub use orphan::{scan_orphans, OrphanScanResult};
-pub use run_skill::{build_prompt, resolve_claude_bin, ClaudeBinResolution, RunSkillError};
+pub use run_skill::{
+    build_prompt, resolve_claude_bin, resolve_gemini_bin, HarnessBinResolution, RunSkillError,
+};
 pub use update::{run_update, UpdateOptions, UpdateResult};
 pub use vault_sync::{
     build_tar_spawn_overrides, normalize_path, resolve_branch, run_vault_sync, VaultSyncOptions,

@@ -83,10 +83,19 @@ fn compute_result(cwd: &Path, qmd_count: impl Fn() -> usize) -> Result<SessionIn
         .format("%a · %d %b %Y · %H:%M")
         .to_string();
 
+    // Set by `onebrain skill run` on the headless harness child. When true,
+    // INSTRUCTIONS.md skips the interactive startup ceremony and runs only the
+    // requested skill. Accept "1" or "true" (case-insensitive); anything else
+    // (incl. unset) is false.
+    let headless = std::env::var("ONEBRAIN_HEADLESS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     Ok(SessionInitResult::Ok(SessionInitOutput {
         datetime,
         session_token: token.to_string(),
         qmd_unembedded,
+        headless,
     }))
 }
 

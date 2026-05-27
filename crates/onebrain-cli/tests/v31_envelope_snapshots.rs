@@ -72,6 +72,9 @@ fn run_json(args: &[&str], dir: &std::path::Path) -> Value {
     let output = Command::cargo_bin("onebrain")
         .unwrap()
         .args(args)
+        // Hermetic `headless`: clear ONEBRAIN_HEADLESS so session-init snapshots
+        // read `false` even when the test runner is itself under `skill run`.
+        .env_remove("ONEBRAIN_HEADLESS")
         .current_dir(dir)
         .output()
         .expect("spawn failed");

@@ -1,12 +1,16 @@
 use crate::output::OutputMode;
 use serde::Serialize;
 
-/// Successful session-init output · matches Bun v2.3.3 JSON shape byte-for-byte.
+/// Successful session-init output. Extends Bun v2.3.3's JSON shape with
+/// `headless` (v3.2.6): `true` when invoked under `onebrain skill run`
+/// (`ONEBRAIN_HEADLESS=1`), letting INSTRUCTIONS.md skip the interactive
+/// startup ceremony. Unknown to older consumers, which ignore extra fields.
 #[derive(Debug, Serialize)]
 pub struct SessionInitOutput {
     pub datetime: String,
     pub session_token: String,
     pub qmd_unembedded: usize,
+    pub headless: bool,
 }
 
 /// Serialize a hook-protocol block / output to the wire format for the given
