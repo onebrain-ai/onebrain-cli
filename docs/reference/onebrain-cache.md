@@ -8,7 +8,7 @@
 src/
   lib.rs            crate root · re-exports the public API from every module
   error.rs          CacheError enum (CacheIo + transparent Core wrapper) + Result alias
-  session_token.rs  8-layer session-token resolution chain + stale .state cleanup
+  session_token.rs  session-token resolution chain (layer 0 = CLAUDE_CODE_SESSION_ID, then Bun's 1-8) + stale .state cleanup
   checkpoint.rs     Stop/reset hook logic · threshold checks · checkpoint-NN derivation
   state.rs          CheckpointState type + atomic read/write of the 3-field .state file
   qmd.rs            qmd status query + text parsing (QmdStatus) + unembedded count
@@ -25,12 +25,13 @@ Crate error type, `thiserror`-derived.
 **Connections** — calls: `onebrain_core::CoreError`; called by: all other modules in this crate (return type) and `onebrain-cli`.
 
 ## `src/session_token.rs`
-Resolves a stable per-session token via an 8-layer priority chain mirroring Bun v2.3.3 `resolveSessionToken`. Also cleans up stale state files.
+Resolves a stable per-session token via a priority chain. Layer 0 (`CLAUDE_CODE_SESSION_ID`) is OneBrain's own addition; layers 1–8 mirror Bun v2.3.3 `resolveSessionToken`. Also cleans up stale state files.
 
 **Token-resolution priority chain** (first match wins, in `resolve_session_token`):
 
 | # | Layer | Source | Treatment |
 |---|-------|--------|-----------|
+| 0 | `CLAUDE_CODE_SESSION_ID` | Claude Code per-session UUID env | sanitize + truncate to 8 chars · **top priority** — set on every host (terminal, Obsidian, Claude Desktop, IDE, agent-teams), unique per session even when several share one terminal |
 | 1 | `WT_SESSION` | Windows Terminal env | sanitize + truncate to 8 chars |
 | 2 | `TMUX_PANE` | tmux pane id env | sanitize + truncate to 8 chars |
 | 3 | `TERM_SESSION_ID` | macOS Terminal env | sanitize + truncate to 8 chars |
@@ -46,7 +47,7 @@ Resolves a stable per-session token via an 8-layer priority chain mirroring Bun 
 - `ResolveInputs` — all resolution inputs (env vars, `ppid`, plus `today_override` / `tmp_dir_override` / `proc_lookup` test seams); built in prod via `from_env`.
 
 **Key functions**
-- `resolve_session_token(inputs: &ResolveInputs) -> Result<SessionToken>` — runs the 8-layer chain above.
+- `resolve_session_token(inputs: &ResolveInputs) -> Result<SessionToken>` — runs the layer 0–8 chain above (layer 0 first).
 - `ResolveInputs::from_env() -> Self` — snapshots real env + parent PID for production callers.
 - `find_claude_ancestor_pid<F>(start_pid: u32, lookup: F, max_depth: u32) -> Option<u32>` — walks the process tree (capped at 12 hops) for a `claude`-named ancestor.
 - `clean_stale_state_file(token: &SessionToken, tmp_dir: &Path, process_start: SystemTime)` — deletes `$TMPDIR/onebrain-{token}.state` if its mtime predates `process_start`; quiet on ENOENT.
@@ -61,12 +62,12 @@ Stop-hook cadence logic: increments a message counter, checks vault-configured t
 Constants: `SKIP_WINDOW = 60` (silent post-reset window, seconds), `MIN_ACTIVITY = 2` (floor to suppress blocks on trivial sessions).
 
 **Key functions**
-- `handle_stop(token, vault_root, now: u64, tmp_dir, stdout: impl Write)` — reads state; honors the 60s post-reset skip window (signed-subtraction semantics, no skip on backward clock skew); increments count; loads `checkpoint.messages`/`checkpoint.minutes`/`folders.logs` (defaults `15`/`30`/`07-logs`); if `count >= messages || elapsed >= minutes*60` and `count >= MIN_ACTIVITY`, derives the next NN and writes `{"decision":"block","reason":"NN since <start|checkpoint-NN>"}` to `stdout`, then resets state to `{count:0, last_ts:now, last_stop_nn:NN}`.
+- `handle_stop(token, vault_root, now: u64, tmp_dir, stdout: impl Write)` — reads state; honors the 60s post-reset skip window (signed-subtraction semantics, no skip on backward clock skew); increments count; **anchors `last_ts` to `now` on the first stop of a session** so the minutes threshold can fire a session's first checkpoint (previously `last_ts` stayed `0` until a count-based block, which forced `elapsed=0` and left the time threshold dead); loads `checkpoint.messages`/`checkpoint.minutes`/`folders.logs` (defaults `15`/`30`/`07-logs`); if `count >= messages || elapsed >= minutes*60` and `count >= MIN_ACTIVITY`, derives the next NN and writes `{"decision":"block","reason":"NN since <start|checkpoint-NN>"}` to `stdout`, then resets state to `{count:0, last_ts:now, last_stop_nn:NN}`.
 - `handle_reset(token, now: u64, tmp_dir)` — writes `{count:0, last_ts:now, last_stop_nn:"00"}` (on-disk `0:<now>:00`); called by the agent after `/wrapup`.
 - `max_checkpoint_nn(vault_root, logs_folder, date, token) -> u32` (`pub(crate)`) — scans `<vault>/<logs>/checkpoint/` for `{date}-{token}-checkpoint-NN.md`, returns the highest NN (0 if none/dir missing).
 
 **Connections** — calls: `state::{read_state, write_state, CheckpointState}`, `onebrain_core::load_vault_config_at`, `chrono` (Local-TZ date formatting); called by: `onebrain-cli` checkpoint/Stop hook + reset command. The block JSON is consumed by the Claude Code Stop hook.
-**Tests** — extensive: skip-window boundaries (exact 60s, backward skew), message/minute threshold firing, min-activity floor, fresh-state elapsed handling, NN derivation, custom logs folder.
+**Tests** — extensive: skip-window boundaries (exact 60s, backward skew), message/minute threshold firing, min-activity floor, fresh-state `last_ts` anchoring + time-threshold firing from a fresh start without 15 messages, NN derivation, custom logs folder.
 
 ## `src/state.rs`
 Owns the on-disk checkpoint state file `$TMPDIR/onebrain-{token}.state` in 3-field `count:last_ts:last_stop_nn` format.

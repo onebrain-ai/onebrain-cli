@@ -75,6 +75,16 @@ pub fn handle_stop(
 
     state.count += 1;
 
+    // Anchor the elapsed clock on the first observed stop of a session. Until
+    // now last_ts stayed 0 until the first count-based block fired, so `elapsed`
+    // was forced to 0 and the minutes threshold could never produce a session's
+    // FIRST checkpoint — a long but low-message session (e.g. 8 turns over an
+    // hour) would never snapshot. Stamping last_ts here starts the clock so the
+    // time threshold can fire the first checkpoint too.
+    if state.last_ts == 0 {
+        state.last_ts = now;
+    }
+
     // Load thresholds from vault.yml · fall back to defaults
     let (messages_threshold, minutes_threshold, logs_folder) =
         match onebrain_core::load_vault_config_at(vault_root) {
@@ -86,11 +96,10 @@ pub fn handle_stop(
             Err(_) => (15u32, 30u32, "07-logs".to_string()),
         };
     let time_threshold = (minutes_threshold as u64) * 60;
-    let elapsed = if state.last_ts == 0 {
-        0
-    } else {
-        now.saturating_sub(state.last_ts)
-    };
+    // last_ts is non-zero now (anchored above). saturating_sub yields 0 on the
+    // first stop (now == last_ts) and on backward clock skew (now < last_ts) —
+    // both correctly suppress a time-based block this round.
+    let elapsed = now.saturating_sub(state.last_ts);
 
     let threshold_met = state.count >= messages_threshold || elapsed >= time_threshold;
 
@@ -386,18 +395,42 @@ mod stop_tests {
     }
 
     #[test]
-    fn fresh_state_elapsed_treated_as_zero() {
-        // last_ts == 0 (fresh state sentinel) → elapsed=0 not "now seconds"
+    fn fresh_state_anchors_last_ts_on_first_stop() {
+        // First stop of a session: elapsed is still 0 (nothing has elapsed yet),
+        // but last_ts is anchored to `now` so the minutes threshold can start
+        // ticking. Previously last_ts stayed 0 until the first count-based block,
+        // which left the time threshold permanently dead for the first checkpoint.
         let (_vd, vault) = make_vault(30, 15);
         let dir = tempdir().unwrap();
+        let now = 1_700_000_000;
         // No state file written · fresh state
-        let stdout =
-            capture_stdout(|buf| handle_stop("tok", &vault, 1_700_000_000, dir.path(), buf));
+        let stdout = capture_stdout(|buf| handle_stop("tok", &vault, now, dir.path(), buf));
         // count=1 after increment · below 15 · elapsed=0 below 30min · no block
         assert_eq!(stdout, "");
         let s = read_state("tok", dir.path());
         assert_eq!(s.count, 1);
-        assert_eq!(s.last_ts, 0); // preserved
+        assert_eq!(s.last_ts, now); // anchored, not left at 0
+    }
+
+    #[test]
+    fn time_threshold_fires_from_fresh_start_without_15_messages() {
+        // Regression guard for the dead-time-threshold bug: a long but
+        // low-message session must still checkpoint. First stop anchors the
+        // clock; a later stop past the 30-min window fires the block even though
+        // the message count never approached 15.
+        let (_vd, vault) = make_vault(30, 15);
+        let dir = tempdir().unwrap();
+        let t0 = 1_700_000_000;
+        // Stop 1 — anchors last_ts=t0, count=1, no block.
+        let out1 = capture_stdout(|buf| handle_stop("tok", &vault, t0, dir.path(), buf));
+        assert_eq!(out1, "");
+        // Stop 2, 31 minutes later — count=2 (≥ MIN_ACTIVITY), elapsed > 30min → block.
+        let out2 = capture_stdout(|buf| handle_stop("tok", &vault, t0 + 31 * 60, dir.path(), buf));
+        assert!(
+            out2.contains("\"decision\":\"block\""),
+            "expected a time-based block on the second stop, got: {out2:?}"
+        );
+        assert!(out2.contains("01 since start"));
     }
 }
 
