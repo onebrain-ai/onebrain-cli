@@ -288,9 +288,18 @@ fn doctor_fix_migrates_vault_yml_with_vault_flag() {
         "expected vault.yml to be gone after --fix"
     );
     let after = std::fs::read_to_string(vault.path().join("onebrain.yml")).unwrap();
-    assert_eq!(
-        after, original,
-        "rename must preserve file content byte-for-byte"
+    // The migration preserves the original content as a prefix; `doctor` then
+    // stamps the run timestamps (v3.2.3) into a trailing `stats:` block — and
+    // because `--fix` ran, both run and fix dates are written.
+    assert!(
+        after.starts_with(&original),
+        "rename must preserve original content as a prefix · got:\n{after}"
+    );
+    assert!(
+        after.contains("stats:")
+            && after.contains("last_doctor_run:")
+            && after.contains("last_doctor_fix:"),
+        "doctor --fix must stamp last_doctor_run + last_doctor_fix · got:\n{after}"
     );
 }
 

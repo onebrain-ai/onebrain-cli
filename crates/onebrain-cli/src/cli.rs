@@ -795,8 +795,9 @@ pub enum PluginVerb {
         cutoff_date: Option<String>,
         #[arg(long, conflicts_with = "cutoff_date")]
         cutoff: Option<String>,
-        #[arg(long = "vault-dir")]
-        vault: Option<PathBuf>,
+        /// Vault root override · also accepts global `--vault`; walks up from cwd when omitted.
+        #[arg(long = "vault-dir", value_name = "PATH")]
+        vault_dir: Option<PathBuf>,
     },
     /// Plugin install status (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
@@ -855,9 +856,9 @@ pub enum ScheduleVerb {
     Remove { skill: String },
     /// Re-write launchd plists from `onebrain.yml` (or legacy `vault.yml`) schedule block · called by `plugin update`.
     Register {
-        /// Vault root override.
-        #[arg(long = "vault-dir")]
-        vault: Option<PathBuf>,
+        /// Vault root override · also accepts global `--vault`; walks up from cwd when omitted.
+        #[arg(long = "vault-dir", value_name = "PATH")]
+        vault_dir: Option<PathBuf>,
         /// Print the plists that would be written without touching disk.
         #[arg(long)]
         dry_run: bool,
@@ -950,9 +951,9 @@ pub enum SkillVerb {
     List,
     /// Run a skill in headless mode (replaces v3.0 `run-skill`).
     Run {
-        /// Vault root directory (also accepts global `--vault`).
-        #[arg(long = "vault-dir")]
-        vault: Option<PathBuf>,
+        /// Vault root override · also accepts global `--vault`, and walks up from cwd when omitted.
+        #[arg(long = "vault-dir", value_name = "PATH")]
+        vault_dir: Option<PathBuf>,
         /// Skill name (with or without slash prefix).
         name: String,
         /// Pass-through arguments (`--arg key=value`).
@@ -1234,6 +1235,55 @@ mod tests {
     #[test]
     fn vault_flag_is_global() {
         let cli = Cli::try_parse_from(["onebrain", "--vault", "/tmp/v", "task", "list"]).unwrap();
+        assert_eq!(cli.vault.as_deref(), Some(std::path::Path::new("/tmp/v")));
+    }
+
+    // Regression (v3.2.3): `skill run`, `schedule register`, and `plugin
+    // migrate` named their local `--vault-dir` field `vault`, which collides
+    // with the global `--vault` arg ID and made clap reject `--vault` on those
+    // leaves (`onebrain skill run NAME --vault PATH` → "unexpected argument").
+    // Renaming the field to `vault_dir` lets the global `--vault` propagate to
+    // every command, matching `session init` / `checkpoint` / `plugin update`.
+    #[test]
+    fn skill_run_accepts_global_vault_post_subcommand() {
+        let cli = Cli::try_parse_from(["onebrain", "skill", "run", "daily", "--vault", "/tmp/v"])
+            .unwrap();
+        assert_eq!(cli.vault.as_deref(), Some(std::path::Path::new("/tmp/v")));
+        assert!(matches!(
+            cli.command,
+            Cmd::Skill(SkillCmd {
+                verb: SkillVerb::Run { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn skill_run_still_accepts_vault_dir_flag() {
+        // Back-compat for the launchd scheduler, which passes `--vault-dir`.
+        let cli =
+            Cli::try_parse_from(["onebrain", "skill", "run", "daily", "--vault-dir", "/tmp/v"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Cmd::Skill(SkillCmd {
+                verb: SkillVerb::Run { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn schedule_register_accepts_global_vault_post_subcommand() {
+        let cli =
+            Cli::try_parse_from(["onebrain", "schedule", "register", "--vault", "/tmp/v"]).unwrap();
+        assert_eq!(cli.vault.as_deref(), Some(std::path::Path::new("/tmp/v")));
+    }
+
+    #[test]
+    fn plugin_migrate_accepts_global_vault_post_subcommand() {
+        let cli = Cli::try_parse_from([
+            "onebrain", "plugin", "migrate", "logs-v2", "--vault", "/tmp/v",
+        ])
+        .unwrap();
         assert_eq!(cli.vault.as_deref(), Some(std::path::Path::new("/tmp/v")));
     }
 

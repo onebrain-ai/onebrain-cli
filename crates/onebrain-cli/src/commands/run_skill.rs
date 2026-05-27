@@ -1,7 +1,13 @@
 //! `onebrain run-skill` — spawn `claude -p "<prompt>" --add-dir <vault>` with
 //! the vault as `cwd`, inheriting the parent process env (so PATH/HOME
 //! survive for Homebrew lookups). Used by the launchd scheduler to dispatch
-//! OneBrain skills headlessly.
+//! OneBrain skills headlessly, and runnable manually from inside a vault.
+//!
+//! The child's stdin is redirected from `/dev/null`: `claude -p` appends any
+//! piped stdin to the prompt, so an inherited interactive TTY (no EOF) makes
+//! it block forever. launchd already gives the child a null stdin, but a
+//! manual terminal run does not — so we set it explicitly to keep both paths
+//! non-blocking. stdout/stderr stay inherited so the user sees claude's output.
 //!
 //! Exit codes mirror Bun's `runSkillCommand`:
 //!
@@ -15,7 +21,7 @@ use anyhow::{anyhow, Context, Result};
 use onebrain_core::find_config_file;
 use onebrain_fs::{build_prompt, resolve_claude_bin};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Entry point invoked from `main.rs`. Returns the exit code the binary
 /// should call `std::process::exit` with.
@@ -62,13 +68,15 @@ fn parse_args(raw: &[String]) -> Result<Vec<(String, String)>> {
 
 fn spawn_claude(claude_bin: &Path, prompt: &str, vault: &Path) -> Result<i32> {
     // No `env` override: child inherits parent env so PATH/HOME survive.
-    // stdio is inherited by default with `std::process::Command::status()`.
+    // stdout/stderr stay inherited (`status()`); stdin is forced to null so
+    // `claude -p` never blocks reading an interactive TTY — see module docs.
     let status = Command::new(claude_bin)
         .arg("-p")
         .arg(prompt)
         .arg("--add-dir")
         .arg(vault)
         .current_dir(vault)
+        .stdin(Stdio::null())
         .status();
 
     match status {
@@ -152,5 +160,35 @@ mod tests {
     fn parse_args_rejects_empty_key() {
         let err = parse_args(&["=value".to_string()]).unwrap_err();
         assert!(err.to_string().contains("empty key"));
+    }
+
+    /// Exercises the spawn path + exit-code translation with `claude` stubbed
+    /// by a script that exits 43 on EOF / 42 after reading a line.
+    ///
+    /// NOTE: under `cargo test` the harness's own stdin is already at EOF, so
+    /// this cannot *distinguish* a null stdin from an inherited one (both yield
+    /// 43) — it pins the EOF→exit-43 contract, not the `.stdin(null)` line
+    /// itself. The real fix (an interactive TTY no longer hangs `claude -p`) is
+    /// verified manually; a hermetic guard would need to inject a live parent
+    /// stdin, which `spawn_claude` (it reads the process's fd 0) can't take
+    /// without an API change made solely for the test.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_claude_gives_child_a_non_blocking_stdin() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("claude_stub.sh");
+        {
+            let mut f = std::fs::File::create(&stub).unwrap();
+            writeln!(
+                f,
+                "#!/bin/sh\nif IFS= read -r _; then exit 42; else exit 43; fi"
+            )
+            .unwrap();
+        }
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let code = spawn_claude(&stub, "/daily", dir.path()).unwrap();
+        assert_eq!(code, 43, "child should see EOF on a null stdin, not block");
     }
 }
