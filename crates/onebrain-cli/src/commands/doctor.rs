@@ -6,11 +6,13 @@
 //! plain report unchanged. The grouped renderer keeps the approved
 //! section/glyph/summary layout (`render_grouped_report`).
 //!
-//! `--fix` attempts targeted auto-repair recipes for each fixable warning,
-//! then re-runs the checks so the user sees the result in a single
-//! invocation. The recipes are deliberately narrow (one well-understood
-//! action per check); anything ambiguous is reported as "untouched · run
-//! the listed command yourself".
+//! `--fix` shows the grouped report once, then — after a confirmation prompt
+//! on an interactive TTY (auto-yes under `--json`/`--yes`/non-interactive so
+//! the `/doctor` skill and cron aren't blocked) — applies targeted auto-repair
+//! recipes and prints a compact post-fix verdict footer (not the whole report
+//! a second time). The recipes are deliberately narrow (one well-understood
+//! action per check); anything ambiguous is reported as "untouched · run the
+//! listed command yourself". Declining the prompt leaves the vault untouched.
 //!
 //! Every run that finds a config file stamps `stats.last_doctor_run` (and,
 //! when `--fix` ran, `stats.last_doctor_fix`) into it via a comment-preserving
@@ -22,7 +24,7 @@
 //! left untouched.
 
 use crate::legacy_output::serialize_for_mode;
-use crate::output::{framing_rule, write_framed_header, OutputMode, RULE_WIDTH};
+use crate::output::{framing_rule_n, write_framed_header, OutputMode, RULE_WIDTH};
 use crate::safety::refuse_dangerous_vault_path;
 use crate::vault_ctx;
 use anyhow::{anyhow, Result};
@@ -46,9 +48,10 @@ enum FixOutcome {
 }
 
 /// Entry point — returns `Ok(0)` on no errors, `Ok(1)` when any check
-/// produced `DoctorStatus::Error`. With `--fix`, the run is two-pass:
-/// initial check, fix attempts on each warning, then a final re-check
-/// whose result drives the exit code.
+/// produced `DoctorStatus::Error`. With `--fix`, the run is two-pass: initial
+/// check, then fix attempts — on the auto-fixable issues after a confirmation
+/// prompt in text mode, or every recipe with no prompt in `--json` mode —
+/// followed by a final re-check whose result drives the exit code.
 ///
 /// `json` switches output from the plain-text formatter to a single JSON
 /// document on stdout (for scripts / the `/doctor` plugin skill). In
@@ -64,6 +67,7 @@ enum FixOutcome {
 pub fn run(
     fix: bool,
     json: bool,
+    yes: bool,
     vault_flag: Option<PathBuf>,
     mode: &OutputMode,
     quiet: bool,
@@ -106,44 +110,38 @@ pub fn run(
     });
 
     let mut results = run_all_checks(vault_root.as_path(), &config);
+    // Frame width from the PRE-fix report so the deferred `--fix` footer lines
+    // up with the header shown above it (both measured from the same results).
+    let report_rule_width = doctor_rule_width(&results, &vault_display_name(vault_root.as_path()));
     if !want_structured {
-        emit_text_report(&results, vault_root.as_path(), mode, quiet)?;
+        // Under `--fix` the verdict footer is deferred until after the fix pass
+        // (one final footer, not a redundant before-and-after pair); a plain
+        // run prints it inline with the report.
+        emit_text_report(&results, vault_root.as_path(), mode, quiet, !fix)?;
     }
 
     let mut any_recipe_failed = false;
     let mut fix_outcomes_json: Vec<serde_json::Value> = Vec::new();
     if fix {
-        // Dispatch on both Warn and Error: some checks (plugin-files,
-        // onebrain.yml-keys) emit Error for the very failure modes the recipes
-        // are designed to repair additively (missing INSTRUCTIONS.md, missing
-        // `folders` block). The dispatcher returns Manual for unrelated
-        // checks, so unhandled errors are surfaced as text rather than
-        // silently re-attempted.
+        // Warn + Error are both candidates: some checks (plugin-files,
+        // onebrain.yml-keys, folders) emit Error for the very failure modes
+        // the recipes repair. `planned_action` classifies which have an
+        // automated recipe vs which need a manual step.
         let issues: Vec<&DoctorResult> = results
             .iter()
             .filter(|r| matches!(r.status, DoctorStatus::Warn | DoctorStatus::Error))
             .collect();
-        if issues.is_empty() {
-            if !want_structured {
-                println!("\nFix · nothing to do — no issues.");
-            }
-        } else {
-            if !want_structured {
-                println!("\nFix · attempting recipes for {} issue(s)", issues.len());
-            }
-            let outcomes: Vec<(String, FixOutcome)> = issues
-                .iter()
-                .map(|r| {
-                    (
-                        r.check.clone(),
-                        attempt_fix(r, vault_root.as_path(), want_structured),
-                    )
-                })
-                .collect();
-            any_recipe_failed = outcomes
-                .iter()
-                .any(|(_, o)| matches!(o, FixOutcome::Failed(_)));
-            if want_structured {
+        if want_structured {
+            // Machine path (the `/doctor` skill drives `--fix --json`): no
+            // prompt, run every recipe, capture outcomes for the `fix[]` array.
+            if !issues.is_empty() {
+                let outcomes: Vec<(String, FixOutcome)> = issues
+                    .iter()
+                    .map(|r| (r.check.clone(), attempt_fix(r, vault_root.as_path(), true)))
+                    .collect();
+                any_recipe_failed = outcomes
+                    .iter()
+                    .any(|(_, o)| matches!(o, FixOutcome::Failed(_)));
                 fix_outcomes_json = outcomes
                     .iter()
                     .map(|(check, o)| {
@@ -152,22 +150,72 @@ pub fn run(
                             FixOutcome::Failed(m) => ("failed", m.as_str()),
                             FixOutcome::Manual(m) => ("manual", m.as_str()),
                         };
-                        serde_json::json!({
-                            "check": check,
-                            "outcome": outcome,
-                            "message": message,
-                        })
+                        serde_json::json!({ "check": check, "outcome": outcome, "message": message })
                     })
                     .collect();
+                results = run_all_checks(vault_root.as_path(), &config);
+            }
+        } else {
+            // Text path: preview the plan, confirm, then apply only the
+            // auto-fixable recipes (manual-only issues never trigger a prompt).
+            let auto: Vec<&DoctorResult> = issues
+                .iter()
+                .copied()
+                .filter(|r| planned_action(r).is_some())
+                .collect();
+            let manual: Vec<&DoctorResult> = issues
+                .iter()
+                .copied()
+                .filter(|r| planned_action(r).is_none())
+                .collect();
+
+            if issues.is_empty() {
+                println!("\nNothing to fix — all checks pass.");
             } else {
-                print_fix_summary(&outcomes);
-                // Blank line separates the fix summary from the post-fix report.
-                println!();
+                if !auto.is_empty() {
+                    println!("\nWill apply {} automated fix(es):", auto.len());
+                    for r in &auto {
+                        println!(
+                            "  • {} — {}",
+                            display_label(&r.check),
+                            planned_action(r).unwrap_or("")
+                        );
+                    }
+                }
+                if !manual.is_empty() {
+                    println!(
+                        "\n{} issue(s) need a manual step (no automated fix):",
+                        manual.len()
+                    );
+                    for r in &manual {
+                        let hint = r.hint.as_deref().unwrap_or(r.message.as_str());
+                        println!("  · {} — {}", display_label(&r.check), hint);
+                    }
+                }
+                if auto.is_empty() {
+                    // Nothing to auto-apply — don't ask a misleading "Apply
+                    // fixes?" when confirming would change nothing.
+                    println!("\nNothing to auto-fix — see the manual steps above.");
+                } else if confirm_fix(auto.len(), false, yes) {
+                    let outcomes: Vec<(String, FixOutcome)> = auto
+                        .iter()
+                        .map(|r| (r.check.clone(), attempt_fix(r, vault_root.as_path(), false)))
+                        .collect();
+                    any_recipe_failed = outcomes
+                        .iter()
+                        .any(|(_, o)| matches!(o, FixOutcome::Failed(_)));
+                    print_fix_summary(&outcomes);
+                    results = run_all_checks(vault_root.as_path(), &config);
+                } else {
+                    println!("\nNo changes made.");
+                }
             }
-            results = run_all_checks(vault_root.as_path(), &config);
-            if !want_structured {
-                emit_text_report(&results, vault_root.as_path(), mode, quiet)?;
-            }
+            // Single deferred verdict footer — the pre-fix report omitted its
+            // own footer so this is the only one the user sees. Uses the
+            // pre-fix frame width so it lines up with the header above.
+            println!();
+            let color = crate::output::is_color_text(mode);
+            write_summary_footer(&mut std::io::stdout(), &results, color, report_rule_width)?;
         }
     }
 
@@ -201,6 +249,33 @@ pub fn run(
     } else {
         1
     })
+}
+
+/// Decide whether the text-mode `--fix` should apply its recipes.
+///
+/// `structured` short-circuits to `true` as a defensive guard — production
+/// routes `--fix --json` through the separate structured branch in `run()` and
+/// never calls this; `--yes` short-circuits too. Otherwise prompt on an
+/// interactive TTY. A non-interactive plain run (piped stdin/stdout — e.g. cron
+/// without `--yes`) proceeds without prompting, matching pre-3.2.4 behaviour so
+/// existing automation keeps working. A read error is treated as "decline".
+fn confirm_fix(fixable_count: usize, structured: bool, yes: bool) -> bool {
+    use std::io::{IsTerminal, Write};
+    if structured || yes {
+        return true;
+    }
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        return true;
+    }
+    // The plan (the bulleted action list) is printed by the caller just above
+    // this prompt, so keep the question itself short.
+    print!("\nApply {fixable_count} fix(es)? [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// Render `results` + optional fix outcomes as a single JSON document.
@@ -309,6 +384,9 @@ fn attempt_fix(result: &DoctorResult, vault_root: &Path, json: bool) -> FixOutco
         // brings INSTRUCTIONS.md / agents/ / skills/ / .claude-plugin/
         // back if they were deleted or never synced.
         "plugin-files" => fix_plugin_files(vault_root, json),
+        // Create any missing standard folders on disk, named from onebrain.yml
+        // (so a customised `folders:` layout gets the right directories).
+        "folders" => fix_folders(vault_root, json),
         // Backfill missing standard folder keys + default `update_channel`
         // in onebrain.yml. Safe (additive) — never overwrites user values.
         "onebrain.yml-keys" => fix_vault_yml_keys(vault_root, json),
@@ -329,6 +407,28 @@ fn attempt_fix(result: &DoctorResult, vault_root: &Path, json: bool) -> FixOutco
                 .to_string(),
         ),
         _ => FixOutcome::Manual(manual_message(result)),
+    }
+}
+
+/// Describe what `--fix` would do to an issue WITHOUT executing it, so the
+/// plan can be previewed before the confirmation prompt. `Some(action)` for an
+/// auto-fixable check, `None` when only a manual step applies (e.g. `qmd`
+/// collection not set, orphan checkpoints).
+///
+/// Keep the match arms in sync with [`attempt_fix`] — same check names and the
+/// same `qmd-embeddings` "unembedded" message guard.
+fn planned_action(result: &DoctorResult) -> Option<&'static str> {
+    match result.check.as_str() {
+        "qmd-embeddings" if result.message.contains("unembedded") => {
+            Some("re-embed pending documents")
+        }
+        "settings-hooks" => Some("register the Stop + qmd hooks and permissions"),
+        "plugin-files" => Some("re-download plugin files from upstream"),
+        "folders" => Some("create the missing standard folders"),
+        "onebrain.yml-keys" => Some("backfill missing onebrain.yml keys"),
+        "claude-settings" => Some("remove the stale marketplace entry"),
+        "vault-config-migration" => Some("migrate vault.yml → onebrain.yml"),
+        _ => None,
     }
 }
 
@@ -412,6 +512,61 @@ fn fix_settings_hooks(vault_root: &Path, json: bool) -> FixOutcome {
             r.permissions_added.len()
         )),
         Err(e) => FixOutcome::Failed(format!("register-hooks: {e}")),
+    }
+}
+
+/// Recipe — `folders` error means one or more standard vault folders are
+/// missing on disk. Create them, using the folder names from `onebrain.yml`
+/// (the `FoldersCheck` checks those exact names, so a customised `folders:`
+/// layout gets the right directories), plus the `00-inbox/imports` subdir
+/// that `init` creates. Additive and idempotent — never deletes or renames.
+fn fix_folders(vault_root: &Path, json: bool) -> FixOutcome {
+    use onebrain_core::load_vault_config_at;
+    if let Err(e) = refuse_dangerous_vault_path(vault_root) {
+        return FixOutcome::Failed(e.to_string());
+    }
+    status_line(json, "running: create folders");
+    let config = load_vault_config_at(vault_root).unwrap_or_else(|_| onebrain_core::VaultConfig {
+        qmd_collection: None,
+        checkpoint: Default::default(),
+        folders: Default::default(),
+    });
+    let f = &config.folders;
+    // Order mirrors FoldersCheck so the post-fix re-check reports 8/8.
+    let names = [
+        &f.inbox,
+        &f.projects,
+        &f.areas,
+        &f.knowledge,
+        &f.resources,
+        &f.agent,
+        &f.archive,
+        &f.logs,
+    ];
+    let mut created: Vec<String> = Vec::new();
+    for name in names {
+        let path = vault_root.join(name.as_str());
+        if !path.is_dir() {
+            if let Err(e) = std::fs::create_dir_all(&path) {
+                return FixOutcome::Failed(format!("create {name}: {e}"));
+            }
+            created.push(name.clone());
+        }
+    }
+    // Match `init`: ensure the inbox staging subdir exists too. Surface a
+    // failure rather than swallow it — `FoldersCheck` doesn't inspect
+    // `imports/`, so a silent miss here would be invisible end-to-end.
+    let imports = vault_root.join(f.inbox.as_str()).join("imports");
+    if !imports.is_dir() {
+        if let Err(e) = std::fs::create_dir_all(&imports) {
+            return FixOutcome::Failed(format!("create {}/imports: {e}", f.inbox));
+        }
+        created.push(format!("{}/imports", f.inbox));
+    }
+    if created.is_empty() {
+        FixOutcome::Fixed("all standard folders already present".to_string())
+    } else {
+        FixOutcome::Fixed(format!("created {}: {}", created.len(), created.join(", ")))
     }
 }
 
@@ -1040,7 +1195,12 @@ fn build_sections(results: &[DoctorResult]) -> Vec<crate::output::Section> {
 /// Render the summary footer: a rule, the verdict line (overall glyph, the
 /// ok/warn/fail counts, and the total), an optional `--fix` next-action line
 /// when there are repairable issues, then a closing rule.
-fn write_summary_footer<W: Write>(w: &mut W, results: &[DoctorResult], color: bool) -> Result<()> {
+fn write_summary_footer<W: Write>(
+    w: &mut W,
+    results: &[DoctorResult],
+    color: bool,
+    rule_width: usize,
+) -> Result<()> {
     use crate::output::StepStatus;
     let total = results.len();
     let errors = results
@@ -1081,10 +1241,10 @@ fn write_summary_footer<W: Write>(w: &mut W, results: &[DoctorResult], color: bo
     // 1 leading space + 1 glyph column + 2 spaces + counts.
     let left_cols = 1 + 1 + 2 + counts.chars().count();
     // At least 2 spaces between counts and total even if the line is wide.
-    let gap = RULE_WIDTH
+    let gap = rule_width
         .saturating_sub(left_cols + total_str.chars().count())
         .max(2);
-    let rule = framing_rule();
+    let rule = framing_rule_n(rule_width);
 
     writeln!(w)?;
     writeln!(w, "{dim}{rule}{reset}")?;
@@ -1094,10 +1254,13 @@ fn write_summary_footer<W: Write>(w: &mut W, results: &[DoctorResult], color: bo
         glyph = verdict.glyph(),
         pad = " ".repeat(gap),
     )?;
-    // `--fix` next-action — shown whenever there's a repairable issue. Both
-    // warn and error feed the fix dispatcher (`attempt_fix` matches on both),
-    // so any non-zero issue count gets the pointer.
-    if warnings + errors > 0 {
+    // `--fix` next-action — shown only when at least one issue has an
+    // automated recipe. A manual-only remainder (e.g. `qmd_collection not set`)
+    // gets no pointer, since `--fix` can't repair it.
+    let any_auto_fixable = results.iter().any(|r| {
+        matches!(r.status, DoctorStatus::Warn | DoctorStatus::Error) && planned_action(r).is_some()
+    });
+    if any_auto_fixable {
         writeln!(w, " →  onebrain doctor --fix  to auto-repair")?;
     }
     writeln!(w, "{dim}{rule}{reset}")?;
@@ -1113,14 +1276,22 @@ fn write_summary_footer<W: Write>(w: &mut W, results: &[DoctorResult], color: bo
 ///
 /// This is the single rendering entry point used for BOTH the initial report
 /// and the post-`--fix` re-render, so they share one layout.
+///
+/// `show_footer` is false for the pre-fix report under `--fix`: the verdict
+/// footer is deferred until after the fix pass so the run shows exactly one
+/// (final) footer instead of a redundant before-and-after pair.
 fn render_grouped_report<W: Write>(
     mut w: W,
     results: &[DoctorResult],
     vault_name: &str,
     color: bool,
     animate: bool,
+    show_footer: bool,
 ) -> Result<()> {
     use crate::output::ProgressRenderer;
+    // Widen the frame so the rules span the longest line (e.g. a "Missing:
+    // 00-inbox, 01-projects, …" hint), instead of stopping short of the text.
+    let rule_width = doctor_rule_width(results, vault_name);
     // Doctor's own header (distinct from the brand wordmark banner on stderr),
     // via the shared framed-header helper that `update` also uses.
     write_framed_header(
@@ -1128,6 +1299,7 @@ fn render_grouped_report<W: Write>(
         "🧠",
         &format!("OneBrain Doctor · {vault_name}"),
         color,
+        rule_width,
     )?;
     let sections = build_sections(results);
     {
@@ -1137,8 +1309,36 @@ fn render_grouped_report<W: Write>(
             renderer.render_section(section)?;
         }
     }
-    write_summary_footer(&mut w, results, color)?;
+    if show_footer {
+        write_summary_footer(&mut w, results, color, rule_width)?;
+    }
     Ok(())
+}
+
+/// Width for the doctor frame rules: the widest rendered body line (section
+/// headers, check lines, hint `└` lines) and the header title, clamped to a
+/// [`RULE_WIDTH`] floor. Measured by rendering the body uncoloured to a buffer
+/// so ANSI escapes don't inflate the count; the body's glyphs (`✓ ⚠ ✗ └ ─`)
+/// are single-column, so a `char` count equals the display width. The 🧠 in the
+/// header title renders as two columns, accounted for explicitly.
+fn doctor_rule_width(results: &[DoctorResult], vault_name: &str) -> usize {
+    use crate::output::ProgressRenderer;
+    let sections = build_sections(results);
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut renderer = ProgressRenderer::with_writer(&mut buf, true, false);
+        for section in &sections {
+            let _ = renderer.render_section(section);
+        }
+    }
+    let body_max = String::from_utf8_lossy(&buf)
+        .lines()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0);
+    // Header line is ` 🧠  <title>`: 1 lead space + 2 emoji columns + 2 spaces.
+    let header_cols = 5 + format!("OneBrain Doctor · {vault_name}").chars().count();
+    body_max.max(header_cols).max(RULE_WIDTH)
 }
 
 /// Derive the human vault name from its root path (the final path component),
@@ -1165,6 +1365,7 @@ fn emit_text_report(
     vault_root: &Path,
     mode: &OutputMode,
     quiet: bool,
+    show_footer: bool,
 ) -> Result<()> {
     use crate::output::{is_color_text, should_animate};
     use std::io::IsTerminal;
@@ -1172,7 +1373,14 @@ fn emit_text_report(
     let animate = should_animate(mode, std::io::stdout().is_terminal(), quiet);
     let color = is_color_text(mode);
     let name = vault_display_name(vault_root);
-    render_grouped_report(std::io::stdout(), results, &name, color, animate)
+    render_grouped_report(
+        std::io::stdout(),
+        results,
+        &name,
+        color,
+        animate,
+        show_footer,
+    )
 }
 
 #[cfg(test)]
@@ -1199,7 +1407,7 @@ mod tests {
 
     fn render_static_report(results: &[DoctorResult], color: bool) -> String {
         let mut buf = Vec::new();
-        render_grouped_report(&mut buf, results, "ob-1", color, false).unwrap();
+        render_grouped_report(&mut buf, results, "ob-1", color, false, true).unwrap();
         String::from_utf8(buf).unwrap()
     }
 
@@ -1342,7 +1550,22 @@ mod tests {
             .find(|l| !l.is_empty() && l.chars().all(|c| c == '─'))
             .map(|l| l.chars().count())
             .expect("a rule line of box dashes");
-        assert_eq!(rule_len, RULE_WIDTH, "rule width");
+        // v3.2.4: the rule is at least the default width, and widens to span
+        // the longest content line so the frame never stops short of the text.
+        assert!(
+            rule_len >= RULE_WIDTH,
+            "rule at least the default width · got {rule_len}"
+        );
+        let widest_content = lines
+            .iter()
+            .filter(|l| !l.is_empty() && !l.chars().all(|c| c == '─'))
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            rule_len >= widest_content,
+            "rule ({rule_len}) must cover the widest content line ({widest_content})"
+        );
         let verdict = lines
             .iter()
             .find(|l| l.contains("ok ·") && l.contains("checks"))
@@ -1800,6 +2023,114 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fix_folders_creates_missing_standard_folders() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("onebrain.yml"), "update_channel: stable\n").unwrap();
+        fs::create_dir_all(d.path().join("00-inbox")).unwrap();
+        fs::create_dir_all(d.path().join("01-projects")).unwrap();
+        let outcome = fix_folders(d.path(), false);
+        match outcome {
+            FixOutcome::Fixed(msg) => assert!(msg.contains("created"), "msg: {msg}"),
+            other => panic!("expected Fixed, got: {other:?}"),
+        }
+        for name in [
+            "00-inbox",
+            "01-projects",
+            "02-areas",
+            "03-knowledge",
+            "04-resources",
+            "05-agent",
+            "06-archive",
+            "07-logs",
+        ] {
+            assert!(d.path().join(name).is_dir(), "missing folder {name}");
+        }
+        assert!(d.path().join("00-inbox/imports").is_dir(), "inbox/imports");
+    }
+
+    #[test]
+    fn fix_folders_uses_custom_names_from_config() {
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "folders:\n  inbox: my-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n",
+        )
+        .unwrap();
+        let outcome = fix_folders(d.path(), false);
+        assert!(matches!(outcome, FixOutcome::Fixed(_)));
+        assert!(
+            d.path().join("my-inbox").is_dir(),
+            "custom inbox name created"
+        );
+        assert!(
+            !d.path().join("00-inbox").exists(),
+            "default name must not be created when overridden"
+        );
+    }
+
+    #[test]
+    fn fix_folders_idempotent_when_all_present() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("onebrain.yml"), "update_channel: stable\n").unwrap();
+        for name in [
+            "00-inbox",
+            "01-projects",
+            "02-areas",
+            "03-knowledge",
+            "04-resources",
+            "05-agent",
+            "06-archive",
+            "07-logs",
+        ] {
+            fs::create_dir_all(d.path().join(name)).unwrap();
+        }
+        fs::create_dir_all(d.path().join("00-inbox/imports")).unwrap();
+        let outcome = fix_folders(d.path(), false);
+        match outcome {
+            FixOutcome::Fixed(msg) => assert!(msg.contains("already present"), "msg: {msg}"),
+            other => panic!("expected Fixed no-op, got: {other:?}"),
+        }
+    }
+
+    // ── --fix confirmation gate (v3.2.4) ─────────────────────────────────
+
+    #[test]
+    fn confirm_fix_auto_yes_in_structured_mode() {
+        // The /doctor skill drives `--fix --json` — it must never block.
+        assert!(confirm_fix(3, true, false));
+    }
+
+    #[test]
+    fn confirm_fix_auto_yes_with_yes_flag() {
+        assert!(confirm_fix(3, false, true));
+    }
+
+    #[test]
+    fn confirm_fix_proceeds_when_non_interactive() {
+        // Under `cargo test` stdin/stdout aren't TTYs → no prompt, proceed
+        // (matches pre-3.2.4 cron/piped behaviour). The interactive decline
+        // path needs a real TTY and is verified manually.
+        assert!(confirm_fix(3, false, false));
+    }
+
+    #[test]
+    fn planned_action_classifies_auto_vs_manual() {
+        // Locks the invariant the doc comment asks a human to maintain:
+        // `planned_action` must agree with `attempt_fix`'s routing. The
+        // `qmd-embeddings` "unembedded" guard is the one message-dependent arm.
+        assert!(planned_action(&DoctorResult::warn("qmd-embeddings", "3 unembedded")).is_some());
+        assert!(planned_action(&DoctorResult::warn(
+            "qmd-embeddings",
+            "qmd_collection not set"
+        ))
+        .is_none());
+        // Manual-only check → no automated action.
+        assert!(planned_action(&DoctorResult::warn("orphan-checkpoints", "2 orphans")).is_none());
+        // Representative auto-fixable check.
+        assert!(planned_action(&DoctorResult::error("folders", "0/8 present")).is_some());
+    }
+
     /// Lock the full grouped (static, monochrome) layout so any drift in
     /// header / section grouping / glyphs / footer surfaces in
     /// `cargo insta review`. Monochrome so the snapshot has no ANSI noise.
@@ -1818,7 +2149,7 @@ mod tests {
             DoctorResult::ok("qmd-embeddings", "602 indexed · 0 unembedded"),
         ];
         let mut buf = Vec::new();
-        render_grouped_report(&mut buf, &results, "ob-1", false, false).unwrap();
+        render_grouped_report(&mut buf, &results, "ob-1", false, false, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
         insta::assert_snapshot!(output);
     }

@@ -12,7 +12,8 @@
 //! Exit codes mirror Bun's `runSkillCommand`:
 //!
 //! - `78` (EX_CONFIG) — no OneBrain config (onebrain.yml / vault.yml) present
-//! - `127` — spawn failed (e.g. claude not on disk)
+//! - `127` — couldn't run/track the child (spawn failed, e.g. claude not on
+//!   disk; or a fault while waiting on it)
 //! - `128 + signal` — child terminated by signal (Unix only)
 //! - any other code — propagated from child verbatim
 //! - `1` — fallback when child exited with no code and no signal
@@ -67,23 +68,70 @@ fn parse_args(raw: &[String]) -> Result<Vec<(String, String)>> {
 }
 
 fn spawn_claude(claude_bin: &Path, prompt: &str, vault: &Path) -> Result<i32> {
+    use std::io::IsTerminal;
     // No `env` override: child inherits parent env so PATH/HOME survive.
-    // stdout/stderr stay inherited (`status()`); stdin is forced to null so
-    // `claude -p` never blocks reading an interactive TTY — see module docs.
-    let status = Command::new(claude_bin)
+    // stdout/stderr stay inherited so claude's output (and colour) reach the
+    // terminal verbatim; stdin is forced to null so `claude -p` never blocks
+    // reading an interactive TTY — see module docs.
+    let mut command = Command::new(claude_bin);
+    command
         .arg("-p")
         .arg(prompt)
         .arg("--add-dir")
         .arg(vault)
         .current_dir(vault)
-        .stdin(Stdio::null())
-        .status();
+        .stdin(Stdio::null());
 
-    match status {
-        Ok(s) => Ok(translate_exit(&s)),
+    // Non-interactive (launchd scheduler, piped, CI): block and let the
+    // captured StandardOutPath / pipe collect the output. No progress lines —
+    // they'd only litter a log file.
+    if !std::io::stderr().is_terminal() {
+        return match command.status() {
+            Ok(s) => Ok(translate_exit(&s)),
+            Err(e) => {
+                eprintln!("Failed to spawn claude ({}): {e}", claude_bin.display());
+                Ok(127)
+            }
+        };
+    }
+
+    // Interactive: `claude -p` runs a full headless agent session (plugin load,
+    // SessionStart hook, the skill's own work, LLM inference) and buffers its
+    // result until done — often tens of seconds. Spawn it non-blocking and emit
+    // an elapsed heartbeat on stderr so the terminal doesn't look frozen. We
+    // use plain stderr lines (not a `\r` spinner) so they never clobber
+    // claude's stdout output when it finally flushes.
+    eprintln!("▶ Running {prompt} headlessly via claude — output appears when it completes.");
+    let mut child = match command.spawn() {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to spawn claude ({}): {e}", claude_bin.display());
-            Ok(127)
+            return Ok(127);
+        }
+    };
+    let started = std::time::Instant::now();
+    let mut next_beat = std::time::Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(translate_exit(&status)),
+            Ok(None) => {
+                if started.elapsed() >= next_beat {
+                    eprintln!("  … still running ({}s)", started.elapsed().as_secs());
+                    next_beat += std::time::Duration::from_secs(10);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(e) => {
+                // Couldn't observe the child — a harness/OS fault, not a skill
+                // failure, so use 127 (the "couldn't run it properly" class)
+                // rather than 1 (which reads as "the skill ran and failed").
+                // kill+wait reaps the child; this may truncate any output it was
+                // mid-flush on, but we can no longer track it reliably.
+                eprintln!("waiting on claude failed: {e}");
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(127);
+            }
         }
     }
 }

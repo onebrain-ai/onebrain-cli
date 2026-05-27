@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.3
+latest_version: 3.2.4
 released: 2026-05-27
 ---
 
@@ -11,6 +11,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.4] — 2026-05-27 — doctor `--fix` UX overhaul · qmd timeout · skill-run feedback
+
+- **`doctor --fix` is now one pass with a confirmation step:** the report is shown once, the planned auto-fixes are previewed as a bulleted list, then a `[y/N]` prompt confirms before anything changes — followed by a single final verdict footer (was: full report → fixes → full report *again*). `--json` / `--yes` / non-interactive runs auto-proceed so the `/doctor` skill and cron aren't blocked. Manual-only issues (e.g. `qmd_collection not set`) no longer trigger a misleading "Apply fixes?" prompt.
+- **Feat: `doctor --fix` creates missing vault folders** — a new `folders` recipe `mkdir`s any missing standard folders, named from `onebrain.yml` (so a customised `folders:` layout gets the right directories) plus `00-inbox/imports`.
+- **Fix: `doctor` qmd check timeout 3 s → 15 s** — a real index (tens of MB) can take ~10 s for `qmd status`, so the old 3 s cap reported a spurious "qmd status unavailable (timeout)" on healthy, well-populated collections.
+- **Polish: `doctor` frame rules span the longest line** — the header/footer rules widen to cover the widest content row (e.g. a long "Missing: …" hint) instead of stopping short; the `--fix` footer hint is shown only when something is actually auto-fixable.
+- **Feat: `skill run` shows progress** — on an interactive TTY it prints a start line and an elapsed heartbeat (`… still running (Ns)`) while `claude -p` runs the (buffered, often slow) headless session, so the terminal no longer looks frozen. Scheduler/piped runs stay quiet for clean logs.
+- **Feat: `skill run` accepts `--skill <name>`** as an alias for the positional name, for parity with the scheduler's `run-skill --skill` form (`skill run daily` and `skill run --skill /daily` are equivalent).
+- **Polish: `--vault` is the single documented vault flag** — `--vault-dir` is now a hidden back-compat alias on every command (it used to show alongside the global `--vault`, which was confusing). The launchd scheduler and existing scripts keep working.
+- **Chore:** removed the dead `.ci-trigger` scaffold file.
 
 ## [3.2.3] — 2026-05-27 — `skill run` fixes · `--vault` everywhere · doctor stamps last-run
 

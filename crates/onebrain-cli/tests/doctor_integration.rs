@@ -137,10 +137,11 @@ fn doctor_fix_qmd_collection_not_set_routes_to_manual() {
         .assert()
         .success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default();
-    // The Fix block must appear (proves the new pass ran).
+    // The fix summary must appear (proves the fix pass ran). Non-TTY runs
+    // (like this one) auto-proceed past the v3.2.4 confirmation prompt.
     assert!(
-        stdout.contains("Fix · attempting") || stdout.contains("Fix · nothing"),
-        "expected the Fix block in stdout · got: {stdout}"
+        stdout.contains("Fix summary:"),
+        "expected the fix summary in stdout · got: {stdout}"
     );
     // Manual outcome should fire — no `running: qmd embed` line.
     assert!(

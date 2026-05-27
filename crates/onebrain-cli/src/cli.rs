@@ -186,6 +186,9 @@ pub struct DoctorArgs {
     /// Attempt auto-repair recipes for any warnings, then re-run the checks.
     #[arg(long)]
     pub fix: bool,
+    /// Skip the confirmation prompt before `--fix` applies changes (for scripts).
+    #[arg(long)]
+    pub yes: bool,
     /// Emit the report as a single JSON document.
     #[arg(long)]
     pub json: bool,
@@ -294,13 +297,13 @@ pub enum CheckpointVerb {
     /// Auto-save checkpoint metadata · used by Claude Code's Stop hook.
     Stop {
         /// Vault root override.
-        #[arg(long = "vault-dir", value_name = "PATH")]
+        #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
         vault_dir: Option<PathBuf>,
     },
     /// Reset the checkpoint cadence counter · used by /wrapup skill.
     Reset {
         /// Vault root override.
-        #[arg(long = "vault-dir", value_name = "PATH")]
+        #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
         vault_dir: Option<PathBuf>,
     },
     /// Find orphan checkpoints needing /wrapup synthesis · used by SessionStart hook.
@@ -768,7 +771,7 @@ pub enum PluginVerb {
     /// Install plugin into the current vault · called by `init` and `plugin update`.
     Install {
         /// Optional vault root override.
-        #[arg(long = "vault-dir", value_name = "PATH")]
+        #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
         vault_dir: Option<PathBuf>,
         /// Override branch (defaults to onebrain.yml `update_channel`).
         #[arg(long)]
@@ -780,7 +783,7 @@ pub enum PluginVerb {
     /// Pull plugin from GitHub · rewrite hooks · rebind launchd plists.
     Update {
         /// Optional vault root override.
-        #[arg(long = "vault-dir", value_name = "PATH")]
+        #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
         vault_dir: Option<PathBuf>,
         /// Override branch (defaults to onebrain.yml `update_channel`).
         #[arg(long)]
@@ -796,7 +799,7 @@ pub enum PluginVerb {
         #[arg(long, conflicts_with = "cutoff_date")]
         cutoff: Option<String>,
         /// Vault root override · also accepts global `--vault`; walks up from cwd when omitted.
-        #[arg(long = "vault-dir", value_name = "PATH")]
+        #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
         vault_dir: Option<PathBuf>,
     },
     /// Plugin install status (not yet implemented · v3.x roadmap).
@@ -857,7 +860,7 @@ pub enum ScheduleVerb {
     /// Re-write launchd plists from `onebrain.yml` (or legacy `vault.yml`) schedule block · called by `plugin update`.
     Register {
         /// Vault root override · also accepts global `--vault`; walks up from cwd when omitted.
-        #[arg(long = "vault-dir", value_name = "PATH")]
+        #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
         vault_dir: Option<PathBuf>,
         /// Print the plists that would be written without touching disk.
         #[arg(long)]
@@ -920,7 +923,7 @@ pub enum SessionVerb {
     /// Print session metadata as JSON (called by Claude Code's SessionStart hook · users can invoke manually).
     Init {
         /// Vault root directory · defaults to auto-detect from cwd.
-        #[arg(long = "vault-dir", value_name = "PATH")]
+        #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
         vault_dir: Option<PathBuf>,
     },
     /// Print the active session token (not yet implemented · v3.x roadmap).
@@ -952,10 +955,15 @@ pub enum SkillVerb {
     /// Run a skill in headless mode (replaces v3.0 `run-skill`).
     Run {
         /// Vault root override · also accepts global `--vault`, and walks up from cwd when omitted.
-        #[arg(long = "vault-dir", value_name = "PATH")]
+        #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
         vault_dir: Option<PathBuf>,
-        /// Skill name (with or without slash prefix).
-        name: String,
+        /// Skill name (with or without slash prefix). Positional form:
+        /// `onebrain skill run daily`.
+        name: Option<String>,
+        /// Skill name as a flag — `--skill /daily` — for parity with the
+        /// scheduler's `run-skill` form. Equivalent to the positional `<NAME>`.
+        #[arg(long = "skill", value_name = "NAME", conflicts_with = "name")]
+        skill: Option<String>,
         /// Pass-through arguments (`--arg key=value`).
         #[arg(long = "arg")]
         args: Vec<String>,
@@ -1007,7 +1015,7 @@ pub enum VaultVerb {
         /// Optional positional vault root · defaults to walk-up from cwd.
         vault_root: Option<PathBuf>,
         /// Vault root override · flag-form.
-        #[arg(long = "vault-dir", conflicts_with = "vault_root")]
+        #[arg(long = "vault-dir", conflicts_with = "vault_root", hide = true)]
         vault_dir: Option<PathBuf>,
         /// Override branch resolved from onebrain.yml::update_channel.
         #[arg(long)]
@@ -1032,7 +1040,7 @@ pub enum VaultVerb {
 
 #[derive(Args, Debug, Clone)]
 pub struct LegacySessionInitArgs {
-    #[arg(long = "vault-dir")]
+    #[arg(long = "vault-dir", hide = true)]
     pub vault_dir: Option<PathBuf>,
 }
 
@@ -1046,7 +1054,7 @@ pub struct LegacyOrphanScanArgs {
 pub struct LegacyRegisterHooksArgs {
     /// Same surface as v3.0: `--vault` is the long; `--vault-dir` is a
     /// visible alias for parity with sibling commands.
-    #[arg(long, visible_alias = "vault-dir")]
+    #[arg(long, alias = "vault-dir")]
     pub vault: Option<PathBuf>,
     #[arg(long = "dry-run")]
     pub dry_run: bool,
@@ -1056,7 +1064,7 @@ pub struct LegacyRegisterHooksArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct LegacyRegisterScheduleArgs {
-    #[arg(long, visible_alias = "vault-dir")]
+    #[arg(long, alias = "vault-dir")]
     pub vault: Option<PathBuf>,
     #[arg(long)]
     pub dry_run: bool,
@@ -1078,14 +1086,14 @@ pub struct LegacyMigrateArgs {
     pub cutoff_date: Option<String>,
     #[arg(long, conflicts_with = "cutoff_date")]
     pub cutoff: Option<String>,
-    #[arg(long, visible_alias = "vault-dir")]
+    #[arg(long, alias = "vault-dir")]
     pub vault: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct LegacyVaultSyncArgs {
     pub vault_root: Option<PathBuf>,
-    #[arg(long = "vault-dir", conflicts_with = "vault_root")]
+    #[arg(long = "vault-dir", conflicts_with = "vault_root", hide = true)]
     pub vault_dir: Option<PathBuf>,
     #[arg(long)]
     pub branch: Option<String>,
@@ -1096,7 +1104,7 @@ pub struct LegacyRunSkillArgs {
     /// `--vault` is the v3.0 canonical long; `--vault-dir` is a sibling
     /// alias for parity. Optional so the global pre-subcommand `--vault`
     /// can also be the source; dispatcher requires at least one.
-    #[arg(long, visible_alias = "vault-dir")]
+    #[arg(long, alias = "vault-dir")]
     pub vault: Option<PathBuf>,
     #[arg(long)]
     pub skill: String,
@@ -1269,6 +1277,30 @@ mod tests {
                 verb: SkillVerb::Run { .. }
             })
         ));
+    }
+
+    #[test]
+    fn skill_run_accepts_skill_flag() {
+        // v3.2.4: `--skill /daily` (parity with the scheduler's `run-skill`)
+        // populates `skill`; the positional `name` stays None.
+        let cli = Cli::try_parse_from(["onebrain", "skill", "run", "--skill", "/daily"]).unwrap();
+        match cli.command {
+            Cmd::Skill(SkillCmd {
+                verb: SkillVerb::Run { name, skill, .. },
+            }) => {
+                assert!(name.is_none(), "positional name should be empty");
+                assert_eq!(skill.as_deref(), Some("/daily"));
+            }
+            _ => panic!("expected skill run"),
+        }
+    }
+
+    #[test]
+    fn skill_run_rejects_positional_and_skill_flag_together() {
+        // `conflicts_with = "name"` — passing both is ambiguous and must error,
+        // so `name.or(skill)` downstream never silently discards one.
+        let res = Cli::try_parse_from(["onebrain", "skill", "run", "daily", "--skill", "/daily"]);
+        assert!(res.is_err(), "positional + --skill must conflict");
     }
 
     #[test]
