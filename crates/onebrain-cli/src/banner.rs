@@ -1,9 +1,10 @@
 //! R1 branded banner — TTY-only OneBrain wordmark.
 //!
 //! Folded into v3.1.0 per the design's "R1 fold-in" decision: render a 6-line
-//! block-shaded `OneBrain` wordmark in a continuous horizontal cyan→purple→pink
-//! gradient (matching the brain logo; light→dark gray ramp as the non-truecolor
-//! fallback) followed by a dim `Your AI Thinking Partner · vX.Y.Z` tagline
+//! block-shaded `OneBrain` wordmark in a horizontal cyan→purple→pink hue
+//! gradient (matching the brain logo) with a top-lit vertical shade layered on;
+//! non-truecolor terminals fall back to a vertical-only gray ramp. Followed by
+//! a dim `Your AI Thinking Partner · vX.Y.Z` tagline
 //! when stdout is a colourful TTY, suppress entirely otherwise. The banner
 //! exists to make interactive sessions feel branded; it never appears in
 //! machine output or hook-protocol invocations.
@@ -56,28 +57,77 @@ const GRAD_CYAN: (u8, u8, u8) = (34, 211, 238);
 const GRAD_PURPLE: (u8, u8, u8) = (168, 85, 247);
 const GRAD_PINK: (u8, u8, u8) = (255, 45, 146);
 
+/// Vertical lightness ramp layered on top of the horizontal hue gradient so
+/// the wordmark reads as top-lit: the top art row keeps its full hue
+/// (`VGRAD_TOP = 1.0`, so the cyan/pink anchors are exact there) and each
+/// lower row is multiplied toward `VGRAD_BOTTOM`, darkening within the same
+/// hue rather than shifting it. A single per-channel multiply — the
+/// horizontal anchors are untouched.
+const VGRAD_TOP: f32 = 1.0;
+const VGRAD_BOTTOM: f32 = 0.62;
+
+/// Monochrome (no-truecolor) fallback grayscale endpoints — xterm-256 levels
+/// for the top (lightest) and bottom (darkest) art rows. The mono banner uses
+/// a vertical-only ramp (no left→right variation): a single tone shaded
+/// top→bottom, the muted "ONE"-style treatment.
+const GRAY_TOP: u8 = 252;
+const GRAY_BOTTOM: u8 = 240;
+
 /// Linear-interpolate two RGB triples at `t` (0.0..=1.0).
 fn lerp_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
     let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     (mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
 }
 
+/// Scale an RGB triple by a brightness factor (clamped to a valid channel),
+/// preserving hue ratios so the colour darkens within its own tone.
+fn scale_rgb((r, g, b): (u8, u8, u8), factor: f32) -> (u8, u8, u8) {
+    let s = |c: u8| (c as f32 * factor).round().clamp(0.0, 255.0) as u8;
+    (s(r), s(g), s(b))
+}
+
+/// Vertical brightness factor for art `row` of `rows` total: `VGRAD_TOP` at
+/// the top, `VGRAD_BOTTOM` at the bottom, linear between. A single-row banner
+/// (or a degenerate `rows <= 1`) keeps the full top brightness.
+fn vgrad_factor(row: usize, rows: usize) -> f32 {
+    if rows <= 1 {
+        return VGRAD_TOP;
+    }
+    let v = row as f32 / (rows - 1) as f32;
+    VGRAD_TOP + (VGRAD_BOTTOM - VGRAD_TOP) * v
+}
+
 /// ANSI foreground escape for the wordmark gradient at horizontal position `t`
-/// (0.0 = left edge .. 1.0 = right edge). Truecolor terminals get the
-/// cyan→purple→pink logo gradient; everyone else falls back to a light→dark
-/// gray ramp via xterm-256 grayscale (the muted "ONE"-style treatment, so the
-/// wordmark still renders cleanly instead of raw 24-bit escapes).
-fn gradient_fg(t: f32, truecolor: bool) -> String {
+/// (0.0 = left edge .. 1.0 = right edge) and vertical `brightness`
+/// (1.0 = full hue at the top row .. `VGRAD_BOTTOM` at the bottom). Truecolor
+/// terminals get the cyan→purple→pink logo gradient scaled by `brightness`
+/// (horizontal hue + vertical shade). Non-truecolor terminals fall back to a
+/// vertical-only xterm-256 grayscale ramp — `t` carries no colour, so the
+/// wordmark reads as one tone shaded top→bottom (the muted "ONE"-style
+/// treatment) instead of raw 24-bit escapes.
+fn gradient_fg(t: f32, brightness: f32, truecolor: bool) -> String {
     if truecolor {
-        let (r, g, b) = if t < 0.5 {
+        let base = if t < 0.5 {
             lerp_rgb(GRAD_CYAN, GRAD_PURPLE, t * 2.0)
         } else {
             lerp_rgb(GRAD_PURPLE, GRAD_PINK, (t - 0.5) * 2.0)
         };
+        let (r, g, b) = scale_rgb(base, brightness);
         format!("\x1b[38;2;{r};{g};{b}m")
     } else {
-        // xterm-256 grayscale ramp: 252 (light) → 240 (mid-gray).
-        let level = 252 - (t * 12.0).round() as u8;
+        // Monochrome fallback: a vertical-only grayscale ramp. Every glyph in a
+        // row shares one tone (no left→right variation — horizontal `t` carries
+        // no colour here); rows shade from GRAY_TOP (top, lightest) to
+        // GRAY_BOTTOM (bottom, darkest), the muted "ONE"-style treatment. The
+        // row's vertical `brightness` factor is remapped from its
+        // [VGRAD_BOTTOM, VGRAD_TOP] range onto the gray endpoints.
+        let span = VGRAD_TOP - VGRAD_BOTTOM;
+        let f = if span > 0.0 {
+            ((brightness - VGRAD_BOTTOM) / span).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let level = (GRAY_BOTTOM as f32 + (GRAY_TOP as f32 - GRAY_BOTTOM as f32) * f).round() as u8;
         format!("\x1b[38;5;{level}m")
     }
 }
@@ -134,9 +184,11 @@ fn is_hook_protocol(cmd: &Cmd) -> bool {
 /// shaded-block (`░`) characters · 32 cols wide. Split into ONE / BRAIN
 /// halves that `build_banner` joins into one row, then colors per-column by
 /// horizontal position for a continuous gradient across the whole wordmark.
-/// Each letter is 4 chars wide; ONE = 3 letters (cols 0-11) · BRAIN = 5
-/// letters (cols 12-31).
-const BANNER_ONE_ART: [&str; 3] = ["░█▀█░█▀█░█▀▀", "░█░█░█░█░█▀▀", " ▀▀▀ ▀ ▀ ▀▀▀"];
+/// The wordmark's original leading shade pixel (a `░` in front of the `O`) is
+/// replaced with a blank, so the `O` keeps its column-2 start while the stray
+/// dot is gone. Each letter is 4 chars wide; ONE = 3 letters (cols 0-11) ·
+/// BRAIN = 5 letters (cols 12-31).
+const BANNER_ONE_ART: [&str; 3] = [" █▀█░█▀█░█▀▀", " █░█░█░█░█▀▀", " ▀▀▀ ▀ ▀ ▀▀▀"];
 
 const BANNER_BRAIN_ART: [&str; 3] = [
     "░█▀▄░█▀▄░█▀█░▀█▀░█▀█",
@@ -149,17 +201,19 @@ const BANNER_BRAIN_ART: [&str; 3] = [
 const BANNER_VISUAL_WIDTH: usize = 32;
 
 /// Build the banner string (no I/O). Five rendered content lines total:
-///   3 × ASCII-art lines (custom block-shaded `OneBrain` wordmark) colored
-///       with a continuous horizontal gradient — cyan → purple → pink in
-///       truecolor (matching the logo), or a light→dark gray ramp as the
-///       non-truecolor fallback (see [`gradient_fg`]).
+///   3 × ASCII-art lines (custom block-shaded `OneBrain` wordmark) colored by a
+///       horizontal cyan → purple → pink hue gradient with a top-lit vertical
+///       shade layered on per row in truecolor (matching the logo), or a
+///       vertical-only gray ramp as the non-truecolor fallback (see
+///       [`gradient_fg`]).
 ///   1 × dim `Your AI Thinking Partner · vX.Y.Z` tagline, indented to centre
 ///       under the art block.
 ///   plus 1 leading + 1 trailing blank line for breathing room — so
 ///   `str::lines()` yields 6 elements total.
 ///
-/// Each art line colors every column by its horizontal position (one escape
-/// per glyph), then emits `ANSI_RESET` at line end. The tagline is wrapped in
+/// Each art line colors every column by its horizontal position and the row's
+/// [`vgrad_factor`] brightness (one escape per glyph), then emits `ANSI_RESET`
+/// at line end. The tagline is wrapped in
 /// `ANSI_DIM ... ANSI_RESET` so the terminal state is always clean after
 /// the banner. The leading newline separates the banner from the previous
 /// shell prompt so it doesn't crowd the user's command line; the trailing
@@ -177,17 +231,20 @@ fn build_banner(version: &str, truecolor: bool) -> String {
     // Breathing room above the banner so it doesn't visually butt up against
     // the prompt line that invoked it.
     out.push('\n');
-    for i in 0..BANNER_ONE_ART.len() {
+    let rows = BANNER_ONE_ART.len();
+    for i in 0..rows {
         // Join the ONE+BRAIN halves into one row, then color each column by its
         // horizontal position so the gradient flows continuously across the
-        // whole wordmark (cyan → purple → pink), matching the logo. A per-column
-        // escape overrides the previous fg, so one trailing reset per line is
-        // enough.
+        // whole wordmark (cyan → purple → pink), matching the logo. The row's
+        // vertical brightness factor (top-lit → darker toward the bottom) is
+        // layered on per glyph. A per-column escape overrides the previous fg,
+        // so one trailing reset per line is enough.
         let row: String = format!("{}{}", BANNER_ONE_ART[i], BANNER_BRAIN_ART[i]);
+        let brightness = vgrad_factor(i, rows);
         let last_col = row.chars().count().saturating_sub(1).max(1);
         for (col, ch) in row.chars().enumerate() {
             let t = col as f32 / last_col as f32;
-            out.push_str(&gradient_fg(t, truecolor));
+            out.push_str(&gradient_fg(t, brightness, truecolor));
             out.push(ch);
         }
         out.push_str(ANSI_RESET);
@@ -732,6 +789,73 @@ mod tests {
         assert!(
             s.contains(ANSI_DIM),
             "missing dim escape for tagline: {s:?}"
+        );
+    }
+
+    // ── Vertical gradient (top-lit within-tone shading) ──────────────────
+
+    #[test]
+    fn vgrad_factor_top_is_full_and_bottom_is_dimmed() {
+        let rows = BANNER_ONE_ART.len();
+        // Top row keeps full hue (×0 term → exact 1.0, safe to compare).
+        assert_eq!(vgrad_factor(0, rows), VGRAD_TOP);
+        // Bottom row lands at the dim anchor and is strictly below the top.
+        let bottom = vgrad_factor(rows - 1, rows);
+        assert!((bottom - VGRAD_BOTTOM).abs() < 1e-6, "bottom {bottom}");
+        assert!(bottom < VGRAD_TOP, "bottom {bottom} not below top");
+    }
+
+    #[test]
+    fn vgrad_factor_single_or_degenerate_row_is_full_brightness() {
+        assert_eq!(vgrad_factor(0, 1), VGRAD_TOP);
+        assert_eq!(vgrad_factor(0, 0), VGRAD_TOP);
+    }
+
+    #[test]
+    fn banner_vertical_gradient_darkens_lower_rows() {
+        // The horizontal anchors stay exact on the top row; the same anchor on
+        // the bottom row is multiplied toward VGRAD_BOTTOM — proving the
+        // vertical ramp is layered on, not just the horizontal gradient.
+        let rows = BANNER_ONE_ART.len();
+        let s = build_banner(env!("CARGO_PKG_VERSION"), true);
+        // Top-left: exact cyan (brightness 1.0).
+        assert!(s.contains("\x1b[38;2;34;211;238m"), "top cyan: {s:?}");
+        // Bottom-left: cyan scaled by the actual bottom-row factor.
+        let (r, g, b) = scale_rgb(GRAD_CYAN, vgrad_factor(rows - 1, rows));
+        let darkened = format!("\x1b[38;2;{r};{g};{b}m");
+        assert_ne!(darkened, "\x1b[38;2;34;211;238m", "must differ from top");
+        assert!(
+            s.contains(&darkened),
+            "expected darkened bottom-row cyan {darkened:?}: {s:?}"
+        );
+    }
+
+    #[test]
+    fn gray_fallback_ignores_horizontal_position() {
+        // Mono: same row (same brightness), different horizontal `t`, must
+        // yield the identical gray — no left→right variation.
+        let left = gradient_fg(0.0, VGRAD_TOP, false);
+        let right = gradient_fg(1.0, VGRAD_TOP, false);
+        assert_eq!(left, right, "mono must not vary left→right");
+    }
+
+    #[test]
+    fn gray_fallback_shades_top_lighter_than_bottom() {
+        // Vertical-only ramp: the top row is a lighter xterm-grayscale level
+        // than the bottom row.
+        let level = |s: &str| -> i32 {
+            s.trim_start_matches("\x1b[38;5;")
+                .trim_end_matches('m')
+                .parse()
+                .expect("256-color level")
+        };
+        let top = gradient_fg(0.5, VGRAD_TOP, false);
+        let bottom = gradient_fg(0.5, VGRAD_BOTTOM, false);
+        assert_eq!(level(&top), GRAY_TOP as i32, "top is lightest");
+        assert_eq!(level(&bottom), GRAY_BOTTOM as i32, "bottom is darkest");
+        assert!(
+            level(&top) > level(&bottom),
+            "top must be lighter than bottom"
         );
     }
 

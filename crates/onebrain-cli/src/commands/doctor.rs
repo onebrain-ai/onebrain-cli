@@ -13,7 +13,7 @@
 //! the listed command yourself".
 
 use crate::legacy_output::serialize_for_mode;
-use crate::output::OutputMode;
+use crate::output::{framing_rule, write_framed_header, OutputMode, RULE_WIDTH};
 use crate::safety::refuse_dangerous_vault_path;
 use crate::vault_ctx;
 use anyhow::{anyhow, Result};
@@ -869,25 +869,6 @@ fn build_sections(results: &[DoctorResult]) -> Vec<crate::output::Section> {
     sections
 }
 
-/// Width of the horizontal rule framing the header + footer. Matches the
-/// approved layout (a thin full-width divider).
-const RULE: &str = "──────────────────────────────────────────";
-
-/// Render the doctor header block: a rule, the `🧠 OneBrain Doctor · <vault>`
-/// title, then a rule + blank line. This is doctor's own header — distinct
-/// from the brand wordmark banner (emitted to stderr by the dispatch path).
-fn write_doctor_header<W: Write>(w: &mut W, vault_name: &str, color: bool) -> Result<()> {
-    let (dim, reset) = if color {
-        ("\x1b[2m", "\x1b[0m")
-    } else {
-        ("", "")
-    };
-    writeln!(w, "{dim}{RULE}{reset}")?;
-    writeln!(w, " 🧠 OneBrain Doctor · {vault_name}")?;
-    writeln!(w, "{dim}{RULE}{reset}")?;
-    Ok(())
-}
-
 /// Render the summary footer: a rule, the verdict line (overall glyph, the
 /// ok/warn/fail counts, and the total), an optional `--fix` next-action line
 /// when there are repairable issues, then a closing rule.
@@ -923,12 +904,27 @@ fn write_summary_footer<W: Write>(w: &mut W, results: &[DoctorResult], color: bo
     // "fail" has no plural form; "warning" does.
     let warnings_word = if warnings == 1 { "warning" } else { "warnings" };
 
+    // Build the verdict line so the total sits flush against the rule's right
+    // edge. The left segment is ` <glyph>  <counts>`; the glyph and the `·`
+    // separators are all single-column, so the visible length is computable
+    // from the uncoloured text (ANSI escapes around the glyph add no columns).
+    let counts = format!("{passing} ok · {warnings} {warnings_word} · {errors} fail");
+    let total_str = format!("{total} checks");
+    // 1 leading space + 1 glyph column + 2 spaces + counts.
+    let left_cols = 1 + 1 + 2 + counts.chars().count();
+    // At least 2 spaces between counts and total even if the line is wide.
+    let gap = RULE_WIDTH
+        .saturating_sub(left_cols + total_str.chars().count())
+        .max(2);
+    let rule = framing_rule();
+
     writeln!(w)?;
-    writeln!(w, "{dim}{RULE}{reset}")?;
+    writeln!(w, "{dim}{rule}{reset}")?;
     writeln!(
         w,
-        " {glyph_prefix}{}{glyph_reset}  {passing} ok · {warnings} {warnings_word} · {errors} fail        {total} checks",
-        verdict.glyph(),
+        " {glyph_prefix}{glyph}{glyph_reset}  {counts}{pad}{total_str}",
+        glyph = verdict.glyph(),
+        pad = " ".repeat(gap),
     )?;
     // `--fix` next-action — shown whenever there's a repairable issue. Both
     // warn and error feed the fix dispatcher (`attempt_fix` matches on both),
@@ -936,7 +932,7 @@ fn write_summary_footer<W: Write>(w: &mut W, results: &[DoctorResult], color: bo
     if warnings + errors > 0 {
         writeln!(w, " →  onebrain doctor --fix  to auto-repair")?;
     }
-    writeln!(w, "{dim}{RULE}{reset}")?;
+    writeln!(w, "{dim}{rule}{reset}")?;
     Ok(())
 }
 
@@ -957,7 +953,14 @@ fn render_grouped_report<W: Write>(
     animate: bool,
 ) -> Result<()> {
     use crate::output::ProgressRenderer;
-    write_doctor_header(&mut w, vault_name, color)?;
+    // Doctor's own header (distinct from the brand wordmark banner on stderr),
+    // via the shared framed-header helper that `update` also uses.
+    write_framed_header(
+        &mut w,
+        "🧠",
+        &format!("OneBrain Doctor · {vault_name}"),
+        color,
+    )?;
     let sections = build_sections(results);
     {
         // force_static = !animate.
@@ -1096,8 +1099,12 @@ mod tests {
     #[test]
     fn static_report_shows_header_section_labels_and_glyphs() {
         let out = render_static_report(&nine_check_results(), false);
-        // Doctor's own header (distinct from the brand banner).
-        assert!(out.contains("🧠 OneBrain Doctor · ob-1"), "header: {out:?}");
+        // Doctor's own header (distinct from the brand banner). Two spaces
+        // after the wide 🧠 glyph so the title doesn't butt against it.
+        assert!(
+            out.contains("🧠  OneBrain Doctor · ob-1"),
+            "header: {out:?}"
+        );
         // Section headers.
         for header in ["Config", "Vault structure", "Integration", "Index & state"] {
             assert!(out.contains(header), "section {header}: {out:?}");
@@ -1152,6 +1159,35 @@ mod tests {
         assert!(
             out.contains("onebrain doctor --fix  to auto-repair"),
             "fix action: {out:?}"
+        );
+    }
+
+    #[test]
+    fn footer_rule_spans_the_verdict_line() {
+        // The rule must be at least as wide as the verdict it frames ("extend
+        // the line to cover the text"). Mono mode has no ANSI escapes, so char
+        // counts equal visible columns.
+        let out = render_static_report(&nine_check_results(), false);
+        let lines: Vec<&str> = out.lines().collect();
+        let rule_len = lines
+            .iter()
+            .find(|l| !l.is_empty() && l.chars().all(|c| c == '─'))
+            .map(|l| l.chars().count())
+            .expect("a rule line of box dashes");
+        assert_eq!(rule_len, RULE_WIDTH, "rule width");
+        let verdict = lines
+            .iter()
+            .find(|l| l.contains("ok ·") && l.contains("checks"))
+            .expect("verdict line");
+        assert!(
+            verdict.chars().count() <= rule_len,
+            "verdict ({}) must not exceed rule ({rule_len}): {verdict:?}",
+            verdict.chars().count(),
+        );
+        // Total is right-aligned flush to the rule's right edge.
+        assert!(
+            verdict.trim_end().ends_with("9 checks"),
+            "total not right-aligned: {verdict:?}"
         );
     }
 
