@@ -1,9 +1,14 @@
 //! qmd-embeddings check — non-fatal qmd status probe. Bun parity:
 //! `checkQmdEmbeddings` in `src/lib/validator.ts:124-208`. Spawns `qmd status`
-//! with a 3-second timeout and parses `Total: N files indexed` / `Pending: M
-//! need embedding` from stdout. Any failure (missing binary, timeout, parse
-//! error) downgrades to a non-fatal `ok` status so a broken or absent qmd
-//! never blocks `onebrain doctor`.
+//! with a [`QMD_STATUS_TIMEOUT_SECS`] timeout and parses `Total: N files
+//! indexed` / `Pending: M need embedding` from stdout. Any failure (missing
+//! binary, timeout, parse error) downgrades to a non-fatal `ok` status so a
+//! broken or absent qmd never blocks `onebrain doctor`.
+//!
+//! The timeout is generous (15 s, up from Bun's 3 s): on a real vault `qmd
+//! status` reads a multi-megabyte index and can take ~10 s, so a 3 s cap
+//! reported a spurious "unavailable (timeout)" on healthy, well-populated
+//! collections.
 //!
 //! Probe-injection design (`run_with`): the real spawn lives in
 //! `real_qmd_probe`, which is hard to unit-test (depends on `qmd` being on
@@ -14,6 +19,11 @@ use crate::doctor::Check;
 use onebrain_core::{DoctorResult, VaultConfig};
 use std::path::Path;
 use std::time::Duration;
+
+/// Hard deadline for the `qmd status` probe. Generous because a real index
+/// (tens of MB) can take ~10 s to report; a tighter cap produced spurious
+/// "qmd status unavailable (timeout)" on healthy vaults.
+const QMD_STATUS_TIMEOUT_SECS: u64 = 15;
 
 pub struct QmdEmbeddingsCheck;
 
@@ -99,8 +109,8 @@ fn extract_count(stdout: &str, prefix: &str) -> Option<u64> {
     None
 }
 
-/// Real probe — spawn `qmd status` with 3-second timeout. On any failure
-/// returns the matching `QmdProbe` variant. NEVER panics.
+/// Real probe — spawn `qmd status` with a [`QMD_STATUS_TIMEOUT_SECS`] timeout.
+/// On any failure returns the matching `QmdProbe` variant. NEVER panics.
 ///
 /// v3 perf rec #2: uses `wait-timeout` to block on the child instead of
 /// polling `try_wait()` every 100 ms. Saves up to a full poll-tick of jitter
@@ -128,10 +138,10 @@ fn real_qmd_probe() -> QmdProbe {
         Err(_) => return QmdProbe::Error,
     };
 
-    // 3. Block on the child with a hard 3-second deadline (replaces the old
+    // 3. Block on the child with a hard deadline (replaces the old
     //    30 × 100 ms poll). On exit, drain stdout and return. On timeout,
     //    kill + reap.
-    match child.wait_timeout(Duration::from_secs(3)) {
+    match child.wait_timeout(Duration::from_secs(QMD_STATUS_TIMEOUT_SECS)) {
         Ok(Some(_status)) => {
             let mut stdout = String::new();
             if let Some(mut s) = child.stdout.take() {

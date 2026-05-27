@@ -29,8 +29,8 @@ pub(crate) use progress::SPINNER_FRAMES;
 pub(crate) use progress::random_step_delay;
 #[allow(unused_imports)]
 pub use progress::{
-    framing_rule, should_animate, write_framed_header, ProgressRenderer, Section, Step, StepStatus,
-    RULE_WIDTH,
+    framing_rule_n, should_animate, write_framed_header, ProgressRenderer, Section, Step,
+    StepStatus, RULE_WIDTH,
 };
 // `ErrorInfo` / `Warning` are part of the v3.1 envelope public surface.
 // `ErrorInfo` is consumed by `main.rs`'s structured-mode error renderer

@@ -2,9 +2,9 @@
 source: crates/onebrain-cli/src/commands/doctor.rs
 expression: output
 ---
-────────────────────────────────────────────────
+────────────────────────────────────────────────────────
  🧠  OneBrain Doctor · ob-1
-────────────────────────────────────────────────
+────────────────────────────────────────────────────────
 
  Config
   ✓ onebrain.yml       valid · stable · qmd ob-1
@@ -25,7 +25,7 @@ expression: output
   ✓ checkpoints        0 orphans
   ✓ qmd                602 indexed · 0 unembedded
 
-────────────────────────────────────────────────
- ✗  7 ok · 1 warning · 1 fail           9 checks
+────────────────────────────────────────────────────────
+ ✗  7 ok · 1 warning · 1 fail                   9 checks
  →  onebrain doctor --fix  to auto-repair
-────────────────────────────────────────────────
+────────────────────────────────────────────────────────

@@ -165,7 +165,7 @@ Defines `Check` and `run_all_checks`. Canonical order: `onebrain.yml` · `onebra
 **Connections** — calls: `walkdir`, `fs::read_dir`.
 
 ### `src/doctor/qmd.rs`
-**Reports `check` = `"qmd-embeddings"`.** Non-fatal `qmd status` probe (3-second `wait-timeout`); parses `Total: N` / `Pending: M`. Missing `qmd_collection` → `warn` ("Run /qmd to set up search index"); pending>0 → `warn` with advisory hint ("run /qmd embed … or onebrain doctor --fix"); pending 0 → `ok`; any spawn/timeout/parse failure → `ok` (never blocks doctor). **Has `--fix`** for the pending case (advisory). `run_with(probe, config)` injects a stub `QmdProbe { NotFound, Timeout, Stdout, Error }` for tests; `real_qmd_probe` resolves `qmd` via `which` (Unix; falls back to `$HOME/.bun/bin`) or `powershell.exe` (Windows).
+**Reports `check` = `"qmd-embeddings"`.** Non-fatal `qmd status` probe (15-second `wait-timeout` — a real multi-MB index can take ~10 s); parses `Total: N` / `Pending: M`. Missing `qmd_collection` → `warn` ("Run /qmd to set up search index"); pending>0 → `warn` with advisory hint ("run /qmd embed … or onebrain doctor --fix"); pending 0 → `ok`; any spawn/timeout/parse failure → `ok` (never blocks doctor). **Has `--fix`** for the pending case (advisory). `run_with(probe, config)` injects a stub `QmdProbe { NotFound, Timeout, Stdout, Error }` for tests; `real_qmd_probe` resolves `qmd` via `which` (Unix; falls back to `$HOME/.bun/bin`) or `powershell.exe` (Windows).
 **Connections** — calls: `which`, `wait_timeout::ChildExt`, `std::process::Command`.
 
 ### `src/doctor/settings_hooks.rs`

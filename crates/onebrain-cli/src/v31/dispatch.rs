@@ -77,7 +77,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             std::process::exit(code);
         }
         Cmd::Doctor(a) => {
-            let code = commands::doctor::run(a.fix, a.json, vault_flag.clone(), &mode, quiet)?;
+            let code =
+                commands::doctor::run(a.fix, a.json, a.yes, vault_flag.clone(), &mode, quiet)?;
             std::process::exit(code);
         }
 
@@ -229,15 +230,22 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             SkillVerb::Run {
                 vault_dir,
                 name,
+                skill,
                 args,
             } => {
+                // Accept the skill name either positionally (`skill run daily`)
+                // or as `--skill /daily` (parity with the scheduler's
+                // `run-skill` form); clap's `conflicts_with` rejects both at once.
+                let skill_name = name.or(skill).ok_or_else(|| {
+                    anyhow::anyhow!("skill run needs a skill name — `onebrain skill run <NAME>` or `--skill <NAME>`")
+                })?;
                 // Resolve through the canonical chain (flag > ONEBRAIN_VAULT >
                 // walk-up from cwd) so `onebrain skill run NAME` just works from
                 // inside a vault — no explicit path required. Errors with exit
                 // 64 when no vault is found anywhere.
                 let resolved = crate::vault_ctx::require(vault_dir.or(vault_flag.clone()))?;
                 let vault = resolved.root.as_path().to_string_lossy();
-                let code = commands::run_skill::run(&vault, &name, &args)?;
+                let code = commands::run_skill::run(&vault, &skill_name, &args)?;
                 std::process::exit(code);
             }
             SkillVerb::List => stubs::not_implemented("skill list"),

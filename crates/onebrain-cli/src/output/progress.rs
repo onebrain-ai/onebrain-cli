@@ -182,15 +182,15 @@ pub fn should_animate(mode: &OutputMode, stdout_is_tty: bool, quiet: bool) -> bo
 /// `doctor` (header + footer) and `update` (header) so the two stay one width.
 pub const RULE_WIDTH: usize = 48;
 
-/// The framing rule: `RULE_WIDTH` box-drawing dashes. Built on demand (a
-/// `&'static str` can't be `repeat`ed at const time); the allocation is
-/// trivial and happens a handful of times per command.
-pub fn framing_rule() -> String {
-    "─".repeat(RULE_WIDTH)
+/// The framing rule at an explicit width — `width` box-drawing dashes. `doctor`
+/// widens it to span its longest line so the frame never stops short of the
+/// text it encloses; `update` passes the default [`RULE_WIDTH`].
+pub fn framing_rule_n(width: usize) -> String {
+    "─".repeat(width)
 }
 
 /// Write a framed command header — a dim rule, ` <emoji>  <title>`, then a dim
-/// rule. Shared by `doctor` and `update` for one consistent header look.
+/// rule, all `rule_width` columns wide. Shared by `doctor` and `update`.
 ///
 /// Two spaces follow the emoji because brand glyphs like 🧠 render as a
 /// double-width cell in many terminals (e.g. the Obsidian terminal), where a
@@ -201,13 +201,14 @@ pub fn write_framed_header<W: Write>(
     emoji: &str,
     title: &str,
     color: bool,
+    rule_width: usize,
 ) -> std::io::Result<()> {
     let (dim, reset) = if color {
         ("\x1b[2m", "\x1b[0m")
     } else {
         ("", "")
     };
-    let rule = framing_rule();
+    let rule = framing_rule_n(rule_width);
     writeln!(w, "{dim}{rule}{reset}")?;
     writeln!(w, " {emoji}  {title}")?;
     writeln!(w, "{dim}{rule}{reset}")?;
@@ -617,7 +618,7 @@ mod tests {
     #[test]
     fn framed_header_two_spaces_after_emoji_and_full_width_rules() {
         let mut buf = Vec::new();
-        write_framed_header(&mut buf, "🧠", "OneBrain Update", false).unwrap();
+        write_framed_header(&mut buf, "🧠", "OneBrain Update", false, RULE_WIDTH).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(
             out.contains("🧠  OneBrain Update"),
@@ -632,7 +633,7 @@ mod tests {
     #[test]
     fn framed_header_color_wraps_rules_in_dim() {
         let mut buf = Vec::new();
-        write_framed_header(&mut buf, "🧠", "OneBrain Doctor · ob-1", true).unwrap();
+        write_framed_header(&mut buf, "🧠", "OneBrain Doctor · ob-1", true, RULE_WIDTH).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("\x1b[2m"), "dim rule: {out:?}");
         assert!(out.contains("\x1b[0m"), "reset: {out:?}");

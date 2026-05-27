@@ -197,7 +197,13 @@ fn braille_spinner(msg: impl Into<String>) -> ProgressBar {
 /// string for the stdout sink. The TTY path always has colour on.
 fn framed_update_header() -> String {
     let mut buf = Vec::new();
-    let _ = crate::output::write_framed_header(&mut buf, "🧠", "OneBrain Update", true);
+    let _ = crate::output::write_framed_header(
+        &mut buf,
+        "🧠",
+        "OneBrain Update",
+        true,
+        crate::output::RULE_WIDTH,
+    );
     String::from_utf8(buf).unwrap_or_default()
 }
 
