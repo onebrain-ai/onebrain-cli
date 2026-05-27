@@ -5,7 +5,7 @@
 //! body is `unimplemented!()` — the tree shape itself is the v3.1 deliverable
 //! (locks the public command surface for v3.2+).
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -947,6 +947,27 @@ pub struct SkillCmd {
     #[command(subcommand)]
     pub verb: SkillVerb,
 }
+/// Which AI runtime `skill run` dispatches through. Maps to the
+/// `onebrain_core::Harness` runtime identifier (`Direct` is not a `skill run`
+/// target — a skill needs an agent).
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[value(rename_all = "lowercase")]
+pub enum HarnessArg {
+    #[default]
+    Claude,
+    Gemini,
+}
+
+impl HarnessArg {
+    /// Lowercase binary/label name — also the binary invoked.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HarnessArg::Claude => "claude",
+            HarnessArg::Gemini => "gemini",
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum SkillVerb {
     /// List installed skills (not yet implemented · v3.x roadmap).
@@ -964,6 +985,14 @@ pub enum SkillVerb {
         /// scheduler's `run-skill` form. Equivalent to the positional `<NAME>`.
         #[arg(long = "skill", value_name = "NAME", conflicts_with = "name")]
         skill: Option<String>,
+        /// AI runtime to run the skill through (default: claude).
+        #[arg(long, value_enum, default_value_t = HarnessArg::Claude)]
+        harness: HarnessArg,
+        /// Model passed through to the harness (`claude --model <m>` /
+        /// `gemini -m <m>`). Omit to use the harness default. A faster model
+        /// (e.g. `claude-haiku-4-5`, `gemini-2.5-flash`) speeds up headless runs.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
         /// Pass-through arguments (`--arg key=value`).
         #[arg(long = "arg")]
         args: Vec<String>,

@@ -26,6 +26,9 @@ fn run_json(args: &[&str], dir: &std::path::Path) -> Value {
         // the dev machine's live qmd index (non-hermetic · fails wherever qmd
         // is installed). Mirrors the qmd-scrub other binary tests already use.
         .env("PATH", "/usr/bin:/bin")
+        // Hermetic `headless`: clear ONEBRAIN_HEADLESS so the snapshot reads
+        // `false` even when the test runner is itself under `skill run`.
+        .env_remove("ONEBRAIN_HEADLESS")
         .current_dir(dir)
         .output()
         .expect("spawn failed");

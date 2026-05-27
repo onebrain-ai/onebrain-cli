@@ -1,6 +1,6 @@
 ---
-latest_version: 3.2.5
-released: 2026-05-27
+latest_version: 3.2.6
+released: 2026-05-28
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -11,6 +11,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.6] — 2026-05-28 — `skill run` harness + model selection · faster headless runs
+
+- **Feat: `skill run --harness {claude,gemini}`** (default `claude`) — run a OneBrain skill through either agent runtime. claude → `claude -p … --add-dir`; gemini → `gemini -p … --include-directories --approval-mode yolo` (yolo so an unattended skill that runs `onebrain` shell commands or writes files isn't blocked on an approval prompt — same trust model as `claude -p` under the scheduler allow-list). Gemini headless verified: namespaced commands (`/onebrain:daily`), GEMINI.md tool mapping, and the `AfterAgent`/`AfterTool` hooks all wire up.
+- **Feat: `skill run --model <m>`** — passed through to the harness (`claude --model <m>` / `gemini -m <m>`); omit to keep the harness default. The biggest raw-speed lever for headless runs — a faster model (`claude-haiku-4-5`, `gemini-2.5-flash`) speeds up every turn.
+- **Perf: skip the interactive startup ceremony in headless runs.** `skill run` sets `ONEBRAIN_HEADLESS=1` on the harness child; `onebrain session init` now reports `headless: true`, which lets INSTRUCTIONS.md skip the greeting + status + memory/inbox/task/orphan scans (Steps 2–4) and go straight to the requested skill. Requires the plugin update that consumes the flag.
+- **Internal:** generalized claude-only binary resolution to `resolve_claude_bin` + `resolve_gemini_bin` over a shared `resolve_bin` (env override `CLAUDE_BIN`/`GEMINI_BIN` → `~/.local/bin` → Homebrew → `/usr/local/bin` → bare); `ClaudeBinResolution` → `HarnessBinResolution`.
 
 ## [3.2.5] — 2026-05-27 — checkpoint hook actually fires now
 

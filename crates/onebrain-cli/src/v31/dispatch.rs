@@ -231,6 +231,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 vault_dir,
                 name,
                 skill,
+                harness,
+                model,
                 args,
             } => {
                 // Accept the skill name either positionally (`skill run daily`)
@@ -245,7 +247,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 // 64 when no vault is found anywhere.
                 let resolved = crate::vault_ctx::require(vault_dir.or(vault_flag.clone()))?;
                 let vault = resolved.root.as_path().to_string_lossy();
-                let code = commands::run_skill::run(&vault, &skill_name, &args)?;
+                let code = commands::run_skill::run(
+                    &vault,
+                    &skill_name,
+                    &args,
+                    harness,
+                    model.as_deref(),
+                )?;
                 std::process::exit(code);
             }
             SkillVerb::List => stubs::not_implemented("skill list"),
@@ -475,7 +483,15 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             let v = a.vault.or(vault_flag.clone()).ok_or_else(|| {
                 anyhow::anyhow!("run-skill requires --vault <PATH> or --vault-dir <PATH>")
             })?;
-            let code = commands::run_skill::run(&v.to_string_lossy(), &a.skill, &a.args)?;
+            // Legacy alias keeps the claude default with no model override;
+            // `--harness` / `--model` live on the modern `skill run`.
+            let code = commands::run_skill::run(
+                &v.to_string_lossy(),
+                &a.skill,
+                &a.args,
+                crate::cli::HarnessArg::Claude,
+                None,
+            )?;
             std::process::exit(code);
         }
     }

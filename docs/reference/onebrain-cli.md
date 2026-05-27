@@ -22,7 +22,7 @@ src/
 │   └── dispatcher.rs    emit() — picks the serializer per OutputMode
 ├── commands/
 │   ├── mod.rs           declares the 15 v3.0/legacy command-handler submodules
-│   ├── session_init.rs  session init — hook-protocol session metadata JSON
+│   ├── session_init.rs  session init — hook-protocol session metadata JSON (incl. headless flag)
 │   ├── checkpoint.rs    checkpoint stop/reset — auto-save cadence
 │   ├── orphan_scan.rs   checkpoint orphans — orphan-checkpoint count
 │   ├── qmd_reindex.rs   qmd reindex — detached `qmd update` spawn (PostToolUse hook)
@@ -36,7 +36,7 @@ src/
 │   ├── vault_sync.rs    vault sync — pull plugin tarball + overlay
 │   ├── register_hooks.rs plugin install — .claude/settings.json hook wiring
 │   ├── register_schedule.rs schedule register — launchd plist emission
-│   └── run_skill.rs     skill run — headless `claude -p` spawn
+│   └── run_skill.rs     skill run — headless claude/gemini spawn (--harness/--model · ONEBRAIN_HEADLESS)
 └── v31/
     ├── mod.rs           v3.1 module root
     ├── dispatch.rs      central Cmd → handler dispatcher (the routing brain)
@@ -182,7 +182,7 @@ Implements `plugin install` (and the `register-hooks` alias). Idempotent `.claud
 Implements `schedule register` (and the `register-schedule` alias). Six flags route at the top (`--remove`/`--status`/`--test`/`--resume`/`--refresh`/`--dry-run`); otherwise validates each `schedule:` entry and emits launchd plists. Library: `onebrain_core::scheduler::*` (validate/generate/label/plist helpers + `LaunchdContext`). Output: plain status lines. Also invoked internally by `plugin_update` (`--refresh`).
 
 ### `src/commands/run_skill.rs`
-Implements `skill run` (and the `run-skill` alias). The skill name is positional (`skill run daily`) or `--skill <name>` (parity with `run-skill`; clap `conflicts_with` rejects both). The dispatcher resolves the vault via `vault_ctx::require` (`--vault` flag, or the hidden `--vault-dir` alias → `ONEBRAIN_VAULT` → walk-up from cwd; exit 64 if none). Then: verifies a config file exists (else exit 78), parses `--arg key=value` pairs, builds the prompt (`onebrain_fs::build_prompt` → `/onebrain:<name>` unless an explicit `ns:` is given), resolves the claude binary (`onebrain_fs::resolve_claude_bin`), spawns `claude -p "<prompt>" --add-dir <vault>` with inherited env + **null stdin**. On an interactive TTY it spawns non-blocking and prints a start line + an elapsed heartbeat (`… still running (Ns)`) while `claude -p` buffers its result; non-interactive (scheduler/piped) blocks silently for clean logs. Exit codes mirror Bun (78/127/128+signal/child code). Library: `onebrain_core::find_config_file`, `onebrain_fs`.
+Implements `skill run` (and the `run-skill` alias). The skill name is positional (`skill run daily`) or `--skill <name>` (parity with `run-skill`; clap `conflicts_with` rejects both). `--harness {claude,gemini}` (default claude) picks the runtime and `--model <m>` the model (the legacy `run-skill` alias is fixed to claude/no-model). The dispatcher resolves the vault via `vault_ctx::require` (`--vault` flag, or the hidden `--vault-dir` alias → `ONEBRAIN_VAULT` → walk-up from cwd; exit 64 if none). Then: verifies a config file exists (else exit 78), parses `--arg key=value` pairs, builds the prompt (`onebrain_fs::build_prompt` → `/onebrain:<name>` unless an explicit `ns:` is given), resolves the harness binary per `--harness` (`onebrain_fs::resolve_claude_bin` / `resolve_gemini_bin`), and builds the per-harness argv via the pure `harness_argv` (claude → `claude -p "<prompt>" --add-dir <vault> [--model m]`; gemini → `gemini -p "<prompt>" --include-directories <vault> --approval-mode yolo [-m m]` — yolo because the child has null stdin and can't answer an approval prompt). Spawns with inherited env + **null stdin** + `ONEBRAIN_HEADLESS=1` (so the harness's `onebrain session init` reports `headless:true`, letting INSTRUCTIONS.md skip the startup ceremony). On an interactive TTY it spawns non-blocking and prints a start line + an elapsed heartbeat (`… still running (Ns)`) while the harness buffers its result; non-interactive (scheduler/piped) blocks silently for clean logs. Exit codes mirror Bun (78/127/128+signal/child code). Library: `onebrain_core::find_config_file`, `onebrain_fs`.
 
 ## `v31/` — command-tree migration & v3.1 verbs
 The v3.1 layer: `dispatch.rs` is the routing brain mapping every `Cmd` variant to a handler; hidden v3.0 aliases call the corresponding new-path handler **after** `migration::print_once`; `hook_rewriter` migrates on-disk `settings.json` hook args; `plugin_update` is the plugin-side overlay workflow (distinct from `commands::update`, which is the CLI binary self-update); `vault_current` is a new informational verb; `stubs` turns the forward-declared command surface into clean `E_NOT_IMPLEMENTED` (exit 72) or `E_VAULT_NOT_FOUND` (exit 64) responses.
@@ -237,7 +237,7 @@ Turns the forward-declared command surface into clean exits.
 | `plugin update` | `v31/plugin_update.rs` | onebrain-fs (vault-sync, register-hooks settings) + hook_rewriter; drives vault_sync + register_schedule |
 | `plugin migrate` | `commands/migrate.rs` | onebrain-fs (`run_backfill_recapped`) · onebrain-core (config) |
 | `schedule register` | `commands/register_schedule.rs` | onebrain-core (`scheduler::*`, launchd plists) |
-| `skill run` | `commands/run_skill.rs` | onebrain-core (`find_config_file`) · onebrain-fs (`build_prompt`, `resolve_claude_bin`) |
+| `skill run` | `commands/run_skill.rs` | onebrain-core (`find_config_file`) · onebrain-fs (`build_prompt`, `resolve_claude_bin`, `resolve_gemini_bin`) |
 | `init` | `commands/init.rs` | onebrain-fs (`init::run_init`) |
 | `update` | `commands/update.rs` | onebrain-fs (`update::run_update`) |
 | `doctor` | `commands/doctor.rs` | onebrain-fs (`doctor::run_all_checks`) · onebrain-core (config) |

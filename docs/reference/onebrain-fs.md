@@ -13,7 +13,7 @@ src/
 ├── harness.rs            detect_harnesses / detect_harness — Claude/Gemini/Direct runtime detection
 ├── migrate.rs            run_backfill_recapped — idempotent session-log `recapped:` backfill migration
 ├── orphan.rs             scan_orphans — unmerged-checkpoint scan with Active-Session Guard
-├── run_skill.rs          build_prompt + resolve_claude_bin — pure helpers for `onebrain run-skill`
+├── run_skill.rs          build_prompt + resolve_claude_bin/resolve_gemini_bin — pure helpers for `onebrain skill run`
 ├── doctor/               health checks (Box<dyn Check> set)
 │   ├── mod.rs            Check trait + run_all_checks orchestrator (qmd probe on bg thread)
 │   ├── folders.rs        FoldersCheck — 8 PARA folders present
@@ -131,12 +131,13 @@ Orphan-checkpoint scan (port of Bun's `runOrphanScan`). An orphan is a checkpoin
 
 ### `src/run_skill.rs`
 Pure helpers for `onebrain run-skill` (the scheduler's headless skill launcher). All side effects (spawn, env reads) live in the CLI handler.
-**Key types** — `RunSkillError::EmptySkill`; `ClaudeBinResolution { path: PathBuf, warning: Option<String> }`.
+**Key types** — `RunSkillError::EmptySkill`; `HarnessBinResolution { path: PathBuf, warning: Option<String> }` (was `ClaudeBinResolution` pre-v3.2.6).
 **Key functions**
-- `build_prompt(skill: &str, args: &[(String,String)]) -> Result<String, RunSkillError>` — strips leading `/`, namespaces bare names with `onebrain:` (keeps explicit `plugin:` form), appends `k=v` tokens preserving order.
-- `resolve_claude_bin(override_path, env_lookup, path_exists, home) -> ClaudeBinResolution` — priority: explicit override → `CLAUDE_BIN` (if exists) → `$HOME/.local/bin/claude` → `/opt/homebrew/bin/claude` → `/usr/local/bin/claude` → bare `claude`. Missing `CLAUDE_BIN` emits a warning string and falls through. Closures keep it deterministic/test-injectable.
-**Connections** — called by: `onebrain-cli` `run-skill` handler (which performs the actual spawn).
-**Tests** — full prompt-build matrix + claude-bin resolution priority.
+- `build_prompt(skill: &str, args: &[(String,String)]) -> Result<String, RunSkillError>` — strips leading `/`, namespaces bare names with `onebrain:` (keeps explicit `plugin:` form), appends `k=v` tokens preserving order. Same form works for both harnesses (gemini exposes the namespaced `/onebrain:<skill>` custom command).
+- `resolve_bin(bin, env_var, override_path, env_lookup, path_exists, home) -> HarnessBinResolution` — shared resolver: explicit override → `{env_var}` (if exists) → `$HOME/.local/bin/{bin}` → `/opt/homebrew/bin/{bin}` → `/usr/local/bin/{bin}` → bare `{bin}`. A missing `{env_var}` emits a warning string and falls through. Closures keep it deterministic/test-injectable.
+- `resolve_claude_bin(..)` / `resolve_gemini_bin(..)` — thin wrappers over `resolve_bin` for `claude`/`CLAUDE_BIN` and `gemini`/`GEMINI_BIN` (v3.2.6 adds gemini).
+**Connections** — called by: `onebrain-cli` `skill run` handler (which picks the resolver per `--harness`, builds the per-harness argv, and spawns).
+**Tests** — full prompt-build matrix + claude/gemini bin-resolution priority.
 
 ## `doctor/` — health checks
 Each check is a zero-sized unit struct implementing the sync `Check` trait. `run_all_checks` builds a `Vec<Box<dyn Check>>`, runs them serially, and splices in the qmd result. The plugin `/doctor` skill matches on the reported `check` name strings; `--fix` recipes (in the CLI) key off the hints these checks emit.
@@ -373,7 +374,7 @@ Top public functions other crates (chiefly `onebrain-cli`) call:
 - `doctor::run_all_checks(&Path, &VaultConfig) -> Vec<DoctorResult>` — `onebrain doctor`.
 - `scan_orphans(&Path, &str, DateTime<Local>, &Path) -> Result<OrphanScanResult>` — `onebrain checkpoint orphans`.
 - `run_backfill_recapped(&Path, Option<&str>, &str, impl FnMut(&str)) -> MigrateResult` — migration command.
-- `build_prompt(&str, &[(String,String)])` + `resolve_claude_bin(..)` — `onebrain run-skill`.
+- `build_prompt(&str, &[(String,String)])` + `resolve_claude_bin(..)` / `resolve_gemini_bin(..)` (→ `HarnessBinResolution`) — `onebrain skill run`.
 - `detect_harnesses(&Path)` / `detect_harness(&Path)` — harness detection (used by init/register-hooks/vault-sync).
 - `backup_config_file(&Path) -> Result<Option<PathBuf>>` — pre-write config backup.
 - `resolve_branch` / `build_tar_spawn_overrides` / `normalize_path` — vault-sync parity/helper re-exports.

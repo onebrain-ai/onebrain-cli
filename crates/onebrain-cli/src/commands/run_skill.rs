@@ -1,32 +1,52 @@
-//! `onebrain run-skill` — spawn `claude -p "<prompt>" --add-dir <vault>` with
-//! the vault as `cwd`, inheriting the parent process env (so PATH/HOME
+//! `onebrain skill run` — spawn a headless agent harness on a OneBrain skill
+//! with the vault as `cwd`, inheriting the parent process env (so PATH/HOME
 //! survive for Homebrew lookups). Used by the launchd scheduler to dispatch
 //! OneBrain skills headlessly, and runnable manually from inside a vault.
+//!
+//! Harnesses (`--harness`, default `claude`):
+//!   - claude → `claude -p "<prompt>" --add-dir <vault> [--model <m>]`
+//!   - gemini → `gemini -p "<prompt>" --include-directories <vault>
+//!     --approval-mode yolo [-m <m>]` (yolo so a skill that runs `onebrain`
+//!     shell commands or writes files isn't blocked on an approval prompt in
+//!     an unattended run — same trust model as `claude -p` under the
+//!     scheduler's settings allow-list).
+//!
+//! `ONEBRAIN_HEADLESS=1` is set on the child so `onebrain session init`
+//! reports `headless: true`, which lets INSTRUCTIONS.md skip the interactive
+//! startup ceremony (greeting + status + memory/inbox/task/orphan scans) and
+//! go straight to the requested skill.
 //!
 //! The child's stdin is redirected from `/dev/null`: `claude -p` appends any
 //! piped stdin to the prompt, so an inherited interactive TTY (no EOF) makes
 //! it block forever. launchd already gives the child a null stdin, but a
 //! manual terminal run does not — so we set it explicitly to keep both paths
-//! non-blocking. stdout/stderr stay inherited so the user sees claude's output.
+//! non-blocking. stdout/stderr stay inherited so the user sees the output.
 //!
 //! Exit codes mirror Bun's `runSkillCommand`:
 //!
 //! - `78` (EX_CONFIG) — no OneBrain config (onebrain.yml / vault.yml) present
-//! - `127` — couldn't run/track the child (spawn failed, e.g. claude not on
-//!   disk; or a fault while waiting on it)
+//! - `127` — couldn't run/track the child (spawn failed, e.g. the harness
+//!   binary not on disk; or a fault while waiting on it)
 //! - `128 + signal` — child terminated by signal (Unix only)
 //! - any other code — propagated from child verbatim
 //! - `1` — fallback when child exited with no code and no signal
 
+use crate::cli::HarnessArg;
 use anyhow::{anyhow, Context, Result};
 use onebrain_core::find_config_file;
-use onebrain_fs::{build_prompt, resolve_claude_bin};
+use onebrain_fs::{build_prompt, resolve_claude_bin, resolve_gemini_bin};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Entry point invoked from `main.rs`. Returns the exit code the binary
 /// should call `std::process::exit` with.
-pub fn run(vault: &str, skill: &str, args: &[String]) -> Result<i32> {
+pub fn run(
+    vault: &str,
+    skill: &str,
+    args: &[String],
+    harness: HarnessArg,
+    model: Option<&str>,
+) -> Result<i32> {
     let vault_path = PathBuf::from(vault);
     if find_config_file(&vault_path).is_none() {
         eprintln!("Vault not found at {vault} (no onebrain.yml present)");
@@ -36,18 +56,54 @@ pub fn run(vault: &str, skill: &str, args: &[String]) -> Result<i32> {
     let pairs = parse_args(args)?;
     let prompt = build_prompt(skill, &pairs).map_err(|e| anyhow!(e))?;
 
-    let resolution = resolve_claude_bin(
-        None,
-        |k| std::env::var(k).ok(),
-        |p| p.exists(),
-        std::env::var("HOME").ok().as_deref(),
-    );
+    let env_lookup = |k: &str| std::env::var(k).ok();
+    let path_exists = |p: &Path| p.exists();
+    let home = std::env::var("HOME").ok();
+    let resolution = match harness {
+        HarnessArg::Claude => resolve_claude_bin(None, env_lookup, path_exists, home.as_deref()),
+        HarnessArg::Gemini => resolve_gemini_bin(None, env_lookup, path_exists, home.as_deref()),
+    };
     if let Some(warning) = &resolution.warning {
         eprintln!("{warning}");
     }
-    let claude_bin = resolution.path;
 
-    spawn_claude(&claude_bin, &prompt, &vault_path)
+    let argv = harness_argv(harness, &prompt, vault, model);
+    spawn_harness(&resolution.path, &argv, &vault_path, harness)
+}
+
+/// Build the argv (after the binary name) for the chosen harness. Pure so the
+/// per-harness flag mapping is unit-testable.
+fn harness_argv(
+    harness: HarnessArg,
+    prompt: &str,
+    vault: &str,
+    model: Option<&str>,
+) -> Vec<String> {
+    let mut argv = vec!["-p".to_string(), prompt.to_string()];
+    match harness {
+        HarnessArg::Claude => {
+            argv.push("--add-dir".to_string());
+            argv.push(vault.to_string());
+            if let Some(m) = model {
+                argv.push("--model".to_string());
+                argv.push(m.to_string());
+            }
+        }
+        HarnessArg::Gemini => {
+            argv.push("--include-directories".to_string());
+            argv.push(vault.to_string());
+            // Auto-approve tools: an unattended skill run can't answer an
+            // approval prompt, and OneBrain skills run `onebrain` shell
+            // commands + write vault files.
+            argv.push("--approval-mode".to_string());
+            argv.push("yolo".to_string());
+            if let Some(m) = model {
+                argv.push("-m".to_string());
+                argv.push(m.to_string());
+            }
+        }
+    }
+    argv
 }
 
 /// Convert clap's `Vec<String>` of `key=value` tokens into ordered pairs.
@@ -67,19 +123,20 @@ fn parse_args(raw: &[String]) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-fn spawn_claude(claude_bin: &Path, prompt: &str, vault: &Path) -> Result<i32> {
+fn spawn_harness(bin: &Path, argv: &[String], vault: &Path, harness: HarnessArg) -> Result<i32> {
     use std::io::IsTerminal;
-    // No `env` override: child inherits parent env so PATH/HOME survive.
-    // stdout/stderr stay inherited so claude's output (and colour) reach the
-    // terminal verbatim; stdin is forced to null so `claude -p` never blocks
-    // reading an interactive TTY — see module docs.
-    let mut command = Command::new(claude_bin);
+    let label = harness.as_str();
+    // No `env` override beyond ONEBRAIN_HEADLESS: child inherits parent env so
+    // PATH/HOME survive. stdout/stderr stay inherited so the harness's output
+    // (and colour) reach the terminal verbatim; stdin is forced to null so
+    // `claude -p` / `gemini -p` never block reading an interactive TTY — see
+    // module docs. ONEBRAIN_HEADLESS=1 drives the session-init handshake that
+    // lets the skill skip the interactive startup ceremony.
+    let mut command = Command::new(bin);
     command
-        .arg("-p")
-        .arg(prompt)
-        .arg("--add-dir")
-        .arg(vault)
+        .args(argv)
         .current_dir(vault)
+        .env("ONEBRAIN_HEADLESS", "1")
         .stdin(Stdio::null());
 
     // Non-interactive (launchd scheduler, piped, CI): block and let the
@@ -89,23 +146,32 @@ fn spawn_claude(claude_bin: &Path, prompt: &str, vault: &Path) -> Result<i32> {
         return match command.status() {
             Ok(s) => Ok(translate_exit(&s)),
             Err(e) => {
-                eprintln!("Failed to spawn claude ({}): {e}", claude_bin.display());
+                eprintln!("Failed to spawn {label} ({}): {e}", bin.display());
                 Ok(127)
             }
         };
     }
 
-    // Interactive: `claude -p` runs a full headless agent session (plugin load,
-    // SessionStart hook, the skill's own work, LLM inference) and buffers its
-    // result until done — often tens of seconds. Spawn it non-blocking and emit
-    // an elapsed heartbeat on stderr so the terminal doesn't look frozen. We
-    // use plain stderr lines (not a `\r` spinner) so they never clobber
-    // claude's stdout output when it finally flushes.
-    eprintln!("▶ Running {prompt} headlessly via claude — output appears when it completes.");
+    // Interactive: the harness runs a full headless agent session (plugin load,
+    // startup, the skill's own work, LLM inference) and buffers its result
+    // until done — often tens of seconds. Spawn it non-blocking and emit an
+    // elapsed heartbeat on stderr so the terminal doesn't look frozen. We use
+    // plain stderr lines (not a `\r` spinner) so they never clobber the
+    // harness's stdout output when it finally flushes.
+    // The child always has a null stdin (see module docs), so a harness can
+    // never answer an approval prompt — gemini runs with `--approval-mode
+    // yolo`. Make that explicit on a watched run so it isn't a surprise.
+    let approval_note = match harness {
+        HarnessArg::Gemini => " (auto-approving tools)",
+        HarnessArg::Claude => "",
+    };
+    eprintln!(
+        "▶ Running {label} on the skill headlessly{approval_note} — output appears when it completes."
+    );
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to spawn claude ({}): {e}", claude_bin.display());
+            eprintln!("Failed to spawn {label} ({}): {e}", bin.display());
             return Ok(127);
         }
     };
@@ -127,7 +193,7 @@ fn spawn_claude(claude_bin: &Path, prompt: &str, vault: &Path) -> Result<i32> {
                 // rather than 1 (which reads as "the skill ran and failed").
                 // kill+wait reaps the child; this may truncate any output it was
                 // mid-flush on, but we can no longer track it reliably.
-                eprintln!("waiting on claude failed: {e}");
+                eprintln!("waiting on {label} failed: {e}");
                 let _ = child.kill();
                 let _ = child.wait();
                 return Ok(127);
@@ -210,23 +276,91 @@ mod tests {
         assert!(err.to_string().contains("empty key"));
     }
 
-    /// Exercises the spawn path + exit-code translation with `claude` stubbed
+    // ---- harness_argv ----
+
+    #[test]
+    fn harness_argv_claude_uses_add_dir_and_no_model_by_default() {
+        let argv = harness_argv(HarnessArg::Claude, "/onebrain:daily", "/vault", None);
+        assert_eq!(argv, vec!["-p", "/onebrain:daily", "--add-dir", "/vault"]);
+    }
+
+    #[test]
+    fn harness_argv_claude_appends_model_flag() {
+        let argv = harness_argv(
+            HarnessArg::Claude,
+            "/onebrain:daily",
+            "/vault",
+            Some("claude-haiku-4-5"),
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "-p",
+                "/onebrain:daily",
+                "--add-dir",
+                "/vault",
+                "--model",
+                "claude-haiku-4-5"
+            ]
+        );
+    }
+
+    #[test]
+    fn harness_argv_gemini_uses_include_directories_and_yolo() {
+        let argv = harness_argv(HarnessArg::Gemini, "/onebrain:daily", "/vault", None);
+        assert_eq!(
+            argv,
+            vec![
+                "-p",
+                "/onebrain:daily",
+                "--include-directories",
+                "/vault",
+                "--approval-mode",
+                "yolo"
+            ]
+        );
+    }
+
+    #[test]
+    fn harness_argv_gemini_appends_short_model_flag() {
+        let argv = harness_argv(
+            HarnessArg::Gemini,
+            "/onebrain:daily",
+            "/vault",
+            Some("gemini-2.5-flash"),
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "-p",
+                "/onebrain:daily",
+                "--include-directories",
+                "/vault",
+                "--approval-mode",
+                "yolo",
+                "-m",
+                "gemini-2.5-flash"
+            ]
+        );
+    }
+
+    /// Exercises the spawn path + exit-code translation with the harness stubbed
     /// by a script that exits 43 on EOF / 42 after reading a line.
     ///
     /// NOTE: under `cargo test` the harness's own stdin is already at EOF, so
     /// this cannot *distinguish* a null stdin from an inherited one (both yield
     /// 43) — it pins the EOF→exit-43 contract, not the `.stdin(null)` line
-    /// itself. The real fix (an interactive TTY no longer hangs `claude -p`) is
+    /// itself. The real fix (an interactive TTY no longer hangs `-p`) is
     /// verified manually; a hermetic guard would need to inject a live parent
-    /// stdin, which `spawn_claude` (it reads the process's fd 0) can't take
+    /// stdin, which `spawn_harness` (it reads the process's fd 0) can't take
     /// without an API change made solely for the test.
     #[cfg(unix)]
     #[test]
-    fn spawn_claude_gives_child_a_non_blocking_stdin() {
+    fn spawn_harness_gives_child_a_non_blocking_stdin() {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let stub = dir.path().join("claude_stub.sh");
+        let stub = dir.path().join("harness_stub.sh");
         {
             let mut f = std::fs::File::create(&stub).unwrap();
             writeln!(
@@ -236,7 +370,8 @@ mod tests {
             .unwrap();
         }
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let code = spawn_claude(&stub, "/daily", dir.path()).unwrap();
+        let argv = vec!["-p".to_string(), "/daily".to_string()];
+        let code = spawn_harness(&stub, &argv, dir.path(), HarnessArg::Claude).unwrap();
         assert_eq!(code, 43, "child should see EOF on a null stdin, not block");
     }
 }
