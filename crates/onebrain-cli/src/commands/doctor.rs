@@ -11,6 +11,15 @@
 //! invocation. The recipes are deliberately narrow (one well-understood
 //! action per check); anything ambiguous is reported as "untouched · run
 //! the listed command yourself".
+//!
+//! Every run that finds a config file stamps `stats.last_doctor_run` (and,
+//! when `--fix` ran, `stats.last_doctor_fix`) into it via a comment-preserving
+//! line edit — regardless of whether the checks passed, since the stamp
+//! records that doctor *ran*, not that the vault is healthy. This keeps a
+//! terminal `onebrain doctor` fresh the same way the `/doctor` plugin skill
+//! does. The stamp is best-effort: a failure is noted on stderr (unless
+//! `--quiet`) but never changes the exit code, and an already-current value is
+//! left untouched.
 
 use crate::legacy_output::serialize_for_mode;
 use crate::output::{framing_rule, write_framed_header, OutputMode, RULE_WIDTH};
@@ -161,6 +170,11 @@ pub fn run(
             }
         }
     }
+
+    // Stamp the run timestamp now that every check (and any --fix recipe) has
+    // settled and the config file is at its final location. Best-effort — the
+    // exit code below reflects check/recipe results only, never the stamp.
+    stamp_doctor_run(vault_root.as_path(), fix, quiet);
 
     let error_count = results
         .iter()
@@ -738,6 +752,160 @@ fn atomic_write_text(path: &Path, contents: &str) -> std::io::Result<()> {
     std::fs::write(&tmp, contents)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// True when the config's top-level `stats` key is an inline mapping or
+/// scalar (`stats: {…}` / `stats: null`) rather than the block form that
+/// [`upsert_doctor_stats`] can extend — such a file is left untouched.
+fn config_has_inline_stats(text: &str) -> bool {
+    text.lines().any(|l| {
+        let indented = l.starts_with(' ') || l.starts_with('\t');
+        !indented && l.starts_with("stats:") && l.trim_end() != "stats:"
+    })
+}
+
+/// Upsert `stats.last_doctor_run: <today>` (and `stats.last_doctor_fix`
+/// when `also_fix`) into raw config text, returning `Some(new_text)` when a
+/// change was made and `None` when the file already carries today's
+/// value(s) — so a same-day re-run never rewrites the file or touches its
+/// mtime.
+///
+/// Deliberately a line edit rather than a `serde_yaml` round-trip: a plain
+/// read-only `onebrain doctor` stamps the timestamp on every run, so it must
+/// preserve the user's comments and key order and touch only the timestamp
+/// line(s). Child indentation is matched from any existing `stats:` child,
+/// defaulting to two spaces. An inline `stats: {…}` mapping is left
+/// untouched (returns `None`) rather than risk corrupting it.
+fn upsert_doctor_stats(text: &str, today: &str, also_fix: bool) -> Option<String> {
+    let is_indented = |l: &str| l.starts_with(' ') || l.starts_with('\t');
+    // Preserve the file's existing line ending (CRLF on Windows-authored
+    // configs) — `lines()` strips the `\r`, so we rejoin with whichever the
+    // file used rather than silently normalising every line to LF.
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let ends_with_newline = text.ends_with('\n');
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+
+    let keys: &[&str] = if also_fix {
+        &["last_doctor_run", "last_doctor_fix"]
+    } else {
+        &["last_doctor_run"]
+    };
+
+    // The top-level `stats:` block header (zero indentation, block form).
+    let stats_idx = lines
+        .iter()
+        .position(|l| !is_indented(l) && l.trim_end() == "stats:");
+
+    // A top-level inline `stats: {…}` (or `stats: null`) can't take block
+    // children — refuse rather than corrupt it (only when there is no
+    // block-form header to edit).
+    if stats_idx.is_none() && config_has_inline_stats(text) {
+        return None;
+    }
+
+    let mut changed = false;
+    match stats_idx {
+        Some(si) => {
+            // Block extent: subsequent blank or indented lines.
+            let mut end = si + 1;
+            while end < lines.len() && (lines[end].is_empty() || is_indented(&lines[end])) {
+                end += 1;
+            }
+            // Trailing blank lines belong after the block, not in it — back
+            // `end` up past them so an inserted key sits beside the existing
+            // children rather than below a blank separator before a sibling.
+            while end > si + 1 && lines[end - 1].is_empty() {
+                end -= 1;
+            }
+            // Match an existing child's indentation; default two spaces.
+            let indent = lines[si + 1..end]
+                .iter()
+                .find(|l| is_indented(l))
+                .map(|l| l[..l.len() - l.trim_start().len()].to_string())
+                .unwrap_or_else(|| "  ".to_string());
+
+            for key in keys {
+                let prefix = format!("{key}:");
+                let desired = format!("{indent}{key}: {today}");
+                match (si + 1..end).find(|&j| lines[j].trim_start().starts_with(&prefix)) {
+                    Some(j) if lines[j] == desired => {}
+                    Some(j) => {
+                        lines[j] = desired;
+                        changed = true;
+                    }
+                    None => {
+                        lines.insert(end, desired);
+                        end += 1;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        None => {
+            lines.push("stats:".to_string());
+            for key in keys {
+                lines.push(format!("  {key}: {today}"));
+            }
+            changed = true;
+        }
+    }
+
+    if !changed {
+        return None;
+    }
+    let mut out = lines.join(newline);
+    if ends_with_newline {
+        out.push_str(newline);
+    }
+    Some(out)
+}
+
+/// Stamp `last_doctor_run` (and `last_doctor_fix` when `--fix` ran) into the
+/// active config file. Best-effort: it never changes the doctor exit code —
+/// the timestamp is a convenience, not a check result. No config file ⇒ no-op
+/// (doctor never creates `onebrain.yml`; that is `init`'s job).
+///
+/// Failures and the inline-`stats:` skip emit a one-line stderr note unless
+/// `--quiet`. Stderr is used (not the structured envelope) so the note is
+/// visible in `--json`/`--yaml` runs too without disturbing the single JSON
+/// document on stdout — matching the existing config-load warning.
+fn stamp_doctor_run(vault_root: &Path, fix: bool, quiet: bool) {
+    use onebrain_core::find_config_file;
+    let Some(path) = find_config_file(vault_root) else {
+        return; // no config file ⇒ nothing to stamp (init's job, not doctor's)
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            if !quiet {
+                eprintln!(
+                    "doctor: could not read {} to stamp last_doctor_run: {e}",
+                    path.display()
+                );
+            }
+            return;
+        }
+    };
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    match upsert_doctor_stats(&text, &today, fix) {
+        Some(updated) => {
+            if let Err(e) = atomic_write_text(&path, &updated) {
+                if !quiet {
+                    eprintln!("doctor: could not update last_doctor_run: {e}");
+                }
+            }
+        }
+        // `None` is the common "already today" no-op, but it also covers a
+        // refusal to edit an inline `stats:` mapping — surface that case so a
+        // never-advancing timestamp doesn't look like a silent bug.
+        None if !quiet && config_has_inline_stats(&text) => {
+            eprintln!(
+                "doctor: `stats` in {} is an inline mapping; last_doctor_run not stamped — convert it to a block to enable stamping",
+                path.display()
+            );
+        }
+        None => {}
+    }
 }
 
 fn print_fix_summary(outcomes: &[(String, FixOutcome)]) {
@@ -1653,5 +1821,191 @@ mod tests {
         render_grouped_report(&mut buf, &results, "ob-1", false, false).unwrap();
         let output = String::from_utf8(buf).unwrap();
         insta::assert_snapshot!(output);
+    }
+
+    // ---- last_doctor_run / last_doctor_fix stamping (v3.2.3) ----
+
+    #[test]
+    fn upsert_creates_stats_block_when_absent() {
+        let out = upsert_doctor_stats("qmd_collection: ob\n", "2026-05-27", false).unwrap();
+        assert!(out.contains("qmd_collection: ob"), "preserved: {out}");
+        assert!(
+            out.contains("stats:\n  last_doctor_run: 2026-05-27"),
+            "added: {out}"
+        );
+        assert!(
+            !out.contains("last_doctor_fix"),
+            "no fix without --fix: {out}"
+        );
+    }
+
+    #[test]
+    fn upsert_replaces_existing_run_date() {
+        let text = "stats:\n  last_doctor_run: 2026-01-01\n";
+        let out = upsert_doctor_stats(text, "2026-05-27", false).unwrap();
+        assert!(out.contains("last_doctor_run: 2026-05-27"), "{out}");
+        assert!(!out.contains("2026-01-01"), "old date gone: {out}");
+        // exactly one run line — no duplicate insert
+        assert_eq!(out.matches("last_doctor_run:").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn upsert_inserts_run_key_into_existing_block() {
+        // stats block exists but only has an unrelated child.
+        let text = "stats:\n  last_memory_review: 2026-02-02\n";
+        let out = upsert_doctor_stats(text, "2026-05-27", false).unwrap();
+        assert!(
+            out.contains("last_memory_review: 2026-02-02"),
+            "preserved sibling: {out}"
+        );
+        assert!(out.contains("last_doctor_run: 2026-05-27"), "{out}");
+    }
+
+    #[test]
+    fn upsert_inserts_above_trailing_blank_before_sibling() {
+        // A blank line separating the stats block from a following sibling
+        // must stay the separator — the new key joins the existing children
+        // above it, not stranded below the blank.
+        let text = "stats:\n  last_memory_review: 2026-02-02\n\nschedule:\n- cron: 0 9 * * *\n";
+        let out = upsert_doctor_stats(text, "2026-05-27", false).unwrap();
+        assert!(
+            out.contains(
+                "  last_memory_review: 2026-02-02\n  last_doctor_run: 2026-05-27\n\nschedule:"
+            ),
+            "new key joins the block above the blank separator: {out:?}"
+        );
+    }
+
+    #[test]
+    fn upsert_also_stamps_fix_when_requested() {
+        let out = upsert_doctor_stats("qmd_collection: ob\n", "2026-05-27", true).unwrap();
+        assert!(out.contains("last_doctor_run: 2026-05-27"), "{out}");
+        assert!(out.contains("last_doctor_fix: 2026-05-27"), "{out}");
+    }
+
+    #[test]
+    fn upsert_idempotent_returns_none_when_current() {
+        let text = "stats:\n  last_doctor_run: 2026-05-27\n";
+        assert!(upsert_doctor_stats(text, "2026-05-27", false).is_none());
+    }
+
+    #[test]
+    fn upsert_idempotent_only_for_requested_keys() {
+        // run already current, but --fix needs the fix line ⇒ must still write.
+        let text = "stats:\n  last_doctor_run: 2026-05-27\n";
+        let out = upsert_doctor_stats(text, "2026-05-27", true).unwrap();
+        assert!(out.contains("last_doctor_fix: 2026-05-27"), "{out}");
+        assert_eq!(out.matches("last_doctor_run:").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn upsert_preserves_comments_and_other_blocks() {
+        let text = "# top comment\nupdate_channel: stable\nstats:\n  last_doctor_run: 2026-01-01\nschedule:\n- cron: 0 9 * * *\n  skill: /daily\n";
+        let out = upsert_doctor_stats(text, "2026-05-27", false).unwrap();
+        assert!(out.contains("# top comment"), "comment kept: {out}");
+        assert!(out.contains("schedule:"), "schedule kept: {out}");
+        assert!(out.contains("skill: /daily"), "schedule body kept: {out}");
+        assert!(out.contains("last_doctor_run: 2026-05-27"), "{out}");
+    }
+
+    #[test]
+    fn upsert_matches_four_space_child_indent() {
+        let text = "stats:\n    last_doctor_run: 2026-01-01\n";
+        let out = upsert_doctor_stats(text, "2026-05-27", true).unwrap();
+        assert!(
+            out.contains("    last_doctor_run: 2026-05-27"),
+            "4-space run: {out}"
+        );
+        assert!(
+            out.contains("    last_doctor_fix: 2026-05-27"),
+            "4-space fix: {out}"
+        );
+    }
+
+    #[test]
+    fn upsert_preserves_missing_trailing_newline() {
+        let out = upsert_doctor_stats("qmd_collection: ob", "2026-05-27", false).unwrap();
+        assert!(!out.ends_with('\n'), "no trailing newline added: {out:?}");
+        let out_nl = upsert_doctor_stats("qmd_collection: ob\n", "2026-05-27", false).unwrap();
+        assert!(out_nl.ends_with('\n'), "trailing newline kept: {out_nl:?}");
+    }
+
+    #[test]
+    fn upsert_preserves_crlf_line_endings() {
+        // Windows-authored config: every line break must stay CRLF, not be
+        // silently normalised to bare LF on stamp.
+        let text = "stats:\r\n  last_doctor_run: 2026-01-01\r\n";
+        let out = upsert_doctor_stats(text, "2026-05-27", false).unwrap();
+        assert!(out.contains("last_doctor_run: 2026-05-27"), "{out:?}");
+        assert_eq!(
+            out.matches('\n').count(),
+            out.matches("\r\n").count(),
+            "all line endings must remain CRLF: {out:?}"
+        );
+        assert!(out.ends_with("\r\n"), "trailing CRLF preserved: {out:?}");
+    }
+
+    #[test]
+    fn upsert_inserts_crlf_when_creating_block_in_crlf_file() {
+        // A newly-appended stats block must also use the file's CRLF ending.
+        let out = upsert_doctor_stats("qmd_collection: ob\r\n", "2026-05-27", true).unwrap();
+        assert!(out.contains("stats:\r\n"), "{out:?}");
+        assert_eq!(
+            out.matches('\n').count(),
+            out.matches("\r\n").count(),
+            "appended lines must use CRLF: {out:?}"
+        );
+    }
+
+    #[test]
+    fn upsert_leaves_inline_stats_untouched() {
+        // An inline mapping can't take block children — refuse rather than corrupt.
+        let text = "stats: { last_doctor_run: 2026-01-01 }\n";
+        assert!(upsert_doctor_stats(text, "2026-05-27", false).is_none());
+    }
+
+    #[test]
+    fn stamp_doctor_run_writes_today_into_onebrain_yml() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("onebrain.yml"), "qmd_collection: ob\n").unwrap();
+        stamp_doctor_run(d.path(), false, true);
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert!(
+            after.contains(&format!("last_doctor_run: {today}")),
+            "{after}"
+        );
+        assert!(after.contains("qmd_collection: ob"), "preserved: {after}");
+        assert!(
+            !after.contains("last_doctor_fix"),
+            "no fix when fix=false: {after}"
+        );
+    }
+
+    #[test]
+    fn stamp_doctor_run_stamps_fix_and_legacy_vault_yml() {
+        let d = tempdir().unwrap();
+        // Legacy filename only — find_config_file resolves vault.yml.
+        fs::write(d.path().join("vault.yml"), "qmd_collection: ob\n").unwrap();
+        stamp_doctor_run(d.path(), true, true);
+        let after = fs::read_to_string(d.path().join("vault.yml")).unwrap();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert!(
+            after.contains(&format!("last_doctor_run: {today}")),
+            "{after}"
+        );
+        assert!(
+            after.contains(&format!("last_doctor_fix: {today}")),
+            "{after}"
+        );
+    }
+
+    #[test]
+    fn stamp_doctor_run_noop_without_config_file() {
+        let d = tempdir().unwrap();
+        // No config file at all — must not panic and must not create one.
+        stamp_doctor_run(d.path(), false, true);
+        assert!(!d.path().join("onebrain.yml").exists());
+        assert!(!d.path().join("vault.yml").exists());
     }
 }

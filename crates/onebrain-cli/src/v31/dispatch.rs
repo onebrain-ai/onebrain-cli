@@ -118,7 +118,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         // ───── Schedule ─────────────────────────────────────────────
         Cmd::Schedule(ScheduleCmd { verb }) => match verb {
             ScheduleVerb::Register {
-                vault,
+                vault_dir,
                 dry_run,
                 remove,
                 refresh,
@@ -126,7 +126,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 status,
                 test,
             } => {
-                let v = vault.or(vault_flag.clone());
+                let v = vault_dir.or(vault_flag.clone());
                 commands::register_schedule::run(v, dry_run, remove, refresh, resume, status, test)
             }
             // Non-protocol verbs are vault-required (need to know which
@@ -185,10 +185,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 name,
                 cutoff_date,
                 cutoff,
-                vault,
+                vault_dir,
             } => {
                 let resolved = cutoff_date.or(cutoff);
-                let vault_str = vault.as_ref().map(|p| p.to_string_lossy().to_string());
+                let vault_str = vault_dir
+                    .or(vault_flag.clone())
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string());
                 commands::migrate::run(&name, resolved.as_deref(), vault_str.as_deref())
             }
             PluginVerb::Status => stubs::not_implemented("plugin status"),
@@ -223,11 +226,18 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
         // ───── Skill ────────────────────────────────────────────────
         Cmd::Skill(SkillCmd { verb }) => match verb {
-            SkillVerb::Run { vault, name, args } => {
-                let v = vault.or(vault_flag.clone()).ok_or_else(|| {
-                    anyhow::anyhow!("skill run requires --vault <PATH> or --vault-dir <PATH>")
-                })?;
-                let code = commands::run_skill::run(&v.to_string_lossy(), &name, &args)?;
+            SkillVerb::Run {
+                vault_dir,
+                name,
+                args,
+            } => {
+                // Resolve through the canonical chain (flag > ONEBRAIN_VAULT >
+                // walk-up from cwd) so `onebrain skill run NAME` just works from
+                // inside a vault — no explicit path required. Errors with exit
+                // 64 when no vault is found anywhere.
+                let resolved = crate::vault_ctx::require(vault_dir.or(vault_flag.clone()))?;
+                let vault = resolved.root.as_path().to_string_lossy();
+                let code = commands::run_skill::run(&vault, &name, &args)?;
                 std::process::exit(code);
             }
             SkillVerb::List => stubs::not_implemented("skill list"),

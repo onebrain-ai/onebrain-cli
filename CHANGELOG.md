@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.2
+latest_version: 3.2.3
 released: 2026-05-27
 ---
 
@@ -11,6 +11,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.3] — 2026-05-27 — `skill run` fixes · `--vault` everywhere · doctor stamps last-run
+
+- **Fix: `onebrain skill run` works from inside a vault** — it now resolves the vault through the canonical chain (`--vault` flag → `ONEBRAIN_VAULT` → walk-up from cwd) instead of demanding an explicit path, so `onebrain skill run daily` just works when run inside a vault. No vault found anywhere → `E_VAULT_NOT_FOUND` (exit 64).
+- **Hardening: `onebrain skill run` gives the spawned `claude -p` a null stdin** so it can't block reading an inherited interactive TTY (`claude -p` appends piped stdin to the prompt; launchd already passed null stdin, this aligns manual runs). stdout/stderr stay inherited. (Does not address `claude -p` showing no output while a long skill like `/daily` runs — that responsiveness work is a follow-up.)
+- **Fix: global `--vault` accepted on every command** — `skill run`, `schedule register`, and `plugin migrate` named their local `--vault-dir` field `vault`, colliding with the global `--vault` arg id and making clap reject `--vault` on those leaves ("unexpected argument '--vault'"). Renamed the field to `vault_dir`; `--vault` now propagates everywhere and `--vault-dir` stays as a back-compat alias for the scheduler.
+- **Feat: `onebrain doctor` stamps `stats.last_doctor_run`** in `onebrain.yml` on every run (and `last_doctor_fix` when `--fix` ran), so a terminal `onebrain doctor` keeps the timestamp current like the `/doctor` skill already does. Best-effort (never changes the exit code), comment-preserving line edit, and a no-op when the value is already today's date.
 
 ## [3.2.2] — 2026-05-27 — animated `update` + banner/doctor polish
 
