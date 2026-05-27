@@ -1,6 +1,8 @@
-//! Reusable terminal-UX progress primitive — a braille spinner + status
-//! rendering layer shared by `doctor` (grouped sections) and `update`
-//! (linear steps).
+//! Doctor's grouped-status renderer — a braille spinner + status rendering
+//! layer. Today its only consumer is `doctor` (grouped sections), but the
+//! surface is deliberately general (sections with optional headers, a static
+//! seam) so a future CLI-layer linear consumer could adopt it without a
+//! rewrite.
 //!
 //! A **step** is a labelled unit of work. While running it shows a spinner
 //! frame; once resolved it renders a final status line:
@@ -10,8 +12,9 @@
 //!    └ <hint>            (optional, only for warn / fail)
 //! ```
 //!
-//! Steps may be grouped under a **section** (a header + its steps) — `doctor`
-//! uses sections; `update` can ignore them and emit a flat run.
+//! Steps may be grouped under a **section** (a header + its steps). A section
+//! with an empty header skips the header line, so a flat (headerless) run is
+//! expressible too.
 //!
 //! ## TTY gating (the critical contract)
 //!
@@ -37,13 +40,11 @@ use std::io::Write;
 use std::time::Duration;
 
 /// Braille spinner frames, cycled left→right. Matches the approved design.
-pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub(crate) const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Default per-step stagger when animating (milliseconds). Picked inside the
-/// approved 60–110 ms band. Overridable via `ONEBRAIN_PROGRESS_STEP_MS`
-/// (`0` disables pacing — instant reveal, handy for demos / impatient users;
-/// tests use the force-static seam instead so they never sleep).
-pub const DEFAULT_STEP_MS: u64 = 80;
+/// Per-step stagger when animating (milliseconds), inside the approved
+/// 60–110 ms band. Tests use the force-static seam so they never sleep.
+const DEFAULT_STEP_MS: u64 = 80;
 
 /// Resolved status of a step. Glyph + colour treatment per the approved
 /// design: passes are quiet (dim green), warnings/fails prominent.
@@ -127,27 +128,24 @@ impl Section {
     }
 }
 
+/// Whether `mode` is colour-bearing text (`Text { color: true, .. }`). The
+/// single source of truth for the colour-text gate used by [`should_animate`],
+/// [`ProgressRenderer::new`], and doctor's header/footer styling.
+pub(crate) fn is_color_text(mode: &OutputMode) -> bool {
+    matches!(mode, OutputMode::Text { color: true, .. })
+}
+
 /// Pure TTY-gating decision: should the spinner animate + pace?
 ///
-/// `true` ⇔ stdout is a real TTY AND mode is `Text { color: true, .. }` AND
-/// not quiet. This mirrors the colour-text gate `banner.rs` uses (a banner
-/// only shows for `Text { color: true }`), extended with the TTY + quiet
-/// conditions the spinner needs.
+/// `true` ⇔ stdout is a real TTY AND mode is colour-bearing text AND not
+/// quiet. This mirrors the colour-text gate `banner.rs` uses (a banner only
+/// shows for `Text { color: true }`), extended with the TTY + quiet conditions
+/// the spinner needs.
 pub fn should_animate(mode: &OutputMode, stdout_is_tty: bool, quiet: bool) -> bool {
     if quiet || !stdout_is_tty {
         return false;
     }
-    matches!(mode, OutputMode::Text { color: true, .. })
-}
-
-/// Read the per-step stagger from `ONEBRAIN_PROGRESS_STEP_MS`, falling back to
-/// [`DEFAULT_STEP_MS`]. `0` (or an unparseable value mapping to 0) disables
-/// pacing. Only consulted on the animated path.
-pub fn step_delay_ms() -> u64 {
-    std::env::var("ONEBRAIN_PROGRESS_STEP_MS")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(DEFAULT_STEP_MS)
+    is_color_text(mode)
 }
 
 /// Renders sections/steps to an injected writer.
@@ -169,17 +167,22 @@ pub struct ProgressRenderer<W: Write> {
 
 impl ProgressRenderer<std::io::Stdout> {
     /// Production constructor — writes to stdout, computes `animate` from live
-    /// stdout TTY state + `mode` + `quiet`.
+    /// stdout TTY state + `mode` + `quiet`. Doctor drives the gating decision
+    /// through the pure [`should_animate`] / [`is_color_text`] helpers and
+    /// passes a stdout handle to [`with_writer`], so this convenience
+    /// constructor currently has no caller; it stays as the documented entry
+    /// point for a future stdout-driven consumer.
+    #[allow(dead_code)]
     pub fn new(mode: &OutputMode, quiet: bool) -> Self {
         use std::io::IsTerminal;
         let stdout_is_tty = std::io::stdout().is_terminal();
         let animate = should_animate(mode, stdout_is_tty, quiet);
-        let color = matches!(mode, OutputMode::Text { color: true, .. });
+        let color = is_color_text(mode);
         Self {
             writer: std::io::stdout(),
             animate,
             color,
-            step_delay: Duration::from_millis(step_delay_ms()),
+            step_delay: Duration::from_millis(DEFAULT_STEP_MS),
         }
     }
 }
@@ -194,18 +197,13 @@ impl<W: Write> ProgressRenderer<W> {
             writer,
             animate: !force_static,
             color,
-            step_delay: Duration::from_millis(step_delay_ms()),
+            step_delay: Duration::from_millis(DEFAULT_STEP_MS),
         }
     }
 
-    /// True when this renderer will animate (spinner + pacing).
-    pub fn is_animated(&self) -> bool {
-        self.animate
-    }
-
     /// Render a section header line: a blank spacer then the header. Skipped
-    /// entirely when the header is empty (linear-run callers).
-    pub fn section_header(&mut self, header: &str) -> std::io::Result<()> {
+    /// entirely when the header is empty (headerless / linear-run callers).
+    fn section_header(&mut self, header: &str) -> std::io::Result<()> {
         if header.is_empty() {
             return Ok(());
         }
@@ -223,7 +221,7 @@ impl<W: Write> ProgressRenderer<W> {
     /// transient spinner line, pace, then clear it with `\r` + clear-to-EOL
     /// and write the final status line. On the static path, write only the
     /// final status line.
-    pub fn step(&mut self, step: &Step) -> std::io::Result<()> {
+    fn step(&mut self, step: &Step) -> std::io::Result<()> {
         if self.animate {
             // Transient spinner line — first frame is enough for the brief
             // stagger window; the line is cleared before the result lands.
@@ -315,18 +313,6 @@ mod tests {
         assert_eq!(seen.len(), 10);
     }
 
-    #[test]
-    fn spinner_cycles_by_modulo() {
-        // The frame for index N is SPINNER_FRAMES[N % 10] — the documented
-        // cycling contract callers (update's linear spinner) rely on.
-        for i in 0..25usize {
-            let expected = SPINNER_FRAMES[i % SPINNER_FRAMES.len()];
-            assert_eq!(SPINNER_FRAMES[i % SPINNER_FRAMES.len()], expected);
-        }
-        assert_eq!(SPINNER_FRAMES[10 % 10], SPINNER_FRAMES[0]);
-        assert_eq!(SPINNER_FRAMES[11 % 10], SPINNER_FRAMES[1]);
-    }
-
     // ── TTY-gating decision ──────────────────────────────────────────────
 
     #[test]
@@ -366,18 +352,6 @@ mod tests {
                 "structured mode {mode:?} must not animate"
             );
         }
-    }
-
-    #[test]
-    fn force_static_renderer_reports_not_animated() {
-        let r = ProgressRenderer::with_writer(Vec::new(), true, false);
-        assert!(!r.is_animated());
-    }
-
-    #[test]
-    fn non_static_renderer_reports_animated() {
-        let r = ProgressRenderer::with_writer(Vec::new(), false, true);
-        assert!(r.is_animated());
     }
 
     // ── Static rendering (deterministic, no timing) ──────────────────────
@@ -533,18 +507,17 @@ mod tests {
         assert_eq!(StepStatus::Fail.glyph(), "✗");
     }
 
-    // ── Animated path (no real timing — pacing disabled via env) ─────────
+    // ── Animated path (exercises the spinner branch; one short sleep) ────
 
     #[test]
     fn animated_step_paints_spinner_then_clears_and_resolves() {
-        // Disable the sleep so the test never blocks; the animation branch
-        // (spinner frame + `\r` clear + resolved line) still runs.
-        std::env::set_var("ONEBRAIN_PROGRESS_STEP_MS", "0");
+        // `force_static = false` puts the renderer on the animated path so the
+        // spinner frame + `\r` clear + resolved line all run. A single step
+        // sleeps once for DEFAULT_STEP_MS — negligible and the only way to
+        // cover the animation branch.
         let mut r = ProgressRenderer::with_writer(Vec::new(), false, false);
-        assert!(r.is_animated(), "renderer should be on the animated path");
         let step = Step::new("folders", StepStatus::Ok, Some("8/8 present".into()), None);
         r.step(&step).unwrap();
-        std::env::remove_var("ONEBRAIN_PROGRESS_STEP_MS");
         let out = String::from_utf8(r.writer.clone()).unwrap();
         // Transient spinner frame painted.
         assert!(out.contains(SPINNER_FRAMES[0]), "spinner frame: {out:?}");

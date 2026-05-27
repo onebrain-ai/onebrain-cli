@@ -446,6 +446,10 @@ mod tests {
     use crate::cli::*;
     use clap::Parser;
 
+    /// Serialises tests that mutate the process-global `ONEBRAIN_FORCE_BANNER`
+    /// env var, which would otherwise race under parallel test threads.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).unwrap()
     }
@@ -965,8 +969,9 @@ mod tests {
     fn emit_help_banner_writes_to_buffer_when_gated_on() {
         // `cargo test`'s harness pipes stderr, so the stderr-tty gate would
         // suppress emission. Lift it the same way integration tests do.
-        // Env mutation is intentionally scoped to this test; sibling tests
-        // either don't read the var or wrap their own scoped set/remove.
+        // Hold ENV_LOCK for the whole env-mutation window so this can't race
+        // the sibling test that toggles the same var under parallel threads.
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("ONEBRAIN_FORCE_BANNER", "1");
         let args = s(&["onebrain", "--help"]);
         let mut buf: Vec<u8> = Vec::new();
@@ -992,7 +997,9 @@ mod tests {
     #[test]
     fn emit_help_banner_writes_nothing_when_version_present() {
         // Force the stderr-tty gate ON so the suppression we observe can
-        // only come from the `--version` short-circuit.
+        // only come from the `--version` short-circuit. Hold ENV_LOCK for the
+        // whole env-mutation window (see the sibling test) to avoid a race.
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("ONEBRAIN_FORCE_BANNER", "1");
         let args = s(&["onebrain", "--version"]);
         let mut buf: Vec<u8> = Vec::new();

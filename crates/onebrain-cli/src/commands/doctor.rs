@@ -3,8 +3,8 @@
 //! On an interactive TTY (text mode) the checks are revealed one at a time
 //! with a short per-step delay so the run reads as sequential work; piped /
 //! non-TTY stdout and structured (`--json`/`--yaml`) modes get the instant
-//! plain report unchanged. The plain renderer keeps the original icon/layout/
-//! summary shape (`print_report`).
+//! plain report unchanged. The grouped renderer keeps the approved
+//! section/glyph/summary layout (`render_grouped_report`).
 //!
 //! `--fix` attempts targeted auto-repair recipes for each fixable warning,
 //! then re-runs the checks so the user sees the result in a single
@@ -920,11 +920,14 @@ fn write_summary_footer<W: Write>(w: &mut W, results: &[DoctorResult], color: bo
     let glyph_prefix = verdict.ansi_prefix(color);
     let glyph_reset = if color { "\x1b[0m" } else { "" };
 
+    // "fail" has no plural form; "warning" does.
+    let warnings_word = if warnings == 1 { "warning" } else { "warnings" };
+
     writeln!(w)?;
     writeln!(w, "{dim}{RULE}{reset}")?;
     writeln!(
         w,
-        " {glyph_prefix}{}{glyph_reset}  {passing} ok · {warnings} warnings · {errors} fail        {total} checks",
+        " {glyph_prefix}{}{glyph_reset}  {passing} ok · {warnings} {warnings_word} · {errors} fail        {total} checks",
         verdict.glyph(),
     )?;
     // `--fix` next-action — shown whenever there's a repairable issue. Both
@@ -982,21 +985,21 @@ fn vault_display_name(vault_root: &Path) -> String {
 /// piped / non-TTY / structured / `--no-color` / `--quiet` get the instant
 /// static layout.
 ///
-/// The gating decision (and colour bit) are derived from the production
-/// [`ProgressRenderer::new`] constructor so doctor and any future caller
-/// (e.g. `update`) share one source of truth for "should this animate?".
+/// The gating decision (and colour bit) come from the pure
+/// [`crate::output::should_animate`] / [`crate::output::is_color_text`]
+/// helpers — the single source of truth for "should this animate?" shared
+/// with [`ProgressRenderer::new`].
 fn emit_text_report(
     results: &[DoctorResult],
     vault_root: &Path,
     mode: &OutputMode,
     quiet: bool,
 ) -> Result<()> {
-    use crate::output::ProgressRenderer;
-    // Build the production renderer once to read the frozen gating decision
-    // (TTY + colour + quiet) — then drive the report with a stdout handle.
-    let gate = ProgressRenderer::new(mode, quiet);
-    let animate = gate.is_animated();
-    let color = matches!(mode, OutputMode::Text { color: true, .. });
+    use crate::output::{is_color_text, should_animate};
+    use std::io::IsTerminal;
+    // Compute the gating decision directly — no throwaway renderer round-trip.
+    let animate = should_animate(mode, std::io::stdout().is_terminal(), quiet);
+    let color = is_color_text(mode);
     let name = vault_display_name(vault_root);
     render_grouped_report(std::io::stdout(), results, &name, color, animate)
 }

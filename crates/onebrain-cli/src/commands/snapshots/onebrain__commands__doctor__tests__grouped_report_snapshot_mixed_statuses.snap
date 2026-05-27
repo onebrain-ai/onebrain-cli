@@ -26,6 +26,6 @@ expression: output
   ✓ qmd                602 indexed · 0 unembedded
 
 ──────────────────────────────────────────
- ✗  7 ok · 1 warnings · 1 fail        9 checks
+ ✗  7 ok · 1 warning · 1 fail        9 checks
  →  onebrain doctor --fix  to auto-repair
 ──────────────────────────────────────────

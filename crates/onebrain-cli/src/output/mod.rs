@@ -14,11 +14,17 @@ pub mod mode;
 pub mod progress;
 
 pub use dispatcher::emit;
-// Progress primitive — braille spinner + grouped status rendering. Shared by
-// `doctor` (sectioned) and `update` (linear). Re-exported at the `output`
-// level so command modules use `output::progress::…` without the deep path.
+// Doctor's grouped-status renderer — braille spinner + sectioned status lines.
+// Re-exported at the `output` level so command modules use `output::…` without
+// the deep path. `is_color_text` / `SPINNER_FRAMES` are crate-internal (doctor +
+// tests); the rest are the public-to-crate surface.
+pub(crate) use progress::is_color_text;
+// `SPINNER_FRAMES` is re-exported only for the doctor static-render test
+// (`crate::output::SPINNER_FRAMES`); unused in non-test builds.
 #[allow(unused_imports)]
-pub use progress::{should_animate, ProgressRenderer, Section, Step, StepStatus, SPINNER_FRAMES};
+pub(crate) use progress::SPINNER_FRAMES;
+#[allow(unused_imports)]
+pub use progress::{should_animate, ProgressRenderer, Section, Step, StepStatus};
 // `ErrorInfo` / `Warning` are part of the v3.1 envelope public surface.
 // `ErrorInfo` is consumed by `main.rs`'s structured-mode error renderer
 // (R1 B5) and by command bodies that build error envelopes directly.
