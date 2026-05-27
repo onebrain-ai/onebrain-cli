@@ -384,7 +384,7 @@ mod tests {
                 "hooks": {
                     "PostToolUse": [{
                         "matcher": "Write|Edit",
-                        "hooks": [{"type": "command", "command": "onebrain qmd-reindex"}],
+                        "hooks": [{"type": "command", "command": "onebrain qmd reindex"}],
                     }]
                 }
             }))
@@ -398,5 +398,46 @@ mod tests {
         .unwrap();
         let after = read_back(v.path());
         assert!(after["hooks"].get("PostToolUse").is_none());
+    }
+
+    #[test]
+    fn run_qmd_set_migrates_legacy_alias_and_dedupes_to_single_new_form() {
+        // Real-world bug: vault ended up with the qmd hook duplicated, one in
+        // the legacy `qmd-reindex` alias form. `--fix` (= register_hooks::run)
+        // must collapse to a single canonical `qmd reindex` entry.
+        let v = fresh_vault(true, Some("ob-1-test"));
+        let settings_path = v.path().join(".claude").join("settings.json");
+        fs::write(
+            &settings_path,
+            serde_json::to_string(&json!({
+                "hooks": {
+                    "PostToolUse": [
+                        {"matcher": "Write|Edit", "hooks": [{
+                            "type": "command", "command": "onebrain", "args": ["qmd-reindex", "--json"]
+                        }]},
+                        {"matcher": "Write|Edit", "hooks": [{
+                            "type": "command", "command": "onebrain", "args": ["qmd", "reindex", "--json"]
+                        }]},
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        run(RegisterHooksOptions {
+            vault_dir: Some(v.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+        let after = read_back(v.path());
+        let entries: Vec<_> = after["hooks"]["PostToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+            .collect();
+        assert_eq!(entries.len(), 1, "entries: {entries:?}");
+        assert_eq!(entries[0]["command"], "onebrain");
+        assert_eq!(entries[0]["args"], json!(["qmd", "reindex", "--json"]));
     }
 }
