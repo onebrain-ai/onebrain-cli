@@ -65,7 +65,7 @@ The entire clap surface, locked at v3.1 per spec §2.4. `Cli` (global flags + `c
 **Connections** — parsed by: `main`; matched by: `v31::dispatch::dispatch`, `banner::is_hook_protocol`. Tests assert root help advertises exactly the 3 verbs + 8 visible groups, hidden aliases parse but don't surface in help, and new `<noun> <verb>` paths parse.
 
 ### `src/banner.rs`
-TTY-only branded `OneBrain` block-art wordmark (dual gradient: BRAIN pink `#ff2d92`, ONE gray) + dim `Your AI Thinking Partner · vX.Y.Z` tagline, emitted to **stderr**. Suppressed for `--quiet`, non-color/structured modes, and all hook-protocol commands.
+TTY-only branded `OneBrain` block-art wordmark + dim `Your AI Thinking Partner · vX.Y.Z` tagline, emitted to **stderr**. Truecolor terminals get a continuous horizontal cyan→purple→pink hue gradient (matching the brain logo) with a top-lit vertical shade layered on; non-truecolor terminals fall back to a vertical-only xterm-256 gray ramp. Suppressed for `--quiet`, non-color/structured modes, and all hook-protocol commands.
 **Key functions**
 - `should_show_banner(cli, mode) -> bool` — pure gate: only `Text{color:true,..}` and non-hook-protocol commands qualify.
 - `is_hook_protocol(cmd) -> bool` — true for `session init`, all `checkpoint *`, `qmd reindex`, and their hidden aliases.
@@ -164,7 +164,7 @@ Implements `harness detect` (default verb when none given). Calls `onebrain_fs::
 Implements `init`. Thin wiring around `onebrain_fs::init::run_init(InitOptions)`; `--yes` skips prompts + installs the Essentials preset, otherwise supplies real `inquire`-backed confirm/preset closures (`ask_overwrite_vault_yml`, `ask_continue_nonempty`, `ask_initialize_here`, `ask_schedule_preset`). Returns `i32` exit code. Library: `onebrain_fs::init`.
 
 ### `src/commands/update.rs`
-Implements `update` (CLI binary self-update). Three output modes — structured (`--json`/`--plan`/global format flag → one document, orchestrator logs suppressed), TTY (colorized + `indicatif` spinner), plain. Calls `onebrain_fs::update::run_update(UpdateOptions)`; `--check`/`--plan` force dry-run. Returns `result.exit_code`. Library: `onebrain_fs::update`.
+Implements `update` (CLI binary self-update). Three output modes — structured (`--json`/`--plan`/global format flag → one document, orchestrator logs suppressed), TTY (framed `🧠 OneBrain Update` header + colorized phase lines + a braille `indicatif` spinner — matching `doctor` — on the fetch and install phases; the version check is padded to a deliberate beat so it reads as real work even on a warm cache), plain. Calls `onebrain_fs::update::run_update(UpdateOptions)`; `--check`/`--plan` force dry-run. Returns `result.exit_code`. Library: `onebrain_fs::update`.
 
 ### `src/commands/doctor.rs`
 Implements `doctor`. Resolves vault via `vault_ctx::resolve` (errors / failure-envelope when absent), loads config (best-effort), runs `onebrain_fs::doctor::run_all_checks`, prints a report (sequential-reveal on TTY, instant when piped/structured). `--fix` runs narrow per-warning recipes (`FixOutcome::{Fixed,Failed,Manual}`) then re-checks. Returns 0 / 1. Library: `onebrain_fs::doctor`, `onebrain_core`, `safety`, `vault_ctx`. Output: text default, `--json`/`--yaml` structured.

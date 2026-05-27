@@ -14,16 +14,18 @@ use crate::output::OutputMode;
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use is_terminal::IsTerminal;
-use onebrain_fs::update::{default_install_binary, run_update, UpdateError, UpdateOptions};
+use onebrain_fs::update::{
+    default_fetch_latest_release, default_install_binary, run_update, FetchFn, UpdateError,
+    UpdateOptions,
+};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const RELEASES_BASE_URL: &str = "https://github.com/onebrain-ai/onebrain-cli/releases";
 
 // ANSI escape codes — kept inline rather than pulling a `colored`-style dep
-// for ~5 distinct color uses.
+// for a handful of distinct color uses.
 const ANSI_RESET: &str = "\x1b[0m";
-const ANSI_BOLD_CYAN: &str = "\x1b[1;36m";
 const ANSI_GREEN: &str = "\x1b[32m";
 const ANSI_RED: &str = "\x1b[31m";
 const ANSI_DIM: &str = "\x1b[2m";
@@ -88,23 +90,27 @@ pub fn run(check: bool, fresh: bool, json: bool, plan: bool, mode: &OutputMode) 
     Ok(result.exit_code)
 }
 
-/// TTY-mode `UpdateOptions`: colorized line output via an `indicatif`-aware
-/// sink + a spinner that ticks during the install download. The spinner is
-/// shared between the sink (so `pb.println` interleaves correctly) and the
-/// `install_fn` wrapper (so we can `start`/`finish_with_message` around the
-/// real install). Both use an `Arc<Mutex<Option<ProgressBar>>>`.
+/// TTY-mode `UpdateOptions`: a framed 🧠 header, colorized phase lines, and a
+/// braille spinner (matching `doctor`) on the two phases that take time —
+/// `fetch` (the version check, padded to a deliberate beat so it reads as real
+/// work even on a warm cache) and `install` (the real download). The install
+/// spinner is shared with the sinks via an `Arc<Mutex<Option<ProgressBar>>>`
+/// so `pb.println` interleaves cleanly; the fetch spinner stands alone because
+/// no log lines are emitted mid-fetch.
 fn build_tty_options(dry_run: bool, fresh: bool) -> UpdateOptions {
     let pb_cell: Arc<Mutex<Option<ProgressBar>>> = Arc::new(Mutex::new(None));
 
-    // stdout sink — color the well-known phase lines, route everything via
-    // the spinner's `println` when one is active so output doesn't trample.
+    // stdout sink — replace the plain "OneBrain Update" title with the framed
+    // 🧠 header, color the well-known phase lines, and route everything via the
+    // install spinner's `println` when one is active so output doesn't trample.
     let pb_for_stdout = Arc::clone(&pb_cell);
     let stdout_sink: Box<dyn FnMut(&str) + Send> = Box::new(move |line: &str| {
-        let colored = colorize_update_line(line);
         let guard = pb_for_stdout.lock().unwrap_or_else(|e| e.into_inner());
+        let rendered = render_stdout_line(line);
+        let body = rendered.trim_end_matches('\n');
         match guard.as_ref() {
-            Some(pb) => pb.println(colored),
-            None => println!("{colored}"),
+            Some(pb) => pb.println(body),
+            None => println!("{body}"),
         }
     });
 
@@ -124,24 +130,31 @@ fn build_tty_options(dry_run: bool, fresh: bool) -> UpdateOptions {
         }
     });
 
+    // fetch_fn — spin while checking GitHub, padded to a deliberate beat so the
+    // check reads as real work even when the cache is warm / network is fast.
+    // Stands alone (no shared cell): the orchestrator emits no lines mid-fetch.
+    let fetch_fn: FetchFn = Box::new(move || {
+        let pb = braille_spinner("checking for updates…");
+        let started = Instant::now();
+        let result = default_fetch_latest_release(fresh);
+        if let Some(remaining) = crate::output::random_step_delay().checked_sub(started.elapsed()) {
+            std::thread::sleep(remaining);
+        }
+        pb.finish_and_clear();
+        result
+    });
+
     // install_fn wrapper — start the spinner, run the real install, stop.
     let pb_for_install = Arc::clone(&pb_cell);
     let install_fn: InstallFn = Box::new(move |version: &str| {
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::with_template("{spinner:.cyan} {msg}")
-                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-        );
-        pb.set_message(format!("downloading onebrain {version}…"));
-        pb.enable_steady_tick(Duration::from_millis(80));
+        let pb = braille_spinner(format!("downloading onebrain {version}…"));
         // Hand the spinner to the sinks while install runs.
         *pb_for_install.lock().unwrap_or_else(|e| e.into_inner()) = Some(pb.clone());
 
         let result = default_install_binary(version);
 
-        // Release the spinner before the orchestrator's next stdout line
-        // so the install summary line ("done: …") doesn't fight for the
-        // cursor with finish_with_message.
+        // Release the spinner before the orchestrator's next stdout line so the
+        // install summary line ("done: …") doesn't fight for the cursor.
         *pb_for_install.lock().unwrap_or_else(|e| e.into_inner()) = None;
         match &result {
             Ok(_) => pb.finish_and_clear(),
@@ -155,9 +168,37 @@ fn build_tty_options(dry_run: bool, fresh: bool) -> UpdateOptions {
         fresh,
         stdout_lines: Some(stdout_sink),
         stderr_lines: Some(stderr_sink),
+        fetch_fn: Some(fetch_fn),
         install_fn: Some(install_fn),
         ..Default::default()
     }
+}
+
+/// A braille-frame spinner matching `doctor`'s animation — the shared
+/// [`crate::output::SPINNER_FRAMES`] fed into indicatif's live ticker, so both
+/// animated commands share one spinner look without duplicating the frames.
+fn braille_spinner(msg: impl Into<String>) -> ProgressBar {
+    // indicatif renders the last tick string when finished; append a blank so
+    // all braille frames animate (the spinner is cleared on finish anyway).
+    let mut ticks: Vec<&str> = crate::output::SPINNER_FRAMES.to_vec();
+    ticks.push(" ");
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .map(|style| style.tick_strings(&ticks))
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    pb.set_message(msg.into());
+    pb.enable_steady_tick(Duration::from_millis(90));
+    pb
+}
+
+/// The framed 🧠 update header (shared layout with `doctor`), rendered to a
+/// string for the stdout sink. The TTY path always has colour on.
+fn framed_update_header() -> String {
+    let mut buf = Vec::new();
+    let _ = crate::output::write_framed_header(&mut buf, "🧠", "OneBrain Update", true);
+    String::from_utf8(buf).unwrap_or_default()
 }
 
 /// Local alias for the install closure type — clippy complains about the
@@ -166,12 +207,21 @@ fn build_tty_options(dry_run: bool, fresh: bool) -> UpdateOptions {
 /// purely a readability win.
 type InstallFn = Box<dyn Fn(&str) -> Result<(), UpdateError> + Send + Sync>;
 
+/// Render one orchestrator stdout line for the TTY sink: the `"OneBrain Update"`
+/// title becomes the framed 🧠 header; every other line is colorized by prefix.
+/// Split out from the sink closure so both branches are unit-testable.
+fn render_stdout_line(line: &str) -> String {
+    if line == "OneBrain Update" {
+        framed_update_header()
+    } else {
+        colorize_update_line(line)
+    }
+}
+
 /// Map known orchestrator log-line prefixes to ANSI-colored variants. Lines
 /// that don't match a known prefix are passed through untouched.
 fn colorize_update_line(line: &str) -> String {
-    if line == "OneBrain Update" {
-        format!("{ANSI_BOLD_CYAN}{line}{ANSI_RESET}")
-    } else if line.starts_with("done:") {
+    if line.starts_with("done:") {
         format!("{ANSI_GREEN}{line}{ANSI_RESET}")
     } else if line.starts_with("already up to date") {
         format!("{ANSI_DIM}{line}{ANSI_RESET}")
@@ -271,6 +321,31 @@ fn build_json_document(
 mod tests {
     use super::*;
     use onebrain_fs::update::UpdateResult;
+
+    // ── TTY stdout-line rendering (framed header + colorized phases) ──────
+
+    #[test]
+    fn render_stdout_line_frames_the_title() {
+        // The "OneBrain Update" title becomes the framed 🧠 header (two spaces
+        // after the glyph, full-width rules) — same layout as doctor's header.
+        let out = render_stdout_line("OneBrain Update");
+        assert!(out.contains("🧠  OneBrain Update"), "framed title: {out:?}");
+        assert!(out.contains('─'), "framed rule: {out:?}");
+    }
+
+    #[test]
+    fn render_stdout_line_colorizes_known_phases_and_passes_others_through() {
+        assert!(
+            render_stdout_line("done: upgraded").starts_with(ANSI_GREEN),
+            "done → green"
+        );
+        assert!(
+            render_stdout_line("already up to date: …").starts_with(ANSI_DIM),
+            "up-to-date → dim"
+        );
+        // Unknown lines pass through untouched (no ANSI added).
+        assert_eq!(render_stdout_line("downloading…"), "downloading…");
+    }
 
     fn result(current: &str, latest: &str, ok: bool) -> UpdateResult {
         UpdateResult {

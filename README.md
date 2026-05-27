@@ -120,6 +120,8 @@ onebrain update --check        # dry-run (compare current vs latest)
 onebrain update --plan         # machine-readable JSON plan
 ```
 
+On an interactive terminal, `update` shows a framed `🧠 OneBrain Update` header and a braille spinner while it checks for (and downloads) a new version; piped / `--json` / `--plan` runs stay plain.
+
 The install path resolves the current target triple at runtime, downloads the matching GitHub Release tarball over HTTPS (rustls TLS), and atomically swaps the running binary (Unix single-rename; Windows rustup-style two-step with rollback on failure). No package-manager middleware.
 
 > **Homebrew users:** since v3.1.4, `onebrain update` auto-detects a brew-managed install (binary under the Cellar) and delegates to `brew upgrade onebrain`, so it stays in sync with brew's metadata — no manual step needed.
@@ -241,6 +243,8 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
 
 ### 🚧 Phase 1 · perceptual speed + skill alignment (v3.2–v3.7)
 - [x] **v3.2.0** — `note` resource group (11 verbs: `search` · `list` · `find` · `read` · `stat` · `backlinks` · `orphans` · `append` · `new` · `archive` · `move`) — native vault note ops replacing ad-hoc `grep` / `ls` / `find` / `cat`; canonical `Envelope`, vault-required, transactional `move` with vault-wide wikilink rewrite.
+- [x] **v3.2.1** — `doctor` grouped UX: 9 checks bucketed into 4 sections under a `🧠 OneBrain Doctor` header via a reusable braille-spinner progress primitive + verdict footer · qmd-hook detector recognizes both `qmd reindex` and the legacy `qmd-reindex` form (`--fix` migrates + dedups) · banner logo gradient.
+- [x] **v3.2.2** — Animated `onebrain update` (framed header + braille spinner on fetch/install, the version check padded to a visible beat) · banner vertical gradient + vertical-only mono fallback · `doctor` spinner now rotates and paces per check. Shared header/spinner/pacing primitives across `doctor` + `update`.
 - [ ] **v3.3** — Daemon foundation: `onebrain daemon start/stop/status` + structured logging.
 - [ ] **v3.4** — RPC layer: stdio JSON-RPC 2.0 over a Unix socket with auto-spawn.
 - [ ] **v3.5** — Skill-speed rewrites (`/daily`, `/wrapup`) + `checkpoint recover`.

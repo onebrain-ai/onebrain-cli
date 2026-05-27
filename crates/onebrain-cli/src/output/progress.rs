@@ -42,9 +42,37 @@ use std::time::Duration;
 /// Braille spinner frames, cycled left→right. Matches the approved design.
 pub(crate) const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Per-step stagger when animating (milliseconds), inside the approved
-/// 60–110 ms band. Tests use the force-static seam so they never sleep.
-const DEFAULT_STEP_MS: u64 = 80;
+/// Per-step pacing band when animating (inclusive milliseconds). Each step
+/// spins for a fresh random duration in this range so the reveal reads as
+/// deliberate, watchable work rather than an instant dump. The delay is
+/// purely cosmetic — every check has already run before rendering. Tests
+/// override the delay to zero via [`ProgressRenderer::set_step_delay`] so
+/// they exercise the animated branch without sleeping.
+const STEP_DELAY_MIN_MS: u64 = 800;
+const STEP_DELAY_MAX_MS: u64 = 2000;
+
+/// Dwell time per spinner frame while a step is spinning. The braille frame
+/// cycles every interval so the spinner visibly rotates for the whole step
+/// delay; the number of frames shown is `step_delay / SPINNER_FRAME_MS`.
+const SPINNER_FRAME_MS: u64 = 90;
+
+/// A fresh pseudo-random per-step delay in
+/// `[STEP_DELAY_MIN_MS, STEP_DELAY_MAX_MS]`. Uses wall-clock nanoseconds as a
+/// cheap entropy source — a `rand` dependency would be overkill for a purely
+/// cosmetic pacing jitter that has no correctness or security stake.
+///
+/// Shared with `update`, which pads its fast phases (fetch / warm cache) to
+/// this same band so its braille spinner reads as deliberate work — one
+/// pacing band across the two animated commands.
+pub(crate) fn random_step_delay() -> Duration {
+    let span = STEP_DELAY_MAX_MS - STEP_DELAY_MIN_MS + 1;
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
+        % span;
+    Duration::from_millis(STEP_DELAY_MIN_MS + jitter)
+}
 
 /// Resolved status of a step. Glyph + colour treatment per the approved
 /// design: passes are quiet (dim green), warnings/fails prominent.
@@ -148,6 +176,44 @@ pub fn should_animate(mode: &OutputMode, stdout_is_tty: bool, quiet: bool) -> bo
     is_color_text(mode)
 }
 
+/// Visible width (columns) of the horizontal rule framing command headers and
+/// the doctor summary footer. Sized to span the widest framed line so the rule
+/// always covers the text it frames rather than stopping short. Shared by
+/// `doctor` (header + footer) and `update` (header) so the two stay one width.
+pub const RULE_WIDTH: usize = 48;
+
+/// The framing rule: `RULE_WIDTH` box-drawing dashes. Built on demand (a
+/// `&'static str` can't be `repeat`ed at const time); the allocation is
+/// trivial and happens a handful of times per command.
+pub fn framing_rule() -> String {
+    "─".repeat(RULE_WIDTH)
+}
+
+/// Write a framed command header — a dim rule, ` <emoji>  <title>`, then a dim
+/// rule. Shared by `doctor` and `update` for one consistent header look.
+///
+/// Two spaces follow the emoji because brand glyphs like 🧠 render as a
+/// double-width cell in many terminals (e.g. the Obsidian terminal), where a
+/// single trailing space gets visually swallowed and the title butts against
+/// the emoji. `color` toggles the dim rule styling (off for mono TTYs).
+pub fn write_framed_header<W: Write>(
+    w: &mut W,
+    emoji: &str,
+    title: &str,
+    color: bool,
+) -> std::io::Result<()> {
+    let (dim, reset) = if color {
+        ("\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    let rule = framing_rule();
+    writeln!(w, "{dim}{rule}{reset}")?;
+    writeln!(w, " {emoji}  {title}")?;
+    writeln!(w, "{dim}{rule}{reset}")?;
+    Ok(())
+}
+
 /// Renders sections/steps to an injected writer.
 ///
 /// Construct via [`ProgressRenderer::new`] (computes the gating decision from
@@ -161,8 +227,11 @@ pub struct ProgressRenderer<W: Write> {
     /// Whether to emit ANSI colour. Independent of `animate` so a colour
     /// pipe-forced-pretty edge case still colours static output.
     color: bool,
-    /// Per-step pacing. Only consulted when `animate` is true.
-    step_delay: Duration,
+    /// Test seam for per-step pacing. `None` (production) → each animated step
+    /// waits a fresh [`random_step_delay`]; `Some(d)` (tests) → fixed `d`, so
+    /// the animated branch can be exercised with `Duration::ZERO` and no sleep.
+    /// Only consulted when `animate` is true.
+    step_delay_override: Option<Duration>,
 }
 
 impl ProgressRenderer<std::io::Stdout> {
@@ -182,7 +251,7 @@ impl ProgressRenderer<std::io::Stdout> {
             writer: std::io::stdout(),
             animate,
             color,
-            step_delay: Duration::from_millis(DEFAULT_STEP_MS),
+            step_delay_override: None,
         }
     }
 }
@@ -197,8 +266,17 @@ impl<W: Write> ProgressRenderer<W> {
             writer,
             animate: !force_static,
             color,
-            step_delay: Duration::from_millis(DEFAULT_STEP_MS),
+            step_delay_override: None,
         }
+    }
+
+    /// Test seam: pin the per-step pacing to a fixed duration (typically
+    /// `Duration::ZERO`) so the animated branch — spinner frame + `\r` clear +
+    /// resolved line — can be exercised deterministically without sleeping for
+    /// the production random band. Production never calls this.
+    #[cfg(test)]
+    pub fn set_step_delay(&mut self, delay: Duration) {
+        self.step_delay_override = Some(delay);
     }
 
     /// Render a section header line: a blank spacer then the header. Skipped
@@ -223,16 +301,43 @@ impl<W: Write> ProgressRenderer<W> {
     /// final status line.
     fn step(&mut self, step: &Step) -> std::io::Result<()> {
         if self.animate {
-            // Transient spinner line — first frame is enough for the brief
-            // stagger window; the line is cleared before the result lands.
-            write!(self.writer, "  {} {}", SPINNER_FRAMES[0], step.label)?;
-            self.writer.flush()?;
-            if !self.step_delay.is_zero() {
-                std::thread::sleep(self.step_delay);
-            }
+            // Production: a fresh random pace per step. Tests pin a zero
+            // override so this branch runs without actually sleeping.
+            let delay = self.step_delay_override.unwrap_or_else(random_step_delay);
+            self.spin(&step.label, delay)?;
             write!(self.writer, "\r\x1b[K")?; // carriage-return + clear EOL
         }
         self.write_resolved_step(step)
+    }
+
+    /// Paint the transient spinner line for `total`, cycling braille frames in
+    /// place (each frame redrawn after a `\r`) so the spinner visibly rotates.
+    /// Always paints at least one frame, so a zero-duration test seam still
+    /// exercises the spinner glyph without sleeping. The frame count is
+    /// `total / SPINNER_FRAME_MS` (clamped to ≥1); the dwell between frames is
+    /// `SPINNER_FRAME_MS`, so the line spins for roughly `total` before the
+    /// caller clears it and writes the resolved status.
+    fn spin(&mut self, label: &str, total: Duration) -> std::io::Result<()> {
+        let interval = Duration::from_millis(SPINNER_FRAME_MS);
+        let frame_count = match total.as_millis().checked_div(interval.as_millis()) {
+            Some(n) => (n as usize).max(1),
+            None => 1, // interval is zero — paint a single frame
+        };
+        for frame in 0..frame_count {
+            write!(
+                self.writer,
+                "\r  {} {}",
+                SPINNER_FRAMES[frame % SPINNER_FRAMES.len()],
+                label
+            )?;
+            self.writer.flush()?;
+            // Dwell between frames only — the last frame hands straight off to
+            // the resolved line, so a step never sleeps past its budget.
+            if frame + 1 < frame_count {
+                std::thread::sleep(interval);
+            }
+        }
+        Ok(())
     }
 
     /// Static status line(s) for a resolved step. Shared by both paths.
@@ -507,15 +612,55 @@ mod tests {
         assert_eq!(StepStatus::Fail.glyph(), "✗");
     }
 
+    // ── Shared framed header (doctor + update) ───────────────────────────
+
+    #[test]
+    fn framed_header_two_spaces_after_emoji_and_full_width_rules() {
+        let mut buf = Vec::new();
+        write_framed_header(&mut buf, "🧠", "OneBrain Update", false).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("🧠  OneBrain Update"),
+            "two spaces after emoji: {out:?}"
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0].chars().count(), RULE_WIDTH, "top rule width");
+        assert!(lines[0].chars().all(|c| c == '─'), "top rule dashes");
+        assert_eq!(lines[2].chars().count(), RULE_WIDTH, "bottom rule width");
+    }
+
+    #[test]
+    fn framed_header_color_wraps_rules_in_dim() {
+        let mut buf = Vec::new();
+        write_framed_header(&mut buf, "🧠", "OneBrain Doctor · ob-1", true).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("\x1b[2m"), "dim rule: {out:?}");
+        assert!(out.contains("\x1b[0m"), "reset: {out:?}");
+    }
+
     // ── Animated path (exercises the spinner branch; one short sleep) ────
+
+    #[test]
+    fn random_step_delay_is_within_band() {
+        // The cosmetic jitter must always land inside the inclusive
+        // [MIN, MAX] band so a slow run never stalls indefinitely nor flashes
+        // past. Sample enough times to catch an off-by-one in the modulo math.
+        let lo = Duration::from_millis(STEP_DELAY_MIN_MS);
+        let hi = Duration::from_millis(STEP_DELAY_MAX_MS);
+        for _ in 0..1000 {
+            let d = random_step_delay();
+            assert!(d >= lo && d <= hi, "delay {d:?} outside [{lo:?}, {hi:?}]");
+        }
+    }
 
     #[test]
     fn animated_step_paints_spinner_then_clears_and_resolves() {
         // `force_static = false` puts the renderer on the animated path so the
-        // spinner frame + `\r` clear + resolved line all run. A single step
-        // sleeps once for DEFAULT_STEP_MS — negligible and the only way to
-        // cover the animation branch.
+        // spinner frame + `\r` clear + resolved line all run. Pin the per-step
+        // delay to zero so the branch is exercised without sleeping for the
+        // production random band.
         let mut r = ProgressRenderer::with_writer(Vec::new(), false, false);
+        r.set_step_delay(Duration::ZERO);
         let step = Step::new("folders", StepStatus::Ok, Some("8/8 present".into()), None);
         r.step(&step).unwrap();
         let out = String::from_utf8(r.writer.clone()).unwrap();
@@ -525,5 +670,23 @@ mod tests {
         assert!(out.contains("\r\x1b[K"), "CR + clear-EOL: {out:?}");
         // Final resolved line lands after the clear.
         assert!(out.contains("✓ folders"), "resolved line: {out:?}");
+    }
+
+    #[test]
+    fn animated_step_cycles_multiple_spinner_frames() {
+        // A multi-interval delay must paint more than one distinct braille
+        // frame — i.e. the spinner actually rotates instead of freezing on the
+        // first frame. Three frame-intervals → frames 0,1,2 (~180 ms of real
+        // sleep, the cost of covering the rotation branch).
+        let mut r = ProgressRenderer::with_writer(Vec::new(), false, false);
+        r.set_step_delay(Duration::from_millis(SPINNER_FRAME_MS * 3));
+        let step = Step::new("folders", StepStatus::Ok, None, None);
+        r.step(&step).unwrap();
+        let out = String::from_utf8(r.writer.clone()).unwrap();
+        let distinct = SPINNER_FRAMES.iter().filter(|f| out.contains(**f)).count();
+        assert!(
+            distinct >= 2,
+            "spinner must cycle ≥2 distinct frames, got {distinct}: {out:?}"
+        );
     }
 }

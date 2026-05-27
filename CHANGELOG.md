@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.1
+latest_version: 3.2.2
 released: 2026-05-27
 ---
 
@@ -11,6 +11,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.2] — 2026-05-27 — animated `update` + banner/doctor polish
+
+- **Feat: `onebrain update` animated TTY** — a framed `🧠 OneBrain Update` header plus a braille spinner (matching `doctor`) on the two phases that take time: `fetch` (the version check) and `install` (the download). The check is padded to a deliberate beat so it reads as real work even on a warm cache or when already up to date. Piped / `--json` / non-TTY output is unchanged.
+- **Polish: banner vertical gradient** — a top-lit within-tone shade is layered on the horizontal cyan→purple→pink hue (top row keeps the exact anchors, lower rows darken). The non-truecolor fallback is now a vertical-only gray ramp (one tone shaded top→bottom, no left→right variation), and the stray leading shade pixel in front of the `O` is removed.
+- **Polish: `doctor` spinner + footer** — the per-step spinner now visibly rotates (was a frozen first frame) and paces 800–2000 ms per check so the reveal is watchable; the summary-footer rule is widened to span the verdict line; a space is added after the `🧠` glyph so it no longer butts against the title.
+- **Internal:** the framed header (rule + `🧠` title), braille `SPINNER_FRAMES`, and the pacing band are extracted into `output::` so `doctor` and `update` share one look without duplication — each keeps only its own renderer (sectioned `ProgressRenderer` vs indicatif live ticker).
 
 ## [3.2.1] — 2026-05-27 — doctor grouped UX + braille spinner · qmd-hook fix · logo banner gradient
 
