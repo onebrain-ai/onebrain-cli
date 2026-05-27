@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.4
+latest_version: 3.2.5
 released: 2026-05-27
 ---
 
@@ -11,6 +11,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.5] — 2026-05-27 — checkpoint hook actually fires now
+
+- **Fix: the auto-checkpoint safety net never fired.** Two compounding root causes left `07-logs/checkpoint/` empty across every session. This release fixes both so long-running sessions get their crash-recovery snapshots.
+- **Root cause 1 — session token churned, so the message counter never accumulated.** The token was resolved from terminal env vars (`WT_SESSION`/`TMUX_PANE`/`TERM_SESSION_ID`) then the `claude` process PID; in the Obsidian terminal and Claude Desktop those env vars are unset, so the token tracked the PID and reset on every Claude Code restart — the count split across many counters and never reached the 15-message threshold.
+- **Fix: `CLAUDE_CODE_SESSION_ID` is now the top-priority token source (new layer 0).** Claude Code sets it on every host (terminal, Obsidian, Claude Desktop, IDE, agent-teams) and it is unique per session — so the counter is stable across PID churn and, crucially, distinct sessions sharing one terminal (agent-teams mode) no longer collide on one counter. Falls back to the existing layer 1–8 chain when absent (older Claude Code).
+- **Root cause 2 — the 30-minute time threshold was dead for a session's first checkpoint.** `last_ts` stayed `0` until the first count-based block fired, which forced `elapsed` to `0`, so a long-but-quiet session (e.g. 8 turns over an hour) never snapshotted.
+- **Fix: anchor `last_ts` on the first stop** so the minutes threshold starts ticking immediately; a long session now checkpoints on time even without 15 messages.
 
 ## [3.2.4] — 2026-05-27 — doctor `--fix` UX overhaul · qmd timeout · skill-run feedback
 
