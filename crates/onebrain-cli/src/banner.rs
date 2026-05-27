@@ -42,11 +42,8 @@ use crate::output::OutputMode;
 use std::io::Write;
 
 /// OneBrain primary brand colour `#ff2d92` as a 24-bit ANSI foreground escape.
-/// Kept as a named constant so tests can pin "brand pink is present" without
-/// reaching into [`BANNER_BRAIN_GRADIENT`] / [`BANNER_ONE_GRADIENT`] by index.
-/// Truecolor is universal on every terminal that survives the TTY gate (the
-/// gate excludes `TERM=dumb` and CI lines), so we don't need to fall back to
-/// 256-colour or basic 16-colour.
+/// Kept as a named constant so tests can pin "brand pink is present" — it is
+/// the right edge of the wordmark gradient (see [`gradient_fg`] / [`GRAD_PINK`]).
 #[cfg_attr(not(test), allow(dead_code))]
 const ANSI_PINK_FG: &str = "\x1b[38;2;255;45;146m";
 const ANSI_DIM: &str = "\x1b[2m";
@@ -134,9 +131,10 @@ fn is_hook_protocol(cmd: &Cmd) -> bool {
 /// Unicode block-shaded rendering of the wordmark `ONEBRAIN`. Three lines
 /// of pixel-art letters using full-block (`█`), half-block (`▀`), and
 /// shaded-block (`░`) characters · 32 cols wide. Split into ONE / BRAIN
-/// halves so each can carry its own gradient (BRAIN = primary brand focus
-/// · ONE = muted secondary). Each letter is 4 chars wide; ONE = 3 letters
-/// (cols 0-11) · BRAIN = 5 letters (cols 12-31).
+/// halves that `build_banner` joins into one row, then colors per-column by
+/// horizontal position for a continuous gradient across the whole wordmark.
+/// Each letter is 4 chars wide; ONE = 3 letters (cols 0-11) · BRAIN = 5
+/// letters (cols 12-31).
 const BANNER_ONE_ART: [&str; 3] = ["░█▀█░█▀█░█▀▀", "░█░█░█░█░█▀▀", " ▀▀▀ ▀ ▀ ▀▀▀"];
 
 const BANNER_BRAIN_ART: [&str; 3] = [
@@ -150,16 +148,17 @@ const BANNER_BRAIN_ART: [&str; 3] = [
 const BANNER_VISUAL_WIDTH: usize = 32;
 
 /// Build the banner string (no I/O). Five rendered content lines total:
-///   3 × dual-gradient ASCII-art lines (custom block-shaded `OneBrain`
-///       wordmark — ONE in gray via [`BANNER_ONE_GRADIENT`], BRAIN in pink
-///       via [`BANNER_BRAIN_GRADIENT`])
+///   3 × ASCII-art lines (custom block-shaded `OneBrain` wordmark) colored
+///       with a continuous horizontal gradient — cyan → purple → pink in
+///       truecolor (matching the logo), or a light→dark gray ramp as the
+///       non-truecolor fallback (see [`gradient_fg`]).
 ///   1 × dim `Your AI Thinking Partner · vX.Y.Z` tagline, indented to centre
 ///       under the art block.
 ///   plus 1 leading + 1 trailing blank line for breathing room — so
 ///   `str::lines()` yields 6 elements total.
 ///
-/// Each art line is wrapped in its gradient-step escape (light at the top →
-/// dark at the bottom) followed by `ANSI_RESET`. The tagline is wrapped in
+/// Each art line colors every column by its horizontal position (one escape
+/// per glyph), then emits `ANSI_RESET` at line end. The tagline is wrapped in
 /// `ANSI_DIM ... ANSI_RESET` so the terminal state is always clean after
 /// the banner. The leading newline separates the banner from the previous
 /// shell prompt so it doesn't crowd the user's command line; the trailing
@@ -661,7 +660,8 @@ mod tests {
             let visible = strip_ansi(lines[i + 1]);
             let expected = format!("{}{}", BANNER_ONE_ART[i], BANNER_BRAIN_ART[i]);
             assert_eq!(
-                visible, expected,
+                visible,
+                expected,
                 "rendered line {} visible glyphs {:?} != combined art {:?}",
                 i + 1,
                 visible,

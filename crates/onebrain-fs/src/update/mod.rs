@@ -747,7 +747,10 @@ pub fn run_update(mut opts: UpdateOptions) -> UpdateResult {
         return result;
     }
 
-    write_stdout(&mut opts, "done: run /update in Claude to sync vault files");
+    write_stdout(
+        &mut opts,
+        "done: to sync the plugin run /update (in Claude) or `onebrain plugin update`",
+    );
     result.ok = true;
     result.exit_code = 0;
     result
@@ -838,7 +841,9 @@ mod tests {
         assert!(out.contains("current: v1.10.18"));
         assert!(out.contains("latest: v2.0.0"));
         assert!(out.contains("upgrading: @onebrain-ai/cli v2.0.0 installed"));
-        assert!(out.contains("done: run /update in Claude to sync vault files"));
+        assert!(out.contains("done:"));
+        assert!(out.contains("/update"));
+        assert!(out.contains("onebrain plugin update"));
     }
 
     #[test]
