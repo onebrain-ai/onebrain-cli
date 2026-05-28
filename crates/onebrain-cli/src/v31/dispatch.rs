@@ -260,10 +260,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             }
             SkillVerb::List => stubs::not_implemented("skill list"),
             SkillVerb::Bootstrap { .. } => stubs::not_implemented("skill bootstrap"),
-            SkillVerb::Help { name } => {
+            SkillVerb::Show { name } => {
                 let resolved = crate::vault_ctx::require(vault_flag.clone())?;
                 let code =
-                    commands::skill_inspect::help_run(resolved.root.as_path(), &name, &mode)?;
+                    commands::skill_inspect::show_run(resolved.root.as_path(), &name, &mode)?;
                 std::process::exit(code);
             }
             SkillVerb::Info { name } => {
@@ -343,7 +343,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         },
         Cmd::Bundle(BundleCmd { verb }) => match verb {
             BundleVerb::Install { .. } => stubs::not_implemented("bundle install"),
-            BundleVerb::Help { .. } => stubs::not_implemented("bundle help"),
+            BundleVerb::Show { .. } => stubs::not_implemented("bundle show"),
             BundleVerb::Info { .. } => stubs::not_implemented("bundle info"),
             BundleVerb::Init { .. } => stubs::not_implemented("bundle init"),
             BundleVerb::Lint { .. } => stubs::not_implemented("bundle lint"),

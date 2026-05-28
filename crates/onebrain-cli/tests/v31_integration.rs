@@ -1536,24 +1536,24 @@ fn help_no_color_env_no_banner() {
 }
 
 #[test]
-fn help_keyword_subcommand_emits_banner() {
-    // `onebrain plugin help` — clap's `help` keyword form. `--pretty` is a
-    // global flag and must sit pre-subcommand here because clap's auto-
-    // generated `help` subcommand doesn't accept globals as positional
-    // overrides.
+fn group_dash_help_emits_banner() {
+    // `onebrain plugin --help` — the canonical group help form after v3.2.11
+    // disabled the legacy `help` subcommand on every group. Regression guard
+    // that the pre-parse banner pass still wraps `--help` screens at the
+    // group level (was the path covering `plugin help` before the rename).
     let out = Command::cargo_bin("onebrain")
         .unwrap()
         .env_remove("NO_COLOR")
         .env_remove("CI")
         .env("TERM", "xterm-256color")
         .env("ONEBRAIN_FORCE_BANNER", "1")
-        .args(["--pretty", "plugin", "help"])
+        .args(["--pretty", "plugin", "--help"])
         .assert()
         .success();
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
     assert!(
         stderr.contains(BRAND_MARK),
-        "expected banner above `plugin help`. stderr=\n{stderr}"
+        "expected banner above `plugin --help`. stderr=\n{stderr}"
     );
 }
 

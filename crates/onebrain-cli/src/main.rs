@@ -29,7 +29,8 @@ fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
     let pre_parse_mode = output::resolve_output_mode(&banner::tty_inputs_for_help(&raw_args));
     let pre_parse_env = banner::HelpBannerEnv::from_env();
-    if banner::argv_requests_help(&raw_args) {
+    let argv_requests_help = banner::argv_requests_help(&raw_args);
+    if argv_requests_help {
         banner::emit_help_banner(
             std::io::stderr().lock(),
             &pre_parse_mode,
@@ -38,7 +39,33 @@ fn main() {
         );
     }
 
-    let cli = Cli::parse();
+    // `try_parse` so we can intercept the `arg_required_else_help` path —
+    // group commands like `onebrain harness` (which require a subcommand) trip
+    // `DisplayHelpOnMissingArgumentOrSubcommand` and clap auto-prints the help
+    // screen + exits. The pre-parse banner pass above only sees argv tokens
+    // (`--help` / `-h` / `help` / no-subcommand-at-all), so a bare group hop
+    // lands here without a banner. Emit it before delegating to `err.exit()`.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            use clap::error::ErrorKind;
+            let prints_help = matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                    | ErrorKind::DisplayVersion
+            );
+            if prints_help && !argv_requests_help {
+                banner::emit_help_banner(
+                    std::io::stderr().lock(),
+                    &pre_parse_mode,
+                    &raw_args,
+                    &pre_parse_env,
+                );
+            }
+            err.exit();
+        }
+    };
     // Capture the resolved output mode BEFORE dispatching so we can render a
     // canonical envelope on the error path. dispatch() also resolves it
     // internally; cheap to compute twice (pure function over env+flags).
