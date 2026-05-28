@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.14
+latest_version: 3.2.15
 released: 2026-05-28
 ---
 
@@ -11,6 +11,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.15] — 2026-05-28 — `--help` compact-with-wrap · `plugin update` silent sub-output · `--json` minified by default
+
+- **Break: `--help` reverts to compact layout** (command + description on the same line) — v3.2.12's blanket `next_line_help = true` pushed every arg into long format, which user testing flagged as "ดูยาก" (hard to read). For args carrying `[default]` + `[possible values]` (`-o, --output`, `--mode`, `--harness` on `skill run` / `harness run`), the description still renders inline but the bracketed value block wraps to a new indented line below. Achieved by `hide_default_value = true` + `hide_possible_values = true` + a manual `\n[default: …, possible values: …]` tail on the `help` string.
+- **Polish: `onebrain plugin update` no longer leaks the orchestrator's per-step `▸ <label>` lines above its framed report.** v3.2.13's `vault_sync::run_embedded` silenced the intro/outro frame but kept the step lines; v3.2.15 routes through new `vault_sync::run_silent` which forces the progress reporter to `io::sink()`. The framed `⚡  Plugin Update` header now appears as the FIRST thing in the report (right after the brand banner), with the animated spinner as the only progress signal during work — matches `doctor`/`update`'s established UX. `run_embedded` (intro-only suppression) removed; no remaining caller wanted the in-between mode.
+- **Break: `--json` (and `--output json`) now emits MINIFIED single-line JSON.** Pre-3.2.15 auto-prettified the JSON when stdout was a TTY, which was convenient for humans glancing at a structured response interactively but made the "copy/paste into curl / a script" path noisier. To get indented JSON now, pass `--json --pretty` (or `--output json --pretty`) explicitly.
 
 ## [3.2.14] — 2026-05-28 — `plugin update` animated spinner pacing (doctor/update parity)
 

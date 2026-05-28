@@ -13,7 +13,6 @@ use std::path::PathBuf;
     name = "onebrain",
     version,
     disable_help_subcommand = true,
-    next_line_help = true,
     propagate_version = true
 )]
 pub struct Cli {
@@ -26,14 +25,16 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub vault: Option<PathBuf>,
 
-    /// Output format. Default `text` is TTY-friendly; pipe-detected calls drop color/pretty automatically.
     #[arg(
         short = 'o',
         long,
         global = true,
         default_value = "text",
         value_parser = ["text", "json", "yaml", "table", "tsv"],
-        value_name = "FMT"
+        value_name = "FMT",
+        hide_default_value = true,
+        hide_possible_values = true,
+        help = "Output format. Default `text` is TTY-friendly; pipe-detected calls drop color/pretty automatically\n[default: text, possible values: text, json, yaml, table, tsv]"
     )]
     pub output: String,
 
@@ -507,13 +508,23 @@ pub enum HarnessVerb {
         vault_dir: Option<PathBuf>,
         /// The prompt to send. If omitted, the prompt is read from stdin.
         prompt: Option<String>,
-        /// Whether to inject the vault's OneBrain context before answering.
-        /// `with-context` loads CLAUDE.md/INSTRUCTIONS.md/GEMINI.md, `ad-hoc`
-        /// skips (cwd=`$TMPDIR`, no vault flag).
-        #[arg(long, value_enum, default_value_t = HarnessMode::WithContext)]
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = HarnessMode::WithContext,
+            hide_default_value = true,
+            hide_possible_values = true,
+            help = "Whether to inject the vault's OneBrain context before answering. `with-context` loads CLAUDE.md/INSTRUCTIONS.md/GEMINI.md, `ad-hoc` skips (cwd=`$TMPDIR`, no vault flag)\n[default: with-context, possible values: with-context, ad-hoc]"
+        )]
         mode: HarnessMode,
-        /// AI runtime to run the prompt through (default: claude).
-        #[arg(long, value_enum, default_value_t = HarnessArg::Claude)]
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = HarnessArg::Claude,
+            hide_default_value = true,
+            hide_possible_values = true,
+            help = "AI runtime to run the prompt through\n[default: claude, possible values: claude, gemini]"
+        )]
         harness: HarnessArg,
         /// Model passed through to the harness (`claude --model <m>` /
         /// `gemini -m <m>`). Omit to use the harness default.
@@ -542,17 +553,13 @@ pub enum HarnessVerb {
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[value(rename_all = "kebab-case")]
 pub enum HarnessMode {
-    /// Pass `--add-dir <vault>` (claude) / `--include-directories <vault>`
-    /// (gemini) and run with `cwd = <vault>` so the harness loads OneBrain's
-    /// CLAUDE.md / INSTRUCTIONS.md / GEMINI.md — full project context.
-    /// Requires a vault (exit 78 if missing).
+    // Variant docs intentionally omitted so clap doesn't render a multi-line
+    // `Possible values:` block under `--mode <MODE>` — that block was the
+    // last thing forcing `harness run --help` into clap's "long" format. The
+    // semantics now live in (a) the help-string wrap on the `mode` arg above
+    // and (b) the enum-level rustdoc on `HarnessMode` for source readers.
     #[default]
     WithContext,
-    /// No `--add-dir` / `--include-directories` flag, and `cwd` is forced to
-    /// `$TMPDIR` so claude / gemini can't auto-walk-up from a vault subdir
-    /// and silently re-load OneBrain's `CLAUDE.md` / `GEMINI.md`. Answers the
-    /// raw prompt with no project context — vault not required. User-level
-    /// config (`~/.claude/CLAUDE.md`) still loads — that's separate.
     AdHoc,
 }
 
@@ -1075,8 +1082,14 @@ pub enum SkillVerb {
         /// scheduler's `run-skill` form. Equivalent to the positional `<NAME>`.
         #[arg(long = "skill", value_name = "NAME", conflicts_with = "name")]
         skill: Option<String>,
-        /// AI runtime to run the skill through (default: claude).
-        #[arg(long, value_enum, default_value_t = HarnessArg::Claude)]
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = HarnessArg::Claude,
+            hide_default_value = true,
+            hide_possible_values = true,
+            help = "AI runtime to run the skill through\n[default: claude, possible values: claude, gemini]"
+        )]
         harness: HarnessArg,
         /// Model passed through to the harness (`claude --model <m>` /
         /// `gemini -m <m>`). Omit to use the harness default. A faster model

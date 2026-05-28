@@ -27,22 +27,28 @@ use std::path::PathBuf;
 /// to occasionally duplicate one line than leave the user with a silent
 /// non-zero exit.
 pub fn run(vault_root_override: Option<PathBuf>, branch: Option<String>) -> Result<i32> {
-    run_with(vault_root_override, branch, false)
+    run_with(vault_root_override, branch, false, false)
 }
 
-/// Identical to [`run`] but sets `VaultSyncOptions::embedded = true`, which
-/// suppresses the orchestrator's "OneBrain Vault Sync" intro frame and
-/// `vault-sync: done` outro. Used by `onebrain plugin update`, which wraps the
-/// sub-op inside its own framed report — the orchestrator frame would just
-/// fight the parent frame for the user's eye.
-pub fn run_embedded(vault_root_override: Option<PathBuf>, branch: Option<String>) -> Result<i32> {
-    run_with(vault_root_override, branch, true)
+/// Same as [`run`] but suppresses the orchestrator's "OneBrain Vault Sync"
+/// intro/outro frame AND routes the per-step progress reporter to
+/// `io::sink()` — so neither the framed banner nor the per-step `▸ <label>`
+/// lines leak. Used by `onebrain plugin update` (v3.2.15+), which renders
+/// its own framed doctor-style report. The framed report's animated spinner
+/// is the only progress signal the user sees, matching `doctor`/`update`.
+///
+/// (v3.2.13 introduced `run_embedded` for the intro-only suppression; v3.2.15
+/// folded that into the silent path because no remaining caller wanted the
+/// in-between "embedded but with step lines" mode.)
+pub fn run_silent(vault_root_override: Option<PathBuf>, branch: Option<String>) -> Result<i32> {
+    run_with(vault_root_override, branch, true, true)
 }
 
 fn run_with(
     vault_root_override: Option<PathBuf>,
     branch: Option<String>,
     embedded: bool,
+    silent: bool,
 ) -> Result<i32> {
     // Bun v2.3.3 parity: optional positional `<vault_root>` lets the caller
     // supply the vault path directly (skipping the cwd walk-up). When absent,
@@ -65,11 +71,21 @@ fn run_with(
     // narrow — any other path is the caller's responsibility.
     refuse_dangerous_vault_path(&vault_root_path)?;
 
+    // `silent` overrides any TTY-vs-non-TTY heuristic: orchestrator routes
+    // `progress_writer = Some(io::sink())` through `PlainProgress`, which
+    // discards every step line. `embedded` is still threaded so the build
+    // chooses the correct progress impl when `silent = false`.
+    let progress_writer: Option<Box<dyn std::io::Write + Send>> = if silent {
+        Some(Box::new(std::io::sink()))
+    } else {
+        None
+    };
     let result = run_vault_sync(
         vault_root_path.as_path(),
         VaultSyncOptions {
             branch,
             embedded,
+            progress_writer,
             ..VaultSyncOptions::default()
         },
     );

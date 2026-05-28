@@ -73,12 +73,15 @@ pub fn run(
     // 2. Sync plugin tarball — same backend as v3.0 `vault-sync`.
     //    v3.2.13: invoke via the embedded-progress entry so the orchestrator
     //    skips its "OneBrain Vault Sync" intro frame and "vault-sync: done"
-    //    outro — those are redundant under plugin update's own framed report
-    //    and were a key part of the "weird" mixed-styles UX the user flagged.
-    //    Step spinners still emit (they're transient) so the user sees
-    //    download/sync activity during a long fetch.
+    //    outro.
+    //    v3.2.15: ALSO route through `run_silent` so the per-step `▸ <label>`
+    //    TTY lines don't leak above the parent's framed report (user testing
+    //    on v3.2.14 flagged "ไม่มี header เลย" — the step lines appeared
+    //    BEFORE the parent's `⚡  Plugin Update` header). The framed report's
+    //    animated spinner is the only progress signal, matching what
+    //    `doctor`/`update` already do.
     if !dry_run {
-        let exit = crate::commands::vault_sync::run_embedded(Some(vault_root.clone()), branch)
+        let exit = crate::commands::vault_sync::run_silent(Some(vault_root.clone()), branch)
             .context("plugin update: vault-sync failed")?;
         // `vault_sync::run` returns Ok(0) on success, Ok(1) on critical fail.
         if exit != 0 {

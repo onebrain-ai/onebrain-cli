@@ -67,29 +67,48 @@ fn root_help_shows_3_root_verbs_and_visible_groups() {
 }
 
 #[test]
-fn root_help_renders_long_format() {
-    // v3.2.12 introduces `next_line_help = true` on the root `Cli`, which
-    // makes every command and option render in clap's "long" format: name on
-    // its own line followed by an indented description. The other layout
-    // tests use OR-fallback patterns (`  init\n` OR `  init `) so a clap
-    // renderer drift or an accidental removal of the attribute doesn't break
-    // ordering/visibility invariants — but those fallbacks would silently
-    // absorb a regression of the long format itself. THIS test positively
-    // asserts the shipped shape so any reversion fails loudly.
+fn root_help_renders_compact_with_wrapped_defaults() {
+    // v3.2.15 reverts the v3.2.12 `next_line_help = true` blanket — that
+    // attribute pushed EVERY arg into long format (name on its own line) and
+    // made `--help` read as "ดูยาก" per user testing. The new shape:
+    //   - Commands: compact (`  init        Initialize a new vault`)
+    //   - Options without defaults: compact
+    //   - Options WITH `[default]` + `[possible values]`: description still
+    //     inline, the bracketed value block wraps to a new line indented to
+    //     the description column.
+    //
+    // This positive assertion pins the new layout so a re-introduction of
+    // `next_line_help = true` (or removal of the `hide_default_value` /
+    // `hide_possible_values` + manual help-string wrap on `--output`) fails
+    // loudly.
     let out = Command::cargo_bin("onebrain")
         .unwrap()
         .arg("--help")
         .assert()
         .success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
-    // The exact indent depth (10 spaces) is what clap 4.x renders for
-    // next-line-help children; the substring below tolerates trailing
-    // description content drift but pins the layout itself.
+    // Commands compact — `  init        Initialize...` on one line.
     assert!(
-        stdout.contains("  init\n          Initialize a new vault"),
-        "expected long-format `--help` (verb on its own line, description \
-         indented on the next). Either `next_line_help = true` was removed \
-         from `Cli`, or clap's renderer changed the indent shape. Got:\n{stdout}"
+        stdout.contains("  init        Initialize a new vault"),
+        "expected compact command row `  init        Initialize a new vault`; \
+         `next_line_help = true` may have crept back. Got:\n{stdout}"
+    );
+    // `-o, --output` description on the same line; `[default: text, \
+    // possible values: ...]` wrapped to a new aligned line below.
+    assert!(
+        stdout.contains(
+            "  -o, --output <FMT>  Output format. Default `text` is TTY-friendly; \
+             pipe-detected calls drop color/pretty automatically\n\
+                                  [default: text, possible values: text, json, yaml, table, tsv]"
+                .replace("             ", "")
+                .as_str()
+        ) || stdout.contains(
+            "  -o, --output <FMT>  Output format. Default `text` is TTY-friendly; pipe-detected calls drop color/pretty automatically\n                      [default: text, possible values: text, json, yaml, table, tsv]"
+        ),
+        "expected `-o, --output` description inline with `[default: text, \
+         possible values: ...]` wrapped to indented next line. The \
+         `hide_default_value` / `hide_possible_values` + manual help-string \
+         wrap on `Cli::output` may have been removed. Got:\n{stdout}"
     );
 }
 
