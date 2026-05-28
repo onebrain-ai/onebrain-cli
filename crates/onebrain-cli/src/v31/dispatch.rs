@@ -164,7 +164,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             } => {
                 let v = vault_dir.or(vault_flag.clone());
                 let report = plugin_update::run(v, branch, dry_run)?;
-                emit_plugin_update_summary(&report, &mode)?;
+                emit_plugin_update_summary(&report, &mode, quiet)?;
                 // Partial failure: hooks were rewritten but plists weren't
                 // (or some other mid-flight step bailed). Surface a
                 // canonical exit so callers don't treat this as success.
@@ -564,14 +564,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 fn emit_plugin_update_summary(
     report: &plugin_update::PluginUpdateReport,
     mode: &OutputMode,
+    quiet: bool,
 ) -> Result<()> {
     use std::io::IsTerminal;
     // Animation gate mirrors `doctor`/`update`: only animate when stdout is a
-    // real TTY (real-time `\r` overwrite works) AND mode is colour-bearing
-    // text (the spinner relies on ANSI). Pipes / CI / structured output all
-    // fall through to the static `_to` path.
+    // real TTY (real-time `\r` overwrite works), mode is colour-bearing text
+    // (spinner relies on ANSI), AND the user did NOT pass `--quiet`. Round-1
+    // review caught the missing `quiet` plumb-through — `should_animate`'s
+    // own contract is `quiet || !stdout_is_tty || !color → false`, so passing
+    // the literal `false` here bypassed the user's `--quiet` request.
+    // `doctor::run` already threads `cli.quiet` through; matching that here
+    // keeps the command family consistent. Pipes / CI / structured output
+    // all fall through to the static `_to` path.
     let stdout_is_tty = std::io::stdout().is_terminal();
-    let animate = crate::output::should_animate(mode, stdout_is_tty, false);
+    let animate = crate::output::should_animate(mode, stdout_is_tty, quiet);
     if animate {
         render_plugin_update_animated(report, mode)
     } else {
