@@ -67,6 +67,33 @@ fn root_help_shows_3_root_verbs_and_visible_groups() {
 }
 
 #[test]
+fn root_help_renders_long_format() {
+    // v3.2.12 introduces `next_line_help = true` on the root `Cli`, which
+    // makes every command and option render in clap's "long" format: name on
+    // its own line followed by an indented description. The other layout
+    // tests use OR-fallback patterns (`  init\n` OR `  init `) so a clap
+    // renderer drift or an accidental removal of the attribute doesn't break
+    // ordering/visibility invariants — but those fallbacks would silently
+    // absorb a regression of the long format itself. THIS test positively
+    // asserts the shipped shape so any reversion fails loudly.
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    // The exact indent depth (10 spaces) is what clap 4.x renders for
+    // next-line-help children; the substring below tolerates trailing
+    // description content drift but pins the layout itself.
+    assert!(
+        stdout.contains("  init\n          Initialize a new vault"),
+        "expected long-format `--help` (verb on its own line, description \
+         indented on the next). Either `next_line_help = true` was removed \
+         from `Cli`, or clap's renderer changed the indent shape. Got:\n{stdout}"
+    );
+}
+
+#[test]
 fn root_help_hides_v30_aliases() {
     let out = Command::cargo_bin("onebrain")
         .unwrap()
