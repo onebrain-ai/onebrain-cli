@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "onebrain", version)]
+#[command(name = "onebrain", version, disable_help_subcommand = true)]
 pub struct Cli {
     // `vault` doc is a single line so `--help` (long) renders identically to
     // `-h` (short) — clap's default expand-paragraphs-on-long behaviour would
@@ -199,6 +199,7 @@ pub struct DoctorArgs {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
 pub struct AvatarCmd {
     #[command(subcommand)]
     pub verb: AvatarVerb,
@@ -227,6 +228,7 @@ pub enum AvatarVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
 pub struct BookmarkCmd {
     #[command(subcommand)]
     pub verb: BookmarkVerb,
@@ -259,9 +261,11 @@ pub enum BundleVerb {
     /// Install a bundle (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     Install { name: String },
-    /// Print bundle help text (not yet implemented · v3.x roadmap).
+    /// Print a bundle's overview / README body (not yet implemented · v3.x
+    /// roadmap). Mirrors `SkillVerb::Show` semantics: renders the bundle's
+    /// human-readable body, NOT clap's CLI usage (use `--help` for that).
     #[command(hide = true)]
-    Help { name: String },
+    Show { name: String },
     /// Print bundle metadata (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     Info { name: String },
@@ -287,7 +291,10 @@ pub enum BundleVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
-#[command(about = "Auto-save management (stop · reset · orphans)")]
+#[command(
+    about = "Auto-save management (stop · reset · orphans)",
+    disable_help_subcommand = true
+)]
 pub struct CheckpointCmd {
     #[command(subcommand)]
     pub verb: CheckpointVerb,
@@ -320,6 +327,7 @@ pub enum CheckpointVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
 pub struct ConfigCmd {
     #[command(subcommand)]
     pub verb: ConfigVerb,
@@ -345,6 +353,7 @@ pub enum ConfigVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
 pub struct DaemonCmd {
     #[command(subcommand)]
     pub verb: DaemonVerb,
@@ -367,6 +376,7 @@ pub enum DaemonVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
 pub struct DateCmd {
     #[command(subcommand)]
     pub verb: DateVerb,
@@ -392,6 +402,7 @@ pub enum DateVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
 pub struct DreamCmd {
     #[command(subcommand)]
     pub verb: DreamVerb,
@@ -417,6 +428,7 @@ pub enum DreamVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
 pub struct FrontmatterCmd {
     #[command(subcommand)]
     pub verb: FrontmatterVerb,
@@ -443,6 +455,7 @@ pub enum FrontmatterVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
 pub struct GatewayCmd {
     #[command(subcommand)]
     pub verb: GatewayVerb,
@@ -465,7 +478,8 @@ pub enum GatewayVerb {
 #[command(
     about = "Detect or run an AI harness (claude / gemini)",
     subcommand_required = true,
-    arg_required_else_help = true
+    arg_required_else_help = true,
+    disable_help_subcommand = true
 )]
 pub struct HarnessCmd {
     #[command(subcommand)]
@@ -478,11 +492,8 @@ pub enum HarnessVerb {
     /// Run a prompt through claude or gemini headlessly. Flags:
     /// `--harness {claude,gemini}` · `--model <m>` (e.g. `claude-haiku-4-5`,
     /// `gemini-2.5-flash`) · `--mode {with-context, ad-hoc}` — with-context
-    /// (default) loads the vault's CLAUDE.md / INSTRUCTIONS.md / GEMINI.md
-    /// so the harness answers with OneBrain's full context, ad-hoc skips the
-    /// vault entirely and answers the raw prompt with no project context
-    /// attached. If `<PROMPT>` is omitted, the prompt is read from stdin so
-    /// the command composes with `cat note.md | onebrain harness run`.
+    /// (default) loads vault CLAUDE.md/INSTRUCTIONS.md/GEMINI.md, ad-hoc skips
+    /// project context. Omit `<PROMPT>` to read from stdin (`cat note.md | …`).
     Run {
         /// Vault root override · also accepts global `--vault`, and walks up from cwd when omitted.
         /// Ignored when `--mode ad-hoc`.
@@ -491,6 +502,8 @@ pub enum HarnessVerb {
         /// The prompt to send. If omitted, the prompt is read from stdin.
         prompt: Option<String>,
         /// Whether to inject the vault's OneBrain context before answering.
+        /// `with-context` loads CLAUDE.md/INSTRUCTIONS.md/GEMINI.md, `ad-hoc`
+        /// skips (cwd=`$TMPDIR`, no vault flag).
         #[arg(long, value_enum, default_value_t = HarnessMode::WithContext)]
         mode: HarnessMode,
         /// AI runtime to run the prompt through (default: claude).
@@ -505,22 +518,30 @@ pub enum HarnessVerb {
 
 /// Whether `onebrain harness run` loads OneBrain's vault context before
 /// invoking the harness, or runs the prompt ad-hoc with no project context.
+///
+/// `WithContext` (default) passes `--add-dir <vault>` (claude) /
+/// `--include-directories <vault>` (gemini) and sets `cwd = <vault>` so the
+/// harness loads OneBrain's CLAUDE.md / INSTRUCTIONS.md / GEMINI.md; requires
+/// a vault (exit 78 if missing).
+///
+/// `AdHoc` skips the context-dir flag and forces `cwd = $TMPDIR` so claude /
+/// gemini can't auto-walk-up from a vault subdir and silently re-load
+/// OneBrain's `CLAUDE.md`. The harness answers the raw prompt with no
+/// project context, regardless of where the user invoked from. User-level
+/// config (`~/.claude/CLAUDE.md`) still loads — that's separate.
+///
+/// Variant doc comments are intentionally one-line so `harness run --help`
+/// stays compact (matches `skill run --help`'s density). The longer
+/// description lives here for rustdoc + future devs reading the source.
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[value(rename_all = "kebab-case")]
 pub enum HarnessMode {
-    /// Pass `--add-dir <vault>` (claude) / `--include-directories <vault>`
-    /// (gemini) and run with `cwd = <vault>` so the harness loads OneBrain's
-    /// CLAUDE.md / INSTRUCTIONS.md / GEMINI.md — full project context.
-    /// Requires a vault.
+    // Variant docs intentionally absent so clap renders `--mode` with the
+    // compact `[possible values: with-context, ad-hoc]` format used by
+    // `skill run --help`. The per-variant semantics live on the field-level
+    // doc on `HarnessVerb::Run::mode` and in the enum-level doc above.
     #[default]
     WithContext,
-    /// No `--add-dir` / `--include-directories` flag, and `cwd` is forced to
-    /// `$TMPDIR` so claude / gemini can't auto-walk-up from a vault subdir
-    /// and silently re-load OneBrain's `CLAUDE.md` / `GEMINI.md`. The harness
-    /// answers the prompt with no OneBrain vault context attached, regardless
-    /// of where the user invoked from. Does not require a vault. (User-level
-    /// config at `~/.claude/CLAUDE.md` still loads — that's separate from the
-    /// cwd-based project context.)
     AdHoc,
 }
 
@@ -529,6 +550,7 @@ pub enum HarnessMode {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
 pub struct InboxCmd {
     #[command(subcommand)]
     pub verb: InboxVerb,
@@ -551,6 +573,7 @@ pub enum InboxVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
 pub struct LogCmd {
     #[command(subcommand)]
     pub verb: LogVerb,
@@ -576,6 +599,7 @@ pub enum LogVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
 pub struct MemoryCmd {
     #[command(subcommand)]
     pub verb: MemoryVerb,
@@ -607,6 +631,7 @@ pub enum MemoryVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
 pub struct NoteCmd {
     #[command(subcommand)]
     pub verb: NoteVerb,
@@ -785,6 +810,7 @@ pub struct NoteOrphansArgs {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
 pub struct PauseCmd {
     #[command(subcommand)]
     pub verb: PauseVerb,
@@ -807,7 +833,10 @@ pub enum PauseVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
-#[command(about = "Plugin lifecycle + hook rewriter")]
+#[command(
+    about = "Plugin lifecycle + hook rewriter",
+    disable_help_subcommand = true
+)]
 pub struct PluginCmd {
     #[command(subcommand)]
     pub verb: PluginVerb,
@@ -861,7 +890,7 @@ pub enum PluginVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
-#[command(about = "Vault search index")]
+#[command(about = "Vault search index", disable_help_subcommand = true)]
 pub struct QmdCmd {
     #[command(subcommand)]
     pub verb: QmdVerb,
@@ -887,7 +916,7 @@ pub enum QmdVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
-#[command(about = "launchd schedule management")]
+#[command(about = "launchd schedule management", disable_help_subcommand = true)]
 pub struct ScheduleCmd {
     #[command(subcommand)]
     pub verb: ScheduleVerb,
@@ -937,6 +966,7 @@ pub enum ScheduleVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
 pub struct ServeCmd {
     #[command(subcommand)]
     pub verb: ServeVerb,
@@ -959,7 +989,7 @@ pub enum ServeVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
-#[command(about = "Session lifecycle (init)")]
+#[command(about = "Session lifecycle (init)", disable_help_subcommand = true)]
 pub struct SessionCmd {
     #[command(subcommand)]
     pub verb: SessionVerb,
@@ -984,7 +1014,7 @@ pub enum SessionVerb {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// skill (bootstrap hidden, list/run/help/info visible)
+// skill (bootstrap hidden, list/run/show/info visible)
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
@@ -1048,9 +1078,10 @@ pub enum SkillVerb {
     },
     /// Bootstrap a skill's state files · called by skills internally.
     Bootstrap { name: String },
-    /// Print a skill's help text · convenience for skill scripting.
-    Help { name: String },
-    /// Print skill metadata as JSON · convenience for skill scripting.
+    /// Print a skill's SKILL.md body (workflow markdown) · convenience for
+    /// skill scripting. Use `onebrain skill run --help` for CLI usage.
+    Show { name: String },
+    /// Print skill metadata (frontmatter) · `--json` for structured output.
     Info { name: String },
 }
 
@@ -1059,6 +1090,7 @@ pub enum SkillVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
 pub struct TaskCmd {
     #[command(subcommand)]
     pub verb: TaskVerb,
@@ -1081,7 +1113,10 @@ pub enum TaskVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
-#[command(about = "Vault operations (sync · current)")]
+#[command(
+    about = "Vault operations (sync · current)",
+    disable_help_subcommand = true
+)]
 pub struct VaultCmd {
     #[command(subcommand)]
     pub verb: VaultVerb,

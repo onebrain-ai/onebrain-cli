@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.10
+latest_version: 3.2.11
 released: 2026-05-28
 ---
 
@@ -11,6 +11,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.11] — 2026-05-28 — help cleanup: `--help` only · `skill help` → `skill show` · `harness run --help` compact · banner consistency
+
+- **Break: `<group> help` subcommand removed across the tree.** Every `*Cmd` group now sets `disable_help_subcommand = true`, so `onebrain plugin help` / `onebrain harness help` / etc. error with "unrecognized subcommand 'help'" instead of duplicating the `--help` flag. Use `onebrain <group> --help` (or `-h`) everywhere — one help surface, no parallel keyword form.
+- **Rename: `skill help <NAME>` → `skill show <NAME>`.** The verb renders SKILL.md body (skill workflow markdown), which is a different concept from clap's `--help` (CLI usage). Pairing them on the same verb caused the "which help is this?" confusion the original verb name carried. Module-level docs in `commands/skill_inspect.rs` spell out the distinction. Same rename applied to the hidden stub `bundle help` → `bundle show`.
+- **Fix: bare `onebrain harness` now emits the brand banner before showing help.** Pre-parse banner pass only fires when argv contains `--help`/`-h`/`help` or no subcommand at all — it missed `arg_required_else_help` group hops. `main` now uses `try_parse()` and emits the banner ahead of `clap::error::Error::exit()` for `DisplayHelp*` error kinds, fixing the missing-banner regression on `onebrain harness` (and any future group that adopts `arg_required_else_help`).
+- **Fix: `onebrain skill show <NAME>` no longer prints the banner twice.** The duplicate emission came from `argv_requests_help` matching the literal `help` keyword in `skill help <name>` (pre-parse banner) AND `dispatch` emitting again on successful parse. Renaming the verb to `show` removes the keyword collision; the heuristic is unchanged.
+- **Polish: `harness run --help` rewritten to the compact one-line style** used by `skill run --help` — `--harness {claude,gemini}` · `--model <m>` · `--mode {with-context,ad-hoc}` listed inline so flags surface in the group-level `harness --help` without a paragraph of prose.
+- **Polish: no more banner above "unrecognized subcommand 'help'" errors.** `argv_requests_help` (the pre-parse banner gate) no longer matches the literal `help` keyword — only `--help` / `-h` / no-subcommand-at-all. Removing `help` from clap as a subcommand made the keyword path strictly an error, so emitting the banner above it was noise. `MissingSubcommand` is wired into the `try_parse` interception path so future clap versions that switch error kinds keep the banner. Adds regression tests: `bare_group_emits_banner_above_help` (issue #2 path) and `argv_requests_help_rejects_legacy_help_keyword` (issue #1's structural fix at the heuristic level).
 
 ## [3.2.10] — 2026-05-28 — `skill info` / `skill help`, harness/skill UX polish, `--json` passthrough
 

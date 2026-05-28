@@ -281,7 +281,7 @@ pub fn emit_banner<W: Write>(mut writer: W, cli: &Cli, mode: &OutputMode) {
 
 /// True when argv signals a help intent — clap will print help output in any
 /// of these cases:
-///   1. Explicit `--help`, `-h`, or the `help` subcommand keyword
+///   1. Explicit `--help` or `-h` flag anywhere in argv
 ///   2. No subcommand at all (`onebrain` bare, or with only global flags) —
 ///      clap defaults to printing top-level help when the subcommand is
 ///      missing
@@ -290,15 +290,20 @@ pub fn emit_banner<W: Write>(mut writer: W, cli: &Cli, mode: &OutputMode) {
 /// to clap (which prints help and exits in-process). The actual color/mode
 /// gating still happens inside `should_show_banner_for_help` — this function
 /// only answers "will clap print a help screen?"
+///
+/// v3.2.11: the literal `help` keyword is NO LONGER matched. Every `*Cmd`
+/// group now sets `disable_help_subcommand = true`, so `onebrain plugin help`
+/// (and friends) trip `ErrorKind::InvalidSubcommand` instead of producing a
+/// help screen — emitting the banner above that error would be noise.
 pub fn argv_requests_help(args: &[String]) -> bool {
     // Skip the binary name (`args[0]`) so we don't accidentally match
     // `/path/to/help-runner/onebrain` or similar.
     let after_binary: Vec<&String> = args.iter().skip(1).collect();
 
-    // (1) Explicit help keywords.
+    // (1) Explicit help flags.
     if after_binary
         .iter()
-        .any(|a| a.as_str() == "--help" || a.as_str() == "-h" || a.as_str() == "help")
+        .any(|a| a.as_str() == "--help" || a.as_str() == "-h")
     {
         return true;
     }
@@ -909,15 +914,13 @@ mod tests {
     }
 
     #[test]
-    fn should_show_banner_for_help_with_help_keyword() {
-        // `onebrain plugin help` — clap's `help` subcommand keyword.
+    fn argv_requests_help_rejects_legacy_help_keyword() {
+        // Regression guard for v3.2.11: every `*Cmd` group disabled the
+        // built-in `help` subcommand, so the literal token `help` is no longer
+        // a help-screen intent — it's an unrecognized subcommand. The
+        // heuristic must NOT short-circuit to banner-emit on that path.
         let args = s(&["onebrain", "plugin", "help"]);
-        assert!(should_show_banner_for_help(
-            &color_text_mode(),
-            &args,
-            &HelpBannerEnv::default()
-        ));
-        assert!(argv_requests_help(&args));
+        assert!(!argv_requests_help(&args));
     }
 
     #[test]

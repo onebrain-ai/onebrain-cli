@@ -1536,11 +1536,71 @@ fn help_no_color_env_no_banner() {
 }
 
 #[test]
-fn help_keyword_subcommand_emits_banner() {
-    // `onebrain plugin help` — clap's `help` keyword form. `--pretty` is a
-    // global flag and must sit pre-subcommand here because clap's auto-
-    // generated `help` subcommand doesn't accept globals as positional
-    // overrides.
+fn group_dash_help_emits_banner() {
+    // `onebrain plugin --help` — the canonical group help form after v3.2.11
+    // disabled the legacy `help` subcommand on every group. Regression guard
+    // that the pre-parse banner pass still wraps `--help` screens at the
+    // group level (was the path covering `plugin help` before the rename).
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .env_remove("NO_COLOR")
+        .env_remove("CI")
+        .env("TERM", "xterm-256color")
+        .env("ONEBRAIN_FORCE_BANNER", "1")
+        .args(["--pretty", "plugin", "--help"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        stderr.contains(BRAND_MARK),
+        "expected banner above `plugin --help`. stderr=\n{stderr}"
+    );
+}
+
+#[test]
+fn bare_group_emits_banner_above_help() {
+    // `onebrain harness` (no subcommand) — the `arg_required_else_help` path
+    // that v3.2.11 fixed via `try_parse` interception. Pre-3.2.11 this hop
+    // through `DisplayHelpOnMissingArgumentOrSubcommand` skipped the banner
+    // entirely because `argv_requests_help` only sees argv tokens and `harness`
+    // by itself doesn't trip the `--help` / no-subcommand cases. Regression
+    // guard so a future clap upgrade that drops the error kind from the
+    // matcher in `main.rs` doesn't silently re-introduce issue #2.
+    //
+    // Tightened in round-2 review: pin both the exit code (2, clap's
+    // `arg_required_else_help` exit) AND "exactly one banner" so the test
+    // doesn't pass-for-the-wrong-reason if the banner emit site moves OR if
+    // the pre-parse path is later broadened to match this argv shape too.
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .env_remove("NO_COLOR")
+        .env_remove("CI")
+        .env("TERM", "xterm-256color")
+        .env("ONEBRAIN_FORCE_BANNER", "1")
+        .args(["--pretty", "harness"])
+        .assert()
+        .code(2);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    let banner_count = stderr.matches(BRAND_MARK).count();
+    assert_eq!(
+        banner_count, 1,
+        "expected exactly 1 banner above bare `harness` help, got {banner_count}. stderr=\n{stderr}"
+    );
+}
+
+#[test]
+fn legacy_help_keyword_emits_no_banner() {
+    // v3.2.11: every `*Cmd` group disabled clap's built-in `help` subcommand
+    // keyword. `onebrain plugin help` now trips
+    // `ErrorKind::InvalidSubcommand`, which must NOT be added to `main.rs`'s
+    // `prints_help` matcher and must NOT match `argv_requests_help` —
+    // emitting a banner above the "unrecognized subcommand 'help'" error
+    // would be noise AND would re-open issue #1's duplicate-banner regression
+    // for any user still typing the v3.2.10 form out of muscle memory.
+    //
+    // This is the end-to-end counterpart to the unit test
+    // `argv_requests_help_rejects_legacy_help_keyword` in banner.rs: it pins
+    // the contract through the full clap → main → banner pipeline.
     let out = Command::cargo_bin("onebrain")
         .unwrap()
         .env_remove("NO_COLOR")
@@ -1549,13 +1609,23 @@ fn help_keyword_subcommand_emits_banner() {
         .env("ONEBRAIN_FORCE_BANNER", "1")
         .args(["--pretty", "plugin", "help"])
         .assert()
-        .success();
+        .failure();
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
     assert!(
-        stderr.contains(BRAND_MARK),
-        "expected banner above `plugin help`. stderr=\n{stderr}"
+        !stderr.contains(BRAND_MARK),
+        "banner must NOT appear above the `InvalidSubcommand` error for the \
+         removed `<group> help` keyword. stderr=\n{stderr}"
     );
 }
+
+// Issue #1's duplicate-banner regression (v3.2.10 `skill help <name>` emitted
+// the banner from BOTH the argv pre-parse pass AND the dispatch path) is
+// pinned at the heuristic level by the `argv_requests_help_rejects_legacy_help_keyword`
+// unit test in `src/banner.rs`. End-to-end "exactly one banner" can't be
+// asserted from `assert_cmd` because the dispatch banner gates on
+// `color: true`, which requires a real TTY stdout — intentional, no banner
+// on pipes. The bare-`harness` integration test above covers the
+// pre-parse-banner-on-DisplayHelp* path that fixes issue #2.
 
 /// `qmd status` is vault-required: exit 64 outside a vault, and a clean exit 0
 /// report inside one (degrading gracefully to `qmd_available:false` when the

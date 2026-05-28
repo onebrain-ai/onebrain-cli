@@ -1,8 +1,13 @@
-//! `onebrain skill info <NAME>` and `onebrain skill help <NAME>` — read a
+//! `onebrain skill info <NAME>` and `onebrain skill show <NAME>` — read a
 //! skill's `SKILL.md` from the vault plugin (`.claude/plugins/onebrain/skills/
 //! <name>/SKILL.md`), split it into frontmatter + body, and emit the relevant
 //! piece. Used by skill-scripting workflows that introspect a skill before
 //! invoking it.
+//!
+//! Naming: `show` (not `help`) intentionally — `--help` flags carry clap's CLI
+//! usage screen, while `show` renders the skill's workflow markdown. Keeping
+//! those concepts on different verbs avoids the "which help is this?"
+//! confusion the old `skill help` verb caused in v3.2.10.
 //!
 //! Exit codes:
 //!
@@ -13,7 +18,7 @@
 //! - `0`               — success
 //!
 //! Text mode renders human-readable; `--json` (or `--yaml`) renders the
-//! structured frontmatter (info) or `{ "body": "..." }` (help).
+//! structured frontmatter (info) or `{ "body": "..." }` (show).
 
 use crate::legacy_output::serialize_for_mode;
 use crate::output::OutputMode;
@@ -187,16 +192,16 @@ fn format_info(out: &SkillInfoOutput, mode: &OutputMode) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// skill help — emit the SKILL.md body (the human-readable workflow)
+// skill show — emit the SKILL.md body (the human-readable workflow)
 // ─────────────────────────────────────────────────────────────────────────
 
-pub fn help_run(vault_root: &Path, name: &str, mode: &OutputMode) -> Result<i32> {
+pub fn show_run(vault_root: &Path, name: &str, mode: &OutputMode) -> Result<i32> {
     let skill = match load_skill(vault_root, name)? {
         Ok(s) => s,
         Err(code) => return Ok(code),
     };
     let body = skill.body.trim_start_matches('\n').to_string();
-    let output = SkillHelpOutput {
+    let output = SkillShowOutput {
         name: skill
             .frontmatter
             .name
@@ -204,17 +209,17 @@ pub fn help_run(vault_root: &Path, name: &str, mode: &OutputMode) -> Result<i32>
             .unwrap_or_else(|| skill.name.clone()),
         body,
     };
-    println!("{}", format_help(&output, mode));
+    println!("{}", format_show(&output, mode));
     Ok(0)
 }
 
 #[derive(Debug, Serialize)]
-struct SkillHelpOutput {
+struct SkillShowOutput {
     name: String,
     body: String,
 }
 
-fn format_help(out: &SkillHelpOutput, mode: &OutputMode) -> String {
+fn format_show(out: &SkillShowOutput, mode: &OutputMode) -> String {
     if let OutputMode::Text { .. } = mode {
         // Text mode: just dump the markdown body — it's already
         // human-readable. Don't decorate; callers piping into pagers shouldn't
@@ -295,12 +300,12 @@ mod tests {
     }
 
     #[test]
-    fn help_run_emits_body() {
+    fn show_run_emits_body() {
         let (_dir, vault) = make_vault_with_skill(
             "daily",
             "---\nname: daily\n---\n# Daily Briefing\n\nDoing the daily.",
         );
-        let code = help_run(&vault, "daily", &text_mode()).unwrap();
+        let code = show_run(&vault, "daily", &text_mode()).unwrap();
         assert_eq!(code, 0);
     }
 
