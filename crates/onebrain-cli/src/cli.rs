@@ -9,7 +9,13 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "onebrain", version, disable_help_subcommand = true)]
+#[command(
+    name = "onebrain",
+    version,
+    disable_help_subcommand = true,
+    next_line_help = true,
+    propagate_version = true
+)]
 pub struct Cli {
     // `vault` doc is a single line so `--help` (long) renders identically to
     // `-h` (short) — clap's default expand-paragraphs-on-long behaviour would
@@ -536,12 +542,17 @@ pub enum HarnessVerb {
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[value(rename_all = "kebab-case")]
 pub enum HarnessMode {
-    // Variant docs intentionally absent so clap renders `--mode` with the
-    // compact `[possible values: with-context, ad-hoc]` format used by
-    // `skill run --help`. The per-variant semantics live on the field-level
-    // doc on `HarnessVerb::Run::mode` and in the enum-level doc above.
+    /// Pass `--add-dir <vault>` (claude) / `--include-directories <vault>`
+    /// (gemini) and run with `cwd = <vault>` so the harness loads OneBrain's
+    /// CLAUDE.md / INSTRUCTIONS.md / GEMINI.md — full project context.
+    /// Requires a vault (exit 78 if missing).
     #[default]
     WithContext,
+    /// No `--add-dir` / `--include-directories` flag, and `cwd` is forced to
+    /// `$TMPDIR` so claude / gemini can't auto-walk-up from a vault subdir
+    /// and silently re-load OneBrain's `CLAUDE.md` / `GEMINI.md`. Answers the
+    /// raw prompt with no project context — vault not required. User-level
+    /// config (`~/.claude/CLAUDE.md`) still loads — that's separate.
     AdHoc,
 }
 

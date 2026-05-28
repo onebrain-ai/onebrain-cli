@@ -38,10 +38,13 @@ fn root_help_shows_3_root_verbs_and_visible_groups() {
         .success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
 
-    // 3 root verbs.
+    // 3 root verbs. v3.2.12: long-format renders verbs as `  init\n` (verb
+    // name on its own line, description indented on next line). Match either
+    // shape so the test survives if clap's renderer changes the trailing
+    // whitespace (it might be `\n` or `  ` depending on alignment column).
     for v in ["init", "update", "doctor"] {
         assert!(
-            stdout.contains(&format!("  {v} ")) || stdout.contains(&format!("  {v}  ")),
+            stdout.contains(&format!("  {v}\n")) || stdout.contains(&format!("  {v}  ")),
             "root verb `{v}` missing from --help. Got:\n{stdout}"
         );
     }
@@ -81,9 +84,13 @@ fn root_help_hides_v30_aliases() {
         "run-skill",
     ] {
         // Not asserting absence of substring (could appear in env help text);
-        // assert it doesn't appear as a command entry (two-space prefix).
+        // assert it doesn't appear as a command entry. v3.2.12 long-format
+        // emits `  {alias}\n`; legacy compact was `  {alias} ` /
+        // `  {alias}  `. Reject all three.
         assert!(
-            !stdout.contains(&format!("  {alias}  ")) && !stdout.contains(&format!("  {alias} ")),
+            !stdout.contains(&format!("  {alias}\n"))
+                && !stdout.contains(&format!("  {alias}  "))
+                && !stdout.contains(&format!("  {alias} ")),
             "hidden alias `{alias}` leaked into top-level --help"
         );
     }
@@ -117,8 +124,13 @@ fn top_level_help_hides_stub_groups() {
         "skill",
         "qmd",
     ] {
+        // v3.2.12 long-format: `  {name}\n` is the canonical shape; legacy
+        // compact `  {name} ` / `  {name}  ` retained as fallback should a
+        // future renderer change put the description on the same line again.
         assert!(
-            stdout.contains(&format!("  {visible} ")) || stdout.contains(&format!("  {visible}  ")),
+            stdout.contains(&format!("  {visible}\n"))
+                || stdout.contains(&format!("  {visible} "))
+                || stdout.contains(&format!("  {visible}  ")),
             "expected visible command `{visible}` in --help. Got:\n{stdout}"
         );
     }
@@ -142,7 +154,9 @@ fn top_level_help_hides_stub_groups() {
         "task",
     ] {
         assert!(
-            !stdout.contains(&format!("  {stub}  ")) && !stdout.contains(&format!("  {stub} ")),
+            !stdout.contains(&format!("  {stub}\n"))
+                && !stdout.contains(&format!("  {stub}  "))
+                && !stdout.contains(&format!("  {stub} ")),
             "stub group `{stub}` leaked into top-level --help. Got:\n{stdout}"
         );
     }
@@ -224,26 +238,34 @@ fn top_level_help_is_production_grade() {
     // Item E: domain-clustered ordering via `display_order`. Find the byte
     // offset of each command-line entry in the rendered help and assert the
     // cluster boundaries.
+    //
+    // v3.2.12 long-format: command name appears as `  {name}\n` (verb on its
+    // own line, description indented below). Pre-3.2.12 compact form was
+    // `  {name} ` (two spaces, name, trailing space alignment). Match the
+    // long-format anchor first, fall back to compact if a future renderer
+    // tweak reverts it — keeps the ordering invariant decoupled from the
+    // renderer's exact whitespace.
     fn offset_of(haystack: &str, needle: &str) -> usize {
         haystack
-            .find(needle)
+            .find(&format!("  {needle}\n"))
+            .or_else(|| haystack.find(&format!("  {needle} ")))
             .unwrap_or_else(|| panic!("expected `{needle}` in --help"))
     }
     // System cluster (1-3).
-    let init = offset_of(&stdout, "  init ");
-    let update = offset_of(&stdout, "  update ");
-    let doctor = offset_of(&stdout, "  doctor ");
+    let init = offset_of(&stdout, "init");
+    let update = offset_of(&stdout, "update");
+    let doctor = offset_of(&stdout, "doctor");
     // Vault & session cluster (10-13).
-    let vault = offset_of(&stdout, "  vault ");
-    let session = offset_of(&stdout, "  session ");
-    let checkpoint = offset_of(&stdout, "  checkpoint ");
-    let harness = offset_of(&stdout, "  harness ");
+    let vault = offset_of(&stdout, "vault");
+    let session = offset_of(&stdout, "session");
+    let checkpoint = offset_of(&stdout, "checkpoint");
+    let harness = offset_of(&stdout, "harness");
     // Config & maintenance cluster (20-23).
-    let plugin = offset_of(&stdout, "  plugin ");
-    let schedule = offset_of(&stdout, "  schedule ");
-    let skill = offset_of(&stdout, "  skill ");
+    let plugin = offset_of(&stdout, "plugin");
+    let schedule = offset_of(&stdout, "schedule");
+    let skill = offset_of(&stdout, "skill");
     // Search cluster (30).
-    let qmd = offset_of(&stdout, "  qmd ");
+    let qmd = offset_of(&stdout, "qmd");
 
     assert!(
         init < update && update < doctor,
