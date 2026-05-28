@@ -98,18 +98,15 @@ fn main() {
 ///
 /// Text mode (default human) writes the v3.0-style `Error: <msg>` line to
 /// stderr — keeps the human-readable path unchanged. Structured modes
-/// (`--json` / `--yaml` / `--output table|tsv`) build a canonical envelope
+/// (`--json` / `--yaml`) build a canonical envelope
 /// (`ok: false`, `error: {code, message}`) and emit it on stdout so machine
 /// consumers always see one well-formed JSON document per invocation.
 ///
 /// R2-H2: structured-mode error envelopes are always rendered as JSON
-/// regardless of the requested format. Tsv and Table modes have no
-/// columnar slots for nested error fields (no `error.code` /
-/// `error.message` / `version` columns), so error envelopes are forced to
-/// Json regardless of requested mode. Forcing JSON guarantees a lossless
-/// canonical envelope on every structured invocation. `--yaml` is also
-/// forced to JSON for the error path so consumers don't need a
-/// format-switch on the error branch.
+/// regardless of the requested format. `--yaml` is forced to JSON for the
+/// error path so consumers don't need a format-switch on the error branch.
+/// (v3.2.15: `Table` / `Tsv` variants dropped from `OutputMode`; pre-3.2.15
+/// they would also have been forced to JSON here for the same reason.)
 ///
 /// R2-H3: when the error chain carries the `AlreadyReported` sentinel the
 /// envelope has been emitted already (e.g. `plugin update`'s partial

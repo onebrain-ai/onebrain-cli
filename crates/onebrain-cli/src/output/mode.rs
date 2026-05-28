@@ -45,7 +45,7 @@ impl OutputMode {
 /// deterministic unit tests.
 #[derive(Debug, Clone, Default)]
 pub struct TtyInputs {
-    /// `--output <fmt>` value from clap (`text|json|yaml|table|tsv`).
+    /// `--output <fmt>` value from clap (`text|json|yaml`).
     pub output_flag: String,
     /// `--json` shorthand.
     pub json_shortcut: bool,

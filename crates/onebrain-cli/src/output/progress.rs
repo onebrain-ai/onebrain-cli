@@ -24,11 +24,11 @@
 //!   2. [`OutputMode`] is `Text { color: true, .. }`, AND
 //!   3. not `--quiet`.
 //!
-//! In every other case — piped / non-TTY stdout, `--json` / `--yaml` /
-//! `--tsv` / `--table`, `--no-color`, `--quiet` — there is NO spinner, NO
-//! pacing, NO carriage-return redraw: the primitive just prints the final
-//! status lines (plain glyphs; ANSI colour only when the resolved mode still
-//! carries `color: true`, which it never does in any of those branches).
+//! In every other case — piped / non-TTY stdout, `--json` / `--yaml`,
+//! `--no-color`, `--quiet` — there is NO spinner, NO pacing, NO
+//! carriage-return redraw: the primitive just prints the final status lines
+//! (plain glyphs; ANSI colour only when the resolved mode still carries
+//! `color: true`, which it never does in any of those branches).
 //!
 //! The gating decision is made once by [`should_animate`] (a pure function
 //! over the same inputs `banner.rs` uses) and frozen into the renderer.

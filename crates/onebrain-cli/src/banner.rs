@@ -12,8 +12,8 @@
 //! Gating rules (see [`should_show_banner`]):
 //! 1. `--quiet` always suppresses.
 //! 2. Only `OutputMode::Text { color: true, .. }` shows the banner — pipes,
-//!    `--json`, `--yaml`, `--output table|tsv`, and `NO_COLOR`/`TERM=dumb`/
-//!    `CI=true`/`--no-color` all drop colour and therefore drop the banner.
+//!    `--json`, `--yaml`, and `NO_COLOR`/`TERM=dumb`/`CI=true`/`--no-color`
+//!    all drop colour and therefore drop the banner.
 //! 3. Hook-protocol commands (`session init`, `checkpoint stop/reset/orphans`,
 //!    `qmd reindex`, and their hidden v3.0 aliases `session-init`/
 //!    `orphan-scan`/`qmd-reindex`) need deterministic stderr because Claude
@@ -374,10 +374,10 @@ impl HelpBannerEnv {
 /// Suppression precedence (any one disqualifies):
 /// 1. `--version` / `-V` — version-only intent, no banner.
 /// 2. `--quiet` / `-q` — explicit silence.
-/// 3. `--json` / `--yaml` / `--output <json|yaml|table|tsv>` — machine consumer.
+/// 3. `--json` / `--yaml` / `--output <json|yaml>` — machine consumer.
 /// 4. `--no-color` flag — explicit colour suppression.
 /// 5. Env says monochrome (`NO_COLOR` / `TERM=dumb` / `CI=<truthy>`).
-/// 6. Mode is not `Text { .. }` (Json/Yaml/Table/Tsv).
+/// 6. Mode is not `Text { .. }` (Json/Yaml).
 ///
 /// The colour bit on the resolved mode is NOT checked: `assert_cmd` pipes
 /// stdout in tests, which collapses the colour bit to `false`. Forcing

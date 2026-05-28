@@ -26,9 +26,10 @@ pub struct SessionInitOutput {
 /// so fix the caller. `debug_assert!` catches the contract violation in
 /// debug builds.
 ///
-/// For the structured branches (`Json` / `Yaml` / `Table` / `Tsv`) this
-/// function is the single emit point; it keeps the JSON shape rules
-/// (compact vs. pretty) in one place.
+/// For the structured branches (`Json` / `Yaml`) this function is the single
+/// emit point; it keeps the JSON shape rules (compact vs. pretty) in one
+/// place. (v3.2.15: `Table` / `Tsv` variants dropped — both fell through to
+/// the JSON encoder unchanged.)
 ///
 /// **Error handling:** serialisation failures are surfaced via a stderr
 /// warning AND the function returns whatever string emerged (typically
