@@ -13,7 +13,8 @@ use std::path::PathBuf;
     name = "onebrain",
     version,
     disable_help_subcommand = true,
-    propagate_version = true
+    propagate_version = true,
+    term_width = 200
 )]
 pub struct Cli {
     // `vault` doc is a single line so `--help` (long) renders identically to
@@ -267,27 +268,48 @@ pub struct BundleCmd {
 pub enum BundleVerb {
     /// Install a bundle (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
-    Install { name: String },
+    Install {
+        /// Bundle name (npm-style identifier).
+        name: String,
+    },
     /// Print a bundle's overview / README body (not yet implemented · v3.x
     /// roadmap). Mirrors `SkillVerb::Show` semantics: renders the bundle's
     /// human-readable body, NOT clap's CLI usage (use `--help` for that).
     #[command(hide = true)]
-    Show { name: String },
+    Show {
+        /// Bundle name (npm-style identifier).
+        name: String,
+    },
     /// Print bundle metadata (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
-    Info { name: String },
+    Info {
+        /// Bundle name (npm-style identifier).
+        name: String,
+    },
     /// Scaffold a new bundle (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
-    Init { name: String },
+    Init {
+        /// Bundle name to create (npm-style identifier).
+        name: String,
+    },
     /// Lint a bundle (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
-    Lint { name: String },
+    Lint {
+        /// Bundle name (npm-style identifier).
+        name: String,
+    },
     /// Update a bundle (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
-    Update { name: String },
+    Update {
+        /// Bundle name (npm-style identifier).
+        name: String,
+    },
     /// Remove an installed bundle (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
-    Remove { name: String },
+    Remove {
+        /// Bundle name (npm-style identifier).
+        name: String,
+    },
     /// Run bundle diagnostics (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     Doctor,
@@ -496,23 +518,7 @@ pub struct HarnessCmd {
 pub enum HarnessVerb {
     /// Detect the active harness (Claude Code / Gemini / direct).
     Detect,
-    // v3.2.15: split `about` (compact-listing form with flag breakdown,
-    // shown under `harness --help`'s Commands: table) from `long_about`
-    // (short prose, shown at the top of `harness run --help`). Pre-split
-    // the parent-level listing was a single dense dot-separated line, AND
-    // the verb-level help screen redundantly repeated the same flag listing
-    // above its own Options: section — clap defaults to using `about` for
-    // both views when `long_about` is unset.
-    #[command(
-        about = "Run a prompt through claude or gemini headlessly.\n\
-            Flags:\n  \
-              --harness {claude,gemini}\n  \
-              --model <m> (e.g. `claude-haiku-4-5`, `gemini-2.5-flash`)\n  \
-              --mode {with-context, ad-hoc} — with-context (default) loads vault CLAUDE.md/INSTRUCTIONS.md/GEMINI.md, ad-hoc skips project context\n\
-            Omit <PROMPT> to read from stdin (`cat note.md | …`).",
-        long_about = "Run a prompt through claude or gemini headlessly. \
-            Omit <PROMPT> to read from stdin (`cat note.md | …`)."
-    )]
+    /// Run a prompt through claude or gemini headlessly. Omit <PROMPT> to read from stdin (`cat note.md | …`).
     Run {
         /// Vault root override · also accepts global `--vault`, and walks up from cwd when omitted.
         /// Ignored when `--mode ad-hoc`.
@@ -526,7 +532,7 @@ pub enum HarnessVerb {
             default_value_t = HarnessMode::WithContext,
             hide_default_value = true,
             hide_possible_values = true,
-            help = "Whether to inject the vault's OneBrain context before answering. `with-context` loads CLAUDE.md/INSTRUCTIONS.md/GEMINI.md, `ad-hoc` skips (cwd=`$TMPDIR`, no vault flag)\n[default: with-context, possible values: with-context, ad-hoc]"
+            help = "Inject the vault's OneBrain context before answering\n[default: with-context, possible values: with-context, ad-hoc]"
         )]
         mode: HarnessMode,
         #[arg(
@@ -1084,26 +1090,14 @@ pub enum SkillVerb {
     // (where it's the only summary the user sees of `run`); the verb-level
     // `skill run --help` uses the short prose since the Options: section
     // already lists each flag with its `[default]` + `[possible values]`.
-    #[command(
-        about = "Run a OneBrain skill (`/onebrain:<name>`) in headless mode.\n\
-        Flags:\n  \
-          --harness {claude,gemini}\n  \
-          --model <m> (e.g. `claude-haiku-4-5`, `gemini-2.5-flash`)\n  \
-          --skill <name> (parity alias for the positional <NAME>)\n  \
-          --arg key=value (pass-through)\n\
-        Replaces v3.0 `run-skill`.",
-        long_about = "Run a OneBrain skill (`/onebrain:<name>`) in headless mode. \
-            Replaces v3.0 `run-skill`."
-    )]
+    /// Run a OneBrain skill (`/onebrain:<name>`) in headless mode. Replaces v3.0 `run-skill`.
     Run {
         /// Vault root override · also accepts global `--vault`, and walks up from cwd when omitted.
         #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
         vault_dir: Option<PathBuf>,
-        /// Skill name (with or without slash prefix). Positional form:
-        /// `onebrain skill run daily`.
+        /// Skill name (with or without slash prefix). Positional form: `onebrain skill run daily`.
         name: Option<String>,
-        /// Skill name as a flag — `--skill /daily` — for parity with the
-        /// scheduler's `run-skill` form. Equivalent to the positional `<NAME>`.
+        /// Skill name as a flag — `--skill /daily` — for parity with the scheduler's `run-skill` form. Equivalent to the positional `<NAME>`.
         #[arg(long = "skill", value_name = "NAME", conflicts_with = "name")]
         skill: Option<String>,
         #[arg(
@@ -1115,9 +1109,7 @@ pub enum SkillVerb {
             help = "AI runtime to run the skill through\n[default: claude, possible values: claude, gemini]"
         )]
         harness: HarnessArg,
-        /// Model passed through to the harness (`claude --model <m>` /
-        /// `gemini -m <m>`). Omit to use the harness default. A faster model
-        /// (e.g. `claude-haiku-4-5`, `gemini-2.5-flash`) speeds up headless runs.
+        /// Model passed through to the harness. Omit to use the harness default. A faster model speeds up headless runs.
         #[arg(long, value_name = "MODEL")]
         model: Option<String>,
         /// Pass-through arguments (`--arg key=value`).
@@ -1125,12 +1117,21 @@ pub enum SkillVerb {
         args: Vec<String>,
     },
     /// Bootstrap a skill's state files · called by skills internally.
-    Bootstrap { name: String },
+    Bootstrap {
+        /// Skill name (with or without slash prefix · e.g. `daily` or `/daily`).
+        name: String,
+    },
     /// Print a skill's SKILL.md body (workflow markdown) · convenience for
     /// skill scripting. Use `onebrain skill run --help` for CLI usage.
-    Show { name: String },
+    Show {
+        /// Skill name (with or without slash prefix · e.g. `daily` or `/daily`).
+        name: String,
+    },
     /// Print skill metadata (frontmatter) · `--json` for structured output.
-    Info { name: String },
+    Info {
+        /// Skill name (with or without slash prefix · e.g. `daily` or `/daily`).
+        name: String,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────
