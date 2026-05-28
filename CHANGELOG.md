@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.14
+latest_version: 3.2.15
 released: 2026-05-28
 ---
 
@@ -11,6 +11,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.15] — 2026-05-28 — `--help` compact-with-wrap · plugin update polish · per-command emoji · version tracking · `--json` minified
+
+- **Break: `--help` reverts to compact layout** (command + description on the same line) — v3.2.12's blanket `next_line_help = true` pushed every arg into long format, which user testing flagged as "ดูยาก" (hard to read). For args carrying `[default]` + `[possible values]` (`-o, --output`, `--mode`, `--harness` on `skill run` / `harness run`), the description still renders inline but the bracketed value block wraps to a new indented line below. Achieved by `hide_default_value = true` + `hide_possible_values = true` + a manual `\n[default: …, possible values: …]` tail on the `help` string.
+- **Polish: per-command framed-header emoji differentiated.** Pre-3.2.15 both `doctor` and `update` used 🧠 (same as the OneBrain wordmark banner above them); v3.2.15: `doctor` → 🔬, `update` → 🚀, `plugin update` → 🔄. Each command now reads at a glance and stops competing with the brand glyph.
+- **Polish: `onebrain plugin update` no longer leaks the orchestrator's per-step `▸ <label>` lines above its framed report.** v3.2.13's `vault_sync::run_embedded` silenced the intro/outro frame but kept the step lines; v3.2.15 routes through new `vault_sync::run_silent` which forces the progress reporter to `io::sink()`. The framed `🔄  Plugin Update` header now appears as the FIRST thing in the report (right after the brand banner), with the animated spinner as the only progress signal during work — matches `doctor`/`update`'s established UX. `run_embedded` (intro-only suppression) removed; no remaining caller wanted the in-between mode.
+- **Feat: `plugin update` now reports current + latest plugin version explicitly.** The vault-sync step row reads `vX → vY` (real update), `vX · up-to-date` (rerun on the same version), or `installed vY` (fresh install) instead of the pre-3.2.15 collapse to `done` / `skipped`. The verdict footer also surfaces the delta — `updated v3.1.3 → v3.1.4` for a real bump, `update complete · v3.1.4` for no-version-change work, `already up-to-date · v3.1.4` for idempotent reruns, and `dry-run · current v3.1.4` for `--dry-run`. JSON envelope gains `version_before` / `version_after` fields (additive — both `#[serde(skip_serializing_if = "Option::is_none")]`).
+- **Break: `--json` (and `--output json`) now emits MINIFIED single-line JSON.** Pre-3.2.15 auto-prettified the JSON when stdout was a TTY, which was convenient for humans glancing at a structured response interactively but made the "copy/paste into curl / a script" path noisier. To get indented JSON now, pass `--json --pretty` (or `--output json --pretty`) explicitly.
+- **Break: `--output table` and `--output tsv` removed.** Both variants fell through to the JSON encoder unchanged for every command, so the format flag silently lied — `--output table doctor` emitted the same minified JSON as `--output json doctor`. Per user testing, dropped both from the `OutputMode` enum and the `--output` value parser; the remaining set is `text` / `json` / `yaml`. If a future command genuinely needs columnar output we'll add the column extractor and renderer together with the variant.
+- **Polish: `skill run --help` and `harness run --help` no longer duplicate the flag breakdown above their Options: section.** Reverted v3.2.15 round-2's parent-listing flag-per-line breakdown on `SkillVerb::Run` / `HarnessVerb::Run` — clap's renderer auto-switches to long format (option name on its own line + indented description) on the verb-level help whenever the variant's `about` contains a newline. Trade-off chosen per user testing: parent-level `skill --help` / `harness --help` Commands: rows now show a one-line summary, but the verb-level `--help` Options: section is COMPACT (matches top-level `onebrain --help`) and still wraps `[default]` + `[possible values]` to an indented next line for args that carry both.
+- **Polish: positional `<NAME>` args on `skill info` / `skill show` / `skill bootstrap` (and the hidden `bundle install/show/info/init/lint/update/remove`) now carry a description in the Arguments: section.** Previously they rendered as a bare `<NAME>` with no help text; the variant doc-comment described what the verb does but didn't propagate to the positional arg.
 
 ## [3.2.14] — 2026-05-28 — `plugin update` animated spinner pacing (doctor/update parity)
 

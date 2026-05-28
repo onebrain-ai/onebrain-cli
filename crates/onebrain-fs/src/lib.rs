@@ -30,6 +30,6 @@ pub use run_skill::{
 };
 pub use update::{run_update, UpdateOptions, UpdateResult};
 pub use vault_sync::{
-    build_tar_spawn_overrides, normalize_path, resolve_branch, run_vault_sync, VaultSyncOptions,
-    VaultSyncResult,
+    build_tar_spawn_overrides, normalize_path, read_plugin_version, resolve_branch, run_vault_sync,
+    VaultSyncOptions, VaultSyncResult,
 };

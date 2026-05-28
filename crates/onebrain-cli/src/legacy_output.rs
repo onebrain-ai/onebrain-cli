@@ -26,9 +26,10 @@ pub struct SessionInitOutput {
 /// so fix the caller. `debug_assert!` catches the contract violation in
 /// debug builds.
 ///
-/// For the structured branches (`Json` / `Yaml` / `Table` / `Tsv`) this
-/// function is the single emit point; it keeps the JSON shape rules
-/// (compact vs. pretty) in one place.
+/// For the structured branches (`Json` / `Yaml`) this function is the single
+/// emit point; it keeps the JSON shape rules (compact vs. pretty) in one
+/// place. (v3.2.15: `Table` / `Tsv` variants dropped — both fell through to
+/// the JSON encoder unchanged.)
 ///
 /// **Error handling:** serialisation failures are surfaced via a stderr
 /// warning AND the function returns whatever string emerged (typically
@@ -56,11 +57,6 @@ pub fn serialize_for_mode<T: Serialize>(value: &T, mode: &OutputMode) -> String 
             }
         },
         OutputMode::Json { pretty } => serialize_json(value, *pretty),
-        // Table / Tsv have no columnar slot for hook-protocol blocks. Fall
-        // back to compact JSON so the consumer still gets parseable output;
-        // commands that care about text rendering branch on
-        // `OutputMode::Text { .. }` before calling this function.
-        OutputMode::Table | OutputMode::Tsv => serialize_json(value, false),
         // Text-mode arrival is a caller bug — the per-command text renderer
         // should have absorbed this. Loud in debug, compact-JSON fallback in
         // release (compact, not pretty, because pretty-text-via-JSON would

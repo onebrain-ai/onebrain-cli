@@ -12,8 +12,8 @@
 //! Gating rules (see [`should_show_banner`]):
 //! 1. `--quiet` always suppresses.
 //! 2. Only `OutputMode::Text { color: true, .. }` shows the banner — pipes,
-//!    `--json`, `--yaml`, `--output table|tsv`, and `NO_COLOR`/`TERM=dumb`/
-//!    `CI=true`/`--no-color` all drop colour and therefore drop the banner.
+//!    `--json`, `--yaml`, and `NO_COLOR`/`TERM=dumb`/`CI=true`/`--no-color`
+//!    all drop colour and therefore drop the banner.
 //! 3. Hook-protocol commands (`session init`, `checkpoint stop/reset/orphans`,
 //!    `qmd reindex`, and their hidden v3.0 aliases `session-init`/
 //!    `orphan-scan`/`qmd-reindex`) need deterministic stderr because Claude
@@ -374,10 +374,10 @@ impl HelpBannerEnv {
 /// Suppression precedence (any one disqualifies):
 /// 1. `--version` / `-V` — version-only intent, no banner.
 /// 2. `--quiet` / `-q` — explicit silence.
-/// 3. `--json` / `--yaml` / `--output <json|yaml|table|tsv>` — machine consumer.
+/// 3. `--json` / `--yaml` / `--output <json|yaml>` — machine consumer.
 /// 4. `--no-color` flag — explicit colour suppression.
 /// 5. Env says monochrome (`NO_COLOR` / `TERM=dumb` / `CI=<truthy>`).
-/// 6. Mode is not `Text { .. }` (Json/Yaml/Table/Tsv).
+/// 6. Mode is not `Text { .. }` (Json/Yaml).
 ///
 /// The colour bit on the resolved mode is NOT checked: `assert_cmd` pipes
 /// stdout in tests, which collapses the colour bit to `false`. Forcing
@@ -398,12 +398,15 @@ pub fn should_show_banner_for_help(
     if args.iter().skip(1).any(|a| a == "--json" || a == "--yaml") {
         return false;
     }
-    // `--output <fmt>` / `-o <fmt>` where fmt ∈ {json,yaml,table,tsv}.
+    // `--output <fmt>` / `-o <fmt>` where fmt ∈ {json,yaml}.
+    // v3.2.15: dropped `table` and `tsv` from the format set — both fell
+    // through to the JSON encoder, so the banner gate now only suppresses
+    // for the structured formats that actually emit non-text output.
     let mut iter = args.iter().skip(1).peekable();
     while let Some(a) = iter.next() {
         if a == "-o" || a == "--output" {
             if let Some(val) = iter.peek() {
-                if matches!(val.as_str(), "json" | "yaml" | "table" | "tsv") {
+                if matches!(val.as_str(), "json" | "yaml") {
                     return false;
                 }
             }
@@ -411,7 +414,7 @@ pub fn should_show_banner_for_help(
             .strip_prefix("--output=")
             .or_else(|| a.strip_prefix("-o="))
         {
-            if matches!(val, "json" | "yaml" | "table" | "tsv") {
+            if matches!(val, "json" | "yaml") {
                 return false;
             }
         }
@@ -560,17 +563,11 @@ mod tests {
         assert!(!should_show_banner(&cli, &OutputMode::Yaml));
     }
 
-    #[test]
-    fn table_mode_suppresses_banner() {
-        let cli = parse(&["onebrain", "vault", "current"]);
-        assert!(!should_show_banner(&cli, &OutputMode::Table));
-    }
-
-    #[test]
-    fn tsv_mode_suppresses_banner() {
-        let cli = parse(&["onebrain", "vault", "current"]);
-        assert!(!should_show_banner(&cli, &OutputMode::Tsv));
-    }
+    // `table_mode_suppresses_banner` / `tsv_mode_suppresses_banner` removed
+    // in v3.2.15 along with the `Table` / `Tsv` `OutputMode` variants — both
+    // formats fell through to the JSON encoder, so the format flag never
+    // produced the columnar / TSV output it promised. JSON / YAML still
+    // suppress the banner via the two tests above.
 
     #[test]
     fn mono_text_mode_suppresses_banner() {
@@ -990,6 +987,8 @@ mod tests {
 
     #[test]
     fn should_show_banner_for_help_output_json_suppresses() {
+        // v3.2.15: dropped `--output=table` / `-o=tsv` rows along with the
+        // removed `OutputMode` variants. JSON / YAML remain.
         let args = s(&["onebrain", "--help", "--output", "json"]);
         assert!(!should_show_banner_for_help(
             &color_text_mode(),
@@ -1000,18 +999,6 @@ mod tests {
         assert!(!should_show_banner_for_help(
             &color_text_mode(),
             &args2,
-            &HelpBannerEnv::default()
-        ));
-        let args3 = s(&["onebrain", "--help", "--output=table"]);
-        assert!(!should_show_banner_for_help(
-            &color_text_mode(),
-            &args3,
-            &HelpBannerEnv::default()
-        ));
-        let args4 = s(&["onebrain", "--help", "-o=tsv"]);
-        assert!(!should_show_banner_for_help(
-            &color_text_mode(),
-            &args4,
             &HelpBannerEnv::default()
         ));
     }
@@ -1036,14 +1023,10 @@ mod tests {
     fn should_show_banner_for_help_structured_mode_suppresses() {
         // Even if argv has no structured flag, OutputMode could already be
         // structured (e.g. consumer-side mode override) — the gate also
-        // suppresses for Json/Yaml/Table/Tsv modes.
+        // suppresses for Json/Yaml modes. (v3.2.15: dropped Table/Tsv from
+        // the suppression list along with the variants themselves.)
         let args = s(&["onebrain", "--help"]);
-        for mode in [
-            OutputMode::Json { pretty: true },
-            OutputMode::Yaml,
-            OutputMode::Table,
-            OutputMode::Tsv,
-        ] {
+        for mode in [OutputMode::Json { pretty: true }, OutputMode::Yaml] {
             assert!(
                 !should_show_banner_for_help(&mode, &args, &HelpBannerEnv::default()),
                 "expected suppression for {mode:?}"

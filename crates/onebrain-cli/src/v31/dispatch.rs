@@ -627,7 +627,7 @@ pub(crate) fn render_plugin_update_animated_to<W: std::io::Write>(
     let reset = if color { "\x1b[0m" } else { "" };
 
     // ── Header (no animation — same as static path) ───────────────────
-    write_framed_header(&mut writer, "⚡", "Plugin Update", color, rule_width)?;
+    write_framed_header(&mut writer, "🔄", "Plugin Update", color, rule_width)?;
 
     // ── Step list (animated) ──────────────────────────────────────────
     // Same per-step Ok/Fail mapping as the static `render_plugin_update_text`
@@ -635,11 +635,12 @@ pub(crate) fn render_plugin_update_animated_to<W: std::io::Write>(
     // shows the braille spinner with its label for ~800–2000ms before the
     // `\r`-clear-and-resolve transition — matches `doctor`/`update`.
     let partial_failed = report.partial_failure.is_some();
-    let vault_detail = if report.vault_synced {
-        "done"
-    } else {
-        "skipped"
-    };
+    let vault_detail = plugin_update_vault_detail(
+        report.vault_synced,
+        report.dry_run,
+        report.version_before.as_deref(),
+        report.version_after.as_deref(),
+    );
     let hooks_detail = format!("{} rewritten", report.hooks_rewritten);
     let plists_detail = if partial_failed {
         "failed".to_string()
@@ -691,19 +692,15 @@ pub(crate) fn render_plugin_update_animated_to<W: std::io::Write>(
     };
     let verdict_glyph = verdict_status.glyph();
     let verdict_prefix = verdict_status.ansi_prefix(color);
-    let verdict_text: &str = match (partial_failed, report.dry_run) {
-        (true, _) => "partial failure",
-        (false, true) => "dry-run · no changes written",
-        (false, false) => {
-            let any_change =
-                report.vault_synced || report.hooks_rewritten > 0 || report.plists_rewritten;
-            if any_change {
-                "update complete"
-            } else {
-                "already up-to-date"
-            }
-        }
-    };
+    let verdict_text = plugin_update_verdict_text(
+        partial_failed,
+        report.dry_run,
+        report.vault_synced,
+        report.hooks_rewritten,
+        report.plists_rewritten,
+        report.version_before.as_deref(),
+        report.version_after.as_deref(),
+    );
     let total_str = "3 steps";
     let left_cols = 1 + 1 + 2 + verdict_text.chars().count();
     let gap = rule_width
@@ -729,6 +726,84 @@ pub(crate) fn render_plugin_update_animated_to<W: std::io::Write>(
     Ok(())
 }
 
+/// Compose the `vault sync` step row's detail string from the captured
+/// version delta + run flags. Shared by both the static and animated
+/// renderers so a future tweak (e.g. trimming the `v` prefix) lands in
+/// exactly one place.
+///
+/// Decision table (v3.2.15):
+/// - dry-run with known current → `current vX · skipped`
+/// - dry-run unknown → `skipped`
+/// - step didn't run → `skipped`
+/// - happy path with versions → `vX → vY` / `vX · up-to-date` / `installed vY`
+/// - happy path no version info → `done` (back-compat with pre-3.2.15)
+///
+/// Partial-failure cases aren't branched here: a later-step failure doesn't
+/// change what version landed on disk during the vault-sync step, so the row
+/// still reports the same delta. The verdict footer + per-step glyph carry
+/// the failure signal.
+fn plugin_update_vault_detail(
+    vault_synced: bool,
+    dry_run: bool,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> String {
+    if dry_run {
+        return match before {
+            Some(v) => format!("current v{v} · skipped"),
+            None => "skipped".to_string(),
+        };
+    }
+    if !vault_synced {
+        return "skipped".to_string();
+    }
+    match (before, after) {
+        (Some(a), Some(b)) if a == b => format!("v{a} · up-to-date"),
+        (Some(a), Some(b)) => format!("v{a} → v{b}"),
+        (None, Some(b)) => format!("installed v{b}"),
+        _ => "done".to_string(),
+    }
+}
+
+/// Compose the verdict footer's right-hand text (e.g. `updated v3.1.3 → v3.1.4`,
+/// `already up-to-date · v3.1.4`). Mirrors the step-detail helper above with
+/// the verdict-summary phrasing.
+fn plugin_update_verdict_text(
+    partial_failed: bool,
+    dry_run: bool,
+    vault_synced: bool,
+    hooks_rewritten: u32,
+    plists_rewritten: bool,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> String {
+    if partial_failed {
+        return "partial failure".to_string();
+    }
+    if dry_run {
+        return match before {
+            Some(v) => format!("dry-run · current v{v}"),
+            None => "dry-run · no changes written".to_string(),
+        };
+    }
+    // Real version bump trumps everything — that IS the headline outcome.
+    if let (Some(a), Some(b)) = (before, after) {
+        if a != b {
+            return format!("updated v{a} → v{b}");
+        }
+    }
+    let any_change = vault_synced || hooks_rewritten > 0 || plists_rewritten;
+    let suffix = after
+        .or(before)
+        .map(|v| format!(" · v{v}"))
+        .unwrap_or_default();
+    if any_change {
+        format!("update complete{suffix}")
+    } else {
+        format!("already up-to-date{suffix}")
+    }
+}
+
 /// On-the-wire payload for `plugin update`. Hoisted out of
 /// [`emit_plugin_update_summary_to`] so [`render_plugin_update_text`] can
 /// borrow the typed fields without a stringly-typed bridge.
@@ -744,6 +819,15 @@ struct PluginUpdateData<'a> {
     /// JSON envelope shape additive (dry-run runs don't gain a new field).
     #[serde(skip_serializing_if = "Option::is_none")]
     plists_count: Option<u32>,
+    /// v3.2.15: plugin version BEFORE the vault-sync step (from
+    /// `.claude-plugin/plugin.json::version`). `None` ⇒ fresh install / file
+    /// missing / version field missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version_before: Option<&'a str>,
+    /// v3.2.15: plugin version AFTER the vault-sync step. In dry-run this
+    /// equals `version_before` (no tarball fetched).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version_after: Option<&'a str>,
     dry_run: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<&'a str>,
@@ -763,6 +847,12 @@ impl<'a> PluginUpdateTextData for PluginUpdateData<'a> {
     }
     fn plists_count(&self) -> Option<u32> {
         self.plists_count
+    }
+    fn version_before(&self) -> Option<&str> {
+        self.version_before
+    }
+    fn version_after(&self) -> Option<&str> {
+        self.version_after
     }
     fn dry_run(&self) -> bool {
         self.dry_run
@@ -792,6 +882,8 @@ pub(crate) fn emit_plugin_update_summary_to<W: std::io::Write>(
         hooks_rewritten: report.hooks_rewritten,
         plists_rewritten: report.plists_rewritten,
         plists_count: report.plists_count,
+        version_before: report.version_before.as_deref(),
+        version_after: report.version_after.as_deref(),
         dry_run: report.dry_run,
         note: if report.dry_run {
             Some("dry-run · no changes written")
@@ -834,7 +926,7 @@ pub(crate) fn emit_plugin_update_summary_to<W: std::io::Write>(
 /// Layout (v3.2.13+):
 /// ```
 /// ────────────────────────────────────────────────
-///  ⚡  Plugin Update
+///  🔄  Plugin Update
 /// ────────────────────────────────────────────────
 ///
 ///  Update steps
@@ -871,7 +963,7 @@ where
     let mut buf: Vec<u8> = Vec::new();
 
     // ── Header ────────────────────────────────────────────────────────
-    let _ = write_framed_header(&mut buf, "⚡", "Plugin Update", color, rule_width);
+    let _ = write_framed_header(&mut buf, "🔄", "Plugin Update", color, rule_width);
 
     // ── Step list ─────────────────────────────────────────────────────
     // Today the only step that can populate `partial_failure` is the launchd
@@ -882,7 +974,12 @@ where
     // pre-3.2.13 it stayed `Ok` and silently misrepresented the failed step
     // as succeeded.
     let partial_failed = d.partial_failure().is_some();
-    let vault_detail = if d.vault_synced() { "done" } else { "skipped" };
+    let vault_detail = plugin_update_vault_detail(
+        d.vault_synced(),
+        d.dry_run(),
+        d.version_before(),
+        d.version_after(),
+    );
     let hooks_detail = format!("{} rewritten", d.hooks_rewritten());
     // `plists_count` (v3.2.13): `Some(N>0)` → N refreshed; `Some(0)` →
     // vault has no schedule entries (well-formed no-op); `None` → step
@@ -903,12 +1000,7 @@ where
         StepStatus::Ok
     };
     let steps = vec![
-        Step::new(
-            "vault sync",
-            StepStatus::Ok,
-            Some(vault_detail.to_string()),
-            None,
-        ),
+        Step::new("vault sync", StepStatus::Ok, Some(vault_detail), None),
         Step::new("hooks", StepStatus::Ok, Some(hooks_detail), None),
         Step::new("launchd plists", plists_status, Some(plists_detail), None),
     ];
@@ -935,18 +1027,15 @@ where
     };
     let verdict_glyph = verdict_status.glyph();
     let verdict_prefix = verdict_status.ansi_prefix(color);
-    let verdict_text = match (d.partial_failure(), d.dry_run()) {
-        (Some(_), _) => "partial failure".to_string(),
-        (None, true) => "dry-run · no changes written".to_string(),
-        (None, false) => {
-            let any_change = d.vault_synced() || d.hooks_rewritten() > 0 || d.plists_rewritten();
-            if any_change {
-                "update complete".to_string()
-            } else {
-                "already up-to-date".to_string()
-            }
-        }
-    };
+    let verdict_text = plugin_update_verdict_text(
+        partial_failed,
+        d.dry_run(),
+        d.vault_synced(),
+        d.hooks_rewritten(),
+        d.plists_rewritten(),
+        d.version_before(),
+        d.version_after(),
+    );
     // Trailing count right-aligned to the rule width (matches doctor's
     // " ✓  N ok · M warn · K fail              N checks" layout).
     let total_str = "3 steps";
@@ -986,6 +1075,8 @@ trait PluginUpdateTextData {
     fn hooks_rewritten(&self) -> u32;
     fn plists_rewritten(&self) -> bool;
     fn plists_count(&self) -> Option<u32>;
+    fn version_before(&self) -> Option<&str>;
+    fn version_after(&self) -> Option<&str>;
     fn dry_run(&self) -> bool;
     fn partial_failure(&self) -> Option<&str>;
 }
@@ -1021,6 +1112,8 @@ mod tests {
             hooks_rewritten: 0,
             plists_rewritten: false,
             plists_count: None,
+            version_before: None,
+            version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
         };
@@ -1079,13 +1172,15 @@ mod tests {
             hooks_rewritten: 3,
             plists_rewritten: true,
             plists_count: Some(3),
+            version_before: None,
+            version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
         };
         let mut buf = Vec::new();
         emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains("⚡  Plugin Update"), "header missing:\n{out}");
+        assert!(out.contains("🔄  Plugin Update"), "header missing:\n{out}");
         assert!(
             out.contains("Update steps"),
             "section marker missing:\n{out}"
@@ -1120,6 +1215,8 @@ mod tests {
             hooks_rewritten: 0,
             plists_rewritten: false,
             plists_count: None,
+            version_before: None,
+            version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
         };
@@ -1149,6 +1246,8 @@ mod tests {
             hooks_rewritten: 2,
             plists_rewritten: false,
             plists_count: None,
+            version_before: None,
+            version_after: None,
             partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
             warnings: Vec::new(),
         };
@@ -1185,6 +1284,8 @@ mod tests {
             hooks_rewritten: 2,
             plists_rewritten: false,
             plists_count: None,
+            version_before: None,
+            version_after: None,
             partial_failure: Some(
                 "schedule re-register failed\nlaunchctl exit 1\nplist syntax error".to_string(),
             ),
@@ -1217,6 +1318,8 @@ mod tests {
             hooks_rewritten: 0,
             plists_rewritten: false,
             plists_count: Some(0),
+            version_before: None,
+            version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
         };
@@ -1241,6 +1344,8 @@ mod tests {
             hooks_rewritten: 1,
             plists_rewritten: false,
             plists_count: Some(0),
+            version_before: None,
+            version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
         };
@@ -1273,6 +1378,8 @@ mod tests {
             hooks_rewritten: 2,
             plists_rewritten: false,
             plists_count: None,
+            version_before: None,
+            version_after: None,
             partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
             warnings: Vec::new(),
         };
@@ -1318,6 +1425,8 @@ mod tests {
             hooks_rewritten: 2,
             plists_rewritten: true,
             plists_count: Some(2),
+            version_before: None,
+            version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
         };
@@ -1372,6 +1481,8 @@ mod tests {
             hooks_rewritten: 2,
             plists_rewritten: false,
             plists_count: None,
+            version_before: None,
+            version_after: None,
             partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
             warnings: Vec::new(),
         };
@@ -1405,6 +1516,8 @@ mod tests {
             hooks_rewritten: 2,
             plists_rewritten: true,
             plists_count: Some(2),
+            version_before: None,
+            version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
         };

@@ -3,7 +3,7 @@ source: crates/onebrain-cli/src/commands/doctor.rs
 expression: output
 ---
 ────────────────────────────────────────────────────────
- 🧠  OneBrain Doctor · ob-1
+ 🔬  OneBrain Doctor · ob-1
 ────────────────────────────────────────────────────────
 
  Config

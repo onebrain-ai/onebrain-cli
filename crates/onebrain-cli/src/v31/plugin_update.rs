@@ -8,6 +8,7 @@
 
 use crate::v31::hook_rewriter::{self, RewriteWarning};
 use anyhow::{Context, Result};
+use onebrain_fs::read_plugin_version;
 use onebrain_fs::register_hooks::settings::settings_path;
 use std::path::PathBuf;
 
@@ -25,6 +26,19 @@ pub struct PluginUpdateReport {
     /// because nothing to do" — previously both collapsed to a misleading
     /// `✓ launchd plists  done` row.
     pub plists_count: Option<u32>,
+    /// v3.2.15: plugin version (`.claude-plugin/plugin.json::version`) BEFORE
+    /// the vault-sync step. `None` means no plugin was installed yet (fresh
+    /// install) OR the file/field was missing/malformed. Used by the framed
+    /// renderer to label the vault-sync step with either `vX → vY` (real
+    /// update), `vX · up-to-date` (no version change), or `installed vY`
+    /// (fresh install).
+    pub version_before: Option<String>,
+    /// v3.2.15: plugin version AFTER the vault-sync step (i.e. the version
+    /// the downloaded tarball ships). `None` means we couldn't read the
+    /// post-sync `plugin.json` (sync failed, or the tarball didn't include
+    /// the manifest — neither expected on the happy path). In dry-run the
+    /// vault-sync step is skipped, so this stays equal to `version_before`.
+    pub version_after: Option<String>,
     pub dry_run: bool,
     /// When `Some(reason)`, the run failed midway. Fields above reflect
     /// whatever progress was made before the failure. The caller emits a
@@ -70,21 +84,38 @@ pub fn run(
     let resolved = crate::vault_ctx::require(vault_dir.clone())?;
     let vault_root = resolved.root.as_path().to_path_buf();
 
+    // v3.2.15: capture the installed plugin version BEFORE sync. The renderer
+    // uses (version_before, version_after) to label the vault-sync step row
+    // as `vX → vY` (real update) / `vX · up-to-date` (no version change) /
+    // `installed vY` (fresh install) — per user feedback, the pre-3.2.15
+    // `done` / `skipped` collapse hid which version was just applied.
+    report.version_before = read_plugin_version(&vault_root);
+
     // 2. Sync plugin tarball — same backend as v3.0 `vault-sync`.
     //    v3.2.13: invoke via the embedded-progress entry so the orchestrator
     //    skips its "OneBrain Vault Sync" intro frame and "vault-sync: done"
-    //    outro — those are redundant under plugin update's own framed report
-    //    and were a key part of the "weird" mixed-styles UX the user flagged.
-    //    Step spinners still emit (they're transient) so the user sees
-    //    download/sync activity during a long fetch.
+    //    outro.
+    //    v3.2.15: ALSO route through `run_silent` so the per-step `▸ <label>`
+    //    TTY lines don't leak above the parent's framed report (user testing
+    //    on v3.2.14 flagged "ไม่มี header เลย" — the step lines appeared
+    //    BEFORE the parent's `🔄  Plugin Update` header). The framed report's
+    //    animated spinner is the only progress signal, matching what
+    //    `doctor`/`update` already do.
     if !dry_run {
-        let exit = crate::commands::vault_sync::run_embedded(Some(vault_root.clone()), branch)
+        let exit = crate::commands::vault_sync::run_silent(Some(vault_root.clone()), branch)
             .context("plugin update: vault-sync failed")?;
         // `vault_sync::run` returns Ok(0) on success, Ok(1) on critical fail.
         if exit != 0 {
             anyhow::bail!("plugin update: vault-sync returned exit code {exit}");
         }
         report.vault_synced = true;
+        // Re-read after sync to capture the (possibly new) installed version.
+        report.version_after = read_plugin_version(&vault_root);
+    } else {
+        // Dry-run skips the tarball fetch, so the "after" version is whatever
+        // is currently on disk (== before). Renderer treats this as "no
+        // change" and just shows the current version in the verdict.
+        report.version_after = report.version_before.clone();
     }
 
     // 3. Rewrite hook entries.
@@ -166,6 +197,8 @@ mod tests {
             hooks_rewritten: 3,
             plists_rewritten: false,
             plists_count: None,
+            version_before: None,
+            version_after: None,
             partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
             warnings: Vec::new(),
         };
