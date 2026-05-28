@@ -291,7 +291,10 @@ pub enum BundleVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
-#[command(about = "Auto-save management (stop · reset · orphans)", disable_help_subcommand = true)]
+#[command(
+    about = "Auto-save management (stop · reset · orphans)",
+    disable_help_subcommand = true
+)]
 pub struct CheckpointCmd {
     #[command(subcommand)]
     pub verb: CheckpointVerb,
@@ -830,7 +833,10 @@ pub enum PauseVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
-#[command(about = "Plugin lifecycle + hook rewriter", disable_help_subcommand = true)]
+#[command(
+    about = "Plugin lifecycle + hook rewriter",
+    disable_help_subcommand = true
+)]
 pub struct PluginCmd {
     #[command(subcommand)]
     pub verb: PluginVerb,
@@ -1107,7 +1113,10 @@ pub enum TaskVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
-#[command(about = "Vault operations (sync · current)", disable_help_subcommand = true)]
+#[command(
+    about = "Vault operations (sync · current)",
+    disable_help_subcommand = true
+)]
 pub struct VaultCmd {
     #[command(subcommand)]
     pub verb: VaultVerb,
