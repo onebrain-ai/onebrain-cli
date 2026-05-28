@@ -261,7 +261,9 @@ pub enum BundleVerb {
     /// Install a bundle (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     Install { name: String },
-    /// Print bundle help text (not yet implemented · v3.x roadmap).
+    /// Print a bundle's overview / README body (not yet implemented · v3.x
+    /// roadmap). Mirrors `SkillVerb::Show` semantics: renders the bundle's
+    /// human-readable body, NOT clap's CLI usage (use `--help` for that).
     #[command(hide = true)]
     Show { name: String },
     /// Print bundle metadata (not yet implemented · v3.x roadmap).

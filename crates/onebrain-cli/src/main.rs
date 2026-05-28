@@ -43,8 +43,16 @@ fn main() {
     // group commands like `onebrain harness` (which require a subcommand) trip
     // `DisplayHelpOnMissingArgumentOrSubcommand` and clap auto-prints the help
     // screen + exits. The pre-parse banner pass above only sees argv tokens
-    // (`--help` / `-h` / `help` / no-subcommand-at-all), so a bare group hop
-    // lands here without a banner. Emit it before delegating to `err.exit()`.
+    // (`--help` / `-h` / no-subcommand-at-all), so a bare group hop lands here
+    // without a banner. Emit it before delegating to `err.exit()`.
+    //
+    // `MissingSubcommand` is included as defense-in-depth: clap's `cli.rs`
+    // round-trip test already documents that `harness` (no verb) can return
+    // either `DisplayHelpOnMissingArgumentOrSubcommand` OR `MissingSubcommand`
+    // depending on the version. If a future clap upgrade switches to the
+    // latter, the banner stays emitted (the trade is one banner above clap's
+    // "missing required arg" error, which is acceptable noise vs. silently
+    // regressing the issue #2 fix).
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
@@ -53,7 +61,7 @@ fn main() {
                 err.kind(),
                 ErrorKind::DisplayHelp
                     | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-                    | ErrorKind::DisplayVersion
+                    | ErrorKind::MissingSubcommand
             );
             if prints_help && !argv_requests_help {
                 banner::emit_help_banner(

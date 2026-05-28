@@ -1557,6 +1557,40 @@ fn group_dash_help_emits_banner() {
     );
 }
 
+#[test]
+fn bare_group_emits_banner_above_help() {
+    // `onebrain harness` (no subcommand) — the `arg_required_else_help` path
+    // that v3.2.11 fixed via `try_parse` interception. Pre-3.2.11 this hop
+    // through `DisplayHelpOnMissingArgumentOrSubcommand` skipped the banner
+    // entirely because `argv_requests_help` only sees argv tokens and `harness`
+    // by itself doesn't trip the `--help` / no-subcommand cases. Regression
+    // guard so a future clap upgrade that drops the error kind from the
+    // matcher in `main.rs` doesn't silently re-introduce issue #2.
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .env_remove("NO_COLOR")
+        .env_remove("CI")
+        .env("TERM", "xterm-256color")
+        .env("ONEBRAIN_FORCE_BANNER", "1")
+        .args(["--pretty", "harness"])
+        .assert()
+        .failure(); // clap exits 2 when `arg_required_else_help` fires.
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    assert!(
+        stderr.contains(BRAND_MARK),
+        "expected banner above bare `harness` help. stderr=\n{stderr}"
+    );
+}
+
+// Issue #1's duplicate-banner regression (v3.2.10 `skill help <name>` emitted
+// the banner from BOTH the argv pre-parse pass AND the dispatch path) is
+// pinned at the heuristic level by the `argv_requests_help_rejects_legacy_help_keyword`
+// unit test in `src/banner.rs`. End-to-end "exactly one banner" can't be
+// asserted from `assert_cmd` because the dispatch banner gates on
+// `color: true`, which requires a real TTY stdout — intentional, no banner
+// on pipes. The bare-`harness` integration test above covers the
+// pre-parse-banner-on-DisplayHelp* path that fixes issue #2.
+
 /// `qmd status` is vault-required: exit 64 outside a vault, and a clean exit 0
 /// report inside one (degrading gracefully to `qmd_available:false` when the
 /// qmd binary is absent). Regression guard for the verb graduating from a
