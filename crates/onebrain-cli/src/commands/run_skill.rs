@@ -67,34 +67,47 @@ pub fn run(
         eprintln!("{warning}");
     }
 
-    let argv = harness_argv(harness, &prompt, vault, model);
+    // Skills always run with-context: --add-dir / --include-directories the vault.
+    let argv = harness_argv(harness, &prompt, Some(vault), model);
     spawn_harness(&resolution.path, &argv, &vault_path, harness)
 }
 
 /// Build the argv (after the binary name) for the chosen harness. Pure so the
-/// per-harness flag mapping is unit-testable.
-fn harness_argv(
+/// per-harness flag mapping is unit-testable. `pub(crate)` so `harness run`
+/// can reuse it with a raw prompt instead of the `/onebrain:<skill>` form.
+///
+/// `context_dir = Some(<vault>)` injects `--add-dir <vault>` (claude) /
+/// `--include-directories <vault>` (gemini) so the harness loads OneBrain's
+/// CLAUDE.md / GEMINI.md. `context_dir = None` skips that flag — the
+/// `--mode ad-hoc` path for `onebrain harness run`. Gemini always gets
+/// `--approval-mode yolo` (we pipe stdin null so the harness can't answer an
+/// approval prompt).
+pub(crate) fn harness_argv(
     harness: HarnessArg,
     prompt: &str,
-    vault: &str,
+    context_dir: Option<&str>,
     model: Option<&str>,
 ) -> Vec<String> {
     let mut argv = vec!["-p".to_string(), prompt.to_string()];
     match harness {
         HarnessArg::Claude => {
-            argv.push("--add-dir".to_string());
-            argv.push(vault.to_string());
+            if let Some(dir) = context_dir {
+                argv.push("--add-dir".to_string());
+                argv.push(dir.to_string());
+            }
             if let Some(m) = model {
                 argv.push("--model".to_string());
                 argv.push(m.to_string());
             }
         }
         HarnessArg::Gemini => {
-            argv.push("--include-directories".to_string());
-            argv.push(vault.to_string());
-            // Auto-approve tools: an unattended skill run can't answer an
-            // approval prompt, and OneBrain skills run `onebrain` shell
-            // commands + write vault files.
+            if let Some(dir) = context_dir {
+                argv.push("--include-directories".to_string());
+                argv.push(dir.to_string());
+            }
+            // Auto-approve tools: the harness child has null stdin and can't
+            // answer an approval prompt, and OneBrain skills run `onebrain`
+            // shell commands + write vault files.
             argv.push("--approval-mode".to_string());
             argv.push("yolo".to_string());
             if let Some(m) = model {
@@ -123,7 +136,12 @@ fn parse_args(raw: &[String]) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-fn spawn_harness(bin: &Path, argv: &[String], vault: &Path, harness: HarnessArg) -> Result<i32> {
+pub(crate) fn spawn_harness(
+    bin: &Path,
+    argv: &[String],
+    vault: &Path,
+    harness: HarnessArg,
+) -> Result<i32> {
     use std::io::IsTerminal;
     let label = harness.as_str();
     // No `env` override beyond ONEBRAIN_HEADLESS: child inherits parent env so
@@ -340,7 +358,7 @@ mod tests {
 
     #[test]
     fn harness_argv_claude_uses_add_dir_and_no_model_by_default() {
-        let argv = harness_argv(HarnessArg::Claude, "/onebrain:daily", "/vault", None);
+        let argv = harness_argv(HarnessArg::Claude, "/onebrain:daily", Some("/vault"), None);
         assert_eq!(argv, vec!["-p", "/onebrain:daily", "--add-dir", "/vault"]);
     }
 
@@ -349,7 +367,7 @@ mod tests {
         let argv = harness_argv(
             HarnessArg::Claude,
             "/onebrain:daily",
-            "/vault",
+            Some("/vault"),
             Some("claude-haiku-4-5"),
         );
         assert_eq!(
@@ -367,7 +385,7 @@ mod tests {
 
     #[test]
     fn harness_argv_gemini_uses_include_directories_and_yolo() {
-        let argv = harness_argv(HarnessArg::Gemini, "/onebrain:daily", "/vault", None);
+        let argv = harness_argv(HarnessArg::Gemini, "/onebrain:daily", Some("/vault"), None);
         assert_eq!(
             argv,
             vec![
@@ -382,11 +400,26 @@ mod tests {
     }
 
     #[test]
+    fn harness_argv_claude_omits_add_dir_when_context_dir_none() {
+        // `--mode ad-hoc`: no `--add-dir` flag, no vault context loaded.
+        let argv = harness_argv(HarnessArg::Claude, "what is 2+2?", None, None);
+        assert_eq!(argv, vec!["-p", "what is 2+2?"]);
+    }
+
+    #[test]
+    fn harness_argv_gemini_omits_include_dirs_but_keeps_yolo_for_ad_hoc() {
+        // `--mode ad-hoc`: no `--include-directories`, but yolo stays because
+        // the child still has null stdin and can't answer approval prompts.
+        let argv = harness_argv(HarnessArg::Gemini, "what is 2+2?", None, None);
+        assert_eq!(argv, vec!["-p", "what is 2+2?", "--approval-mode", "yolo"]);
+    }
+
+    #[test]
     fn harness_argv_gemini_appends_short_model_flag() {
         let argv = harness_argv(
             HarnessArg::Gemini,
             "/onebrain:daily",
-            "/vault",
+            Some("/vault"),
             Some("gemini-2.5-flash"),
         );
         assert_eq!(

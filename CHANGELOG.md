@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.7
+latest_version: 3.2.8
 released: 2026-05-28
 ---
 
@@ -11,6 +11,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.8] — 2026-05-28 — `onebrain harness run` (ad-hoc prompts through claude / gemini)
+
+- **Feat: `onebrain harness run [PROMPT]`** — send an ad-hoc prompt to the chosen agent harness (`--harness {claude,gemini}`, default claude) with `--model <m>` passthrough. Verbatim prompt (no `/onebrain:<skill>` namespacing — for that use `skill run`). Reads stdin if `[PROMPT]` is omitted, so `cat note.md | onebrain harness run --harness gemini --model gemini-2.5-flash` composes naturally.
+- **Two modes via `--mode {with-context,ad-hoc}`** (default `with-context`): with-context loads the vault's CLAUDE.md / INSTRUCTIONS.md / GEMINI.md via `--add-dir` / `--include-directories` and `cwd = <vault>` (vault required, exit 78 if missing); ad-hoc skips the vault flag entirely and runs with `cwd = $PWD` so the harness answers the raw prompt with no OneBrain context attached (vault not required). Empty prompt rejected with exit 64.
+- **Internal:** refactored the shared spawn path so `harness_argv(harness, prompt, context_dir: Option<&str>, model)` builds argv for both modes — `Some(<vault>)` adds the context-dir flag, `None` skips it. `skill run` always passes `Some(vault)`; `harness run` passes `None` for ad-hoc. `spawn_harness`, `ONEBRAIN_HEADLESS=1`, the in-place spinner, and the piped-output capture are all reused unchanged.
 
 ## [3.2.7] — 2026-05-28 — `skill run` in-place spinner (no more heartbeat scrollback)
 

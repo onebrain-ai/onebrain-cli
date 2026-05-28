@@ -29,6 +29,7 @@ src/
 │   ├── qmd_embed.rs     qmd embed — foreground `qmd embed`
 │   ├── qmd_status.rs    qmd status — index+embedding health report
 │   ├── harness.rs       harness detect — runtime detection
+│   ├── harness_run.rs   harness run — ad-hoc prompt through claude/gemini (--mode with-context | ad-hoc)
 │   ├── init.rs          init — vault scaffold wizard wiring
 │   ├── update.rs        update — CLI self-update (json/tty/plain modes)
 │   ├── doctor.rs        doctor — vault health checks (+ --fix recipes)

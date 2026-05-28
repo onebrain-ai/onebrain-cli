@@ -476,6 +476,52 @@ pub struct HarnessCmd {
 pub enum HarnessVerb {
     /// Detect the active harness (Claude Code / Gemini / direct).
     Detect,
+    /// Run a prompt through claude or gemini headlessly (no
+    /// `/onebrain:<skill>` namespacing — for that use `onebrain skill run`).
+    /// `--mode with-context` (default) loads the vault's CLAUDE.md /
+    /// INSTRUCTIONS.md / GEMINI.md so the harness has OneBrain's full
+    /// context; `--mode ad-hoc` skips the vault entirely — the harness
+    /// answers the raw prompt with no project context attached. If
+    /// `<PROMPT>` is omitted, the prompt is read from stdin so the command
+    /// composes with `cat note.md | onebrain harness run --harness gemini`.
+    Run {
+        /// Vault root override · also accepts global `--vault`, and walks up from cwd when omitted.
+        /// Ignored when `--mode ad-hoc`.
+        #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
+        vault_dir: Option<PathBuf>,
+        /// The prompt to send. If omitted, the prompt is read from stdin.
+        prompt: Option<String>,
+        /// Whether to inject the vault's OneBrain context before answering.
+        #[arg(long, value_enum, default_value_t = HarnessMode::WithContext)]
+        mode: HarnessMode,
+        /// AI runtime to run the prompt through (default: claude).
+        #[arg(long, value_enum, default_value_t = HarnessArg::Claude)]
+        harness: HarnessArg,
+        /// Model passed through to the harness (`claude --model <m>` /
+        /// `gemini -m <m>`). Omit to use the harness default.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+    },
+}
+
+/// Whether `onebrain harness run` loads OneBrain's vault context before
+/// invoking the harness, or runs the prompt ad-hoc with no project context.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[value(rename_all = "kebab-case")]
+pub enum HarnessMode {
+    /// Pass `--add-dir <vault>` (claude) / `--include-directories <vault>`
+    /// (gemini) and run with `cwd = <vault>` so the harness loads OneBrain's
+    /// CLAUDE.md / INSTRUCTIONS.md / GEMINI.md — full project context.
+    /// Requires a vault.
+    #[default]
+    WithContext,
+    /// No `--add-dir` / `--include-directories` flag, `cwd` is the current
+    /// working directory — the harness answers the prompt with no OneBrain
+    /// vault context attached. Does not require a vault. (Note: claude / gemini
+    /// may still auto-load any `CLAUDE.md` / `GEMINI.md` they find by walking
+    /// up from `cwd`; for full isolation, run from a directory outside any
+    /// vault — e.g. `cd ~ && onebrain harness run --mode ad-hoc "..."`.)
+    AdHoc,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
