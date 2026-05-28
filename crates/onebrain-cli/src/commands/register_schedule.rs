@@ -37,19 +37,25 @@ pub fn run(
     status: bool,
     test: Option<String>,
 ) -> Result<()> {
-    run_with(vault, dry_run, remove, refresh, resume, status, test, false)
+    run_with(vault, dry_run, remove, refresh, resume, status, test, false).map(|_| ())
 }
 
 /// Same as [`run`] but suppresses all progress and summary `println!` calls
-/// so the caller can render its own report. Used by `onebrain plugin update`,
-/// which wraps `register_schedule` as one step inside its framed report —
-/// the bare per-plist `✓ Wrote ...` lines and the trailing "Use launchctl
-/// to load …" hint would otherwise leak through the parent frame.
+/// AND returns the number of plists actually written. Used by `onebrain
+/// plugin update`, which wraps `register_schedule` as one step inside its
+/// framed report — the bare per-plist `✓ Wrote ...` lines and the trailing
+/// "Use launchctl to load …" hint would otherwise leak through the parent
+/// frame, and the parent needs the count to distinguish "no schedule
+/// entries · skipped" from "N plists refreshed".
 ///
 /// Other paths (`status`, `remove`, `test`, `resume`, real `register` from
 /// the CLI surface) keep their existing output — only the embedded-from-
 /// plugin-update path passes `quiet = true`.
-pub fn run_quiet(vault: Option<PathBuf>, dry_run: bool, refresh: bool) -> Result<()> {
+///
+/// Returns `Ok(0)` when `onebrain.yml` has no `schedule:` entries (a
+/// well-formed no-op, NOT an error). `Ok(N)` where `N == entries.len()`
+/// on a successful registration pass. Errors bubble up via `?` as usual.
+pub fn run_quiet(vault: Option<PathBuf>, dry_run: bool, refresh: bool) -> Result<usize> {
     run_with(vault, dry_run, false, refresh, None, false, None, true)
 }
 
@@ -63,7 +69,7 @@ fn run_with(
     status: bool,
     test: Option<String>,
     quiet: bool,
-) -> Result<()> {
+) -> Result<usize> {
     let vault = match vault {
         Some(path) => path,
         None => {
@@ -73,16 +79,20 @@ fn run_with(
     };
 
     if remove {
-        return remove_all(&vault);
+        remove_all(&vault)?;
+        return Ok(0);
     }
     if status {
-        return print_status(&vault);
+        print_status(&vault)?;
+        return Ok(0);
     }
     if let Some(skill) = test {
-        return test_run(&vault, &skill);
+        test_run(&vault, &skill)?;
+        return Ok(0);
     }
     if let Some(skill) = resume {
-        return resume_skill(&vault, &skill);
+        resume_skill(&vault, &skill)?;
+        return Ok(0);
     }
     if refresh && !quiet {
         println!("(--refresh: re-emitting plists with current vault path)");
@@ -94,7 +104,7 @@ fn run_with(
         if !quiet {
             println!("No schedule entries in onebrain.yml. Nothing to register.");
         }
-        return Ok(());
+        return Ok(0);
     }
 
     // Pass 1 — structural + field-format validation. We do NOT mutate input
@@ -169,7 +179,7 @@ fn run_with(
             println!("  launchctl load {}", target.display());
         }
     }
-    Ok(())
+    Ok(entries.len())
 }
 
 /// Resolve the active vault root. Falls back to `cwd` when no `vault.yml`

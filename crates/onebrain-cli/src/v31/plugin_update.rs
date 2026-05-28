@@ -16,6 +16,15 @@ pub struct PluginUpdateReport {
     pub vault_synced: bool,
     pub hooks_rewritten: u32,
     pub plists_rewritten: bool,
+    /// v3.2.13: count of launchd plists actually written this run. `None`
+    /// means the step did not run (dry-run, or a pre-step bailed); `Some(0)`
+    /// means the step ran but `onebrain.yml` had no `schedule:` entries to
+    /// register (a well-formed no-op, not an error); `Some(N)` is the
+    /// normal success case. Separated from `plists_rewritten` so the framed
+    /// renderer can distinguish "skipped because dry-run" from "skipped
+    /// because nothing to do" — previously both collapsed to a misleading
+    /// `✓ launchd plists  done` row.
+    pub plists_count: Option<u32>,
     pub dry_run: bool,
     /// When `Some(reason)`, the run failed midway. Fields above reflect
     /// whatever progress was made before the failure. The caller emits a
@@ -105,7 +114,15 @@ pub fn run(
             /* dry_run */ false,
             /* refresh */ true,
         ) {
-            Ok(()) => report.plists_rewritten = true,
+            Ok(count) => {
+                // v3.2.13: `plists_rewritten = true` ONLY when actual writes
+                // happened. A vault without `schedule:` entries returns
+                // `Ok(0)` — the step ran successfully but produced no work,
+                // so the renderer surfaces "no schedule entries" instead of
+                // a misleading "done".
+                report.plists_rewritten = count > 0;
+                report.plists_count = Some(count as u32);
+            }
             Err(e) => {
                 report.partial_failure = Some(format!(
                     "schedule re-register failed after hook rewrite: {e:#}"
@@ -132,6 +149,7 @@ mod tests {
         assert!(!r.vault_synced);
         assert_eq!(r.hooks_rewritten, 0);
         assert!(!r.plists_rewritten);
+        assert!(r.plists_count.is_none());
         assert!(!r.dry_run);
         assert!(r.partial_failure.is_none());
         assert!(r.warnings.is_empty());
@@ -147,6 +165,7 @@ mod tests {
             vault_synced: true,
             hooks_rewritten: 3,
             plists_rewritten: false,
+            plists_count: None,
             partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
             warnings: Vec::new(),
         };

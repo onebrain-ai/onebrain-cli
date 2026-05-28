@@ -29,13 +29,31 @@ pub trait Progress: Send {
 pub struct PlainProgress<W: Write + Send> {
     out: W,
     current_label: Option<String>,
+    /// When true the start-line and outro-line `vault-sync: …` writes are
+    /// suppressed — parity with [`TtyProgress::embedded`]. Set by
+    /// `build_progress` when the orchestrator runs as a sub-step of a wrapper
+    /// command (e.g. `onebrain plugin update`) that renders its own report
+    /// and would otherwise see this progress leak through.
+    embedded: bool,
 }
 
 impl<W: Write + Send> PlainProgress<W> {
     pub fn new(out: W) -> Self {
+        Self::with_embedded(out, false)
+    }
+
+    /// Construct a `PlainProgress` with the embedded flag set explicitly.
+    /// `embedded = true` mirrors `TtyProgress::embedded` and silences the
+    /// per-step `vault-sync: <label>` lines and the `vault-sync: done` outro
+    /// so the parent command can frame the run with its own report. v3.2.13:
+    /// `onebrain plugin update` is the first caller — non-TTY runs (CI,
+    /// scheduler, piped stdout) would otherwise still see the bare
+    /// `vault-sync: …` chatter through plugin update's framed UI.
+    pub fn with_embedded(out: W, embedded: bool) -> Self {
         Self {
             out,
             current_label: None,
+            embedded,
         }
     }
 }
@@ -47,7 +65,10 @@ impl<W: Write + Send> Progress for PlainProgress<W> {
 
     fn start(&mut self, _emoji: &str, label: &str) {
         // Bun emits one line per step on non-TTY: `vault-sync: <label>\n`.
-        let _ = writeln!(self.out, "vault-sync: {label}");
+        // v3.2.13: embedded callers suppress to keep parent reports clean.
+        if !self.embedded {
+            let _ = writeln!(self.out, "vault-sync: {label}");
+        }
         self.current_label = Some(label.to_string());
     }
 
@@ -59,7 +80,9 @@ impl<W: Write + Send> Progress for PlainProgress<W> {
     }
 
     fn outro(&mut self, _msg: &str) {
-        let _ = writeln!(self.out, "vault-sync: done");
+        if !self.embedded {
+            let _ = writeln!(self.out, "vault-sync: done");
+        }
     }
 }
 
@@ -109,12 +132,15 @@ impl Progress for TtyProgress {
 }
 
 /// Pick the right progress implementation based on TTY + embedded flags.
-/// `stdout` writer is only used by `PlainProgress`.
+/// `stdout` writer is only used by `PlainProgress`. The `embedded` flag flows
+/// into both backends (since v3.2.13: previously the `PlainProgress` path
+/// ignored it and leaked `vault-sync: …` lines through embedded callers like
+/// `onebrain plugin update`).
 pub fn build_progress(is_tty: bool, embedded: bool) -> Box<dyn Progress> {
     if is_tty {
         Box::new(TtyProgress::new(embedded))
     } else {
-        Box::new(PlainProgress::new(std::io::stdout()))
+        Box::new(PlainProgress::with_embedded(std::io::stdout(), embedded))
     }
 }
 

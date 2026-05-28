@@ -565,13 +565,6 @@ fn emit_plugin_update_summary(
     emit_plugin_update_summary_to(report, mode, std::io::stdout().lock())
 }
 
-/// Same as [`emit_plugin_update_summary`] but with an injectable writer for
-/// unit tests. R2-M4: the broken-pipe regression test feeds a writer that
-/// always returns `io::ErrorKind::BrokenPipe`; the function must surface
-/// the failure as `Err` so `exit::exit_code_for` can classify it to 0 (the
-/// POSIX-correct exit when downstream hung up). Previously the production
-/// code used `let _ = emit(...)` and the integration smoke-test couldn't
-/// observe propagation deterministically (OS pipe buffer size varies).
 /// On-the-wire payload for `plugin update`. Hoisted out of
 /// [`emit_plugin_update_summary_to`] so [`render_plugin_update_text`] can
 /// borrow the typed fields without a stringly-typed bridge.
@@ -580,6 +573,13 @@ struct PluginUpdateData<'a> {
     vault_synced: bool,
     hooks_rewritten: u32,
     plists_rewritten: bool,
+    /// v3.2.13: exact count of launchd plists written this run. `None` means
+    /// the step did not run (dry-run); `Some(0)` means there were no
+    /// `schedule:` entries to register; `Some(N)` is the standard success
+    /// case. `#[serde(skip_serializing_if = "Option::is_none")]` keeps the
+    /// JSON envelope shape additive (dry-run runs don't gain a new field).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plists_count: Option<u32>,
     dry_run: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<&'a str>,
@@ -597,6 +597,9 @@ impl<'a> PluginUpdateTextData for PluginUpdateData<'a> {
     fn plists_rewritten(&self) -> bool {
         self.plists_rewritten
     }
+    fn plists_count(&self) -> Option<u32> {
+        self.plists_count
+    }
     fn dry_run(&self) -> bool {
         self.dry_run
     }
@@ -605,6 +608,13 @@ impl<'a> PluginUpdateTextData for PluginUpdateData<'a> {
     }
 }
 
+/// Same as [`emit_plugin_update_summary`] but with an injectable writer for
+/// unit tests. R2-M4: the broken-pipe regression test feeds a writer that
+/// always returns `io::ErrorKind::BrokenPipe`; the function must surface the
+/// failure as `Err` so `exit::exit_code_for` can classify it to 0 (the POSIX-
+/// correct exit when downstream hung up). Previously the production code used
+/// `let _ = emit(...)` and the integration smoke-test couldn't observe
+/// propagation deterministically (OS pipe buffer size varies).
 pub(crate) fn emit_plugin_update_summary_to<W: std::io::Write>(
     report: &plugin_update::PluginUpdateReport,
     mode: &OutputMode,
@@ -617,6 +627,7 @@ pub(crate) fn emit_plugin_update_summary_to<W: std::io::Write>(
         vault_synced: report.vault_synced,
         hooks_rewritten: report.hooks_rewritten,
         plists_rewritten: report.plists_rewritten,
+        plists_count: report.plists_count,
         dry_run: report.dry_run,
         note: if report.dry_run {
             Some("dry-run · no changes written")
@@ -699,18 +710,33 @@ where
     let _ = write_framed_header(&mut buf, "⚡", "Plugin Update", color, rule_width);
 
     // ── Step list ─────────────────────────────────────────────────────
-    // Currently the `plugin update` pipeline doesn't track which sub-step
-    // tripped a partial failure — `partial_failure` is a free-form message
-    // from the deepest call that failed (`vault_sync`, `register_hooks`, or
-    // `register_schedule`). Map the reported booleans into "Ok" status lines
-    // and attach the failure reason as a hint on the verdict footer; this
-    // keeps the report honest without inventing per-step blame.
+    // Today the only step that can populate `partial_failure` is the launchd
+    // plist re-registration (see `plugin_update::run` step 4 — vault-sync
+    // and hook-rewriter errors bubble as `Err` instead of leaving on-disk
+    // state half-applied). v3.2.13: when `partial_failure` is set we mark
+    // the plist step as `Fail` so the per-step glyph matches the verdict —
+    // pre-3.2.13 it stayed `Ok` and silently misrepresented the failed step
+    // as succeeded.
+    let partial_failed = d.partial_failure().is_some();
     let vault_detail = if d.vault_synced() { "done" } else { "skipped" };
     let hooks_detail = format!("{} rewritten", d.hooks_rewritten());
-    let plists_detail = if d.plists_rewritten() {
-        "done"
+    // `plists_count` (v3.2.13): `Some(N>0)` → N refreshed; `Some(0)` →
+    // vault has no schedule entries (well-formed no-op); `None` → step
+    // didn't run (dry-run, or a prior step failed). Distinguishes the cases
+    // the pre-3.2.13 bool collapsed into a single "done"/"skipped".
+    let plists_detail = if partial_failed {
+        "failed".to_string()
     } else {
-        "skipped"
+        match d.plists_count() {
+            Some(0) => "no schedule entries".to_string(),
+            Some(n) => format!("{n} refreshed"),
+            None => "skipped".to_string(),
+        }
+    };
+    let plists_status = if partial_failed {
+        StepStatus::Fail
+    } else {
+        StepStatus::Ok
     };
     let steps = vec![
         Step::new(
@@ -720,12 +746,7 @@ where
             None,
         ),
         Step::new("hooks", StepStatus::Ok, Some(hooks_detail), None),
-        Step::new(
-            "launchd plists",
-            StepStatus::Ok,
-            Some(plists_detail.to_string()),
-            None,
-        ),
+        Step::new("launchd plists", plists_status, Some(plists_detail), None),
     ];
     let header = if d.dry_run() {
         "Update plan (dry-run)"
@@ -774,12 +795,16 @@ where
         " {verdict_prefix}{verdict_glyph}{reset}  {verdict_text}{pad}{total_str}",
         pad = " ".repeat(gap),
     );
-    // Failure hint — indented `└` line, doctor-style.
+    // Failure hint — indented `└` line, doctor-style. Multi-line `reason`
+    // strings (deep anyhow chains can include newlines via `{:#}`) get
+    // flattened to ` · ` so the indented layout stays intact — without this
+    // the second line would have no `└ ` prefix and break the visual frame.
     if let Some(reason) = d.partial_failure() {
+        let one_line = reason.replace('\n', " · ");
         if color {
-            let _ = writeln!(buf, " {dim}└ {reason}{reset}");
+            let _ = writeln!(buf, " {dim}└ {one_line}{reset}");
         } else {
-            let _ = writeln!(buf, " └ {reason}");
+            let _ = writeln!(buf, " └ {one_line}");
         }
     }
     let _ = writeln!(buf, "{dim}{rule}{reset}");
@@ -788,13 +813,15 @@ where
 }
 
 /// Read-only view of the typed `plugin update` envelope payload — narrowing
-/// the renderer's coupling to the on-the-wire `Data` struct defined inside
-/// `emit_plugin_update_summary_to`. Lets the renderer stay private to this
-/// module without exporting `Data` itself.
+/// the renderer's coupling to the module-level [`PluginUpdateData`] struct.
+/// Lets the renderer stay generic over any payload that provides the same
+/// shape (used by the unit tests; production always goes through the real
+/// `PluginUpdateData` instance built in [`emit_plugin_update_summary_to`]).
 trait PluginUpdateTextData {
     fn vault_synced(&self) -> bool;
     fn hooks_rewritten(&self) -> u32;
     fn plists_rewritten(&self) -> bool;
+    fn plists_count(&self) -> Option<u32>;
     fn dry_run(&self) -> bool;
     fn partial_failure(&self) -> Option<&str>;
 }
@@ -829,6 +856,7 @@ mod tests {
             vault_synced: false,
             hooks_rewritten: 0,
             plists_rewritten: false,
+            plists_count: None,
             partial_failure: None,
             warnings: Vec::new(),
         };
@@ -886,6 +914,7 @@ mod tests {
             vault_synced: true,
             hooks_rewritten: 3,
             plists_rewritten: true,
+            plists_count: Some(3),
             partial_failure: None,
             warnings: Vec::new(),
         };
@@ -904,6 +933,7 @@ mod tests {
             "plists step missing:\n{out}"
         );
         assert!(out.contains("3 rewritten"), "hook count missing:\n{out}");
+        assert!(out.contains("3 refreshed"), "plist count missing:\n{out}");
         assert!(out.contains("update complete"), "verdict missing:\n{out}");
         assert!(out.contains("3 steps"), "step count missing:\n{out}");
         // No legacy `plugin update:` lead-in or `vault sync       :` colon
@@ -925,6 +955,7 @@ mod tests {
             vault_synced: false,
             hooks_rewritten: 0,
             plists_rewritten: false,
+            plists_count: None,
             partial_failure: None,
             warnings: Vec::new(),
         };
@@ -943,15 +974,17 @@ mod tests {
 
     #[test]
     fn plugin_update_text_partial_failure_renders_fail_glyph_and_hint_line() {
-        // R1 B3 + v3.2.13: the partial-failure path must surface a ✗ glyph
-        // AND attach the failure reason as an indented `└` hint line under
-        // the verdict, doctor-style. Previously the failure was rendered as
-        // a bare `  partial failure  : <reason>` line in the key:value table.
+        // R1 B3 + v3.2.13 + Round-2 review HIGH-2: the partial-failure path
+        // must surface a ✗ glyph on the verdict footer AND the failing
+        // launchd plist step row (previously the step row stayed ✓ + "skipped"
+        // — silently misrepresenting the failed step as succeeded). The
+        // failure reason hangs off the verdict as an indented `└` hint line.
         let report = plugin_update::PluginUpdateReport {
             dry_run: false,
             vault_synced: true,
             hooks_rewritten: 2,
             plists_rewritten: false,
+            plists_count: None,
             partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
             warnings: Vec::new(),
         };
@@ -966,6 +999,46 @@ mod tests {
             out.contains("└ schedule re-register failed"),
             "partial-failure hint line missing:\n{out}"
         );
+        assert!(
+            out.contains("✗ launchd plists"),
+            "partial-failure path must mark the plist step with ✗, not ✓:\n{out}"
+        );
+        assert!(
+            out.contains("failed"),
+            "partial-failure plist step detail must read \"failed\":\n{out}"
+        );
+    }
+
+    #[test]
+    fn plugin_update_text_partial_failure_with_multiline_reason_collapses_to_single_line() {
+        // Round-2 review MEDIUM: deep anyhow chains can carry newlines via
+        // `{e:#}`. A multi-line `reason` would break the indented `└` layout
+        // because the second line has no `└ ` prefix. Defensive flatten
+        // pinned: every newline becomes ` · ` so the indent stays intact.
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 2,
+            plists_rewritten: false,
+            plists_count: None,
+            partial_failure: Some(
+                "schedule re-register failed\nlaunchctl exit 1\nplist syntax error".to_string(),
+            ),
+            warnings: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("└ schedule re-register failed · launchctl exit 1 · plist syntax error"),
+            "multi-line reason must flatten to single ` · `-separated line:\n{out}"
+        );
+        // No raw newlines inside the bracketed reason — guard against the
+        // layout-breaking case directly.
+        assert!(
+            !out.contains("schedule re-register failed\nlaunchctl"),
+            "raw newline leaked through the `└ <reason>` hint:\n{out}"
+        );
     }
 
     #[test]
@@ -979,6 +1052,7 @@ mod tests {
             vault_synced: false,
             hooks_rewritten: 0,
             plists_rewritten: false,
+            plists_count: Some(0),
             partial_failure: None,
             warnings: Vec::new(),
         };
@@ -992,6 +1066,75 @@ mod tests {
     }
 
     #[test]
+    fn plugin_update_text_no_schedule_entries_renders_distinct_detail() {
+        // Round-2 review HIGH-1: a vault with zero `schedule:` entries
+        // returns `Ok(0)` from `register_schedule::run_quiet` — a well-formed
+        // no-op. The plist step must render as "no schedule entries" rather
+        // than the misleading "done" the pre-Round-2 bool collapse produced.
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 1,
+            plists_rewritten: false,
+            plists_count: Some(0),
+            partial_failure: None,
+            warnings: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("no schedule entries"),
+            "empty-schedule no-op must render as \"no schedule entries\":\n{out}"
+        );
+        // The "done" line was the old wording; ensure it doesn't sneak back
+        // for this case (regression guard against the bool collapse).
+        assert!(
+            !out.contains("launchd plists     done"),
+            "empty-schedule no-op rendered as misleading \"done\":\n{out}"
+        );
+    }
+
+    #[test]
+    fn plugin_update_text_color_mode_balances_ansi_escapes() {
+        // Round-2 review MEDIUM: every dim/reset wrapper in the renderer must
+        // be balanced — a dangling `\x1b[2m` (dim) or unmatched `\x1b[31m` (red)
+        // would leak ANSI state past the framed report into whatever the
+        // terminal prints next. All five new text tests use mono mode (color:
+        // false); this one exercises the color path and asserts the open
+        // count matches the close (`\x1b[0m`) count.
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 2,
+            plists_rewritten: false,
+            plists_count: None,
+            partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
+            warnings: Vec::new(),
+        };
+        let color_mode = OutputMode::Text {
+            color: true,
+            pretty: true,
+        };
+        let mut buf = Vec::new();
+        emit_plugin_update_summary_to(&report, &color_mode, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        // `\x1b` counts EVERY SGR sequence (openers + resets). Subtract the
+        // reset count to isolate the non-reset openers we emit (`[2m`, `[1m`,
+        // `[31m`, `[2;32m`, etc.). A balanced wrapper has openers == resets;
+        // any imbalance means dim/red/bold leaks past the framed report into
+        // whatever the terminal prints next.
+        let total_sgr = out.matches('\x1b').count();
+        let resets = out.matches("\x1b[0m").count();
+        let openers = total_sgr - resets;
+        assert_eq!(
+            openers, resets,
+            "ANSI escape openers ({openers}) ≠ resets ({resets}) — wrapper \
+             imbalance will leak terminal state past the framed report.\nstdout:\n{out}"
+        );
+    }
+
+    #[test]
     fn plugin_update_json_envelope_unchanged_by_v3_2_13_text_refactor() {
         // The text-mode renderer was rewritten in v3.2.13; the JSON envelope
         // shape MUST stay byte-stable for downstream machine consumers. Pin
@@ -1001,6 +1144,7 @@ mod tests {
             vault_synced: true,
             hooks_rewritten: 2,
             plists_rewritten: true,
+            plists_count: Some(2),
             partial_failure: None,
             warnings: Vec::new(),
         };
