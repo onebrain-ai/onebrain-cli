@@ -37,6 +37,33 @@ pub fn run(
     status: bool,
     test: Option<String>,
 ) -> Result<()> {
+    run_with(vault, dry_run, remove, refresh, resume, status, test, false)
+}
+
+/// Same as [`run`] but suppresses all progress and summary `println!` calls
+/// so the caller can render its own report. Used by `onebrain plugin update`,
+/// which wraps `register_schedule` as one step inside its framed report —
+/// the bare per-plist `✓ Wrote ...` lines and the trailing "Use launchctl
+/// to load …" hint would otherwise leak through the parent frame.
+///
+/// Other paths (`status`, `remove`, `test`, `resume`, real `register` from
+/// the CLI surface) keep their existing output — only the embedded-from-
+/// plugin-update path passes `quiet = true`.
+pub fn run_quiet(vault: Option<PathBuf>, dry_run: bool, refresh: bool) -> Result<()> {
+    run_with(vault, dry_run, false, refresh, None, false, None, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with(
+    vault: Option<PathBuf>,
+    dry_run: bool,
+    remove: bool,
+    refresh: bool,
+    resume: Option<String>,
+    status: bool,
+    test: Option<String>,
+    quiet: bool,
+) -> Result<()> {
     let vault = match vault {
         Some(path) => path,
         None => {
@@ -57,14 +84,16 @@ pub fn run(
     if let Some(skill) = resume {
         return resume_skill(&vault, &skill);
     }
-    if refresh {
+    if refresh && !quiet {
         println!("(--refresh: re-emitting plists with current vault path)");
     }
 
     let config = read_vault_config(&vault)?;
     let entries = config.schedule;
     if entries.is_empty() {
-        println!("No schedule entries in onebrain.yml. Nothing to register.");
+        if !quiet {
+            println!("No schedule entries in onebrain.yml. Nothing to register.");
+        }
         return Ok(());
     }
 
@@ -110,8 +139,10 @@ pub fn run(
         let plist = generate_plist(entry, &ctx);
         let target = plist_path(&label_for_entry(entry), &ctx.homedir);
         if dry_run {
-            println!("---  {}  ---", target.display());
-            println!("{plist}");
+            if !quiet {
+                println!("---  {}  ---", target.display());
+                println!("{plist}");
+            }
             continue;
         }
         // Best-effort: create LaunchAgents dir if missing. launchd refuses to
@@ -125,14 +156,18 @@ pub fn run(
         }
         std::fs::write(&target, &plist)
             .with_context(|| format!("write plist to {}", target.display()))?;
-        println!("\u{2713} Wrote {}", target.display());
+        if !quiet {
+            println!("\u{2713} Wrote {}", target.display());
+        }
     }
 
-    println!("\nRegistered {} schedule entries.", entries.len());
-    println!("Use launchctl to load (or restart launchd):");
-    for entry in &resolved {
-        let target = plist_path(&label_for_entry(entry), &ctx.homedir);
-        println!("  launchctl load {}", target.display());
+    if !quiet {
+        println!("\nRegistered {} schedule entries.", entries.len());
+        println!("Use launchctl to load (or restart launchd):");
+        for entry in &resolved {
+            let target = plist_path(&label_for_entry(entry), &ctx.homedir);
+            println!("  launchctl load {}", target.display());
+        }
     }
     Ok(())
 }

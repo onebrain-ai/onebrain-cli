@@ -572,6 +572,39 @@ fn emit_plugin_update_summary(
 /// POSIX-correct exit when downstream hung up). Previously the production
 /// code used `let _ = emit(...)` and the integration smoke-test couldn't
 /// observe propagation deterministically (OS pipe buffer size varies).
+/// On-the-wire payload for `plugin update`. Hoisted out of
+/// [`emit_plugin_update_summary_to`] so [`render_plugin_update_text`] can
+/// borrow the typed fields without a stringly-typed bridge.
+#[derive(serde::Serialize)]
+struct PluginUpdateData<'a> {
+    vault_synced: bool,
+    hooks_rewritten: u32,
+    plists_rewritten: bool,
+    dry_run: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    partial_failure: Option<&'a str>,
+}
+
+impl<'a> PluginUpdateTextData for PluginUpdateData<'a> {
+    fn vault_synced(&self) -> bool {
+        self.vault_synced
+    }
+    fn hooks_rewritten(&self) -> u32 {
+        self.hooks_rewritten
+    }
+    fn plists_rewritten(&self) -> bool {
+        self.plists_rewritten
+    }
+    fn dry_run(&self) -> bool {
+        self.dry_run
+    }
+    fn partial_failure(&self) -> Option<&str> {
+        self.partial_failure
+    }
+}
+
 pub(crate) fn emit_plugin_update_summary_to<W: std::io::Write>(
     report: &plugin_update::PluginUpdateReport,
     mode: &OutputMode,
@@ -579,21 +612,8 @@ pub(crate) fn emit_plugin_update_summary_to<W: std::io::Write>(
 ) -> Result<()> {
     use crate::output::{emit, Envelope, ErrorInfo};
     use anyhow::Context;
-    use serde::Serialize;
 
-    #[derive(Serialize)]
-    struct Data<'a> {
-        vault_synced: bool,
-        hooks_rewritten: u32,
-        plists_rewritten: bool,
-        dry_run: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        note: Option<&'a str>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        partial_failure: Option<&'a str>,
-    }
-
-    let data = Data {
+    let data = PluginUpdateData {
         vault_synced: report.vault_synced,
         hooks_rewritten: report.hooks_rewritten,
         plists_rewritten: report.plists_rewritten,
@@ -626,35 +646,157 @@ pub(crate) fn emit_plugin_update_summary_to<W: std::io::Write>(
         env = env.with_warning(w.code.clone(), w.message.clone());
     }
 
-    emit(&env, mode, writer, |e| {
-        let d = e.data.as_ref().unwrap();
-        let mut s = String::from("plugin update:\n");
-        s.push_str(&format!(
-            "  vault sync       : {}\n",
-            if d.vault_synced { "done" } else { "skipped" }
-        ));
-        s.push_str(&format!("  hooks rewritten  : {}\n", d.hooks_rewritten));
-        s.push_str(&format!(
-            "  plists refreshed : {}\n",
-            if d.plists_rewritten {
-                "done"
-            } else {
-                "skipped"
-            }
-        ));
-        if d.dry_run {
-            s.push_str("  (dry-run · no changes written)\n");
-        }
-        if let Some(reason) = d.partial_failure {
-            s.push_str(&format!("  partial failure  : {reason}\n"));
-        }
-        // Soft warnings are rendered uniformly by `emit` for all text/table
-        // commands (since v3.2.0) — don't re-render them here or they'd
-        // double-print.
-        s
-    })
-    .context("plugin update: render summary failed")?;
+    emit(&env, mode, writer, |e| render_plugin_update_text(e, mode))
+        .context("plugin update: render summary failed")?;
     Ok(())
+}
+
+/// Text-mode renderer for `plugin update` — produces a framed report that
+/// mirrors `doctor`'s style (FIGlet-flanked header + sectioned step lines +
+/// verdict footer). Returns the rendered block as a `String` so the caller's
+/// `emit` writes it through the standard text-mode pipeline.
+///
+/// Layout (v3.2.13+):
+/// ```
+/// ────────────────────────────────────────────────
+///  ⚡  Plugin Update
+/// ────────────────────────────────────────────────
+///
+///  Update steps
+///   ✓ vault sync         done
+///   ✓ hooks              2 rewritten
+///   ✓ launchd plists     done
+///
+/// ────────────────────────────────────────────────
+///  ✓  update complete                       3 steps
+/// ────────────────────────────────────────────────
+/// ```
+///
+/// Partial-failure path replaces the verdict glyph with `✗` and prepends an
+/// indented `└ <reason>` hint line under the failing step's row (closest to
+/// doctor's warn/fail rendering).
+fn render_plugin_update_text<D>(env: &crate::output::Envelope<D>, mode: &OutputMode) -> String
+where
+    D: PluginUpdateTextData + serde::Serialize,
+{
+    use crate::output::{
+        framing_rule_n, is_color_text, write_framed_header, ProgressRenderer, Section, Step,
+        StepStatus, RULE_WIDTH,
+    };
+    use std::io::Write;
+
+    let d = match env.data.as_ref() {
+        Some(d) => d,
+        None => return String::new(),
+    };
+    let color = is_color_text(mode);
+    let rule_width = RULE_WIDTH;
+    let dim = if color { "\x1b[2m" } else { "" };
+    let reset = if color { "\x1b[0m" } else { "" };
+    let mut buf: Vec<u8> = Vec::new();
+
+    // ── Header ────────────────────────────────────────────────────────
+    let _ = write_framed_header(&mut buf, "⚡", "Plugin Update", color, rule_width);
+
+    // ── Step list ─────────────────────────────────────────────────────
+    // Currently the `plugin update` pipeline doesn't track which sub-step
+    // tripped a partial failure — `partial_failure` is a free-form message
+    // from the deepest call that failed (`vault_sync`, `register_hooks`, or
+    // `register_schedule`). Map the reported booleans into "Ok" status lines
+    // and attach the failure reason as a hint on the verdict footer; this
+    // keeps the report honest without inventing per-step blame.
+    let vault_detail = if d.vault_synced() { "done" } else { "skipped" };
+    let hooks_detail = format!("{} rewritten", d.hooks_rewritten());
+    let plists_detail = if d.plists_rewritten() {
+        "done"
+    } else {
+        "skipped"
+    };
+    let steps = vec![
+        Step::new(
+            "vault sync",
+            StepStatus::Ok,
+            Some(vault_detail.to_string()),
+            None,
+        ),
+        Step::new("hooks", StepStatus::Ok, Some(hooks_detail), None),
+        Step::new(
+            "launchd plists",
+            StepStatus::Ok,
+            Some(plists_detail.to_string()),
+            None,
+        ),
+    ];
+    let header = if d.dry_run() {
+        "Update plan (dry-run)"
+    } else {
+        "Update steps"
+    };
+    let section = Section::new(header, steps);
+    // `force_static = true` — no spinner for `plugin update`; the operation
+    // is fast (single HTTP fetch + a few file writes) and the user already
+    // sees doctor-level animation elsewhere. Skip the artificial pacing.
+    let mut renderer = ProgressRenderer::with_writer(&mut buf, true, color);
+    let _ = renderer.render_section(&section);
+
+    // ── Verdict footer ────────────────────────────────────────────────
+    let _ = writeln!(buf);
+    let rule = framing_rule_n(rule_width);
+    let _ = writeln!(buf, "{dim}{rule}{reset}");
+    let verdict_status = if d.partial_failure().is_some() {
+        StepStatus::Fail
+    } else {
+        StepStatus::Ok
+    };
+    let verdict_glyph = verdict_status.glyph();
+    let verdict_prefix = verdict_status.ansi_prefix(color);
+    let verdict_text = match (d.partial_failure(), d.dry_run()) {
+        (Some(_), _) => "partial failure".to_string(),
+        (None, true) => "dry-run · no changes written".to_string(),
+        (None, false) => {
+            let any_change = d.vault_synced() || d.hooks_rewritten() > 0 || d.plists_rewritten();
+            if any_change {
+                "update complete".to_string()
+            } else {
+                "already up-to-date".to_string()
+            }
+        }
+    };
+    // Trailing count right-aligned to the rule width (matches doctor's
+    // " ✓  N ok · M warn · K fail              N checks" layout).
+    let total_str = "3 steps";
+    let left_cols = 1 + 1 + 2 + verdict_text.chars().count(); // " ✓  " + text
+    let gap = rule_width
+        .saturating_sub(left_cols + total_str.chars().count())
+        .max(2);
+    let _ = writeln!(
+        buf,
+        " {verdict_prefix}{verdict_glyph}{reset}  {verdict_text}{pad}{total_str}",
+        pad = " ".repeat(gap),
+    );
+    // Failure hint — indented `└` line, doctor-style.
+    if let Some(reason) = d.partial_failure() {
+        if color {
+            let _ = writeln!(buf, " {dim}└ {reason}{reset}");
+        } else {
+            let _ = writeln!(buf, " └ {reason}");
+        }
+    }
+    let _ = writeln!(buf, "{dim}{rule}{reset}");
+
+    String::from_utf8(buf).unwrap_or_default()
+}
+
+/// Read-only view of the typed `plugin update` envelope payload — narrowing
+/// the renderer's coupling to the on-the-wire `Data` struct defined inside
+/// `emit_plugin_update_summary_to`. Lets the renderer stay private to this
+/// module without exporting `Data` itself.
+trait PluginUpdateTextData {
+    fn vault_synced(&self) -> bool;
+    fn hooks_rewritten(&self) -> u32;
+    fn plists_rewritten(&self) -> bool;
+    fn dry_run(&self) -> bool;
+    fn partial_failure(&self) -> Option<&str>;
 }
 
 #[cfg(test)]
@@ -720,5 +862,156 @@ mod tests {
         // also verify .context-wrapping with a different type doesn't false-positive
         let other: anyhow::Error = anyhow::anyhow!("base").context("unrelated context string");
         assert!(other.downcast_ref::<AlreadyReported>().is_none());
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // v3.2.13 — framed-report rendering tests for `plugin update`
+    // ──────────────────────────────────────────────────────────────────
+
+    fn text_mode_mono() -> OutputMode {
+        OutputMode::Text {
+            color: false,
+            pretty: false,
+        }
+    }
+
+    #[test]
+    fn plugin_update_text_renders_framed_report_with_header_and_footer() {
+        // v3.2.13: replace the old `plugin update:` key:value summary with a
+        // doctor-style framed report. Pin the header glyph, the section
+        // marker, all three step lines, and the verdict footer so any future
+        // template churn fails loudly.
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 3,
+            plists_rewritten: true,
+            partial_failure: None,
+            warnings: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("⚡  Plugin Update"), "header missing:\n{out}");
+        assert!(
+            out.contains("Update steps"),
+            "section marker missing:\n{out}"
+        );
+        assert!(out.contains("✓ vault sync"), "vault step missing:\n{out}");
+        assert!(out.contains("✓ hooks"), "hooks step missing:\n{out}");
+        assert!(
+            out.contains("✓ launchd plists"),
+            "plists step missing:\n{out}"
+        );
+        assert!(out.contains("3 rewritten"), "hook count missing:\n{out}");
+        assert!(out.contains("update complete"), "verdict missing:\n{out}");
+        assert!(out.contains("3 steps"), "step count missing:\n{out}");
+        // No legacy `plugin update:` lead-in or `vault sync       :` colon
+        // table — those were the visual marks of the pre-3.2.13 format.
+        assert!(
+            !out.contains("plugin update:"),
+            "legacy key:value summary leaked:\n{out}"
+        );
+        assert!(
+            !out.contains("vault sync       :"),
+            "legacy colon-aligned table leaked:\n{out}"
+        );
+    }
+
+    #[test]
+    fn plugin_update_text_dry_run_renders_dry_run_section_header_and_verdict() {
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: true,
+            vault_synced: false,
+            hooks_rewritten: 0,
+            plists_rewritten: false,
+            partial_failure: None,
+            warnings: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("Update plan (dry-run)"),
+            "dry-run section header missing:\n{out}"
+        );
+        assert!(
+            out.contains("dry-run · no changes written"),
+            "dry-run verdict missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn plugin_update_text_partial_failure_renders_fail_glyph_and_hint_line() {
+        // R1 B3 + v3.2.13: the partial-failure path must surface a ✗ glyph
+        // AND attach the failure reason as an indented `└` hint line under
+        // the verdict, doctor-style. Previously the failure was rendered as
+        // a bare `  partial failure  : <reason>` line in the key:value table.
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 2,
+            plists_rewritten: false,
+            partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
+            warnings: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("✗  partial failure"),
+            "partial-failure verdict glyph missing:\n{out}"
+        );
+        assert!(
+            out.contains("└ schedule re-register failed"),
+            "partial-failure hint line missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn plugin_update_text_no_changes_renders_already_up_to_date_verdict() {
+        // Idempotent rerun: every step ran but nothing changed (vault already
+        // up-to-date, no hooks to rewrite, plists already current). Verdict
+        // must communicate the no-op rather than masquerading as a real
+        // update.
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: false,
+            hooks_rewritten: 0,
+            plists_rewritten: false,
+            partial_failure: None,
+            warnings: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("already up-to-date"),
+            "no-op verdict missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn plugin_update_json_envelope_unchanged_by_v3_2_13_text_refactor() {
+        // The text-mode renderer was rewritten in v3.2.13; the JSON envelope
+        // shape MUST stay byte-stable for downstream machine consumers. Pin
+        // the field set on a happy-path payload.
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 2,
+            plists_rewritten: true,
+            partial_failure: None,
+            warnings: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        let mode = OutputMode::Json { pretty: false };
+        emit_plugin_update_summary_to(&report, &mode, &mut buf).unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(env["ok"], serde_json::json!(true));
+        assert_eq!(env["data"]["vault_synced"], serde_json::json!(true));
+        assert_eq!(env["data"]["hooks_rewritten"], serde_json::json!(2));
+        assert_eq!(env["data"]["plists_rewritten"], serde_json::json!(true));
+        assert_eq!(env["data"]["dry_run"], serde_json::json!(false));
     }
 }

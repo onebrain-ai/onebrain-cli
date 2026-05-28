@@ -27,6 +27,23 @@ use std::path::PathBuf;
 /// to occasionally duplicate one line than leave the user with a silent
 /// non-zero exit.
 pub fn run(vault_root_override: Option<PathBuf>, branch: Option<String>) -> Result<i32> {
+    run_with(vault_root_override, branch, false)
+}
+
+/// Identical to [`run`] but sets `VaultSyncOptions::embedded = true`, which
+/// suppresses the orchestrator's "OneBrain Vault Sync" intro frame and
+/// `vault-sync: done` outro. Used by `onebrain plugin update`, which wraps the
+/// sub-op inside its own framed report — the orchestrator frame would just
+/// fight the parent frame for the user's eye.
+pub fn run_embedded(vault_root_override: Option<PathBuf>, branch: Option<String>) -> Result<i32> {
+    run_with(vault_root_override, branch, true)
+}
+
+fn run_with(
+    vault_root_override: Option<PathBuf>,
+    branch: Option<String>,
+    embedded: bool,
+) -> Result<i32> {
     // Bun v2.3.3 parity: optional positional `<vault_root>` lets the caller
     // supply the vault path directly (skipping the cwd walk-up). When absent,
     // walk up from cwd as before.
@@ -52,6 +69,7 @@ pub fn run(vault_root_override: Option<PathBuf>, branch: Option<String>) -> Resu
         vault_root_path.as_path(),
         VaultSyncOptions {
             branch,
+            embedded,
             ..VaultSyncOptions::default()
         },
     );

@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.12
+latest_version: 3.2.13
 released: 2026-05-28
 ---
 
@@ -11,6 +11,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.13] — 2026-05-28 — `plugin update` UX polish: framed report (doctor-style) · silenced sub-output
+
+- **Polish: `onebrain plugin update` now renders a framed doctor-style report** instead of a key:value summary. New layout: ⚡-flanked header (`⚡  Plugin Update`), one "Update steps" section with ✓-glyphed step lines (`vault sync` / `hooks` / `launchd plists`), and a verdict footer that mirrors `doctor`'s ` ✓  <text>             <total> steps` shape. Partial failures attach an indented `└ <reason>` hint under the verdict line, matching doctor's warn/fail hint rendering.
+- **Polish: removed "OneBrain Vault Sync" intro/outro frame leakage from inside the workflow.** Routes the sub-call through a new `vault_sync::run_embedded` helper that sets `VaultSyncOptions::embedded = true`, so the orchestrator skips its own banner + outro under plugin update (still emits transient step spinners during long fetches so the user sees activity).
+- **Polish: silenced `register_schedule`'s per-plist `✓ Wrote …` chatter** when invoked from plugin update. New `register_schedule::run_quiet` entry suppresses the progress/summary `println!`s; the direct `onebrain schedule register` surface keeps its existing output untouched.
 
 ## [3.2.12] — 2026-05-28 — `--help` long-format · `[default]` / `[possible values]` wrap onto their own line
 

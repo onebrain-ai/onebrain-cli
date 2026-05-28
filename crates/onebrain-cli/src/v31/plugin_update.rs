@@ -62,8 +62,14 @@ pub fn run(
     let vault_root = resolved.root.as_path().to_path_buf();
 
     // 2. Sync plugin tarball — same backend as v3.0 `vault-sync`.
+    //    v3.2.13: invoke via the embedded-progress entry so the orchestrator
+    //    skips its "OneBrain Vault Sync" intro frame and "vault-sync: done"
+    //    outro — those are redundant under plugin update's own framed report
+    //    and were a key part of the "weird" mixed-styles UX the user flagged.
+    //    Step spinners still emit (they're transient) so the user sees
+    //    download/sync activity during a long fetch.
     if !dry_run {
-        let exit = crate::commands::vault_sync::run(Some(vault_root.clone()), branch)
+        let exit = crate::commands::vault_sync::run_embedded(Some(vault_root.clone()), branch)
             .context("plugin update: vault-sync failed")?;
         // `vault_sync::run` returns Ok(0) on success, Ok(1) on critical fail.
         if exit != 0 {
@@ -88,15 +94,16 @@ pub fn run(
     //    pointing at v3.1 paths while plists may still reference v3.0 —
     //    we surface this as a partial failure rather than bubbling Err, so
     //    the dispatcher can render the partial state in the envelope.
+    //
+    //    v3.2.13: use the `run_quiet` entry so the per-plist `✓ Wrote …`
+    //    confirmation lines and the trailing "Use launchctl to load …" hint
+    //    don't leak through plugin update's framed report — those belong on
+    //    the direct `onebrain schedule register` surface, not embedded.
     if !dry_run {
-        match crate::commands::register_schedule::run(
+        match crate::commands::register_schedule::run_quiet(
             Some(vault_root),
-            /* dry_run    */ false,
-            /* remove     */ false,
-            /* refresh    */ true,
-            /* resume     */ None,
-            /* status     */ false,
-            /* test       */ None,
+            /* dry_run */ false,
+            /* refresh */ true,
         ) {
             Ok(()) => report.plists_rewritten = true,
             Err(e) => {
