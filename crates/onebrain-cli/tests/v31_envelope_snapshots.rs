@@ -75,6 +75,11 @@ fn run_json(args: &[&str], dir: &std::path::Path) -> Value {
         // Hermetic `headless`: clear ONEBRAIN_HEADLESS so session-init snapshots
         // read `false` even when the test runner is itself under `skill run`.
         .env_remove("ONEBRAIN_HEADLESS")
+        // Hermetic `qmd_unembedded`: scrub PATH so the spawned `qmd` probe
+        // finds nothing → unembedded count degrades to a deterministic 0
+        // (otherwise the test reads the dev machine's live qmd index).
+        // Mirrors `tests/snapshots.rs`'s helper.
+        .env("PATH", "/usr/bin:/bin")
         .current_dir(dir)
         .output()
         .expect("spawn failed");

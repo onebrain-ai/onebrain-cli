@@ -462,28 +462,27 @@ pub enum GatewayVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
-#[command(about = "Detect Claude Code runtime")]
+#[command(
+    about = "Detect or run an AI harness (claude / gemini)",
+    subcommand_required = true,
+    arg_required_else_help = true
+)]
 pub struct HarnessCmd {
-    /// `detect` is the only verb. Made optional so v3.0's flat
-    /// `onebrain harness` invocation (no verb) still works — that path is
-    /// silently treated as `harness detect`. Future v3.x verbs can be added
-    /// without breaking this; if `verb` is missing the dispatcher picks
-    /// `Detect` by default.
     #[command(subcommand)]
-    pub verb: Option<HarnessVerb>,
+    pub verb: HarnessVerb,
 }
 #[derive(Subcommand, Debug)]
 pub enum HarnessVerb {
     /// Detect the active harness (Claude Code / Gemini / direct).
     Detect,
-    /// Run a prompt through claude or gemini headlessly (no
-    /// `/onebrain:<skill>` namespacing — for that use `onebrain skill run`).
-    /// `--mode with-context` (default) loads the vault's CLAUDE.md /
-    /// INSTRUCTIONS.md / GEMINI.md so the harness has OneBrain's full
-    /// context; `--mode ad-hoc` skips the vault entirely — the harness
-    /// answers the raw prompt with no project context attached. If
-    /// `<PROMPT>` is omitted, the prompt is read from stdin so the command
-    /// composes with `cat note.md | onebrain harness run --harness gemini`.
+    /// Run a prompt through claude or gemini headlessly. Flags:
+    /// `--harness {claude,gemini}` · `--model <m>` (e.g. `claude-haiku-4-5`,
+    /// `gemini-2.5-flash`) · `--mode {with-context, ad-hoc}` — with-context
+    /// (default) loads the vault's CLAUDE.md / INSTRUCTIONS.md / GEMINI.md
+    /// so the harness answers with OneBrain's full context, ad-hoc skips the
+    /// vault entirely and answers the raw prompt with no project context
+    /// attached. If `<PROMPT>` is omitted, the prompt is read from stdin so
+    /// the command composes with `cat note.md | onebrain harness run`.
     Run {
         /// Vault root override · also accepts global `--vault`, and walks up from cwd when omitted.
         /// Ignored when `--mode ad-hoc`.
@@ -1020,7 +1019,10 @@ pub enum SkillVerb {
     /// List installed skills (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     List,
-    /// Run a skill in headless mode (replaces v3.0 `run-skill`).
+    /// Run a OneBrain skill (`/onebrain:<name>`) in headless mode. Flags:
+    /// `--harness {claude,gemini}` · `--model <m>` (e.g. `claude-haiku-4-5`,
+    /// `gemini-2.5-flash`) · `--skill <name>` (parity alias for the positional
+    /// `<NAME>`) · `--arg key=value` (pass-through). Replaces v3.0 `run-skill`.
     Run {
         /// Vault root override · also accepts global `--vault`, and walks up from cwd when omitted.
         #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
@@ -1289,17 +1291,25 @@ mod tests {
         assert!(matches!(
             cli.command,
             Cmd::Harness(HarnessCmd {
-                verb: Some(HarnessVerb::Detect)
+                verb: HarnessVerb::Detect
             })
         ));
 
-        // v3.0 flat form: `onebrain harness` (no verb). Resolved by the
-        // dispatcher to `Detect` because the verb is Option<>.
-        let cli = Cli::try_parse_from(["onebrain", "harness"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Cmd::Harness(HarnessCmd { verb: None })
-        ));
+        // v3.2.10: a verb is now required (drops the v3.0 flat-form
+        // back-compat — `onebrain harness` alone now prints help and exits
+        // rather than silently running `detect`). Parsing must fail — clap
+        // emits either MissingSubcommand or its help-on-missing variant
+        // depending on the `arg_required_else_help` interaction.
+        let err = Cli::try_parse_from(["onebrain", "harness"]).unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                clap::error::ErrorKind::MissingSubcommand
+                    | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ),
+            "expected missing-subcommand or display-help kind, got {:?}",
+            err.kind()
+        );
     }
 
     #[test]

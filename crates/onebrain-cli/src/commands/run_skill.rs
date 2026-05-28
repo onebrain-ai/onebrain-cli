@@ -46,6 +46,7 @@ pub fn run(
     args: &[String],
     harness: HarnessArg,
     model: Option<&str>,
+    want_json: bool,
 ) -> Result<i32> {
     let vault_path = PathBuf::from(vault);
     if find_config_file(&vault_path).is_none() {
@@ -68,7 +69,7 @@ pub fn run(
     }
 
     // Skills always run with-context: --add-dir / --include-directories the vault.
-    let argv = harness_argv(harness, &prompt, Some(vault), model);
+    let argv = harness_argv(harness, &prompt, Some(vault), model, want_json);
     spawn_harness(&resolution.path, &argv, &vault_path, harness, "the skill")
 }
 
@@ -87,6 +88,7 @@ pub(crate) fn harness_argv(
     prompt: &str,
     context_dir: Option<&str>,
     model: Option<&str>,
+    want_json: bool,
 ) -> Vec<String> {
     let mut argv = vec!["-p".to_string(), prompt.to_string()];
     match harness {
@@ -98,6 +100,10 @@ pub(crate) fn harness_argv(
             if let Some(m) = model {
                 argv.push("--model".to_string());
                 argv.push(m.to_string());
+            }
+            if want_json {
+                argv.push("--output-format".to_string());
+                argv.push("json".to_string());
             }
         }
         HarnessArg::Gemini => {
@@ -113,6 +119,10 @@ pub(crate) fn harness_argv(
             if let Some(m) = model {
                 argv.push("-m".to_string());
                 argv.push(m.to_string());
+            }
+            if want_json {
+                argv.push("--output-format".to_string());
+                argv.push("json".to_string());
             }
         }
     }
@@ -363,7 +373,13 @@ mod tests {
 
     #[test]
     fn harness_argv_claude_uses_add_dir_and_no_model_by_default() {
-        let argv = harness_argv(HarnessArg::Claude, "/onebrain:daily", Some("/vault"), None);
+        let argv = harness_argv(
+            HarnessArg::Claude,
+            "/onebrain:daily",
+            Some("/vault"),
+            None,
+            false,
+        );
         assert_eq!(argv, vec!["-p", "/onebrain:daily", "--add-dir", "/vault"]);
     }
 
@@ -374,6 +390,7 @@ mod tests {
             "/onebrain:daily",
             Some("/vault"),
             Some("claude-haiku-4-5"),
+            false,
         );
         assert_eq!(
             argv,
@@ -390,7 +407,13 @@ mod tests {
 
     #[test]
     fn harness_argv_gemini_uses_include_directories_and_yolo() {
-        let argv = harness_argv(HarnessArg::Gemini, "/onebrain:daily", Some("/vault"), None);
+        let argv = harness_argv(
+            HarnessArg::Gemini,
+            "/onebrain:daily",
+            Some("/vault"),
+            None,
+            false,
+        );
         assert_eq!(
             argv,
             vec![
@@ -407,7 +430,7 @@ mod tests {
     #[test]
     fn harness_argv_claude_omits_add_dir_when_context_dir_none() {
         // `--mode ad-hoc`: no `--add-dir` flag, no vault context loaded.
-        let argv = harness_argv(HarnessArg::Claude, "what is 2+2?", None, None);
+        let argv = harness_argv(HarnessArg::Claude, "what is 2+2?", None, None, false);
         assert_eq!(argv, vec!["-p", "what is 2+2?"]);
     }
 
@@ -415,8 +438,34 @@ mod tests {
     fn harness_argv_gemini_omits_include_dirs_but_keeps_yolo_for_ad_hoc() {
         // `--mode ad-hoc`: no `--include-directories`, but yolo stays because
         // the child still has null stdin and can't answer approval prompts.
-        let argv = harness_argv(HarnessArg::Gemini, "what is 2+2?", None, None);
+        let argv = harness_argv(HarnessArg::Gemini, "what is 2+2?", None, None, false);
         assert_eq!(argv, vec!["-p", "what is 2+2?", "--approval-mode", "yolo"]);
+    }
+
+    #[test]
+    fn harness_argv_claude_appends_output_format_json_when_want_json() {
+        // `--json` at the OneBrain CLI maps to `--output-format json` on the
+        // claude harness — passthrough so the captured stdout is native JSON.
+        let argv = harness_argv(HarnessArg::Claude, "hi", None, None, true);
+        assert_eq!(argv, vec!["-p", "hi", "--output-format", "json"]);
+    }
+
+    #[test]
+    fn harness_argv_gemini_appends_output_format_json_when_want_json() {
+        // Gemini supports `--output-format json` too. Sits after `--approval-mode
+        // yolo` and after `-m <model>` if present.
+        let argv = harness_argv(HarnessArg::Gemini, "hi", None, None, true);
+        assert_eq!(
+            argv,
+            vec![
+                "-p",
+                "hi",
+                "--approval-mode",
+                "yolo",
+                "--output-format",
+                "json"
+            ]
+        );
     }
 
     #[test]
@@ -426,6 +475,7 @@ mod tests {
             "/onebrain:daily",
             Some("/vault"),
             Some("gemini-2.5-flash"),
+            false,
         );
         assert_eq!(
             argv,
