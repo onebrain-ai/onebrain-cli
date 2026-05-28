@@ -1635,12 +1635,8 @@ mod tests {
             pretty: true,
         };
         assert!(!should_animate(&mono, true, false), "no-color off");
-        for structured in [
-            OutputMode::Json { pretty: true },
-            OutputMode::Yaml,
-            OutputMode::Tsv,
-            OutputMode::Table,
-        ] {
+        // v3.2.15: Table / Tsv variants dropped from `OutputMode`.
+        for structured in [OutputMode::Json { pretty: true }, OutputMode::Yaml] {
             assert!(
                 !should_animate(&structured, true, false),
                 "structured {structured:?} off"

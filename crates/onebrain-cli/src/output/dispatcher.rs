@@ -13,10 +13,16 @@ use std::io::Write;
 
 /// Emit `envelope` to `writer` in the format chosen by `mode`.
 ///
-/// The `text_render` closure is only invoked in `OutputMode::Text` /
-/// `OutputMode::Table` — structured modes (`json`/`yaml`/`tsv`) ignore it
-/// entirely. This keeps text rendering lazy so commands don't pay the
-/// formatting cost when piping to a downstream parser.
+/// The `text_render` closure is only invoked in `OutputMode::Text` —
+/// structured modes (`json`/`yaml`) ignore it entirely. This keeps text
+/// rendering lazy so commands don't pay the formatting cost when piping to a
+/// downstream parser.
+///
+/// v3.2.15: `Table` and `Tsv` variants were dropped from `OutputMode` — both
+/// fell through to `serialize_json(value, false)` so the format flag silently
+/// lied about its output. The arms that previously emitted a stub TSV header
+/// or routed through the text renderer for `Table` are gone with the
+/// variants.
 pub fn emit<T, W, F>(
     envelope: &Envelope<T>,
     mode: &OutputMode,
@@ -41,23 +47,14 @@ where
             let s = serde_yaml::to_string(envelope)?;
             writer.write_all(s.as_bytes())?;
         }
-        OutputMode::Tsv => {
-            // Generic TSV fallback: header `command\tok` + one row. Commands
-            // with list payloads override by passing a structured text body
-            // through the `text_render` closure when mode==Tsv if they want
-            // a real columnar emit. v3.1 ships the fallback; v3.2+ widens
-            // per-command.
-            writeln!(writer, "command\tok")?;
-            writeln!(writer, "{}\t{}", envelope.command, envelope.ok)?;
-        }
-        OutputMode::Table | OutputMode::Text { .. } => {
+        OutputMode::Text { .. } => {
             let s = text_render(envelope);
             writer.write_all(s.as_bytes())?;
             if !s.ends_with('\n') {
                 writeln!(writer)?;
             }
             // Surface soft warnings in human modes — structured modes already
-            // carry them in the `warnings` array, but a text/table user would
+            // carry them in the `warnings` array, but a text user would
             // otherwise never see e.g. "N notes were unreadable and skipped".
             for w in &envelope.warnings {
                 writeln!(writer, "⚠️  {}", w.message)?;
@@ -185,12 +182,8 @@ mod tests {
         assert!(s.contains("2 note(s) unreadable and skipped"));
     }
 
-    #[test]
-    fn tsv_mode_emits_header_and_row() {
-        let env = Envelope::ok("task.list", None, P { n: 9 });
-        let mut buf = Vec::new();
-        emit(&env, &OutputMode::Tsv, &mut buf, |_| unreachable!()).unwrap();
-        let s = String::from_utf8(buf).unwrap();
-        assert_eq!(s, "command\tok\ntask.list\ttrue\n");
-    }
+    // `tsv_mode_emits_header_and_row` test removed in v3.2.15 along with the
+    // `OutputMode::Tsv` variant — pre-3.2.15 every command routed Tsv (and
+    // Table) through the JSON encoder, so the stub `command\tok` row this
+    // test asserted was visible to no real consumer.
 }

@@ -56,11 +56,6 @@ pub fn serialize_for_mode<T: Serialize>(value: &T, mode: &OutputMode) -> String 
             }
         },
         OutputMode::Json { pretty } => serialize_json(value, *pretty),
-        // Table / Tsv have no columnar slot for hook-protocol blocks. Fall
-        // back to compact JSON so the consumer still gets parseable output;
-        // commands that care about text rendering branch on
-        // `OutputMode::Text { .. }` before calling this function.
-        OutputMode::Table | OutputMode::Tsv => serialize_json(value, false),
         // Text-mode arrival is a caller bug — the per-command text renderer
         // should have absorbed this. Loud in debug, compact-JSON fallback in
         // release (compact, not pretty, because pretty-text-via-JSON would

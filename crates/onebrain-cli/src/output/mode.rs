@@ -22,18 +22,19 @@ pub enum OutputMode {
     Json { pretty: bool },
     /// `--yaml` / `-o yaml`. Same envelope shape, YAML serialised.
     Yaml,
-    /// `--output table`. Aligned columns; falls back to text for non-list
-    /// commands.
-    Table,
-    /// `--output tsv`. Header + tab-separated rows.
-    Tsv,
+    // v3.2.15 dropped `Table` and `Tsv` — both variants fell through to the
+    // JSON encoder unchanged for every command, so the format flag silently
+    // claimed to render columns / tab-separated rows while emitting the same
+    // bytes as `--output json`. Removing the variants closes the false
+    // promise; if a future command genuinely needs tabular output we'll add
+    // the column extractor + renderer together with the variant.
 }
 
 impl OutputMode {
-    /// True when the mode is structured (JSON/YAML/TSV/table). Used by
-    /// `main.rs`'s error-path renderer (R1 B5) to decide between the
-    /// human-readable `Error: <msg>` line on stderr and the canonical
-    /// JSON envelope on stdout.
+    /// True when the mode is structured (JSON/YAML). Used by `main.rs`'s
+    /// error-path renderer (R1 B5) to decide between the human-readable
+    /// `Error: <msg>` line on stderr and the canonical JSON envelope on
+    /// stdout.
     pub fn is_structured(&self) -> bool {
         !matches!(self, OutputMode::Text { .. })
     }
@@ -113,8 +114,6 @@ pub fn resolve_output_mode(i: &TtyInputs) -> OutputMode {
     match i.output_flag.as_str() {
         "json" => OutputMode::Json { pretty: i.pretty },
         "yaml" => OutputMode::Yaml,
-        "table" => OutputMode::Table,
-        "tsv" => OutputMode::Tsv,
         _ => {
             // text — apply the 6-rule chain. CI is "any non-empty value" per
             // is-ci / ci-info convention (R1 C4).
@@ -316,16 +315,13 @@ mod tests {
     }
 
     #[test]
-    fn output_flag_yaml_table_tsv() {
-        for (flag, expected) in [
-            ("yaml", OutputMode::Yaml),
-            ("table", OutputMode::Table),
-            ("tsv", OutputMode::Tsv),
-        ] {
-            let mut i = base();
-            i.output_flag = flag.into();
-            assert_eq!(resolve_output_mode(&i), expected, "flag={flag}");
-        }
+    fn output_flag_yaml_picks_yaml_mode() {
+        // v3.2.15: `Table` and `Tsv` variants dropped — both fell through to
+        // the JSON encoder unchanged, so the format flag silently lied about
+        // its output. The remaining structured target via `--output` is YAML.
+        let mut i = base();
+        i.output_flag = "yaml".into();
+        assert_eq!(resolve_output_mode(&i), OutputMode::Yaml);
     }
 
     #[test]
@@ -345,7 +341,5 @@ mod tests {
         .is_structured());
         assert!(OutputMode::Json { pretty: true }.is_structured());
         assert!(OutputMode::Yaml.is_structured());
-        assert!(OutputMode::Table.is_structured());
-        assert!(OutputMode::Tsv.is_structured());
     }
 }

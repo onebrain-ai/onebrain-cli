@@ -452,12 +452,12 @@ mod tests {
 
     #[test]
     fn no_animate_for_structured_modes() {
+        // v3.2.15: Table / Tsv variants dropped from `OutputMode`. Json / Yaml
+        // are the remaining structured targets.
         for mode in [
             OutputMode::Json { pretty: true },
             OutputMode::Json { pretty: false },
             OutputMode::Yaml,
-            OutputMode::Table,
-            OutputMode::Tsv,
         ] {
             assert!(
                 !should_animate(&mode, true, false),

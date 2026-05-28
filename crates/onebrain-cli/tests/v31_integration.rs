@@ -95,20 +95,18 @@ fn root_help_renders_compact_with_wrapped_defaults() {
     );
     // `-o, --output` description on the same line; `[default: text, \
     // possible values: ...]` wrapped to a new aligned line below.
+    // v3.2.15: dropped `table` and `tsv` from the possible values along
+    // with the OutputMode variants that lied about emitting columnar / TSV
+    // output (every command routed both through the JSON encoder).
     assert!(
         stdout.contains(
-            "  -o, --output <FMT>  Output format. Default `text` is TTY-friendly; \
-             pipe-detected calls drop color/pretty automatically\n\
-                                  [default: text, possible values: text, json, yaml, table, tsv]"
-                .replace("             ", "")
-                .as_str()
-        ) || stdout.contains(
-            "  -o, --output <FMT>  Output format. Default `text` is TTY-friendly; pipe-detected calls drop color/pretty automatically\n                      [default: text, possible values: text, json, yaml, table, tsv]"
+            "  -o, --output <FMT>  Output format. Default `text` is TTY-friendly; pipe-detected calls drop color/pretty automatically\n                      [default: text, possible values: text, json, yaml]"
         ),
         "expected `-o, --output` description inline with `[default: text, \
-         possible values: ...]` wrapped to indented next line. The \
-         `hide_default_value` / `hide_possible_values` + manual help-string \
-         wrap on `Cli::output` may have been removed. Got:\n{stdout}"
+         possible values: text, json, yaml]` wrapped to indented next line. \
+         The `hide_default_value` / `hide_possible_values` + manual help-string \
+         wrap on `Cli::output` may have been removed, or `table` / `tsv` may \
+         have been re-added to the possible values list. Got:\n{stdout}"
     );
 }
 
