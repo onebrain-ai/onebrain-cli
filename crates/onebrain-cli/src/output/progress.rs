@@ -271,18 +271,17 @@ impl<W: Write> ProgressRenderer<W> {
         }
     }
 
-    /// Pin the per-step pacing to a fixed duration. Production callers leave
-    /// the override unset so the renderer falls back to [`random_step_delay`]
-    /// (800–2000ms jitter).
+    /// Pin the per-step pacing to a fixed duration. **Test seam only**: production
+    /// callers leave the override unset so the renderer falls back to
+    /// [`random_step_delay`] (800–2000ms jitter).
     ///
-    /// v3.2.14: tests for `plugin update`'s animated renderer pass
-    /// `Duration::ZERO` so the animated branch — spinner frame + `\r` clear +
-    /// resolved line — runs deterministically without sleeping for the
-    /// production band. Previously gated behind `#[cfg(test)]`; promoted to a
-    /// first-class crate seam now that an additional command reuses the same
-    /// animation infrastructure and needs to inject the override at the
-    /// dispatch boundary (not from inside a test mod).
-    pub fn set_step_delay(&mut self, delay: Duration) {
+    /// Exposed `pub(crate)` (not `pub`) so the cross-module animated-path tests
+    /// in `v31::dispatch::tests` can inject `Duration::ZERO` to exercise the
+    /// animated branch without sleeping. v3.2.14 promoted it from
+    /// `#[cfg(test)]` to crate-visible; v3.2.15 trimmed it back to
+    /// `pub(crate)` after the production path confirmed it always passes
+    /// `None`.
+    pub(crate) fn set_step_delay(&mut self, delay: Duration) {
         self.step_delay_override = Some(delay);
     }
 

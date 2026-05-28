@@ -8,28 +8,9 @@
 
 use crate::v31::hook_rewriter::{self, RewriteWarning};
 use anyhow::{Context, Result};
+use onebrain_fs::read_plugin_version;
 use onebrain_fs::register_hooks::settings::settings_path;
-use std::path::{Path, PathBuf};
-
-/// Read the plugin version from `<vault>/.claude/plugins/onebrain/.claude-plugin/plugin.json`.
-/// Returns `None` on the well-formed "no plugin installed yet" / "manifest
-/// missing the `version` field" paths so the framed renderer can fall back
-/// to the generic `done` / `skipped` detail strings; the orchestrator's own
-/// `read_plugin_version` in `onebrain-fs::vault_sync::orchestrate` does the
-/// same for the post-extract path inside the sync flow.
-fn read_plugin_version(vault_root: &Path) -> Option<String> {
-    let path = vault_root
-        .join(".claude")
-        .join("plugins")
-        .join("onebrain")
-        .join(".claude-plugin")
-        .join("plugin.json");
-    let text = std::fs::read_to_string(&path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    v.get("version")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-}
+use std::path::PathBuf;
 
 #[derive(Debug, Default)]
 pub struct PluginUpdateReport {

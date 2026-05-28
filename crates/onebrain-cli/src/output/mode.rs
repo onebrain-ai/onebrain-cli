@@ -10,9 +10,13 @@
 
 use std::io::IsTerminal;
 
-/// Resolved output mode for the current invocation. Each command renders
-/// according to this; the dispatcher in [`super::dispatcher`] picks the
-/// serializer.
+/// Resolved output mode for the current invocation. Three variants: `Text`
+/// (default, TTY-friendly), `Json` (canonical envelope), `Yaml` (same
+/// envelope serialised as YAML). Each command renders according to this;
+/// the dispatcher in [`super::dispatcher`] picks the serializer.
+///
+/// v3.2.15 dropped `Table` and `Tsv` — both fell through to the JSON
+/// encoder unchanged for every command. See the inline comment below.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputMode {
     /// Default — TTY-friendly text. `color` and `pretty` already reflect the

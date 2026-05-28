@@ -37,6 +37,6 @@ mod types;
 
 pub use branch::resolve_branch;
 pub use download::build_tar_spawn_overrides;
-pub use orchestrate::run_vault_sync;
+pub use orchestrate::{read_plugin_version, run_vault_sync};
 pub use pin::normalize_path;
 pub use types::{VaultSyncOptions, VaultSyncResult};

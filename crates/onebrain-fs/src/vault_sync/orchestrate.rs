@@ -211,8 +211,17 @@ fn read_update_channel(vault_root: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-fn read_plugin_version(extracted_dir: &Path) -> Option<String> {
-    let path = extracted_dir.join(".claude/plugins/onebrain/.claude-plugin/plugin.json");
+/// Read the `version` field from `<base>/.claude/plugins/onebrain/.claude-plugin/plugin.json`.
+/// `base` is either the extracted-tarball directory (during a sync) or an
+/// installed vault root. Returns `None` for any well-formed "not installed /
+/// file missing / version field missing / malformed JSON" case so callers
+/// can fall back to generic detail strings without distinguishing the four.
+///
+/// v3.2.15: hoisted from a `fn` (orchestrator-private) to `pub fn` so
+/// `onebrain-cli`'s `plugin_update::run` can reuse it on the installed-vault
+/// side without duplicating the path-join + parse logic.
+pub fn read_plugin_version(base: &Path) -> Option<String> {
+    let path = base.join(".claude/plugins/onebrain/.claude-plugin/plugin.json");
     let text = fs::read_to_string(&path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     v.get("version")

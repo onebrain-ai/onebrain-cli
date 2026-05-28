@@ -7,6 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use onebrain_core::find_vault_root;
 use onebrain_fs::{run_vault_sync, VaultSyncOptions};
 use std::env;
+use std::io;
 use std::path::PathBuf;
 
 /// Entry point — returns `Ok(0)` on success, `Ok(1)` on any critical failure.
@@ -27,27 +28,29 @@ use std::path::PathBuf;
 /// to occasionally duplicate one line than leave the user with a silent
 /// non-zero exit.
 pub fn run(vault_root_override: Option<PathBuf>, branch: Option<String>) -> Result<i32> {
-    run_with(vault_root_override, branch, false, false)
+    run_with(vault_root_override, branch, false)
 }
 
-/// Same as [`run`] but suppresses the orchestrator's "OneBrain Vault Sync"
-/// intro/outro frame AND routes the per-step progress reporter to
-/// `io::sink()` — so neither the framed banner nor the per-step `▸ <label>`
-/// lines leak. Used by `onebrain plugin update` (v3.2.15+), which renders
-/// its own framed doctor-style report. The framed report's animated spinner
-/// is the only progress signal the user sees, matching `doctor`/`update`.
+/// Same as [`run`] but routes the per-step progress reporter to
+/// `std::io::sink()` — so neither the "OneBrain Vault Sync" intro/outro
+/// frame nor the per-step `▸ <label>` lines leak. Used by `onebrain plugin
+/// update` (v3.2.15+), which renders its own framed doctor-style report;
+/// the framed report's animated spinner is the only progress signal the
+/// user sees, matching `doctor`/`update`.
 ///
 /// (v3.2.13 introduced `run_embedded` for the intro-only suppression; v3.2.15
 /// folded that into the silent path because no remaining caller wanted the
-/// in-between "embedded but with step lines" mode.)
+/// in-between "embedded but with step lines" mode. v3.2.15 round-2 also
+/// dropped the now-dead `embedded` flag from the inner shape — the
+/// orchestrator only consults it when `progress_writer` is `None`, and the
+/// silent path always sets the writer to a sink.)
 pub fn run_silent(vault_root_override: Option<PathBuf>, branch: Option<String>) -> Result<i32> {
-    run_with(vault_root_override, branch, true, true)
+    run_with(vault_root_override, branch, true)
 }
 
 fn run_with(
     vault_root_override: Option<PathBuf>,
     branch: Option<String>,
-    embedded: bool,
     silent: bool,
 ) -> Result<i32> {
     // Bun v2.3.3 parity: optional positional `<vault_root>` lets the caller
@@ -73,10 +76,12 @@ fn run_with(
 
     // `silent` overrides any TTY-vs-non-TTY heuristic: orchestrator routes
     // `progress_writer = Some(io::sink())` through `PlainProgress`, which
-    // discards every step line. `embedded` is still threaded so the build
-    // chooses the correct progress impl when `silent = false`.
-    let progress_writer: Option<Box<dyn std::io::Write + Send>> = if silent {
-        Some(Box::new(std::io::sink()))
+    // discards every step line. The orchestrator's `embedded` flag only
+    // affects the `progress_writer = None` branch, so leaving it at default
+    // (`false`) when silent is fine — the sink doesn't care which mode
+    // claims to write to it.
+    let progress_writer: Option<Box<dyn io::Write + Send>> = if silent {
+        Some(Box::new(io::sink()))
     } else {
         None
     };
@@ -84,7 +89,6 @@ fn run_with(
         vault_root_path.as_path(),
         VaultSyncOptions {
             branch,
-            embedded,
             progress_writer,
             ..VaultSyncOptions::default()
         },

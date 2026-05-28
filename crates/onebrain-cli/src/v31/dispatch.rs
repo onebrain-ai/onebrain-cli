@@ -638,7 +638,6 @@ pub(crate) fn render_plugin_update_animated_to<W: std::io::Write>(
     let vault_detail = plugin_update_vault_detail(
         report.vault_synced,
         report.dry_run,
-        partial_failed,
         report.version_before.as_deref(),
         report.version_after.as_deref(),
     );
@@ -733,19 +732,19 @@ pub(crate) fn render_plugin_update_animated_to<W: std::io::Write>(
 /// exactly one place.
 ///
 /// Decision table (v3.2.15):
-/// - partial-failed AND step ran  → version-aware `vX → vY` / `vX · up-to-date`
-///   / `installed vY` / fallback `done` (the plist step is what failed; the
-///   vault row tells the user what version it ended up on)
-/// - partial-failed AND step skipped → `skipped`
 /// - dry-run with known current → `current vX · skipped`
 /// - dry-run unknown → `skipped`
+/// - step didn't run → `skipped`
 /// - happy path with versions → `vX → vY` / `vX · up-to-date` / `installed vY`
 /// - happy path no version info → `done` (back-compat with pre-3.2.15)
-/// - step didn't run → `skipped`
+///
+/// Partial-failure cases aren't branched here: a later-step failure doesn't
+/// change what version landed on disk during the vault-sync step, so the row
+/// still reports the same delta. The verdict footer + per-step glyph carry
+/// the failure signal.
 fn plugin_update_vault_detail(
     vault_synced: bool,
     dry_run: bool,
-    partial_failed: bool,
     before: Option<&str>,
     after: Option<&str>,
 ) -> String {
@@ -758,9 +757,6 @@ fn plugin_update_vault_detail(
     if !vault_synced {
         return "skipped".to_string();
     }
-    // Vault step ran. Partial failure on a later step doesn't change what
-    // version landed on disk, so the row still reports the delta here.
-    let _ = partial_failed; // (kept in the signature for future per-step blame)
     match (before, after) {
         (Some(a), Some(b)) if a == b => format!("v{a} · up-to-date"),
         (Some(a), Some(b)) => format!("v{a} → v{b}"),
@@ -981,7 +977,6 @@ where
     let vault_detail = plugin_update_vault_detail(
         d.vault_synced(),
         d.dry_run(),
-        partial_failed,
         d.version_before(),
         d.version_after(),
     );
