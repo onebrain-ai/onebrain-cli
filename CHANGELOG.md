@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.11
+latest_version: 3.2.12
 released: 2026-05-28
 ---
 
@@ -11,6 +11,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.12] — 2026-05-28 — `--help` long-format · `[default]` / `[possible values]` wrap onto their own line
+
+- **Polish: every `--help` screen now uses the long format** (description below the option name, `[default]` and `[possible values]` on their own lines). Added `next_line_help = true` + `propagate_version = true` to the root `Cli` struct — both settings propagate to every subcommand automatically. Trade-off vs v3.2.11's "compact" `harness run --help`: more vertical space per option, but every value block (defaults, possible values, enum variants) now gets the breathing room it needs to stay readable.
+- **Restored: `HarnessMode::WithContext` / `HarnessMode::AdHoc` variant docs** — v3.2.11 stripped them to keep `harness run --help` compact, but the long format makes that compromise unnecessary. The `Possible values:` block under `--mode` now renders each variant's full semantics inline (vault required vs cwd=$TMPDIR, what flags get passed to the harness, etc.), so the user no longer has to cross-reference the `--mode <MODE>` summary against the source to know what each value does.
 
 ## [3.2.11] — 2026-05-28 — help cleanup: `--help` only · `skill help` → `skill show` · `harness run --help` compact · banner consistency
 
