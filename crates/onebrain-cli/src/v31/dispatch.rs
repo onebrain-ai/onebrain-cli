@@ -268,6 +268,37 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         // remaining after the v3.1 tree rename).
         Cmd::Harness(HarnessCmd { verb }) => match verb.unwrap_or(HarnessVerb::Detect) {
             HarnessVerb::Detect => commands::harness::run(&mode),
+            HarnessVerb::Run {
+                vault_dir,
+                prompt,
+                mode: harness_mode,
+                harness,
+                model,
+            } => {
+                use crate::cli::HarnessMode;
+                use anyhow::Context as _;
+                // with-context: require vault, cwd = vault, --add-dir vault.
+                // ad-hoc: no vault, cwd = $PWD, no --add-dir.
+                let (cwd, context_dir) = match harness_mode {
+                    HarnessMode::WithContext => {
+                        let resolved = crate::vault_ctx::require(vault_dir.or(vault_flag.clone()))?;
+                        let v = resolved.root.as_path().to_path_buf();
+                        (v.clone(), Some(v))
+                    }
+                    HarnessMode::AdHoc => (
+                        std::env::current_dir().context("read current directory")?,
+                        None,
+                    ),
+                };
+                let code = commands::harness_run::run(
+                    &cwd,
+                    context_dir.as_deref(),
+                    prompt.as_deref(),
+                    harness,
+                    model.as_deref(),
+                )?;
+                std::process::exit(code);
+            }
         },
 
         // ───── Stub-only resource groups ────────────────────────────

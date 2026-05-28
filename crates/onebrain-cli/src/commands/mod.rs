@@ -1,6 +1,7 @@
 pub mod checkpoint;
 pub mod doctor;
 pub mod harness;
+pub mod harness_run;
 pub mod init;
 pub mod migrate;
 pub mod note_append;
