@@ -1566,6 +1566,11 @@ fn bare_group_emits_banner_above_help() {
     // by itself doesn't trip the `--help` / no-subcommand cases. Regression
     // guard so a future clap upgrade that drops the error kind from the
     // matcher in `main.rs` doesn't silently re-introduce issue #2.
+    //
+    // Tightened in round-2 review: pin both the exit code (2, clap's
+    // `arg_required_else_help` exit) AND "exactly one banner" so the test
+    // doesn't pass-for-the-wrong-reason if the banner emit site moves OR if
+    // the pre-parse path is later broadened to match this argv shape too.
     let out = Command::cargo_bin("onebrain")
         .unwrap()
         .env_remove("NO_COLOR")
@@ -1574,11 +1579,42 @@ fn bare_group_emits_banner_above_help() {
         .env("ONEBRAIN_FORCE_BANNER", "1")
         .args(["--pretty", "harness"])
         .assert()
-        .failure(); // clap exits 2 when `arg_required_else_help` fires.
+        .code(2);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
+    let banner_count = stderr.matches(BRAND_MARK).count();
+    assert_eq!(
+        banner_count, 1,
+        "expected exactly 1 banner above bare `harness` help, got {banner_count}. stderr=\n{stderr}"
+    );
+}
+
+#[test]
+fn legacy_help_keyword_emits_no_banner() {
+    // v3.2.11: every `*Cmd` group disabled clap's built-in `help` subcommand
+    // keyword. `onebrain plugin help` now trips
+    // `ErrorKind::InvalidSubcommand`, which must NOT be added to `main.rs`'s
+    // `prints_help` matcher and must NOT match `argv_requests_help` —
+    // emitting a banner above the "unrecognized subcommand 'help'" error
+    // would be noise AND would re-open issue #1's duplicate-banner regression
+    // for any user still typing the v3.2.10 form out of muscle memory.
+    //
+    // This is the end-to-end counterpart to the unit test
+    // `argv_requests_help_rejects_legacy_help_keyword` in banner.rs: it pins
+    // the contract through the full clap → main → banner pipeline.
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .env_remove("NO_COLOR")
+        .env_remove("CI")
+        .env("TERM", "xterm-256color")
+        .env("ONEBRAIN_FORCE_BANNER", "1")
+        .args(["--pretty", "plugin", "help"])
+        .assert()
+        .failure();
     let stderr = String::from_utf8_lossy(&out.get_output().stderr).to_string();
     assert!(
-        stderr.contains(BRAND_MARK),
-        "expected banner above bare `harness` help. stderr=\n{stderr}"
+        !stderr.contains(BRAND_MARK),
+        "banner must NOT appear above the `InvalidSubcommand` error for the \
+         removed `<group> help` keyword. stderr=\n{stderr}"
     );
 }
 

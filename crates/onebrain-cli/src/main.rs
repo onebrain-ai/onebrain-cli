@@ -21,11 +21,17 @@ use onebrain_core::CoreError;
 use output::{emit, Envelope, ErrorInfo, OutputMode};
 
 fn main() {
-    // Pre-parse help-banner pass. Clap renders `--help` / `-h` / `help <verb>`
-    // output and exits in-process, BEFORE `dispatch::dispatch` would otherwise
-    // emit the banner. Emit it here so every help screen — top-level, group,
-    // verb — carries the brand line. Gating mirrors `should_show_banner` minus
-    // the parsed-CLI-only checks (hook-protocol gate isn't relevant for help).
+    // Pre-parse help-banner pass. Clap renders `--help` / `-h` output and
+    // exits in-process, BEFORE `dispatch::dispatch` would otherwise emit the
+    // banner. Emit it here so every help screen — top-level, group, verb —
+    // carries the brand line. Gating mirrors `should_show_banner` minus the
+    // parsed-CLI-only checks (hook-protocol gate isn't relevant for help).
+    //
+    // v3.2.11: the literal `help` keyword no longer triggers a help screen —
+    // every `*Cmd` group sets `disable_help_subcommand = true`, so `<group>
+    // help` returns `ErrorKind::InvalidSubcommand` (not matched by the
+    // `prints_help` guard below, intentionally — banner above that error is
+    // noise).
     let raw_args: Vec<String> = std::env::args().collect();
     let pre_parse_mode = output::resolve_output_mode(&banner::tty_inputs_for_help(&raw_args));
     let pre_parse_env = banner::HelpBannerEnv::from_env();
