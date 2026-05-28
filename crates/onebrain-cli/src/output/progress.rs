@@ -271,11 +271,17 @@ impl<W: Write> ProgressRenderer<W> {
         }
     }
 
-    /// Test seam: pin the per-step pacing to a fixed duration (typically
-    /// `Duration::ZERO`) so the animated branch — spinner frame + `\r` clear +
-    /// resolved line — can be exercised deterministically without sleeping for
-    /// the production random band. Production never calls this.
-    #[cfg(test)]
+    /// Pin the per-step pacing to a fixed duration. Production callers leave
+    /// the override unset so the renderer falls back to [`random_step_delay`]
+    /// (800–2000ms jitter).
+    ///
+    /// v3.2.14: tests for `plugin update`'s animated renderer pass
+    /// `Duration::ZERO` so the animated branch — spinner frame + `\r` clear +
+    /// resolved line — runs deterministically without sleeping for the
+    /// production band. Previously gated behind `#[cfg(test)]`; promoted to a
+    /// first-class crate seam now that an additional command reuses the same
+    /// animation infrastructure and needs to inject the override at the
+    /// dispatch boundary (not from inside a test mod).
     pub fn set_step_delay(&mut self, delay: Duration) {
         self.step_delay_override = Some(delay);
     }

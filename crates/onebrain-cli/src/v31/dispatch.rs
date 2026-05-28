@@ -164,7 +164,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             } => {
                 let v = vault_dir.or(vault_flag.clone());
                 let report = plugin_update::run(v, branch, dry_run)?;
-                emit_plugin_update_summary(&report, &mode)?;
+                emit_plugin_update_summary(&report, &mode, quiet)?;
                 // Partial failure: hooks were rewritten but plists weren't
                 // (or some other mid-flight step bailed). Surface a
                 // canonical exit so callers don't treat this as success.
@@ -550,8 +550,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     }
 }
 
-/// Render a `plugin update` report to the user. JSON mode emits the
-/// canonical envelope; text mode emits a short bullet list.
+/// Render a `plugin update` report to the user. JSON mode emits the canonical
+/// envelope; text mode emits the framed doctor-style report (since v3.2.13),
+/// with per-step spinner + random 800–2000ms pacing on a real-colour TTY
+/// (since v3.2.14) so the report reads as live work instead of an instant
+/// flash — matches the `doctor` and `update` visual vocabulary.
 ///
 /// On partial failure (mid-flight bail after some on-disk state changed),
 /// emits a partial-report envelope with `ok: false`, error code
@@ -561,8 +564,169 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 fn emit_plugin_update_summary(
     report: &plugin_update::PluginUpdateReport,
     mode: &OutputMode,
+    quiet: bool,
 ) -> Result<()> {
-    emit_plugin_update_summary_to(report, mode, std::io::stdout().lock())
+    use std::io::IsTerminal;
+    // Animation gate mirrors `doctor`/`update`: only animate when stdout is a
+    // real TTY (real-time `\r` overwrite works), mode is colour-bearing text
+    // (spinner relies on ANSI), AND the user did NOT pass `--quiet`. Round-1
+    // review caught the missing `quiet` plumb-through — `should_animate`'s
+    // own contract is `quiet || !stdout_is_tty || !color → false`, so passing
+    // the literal `false` here bypassed the user's `--quiet` request.
+    // `doctor::run` already threads `cli.quiet` through; matching that here
+    // keeps the command family consistent. Pipes / CI / structured output
+    // all fall through to the static `_to` path.
+    let stdout_is_tty = std::io::stdout().is_terminal();
+    let animate = crate::output::should_animate(mode, stdout_is_tty, quiet);
+    if animate {
+        render_plugin_update_animated(report, mode)
+    } else {
+        emit_plugin_update_summary_to(report, mode, std::io::stdout().lock())
+    }
+}
+
+/// TTY-animated text-mode renderer for `plugin update`. Writes the framed
+/// report **directly** to stdout (not through `emit`'s text closure) so the
+/// per-step spinner sleeps + `\r` overwrites are real-time visible — pre-
+/// v3.2.14 the static `_to` path returned a pre-built `String` to `emit`,
+/// which collapsed the spinner cycles into a single flash.
+///
+/// Mirrors `doctor`'s rendering vocabulary: braille spinner frame cycling
+/// through `SPINNER_FRAMES` at `SPINNER_FRAME_MS`, total per-step duration
+/// drawn from [`crate::output::progress::random_step_delay`] (800–2000ms),
+/// then `\r`-clear and write the resolved `✓/⚠/✗ <label>  <detail>` line.
+fn render_plugin_update_animated(
+    report: &plugin_update::PluginUpdateReport,
+    mode: &OutputMode,
+) -> Result<()> {
+    let stdout = std::io::stdout();
+    render_plugin_update_animated_to(report, mode, stdout.lock(), None)
+}
+
+/// Inner helper for [`render_plugin_update_animated`] with two extra test
+/// seams: an injectable `Write` and a per-step delay override (`None` →
+/// production random pacing; `Some(d)` → fixed dwell, set to
+/// `Duration::ZERO` in unit tests so the animated branch runs without
+/// sleeping). Production always passes `(stdout.lock(), None)`; tests pass
+/// `(Vec<u8>, Some(Duration::ZERO))` to assert spinner artefacts
+/// deterministically.
+pub(crate) fn render_plugin_update_animated_to<W: std::io::Write>(
+    report: &plugin_update::PluginUpdateReport,
+    mode: &OutputMode,
+    mut writer: W,
+    step_delay_override: Option<std::time::Duration>,
+) -> Result<()> {
+    use crate::output::{
+        framing_rule_n, is_color_text, write_framed_header, ProgressRenderer, Section, Step,
+        StepStatus, RULE_WIDTH,
+    };
+
+    let color = is_color_text(mode);
+    let rule_width = RULE_WIDTH;
+    let dim = if color { "\x1b[2m" } else { "" };
+    let reset = if color { "\x1b[0m" } else { "" };
+
+    // ── Header (no animation — same as static path) ───────────────────
+    write_framed_header(&mut writer, "⚡", "Plugin Update", color, rule_width)?;
+
+    // ── Step list (animated) ──────────────────────────────────────────
+    // Same per-step Ok/Fail mapping as the static `render_plugin_update_text`
+    // path. The visible difference is purely the rendering side: each step
+    // shows the braille spinner with its label for ~800–2000ms before the
+    // `\r`-clear-and-resolve transition — matches `doctor`/`update`.
+    let partial_failed = report.partial_failure.is_some();
+    let vault_detail = if report.vault_synced {
+        "done"
+    } else {
+        "skipped"
+    };
+    let hooks_detail = format!("{} rewritten", report.hooks_rewritten);
+    let plists_detail = if partial_failed {
+        "failed".to_string()
+    } else {
+        match report.plists_count {
+            Some(0) => "no schedule entries".to_string(),
+            Some(n) => format!("{n} refreshed"),
+            None => "skipped".to_string(),
+        }
+    };
+    let plists_status = if partial_failed {
+        StepStatus::Fail
+    } else {
+        StepStatus::Ok
+    };
+    let steps = vec![
+        Step::new(
+            "vault sync",
+            StepStatus::Ok,
+            Some(vault_detail.to_string()),
+            None,
+        ),
+        Step::new("hooks", StepStatus::Ok, Some(hooks_detail), None),
+        Step::new("launchd plists", plists_status, Some(plists_detail), None),
+    ];
+    let section_header = if report.dry_run {
+        "Update plan (dry-run)"
+    } else {
+        "Update steps"
+    };
+    let section = Section::new(section_header, steps);
+    // `force_static = false` → spinner animates per step.
+    let mut renderer = ProgressRenderer::with_writer(&mut writer, false, color);
+    if let Some(d) = step_delay_override {
+        renderer.set_step_delay(d);
+    }
+    renderer.render_section(&section)?;
+
+    // ── Verdict footer ────────────────────────────────────────────────
+    // Reuse the static path's footer rendering by manually replicating it
+    // against the live writer — keeps the two surfaces byte-identical except
+    // for the spinner artifacts. The footer doesn't need animation: doctor's
+    // own footer is static, and the user has already absorbed the spinner
+    // pacing across the three step rows.
+    let verdict_status = if partial_failed {
+        StepStatus::Fail
+    } else {
+        StepStatus::Ok
+    };
+    let verdict_glyph = verdict_status.glyph();
+    let verdict_prefix = verdict_status.ansi_prefix(color);
+    let verdict_text: &str = match (partial_failed, report.dry_run) {
+        (true, _) => "partial failure",
+        (false, true) => "dry-run · no changes written",
+        (false, false) => {
+            let any_change =
+                report.vault_synced || report.hooks_rewritten > 0 || report.plists_rewritten;
+            if any_change {
+                "update complete"
+            } else {
+                "already up-to-date"
+            }
+        }
+    };
+    let total_str = "3 steps";
+    let left_cols = 1 + 1 + 2 + verdict_text.chars().count();
+    let gap = rule_width
+        .saturating_sub(left_cols + total_str.chars().count())
+        .max(2);
+    let rule = framing_rule_n(rule_width);
+    writeln!(writer)?;
+    writeln!(writer, "{dim}{rule}{reset}")?;
+    writeln!(
+        writer,
+        " {verdict_prefix}{verdict_glyph}{reset}  {verdict_text}{pad}{total_str}",
+        pad = " ".repeat(gap),
+    )?;
+    if let Some(reason) = report.partial_failure.as_deref() {
+        let one_line = reason.replace('\n', " · ");
+        if color {
+            writeln!(writer, " {dim}└ {one_line}{reset}")?;
+        } else {
+            writeln!(writer, " └ {one_line}")?;
+        }
+    }
+    writeln!(writer, "{dim}{rule}{reset}")?;
+    Ok(())
 }
 
 /// On-the-wire payload for `plugin update`. Hoisted out of
@@ -1131,6 +1295,102 @@ mod tests {
             openers, resets,
             "ANSI escape openers ({openers}) ≠ resets ({resets}) — wrapper \
              imbalance will leak terminal state past the framed report.\nstdout:\n{out}"
+        );
+    }
+
+    #[test]
+    fn plugin_update_animated_emits_spinner_artifacts_with_zero_delay() {
+        // v3.2.14: the animated text path renders the same framed report as
+        // the static path PLUS interleaves a braille spinner with `\r`-clear
+        // sequences per step. Inject `Duration::ZERO` so the spinner cycles
+        // run instantly (no sleeping in the test). Assert the spinner
+        // artefacts are present so a future refactor that accidentally hands
+        // the animated path a `force_static = true` renderer fails loudly.
+        //
+        // Mode is mono so the resolved-line glyph isn't wrapped in
+        // `\x1b[2;32m...\x1b[0m` ANSI escapes — keeps the `✓ vault sync`
+        // assertion below substring-stable. `\r\x1b[K` is still emitted by
+        // the spinner clear pass even under color: false (it's positioning,
+        // not color).
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 2,
+            plists_rewritten: true,
+            plists_count: Some(2),
+            partial_failure: None,
+            warnings: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        render_plugin_update_animated_to(
+            &report,
+            &text_mode_mono(),
+            &mut buf,
+            Some(std::time::Duration::ZERO),
+        )
+        .unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        // `\r\x1b[K` is the carriage-return + clear-EOL pair the animated
+        // step renderer writes between spinner cycles and the resolved line.
+        // Absent ⇒ animation was skipped or the renderer was force-static.
+        assert!(
+            out.contains("\r\x1b[K"),
+            "expected `\\r\\x1b[K` spinner-clear sequence in animated \
+             output; the renderer may have collapsed to static.\nstdout:\n{out:?}"
+        );
+        // At least one braille spinner frame must appear pre-resolve.
+        let any_spinner_frame = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+            .iter()
+            .any(|f| out.contains(f));
+        assert!(
+            any_spinner_frame,
+            "expected at least one braille spinner frame in animated \
+             output.\nstdout:\n{out:?}"
+        );
+        // The resolved lines + verdict footer must still appear after the
+        // animation overlay — the spinner only PRECEDES the resolved line,
+        // it doesn't replace it.
+        assert!(
+            out.contains("✓ vault sync"),
+            "resolved vault step missing after animation:\n{out:?}"
+        );
+        assert!(
+            out.contains("update complete"),
+            "verdict missing after animation:\n{out:?}"
+        );
+    }
+
+    #[test]
+    fn plugin_update_animated_partial_failure_renders_fail_glyph_under_animation() {
+        // Cross-cut between the v3.2.13 round-2 fix (✗ glyph on the failing
+        // step instead of ✓ + "skipped") and v3.2.14 animation: the animated
+        // path must mark the launchd plist row as fail too. Mono mode keeps
+        // the glyph substring-stable (no ANSI wrap).
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 2,
+            plists_rewritten: false,
+            plists_count: None,
+            partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
+            warnings: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        render_plugin_update_animated_to(
+            &report,
+            &text_mode_mono(),
+            &mut buf,
+            Some(std::time::Duration::ZERO),
+        )
+        .unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("✗ launchd plists"),
+            "animated path must mark failed plist step with ✗, not ✓:\n{out:?}"
+        );
+        assert!(
+            out.contains("└ schedule re-register failed"),
+            "partial-failure hint missing under animation:\n{out:?}"
         );
     }
 

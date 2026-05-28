@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.13
+latest_version: 3.2.14
 released: 2026-05-28
 ---
 
@@ -11,6 +11,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.14] — 2026-05-28 — `plugin update` animated spinner pacing (doctor/update parity)
+
+- **Polish: `onebrain plugin update` now animates the three step rows with the same braille spinner + random 800–2000ms pacing that `doctor` and `onebrain update` use.** Each step paints `⠋ <label>` with the cycling spinner for the random dwell, then `\r`-clears and writes the resolved `✓ <label>  <detail>` row — so the framed report reads as live work instead of an instant flash. Animation gates on a real-colour stdout TTY AND respects `--quiet` (`should_animate(mode, stdout_is_tty, cli.quiet)`); pipes / CI / structured output / `--quiet` runs all fall through to the static `_to` path unchanged.
+- **Internal: new `render_plugin_update_animated` / `render_plugin_update_animated_to` pair** in `crate::v31::dispatch`. The `_to` variant accepts an injectable `Write` plus a `step_delay_override: Option<Duration>` so unit tests can pass `Some(Duration::ZERO)` and assert spinner artefacts (`\r\x1b[K`, braille frames, post-animation resolved lines) without sleeping. `ProgressRenderer::set_step_delay` promoted from `#[cfg(test)]` to a first-class crate seam now that a second command reuses the animation infrastructure.
 
 ## [3.2.13] — 2026-05-28 — `plugin update` UX polish: framed report (doctor-style) · silenced sub-output
 
