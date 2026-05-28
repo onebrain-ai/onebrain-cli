@@ -496,11 +496,18 @@ pub struct HarnessCmd {
 pub enum HarnessVerb {
     /// Detect the active harness (Claude Code / Gemini / direct).
     Detect,
-    /// Run a prompt through claude or gemini headlessly. Flags:
-    /// `--harness {claude,gemini}` · `--model <m>` (e.g. `claude-haiku-4-5`,
-    /// `gemini-2.5-flash`) · `--mode {with-context, ad-hoc}` — with-context
-    /// (default) loads vault CLAUDE.md/INSTRUCTIONS.md/GEMINI.md, ad-hoc skips
-    /// project context. Omit `<PROMPT>` to read from stdin (`cat note.md | …`).
+    // v3.2.15: use `#[command(about = "...")]` with explicit `\n` so each
+    // flag in the inline summary lands on its own indented line under
+    // `harness --help`'s Commands: list (per user testing — the dot-separated
+    // single-line form was too dense to scan). The hidden `long_about` keeps
+    // the same content for `harness run --help` (clap derives both from
+    // `about` when `long_about` is unset).
+    #[command(about = "Run a prompt through claude or gemini headlessly.\n\
+        Flags:\n  \
+          --harness {claude,gemini}\n  \
+          --model <m> (e.g. `claude-haiku-4-5`, `gemini-2.5-flash`)\n  \
+          --mode {with-context, ad-hoc} — with-context (default) loads vault CLAUDE.md/INSTRUCTIONS.md/GEMINI.md, ad-hoc skips project context\n\
+        Omit <PROMPT> to read from stdin (`cat note.md | …`).")]
     Run {
         /// Vault root override · also accepts global `--vault`, and walks up from cwd when omitted.
         /// Ignored when `--mode ad-hoc`.
@@ -1067,10 +1074,18 @@ pub enum SkillVerb {
     /// List installed skills (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     List,
-    /// Run a OneBrain skill (`/onebrain:<name>`) in headless mode. Flags:
-    /// `--harness {claude,gemini}` · `--model <m>` (e.g. `claude-haiku-4-5`,
-    /// `gemini-2.5-flash`) · `--skill <name>` (parity alias for the positional
-    /// `<NAME>`) · `--arg key=value` (pass-through). Replaces v3.0 `run-skill`.
+    // v3.2.15: same flag-per-line treatment as `HarnessVerb::Run` — per user
+    // testing the dot-separated single-line form was too dense to scan under
+    // `skill --help`.
+    #[command(
+        about = "Run a OneBrain skill (`/onebrain:<name>`) in headless mode.\n\
+        Flags:\n  \
+          --harness {claude,gemini}\n  \
+          --model <m> (e.g. `claude-haiku-4-5`, `gemini-2.5-flash`)\n  \
+          --skill <name> (parity alias for the positional <NAME>)\n  \
+          --arg key=value (pass-through)\n\
+        Replaces v3.0 `run-skill`."
+    )]
     Run {
         /// Vault root override · also accepts global `--vault`, and walks up from cwd when omitted.
         #[arg(long = "vault-dir", value_name = "PATH", hide = true)]

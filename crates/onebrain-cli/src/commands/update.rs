@@ -90,7 +90,7 @@ pub fn run(check: bool, fresh: bool, json: bool, plan: bool, mode: &OutputMode) 
     Ok(result.exit_code)
 }
 
-/// TTY-mode `UpdateOptions`: a framed 🧠 header, colorized phase lines, and a
+/// TTY-mode `UpdateOptions`: a framed 🚀 header, colorized phase lines, and a
 /// braille spinner (matching `doctor`) on the two phases that take time —
 /// `fetch` (the version check, padded to a deliberate beat so it reads as real
 /// work even on a warm cache) and `install` (the real download). The install
@@ -101,7 +101,7 @@ fn build_tty_options(dry_run: bool, fresh: bool) -> UpdateOptions {
     let pb_cell: Arc<Mutex<Option<ProgressBar>>> = Arc::new(Mutex::new(None));
 
     // stdout sink — replace the plain "OneBrain Update" title with the framed
-    // 🧠 header, color the well-known phase lines, and route everything via the
+    // 🚀 header, color the well-known phase lines, and route everything via the
     // install spinner's `println` when one is active so output doesn't trample.
     let pb_for_stdout = Arc::clone(&pb_cell);
     let stdout_sink: Box<dyn FnMut(&str) + Send> = Box::new(move |line: &str| {
@@ -193,13 +193,17 @@ fn braille_spinner(msg: impl Into<String>) -> ProgressBar {
     pb
 }
 
-/// The framed 🧠 update header (shared layout with `doctor`), rendered to a
+/// The framed 🚀 update header (shared layout with `doctor`), rendered to a
 /// string for the stdout sink. The TTY path always has colour on.
+/// v3.2.15: emoji set differentiated per command (was 🧠 — collided with
+/// `doctor`'s 🧠 AND with the brand wordmark banner). `🚀` reads as
+/// "self-update / take off / fast release" for the CLI's own bump path;
+/// `doctor` now uses `🔬` (lab), `plugin update` uses `🔄` (sync).
 fn framed_update_header() -> String {
     let mut buf = Vec::new();
     let _ = crate::output::write_framed_header(
         &mut buf,
-        "🧠",
+        "🚀",
         "OneBrain Update",
         true,
         crate::output::RULE_WIDTH,
@@ -332,10 +336,13 @@ mod tests {
 
     #[test]
     fn render_stdout_line_frames_the_title() {
-        // The "OneBrain Update" title becomes the framed 🧠 header (two spaces
-        // after the glyph, full-width rules) — same layout as doctor's header.
+        // The "OneBrain Update" title becomes the framed 🚀 header (two spaces
+        // after the glyph, full-width rules) — same layout as doctor's header
+        // (v3.2.15: doctor uses 🔬, update uses 🚀, plugin update uses 🔄 —
+        // each command gets its own distinct glyph instead of the previous
+        // shared 🧠 that doubled as the brand banner).
         let out = render_stdout_line("OneBrain Update");
-        assert!(out.contains("🧠  OneBrain Update"), "framed title: {out:?}");
+        assert!(out.contains("🚀  OneBrain Update"), "framed title: {out:?}");
         assert!(out.contains('─'), "framed rule: {out:?}");
     }
 

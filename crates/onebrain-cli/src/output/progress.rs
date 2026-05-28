@@ -624,10 +624,10 @@ mod tests {
     #[test]
     fn framed_header_two_spaces_after_emoji_and_full_width_rules() {
         let mut buf = Vec::new();
-        write_framed_header(&mut buf, "🧠", "OneBrain Update", false, RULE_WIDTH).unwrap();
+        write_framed_header(&mut buf, "🚀", "OneBrain Update", false, RULE_WIDTH).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(
-            out.contains("🧠  OneBrain Update"),
+            out.contains("🚀  OneBrain Update"),
             "two spaces after emoji: {out:?}"
         );
         let lines: Vec<&str> = out.lines().collect();

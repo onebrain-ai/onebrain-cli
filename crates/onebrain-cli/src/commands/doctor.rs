@@ -1296,7 +1296,7 @@ fn render_grouped_report<W: Write>(
     // via the shared framed-header helper that `update` also uses.
     write_framed_header(
         &mut w,
-        "🧠",
+        "🔬",
         &format!("OneBrain Doctor · {vault_name}"),
         color,
         rule_width,
@@ -1319,7 +1319,7 @@ fn render_grouped_report<W: Write>(
 /// headers, check lines, hint `└` lines) and the header title, clamped to a
 /// [`RULE_WIDTH`] floor. Measured by rendering the body uncoloured to a buffer
 /// so ANSI escapes don't inflate the count; the body's glyphs (`✓ ⚠ ✗ └ ─`)
-/// are single-column, so a `char` count equals the display width. The 🧠 in the
+/// are single-column, so a `char` count equals the display width. The 🔬 in the
 /// header title renders as two columns, accounted for explicitly.
 fn doctor_rule_width(results: &[DoctorResult], vault_name: &str) -> usize {
     use crate::output::ProgressRenderer;
@@ -1336,7 +1336,7 @@ fn doctor_rule_width(results: &[DoctorResult], vault_name: &str) -> usize {
         .map(|l| l.chars().count())
         .max()
         .unwrap_or(0);
-    // Header line is ` 🧠  <title>`: 1 lead space + 2 emoji columns + 2 spaces.
+    // Header line is ` 🔬  <title>`: 1 lead space + 2 emoji columns + 2 spaces.
     let header_cols = 5 + format!("OneBrain Doctor · {vault_name}").chars().count();
     body_max.max(header_cols).max(RULE_WIDTH)
 }
@@ -1476,9 +1476,9 @@ mod tests {
     fn static_report_shows_header_section_labels_and_glyphs() {
         let out = render_static_report(&nine_check_results(), false);
         // Doctor's own header (distinct from the brand banner). Two spaces
-        // after the wide 🧠 glyph so the title doesn't butt against it.
+        // after the wide 🔬 glyph so the title doesn't butt against it.
         assert!(
-            out.contains("🧠  OneBrain Doctor · ob-1"),
+            out.contains("🔬  OneBrain Doctor · ob-1"),
             "header: {out:?}"
         );
         // Section headers.
