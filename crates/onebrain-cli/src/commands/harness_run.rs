@@ -51,6 +51,7 @@ pub fn run(
     prompt: Option<&str>,
     harness: HarnessArg,
     model: Option<&str>,
+    want_json: bool,
 ) -> Result<i32> {
     use std::io::IsTerminal;
 
@@ -104,7 +105,13 @@ pub fn run(
     }
 
     let context_str = context_dir.map(|p| p.to_string_lossy().into_owned());
-    let argv = harness_argv(harness, &resolved_prompt, context_str.as_deref(), model);
+    let argv = harness_argv(
+        harness,
+        &resolved_prompt,
+        context_str.as_deref(),
+        model,
+        want_json,
+    );
     spawn_harness(&resolution.path, &argv, cwd, harness, "the prompt")
 }
 
@@ -134,6 +141,7 @@ mod tests {
             Some("hi"),
             HarnessArg::Claude,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(code, 78);
@@ -151,6 +159,7 @@ mod tests {
             Some("   "),
             HarnessArg::Claude,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(code, 64);
@@ -162,7 +171,15 @@ mod tests {
     fn ad_hoc_skips_vault_check_and_still_validates_prompt() {
         let dir = tempdir().unwrap();
         // No onebrain.yml. With-context would return 78; ad-hoc must NOT.
-        let code = run(dir.path(), None, Some("   "), HarnessArg::Claude, None).unwrap();
+        let code = run(
+            dir.path(),
+            None,
+            Some("   "),
+            HarnessArg::Claude,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             code, 64,
             "ad-hoc should reach the empty-prompt branch (64), not the vault check (78)"

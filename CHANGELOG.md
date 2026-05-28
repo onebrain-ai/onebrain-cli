@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.9
+latest_version: 3.2.10
 released: 2026-05-28
 ---
 
@@ -11,6 +11,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.10] — 2026-05-28 — `skill info` / `skill help`, harness/skill UX polish, `--json` passthrough
+
+- **Feat: `onebrain skill info <NAME>`** — print a skill's frontmatter (name · description · schedulable · required_args). JSON / YAML modes supported (`--json` / `--yaml`); text mode renders key:value lines. Previously stubbed.
+- **Feat: `onebrain skill help <NAME>`** — print the SKILL.md body (the human-readable workflow). Text mode dumps the markdown verbatim; `--json` wraps as `{"name":...,"body":...}`. Previously stubbed. Exit codes mirror the standard: 64 (empty name), 66 (missing skill), 78 (no vault), 65 (malformed YAML).
+- **Feat: `--json` on `skill run` / `harness run` passes through to the harness** — maps to `claude --output-format json` / `gemini --output-format json` so the captured stdout is the harness's native structured response (tool calls, metadata) instead of free text.
+- **Polish: `onebrain harness` (no verb) now prints help instead of silently running `detect`** — drops the v3.0 flat-form back-compat. Use `onebrain harness detect` explicitly (or any other verb). `arg_required_else_help = true` does the work.
+- **Polish: `harness run` description rewritten** to drop the now-stale `/onebrain:<skill>` cross-reference and surface the `--harness` / `--model` / `--mode` flags inline in the summary so they show in `harness --help` at the group level. Same treatment for `skill run`. The `harness` command `about` is now "Detect or run an AI harness (claude / gemini)" (was misleading "Detect Claude Code runtime" — predated `harness run`).
 
 ## [3.2.9] — 2026-05-28 — `harness run` polish: spinner subject + true ad-hoc
 

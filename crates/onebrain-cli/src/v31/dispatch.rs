@@ -247,26 +247,38 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 // 64 when no vault is found anywhere.
                 let resolved = crate::vault_ctx::require(vault_dir.or(vault_flag.clone()))?;
                 let vault = resolved.root.as_path().to_string_lossy();
+                let want_json = matches!(mode, OutputMode::Json { .. });
                 let code = commands::run_skill::run(
                     &vault,
                     &skill_name,
                     &args,
                     harness,
                     model.as_deref(),
+                    want_json,
                 )?;
                 std::process::exit(code);
             }
             SkillVerb::List => stubs::not_implemented("skill list"),
             SkillVerb::Bootstrap { .. } => stubs::not_implemented("skill bootstrap"),
-            SkillVerb::Help { .. } => stubs::not_implemented("skill help"),
-            SkillVerb::Info { .. } => stubs::not_implemented("skill info"),
+            SkillVerb::Help { name } => {
+                let resolved = crate::vault_ctx::require(vault_flag.clone())?;
+                let code =
+                    commands::skill_inspect::help_run(resolved.root.as_path(), &name, &mode)?;
+                std::process::exit(code);
+            }
+            SkillVerb::Info { name } => {
+                let resolved = crate::vault_ctx::require(vault_flag.clone())?;
+                let code =
+                    commands::skill_inspect::info_run(resolved.root.as_path(), &name, &mode)?;
+                std::process::exit(code);
+            }
         },
 
         // ───── Harness (1-verb · accepted exception) ────────────────
         // Missing verb → silently treat as `detect` for v3.0 back-compat
         // (`onebrain harness` with no verb was the only v3.0 flat invocation
         // remaining after the v3.1 tree rename).
-        Cmd::Harness(HarnessCmd { verb }) => match verb.unwrap_or(HarnessVerb::Detect) {
+        Cmd::Harness(HarnessCmd { verb }) => match verb {
             HarnessVerb::Detect => commands::harness::run(&mode),
             HarnessVerb::Run {
                 vault_dir,
@@ -297,12 +309,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         None,
                     ),
                 };
+                let want_json = matches!(mode, OutputMode::Json { .. });
                 let code = commands::harness_run::run(
                     &cwd,
                     context_dir.as_deref(),
                     prompt.as_deref(),
                     harness,
                     model.as_deref(),
+                    want_json,
                 )?;
                 std::process::exit(code);
             }
@@ -529,6 +543,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 &a.args,
                 crate::cli::HarnessArg::Claude,
                 None,
+                /* want_json */ false,
             )?;
             std::process::exit(code);
         }

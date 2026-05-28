@@ -12,7 +12,7 @@ fn fixture(name: &str) -> PathBuf {
 fn empty_dir_emits_direct_json() {
     Command::cargo_bin("onebrain")
         .unwrap()
-        .args(["harness", "--json"])
+        .args(["harness", "detect", "--json"])
         .current_dir(fixture("empty"))
         .env_remove("ONEBRAIN_HARNESS")
         .assert()
@@ -24,7 +24,7 @@ fn empty_dir_emits_direct_json() {
 fn claude_dir_emits_claude_json() {
     Command::cargo_bin("onebrain")
         .unwrap()
-        .args(["harness", "--json"])
+        .args(["harness", "detect", "--json"])
         .current_dir(fixture("with_claude"))
         .env_remove("ONEBRAIN_HARNESS")
         .assert()
@@ -36,7 +36,7 @@ fn claude_dir_emits_claude_json() {
 fn both_dirs_emit_claude_first_json() {
     Command::cargo_bin("onebrain")
         .unwrap()
-        .args(["harness", "--json"])
+        .args(["harness", "detect", "--json"])
         .current_dir(fixture("with_both"))
         .env_remove("ONEBRAIN_HARNESS")
         .assert()
@@ -53,7 +53,7 @@ fn both_dirs_emit_claude_first_json() {
 fn default_mode_is_text_not_json() {
     Command::cargo_bin("onebrain")
         .unwrap()
-        .arg("harness")
+        .args(["harness", "detect"])
         .current_dir(fixture("empty"))
         .env_remove("ONEBRAIN_HARNESS")
         .assert()
@@ -67,7 +67,7 @@ fn default_mode_is_text_not_json() {
 fn yaml_mode_emits_yaml_not_json() {
     Command::cargo_bin("onebrain")
         .unwrap()
-        .args(["harness", "--yaml"])
+        .args(["harness", "detect", "--yaml"])
         .current_dir(fixture("with_claude"))
         .env_remove("ONEBRAIN_HARNESS")
         .assert()
@@ -80,7 +80,7 @@ fn yaml_mode_emits_yaml_not_json() {
 fn pretty_json_is_indented_multiline() {
     let assert = Command::cargo_bin("onebrain")
         .unwrap()
-        .args(["harness", "--json", "--pretty"])
+        .args(["harness", "detect", "--json", "--pretty"])
         .current_dir(fixture("with_claude"))
         .env_remove("ONEBRAIN_HARNESS")
         .assert()

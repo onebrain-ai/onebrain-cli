@@ -209,7 +209,7 @@ fn top_level_help_is_production_grade() {
         "Vault operations (sync · current)",
         "Session lifecycle (init)",
         "Auto-save management (stop · reset · orphans)",
-        "Detect Claude Code runtime",
+        "Detect or run an AI harness (claude / gemini)",
         "Plugin lifecycle + hook rewriter",
         "launchd schedule management",
         "Skill invocation",
@@ -725,14 +725,15 @@ fn yaml_output_matches_envelope_keys() {
 }
 
 #[test]
-fn harness_flat_invocation_still_works() {
-    // v3.0 back-compat: `onebrain harness` (no verb) silently becomes
-    // `harness detect`.
+fn harness_flat_invocation_now_shows_help() {
+    // v3.2.10: dropped the v3.0 silent-`detect` back-compat. `onebrain harness`
+    // (no verb) now prints help and exits — the documented intent. The
+    // help-on-missing-subcommand exit is non-zero, hence `failure()`.
     Command::cargo_bin("onebrain")
         .unwrap()
         .args(["harness"])
         .assert()
-        .success();
+        .failure();
 }
 
 #[test]

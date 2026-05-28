@@ -70,7 +70,7 @@ const COMMANDS: &[Cmd<'static>] = &[
     },
     Cmd {
         name: "harness · empty dir",
-        args: &["harness"],
+        args: &["harness", "detect"],
         // No setup — empty cwd → `direct` harness detected.
         cwd_setup: no_setup,
         hook_protocol_shape: true,
