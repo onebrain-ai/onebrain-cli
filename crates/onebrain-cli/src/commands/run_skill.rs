@@ -154,52 +154,112 @@ fn spawn_harness(bin: &Path, argv: &[String], vault: &Path, harness: HarnessArg)
 
     // Interactive: the harness runs a full headless agent session (plugin load,
     // startup, the skill's own work, LLM inference) and buffers its result
-    // until done — often tens of seconds. Spawn it non-blocking and emit an
-    // elapsed heartbeat on stderr so the terminal doesn't look frozen. We use
-    // plain stderr lines (not a `\r` spinner) so they never clobber the
-    // harness's stdout output when it finally flushes.
-    // The child always has a null stdin (see module docs), so a harness can
-    // never answer an approval prompt — gemini runs with `--approval-mode
-    // yolo`. Make that explicit on a watched run so it isn't a surprise.
+    // until done — often tens of seconds. We pipe its stdout/stderr, show an
+    // in-place `indicatif` spinner during the wait, then dump the captured
+    // streams once on exit.
+    //
+    // ASSUMES: `claude -p` and `gemini -p` are buffered-flush-at-end (no
+    // real-time streaming in their headless modes today). Capturing therefore
+    // loses nothing visible and removes the spinner-vs-flush race that was the
+    // v3.2.4 tradeoff that turned the wait into a wall of "still running"
+    // newlines. If a future harness version starts streaming via `-p`, this
+    // branch will swallow that streaming until exit — revisit then.
+    //
+    // The child has a null stdin (see module docs), so a harness can never
+    // answer an approval prompt — gemini runs with `--approval-mode yolo`.
+    // Note that explicitly on a watched run so it isn't a surprise.
+    use indicatif::{ProgressBar, ProgressStyle};
+    use std::io::{Read, Write};
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
     let approval_note = match harness {
         HarnessArg::Gemini => " (auto-approving tools)",
         HarnessArg::Claude => "",
     };
-    eprintln!(
-        "▶ Running {label} on the skill headlessly{approval_note} — output appears when it completes."
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg} · {elapsed}")
+            .expect("static template is valid")
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
     );
+    spinner.set_message(format!(
+        "Running {label} on the skill headlessly{approval_note}"
+    ));
+    spinner.enable_steady_tick(std::time::Duration::from_millis(120));
+
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
+            spinner.finish_and_clear();
             eprintln!("Failed to spawn {label} ({}): {e}", bin.display());
             return Ok(127);
         }
     };
-    let started = std::time::Instant::now();
-    let mut next_beat = std::time::Duration::from_secs(10);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(translate_exit(&status)),
-            Ok(None) => {
-                if started.elapsed() >= next_beat {
-                    eprintln!("  … still running ({}s)", started.elapsed().as_secs());
-                    next_beat += std::time::Duration::from_secs(10);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(250));
-            }
-            Err(e) => {
-                // Couldn't observe the child — a harness/OS fault, not a skill
-                // failure, so use 127 (the "couldn't run it properly" class)
-                // rather than 1 (which reads as "the skill ran and failed").
-                // kill+wait reaps the child; this may truncate any output it was
-                // mid-flush on, but we can no longer track it reliably.
-                eprintln!("waiting on {label} failed: {e}");
-                let _ = child.kill();
-                let _ = child.wait();
-                return Ok(127);
-            }
+
+    // Drain both pipes on spawned threads (avoids the pipe-deadlock that
+    // `wait_with_output` handles internally) while we keep the child handle.
+    // That way, if `child.wait()` later errors with the child still running,
+    // we can still `kill()` + `wait()` — `wait_with_output` consumes the
+    // handle and would leak an orphan harness still burning API tokens.
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .expect("stdout was piped, must be present");
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .expect("stderr was piped, must be present");
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let status = match child.wait() {
+        Ok(s) => s,
+        Err(e) => {
+            // Couldn't observe the child — a harness/OS fault, not a skill
+            // failure, so 127 (the "couldn't run it properly" class) rather
+            // than 1. kill+wait reaps the child so it doesn't keep running
+            // (and burning API tokens) after we return.
+            spinner.finish_and_clear();
+            eprintln!("waiting on {label} failed: {e}");
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(127);
         }
+    };
+    let stdout_bytes = stdout_thread.join().unwrap_or_default();
+    let stderr_bytes = stderr_thread.join().unwrap_or_default();
+    spinner.finish_and_clear();
+
+    // Flush captured streams in the natural order: stderr first (warnings,
+    // YOLO note), then stdout (the actual result). Raw `write_all` so any
+    // ANSI colour the harness emitted (when it kept colour despite the pipe)
+    // reaches the terminal verbatim. Errors are swallowed — the run already
+    // completed; a downstream pipe closing after success shouldn't flip the
+    // exit code. Explicit `flush` covers the block-buffered piped-stdout case
+    // (e.g. `onebrain skill run … | tee log`).
+    {
+        let stderr = std::io::stderr();
+        let mut handle = stderr.lock();
+        let _ = handle.write_all(&stderr_bytes);
+        let _ = handle.flush();
     }
+    {
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        let _ = handle.write_all(&stdout_bytes);
+        let _ = handle.flush();
+    }
+
+    Ok(translate_exit(&status))
 }
 
 #[cfg(unix)]

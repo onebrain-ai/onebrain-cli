@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.6
+latest_version: 3.2.7
 released: 2026-05-28
 ---
 
@@ -11,6 +11,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.7] — 2026-05-28 — `skill run` in-place spinner (no more heartbeat scrollback)
+
+- **UX: `skill run` shows an in-place `indicatif` spinner on a watched run** — replaces the per-10s "still running (Ns)" newline heartbeat (which flooded scrollback during long runs) with a single ticking spinner line that updates in place: `⠋ Running claude on the skill headlessly · 23s`. Cleared on completion before the harness's output prints, so nothing ever overlaps the spinner.
+- **Internal: pipe the harness's stdout/stderr into in-process buffers via two reader threads while `child.wait()` blocks** (keeping the child handle so a `wait()` error can still `kill()` + `wait()` the harness instead of leaking an orphan that keeps burning API tokens). The captured streams flush once on exit, with `flush()` to handle piped stdout (`onebrain skill run … | tee log`). `claude -p` / `gemini -p` already buffer-flush-at-end (no real-time streaming), so capturing loses nothing — and it removes the v3.2.4 spinner-vs-flush race that originally forced the plain-newline heartbeat. Non-interactive runs (launchd scheduler, piped, CI) keep inherited stdio + blocking `command.status()` — quiet logs, no spinner.
 
 ## [3.2.6] — 2026-05-28 — `skill run` harness + model selection · faster headless runs
 

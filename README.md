@@ -232,23 +232,14 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
 
 > Directional — themes are committed, timing flexes with the weekly-minor cadence (≈ one themed minor per week). The live public roadmap is at [onebrain.run](https://onebrain.run).
 
+> Major/minor only — see [CHANGELOG](CHANGELOG.md) for per-patch detail.
+
 ### ✅ Shipped
 - [x] **v3.0** — Rust rewrite GA · 9-platform release pipeline · stable JSON contracts.
-- [x] **v3.1.0** — Consistency standard: locked `<noun> <verb>` command tree · canonical `Envelope` output · branded banner · `vault.yml → onebrain.yml`.
-- [x] **v3.1.1** — Config-loss fix (`init --force` no longer clobbers config) + timestamped config backups · doctor `onebrain.yml` labels + animated TTY · `qmd status`.
-- [x] **v3.1.2** — `onebrain qmd embed` implemented.
-- [x] **v3.1.3** — `schedule register` dual-reads `onebrain.yml`.
-- [x] **v3.1.4** — Self-update hardening: SHA-256 verification of the downloaded binary before swap + Homebrew-aware `onebrain update` (delegates to `brew upgrade`). Cosign/signature verification remains a follow-up.
-- [x] **v3.1.5** — `onebrain update` validation fix: accepts clap's bare `--version` output (was a false "Binary validation failed" on every upgrade) and now confirms the on-PATH binary reports the just-installed version (catches no-op `brew upgrade` / PATH shadowing) with specific failure messages.
+- [x] **v3.1** — Consistency standard: locked `<noun> <verb>` command tree · canonical `Envelope` output · branded banner · `vault.yml → onebrain.yml` · `qmd embed` · `schedule register` `onebrain.yml` support · self-update hardening (SHA-256 verify + Homebrew-aware).
 
 ### 🚧 Phase 1 · perceptual speed + skill alignment (v3.2–v3.7)
-- [x] **v3.2.0** — `note` resource group (11 verbs: `search` · `list` · `find` · `read` · `stat` · `backlinks` · `orphans` · `append` · `new` · `archive` · `move`) — native vault note ops replacing ad-hoc `grep` / `ls` / `find` / `cat`; canonical `Envelope`, vault-required, transactional `move` with vault-wide wikilink rewrite.
-- [x] **v3.2.1** — `doctor` grouped UX: 9 checks bucketed into 4 sections under a `🧠 OneBrain Doctor` header via a reusable braille-spinner progress primitive + verdict footer · qmd-hook detector recognizes both `qmd reindex` and the legacy `qmd-reindex` form (`--fix` migrates + dedups) · banner logo gradient.
-- [x] **v3.2.2** — Animated `onebrain update` (framed header + braille spinner on fetch/install, the version check padded to a visible beat) · banner vertical gradient + vertical-only mono fallback · `doctor` spinner now rotates and paces per check. Shared header/spinner/pacing primitives across `doctor` + `update`.
-- [x] **v3.2.3** — `skill run` walk-up from cwd (runs inside a vault without an explicit path) + null-stdin headless hardening · global `--vault` now accepted on every command (`skill run` / `schedule register` / `plugin migrate` had a `--vault-dir` field-name collision suppressing it) · `doctor` stamps `stats.last_doctor_run` (+ `last_doctor_fix` on `--fix`).
-- [x] **v3.2.4** — doctor `--fix` UX overhaul (one pass · planned-fix preview · `[y/N]` confirm · single footer · creates missing folders · no misleading prompt for manual-only issues) · qmd check timeout 3 s → 15 s · frame rules widen to span the longest line · `skill run` elapsed heartbeat + `--skill` alias · `--vault-dir` hidden (only `--vault` documented).
-- [x] **v3.2.5** — auto-checkpoint hook actually fires: `CLAUDE_CODE_SESSION_ID` is now the top-priority session token (stable across PID churn · distinct sessions sharing one terminal in agent-teams mode no longer collide · works on every host incl. Obsidian terminal + Claude Desktop) · the 30-min time threshold is no longer dead for a session's first checkpoint (`last_ts` anchored on the first stop).
-- [x] **v3.2.6** — `skill run --harness {claude,gemini}` + `--model <m>` (pick the runtime and a faster model per run) · headless runs skip the interactive startup ceremony via an `ONEBRAIN_HEADLESS` → `session init` `headless:true` handshake (needs the matching plugin update).
+- [x] **v3.2** — `note` resource group (11 verbs) · grouped `doctor` UX with braille spinner + one-pass `--fix` · animated `onebrain update` · `skill run --harness {claude,gemini}` + `--model <m>` + headless startup-skip handshake + in-place spinner · auto-checkpoint hook fix (`CLAUDE_CODE_SESSION_ID` top-priority token + anchored `last_ts` so the time threshold actually fires) · `--vault` accepted everywhere.
 - [ ] **v3.3** — Daemon foundation: `onebrain daemon start/stop/status` + structured logging.
 - [ ] **v3.4** — RPC layer: stdio JSON-RPC 2.0 over a Unix socket with auto-spawn.
 - [ ] **v3.5** — Skill-speed rewrites (`/daily`, `/wrapup`) + `checkpoint recover`.
