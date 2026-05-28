@@ -69,7 +69,7 @@ pub fn run(
 
     // Skills always run with-context: --add-dir / --include-directories the vault.
     let argv = harness_argv(harness, &prompt, Some(vault), model);
-    spawn_harness(&resolution.path, &argv, &vault_path, harness)
+    spawn_harness(&resolution.path, &argv, &vault_path, harness, "the skill")
 }
 
 /// Build the argv (after the binary name) for the chosen harness. Pure so the
@@ -136,11 +136,16 @@ fn parse_args(raw: &[String]) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
+/// Spawn the chosen harness binary on the prepared argv. Shared by `skill run`
+/// and `harness run` — `subject` is the noun in the spinner message
+/// ("the skill" vs "the prompt") so the watched-run UI matches whichever
+/// command the user invoked.
 pub(crate) fn spawn_harness(
     bin: &Path,
     argv: &[String],
-    vault: &Path,
+    cwd: &Path,
     harness: HarnessArg,
+    subject: &str,
 ) -> Result<i32> {
     use std::io::IsTerminal;
     let label = harness.as_str();
@@ -153,7 +158,7 @@ pub(crate) fn spawn_harness(
     let mut command = Command::new(bin);
     command
         .args(argv)
-        .current_dir(vault)
+        .current_dir(cwd)
         .env("ONEBRAIN_HEADLESS", "1")
         .stdin(Stdio::null());
 
@@ -202,7 +207,7 @@ pub(crate) fn spawn_harness(
             .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
     );
     spinner.set_message(format!(
-        "Running {label} on the skill headlessly{approval_note}"
+        "Running {label} on {subject} headlessly{approval_note}"
     ));
     spinner.enable_steady_tick(std::time::Duration::from_millis(120));
 
@@ -464,7 +469,7 @@ mod tests {
         }
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         let argv = vec!["-p".to_string(), "/daily".to_string()];
-        let code = spawn_harness(&stub, &argv, dir.path(), HarnessArg::Claude).unwrap();
+        let code = spawn_harness(&stub, &argv, dir.path(), HarnessArg::Claude, "the test").unwrap();
         assert_eq!(code, 43, "child should see EOF on a null stdin, not block");
     }
 }

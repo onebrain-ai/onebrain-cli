@@ -276,7 +276,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 model,
             } => {
                 use crate::cli::HarnessMode;
-                use anyhow::Context as _;
                 // with-context: require vault, cwd = vault, --add-dir vault.
                 // ad-hoc: no vault, cwd = $PWD, no --add-dir.
                 let (cwd, context_dir) = match harness_mode {
@@ -286,7 +285,15 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                         (v.clone(), Some(v))
                     }
                     HarnessMode::AdHoc => (
-                        std::env::current_dir().context("read current directory")?,
+                        // Force a neutral cwd ($TMPDIR) so claude / gemini
+                        // can't walk up from a vault subdir to find
+                        // OneBrain's CLAUDE.md / GEMINI.md. v3.2.8 used $PWD
+                        // and documented the cwd-auto-load caveat, but a user
+                        // invoking ad-hoc from inside their vault still got
+                        // full OneBrain context — defeating the mode. User-
+                        // level config (`~/.claude/CLAUDE.md`) loads via its
+                        // own path and is unaffected by this cwd.
+                        std::env::temp_dir(),
                         None,
                     ),
                 };

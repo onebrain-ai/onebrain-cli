@@ -515,12 +515,13 @@ pub enum HarnessMode {
     /// Requires a vault.
     #[default]
     WithContext,
-    /// No `--add-dir` / `--include-directories` flag, `cwd` is the current
-    /// working directory — the harness answers the prompt with no OneBrain
-    /// vault context attached. Does not require a vault. (Note: claude / gemini
-    /// may still auto-load any `CLAUDE.md` / `GEMINI.md` they find by walking
-    /// up from `cwd`; for full isolation, run from a directory outside any
-    /// vault — e.g. `cd ~ && onebrain harness run --mode ad-hoc "..."`.)
+    /// No `--add-dir` / `--include-directories` flag, and `cwd` is forced to
+    /// `$TMPDIR` so claude / gemini can't auto-walk-up from a vault subdir
+    /// and silently re-load OneBrain's `CLAUDE.md` / `GEMINI.md`. The harness
+    /// answers the prompt with no OneBrain vault context attached, regardless
+    /// of where the user invoked from. Does not require a vault. (User-level
+    /// config at `~/.claude/CLAUDE.md` still loads — that's separate from the
+    /// cwd-based project context.)
     AdHoc,
 }
 

@@ -10,11 +10,13 @@
 //!   `--include-directories <vault>` so the harness loads OneBrain's
 //!   `CLAUDE.md` / `INSTRUCTIONS.md` / `GEMINI.md`. Vault required (exit 78
 //!   if `onebrain.yml` is missing under `context_dir`).
-//! - **ad-hoc** — `cwd = $PWD`, no `--add-dir` / `--include-directories`. The
-//!   harness answers the prompt with no OneBrain vault context attached. No
-//!   vault required. (`claude` / `gemini` may still auto-load any `CLAUDE.md`
-//!   / `GEMINI.md` they find by walking up from `cwd`; full isolation needs
-//!   `cd ~ && onebrain harness run --mode ad-hoc "..."`.)
+//! - **ad-hoc** — `cwd = $TMPDIR` (forced, so claude / gemini can't auto-walk-
+//!   up from a vault subdir and silently re-load OneBrain's `CLAUDE.md` /
+//!   `GEMINI.md`); no `--add-dir` / `--include-directories`. The harness
+//!   answers the prompt with no OneBrain vault context attached, regardless
+//!   of where the user invoked from. No vault required. (User-level config at
+//!   `~/.claude/CLAUDE.md` still loads — that's separate from cwd-based
+//!   project context.)
 //!
 //! Reads the prompt from stdin when the positional `<PROMPT>` is omitted, so
 //! the command composes with `cat note.md | onebrain harness run --harness
@@ -103,7 +105,7 @@ pub fn run(
 
     let context_str = context_dir.map(|p| p.to_string_lossy().into_owned());
     let argv = harness_argv(harness, &resolved_prompt, context_str.as_deref(), model);
-    spawn_harness(&resolution.path, &argv, cwd, harness)
+    spawn_harness(&resolution.path, &argv, cwd, harness, "the prompt")
 }
 
 /// Read the prompt from stdin. Errors only on a real IO failure — an empty

@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.8
+latest_version: 3.2.9
 released: 2026-05-28
 ---
 
@@ -11,6 +11,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.9] — 2026-05-28 — `harness run` polish: spinner subject + true ad-hoc
+
+- **Fix: `--mode ad-hoc` now actually skips vault context.** v3.2.8 used `cwd = $PWD`, which let `claude` / `gemini` auto-walk-up from a vault subdir and silently re-load OneBrain's `CLAUDE.md` / `GEMINI.md` — running ad-hoc from inside the vault still returned the OneBrain agent name and persona, defeating the mode. Now forces `cwd = $TMPDIR` so ad-hoc means ad-hoc regardless of where the user invoked from. User-level config (`~/.claude/CLAUDE.md`) still loads — that is separate from cwd-based project context.
+- **Polish: `harness run` watched spinner now says "on the prompt" instead of "on the skill"** — copy-paste leak from `skill run`. The shared `spawn_harness` helper now takes a `subject: &str` parameter so each command labels itself correctly (`skill run` → "the skill", `harness run` → "the prompt"). Internal-only API change.
 
 ## [3.2.8] — 2026-05-28 — `onebrain harness run` (ad-hoc prompts through claude / gemini)
 
