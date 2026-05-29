@@ -39,3 +39,15 @@ fn completions_rejects_unknown_shell() {
         .assert()
         .failure();
 }
+
+#[test]
+fn init_yes_does_not_print_completions_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes", "--no-sync"])
+        .current_dir(tmp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Shell completions").not());
+}
