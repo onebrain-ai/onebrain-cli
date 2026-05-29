@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.17
+latest_version: 3.2.18
 released: 2026-05-29
 ---
 
@@ -11,6 +11,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.18] — 2026-05-29 — dependency + size cleanup (reqwest→ureq · serde_yaml_ng · async-stack drop)
+
+- **Perf/size: `reqwest` → `ureq` (blocking sync HTTP).** The 4 GitHub/tarball fetch sites (`update` · `vault-sync`) now use `ureq`, which carries no async runtime. This removes the entire async stack — `tokio` · `hyper` · `h2` · `tower` · `tower-http` · `hyper-rustls` · `tokio-rustls` · `hyper-util` — from the release binary (all pulled in only by reqwest). TLS stays rustls. Result: **−342 KB** binary (3.34 → 3.01 MB) · **−54 crates** (178 → 124) · **~12% faster clean build** (41.0s → 36.2s). Runtime of everyday commands is unchanged — they never made HTTP calls, and these fetch paths are network-bound.
+- **Internal: removed the dead `tokio_helper` runtime shim.** It was reserved for "future async commands (v3.1+ serve)" with zero callers and was the only direct `tokio` user, so dropping it lets the async stack leave entirely. The daemon (v3.3) re-introduces `tokio` deliberately for its async RPC server.
+- **Dep: `serde_yaml` (archived/unmaintained upstream) → `serde_yaml_ng`** via a package-rename alias — an actively-maintained drop-in, zero code changes.
+- **Internal: dropped the unused `clap` `env` feature** (no `#[arg(env)]` anywhere in the tree).
+- **Internal: unified the two `plugin update` text renderers** into one `render_plugin_update_inner`, removing the `PluginUpdateTextData` trait that existed only to make the static renderer generic over a test double (−~80 LOC · Code-Simplifier finding on PR #57).
+- **Internal: renamed `vault_sync::run_silent` + `register_schedule::run_quiet` → both `run_embedded`** — same intent (the embedded-from-plugin-update entry point), now a consistent name (Consistency reviewer finding on PR #57).
 
 ## [3.2.17] — 2026-05-29 — `onebrain update`: refresh Homebrew tap before upgrade + dedicated npm channel
 

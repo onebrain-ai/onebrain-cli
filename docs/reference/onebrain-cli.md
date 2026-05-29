@@ -1,7 +1,7 @@
 # onebrain-cli
 
 ## Purpose & dependencies
-`onebrain-cli` is the binary crate at the top of the OneBrain CLI workspace — it owns everything between `argv` and a process exit code. It parses the locked v3.1 `<noun> <verb>` command tree (`clap`), dispatches each verb to a handler, renders results through the canonical `Envelope<T>` + `serialize_for_mode` output stack across five output modes (text/json/yaml/table/tsv), prints the TTY-only branded banner, resolves the active vault, and centralises `CoreError → exit code` mapping. It also carries the v3.0→v3.1 migration layer: hidden aliases that emit a one-time rename notice before dispatching, a `.claude/settings.json` hook-path rewriter, and `E_NOT_IMPLEMENTED` stubs for the forward-declared command surface. Depends on **all three** in-workspace library crates — `onebrain-core` (config, `CoreError`, vault resolution, scheduler model), `onebrain-fs` (init, vault-sync, register-hooks, doctor checks, update, harness detection), `onebrain-cache` (session token, checkpoint stop/reset, qmd queries) — plus `clap`, `anyhow`, `serde`, `serde_json`, `serde_yaml`, `chrono`, `tokio`, `indicatif`, `dirs`. Nothing in-workspace depends on it.
+`onebrain-cli` is the binary crate at the top of the OneBrain CLI workspace — it owns everything between `argv` and a process exit code. It parses the locked v3.1 `<noun> <verb>` command tree (`clap`), dispatches each verb to a handler, renders results through the canonical `Envelope<T>` + `serialize_for_mode` output stack across five output modes (text/json/yaml/table/tsv), prints the TTY-only branded banner, resolves the active vault, and centralises `CoreError → exit code` mapping. It also carries the v3.0→v3.1 migration layer: hidden aliases that emit a one-time rename notice before dispatching, a `.claude/settings.json` hook-path rewriter, and `E_NOT_IMPLEMENTED` stubs for the forward-declared command surface. Depends on **all three** in-workspace library crates — `onebrain-core` (config, `CoreError`, vault resolution, scheduler model), `onebrain-fs` (init, vault-sync, register-hooks, doctor checks, update, harness detection), `onebrain-cache` (session token, checkpoint stop/reset, qmd queries) — plus `clap`, `anyhow`, `serde`, `serde_json`, `serde_yaml`, `chrono`, `indicatif`, `dirs`. Nothing in-workspace depends on it.
 
 ## Module map
 ```
@@ -14,7 +14,6 @@ src/
 ├── safety.rs            refuse_dangerous_vault_path guard for FS-mutating commands
 ├── migration.rs         v3.0→v3.1 one-time rename notice (state file + suppression env)
 ├── legacy_output.rs     SessionInitOutput/Block byte-stable shapes + serialize_for_mode
-├── tokio_helper.rs      on-demand tokio runtime (reserved for v3.1+ async verbs)
 ├── output/
 │   ├── mod.rs           output stack root · re-exports Envelope/emit/OutputMode/TtyInputs
 │   ├── envelope.rs      canonical Envelope<T> {version,command,ok,vault,data,warnings,error}
@@ -107,9 +106,6 @@ Byte-stable v3.0 output shapes + the structured-mode serializer shared by the ho
 **Key types** — `SessionInitOutput {datetime, session_token, qmd_unembedded}` (Bun v2.3.3 byte-parity); `SessionInitBlock {decision, reason, error_detail}` with `init_required()` (`onebrain-vault-not-found`) and `vault_malformed(detail)` (`onebrain-vault-malformed`) constructors.
 **Key functions** — `serialize_for_mode<T>(value, mode) -> String` — JSON (compact/pretty), YAML, Table/Tsv→compact-JSON fallback; Text-mode arrival is a caller bug (`debug_assert!`, compact-JSON fallback in release). Serde failures are loud on stderr (avoids the v3.0 empty-stdout regression).
 **Connections** — called by: `session_init`, `orphan_scan`, `harness`, `qmd_status`, `update`, `doctor`.
-
-### `src/tokio_helper.rs`
-On-demand multi-thread tokio runtime, `run_async<F>(future) -> F::Output`. Dead-code-allowed; reserved for future async verbs (`serve`, gateways) so adding them won't restructure `main`. **Connections** — none yet.
 
 ## `output/` — rendering & the Envelope
 Every v3.1 command body builds typed `data`, wraps it in an `Envelope<T>`, and hands it to `dispatcher::emit`, which picks the serializer from the `OutputMode` resolved from CLI flags + env + TTY state. The envelope is the canonical machine contract; the legacy hook-protocol commands instead use `legacy_output::serialize_for_mode` for their byte-stable shapes.

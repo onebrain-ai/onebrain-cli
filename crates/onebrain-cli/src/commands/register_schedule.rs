@@ -55,7 +55,7 @@ pub fn run(
 /// Returns `Ok(0)` when `onebrain.yml` has no `schedule:` entries (a
 /// well-formed no-op, NOT an error). `Ok(N)` where `N == entries.len()`
 /// on a successful registration pass. Errors bubble up via `?` as usual.
-pub fn run_quiet(vault: Option<PathBuf>, dry_run: bool, refresh: bool) -> Result<usize> {
+pub fn run_embedded(vault: Option<PathBuf>, dry_run: bool, refresh: bool) -> Result<usize> {
     run_with(vault, dry_run, false, refresh, None, false, None, true)
 }
 

@@ -16,7 +16,7 @@
 //!
 //! All four external IO surfaces are injectable through `UpdateOptions` so
 //! the unit + integration tests run offline. Defaults call out to the real
-//! environment via `reqwest::blocking` and `std::process::Command`.
+//! environment via `ureq` and `std::process::Command`.
 //!
 //! v3.0 ships non-TTY output only — TTY spinner / colored output is deferred
 //! to v3.0.1 (no `picocolors` / `cli-banner` equivalent in tree yet).
@@ -171,9 +171,8 @@ const HTTP_TIMEOUT_SECS: u64 = 15;
 /// the call from ~200 ms to ~5 ms.
 const RELEASE_CACHE_TTL: Duration = Duration::from_secs(3600);
 
-/// User-Agent. reqwest requires a non-empty UA for the GitHub API otherwise
-/// the API returns 403. Use a stable string the v3 release pipeline can
-/// audit.
+/// User-Agent. The GitHub API rejects requests that send no User-Agent
+/// (HTTP 403), so set a stable string the v3 release pipeline can audit.
 const USER_AGENT: &str = "onebrain-cli/3.0";
 
 // ---------------------------------------------------------------------------
@@ -246,22 +245,29 @@ pub fn default_fetch_latest_release(fresh: bool) -> Result<ReleaseInfo, UpdateEr
     }
     let url = std::env::var(GITHUB_ENV_OVERRIDE)
         .unwrap_or_else(|_| DEFAULT_GITHUB_RELEASES_URL.to_string());
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(HTTP_TIMEOUT_SECS)))
         .user_agent(USER_AGENT)
         .build()
-        .map_err(|e| UpdateError::Network(e.to_string()))?;
-    let resp = client
+        .into();
+    // ureq surfaces 4xx/5xx as `Err(StatusCode)` by default; an `Ok` response
+    // is already 2xx. Read the body as text and parse with the existing
+    // `serde_json` dep (ureq's own `json` feature is left off to avoid the dep).
+    let json: serde_json::Value = match agent
         .get(&url)
         .header("Accept", "application/vnd.github.v3+json")
-        .send()
-        .map_err(|e| UpdateError::Network(e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(UpdateError::GithubStatus(resp.status().as_u16()));
-    }
-    let json: serde_json::Value = resp
-        .json()
-        .map_err(|e| UpdateError::Decode(e.to_string()))?;
+        .call()
+    {
+        Ok(mut resp) => {
+            let body = resp
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| UpdateError::Decode(e.to_string()))?;
+            serde_json::from_str(&body).map_err(|e| UpdateError::Decode(e.to_string()))?
+        }
+        Err(ureq::Error::StatusCode(code)) => return Err(UpdateError::GithubStatus(code)),
+        Err(e) => return Err(UpdateError::Network(e.to_string())),
+    };
     // The CLI repo endpoint returns an array (`/releases?per_page=1`) where
     // the previous plugin-repo endpoint returned an object (`/releases/latest`).
     // Accept both shapes so the env-override path still works against either

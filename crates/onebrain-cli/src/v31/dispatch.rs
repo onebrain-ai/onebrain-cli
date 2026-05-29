@@ -613,8 +613,57 @@ fn render_plugin_update_animated(
 pub(crate) fn render_plugin_update_animated_to<W: std::io::Write>(
     report: &plugin_update::PluginUpdateReport,
     mode: &OutputMode,
-    mut writer: W,
+    writer: W,
     step_delay_override: Option<std::time::Duration>,
+) -> Result<()> {
+    // Animated path: `force_static = false` → the per-step braille spinner
+    // animates before each row resolves. Shares the whole render body with the
+    // static text path via `render_plugin_update_inner` (v3.2.18).
+    let fields = PluginUpdateFields {
+        vault_synced: report.vault_synced,
+        hooks_rewritten: report.hooks_rewritten,
+        plists_rewritten: report.plists_rewritten,
+        plists_count: report.plists_count,
+        version_before: report.version_before.as_deref(),
+        version_after: report.version_after.as_deref(),
+        dry_run: report.dry_run,
+        partial_failure: report.partial_failure.as_deref(),
+    };
+    render_plugin_update_inner(writer, &fields, mode, false, step_delay_override)
+}
+
+/// Plain, borrow-only view of the fields the `plugin update` renderer needs.
+/// Built from either the live [`plugin_update::PluginUpdateReport`] (animated
+/// path) or the serialized [`PluginUpdateData`] envelope payload (static text
+/// path), so [`render_plugin_update_inner`] stays agnostic to its data source.
+/// Replaces the old `PluginUpdateTextData` trait (v3.2.18 · Code-Simplifier
+/// finding 1.2/1.3 on PR #57 — the trait existed only to make the static
+/// renderer generic over a test double, which a plain struct does for free).
+struct PluginUpdateFields<'a> {
+    vault_synced: bool,
+    hooks_rewritten: u32,
+    plists_rewritten: bool,
+    plists_count: Option<u32>,
+    version_before: Option<&'a str>,
+    version_after: Option<&'a str>,
+    dry_run: bool,
+    partial_failure: Option<&'a str>,
+}
+
+/// Shared body for both `plugin update` text surfaces (v3.2.18 · unifies the
+/// former `render_plugin_update_text` + `render_plugin_update_animated_to`).
+/// `force_static = true` suppresses the per-step braille spinner (the static
+/// text-mode report rendered into a buffer); `false` animates each step (the
+/// live stdout path). `step_delay` overrides the per-step dwell — `Some(ZERO)`
+/// in unit tests so the animated branch runs without sleeping. The header,
+/// step list, and verdict footer are byte-identical across both modes; only
+/// the per-step spinner overlay differs.
+fn render_plugin_update_inner<W: std::io::Write>(
+    mut writer: W,
+    f: &PluginUpdateFields<'_>,
+    mode: &OutputMode,
+    force_static: bool,
+    step_delay: Option<std::time::Duration>,
 ) -> Result<()> {
     use crate::output::{
         framing_rule_n, is_color_text, write_framed_header, ProgressRenderer, Section, Step,
@@ -626,26 +675,25 @@ pub(crate) fn render_plugin_update_animated_to<W: std::io::Write>(
     let dim = if color { "\x1b[2m" } else { "" };
     let reset = if color { "\x1b[0m" } else { "" };
 
-    // ── Header (no animation — same as static path) ───────────────────
+    // ── Header ────────────────────────────────────────────────────────
     write_framed_header(&mut writer, "🔄", "Plugin Update", color, rule_width)?;
 
-    // ── Step list (animated) ──────────────────────────────────────────
-    // Same per-step Ok/Fail mapping as the static `render_plugin_update_text`
-    // path. The visible difference is purely the rendering side: each step
-    // shows the braille spinner with its label for ~800–2000ms before the
-    // `\r`-clear-and-resolve transition — matches `doctor`/`update`.
-    let partial_failed = report.partial_failure.is_some();
-    let vault_detail = plugin_update_vault_detail(
-        report.vault_synced,
-        report.dry_run,
-        report.version_before.as_deref(),
-        report.version_after.as_deref(),
-    );
-    let hooks_detail = format!("{} rewritten", report.hooks_rewritten);
+    // ── Step list ─────────────────────────────────────────────────────
+    // v3.2.13: when `partial_failure` is set, mark the launchd-plist step as
+    // `Fail` so the per-step glyph matches the verdict (pre-3.2.13 it stayed
+    // `Ok` and silently misrepresented the failed step as succeeded). The
+    // plist re-registration is the only step that can populate it today.
+    let partial_failed = f.partial_failure.is_some();
+    let vault_detail =
+        plugin_update_vault_detail(f.vault_synced, f.dry_run, f.version_before, f.version_after);
+    let hooks_detail = format!("{} rewritten", f.hooks_rewritten);
+    // `plists_count` (v3.2.13): `Some(N>0)` → N refreshed; `Some(0)` → vault
+    // has no schedule entries (well-formed no-op); `None` → step didn't run
+    // (dry-run, or a prior step failed).
     let plists_detail = if partial_failed {
         "failed".to_string()
     } else {
-        match report.plists_count {
+        match f.plists_count {
             Some(0) => "no schedule entries".to_string(),
             Some(n) => format!("{n} refreshed"),
             None => "skipped".to_string(),
@@ -657,34 +705,23 @@ pub(crate) fn render_plugin_update_animated_to<W: std::io::Write>(
         StepStatus::Ok
     };
     let steps = vec![
-        Step::new(
-            "vault sync",
-            StepStatus::Ok,
-            Some(vault_detail.to_string()),
-            None,
-        ),
+        Step::new("vault sync", StepStatus::Ok, Some(vault_detail), None),
         Step::new("hooks", StepStatus::Ok, Some(hooks_detail), None),
         Step::new("launchd plists", plists_status, Some(plists_detail), None),
     ];
-    let section_header = if report.dry_run {
+    let section_header = if f.dry_run {
         "Update plan (dry-run)"
     } else {
         "Update steps"
     };
     let section = Section::new(section_header, steps);
-    // `force_static = false` → spinner animates per step.
-    let mut renderer = ProgressRenderer::with_writer(&mut writer, false, color);
-    if let Some(d) = step_delay_override {
+    let mut renderer = ProgressRenderer::with_writer(&mut writer, force_static, color);
+    if let Some(d) = step_delay {
         renderer.set_step_delay(d);
     }
     renderer.render_section(&section)?;
 
     // ── Verdict footer ────────────────────────────────────────────────
-    // Reuse the static path's footer rendering by manually replicating it
-    // against the live writer — keeps the two surfaces byte-identical except
-    // for the spinner artifacts. The footer doesn't need animation: doctor's
-    // own footer is static, and the user has already absorbed the spinner
-    // pacing across the three step rows.
     let verdict_status = if partial_failed {
         StepStatus::Fail
     } else {
@@ -694,15 +731,16 @@ pub(crate) fn render_plugin_update_animated_to<W: std::io::Write>(
     let verdict_prefix = verdict_status.ansi_prefix(color);
     let verdict_text = plugin_update_verdict_text(
         partial_failed,
-        report.dry_run,
-        report.vault_synced,
-        report.hooks_rewritten,
-        report.plists_rewritten,
-        report.version_before.as_deref(),
-        report.version_after.as_deref(),
+        f.dry_run,
+        f.vault_synced,
+        f.hooks_rewritten,
+        f.plists_rewritten,
+        f.version_before,
+        f.version_after,
     );
+    // Trailing count right-aligned to the rule width (matches doctor's layout).
     let total_str = "3 steps";
-    let left_cols = 1 + 1 + 2 + verdict_text.chars().count();
+    let left_cols = 1 + 1 + 2 + verdict_text.chars().count(); // " ✓  " + text
     let gap = rule_width
         .saturating_sub(left_cols + total_str.chars().count())
         .max(2);
@@ -714,7 +752,9 @@ pub(crate) fn render_plugin_update_animated_to<W: std::io::Write>(
         " {verdict_prefix}{verdict_glyph}{reset}  {verdict_text}{pad}{total_str}",
         pad = " ".repeat(gap),
     )?;
-    if let Some(reason) = report.partial_failure.as_deref() {
+    // Failure hint — indented `└` line; multi-line reasons flattened to ` · `
+    // so the indented layout stays intact.
+    if let Some(reason) = f.partial_failure {
         let one_line = reason.replace('\n', " · ");
         if color {
             writeln!(writer, " {dim}└ {one_line}{reset}")?;
@@ -722,17 +762,12 @@ pub(crate) fn render_plugin_update_animated_to<W: std::io::Write>(
             writeln!(writer, " └ {one_line}")?;
         }
     }
-    // R6: surface the reload next-step whenever a real version change landed —
-    // INDEPENDENT of partial_failed. `version_after` is read post-sync, so the
-    // new version is already on disk; a later schedule-step failure doesn't
-    // un-land it, and the running session still holds the old one. Suppressing
-    // the hint on partial failure would lose the guidance exactly when the user
-    // most needs it.
-    if let Some(hint) = plugin_update_reload_hint(
-        report.dry_run,
-        report.version_before.as_deref(),
-        report.version_after.as_deref(),
-    ) {
+    // R6: reload next-step fires on a real version change regardless of partial
+    // failure — `version_after` is read post-sync, so the new version already
+    // landed on disk and the running session still holds the old one.
+    // Suppressing the hint on partial failure would lose it exactly when the
+    // user most needs it.
+    if let Some(hint) = plugin_update_reload_hint(f.dry_run, f.version_before, f.version_after) {
         if color {
             writeln!(writer, " {dim}↻ {hint}{reset}")?;
         } else {
@@ -881,33 +916,6 @@ struct PluginUpdateData<'a> {
     partial_failure: Option<&'a str>,
 }
 
-impl<'a> PluginUpdateTextData for PluginUpdateData<'a> {
-    fn vault_synced(&self) -> bool {
-        self.vault_synced
-    }
-    fn hooks_rewritten(&self) -> u32 {
-        self.hooks_rewritten
-    }
-    fn plists_rewritten(&self) -> bool {
-        self.plists_rewritten
-    }
-    fn plists_count(&self) -> Option<u32> {
-        self.plists_count
-    }
-    fn version_before(&self) -> Option<&str> {
-        self.version_before
-    }
-    fn version_after(&self) -> Option<&str> {
-        self.version_after
-    }
-    fn dry_run(&self) -> bool {
-        self.dry_run
-    }
-    fn partial_failure(&self) -> Option<&str> {
-        self.partial_failure
-    }
-}
-
 /// Same as [`emit_plugin_update_summary`] but with an injectable writer for
 /// unit tests. R2-M4: the broken-pipe regression test feeds a writer that
 /// always returns `io::ErrorKind::BrokenPipe`; the function must surface the
@@ -988,155 +996,32 @@ pub(crate) fn emit_plugin_update_summary_to<W: std::io::Write>(
 /// Partial-failure path replaces the verdict glyph with `✗` and prepends an
 /// indented `└ <reason>` hint line under the failing step's row (closest to
 /// doctor's warn/fail rendering).
-fn render_plugin_update_text<D>(env: &crate::output::Envelope<D>, mode: &OutputMode) -> String
-where
-    D: PluginUpdateTextData + serde::Serialize,
-{
-    use crate::output::{
-        framing_rule_n, is_color_text, write_framed_header, ProgressRenderer, Section, Step,
-        StepStatus, RULE_WIDTH,
-    };
-    use std::io::Write;
-
+fn render_plugin_update_text(
+    env: &crate::output::Envelope<PluginUpdateData<'_>>,
+    mode: &OutputMode,
+) -> String {
     let d = match env.data.as_ref() {
         Some(d) => d,
         None => return String::new(),
     };
-    let color = is_color_text(mode);
-    let rule_width = RULE_WIDTH;
-    let dim = if color { "\x1b[2m" } else { "" };
-    let reset = if color { "\x1b[0m" } else { "" };
+    let fields = PluginUpdateFields {
+        vault_synced: d.vault_synced,
+        hooks_rewritten: d.hooks_rewritten,
+        plists_rewritten: d.plists_rewritten,
+        plists_count: d.plists_count,
+        version_before: d.version_before,
+        version_after: d.version_after,
+        dry_run: d.dry_run,
+        partial_failure: d.partial_failure,
+    };
+    // Static text mode: `force_static = true` — no spinner for `plugin
+    // update`; the operation is fast (single HTTP fetch + a few file writes)
+    // and the user already sees doctor-level animation elsewhere. Render into
+    // a buffer and hand the string back to `emit` — writes to a `Vec` never
+    // fail, so the `io::Result` is safely discarded here.
     let mut buf: Vec<u8> = Vec::new();
-
-    // ── Header ────────────────────────────────────────────────────────
-    let _ = write_framed_header(&mut buf, "🔄", "Plugin Update", color, rule_width);
-
-    // ── Step list ─────────────────────────────────────────────────────
-    // Today the only step that can populate `partial_failure` is the launchd
-    // plist re-registration (see `plugin_update::run` step 4 — vault-sync
-    // and hook-rewriter errors bubble as `Err` instead of leaving on-disk
-    // state half-applied). v3.2.13: when `partial_failure` is set we mark
-    // the plist step as `Fail` so the per-step glyph matches the verdict —
-    // pre-3.2.13 it stayed `Ok` and silently misrepresented the failed step
-    // as succeeded.
-    let partial_failed = d.partial_failure().is_some();
-    let vault_detail = plugin_update_vault_detail(
-        d.vault_synced(),
-        d.dry_run(),
-        d.version_before(),
-        d.version_after(),
-    );
-    let hooks_detail = format!("{} rewritten", d.hooks_rewritten());
-    // `plists_count` (v3.2.13): `Some(N>0)` → N refreshed; `Some(0)` →
-    // vault has no schedule entries (well-formed no-op); `None` → step
-    // didn't run (dry-run, or a prior step failed). Distinguishes the cases
-    // the pre-3.2.13 bool collapsed into a single "done"/"skipped".
-    let plists_detail = if partial_failed {
-        "failed".to_string()
-    } else {
-        match d.plists_count() {
-            Some(0) => "no schedule entries".to_string(),
-            Some(n) => format!("{n} refreshed"),
-            None => "skipped".to_string(),
-        }
-    };
-    let plists_status = if partial_failed {
-        StepStatus::Fail
-    } else {
-        StepStatus::Ok
-    };
-    let steps = vec![
-        Step::new("vault sync", StepStatus::Ok, Some(vault_detail), None),
-        Step::new("hooks", StepStatus::Ok, Some(hooks_detail), None),
-        Step::new("launchd plists", plists_status, Some(plists_detail), None),
-    ];
-    let header = if d.dry_run() {
-        "Update plan (dry-run)"
-    } else {
-        "Update steps"
-    };
-    let section = Section::new(header, steps);
-    // `force_static = true` — no spinner for `plugin update`; the operation
-    // is fast (single HTTP fetch + a few file writes) and the user already
-    // sees doctor-level animation elsewhere. Skip the artificial pacing.
-    let mut renderer = ProgressRenderer::with_writer(&mut buf, true, color);
-    let _ = renderer.render_section(&section);
-
-    // ── Verdict footer ────────────────────────────────────────────────
-    let _ = writeln!(buf);
-    let rule = framing_rule_n(rule_width);
-    let _ = writeln!(buf, "{dim}{rule}{reset}");
-    let verdict_status = if d.partial_failure().is_some() {
-        StepStatus::Fail
-    } else {
-        StepStatus::Ok
-    };
-    let verdict_glyph = verdict_status.glyph();
-    let verdict_prefix = verdict_status.ansi_prefix(color);
-    let verdict_text = plugin_update_verdict_text(
-        partial_failed,
-        d.dry_run(),
-        d.vault_synced(),
-        d.hooks_rewritten(),
-        d.plists_rewritten(),
-        d.version_before(),
-        d.version_after(),
-    );
-    // Trailing count right-aligned to the rule width (matches doctor's
-    // " ✓  N ok · M warn · K fail              N checks" layout).
-    let total_str = "3 steps";
-    let left_cols = 1 + 1 + 2 + verdict_text.chars().count(); // " ✓  " + text
-    let gap = rule_width
-        .saturating_sub(left_cols + total_str.chars().count())
-        .max(2);
-    let _ = writeln!(
-        buf,
-        " {verdict_prefix}{verdict_glyph}{reset}  {verdict_text}{pad}{total_str}",
-        pad = " ".repeat(gap),
-    );
-    // Failure hint — indented `└` line, doctor-style. Multi-line `reason`
-    // strings (deep anyhow chains can include newlines via `{:#}`) get
-    // flattened to ` · ` so the indented layout stays intact — without this
-    // the second line would have no `└ ` prefix and break the visual frame.
-    if let Some(reason) = d.partial_failure() {
-        let one_line = reason.replace('\n', " · ");
-        if color {
-            let _ = writeln!(buf, " {dim}└ {one_line}{reset}");
-        } else {
-            let _ = writeln!(buf, " └ {one_line}");
-        }
-    }
-    // R6: same reload next-step as the animated path (shared helper); fires on
-    // a real version change regardless of partial_failed — the version already
-    // landed on disk, so the running session needs a reload either way.
-    if let Some(hint) =
-        plugin_update_reload_hint(d.dry_run(), d.version_before(), d.version_after())
-    {
-        if color {
-            let _ = writeln!(buf, " {dim}↻ {hint}{reset}");
-        } else {
-            let _ = writeln!(buf, " ↻ {hint}");
-        }
-    }
-    let _ = writeln!(buf, "{dim}{rule}{reset}");
-
+    let _ = render_plugin_update_inner(&mut buf, &fields, mode, true, None);
     String::from_utf8(buf).unwrap_or_default()
-}
-
-/// Read-only view of the typed `plugin update` envelope payload — narrowing
-/// the renderer's coupling to the module-level [`PluginUpdateData`] struct.
-/// Lets the renderer stay generic over any payload that provides the same
-/// shape (used by the unit tests; production always goes through the real
-/// `PluginUpdateData` instance built in [`emit_plugin_update_summary_to`]).
-trait PluginUpdateTextData {
-    fn vault_synced(&self) -> bool;
-    fn hooks_rewritten(&self) -> u32;
-    fn plists_rewritten(&self) -> bool;
-    fn plists_count(&self) -> Option<u32>;
-    fn version_before(&self) -> Option<&str>;
-    fn version_after(&self) -> Option<&str>;
-    fn dry_run(&self) -> bool;
-    fn partial_failure(&self) -> Option<&str>;
 }
 
 #[cfg(test)]
@@ -1433,7 +1318,7 @@ mod tests {
     #[test]
     fn plugin_update_text_no_schedule_entries_renders_distinct_detail() {
         // Round-2 review HIGH-1: a vault with zero `schedule:` entries
-        // returns `Ok(0)` from `register_schedule::run_quiet` — a well-formed
+        // returns `Ok(0)` from `register_schedule::run_embedded` — a well-formed
         // no-op. The plist step must render as "no schedule entries" rather
         // than the misleading "done" the pre-Round-2 bool collapse produced.
         let report = plugin_update::PluginUpdateReport {

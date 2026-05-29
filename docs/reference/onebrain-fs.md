@@ -1,7 +1,7 @@
 # onebrain-fs
 
 ## Purpose & dependencies
-`onebrain-fs` is the filesystem-effects crate of the OneBrain CLI workspace — everything that reads, writes, walks, downloads, or mutates files on disk lives here. It owns: vault frontmatter parsing, orphan-checkpoint scanning, harness detection, timestamped config backups, the `onebrain init` bootstrap, the `doctor` health-check set (the `Box<dyn Check>` collection), the self-update install path (direct GitHub-Release tarball fetch + atomic binary swap — explicitly **not** npm/bun), `register-hooks` settings.json wiring, the `run-skill` prompt/binary resolver, idempotent structure migrations, and the multi-step `vault-sync` plugin-tarball overlay. It depends only on **`onebrain-core`** in-workspace (for `VaultConfig`, `CoreError`/`FsError` chaining, `Harness`, `DoctorResult`, config-file discovery, vault-root helpers). External crates: `serde`/`serde_json`/`serde_yaml`, `thiserror`, `chrono`, `walkdir`, `tar`/`flate2`, `reqwest` (blocking), `indicatif`, `inquire`, `which`, `wait-timeout`, `tempfile`, `dirs`, `semver`, `indexmap`, `is-terminal`, `filetime`. The binary crate `onebrain-cli` depends on it and drives every public entry point.
+`onebrain-fs` is the filesystem-effects crate of the OneBrain CLI workspace — everything that reads, writes, walks, downloads, or mutates files on disk lives here. It owns: vault frontmatter parsing, orphan-checkpoint scanning, harness detection, timestamped config backups, the `onebrain init` bootstrap, the `doctor` health-check set (the `Box<dyn Check>` collection), the self-update install path (direct GitHub-Release tarball fetch + atomic binary swap — explicitly **not** npm/bun), `register-hooks` settings.json wiring, the `run-skill` prompt/binary resolver, idempotent structure migrations, and the multi-step `vault-sync` plugin-tarball overlay. It depends only on **`onebrain-core`** in-workspace (for `VaultConfig`, `CoreError`/`FsError` chaining, `Harness`, `DoctorResult`, config-file discovery, vault-root helpers). External crates: `serde`/`serde_json`/`serde_yaml`, `thiserror`, `chrono`, `walkdir`, `tar`/`flate2`, `ureq` (blocking, sync), `indicatif`, `inquire`, `which`, `wait-timeout`, `tempfile`, `dirs`, `semver`, `indexmap`, `is-terminal`, `filetime`. The binary crate `onebrain-cli` depends on it and drives every public entry point.
 
 ## Module map
 ```
@@ -282,7 +282,7 @@ settings.json read + atomic write.
 Orchestrator + GitHub fetch/cache + pure version helpers.
 **Key types** — `UpdateResult { ok, exit_code, latest_version, current_version, error, latest_published_at }`; `ReleaseInfo`; `CurrentVersion`; `UpdateOptions { check, fresh, fetch_fn, install_fn, validate_fn, current_version_fn, stdout/stderr_lines }`; `UpdateError { GithubStatus, MissingTag, Network, Decode, Install, InstallBinary, Spawn }`.
 **Key functions** — `run_update(opts) -> UpdateResult`; `default_fetch_latest_release(fresh)` (1 h on-disk cache, `ONEBRAIN_GITHUB_RELEASES_URL` override; endpoint is `/releases?per_page=1` on the **CLI** repo); `parse_release_payload`; `default_install_binary(version)` → `install::fetch_and_swap_binary`; `default_validate_binary(expected)` (spawn `onebrain --version`, parse via `extract_version_token`, require `>= expected` semver — pure core split out as `validate_reported`); `default_current_version` (compile-time `CARGO_PKG_VERSION`); `version_at_least(current, candidate)` (semver-aware downgrade guard, string-eq fallback); helpers `extract_version_token`/`version_regex_matches`/`extract_version_prefix`/`extract_release_date`/`format_release_date`/`windows_shell`.
-**Connections** — calls: `reqwest::blocking`, `semver`, `dirs::cache_dir`, `chrono`, `install::fetch_and_swap_binary`; called by: `onebrain-cli` `update`.
+**Connections** — calls: `ureq`, `semver`, `dirs::cache_dir`, `chrono`, `install::fetch_and_swap_binary`; called by: `onebrain-cli` `update`.
 **Tests** — full orchestrator paths (upgrade/check/up-to-date/fetch-fail/install-fail/validate-fail) + cache round-trip/stale/corrupt + semver comparison matrix.
 
 ### `src/update/install.rs`
@@ -292,10 +292,10 @@ Direct GitHub-Release fetch + atomic binary swap (replaces the broken npm/bun pa
 - `fetch_and_swap_binary(version, current_exe) -> Result<(), UpdateError>` — resolve asset → build `{base}/v{version}/onebrain-{triple}.{ext}` → download → extract → swap.
 - `AssetInfo::for_running_target()` — resolves the running target triple via `cfg!(all(target_arch, target_os, target_env))` (8 triples incl. linux musl vs gnu; macOS/linux→`tar.gz`, windows→`zip`); unsupported triple → `UpdateError::Install` with arch/os/env hint.
 - `AssetInfo::extract_binary` — delegates to `extract_tar_gz` (Windows zip path intentionally unwired for v3.0.0 GA → error).
-- `download_archive(url)` — blocking reqwest GET (90 s timeout); non-2xx → `GithubStatus`.
+- `download_archive(url)` — blocking ureq GET (90 s `timeout_global`); non-2xx → `GithubStatus`.
 - `extract_tar_gz(bytes, target_name)` — gzip+tar; skips non-regular-file entries (symlink/dir guard); matches the binary by file_name at root or one-level prefix.
 - `swap_binary(current_exe, new_bytes)` — writes `<exe>.new` + `set_executable` (chmod 0755 Unix; no-op Windows), then atomic `rename` over the live binary on Unix; on Windows renames live exe → `.old` first, moves new into place, and **rolls back** `.old`→live if the second rename fails (surfacing rollback outcome to stderr).
-**Connections** — calls: `reqwest`, `flate2`, `tar`, `fs::{rename,File,set_permissions}`; called by: `update::mod::default_install_binary`.
+**Connections** — calls: `ureq`, `flate2`, `tar`, `fs::{rename,File,set_permissions}`; called by: `update::mod::default_install_binary`.
 **Tests** — tar extraction (found/skip/missing) + unix swap (replace + chmod + tmp cleanup) + running-target smoke.
 
 ## `vault_sync/` — plugin tarball overlay
@@ -319,8 +319,8 @@ Module root — declares step submodules and re-exports `run_vault_sync`, `resol
 
 ### `src/vault_sync/download.rs`
 Step 1 — tarball download + extract (pure-Rust `tar`+`flate2`, no system `tar` spawn).
-**Key functions** — `default_fetch_fn()` (blocking reqwest; `ONEBRAIN_VAULT_SYNC_FIXTURE` reads a local file for tests); `download_tarball(branch, fetch)`; `extract_tarball(bytes, dest_dir) -> io::Result<PathBuf>` (returns the single top-level dir); `tarball_url`/`format_http_error` (403/404/429 hints); `build_tar_spawn_overrides(platform, parent_env)` (kept for parity — empty on non-Windows, `TAR_OPTIONS=--force-local` on Windows).
-**Connections** — calls: `flate2`, `tar`, `reqwest`; called by: `orchestrate`.
+**Key functions** — `default_fetch_fn()` (blocking ureq, no timeout; `ONEBRAIN_VAULT_SYNC_FIXTURE` reads a local file for tests); `download_tarball(branch, fetch)`; `extract_tarball(bytes, dest_dir) -> io::Result<PathBuf>` (returns the single top-level dir); `tarball_url`/`format_http_error` (403/404/429 hints); `build_tar_spawn_overrides(platform, parent_env)` (kept for parity — empty on non-Windows, `TAR_OPTIONS=--force-local` on Windows).
+**Connections** — calls: `flate2`, `tar`, `ureq`; called by: `orchestrate`.
 
 ### `src/vault_sync/walker.rs`
 **Key functions** — `list_files_recursive(dir) -> Vec<PathBuf>` — best-effort recursive regular-file listing (missing/unreadable→empty, no symlink follow).

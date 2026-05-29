@@ -19,7 +19,7 @@ use super::types::FetchFn;
 /// for URL-safety, which is trivial in practice (branch names are git refs).
 const TARBALL_BASE: &str = "https://api.github.com/repos/onebrain-ai/onebrain/tarball/";
 
-/// Default fetch implementation — a blocking reqwest GET that returns the raw
+/// Default fetch implementation — a blocking ureq GET that returns the raw
 /// body bytes on 2xx and an error string with Bun's hint table on 4xx/5xx.
 ///
 /// Test escape hatch: when the `ONEBRAIN_VAULT_SYNC_FIXTURE` environment variable
@@ -32,21 +32,25 @@ pub fn default_fetch_fn() -> FetchFn {
         if let Ok(fixture) = std::env::var("ONEBRAIN_VAULT_SYNC_FIXTURE") {
             return std::fs::read(&fixture).map_err(|e| format!("fixture read {fixture}: {e}"));
         }
-        let client = reqwest::blocking::Client::builder()
+        let agent: ureq::Agent = ureq::Agent::config_builder()
             .user_agent("onebrain-cli")
             .build()
-            .map_err(|e| format!("HTTP client init failed: {e}"))?;
-        let resp = client
-            .get(url)
-            .send()
-            .map_err(|e| format!("HTTP request failed: {e}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(format_http_error(status.as_u16(), url));
+            .into();
+        // ureq returns `Err(StatusCode)` for 4xx/5xx by default, so an `Ok`
+        // response is already 2xx — no explicit status check needed. The body
+        // is streamed through `into_reader()` (no size cap) since the tarball
+        // can be several MB — an unbounded read, not the limited `read_to_vec()`.
+        match agent.get(url).call() {
+            Ok(resp) => {
+                let mut reader = resp.into_body().into_reader();
+                let mut buf = Vec::new();
+                std::io::Read::read_to_end(&mut reader, &mut buf)
+                    .map_err(|e| format!("read body: {e}"))?;
+                Ok(buf)
+            }
+            Err(ureq::Error::StatusCode(code)) => Err(format_http_error(code, url)),
+            Err(e) => Err(format!("HTTP request failed: {e}")),
         }
-        resp.bytes()
-            .map(|b| b.to_vec())
-            .map_err(|e| format!("read body: {e}"))
     })
 }
 
