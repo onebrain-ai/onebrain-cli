@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.19
+latest_version: 3.2.20
 released: 2026-05-29
 ---
 
@@ -11,6 +11,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.20] — 2026-05-29 — completions: exclude hidden commands
+
+- fix(cli): shell completions no longer list hidden/internal/legacy subcommands
+  (avatar, daemon, session-init, …) — clap_complete's aot generators don't honor
+  `hide`, so completions are now generated from a recursively hidden-filtered
+  command tree.
 
 ## [3.2.19] — 2026-05-29 — shell completions
 
