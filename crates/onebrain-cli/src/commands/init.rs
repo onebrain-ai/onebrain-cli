@@ -43,6 +43,17 @@ pub fn run(
     };
 
     let result = run_init(opts)?;
+
+    // Optional discovery hint for non-brew installs (npm/cargo). Brew users
+    // already had completions auto-installed by the formula. Suppressed for
+    // --yes and structured/JSON modes to keep machine output clean.
+    if result.exit_code == 0 && !yes && !structured_output {
+        let detected = crate::commands::completions::detect_login_shell_from(
+            std::env::var("SHELL").ok().as_deref(),
+        );
+        println!("\n{}", crate::commands::completions::hint_line(detected));
+    }
+
     Ok(result.exit_code)
 }
 

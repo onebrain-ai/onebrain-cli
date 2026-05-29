@@ -228,6 +228,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0a7a9bfdb35811f9e59832f0f05975114d2251b415fb534108e6f34060fd772"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -988,7 +997,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onebrain-cache"
-version = "3.2.18"
+version = "3.2.19"
 dependencies = [
  "chrono",
  "onebrain-core",
@@ -1001,12 +1010,13 @@ dependencies = [
 
 [[package]]
 name = "onebrain-cli"
-version = "3.2.18"
+version = "3.2.19"
 dependencies = [
  "anyhow",
  "assert_cmd",
  "chrono",
  "clap",
+ "clap_complete",
  "dirs",
  "flate2",
  "indicatif",
@@ -1029,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "onebrain-core"
-version = "3.2.18"
+version = "3.2.19"
 dependencies = [
  "chrono",
  "indexmap",
@@ -1045,7 +1055,7 @@ dependencies = [
 
 [[package]]
 name = "onebrain-fs"
-version = "3.2.18"
+version = "3.2.19"
 dependencies = [
  "chrono",
  "dirs",

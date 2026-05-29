@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.18
+latest_version: 3.2.19
 released: 2026-05-29
 ---
 
@@ -11,6 +11,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.19] — 2026-05-29 — shell completions
+
+- feat(cli): `onebrain completions <SHELL>` — hidden subcommand emitting a shell
+  completion script (bash · zsh · fish · powershell · elvish) via clap_complete.
+- feat(cli): optional shell-aware hint after interactive `onebrain init` (detects
+  `$SHELL`); enables Homebrew formula completion auto-install (tap PR follows).
 
 ## [3.2.18] — 2026-05-29 — dependency + size cleanup (reqwest→ureq · serde_yaml_ng · async-stack drop)
 

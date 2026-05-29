@@ -4,7 +4,7 @@ default-members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "3.2.18"
+version = "3.2.19"
 edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["OneBrain Contributors"]
@@ -25,6 +25,7 @@ thiserror   = "1"
 anyhow      = "1"
 chrono      = { version = "0.4", features = ["serde"] }
 clap        = { version = "4", features = ["derive"] }
+clap_complete = "4"
 
 # Filesystem (Slice 1 partial · used by count_unembedded)
 walkdir   = "2"

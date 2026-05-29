@@ -81,6 +81,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 commands::doctor::run(a.fix, a.json, a.yes, vault_flag.clone(), &mode, quiet)?;
             std::process::exit(code);
         }
+        Cmd::Completions(a) => {
+            let code = commands::completions::run(a.shell);
+            std::process::exit(code);
+        }
 
         // ───── Session ──────────────────────────────────────────────
         Cmd::Session(SessionCmd { verb }) => match verb {

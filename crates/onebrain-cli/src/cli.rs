@@ -82,6 +82,10 @@ pub enum Cmd {
     /// Diagnose system (vault + plugin + CLI · includes harness).
     #[command(display_order = 3)]
     Doctor(DoctorArgs),
+    /// Generate a shell completion script (hidden · used by the Homebrew
+    /// formula and the post-init hint). Writes to stdout.
+    #[command(hide = true)]
+    Completions(CompletionsArgs),
 
     // ───── Resource groups (24 · alphabetical) ─────────────────────────
     // v3.1.0 UX: groups whose every verb still returns `E_NOT_IMPLEMENTED`
@@ -200,6 +204,12 @@ pub struct DoctorArgs {
     /// Emit the report as a single JSON document.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CompletionsArgs {
+    /// Target shell (bash · zsh · fish · powershell · elvish).
+    pub shell: clap_complete::Shell,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
