@@ -26,7 +26,13 @@ pub fn run(shell: Shell) -> i32 {
 /// detection logic is unit-testable without mutating process env.
 pub fn detect_login_shell_from(shell_env: Option<&str>) -> Option<Shell> {
     let path = shell_env?;
-    let name = path.trim().trim_end_matches('/').rsplit('/').next().unwrap_or(path).trim();
+    let name = path
+        .trim()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .trim();
     // 2-arg form selects ValueEnum::from_str (ignore_case=true), NOT std FromStr (1-arg, case-sensitive).
     Shell::from_str(name, true).ok()
 }
@@ -37,9 +43,7 @@ pub fn detect_login_shell_from(shell_env: Option<&str>) -> Option<Shell> {
 /// shell list is shown.
 pub fn hint_line(detected: Option<Shell>) -> String {
     match detected {
-        Some(shell) => format!(
-            "💡 Shell completions (optional):\n   onebrain completions {shell}"
-        ),
+        Some(shell) => format!("💡 Shell completions (optional):\n   onebrain completions {shell}"),
         None => "💡 Shell completions (optional):\n   onebrain completions <shell>   \
                  (bash · zsh · fish · powershell · elvish)"
             .to_string(),
@@ -57,7 +61,10 @@ mod tests {
 
     #[test]
     fn detects_bash_from_usr_path() {
-        assert_eq!(detect_login_shell_from(Some("/usr/bin/bash")), Some(Shell::Bash));
+        assert_eq!(
+            detect_login_shell_from(Some("/usr/bin/bash")),
+            Some(Shell::Bash)
+        );
     }
 
     #[test]
@@ -83,14 +90,20 @@ mod tests {
     #[test]
     fn tolerates_trailing_slash_and_whitespace() {
         assert_eq!(detect_login_shell_from(Some("/bin/zsh/")), Some(Shell::Zsh));
-        assert_eq!(detect_login_shell_from(Some("  /bin/fish  ")), Some(Shell::Fish));
+        assert_eq!(
+            detect_login_shell_from(Some("  /bin/fish  ")),
+            Some(Shell::Fish)
+        );
     }
 
     #[test]
     fn hint_uses_detected_shell() {
         let h = hint_line(Some(Shell::Zsh));
         assert!(h.contains("onebrain completions zsh"), "got: {h}");
-        assert!(!h.contains("<shell>"), "should not show placeholder when detected");
+        assert!(
+            !h.contains("<shell>"),
+            "should not show placeholder when detected"
+        );
     }
 
     #[test]
