@@ -26,8 +26,8 @@ pub fn run(shell: Shell) -> i32 {
 /// detection logic is unit-testable without mutating process env.
 pub fn detect_login_shell_from(shell_env: Option<&str>) -> Option<Shell> {
     let path = shell_env?;
-    let name = path.rsplit('/').next().unwrap_or(path);
-    // `ValueEnum::from_str` reuses clap's own shell-name parsing (case-insensitive).
+    let name = path.trim().trim_end_matches('/').rsplit('/').next().unwrap_or(path).trim();
+    // 2-arg form selects ValueEnum::from_str (ignore_case=true), NOT std FromStr (1-arg, case-sensitive).
     Shell::from_str(name, true).ok()
 }
 
@@ -68,6 +68,22 @@ mod tests {
     #[test]
     fn returns_none_for_unknown_shell() {
         assert_eq!(detect_login_shell_from(Some("/bin/tcsh")), None);
+    }
+
+    #[test]
+    fn detects_bare_name_without_path() {
+        assert_eq!(detect_login_shell_from(Some("zsh")), Some(Shell::Zsh));
+    }
+
+    #[test]
+    fn detects_case_insensitively() {
+        assert_eq!(detect_login_shell_from(Some("/bin/ZSH")), Some(Shell::Zsh));
+    }
+
+    #[test]
+    fn tolerates_trailing_slash_and_whitespace() {
+        assert_eq!(detect_login_shell_from(Some("/bin/zsh/")), Some(Shell::Zsh));
+        assert_eq!(detect_login_shell_from(Some("  /bin/fish  ")), Some(Shell::Fish));
     }
 
     #[test]
