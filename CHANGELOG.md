@@ -1,6 +1,6 @@
 ---
-latest_version: 3.2.20
-released: 2026-05-29
+latest_version: 3.2.21
+released: 2026-05-30
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -11,6 +11,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.21] — 2026-05-30 — cache-clean hardening
+
+- fix(cache-clean): orphan cache dirs under an UNregistered marketplace are now
+  swept even when a registered marketplace exists (was gated on `dirs.is_empty()`).
+- fix(cache-clean): `remove_dir_all` failures are surfaced (counted + stderr
+  warning) instead of silently dropped — `clean_plugin_cache` now returns
+  `CacheCleanOutcome { removed, failed }`.
+- Verified the Step 9 sweep runs unconditionally on every real Claude update
+  (only `--dry-run` skips); added a clarifying comment.
 
 ## [3.2.20] — 2026-05-29 — completions: exclude hidden commands
 

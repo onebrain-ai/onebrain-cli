@@ -1,8 +1,8 @@
 //! Step 9 · detect + clean obsolete OneBrain cache versions under
 //! `<cacheDir>/<marketplace>/onebrain/`. `clean_plugin_cache` ports Bun's
-//! `cleanPluginCache` (non-fatal — returns the count of successful removals);
-//! `detect_stale_plugin_cache` is the read-only sibling added for the
-//! `doctor` plugin-cache check.
+//! `cleanPluginCache` (non-fatal — returns a [`CacheCleanOutcome`] of the
+//! successful + failed removals); `detect_stale_plugin_cache` is the read-only
+//! sibling added for the `doctor` plugin-cache check.
 //!
 //! Two public entry points share ONE discovery + enumeration pass:
 //! - [`detect_stale_plugin_cache`] — **read-only**; lists the orphan version
@@ -13,9 +13,10 @@
 //! Both walk the identical set of dirs (`discover_onebrain_cache_dirs` →
 //! `version_dirs_under`), so detection and removal can only diverge on the
 //! *removal step itself*: a `remove_dir_all` that fails (permission, race) is
-//! not counted, so `clean`'s returned count is "removed", which may be **less
-//! than** `detect`'s "found" when a removal fails. Callers that need to confirm
-//! the cache is actually clean should re-run `detect_stale_plugin_cache` after.
+//! counted in `CacheCleanOutcome::failed` (not `removed`), so `clean`'s
+//! `removed` count may be **less than** `detect`'s "found" when a removal
+//! fails. Callers that need to confirm the cache is actually clean should
+//! re-run `detect_stale_plugin_cache` after.
 //!
 //! Why removing *every* cached version dir is safe: when OneBrain is pinned to
 //! the vault-local copy (`installPath` → `<vault>/.claude/plugins/onebrain`),
@@ -75,12 +76,13 @@ fn resolve_cache_dir(
 
 /// Discover every `<cache>/<marketplace>/onebrain/` directory.
 ///
-/// Primary source: the marketplaces registered in `installed_plugins.json`
-/// (keys shaped `onebrain@<marketplace>`). Fallback: if that file is missing or
-/// unreadable, glob every `<cache>/*/onebrain/` so an unregistered orphan is
-/// still found. The fallback path only ever joins real `read_dir` entries, so
-/// it cannot traverse outside the cache; the JSON-key path is sanitized via
-/// [`is_safe_marketplace`].
+/// Unions two sources (deduped):
+/// 1. Marketplaces registered in `installed_plugins.json` (keys shaped
+///    `onebrain@<marketplace>`), sanitized via [`is_safe_marketplace`].
+/// 2. An UNCONDITIONAL glob of `<cache>/*/onebrain/`, so an orphan under an
+///    unregistered marketplace is found even when a registered marketplace also
+///    exists. The glob only ever joins real `read_dir` entries, so it cannot
+///    traverse outside the cache.
 fn discover_onebrain_cache_dirs(installed_plugins_path: &Path, cache_dir: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
 
@@ -107,20 +109,26 @@ fn discover_onebrain_cache_dirs(installed_plugins_path: &Path, cache_dir: &Path)
         }
     }
 
-    // Fallback glob — covers orphans whose marketplace is no longer registered
-    // in installed_plugins.json (exactly the 2.2.4 case we hit).
-    if dirs.is_empty() {
-        if let Ok(read) = fs::read_dir(cache_dir) {
-            // `.flatten()` drops `Err` entries (e.g. a racing unlink) and yields
-            // only the readable `DirEntry`s.
-            for entry in read.flatten() {
-                let candidate = entry.path().join("onebrain");
-                if candidate.exists() {
-                    dirs.push(candidate);
-                }
+    // ALWAYS also glob the cache: covers orphans whose marketplace is no longer
+    // registered in installed_plugins.json (the 2.2.4 case) EVEN WHEN a
+    // registered marketplace also exists. Previously gated on `dirs.is_empty()`,
+    // which missed an unregistered orphan whenever any registered marketplace
+    // was present.
+    if let Ok(read) = fs::read_dir(cache_dir) {
+        // `.flatten()` drops `Err` entries (e.g. a racing unlink) and yields
+        // only the readable `DirEntry`s.
+        for entry in read.flatten() {
+            let candidate = entry.path().join("onebrain");
+            if candidate.exists() {
+                dirs.push(candidate);
             }
         }
     }
+
+    // A registered marketplace also surfaces in the glob — dedup so each
+    // `.../onebrain/` dir is enumerated once.
+    dirs.sort();
+    dirs.dedup();
 
     dirs
 }
@@ -185,31 +193,50 @@ pub fn detect_stale_plugin_cache(
     stale
 }
 
+/// Outcome of a destructive cache sweep. `removed` + `failed` together account
+/// for every version dir discovered, so a caller can report partial success
+/// instead of silently dropping failures.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheCleanOutcome {
+    pub removed: u64,
+    pub failed: u64,
+}
+
 /// **Destructive.** Step 9 entry point + `doctor --fix` worker. Removes every
-/// version dir under the discovered onebrain cache dirs. Returns the count
-/// actually **removed** (may be less than [`detect_stale_plugin_cache`] found
-/// if a removal fails). Non-fatal — a failed removal is simply not counted.
+/// version dir under the discovered onebrain cache dirs. Returns a
+/// [`CacheCleanOutcome`] whose `removed` + `failed` together account for every
+/// version dir found, so `removed` may be less than [`detect_stale_plugin_cache`]
+/// found when a removal fails. Non-fatal — a failed removal is counted in
+/// `failed` (and an stderr warning is emitted), never silently swallowed.
 pub fn clean_plugin_cache(
     installed_plugins_path: &Path,
     installed_plugins_cache_dir: Option<&Path>,
-) -> u64 {
+) -> CacheCleanOutcome {
     let Some(cache_dir) = resolve_cache_dir(installed_plugins_path, installed_plugins_cache_dir)
     else {
-        return 0;
+        return CacheCleanOutcome::default();
     };
 
-    let mut removed = 0u64;
+    let mut out = CacheCleanOutcome::default();
     for plugin_dir in discover_onebrain_cache_dirs(installed_plugins_path, &cache_dir) {
         for path in version_dirs_under(&plugin_dir) {
-            // `remove_dir_all` is recursive; `.is_ok()` gates the counter so a
-            // permission error on one dir doesn't abort the rest.
-            if fs::remove_dir_all(&path).is_ok() {
-                removed += 1;
+            // `remove_dir_all` is recursive; the failure branch counts + warns so
+            // a permission error on one dir doesn't abort the rest and isn't lost.
+            match fs::remove_dir_all(&path) {
+                Ok(()) => out.removed += 1,
+                Err(e) => {
+                    out.failed += 1;
+                    // Surface, don't swallow: a stale cache dir we couldn't
+                    // remove will keep shadowing the vault-local plugin.
+                    eprintln!(
+                        "vault-sync: failed to remove stale cache dir {}: {e}",
+                        path.display()
+                    );
+                }
             }
         }
     }
-
-    removed
+    out
 }
 
 #[cfg(test)]
@@ -242,8 +269,9 @@ mod tests {
                 }
             }),
         );
-        let n = clean_plugin_cache(&installed, Some(&cache_dir));
-        assert_eq!(n, 2);
+        let out = clean_plugin_cache(&installed, Some(&cache_dir));
+        assert_eq!(out.removed, 2);
+        assert_eq!(out.failed, 0);
         assert!(!v_a.exists());
         assert!(!v_b.exists());
     }
@@ -253,8 +281,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let installed = dir.path().join("installed_plugins.json");
         fs::write(&installed, "{}").unwrap();
-        let n = clean_plugin_cache(&installed, Some(&dir.path().join("nonexistent-cache")));
-        assert_eq!(n, 0);
+        let out = clean_plugin_cache(&installed, Some(&dir.path().join("nonexistent-cache")));
+        assert_eq!(out.removed, 0);
+        assert_eq!(out.failed, 0);
     }
 
     #[test]
@@ -265,8 +294,8 @@ mod tests {
         fs::create_dir_all(&v).unwrap();
         let installed = dir.path().join("installed_plugins.json");
         // No file written — fallback glob path.
-        let n = clean_plugin_cache(&installed, Some(&cache_dir));
-        assert_eq!(n, 1);
+        let out = clean_plugin_cache(&installed, Some(&cache_dir));
+        assert_eq!(out.removed, 1);
     }
 
     // ── detection (read-only) ───────────────────────────────────────────────
@@ -323,8 +352,8 @@ mod tests {
         );
         let detected = detect_stale_plugin_cache(&installed, Some(&cache_dir));
         assert_eq!(detected.len(), 2);
-        let removed = clean_plugin_cache(&installed, Some(&cache_dir));
-        assert_eq!(removed as usize, detected.len());
+        let out = clean_plugin_cache(&installed, Some(&cache_dir));
+        assert_eq!(out.removed as usize, detected.len());
     }
 
     #[test]
@@ -346,8 +375,8 @@ mod tests {
         let detected = detect_stale_plugin_cache(&installed, Some(&cache_dir));
         assert_eq!(detected.len(), 1, "only the version dir is stale");
         assert_eq!(detected[0].version, "3.0.0");
-        let removed = clean_plugin_cache(&installed, Some(&cache_dir));
-        assert_eq!(removed, 1);
+        let out = clean_plugin_cache(&installed, Some(&cache_dir));
+        assert_eq!(out.removed, 1);
         assert!(stray.exists(), "stray file must survive the sweep");
     }
 
@@ -369,9 +398,72 @@ mod tests {
             &serde_json::json!({ "plugins": { "onebrain@../escape": [{"id":"onebrain"}] } }),
         );
 
-        let removed = clean_plugin_cache(&installed, Some(&cache_dir));
-        assert_eq!(removed, 0, "traversal key must not reach outside the cache");
+        let out = clean_plugin_cache(&installed, Some(&cache_dir));
+        assert_eq!(
+            out.removed, 0,
+            "traversal key must not reach outside the cache"
+        );
         assert!(escape.exists(), "the escape target must be untouched");
+    }
+
+    #[test]
+    fn glob_catches_orphan_under_unregistered_marketplace() {
+        // Registered marketplace "mktA" has a version dir; an ORPHAN lives under
+        // unregistered "mktB". Pre-fix, the `if dirs.is_empty()` gate skipped the
+        // glob (dirs already had mktA), so mktB's orphan was never cleaned.
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let registered = cache_dir.join("mktA/onebrain/3.2.0");
+        let orphan = cache_dir.join("mktB/onebrain/2.2.4");
+        fs::create_dir_all(&registered).unwrap();
+        fs::create_dir_all(&orphan).unwrap();
+        let installed = dir.path().join("installed_plugins.json");
+        write_json(
+            &installed,
+            &serde_json::json!({ "plugins": { "onebrain@mktA": [{"id":"onebrain"}] } }),
+        );
+        let out = clean_plugin_cache(&installed, Some(&cache_dir));
+        assert_eq!(
+            out.removed, 2,
+            "both registered + orphan version dirs removed"
+        );
+        assert!(!registered.exists());
+        assert!(
+            !orphan.exists(),
+            "orphan under unregistered marketplace must be cleaned"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_failure_is_counted_and_surfaced_not_swallowed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let onebrain = cache_dir.join("mkt/onebrain");
+        let version = onebrain.join("9.9.9");
+        fs::create_dir_all(&version).unwrap();
+        let installed = dir.path().join("installed_plugins.json");
+        write_json(
+            &installed,
+            &serde_json::json!({ "plugins": { "onebrain@mkt": [{"id":"onebrain"}] } }),
+        );
+        // Make the parent `onebrain/` non-writable so removing the child dir fails
+        // (can't unlink within a read-only directory on Unix).
+        fs::set_permissions(&onebrain, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let out = clean_plugin_cache(&installed, Some(&cache_dir));
+        assert_eq!(
+            out.removed, 0,
+            "removal failed → nothing counted as removed"
+        );
+        assert_eq!(
+            out.failed, 1,
+            "the failure is COUNTED, not silently swallowed"
+        );
+
+        // Restore perms so tempdir cleanup succeeds.
+        fs::set_permissions(&onebrain, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
@@ -394,8 +486,8 @@ mod tests {
             );
 
             assert!(detect_stale_plugin_cache(&installed, Some(&cache_dir)).is_empty());
-            let removed = clean_plugin_cache(&installed, Some(&cache_dir));
-            assert_eq!(removed, 0);
+            let out = clean_plugin_cache(&installed, Some(&cache_dir));
+            assert_eq!(out.removed, 0);
             // The symlink target's contents must be untouched.
             assert!(real_target.join("keep").exists());
         }

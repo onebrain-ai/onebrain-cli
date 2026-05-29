@@ -175,16 +175,26 @@ pub fn run_vault_sync(vault_root: &Path, opts: VaultSyncOptions) -> VaultSyncRes
             }
         }
 
+        // Unconditional on every real Claude update (NOT gated on a version
+        // change): a no-op/up-to-date sync still sweeps stale cache version
+        // dirs. Only `--dry-run` skips this (it short-circuits the whole
+        // vault-sync earlier). Verified 2026-05-30 — closes item 1 of the
+        // plugin-update-robustness reopen.
         progress.start("🧹", "Cleaning cache");
-        let cache_removed = clean_plugin_cache(
+        let outcome = clean_plugin_cache(
             &installed_plugins_path,
             installed_plugins_cache_dir.as_deref(),
         );
-        result.cache_removed = cache_removed;
-        if cache_removed > 0 {
+        result.cache_removed = outcome.removed;
+        if outcome.removed > 0 || outcome.failed > 0 {
             progress.stop(&format!(
-                "{cache_removed} cached version{} removed",
-                if cache_removed == 1 { "" } else { "s" }
+                "{} removed{}",
+                outcome.removed,
+                if outcome.failed > 0 {
+                    format!(", {} failed (see warnings)", outcome.failed)
+                } else {
+                    String::new()
+                }
             ));
         } else {
             progress.stop("no cache to clean");
