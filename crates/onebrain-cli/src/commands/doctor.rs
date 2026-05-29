@@ -394,6 +394,13 @@ fn attempt_fix(result: &DoctorResult, vault_root: &Path, json: bool) -> FixOutco
         // `.claude/settings.json`. Cosmetic config cleanup; no behavioral
         // change at runtime (the plugin is enabled via `enabledPlugins`).
         "claude-settings" => fix_claude_settings(vault_root, json),
+        // Prune stale OneBrain version dirs from the marketplace cache
+        // (`~/.claude/plugins/cache/<mkt>/onebrain/`). Home-based, not the
+        // vault — so this recipe ignores `vault_root`. Removing every cached
+        // version is safe: the active plugin is the vault-local pin, never a
+        // cache copy. The user must restart / `/reload-plugins` to drop the
+        // stale copy from the running session (Claude can't hot-swap it).
+        "plugin-cache" => fix_plugin_cache(json),
         // Migrate legacy `vault.yml` → canonical `onebrain.yml` via a
         // single atomic `fs::rename`. Idempotent: drops legacy if both
         // exist (canonical wins); reports already-clean when only the
@@ -427,6 +434,7 @@ fn planned_action(result: &DoctorResult) -> Option<&'static str> {
         "folders" => Some("create the missing standard folders"),
         "onebrain.yml-keys" => Some("backfill missing onebrain.yml keys"),
         "claude-settings" => Some("remove the stale marketplace entry"),
+        "plugin-cache" => Some("remove the stale plugin cache"),
         "vault-config-migration" => Some("migrate vault.yml → onebrain.yml"),
         _ => None,
     }
@@ -602,6 +610,40 @@ fn fix_plugin_files(vault_root: &Path, json: bool) -> FixOutcome {
                 .error
                 .unwrap_or_else(|| "vault-sync failed (no error detail)".to_string()),
         )
+    }
+}
+
+/// Recipe — `plugin-cache` warning means stale OneBrain version dirs linger in
+/// the Claude Code marketplace cache (`~/.claude/plugins/cache/<mkt>/onebrain/`).
+/// They can shadow the vault-local copy and make Claude Code load old skills.
+/// Prune them via the shared `clean_plugin_cache` (home-based — no `vault_root`).
+/// A restart or `/reload-plugins` is still needed to drop the stale copy from
+/// the *running* session.
+fn fix_plugin_cache(json: bool) -> FixOutcome {
+    use onebrain_fs::vault_sync::cache_clean::{clean_plugin_cache, detect_stale_plugin_cache};
+    // Shared resolver (same `~/.claude/plugins/installed_plugins.json` the
+    // `plugin-cache` check uses) — keeps check + fix pointed at one location.
+    let Some(installed) = onebrain_fs::vault_sync::default_installed_plugins_path() else {
+        return FixOutcome::Failed("could not resolve home directory".to_string());
+    };
+    status_line(json, "running: clean plugin cache");
+    // `None` → clean derives `<home>/.claude/plugins/cache`.
+    let removed = clean_plugin_cache(&installed, None);
+    // Honest result: re-detect after the sweep. If versions remain, a removal
+    // failed (permissions, open handle, race) — report Failed rather than a
+    // misleading "Fixed" with exit 0, so the user learns why the `plugin-cache`
+    // warning will still be there on the next doctor run.
+    let remaining = detect_stale_plugin_cache(&installed, None);
+    if remaining.is_empty() {
+        FixOutcome::Fixed(format!(
+            "removed {removed} stale cached version{} — restart Claude or run /reload-plugins to apply",
+            if removed == 1 { "" } else { "s" }
+        ))
+    } else {
+        FixOutcome::Failed(format!(
+            "removed {removed}, but {} version(s) remain — check permissions on ~/.claude/plugins/cache",
+            remaining.len()
+        ))
     }
 }
 
@@ -1094,7 +1136,7 @@ fn print_fix_summary(outcomes: &[(String, FixOutcome)]) {
 // the human text/TTY surface.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// The approved 4-section grouping of the 9 checks, in display order. Each
+/// The approved 4-section grouping of the 10 checks, in display order. Each
 /// entry is `(section header, [check names in order])`. Check names are the
 /// stable `DoctorResult::check` identifiers produced by the check modules.
 const DOCTOR_SECTIONS: [(&str, &[&str]); 4] = [
@@ -1106,7 +1148,10 @@ const DOCTOR_SECTIONS: [(&str, &[&str]); 4] = [
             "vault-config-migration",
         ],
     ),
-    ("Vault structure", &["folders", "plugin-files"]),
+    (
+        "Vault structure",
+        &["folders", "plugin-files", "plugin-cache"],
+    ),
     ("Integration", &["settings-hooks", "claude-settings"]),
     ("Index & state", &["orphan-checkpoints", "qmd-embeddings"]),
 ];
@@ -1121,6 +1166,7 @@ fn display_label(check: &str) -> &str {
         "vault-config-migration" => "config migration",
         "folders" => "folders",
         "plugin-files" => "plugin files",
+        "plugin-cache" => "plugin cache",
         "settings-hooks" => "hooks",
         "claude-settings" => "claude settings",
         "orphan-checkpoints" => "checkpoints",

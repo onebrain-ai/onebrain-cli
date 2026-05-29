@@ -1,6 +1,6 @@
 ---
-latest_version: 3.2.15
-released: 2026-05-28
+latest_version: 3.2.16
+released: 2026-05-29
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -11,6 +11,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.16] — 2026-05-29 — plugin-cache doctor check + orphan cleanup + post-update reload hint
+
+- **Fix: stale plugin-cache orphans no longer silently shadow the vault-local plugin.** A leftover `~/.claude/plugins/cache/<mkt>/onebrain/<version>/` (orphaned by a marketplace install that predated a vault-local update) could make Claude Code load OLD skills while `INSTRUCTIONS.md` came from the current copy. vault-sync Step 9 already pruned these during a sync; this adds proactive detection so an orphan created outside an update is caught on the next `doctor` run.
+- **Feat: new `doctor` `plugin-cache` check** (Vault structure section) reports stale cached plugin versions (cache vs the vault-local pin). `--fix` prunes them, then re-detects to report an honest result — `Failed` (non-zero exit), not a misleading `Fixed`, if a removal hit a permission error.
+- **Feat: `plugin update` prints a post-update reload next-step** (`↻ /reload-plugins …`) whenever a real version change lands, so the running session picks up the new plugin; `/wrapup` + reopen is called out for `INSTRUCTIONS.md`/`CLAUDE.md` changes. Fires on partial-failure-with-version-change too (the version already landed on disk).
+- **Internal: hardened cache cleanup** — `detect_stale_plugin_cache` + `clean_plugin_cache` share one enumeration pass (`version_dirs_under`), skip symlinks (`symlink_metadata`, no follow), and reject path-traversal marketplace keys (`onebrain@../…`). `installed_plugins.json` path resolution consolidated into one shared `default_installed_plugins_path`.
 
 ## [3.2.15] — 2026-05-28 — `--help` compact-with-wrap · plugin update polish · per-command emoji · version tracking · `--json` minified
 
