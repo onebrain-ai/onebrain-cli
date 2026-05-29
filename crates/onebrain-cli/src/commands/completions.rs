@@ -31,6 +31,21 @@ pub fn detect_login_shell_from(shell_env: Option<&str>) -> Option<Shell> {
     Shell::from_str(name, true).ok()
 }
 
+/// Build the optional "Shell completions" hint shown after interactive
+/// `onebrain init`. When the login shell is detected it is dropped straight
+/// into a copy-pasteable command; otherwise a placeholder + the supported
+/// shell list is shown.
+pub fn hint_line(detected: Option<Shell>) -> String {
+    match detected {
+        Some(shell) => format!(
+            "💡 Shell completions (optional):\n   onebrain completions {shell}"
+        ),
+        None => "💡 Shell completions (optional):\n   onebrain completions <shell>   \
+                 (bash · zsh · fish · powershell · elvish)"
+            .to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,5 +68,19 @@ mod tests {
     #[test]
     fn returns_none_for_unknown_shell() {
         assert_eq!(detect_login_shell_from(Some("/bin/tcsh")), None);
+    }
+
+    #[test]
+    fn hint_uses_detected_shell() {
+        let h = hint_line(Some(Shell::Zsh));
+        assert!(h.contains("onebrain completions zsh"), "got: {h}");
+        assert!(!h.contains("<shell>"), "should not show placeholder when detected");
+    }
+
+    #[test]
+    fn hint_falls_back_to_placeholder() {
+        let h = hint_line(None);
+        assert!(h.contains("onebrain completions <shell>"), "got: {h}");
+        assert!(h.contains("bash"), "fallback lists shells");
     }
 }
