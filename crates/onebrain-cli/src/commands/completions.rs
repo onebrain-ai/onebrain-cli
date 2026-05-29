@@ -40,10 +40,13 @@ fn visible_tree(src: &clap::Command) -> clap::Command {
 /// exit code (always 0 — clap already validated `shell` into a known variant).
 pub fn run(shell: Shell) -> i32 {
     // `CommandFactory::command()` reconstructs the clap `Command` that the
-    // derive macro built for `Cli`. `generate` needs `&mut Command` because it
-    // finalizes the command tree (propagating help/version) before walking it.
-    let mut cmd = Cli::command();
-    let bin = cmd.get_name().to_string();
+    // derive macro built for `Cli`. clap_complete's aot generators don't honor
+    // `#[command(hide = true)]`, so we regenerate from a tree with hidden
+    // subcommands recursively stripped (`visible_tree`). `bin` is taken from the
+    // original command's name (`onebrain`) so the script binds to the real binary.
+    let full = Cli::command();
+    let bin = full.get_name().to_string();
+    let mut cmd = visible_tree(&full);
     generate(shell, &mut cmd, bin, &mut std::io::stdout());
     0
 }
