@@ -40,6 +40,7 @@ The CLI is **cross-harness**: paired with the [OneBrain plugin](https://github.c
 Point an AI agent at a vault and it improvises — a different pile of `grep` / `ls` / `find` / `sed` each time, behaving differently on each harness and re-derived every session: slow, token-hungry, non-portable, sometimes wrong. **OneBrain CLI replaces that improvisation with one deterministic binary.**
 
 - **Same behavior on every harness & model** — Claude Code and Gemini CLI both run `onebrain <noun> <verb>` and get identical output; switch harness without re-testing how your vault gets touched.
+- **Cross-platform, one command** — the *same* `onebrain <noun> <verb>` runs on macOS, Linux, and Windows (Apple Silicon & Intel, x86_64 & ARM down to a Pi Zero) and returns the *same* typed result on every OS. Write a hook or script once; it behaves identically everywhere — no per-platform shell quirks (`sed`/`find`/path-separator differences) to work around.
 - **Yours to extend, no waiting** — add a capability the harness/LLM doesn't have yet and every agent can use it immediately; they only learn the command, not implement the feature.
 - **No re-deriving solved workflows** — search, capture, consolidate, checkpoint live in the binary, so the agent calls one command instead of re-reasoning the recipe each session. Fewer tokens, no drift.
 - **Deterministic & safe** — a typed command with a frozen `Envelope` can't half-finish or quietly differ like an ad-hoc `rm` / `sed` pipeline. Same input → same output, scriptable by hooks.
@@ -61,7 +62,7 @@ brew install onebrain-ai/onebrain/onebrain
 
 # 2. Verify
 onebrain --version
-# → onebrain 3.1.5
+# → onebrain 3.2.17
 
 # 3. Scaffold a vault and let init pull the OneBrain plugin
 mkdir my-vault && cd my-vault
@@ -122,9 +123,13 @@ onebrain update --plan         # machine-readable JSON plan
 
 On an interactive terminal, `update` shows a framed `🧠 OneBrain Update` header and a braille spinner while it checks for (and downloads) a new version; piped / `--json` / `--plan` runs stay plain.
 
-The install path resolves the current target triple at runtime, downloads the matching GitHub Release tarball over HTTPS (rustls TLS), and atomically swaps the running binary (Unix single-rename; Windows rustup-style two-step with rollback on failure). No package-manager middleware.
+`onebrain update` auto-detects how the binary was installed and uses the right path so package-manager metadata never desyncs:
 
-> **Homebrew users:** since v3.1.4, `onebrain update` auto-detects a brew-managed install (binary under the Cellar) and delegates to `brew upgrade onebrain`, so it stays in sync with brew's metadata — no manual step needed.
+- **Homebrew** (binary under the Cellar) — refreshes the `onebrain-ai/onebrain` tap, then runs `brew upgrade onebrain`. The tap refresh (added v3.2.17) means a freshly-released version applies in one `onebrain update` with no manual `brew update`.
+- **npm** (under `node_modules/@onebrain-ai/`) — runs `npm install -g @onebrain-ai/cli@<version>` (added v3.2.17).
+- **Direct download** (a plain file we own) — resolves the current target triple, downloads the matching GitHub Release tarball over HTTPS (rustls TLS), verifies its SHA-256, and atomically swaps the running binary (Unix single-rename; Windows rustup-style two-step with rollback on failure).
+
+After any path, a post-install guard runs `onebrain --version` from PATH and confirms the upgrade actually took effect.
 
 ### Build from source
 
