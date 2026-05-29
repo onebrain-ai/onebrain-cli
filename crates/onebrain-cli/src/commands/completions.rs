@@ -7,14 +7,60 @@ use clap::CommandFactory;
 use clap::ValueEnum;
 use clap_complete::{generate, Shell};
 
+/// Rebuild `src` keeping only non-hidden subcommands, recursively. clap_complete's
+/// aot generators emit every subcommand (they don't honor `hide`), and clap has no
+/// remove-subcommand API — so we reconstruct the tree.
+///
+/// Only a CURATED set of command-level settings is copied — about, version, args,
+/// visible aliases, `disable_help_subcommand`, `propagate_version`. The auto
+/// `help`/`version` args are skipped so clap re-adds `help` without a duplicate-id
+/// panic. Any future command-level setting that affects completion output (e.g.
+/// another auto-injected subcommand toggle) MUST be added here too, or the rebuilt
+/// tree will silently diverge from the real CLI.
+fn visible_tree(src: &clap::Command) -> clap::Command {
+    let mut out = clap::Command::new(src.get_name().to_string());
+    if let Some(about) = src.get_about() {
+        out = out.about(about.clone());
+    }
+    if let Some(version) = src.get_version() {
+        out = out.version(version.to_string());
+    }
+    // Carry the `help` subcommand suppression (set on the root + resource groups);
+    // otherwise clap auto-injects a `help` subcommand that leaks as a candidate.
+    if src.is_disable_help_subcommand_set() {
+        out = out.disable_help_subcommand(true);
+    }
+    // Carry `--version` propagation so the rebuilt tree matches the real CLI.
+    if src.is_propagate_version_set() {
+        out = out.propagate_version(true);
+    }
+    for arg in src.get_arguments() {
+        let id = arg.get_id().as_str();
+        if id == "help" || id == "version" {
+            continue; // clap auto-adds help; avoid duplicate-definition panic
+        }
+        out = out.arg(arg.clone());
+    }
+    for alias in src.get_visible_aliases() {
+        out = out.visible_alias(alias.to_string());
+    }
+    for sub in src.get_subcommands().filter(|s| !s.is_hide_set()) {
+        out = out.subcommand(visible_tree(sub));
+    }
+    out
+}
+
 /// Generate the completion script for `shell` to stdout. Returns the process
 /// exit code (always 0 — clap already validated `shell` into a known variant).
 pub fn run(shell: Shell) -> i32 {
     // `CommandFactory::command()` reconstructs the clap `Command` that the
-    // derive macro built for `Cli`. `generate` needs `&mut Command` because it
-    // finalizes the command tree (propagating help/version) before walking it.
-    let mut cmd = Cli::command();
-    let bin = cmd.get_name().to_string();
+    // derive macro built for `Cli`. clap_complete's aot generators don't honor
+    // `#[command(hide = true)]`, so we regenerate from a tree with hidden
+    // subcommands recursively stripped (`visible_tree`). `bin` is taken from the
+    // original command's name (`onebrain`) so the script binds to the real binary.
+    let full = Cli::command();
+    let bin = full.get_name().to_string();
+    let mut cmd = visible_tree(&full);
     generate(shell, &mut cmd, bin, &mut std::io::stdout());
     0
 }
@@ -53,6 +99,61 @@ pub fn hint_line(detected: Option<Shell>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Command;
+
+    fn sample() -> Command {
+        Command::new("app")
+            .subcommand(Command::new("visible-a").subcommand(Command::new("kid")))
+            .subcommand(Command::new("hidden-top").hide(true))
+            .subcommand(
+                Command::new("group")
+                    .subcommand(Command::new("vis-verb"))
+                    .subcommand(Command::new("hid-verb").hide(true)),
+            )
+    }
+
+    fn names(cmd: &Command) -> Vec<String> {
+        cmd.get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn visible_tree_drops_hidden_top_level() {
+        let t = visible_tree(&sample());
+        let n = names(&t);
+        assert!(n.contains(&"visible-a".to_string()));
+        assert!(n.contains(&"group".to_string()));
+        assert!(
+            !n.contains(&"hidden-top".to_string()),
+            "hidden top-level kept: {n:?}"
+        );
+    }
+
+    #[test]
+    fn visible_tree_drops_hidden_nested_verbs() {
+        let t = visible_tree(&sample());
+        let group = t
+            .get_subcommands()
+            .find(|c| c.get_name() == "group")
+            .unwrap();
+        let verbs = names(group);
+        assert!(verbs.contains(&"vis-verb".to_string()));
+        assert!(
+            !verbs.contains(&"hid-verb".to_string()),
+            "hidden nested verb kept: {verbs:?}"
+        );
+    }
+
+    #[test]
+    fn visible_tree_keeps_deep_visible_children() {
+        let t = visible_tree(&sample());
+        let a = t
+            .get_subcommands()
+            .find(|c| c.get_name() == "visible-a")
+            .unwrap();
+        assert!(names(a).contains(&"kid".to_string()));
+    }
 
     #[test]
     fn detects_zsh_from_login_path() {
