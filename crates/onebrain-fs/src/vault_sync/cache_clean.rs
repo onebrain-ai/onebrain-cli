@@ -423,7 +423,10 @@ mod tests {
             &serde_json::json!({ "plugins": { "onebrain@mktA": [{"id":"onebrain"}] } }),
         );
         let out = clean_plugin_cache(&installed, Some(&cache_dir));
-        assert_eq!(out.removed, 2, "both registered + orphan version dirs removed");
+        assert_eq!(
+            out.removed, 2,
+            "both registered + orphan version dirs removed"
+        );
         assert!(!registered.exists());
         assert!(
             !orphan.exists(),
@@ -450,8 +453,14 @@ mod tests {
         fs::set_permissions(&onebrain, fs::Permissions::from_mode(0o500)).unwrap();
 
         let out = clean_plugin_cache(&installed, Some(&cache_dir));
-        assert_eq!(out.removed, 0, "removal failed → nothing counted as removed");
-        assert_eq!(out.failed, 1, "the failure is COUNTED, not silently swallowed");
+        assert_eq!(
+            out.removed, 0,
+            "removal failed → nothing counted as removed"
+        );
+        assert_eq!(
+            out.failed, 1,
+            "the failure is COUNTED, not silently swallowed"
+        );
 
         // Restore perms so tempdir cleanup succeeds.
         fs::set_permissions(&onebrain, fs::Permissions::from_mode(0o700)).unwrap();
