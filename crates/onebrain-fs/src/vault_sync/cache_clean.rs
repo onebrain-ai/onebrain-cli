@@ -76,12 +76,13 @@ fn resolve_cache_dir(
 
 /// Discover every `<cache>/<marketplace>/onebrain/` directory.
 ///
-/// Primary source: the marketplaces registered in `installed_plugins.json`
-/// (keys shaped `onebrain@<marketplace>`). Fallback: if that file is missing or
-/// unreadable, glob every `<cache>/*/onebrain/` so an unregistered orphan is
-/// still found. The fallback path only ever joins real `read_dir` entries, so
-/// it cannot traverse outside the cache; the JSON-key path is sanitized via
-/// [`is_safe_marketplace`].
+/// Unions two sources (deduped):
+/// 1. Marketplaces registered in `installed_plugins.json` (keys shaped
+///    `onebrain@<marketplace>`), sanitized via [`is_safe_marketplace`].
+/// 2. An UNCONDITIONAL glob of `<cache>/*/onebrain/`, so an orphan under an
+///    unregistered marketplace is found even when a registered marketplace also
+///    exists. The glob only ever joins real `read_dir` entries, so it cannot
+///    traverse outside the cache.
 fn discover_onebrain_cache_dirs(installed_plugins_path: &Path, cache_dir: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
 
@@ -108,20 +109,26 @@ fn discover_onebrain_cache_dirs(installed_plugins_path: &Path, cache_dir: &Path)
         }
     }
 
-    // Fallback glob — covers orphans whose marketplace is no longer registered
-    // in installed_plugins.json (exactly the 2.2.4 case we hit).
-    if dirs.is_empty() {
-        if let Ok(read) = fs::read_dir(cache_dir) {
-            // `.flatten()` drops `Err` entries (e.g. a racing unlink) and yields
-            // only the readable `DirEntry`s.
-            for entry in read.flatten() {
-                let candidate = entry.path().join("onebrain");
-                if candidate.exists() {
-                    dirs.push(candidate);
-                }
+    // ALWAYS also glob the cache: covers orphans whose marketplace is no longer
+    // registered in installed_plugins.json (the 2.2.4 case) EVEN WHEN a
+    // registered marketplace also exists. Previously gated on `dirs.is_empty()`,
+    // which missed an unregistered orphan whenever any registered marketplace
+    // was present.
+    if let Ok(read) = fs::read_dir(cache_dir) {
+        // `.flatten()` drops `Err` entries (e.g. a racing unlink) and yields
+        // only the readable `DirEntry`s.
+        for entry in read.flatten() {
+            let candidate = entry.path().join("onebrain");
+            if candidate.exists() {
+                dirs.push(candidate);
             }
         }
     }
+
+    // A registered marketplace also surfaces in the glob — dedup so each
+    // `.../onebrain/` dir is enumerated once.
+    dirs.sort();
+    dirs.dedup();
 
     dirs
 }
@@ -397,6 +404,31 @@ mod tests {
             "traversal key must not reach outside the cache"
         );
         assert!(escape.exists(), "the escape target must be untouched");
+    }
+
+    #[test]
+    fn glob_catches_orphan_under_unregistered_marketplace() {
+        // Registered marketplace "mktA" has a version dir; an ORPHAN lives under
+        // unregistered "mktB". Pre-fix, the `if dirs.is_empty()` gate skipped the
+        // glob (dirs already had mktA), so mktB's orphan was never cleaned.
+        let dir = tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let registered = cache_dir.join("mktA/onebrain/3.2.0");
+        let orphan = cache_dir.join("mktB/onebrain/2.2.4");
+        fs::create_dir_all(&registered).unwrap();
+        fs::create_dir_all(&orphan).unwrap();
+        let installed = dir.path().join("installed_plugins.json");
+        write_json(
+            &installed,
+            &serde_json::json!({ "plugins": { "onebrain@mktA": [{"id":"onebrain"}] } }),
+        );
+        let out = clean_plugin_cache(&installed, Some(&cache_dir));
+        assert_eq!(out.removed, 2, "both registered + orphan version dirs removed");
+        assert!(!registered.exists());
+        assert!(
+            !orphan.exists(),
+            "orphan under unregistered marketplace must be cleaned"
+        );
     }
 
     #[test]
