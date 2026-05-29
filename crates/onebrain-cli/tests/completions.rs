@@ -124,8 +124,12 @@ fn completions_hidden_aliases_absent_from_top_level() {
 
     // Hidden top-level names — including the `migrate`/`session-init`/... legacy
     // aliases and the hidden `completions` command — must NOT be candidates.
+    // `help` is included: the root sets `disable_help_subcommand`, so clap's
+    // auto-injected `help` subcommand must not leak as a candidate either
+    // (regression guard — `visible_tree` must carry `disable_help_subcommand`).
     for hidden in [
         "completions",
+        "help",
         "avatar",
         "daemon",
         "bundle",
@@ -157,6 +161,45 @@ fn completions_hidden_aliases_absent_from_top_level() {
         assert!(
             present,
             "visible top-level command `{visible}` missing from candidate list: {opts_line}"
+        );
+    }
+}
+
+/// Real-tree proof that hidden NESTED verbs are filtered. The unit tests cover
+/// this on a synthetic tree; this asserts it against the actual `qmd` group in
+/// the generated bash script: `embed`/`status`/`reindex` are visible verbs while
+/// `setup`/`search` are `#[command(hide = true)]` (and `help` is suppressed via
+/// the group's `disable_help_subcommand`).
+#[test]
+fn completions_exclude_hidden_nested_verbs() {
+    let out = completions_for("bash");
+    // The qmd group's candidate list is the `opts="..."` line holding its visible
+    // verbs (and not the top-level list, which carries `init`/`doctor`).
+    let qmd_opts = out
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| l.starts_with("opts=\""))
+        .find(|l| {
+            l.contains(" embed ") || l.ends_with(" embed\"") || l.contains(" embed reindex")
+        })
+        .filter(|l| !(l.contains(" init ") && l.contains(" doctor ")))
+        .expect("bash script must contain a qmd group opts= candidate list");
+
+    let candidates: Vec<&str> = qmd_opts
+        .split_whitespace()
+        .map(|tok| tok.trim_start_matches("opts=\"").trim_matches('"'))
+        .collect();
+
+    for visible in ["embed", "status", "reindex"] {
+        assert!(
+            candidates.contains(&visible),
+            "visible qmd verb `{visible}` missing from candidate list: {qmd_opts}"
+        );
+    }
+    for hidden in ["setup", "search", "help"] {
+        assert!(
+            !candidates.contains(&hidden),
+            "hidden qmd verb `{hidden}` leaked into candidate list: {qmd_opts}"
         );
     }
 }

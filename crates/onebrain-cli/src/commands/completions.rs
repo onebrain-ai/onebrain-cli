@@ -9,9 +9,14 @@ use clap_complete::{generate, Shell};
 
 /// Rebuild `src` keeping only non-hidden subcommands, recursively. clap_complete's
 /// aot generators emit every subcommand (they don't honor `hide`), and clap has no
-/// remove-subcommand API — so we reconstruct the tree. Only the config that affects
-/// completion output is copied (about/version/args/visible aliases); the auto
-/// `help`/`version` args are skipped so clap re-adds `help` without a duplicate-id panic.
+/// remove-subcommand API — so we reconstruct the tree.
+///
+/// Only a CURATED set of command-level settings is copied — about, version, args,
+/// visible aliases, `disable_help_subcommand`, `propagate_version`. The auto
+/// `help`/`version` args are skipped so clap re-adds `help` without a duplicate-id
+/// panic. Any future command-level setting that affects completion output (e.g.
+/// another auto-injected subcommand toggle) MUST be added here too, or the rebuilt
+/// tree will silently diverge from the real CLI.
 fn visible_tree(src: &clap::Command) -> clap::Command {
     let mut out = clap::Command::new(src.get_name().to_string());
     if let Some(about) = src.get_about() {
@@ -19,6 +24,15 @@ fn visible_tree(src: &clap::Command) -> clap::Command {
     }
     if let Some(version) = src.get_version() {
         out = out.version(version.to_string());
+    }
+    // Carry the `help` subcommand suppression (set on the root + resource groups);
+    // otherwise clap auto-injects a `help` subcommand that leaks as a candidate.
+    if src.is_disable_help_subcommand_set() {
+        out = out.disable_help_subcommand(true);
+    }
+    // Carry `--version` propagation so the rebuilt tree matches the real CLI.
+    if src.is_propagate_version_set() {
+        out = out.propagate_version(true);
     }
     for arg in src.get_arguments() {
         let id = arg.get_id().as_str();
