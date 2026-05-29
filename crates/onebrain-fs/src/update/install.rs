@@ -432,6 +432,11 @@ fn download_text(url: &str) -> Result<String, UpdateError> {
 pub(crate) enum InstallChannel {
     /// Homebrew-managed: lives in the Cellar behind a `brew` symlink.
     Homebrew,
+    /// npm-managed: the `@onebrain-ai/cli` global package — the binary lives
+    /// under `node_modules/@onebrain-ai/cli`. Hand off to `npm install -g` so
+    /// npm's metadata stays in sync; swapping the file in place would desync it
+    /// (the same divergence the Homebrew path avoids).
+    Npm,
     /// Direct download / `cargo-binstall` / manual — a file we own and can
     /// safely swap in place.
     Direct,
@@ -460,20 +465,69 @@ pub(crate) fn detect_install_channel(current_exe: &Path) -> InstallChannel {
 /// never matches and always resolves to `Direct` (the Windows update path is
 /// unwired anyway — see `AssetInfo::extract_binary`).
 fn classify_path(resolved: &Path) -> InstallChannel {
-    if resolved.to_string_lossy().contains("/Cellar/onebrain/") {
+    let s = resolved.to_string_lossy();
+    if s.contains("/Cellar/onebrain/") {
         InstallChannel::Homebrew
+    } else if s.contains("/node_modules/@onebrain-ai/") {
+        // The npm wrapper's native binary canonicalizes to
+        // `<prefix>/lib/node_modules/@onebrain-ai/cli/bin/onebrain`; pnpm/yarn
+        // and `bun add -g` nest it under `.../node_modules/@onebrain-ai/cli`
+        // too (bun via its bin symlink). The scoped `@onebrain-ai` segment is
+        // the precise signal — a bare `node_modules` check would over-match
+        // unrelated binaries. Unix path separator: Windows npm globals use
+        // backslashes and fall through to Direct (Windows update is unwired —
+        // see `AssetInfo::extract_binary`).
+        InstallChannel::Npm
     } else {
         InstallChannel::Direct
     }
 }
 
-/// Delegate the update to Homebrew. `brew upgrade onebrain` refreshes the tap
-/// formula and is idempotent (a no-op when already current); stdio is
-/// inherited so the user sees brew's own output. We never swap a Cellar
-/// binary in place — that would leave brew's metadata pointing at a version
-/// it no longer manages.
+/// The Homebrew tap that ships the `onebrain` formula.
+const ONEBRAIN_TAP: &str = "onebrain-ai/onebrain";
+
+/// Best-effort, quiet refresh of the `onebrain` Homebrew tap so a
+/// freshly-published formula is visible to `brew upgrade`.
+///
+/// `brew upgrade` does NOT fetch new formulae — that's `brew update`, which
+/// refreshes EVERY tap and can be slow. We scope the refresh to just our tap by
+/// git-pulling its checkout (resolved via `brew --repository <tap>`). All
+/// failures are swallowed: this is a convenience that removes the need for a
+/// manual `brew update`, never a hard requirement — `brew_upgrade` proceeds and
+/// the post-install version guard still catches a genuine no-op.
+fn refresh_onebrain_tap() {
+    use std::process::Command;
+    let Ok(out) = Command::new("brew")
+        .args(["--repository", ONEBRAIN_TAP])
+        .output()
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    let tap_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if tap_dir.is_empty() {
+        return;
+    }
+    // `--ff-only` keeps it safe (never a merge commit on a read-only tap);
+    // `--quiet` keeps the framed update report clean.
+    let _ = Command::new("git")
+        .args(["-C", &tap_dir, "pull", "--ff-only", "--quiet"])
+        .status();
+}
+
+/// Delegate the update to Homebrew. We refresh the onebrain tap FIRST (see
+/// [`refresh_onebrain_tap`]) so `brew upgrade` sees a just-published formula —
+/// without it, running `onebrain update` right after a release found a stale
+/// local formula, no-op'd ("already installed"), and the post-install version
+/// guard then flagged the mismatch. `brew upgrade` itself is idempotent (a
+/// no-op when already current); stdio is inherited so the user sees brew's own
+/// output. We never swap a Cellar binary in place — that would leave brew's
+/// metadata pointing at a version it no longer manages.
 pub(crate) fn brew_upgrade() -> Result<(), UpdateError> {
     use std::process::Command;
+    refresh_onebrain_tap();
     let status = Command::new("brew")
         .args(["upgrade", "onebrain"])
         .status()
@@ -489,6 +543,52 @@ pub(crate) fn brew_upgrade() -> Result<(), UpdateError> {
         Err(UpdateError::Install(format!(
             "`brew upgrade onebrain` failed (exit {}). \
              Try `brew update && brew upgrade onebrain`.",
+            status.code().unwrap_or(-1)
+        )))
+    }
+}
+
+/// Build the npm install spec for a target version. Pins to the exact version
+/// the update flow resolved (not `@latest`) so the install matches what was
+/// already decided, and strips any leading `v` — npm specs are bare semver, so
+/// an unstripped tag would yield `@onebrain-ai/cli@v3.2.17`, which npm rejects.
+/// Extracted as a pure fn because it's the one silently-breakable bit of
+/// [`npm_update`] (the rest just shells out).
+fn npm_spec(version: &str) -> String {
+    format!("@onebrain-ai/cli@{}", version.trim_start_matches('v'))
+}
+
+/// Delegate the update to npm for the `@onebrain-ai/cli` global package.
+/// `npm install -g @onebrain-ai/cli@<version>` re-runs the wrapper's binary
+/// download and keeps npm's metadata in sync. We never swap the file in place —
+/// that would desync npm (the same divergence the Homebrew path avoids). stdio
+/// is inherited so the user sees npm's own progress.
+///
+/// `npm` is resolved from the ambient PATH, so the install targets whatever
+/// node prefix is active in this process (relevant under nvm / Volta / fnm — a
+/// different active node could install into a different prefix than the running
+/// binary, surfacing as a no-op caught by the post-install version guard, not a
+/// corruption). Bun users (`bun add -g`) canonicalize into this same Npm arm
+/// via their `node_modules` symlink, but would want `bun add -g` instead — Bun
+/// is not a v3 canonical install channel, so the npm path + guard is the
+/// safe-enough fallback.
+pub(crate) fn npm_update(version: &str) -> Result<(), UpdateError> {
+    use std::process::Command;
+    let spec = npm_spec(version);
+    let status = Command::new("npm")
+        .args(["install", "-g", &spec])
+        .status()
+        .map_err(|e| {
+            UpdateError::Install(format!(
+                "npm install detected but `npm` is not runnable ({e}). \
+                 Run `npm install -g {spec}` manually."
+            ))
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(UpdateError::Install(format!(
+            "`npm install -g {spec}` failed (exit {}).",
             status.code().unwrap_or(-1)
         )))
     }
@@ -674,5 +774,46 @@ mod tests {
             classify_path(Path::new("/opt/homebrew/Cellar/ripgrep/14.0/bin/onebrain")),
             InstallChannel::Direct
         );
+    }
+
+    #[test]
+    fn classify_path_detects_npm_global() {
+        use std::path::Path;
+        // npm global: the native binary canonicalizes to the package's `bin/`
+        // (per the wrapper's postinstall) — the REAL production path.
+        assert_eq!(
+            classify_path(Path::new(
+                "/opt/homebrew/lib/node_modules/@onebrain-ai/cli/bin/onebrain"
+            )),
+            InstallChannel::Npm
+        );
+        // system-node npm prefix layout, same scope.
+        assert_eq!(
+            classify_path(Path::new(
+                "/usr/local/lib/node_modules/@onebrain-ai/cli/bin/onebrain"
+            )),
+            InstallChannel::Npm
+        );
+        // pnpm nests it under the @onebrain-ai scope too.
+        assert_eq!(
+            classify_path(Path::new(
+                "/Users/x/Library/pnpm/global/5/.pnpm/@onebrain-ai+cli@3.2.17/node_modules/@onebrain-ai/cli/onebrain"
+            )),
+            InstallChannel::Npm
+        );
+        // An UNSCOPED node_modules binary must NOT match — the `@onebrain-ai`
+        // scope is required, so a bare node_modules path stays Direct.
+        assert_eq!(
+            classify_path(Path::new("/proj/node_modules/.bin/onebrain")),
+            InstallChannel::Direct
+        );
+    }
+
+    #[test]
+    fn npm_spec_strips_v_prefix() {
+        // The one silently-breakable bit of npm_update: a stray `v` would yield
+        // `@onebrain-ai/cli@v3.2.17`, which npm rejects.
+        assert_eq!(npm_spec("3.2.17"), "@onebrain-ai/cli@3.2.17");
+        assert_eq!(npm_spec("v3.2.17"), "@onebrain-ai/cli@3.2.17");
     }
 }

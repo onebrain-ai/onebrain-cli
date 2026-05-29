@@ -389,10 +389,12 @@ pub fn default_install_binary(version: &str) -> Result<(), UpdateError> {
     let current_exe = std::env::current_exe()
         .map_err(|e| UpdateError::Install(format!("could not resolve current binary path: {e}")))?;
     match install::detect_install_channel(&current_exe) {
-        // Homebrew-managed installs live in the Cellar behind a `brew` symlink.
-        // Swapping that file in place would desync brew's metadata from disk
-        // (the dual-install divergence), so hand off to `brew upgrade` instead.
+        // Homebrew- and npm-managed installs live behind their package
+        // manager's metadata; swapping the file in place would desync it (the
+        // dual-install divergence). Hand off to the package manager instead.
+        // Only a Direct install is a plain file we own and can safely swap.
         install::InstallChannel::Homebrew => install::brew_upgrade(),
+        install::InstallChannel::Npm => install::npm_update(version),
         install::InstallChannel::Direct => install::fetch_and_swap_binary(version, &current_exe),
     }
 }

@@ -1,5 +1,5 @@
 ---
-latest_version: 3.2.16
+latest_version: 3.2.17
 released: 2026-05-29
 ---
 
@@ -11,6 +11,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.2.17] — 2026-05-29 — `onebrain update`: refresh Homebrew tap before upgrade + dedicated npm channel
+
+- **Fix: `onebrain update` on a Homebrew install now refreshes the `onebrain-ai/onebrain` tap before `brew upgrade`.** `brew upgrade` does not fetch new formulae, so running `onebrain update` right after a release found a stale local formula, no-op'd ("already installed"), and the post-install version guard then reported the upgrade "may not have taken effect" (a confusing false-ish failure that forced a manual `brew update && brew upgrade onebrain`). The fix git-pulls **only** our tap (not a full `brew update` — stays fast) so the freshly-published formula is visible and the upgrade applies in one `onebrain update`. Best-effort + non-fatal: a refresh failure falls through to `brew upgrade` exactly as before.
+- **Feat: `onebrain update` now has a dedicated npm channel.** A binary installed via `npm i -g @onebrain-ai/cli` previously fell through to the Direct path, which swaps the file in place and desyncs npm's metadata (the same divergence the Homebrew path avoids). It's now detected by the `@onebrain-ai` `node_modules` scope and updated via `npm install -g @onebrain-ai/cli@<version>`. This completes the "delegate to the package manager, never swap a managed binary" model across all three channels — **Homebrew · npm · Direct download**.
 
 ## [3.2.16] — 2026-05-29 — plugin-cache doctor check + orphan cleanup + post-update reload hint
 
