@@ -25,6 +25,7 @@ thiserror   = "1"
 anyhow      = "1"
 chrono      = { version = "0.4", features = ["serde"] }
 clap        = { version = "4", features = ["derive"] }
+clap_complete = "4"
 
 # Filesystem (Slice 1 partial · used by count_unembedded)
 walkdir   = "2"
