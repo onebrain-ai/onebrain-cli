@@ -33,18 +33,20 @@ pub fn run(vault_root_override: Option<PathBuf>, branch: Option<String>) -> Resu
 
 /// Same as [`run`] but routes the per-step progress reporter to
 /// `std::io::sink()` — so neither the "OneBrain Vault Sync" intro/outro
-/// frame nor the per-step `▸ <label>` lines leak. Used by `onebrain plugin
-/// update` (v3.2.15+), which renders its own framed doctor-style report;
-/// the framed report's animated spinner is the only progress signal the
-/// user sees, matching `doctor`/`update`.
+/// frame nor the per-step `▸ <label>` lines leak. This is the entry point
+/// `onebrain plugin update` (v3.2.15+) calls to embed vault-sync inside its
+/// own framed doctor-style report; the framed report's animated spinner is
+/// the only progress signal the user sees, matching `doctor`/`update`. The
+/// `register_schedule` sibling shares the `run_embedded` name (v3.2.18) so
+/// both plugin-update entry points read consistently.
 ///
-/// (v3.2.13 introduced `run_embedded` for the intro-only suppression; v3.2.15
-/// folded that into the silent path because no remaining caller wanted the
-/// in-between "embedded but with step lines" mode. v3.2.15 round-2 also
-/// dropped the now-dead `embedded` flag from the inner shape — the
-/// orchestrator only consults it when `progress_writer` is `None`, and the
-/// silent path always sets the writer to a sink.)
-pub fn run_silent(vault_root_override: Option<PathBuf>, branch: Option<String>) -> Result<i32> {
+/// (History: v3.2.13 had a separate intro-only-suppression variant under this
+/// name; v3.2.15 folded it into the fully-silent path because no remaining
+/// caller wanted the in-between "embedded but with step lines" mode, and
+/// round-2 dropped the now-dead `embedded` flag from the inner shape — the
+/// orchestrator only consults it when `progress_writer` is `None`, and this
+/// path always sets the writer to a sink.)
+pub fn run_embedded(vault_root_override: Option<PathBuf>, branch: Option<String>) -> Result<i32> {
     run_with(vault_root_override, branch, true)
 }
 

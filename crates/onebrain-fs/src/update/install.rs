@@ -187,22 +187,25 @@ impl AssetInfo {
 }
 
 fn download_archive(url: &str) -> Result<Vec<u8>, UpdateError> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS)))
         .user_agent("onebrain-cli-update")
         .build()
-        .map_err(|e| UpdateError::Network(format!("build http client: {e}")))?;
-    let mut resp = client
-        .get(url)
-        .send()
-        .map_err(|e| UpdateError::Network(format!("GET {url}: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(UpdateError::GithubStatus(resp.status().as_u16()));
+        .into();
+    // ureq surfaces 4xx/5xx as `Err(StatusCode)`; an `Ok` is already 2xx. The
+    // release archive is several MB, so stream it through `into_reader()`
+    // (no size cap) rather than the limited `read_to_vec()`.
+    match agent.get(url).call() {
+        Ok(resp) => {
+            let mut reader = resp.into_body().into_reader();
+            let mut buf = Vec::with_capacity(8 * 1024 * 1024);
+            std::io::Read::read_to_end(&mut reader, &mut buf)
+                .map_err(|e| UpdateError::Network(format!("read body: {e}")))?;
+            Ok(buf)
+        }
+        Err(ureq::Error::StatusCode(code)) => Err(UpdateError::GithubStatus(code)),
+        Err(e) => Err(UpdateError::Network(format!("GET {url}: {e}"))),
     }
-    let mut buf = Vec::with_capacity(8 * 1024 * 1024);
-    resp.copy_to(&mut buf)
-        .map_err(|e| UpdateError::Network(format!("read body: {e}")))?;
-    Ok(buf)
 }
 
 fn extract_tar_gz(archive_bytes: &[u8], target_name: &str) -> Result<Vec<u8>, UpdateError> {
@@ -403,23 +406,21 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// `.sha256` sidecar. A missing sidecar is a `Checksum` error (we cannot
 /// verify, so we must refuse), not a generic network error.
 fn download_text(url: &str) -> Result<String, UpdateError> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS)))
         .user_agent("onebrain-cli-update")
         .build()
-        .map_err(|e| UpdateError::Network(format!("build http client: {e}")))?;
-    let resp = client
-        .get(url)
-        .send()
-        .map_err(|e| UpdateError::Network(format!("GET {url}: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(UpdateError::Checksum(format!(
-            "checksum file unavailable at {url} (HTTP {})",
-            resp.status().as_u16()
-        )));
+        .into();
+    match agent.get(url).call() {
+        Ok(mut resp) => resp
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| UpdateError::Network(format!("read checksum body: {e}"))),
+        Err(ureq::Error::StatusCode(code)) => Err(UpdateError::Checksum(format!(
+            "checksum file unavailable at {url} (HTTP {code})"
+        ))),
+        Err(e) => Err(UpdateError::Network(format!("GET {url}: {e}"))),
     }
-    resp.text()
-        .map_err(|e| UpdateError::Network(format!("read checksum body: {e}")))
 }
 
 // ---------------------------------------------------------------------------

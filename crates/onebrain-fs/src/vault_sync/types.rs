@@ -27,7 +27,7 @@ pub type NowFn = Box<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 pub struct VaultSyncOptions {
     /// Overrides `vault.yml::update_channel` branch resolution.
     pub branch: Option<String>,
-    /// Mock fetch — defaults to a real `reqwest::blocking` GET against GitHub.
+    /// Mock fetch — defaults to a real blocking `ureq` GET against GitHub.
     pub fetch_fn: Option<FetchFn>,
     /// Override path to `installed_plugins.json` (test-only).
     pub installed_plugins_path: Option<PathBuf>,

@@ -4,7 +4,7 @@ default-members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "3.2.17"
+version = "3.2.18"
 edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["OneBrain Contributors"]
@@ -19,15 +19,12 @@ onebrain-cache = { path = "crates/onebrain-cache" }
 
 # Foundation (Slice 1)
 serde       = { version = "1", features = ["derive"] }
-serde_yaml  = "0.9"
+serde_yaml  = { package = "serde_yaml_ng", version = "0.10" }
 serde_json  = { version = "1", features = ["preserve_order"] }
 thiserror   = "1"
 anyhow      = "1"
 chrono      = { version = "0.4", features = ["serde"] }
-clap        = { version = "4", features = ["derive", "env"] }
-
-# v3.1 forward-compat (binary only)
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+clap        = { version = "4", features = ["derive"] }
 
 # Filesystem (Slice 1 partial · used by count_unembedded)
 walkdir   = "2"
@@ -43,7 +40,14 @@ wait-timeout = "0.2"
 semver    = "1"
 
 # HTTP client (Slice 11 · update · GitHub releases API · Slice 13 · vault-sync tarball)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+# v3.2.18: reqwest → ureq. ureq is a blocking, synchronous client, so swapping it
+# in drops the entire async stack (tokio · hyper · h2 · tower · tower-http ·
+# hyper-rustls · hyper-util) from the release binary — these were pulled in ONLY
+# by reqwest. TLS still rustls (ureq default features: rustls + ring + webpki-roots
+# + gzip). JSON is parsed via the existing serde_json dep, so ureq's `json` feature
+# is left off. The daemon (v3.3) re-introduces tokio deliberately for its async
+# RPC server — keeping it out of the one-shot CLI hot path until then.
+ureq = "3"
 
 # SHA-256 verification of the self-update binary (v3.1.4 · onebrain-fs update install path)
 sha2 = "0.10"

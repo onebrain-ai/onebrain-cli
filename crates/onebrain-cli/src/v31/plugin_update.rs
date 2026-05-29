@@ -95,14 +95,14 @@ pub fn run(
     //    v3.2.13: invoke via the embedded-progress entry so the orchestrator
     //    skips its "OneBrain Vault Sync" intro frame and "vault-sync: done"
     //    outro.
-    //    v3.2.15: ALSO route through `run_silent` so the per-step `▸ <label>`
+    //    v3.2.15: ALSO route through `run_embedded` so the per-step `▸ <label>`
     //    TTY lines don't leak above the parent's framed report (user testing
     //    on v3.2.14 flagged "ไม่มี header เลย" — the step lines appeared
     //    BEFORE the parent's `🔄  Plugin Update` header). The framed report's
     //    animated spinner is the only progress signal, matching what
     //    `doctor`/`update` already do.
     if !dry_run {
-        let exit = crate::commands::vault_sync::run_silent(Some(vault_root.clone()), branch)
+        let exit = crate::commands::vault_sync::run_embedded(Some(vault_root.clone()), branch)
             .context("plugin update: vault-sync failed")?;
         // `vault_sync::run` returns Ok(0) on success, Ok(1) on critical fail.
         if exit != 0 {
@@ -135,12 +135,12 @@ pub fn run(
     //    we surface this as a partial failure rather than bubbling Err, so
     //    the dispatcher can render the partial state in the envelope.
     //
-    //    v3.2.13: use the `run_quiet` entry so the per-plist `✓ Wrote …`
+    //    v3.2.13: use the `run_embedded` entry so the per-plist `✓ Wrote …`
     //    confirmation lines and the trailing "Use launchctl to load …" hint
     //    don't leak through plugin update's framed report — those belong on
     //    the direct `onebrain schedule register` surface, not embedded.
     if !dry_run {
-        match crate::commands::register_schedule::run_quiet(
+        match crate::commands::register_schedule::run_embedded(
             Some(vault_root),
             /* dry_run */ false,
             /* refresh */ true,
