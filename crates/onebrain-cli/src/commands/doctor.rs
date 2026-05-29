@@ -628,11 +628,13 @@ fn fix_plugin_cache(json: bool) -> FixOutcome {
     };
     status_line(json, "running: clean plugin cache");
     // `None` → clean derives `<home>/.claude/plugins/cache`.
-    let removed = clean_plugin_cache(&installed, None);
+    let outcome = clean_plugin_cache(&installed, None);
+    let removed = outcome.removed;
     // Honest result: re-detect after the sweep. If versions remain, a removal
     // failed (permissions, open handle, race) — report Failed rather than a
     // misleading "Fixed" with exit 0, so the user learns why the `plugin-cache`
-    // warning will still be there on the next doctor run.
+    // warning will still be there on the next doctor run. `outcome.failed`
+    // already counted those failures (and warned on stderr per path).
     let remaining = detect_stale_plugin_cache(&installed, None);
     if remaining.is_empty() {
         FixOutcome::Fixed(format!(
@@ -641,7 +643,8 @@ fn fix_plugin_cache(json: bool) -> FixOutcome {
         ))
     } else {
         FixOutcome::Failed(format!(
-            "removed {removed}, but {} version(s) remain — check permissions on ~/.claude/plugins/cache",
+            "removed {removed}, {} failed, {} version(s) remain — check permissions on ~/.claude/plugins/cache",
+            outcome.failed,
             remaining.len()
         ))
     }
