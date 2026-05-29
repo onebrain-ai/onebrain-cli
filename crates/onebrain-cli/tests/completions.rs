@@ -154,7 +154,9 @@ fn completions_hidden_aliases_absent_from_top_level() {
     }
 
     // Sanity: the visible top-level commands ARE candidates.
-    for visible in ["init", "update", "doctor", "qmd", "schedule", "vault", "session"] {
+    for visible in [
+        "init", "update", "doctor", "qmd", "schedule", "vault", "session",
+    ] {
         let present = opts_line
             .split_whitespace()
             .any(|tok| tok.trim_matches('"') == visible);
@@ -179,9 +181,7 @@ fn completions_exclude_hidden_nested_verbs() {
         .lines()
         .map(str::trim_start)
         .filter(|l| l.starts_with("opts=\""))
-        .find(|l| {
-            l.contains(" embed ") || l.ends_with(" embed\"") || l.contains(" embed reindex")
-        })
+        .find(|l| l.contains(" embed ") || l.ends_with(" embed\"") || l.contains(" embed reindex"))
         .filter(|l| !(l.contains(" init ") && l.contains(" doctor ")))
         .expect("bash script must contain a qmd group opts= candidate list");
 
