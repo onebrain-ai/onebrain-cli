@@ -722,6 +722,23 @@ pub(crate) fn render_plugin_update_animated_to<W: std::io::Write>(
             writeln!(writer, " └ {one_line}")?;
         }
     }
+    // R6: surface the reload next-step whenever a real version change landed —
+    // INDEPENDENT of partial_failed. `version_after` is read post-sync, so the
+    // new version is already on disk; a later schedule-step failure doesn't
+    // un-land it, and the running session still holds the old one. Suppressing
+    // the hint on partial failure would lose the guidance exactly when the user
+    // most needs it.
+    if let Some(hint) = plugin_update_reload_hint(
+        report.dry_run,
+        report.version_before.as_deref(),
+        report.version_after.as_deref(),
+    ) {
+        if color {
+            writeln!(writer, " {dim}↻ {hint}{reset}")?;
+        } else {
+            writeln!(writer, " ↻ {hint}")?;
+        }
+    }
     writeln!(writer, "{dim}{rule}{reset}")?;
     Ok(())
 }
@@ -802,6 +819,35 @@ fn plugin_update_verdict_text(
     } else {
         format!("already up-to-date{suffix}")
     }
+}
+
+/// R6 · next-step guidance after a plugin update. When a real version change
+/// (or fresh install) landed, the RUNNING Claude session still holds the OLD
+/// plugin in memory — skills hot-reload on next use, but hooks/MCP and
+/// `INSTRUCTIONS.md`/`CLAUDE.md` (loaded once at session start) do not. Point
+/// the user at the reload path. Returns `None` for dry-run or a no-op
+/// (`up-to-date`) — nothing to apply, so we stay quiet.
+///
+/// Shared by both renderers (static + animated) so the wording lives in one
+/// place, mirroring `plugin_update_verdict_text`.
+fn plugin_update_reload_hint(
+    dry_run: bool,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> Option<String> {
+    if dry_run {
+        return None;
+    }
+    let changed = match (before, after) {
+        (Some(a), Some(b)) => a != b, // real version bump
+        (None, Some(_)) => true,      // fresh install
+        _ => false,
+    };
+    changed.then(|| {
+        "apply: /reload-plugins (skills · hooks · agents · MCP) — \
+         for INSTRUCTIONS/CLAUDE.md changes, /wrapup + reopen the session"
+            .to_string()
+    })
 }
 
 /// On-the-wire payload for `plugin update`. Hoisted out of
@@ -1058,6 +1104,18 @@ where
             let _ = writeln!(buf, " {dim}└ {one_line}{reset}");
         } else {
             let _ = writeln!(buf, " └ {one_line}");
+        }
+    }
+    // R6: same reload next-step as the animated path (shared helper); fires on
+    // a real version change regardless of partial_failed — the version already
+    // landed on disk, so the running session needs a reload either way.
+    if let Some(hint) =
+        plugin_update_reload_hint(d.dry_run(), d.version_before(), d.version_after())
+    {
+        if color {
+            let _ = writeln!(buf, " {dim}↻ {hint}{reset}");
+        } else {
+            let _ = writeln!(buf, " ↻ {hint}");
         }
     }
     let _ = writeln!(buf, "{dim}{rule}{reset}");
@@ -1333,6 +1391,46 @@ mod tests {
     }
 
     #[test]
+    fn reload_hint_fires_only_on_real_version_change() {
+        // Real bump + fresh install → hint; no-op / dry-run / unknown-after → none.
+        assert!(plugin_update_reload_hint(false, Some("3.1.3"), Some("3.1.4")).is_some());
+        assert!(plugin_update_reload_hint(false, None, Some("3.1.4")).is_some());
+        assert!(plugin_update_reload_hint(false, Some("3.1.4"), Some("3.1.4")).is_none());
+        assert!(plugin_update_reload_hint(true, Some("3.1.3"), Some("3.1.4")).is_none());
+        assert!(plugin_update_reload_hint(false, Some("3.1.3"), None).is_none());
+        let h = plugin_update_reload_hint(false, Some("a"), Some("b")).unwrap();
+        assert!(h.contains("/reload-plugins") && h.contains("/wrapup"));
+    }
+
+    #[test]
+    fn plugin_update_text_real_bump_emits_reload_next_step() {
+        // Integration: a real version change must surface the reload guidance
+        // in the rendered report (not just in the helper).
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 0,
+            plists_rewritten: false,
+            plists_count: Some(0),
+            version_before: Some("3.1.3".to_string()),
+            version_after: Some("3.1.4".to_string()),
+            partial_failure: None,
+            warnings: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("updated v3.1.3 → v3.1.4"),
+            "verdict missing:\n{out}"
+        );
+        assert!(
+            out.contains("/reload-plugins"),
+            "reload next-step missing:\n{out}"
+        );
+    }
+
+    #[test]
     fn plugin_update_text_no_schedule_entries_renders_distinct_detail() {
         // Round-2 review HIGH-1: a vault with zero `schedule:` entries
         // returns `Ok(0)` from `register_schedule::run_quiet` — a well-formed
@@ -1502,6 +1600,64 @@ mod tests {
         assert!(
             out.contains("└ schedule re-register failed"),
             "partial-failure hint missing under animation:\n{out:?}"
+        );
+    }
+
+    #[test]
+    fn reload_hint_survives_partial_failure_when_version_changed() {
+        // B-HIGH1 regression: a real version bump landed on disk, THEN the
+        // schedule re-register failed (partial). The new version is live, so the
+        // reload guidance MUST still appear — suppressing it on partial failure
+        // would lose the guidance exactly when the user needs it.
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 1,
+            plists_rewritten: false,
+            plists_count: None,
+            version_before: Some("3.1.3".to_string()),
+            version_after: Some("3.1.4".to_string()),
+            partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
+            warnings: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("partial failure"), "verdict missing:\n{out}");
+        assert!(
+            out.contains("/reload-plugins"),
+            "reload guidance lost on partial failure despite version change:\n{out}"
+        );
+    }
+
+    #[test]
+    fn reload_hint_renders_in_animated_path() {
+        // C-L2: the animated renderer wires the same reload helper — assert the
+        // hint actually reaches its output on a real version change (the text
+        // path is covered separately).
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 0,
+            plists_rewritten: false,
+            plists_count: Some(0),
+            version_before: Some("3.1.3".to_string()),
+            version_after: Some("3.1.4".to_string()),
+            partial_failure: None,
+            warnings: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        render_plugin_update_animated_to(
+            &report,
+            &text_mode_mono(),
+            &mut buf,
+            Some(std::time::Duration::ZERO),
+        )
+        .unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("/reload-plugins"),
+            "animated path missing reload hint:\n{out}"
         );
     }
 

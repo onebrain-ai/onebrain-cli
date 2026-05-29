@@ -22,6 +22,7 @@ pub mod folders;
 pub mod marketplace;
 pub mod orphans;
 pub mod plugin;
+pub mod plugin_cache;
 pub mod qmd;
 pub mod settings_hooks;
 pub mod vault_config_migration;
@@ -32,6 +33,7 @@ pub use folders::FoldersCheck;
 pub use marketplace::ClaudeSettingsCheck;
 pub use orphans::OrphanCheckpointsCheck;
 pub use plugin::PluginFilesCheck;
+pub use plugin_cache::PluginCacheCheck;
 pub use qmd::QmdEmbeddingsCheck;
 pub use settings_hooks::SettingsHooksCheck;
 pub use vault_config_migration::VaultConfigMigrationCheck;
@@ -61,7 +63,7 @@ pub fn run_all_checks(vault_root: &Path, config: &VaultConfig) -> Vec<DoctorResu
     /// requires updating this constant. The `debug_assert_eq!` below
     /// catches misalignment in CI.
     const QMD_SPLICE_POSITION: usize = 7;
-    const EXPECTED_SERIAL_LEN: usize = 8;
+    const EXPECTED_SERIAL_LEN: usize = 9;
 
     let qmd_config = config.clone();
     let qmd_handle = std::thread::spawn(move || QmdEmbeddingsCheck.run(Path::new(""), &qmd_config));
@@ -75,6 +77,10 @@ pub fn run_all_checks(vault_root: &Path, config: &VaultConfig) -> Vec<DoctorResu
         Box::new(SettingsHooksCheck),
         Box::new(OrphanCheckpointsCheck),
         Box::new(ClaudeSettingsCheck),
+        // plugin-cache lands last (after the qmd splice at index 7) so
+        // QMD_SPLICE_POSITION stays valid. Final order: … qmd · claude-settings
+        // · plugin-cache.
+        Box::new(PluginCacheCheck),
     ];
     debug_assert_eq!(
         serial_checks.len(),

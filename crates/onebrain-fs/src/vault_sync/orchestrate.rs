@@ -229,7 +229,11 @@ pub fn read_plugin_version(base: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-fn default_installed_plugins_path() -> Option<PathBuf> {
+/// `~/.claude/plugins/installed_plugins.json` — the home registry of installed
+/// Claude Code plugins. `pub` + re-exported from `vault_sync` so the doctor
+/// `plugin-cache` check and its `--fix` recipe resolve this ONE place instead
+/// of each re-inlining the literal (which would drift independently).
+pub fn default_installed_plugins_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude/plugins/installed_plugins.json"))
 }
 
