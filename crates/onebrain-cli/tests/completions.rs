@@ -73,14 +73,7 @@ fn completions_exclude_hidden_top_level_commands() {
     // appears — the hidden top-level `migrate` alias is covered structurally by
     // `completions_hidden_aliases_absent_from_top_level` below.
     let out = completions_for("zsh");
-    for hidden in [
-        "avatar",
-        "daemon",
-        "bundle",
-        "serve",
-        "session-init",
-        "orphan-scan",
-    ] {
+    for hidden in ["avatar", "daemon", "bundle", "session-init", "orphan-scan"] {
         assert!(
             !out.contains(hidden),
             "hidden command `{hidden}` leaked into zsh completions"
@@ -133,7 +126,6 @@ fn completions_hidden_aliases_absent_from_top_level() {
         "avatar",
         "daemon",
         "bundle",
-        "serve",
         "session-init",
         "orphan-scan",
         "migrate",
@@ -153,9 +145,10 @@ fn completions_hidden_aliases_absent_from_top_level() {
         );
     }
 
-    // Sanity: the visible top-level commands ARE candidates.
+    // Sanity: the visible top-level commands ARE candidates. `serve` joined
+    // the visible set in v3.3 (was a hidden stub group pre-v3.3 step 2).
     for visible in [
-        "init", "update", "doctor", "qmd", "schedule", "vault", "session",
+        "init", "update", "doctor", "qmd", "schedule", "vault", "session", "serve",
     ] {
         let present = opts_line
             .split_whitespace()

@@ -11,6 +11,7 @@ mod legacy_output;
 mod migration;
 mod output;
 mod safety;
+mod server;
 mod v31;
 mod vault_ctx;
 

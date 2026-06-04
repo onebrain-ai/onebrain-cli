@@ -362,9 +362,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             ConfigVerb::Init => stubs::not_implemented("config init"),
         },
         Cmd::Daemon(DaemonCmd { verb }) => match verb {
-            DaemonVerb::Start => stubs::not_implemented("daemon start"),
-            DaemonVerb::Stop => stubs::not_implemented("daemon stop"),
-            DaemonVerb::Status => stubs::not_implemented("daemon status"),
+            DaemonVerb::Start => commands::daemon::run_start(&mode),
+            DaemonVerb::Stop => commands::daemon::run_stop(&mode),
+            DaemonVerb::Status => commands::daemon::run_status(&mode),
+            // Hidden internal verb — the detached child's body.
+            DaemonVerb::Run => commands::daemon::run_internal(),
         },
         Cmd::Date(DateCmd { verb }) => match verb {
             DateVerb::Today => stubs::not_implemented("date today"),
@@ -476,11 +478,15 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 stubs::not_implemented_vault_required(vault_flag.clone(), "pause resume")
             }
         },
-        Cmd::Serve(ServeCmd { verb }) => match verb {
-            ServeVerb::Start => stubs::not_implemented("serve start"),
-            ServeVerb::Stop => stubs::not_implemented("serve stop"),
-            ServeVerb::Status => stubs::not_implemented("serve status"),
-        },
+        Cmd::Serve(args) => {
+            // Fold the global `--vault` into the serve-local override so
+            // `onebrain serve --vault PATH` and `--vault-dir PATH` both work.
+            let mut args = args;
+            if args.vault_dir.is_none() {
+                args.vault_dir = vault_flag.clone();
+            }
+            commands::serve::run(&args, &mode)
+        }
         Cmd::Task(TaskCmd { verb }) => match verb {
             TaskVerb::List => {
                 stubs::not_implemented_vault_required(vault_flag.clone(), "task list")

@@ -1,6 +1,6 @@
 ---
-latest_version: 3.2.21
-released: 2026-05-30
+latest_version: 3.3.0
+released: 2026-06-05
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -11,6 +11,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.3.0] — 2026-06-05 — daemon foundation + HTTP surface
+
+- feat(daemon): `onebrain daemon start|stop|status` — `start` self-respawns a
+  detached process (`setsid` + `chdir`, log → `~/.onebrain/run/daemon.log`) tracked
+  by `daemon.pid` with a session-leader identity probe; `stop` SIGTERMs + clears it.
+- feat(serve): `onebrain serve [--dir <dist>] [--port] [--host] [--open]` brings up
+  ONE local HTTP surface — static SPA (token-injected `index.html`, `..` fallback)
+  + a read-only vault JSON API (`/api/config`, `/api/vault/tree`, `/api/vault/file`).
+  Per-session token gates `/api/*` (401 without); path-traversal is rejected (400).
+  `daemon __run` now runs the SAME server (SIGTERM shutdown vs `serve`'s Ctrl-C).
+  Security: no-vault → 503 (never falls back to `/`, so `?path=etc/passwd` can't leak the host); constant-time token compare; token never written to the log (log 0600, run dir 0700); 10 MB file cap → 413; 4xx error mapping.
+- deps: net-new compiled crates are `axum 0.8` + `tower` + `tower-http` (fs) — `tokio`/`hyper`/`http`
+  were already transitive deps at step 1 (the deliberate v3.3 daemon binary-size tradeoff) · `tracing` · `nix`.
 
 ## [3.2.21] — 2026-05-30 — cache-clean hardening
 

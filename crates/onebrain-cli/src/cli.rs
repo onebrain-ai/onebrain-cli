@@ -130,8 +130,9 @@ pub enum Cmd {
     Qmd(QmdCmd),
     #[command(display_order = 21)]
     Schedule(ScheduleCmd),
-    #[command(hide = true)]
-    Serve(ServeCmd),
+    /// Serve the local web UI + vault JSON API (foreground · Ctrl-C to stop).
+    #[command(display_order = 14)]
+    Serve(ServeArgs),
     #[command(display_order = 11)]
     Session(SessionCmd),
     #[command(display_order = 23)]
@@ -399,15 +400,16 @@ pub struct DaemonCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum DaemonVerb {
-    /// Start the OneBrain daemon (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
+    /// Start the OneBrain daemon as a detached background process.
     Start,
-    /// Stop the running daemon (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
+    /// Stop the running daemon (SIGTERM + PID-file cleanup).
     Stop,
-    /// Report daemon status (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
+    /// Report whether the daemon is running, and its PID.
     Status,
+    /// Internal: the detached daemon body. Spawned by `daemon start`; not for
+    /// direct use. Parks until SIGTERM (no server yet — arrives in v3.3 step 2).
+    #[command(name = "__run", hide = true)]
+    Run,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1008,26 +1010,37 @@ pub enum ScheduleVerb {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// serve (forward-compat)
+// serve (v3.3 step 2 — foreground ephemeral HTTP surface)
 // ─────────────────────────────────────────────────────────────────────────
 
+/// `onebrain serve` is a flag-based FOREGROUND command (not a verb group): it
+/// brings up one local HTTP listener that serves a static web dist (SPA) + the
+/// read-only vault JSON API, then blocks until Ctrl-C. The pre-v3.3
+/// `start/stop/status` verb stub (`ServeVerb`) was a placeholder; persistent
+/// lifecycle lives under `onebrain daemon` instead.
 #[derive(Args, Debug)]
-#[command(disable_help_subcommand = true)]
-pub struct ServeCmd {
-    #[command(subcommand)]
-    pub verb: ServeVerb,
-}
-#[derive(Subcommand, Debug)]
-pub enum ServeVerb {
-    /// Start the HTTP server (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Start,
-    /// Stop the running HTTP server (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Stop,
-    /// Report HTTP server status (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Status,
+pub struct ServeArgs {
+    /// Static web dist to serve as an SPA. Omit to run API-only (a placeholder
+    /// page is served at `/`).
+    #[arg(long, value_name = "PATH")]
+    pub dir: Option<PathBuf>,
+    /// Bind port (default 4317).
+    #[arg(long, value_name = "PORT")]
+    pub port: Option<u16>,
+    /// Bind host (default 127.0.0.1). Use `0.0.0.0` for single-tenant remote
+    /// self-host — MUST sit behind TLS.
+    #[arg(long, value_name = "ADDR")]
+    pub host: Option<String>,
+    /// Open the served URL in the default browser after binding.
+    #[arg(long)]
+    pub open: bool,
+    /// Vault root override · also accepts global `--vault`; walks up from cwd when omitted.
+    /// Field is named `vault_dir` (not `vault`) to avoid colliding with the
+    /// global `--vault` arg ID — the collision would otherwise make clap reject
+    /// `onebrain serve --vault PATH` (same regression fixed for `skill run` in
+    /// v3.2.3). With this name the global `--vault` propagates here normally.
+    #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
+    pub vault_dir: Option<PathBuf>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1552,5 +1565,57 @@ mod tests {
         let _ = Cli::try_parse_from(["onebrain", "dream", "list"]).unwrap();
         let _ = Cli::try_parse_from(["onebrain", "memory", "list"]).unwrap();
         let _ = Cli::try_parse_from(["onebrain", "note", "search", "TODO"]).unwrap();
+    }
+
+    // v3.3 step 2 — `serve` is a flag-based foreground command (not a verb
+    // group). These pin its flag surface + the global-`--vault` propagation.
+    #[test]
+    fn serve_parses_all_flags() {
+        let cli = Cli::try_parse_from([
+            "onebrain",
+            "serve",
+            "--dir",
+            "/tmp/dist",
+            "--port",
+            "8080",
+            "--host",
+            "0.0.0.0",
+            "--open",
+        ])
+        .unwrap();
+        match cli.command {
+            Cmd::Serve(args) => {
+                assert_eq!(args.dir.as_deref(), Some(std::path::Path::new("/tmp/dist")));
+                assert_eq!(args.port, Some(8080));
+                assert_eq!(args.host.as_deref(), Some("0.0.0.0"));
+                assert!(args.open);
+            }
+            _ => panic!("expected Serve"),
+        }
+    }
+
+    #[test]
+    fn serve_accepts_global_vault_post_subcommand() {
+        // Regression guard (mirrors `skill_run_accepts_global_vault…`): the
+        // serve-local vault override field is named `vault_dir`, so the global
+        // `--vault` propagates instead of colliding with the arg ID.
+        let cli = Cli::try_parse_from(["onebrain", "serve", "--port", "8080", "--vault", "/tmp/v"])
+            .unwrap();
+        assert_eq!(cli.vault.as_deref(), Some(std::path::Path::new("/tmp/v")));
+        assert!(matches!(cli.command, Cmd::Serve(_)));
+    }
+
+    #[test]
+    fn serve_still_accepts_vault_dir_flag() {
+        let cli = Cli::try_parse_from(["onebrain", "serve", "--vault-dir", "/tmp/v"]).unwrap();
+        match cli.command {
+            Cmd::Serve(args) => {
+                assert_eq!(
+                    args.vault_dir.as_deref(),
+                    Some(std::path::Path::new("/tmp/v"))
+                )
+            }
+            _ => panic!("expected Serve"),
+        }
     }
 }
