@@ -81,6 +81,34 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # just `signal` + `process` to keep the dependency surface small.
 nix       = { version = "0.29", default-features = false, features = ["signal", "process"] }
 
+# ── v3.3 daemon step 2 — async HTTP surface (serve + daemon __run) ──────────
+# The v3.2.18 CHANGELOG dropped the async stack (reqwest → ureq) to shrink the
+# one-shot CLI binary. The daemon RE-INTRODUCES tokio + axum deliberately: a
+# persistent local server is inherently async (one runtime drives many
+# concurrent connections, graceful shutdown, signal handling). The binary-size
+# cost is the conscious v3.3 daemon tradeoff — it only weighs on the daemon
+# code path, not the everyday one-shot CLI commands.
+#
+# tokio features pared to what the server needs: multi-thread runtime + the
+# `#[tokio::main]`-style `block_on`, async TCP (`net`), Unix signal handling
+# (`signal`, for SIGTERM/Ctrl-C graceful shutdown), and timers (`time`).
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+    "time",
+] }
+# axum 0.8 — ergonomic router + extractors over hyper. Default features give us
+# JSON (`Json`), query extraction, and the matched-path router we need.
+axum  = "0.8"
+# tower — the `Service`/`Layer` abstraction axum builds on. We use it directly
+# for the per-route auth middleware (`from_fn`) and `ServiceExt::oneshot` in
+# tests (drive the Router without binding a socket).
+tower = "0.5"
+# tower-http `fs` feature — `ServeDir`/`ServeFile` for the static SPA dist.
+tower-http = { version = "0.6", features = ["fs"] }
+
 # Interactive prompts (Slice 10 · init wizard)
 inquire   = "0.7"
 

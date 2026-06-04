@@ -25,6 +25,7 @@ pub mod qmd_status;
 pub mod register_hooks;
 pub mod register_schedule;
 pub mod run_skill;
+pub mod serve;
 pub mod session_init;
 pub mod skill_inspect;
 pub mod update;

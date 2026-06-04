@@ -12,16 +12,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-## [3.3.0] — 2026-06-05 — daemon foundation (start/stop/status)
+## [3.3.0] — 2026-06-05 — daemon foundation + HTTP surface
 
-- feat(daemon): `onebrain daemon start|stop|status` — manage the persistent local
-  engine. `start` self-respawns a detached background process (`setsid` + `chdir`,
-  stdio → `~/.onebrain/run/daemon.log`); the PID is tracked in `daemon.pid` with a
-  session-leader identity probe (`kill(pid,0)` + `getpgid==pid`) so a recycled PID
-  isn't mistaken for the daemon; `stop` sends SIGTERM and clears the PID file;
-  structured `tracing` logging. The hidden `__run` body is sync — the tokio/axum
-  HTTP server lands in v3.3 step 2.
-- deps: `tracing` · `tracing-subscriber` · `nix` (unix: signal + process).
+- feat(daemon): `onebrain daemon start|stop|status` — `start` self-respawns a
+  detached process (`setsid` + `chdir`, log → `~/.onebrain/run/daemon.log`) tracked
+  by `daemon.pid` with a session-leader identity probe; `stop` SIGTERMs + clears it.
+- feat(serve): `onebrain serve [--dir <dist>] [--port] [--host] [--open]` brings up
+  ONE local HTTP surface — static SPA (token-injected `index.html`, `..` fallback)
+  + a read-only vault JSON API (`/api/config`, `/api/vault/tree`, `/api/vault/file`).
+  Per-session token gates `/api/*` (401 without); path-traversal is rejected (400).
+  `daemon __run` now runs the SAME server (SIGTERM shutdown vs `serve`'s Ctrl-C).
+  Security: no-vault → 503 (never falls back to `/`, so `?path=etc/passwd` can't leak the host); constant-time token compare; token never written to the log (log 0600, run dir 0700); 10 MB file cap → 413; 4xx error mapping.
+- deps: net-new compiled crates are `axum 0.8` + `tower` + `tower-http` (fs) — `tokio`/`hyper`/`http`
+  were already transitive deps at step 1 (the deliberate v3.3 daemon binary-size tradeoff) · `tracing` · `nix`.
 
 ## [3.2.21] — 2026-05-30 — cache-clean hardening
 

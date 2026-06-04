@@ -5,9 +5,11 @@
 //! subcommand as a detached background process (its own session via
 //! [`nix::unistd::setsid`], stdio redirected to a log file), records the
 //! child's PID in a PID file, and returns. `daemon __run` is the long-lived
-//! process: it initialises file logging, writes its own PID, installs a
-//! SIGTERM handler, then parks. This step has no real work yet — the HTTP/RPC
-//! server arrives in v3.3 step 2, at which point `__run` becomes async.
+//! process: it initialises file logging, writes its own PID, then (v3.3 step 2)
+//! spins up a tokio runtime and runs the shared HTTP surface ([`crate::server`])
+//! until SIGTERM. The server + its graceful shutdown are shared verbatim with
+//! the foreground `onebrain serve` command — only the shutdown trigger differs
+//! (SIGTERM here, Ctrl-C there).
 //!
 //! ## Layout (mirrors `session_init.rs`)
 //! - The status/PID logic is a **pure, dependency-injected core**
@@ -40,16 +42,6 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-
-/// Set to `true` by the SIGTERM handler; polled by `park_until_sigterm` to
-/// break the park loop. Module-level (not function-local) because a `static`
-/// inside the function would still be process-global anyway, and a signal
-/// handler — an `extern "C" fn` — can only reference a free `static`, not a
-/// captured one. The daemon body (`run_internal`) runs exactly once per
-/// process, so there's no risk of a stale `true` leaking across runs.
-#[cfg(unix)]
-static TERMINATE: AtomicBool = AtomicBool::new(false);
 
 // ─────────────────────────────────────────────────────────────────────────
 // Envelope data payloads — one `#[derive(Serialize)]` struct per verb, so
@@ -129,11 +121,10 @@ fn read_pid(pid_path: &Path) -> Option<u32> {
     Some(pid)
 }
 
-/// Write `pid` to the PID file, creating the parent `run/` directory first.
+/// Write `pid` to the PID file, creating the parent `run/` directory (0700) first.
 fn write_pid(pid_path: &Path, pid: u32) -> Result<()> {
     if let Some(parent) = pid_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create daemon run dir {}", parent.display()))?;
+        ensure_private_run_dir(parent)?;
     }
     fs::write(pid_path, format!("{pid}\n"))
         .with_context(|| format!("write PID file {}", pid_path.display()))
@@ -162,6 +153,35 @@ fn remove_pid(pid_path: &Path) -> Result<()> {
 fn run_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("resolve home directory for daemon run dir")?;
     Ok(home.join(".onebrain").join("run"))
+}
+
+/// Create the daemon run dir (`~/.onebrain/run/`) if missing, with private
+/// (0700 owner-only) permissions on Unix (fix B).
+///
+/// The run dir holds the PID file + the (0600) log; both are user-private, so
+/// the directory itself should not be group/world-traversable. `DirBuilder`
+/// with `.mode(0o700)` applies the mode atomically at creation. On a
+/// pre-existing dir we re-assert 0700 so an older, looser dir is tightened.
+/// On non-Unix this is a plain `create_dir_all` (mode bits don't apply).
+fn ensure_private_run_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("create daemon run dir {}", dir.display()))?;
+        // `.mode` only applies to dirs this call creates; re-assert 0700 so an
+        // existing looser dir is tightened on the next daemon start.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("tighten daemon run dir perms {}", dir.display()))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir).with_context(|| format!("create daemon run dir {}", dir.display()))
+    }
 }
 
 fn pid_path() -> Result<PathBuf> {
@@ -358,23 +378,39 @@ fn render_stop_text(env: &Envelope<DaemonStopData>) -> String {
 #[cfg(unix)]
 fn spawn_detached_run(log_path: &Path) -> Result<u32> {
     use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt; // for `.mode(...)`
     use std::os::unix::process::CommandExt; // for `pre_exec`
     use std::process::{Command, Stdio};
 
-    // Ensure the run dir exists before opening the log inside it.
+    // Ensure the run dir exists (0700) before opening the log inside it.
     if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create daemon run dir {}", parent.display()))?;
+        ensure_private_run_dir(parent)?;
     }
 
     let exe = std::env::current_exe().context("resolve current executable path")?;
 
     // Append so restarts accumulate history rather than truncating the log.
+    //
+    // SECURITY (fix B): the daemon log can contain operational detail and lives
+    // for the life of the install, so it must be private to the user. `.mode`
+    // sets the permission bits at CREATE time — owner read/write only (0600),
+    // no group/other — so the log is never created world-readable. `.mode` only
+    // applies when this call creates the file; for an existing log we re-assert
+    // 0600 below so an older, looser file is tightened on the next start.
     let log = OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(log_path)
         .with_context(|| format!("open daemon log {}", log_path.display()))?;
+    // Re-assert 0600 on an already-existing log (the `.mode` above is a no-op
+    // when the file already exists).
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(log_path, perms)
+            .with_context(|| format!("tighten daemon log perms {}", log_path.display()))?;
+    }
     // The child needs its own owned handle for each of stdout/stderr.
     let log_err = log
         .try_clone()
@@ -455,7 +491,8 @@ fn terminate(_pid: u32) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// `daemon __run` — the detached child's body. SYNC for this step (no tokio).
+// `daemon __run` — the detached child's body. ASYNC since v3.3 step 2: it runs
+// the shared HTTP surface ([`crate::server`]) on a tokio runtime until SIGTERM.
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Hidden internal verb: the long-lived daemon process.
@@ -463,17 +500,34 @@ fn terminate(_pid: u32) -> Result<()> {
 /// 1. Initialise `tracing` file logging (`~/.onebrain/run/daemon.log`).
 /// 2. Write our own PID (the parent also wrote it; we re-assert it so a
 ///    directly-launched `__run` is still tracked).
-/// 3. Install a SIGTERM handler that flips a shutdown flag.
-/// 4. Park until SIGTERM, then log + remove the PID file + exit cleanly.
+/// 3. Build a tokio runtime and run the HTTP server until SIGTERM, then remove
+///    the PID file + exit cleanly.
 ///
-/// KNOWN LIMITATION (step 1): invoking `onebrain daemon __run` directly while a
-/// daemon is already running overwrites `daemon.pid` with this process's PID,
-/// orphaning the existing daemon (it keeps running but is no longer tracked).
-/// A TTY / already-running guard is deferred to step 2 with the RPC/server infra.
+/// The server is the SAME one `onebrain serve` runs — only the shutdown trigger
+/// differs (SIGTERM here vs Ctrl-C there). The daemon resolves its
+/// [`crate::server::ServeConfig`] from:
+/// - **vault_root** — `$ONEBRAIN_VAULT`, but ONLY if it names a real vault (see
+///   [`resolve_daemon_vault`]). Otherwise `None`.
+/// - **port** — the shared default ([`crate::commands::serve::DEFAULT_PORT`]).
+/// - **token** — freshly generated per process.
+/// - **dist_dir** — `$ONEBRAIN_DIST` if set, else `None` (API-only). The plugin
+///   passes the pinned webui dist via this env when it launches the daemon.
 ///
-/// No work happens here yet — the axum/tokio RPC server lands in step 2, which
-/// is when this becomes `async`.
+/// VAULT RESOLUTION (fix A): because the detached child `chdir`s to `/`, walk-up
+/// from cwd can't find the vault the user started from, so the daemon relies on
+/// `$ONEBRAIN_VAULT` (exported by the launcher). That candidate is VALIDATED to
+/// be a real OneBrain vault before it is trusted — a missing or non-vault path
+/// resolves to `None`, NOT to a placeholder like `/`. With `None`, the vault
+/// endpoints (config/tree/file) return 503; the static surface + token still
+/// work so the daemon runs and reports cleanly while exposing no filesystem.
+///
+/// KNOWN LIMITATION (step 1, still open): invoking `onebrain daemon __run`
+/// directly while a daemon is already running overwrites `daemon.pid` with this
+/// process's PID, orphaning the existing daemon.
 pub fn run_internal() -> Result<()> {
+    use crate::commands::serve::DEFAULT_PORT;
+    use crate::server::{self, generate_token, ServeConfig};
+
     let pid_path = pid_path()?;
     let log_path = log_path()?;
 
@@ -481,14 +535,114 @@ pub fn run_internal() -> Result<()> {
 
     let pid = std::process::id();
     write_pid(&pid_path, pid)?;
-    tracing::info!(pid, "daemon __run started; parking until SIGTERM");
 
-    park_until_sigterm()?;
+    // Resolve the vault the daemon serves. The detached child has chdir'd to
+    // `/`, so walk-up from cwd is useless; rely on `$ONEBRAIN_VAULT` (the
+    // launcher's job to export).
+    //
+    // SECURITY (fix A): we NEVER fall back to a placeholder root like `/`. A
+    // `/` root would let `GET /api/vault/file?path=etc/passwd` serve
+    // `/etc/passwd`. Instead we REQUIRE a real vault: the candidate dir from
+    // `$ONEBRAIN_VAULT` must actually be a vault (contain `onebrain.yml` or the
+    // legacy `vault.yml`). If it isn't — or the env var is unset — we bind
+    // `None`, and the vault handlers return 503 (the static surface + token
+    // still work, so the daemon runs and reports cleanly; it just exposes no
+    // filesystem).
+    let vault_root = resolve_daemon_vault();
+    // Optional pre-built webui dist, passed by the plugin launcher.
+    let dist_dir = std::env::var_os("ONEBRAIN_DIST").map(PathBuf::from);
+    let token = generate_token();
 
-    tracing::info!("SIGTERM received; shutting down");
+    // Port: `$ONEBRAIN_DAEMON_PORT` overrides the shared default. The override
+    // exists mainly so the lifecycle integration test can bind a free port and
+    // avoid colliding with a real daemon (or a parallel test) on 4317. `0` is
+    // honoured (OS-assigned ephemeral port) for tests that don't curl.
+    let port = std::env::var("ONEBRAIN_DAEMON_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_PORT);
+
+    // Daemon always binds localhost — a persistent boot-time engine should never
+    // listen on a public interface implicitly. `serve --host 0.0.0.0` is the
+    // explicit, foreground-only path for remote self-host.
+    let cfg = ServeConfig::localhost(vault_root, port, token, dist_dir);
+
+    tracing::info!(pid, "daemon __run started; bringing up HTTP surface");
+
+    // Own a tokio runtime for the lifetime of the daemon. `enable_all` turns on
+    // the I/O + time drivers the server + signal handling need.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for daemon")?;
+
+    let result = runtime.block_on(async move {
+        let shutdown = sigterm_future();
+        server::run_server(cfg, shutdown).await
+    });
+
+    // Always clear the PID file on the way out, even if the server returned an
+    // error — a stale PID file would block the next `daemon start`.
+    tracing::info!("daemon shutting down; removing PID file");
     remove_pid(&pid_path)?;
     tracing::info!("PID file removed; exit");
-    Ok(())
+    result
+}
+
+/// Resolve the vault the daemon should serve, or `None` when none is bound.
+///
+/// Reads the `$ONEBRAIN_VAULT` candidate and verifies it is a REAL vault before
+/// trusting it (fix A): a directory only counts if it contains a config file
+/// (`onebrain.yml`, or legacy `vault.yml`) at its root, exactly the check
+/// `onebrain_core::find_vault_root` / `load_vault_config` rely on. We use
+/// `find_config_file` (not a walk-up) because `$ONEBRAIN_VAULT` is meant to name
+/// the vault root directly. An unset env var, or a path that isn't a vault,
+/// yields `None` — never a fallback like `/`.
+fn resolve_daemon_vault() -> Option<PathBuf> {
+    let candidate = PathBuf::from(std::env::var_os("ONEBRAIN_VAULT")?);
+    // `find_config_file` returns `Some(path-to-config)` only when the dir really
+    // holds a vault config. Map that to the vault ROOT (the candidate dir).
+    if onebrain_core::find_config_file(&candidate).is_some() {
+        Some(candidate)
+    } else {
+        tracing::warn!(
+            vault = %candidate.display(),
+            "ONEBRAIN_VAULT is not a OneBrain vault (no onebrain.yml/vault.yml); \
+             serving with no vault bound (vault endpoints return 503)"
+        );
+        None
+    }
+}
+
+/// A future that resolves when SIGTERM is received — the daemon's graceful-
+/// shutdown trigger, handed to `server::run_server`'s `with_graceful_shutdown`.
+///
+/// Uses tokio's async signal handling (a self-pipe under the hood) rather than
+/// the old `sigaction` + `AtomicBool` park loop: it composes cleanly as a
+/// `Future` the server can race against its accept loop, and tokio installs the
+/// handler in an async-signal-safe way.
+#[cfg(unix)]
+async fn sigterm_future() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut term) => {
+            term.recv().await;
+            tracing::info!("SIGTERM received; shutting down daemon");
+        }
+        Err(e) => {
+            // Installing the handler failed — extraordinarily rare. Log and
+            // resolve immediately so we don't serve un-stoppably; the parent's
+            // `stop` SIGTERM would then just kill the process outright.
+            tracing::error!(error = %e, "failed to install SIGTERM handler");
+        }
+    }
+}
+
+/// Non-Unix: no SIGTERM. The daemon is Unix-only for now, so this never runs in
+/// production; it exists so the async server fn type-checks on Windows.
+#[cfg(not(unix))]
+async fn sigterm_future() {
+    std::future::pending::<()>().await
 }
 
 /// Point `tracing` at `stderr`, which the parent already redirected to the
@@ -506,8 +660,7 @@ fn init_tracing(log_path: &Path) -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
     if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create daemon run dir {}", parent.display()))?;
+        ensure_private_run_dir(parent)?;
     }
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -523,48 +676,6 @@ fn init_tracing(log_path: &Path) -> Result<()> {
         .with_ansi(false) // log file, not a terminal
         .try_init();
     Ok(())
-}
-
-/// Install a SIGTERM handler and block until it fires.
-///
-/// Uses a process-global `AtomicBool` flipped by the handler, polled here.
-/// `signal_hook`-free: `nix`'s `sigaction` is enough for one flag. The handler
-/// only does an atomic store, which is async-signal-safe.
-#[cfg(unix)]
-fn park_until_sigterm() -> Result<()> {
-    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
-
-    // Plain `extern "C"` handler: the ONLY thing it may safely do is an atomic
-    // store (no allocation, no locks, no I/O).
-    extern "C" fn on_sigterm(_sig: i32) {
-        TERMINATE.store(true, Ordering::SeqCst);
-    }
-
-    let action = SigAction::new(
-        SigHandler::Handler(on_sigterm),
-        SaFlags::empty(),
-        SigSet::empty(),
-    );
-    // SAFETY: installing a signal handler whose body is a single atomic store
-    // is async-signal-safe; no shared state is mutated unsafely.
-    unsafe {
-        sigaction(Signal::SIGTERM, &action).context("install SIGTERM handler")?;
-    }
-
-    // Park: poll the flag. A 100 ms tick keeps shutdown latency low without
-    // busy-spinning. Step 2 replaces this with a tokio signal future + the
-    // server's run loop.
-    while !TERMINATE.load(Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn park_until_sigterm() -> Result<()> {
-    anyhow::bail!("daemon is not yet supported on this platform")
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -803,10 +914,17 @@ mod tests {
 
         // Small helper: run `onebrain daemon <verb>` with HOME overridden,
         // returning combined stdout as a String. We assert success separately.
+        //
+        // `ONEBRAIN_DAEMON_PORT=0` makes the detached `__run` bind an
+        // OS-assigned ephemeral port instead of the fixed default (4317), so
+        // this test never collides with a real running daemon or a parallel
+        // test on the same machine. (We exercise PID-file lifecycle here, not
+        // HTTP — the curl-the-port smoke test is the manual verify step.)
         let run = |verb: &str| -> String {
             let out = Command::cargo_bin("onebrain")
                 .unwrap()
                 .env("HOME", home.path())
+                .env("ONEBRAIN_DAEMON_PORT", "0")
                 .args(["daemon", verb])
                 .output()
                 .expect("spawn onebrain binary");

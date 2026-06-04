@@ -478,11 +478,15 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 stubs::not_implemented_vault_required(vault_flag.clone(), "pause resume")
             }
         },
-        Cmd::Serve(ServeCmd { verb }) => match verb {
-            ServeVerb::Start => stubs::not_implemented("serve start"),
-            ServeVerb::Stop => stubs::not_implemented("serve stop"),
-            ServeVerb::Status => stubs::not_implemented("serve status"),
-        },
+        Cmd::Serve(args) => {
+            // Fold the global `--vault` into the serve-local override so
+            // `onebrain serve --vault PATH` and `--vault-dir PATH` both work.
+            let mut args = args;
+            if args.vault_dir.is_none() {
+                args.vault_dir = vault_flag.clone();
+            }
+            commands::serve::run(&args, &mode)
+        }
         Cmd::Task(TaskCmd { verb }) => match verb {
             TaskVerb::List => {
                 stubs::not_implemented_vault_required(vault_flag.clone(), "task list")
