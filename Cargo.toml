@@ -4,7 +4,7 @@ default-members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "3.2.21"
+version = "3.3.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["OneBrain Contributors"]
@@ -67,6 +67,19 @@ dirs      = "5"
 
 # Direct getuid() on Unix for launchd plist UID field (Slice 8)
 libc      = "0.2"
+
+# Structured logging for the v3.3 daemon (`daemon __run` writes to a file).
+# `tracing` is the facade; `tracing-subscriber` provides the file writer + env
+# filter. Kept out of the one-shot CLI hot path — only the detached daemon
+# child initialises a subscriber.
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Unix syscalls for the v3.3 daemon: kill(pid, 0) liveness probe, SIGTERM,
+# and setsid() for the detached spawn. Gated to `cfg(unix)` in the crate so
+# Windows still builds (its daemon lands in a later step). Features pared to
+# just `signal` + `process` to keep the dependency surface small.
+nix       = { version = "0.29", default-features = false, features = ["signal", "process"] }
 
 # Interactive prompts (Slice 10 · init wizard)
 inquire   = "0.7"

@@ -399,15 +399,16 @@ pub struct DaemonCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum DaemonVerb {
-    /// Start the OneBrain daemon (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
+    /// Start the OneBrain daemon as a detached background process.
     Start,
-    /// Stop the running daemon (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
+    /// Stop the running daemon (SIGTERM + PID-file cleanup).
     Stop,
-    /// Report daemon status (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
+    /// Report whether the daemon is running, and its PID.
     Status,
+    /// Internal: the detached daemon body. Spawned by `daemon start`; not for
+    /// direct use. Parks until SIGTERM (no server yet — arrives in v3.3 step 2).
+    #[command(name = "__run", hide = true)]
+    Run,
 }
 
 // ─────────────────────────────────────────────────────────────────────────

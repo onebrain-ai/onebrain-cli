@@ -26,9 +26,15 @@ which          = { workspace = true }
 dirs           = { workspace = true }
 indicatif      = { workspace = true }
 is-terminal    = { workspace = true }
+# v3.3 daemon — structured file logging for the detached `daemon __run` child.
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc           = { workspace = true }
+# v3.3 daemon — Unix-only syscalls (signal-0 liveness, SIGTERM, setsid).
+# Windows builds skip this; the Windows daemon is a later step.
+nix            = { workspace = true }
 
 [dev-dependencies]
 tempfile          = { workspace = true }

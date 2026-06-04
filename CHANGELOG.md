@@ -1,6 +1,6 @@
 ---
-latest_version: 3.2.21
-released: 2026-05-30
+latest_version: 3.3.0
+released: 2026-06-05
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -11,6 +11,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.3.0] — 2026-06-05 — daemon foundation (start/stop/status)
+
+- feat(daemon): `onebrain daemon start|stop|status` — manage the persistent local
+  engine. `start` self-respawns a detached background process (`setsid` + `chdir`,
+  stdio → `~/.onebrain/run/daemon.log`); the PID is tracked in `daemon.pid` with a
+  session-leader identity probe (`kill(pid,0)` + `getpgid==pid`) so a recycled PID
+  isn't mistaken for the daemon; `stop` sends SIGTERM and clears the PID file;
+  structured `tracing` logging. The hidden `__run` body is sync — the tokio/axum
+  HTTP server lands in v3.3 step 2.
+- deps: `tracing` · `tracing-subscriber` · `nix` (unix: signal + process).
 
 ## [3.2.21] — 2026-05-30 — cache-clean hardening
 

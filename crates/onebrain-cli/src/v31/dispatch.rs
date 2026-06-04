@@ -362,9 +362,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             ConfigVerb::Init => stubs::not_implemented("config init"),
         },
         Cmd::Daemon(DaemonCmd { verb }) => match verb {
-            DaemonVerb::Start => stubs::not_implemented("daemon start"),
-            DaemonVerb::Stop => stubs::not_implemented("daemon stop"),
-            DaemonVerb::Status => stubs::not_implemented("daemon status"),
+            DaemonVerb::Start => commands::daemon::run_start(&mode),
+            DaemonVerb::Stop => commands::daemon::run_stop(&mode),
+            DaemonVerb::Status => commands::daemon::run_status(&mode),
+            // Hidden internal verb — the detached child's body.
+            DaemonVerb::Run => commands::daemon::run_internal(),
         },
         Cmd::Date(DateCmd { verb }) => match verb {
             DateVerb::Today => stubs::not_implemented("date today"),
