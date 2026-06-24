@@ -4,7 +4,7 @@ default-members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "3.3.0"
+version = "3.3.1"
 edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["OneBrain Contributors"]
@@ -92,13 +92,24 @@ nix       = { version = "0.29", default-features = false, features = ["signal", 
 # tokio features pared to what the server needs: multi-thread runtime + the
 # `#[tokio::main]`-style `block_on`, async TCP (`net`), Unix signal handling
 # (`signal`, for SIGTERM/Ctrl-C graceful shutdown), and timers (`time`).
+# `process` + `io-util` + `sync` (v3.4 chat): async child spawn for `claude -p`,
+# line-by-line stdout reads, and the concurrency Semaphore.
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
     "macros",
     "net",
     "signal",
     "time",
+    "process",
+    "io-util",
+    "sync",
 ] }
+
+# Async stream construction (v3.4 chat) — the `stream!{}` macro builds the SSE
+# body that reads claude's stdout line-by-line and yields events. `futures-core`
+# provides the `Stream` trait used in the handler signature.
+async-stream = "0.3"
+futures-core = "0.3"
 # axum 0.8 — ergonomic router + extractors over hyper. Default features give us
 # JSON (`Json`), query extraction, and the matched-path router we need.
 axum  = "0.8"

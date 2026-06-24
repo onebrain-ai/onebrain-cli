@@ -16,6 +16,7 @@ pub mod note;
 pub mod orphan;
 pub mod register_hooks;
 pub mod run_skill;
+pub mod task;
 pub mod update;
 pub mod vault_sync;
 

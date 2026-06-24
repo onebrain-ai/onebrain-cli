@@ -6,7 +6,7 @@ use walkdir::WalkDir;
 
 /// VCS / editor / plugin-internal directories that never hold user content —
 /// pruned by every walk.
-const TOOLING_DIRS: &[&str] = &[".git", ".obsidian", ".claude", ".trash", "node_modules"];
+pub const TOOLING_DIRS: &[&str] = &[".git", ".obsidian", ".claude", ".trash", "node_modules"];
 
 /// Additional dirs pruned by [`walk_notes`] (live-note verbs): binary
 /// attachments and the archive bucket. `find` walks these (it's a raw finder).
@@ -90,7 +90,10 @@ fn is_skipped_note_dir(entry: &walkdir::DirEntry) -> bool {
     dir_name_in(entry, TOOLING_DIRS) || dir_name_in(entry, NOTE_EXTRA_SKIP)
 }
 
-fn is_tooling_dir(entry: &walkdir::DirEntry) -> bool {
+/// True if `entry` is a tooling directory pruned from every vault walk
+/// (`.git`, `.obsidian`, …). Shared so the daemon's tree + task scans prune the
+/// SAME set the `note` commands do — one definition, no divergent copies.
+pub fn is_tooling_dir(entry: &walkdir::DirEntry) -> bool {
     dir_name_in(entry, TOOLING_DIRS)
 }
 

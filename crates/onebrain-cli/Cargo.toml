@@ -36,6 +36,9 @@ axum               = { workspace = true }
 tower              = { workspace = true }
 tower-http         = { workspace = true }
 walkdir            = { workspace = true }
+# v3.4 daemon — chat SSE stream (`stream!{}` body) + `Stream` trait in the handler.
+async-stream       = { workspace = true }
+futures-core       = { workspace = true }
 # Hex-encode the random session token (read from /dev/urandom on unix). `urlencoding`
 # is already a dep for vault-sync; it does NOT do hex, so we hand-roll a 1-liner
 # instead of pulling `hex`/`getrandom`/`rand` (see server::token).

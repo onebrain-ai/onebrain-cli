@@ -1,6 +1,6 @@
 ---
-latest_version: 3.3.0
-released: 2026-06-05
+latest_version: 3.3.1
+released: 2026-06-24
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -11,6 +11,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.3.1] — 2026-06-24 — daemon write / media / chat surface
+
+- feat(daemon): note write surface — `POST/PUT/DELETE /api/vault/file` (create /
+  overwrite with `rev` conflict-check / move-to-`.trash`), `POST /api/vault/move`
+  (rename + rewrite incoming wikilinks), `POST`+`DELETE /api/vault/folder`.
+- feat(daemon): `GET /api/vault/raw` (bytes + content-type for image/PDF preview)
+  and `POST /api/vault/upload` (binary attachments), behind a `DefaultBodyLimit`.
+- feat(daemon): `GET /api/vault/tasks` — vault-wide dated Obsidian-Tasks scan.
+- feat(daemon): `POST /api/chat` — SSE stream over a `claude -p` agent turn
+  (concurrency-capped; process-group kill on client disconnect).
+- feat(auth): accept the per-session token via `?token=` query on GET/HEAD only
+  (image/raw fetches that can't set a header); writes stay header-only.
+- refactor(core): handlers are thin veneers over shared `onebrain_fs` primitives —
+  `note::{write_note,delete_note,create_folder,delete_folder}` + new
+  `task::scan_tasks`; `note::TOOLING_DIRS` made public — so the CLI and daemon
+  share ONE implementation per vault operation (no duplication).
 
 ## [3.3.0] — 2026-06-05 — daemon foundation + HTTP surface
 

@@ -54,6 +54,24 @@ async fn get_authed(router: &Router, uri: &str) -> (StatusCode, String) {
     send(router, req).await
 }
 
+/// Send an authed request with a body + content-type; return (status, body).
+async fn send_authed(
+    router: &Router,
+    method: &str,
+    uri: &str,
+    content_type: &str,
+    body: &str,
+) -> (StatusCode, String) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("X-OneBrain-Token", TOKEN)
+        .header("content-type", content_type)
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    send(router, req).await
+}
+
 /// Send any request and collect `(status, body-as-string)`.
 async fn send(router: &Router, req: Request<Body>) -> (StatusCode, String) {
     let res = router.clone().oneshot(req).await.unwrap();
@@ -141,6 +159,91 @@ async fn vault_file_absolute_path_is_rejected_400() {
 async fn vault_file_missing_is_404() {
     let (_dir, router) = vault_router(None);
     let (status, _body) = get_authed(&router, "/api/vault/file?path=does-not-exist.md").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// POST /api/vault/file
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn post_file_creates_note() {
+    let (_dir, router) = vault_router(None);
+    let (status, body) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/file?path=01-projects/new.md",
+        "text/markdown",
+        "# New\nhi\n",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["path"], "01-projects/new.md");
+    assert!(!json["rev"].as_str().unwrap().is_empty());
+
+    // Second create on the same path → 409.
+    let (status2, _) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/file?path=01-projects/new.md",
+        "text/markdown",
+        "dupe",
+    )
+    .await;
+    assert_eq!(status2, StatusCode::CONFLICT);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PUT /api/vault/file
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn put_file_saves_and_bumps_rev() {
+    let (_dir, router) = vault_router(None);
+
+    let (_s, body) = get_authed(&router, "/api/vault/file?path=01-projects/alpha.md").await;
+    let rev = serde_json::from_str::<serde_json::Value>(&body).unwrap()["rev"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/vault/file?path=01-projects/alpha.md")
+        .header("X-OneBrain-Token", TOKEN)
+        .header("content-type", "text/markdown")
+        .header("If-Match", &rev)
+        .body(Body::from("# Alpha edited\n"))
+        .unwrap();
+    let (status, body) = send(&router, req).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let req2 = Request::builder()
+        .method("PUT")
+        .uri("/api/vault/file?path=01-projects/alpha.md")
+        .header("X-OneBrain-Token", TOKEN)
+        .header("content-type", "text/markdown")
+        .header("If-Match", &rev) // stale now
+        .body(Body::from("conflict"))
+        .unwrap();
+    let (status2, body2) = send(&router, req2).await;
+    assert_eq!(status2, StatusCode::CONFLICT, "body: {body2}");
+    assert!(serde_json::from_str::<serde_json::Value>(&body2).unwrap()["rev"].is_string());
+}
+
+#[tokio::test]
+async fn put_missing_file_is_404() {
+    let (_dir, router) = vault_router(None);
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/vault/file?path=does/not/exist.md")
+        .header("X-OneBrain-Token", TOKEN)
+        .header("content-type", "text/markdown")
+        .header("If-Match", "*")
+        .body(Body::from("x"))
+        .unwrap();
+    let (status, _) = send(&router, req).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -305,6 +408,79 @@ async fn config_malformed_is_400() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// POST /api/vault/move
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn move_renames_and_returns_result() {
+    let (dir, router) = vault_router(None);
+    let (status, body) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/move",
+        "application/json",
+        r#"{"from":"01-projects/alpha.md","to":"01-projects/beta.md"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["from"], "01-projects/alpha.md");
+    assert_eq!(json["to"], "01-projects/beta.md");
+    // filesystem actually moved
+    assert!(
+        !dir.path().join("01-projects/alpha.md").exists(),
+        "source still present"
+    );
+    assert!(
+        dir.path().join("01-projects/beta.md").exists(),
+        "dest missing"
+    );
+}
+
+#[tokio::test]
+async fn move_missing_source_is_404() {
+    let (_dir, router) = vault_router(None);
+    let (status, _) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/move",
+        "application/json",
+        r#"{"from":"nope/missing.md","to":"01-projects/x.md"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn move_to_existing_dest_is_409() {
+    let (_dir, router) = vault_router(None);
+    let (status, _) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/move",
+        "application/json",
+        r#"{"from":"01-projects/alpha.md","to":"README.md"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn post_create_in_new_subdir_creates_parents() {
+    let (dir, router) = vault_router(None);
+    let (status, _) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/file?path=04-resources/deep/new.md",
+        "text/markdown",
+        "# Deep\n",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(dir.path().join("04-resources/deep/new.md").exists());
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Static / SPA fallback + token injection
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -392,6 +568,138 @@ async fn static_routes_are_open_without_token() {
     let req = Request::builder().uri("/").body(Body::empty()).unwrap();
     let (status, _body) = send(&router, req).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// DELETE /api/vault/file
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn delete_file_moves_to_trash() {
+    let (dir, router) = vault_router(None);
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/api/vault/file?path=01-projects/alpha.md")
+        .header("X-OneBrain-Token", TOKEN)
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send(&router, req).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["trashed_to"], ".trash/01-projects/alpha.md");
+    assert!(
+        !dir.path().join("01-projects/alpha.md").exists(),
+        "source still present"
+    );
+    assert!(
+        dir.path().join(".trash/01-projects/alpha.md").exists(),
+        "trashed copy missing"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// resolve_in_vault_create — unit tests (no async needed)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn resolve_create_allows_missing_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let p = super::api::resolve_in_vault_create(root, "01-projects/brand-new.md");
+    assert!(
+        p.is_ok(),
+        "missing target should be allowed for create: {p:?}"
+    );
+    assert_eq!(
+        p.unwrap(),
+        root.canonicalize()
+            .unwrap()
+            .join("01-projects/brand-new.md")
+    );
+}
+
+#[test]
+fn resolve_create_rejects_parent_escape() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    assert!(super::api::resolve_in_vault_create(root, "../evil.md").is_err());
+    assert!(super::api::resolve_in_vault_create(root, "/etc/passwd").is_err());
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// GET /api/vault/tree — excluded directories
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tree_excludes_trash_and_dotdirs() {
+    let (_dir, router) = vault_router(None);
+    // Delete README.md so .trash/ exists with content.
+    let del = Request::builder()
+        .method("DELETE")
+        .uri("/api/vault/file?path=README.md")
+        .header("X-OneBrain-Token", TOKEN)
+        .body(Body::empty())
+        .unwrap();
+    let (del_status, _) = send(&router, del).await;
+    assert_eq!(
+        del_status,
+        StatusCode::OK,
+        "delete should succeed so .trash is populated"
+    );
+
+    let (status, body) = get_authed(&router, "/api/vault/tree").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains(".trash"), "tree leaked .trash: {body}");
+    assert!(!body.contains(".git"), "tree leaked .git: {body}");
+    assert!(!body.contains(".obsidian"), "tree leaked .obsidian: {body}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// POST + DELETE /api/vault/folder
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn create_and_delete_folder() {
+    let (dir, router) = vault_router(None);
+
+    let (s1, b1) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/folder?path=01-projects/zeta",
+        "text/plain",
+        "",
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED, "body: {b1}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&b1).unwrap()["path"],
+        "01-projects/zeta"
+    );
+    assert!(
+        dir.path().join("01-projects/zeta").is_dir(),
+        "folder not created on disk"
+    );
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/api/vault/folder?path=01-projects/zeta")
+        .header("X-OneBrain-Token", TOKEN)
+        .body(Body::empty())
+        .unwrap();
+    let (s2, b2) = send(&router, req).await;
+    assert_eq!(s2, StatusCode::OK, "body: {b2}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&b2).unwrap()["trashed_to"],
+        ".trash/01-projects/zeta"
+    );
+    assert!(
+        !dir.path().join("01-projects/zeta").exists(),
+        "folder still present"
+    );
+    assert!(
+        dir.path().join(".trash/01-projects/zeta").is_dir(),
+        "folder not in trash"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -523,4 +831,316 @@ async fn run_server_binds_serves_and_shuts_down_cleanly() {
             .unwrap_or_default();
         (status, body)
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// FIX 1: large note round-trip (body limit matches the 10MB read cap)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn large_note_round_trips() {
+    let (_dir, router) = vault_router(None);
+
+    // 3 MB body — above the 2MB axum default but well under the 10MB cap.
+    let big_body = "x".repeat(3 * 1024 * 1024);
+
+    let (status, body) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/file?path=01-projects/large.md",
+        "text/markdown",
+        &big_body,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "3MB POST should be CREATED, not 413; body: {body}"
+    );
+
+    // GET it back and verify the content length matches.
+    let (get_status, get_body) =
+        get_authed(&router, "/api/vault/file?path=01-projects/large.md").await;
+    assert_eq!(
+        get_status,
+        StatusCode::OK,
+        "GET after large POST; body: {get_body}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&get_body).unwrap();
+    let content = json["content"].as_str().unwrap();
+    assert_eq!(
+        content.len(),
+        big_body.len(),
+        "round-tripped content length mismatch"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// FIX 2: writes to tooling dirs are rejected
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn write_to_tooling_dir_is_rejected() {
+    let (_dir, router) = vault_router(None);
+
+    // POST into .git
+    let (status, body) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/file?path=.git/hack.md",
+        "text/markdown",
+        "evil\n",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "POST into .git must be 400; body: {body}"
+    );
+
+    // POST a folder into .obsidian
+    let (status2, body2) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/folder?path=.obsidian/x",
+        "text/plain",
+        "",
+    )
+    .await;
+    assert_eq!(
+        status2,
+        StatusCode::BAD_REQUEST,
+        "POST folder into .obsidian must be 400; body: {body2}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// FIX 3: DELETE /api/vault/file must not trash a directory
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn delete_file_on_directory_is_rejected() {
+    let (_dir, router) = vault_router(None);
+
+    // `01-projects` exists as a directory in the fixture vault.
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/api/vault/file?path=01-projects")
+        .header("X-OneBrain-Token", TOKEN)
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send(&router, req).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "DELETE file on a directory must be 400; body: {body}"
+    );
+    assert!(
+        body.contains("not a file"),
+        "error message should mention 'not a file': {body}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// FIX 4: move endpoint exercises wikilink rewrite
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn move_rewrites_incoming_wikilinks() {
+    let (_dir, router) = vault_router(None);
+
+    // Create a referencing note via the API.
+    let (create_status, create_body) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/file?path=01-projects/ref.md",
+        "text/markdown",
+        "see [[alpha]]\n",
+    )
+    .await;
+    assert_eq!(
+        create_status,
+        StatusCode::CREATED,
+        "create ref.md failed; body: {create_body}"
+    );
+
+    // Move alpha.md → renamed.md via the HTTP endpoint.
+    let (move_status, move_body) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/move",
+        "application/json",
+        r#"{"from":"01-projects/alpha.md","to":"01-projects/renamed.md"}"#,
+    )
+    .await;
+    assert_eq!(
+        move_status,
+        StatusCode::OK,
+        "move failed; body: {move_body}"
+    );
+
+    let move_json: serde_json::Value = serde_json::from_str(&move_body).unwrap();
+    let links_rewritten = move_json["links_rewritten"]
+        .as_u64()
+        .expect("links_rewritten must be a number");
+    assert!(
+        links_rewritten >= 1,
+        "expected at least 1 link rewritten but got {links_rewritten}; move result: {move_body}"
+    );
+
+    // GET ref.md and verify the link was updated.
+    let (get_status, get_body) =
+        get_authed(&router, "/api/vault/file?path=01-projects/ref.md").await;
+    assert_eq!(get_status, StatusCode::OK, "GET ref.md; body: {get_body}");
+    let ref_json: serde_json::Value = serde_json::from_str(&get_body).unwrap();
+    let ref_content = ref_json["content"].as_str().unwrap();
+    assert!(
+        !ref_content.contains("[[alpha]]"),
+        "old link [[alpha]] must be gone from ref.md; content: {ref_content}"
+    );
+    assert!(
+        ref_content.contains("[[renamed]]"),
+        "new link [[renamed]] must appear in ref.md; content: {ref_content}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Tooling-dir guard bypass vectors (hardened fix)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn write_to_tooling_dir_bypass_rejected() {
+    let (_dir, router) = vault_router(None);
+
+    // Each of these must return 400: leading ./, uppercase, and nested component.
+    for path in [
+        ".git/hack.md",
+        "./.git/hack.md",
+        ".GIT/hack.md",
+        "01-projects/.git/x.md",
+    ] {
+        let (status, body) = send_authed(
+            &router,
+            "POST",
+            &format!("/api/vault/file?path={path}"),
+            "text/markdown",
+            "x",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "path {path} should be rejected (400); body: {body}"
+        );
+    }
+
+    // Nested .obsidian via the folder endpoint.
+    let (status, body) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/folder?path=01-projects/.obsidian",
+        "text/plain",
+        "",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "nested .obsidian folder should be rejected (400); body: {body}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// FIX 5: write routes reject path traversal
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn write_route_rejects_traversal() {
+    let (_dir, router) = vault_router(None);
+
+    let (status, body) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/file?path=../escape.md",
+        "text/markdown",
+        "evil\n",
+    )
+    .await;
+    // 400 or 404 — any client error except 401
+    assert!(
+        status.is_client_error() && status != StatusCode::UNAUTHORIZED,
+        "traversal POST must be rejected (4xx ≠ 401); got {status}; body: {body}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// /api/vault/tasks
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn vault_tasks_returns_only_dated_checkboxes_outside_skipped_folders() {
+    let (dir, router) = vault_router(None);
+    // A dated task (kept), an undated checkbox (excluded), and a dated task in a
+    // skipped folder (07-logs — excluded).
+    fs::write(
+        dir.path().join("01-projects/todo.md"),
+        "# Todo\n\n- [ ] ship it ⏫ 📅 2026-06-30\n- [ ] no date here\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("07-logs")).unwrap();
+    fs::write(
+        dir.path().join("07-logs/s.md"),
+        "- [ ] log task 📅 2026-06-30\n",
+    )
+    .unwrap();
+
+    let (status, body) = get_authed(&router, "/api/vault/tasks").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let tasks = json["tasks"].as_array().unwrap();
+    assert_eq!(
+        tasks.len(),
+        1,
+        "only the one dated, non-skipped task: {body}"
+    );
+    let t = &tasks[0];
+    assert_eq!(t["file"], "01-projects/todo.md");
+    assert_eq!(t["due"], "2026-06-30");
+    assert_eq!(t["done"], false);
+    assert_eq!(t["text"], "ship it ⏫", "📅 stripped, priority kept");
+    assert_eq!(t["line"], 3, "1-based line within the note");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Symlink-escape on the WRITE path (resolve_in_vault_create) — security
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A write whose parent component is a symlink pointing OUTSIDE the vault must
+/// be refused, even though the path is lexically clean (no `..`). The create
+/// path can't canonicalize the not-yet-existing target, so it canonicalizes the
+/// deepest existing ancestor and checks it stays inside the vault.
+#[cfg(unix)]
+#[tokio::test]
+async fn write_through_symlinked_dir_escaping_vault_is_rejected() {
+    let (dir, router) = vault_router(None);
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+
+    let (status, body) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/file?path=escape/pwned.md",
+        "text/markdown",
+        "evil\n",
+    )
+    .await;
+    assert!(
+        status.is_client_error() && status != StatusCode::UNAUTHORIZED,
+        "symlink-escape write must be rejected (4xx ≠ 401); got {status}; body: {body}"
+    );
+    assert!(
+        !outside.path().join("pwned.md").exists(),
+        "a write escaped the vault through a symlinked directory"
+    );
 }

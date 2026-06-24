@@ -30,6 +30,7 @@
 
 mod api;
 mod auth;
+mod chat;
 mod r#static;
 mod token;
 
@@ -109,7 +110,18 @@ pub struct AppState {
     pub vault_root: Option<PathBuf>,
     pub token: String,
     pub dist_dir: Option<PathBuf>,
+    /// Caps how many `POST /api/chat` agent turns may run at once. Each chat
+    /// turn spawns a full `claude` agent (loads MEMORY/plugins, burns API
+    /// tokens), so an unbounded fan-out is a denial-of-wallet vector even behind
+    /// the auth token. Handlers `try_acquire_owned()` a permit and hold it for
+    /// the lifetime of the turn (503 when exhausted).
+    pub chat_limit: Arc<tokio::sync::Semaphore>,
 }
+
+/// Max concurrent `POST /api/chat` agent turns. Small: this is a single-tenant
+/// local assistant, not a fleet — a couple in flight is plenty and bounds the
+/// parallel API-token burn.
+pub const MAX_CONCURRENT_CHATS: usize = 2;
 
 /// Build the axum [`Router`] for a given config WITHOUT binding a socket.
 ///
@@ -130,6 +142,7 @@ pub fn build_router(cfg: ServeConfig) -> Router {
         vault_root: cfg.vault_root,
         token: cfg.token,
         dist_dir: cfg.dist_dir,
+        chat_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CHATS)),
     });
 
     // The `/api` sub-router carries the auth layer. It is built WITHOUT its own
