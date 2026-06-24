@@ -67,7 +67,31 @@ fn request_has_valid_token(expected: &str, request: &Request) -> bool {
         }
     }
 
+    // 3. `?token=<token>` query param — accepted ONLY for safe, read-only verbs
+    //    (GET + HEAD, the latter used by media-preview probes), so an `<img>` / `<a>`
+    //    that can't set a header can authenticate a READ. Mutating verbs
+    //    (POST/PUT/DELETE) are NOT reachable this way, keeping query-token off the
+    //    CSRF surface. The token is fixed-charset hex, so no percent-decoding.
+    //    SECURITY: a `?token=` rides in the request URI, so do NOT enable HTTP
+    //    access-logging middleware (or a URI-logging reverse proxy) on a
+    //    remote-exposed instance — it would capture the token. The daemon's own
+    //    tracing never logs the URI/token; keep it that way.
+    if matches!(request.method().as_str(), "GET" | "HEAD") {
+        if let Some(token) = request.uri().query().and_then(query_param_token) {
+            if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
+                return true;
+            }
+        }
+    }
+
     false
+}
+
+/// Extract the `token` value from a raw query string (`a=1&token=xxx&b=2`).
+fn query_param_token(query: &str) -> Option<&str> {
+    query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("token="))
 }
 
 /// Constant-time byte-slice equality.
@@ -153,5 +177,40 @@ mod tests {
         assert!(!constant_time_eq(b"abc123", b"abc"));
         // Two empties are equal (degenerate but well-defined).
         assert!(constant_time_eq(b"", b""));
+    }
+
+    fn req(method: &str, uri: &str) -> Request {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn accepts_query_token_on_get() {
+        // an <img src="/api/vault/raw?path=x.png&token=…"> can authenticate a read
+        let r = req("GET", "/api/vault/raw?path=x.png&token=secret123");
+        assert!(request_has_valid_token("secret123", &r));
+    }
+
+    #[test]
+    fn accepts_query_token_on_head() {
+        // media-preview probes use HEAD — it's read-only, so query-token is allowed
+        let r = req("HEAD", "/api/vault/raw?path=x.png&token=secret123");
+        assert!(request_has_valid_token("secret123", &r));
+    }
+
+    #[test]
+    fn rejects_query_token_on_non_get() {
+        // query-token must NOT authenticate a mutating request (CSRF surface)
+        let r = req("POST", "/api/vault/delete?path=x&token=secret123");
+        assert!(!request_has_valid_token("secret123", &r));
+    }
+
+    #[test]
+    fn rejects_wrong_query_token() {
+        let r = req("GET", "/api/vault/raw?path=x&token=nope");
+        assert!(!request_has_valid_token("secret123", &r));
     }
 }

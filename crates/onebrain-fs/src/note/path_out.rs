@@ -12,12 +12,18 @@
 //! [`Path`](std::path::Path)/`PathBuf`; only the values that get serialized or
 //! displayed pass through here.
 
-use std::path::Path;
+use std::path::{Component, Path};
 
 /// Render a path as a forward-slash string for output, OS-independent.
-/// Obsidian + JSON consumers use `/` on every platform.
-pub(super) fn to_slash(p: &Path) -> String {
+/// Obsidian + JSON consumers use `/` on every platform. Public so the daemon's
+/// API layer + task scan render vault-relative paths the same way (one source).
+///
+/// `CurDir` (`.`) components are dropped so a request like `?path=./a/b.md`
+/// renders as the normalised `a/b.md`, not `./a/b.md` — callers should get a
+/// stable vault-relative identifier regardless of a leading `./`.
+pub fn to_slash(p: &Path) -> String {
     p.components()
+        .filter(|c| !matches!(c, Component::CurDir))
         .map(|c| c.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
@@ -43,6 +49,16 @@ mod tests {
     #[test]
     fn to_slash_single_component() {
         assert_eq!(to_slash(Path::new("note.md")), "note.md");
+    }
+
+    #[test]
+    fn to_slash_drops_leading_current_dir() {
+        // A `./` prefix must not leak into the rendered identifier.
+        assert_eq!(
+            to_slash(Path::new("./01-projects/a.md")),
+            "01-projects/a.md"
+        );
+        assert_eq!(to_slash(Path::new("./note.md")), "note.md");
     }
 
     #[test]
