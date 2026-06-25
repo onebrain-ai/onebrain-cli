@@ -20,7 +20,7 @@
     "type": "git",
     "url": "git+https://github.com/onebrain-ai/onebrain-cli.git"
   },
-  "license": "AGPL-3.0-only",
+  "license": "MIT OR Apache-2.0",
   "author": "OneBrain Contributors",
   "bin": {
     "onebrain": "bin/onebrain.js"

@@ -22,5 +22,5 @@ The workspace root sets `publish = false`; every crate inherits it.
 
 - **`core` is trivially testable** — no I/O means fast, deterministic unit tests, and it's where the tricky pure logic lives.
 - **Clear "where does this go?"** — business logic in a library crate, rendering in the binary; the library never decides output format, the binary never decides logic.
-- **Refactor freedom** — `publish = false` means no crates.io semver obligations; crate boundaries can move freely. This is also part of the AGPL + Path-B product boundary: Studio spawns the `onebrain` binary as a sidecar rather than importing these crates.
+- **Refactor freedom** — `publish = false` means no crates.io semver obligations; crate boundaries can move freely. This also reflects the Path-B product boundary: Studio spawns the `onebrain` binary as a sidecar rather than importing these crates — a product/architecture choice (no longer copyleft-forced now that the workspace is `MIT OR Apache-2.0`).
 - **Cost:** more crates to navigate and a little re-export boilerplate. The [code reference](../reference/) exists partly to offset the navigation cost.

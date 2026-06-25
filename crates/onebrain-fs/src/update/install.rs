@@ -630,7 +630,7 @@ mod tests {
         let archive = make_tar_gz(&[
             ("README.md", b"docs" as &[u8]),
             ("onebrain", b"BINARY"),
-            ("LICENSE", b"AGPL"),
+            ("LICENSE-MIT", b"MIT"),
         ]);
         let out = extract_tar_gz(&archive, "onebrain").unwrap();
         assert_eq!(out, b"BINARY");

@@ -111,4 +111,4 @@ When 2+ independent reviewers flag the same issue, treat it as consensus — fix
 
 ---
 
-License: AGPL-3.0-only · see [`LICENSE`](LICENSE).
+License: MIT OR Apache-2.0 · see [`LICENSE-MIT`](LICENSE-MIT) / [`LICENSE-APACHE`](LICENSE-APACHE). By contributing, you agree your contributions are dual-licensed under the same terms.
