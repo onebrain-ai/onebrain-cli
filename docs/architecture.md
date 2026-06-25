@@ -46,7 +46,7 @@ The same shape holds for every command: **parse → resolve → do work in a lib
 
 ## Why `publish = false`
 
-The workspace root sets `publish = false` and every crate inherits it via `publish.workspace = true`. The library crates are implementation detail, not a public Rust API — only the compiled `onebrain` binary is a product. This keeps us free to refactor crate boundaries without semver obligations to crates.io consumers, and it's a deliberate part of the AGPL + Path-B boundary (Studio spawns the binary as a sidecar; it does not import these crates).
+The workspace root sets `publish = false` and every crate inherits it via `publish.workspace = true`. The library crates are implementation detail, not a public Rust API — only the compiled `onebrain` binary is a product. This keeps us free to refactor crate boundaries without semver obligations to crates.io consumers, and it reflects the Path-B product boundary (Studio spawns the binary as a sidecar rather than importing these crates). With the workspace now permissively licensed (`MIT OR Apache-2.0`), that boundary is a product/architecture choice — no longer forced by copyleft as it was under AGPL.
 
 ## Where to go next
 

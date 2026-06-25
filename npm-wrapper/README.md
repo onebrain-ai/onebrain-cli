@@ -51,4 +51,4 @@ The shim runs but exits `127` until the binary is staged at `node_modules/@onebr
 
 Source lives at [`npm-wrapper/`](https://github.com/onebrain-ai/onebrain-cli/tree/main/npm-wrapper). CI publishes on each stable `vMAJOR.MINOR.PATCH` tag via npm Trusted Publishers (OIDC, no long-lived token) with `--provenance` for a Sigstore attestation — never published manually, and prerelease tags (containing `-`) are skipped. The wrapper version always equals the binary release version.
 
-[AGPL-3.0-only](https://github.com/onebrain-ai/onebrain-cli/blob/main/LICENSE), matching the upstream CLI binary. For commercial licensing, contact [hello@onebrain.run](mailto:hello@onebrain.run).
+[MIT](https://github.com/onebrain-ai/onebrain-cli/blob/main/LICENSE-MIT) OR [Apache-2.0](https://github.com/onebrain-ai/onebrain-cli/blob/main/LICENSE-APACHE) at your option, matching the upstream CLI binary. Questions: [hello@onebrain.run](mailto:hello@onebrain.run).

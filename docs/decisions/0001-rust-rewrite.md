@@ -23,4 +23,4 @@ Rewrite the CLI in Rust as a single static binary, in a new repo (`onebrain-ai/o
 - **Single static executable per platform** — no runtime to install; distribution is just "download the binary" (see [0003](0003-direct-github-self-update.md)).
 - **A real systems-language base** for the daemon/RPC/mesh work on the roadmap.
 - **Cost:** a full reimplementation, and a golden-master parity suite against the Bun binary to prove behavior matched (since retired in v3.1.0 once the contract was pinned by the `Envelope` snapshots).
-- Licensed AGPL-3.0-only; the workspace is `publish = false` (see [0002](0002-four-crate-workspace.md)).
+- Licensed MIT OR Apache-2.0; the workspace is `publish = false` (see [0002](0002-four-crate-workspace.md)).
