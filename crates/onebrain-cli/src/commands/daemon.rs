@@ -555,7 +555,7 @@ pub fn run_internal() -> Result<()> {
 
     // Port: `$ONEBRAIN_DAEMON_PORT` overrides the shared default. The override
     // exists mainly so the lifecycle integration test can bind a free port and
-    // avoid colliding with a real daemon (or a parallel test) on 4317. `0` is
+    // avoid colliding with a real daemon (or a parallel test) on 6789. `0` is
     // honoured (OS-assigned ephemeral port) for tests that don't curl.
     let port = std::env::var("ONEBRAIN_DAEMON_PORT")
         .ok()
@@ -916,7 +916,7 @@ mod tests {
         // returning combined stdout as a String. We assert success separately.
         //
         // `ONEBRAIN_DAEMON_PORT=0` makes the detached `__run` bind an
-        // OS-assigned ephemeral port instead of the fixed default (4317), so
+        // OS-assigned ephemeral port instead of the fixed default (6789), so
         // this test never collides with a real running daemon or a parallel
         // test on the same machine. (We exercise PID-file lifecycle here, not
         // HTTP — the curl-the-port smoke test is the manual verify step.)

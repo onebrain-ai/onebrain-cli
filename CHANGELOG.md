@@ -14,6 +14,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 - **Relicensed from `AGPL-3.0-only` to `MIT OR Apache-2.0`** — permissive dual license, applied org-wide. Sole-author relicense; effective for all releases from here on.
+- **`serve`/`daemon` default port `4317` → `6789`** — `4317`/`4318` collided with OpenTelemetry OTLP (gRPC/HTTP); `6789` is memorable and avoids the busy round ports. Override with `--port` as before.
 
 ## [3.3.2] — 2026-06-25 — note edit / delete / mkdir CLI verbs
 

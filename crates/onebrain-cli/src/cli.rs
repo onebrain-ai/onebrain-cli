@@ -1054,7 +1054,7 @@ pub struct ServeArgs {
     /// page is served at `/`).
     #[arg(long, value_name = "PATH")]
     pub dir: Option<PathBuf>,
-    /// Bind port (default 4317).
+    /// Bind port (default 6789).
     #[arg(long, value_name = "PORT")]
     pub port: Option<u16>,
     /// Bind host (default 127.0.0.1). Use `0.0.0.0` for single-tenant remote
