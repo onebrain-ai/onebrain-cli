@@ -29,7 +29,8 @@
     "bin/",
     "postinstall.js",
     "README.md",
-    "LICENSE"
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
   ],
   "scripts": {
     "postinstall": "node postinstall.js"
