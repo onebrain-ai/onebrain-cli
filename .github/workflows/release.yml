@@ -351,7 +351,7 @@ jobs:
           class Onebrain < Formula
             desc "Local-first Rust CLI for OneBrain — personal AI OS for Obsidian"
             homepage "https://onebrain.run"
-            license "MIT OR Apache-2.0"
+            license any_of: ["MIT", "Apache-2.0"]
 
             on_macos do
               on_arm do
