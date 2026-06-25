@@ -1,6 +1,6 @@
 ---
-latest_version: 3.3.1
-released: 2026-06-24
+latest_version: 3.3.2
+released: 2026-06-25
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -11,6 +11,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
 ## [Unreleased]
+
+## [3.3.2] — 2026-06-25 — note edit / delete / mkdir CLI verbs
+
+- feat(note): `onebrain note edit <path> <content>` — verbatim overwrite (or create) a note via the shared `onebrain_fs::note::write_note` primitive.
+- feat(note): `onebrain note delete <path>` — move a note to `.trash` via `delete_note`.
+- feat(note): `onebrain note mkdir <path>` — create a folder via `create_folder`.
+- These are the CLI counterparts to the v3.3.1 daemon write endpoints — both surfaces now share ONE write/delete/folder implementation (no duplication).
 
 ## [3.3.1] — 2026-06-24 — daemon write / media / chat surface
 
