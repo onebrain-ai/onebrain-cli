@@ -12,6 +12,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+- **Relicensed from `AGPL-3.0-only` to `MIT OR Apache-2.0`** — permissive dual license, applied org-wide. Sole-author relicense; effective for all releases from here on.
+
 ## [3.3.2] — 2026-06-25 — note edit / delete / mkdir CLI verbs
 
 - feat(note): `onebrain note edit <path> <content>` — verbatim overwrite (or create) a note via the shared `onebrain_fs::note::write_note` primitive.

@@ -6,7 +6,7 @@ resolver = "2"
 [workspace.package]
 version = "3.3.2"
 edition = "2021"
-license = "AGPL-3.0-only"
+license = "MIT OR Apache-2.0"
 authors = ["OneBrain Contributors"]
 repository = "https://github.com/onebrain-ai/onebrain-cli"
 publish = false
