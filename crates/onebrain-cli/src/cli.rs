@@ -675,7 +675,7 @@ pub enum MemoryVerb {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// note (11 verbs locked 2026-05-25 · ships v3.2.0, stubs in v3.1)
+// note (14 verbs · 11 locked 2026-05-25 ship v3.2.0 · edit/delete/mkdir added 2026-06-25)
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
@@ -702,6 +702,12 @@ pub enum NoteVerb {
     Move(NoteMoveArgs),
     /// Archive a note into the dated archive bucket (`<root>/YYYY/MM/<file>`).
     Archive(NoteArchiveArgs),
+    /// Write content verbatim to a note (create or overwrite).
+    Edit(NoteEditArgs),
+    /// Delete a note (moves it to `.trash/`).
+    Delete(NoteDeleteArgs),
+    /// Create a folder (and any missing parents).
+    Mkdir(NoteMkdirArgs),
     /// List every note that links to the target note.
     Backlinks(NoteBacklinksArgs),
     /// List orphan notes — notes with zero incoming wikilinks.
@@ -851,6 +857,30 @@ pub struct NoteOrphansArgs {
     /// Maximum orphans to return.
     #[arg(long, default_value_t = 50)]
     pub limit: usize,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteEditArgs {
+    /// Note path, relative to the vault root.
+    pub path: PathBuf,
+    /// New content to write verbatim. The note is created if it does not exist.
+    /// `allow_hyphen_values` so Markdown list/task lines (`- [ ] …`, `- item`)
+    /// parse as content rather than being mistaken for a flag.
+    #[arg(allow_hyphen_values = true)]
+    pub content: String,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteDeleteArgs {
+    /// Note path, relative to the vault root (moved to `.trash/`, not removed).
+    pub path: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub struct NoteMkdirArgs {
+    /// Folder path, relative to the vault root. Parent directories are created
+    /// as needed. Errors if the path already exists.
+    pub path: PathBuf,
 }
 
 // ─────────────────────────────────────────────────────────────────────────

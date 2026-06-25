@@ -466,6 +466,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 commands::note_orphans::run(vault_flag.clone(), &mode, &args)
             }
             NoteVerb::Stat(args) => commands::note_stat::run(vault_flag.clone(), &mode, &args),
+            NoteVerb::Edit(args) => commands::note_edit::run(vault_flag.clone(), &mode, &args),
+            NoteVerb::Delete(args) => commands::note_delete::run(vault_flag.clone(), &mode, &args),
+            NoteVerb::Mkdir(args) => commands::note_mkdir::run(vault_flag.clone(), &mode, &args),
         },
         Cmd::Pause(PauseCmd { verb }) => match verb {
             PauseVerb::List => {
