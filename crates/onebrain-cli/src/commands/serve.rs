@@ -18,10 +18,12 @@ use crate::server::{self, generate_token, ServeConfig};
 use anyhow::{Context, Result};
 use std::net::{IpAddr, Ipv4Addr};
 
-/// Default port for `serve` when `--port` is omitted. Chosen in the
-/// user/dynamic range, unlikely to collide with common dev servers (3000/5173/
-/// 8080). The daemon uses the same default (one surface, one well-known port).
-pub const DEFAULT_PORT: u16 = 4317;
+/// Default port for `serve` when `--port` is omitted. `6789` is memorable
+/// (the 6-7-8-9 run) and avoids the busy "round" ports — 8888 (Jupyter),
+/// 5555 (Android ADB), 6666 (IRC), 3000/5173/8080 (dev servers) — as well as
+/// 4317/4318 (OpenTelemetry OTLP gRPC/HTTP), which the previous default
+/// collided with. The daemon uses the same default (one surface, one port).
+pub const DEFAULT_PORT: u16 = 6789;
 
 /// Run the foreground serve command. `mode` is currently unused for output
 /// shaping (serve streams `tracing` lines, not an envelope) but is accepted for
