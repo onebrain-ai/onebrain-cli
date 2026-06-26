@@ -81,21 +81,25 @@ Owns the on-disk checkpoint state file `$TMPDIR/onebrain-{token}.state` in 3-fie
 **Tests** — roundtrip, fresh-on-missing/malformed/wrong-field-count, atomic temp-file cleanup.
 
 ## `src/qmd.rs`
-Queries `qmd status`, parses its human-readable text output, and reports index/embedding health. Designed for silent fallback — a missing or hung qmd never blocks the caller.
+The **single source of truth** for probing `qmd status` — spawn, PATH resolution, timeout, and parse all live here. Every consumer (session-init's unembedded count, `onebrain qmd status`, and `onebrain doctor`'s qmd-embeddings check in `onebrain-fs`) goes through it, so they can't drift. Designed for silent fallback — a missing or hung qmd never blocks the caller.
 
-`QMD_TIMEOUT_MS = 2000` caps every subprocess call.
+Two deadlines, one probe core (`probe_qmd_status_with(timeout)`), chosen by intent — compile-time `const _: () = assert!(…)` guards keep them sane (generous ≥ 15; startup ≤ generous):
+- `QMD_STATUS_TIMEOUT_SECS = 15` — explicit `onebrain qmd status` + `onebrain doctor`, where the user waits *for* the figure and a cold multi-MB index can take ~10 s. (`probe_qmd_status()` uses this; `doctor` reuses it rather than defining its own.)
+- `QMD_STARTUP_TIMEOUT_SECS = 5` — the interactive session-init probe (`query_unembedded_count`), which blocks the greeting. A timeout degrades to `None`/`null` ("unknown"), never a false `0`, so a slow/hung qmd can't freeze startup — the shorter cap trades "exact count on a cold index" for "snappy startup", never correctness.
 
-**Key types** — `QmdStatus` (`Serialize`, all `Option`) — `total_files: Option<u64>`, `embedded_vectors: Option<u64>`, `pending_embedding: Option<u64>`, `index_size: Option<String>`, `last_updated: Option<String>`.
+**Key types**
+- `QmdStatus` (`Serialize`, all `Option`) — `total_files`, `embedded_vectors`, `pending_embedding`, `index_size`, `last_updated`. `QmdStatus::parse(text)` is public so other crates parse identically.
+- `QmdProbe` — `NotFound | Timeout | Stdout(String) | Error`; the classified outcome of one spawn, so consumers can render failure modes differently and unit-test every branch without spawning.
 
-**How status is parsed** — `query_status()` spawns `qmd status` (platform-wrapped: direct on Unix, `powershell.exe -Command "qmd ..."` on Windows) via `capture_qmd_stdout`, then `parse_status` line-matches prefixes — `Total:` → `total_files`, `Vectors:` → `embedded_vectors`, `Pending:` → `pending_embedding`, `Size:` → `index_size`, `Updated:` → `last_updated`. Numeric fields take the first `u64` token on the line; unmatched lines leave their field `None`. (Text parsing rather than `--json` because qmd ≤ 2.1.0 ignores `--json`.)
+**How status is parsed** — `probe_qmd_status()` spawns `qmd status` (platform-wrapped: direct on Unix, `powershell.exe -Command "qmd status"` on Windows) with a `wait-timeout` deadline, then `parse_status` line-matches prefixes — `Total:` → `total_files`, `Vectors:` → `embedded_vectors`, `Pending:` → `pending_embedding`, `Size:` → `index_size`, `Updated:` → `last_updated`. Numeric fields take the first `u64` token; unmatched lines leave their field `None`. (Text parsing rather than `--json` because qmd ≤ 2.1.0 ignores `--json`.) On Unix the binary is resolved on PATH first, then the bun-global dir (`~/.bun/bin`); qmd runs with that dir on PATH so a located-but-interpreted qmd finds its own interpreter under a restricted launcher PATH.
 
 **Key functions**
-- `query_status() -> Option<QmdStatus>` — runs `qmd status`; `None` when qmd is unavailable/empty, else best-effort parsed struct.
-- `query_unembedded_count() -> usize` — `query_status().and_then(|s| s.pending_embedding).unwrap_or(0)`; the count surfaced at session-init.
-- `capture_qmd_stdout(args, timeout_ms) -> Option<String>` (private) — spawns, reads stdout on a worker thread with `recv_timeout`, kills child on timeout; `None` on any failure.
+- `probe_qmd_status() -> QmdProbe` — the one spawn; never panics.
+- `query_status() -> Option<QmdStatus>` — `None` when qmd is unavailable/empty, else best-effort parsed struct.
+- `query_unembedded_count() -> Option<usize>` — `None` when the count can't be determined (probe failure / unparseable), `Some(n)` otherwise. `None` is deliberate: a false `0` is indistinguishable from "all embedded" and hides pending work at startup.
 
-**Connections** — calls: `qmd` subprocess (via `powershell.exe` on Windows); called by: `onebrain-cli` session-init (unembedded count) and qmd `status` command.
-**Tests** — verbatim qmd-2.1.0 sample parse, missing-field `None`, zero-pending vs none, all-garbage → all-`None`, no-panic when qmd absent.
+**Connections** — calls: `qmd` subprocess (via `powershell.exe` on Windows); called by: `onebrain-cli` session-init (unembedded count) + qmd `status` command, and `onebrain-fs` doctor (qmd-embeddings check).
+**Tests** — verbatim qmd-2.1.0 sample parse (incl. full multi-block output), missing-field `None`, zero-pending vs none, all-garbage → all-`None`, probe→`None` for every non-stdout outcome, probe→count mapping, bun-dir on the search path, no-panic when qmd absent.
 
 ## `src/qmd_reindex.rs`
 Fire-and-forget reindex: spawns a detached `qmd update -c <collection>` background process. Always returns `Ok(())` (matches Bun's exit-0 contract).

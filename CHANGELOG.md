@@ -1,6 +1,6 @@
 ---
-latest_version: 3.3.2
-released: 2026-06-25
+latest_version: 3.3.3
+released: 2026-06-26
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -10,11 +10,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
-## [Unreleased]
+## [3.3.3] — 2026-06-26 — qmd probe: one shared source of truth · 15 s timeout · null-not-zero
 
-### Changed
-- **Relicensed from `AGPL-3.0-only` to `MIT OR Apache-2.0`** — permissive dual license, applied org-wide. Sole-author relicense; effective for all releases from here on.
+- fix(qmd): session-init's unembedded count and `onebrain qmd status` no longer report a false `0` / "not installed" when `qmd status` is slow. The shared probe timed out at 2 s, but a real index can take ~10 s — `onebrain doctor` already learned this (3 s → 15 s in v3.2.4) and the fix was never carried over. Bumped to 15 s, enforced by a compile-time guard.
+- perf(session-init): the startup probe uses a tighter 5 s cap (vs 15 s for `qmd status` / `doctor`) so a slow/hung qmd can't freeze the greeting — on timeout it degrades to `null` ("unknown"), never a false `0`. One shared probe, two caps documented by intent.
+- feat(session-init): `qmd_unembedded` is now `null` (not `0`) when the qmd probe can't determine the count (missing / timed out / unparseable), so a probe failure is distinguishable from a genuine zero and no longer silently hides pending embeddings at startup. Additive change to the internal hook protocol — the JSON key is always present and `0`/`N>0` are unchanged. The SessionStart consumer should treat `null` as "unknown" (companion INSTRUCTIONS.md update); text mode prints `qmd index: unknown (qmd unavailable)`.
+- fix(qmd): robust `qmd` resolution — the probe looks in (and runs qmd with) the bun-global dir so a `bun install -g qmd` install resolves under a restricted launcher PATH (hook / launchd / Obsidian terminal) and a located-but-interpreted qmd finds its own interpreter. Mirrors doctor's long-standing lookup.
+- refactor(qmd): unified the duplicated qmd-status probes — `onebrain-cache::qmd` is now the single source of truth (spawn · PATH · timeout · parse) reused by session-init, `qmd status`, and `onebrain doctor` (which previously had its own copy), so they can't drift again.
 - **`serve`/`daemon` default port `4317` → `6789`** — `4317`/`4318` collided with OpenTelemetry OTLP (gRPC/HTTP); `6789` is memorable and avoids the busy round ports. Override with `--port` as before.
+- chore(license): relicensed from `AGPL-3.0-only` to `MIT OR Apache-2.0` — permissive dual license, applied org-wide. Sole-author relicense; effective for all releases from here on.
 
 ## [3.3.2] — 2026-06-25 — note edit / delete / mkdir CLI verbs
 

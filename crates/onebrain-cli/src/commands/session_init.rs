@@ -30,11 +30,15 @@ pub fn run(vault_dir: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
 /// `qmd_count` is injected so the unembedded figure is deterministic in tests
 /// (production passes `query_unembedded_count`, which shells out to qmd). It
 /// is only invoked on the happy path when the vault actually uses qmd.
-fn build_output(cwd: &Path, mode: &OutputMode, qmd_count: impl Fn() -> usize) -> Result<String> {
+fn build_output(
+    cwd: &Path,
+    mode: &OutputMode,
+    qmd_count: impl Fn() -> Option<usize>,
+) -> Result<String> {
     Ok(format_output(&compute_result(cwd, qmd_count)?, mode))
 }
 
-fn compute_result(cwd: &Path, qmd_count: impl Fn() -> usize) -> Result<SessionInitResult> {
+fn compute_result(cwd: &Path, qmd_count: impl Fn() -> Option<usize>) -> Result<SessionInitResult> {
     // Distinct block reasons for missing-vault vs malformed-yaml — the
     // SessionStart hook routes each to a different recovery path.
     let Some(vault_root) = find_vault_root(cwd) else {
@@ -69,14 +73,16 @@ fn compute_result(cwd: &Path, qmd_count: impl Fn() -> usize) -> Result<SessionIn
     clean_stale_state_file(&token, &std::env::temp_dir(), process_start);
 
     // Unembedded-doc count · queried only when THIS vault actually uses qmd
-    // (`qmd_collection` set). Vaults that don't use qmd report 0 rather than
-    // leaking the global qmd index's pending count into an unrelated vault's
-    // startup. The query itself still degrades to 0 on a missing binary /
-    // timeout / unparseable output.
+    // (`qmd_collection` set). Vaults that don't use qmd report a genuine
+    // `Some(0)` rather than leaking the global qmd index's pending count into
+    // an unrelated vault's startup. When the vault DOES use qmd, the probe may
+    // return `None` (qmd missing / timed out / unparseable) — surfaced as
+    // `null` so a probe failure is distinguishable from a true zero instead of
+    // silently hiding pending embeddings at startup.
     let qmd_unembedded = if config.qmd_collection.is_some() {
         qmd_count()
     } else {
-        0
+        Some(0)
     };
 
     let datetime = chrono::Local::now()
@@ -119,12 +125,17 @@ fn render_text(result: &SessionInitResult) -> String {
     match result {
         SessionInitResult::Ok(out) => {
             // Single-line happy path → keep tight; multi-line metadata risks
-            // pushing useful info offscreen on narrow terminals.
+            // pushing useful info offscreen on narrow terminals. `None` ⟹ the
+            // qmd probe couldn't determine the count (missing / timed out);
+            // say so rather than printing a misleading "0 unembedded".
+            let qmd = match out.qmd_unembedded {
+                Some(n) => format!("{n} unembedded"),
+                None => "unknown (qmd unavailable)".to_string(),
+            };
             format!(
-                "Session ready · token={token} · datetime={datetime}\nqmd index: {qmd} unembedded",
+                "Session ready · token={token} · datetime={datetime}\nqmd index: {qmd}",
                 token = out.session_token,
                 datetime = out.datetime,
-                qmd = out.qmd_unembedded,
             )
         }
         SessionInitResult::Block(block) => match block.reason {
@@ -168,7 +179,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "qmd_collection: ob-1\n").unwrap();
 
-        let line = build_output(dir.path(), &json_mode(), || 0).unwrap();
+        let line = build_output(dir.path(), &json_mode(), || Some(0)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
 
         assert!(v.get("datetime").and_then(|d| d.as_str()).is_some());
@@ -184,7 +195,7 @@ mod tests {
     fn block_path_when_no_vault_yml_found() {
         let dir = tempdir().unwrap();
         // No vault.yml anywhere.
-        let line = build_output(dir.path(), &json_mode(), || 0).unwrap();
+        let line = build_output(dir.path(), &json_mode(), || Some(0)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v.get("decision").and_then(|d| d.as_str()), Some("block"));
         assert_eq!(
@@ -202,7 +213,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "not: : valid\n").unwrap();
 
-        let line = build_output(dir.path(), &json_mode(), || 0).unwrap();
+        let line = build_output(dir.path(), &json_mode(), || Some(0)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v.get("decision").and_then(|d| d.as_str()), Some("block"));
         assert_eq!(
@@ -224,7 +235,7 @@ mod tests {
         // `onebrain-vault-not-found` reason (renamed from `init-required`
         // in v3.1) and skips the `error_detail` field.
         let dir = tempdir().unwrap();
-        let line = build_output(dir.path(), &json_mode(), || 0).unwrap();
+        let line = build_output(dir.path(), &json_mode(), || Some(0)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(
             v.get("reason").and_then(|r| r.as_str()),
@@ -244,7 +255,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "# no qmd_collection\n").unwrap();
 
-        let line = build_output(dir.path(), &json_mode(), || 99).unwrap();
+        let line = build_output(dir.path(), &json_mode(), || Some(99)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(
             v.get("qmd_unembedded").and_then(|n| n.as_u64()),
@@ -261,7 +272,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "qmd_collection: ob-1\n").unwrap();
 
-        let line = build_output(dir.path(), &json_mode(), || 7).unwrap();
+        let line = build_output(dir.path(), &json_mode(), || Some(7)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(
             v.get("qmd_unembedded").and_then(|n| n.as_u64()),
@@ -271,11 +282,62 @@ mod tests {
     }
 
     #[test]
+    fn collection_set_probe_failure_reports_null_not_zero() {
+        // The core contract change: when the vault uses qmd but the probe can't
+        // determine the count (`None` — missing binary / timeout), the field is
+        // `null`, NOT a misleading `0` that hides pending embeddings. The field
+        // is still present (key required by the hook contract).
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("vault.yml"), "qmd_collection: ob-1\n").unwrap();
+
+        let line = build_output(dir.path(), &json_mode(), || None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let field = v.get("qmd_unembedded").expect("key must be present");
+        assert!(
+            field.is_null(),
+            "probe failure must report null (unknown), not a false zero; got {field:?}"
+        );
+    }
+
+    #[test]
+    fn text_mode_reports_unknown_when_probe_unavailable() {
+        // Counterpart of the JSON `null`: the human-readable line must say the
+        // count is unknown rather than printing "0 unembedded".
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("vault.yml"), "qmd_collection: ob-1\n").unwrap();
+
+        let line = build_output(dir.path(), &text_mode(), || None).unwrap();
+        assert!(
+            line.contains("qmd index: unknown"),
+            "expected unknown marker for unavailable qmd; got: {line}"
+        );
+        assert!(
+            !line.contains("0 unembedded"),
+            "must not print a false zero; got: {line}"
+        );
+    }
+
+    #[test]
+    fn text_mode_reports_count_when_probe_succeeds() {
+        // Positive text path: a determined count renders as "N unembedded"
+        // (the same figure the JSON `qmd_unembedded` carries — both render from
+        // the one `SessionInitOutput` field, so text and --json agree).
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("vault.yml"), "qmd_collection: ob-1\n").unwrap();
+
+        let line = build_output(dir.path(), &text_mode(), || Some(7)).unwrap();
+        assert!(
+            line.contains("qmd index: 7 unembedded"),
+            "expected the determined count in text mode; got: {line}"
+        );
+    }
+
+    #[test]
     fn block_path_emits_yaml_when_mode_is_yaml() {
         // v3.1: --yaml / --output yaml flips the hook-protocol block to
         // YAML. Default stays JSON (verified above).
         let dir = tempdir().unwrap();
-        let line = build_output(dir.path(), &OutputMode::Yaml, || 0).unwrap();
+        let line = build_output(dir.path(), &OutputMode::Yaml, || Some(0)).unwrap();
         // Parse the YAML to assert structure rather than string-matching
         // (serde_yaml's emitter formatting is implementation-defined).
         let v: serde_yaml::Value = serde_yaml::from_str(&line).unwrap();
@@ -300,7 +362,7 @@ mod tests {
     fn happy_path_emits_yaml_when_mode_is_yaml() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "qmd_collection: ob-1\n").unwrap();
-        let line = build_output(dir.path(), &OutputMode::Yaml, || 0).unwrap();
+        let line = build_output(dir.path(), &OutputMode::Yaml, || Some(0)).unwrap();
         let v: serde_yaml::Value = serde_yaml::from_str(&line).unwrap();
         assert!(v.get("datetime").and_then(|d| d.as_str()).is_some());
         assert!(v.get("session_token").and_then(|s| s.as_str()).is_some());
@@ -316,7 +378,7 @@ mod tests {
     #[test]
     fn default_outside_vault_emits_text_not_json() {
         let dir = tempdir().unwrap();
-        let line = build_output(dir.path(), &text_mode(), || 0).unwrap();
+        let line = build_output(dir.path(), &text_mode(), || Some(0)).unwrap();
         assert!(
             !line.trim_start().starts_with('{'),
             "default mode must NOT emit JSON braces; got: {line}"
@@ -335,7 +397,7 @@ mod tests {
     fn default_inside_vault_emits_text_success() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "qmd_collection: ob-1\n").unwrap();
-        let line = build_output(dir.path(), &text_mode(), || 0).unwrap();
+        let line = build_output(dir.path(), &text_mode(), || Some(0)).unwrap();
         assert!(
             !line.trim_start().starts_with('{'),
             "default mode must NOT emit JSON braces; got: {line}"
@@ -351,7 +413,7 @@ mod tests {
     fn default_on_malformed_vault_emits_text() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "not: : valid\n").unwrap();
-        let line = build_output(dir.path(), &text_mode(), || 0).unwrap();
+        let line = build_output(dir.path(), &text_mode(), || Some(0)).unwrap();
         assert!(!line.trim_start().starts_with('{'), "got: {line}");
         assert!(line.contains("malformed"), "got: {line}");
         assert!(line.contains("onebrain doctor"), "got: {line}");
@@ -361,7 +423,8 @@ mod tests {
     fn json_pretty_emits_indented_multiline() {
         let dir = tempdir().unwrap();
         // Block path is simplest — no volatile fields to assert against.
-        let line = build_output(dir.path(), &OutputMode::Json { pretty: true }, || 0).unwrap();
+        let line =
+            build_output(dir.path(), &OutputMode::Json { pretty: true }, || Some(0)).unwrap();
         // Pretty JSON contains newlines + 2-space indent.
         assert!(
             line.contains('\n'),

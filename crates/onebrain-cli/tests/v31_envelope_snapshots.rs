@@ -75,11 +75,13 @@ fn run_json(args: &[&str], dir: &std::path::Path) -> Value {
         // Hermetic `headless`: clear ONEBRAIN_HEADLESS so session-init snapshots
         // read `false` even when the test runner is itself under `skill run`.
         .env_remove("ONEBRAIN_HEADLESS")
-        // Hermetic `qmd_unembedded`: scrub PATH so the spawned `qmd` probe
-        // finds nothing → unembedded count degrades to a deterministic 0
-        // (otherwise the test reads the dev machine's live qmd index).
-        // Mirrors `tests/snapshots.rs`'s helper.
+        // Hermetic `qmd_unembedded`: scrub PATH *and* HOME so the spawned `qmd`
+        // probe finds nothing → unembedded count is a deterministic `null` (v3.4:
+        // "unknown"). PATH alone is insufficient — the probe also falls back to
+        // `$HOME/.bun/bin` (`bun install -g qmd`); without clearing HOME a
+        // bun-installed qmd would read the live index. Mirrors `snapshots.rs`.
         .env("PATH", "/usr/bin:/bin")
+        .env_remove("HOME")
         .current_dir(dir)
         .output()
         .expect("spawn failed");
@@ -153,8 +155,8 @@ fn plugin_update_json_envelope_snapshot_dry_run() {
 fn session_init_json_envelope_snapshot_inside_vault() {
     let dir = tempdir().unwrap();
     // Same fixture shape as legacy session_init snapshot — qmd_collection
-    // present so the qmd_unembedded probe runs (returns 0 with no qmd
-    // binary installed in the test env).
+    // present so the qmd_unembedded probe runs; with PATH scrubbed (no qmd
+    // binary on it) it reports `null` (v3.4: "unknown" rather than a false 0).
     fs::write(dir.path().join("vault.yml"), "qmd_collection: x\n").unwrap();
     // v3.1: machine consumers must opt into JSON explicitly now that text
     // is the default for interactive use.

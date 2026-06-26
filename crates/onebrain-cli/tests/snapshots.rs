@@ -21,11 +21,13 @@ fn run_json(args: &[&str], dir: &std::path::Path) -> Value {
     let output = Command::cargo_bin("onebrain")
         .unwrap()
         .args(args)
-        // Scrub PATH so the spawned `qmd` probe finds nothing → the unembedded
-        // count degrades to a deterministic 0. Without this the snapshot reads
-        // the dev machine's live qmd index (non-hermetic · fails wherever qmd
-        // is installed). Mirrors the qmd-scrub other binary tests already use.
+        // Scrub PATH *and* HOME so the spawned `qmd` probe finds nothing → the
+        // unembedded count is reported as `null` (v3.4: "unknown", deterministic).
+        // PATH alone is insufficient: the probe also falls back to `$HOME/.bun/bin`
+        // (`bun install -g qmd`), so without clearing HOME a contributor with a
+        // bun-installed qmd would read the live index and break this snapshot.
         .env("PATH", "/usr/bin:/bin")
+        .env_remove("HOME")
         // Hermetic `headless`: clear ONEBRAIN_HEADLESS so the snapshot reads
         // `false` even when the test runner is itself under `skill run`.
         .env_remove("ONEBRAIN_HEADLESS")

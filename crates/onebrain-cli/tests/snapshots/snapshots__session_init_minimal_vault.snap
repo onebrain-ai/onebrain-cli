@@ -5,6 +5,6 @@ expression: normalize_volatile(raw)
 {
   "datetime": "<NORMALIZED>",
   "session_token": "<NORMALIZED>",
-  "qmd_unembedded": 0,
+  "qmd_unembedded": null,
   "headless": false
 }

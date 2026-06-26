@@ -120,9 +120,14 @@ fn flow_established_user_inside_vault() {
         v.get("session_token").and_then(|s| s.as_str()).is_some(),
         "missing session_token: {v:?}"
     );
+    // v3.4 contract: `qmd_unembedded` is always present, but is `null` when the
+    // qmd probe can't determine the count (e.g. no qmd binary in CI) and a
+    // non-negative integer otherwise. This test is non-hermetic (PATH not
+    // scrubbed), so accept either — never absent.
+    let qmd = v.get("qmd_unembedded").expect("qmd_unembedded key missing");
     assert!(
-        v.get("qmd_unembedded").and_then(|n| n.as_u64()).is_some(),
-        "missing qmd_unembedded: {v:?}"
+        qmd.is_null() || qmd.is_u64(),
+        "qmd_unembedded must be null or a u64: {v:?}"
     );
     assert!(
         v.get("decision").is_none(),

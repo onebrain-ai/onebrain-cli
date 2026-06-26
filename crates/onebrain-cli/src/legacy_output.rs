@@ -5,11 +5,22 @@ use serde::Serialize;
 /// `headless` (v3.2.6): `true` when invoked under `onebrain skill run`
 /// (`ONEBRAIN_HEADLESS=1`), letting INSTRUCTIONS.md skip the interactive
 /// startup ceremony. Unknown to older consumers, which ignore extra fields.
+///
+/// `qmd_unembedded` is `Option` (v3.4): `null` means the qmd probe could not
+/// determine the count (qmd missing, timed out, errored, or output
+/// unparseable), `0` means a genuine zero (or a vault without qmd), `N` means N
+/// pending. The field is always serialised (never skipped) so the hook contract
+/// keeps the key. A false `0` on probe failure silently hid pending embeddings
+/// at startup — `null` lets the SessionStart consumer surface "unknown" instead.
+/// Consumers MUST treat `null` as "couldn't check" rather than a count: the
+/// OneBrain INSTRUCTIONS.md startup status keys its embed warning on `= 0` /
+/// `> 0`, both of which `null` correctly falls outside of (see the companion
+/// INSTRUCTIONS.md update that renders `null` as "qmd status unknown").
 #[derive(Debug, Serialize)]
 pub struct SessionInitOutput {
     pub datetime: String,
     pub session_token: String,
-    pub qmd_unembedded: usize,
+    pub qmd_unembedded: Option<usize>,
     pub headless: bool,
 }
 
