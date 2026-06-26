@@ -1,5 +1,5 @@
 ---
-latest_version: 3.3.6
+latest_version: 3.3.7
 released: 2026-06-26
 ---
 
@@ -9,6 +9,10 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.7] — 2026-06-26 — serve: allow data: fonts for the Office-doc preview
+
+- fix(serve): `Content-Security-Policy` now allows `data:` fonts (`font-src 'self' data:`) so the web UI's Office-document preview can render the slide/text fonts that PowerPoint (and Word) embed as data-URIs — without it the browser blocked every embedded `@font-face` and slides rendered blank. Images already permitted `data:`; fonts now match. No other directive changed.
 
 ## [3.3.6] — 2026-06-26 — serve: security hardening (token gating · CSP · stable token)
 
