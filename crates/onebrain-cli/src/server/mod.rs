@@ -23,21 +23,24 @@
 //! ## Security model (single-tenant, localhost)
 //! - Bind `127.0.0.1` by default — the primary boundary. A remote self-host
 //!   (`--host 0.0.0.0`) is single-tenant only and MUST run behind TLS.
-//! - Every `/api/*` route requires the per-session token (header). Static
-//!   routes are open on localhost (the token rides in the served HTML).
+//! - EVERY route — `/api/*` AND the static SPA — requires the per-session token
+//!   (header, `?token=` query, or the `onebrain_token` cookie seeded by the
+//!   first `?token=` load). Gating the static shell too is what stops an
+//!   unauthenticated browser from loading the page (which carries the token).
 //! - `GET /api/vault/file` canonicalises the requested path and rejects
 //!   anything that escapes the vault root (`..`, absolute paths, symlinks out).
 
 mod api;
 mod auth;
 mod chat;
+mod headers;
 mod r#static;
 mod token;
 
 #[cfg(test)]
 mod tests;
 
-pub use token::generate_token;
+pub use token::resolve_token;
 
 use anyhow::Context;
 use axum::Router;
@@ -134,8 +137,9 @@ pub const MAX_CONCURRENT_CHATS: usize = 2;
 ///   /api/config            GET   → onebrain.yml as JSON
 ///   /api/vault/tree        GET   → recursive folder/file listing
 ///   /api/vault/file?path=  GET   → one note's content + rev
-///       └─ all of /api/*   gated by the auth-token middleware (401 without)
 ///   /* (everything else)   GET   → static dist (SPA fallback to index.html)
+///       └─ EVERY route (API + static) gated by the auth-token middleware
+///          (401 without a header / ?token= / onebrain_token cookie)
 /// ```
 pub fn build_router(cfg: ServeConfig) -> Router {
     let state = Arc::new(AppState {
@@ -145,16 +149,10 @@ pub fn build_router(cfg: ServeConfig) -> Router {
         chat_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CHATS)),
     });
 
-    // The `/api` sub-router carries the auth layer. It is built WITHOUT its own
-    // `.with_state` (it stays a `Router<Arc<AppState>>`); the single
-    // `.with_state(state)` at the bottom supplies the state to the whole tree —
-    // both the nested API routes and the static fallback — exactly once. The
-    // auth layer still needs the state directly (it's `from_fn_with_state`), so
-    // it gets its own clone here.
-    let api = api::router().layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        auth::require_token,
-    ));
+    // The API sub-router stays a `Router<Arc<AppState>>` (no own `.with_state`);
+    // the single `.with_state(state)` at the bottom supplies state to the whole
+    // tree — nested API routes AND the static fallback — exactly once.
+    let api = api::router();
 
     // DoS hardening note (fix L, deferred): a `tower_http::timeout::TimeoutLayer`
     // here would cap slow/stuck requests cheaply. It needs tower-http's `timeout`
@@ -164,10 +162,20 @@ pub fn build_router(cfg: ServeConfig) -> Router {
     Router::new()
         .nest("/api", api)
         // Static + SPA fallback handles every non-`/api` path. `fallback`
-        // (not a route) so it only fires when no API route matched. The handler
-        // reads the shared state via the `State` extractor, supplied by the
-        // single `.with_state` below.
+        // (not a route) so it only fires when no API route matched.
         .fallback(r#static::serve_static)
+        // Auth gate on the ENTIRE surface — API *and* the static SPA. Gating the
+        // static shell too is what stops an unauthenticated browser from loading
+        // the page (which carries the token). `from_fn_with_state` needs the
+        // state directly, so it gets its own clone. Applied here (outermost) so
+        // every request — nested or fallback — passes through it.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_token,
+        ))
+        // Outermost: stamp security headers on EVERY response, including the auth
+        // layer's 401s. (Applied after auth so it wraps it.)
+        .layer(axum::middleware::from_fn(headers::security_headers))
         .with_state(state)
 }
 

@@ -13,6 +13,36 @@
 //! *local* processes from poking the API. (The 127.0.0.1 bind is the primary
 //! boundary; the token is the secondary one.)
 
+/// Resolve the session token for a server run.
+///
+/// Honours a caller-supplied `ONEBRAIN_TOKEN` env var (≥ 16 chars) so a remote /
+/// tunnel deploy can PIN a stable token across restarts — the `?token=` URL then
+/// stays valid and bookmarkable, which is what makes `app.example.com` usable
+/// without re-reading a fresh token after every restart. The operator is
+/// responsible for making a pinned token long + unguessable. Otherwise (unset,
+/// or too short) we generate a fresh random one as before.
+pub fn resolve_token() -> String {
+    resolve_token_from(std::env::var("ONEBRAIN_TOKEN").ok())
+}
+
+/// Pure core of [`resolve_token`] (env value injected) so the rule is testable
+/// without touching process-global env state.
+fn resolve_token_from(env: Option<String>) -> String {
+    if let Some(raw) = env {
+        let t = raw.trim();
+        if t.len() >= 16 {
+            return t.to_string();
+        }
+        if !t.is_empty() {
+            tracing::warn!(
+                "ONEBRAIN_TOKEN is too short (< 16 chars) — ignoring it and \
+                 generating a fresh random token instead"
+            );
+        }
+    }
+    generate_token()
+}
+
 /// Generate a fresh 32-hex-char (128-bit) session token.
 ///
 /// Unix: reads 16 bytes from `/dev/urandom`. If that read fails (extraordinarily
@@ -101,6 +131,27 @@ mod tests {
         let a = generate_token();
         let b = generate_token();
         assert_ne!(a, b, "two generated tokens collided: {a}");
+    }
+
+    #[test]
+    fn resolve_pins_a_strong_env_token() {
+        let pinned = "my-stable-remote-token-123456";
+        assert_eq!(resolve_token_from(Some(pinned.to_string())), pinned);
+        // surrounding whitespace is trimmed
+        assert_eq!(resolve_token_from(Some(format!("  {pinned}  "))), pinned);
+    }
+
+    #[test]
+    fn resolve_falls_back_when_env_absent_or_too_short() {
+        // unset → fresh 32-hex token
+        assert_eq!(resolve_token_from(None).len(), 32);
+        // too short (< 16) → ignored, fresh token instead (not the short value)
+        let short = "abc";
+        let got = resolve_token_from(Some(short.to_string()));
+        assert_ne!(got, short);
+        assert_eq!(got.len(), 32);
+        // empty → fresh token
+        assert_eq!(resolve_token_from(Some(String::new())).len(), 32);
     }
 
     #[test]
