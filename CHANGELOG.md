@@ -1,5 +1,5 @@
 ---
-latest_version: 3.3.3
+latest_version: 3.3.4
 released: 2026-06-26
 ---
 
@@ -9,6 +9,10 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.4] — 2026-06-26 — doctor qmd: unknown-not-zero parity
+
+- fix(doctor): `onebrain doctor`'s qmd-embeddings check now reports `qmd status unavailable` when `qmd status` prints a `Total:` line but no `Pending:` line (incomplete/corrupted output), instead of inventing `0 unembedded`. This carries the v3.3.3 null-not-zero rule to the last consumer of the shared probe: session-init already leaves the count `null` (`unembedded_from_probe` → `None`) for the same input, so every consumer now treats it as unknown rather than inventing a zero. Still non-fatal (`ok`).
 
 ## [3.3.3] — 2026-06-26 — qmd probe: one shared source of truth · 15 s timeout · null-not-zero
 
