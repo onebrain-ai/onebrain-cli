@@ -358,10 +358,15 @@ async fn get_vault_tasks(State(state): State<Arc<AppState>>) -> Result<Response,
 // GET /api/vault/file?path=<rel>
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Query string for `GET /api/vault/file`.
+/// Query string for `GET /api/vault/file` and `/api/vault/raw`.
 #[derive(Debug, Deserialize)]
 struct FileQuery {
     path: String,
+    /// When present (`&download=1`), `/api/vault/raw` adds a `Content-Disposition:
+    /// attachment` carrying the file's real name, so a save keeps the original
+    /// filename + extension instead of the blob-URL id some webviews fall back to.
+    #[serde(default)]
+    download: Option<String>,
 }
 
 /// `GET /api/vault/file` response body.
@@ -507,9 +512,39 @@ fn content_type_for(path: &str) -> &'static str {
     }
 }
 
+/// Build a `Content-Disposition: attachment` value that survives spaces and
+/// non-ASCII (e.g. Thai) filenames: a quoted ASCII fallback plus an RFC 5987
+/// `filename*` carrying the UTF-8 name percent-encoded. Browsers prefer
+/// `filename*`, so the saved file keeps its real name + extension.
+fn content_disposition_attachment(path: &str) -> String {
+    let raw = path.rsplit('/').next().unwrap_or("");
+    let name = if raw.is_empty() { "download" } else { raw };
+    let ascii: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii() && c != '"' && c != '\\' && !c.is_control() {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut enc = String::new();
+    for &b in name.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            enc.push(b as char);
+        } else {
+            enc.push('%');
+            enc.push_str(&format!("{b:02X}"));
+        }
+    }
+    format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{enc}")
+}
+
 /// Serve a vault file's RAW bytes (same path-traversal guard + size cap as the
 /// text read, but no UTF-8 requirement) with a content-type for the browser to
-/// render. Used by the editor's image/PDF preview.
+/// render. Used by the editor's image/PDF preview and, with `&download=1`, its
+/// download button.
 async fn get_vault_raw(
     State(state): State<Arc<AppState>>,
     Query(q): Query<FileQuery>,
@@ -517,6 +552,12 @@ async fn get_vault_raw(
     let root = require_vault_root(&state)?.to_path_buf();
     let requested = q.path;
     let ctype = content_type_for(&requested);
+    // Build the attachment header before `requested` is moved into the read task.
+    let disposition = q
+        .download
+        .as_deref()
+        .filter(|v| !v.is_empty() && *v != "0")
+        .map(|_| content_disposition_attachment(&requested));
     let bytes = tokio::task::spawn_blocking(move || read_vault_raw(&root, &requested))
         .await
         .map_err(|e| {
@@ -528,6 +569,12 @@ async fn get_vault_raw(
         axum::http::header::CONTENT_TYPE,
         axum::http::HeaderValue::from_static(ctype),
     );
+    if let Some(cd) = disposition {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&cd) {
+            resp.headers_mut()
+                .insert(axum::http::header::CONTENT_DISPOSITION, v);
+        }
+    }
     Ok(resp)
 }
 
@@ -1183,5 +1230,26 @@ mod tests {
     #[test]
     fn to_slash_normalises_separators() {
         assert_eq!(to_slash(Path::new("a/b/c.md")), "a/b/c.md");
+    }
+
+    #[test]
+    fn content_disposition_keeps_name_and_extension() {
+        // ASCII + spaces: real name in BOTH the quoted fallback and filename*.
+        let cd = content_disposition_attachment("00-inbox/Workstream 1b - Kickoff.pptx");
+        assert!(
+            cd.contains(r#"filename="Workstream 1b - Kickoff.pptx""#),
+            "{cd}"
+        );
+        assert!(
+            cd.contains("filename*=UTF-8''Workstream%201b%20-%20Kickoff.pptx"),
+            "{cd}"
+        );
+        // Non-ASCII (Thai): ASCII fallback sanitised to '_', filename* carries it.
+        let th = content_disposition_attachment("งานวิจัย.pdf");
+        assert!(th.starts_with("attachment;"), "{th}");
+        assert!(th.contains("filename*=UTF-8''"), "{th}");
+        assert!(th.ends_with(".pdf"), "{th}");
+        // Trailing-slash / empty basename falls back to a safe name.
+        assert!(content_disposition_attachment("a/b/").contains("download"));
     }
 }
