@@ -31,9 +31,13 @@ pub struct TaskHit {
 
 /// Tuning for [`scan_tasks`].
 pub struct TaskScanOptions {
-    /// Vault-relative folder prefixes whose tasks are NOT user todos (session
-    /// logs, archive, agent memory). Caller passes the configured folder names.
-    pub skip_prefixes: Vec<String>,
+    /// Vault-relative folder prefixes to scan (allowlist, e.g. `01-projects/`,
+    /// `02-areas/`). ONLY tasks under these folders are returned — this keeps the
+    /// scan to actionable project/area notes and excludes documentation
+    /// (READMEs), the inbox, knowledge, resources, logs, archive, agent memory,
+    /// etc. An empty list scans the whole vault. Callers pass the configured
+    /// folder names (`folders.projects` / `folders.areas`).
+    pub include_prefixes: Vec<String>,
     /// Cap the result so a pathological vault can't return an unbounded list.
     pub max: usize,
 }
@@ -41,7 +45,7 @@ pub struct TaskScanOptions {
 impl Default for TaskScanOptions {
     fn default() -> Self {
         Self {
-            skip_prefixes: ["05-agent/", "06-archive/", "07-logs/"]
+            include_prefixes: ["01-projects/", "02-areas/"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
@@ -86,10 +90,13 @@ pub fn scan_tasks(vault_root: &Path, opts: &TaskScanOptions) -> Vec<TaskHit> {
             .strip_prefix(vault_root)
             .map(to_slash)
             .unwrap_or_default();
-        if opts
-            .skip_prefixes
-            .iter()
-            .any(|p| rel.starts_with(p.as_str()))
+        // Allowlist: scan only the configured task folders (projects + areas).
+        // An empty list means "scan everything".
+        if !opts.include_prefixes.is_empty()
+            && !opts
+                .include_prefixes
+                .iter()
+                .any(|p| rel.starts_with(p.as_str()))
         {
             continue;
         }
@@ -156,17 +163,53 @@ mod tests {
     }
 
     #[test]
-    fn skips_excluded_folders_and_tooling_dirs() {
+    fn includes_only_projects_and_areas() {
         let dir = tempdir().unwrap();
         let root = dir.path();
-        write(root, "07-logs/session.md", "- [ ] log task 📅 2026-06-30\n");
-        write(root, "06-archive/old.md", "- [ ] archived 📅 2026-06-30\n");
+        // Allowlisted (projects + areas) — included.
+        write(
+            root,
+            "01-projects/p.md",
+            "- [ ] project task 📅 2026-06-30\n",
+        );
+        write(
+            root,
+            "02-areas/health.md",
+            "- [ ] area task 📅 2026-06-30\n",
+        );
+        // Everything else — excluded (README docs, inbox, knowledge, logs, tooling).
+        write(
+            root,
+            "README.md",
+            "- [ ] High priority task 🔺 📅 2026-03-22\n",
+        );
+        write(root, "00-inbox/i.md", "- [ ] inbox 📅 2026-06-30\n");
+        write(root, "03-knowledge/k.md", "- [ ] knowledge 📅 2026-06-30\n");
+        write(root, "07-logs/session.md", "- [ ] log 📅 2026-06-30\n");
         write(root, ".obsidian/x.md", "- [ ] tooling 📅 2026-06-30\n");
-        write(root, "00-inbox/i.md", "- [ ] real one 📅 2026-06-30\n");
         let hits = scan_tasks(root, &TaskScanOptions::default());
 
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].file, "00-inbox/i.md");
+        assert_eq!(hits.len(), 2, "only projects + areas: {hits:?}");
+        let files: Vec<&str> = hits.iter().map(|t| t.file.as_str()).collect();
+        assert!(files.contains(&"01-projects/p.md"));
+        assert!(files.contains(&"02-areas/health.md"));
+        assert!(!files.iter().any(|f| f.starts_with("README")));
+    }
+
+    #[test]
+    fn empty_include_scans_everything() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "anywhere/x.md", "- [ ] a 📅 2026-06-30\n");
+        write(root, "README.md", "- [ ] b 📅 2026-06-30\n");
+        let hits = scan_tasks(
+            root,
+            &TaskScanOptions {
+                include_prefixes: vec![],
+                max: 2000,
+            },
+        );
+        assert_eq!(hits.len(), 2, "empty allowlist = scan all");
     }
 
     #[test]
@@ -180,7 +223,7 @@ mod tests {
         let hits = scan_tasks(
             root,
             &TaskScanOptions {
-                skip_prefixes: vec![],
+                include_prefixes: vec!["01-projects/".into()],
                 max: 4,
             },
         );

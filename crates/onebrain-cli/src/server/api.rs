@@ -326,7 +326,25 @@ struct TasksResponse {
 async fn get_vault_tasks(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
     let root = require_vault_root(&state)?.to_path_buf();
     let tasks = tokio::task::spawn_blocking(move || {
-        onebrain_fs::task::scan_tasks(&root, &onebrain_fs::task::TaskScanOptions::default())
+        // Scan only the configured project + area folders (real, actionable
+        // todos) — not docs/READMEs, inbox, knowledge, etc. Read the folder
+        // names from the vault config so a customised layout still works; fall
+        // back to the default allowlist (01-projects/ + 02-areas/) if config
+        // can't be read.
+        let opts = match onebrain_core::load_vault_config_at(&root) {
+            Ok(cfg) => onebrain_fs::task::TaskScanOptions {
+                // trim_end_matches('/') so a config value written with a trailing
+                // slash (e.g. `projects: 01-projects/`) doesn't become a `//`
+                // prefix that matches no note → silently zero tasks.
+                include_prefixes: vec![
+                    format!("{}/", cfg.folders.projects.trim_end_matches('/')),
+                    format!("{}/", cfg.folders.areas.trim_end_matches('/')),
+                ],
+                ..Default::default()
+            },
+            Err(_) => onebrain_fs::task::TaskScanOptions::default(),
+        };
+        onebrain_fs::task::scan_tasks(&root, &opts)
     })
     .await
     .map_err(|e| {
