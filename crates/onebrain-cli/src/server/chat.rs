@@ -105,6 +105,16 @@ pub(crate) async fn post_chat(
     if message.is_empty() {
         return Err(ApiError::BadRequest("empty message".to_string()));
     }
+    // Cap the prompt: each turn spawns a `claude` agent, so an oversized message
+    // multiplies API-token burn (and would bump the OS argv limit). 100 KB is
+    // generous for a chat turn (~25k words) while bounding abuse.
+    const MAX_MESSAGE_BYTES: usize = 100 * 1024;
+    if message.len() > MAX_MESSAGE_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "message too large ({} bytes; max {MAX_MESSAGE_BYTES})",
+            message.len()
+        )));
+    }
     if let Some(sid) = req.session_id.as_deref().filter(|s| !s.is_empty()) {
         if !valid_session_id(sid) {
             return Err(ApiError::BadRequest("invalid session id".to_string()));

@@ -1,5 +1,5 @@
 ---
-latest_version: 3.3.5
+latest_version: 3.3.6
 released: 2026-06-26
 ---
 
@@ -9,6 +9,13 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.6] — 2026-06-26 — serve: security hardening (token gating · CSP · stable token)
+
+- feat(serve): the whole router is now token-gated — every route and method (SPA, file read/write, `/api/vault/raw` + `/upload`, `/api/chat`) requires the per-session token via `X-OneBrain-Token`, `Authorization: Bearer`, `?token=` (GET/HEAD only — CSRF-safe), or the `onebrain_token` cookie (set on query-auth; `HttpOnly`, `SameSite=Strict`, `Secure` on https). Token compared with `constant_time_eq`.
+- feat(serve): a security-headers middleware (outermost layer) sets CSP (`object-src 'none'`, `base-uri 'self'`, `frame-ancestors 'none'`, …), `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`, `COOP`, and HSTS on https — so the token-bearing page is hardened against XSS-exfiltration and clickjacking even when exposed via a tunnel.
+- feat(serve): `resolve_token` honours `$ONEBRAIN_TOKEN` (≥16 chars) so the token can stay stable across restarts (otherwise a fresh random token each launch); the injected `window.__ONEBRAIN_TOKEN__` is JSON-escaped.
+- fix(serve): chat request bodies are capped (`MAX_MESSAGE_BYTES`) and `serve` warns when binding a non-loopback address over plain HTTP.
 
 ## [3.3.5] — 2026-06-26 — tasks: scan projects + areas only
 

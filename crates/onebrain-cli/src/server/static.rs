@@ -89,11 +89,20 @@ fn placeholder_html(token: &str) -> Response {
     let html = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
          <title>OneBrain daemon</title>\
-         <script>window.{TOKEN_VAR}=\"{token}\";</script>\
+         {script}\
          </head><body>OneBrain daemon — no UI dist mounted</body></html>",
-        TOKEN_VAR = "__ONEBRAIN_TOKEN__",
+        script = token_script(token),
     );
     html_response(html)
+}
+
+/// The `<script>` that defines `window.__ONEBRAIN_TOKEN__`. The value is
+/// JSON-escaped (`serde_json`) so it cannot break out of the string literal —
+/// the token is fixed-charset hex today, but this keeps the injection safe by
+/// construction rather than by assumption.
+fn token_script(token: &str) -> String {
+    let json = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string());
+    format!("<script>window.__ONEBRAIN_TOKEN__={json};</script>")
 }
 
 /// Inject the session token into an HTML document.
@@ -110,7 +119,7 @@ pub fn inject_token(html: &str, token: &str) -> String {
         return html.replace(TOKEN_PLACEHOLDER, token);
     }
 
-    let script = format!("<script>window.__ONEBRAIN_TOKEN__=\"{token}\";</script>");
+    let script = token_script(token);
 
     if let Some(idx) = html.find("</head>") {
         let mut out = String::with_capacity(html.len() + script.len());

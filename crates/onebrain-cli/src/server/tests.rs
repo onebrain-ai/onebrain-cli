@@ -507,6 +507,7 @@ async fn spa_fallback_serves_index_for_unknown_route() {
     // An unknown, non-api deep link must return the SPA shell (client routing).
     let req = Request::builder()
         .uri("/v/explorer/some/deep/link")
+        .header("X-OneBrain-Token", TOKEN)
         .body(Body::empty())
         .unwrap();
     let (status, body) = send(&router, req).await;
@@ -520,7 +521,11 @@ async fn served_index_contains_the_injected_token() {
     let dist = make_dist(holder.path());
     let (_vault, router) = vault_router(Some(dist));
 
-    let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+    let req = Request::builder()
+        .uri("/")
+        .header("X-OneBrain-Token", TOKEN)
+        .body(Body::empty())
+        .unwrap();
     let (status, body) = send(&router, req).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -537,6 +542,7 @@ async fn real_static_asset_is_served_directly() {
 
     let req = Request::builder()
         .uri("/app.js")
+        .header("X-OneBrain-Token", TOKEN)
         .body(Body::empty())
         .unwrap();
     let (status, body) = send(&router, req).await;
@@ -547,7 +553,11 @@ async fn real_static_asset_is_served_directly() {
 #[tokio::test]
 async fn no_dist_serves_placeholder_with_token() {
     let (_dir, router) = vault_router(None);
-    let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+    let req = Request::builder()
+        .uri("/")
+        .header("X-OneBrain-Token", TOKEN)
+        .body(Body::empty())
+        .unwrap();
     let (status, body) = send(&router, req).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -561,13 +571,74 @@ async fn no_dist_serves_placeholder_with_token() {
 }
 
 #[tokio::test]
-async fn static_routes_are_open_without_token() {
-    // Static serving is intentionally NOT token-gated (the token rides in the
-    // HTML). The root must load with no auth header.
+async fn every_response_carries_security_headers() {
+    // The headers layer is outermost, so even an unauthenticated 401 is stamped.
+    let (_dir, router) = vault_router(None);
+    let res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/config")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let h = res.headers();
+    assert_eq!(h.get("x-frame-options").unwrap(), "DENY");
+    assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
+    assert_eq!(h.get("referrer-policy").unwrap(), "no-referrer");
+    assert!(h.get("content-security-policy").is_some());
+}
+
+#[tokio::test]
+async fn static_routes_require_a_token() {
+    // The static SPA is token-gated too — closing the hole where opening the URL
+    // with no `?token=` still loaded the (token-bearing) shell.
     let (_dir, router) = vault_router(None);
     let req = Request::builder().uri("/").body(Body::empty()).unwrap();
     let (status, _body) = send(&router, req).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "static must be gated");
+}
+
+#[tokio::test]
+async fn static_entry_with_query_token_seeds_the_cookie() {
+    // The page-load entry: `/?token=…` authenticates AND sets the onebrain_token
+    // cookie so the browser's later token-less asset requests authenticate.
+    let (_dir, router) = vault_router(None);
+    let req = Request::builder()
+        .uri(format!("/?token={TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let set_cookie = res
+        .headers()
+        .get(axum::http::header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        set_cookie.contains(&format!("onebrain_token={TOKEN}")),
+        "must seed the token cookie: {set_cookie}"
+    );
+    assert!(
+        set_cookie.contains("HttpOnly") && set_cookie.contains("SameSite=Strict"),
+        "cookie must be HttpOnly + SameSite=Strict: {set_cookie}"
+    );
+
+    // And the seeded cookie then authenticates a token-less asset/read request.
+    let req2 = Request::builder()
+        .uri("/")
+        .header("cookie", format!("onebrain_token={TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status2, _b) = send(&router, req2).await;
+    assert_eq!(
+        status2,
+        StatusCode::OK,
+        "cookie must authenticate the next load"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1110,6 +1181,56 @@ async fn vault_tasks_returns_only_dated_checkboxes_outside_skipped_folders() {
     assert_eq!(t["done"], false);
     assert_eq!(t["text"], "ship it ⏫", "📅 stripped, priority kept");
     assert_eq!(t["line"], 3, "1-based line within the note");
+}
+
+/// The task scan reads the project/area folder names from onebrain.yml, and a
+/// trailing slash on those names (a natural hand-edit) must not break it. Here
+/// the vault renames its folders to `Work/` + `Life/` (with trailing slashes) —
+/// tasks under those are returned, the default `01-projects` is now excluded,
+/// and the trailing slash does NOT produce a `//` prefix that matches nothing.
+#[tokio::test]
+async fn vault_tasks_honors_custom_folder_names_with_trailing_slash() {
+    let (dir, router) = vault_router(None);
+    fs::write(
+        dir.path().join("onebrain.yml"),
+        "qmd_collection: test-vault\nfolders:\n  projects: Work/\n  areas: Life/\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("Work")).unwrap();
+    fs::create_dir_all(dir.path().join("Life")).unwrap();
+    fs::write(
+        dir.path().join("Work/p.md"),
+        "- [ ] work task 📅 2026-06-30\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("Life/h.md"),
+        "- [ ] life task 📅 2026-06-30\n",
+    )
+    .unwrap();
+    // A task in the default 01-projects must now be EXCLUDED (folders are custom).
+    fs::write(
+        dir.path().join("01-projects/x.md"),
+        "- [ ] default-folder task 📅 2026-06-30\n",
+    )
+    .unwrap();
+
+    let (status, body) = get_authed(&router, "/api/vault/tasks").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let files: Vec<&str> = json["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["file"].as_str().unwrap())
+        .collect();
+    assert_eq!(files.len(), 2, "only the custom-folder tasks: {body}");
+    assert!(files.contains(&"Work/p.md"));
+    assert!(files.contains(&"Life/h.md"));
+    assert!(
+        !files.contains(&"01-projects/x.md"),
+        "default folder excluded under custom config"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────

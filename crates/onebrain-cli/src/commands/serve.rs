@@ -14,7 +14,7 @@
 
 use crate::cli::ServeArgs;
 use crate::output::OutputMode;
-use crate::server::{self, generate_token, ServeConfig};
+use crate::server::{self, resolve_token, ServeConfig};
 use anyhow::{Context, Result};
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -43,7 +43,9 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
             .with_context(|| format!("invalid --host address: {h}"))?,
     };
     let port = args.port.unwrap_or(DEFAULT_PORT);
-    let token = generate_token();
+    // Honours $ONEBRAIN_TOKEN (≥16 chars) for a stable, bookmarkable URL behind a
+    // tunnel; otherwise a fresh random per-process token.
+    let token = resolve_token();
 
     let cfg = ServeConfig {
         dist_dir: args.dir.clone(),
@@ -67,6 +69,23 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
         None => println!("  dist:  (none — API only, placeholder page)"),
     }
     println!("  press Ctrl-C to stop");
+
+    // Binding beyond loopback exposes the daemon on the network over PLAIN HTTP
+    // — the token + vault content would travel unencrypted. Warn loudly and
+    // point at the safe way to do it (a TLS tunnel/proxy in front).
+    if !host.is_loopback() {
+        eprintln!();
+        eprintln!(
+            "  ⚠️  WARNING: --host {host} exposes OneBrain beyond this machine over PLAIN HTTP."
+        );
+        eprintln!("     The auth token and all vault content would travel UNENCRYPTED.");
+        eprintln!("     Do NOT expose this port directly. Put a TLS tunnel/proxy in front:");
+        eprintln!(
+            "       • Cloudflare Tunnel + Access   • Tailscale Serve   • Caddy + Let's Encrypt"
+        );
+        eprintln!("     Keep the default --host 127.0.0.1 unless you've set one up.");
+        eprintln!();
+    }
 
     if args.open {
         // Best-effort: a failed browser launch must not stop the server.

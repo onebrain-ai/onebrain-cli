@@ -526,7 +526,7 @@ fn terminate(_pid: u32) -> Result<()> {
 /// process's PID, orphaning the existing daemon.
 pub fn run_internal() -> Result<()> {
     use crate::commands::serve::DEFAULT_PORT;
-    use crate::server::{self, generate_token, ServeConfig};
+    use crate::server::{self, resolve_token, ServeConfig};
 
     let pid_path = pid_path()?;
     let log_path = log_path()?;
@@ -551,7 +551,8 @@ pub fn run_internal() -> Result<()> {
     let vault_root = resolve_daemon_vault();
     // Optional pre-built webui dist, passed by the plugin launcher.
     let dist_dir = std::env::var_os("ONEBRAIN_DIST").map(PathBuf::from);
-    let token = generate_token();
+    // Honours $ONEBRAIN_TOKEN (≥16 chars) for a stable token across restarts.
+    let token = resolve_token();
 
     // Port: `$ONEBRAIN_DAEMON_PORT` overrides the shared default. The override
     // exists mainly so the lifecycle integration test can bind a free port and
