@@ -103,7 +103,7 @@ Prints the v3.0→v3.1 rename notice once per alias, persisting shown aliases to
 
 ### `src/legacy_output.rs`
 Byte-stable v3.0 output shapes + the structured-mode serializer shared by the hook-protocol commands.
-**Key types** — `SessionInitOutput {datetime, session_token, qmd_unembedded}` (Bun v2.3.3 byte-parity); `SessionInitBlock {decision, reason, error_detail}` with `init_required()` (`onebrain-vault-not-found`) and `vault_malformed(detail)` (`onebrain-vault-malformed`) constructors.
+**Key types** — `SessionInitOutput {datetime, session_token, qmd_unembedded, headless}` — extends the Bun v2.3.3 shape; `qmd_unembedded` is `Option<usize>` (v3.4: `null` when the qmd probe can't determine the count — missing / timed out / unparseable — distinct from a genuine `0`), the key is always present; `SessionInitBlock {decision, reason, error_detail}` with `init_required()` (`onebrain-vault-not-found`) and `vault_malformed(detail)` (`onebrain-vault-malformed`) constructors.
 **Key functions** — `serialize_for_mode<T>(value, mode) -> String` — JSON (compact/pretty), YAML, Table/Tsv→compact-JSON fallback; Text-mode arrival is a caller bug (`debug_assert!`, compact-JSON fallback in release). Serde failures are loud on stderr (avoids the v3.0 empty-stdout regression).
 **Connections** — called by: `session_init`, `orphan_scan`, `harness`, `qmd_status`, `update`, `doctor`.
 

@@ -1,103 +1,203 @@
 //! qmd MCP server query helpers.
+//!
+//! This module is the single source of truth for probing `qmd status` — the
+//! spawn, the PATH resolution, the timeout, and the parse all live here so
+//! every consumer (session-init's unembedded count, `onebrain qmd status`,
+//! and `onebrain doctor`'s qmd-embeddings check in `onebrain-fs`) reports the
+//! same thing. Before v3.4 these had drifted: this probe used a 2 s timeout +
+//! a bare `qmd` spawn while doctor used 15 s + a PATH-robust lookup, so a slow
+//! or PATH-hidden qmd produced a false "unavailable" / `0` here but not there.
 
 use serde::Serialize;
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
+use std::process::Command;
 use std::time::Duration;
 
-/// Default timeout for `qmd` subprocess calls (ms). Keeps a missing or hung
-/// qmd from blocking session-init / status.
-const QMD_TIMEOUT_MS: u64 = 2000;
+/// Hard deadline for the `qmd status` probe. Generous because a real index
+/// (tens of MB) can take ~10 s to report; a tighter cap produced spurious
+/// "qmd unavailable" / false-zero unembedded counts on healthy, well-populated
+/// vaults. Reused by `onebrain doctor` so the two probes can't drift again
+/// (that drift was the v3.4 bug — doctor had been bumped 3 s → 15 s in v3.2.4
+/// but this probe was left at 2 s).
+pub const QMD_STATUS_TIMEOUT_SECS: u64 = 15;
 
-/// Build a `qmd` subprocess for the given args, platform-wrapped.
-///
-/// On Windows qmd ships as a `.cmd`/`.ps1` shim that can't be spawned
-/// directly, so we route through `powershell.exe -Command`.
-#[cfg(unix)]
-fn build_qmd_command(args: &[&str]) -> Command {
-    let mut c = Command::new("qmd");
-    c.args(args);
-    c
+// Compile-time regression guard: a real index can take ~10 s for `qmd status`,
+// so the cap must stay generous. The v3.2.4 doctor lesson (3 s → 15 s) was never
+// carried to this shared probe — the old 2 s cap caused intermittent false
+// zeros at session startup. Fails the build if anyone tightens it.
+const _: () = assert!(
+    QMD_STATUS_TIMEOUT_SECS >= 15,
+    "qmd status timeout must stay >= 15s; a real index can take ~10s to report"
+);
+
+/// Tighter cap for the interactive session-startup probe ([`query_unembedded_count`]).
+/// Session init blocks the greeting on this, so we'd rather report "unknown"
+/// (`null`) after a few seconds than freeze startup for the full
+/// [`QMD_STATUS_TIMEOUT_SECS`] on a slow/hung qmd. Safe because a probe timeout
+/// now maps to `None`/`null` (not a false `0`): a shorter cap trades "exact
+/// count on a cold index" for "snappy startup", never correctness. Explicit
+/// status queries (`onebrain qmd status`) and `onebrain doctor` keep the
+/// generous cap, since there the user is waiting *for* the figure.
+pub const QMD_STARTUP_TIMEOUT_SECS: u64 = 5;
+
+// The startup cap is the tighter of the two — it must never exceed the generous
+// cap (else the "snappy startup" intent is lost).
+const _: () = assert!(QMD_STARTUP_TIMEOUT_SECS <= QMD_STATUS_TIMEOUT_SECS);
+
+/// Outcome of spawning `qmd status`. Distinguishes failure modes so consumers
+/// can render them differently (doctor reports "timeout" vs "not found");
+/// session-init / `qmd status` collapse every non-`Stdout` variant to
+/// "unavailable". Lets callers unit-test all branches without spawning a real
+/// `qmd`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QmdProbe {
+    /// `qmd` not found on PATH (or the common install dirs).
+    NotFound,
+    /// Spawned but exceeded [`QMD_STATUS_TIMEOUT_SECS`] (child was killed).
+    Timeout,
+    /// Spawned, exited, returned this stdout (may or may not be parseable).
+    Stdout(String),
+    /// Spawn or I/O error.
+    Error,
 }
 
-#[cfg(windows)]
-fn build_qmd_command(args: &[&str]) -> Command {
-    let mut c = Command::new("powershell.exe");
-    c.args(["-NoProfile", "-Command", &format!("qmd {}", args.join(" "))]);
-    c
+/// Spawn `qmd status` with the generous [`QMD_STATUS_TIMEOUT_SECS`] deadline and
+/// classify the result. Used by explicit status queries (`onebrain qmd status`)
+/// and `onebrain doctor`, which want the real figure even on a cold index.
+/// NEVER panics — a missing or hung qmd must never block the caller.
+pub fn probe_qmd_status() -> QmdProbe {
+    probe_qmd_status_with(Duration::from_secs(QMD_STATUS_TIMEOUT_SECS))
 }
 
-#[cfg(not(any(unix, windows)))]
-fn build_qmd_command(args: &[&str]) -> Command {
-    let mut c = Command::new("qmd");
-    c.args(args);
-    c
-}
+/// Core probe with an explicit deadline, so the interactive startup path can use
+/// the tighter [`QMD_STARTUP_TIMEOUT_SECS`]. ALL probe logic — PATH resolution,
+/// spawn, stdout drain, kill-on-timeout — lives here; the only thing that varies
+/// by caller is the deadline (so the two consumers can't drift in behavior, only
+/// in how long they're willing to wait).
+fn probe_qmd_status_with(timeout: Duration) -> QmdProbe {
+    use std::io::Read;
+    use std::process::Stdio;
+    use wait_timeout::ChildExt;
 
-/// Spawn `qmd <args>`, capture stdout, and return it as a string.
-///
-/// Returns `None` on any failure — spawn error (missing binary), timeout,
-/// or unreadable stdout. Silent fallback by design: a missing or broken qmd
-/// must never block the caller. Kills the child on timeout.
-fn capture_qmd_stdout(args: &[&str], timeout_ms: u64) -> Option<String> {
-    let mut command = build_qmd_command(args);
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-
-    let stdout = match child.stdout.take() {
-        Some(s) => s,
-        None => {
-            let _ = child.kill();
-            return None;
-        }
+    let Some(mut command) = build_qmd_command() else {
+        return QmdProbe::NotFound;
     };
-
-    let (tx, rx) = mpsc::channel::<Option<String>>();
-    thread::spawn(move || {
-        let mut buf = String::new();
-        let mut stdout = stdout;
-        let res = stdout.read_to_string(&mut buf).ok().map(|_| buf);
-        let _ = tx.send(res);
-    });
-
-    match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
-        Ok(Some(s)) => {
-            let _ = child.wait();
-            Some(s)
+    let mut child = match command.stdout(Stdio::piped()).stderr(Stdio::null()).spawn() {
+        Ok(c) => c,
+        Err(_) => return QmdProbe::Error,
+    };
+    // Block on the child with a hard deadline. `qmd status` output is small
+    // (well under the pipe buffer) so draining stdout after exit cannot
+    // deadlock. On timeout, kill + reap.
+    match child.wait_timeout(timeout) {
+        Ok(Some(_status)) => {
+            let mut out = String::new();
+            if let Some(mut s) = child.stdout.take() {
+                if s.read_to_string(&mut out).is_err() {
+                    return QmdProbe::Error;
+                }
+            }
+            QmdProbe::Stdout(out)
         }
         Ok(None) => {
-            let _ = child.wait();
-            None
-        }
-        Err(_) => {
-            // Timeout · kill child · give up.
             let _ = child.kill();
             let _ = child.wait();
-            None
+            QmdProbe::Timeout
         }
+        Err(_) => QmdProbe::Error,
     }
 }
 
-/// Count documents that still need embedding.
+/// Build the platform-appropriate `qmd status` command, resolving the binary
+/// robustly and running it with a PATH that can also find its interpreter.
+/// Returns `None` (⟹ [`QmdProbe::NotFound`]) when `qmd` can't be located on
+/// Unix; Windows defers to `powershell.exe` so the user's profile PATH is
+/// consulted.
+#[cfg(unix)]
+fn build_qmd_command() -> Option<Command> {
+    let search = qmd_search_path();
+    // Resolve on the normal PATH first, then fall back to the augmented one.
+    let qmd = which::which("qmd")
+        .ok()
+        .or_else(|| which::which_in("qmd", Some(&search), std::env::current_dir().ok()?).ok())?;
+    let mut c = Command::new(qmd);
+    c.arg("status");
+    // Run qmd with the augmented PATH so its own interpreter (node/bun) resolves
+    // even under a restricted launcher PATH — otherwise a located-but-interpreted
+    // qmd (e.g. the node shim in `/opt/homebrew/bin`) fails its `#!/usr/bin/env
+    // node` shebang when node isn't on PATH, which looks like an unavailable qmd.
+    c.env("PATH", &search);
+    Some(c)
+}
+
+/// PATH for locating and running `qmd`: the existing PATH (kept at priority)
+/// plus the bun-global dir (`bun install -g qmd`) appended as a fallback,
+/// mirroring the resolution `onebrain doctor` has used since v3.1. This covers
+/// a restricted launcher PATH (Claude Code's SessionStart hook, launchd, the
+/// Obsidian terminal) that omits the bun dir, and — crucially — also lets a
+/// located-but-interpreted qmd find its own interpreter (node/bun) when it
+/// runs. HOME-relative on purpose: it can't pick up a system-wide qmd, so it
+/// doesn't defeat hermetic tests that scrub PATH to simulate an absent qmd.
+#[cfg(unix)]
+fn qmd_search_path() -> std::ffi::OsString {
+    let mut path = std::env::var_os("PATH").unwrap_or_default();
+    if let Some(home) = std::env::var_os("HOME") {
+        if !path.is_empty() {
+            path.push(":");
+        }
+        path.push(&home);
+        path.push("/.bun/bin");
+    }
+    path
+}
+
+#[cfg(windows)]
+fn build_qmd_command() -> Option<Command> {
+    // Delegate to powershell so the user's profile PATH is consulted.
+    let mut c = Command::new("powershell.exe");
+    c.args(["-NoProfile", "-Command", "qmd status"]);
+    Some(c)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn build_qmd_command() -> Option<Command> {
+    let mut c = Command::new("qmd");
+    c.arg("status");
+    Some(c)
+}
+
+/// Count documents that still need embedding, or `None` when that can't be
+/// determined (qmd missing, timed out, errored, or output unparseable).
 ///
-/// Reads the `Pending: N need embedding` figure from `qmd status` via
-/// [`query_status`]. qmd ≤ 2.1.0 ignores `--json` and always prints the
-/// human-readable text, so the v3.0 `--json`-parsing path was effectively
-/// dead (always 0) on real installs; parsing the text form fixes that while
-/// keeping the silent fallback — returns `0` on any error, timeout, missing
-/// binary, or unparseable output so a missing/broken qmd never blocks
-/// session-init.
+/// Returning `Option` — not `0` on failure — is deliberate: a false `0` is
+/// indistinguishable from "all embedded" and silently hides pending work at
+/// session startup. `None` lets the caller surface "unknown" instead;
+/// `Some(0)` is a genuine zero. qmd ≤ 2.1.0 ignores `--json` and prints the
+/// human-readable text, so this parses the text form (see [`parse_status`]).
 ///
-/// Timeout: 2000ms (via `query_status`).
-pub fn query_unembedded_count() -> usize {
-    query_status()
+/// Timeout: [`QMD_STARTUP_TIMEOUT_SECS`] — tighter than the status/doctor cap
+/// because interactive session startup blocks on this; a timeout degrades to
+/// `None` (unknown), never a false `0`, so a slow qmd can't freeze the greeting.
+pub fn query_unembedded_count() -> Option<usize> {
+    unembedded_from_probe(probe_qmd_status_with(Duration::from_secs(
+        QMD_STARTUP_TIMEOUT_SECS,
+    )))
+}
+
+/// Pure mapping from a probe outcome to an unembedded count. Split out so the
+/// false-zero-prevention logic is unit-testable without spawning a real qmd.
+fn unembedded_from_probe(probe: QmdProbe) -> Option<usize> {
+    status_from_probe(probe)
         .and_then(|s| s.pending_embedding)
-        .unwrap_or(0) as usize
+        .map(|n| n as usize)
+}
+
+/// Pure mapping from a probe outcome to a parsed [`QmdStatus`]. Any non-stdout
+/// outcome, or empty stdout, is "unavailable" (`None`). Unit-testable.
+fn status_from_probe(probe: QmdProbe) -> Option<QmdStatus> {
+    match probe {
+        QmdProbe::Stdout(text) if !text.trim().is_empty() => Some(parse_status(&text)),
+        _ => None,
+    }
 }
 
 /// Index + embedding health reported by `qmd status`, as parsed from the
@@ -118,19 +218,24 @@ pub struct QmdStatus {
     pub last_updated: Option<String>,
 }
 
+impl QmdStatus {
+    /// Parse the text output of `qmd status` into a [`QmdStatus`]. Public so
+    /// other crates (e.g. `onebrain doctor`) parse identically rather than
+    /// re-implementing prefix matching.
+    pub fn parse(text: &str) -> Self {
+        parse_status(text)
+    }
+}
+
 /// Run `qmd status` and parse the headline index/embedding figures.
 ///
-/// Returns `None` when qmd is unavailable (missing binary, timeout, empty
-/// output) so the caller can report "qmd not installed". Returns
-/// `Some(QmdStatus)` with best-effort field parsing otherwise.
+/// Returns `None` when qmd is unavailable (missing binary, timeout, error,
+/// empty output) so the caller can report "qmd not installed"; `Some` with
+/// best-effort field parsing otherwise.
 ///
-/// Timeout: 2000ms.
+/// Timeout: [`QMD_STATUS_TIMEOUT_SECS`].
 pub fn query_status() -> Option<QmdStatus> {
-    let text = capture_qmd_stdout(&["status"], QMD_TIMEOUT_MS)?;
-    if text.trim().is_empty() {
-        return None;
-    }
-    Some(parse_status(&text))
+    status_from_probe(probe_qmd_status())
 }
 
 /// First whitespace-delimited token in `s` that parses as a `u64`.
@@ -173,14 +278,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn returns_zero_when_qmd_not_installed() {
-        // In test environments qmd is rarely installed → spawn fails or returns
-        // garbage · result must be 0 either way.
-        let n = query_unembedded_count();
-        // Can't assert exactly 0 in environments that *do* have qmd available,
-        // but for CI/sandbox we expect 0. Just check it doesn't panic and
-        // returns a usize. (No-op assertion.)
-        let _ = n;
+    fn query_unembedded_count_does_not_panic() {
+        // Smoke test: whether or not a real qmd is installed, the public probe
+        // must return without panicking. The value is environment-dependent
+        // (`None` when qmd is absent, `Some(n)` when present), so we don't pin
+        // it here — the probe→count mapping is pinned by the tests above.
+        let _ = query_unembedded_count();
     }
 
     // Captured verbatim from `qmd status` on qmd 2.1.0 (the documented/installed
@@ -236,5 +339,114 @@ Documents\n\
                 last_updated: None,
             }
         );
+    }
+
+    // ── Probe → status mapping ────────────────────────────────────────────
+    // A failed probe must NEVER degrade to a false zero: it maps to `None`
+    // ("unknown") so callers can surface "qmd unavailable" instead of
+    // "0 pending". This is the core regression these changes guard against.
+
+    #[test]
+    fn unavailable_probe_maps_to_none_not_zero() {
+        assert_eq!(status_from_probe(QmdProbe::NotFound), None);
+        assert_eq!(status_from_probe(QmdProbe::Timeout), None);
+        assert_eq!(status_from_probe(QmdProbe::Error), None);
+        assert_eq!(status_from_probe(QmdProbe::Stdout(String::new())), None);
+        assert_eq!(status_from_probe(QmdProbe::Stdout("   \n".into())), None);
+    }
+
+    #[test]
+    fn stdout_probe_parses_into_status() {
+        let s = status_from_probe(QmdProbe::Stdout(SAMPLE.into())).expect("some status");
+        assert_eq!(s.pending_embedding, Some(29));
+        assert_eq!(s.total_files, Some(600));
+    }
+
+    #[test]
+    fn unembedded_count_is_none_when_probe_unavailable() {
+        // The false-zero regression guard: a missing/timed-out/erroring qmd
+        // must report "unknown" (None), not a misleading 0.
+        assert_eq!(unembedded_from_probe(QmdProbe::NotFound), None);
+        assert_eq!(unembedded_from_probe(QmdProbe::Timeout), None);
+        assert_eq!(unembedded_from_probe(QmdProbe::Error), None);
+    }
+
+    #[test]
+    fn unembedded_count_reads_real_pending() {
+        assert_eq!(
+            unembedded_from_probe(QmdProbe::Stdout(SAMPLE.into())),
+            Some(29)
+        );
+    }
+
+    #[test]
+    fn unembedded_count_zero_pending_is_some_zero_not_none() {
+        // A genuine "0 pending" stays Some(0) — distinct from None (unknown).
+        let out = "Documents\n  Total: 5 files indexed\n  Pending:  0 need embedding\n";
+        assert_eq!(unembedded_from_probe(QmdProbe::Stdout(out.into())), Some(0));
+    }
+
+    #[test]
+    fn unembedded_count_is_none_when_stdout_has_no_pending_line() {
+        // qmd responded, but the `Pending:` line is absent/unparseable → the
+        // count is unknown (None), never a false 0. Session-init surfaces this
+        // as `null`, not "0 unembedded".
+        let out = "Documents\n  Total: 5 files indexed\n";
+        assert_eq!(unembedded_from_probe(QmdProbe::Stdout(out.into())), None);
+    }
+
+    // The generous-timeout invariant is enforced at compile time by the
+    // `const _: () = assert!(...)` guard next to the constant definition above.
+
+    #[cfg(unix)]
+    #[test]
+    fn qmd_search_path_appends_bun_global_dir() {
+        // The augmented PATH must include the bun-global install dir so a
+        // bun-installed qmd (and its interpreter) resolves under a restricted
+        // launcher PATH. HOME-relative so hermetic tests that scrub PATH don't
+        // accidentally pick up a system qmd.
+        let p = qmd_search_path();
+        let s = p.to_string_lossy();
+        assert!(s.contains(".bun/bin"), "missing bun-global dir: {s}");
+    }
+
+    // Captured verbatim from `qmd status` on qmd 2.1.0 with a real, populated
+    // index — includes the AST Chunking / Collections / Examples blocks that
+    // follow Documents. Guards against cross-block prefix collisions skewing
+    // the headline figures (and thus text == --json equivalence, since both
+    // render from this single parse).
+    const REAL_FULL_SAMPLE: &str = "QMD Status\n\
+\n\
+Index: /Users/keng/.cache/qmd/index.sqlite\n\
+Size:  51.1 MB\n\
+\n\
+Documents\n\
+  Total:    726 files indexed\n\
+  Vectors:  9062 embedded\n\
+  Pending:  85 need embedding (run 'qmd embed')\n\
+  Updated:  4m ago\n\
+\n\
+AST Chunking\n\
+  Status:   active\n\
+  Languages: typescript, tsx, javascript, python, go, rust\n\
+\n\
+Collections\n\
+  ob-1-441565 (qmd://ob-1-441565/)\n\
+    Pattern:  **/*.md\n\
+    Files:    726 (updated 4m ago)\n\
+    Contexts: 1\n\
+\n\
+Examples\n\
+  # List files in a collection\n\
+  qmd ls ob-1-441565\n";
+
+    #[test]
+    fn parse_status_ignores_unrelated_blocks_in_real_output() {
+        let s = parse_status(REAL_FULL_SAMPLE);
+        assert_eq!(s.total_files, Some(726));
+        assert_eq!(s.embedded_vectors, Some(9062));
+        assert_eq!(s.pending_embedding, Some(85));
+        assert_eq!(s.index_size.as_deref(), Some("51.1 MB"));
+        assert_eq!(s.last_updated.as_deref(), Some("4m ago"));
     }
 }
