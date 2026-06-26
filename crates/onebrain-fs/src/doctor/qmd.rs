@@ -63,10 +63,14 @@ impl Check for QmdEmbeddingsCheck {
 /// other qmd consumers agree on the headline figures.
 fn parse_qmd_status(stdout: &str, collection: &str) -> DoctorResult {
     let status = QmdStatus::parse(stdout);
-    let Some(total) = status.total_files else {
+    // Both figures must parse. A missing `Total:` or `Pending:` line means
+    // incomplete/corrupted output — report unknown (non-fatal `ok`) rather than
+    // inventing a `0` for the missing figure. session-init leaves
+    // `pending_embedding` `None` (→ JSON `null`) for the same input, so every
+    // consumer of the shared probe now treats it as unknown, not a false zero.
+    let (Some(total), Some(pending)) = (status.total_files, status.pending_embedding) else {
         return DoctorResult::ok("qmd-embeddings", "qmd status unavailable");
     };
-    let pending = status.pending_embedding.unwrap_or(0);
     let summary = format!("{} indexed · {} unembedded", total, pending);
     if pending > 0 {
         return DoctorResult::warn("qmd-embeddings", summary)
@@ -143,6 +147,36 @@ mod tests {
     #[test]
     fn unparseable_stdout_is_ok_unavailable() {
         let stdout = "qmd: unknown command\n";
+        let r = QmdEmbeddingsCheck::run_with(
+            || QmdProbe::Stdout(stdout.into()),
+            &cfg_with_collection("ob-1"),
+        );
+        assert_eq!(r.message, "qmd status unavailable");
+    }
+
+    #[test]
+    fn total_present_pending_missing_is_ok_unavailable() {
+        // Incomplete/corrupted `qmd status`: a `Total:` line but no `Pending:`
+        // line. Report unknown (non-fatal `ok`), not "0 unembedded" — the same
+        // input maps to `None` in the shared probe (onebrain-cache test
+        // `unembedded_count_is_none_when_stdout_has_no_pending_line`), which
+        // session-init surfaces as `null`. Single source of truth: every
+        // consumer treats this input as unknown, not a false zero.
+        let stdout = "Total:    500 files indexed\n";
+        let r = QmdEmbeddingsCheck::run_with(
+            || QmdProbe::Stdout(stdout.into()),
+            &cfg_with_collection("ob-1"),
+        );
+        assert_eq!(r.message, "qmd status unavailable");
+    }
+
+    #[test]
+    fn pending_present_total_missing_is_ok_unavailable() {
+        // Symmetric to the above: a `Pending:` line but no `Total:` line is also
+        // incomplete output. Locks that BOTH arms of the combined destructure
+        // reject a missing figure — guards against a future edit accidentally
+        // making `Total:` optional again.
+        let stdout = "Pending:  3 need embedding\n";
         let r = QmdEmbeddingsCheck::run_with(
             || QmdProbe::Stdout(stdout.into()),
             &cfg_with_collection("ob-1"),
