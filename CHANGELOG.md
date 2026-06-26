@@ -1,6 +1,6 @@
 ---
-latest_version: 3.3.7
-released: 2026-06-26
+latest_version: 3.3.8
+released: 2026-06-27
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,10 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.8] — 2026-06-27 — serve: download keeps the original filename
+
+- fix(serve): `GET /api/vault/raw?…&download=1` now sends `Content-Disposition: attachment` with the file's real name (RFC 5987 `filename*`, so spaces and non-ASCII/Thai names survive), so the web UI's download button saves the original filename + extension instead of the blob-URL id some webviews fall back to. Without the flag the endpoint still serves inline for image/PDF preview.
 
 ## [3.3.7] — 2026-06-26 — serve: allow data: fonts for the Office-doc preview
 
