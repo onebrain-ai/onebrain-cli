@@ -1,5 +1,5 @@
 ---
-latest_version: 3.3.4
+latest_version: 3.3.5
 released: 2026-06-26
 ---
 
@@ -9,6 +9,10 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.5] — 2026-06-26 — tasks: scan projects + areas only
+
+- fix(tasks): `GET /api/vault/tasks` (and the scan it backs) now scans only the configured project + area folders — default `01-projects/` + `02-areas/` — instead of the whole vault, so READMEs, inbox, knowledge, and resource notes no longer surface as actionable todos. Folder names come from the vault config (with a trailing-slash guard so `projects: 01-projects/` doesn't become a `//` prefix that matches nothing) and fall back to the PARA defaults when config can't be read.
 
 ## [3.3.4] — 2026-06-26 — doctor qmd: unknown-not-zero parity
 
