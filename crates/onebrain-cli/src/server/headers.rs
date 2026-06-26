@@ -20,14 +20,15 @@ use axum::{
 };
 
 /// SPA-safe policy: `'self'` for everything, plus the inline token script/styles
-/// the build emits, `data:`/`https:` images (vault data-URIs + README badges).
+/// the build emits, `data:`/`https:` images (vault data-URIs + README badges), and
+/// `data:` fonts (the web UI's Office-doc preview inlines slide/text fonts as data-URIs).
 /// Tightening `script-src` to a nonce is a follow-up (would need the static
 /// handler + this layer to share a per-response nonce).
 const CSP: &str = "default-src 'self'; \
 script-src 'self' 'unsafe-inline'; \
 style-src 'self' 'unsafe-inline'; \
 img-src 'self' data: https:; \
-font-src 'self'; \
+font-src 'self' data:; \
 connect-src 'self'; \
 object-src 'none'; \
 base-uri 'self'; \
@@ -110,6 +111,9 @@ mod tests {
             .unwrap();
         assert!(csp.contains("frame-ancestors 'none'"));
         assert!(csp.contains("object-src 'none'"));
+        // `data:` fonts are allowed so the web UI's Office-doc preview can render
+        // the slide/text fonts PowerPoint/Word embed as data-URIs.
+        assert!(csp.contains("font-src 'self' data:"));
     }
 
     #[tokio::test]
