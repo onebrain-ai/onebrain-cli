@@ -522,13 +522,34 @@ fn content_type_for(path: &str) -> &'static str {
     }
 }
 
+/// Extensions a browser would RENDER (and run embedded scripts from) when
+/// navigated to directly — SVG most of all. The raw endpoint always serves these
+/// as an attachment so an attacker-authored vault file can't execute in the app
+/// origin and steal the session token. The web UI's previews fetch the bytes
+/// (disposition-agnostic) or use `<img>` (which ignores Content-Disposition), so
+/// forcing the attachment doesn't break them.
+fn forces_attachment(path: &str) -> bool {
+    matches!(
+        path.rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "svg" | "svgz" | "html" | "htm" | "xhtml" | "xht" | "xml" | "xsl"
+    )
+}
+
 /// Build a `Content-Disposition: attachment` value that survives spaces and
 /// non-ASCII (e.g. Thai) filenames: a quoted ASCII fallback plus an RFC 5987
 /// `filename*` carrying the UTF-8 name percent-encoded. Browsers prefer
 /// `filename*`, so the saved file keeps its real name + extension.
 fn content_disposition_attachment(path: &str) -> String {
     let raw = path.rsplit('/').next().unwrap_or("");
-    let name = if raw.is_empty() { "download" } else { raw };
+    // Strip control chars (incl. CR/LF) up front so neither the quoted ASCII
+    // fallback nor the percent-encoded `filename*` can carry a %0D/%0A that a
+    // lenient downstream proxy might decode into a header break.
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let name = if cleaned.is_empty() { "download" } else { cleaned.as_str() };
     let ascii: String = name
         .chars()
         .map(|c| {
@@ -563,12 +584,16 @@ async fn get_vault_raw(
     let root = require_vault_root(&state)?.to_path_buf();
     let requested = q.path;
     let ctype = content_type_for(&requested);
-    // Build the attachment header before `requested` is moved into the read task.
-    let disposition = q
+    // Force an attachment (browser DOWNLOADS instead of rendering) for an explicit
+    // `&download=1` AND, unconditionally, for types a browser would render-and-script
+    // on navigation (SVG/HTML/XML) — serving those inline would let an attacker-
+    // authored vault file run in the app origin. Built before `requested` moves.
+    let download_requested = q
         .download
         .as_deref()
-        .filter(|v| !v.is_empty() && *v != "0")
-        .map(|_| content_disposition_attachment(&requested));
+        .is_some_and(|v| !v.is_empty() && v != "0");
+    let disposition = (download_requested || forces_attachment(&requested))
+        .then(|| content_disposition_attachment(&requested));
     let bytes = tokio::task::spawn_blocking(move || read_vault_raw(&root, &requested))
         .await
         .map_err(|e| {
@@ -1319,6 +1344,26 @@ mod tests {
         assert!(th.ends_with(".pdf"), "{th}");
         // Trailing-slash / empty basename falls back to a safe name.
         assert!(content_disposition_attachment("a/b/").contains("download"));
+    }
+
+    #[test]
+    fn forces_attachment_for_script_carrying_types() {
+        for p in ["a/b.svg", "x.SVG", "evil.html", "n.htm", "d.xml", "s.xhtml", "z.svgz"] {
+            assert!(forces_attachment(p), "{p} should force an attachment");
+        }
+        for p in ["photo.png", "clip.mp4", "doc.pdf", "note.md", "data.csv"] {
+            assert!(!forces_attachment(p), "{p} should NOT force an attachment");
+        }
+    }
+
+    #[test]
+    fn content_disposition_strips_control_chars() {
+        // A filename carrying CR/LF must not survive into EITHER header field —
+        // no %0D / %0A in the filename* value (CRLF-header-injection guard).
+        let cd = content_disposition_attachment("a/ev\r\nil.svg");
+        assert!(!cd.contains("%0D") && !cd.contains("%0A"), "{cd}");
+        assert!(!cd.contains('\r') && !cd.contains('\n'), "{cd}");
+        assert!(cd.contains("evil.svg"), "{cd}");
     }
 
     #[test]
