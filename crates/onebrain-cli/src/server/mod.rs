@@ -34,6 +34,7 @@ mod api;
 mod auth;
 mod chat;
 mod headers;
+mod search;
 mod r#static;
 mod token;
 
