@@ -156,6 +156,12 @@ pub(crate) async fn post_chat(
     let mut cmd = Command::new(&bin);
     cmd.args(&argv)
         .current_dir(&vault)
+        // Strip the daemon's OWN auth token from the agent's environment — `claude`
+        // doesn't need it, and neither the agent nor its MCP tools / bash should be
+        // able to read the credential that gates the HTTP API. (Other inherited env
+        // — PATH, HOME, the model API key — the agent genuinely needs and is the
+        // user's own environment anyway, so we leave it.)
+        .env_remove("ONEBRAIN_TOKEN")
         // ONEBRAIN_HEADLESS=1 makes `onebrain session init` report headless, so
         // the agent skips the interactive greeting/status ceremony and answers
         // directly — but still loads MEMORY/identity (same as the scheduler).

@@ -508,8 +508,35 @@ fn content_type_for(path: &str) -> &'static str {
         "bmp" => "image/bmp",
         "ico" => "image/x-icon",
         "pdf" => "application/pdf",
+        // audio / video — played by the web UI's native <audio>/<video> element
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "ogv" => "video/ogg",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" | "aac" => "audio/mp4",
+        "oga" | "ogg" => "audio/ogg",
+        "flac" => "audio/flac",
         _ => "application/octet-stream",
     }
+}
+
+/// Extensions a browser would RENDER (and run embedded scripts from) when
+/// navigated to directly — SVG most of all. The raw endpoint always serves these
+/// as an attachment so an attacker-authored vault file can't execute in the app
+/// origin and steal the session token. The web UI's previews fetch the bytes
+/// (disposition-agnostic) or use `<img>` (which ignores Content-Disposition), so
+/// forcing the attachment doesn't break them.
+fn forces_attachment(path: &str) -> bool {
+    matches!(
+        path.rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "svg" | "svgz" | "html" | "htm" | "xhtml" | "xht" | "xml" | "xsl"
+    )
 }
 
 /// Build a `Content-Disposition: attachment` value that survives spaces and
@@ -518,7 +545,15 @@ fn content_type_for(path: &str) -> &'static str {
 /// `filename*`, so the saved file keeps its real name + extension.
 fn content_disposition_attachment(path: &str) -> String {
     let raw = path.rsplit('/').next().unwrap_or("");
-    let name = if raw.is_empty() { "download" } else { raw };
+    // Strip control chars (incl. CR/LF) up front so neither the quoted ASCII
+    // fallback nor the percent-encoded `filename*` can carry a %0D/%0A that a
+    // lenient downstream proxy might decode into a header break.
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let name = if cleaned.is_empty() {
+        "download"
+    } else {
+        cleaned.as_str()
+    };
     let ascii: String = name
         .chars()
         .map(|c| {
@@ -547,35 +582,116 @@ fn content_disposition_attachment(path: &str) -> String {
 /// download button.
 async fn get_vault_raw(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<FileQuery>,
 ) -> Result<Response, ApiError> {
     let root = require_vault_root(&state)?.to_path_buf();
     let requested = q.path;
-    let ctype = content_type_for(&requested);
-    // Build the attachment header before `requested` is moved into the read task.
-    let disposition = q
+    // Types a browser would render-and-script on navigation (SVG/HTML/XML) are
+    // served as octet-stream AND as an attachment — defence in depth (Content-Type
+    // + nosniff + disposition), so an attacker-authored vault file can never run in
+    // the app origin even if one layer is bypassed. The web UI's previews don't rely
+    // on the raw Content-Type for these (SVG is fetched + inlined; raster uses
+    // <img>), so nothing breaks. Built before `requested` moves into the read task.
+    let force_attach = forces_attachment(&requested);
+    let ctype = if force_attach {
+        "application/octet-stream"
+    } else {
+        content_type_for(&requested)
+    };
+    let download_requested = q
         .download
         .as_deref()
-        .filter(|v| !v.is_empty() && *v != "0")
-        .map(|_| content_disposition_attachment(&requested));
+        .is_some_and(|v| !v.is_empty() && v != "0");
+    let disposition =
+        (download_requested || force_attach).then(|| content_disposition_attachment(&requested));
     let bytes = tokio::task::spawn_blocking(move || read_vault_raw(&root, &requested))
         .await
         .map_err(|e| {
             tracing::warn!(error = %e, "raw read task failed");
             ApiError::Internal("could not read file".to_string())
         })??;
+    let total = bytes.len() as u64;
+    use axum::http::header::{ACCEPT_RANGES, CONTENT_RANGE, CONTENT_TYPE, RANGE};
+    let ct = axum::http::HeaderValue::from_static(ctype);
+
+    // Honour a Range request for inline media — audio/video seeking, and Safari,
+    // which refuses to play a 200 full-body. Never for an explicit download.
+    if disposition.is_none() {
+        if let Some((start, end)) = headers
+            .get(RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|r| parse_byte_range(r, total))
+        {
+            let slice = bytes[start as usize..=end as usize].to_vec();
+            let mut resp = Response::new(axum::body::Body::from(slice));
+            *resp.status_mut() = axum::http::StatusCode::PARTIAL_CONTENT;
+            let h = resp.headers_mut();
+            h.insert(CONTENT_TYPE, ct);
+            h.insert(ACCEPT_RANGES, axum::http::HeaderValue::from_static("bytes"));
+            if let Ok(v) =
+                axum::http::HeaderValue::from_str(&format!("bytes {start}-{end}/{total}"))
+            {
+                h.insert(CONTENT_RANGE, v);
+            }
+            return Ok(resp);
+        }
+    }
+
     let mut resp = Response::new(axum::body::Body::from(bytes));
-    resp.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static(ctype),
-    );
+    let h = resp.headers_mut();
+    h.insert(CONTENT_TYPE, ct);
+    // advertise range support so the browser knows it can seek media
+    h.insert(ACCEPT_RANGES, axum::http::HeaderValue::from_static("bytes"));
     if let Some(cd) = disposition {
-        if let Ok(v) = axum::http::HeaderValue::from_str(&cd) {
-            resp.headers_mut()
-                .insert(axum::http::header::CONTENT_DISPOSITION, v);
+        match axum::http::HeaderValue::from_str(&cd) {
+            Ok(v) => {
+                h.insert(axum::http::header::CONTENT_DISPOSITION, v);
+            }
+            Err(e) => {
+                // Never let a forced-attachment type slip through inline: if the
+                // rich header is unbuildable, fall back to a bare `attachment` so
+                // the browser still downloads rather than renders.
+                tracing::error!(error = %e, "content-disposition unbuildable; bare attachment");
+                h.insert(
+                    axum::http::header::CONTENT_DISPOSITION,
+                    axum::http::HeaderValue::from_static("attachment"),
+                );
+            }
         }
     }
     Ok(resp)
+}
+
+/// Parse a single-range `Range: bytes=start-end` header into inclusive `[start, end]`
+/// byte offsets clamped to `total`. Returns `None` for malformed, multi-range, or
+/// unsatisfiable requests — the caller then serves the full `200` body.
+fn parse_byte_range(header: &str, total: u64) -> Option<(u64, u64)> {
+    if total == 0 {
+        return None;
+    }
+    let spec = header.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None; // multi-range not supported
+    }
+    let (s, e) = spec.split_once('-')?;
+    let (start, end) = match (s.trim(), e.trim()) {
+        ("", "") => return None,
+        ("", suffix) => {
+            // `bytes=-N` → final N bytes
+            let n: u64 = suffix.parse().ok()?;
+            if n == 0 {
+                return None;
+            }
+            (total.saturating_sub(n), total - 1)
+        }
+        (start, "") => (start.parse().ok()?, total - 1),
+        (start, end) => (start.parse().ok()?, end.parse::<u64>().ok()?.min(total - 1)),
+    };
+    if start > end || start >= total {
+        return None;
+    }
+    Some((start, end))
 }
 
 /// Validate → stat (size cap) → read raw bytes. Runs under `spawn_blocking`.
@@ -1251,5 +1367,47 @@ mod tests {
         assert!(th.ends_with(".pdf"), "{th}");
         // Trailing-slash / empty basename falls back to a safe name.
         assert!(content_disposition_attachment("a/b/").contains("download"));
+    }
+
+    #[test]
+    fn forces_attachment_for_script_carrying_types() {
+        for p in [
+            "a/b.svg",
+            "x.SVG",
+            "evil.html",
+            "n.htm",
+            "d.xml",
+            "s.xhtml",
+            "z.svgz",
+        ] {
+            assert!(forces_attachment(p), "{p} should force an attachment");
+        }
+        for p in ["photo.png", "clip.mp4", "doc.pdf", "note.md", "data.csv"] {
+            assert!(!forces_attachment(p), "{p} should NOT force an attachment");
+        }
+    }
+
+    #[test]
+    fn content_disposition_strips_control_chars() {
+        // A filename carrying CR/LF must not survive into EITHER header field —
+        // no %0D / %0A in the filename* value (CRLF-header-injection guard).
+        let cd = content_disposition_attachment("a/ev\r\nil.svg");
+        assert!(!cd.contains("%0D") && !cd.contains("%0A"), "{cd}");
+        assert!(!cd.contains('\r') && !cd.contains('\n'), "{cd}");
+        assert!(cd.contains("evil.svg"), "{cd}");
+    }
+
+    #[test]
+    fn parse_byte_range_handles_common_forms() {
+        assert_eq!(parse_byte_range("bytes=0-99", 1000), Some((0, 99)));
+        assert_eq!(parse_byte_range("bytes=100-", 1000), Some((100, 999)));
+        assert_eq!(parse_byte_range("bytes=-200", 1000), Some((800, 999)));
+        assert_eq!(parse_byte_range("bytes=0-99999", 1000), Some((0, 999))); // end clamped
+                                                                             // malformed / unsatisfiable → None (caller serves the full 200 body)
+        assert_eq!(parse_byte_range("bytes=abc", 1000), None);
+        assert_eq!(parse_byte_range("bytes=500-100", 1000), None); // start > end
+        assert_eq!(parse_byte_range("bytes=2000-3000", 1000), None); // start >= total
+        assert_eq!(parse_byte_range("bytes=0-1,2-3", 1000), None); // multi-range
+        assert_eq!(parse_byte_range("bytes=0-99", 0), None); // empty file
     }
 }

@@ -4,8 +4,9 @@
 //! These harden the browser side so the surface is safer the moment it's put
 //! behind a TLS tunnel/proxy (the recommended way to expose it):
 //! - `Content-Security-Policy` — confines the SPA to its own origin; blocks
-//!   framing, `<base>` injection, and plugin/object embeds.
-//! - `X-Frame-Options: DENY` + CSP `frame-ancestors 'none'` — clickjacking.
+//!   cross-origin framing, `<base>` injection, and plugin/object embeds.
+//! - `X-Frame-Options: SAMEORIGIN` + CSP `frame-ancestors 'self'` — clickjacking
+//!   protection that still lets the SPA frame its own raw endpoint (PDF preview).
 //! - `X-Content-Type-Options: nosniff` — MIME-sniffing.
 //! - `Referrer-Policy: no-referrer` — stops the `?token=` entry URL leaking to
 //!   any external link clicked inside a rendered note.
@@ -20,20 +21,21 @@ use axum::{
 };
 
 /// SPA-safe policy: `'self'` for everything, plus the inline token script/styles
-/// the build emits, `data:`/`https:` images (vault data-URIs + README badges), and
+/// the build emits, `data:`/`https:`/`blob:` images (vault data-URIs, README badges,
+/// and the pptx preview's media materialised as same-origin blob: URLs), and
 /// `data:` fonts (the web UI's Office-doc preview inlines slide/text fonts as data-URIs).
 /// Tightening `script-src` to a nonce is a follow-up (would need the static
 /// handler + this layer to share a per-response nonce).
 const CSP: &str = "default-src 'self'; \
 script-src 'self' 'unsafe-inline'; \
 style-src 'self' 'unsafe-inline'; \
-img-src 'self' data: https:; \
+img-src 'self' data: https: blob:; \
 font-src 'self' data:; \
 connect-src 'self'; \
 object-src 'none'; \
 base-uri 'self'; \
 form-action 'self'; \
-frame-ancestors 'none'";
+frame-ancestors 'self'";
 
 /// Middleware: run the request, then stamp the security headers on the response.
 pub async fn security_headers(request: Request, next: Next) -> Response {
@@ -50,7 +52,7 @@ pub async fn security_headers(request: Request, next: Next) -> Response {
     let h = resp.headers_mut();
     set(h, header::CONTENT_SECURITY_POLICY, CSP);
     set(h, header::X_CONTENT_TYPE_OPTIONS, "nosniff");
-    set(h, header::X_FRAME_OPTIONS, "DENY");
+    set(h, header::X_FRAME_OPTIONS, "SAMEORIGIN");
     set(h, header::REFERRER_POLICY, "no-referrer");
     set(
         h,
@@ -100,16 +102,16 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let h = resp.headers();
         assert!(h.get(header::CONTENT_SECURITY_POLICY).is_some());
-        assert_eq!(h.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+        assert_eq!(h.get(header::X_FRAME_OPTIONS).unwrap(), "SAMEORIGIN");
         assert_eq!(h.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
         assert_eq!(h.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
-        // CSP forbids framing + object embeds.
+        // CSP allows only same-origin framing (PDF preview) + forbids object embeds.
         let csp = h
             .get(header::CONTENT_SECURITY_POLICY)
             .unwrap()
             .to_str()
             .unwrap();
-        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(csp.contains("frame-ancestors 'self'"));
         assert!(csp.contains("object-src 'none'"));
         // `data:` fonts are allowed so the web UI's Office-doc preview can render
         // the slide/text fonts PowerPoint/Word embed as data-URIs.
