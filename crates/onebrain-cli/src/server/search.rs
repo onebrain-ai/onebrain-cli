@@ -15,9 +15,9 @@
 //! translator: it never reads a note itself — it returns vault-relative paths
 //! the existing `GET /api/vault/file` (with its path-traversal guard) opens.
 
-use std::path::Path;
-use std::process::Command;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use axum::{
     extract::{Query, State},
@@ -25,6 +25,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use tokio::process::Command;
 
 use super::api::{require_vault_root, ApiError};
 use super::AppState;
@@ -92,23 +93,20 @@ pub(crate) async fn get_vault_search(
         return Ok(Json(SearchResponse { hits: vec![], mode }).into_response());
     }
 
-    // The qmd collection that maps onto THIS vault — used to strip the
-    // `qmd://<collection>/` prefix and to drop hits from any OTHER indexed
-    // collection (a multi-collection qmd install) that this vault can't open.
+    // qmd is "enabled" for a vault only when it names its collection (onebrain.yml
+    // `qmd_collection`). Absent → qmd is off for this vault: return 503 so the
+    // client falls back to its own filename/path search, rather than running qmd
+    // unscoped and leaking hits from other indexed collections.
     let collection = onebrain_core::load_vault_config_at(&root)
         .ok()
-        .and_then(|c| c.qmd_collection);
+        .and_then(|c| c.qmd_collection)
+        .ok_or_else(|| {
+            ApiError::ServiceUnavailable(
+                "search unavailable — qmd is not configured for this vault".to_string(),
+            )
+        })?;
 
-    // qmd is a blocking subprocess → keep it off the async worker threads.
-    let hits = tokio::task::spawn_blocking(move || {
-        run_qmd(&root, &query, mode, collection.as_deref())
-    })
-    .await
-    .map_err(|e| {
-        tracing::warn!(error = %e, "qmd search task panicked");
-        ApiError::Internal("search failed".to_string())
-    })??;
-
+    let hits = run_qmd(&root, &query, mode, &collection).await?;
     Ok(Json(SearchResponse { hits, mode }).into_response())
 }
 
@@ -132,33 +130,50 @@ fn qmd_args(mode: &str, query: &str) -> Vec<String> {
     }
 }
 
-fn run_qmd(
+/// Hard ceiling on a single qmd invocation — hybrid is ~1-5s, so this only trips
+/// on a genuine hang (a stuck embedding call, a deadlocked node process).
+const QMD_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The resolved `qmd` binary, cached — a PATH walk on every keystroke would be
+/// wasteful (and a cheap DoS amplifier). Resolved once; `None` if qmd isn't
+/// installed (→ 503 → the client uses its own fallback search).
+fn qmd_bin() -> Option<&'static PathBuf> {
+    static QMD_BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
+    QMD_BIN.get_or_init(|| which::which("qmd").ok()).as_ref()
+}
+
+async fn run_qmd(
     root: &Path,
     query: &str,
     mode: &str,
-    collection: Option<&str>,
+    collection: &str,
 ) -> Result<Vec<SearchHit>, ApiError> {
-    // Resolve via PATH like the other qmd call sites (`qmd embed`, `doctor`); the
-    // daemon inherits the user's environment, so qmd runs under whatever node the
-    // user's qmd install expects.
-    let qmd = which::which("qmd").map_err(|_| {
+    let qmd = qmd_bin().ok_or_else(|| {
         ApiError::ServiceUnavailable(
             "search unavailable — the qmd binary is not installed".to_string(),
         )
     })?;
 
-    // No server-side timeout yet (mirrors the deferred TimeoutLayer in mod.rs):
-    // qmd normally returns in ≤2s and the webui aborts its own fetch if a query
-    // stalls. `--json` writes results to stdout; tips/warnings go to stderr, so
-    // stdout stays clean JSON.
-    let out = Command::new(qmd)
-        .current_dir(root)
+    // Async child with a hard timeout so a stuck qmd can't pin a runtime worker;
+    // `kill_on_drop` reaps the child when the timeout drops the output future.
+    // `--json` writes results to stdout (qmd self-caps at ~20 rows, so it stays
+    // small); tips/warnings go to stderr, so stdout stays clean JSON.
+    let mut cmd = Command::new(qmd);
+    cmd.current_dir(root)
         .args(qmd_args(mode, query))
-        .output()
-        .map_err(|e| {
+        .kill_on_drop(true);
+
+    let out = match tokio::time::timeout(QMD_TIMEOUT, cmd.output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, "qmd invocation failed");
-            ApiError::Internal("search failed".to_string())
-        })?;
+            return Err(ApiError::Internal("search failed".to_string()));
+        }
+        Err(_) => {
+            tracing::warn!(timeout_s = QMD_TIMEOUT.as_secs(), "qmd search timed out");
+            return Err(ApiError::Internal("search timed out".to_string()));
+        }
+    };
 
     if !out.status.success() {
         tracing::warn!(
@@ -176,7 +191,7 @@ fn run_qmd(
 
     Ok(rows
         .into_iter()
-        .filter_map(|r| map_row(r, collection))
+        .filter_map(|r| map_row(r, Some(collection)))
         .collect())
 }
 
