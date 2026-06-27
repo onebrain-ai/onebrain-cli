@@ -15,6 +15,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - fix(serve): security headers relaxed from `X-Frame-Options: DENY` + CSP `frame-ancestors 'none'` to `SAMEORIGIN` / `frame-ancestors 'self'`, so the web UI can frame its own `/api/vault/raw` endpoint to preview PDFs in an `<iframe>` — previously both directives blocked the same-origin frame and the PDF pane rendered blank. Cross-origin framing (clickjacking) is still denied.
 - fix(serve): CSP `img-src` now allows `blob:` so the pptx preview's embedded media (logos, photos the renderer materialises as same-origin blob: URLs) can load — without it every embedded slide image was blocked.
 - feat(serve): `/api/vault/raw` now sends audio/video `Content-Type`s and honours `Range` requests (`206 Partial Content` + `Accept-Ranges: bytes`), so the web UI's native `<audio>`/`<video>` player can stream + seek (Safari refuses a `200` full-body for media).
+- fix(serve): harden `/api/vault/raw` against stored XSS now that same-origin framing is allowed — script-carrying types (`.svg`/`.html`/`.xml`) are served as `application/octet-stream` + `Content-Disposition: attachment` (with a fail-safe bare `attachment`), so navigating straight to a raw URL can't execute an attacker-authored SVG/HTML in the app origin; the download filename is stripped of control chars to block CR/LF header injection.
 
 ## [3.3.8] — 2026-06-27 — serve: download keeps the original filename
 
