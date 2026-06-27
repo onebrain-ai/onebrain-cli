@@ -583,17 +583,24 @@ async fn get_vault_raw(
 ) -> Result<Response, ApiError> {
     let root = require_vault_root(&state)?.to_path_buf();
     let requested = q.path;
-    let ctype = content_type_for(&requested);
-    // Force an attachment (browser DOWNLOADS instead of rendering) for an explicit
-    // `&download=1` AND, unconditionally, for types a browser would render-and-script
-    // on navigation (SVG/HTML/XML) — serving those inline would let an attacker-
-    // authored vault file run in the app origin. Built before `requested` moves.
+    // Types a browser would render-and-script on navigation (SVG/HTML/XML) are
+    // served as octet-stream AND as an attachment — defence in depth (Content-Type
+    // + nosniff + disposition), so an attacker-authored vault file can never run in
+    // the app origin even if one layer is bypassed. The web UI's previews don't rely
+    // on the raw Content-Type for these (SVG is fetched + inlined; raster uses
+    // <img>), so nothing breaks. Built before `requested` moves into the read task.
+    let force_attach = forces_attachment(&requested);
+    let ctype = if force_attach {
+        "application/octet-stream"
+    } else {
+        content_type_for(&requested)
+    };
     let download_requested = q
         .download
         .as_deref()
         .is_some_and(|v| !v.is_empty() && v != "0");
-    let disposition = (download_requested || forces_attachment(&requested))
-        .then(|| content_disposition_attachment(&requested));
+    let disposition =
+        (download_requested || force_attach).then(|| content_disposition_attachment(&requested));
     let bytes = tokio::task::spawn_blocking(move || read_vault_raw(&root, &requested))
         .await
         .map_err(|e| {
@@ -633,8 +640,20 @@ async fn get_vault_raw(
     // advertise range support so the browser knows it can seek media
     h.insert(ACCEPT_RANGES, axum::http::HeaderValue::from_static("bytes"));
     if let Some(cd) = disposition {
-        if let Ok(v) = axum::http::HeaderValue::from_str(&cd) {
-            h.insert(axum::http::header::CONTENT_DISPOSITION, v);
+        match axum::http::HeaderValue::from_str(&cd) {
+            Ok(v) => {
+                h.insert(axum::http::header::CONTENT_DISPOSITION, v);
+            }
+            Err(e) => {
+                // Never let a forced-attachment type slip through inline: if the
+                // rich header is unbuildable, fall back to a bare `attachment` so
+                // the browser still downloads rather than renders.
+                tracing::error!(error = %e, "content-disposition unbuildable; bare attachment");
+                h.insert(
+                    axum::http::header::CONTENT_DISPOSITION,
+                    axum::http::HeaderValue::from_static("attachment"),
+                );
+            }
         }
     }
     Ok(resp)
