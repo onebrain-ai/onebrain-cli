@@ -16,6 +16,7 @@
 //! the existing `GET /api/vault/file` (with its path-traversal guard) opens.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -25,6 +26,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use super::api::{require_vault_root, ApiError};
@@ -94,17 +96,20 @@ pub(crate) async fn get_vault_search(
     }
 
     // qmd is "enabled" for a vault only when it names its collection (onebrain.yml
-    // `qmd_collection`). Absent → qmd is off for this vault: return 503 so the
-    // client falls back to its own filename/path search, rather than running qmd
-    // unscoped and leaking hits from other indexed collections.
-    let collection = onebrain_core::load_vault_config_at(&root)
-        .ok()
-        .and_then(|c| c.qmd_collection)
-        .ok_or_else(|| {
-            ApiError::ServiceUnavailable(
-                "search unavailable — qmd is not configured for this vault".to_string(),
-            )
-        })?;
+    // `qmd_collection`). Absent/missing → qmd is off: 503 so the client falls back
+    // to its own filename/path search rather than running qmd unscoped (which would
+    // leak hits from other indexed collections). A genuine config-READ failure is a
+    // logged 500 — not silently conflated with "not configured".
+    let qmd_unconfigured =
+        || ApiError::ServiceUnavailable("search unavailable — qmd is not configured for this vault".to_string());
+    let collection = match onebrain_core::load_vault_config_at(&root) {
+        Ok(cfg) => cfg.qmd_collection.ok_or_else(qmd_unconfigured)?,
+        Err(onebrain_core::CoreError::VaultYamlMissing { .. }) => return Err(qmd_unconfigured()),
+        Err(e) => {
+            tracing::warn!(error = %e, "qmd search: vault config unreadable");
+            return Err(ApiError::Internal("search failed".to_string()));
+        }
+    };
 
     let hits = run_qmd(&root, &query, mode, &collection).await?;
     Ok(Json(SearchResponse { hits, mode }).into_response())
@@ -130,13 +135,15 @@ fn qmd_args(mode: &str, query: &str) -> Vec<String> {
     }
 }
 
-/// Hard ceiling on a single qmd invocation — hybrid is ~1-5s, so this only trips
-/// on a genuine hang (a stuck embedding call, a deadlocked node process).
-const QMD_TIMEOUT: Duration = Duration::from_secs(20);
+/// Hard ceiling on a single qmd invocation. Hybrid is normally ~1-5s but a cold
+/// embedding model can push it toward ~18s, so this sits well above that and only
+/// trips on a genuine hang.
+const QMD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The resolved `qmd` binary, cached — a PATH walk on every keystroke would be
 /// wasteful (and a cheap DoS amplifier). Resolved once; `None` if qmd isn't
-/// installed (→ 503 → the client uses its own fallback search).
+/// installed (→ 503 → the client uses its own fallback search). Installing qmd
+/// after the server starts needs a restart to take effect.
 fn qmd_bin() -> Option<&'static PathBuf> {
     static QMD_BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
     QMD_BIN.get_or_init(|| which::which("qmd").ok()).as_ref()
@@ -148,43 +155,63 @@ async fn run_qmd(
     mode: &str,
     collection: &str,
 ) -> Result<Vec<SearchHit>, ApiError> {
-    let qmd = qmd_bin().ok_or_else(|| {
-        ApiError::ServiceUnavailable(
-            "search unavailable — the qmd binary is not installed".to_string(),
-        )
-    })?;
+    let qmd = match qmd_bin() {
+        Some(q) => q,
+        None => {
+            tracing::warn!("qmd binary not on PATH — search disabled (install qmd, then restart)");
+            return Err(ApiError::ServiceUnavailable(
+                "search unavailable — the qmd binary is not installed".to_string(),
+            ));
+        }
+    };
 
-    // Async child with a hard timeout so a stuck qmd can't pin a runtime worker;
-    // `kill_on_drop` reaps the child when the timeout drops the output future.
-    // `--json` writes results to stdout (qmd self-caps at ~20 rows, so it stays
-    // small); tips/warnings go to stderr, so stdout stays clean JSON.
-    let mut cmd = Command::new(qmd);
-    cmd.current_dir(root)
+    // Spawn qmd and hold the Child handle (not `cmd.output()`) so that on timeout
+    // we can SIGKILL *and* reap it immediately — `kill_on_drop` alone defers reaping
+    // to the runtime, which can leave zombies under repeated timeouts (tokio #2685).
+    // `--json` goes to stdout (qmd self-caps at ~20 rows, so it stays small); stderr
+    // (qmd's tips/warnings) is discarded.
+    let mut child = Command::new(qmd)
+        .current_dir(root)
         .args(qmd_args(mode, query))
-        .kill_on_drop(true);
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| {
+            tracing::warn!(error = %e, "qmd spawn failed");
+            ApiError::Internal("search failed".to_string())
+        })?;
+    let mut stdout = child.stdout.take().expect("stdout was piped above");
 
-    let out = match tokio::time::timeout(QMD_TIMEOUT, cmd.output()).await {
-        Ok(Ok(out)) => out,
+    // Read stdout to completion and reap the child, all bounded by QMD_TIMEOUT.
+    let collect = async {
+        let mut buf = Vec::new();
+        stdout.read_to_end(&mut buf).await?;
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((status, buf))
+    };
+
+    let (status, stdout) = match tokio::time::timeout(QMD_TIMEOUT, collect).await {
+        Ok(Ok(v)) => v,
         Ok(Err(e)) => {
-            tracing::warn!(error = %e, "qmd invocation failed");
+            tracing::warn!(error = %e, "qmd i/o failed");
             return Err(ApiError::Internal("search failed".to_string()));
         }
         Err(_) => {
+            // Hung qmd: kill and reap now so we don't leak a zombie.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
             tracing::warn!(timeout_s = QMD_TIMEOUT.as_secs(), "qmd search timed out");
             return Err(ApiError::Internal("search timed out".to_string()));
         }
     };
 
-    if !out.status.success() {
-        tracing::warn!(
-            code = ?out.status.code(),
-            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-            "qmd exited non-zero"
-        );
+    if !status.success() {
+        tracing::warn!(code = ?status.code(), "qmd exited non-zero");
         return Err(ApiError::Internal("search failed".to_string()));
     }
 
-    let rows: Vec<QmdRow> = serde_json::from_slice(&out.stdout).map_err(|e| {
+    let rows: Vec<QmdRow> = serde_json::from_slice(&stdout).map_err(|e| {
         tracing::warn!(error = %e, "qmd --json parse failed");
         ApiError::Internal("search failed".to_string())
     })?;
