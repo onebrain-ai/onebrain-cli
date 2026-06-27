@@ -3,3 +3,9 @@
 Cargo.lock.bak
 *.snap.new
 .DS_Store
+
+# Embedded web UI dist (v3.3.10) — populated at build time: the release CI builds
+# onebrain-webui, local dev copies its dist in. Kept as an empty dir via .gitkeep
+# so rust-embed compiles; the built assets themselves are never committed.
+/crates/onebrain-cli/webui/*
+!/crates/onebrain-cli/webui/.gitkeep

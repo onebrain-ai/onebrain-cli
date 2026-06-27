@@ -39,6 +39,9 @@ walkdir            = { workspace = true }
 # v3.4 daemon — chat SSE stream (`stream!{}` body) + `Stream` trait in the handler.
 async-stream       = { workspace = true }
 futures-core       = { workspace = true }
+# v3.3.10 — embed the built web UI into the binary so `onebrain serve` ships a
+# standalone UI (dist built by CI / scripts, NOT committed; see .gitignore).
+rust-embed         = { version = "8", features = ["mime-guess"] }
 # Hex-encode the random session token (read from /dev/urandom on unix). `urlencoding`
 # is already a dep for vault-sync; it does NOT do hex, so we hand-roll a 1-liner
 # instead of pulling `hex`/`getrandom`/`rand` (see server::token).

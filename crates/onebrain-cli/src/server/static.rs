@@ -24,6 +24,7 @@ use axum::{
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
+use rust_embed::RustEmbed;
 use std::path::Path;
 use std::sync::Arc;
 use tower::ServiceExt; // for ServeDir::oneshot
@@ -35,6 +36,14 @@ use super::AppState;
 /// the live token. SPAs that prefer the script-injection path simply omit it.
 const TOKEN_PLACEHOLDER: &str = "__ONEBRAIN_TOKEN__";
 
+/// The web UI built into the binary. The `webui/` folder is populated at build
+/// time (the release CI builds onebrain-webui; local dev copies its dist in), and
+/// is empty (just `.gitkeep`) in a fresh checkout — in which case `get("index.html")`
+/// is `None` and `serve` falls back to the placeholder page.
+#[derive(RustEmbed)]
+#[folder = "webui/"]
+struct WebAssets;
+
 /// The catch-all static handler, wired into the router via `Router::fallback`
 /// so it answers every non-`/api` route. We can't hand a bare `ServeDir` to
 /// `fallback` because we need to intercept `index.html` for token injection;
@@ -44,9 +53,38 @@ const TOKEN_PLACEHOLDER: &str = "__ONEBRAIN_TOKEN__";
 /// - otherwise delegates to `ServeDir` for real static assets.
 pub async fn serve_static(State(state): State<Arc<AppState>>, request: Request) -> Response {
     match &state.dist_dir {
+        // An explicit dist (`--dir` / $ONEBRAIN_DIST) overrides the embedded build
+        // — handy for webui development against a live daemon.
         Some(dist) => serve_from_dist(dist, &state.token, request).await,
-        // No UI mounted — always return the injected placeholder page.
-        None => placeholder_html(&state.token).into_response(),
+        // Default: the web UI embedded in the binary (falls back to the placeholder
+        // page if this binary was built without a bundled UI).
+        None => serve_from_embedded(&state.token, request).await,
+    }
+}
+
+/// Serve a request against the embedded web UI (`WebAssets`), mirroring
+/// `serve_from_dist`: the entry shell + any unknown route returns the
+/// token-injected `index.html`; real assets are returned by name.
+async fn serve_from_embedded(token: &str, request: Request) -> Response {
+    let path = request.uri().path().trim_start_matches('/');
+    if path.is_empty() || path == "index.html" {
+        return embedded_index(token);
+    }
+    match WebAssets::get(path) {
+        Some(file) => {
+            let mime = file.metadata.mimetype().to_string();
+            ([(header::CONTENT_TYPE, mime)], file.data.into_owned()).into_response()
+        }
+        // Unknown route → SPA fallback to the injected entry shell.
+        None => embedded_index(token),
+    }
+}
+
+/// The embedded `index.html`, token-injected. `None` (no bundled UI) → placeholder.
+fn embedded_index(token: &str) -> Response {
+    match WebAssets::get("index.html") {
+        Some(file) => html_response(inject_token(&String::from_utf8_lossy(&file.data), token)),
+        None => placeholder_html(token).into_response(),
     }
 }
 

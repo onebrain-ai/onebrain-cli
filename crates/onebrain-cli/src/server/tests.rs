@@ -551,7 +551,11 @@ async fn real_static_asset_is_served_directly() {
 }
 
 #[tokio::test]
-async fn no_dist_serves_placeholder_with_token() {
+async fn no_dir_serve_injects_the_token() {
+    // With no --dir / $ONEBRAIN_DIST, `serve` falls back to the EMBEDDED web UI
+    // (or, when the binary was built without a bundled UI, the placeholder page).
+    // Either way the entry shell must carry the session token. (The placeholder
+    // itself is unit-tested in server::static::placeholder_page_carries_the_token.)
     let (_dir, router) = vault_router(None);
     let req = Request::builder()
         .uri("/")
@@ -561,12 +565,8 @@ async fn no_dist_serves_placeholder_with_token() {
     let (status, body) = send(&router, req).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        body.contains("no UI dist mounted"),
-        "placeholder body: {body}"
-    );
-    assert!(
         body.contains(TOKEN),
-        "placeholder must carry the token: {body}"
+        "the no-dir entry shell must carry the token: {body}"
     );
 }
 

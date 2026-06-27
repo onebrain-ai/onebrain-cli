@@ -100,8 +100,11 @@ pub(crate) async fn get_vault_search(
     // to its own filename/path search rather than running qmd unscoped (which would
     // leak hits from other indexed collections). A genuine config-READ failure is a
     // logged 500 — not silently conflated with "not configured".
-    let qmd_unconfigured =
-        || ApiError::ServiceUnavailable("search unavailable — qmd is not configured for this vault".to_string());
+    let qmd_unconfigured = || {
+        ApiError::ServiceUnavailable(
+            "search unavailable — qmd is not configured for this vault".to_string(),
+        )
+    };
     let collection = match onebrain_core::load_vault_config_at(&root) {
         Ok(cfg) => cfg.qmd_collection.ok_or_else(qmd_unconfigured)?,
         Err(onebrain_core::CoreError::VaultYamlMissing { .. }) => return Err(qmd_unconfigured()),
@@ -131,7 +134,11 @@ fn qmd_args(mode: &str, query: &str) -> Vec<String> {
             "--json".to_string(),
         ],
         // BM25 keyword — no LLM, fast enough to run on every keystroke.
-        _ => vec!["search".to_string(), query.to_string(), "--json".to_string()],
+        _ => vec![
+            "search".to_string(),
+            query.to_string(),
+            "--json".to_string(),
+        ],
     }
 }
 
@@ -264,7 +271,12 @@ fn clean_snippet(raw: &str) -> String {
     } else {
         raw
     };
-    body.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(240).collect()
+    body.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect()
 }
 
 #[cfg(test)]
@@ -328,7 +340,10 @@ mod tests {
     #[test]
     fn lex_is_the_default_mode() {
         let a = qmd_args("lex", "foo");
-        assert_eq!(a.iter().map(String::as_str).collect::<Vec<_>>(), ["search", "foo", "--json"]);
+        assert_eq!(
+            a.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["search", "foo", "--json"]
+        );
     }
 
     #[test]
