@@ -15,7 +15,7 @@
 
 /// Resolve the session token for a server run.
 ///
-/// Honours a caller-supplied `ONEBRAIN_TOKEN` env var (≥ 16 chars) so a remote /
+/// Honours a caller-supplied `ONEBRAIN_TOKEN` env var (≥ 32 chars) so a remote /
 /// tunnel deploy can PIN a stable token across restarts — the `?token=` URL then
 /// stays valid and bookmarkable, which is what makes `app.example.com` usable
 /// without re-reading a fresh token after every restart. The operator is
@@ -30,13 +30,14 @@ pub fn resolve_token() -> String {
 fn resolve_token_from(env: Option<String>) -> String {
     if let Some(raw) = env {
         let t = raw.trim();
-        if t.len() >= 16 {
+        if t.len() >= 32 {
             return t.to_string();
         }
         if !t.is_empty() {
             tracing::warn!(
-                "ONEBRAIN_TOKEN is too short (< 16 chars) — ignoring it and \
-                 generating a fresh random token instead"
+                "ONEBRAIN_TOKEN is too short (< 32 chars) — ignoring it and \
+                 generating a fresh random token instead. Pin a strong value, \
+                 e.g. the output of `openssl rand -hex 16`."
             );
         }
     }
@@ -135,7 +136,7 @@ mod tests {
 
     #[test]
     fn resolve_pins_a_strong_env_token() {
-        let pinned = "my-stable-remote-token-123456";
+        let pinned = "my-stable-remote-pinned-token-0123456789"; // ≥ 32 chars
         assert_eq!(resolve_token_from(Some(pinned.to_string())), pinned);
         // surrounding whitespace is trimmed
         assert_eq!(resolve_token_from(Some(format!("  {pinned}  "))), pinned);
@@ -145,11 +146,14 @@ mod tests {
     fn resolve_falls_back_when_env_absent_or_too_short() {
         // unset → fresh 32-hex token
         assert_eq!(resolve_token_from(None).len(), 32);
-        // too short (< 16) → ignored, fresh token instead (not the short value)
+        // too short (< 32) → ignored, fresh token instead (not the short value)
         let short = "abc";
         let got = resolve_token_from(Some(short.to_string()));
         assert_ne!(got, short);
         assert_eq!(got.len(), 32);
+        // a 20-char token (honoured under the old 16-char floor) is now rejected
+        let medium = "0123456789abcdef0123"; // 20 chars
+        assert_ne!(resolve_token_from(Some(medium.to_string())), medium);
         // empty → fresh token
         assert_eq!(resolve_token_from(Some(String::new())).len(), 32);
     }
