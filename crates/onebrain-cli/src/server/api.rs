@@ -508,6 +508,16 @@ fn content_type_for(path: &str) -> &'static str {
         "bmp" => "image/bmp",
         "ico" => "image/x-icon",
         "pdf" => "application/pdf",
+        // audio / video — played by the web UI's native <audio>/<video> element
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "ogv" => "video/ogg",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" | "aac" => "audio/mp4",
+        "oga" | "ogg" => "audio/ogg",
+        "flac" => "audio/flac",
         _ => "application/octet-stream",
     }
 }
@@ -547,6 +557,7 @@ fn content_disposition_attachment(path: &str) -> String {
 /// download button.
 async fn get_vault_raw(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Query(q): Query<FileQuery>,
 ) -> Result<Response, ApiError> {
     let root = require_vault_root(&state)?.to_path_buf();
@@ -564,18 +575,75 @@ async fn get_vault_raw(
             tracing::warn!(error = %e, "raw read task failed");
             ApiError::Internal("could not read file".to_string())
         })??;
+    let total = bytes.len() as u64;
+    use axum::http::header::{ACCEPT_RANGES, CONTENT_RANGE, CONTENT_TYPE, RANGE};
+    let ct = axum::http::HeaderValue::from_static(ctype);
+
+    // Honour a Range request for inline media — audio/video seeking, and Safari,
+    // which refuses to play a 200 full-body. Never for an explicit download.
+    if disposition.is_none() {
+        if let Some((start, end)) = headers
+            .get(RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|r| parse_byte_range(r, total))
+        {
+            let slice = bytes[start as usize..=end as usize].to_vec();
+            let mut resp = Response::new(axum::body::Body::from(slice));
+            *resp.status_mut() = axum::http::StatusCode::PARTIAL_CONTENT;
+            let h = resp.headers_mut();
+            h.insert(CONTENT_TYPE, ct);
+            h.insert(ACCEPT_RANGES, axum::http::HeaderValue::from_static("bytes"));
+            if let Ok(v) =
+                axum::http::HeaderValue::from_str(&format!("bytes {start}-{end}/{total}"))
+            {
+                h.insert(CONTENT_RANGE, v);
+            }
+            return Ok(resp);
+        }
+    }
+
     let mut resp = Response::new(axum::body::Body::from(bytes));
-    resp.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static(ctype),
-    );
+    let h = resp.headers_mut();
+    h.insert(CONTENT_TYPE, ct);
+    // advertise range support so the browser knows it can seek media
+    h.insert(ACCEPT_RANGES, axum::http::HeaderValue::from_static("bytes"));
     if let Some(cd) = disposition {
         if let Ok(v) = axum::http::HeaderValue::from_str(&cd) {
-            resp.headers_mut()
-                .insert(axum::http::header::CONTENT_DISPOSITION, v);
+            h.insert(axum::http::header::CONTENT_DISPOSITION, v);
         }
     }
     Ok(resp)
+}
+
+/// Parse a single-range `Range: bytes=start-end` header into inclusive `[start, end]`
+/// byte offsets clamped to `total`. Returns `None` for malformed, multi-range, or
+/// unsatisfiable requests — the caller then serves the full `200` body.
+fn parse_byte_range(header: &str, total: u64) -> Option<(u64, u64)> {
+    if total == 0 {
+        return None;
+    }
+    let spec = header.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None; // multi-range not supported
+    }
+    let (s, e) = spec.split_once('-')?;
+    let (start, end) = match (s.trim(), e.trim()) {
+        ("", "") => return None,
+        ("", suffix) => {
+            // `bytes=-N` → final N bytes
+            let n: u64 = suffix.parse().ok()?;
+            if n == 0 {
+                return None;
+            }
+            (total.saturating_sub(n), total - 1)
+        }
+        (start, "") => (start.parse().ok()?, total - 1),
+        (start, end) => (start.parse().ok()?, end.parse::<u64>().ok()?.min(total - 1)),
+    };
+    if start > end || start >= total {
+        return None;
+    }
+    Some((start, end))
 }
 
 /// Validate → stat (size cap) → read raw bytes. Runs under `spawn_blocking`.
@@ -1251,5 +1319,19 @@ mod tests {
         assert!(th.ends_with(".pdf"), "{th}");
         // Trailing-slash / empty basename falls back to a safe name.
         assert!(content_disposition_attachment("a/b/").contains("download"));
+    }
+
+    #[test]
+    fn parse_byte_range_handles_common_forms() {
+        assert_eq!(parse_byte_range("bytes=0-99", 1000), Some((0, 99)));
+        assert_eq!(parse_byte_range("bytes=100-", 1000), Some((100, 999)));
+        assert_eq!(parse_byte_range("bytes=-200", 1000), Some((800, 999)));
+        assert_eq!(parse_byte_range("bytes=0-99999", 1000), Some((0, 999))); // end clamped
+                                                                             // malformed / unsatisfiable → None (caller serves the full 200 body)
+        assert_eq!(parse_byte_range("bytes=abc", 1000), None);
+        assert_eq!(parse_byte_range("bytes=500-100", 1000), None); // start > end
+        assert_eq!(parse_byte_range("bytes=2000-3000", 1000), None); // start >= total
+        assert_eq!(parse_byte_range("bytes=0-1,2-3", 1000), None); // multi-range
+        assert_eq!(parse_byte_range("bytes=0-99", 0), None); // empty file
     }
 }

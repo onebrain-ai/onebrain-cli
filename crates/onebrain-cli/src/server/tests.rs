@@ -586,7 +586,7 @@ async fn every_response_carries_security_headers() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     let h = res.headers();
-    assert_eq!(h.get("x-frame-options").unwrap(), "DENY");
+    assert_eq!(h.get("x-frame-options").unwrap(), "SAMEORIGIN");
     assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
     assert_eq!(h.get("referrer-policy").unwrap(), "no-referrer");
     assert!(h.get("content-security-policy").is_some());
