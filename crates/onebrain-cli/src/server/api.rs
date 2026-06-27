@@ -549,7 +549,11 @@ fn content_disposition_attachment(path: &str) -> String {
     // fallback nor the percent-encoded `filename*` can carry a %0D/%0A that a
     // lenient downstream proxy might decode into a header break.
     let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
-    let name = if cleaned.is_empty() { "download" } else { cleaned.as_str() };
+    let name = if cleaned.is_empty() {
+        "download"
+    } else {
+        cleaned.as_str()
+    };
     let ascii: String = name
         .chars()
         .map(|c| {
@@ -1367,7 +1371,15 @@ mod tests {
 
     #[test]
     fn forces_attachment_for_script_carrying_types() {
-        for p in ["a/b.svg", "x.SVG", "evil.html", "n.htm", "d.xml", "s.xhtml", "z.svgz"] {
+        for p in [
+            "a/b.svg",
+            "x.SVG",
+            "evil.html",
+            "n.htm",
+            "d.xml",
+            "s.xhtml",
+            "z.svgz",
+        ] {
             assert!(forces_attachment(p), "{p} should force an attachment");
         }
         for p in ["photo.png", "clip.mp4", "doc.pdf", "note.md", "data.csv"] {
