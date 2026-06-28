@@ -44,6 +44,14 @@ const TOKEN_PLACEHOLDER: &str = "__ONEBRAIN_TOKEN__";
 #[folder = "webui/"]
 struct WebAssets;
 
+/// Whether this binary was built with a bundled web UI (the `webui/` folder was
+/// populated at build time). With no `--dir`, an embedded build still serves the
+/// full UI via [`serve_from_embedded`] — so `serve`'s startup banner uses this to
+/// report "embedded web UI" instead of the API-only placeholder.
+pub fn has_embedded_ui() -> bool {
+    WebAssets::get("index.html").is_some()
+}
+
 /// The catch-all static handler, wired into the router via `Router::fallback`
 /// so it answers every non-`/api` route. We can't hand a bare `ServeDir` to
 /// `fallback` because we need to intercept `index.html` for token injection;

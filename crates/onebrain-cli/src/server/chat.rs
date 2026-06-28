@@ -84,6 +84,40 @@ fn valid_model(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// Build claude's argv for one headless turn. claude's CLI is `claude [options]
+/// [prompt]` — the prompt is a POSITIONAL and -p/--print is a boolean — so the
+/// message goes LAST, after a `--` end-of-options terminator. A message starting
+/// with `-`/`--` is then parsed as the prompt, never a smuggled claude flag (the
+/// same anti-flag-smuggling stance as the --resume/--model leading-dash guard).
+/// `session_id`/`model` are expected already-validated + non-empty (or `None`).
+fn build_claude_argv(
+    message: String,
+    vault_str: String,
+    session_id: Option<&str>,
+    model: Option<&str>,
+) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
+        "-p".into(),
+        "--add-dir".into(),
+        vault_str,
+        "--output-format".into(),
+        "stream-json".into(),
+        "--verbose".into(),
+    ];
+    if let Some(sid) = session_id {
+        argv.push("--resume".into());
+        argv.push(sid.to_string());
+    }
+    if let Some(m) = model {
+        argv.push("--model".into());
+        argv.push(m.to_string());
+    }
+    // End-of-options terminator — everything after is the positional prompt.
+    argv.push("--".into());
+    argv.push(message);
+    argv
+}
+
 /// Run one chat turn and stream the agent's reply as SSE.
 pub(crate) async fn post_chat(
     State(state): State<Arc<AppState>>,
@@ -135,23 +169,12 @@ pub(crate) async fn post_chat(
     .path;
 
     let vault_str = vault.to_string_lossy().to_string();
-    let mut argv: Vec<String> = vec![
-        "-p".into(),
+    let argv = build_claude_argv(
         message,
-        "--add-dir".into(),
         vault_str,
-        "--output-format".into(),
-        "stream-json".into(),
-        "--verbose".into(),
-    ];
-    if let Some(sid) = req.session_id.as_ref().filter(|s| !s.is_empty()) {
-        argv.push("--resume".into());
-        argv.push(sid.clone());
-    }
-    if let Some(m) = req.model.as_ref().filter(|s| !s.is_empty()) {
-        argv.push("--model".into());
-        argv.push(m.clone());
-    }
+        req.session_id.as_deref().filter(|s| !s.is_empty()),
+        req.model.as_deref().filter(|s| !s.is_empty()),
+    );
 
     let mut cmd = Command::new(&bin);
     cmd.args(&argv)
@@ -364,6 +387,42 @@ mod tests {
     #[test]
     fn session_id_accepts_a_real_uuid() {
         assert!(valid_session_id("312cc1ad-1583-4d3c-b648-c696a540cd5c"));
+    }
+
+    #[test]
+    fn argv_puts_a_dash_leading_message_after_the_terminator() {
+        // Flag-smuggling case: a message shaped like a claude flag must land as the
+        // positional prompt (last arg, after `--`), never be parsed as a flag.
+        let argv = build_claude_argv(
+            "--dangerously-skip-permissions".to_string(),
+            "/vault".to_string(),
+            None,
+            None,
+        );
+        let term = argv
+            .iter()
+            .position(|a| a == "--")
+            .expect("has -- terminator");
+        assert_eq!(argv.last().unwrap(), "--dangerously-skip-permissions");
+        assert_eq!(
+            term,
+            argv.len() - 2,
+            "message must be the only arg after --"
+        );
+    }
+
+    #[test]
+    fn argv_keeps_resume_and_model_before_the_terminator() {
+        let argv = build_claude_argv(
+            "hi".into(),
+            "/v".into(),
+            Some("abc-123"),
+            Some("claude-opus-4-8"),
+        );
+        let term = argv.iter().position(|a| a == "--").unwrap();
+        assert!(argv.iter().position(|a| a == "--resume").unwrap() < term);
+        assert!(argv.iter().position(|a| a == "--model").unwrap() < term);
+        assert_eq!(argv.last().unwrap(), "hi");
     }
 
     #[test]

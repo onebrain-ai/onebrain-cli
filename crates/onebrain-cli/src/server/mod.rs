@@ -41,6 +41,7 @@ mod token;
 #[cfg(test)]
 mod tests;
 
+pub use r#static::has_embedded_ui;
 pub use token::resolve_token;
 
 use anyhow::Context;

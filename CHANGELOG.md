@@ -1,6 +1,6 @@
 ---
-latest_version: 3.3.10
-released: 2026-06-27
+latest_version: 3.3.11
+released: 2026-06-28
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,12 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.11] — 2026-06-28 — serve: embedded-UI banner + API hardening
+
+- fix(serve): the startup banner reports `dist: (embedded web UI)` when the binary ships a bundled UI — previously it printed `(none — API only, placeholder page)` for any no-`--dir` run, wrongly implying the embedded web UI wasn't being served.
+- fix(serve): OWASP A03 — read endpoints `GET /api/vault/file` and `/api/vault/raw` now refuse vault tooling dirs (`.git`/`.obsidian`/`.claude`/`.trash`/`node_modules`), matching the write paths; previously a direct path read could pull tree-hidden files that may hold secrets (e.g. `.claude/settings.local.json`).
+- fix(serve): OWASP A03 — the `claude` chat subprocess argv ends options with `--` before the message, so a chat message starting with `-`/`--` is the positional prompt, never a smuggled claude flag (extends the leading-dash guard already on `--resume`/`--model`).
 
 ## [3.3.10] — 2026-06-27 — serve: qmd-backed vault search
 
