@@ -66,6 +66,7 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
     println!("  vault: {}", resolved.root.as_path().display());
     match &cfg.dist_dir {
         Some(d) => println!("  dist:  {}", d.display()),
+        None if server::has_embedded_ui() => println!("  dist:  (embedded web UI)"),
         None => println!("  dist:  (none — API only, placeholder page)"),
     }
     println!("  press Ctrl-C to stop");

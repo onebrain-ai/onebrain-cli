@@ -163,7 +163,7 @@ fn reject_tooling_path(rel: &str) -> Result<(), ApiError> {
             if let Some(s) = name.to_str() {
                 if TOOLING_DIRS.iter().any(|t| t.eq_ignore_ascii_case(s)) {
                     return Err(ApiError::BadRequest(format!(
-                        "cannot write to a tooling directory: {s}"
+                        "cannot access a tooling directory: {s}"
                     )));
                 }
             }
@@ -403,6 +403,10 @@ async fn get_vault_file(
 ) -> Result<Response, ApiError> {
     let root = require_vault_root(&state)?.to_path_buf();
     let requested = q.path;
+    // Read confinement mirrors the write paths: tooling dirs (.git/.obsidian/
+    // .claude/…) are hidden from the tree and can hold secrets (e.g.
+    // .claude/settings.local.json), so a direct path read must not bypass that.
+    reject_tooling_path(&requested)?;
 
     let response = tokio::task::spawn_blocking(move || read_vault_file(&root, &requested))
         .await
@@ -589,6 +593,10 @@ async fn get_vault_raw(
 ) -> Result<Response, ApiError> {
     let root = require_vault_root(&state)?.to_path_buf();
     let requested = q.path;
+    // Read confinement mirrors the write paths: tooling dirs (.git/.obsidian/
+    // .claude/…) are hidden from the tree and can hold secrets, so refuse them
+    // here too — a direct raw read must not bypass the tree's hiding.
+    reject_tooling_path(&requested)?;
     // Types a browser would render-and-script on navigation (SVG/HTML/XML) are
     // served as octet-stream AND as an attachment — defence in depth (Content-Type
     // + nosniff + disposition), so an attacker-authored vault file can never run in

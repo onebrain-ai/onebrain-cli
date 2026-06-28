@@ -162,6 +162,24 @@ async fn vault_file_missing_is_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn read_endpoints_reject_tooling_dir_paths() {
+    // Tooling dirs are hidden from the tree + can hold secrets (e.g.
+    // .claude/settings.local.json); reads must refuse them like writes do, so a
+    // direct path read can't bypass the tree's hiding.
+    let (_dir, router) = vault_router(None);
+    for path in [
+        ".claude/settings.local.json",
+        ".git/config",
+        ".obsidian/app.json",
+    ] {
+        let (s, b) = get_authed(&router, &format!("/api/vault/file?path={path}")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "file {path}: {b}");
+        let (s2, b2) = get_authed(&router, &format!("/api/vault/raw?path={path}")).await;
+        assert_eq!(s2, StatusCode::BAD_REQUEST, "raw {path}: {b2}");
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // POST /api/vault/file
 // ─────────────────────────────────────────────────────────────────────────
