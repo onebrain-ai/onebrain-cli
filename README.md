@@ -3,8 +3,8 @@
      404 this image. Bump the SHA when refreshing the brand assets. -->
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/onebrain-ai/onebrain/bc55d8f6edb5eb57992a964e30a45d8926b62f5b/assets/header-dark.png">
-    <img alt="OneBrain — Your AI Thinking Partner" src="https://raw.githubusercontent.com/onebrain-ai/onebrain/bc55d8f6edb5eb57992a964e30a45d8926b62f5b/assets/header-light.png" width="640">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/onebrain-ai/onebrain/c391f40e1881e4a07586a564efd1db40d3920b26/assets/header-dark.png">
+    <img alt="OneBrain — Your AI Thinking Partner" src="https://raw.githubusercontent.com/onebrain-ai/onebrain/c391f40e1881e4a07586a564efd1db40d3920b26/assets/header-light.png" width="640">
   </picture>
 </p>
 
