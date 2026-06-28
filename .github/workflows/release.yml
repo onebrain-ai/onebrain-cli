@@ -180,6 +180,12 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
+          # Only the per-platform binary artifacts (onebrain-<target>) become
+          # release assets. WITHOUT this pattern, merge-multiple also pulls in the
+          # `webui-dist` artifact (built for the embed step), flattening its
+          # index.html + assets/ dir into artifacts/ — and `gh release ... artifacts/*`
+          # then chokes on the directory ("read artifacts/assets: is a directory").
+          pattern: onebrain-*
           path: artifacts
           merge-multiple: true
 
