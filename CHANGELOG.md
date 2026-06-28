@@ -1,5 +1,5 @@
 ---
-latest_version: 3.3.9
+latest_version: 3.3.10
 released: 2026-06-27
 ---
 
@@ -9,6 +9,11 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.10] — 2026-06-27 — serve: qmd-backed vault search
+
+- feat(serve): new `GET /api/vault/search?q=&mode=lex|hybrid` for the web UI's search panel — shells out to the `qmd` index: `lex` = BM25 keyword (fast, no LLM), `hybrid` = keyword + semantic vector (one query embedding, local rerank). Returns ranked `{hits, mode}` with qmd's `qmd://<collection>/…` URIs mapped to vault-relative paths (other-collection hits dropped). Read-only; the query is a single argv (no shell injection); 30s timeout with child reaping; cached binary path.
+- fix(serve): the endpoint returns 503 when `qmd_collection` is absent or the `qmd` binary is missing, so the web UI falls back to its own filename/path search instead of running qmd unscoped.
 
 ## [3.3.9] — 2026-06-27 — serve: web UI preview support (framing, media)
 

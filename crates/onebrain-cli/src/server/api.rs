@@ -67,6 +67,8 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         // v3.3 — scan vault notes for Obsidian-Tasks lines (real Tasks panel).
         .route("/vault/tasks", get(get_vault_tasks))
+        // Vault search backed by the qmd index (BM25 lex + hybrid lex/vec).
+        .route("/vault/search", get(super::search::get_vault_search))
         // v3.3 chat — SSE stream over a `claude -p` agent turn. Inherits the auth
         // middleware + body limit applied to this whole sub-router.
         .route("/chat", post(super::chat::post_chat))
@@ -173,7 +175,7 @@ fn reject_tooling_path(rel: &str) -> Result<(), ApiError> {
 /// Pull the bound vault root out of the shared state, or return 503 when no
 /// vault is bound. Centralises the guard the three vault handlers share so the
 /// "never serve `/` as a fallback vault" rule lives in exactly one place.
-fn require_vault_root(state: &AppState) -> Result<&Path, ApiError> {
+pub(crate) fn require_vault_root(state: &AppState) -> Result<&Path, ApiError> {
     state.vault_root.as_deref().ok_or_else(|| {
         ApiError::ServiceUnavailable(
             "no vault bound — set ONEBRAIN_VAULT to a OneBrain vault".to_string(),
