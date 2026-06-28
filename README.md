@@ -50,7 +50,7 @@ Point an AI agent at a vault and it improvises — a different pile of `grep` / 
 
 ## Status
 
-**v3.2.0 — stable & production-ready, in active maintenance.** GA since v3.0.0 (2026-05-22), shipping ~weekly themed minors. Version history + direction in the [Roadmap](#roadmap); full detail in [CHANGELOG.md](CHANGELOG.md).
+**v3.3.x — stable & production-ready, in active maintenance.** GA since v3.0.0 (2026-05-22), shipping ~weekly themed minors. The v3.3 line landed the daemon foundation — `onebrain serve` hosts a local web UI (embedded in the binary) over a token-gated vault JSON API. Version history + direction in the [Roadmap](#roadmap); full detail in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quickstart
 
@@ -62,7 +62,7 @@ brew install onebrain-ai/onebrain/onebrain
 
 # 2. Verify
 onebrain --version
-# → onebrain 3.2.17
+# → onebrain 3.3.11
 
 # 3. Scaffold a vault and let init pull the OneBrain plugin
 mkdir my-vault && cd my-vault
@@ -144,13 +144,14 @@ Requires a recent stable Rust toolchain (`rustup default stable`). The only `uns
 
 ## Command surface
 
-v3.1 locks a singular-noun, two-level grammar — `onebrain <noun> <verb>` — so every command path is predictable. Three root verbs handle the common flow; eight resource groups cluster the rest.
+v3.1 locks a singular-noun, two-level grammar — `onebrain <noun> <verb>` — so every command path is predictable. Four root verbs handle the common flow; eight resource groups cluster the rest.
 
 ```text
 onebrain
 ├── init                       create / re-scaffold a vault (--yes · --force · --no-sync)
 ├── update                     self-update the binary (--check · --plan)
 ├── doctor [--fix]             9 health checks + auto-repair recipes
+├── serve                      local web UI + vault JSON API (--port · --host · --open)
 │
 ├── vault       sync · current
 ├── session     init
@@ -167,10 +168,26 @@ onebrain
 | **Setup** | `init`, `plugin install`, `vault sync` | Scaffold `onebrain.yml` + PARA folders, register the plugin with the harness, overlay the latest plugin tarball. |
 | **Runtime** (hook protocol) | `session init`, `checkpoint stop · reset · orphans`, `qmd reindex` | Called by the harness `SessionStart` / `Stop` / `PostToolUse` hooks. Emit hard-wired JSON; banner suppressed for clean machine stdio. |
 | **Search** | `qmd reindex · embed · status` | Rebuild the qmd index, re-embed documents, report index + embedding health. |
+| **Web UI** | `serve` | Host the binary-embedded web UI + token-gated vault JSON API on `127.0.0.1:6789` — file explorer, reading view, qmd search, agent chat; `--open` launches the browser. |
 | **Maintenance** | `doctor [--fix]`, `plugin update · migrate`, `schedule register` | Nine read-only checks + `--fix` recipes, self-update the binary + rewrite hooks + rebind launchd plists, compile the `onebrain.yml schedule:` block into OS scheduler artifacts. |
 | **Diagnostics** | `vault current`, `harness detect` | Report which mechanism resolved the active vault, and which AI harness is running. |
 
 > The tree shape is **locked for v3.2+** — 200+ verbs beyond the working set above are stubbed with a stable `E_NOT_IMPLEMENTED` (exit 72) so the grammar can't drift while features land. Hidden v3.0 flat aliases (`session-init`, `qmd-reindex`, `register-hooks`, …) still dispatch, printing a one-time migration notice (silence with `ONEBRAIN_QUIET_MIGRATION=1`); they're removed no earlier than v4.
+
+## Local web UI
+
+`onebrain serve` starts a local, token-gated HTTP server that hosts the **OneBrain web UI** — a file explorer, a reading view (markdown, code, PDF, Office docs, images, audio/video, Jupyter notebooks), a qmd-backed search panel, and an agent chat — over a small vault JSON API.
+
+```bash
+onebrain serve          # → http://127.0.0.1:6789/?token=<TOKEN>   (Ctrl-C to stop)
+onebrain serve --open   # …and open it in your browser
+```
+
+The web UI is **embedded in the binary** — a release `onebrain` ships the latest build and `serve` mounts it at `/`, so there's nothing extra to install. Pass `--dir <dist>` only to override the bundle (web UI development against a live daemon).
+
+- **Token-gated** — every request (and the SPA shell itself) needs the per-session token printed in the URL, sent as the `X-OneBrain-Token` header, a `?token=` query param, or an `HttpOnly` cookie.
+- **Loopback by default** (`127.0.0.1:6789`). `--host 0.0.0.0` self-hosts remotely but serves plain HTTP — put a TLS tunnel/proxy (Cloudflare Tunnel, Tailscale Serve, Caddy) in front; `serve` warns loudly when you bind beyond loopback.
+- **Hardened surface** — confined to the vault (tooling dirs like `.git`/`.claude` are refused), script-carrying files forced to download, a strict CSP, and the agent subprocess never inherits the daemon token. See [Security & trust model](#security--trust-model).
 
 ## Output modes
 
@@ -245,7 +262,7 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
 
 ### 🚧 Phase 1 · perceptual speed + skill alignment (v3.2–v3.7)
 - [x] **v3.2** — `note` resource group (11 verbs) · grouped `doctor` UX with braille spinner + one-pass `--fix` · animated `onebrain update` · `skill run --harness {claude,gemini}` + `--model <m>` + headless startup-skip handshake + in-place spinner · `harness run [PROMPT] --mode {with-context,ad-hoc}` for ad-hoc prompts through claude / gemini (reads stdin when omitted) · auto-checkpoint hook fix (`CLAUDE_CODE_SESSION_ID` top-priority token + anchored `last_ts` so the time threshold actually fires) · `--vault` accepted everywhere.
-- [ ] **v3.3** — Daemon foundation: `onebrain daemon start/stop/status` + structured logging.
+- [x] **v3.3** — Daemon foundation: `onebrain serve` — a local **web UI embedded in the binary** over a token-gated vault JSON API (file explorer · reading view · qmd-backed search · agent chat), on a security-hardened surface (whole-surface token gate · vault path confinement · CSP + forced-attachment · agent env isolation).
 - [ ] **v3.4** — RPC layer: stdio JSON-RPC 2.0 over a Unix socket with auto-spawn.
 - [ ] **v3.5** — Skill-speed rewrites (`/daily`, `/wrapup`) + `checkpoint recover`.
 - [ ] **v3.6** — Capture pipeline (`/capture`, `/bookmark`, `/braindump`).
