@@ -1050,8 +1050,9 @@ pub enum ScheduleVerb {
 /// lifecycle lives under `onebrain daemon` instead.
 #[derive(Args, Debug)]
 pub struct ServeArgs {
-    /// Static web dist to serve as an SPA. Omit to run API-only (a placeholder
-    /// page is served at `/`).
+    /// Static web dist to serve as an SPA — overrides the web UI embedded in the
+    /// binary (for web-UI development). Omit to serve the embedded UI, or a
+    /// placeholder page if this binary was built without one.
     #[arg(long, value_name = "PATH")]
     pub dir: Option<PathBuf>,
     /// Bind port (default 6789).

@@ -1,5 +1,5 @@
 ---
-latest_version: 3.3.11
+latest_version: 3.3.12
 released: 2026-06-28
 ---
 
@@ -9,6 +9,10 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.12] — 2026-06-28 — serve: --dir help matches the embedded UI
+
+- docs(serve): the `serve --help` `--dir` text + the `ServeConfig.dist_dir` doc said "Omit to run API-only (a placeholder page is served)" — stale since the web UI was embedded in the binary (v3.3.10). They now read "Omit to serve the embedded UI" (override with `--dir` for web-UI dev), matching the v3.3.11 startup-banner fix.
 
 ## [3.3.11] — 2026-06-28 — serve: embedded-UI banner + API hardening
 

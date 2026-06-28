@@ -57,8 +57,9 @@ use std::sync::Arc;
 /// so this struct is consumed once at build time.
 #[derive(Debug, Clone)]
 pub struct ServeConfig {
-    /// Static web dist to serve as an SPA. `None` → serve a built-in
-    /// placeholder `index.html` so the API is still reachable for testing.
+    /// Static web dist to serve as an SPA, overriding the embedded web UI.
+    /// `None` → serve the binary-embedded UI (or a built-in placeholder page if
+    /// this binary was built without one).
     pub dist_dir: Option<PathBuf>,
     /// The vault the JSON API reads from, or `None` when no real vault is bound.
     /// All `/api/vault/*` paths resolve relative to (and are confined within)
