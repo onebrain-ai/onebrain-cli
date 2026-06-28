@@ -62,7 +62,7 @@ brew install onebrain-ai/onebrain/onebrain
 
 # 2. Verify
 onebrain --version
-# → onebrain 3.3.11
+# → onebrain 3.3.12
 
 # 3. Scaffold a vault and let init pull the OneBrain plugin
 mkdir my-vault && cd my-vault
