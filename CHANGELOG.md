@@ -1,6 +1,6 @@
 ---
-latest_version: 3.3.12
-released: 2026-06-28
+latest_version: 3.3.13
+released: 2026-06-29
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,11 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.13] — 2026-06-29 — fence-aware task scan + task list verb
+
+- fix(fs): `scan_tasks` now skips checkbox lines inside `` ` `` `` ` `` `` ` `` / `~~~` fenced code blocks — demo/fixture tasks in plan & spec docs no longer pollute task scans (also fixes the daemon `/api/vault/tasks` endpoint)
+- feat(cli): implement `onebrain task list` — fence-aware dated-task listing with `--due-by <today|YYYY-MM-DD>`, repeatable `--folder`, and `--all`; JSON envelope `task.list`
 
 ## [3.3.12] — 2026-06-28 — serve: --dir help matches the embedded UI
 
