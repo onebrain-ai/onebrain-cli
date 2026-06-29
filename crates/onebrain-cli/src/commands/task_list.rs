@@ -183,4 +183,28 @@ mod tests {
         let env = Envelope::ok("task.list", None, TaskListData { tasks: vec![], total: 0 });
         assert_eq!(render_text(&env), "No tasks.");
     }
+
+    #[test]
+    fn render_text_done_task_uses_x_marker() {
+        let env = Envelope::ok(
+            "task.list",
+            None,
+            TaskListData { tasks: vec![hit("01-projects/p.md", "2026-06-29", true)], total: 1 },
+        );
+        let s = render_text(&env);
+        assert!(s.contains("- [x] t 📅 2026-06-29 (01-projects/p.md)"));
+    }
+
+    #[test]
+    fn filters_cutoff_drops_task_with_no_due_date() {
+        let no_due = TaskHit {
+            file: "01-projects/p.md".into(),
+            line: 1,
+            text: "t".into(),
+            done: false,
+            due: None,
+        };
+        let out = apply_filters(vec![no_due], false, Some("2026-06-29"));
+        assert!(out.is_empty(), "task with no due date should be dropped when cutoff is set");
+    }
 }
