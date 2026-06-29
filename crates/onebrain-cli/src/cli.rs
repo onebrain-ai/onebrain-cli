@@ -1666,11 +1666,20 @@ mod tests {
     #[test]
     fn task_list_parses_filters() {
         let cli = Cli::try_parse_from([
-            "onebrain", "task", "list", "--due-by", "today", "--folder", "01-projects", "--all",
+            "onebrain",
+            "task",
+            "list",
+            "--due-by",
+            "today",
+            "--folder",
+            "01-projects",
+            "--all",
         ])
         .unwrap();
         match cli.command {
-            Cmd::Task(TaskCmd { verb: TaskVerb::List(args) }) => {
+            Cmd::Task(TaskCmd {
+                verb: TaskVerb::List(args),
+            }) => {
                 assert_eq!(args.due_by.as_deref(), Some("today"));
                 assert_eq!(args.folder, vec!["01-projects".to_string()]);
                 assert!(args.all);

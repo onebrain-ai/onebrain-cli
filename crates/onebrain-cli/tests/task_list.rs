@@ -24,10 +24,22 @@ fn task_list_json_excludes_fenced_and_respects_due_by() {
     );
 
     let out = Command::new(env!("CARGO_BIN_EXE_onebrain"))
-        .args(["--vault", root.to_str().unwrap(), "--json", "task", "list", "--due-by", "2026-06-29"])
+        .args([
+            "--vault",
+            root.to_str().unwrap(),
+            "--json",
+            "task",
+            "list",
+            "--due-by",
+            "2026-06-29",
+        ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let tasks = v["data"]["tasks"].as_array().unwrap();

@@ -35,7 +35,11 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &TaskListArgs) 
     let hits = apply_filters(hits, args.all, cutoff.as_deref());
 
     let total = hits.len();
-    let envelope = Envelope::ok("task.list", Some(vault_info), TaskListData { tasks: hits, total });
+    let envelope = Envelope::ok(
+        "task.list",
+        Some(vault_info),
+        TaskListData { tasks: hits, total },
+    );
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
 }
@@ -60,7 +64,10 @@ fn resolve_due_by(raw: &str) -> Result<String> {
     }
     let b = raw.as_bytes();
     ensure!(
-        raw.len() == 10 && b[4] == b'-' && b[7] == b'-' && raw.bytes().filter(|c| *c == b'-').count() == 2,
+        raw.len() == 10
+            && b[4] == b'-'
+            && b[7] == b'-'
+            && raw.bytes().filter(|c| *c == b'-').count() == 2,
         "invalid --due-by date: expected YYYY-MM-DD or `today`, got `{raw}`"
     );
     Ok(raw.to_string())
@@ -171,7 +178,10 @@ mod tests {
         let env = Envelope::ok(
             "task.list",
             None,
-            TaskListData { tasks: vec![hit("01-projects/p.md", "2026-06-29", false)], total: 1 },
+            TaskListData {
+                tasks: vec![hit("01-projects/p.md", "2026-06-29", false)],
+                total: 1,
+            },
         );
         let s = render_text(&env);
         assert!(s.contains("- [ ] t 📅 2026-06-29 (01-projects/p.md)"));
@@ -180,7 +190,14 @@ mod tests {
 
     #[test]
     fn render_text_handles_empty() {
-        let env = Envelope::ok("task.list", None, TaskListData { tasks: vec![], total: 0 });
+        let env = Envelope::ok(
+            "task.list",
+            None,
+            TaskListData {
+                tasks: vec![],
+                total: 0,
+            },
+        );
         assert_eq!(render_text(&env), "No tasks.");
     }
 
@@ -189,7 +206,10 @@ mod tests {
         let env = Envelope::ok(
             "task.list",
             None,
-            TaskListData { tasks: vec![hit("01-projects/p.md", "2026-06-29", true)], total: 1 },
+            TaskListData {
+                tasks: vec![hit("01-projects/p.md", "2026-06-29", true)],
+                total: 1,
+            },
         );
         let s = render_text(&env);
         assert!(s.contains("- [x] t 📅 2026-06-29 (01-projects/p.md)"));
@@ -200,7 +220,7 @@ mod tests {
         let hits = vec![
             hit("01-projects/TASKS.md", "2026-06-01", false), // dropped: nested dashboard
             hit("TASKS.md", "2026-06-01", false),             // dropped: root dashboard
-            hit("01-projects/p.md", "2026-06-01", false),    // kept
+            hit("01-projects/p.md", "2026-06-01", false),     // kept
         ];
         let out = apply_filters(hits, false, None);
         assert_eq!(out.len(), 1);
@@ -219,10 +239,16 @@ mod tests {
         let env = Envelope::ok(
             "task.list",
             None,
-            TaskListData { tasks: vec![no_due], total: 1 },
+            TaskListData {
+                tasks: vec![no_due],
+                total: 1,
+            },
         );
         let s = render_text(&env);
-        assert!(s.contains("- [ ] no date task 📅  (01-projects/p.md)"), "got: {s}");
+        assert!(
+            s.contains("- [ ] no date task 📅  (01-projects/p.md)"),
+            "got: {s}"
+        );
     }
 
     #[test]
@@ -235,6 +261,9 @@ mod tests {
             due: None,
         };
         let out = apply_filters(vec![no_due], false, Some("2026-06-29"));
-        assert!(out.is_empty(), "task with no due date should be dropped when cutoff is set");
+        assert!(
+            out.is_empty(),
+            "task with no due date should be dropped when cutoff is set"
+        );
     }
 }
