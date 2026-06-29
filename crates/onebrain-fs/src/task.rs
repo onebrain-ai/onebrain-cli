@@ -54,6 +54,57 @@ impl Default for TaskScanOptions {
     }
 }
 
+/// If `trimmed` (already left-trimmed) is a fenced-code-block marker, return
+/// `(fence_char, run_length, has_info_string)`. A marker is 3+ backticks or
+/// 3+ tildes. Frontmatter / thematic-break `---` is not a fence.
+fn fence_marker(trimmed: &str) -> Option<(char, usize, bool)> {
+    let ch = trimmed.chars().next()?;
+    if ch != '`' && ch != '~' {
+        return None;
+    }
+    // `ch` is ASCII (1 byte), so the run length in chars == byte length of the
+    // prefix; slicing at `run` below is a valid UTF-8 boundary.
+    let run = trimmed.chars().take_while(|&c| c == ch).count();
+    if run < 3 {
+        return None;
+    }
+    let has_info = !trimmed[run..].trim().is_empty();
+    Some((ch, run, has_info))
+}
+
+/// Tracks open fenced-code-block state across one file's lines.
+#[derive(Default)]
+struct FenceState {
+    /// `Some((fence_char, opening_run_len))` while inside a fence.
+    open: Option<(char, usize)>,
+}
+
+impl FenceState {
+    /// Feed the next line; returns true if the line is part of a code block
+    /// (the fence delimiters themselves included) and must be ignored for
+    /// task scanning.
+    fn in_code(&mut self, line: &str) -> bool {
+        let marker = fence_marker(line.trim_start());
+        match (self.open, marker) {
+            // Inside a fence: close only on a same-char run >= opener with no
+            // info string (a CommonMark closing fence carries no info string).
+            (Some((open_ch, open_len)), Some((ch, len, has_info))) => {
+                if ch == open_ch && len >= open_len && !has_info {
+                    self.open = None;
+                }
+                true
+            }
+            (Some(_), None) => true,
+            // Outside a fence: an opening marker starts one.
+            (None, Some((ch, len, _))) => {
+                self.open = Some((ch, len));
+                true
+            }
+            (None, None) => false,
+        }
+    }
+}
+
 static TASK_RE: OnceLock<Regex> = OnceLock::new();
 static DUE_RE: OnceLock<Regex> = OnceLock::new();
 
@@ -104,9 +155,15 @@ pub fn scan_tasks(vault_root: &Path, opts: &TaskScanOptions) -> Vec<TaskHit> {
             Ok(c) => c,
             Err(_) => continue,
         };
+        let mut fence = FenceState::default();
         for (i, line) in content.lines().enumerate() {
             if tasks.len() >= opts.max {
                 break;
+            }
+            // Checkbox lines inside ``` / ~~~ fences are documentation, not
+            // calendar todos — skip them (fixes demo-task pollution).
+            if fence.in_code(line) {
+                continue;
             }
             if let Some(caps) = task_re.captures(line) {
                 let text = caps.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
@@ -210,6 +267,93 @@ mod tests {
             },
         );
         assert_eq!(hits.len(), 2, "empty allowlist = scan all");
+    }
+
+    #[test]
+    fn excludes_tasks_inside_fenced_code_blocks() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // A real task, then a fenced block whose task lines must be ignored,
+        // then another real task after the fence closes.
+        write(
+            root,
+            "01-projects/p.md",
+            "- [ ] real one 📅 2026-06-30\n\
+             ```\n\
+             - [ ] fenced demo 📅 2026-05-20\n\
+             - [ ] another fenced 📅 2026-05-22\n\
+             ```\n\
+             - [ ] real two 📅 2026-07-01\n",
+        );
+        let hits = scan_tasks(root, &TaskScanOptions::default());
+        let texts: Vec<&str> = hits.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(hits.len(), 2, "fenced tasks excluded: {texts:?}");
+        assert!(texts.contains(&"real one"));
+        assert!(texts.contains(&"real two"));
+        assert!(!texts.iter().any(|t| t.contains("fenced")));
+    }
+
+    #[test]
+    fn fence_tilde_variant_and_info_string() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "01-projects/p.md",
+            "~~~rust\n- [ ] tilde fenced 📅 2026-05-20\n~~~\n- [ ] after 📅 2026-06-30\n",
+        );
+        let hits = scan_tasks(root, &TaskScanOptions::default());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "after");
+    }
+
+    #[test]
+    fn longer_outer_fence_not_closed_by_shorter_inner() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // 4-backtick opener; an inner 3-backtick line must NOT close it.
+        write(
+            root,
+            "01-projects/p.md",
+            "````\n```\n- [ ] still fenced 📅 2026-05-20\n````\n- [ ] out 📅 2026-06-30\n",
+        );
+        let hits = scan_tasks(root, &TaskScanOptions::default());
+        assert_eq!(hits.len(), 1, "{:?}", hits);
+        assert_eq!(hits[0].text, "out");
+    }
+
+    #[test]
+    fn frontmatter_dashes_do_not_start_a_fence() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "01-projects/p.md",
+            "---\ntags: [x]\n---\n- [ ] after frontmatter 📅 2026-06-30\n",
+        );
+        let hits = scan_tasks(root, &TaskScanOptions::default());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "after frontmatter");
+    }
+
+    #[test]
+    fn fence_marker_classifies_lines() {
+        assert_eq!(fence_marker("```"), Some(('`', 3, false)));
+        assert_eq!(fence_marker("```rust"), Some(('`', 3, true)));
+        assert_eq!(fence_marker("~~~~"), Some(('~', 4, false)));
+        assert_eq!(fence_marker("``"), None, "only 2 backticks");
+        assert_eq!(fence_marker("- [ ] x"), None);
+        assert_eq!(fence_marker("---"), None, "frontmatter dash is not a fence");
+    }
+
+    #[test]
+    fn fence_state_toggles() {
+        let mut f = FenceState::default();
+        assert!(!f.in_code("plain text"));
+        assert!(f.in_code("```"), "opener is in-code");
+        assert!(f.in_code("inside"), "body is in-code");
+        assert!(f.in_code("```"), "closer is in-code");
+        assert!(!f.in_code("plain again"), "closed");
     }
 
     #[test]
