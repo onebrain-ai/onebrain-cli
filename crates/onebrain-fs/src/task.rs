@@ -344,6 +344,7 @@ mod tests {
         assert_eq!(fence_marker("``"), None, "only 2 backticks");
         assert_eq!(fence_marker("- [ ] x"), None);
         assert_eq!(fence_marker("---"), None, "frontmatter dash is not a fence");
+        assert_eq!(fence_marker(""), None, "empty string early return");
     }
 
     #[test]

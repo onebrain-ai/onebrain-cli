@@ -70,7 +70,7 @@ fn resolve_due_by(raw: &str) -> Result<String> {
 /// tasks); drop done unless `--all`; keep only `due <= cutoff` when set.
 fn apply_filters(hits: Vec<TaskHit>, all: bool, cutoff: Option<&str>) -> Vec<TaskHit> {
     hits.into_iter()
-        .filter(|t| t.file != "TASKS.md")
+        .filter(|t| t.file != "TASKS.md" && !t.file.ends_with("/TASKS.md"))
         .filter(|t| all || !t.done)
         .filter(|t| match cutoff {
             Some(c) => t.due.as_deref().is_some_and(|d| d <= c),
@@ -193,6 +193,36 @@ mod tests {
         );
         let s = render_text(&env);
         assert!(s.contains("- [x] t 📅 2026-06-29 (01-projects/p.md)"));
+    }
+
+    #[test]
+    fn filters_drop_nested_tasks_md() {
+        let hits = vec![
+            hit("01-projects/TASKS.md", "2026-06-01", false), // dropped: nested dashboard
+            hit("TASKS.md", "2026-06-01", false),             // dropped: root dashboard
+            hit("01-projects/p.md", "2026-06-01", false),    // kept
+        ];
+        let out = apply_filters(hits, false, None);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].file, "01-projects/p.md");
+    }
+
+    #[test]
+    fn render_text_due_none_emits_empty_date_field() {
+        let no_due = TaskHit {
+            file: "01-projects/p.md".into(),
+            line: 1,
+            text: "no date task".into(),
+            done: false,
+            due: None,
+        };
+        let env = Envelope::ok(
+            "task.list",
+            None,
+            TaskListData { tasks: vec![no_due], total: 1 },
+        );
+        let s = render_text(&env);
+        assert!(s.contains("- [ ] no date task 📅  (01-projects/p.md)"), "got: {s}");
     }
 
     #[test]
