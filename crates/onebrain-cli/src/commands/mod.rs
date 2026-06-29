@@ -31,5 +31,6 @@ pub mod run_skill;
 pub mod serve;
 pub mod session_init;
 pub mod skill_inspect;
+pub mod task_list;
 pub mod update;
 pub mod vault_sync;

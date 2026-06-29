@@ -1200,15 +1200,28 @@ pub struct TaskCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum TaskVerb {
-    /// List tasks (not yet implemented · v3.x roadmap).
+    /// List dated tasks across the vault (fence-aware), filterable by due date.
     #[command(hide = true)]
-    List,
+    List(TaskListArgs),
     /// Add a task (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     Add { content: String },
     /// Mark a task done (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     Done { id: String },
+}
+
+#[derive(Args, Debug)]
+pub struct TaskListArgs {
+    /// Keep only tasks due on or before this date. Accepts `today` or `YYYY-MM-DD`.
+    #[arg(long = "due-by", value_name = "DATE")]
+    pub due_by: Option<String>,
+    /// Folder prefix to scan (repeatable). Default: projects + areas + inbox from config.
+    #[arg(long = "folder", value_name = "PATH")]
+    pub folder: Vec<String>,
+    /// Include done (`- [x]`) tasks. Default returns open tasks only.
+    #[arg(long)]
+    pub all: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1647,6 +1660,31 @@ mod tests {
                 )
             }
             _ => panic!("expected Serve"),
+        }
+    }
+
+    #[test]
+    fn task_list_parses_filters() {
+        let cli = Cli::try_parse_from([
+            "onebrain",
+            "task",
+            "list",
+            "--due-by",
+            "today",
+            "--folder",
+            "01-projects",
+            "--all",
+        ])
+        .unwrap();
+        match cli.command {
+            Cmd::Task(TaskCmd {
+                verb: TaskVerb::List(args),
+            }) => {
+                assert_eq!(args.due_by.as_deref(), Some("today"));
+                assert_eq!(args.folder, vec!["01-projects".to_string()]);
+                assert!(args.all);
+            }
+            _ => panic!("expected task list"),
         }
     }
 }

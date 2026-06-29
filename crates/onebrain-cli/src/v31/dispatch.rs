@@ -491,9 +491,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             commands::serve::run(&args, &mode)
         }
         Cmd::Task(TaskCmd { verb }) => match verb {
-            TaskVerb::List => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "task list")
-            }
+            TaskVerb::List(args) => commands::task_list::run(vault_flag.clone(), &mode, &args),
             TaskVerb::Add { .. } => {
                 stubs::not_implemented_vault_required(vault_flag.clone(), "task add")
             }
