@@ -1,5 +1,5 @@
 ---
-latest_version: 3.3.20
+latest_version: 3.3.21
 released: 2026-06-30
 ---
 
@@ -9,6 +9,13 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.21] — 2026-06-30 — coverage phase 3d (dispatch.rs exit-code integration tests)
+
+- **test(cli): cover the `dispatch()` `process::exit` arms via integration tests** (+9 assert_cmd tests, no production change) — `v31/dispatch.rs` 91.08% → **95.64%**. Verbs `qmd reindex`, `plugin install`/`migrate`, `skill show`/`info`, and the early vault/arg-guard exit paths of `serve`/`harness run`/`skill run` (which return before any subprocess), asserting exact exit codes (0/1/64/66).
+- Core line coverage 95.03% → **95.21%** (`scripts/coverage.sh`).
+- Residual `dispatch()` arms documented in `docs/coverage.md` — real network/subprocess/TTY paths (`vault sync` git, `skill run`/`harness run` claude/gemini spawn, `daemon` fork, `plugin update` TTY render) that an integration test cannot safely trigger.
+- No behavior change — tests + docs only.
 
 ## [3.3.20] — 2026-06-30 — coverage phase 3b + 3c (server/api.rs + command residuals)
 
