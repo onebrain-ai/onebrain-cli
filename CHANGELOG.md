@@ -1,6 +1,6 @@
 ---
-latest_version: 3.3.18
-released: 2026-06-29
+latest_version: 3.3.19
+released: 2026-06-30
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,13 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.19] — 2026-06-30 — coverage phase 3 (fs cluster)
+
+- **test(fs): close coverage gaps across the onebrain-fs cluster** (+94 tests, no production change) — `note/archive.rs` 80.25% → 94.20%, `init/mod.rs` 89.11% → 94.14%, `vault_sync/pin.rs` 93.43% → 97.16%, `register_hooks/settings.rs` 78.26% → 85.71%, `register_hooks/hooks.rs` → 97.83%, `doctor/vault_yml_keys.rs` → 97.45%, `v31/hook_rewriter.rs` → 97.98%, plus `note/move.rs`, `init/marketplace.rs`, `vault_sync/{orchestrate,sync}.rs`, `migrate.rs`, `output/dispatcher.rs` — every target file improved.
+- Tests target real error/edge paths (missing/malformed files, permission failures, idempotency + fallback branches) with meaningful assertions; permission-denial tests are `#[cfg(unix)]`-gated.
+- Core line coverage (per `scripts/coverage.sh`) 93.62% → **94.28%** / 94.63% region; ~1,429 missed lines remain. Residuals (hard `EXDEV`/network/edge paths) tracked in `docs/coverage.md`.
+- No behavior change — tests only.
 
 ## [3.3.18] — 2026-06-29 — coverage phase 2 (command modules)
 

@@ -772,4 +772,122 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["command"], "my-custom.sh");
     }
+
+    // ── HookStatus::as_str ──────────────────────────────────────────────────
+
+    #[test]
+    fn hookstatus_as_str_added() {
+        assert_eq!(HookStatus::Added.as_str(), "added");
+    }
+
+    #[test]
+    fn hookstatus_as_str_migrated() {
+        assert_eq!(HookStatus::Migrated.as_str(), "migrated");
+    }
+
+    #[test]
+    fn hookstatus_as_str_ok() {
+        assert_eq!(HookStatus::Ok.as_str(), "ok");
+    }
+
+    // ── strip_onebrain_hooks early-return guards ─────────────────────────────
+
+    #[test]
+    fn strip_onebrain_hooks_noop_on_non_object() {
+        // settings is not an object → first guard fires, returns immediately.
+        let mut s = json!([1, 2, 3]);
+        strip_onebrain_hooks(&mut s);
+        assert_eq!(s, json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn strip_onebrain_hooks_noop_when_no_hooks_key() {
+        // No "hooks" key → second guard fires, returns immediately.
+        let mut s = json!({"theme": "dark"});
+        strip_onebrain_hooks(&mut s);
+        assert!(s.get("hooks").is_none());
+        assert_eq!(s["theme"], "dark");
+    }
+
+    #[test]
+    fn strip_onebrain_hooks_noop_when_hooks_is_not_object() {
+        // "hooks" is an array rather than an object → third guard fires.
+        let mut s = json!({"hooks": ["not", "an", "object"]});
+        strip_onebrain_hooks(&mut s);
+        assert_eq!(s["hooks"], json!(["not", "an", "object"]));
+    }
+
+    // ── apply_hooks reset branches ───────────────────────────────────────────
+
+    #[test]
+    fn apply_hooks_resets_non_object_hooks_field() {
+        // "hooks" is a scalar → must be reset to {} before Stop is registered.
+        let mut s = json!({"hooks": "corrupted"});
+        let r = apply_hooks(&mut s);
+        assert_eq!(r, vec![("Stop", HookStatus::Added)]);
+        assert!(s["hooks"].is_object());
+        let groups = s["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["hooks"][0]["command"], "onebrain");
+    }
+
+    #[test]
+    fn apply_hooks_resets_non_array_stop_event() {
+        // "hooks.Stop" is a scalar → must be reset to [] then populated.
+        let mut s = json!({"hooks": {"Stop": "bad"}});
+        let r = apply_hooks(&mut s);
+        assert_eq!(r, vec![("Stop", HookStatus::Added)]);
+        let groups = s["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["hooks"][0]["command"], "onebrain");
+    }
+
+    #[test]
+    fn apply_hooks_stale_event_non_array_value_is_skipped() {
+        // A stale event whose value is a scalar (not an array) → the cleanup
+        // loop hits the `else { continue }` guard without panicking.
+        let mut s = json!({
+            "hooks": {
+                "UserPromptSubmit": "not-an-array",
+            }
+        });
+        let r = apply_hooks(&mut s);
+        // Stop is still added; the malformed stale entry is left untouched.
+        assert_eq!(r, vec![("Stop", HookStatus::Added)]);
+        assert!(s["hooks"]["Stop"].is_array());
+    }
+
+    // ── spec_args_without_json / matches_pre_json_full_cmd None paths ────────
+
+    #[test]
+    fn matches_spec_pre_json_false_when_spec_has_no_json_suffix() {
+        // spec_args_without_json returns None → matches_spec_pre_json returns
+        // false immediately (the early-return else branch).
+        const SPEC: HookSpec = HookSpec {
+            command: "onebrain",
+            args: &["checkpoint", "stop"], // no trailing --json
+        };
+        let entry = json!({"command": "onebrain", "args": ["checkpoint", "stop"]});
+        assert!(!matches_spec_pre_json(&entry, &SPEC));
+    }
+
+    #[test]
+    fn rewrite_if_shell_form_false_for_spec_without_json_suffix() {
+        // With no trailing --json on the spec, matches_pre_json_full_cmd hits
+        // the None → return-false branch inside its own else guard.
+        const SPEC: HookSpec = HookSpec {
+            command: "onebrain",
+            args: &["checkpoint", "stop"], // no trailing --json
+        };
+        // cmd doesn't match spec.full_cmd() either, so both branches return false.
+        let mut entry = json!({"command": "something-entirely-different"});
+        assert!(!rewrite_if_shell_form(&mut entry, &SPEC));
+    }
+
+    // ── check_hook_presence with empty input ─────────────────────────────────
+
+    #[test]
+    fn check_hook_presence_empty_groups_is_missing() {
+        assert_eq!(check_hook_presence(&[], &HookSpec::STOP), Presence::Missing);
+    }
 }

@@ -186,4 +186,108 @@ mod tests {
     // `OutputMode::Tsv` variant — pre-3.2.15 every command routed Tsv (and
     // Table) through the JSON encoder, so the stub `command\tok` row this
     // test asserted was visible to no real consumer.
+
+    // ── text mode edge cases ────────────────────────────────────────────
+
+    #[test]
+    fn text_mode_already_newlined_with_warning_no_double_newline() {
+        // When text_render returns a string already ending with '\n', the
+        // `if !s.ends_with('\n')` branch must NOT add another newline —
+        // but soft warnings must still be appended on subsequent lines.
+        let env = Envelope::ok("note.search", None, P { n: 3 })
+            .with_warning("W_NOTES_SKIPPED", "1 note unreadable");
+        let mut buf = Vec::new();
+        emit(
+            &env,
+            &OutputMode::Text {
+                color: false,
+                pretty: false,
+            },
+            &mut buf,
+            |_| "result\n".into(),
+        )
+        .unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        // Body line is not doubled.
+        assert!(s.starts_with("result\n"), "body must be preserved as-is");
+        // Warning must still appear after the body.
+        assert!(s.contains("1 note unreadable"), "warning must follow body");
+        // No blank line between body and warning (no extra \n injected).
+        assert!(
+            !s.starts_with("result\n\n"),
+            "must not double-newline the body"
+        );
+    }
+
+    #[test]
+    fn text_mode_multiple_warnings_all_rendered() {
+        // The `for w in &envelope.warnings` loop must emit every warning,
+        // not just the first. Two distinct warning messages must both appear.
+        let env = Envelope::ok("note.search", vault(), P { n: 0 })
+            .with_warning("W_A", "first warning message")
+            .with_warning("W_B", "second warning message");
+        let mut buf = Vec::new();
+        emit(
+            &env,
+            &OutputMode::Text {
+                color: false,
+                pretty: false,
+            },
+            &mut buf,
+            |_| "body".into(),
+        )
+        .unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.contains("first warning message"),
+            "first warning must appear"
+        );
+        assert!(
+            s.contains("second warning message"),
+            "second warning must appear"
+        );
+    }
+
+    // ── yaml mode with vault info ───────────────────────────────────────
+
+    #[test]
+    fn yaml_mode_with_vault_info_includes_vault_field() {
+        // Existing yaml tests use vault=None. This confirms the vault sub-object
+        // is serialised when present (distinct envelope shape).
+        let env = Envelope::ok("session.init", vault(), P { n: 5 });
+        let mut buf = Vec::new();
+        emit(&env, &OutputMode::Yaml, &mut buf, |_| unreachable!()).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("session.init"), "command must appear");
+        assert!(
+            s.contains("ob-1"),
+            "vault name must appear in YAML when vault is Some"
+        );
+    }
+
+    // ── json mode with warnings ─────────────────────────────────────────
+
+    #[test]
+    fn json_compact_with_warnings_includes_warnings_array() {
+        // Soft warnings must be serialised into the JSON envelope's `warnings`
+        // array so downstream parsers can inspect them.
+        let env = Envelope::ok("task.list", None, P { n: 1 }).with_warning("W_X", "a soft warning");
+        let mut buf = Vec::new();
+        emit(
+            &env,
+            &OutputMode::Json { pretty: false },
+            &mut buf,
+            |_| unreachable!(),
+        )
+        .unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(
+            v["warnings"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
+            "warnings array must be non-empty in JSON output"
+        );
+    }
 }

@@ -161,4 +161,52 @@ mod tests {
         assert!(text.starts_with("{\n    \"hooks\": "), "got: {text:?}");
         assert!(!text.ends_with('\n'), "no trailing newline; got: {text:?}");
     }
+
+    #[test]
+    fn settings_path_returns_dot_claude_settings_json() {
+        let d = tempdir().unwrap();
+        let base = d.path();
+        assert_eq!(
+            settings_path(base),
+            base.join(".claude").join("settings.json")
+        );
+    }
+
+    #[test]
+    fn write_settings_path_without_extension_uses_tmp_ext() {
+        // When path has no extension, the tmp side-file gets ".tmp" (not
+        // "<ext>.tmp"). This exercises the `None` arm of the extension match.
+        let d = tempdir().unwrap();
+        let path = d.path().join("settings"); // deliberately no .json extension
+        write_settings(&path, &json!({"x": 1})).unwrap();
+        assert!(path.exists(), "final file must exist");
+        assert!(
+            !d.path().join("settings.tmp").exists(),
+            "tmp file must be cleaned up"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["x"], 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_settings_permission_denied_returns_io_error() {
+        // Covers the last `Err(e)` arm of read_settings (non-NotFound I/O error).
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir().unwrap();
+        let path = d.path().join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&path, perms.clone()).unwrap();
+        let result = read_settings(&path);
+        // Restore before assert so tempdir cleanup succeeds.
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&path, perms).unwrap();
+        match result {
+            Err(FsError::Io { .. }) => {}
+            other => panic!("expected FsError::Io for permission-denied, got: {other:?}"),
+        }
+    }
 }

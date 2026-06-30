@@ -688,4 +688,211 @@ mod tests {
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(after, original);
     }
+
+    // ── malformed document shapes ───────────────────────────────────────
+
+    #[test]
+    fn hooks_value_not_object_returns_empty_report() {
+        // `hooks` key exists but is a string (not an object of event arrays).
+        // `and_then(|v| v.as_object_mut())` returns None → early return.
+        let mut s = json!({ "hooks": "not-an-object" });
+        let report = rewrite_hooks(&mut s);
+        assert_eq!(report.total, 0);
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn event_hooks_value_not_array_is_skipped() {
+        // Event value is a plain object instead of an array of groups.
+        // The `let Some(group_arr) = event_val.as_array_mut() else { continue }`
+        // branch fires and the event is skipped without panicking.
+        let mut s = json!({
+            "hooks": {
+                "SessionStart": { "wrong": "shape" }
+            }
+        });
+        let report = rewrite_hooks(&mut s);
+        assert_eq!(report.total, 0);
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn group_entry_not_object_is_skipped() {
+        // Groups array contains a raw string instead of an object.
+        let mut s = json!({
+            "hooks": {
+                "Stop": [ "not-a-group-object" ]
+            }
+        });
+        let report = rewrite_hooks(&mut s);
+        assert_eq!(report.total, 0);
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn group_without_hooks_key_is_skipped() {
+        // Group object exists but carries no "hooks" array.
+        let mut s = json!({
+            "hooks": {
+                "Stop": [
+                    { "type": "command", "matcher": ".*" }
+                ]
+            }
+        });
+        let report = rewrite_hooks(&mut s);
+        assert_eq!(report.total, 0);
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn inner_entry_not_object_is_skipped() {
+        // The hooks array inside a group contains a non-object (string).
+        // `entry.as_object_mut()` returns None → early return from rewrite_entry.
+        let mut s = json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [ "just-a-string" ] }
+                ]
+            }
+        });
+        let report = rewrite_hooks(&mut s);
+        assert_eq!(report.total, 0);
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn onebrain_command_without_args_key_is_skipped() {
+        // command == "onebrain" but no "args" key at all (None arm, line 185).
+        // Different from `ignores_missing_args_array` which uses a non-onebrain command.
+        let mut s = json!({
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            { "type": "command", "command": "onebrain" }
+                        ]
+                    }
+                ]
+            }
+        });
+        let report = rewrite_hooks(&mut s);
+        assert_eq!(report.total, 0);
+        assert!(report.warnings.is_empty());
+    }
+
+    // ── json_type_name non-array branch ────────────────────────────────
+
+    #[test]
+    fn malformed_null_command_emits_warning_with_type_name() {
+        // command: null → json_type_name returns "null"; warning message must
+        // contain the type so the user knows what they put there.
+        let mut s = json!({
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            { "type": "command", "command": null,
+                              "args": ["checkpoint", "stop"] }
+                        ]
+                    }
+                ]
+            }
+        });
+        let report = rewrite_hooks(&mut s);
+        assert_eq!(report.total, 0);
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].code, "W_MALFORMED_HOOK_ENTRY");
+        assert!(
+            report.warnings[0].message.contains("null"),
+            "warning must name the type; got: {}",
+            report.warnings[0].message
+        );
+    }
+
+    // ── record() tally accumulation ────────────────────────────────────
+
+    #[test]
+    fn record_increments_existing_tally_for_same_rewrite() {
+        // Two hook entries both carry `session-init`. The first call to
+        // record() pushes a new tally entry; the second call finds it and
+        // increments `.2` rather than pushing a duplicate (lines 99-102).
+        let mut s = json!({
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "hooks": [
+                            { "type": "command", "command": "onebrain",
+                              "args": ["session-init"] },
+                            { "type": "command", "command": "onebrain",
+                              "args": ["session-init"] }
+                        ]
+                    }
+                ]
+            }
+        });
+        let report = rewrite_hooks(&mut s);
+        // Each entry: 1 path rewrite + 1 flag injection = 2; two entries = 4.
+        assert_eq!(report.total, 4);
+        assert_eq!(report.json_flag_added, 2);
+        // Exactly one tally row with count = 2 (not two rows with count 1 each).
+        assert_eq!(
+            report.rewrites.len(),
+            1,
+            "should have one combined tally, not two"
+        );
+        let (from, to, count) = &report.rewrites[0];
+        assert_eq!(from, "session-init");
+        assert_eq!(to, "session init");
+        assert_eq!(*count, 2);
+    }
+
+    // ── rewrite_settings_file edge cases ───────────────────────────────
+
+    #[test]
+    fn rewrite_settings_file_empty_body_is_no_op() {
+        // Whitespace-only body is treated as empty → `Value::Object(Map::new())`
+        // (line 299). No hooks → report.total = 0; no error.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "   ").unwrap();
+        let report = rewrite_settings_file(&path, false).unwrap();
+        assert_eq!(report.total, 0);
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn rewrite_settings_file_invalid_json_returns_error() {
+        // Malformed JSON body → `serde_json::from_str` fails; error propagates
+        // as Err rather than panicking or silently returning an empty report.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{ not: valid json }").unwrap();
+        let result = rewrite_settings_file(&path, false);
+        assert!(result.is_err(), "invalid JSON must return Err");
+    }
+
+    #[test]
+    fn rewrite_settings_file_already_migrated_no_write_occurs() {
+        // dry_run=false on already-v3.1 content: report.total = 0 →
+        // `!dry_run && report.total > 0` is false → write is skipped entirely.
+        // File on disk must remain byte-for-byte identical.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let already_migrated = json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [
+                        { "type": "command", "command": "onebrain",
+                          "args": ["session", "init", "--json"] }
+                    ] }
+                ]
+            }
+        });
+        let original = serde_json::to_string_pretty(&already_migrated).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let report = rewrite_settings_file(&path, false).unwrap();
+        assert_eq!(report.total, 0);
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, original, "file must not be rewritten when total = 0");
+    }
 }

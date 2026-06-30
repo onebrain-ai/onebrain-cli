@@ -509,4 +509,204 @@ mod tests {
             Some("Run onebrain doctor --fix to repair onebrain.yml")
         );
     }
+
+    // ── update_channel valid values ─────────────────────────────────────
+
+    #[test]
+    fn update_channel_next_is_valid() {
+        let d = tempdir().unwrap();
+        write_yaml(
+            d.path(),
+            "update_channel: next\n\
+             folders:\n  \
+               inbox: 00-inbox\n  \
+               projects: 01-projects\n  \
+               areas: 02-areas\n  \
+               knowledge: 03-knowledge\n  \
+               resources: 04-resources\n  \
+               agent: 05-agent\n  \
+               archive: 06-archive\n  \
+               logs: 07-logs\n",
+        );
+        let r = VaultYmlKeysCheck.run(d.path(), &cfg());
+        assert_eq!(r.status, DoctorStatus::Ok);
+        assert_eq!(r.message, "schema ok");
+    }
+
+    // ── yaml_to_display non-string arms ────────────────────────────────
+
+    #[test]
+    fn invalid_update_channel_null_shows_null_in_error() {
+        // YAML null (~) → yaml_to_display returns "null"; error message must
+        // contain it so the doctor output is informative.
+        let d = tempdir().unwrap();
+        write_yaml(
+            d.path(),
+            "update_channel: ~\n\
+             folders:\n  \
+               inbox: 00-inbox\n  \
+               projects: 01-projects\n  \
+               areas: 02-areas\n  \
+               knowledge: 03-knowledge\n  \
+               resources: 04-resources\n  \
+               agent: 05-agent\n  \
+               archive: 06-archive\n  \
+               logs: 07-logs\n",
+        );
+        let r = VaultYmlKeysCheck.run(d.path(), &cfg());
+        assert_eq!(r.status, DoctorStatus::Error);
+        assert!(r
+            .details
+            .iter()
+            .any(|x| x.contains("invalid update_channel") && x.contains("null")));
+    }
+
+    #[test]
+    fn invalid_update_channel_bool_shows_value_in_error() {
+        // Boolean update_channel (true) → yaml_to_display renders as "true".
+        let d = tempdir().unwrap();
+        write_yaml(
+            d.path(),
+            "update_channel: true\n\
+             folders:\n  \
+               inbox: 00-inbox\n  \
+               projects: 01-projects\n  \
+               areas: 02-areas\n  \
+               knowledge: 03-knowledge\n  \
+               resources: 04-resources\n  \
+               agent: 05-agent\n  \
+               archive: 06-archive\n  \
+               logs: 07-logs\n",
+        );
+        let r = VaultYmlKeysCheck.run(d.path(), &cfg());
+        assert_eq!(r.status, DoctorStatus::Error);
+        assert!(r
+            .details
+            .iter()
+            .any(|x| x.contains("invalid update_channel") && x.contains("true")));
+    }
+
+    // ── deprecated method key (standalone) ────────────────────────────
+
+    #[test]
+    fn deprecated_method_key_is_warning_with_remove_hint() {
+        let d = tempdir().unwrap();
+        write_yaml(d.path(), &format!("{}method: legacy\n", valid_schema()));
+        let r = VaultYmlKeysCheck.run(d.path(), &cfg());
+        assert_eq!(r.status, DoctorStatus::Warn);
+        assert!(r
+            .details
+            .iter()
+            .any(|x| x == "deprecated key: method (safe to remove)"));
+        assert_eq!(
+            r.hint.as_deref(),
+            Some("Run onebrain doctor --fix to remove deprecated keys")
+        );
+    }
+
+    // ── checkpoint.minutes ─────────────────────────────────────────────
+
+    #[test]
+    fn checkpoint_minutes_zero_is_warning() {
+        // Lines 122-127 — the `minutes` branch inside the checkpoint block
+        // is a distinct code path from the already-tested `messages` branch.
+        let d = tempdir().unwrap();
+        write_yaml(
+            d.path(),
+            &format!("{}checkpoint:\n  minutes: 0\n", valid_schema()),
+        );
+        let r = VaultYmlKeysCheck.run(d.path(), &cfg());
+        assert_eq!(r.status, DoctorStatus::Warn);
+        assert!(r
+            .details
+            .iter()
+            .any(|x| x == "checkpoint.minutes should be a number > 0"));
+    }
+
+    #[test]
+    fn checkpoint_both_messages_and_minutes_invalid_produces_two_warnings_with_no_hint() {
+        // Both fields zero → 2 warnings; neither deprecated nor missing soft
+        // key, so the warnings branch picks hint = None.
+        let d = tempdir().unwrap();
+        write_yaml(
+            d.path(),
+            &format!(
+                "{}checkpoint:\n  messages: 0\n  minutes: 0\n",
+                valid_schema()
+            ),
+        );
+        let r = VaultYmlKeysCheck.run(d.path(), &cfg());
+        assert_eq!(r.status, DoctorStatus::Warn);
+        let count = r
+            .details
+            .iter()
+            .filter(|x| x.contains("should be a number > 0"))
+            .count();
+        assert_eq!(count, 2, "expected exactly 2 checkpoint warnings");
+        // checkpoint-only warnings → hint = None (lines 186-188)
+        assert!(
+            r.hint.is_none(),
+            "checkpoint-only warnings must have no hint"
+        );
+    }
+
+    #[test]
+    fn checkpoint_messages_negative_is_warning() {
+        // Negative integers are not > 0; is_positive_number returns false via
+        // the f64 branch (`-5.0 > 0.0` is false).
+        let d = tempdir().unwrap();
+        write_yaml(
+            d.path(),
+            &format!("{}checkpoint:\n  messages: -5\n", valid_schema()),
+        );
+        let r = VaultYmlKeysCheck.run(d.path(), &cfg());
+        assert_eq!(r.status, DoctorStatus::Warn);
+        assert!(r
+            .details
+            .iter()
+            .any(|x| x == "checkpoint.messages should be a number > 0"));
+    }
+
+    #[test]
+    fn checkpoint_messages_non_number_value_is_warning() {
+        // String value hits `_ => false` in is_positive_number (line 223).
+        let d = tempdir().unwrap();
+        write_yaml(
+            d.path(),
+            &format!("{}checkpoint:\n  messages: foo\n", valid_schema()),
+        );
+        let r = VaultYmlKeysCheck.run(d.path(), &cfg());
+        assert_eq!(r.status, DoctorStatus::Warn);
+        assert!(r
+            .details
+            .iter()
+            .any(|x| x == "checkpoint.messages should be a number > 0"));
+    }
+
+    // ── multiple folder sub-key errors ─────────────────────────────────
+
+    #[test]
+    fn multiple_folder_subkeys_missing_error_count_reflects_both() {
+        // Two sub-keys absent → "2 error(s)" message; `folders` key IS present
+        // so `has_missing_key = false` → hint stays None.
+        let d = tempdir().unwrap();
+        write_yaml(
+            d.path(),
+            "update_channel: stable\n\
+             folders:\n  \
+               inbox: 00-inbox\n  \
+               projects: 01-projects\n  \
+               areas: 02-areas\n  \
+               knowledge: 03-knowledge\n  \
+               resources: 04-resources\n  \
+               archive: 06-archive\n",
+        );
+        let r = VaultYmlKeysCheck.run(d.path(), &cfg());
+        assert_eq!(r.status, DoctorStatus::Error);
+        assert_eq!(r.message, "2 error(s)");
+        assert!(r.details.iter().any(|x| x == "missing folders.agent"));
+        assert!(r.details.iter().any(|x| x == "missing folders.logs"));
+        // No `missing key:` top-level error → no init-force hint.
+        assert!(r.hint.is_none());
+    }
 }

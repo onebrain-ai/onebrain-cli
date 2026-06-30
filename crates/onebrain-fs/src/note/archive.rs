@@ -256,4 +256,96 @@ mod tests {
         assert!(root.join(&expected).exists());
         assert!(!root.join("live.md").exists());
     }
+
+    #[test]
+    fn no_filename_source_errors() {
+        // rel_path=".." terminates in ".." so Path::file_name() returns None.
+        // The parent directory of the tempdir does exist, so the ENOENT guard
+        // passes and we reach the ok_or_else closure (lines 70-73).
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let err =
+            archive_note_at(root, Path::new(".."), Path::new("06-archive"), 2026, 5).unwrap_err();
+        assert!(
+            matches!(err, FsError::Core(CoreError::InvalidTarget(_))),
+            "expected InvalidTarget for a path with no filename, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn libc_exdev_returns_18() {
+        // EXDEV is errno 18 on Linux and macOS/BSD — document and pin this.
+        assert_eq!(libc_exdev(), 18);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_mkdir_failure_propagates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "note.md", "x\n");
+
+        // "locked/" exists but is write-denied, so create_dir_all("locked/06-archive/…")
+        // fails — exercises the map_err closure and the Io error return (lines 90-93).
+        let locked = root.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        let mut perms = fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&locked, perms).unwrap();
+
+        let err = archive_note_at(
+            root,
+            Path::new("note.md"),
+            Path::new("locked/06-archive"),
+            2026,
+            3,
+        )
+        .unwrap_err();
+
+        // Restore so tempdir can clean up.
+        let mut perms = fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&locked, perms).unwrap();
+
+        assert!(matches!(err, FsError::Io { .. }));
+        assert!(
+            root.join("note.md").exists(),
+            "source must not move when mkdir fails"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_rename_non_exdev_failure_propagates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "note.md", "x\n");
+
+        // Pre-create the dated bucket as read-only. create_dir_all on an already-
+        // existing directory is a no-op (Ok), but rename into the read-only bucket
+        // fails with EACCES (not EXDEV=18), hitting the else branch (lines 108-113).
+        let bucket = root.join("06-archive/2026/03");
+        fs::create_dir_all(&bucket).unwrap();
+        let mut perms = fs::metadata(&bucket).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&bucket, perms).unwrap();
+
+        let err = archive_note_at(root, Path::new("note.md"), Path::new("06-archive"), 2026, 3)
+            .unwrap_err();
+
+        let mut perms = fs::metadata(&bucket).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&bucket, perms).unwrap();
+
+        assert!(matches!(err, FsError::Io { .. }));
+        assert!(
+            root.join("note.md").exists(),
+            "source must not disappear when rename fails"
+        );
+    }
 }

@@ -323,4 +323,146 @@ mod tests {
         let path = d.path().join(".claude-plugin").join("marketplace.json");
         assert!(path.is_file());
     }
+
+    /// `is_canonical_existing`: `.unwrap_or(false)` branch — empty plugins array
+    /// means `.get(0)` returns None → the map closure is never called → false.
+    #[test]
+    fn force_repairs_empty_plugins_array() {
+        let d = tempdir().unwrap();
+        let dir = d.path().join(".claude-plugin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("marketplace.json");
+        std::fs::write(&path, r#"{"plugins":[]}"#).unwrap();
+
+        let out = write_marketplace_json_with_force(d.path(), true).unwrap();
+        assert_eq!(out, MarketplaceOutcome::Repaired);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["plugins"][0]["name"], "onebrain");
+        assert_eq!(v["plugins"][0]["source"], "./.claude/plugins/onebrain");
+    }
+
+    /// `is_canonical_existing`: `.unwrap_or(false)` branch — missing `plugins` key
+    /// means `.get("plugins")` returns None → `.and_then` yields None → false.
+    #[test]
+    fn force_repairs_missing_plugins_key() {
+        let d = tempdir().unwrap();
+        let dir = d.path().join(".claude-plugin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("marketplace.json");
+        std::fs::write(&path, r#"{}"#).unwrap();
+
+        let out = write_marketplace_json_with_force(d.path(), true).unwrap();
+        assert_eq!(out, MarketplaceOutcome::Repaired);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["plugins"][0]["source"], "./.claude/plugins/onebrain");
+    }
+
+    /// `is_canonical_existing`: second half of `&&` — correct name but wrong source
+    /// makes the first condition true, so the second condition IS evaluated (no
+    /// short-circuit) and returns false. The existing wrong-shape test only uses
+    /// a wrong name, which short-circuits before evaluating source.
+    #[test]
+    fn force_repairs_correct_name_wrong_source() {
+        let d = tempdir().unwrap();
+        let dir = d.path().join(".claude-plugin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("marketplace.json");
+        std::fs::write(
+            &path,
+            r#"{"plugins":[{"name":"onebrain","source":"./somewhere-else"}]}"#,
+        )
+        .unwrap();
+
+        let out = write_marketplace_json_with_force(d.path(), true).unwrap();
+        assert_eq!(out, MarketplaceOutcome::Repaired);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["plugins"][0]["source"], "./.claude/plugins/onebrain");
+    }
+
+    /// `is_canonical_existing`: correct source but wrong name — first condition
+    /// false, short-circuits (source not evaluated). Repair triggered.
+    #[test]
+    fn force_repairs_wrong_name_correct_source() {
+        let d = tempdir().unwrap();
+        let dir = d.path().join(".claude-plugin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("marketplace.json");
+        std::fs::write(
+            &path,
+            r#"{"plugins":[{"name":"other-plugin","source":"./.claude/plugins/onebrain"}]}"#,
+        )
+        .unwrap();
+
+        let out = write_marketplace_json_with_force(d.path(), true).unwrap();
+        assert_eq!(out, MarketplaceOutcome::Repaired);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["plugins"][0]["name"], "onebrain");
+    }
+
+    /// `MarketplaceOutcome::wrote()` for all three variants. The existing tests
+    /// exercise `write_marketplace_json` (which calls `.wrote()`) for Written and
+    /// Skipped but never assert `.wrote()` on the Repaired variant directly.
+    #[test]
+    fn outcome_wrote_returns_correct_values() {
+        assert!(
+            MarketplaceOutcome::Written.wrote(),
+            "Written must report wrote=true"
+        );
+        assert!(
+            MarketplaceOutcome::Repaired.wrote(),
+            "Repaired must report wrote=true"
+        );
+        assert!(
+            !MarketplaceOutcome::Skipped.wrote(),
+            "Skipped must report wrote=false"
+        );
+    }
+
+    /// `is_canonical_existing`: `read_to_string` error branch — an unreadable file
+    /// returns false, triggering the repair path under `force=true`.
+    #[cfg(unix)]
+    #[test]
+    fn force_treats_unreadable_file_as_non_canonical() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir().unwrap();
+        let dir = d.path().join(".claude-plugin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("marketplace.json");
+        // Write canonical content, then strip read permission.
+        std::fs::write(
+            &path,
+            r#"{"plugins":[{"name":"onebrain","source":"./.claude/plugins/onebrain"}]}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let out = write_marketplace_json_with_force(d.path(), true);
+        // Restore permissions before any assertions so tempdir cleanup works.
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+
+        // read_to_string fails → is_canonical_existing returns false → repair branch.
+        // The rewrite may succeed (Repaired) or fail if the dir itself restricts
+        // writes, but it must NOT return Skipped (which would mean we bypassed repair).
+        match out {
+            Ok(MarketplaceOutcome::Repaired) => {
+                let text = std::fs::read_to_string(&path).unwrap();
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(v["plugins"][0]["name"], "onebrain");
+            }
+            Err(_) => {
+                // Couldn't rewrite (e.g. EACCES on the tmp write or rename).
+                // Still valid: repair branch was entered, which is the contract.
+            }
+            Ok(MarketplaceOutcome::Skipped) => {
+                panic!("unreadable file must not produce Skipped — repair branch not entered")
+            }
+            Ok(MarketplaceOutcome::Written) => {
+                panic!("unexpected Written outcome for pre-existing path")
+            }
+        }
+    }
 }

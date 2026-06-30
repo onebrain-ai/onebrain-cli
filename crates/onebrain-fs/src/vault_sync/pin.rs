@@ -328,6 +328,7 @@ pub(crate) fn default_now_fn() -> NowFn {
 
 #[cfg(test)]
 mod tests {
+    use super::io_err_code;
     use super::*;
     use chrono::TimeZone;
     use std::fs;
@@ -791,5 +792,261 @@ mod tests {
         fs::write(&installed, "{not valid json").unwrap();
         let err = pin_to_vault(dir.path(), &installed, None, &fixed_now()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    // ---- read_plugin_metadata ----
+
+    #[test]
+    fn read_plugin_metadata_missing_file_returns_unknown() {
+        let dir = tempdir().unwrap();
+        // No plugin.json created — exercises the Err branch in read_to_string.
+        let meta = read_plugin_metadata(dir.path());
+        assert_eq!(meta.version, "unknown");
+        assert!(meta.last_updated.is_none());
+    }
+
+    #[test]
+    fn read_plugin_metadata_invalid_json_returns_unknown() {
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join(".claude/plugins/onebrain/.claude-plugin/plugin.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{ not valid json }{{").unwrap();
+        let meta = read_plugin_metadata(dir.path());
+        assert_eq!(meta.version, "unknown");
+        assert!(meta.last_updated.is_none());
+    }
+
+    #[test]
+    fn read_plugin_metadata_missing_version_field_returns_unknown() {
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join(".claude/plugins/onebrain/.claude-plugin/plugin.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"id": "onebrain", "name": "OneBrain"}"#).unwrap();
+        // No "version" key → unwrap_or("unknown")
+        let meta = read_plugin_metadata(dir.path());
+        assert_eq!(meta.version, "unknown");
+        assert!(meta.last_updated.is_none());
+    }
+
+    #[test]
+    fn read_plugin_metadata_with_last_updated_field() {
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join(".claude/plugins/onebrain/.claude-plugin/plugin.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"version": "2.5.0", "lastUpdated": "2026-03-15T08:00:00.000Z"}"#,
+        )
+        .unwrap();
+        let meta = read_plugin_metadata(dir.path());
+        assert_eq!(meta.version, "2.5.0");
+        assert_eq!(
+            meta.last_updated.as_deref(),
+            Some("2026-03-15T08:00:00.000Z")
+        );
+    }
+
+    // ---- installed_plugins.json structural edge cases ----
+
+    #[test]
+    fn no_plugins_key_returns_skipped() {
+        let dir = tempdir().unwrap();
+        let installed = dir.path().join("installed_plugins.json");
+        fs::write(&installed, r#"{"mcpServers": {}}"#).unwrap();
+        let result = pin_to_vault(dir.path(), &installed, None, &fixed_now()).unwrap();
+        assert!(result.skipped);
+    }
+
+    #[test]
+    fn plugins_key_is_array_not_object_returns_skipped() {
+        let dir = tempdir().unwrap();
+        let installed = dir.path().join("installed_plugins.json");
+        // "plugins" is an array — as_object_mut() returns None → skipped.
+        fs::write(&installed, r#"{"plugins": ["onebrain@onebrain"]}"#).unwrap();
+        let result = pin_to_vault(dir.path(), &installed, None, &fixed_now()).unwrap();
+        assert!(result.skipped);
+    }
+
+    #[test]
+    fn no_onebrain_key_returns_skipped() {
+        let dir = tempdir().unwrap();
+        let installed = dir.path().join("installed_plugins.json");
+        fs::write(
+            &installed,
+            r#"{"plugins": {"other-plugin@1.0.0": [{"installPath": "/some/path"}]}}"#,
+        )
+        .unwrap();
+        let result = pin_to_vault(dir.path(), &installed, None, &fixed_now()).unwrap();
+        assert!(result.skipped);
+    }
+
+    // ---- orphan dedup edge cases ----
+
+    #[test]
+    fn orphan_entry_without_project_path_key_is_kept() {
+        let dir = tempdir().unwrap();
+        write_plugin_json(dir.path(), "1.11.0");
+        let fake = dir.path().join(".fake");
+        let installed = fake.join("installed_plugins.json");
+        // Entry has no "projectPath" key at all → None arm → kept (not orphan-dropped).
+        write_json(
+            &installed,
+            &serde_json::json!({
+                "plugins": {
+                    "onebrain@onebrain": [{
+                        "id": "onebrain",
+                        "installPath": dir.path().join(".claude/plugins/onebrain").to_string_lossy(),
+                        "version": "1.11.0",
+                    }]
+                }
+            }),
+        );
+        pin_to_vault(dir.path(), &installed, None, &fixed_now()).unwrap();
+        let after: Value = serde_json::from_str(&fs::read_to_string(&installed).unwrap()).unwrap();
+        let arr = after["plugins"]["onebrain@onebrain"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "entry without projectPath must be preserved");
+    }
+
+    // ---- per-entry refresh edge cases ----
+
+    #[test]
+    fn non_object_entry_in_plugin_array_is_silently_skipped() {
+        let dir = tempdir().unwrap();
+        write_plugin_json(dir.path(), "1.11.0");
+        let fake = dir.path().join(".fake");
+        let installed = fake.join("installed_plugins.json");
+        write_json(
+            &installed,
+            &serde_json::json!({
+                "plugins": {
+                    "onebrain@onebrain": [
+                        "this_string_is_not_an_object",
+                        {
+                            "id": "onebrain",
+                            "installPath": dir.path().join(".claude/plugins/onebrain").to_string_lossy(),
+                            "version": "1.10.0",
+                        }
+                    ]
+                }
+            }),
+        );
+        let result = pin_to_vault(dir.path(), &installed, None, &fixed_now()).unwrap();
+        assert!(!result.skipped);
+        let after: Value = serde_json::from_str(&fs::read_to_string(&installed).unwrap()).unwrap();
+        let arr = after["plugins"]["onebrain@onebrain"].as_array().unwrap();
+        // Non-object entry preserved unchanged.
+        assert_eq!(arr[0], serde_json::json!("this_string_is_not_an_object"));
+        // Object sibling refreshed.
+        assert_eq!(arr[1]["version"], "1.11.0");
+    }
+
+    #[test]
+    fn malformed_projectpath_warns_and_skips_entry() {
+        let dir = tempdir().unwrap();
+        write_plugin_json(dir.path(), "1.11.0");
+        let fake = dir.path().join(".fake");
+        let installed = fake.join("installed_plugins.json");
+        write_json(
+            &installed,
+            &serde_json::json!({
+                "plugins": {
+                    "onebrain@onebrain": [{
+                        "id": "onebrain",
+                        "installPath": dir.path().join(".claude/plugins/onebrain").to_string_lossy(),
+                        "projectPath": 9999,  // non-string, non-null → project_bad = true
+                        "version": "1.10.0",
+                    }]
+                }
+            }),
+        );
+        let mut stderr = Vec::new();
+        pin_to_vault_inner(dir.path(), &installed, None, &fixed_now(), &mut stderr).unwrap();
+        let stderr_str = String::from_utf8(stderr).unwrap();
+        assert!(
+            stderr_str.contains("malformed entry"),
+            "expected malformed-entry warning, got: {stderr_str}"
+        );
+        // Entry is skipped → version untouched.
+        let after: Value = serde_json::from_str(&fs::read_to_string(&installed).unwrap()).unwrap();
+        assert_eq!(
+            after["plugins"]["onebrain@onebrain"][0]["version"],
+            "1.10.0"
+        );
+    }
+
+    #[test]
+    fn install_path_exactly_equals_cache_dir_treated_as_in_cache() {
+        let dir = tempdir().unwrap();
+        write_plugin_json(dir.path(), "2.0.0");
+        let fake = dir.path().join(".fake");
+        let cache_dir = fake.join("cache");
+        let installed = fake.join("installed_plugins.json");
+        // installPath == cache_dir exactly (not a subpath under it) → *p == normalized_cache_dir.
+        write_json(
+            &installed,
+            &serde_json::json!({
+                "plugins": {
+                    "onebrain@onebrain": [{
+                        "id": "onebrain",
+                        "installPath": cache_dir.to_string_lossy(),
+                        "version": "1.0.0",
+                    }]
+                }
+            }),
+        );
+        let result = pin_to_vault(dir.path(), &installed, Some(&cache_dir), &fixed_now()).unwrap();
+        assert!(
+            !result.skipped,
+            "entry should be processed (installPath == cacheDir)"
+        );
+        let after: Value = serde_json::from_str(&fs::read_to_string(&installed).unwrap()).unwrap();
+        let entry = &after["plugins"]["onebrain@onebrain"][0];
+        assert_eq!(
+            entry["installPath"],
+            dir.path()
+                .join(".claude/plugins/onebrain")
+                .to_string_lossy()
+                .to_string()
+        );
+        assert_eq!(entry["version"], "2.0.0");
+    }
+
+    // ---- utility functions ----
+
+    #[test]
+    fn io_err_code_with_os_error_includes_numeric_code() {
+        // Error::from_raw_os_error always has a raw OS code (ENOENT = 2 on Unix/Windows).
+        let err = std::io::Error::from_raw_os_error(2);
+        let s = io_err_code(&err);
+        assert!(s.contains("os error 2"), "expected 'os error 2' in: {s}");
+    }
+
+    #[test]
+    fn io_err_code_without_os_error_shows_kind_name() {
+        // Error::new with a message string has no raw OS code.
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "synthetic error");
+        let s = io_err_code(&err);
+        assert!(
+            s.contains("PermissionDenied"),
+            "expected 'PermissionDenied' in: {s}"
+        );
+    }
+
+    #[test]
+    fn default_now_fn_returns_callable_recent_datetime() {
+        let f = default_now_fn();
+        let dt = f();
+        // A reasonable sanity check: after 2024-01-01T00:00:00Z.
+        assert!(
+            dt.timestamp() > 1_700_000_000,
+            "expected a recent timestamp, got {}",
+            dt.timestamp()
+        );
     }
 }
