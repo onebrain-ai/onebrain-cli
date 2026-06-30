@@ -73,8 +73,8 @@ it is untestable.
 ## Status (2026-06-30)
 
 - Whole-workspace baseline (no exclusions): **89.58% line** (`cargo llvm-cov --workspace`).
-- **Core (this initiative's target surface, exclusions applied): 95.03% line** —
-  `scripts/coverage.sh`. ~1,273 missed lines remain on core code (down from 1,711 baseline).
+- **Core (this initiative's target surface, exclusions applied): 95.21% line** —
+  `scripts/coverage.sh`. ~1,226 missed lines remain on core code (down from 1,711 baseline).
 
 Closed so far:
 - Phase 1 — `v31/dispatch.rs` 76.94% → 86.70% (stub/verb exit-code tests).
@@ -104,6 +104,13 @@ Closed so far:
     `home_dir()`-None / `create_dir_all` fault paths.
   - `commands/doctor.rs` — `fix_qmd_embeddings` qmd-not-on-PATH, `fix_plugin_cache` no-home,
     `fix_plugin_files` network sync, backup-I/O-fault, `emit_structured` debug-assert fallback.
+- Phase 3d (dispatch exit-code integration tests, +9 assert_cmd tests) — `v31/dispatch.rs` 91.08% →
+  **95.64%**. Covered the `process::exit` arms for `qmd reindex`, `plugin install`/`migrate`,
+  `skill show`/`info`, and the early vault/arg guards of `serve`/`harness run`/`skill run` (exit
+  before any subprocess). Remaining `dispatch.rs` residuals (real network/subprocess/TTY, not
+  safely invocable): `vault sync` (git clone/pull), `skill run`/`harness run` real path (claude/gemini
+  spawn — note onebrain probes absolute harness paths so stripping `PATH` can't force a fail), `daemon
+  start`/`run` (process fork / blocking server), `plugin update` TTY-animated render.
 
 A ratcheting CI coverage gate (fail-under the achieved core %) lands in the final phase — once
 the remaining testable gaps are closed and the residuals are documented, so it doesn't fight a
@@ -111,16 +118,20 @@ moving target. Literal 100% is not the bar (see the ceiling note up top); the ga
 whatever % the documented-residual set leaves.
 
 Remaining core gaps to close (tracked, by reachable missed lines):
-- **Biggest reachable win:** `v31/dispatch.rs` `process::exit` arms (~90 lines) — one exit-code
-  integration test per remaining verb (assert_cmd). Not done in 3c (which was unit-test-scoped).
 - The fs-cluster residuals not yet maxed (`register_hooks/settings.rs` ~86%, `init/{mod,marketplace}.rs`
   ~94/91%, `vault_sync/orchestrate.rs` ~94%) and the long tail of 1–6-missed-line files
   (`note/{folder,walker,delete,stat,write}.rs`, `init/{safety,folders}.rs`, `doctor/*`, `backup.rs`).
+- A few unit-coverable render-helper edges in `v31/dispatch.rs` left after 3d
+  (`render_plugin_update_text` empty-data guard, color/version-bump reload-hint branch, a writeln
+  error edge) — small, unit-testable in a later sweep.
 - `commands/run_skill.rs` interactive-spinner paths (needs a pty harness — likely promoted to the
   exclusion list).
-- The documented residuals above (`server/api.rs`, `dispatch.rs` TTY, `update/mod.rs` network,
-  `register_schedule.rs` subprocess, `doctor.rs` network/fault) are at their testable ceiling.
+- The documented residuals above (`server/api.rs`, `dispatch.rs` network/subprocess/TTY,
+  `update/mod.rs` network, `register_schedule.rs` subprocess, `doctor.rs` network/fault) are at
+  their testable ceiling.
 
-`commands/doctor.rs`, `v31/dispatch.rs`, `onebrain-fs/src/update/mod.rs`, `commands/register_schedule.rs`,
-and `server/api.rs` were advanced in phases 3b–3c and are now near their testable ceilings (modulo the
-dispatch integration tests above). See `01-projects/onebrain/cli/2026-06-29-cli-coverage-100-design.md`.
+`commands/doctor.rs`, `v31/dispatch.rs` (95.64%), `onebrain-fs/src/update/mod.rs`,
+`commands/register_schedule.rs`, and `server/api.rs` were advanced in phases 3b–3d and are now near
+their testable ceilings. The next milestone is **Phase 4**: add the ratcheting CI `--fail-under-lines`
+gate at the achieved core % and lock the initiative. See
+`01-projects/onebrain/cli/2026-06-29-cli-coverage-100-design.md`.

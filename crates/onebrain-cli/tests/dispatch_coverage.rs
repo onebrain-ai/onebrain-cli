@@ -369,3 +369,198 @@ fn daemon_stop_graceful_when_not_running() {
         "daemon stop should exit 0 or 1 when no daemon runs, got {code}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Real handler arms reachable WITHOUT network / subprocess / a blocking server
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These arms route to a real handler that completes (or fails its vault/arg
+// guard) entirely in-process — no `claude`/`gemini`/`qmd`/`git` spawn, no
+// listener bind, no TTY. Each was previously uncovered because only the
+// hidden v3.0 *alias* spelling (or no spelling at all) had an integration test.
+
+/// `qmd reindex` with no `qmd_collection` configured is a clean no-op (the
+/// detached `qmd` spawn only fires when a collection is set). Exercises the
+/// real `QmdVerb::Reindex` arm — distinct from the already-covered hidden
+/// `qmd-reindex` alias.
+#[test]
+fn qmd_reindex_no_collection_exits_0() {
+    let vault = vault_dir(); // onebrain.yml has no `qmd_collection:` key
+    let code = exit_in(vault.path(), &["qmd", "reindex"]);
+    assert_eq!(
+        code, 0,
+        "qmd reindex with no collection should no-op and exit 0, got {code}"
+    );
+}
+
+/// `plugin install` routes to `register_hooks::run` (the v3.0 `register-hooks`
+/// body) against the target vault. Filesystem-only — harness detection is
+/// dir/env based, never a `claude` spawn — so it always lands a clean exit 0.
+/// Exercises the `PluginVerb::Install` arm (the alias `register-hooks` is
+/// covered elsewhere, but this v3.1 spelling was not).
+#[test]
+fn plugin_install_into_vault_exits_0() {
+    let vault = vault_dir();
+    let code = exit_in(
+        vault.path(),
+        &[
+            "plugin",
+            "install",
+            "--vault-dir",
+            vault.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "plugin install into a writable vault should exit 0, got {code}"
+    );
+}
+
+/// `plugin migrate <unknown>` routes to `migrate::run`, which loads the vault
+/// config and dispatches the named migration. An unknown name is reported on
+/// stderr and — per the internal-command contract — still exits 0. Exercises
+/// the `PluginVerb::Migrate` arm (the alias `migrate` is covered elsewhere).
+#[test]
+fn plugin_migrate_unknown_migration_exits_0() {
+    let vault = vault_dir();
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env_remove("ONEBRAIN_VAULT")
+        .args([
+            "plugin",
+            "migrate",
+            "not-a-real-migration",
+            "--vault-dir",
+            vault.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "plugin migrate (unknown migration) must exit 0 per the internal-command contract"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown migration"),
+        "expected an 'unknown migration' note on stderr. got:\n{stderr}"
+    );
+}
+
+/// `skill show <name>` resolves the vault, then reads the skill's `SKILL.md`.
+/// Run inside a vault whose plugin tree has no such skill, the handler returns
+/// `66` (EX_NOINPUT). Exercises the `SkillVerb::Show` arm — `vault_ctx::require`
+/// succeeds (walk-up finds `onebrain.yml`) so the handler body actually runs.
+#[test]
+fn skill_show_missing_skill_in_vault_exits_66() {
+    let vault = vault_dir();
+    let code = exit_in(vault.path(), &["skill", "show", "daily"]);
+    assert_eq!(
+        code, 66,
+        "skill show for a missing skill inside a vault should exit 66 (EX_NOINPUT), got {code}"
+    );
+}
+
+/// `skill info <name>` mirror of `skill show` — same vault-resolve-then-read
+/// path, same `66` for a missing skill. Exercises the `SkillVerb::Info` arm.
+#[test]
+fn skill_info_missing_skill_in_vault_exits_66() {
+    let vault = vault_dir();
+    let code = exit_in(vault.path(), &["skill", "info", "daily"]);
+    assert_eq!(
+        code, 66,
+        "skill info for a missing skill inside a vault should exit 66 (EX_NOINPUT), got {code}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Vault / arg guard arms that fail BEFORE any harness or server spawn
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `harness run` (default `--mode with-context`), `serve`, `skill run`, and the
+// `run-skill` alias all reach a guard — vault resolution or a required-arg
+// check — that returns `Err` *before* any `claude`/`gemini` process is spawned
+// or any TCP listener is bound. That makes the dispatch arm reachable without
+// the dangerous side effect: we only ever exercise the early-return path.
+// (The real harness/serve bodies — spawn + block — stay genuinely residual.)
+
+/// `harness run <prompt>` with the default `with-context` mode requires a
+/// vault; resolution is the FIRST statement in that arm, so outside any vault
+/// it returns `E_VAULT_NOT_FOUND` (exit 64) before reaching the harness spawn.
+/// (NB: 64 here, not the 78 that `harness_run::run`'s own internal config check
+/// would yield — the dispatcher's `vault_ctx::require` fires first.)
+#[test]
+fn harness_run_with_context_without_vault_exits_64() {
+    let neutral = tempdir().unwrap(); // no onebrain.yml anywhere above
+    let code = exit_in(neutral.path(), &["harness", "run", "ping"]);
+    assert_eq!(
+        code, 64,
+        "harness run (with-context) outside a vault should exit 64 before spawning, got {code}"
+    );
+}
+
+/// `serve` is vault-required; `vault_ctx::require` is the first thing the
+/// handler does, so outside a vault it exits 64 *before* binding a listener
+/// (no hang). Exercises the `Cmd::Serve` arm.
+#[test]
+fn serve_without_vault_exits_64() {
+    let neutral = tempdir().unwrap();
+    let code = exit_in(neutral.path(), &["serve"]);
+    assert_eq!(
+        code, 64,
+        "serve outside a vault should exit 64 before binding a server, got {code}"
+    );
+}
+
+/// `skill run` with neither a positional name nor `--skill` hits the
+/// `ok_or_else` guard (before vault resolution and before any spawn), surfacing
+/// a usage error → generic exit 1.
+#[test]
+fn skill_run_without_name_errors_exit_1() {
+    let neutral = tempdir().unwrap();
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(neutral.path())
+        .env_remove("ONEBRAIN_VAULT")
+        .args(["skill", "run"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "skill run with no name should exit 1 (generic)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("skill name"),
+        "expected a 'skill name' usage error on stderr. got:\n{stderr}"
+    );
+}
+
+/// `run-skill` (hidden v3.0 alias) requires an explicit `--vault`/`--vault-dir`
+/// — it does NOT walk up from cwd. With none provided (and `ONEBRAIN_VAULT`
+/// cleared) the dispatcher's `ok_or_else` guard fires before `run_skill::run`,
+/// surfacing a usage error → exit 1. Exercises the `Cmd::RunSkillAlias`
+/// missing-vault branch.
+#[test]
+fn run_skill_alias_without_vault_errors_exit_1() {
+    let neutral = tempdir().unwrap();
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(neutral.path())
+        .env_remove("ONEBRAIN_VAULT")
+        .args(["run-skill", "--skill", "daily"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "run-skill without --vault should exit 1 (generic)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("requires --vault"),
+        "expected a 'requires --vault' usage error on stderr. got:\n{stderr}"
+    );
+}
