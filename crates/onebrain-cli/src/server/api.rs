@@ -1419,5 +1419,72 @@ mod tests {
         assert_eq!(parse_byte_range("bytes=2000-3000", 1000), None); // start >= total
         assert_eq!(parse_byte_range("bytes=0-1,2-3", 1000), None); // multi-range
         assert_eq!(parse_byte_range("bytes=0-99", 0), None); // empty file
+        assert_eq!(parse_byte_range("bytes=-0", 1000), None); // suffix length zero
+    }
+
+    // ── error-type plumbing the handlers reach only via fault closures ──
+
+    #[test]
+    fn into_response_maps_internal_to_500() {
+        // The Internal arm is only produced inside the handlers' fault closures
+        // (spawn_blocking JoinError / post-canonicalize I/O), so exercise its
+        // status mapping directly here.
+        let resp = ApiError::Internal("boom".to_string()).into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn api_error_from_fs_error_maps_core_and_io() {
+        use onebrain_core::CoreError;
+        // A core (client-caused) error → 400 carrying the core message.
+        let core = ApiError::from(onebrain_fs::FsError::Core(CoreError::InvalidTarget(
+            "../escape".into(),
+        )));
+        assert!(matches!(core, ApiError::BadRequest(_)), "got {core:?}");
+        // A raw I/O error → 500 with a generic, non-leaking label (no errno/path).
+        let io = ApiError::from(onebrain_fs::FsError::Io {
+            path: std::path::PathBuf::from("x.md"),
+            source: std::io::Error::other("denied"),
+        });
+        assert!(
+            matches!(&io, ApiError::Internal(m) if m == "filesystem error"),
+            "got {io:?}"
+        );
+    }
+
+    #[test]
+    fn deletion_error_maps_vanished_target_to_404_else_delegates() {
+        use onebrain_core::CoreError;
+        // InvalidTarget reaching the delete mapper = the target vanished in the
+        // TOCTOU window after the handler's existence check → 404, not 400.
+        let gone = deletion_error(onebrain_fs::FsError::Core(CoreError::InvalidTarget(
+            "x".into(),
+        )));
+        assert!(matches!(gone, ApiError::NotFound(_)), "got {gone:?}");
+        // Any other FsError falls through to the standard From mapping (I/O → 500).
+        let other = deletion_error(onebrain_fs::FsError::Io {
+            path: std::path::PathBuf::from("x.md"),
+            source: std::io::Error::other("io"),
+        });
+        assert!(matches!(other, ApiError::Internal(_)), "got {other:?}");
+    }
+
+    #[test]
+    fn read_vault_raw_empty_path_is_bad_request() {
+        // Mirror of read_vault_file's empty-path guard, for the raw byte path.
+        let dir = tempdir().unwrap();
+        let err = read_vault_raw(dir.path(), "").unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn resolve_create_rejects_nul_and_empty_paths() {
+        // The create-path guard rejects a NUL byte and an empty string up front,
+        // before any canonicalize syscall.
+        let dir = tempdir().unwrap();
+        let nul = resolve_in_vault_create(dir.path(), "a\0b.md").unwrap_err();
+        assert!(matches!(nul, ApiError::BadRequest(_)), "got {nul:?}");
+        let empty = resolve_in_vault_create(dir.path(), "").unwrap_err();
+        assert!(matches!(empty, ApiError::BadRequest(_)), "got {empty:?}");
     }
 }

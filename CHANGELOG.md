@@ -1,5 +1,5 @@
 ---
-latest_version: 3.3.19
+latest_version: 3.3.20
 released: 2026-06-30
 ---
 
@@ -9,6 +9,13 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.20] — 2026-06-30 — coverage phase 3b (server/api.rs)
+
+- **test(server): cover the JSON API handlers** (+28 oneshot/unit tests, no production change) — `server/api.rs` 69.56% → **87.06%**. Extends the existing `tower::oneshot` harness in `server/tests.rs`: no-vault 503 guard for every vault handler, byte-range 206 + `Content-Range`, forced-attachment for scriptable types, raw upload, `If-Match` overwrite, move/folder 404/409/415/422, method 405, plus `ApiError`/`From<FsError>` mapping unit tests.
+- Core line coverage 94.28% → **94.84%** (`scripts/coverage.sh`).
+- **Documented the realistic coverage ceiling** in `docs/coverage.md`: literal 100% is unreachable on the stable toolchain (no inline `// coverage:ignore`; `#[coverage(off)]` is nightly-only), so genuinely-unreachable lines (`spawn_blocking` `JoinError` closures, post-`canonicalize` I/O errors, body-limit-middleware dead branches, platform-defensive arms) are listed as residuals rather than ignored. Target is ≈99% core + documented residuals + a ratcheting CI gate.
+- No behavior change — tests + docs only.
 
 ## [3.3.19] — 2026-06-30 — coverage phase 3 (fs cluster)
 

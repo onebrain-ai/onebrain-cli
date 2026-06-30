@@ -1251,6 +1251,36 @@ async fn vault_tasks_honors_custom_folder_names_with_trailing_slash() {
     );
 }
 
+/// When the config can't be loaded at all, the task scan falls back to the
+/// DEFAULT allowlist (01-projects/ + 02-areas/) instead of failing. Delete
+/// onebrain.yml so the in-handler `load_vault_config_at` errors, then a dated
+/// task under the default project folder must still be returned.
+#[tokio::test]
+async fn vault_tasks_without_config_falls_back_to_default_folders() {
+    let (dir, router) = vault_router(None);
+    fs::write(
+        dir.path().join("01-projects/dated.md"),
+        "- [ ] default-folder task 📅 2026-06-30\n",
+    )
+    .unwrap();
+    // Remove the config so the load inside get_vault_tasks fails → default opts.
+    fs::remove_file(dir.path().join("onebrain.yml")).unwrap();
+
+    let (status, body) = get_authed(&router, "/api/vault/tasks").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let files: Vec<&str> = json["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["file"].as_str().unwrap())
+        .collect();
+    assert!(
+        files.contains(&"01-projects/dated.md"),
+        "default-folder task should scan even without a config: {body}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Symlink-escape on the WRITE path (resolve_in_vault_create) — security
 // ─────────────────────────────────────────────────────────────────────────
@@ -1282,4 +1312,436 @@ async fn write_through_symlinked_dir_escaping_vault_is_rejected() {
         !outside.path().join("pwned.md").exists(),
         "a write escaped the vault through a symlinked directory"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// GET /api/vault/raw — raw-bytes serving (content-type guess, forced
+// attachment, byte ranges, size cap). The pure helpers (content_type_for,
+// forces_attachment, parse_byte_range, content_disposition_attachment) are
+// unit-tested in api.rs; these drive the full handler wiring end-to-end.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn raw_serves_image_bytes_with_guessed_content_type() {
+    let (dir, router) = vault_router(None);
+    // A short PNG-signature-ish byte blob (not valid UTF-8 → proves the raw path
+    // is byte-faithful, unlike the text /file endpoint which would 422 on this).
+    let bytes = [
+        0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0xFF, 0x10,
+    ];
+    fs::write(dir.path().join("img.png"), bytes).unwrap();
+
+    let req = Request::builder()
+        .uri("/api/vault/raw?path=img.png")
+        .header("X-OneBrain-Token", TOKEN)
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers().get("content-type").unwrap(), "image/png");
+    // Range support is advertised so the browser knows it can seek media.
+    assert_eq!(res.headers().get("accept-ranges").unwrap(), "bytes");
+    // No attachment forced for a plain image.
+    assert!(res.headers().get("content-disposition").is_none());
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], &bytes[..], "raw bytes must round-trip unchanged");
+}
+
+#[tokio::test]
+async fn raw_forces_attachment_for_scriptable_svg() {
+    // An SVG can carry script; the raw endpoint must serve it as an octet-stream
+    // attachment so it can never render+run in the app origin.
+    let (dir, router) = vault_router(None);
+    fs::write(dir.path().join("pic.svg"), "<svg onload=\"x\"></svg>").unwrap();
+
+    let req = Request::builder()
+        .uri("/api/vault/raw?path=pic.svg")
+        .header("X-OneBrain-Token", TOKEN)
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers().get("content-type").unwrap(),
+        "application/octet-stream",
+        "scriptable types must NOT keep their real image/svg+xml type"
+    );
+    let cd = res
+        .headers()
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(cd.contains("attachment"), "must force attachment: {cd}");
+    assert!(cd.contains("pic.svg"), "must carry the real filename: {cd}");
+}
+
+#[tokio::test]
+async fn raw_download_param_forces_attachment_keeping_type() {
+    // `&download=1` on a normal image forces the attachment disposition but the
+    // content-type stays the real image type (download, not a security force).
+    let (dir, router) = vault_router(None);
+    fs::write(dir.path().join("photo.png"), [1u8, 2, 3, 4]).unwrap();
+
+    let req = Request::builder()
+        .uri("/api/vault/raw?path=photo.png&download=1")
+        .header("X-OneBrain-Token", TOKEN)
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers().get("content-type").unwrap(), "image/png");
+    let cd = res
+        .headers()
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        cd.contains("attachment"),
+        "download=1 forces attachment: {cd}"
+    );
+    assert!(cd.contains("photo.png"), "keeps the real filename: {cd}");
+}
+
+#[tokio::test]
+async fn raw_byte_range_returns_206_partial_slice() {
+    let (dir, router) = vault_router(None);
+    // 10 bytes "0123456789" in a non-forced type so the range path is honoured.
+    fs::write(dir.path().join("media.png"), b"0123456789").unwrap();
+
+    let req = Request::builder()
+        .uri("/api/vault/raw?path=media.png")
+        .header("X-OneBrain-Token", TOKEN)
+        .header("range", "bytes=2-5")
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(res.headers().get("content-range").unwrap(), "bytes 2-5/10");
+    assert_eq!(res.headers().get("content-type").unwrap(), "image/png");
+    assert_eq!(res.headers().get("accept-ranges").unwrap(), "bytes");
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"2345", "inclusive [2,5] slice");
+}
+
+#[tokio::test]
+async fn raw_unsatisfiable_range_falls_back_to_full_200() {
+    // A range whose start is past EOF is unsatisfiable → the handler ignores it
+    // and serves the full 200 body (it never emits a 416).
+    let (dir, router) = vault_router(None);
+    fs::write(dir.path().join("media.png"), b"0123456789").unwrap();
+
+    let req = Request::builder()
+        .uri("/api/vault/raw?path=media.png")
+        .header("X-OneBrain-Token", TOKEN)
+        .header("range", "bytes=100-200")
+        .body(Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "unsatisfiable range → full 200"
+    );
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.len(), 10, "full body served");
+}
+
+#[tokio::test]
+async fn raw_missing_is_404() {
+    let (_dir, router) = vault_router(None);
+    let (status, _body) = get_authed(&router, "/api/vault/raw?path=nope.png").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn raw_directory_path_is_400() {
+    // `01-projects` is a directory in the fixture vault → 400 "not a file".
+    let (_dir, router) = vault_router(None);
+    let (status, body) = get_authed(&router, "/api/vault/raw?path=01-projects").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(body.contains("not a file"), "body: {body}");
+}
+
+#[tokio::test]
+async fn raw_over_cap_is_413() {
+    // A file just past the 50 MB raw cap → 413, refused before the read (sparse).
+    let (dir, router) = vault_router(None);
+    let big = dir.path().join("big.bin");
+    let f = fs::File::create(&big).unwrap();
+    f.set_len(50 * 1024 * 1024 + 1).unwrap(); // sparse, cheap
+    let (status, body) = get_authed(&router, "/api/vault/raw?path=big.bin").await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "body: {body}");
+    assert!(body.contains("too large"), "body: {body}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// POST /api/vault/upload — raw binary write (chat attachments)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn upload_writes_raw_bytes_and_creates_parents() {
+    let (dir, router) = vault_router(None);
+    // Body need not be valid markdown; deep path proves parents are created.
+    let payload = "attachment-bytes-\u{0}\u{1}\u{2}-end";
+    let (status, body) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/upload?path=attachments/img/a.bin",
+        "application/octet-stream",
+        payload,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["path"], "attachments/img/a.bin");
+    let on_disk = fs::read(dir.path().join("attachments/img/a.bin")).unwrap();
+    assert_eq!(on_disk, payload.as_bytes(), "uploaded bytes must match");
+}
+
+#[tokio::test]
+async fn upload_rejects_tooling_and_traversal_paths() {
+    let (_dir, router) = vault_router(None);
+    for path in [".git/x.bin", "../escape.bin"] {
+        let (status, body) = send_authed(
+            &router,
+            "POST",
+            &format!("/api/vault/upload?path={path}"),
+            "application/octet-stream",
+            "x",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "upload to {path} must be 400; body: {body}"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PUT /api/vault/file — If-Match variants + tooling guard
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn put_with_star_if_match_overwrites_unconditionally() {
+    let (dir, router) = vault_router(None);
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/vault/file?path=01-projects/alpha.md")
+        .header("X-OneBrain-Token", TOKEN)
+        .header("content-type", "text/markdown")
+        .header("If-Match", "*") // wildcard = overwrite whatever's there
+        .body(Body::from("# Star overwrite\n"))
+        .unwrap();
+    let (status, body) = send(&router, req).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let on_disk = fs::read_to_string(dir.path().join("01-projects/alpha.md")).unwrap();
+    assert!(on_disk.contains("Star overwrite"), "disk: {on_disk}");
+}
+
+#[tokio::test]
+async fn put_without_if_match_overwrites_unconditionally() {
+    let (dir, router) = vault_router(None);
+    // No If-Match header at all → no conflict check, plain overwrite.
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/vault/file?path=01-projects/alpha.md")
+        .header("X-OneBrain-Token", TOKEN)
+        .header("content-type", "text/markdown")
+        .body(Body::from("# Headerless overwrite\n"))
+        .unwrap();
+    let (status, body) = send(&router, req).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let on_disk = fs::read_to_string(dir.path().join("01-projects/alpha.md")).unwrap();
+    assert!(on_disk.contains("Headerless overwrite"), "disk: {on_disk}");
+}
+
+#[tokio::test]
+async fn put_to_tooling_dir_is_400() {
+    let (_dir, router) = vault_router(None);
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/vault/file?path=.git/config")
+        .header("X-OneBrain-Token", TOKEN)
+        .header("content-type", "text/markdown")
+        .header("If-Match", "*")
+        .body(Body::from("evil"))
+        .unwrap();
+    let (status, body) = send(&router, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(body.contains("tooling directory"), "body: {body}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// DELETE /api/vault/file — missing target
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn delete_missing_file_is_404() {
+    let (_dir, router) = vault_router(None);
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/api/vault/file?path=01-projects/ghost.md")
+        .header("X-OneBrain-Token", TOKEN)
+        .body(Body::empty())
+        .unwrap();
+    let (status, _body) = send(&router, req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// POST /api/vault/folder — conflict; DELETE /api/vault/folder — error branches
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn create_folder_over_existing_is_409() {
+    // `01-projects` already exists in the fixture vault.
+    let (_dir, router) = vault_router(None);
+    let (status, body) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/folder?path=01-projects",
+        "text/plain",
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert!(body.contains("already exists"), "body: {body}");
+}
+
+#[tokio::test]
+async fn delete_folder_missing_is_404() {
+    let (_dir, router) = vault_router(None);
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/api/vault/folder?path=01-projects/ghostdir")
+        .header("X-OneBrain-Token", TOKEN)
+        .body(Body::empty())
+        .unwrap();
+    let (status, _body) = send(&router, req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn delete_folder_on_a_file_is_400() {
+    // README.md is a file → the FOLDER endpoint must refuse it (mirror guard).
+    let (_dir, router) = vault_router(None);
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/api/vault/folder?path=README.md")
+        .header("X-OneBrain-Token", TOKEN)
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send(&router, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(body.contains("not a folder"), "body: {body}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// POST /api/vault/move — body rejection + tooling guard
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn move_missing_field_body_is_422() {
+    // Valid JSON but missing the required `to` field → axum Json data error → 422.
+    let (_dir, router) = vault_router(None);
+    let (status, _body) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/move",
+        "application/json",
+        r#"{"from":"01-projects/alpha.md"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn move_wrong_content_type_is_415() {
+    // Right shape, wrong content-type → axum Json missing-content-type → 415.
+    let (_dir, router) = vault_router(None);
+    let (status, _body) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/move",
+        "text/plain",
+        r#"{"from":"01-projects/alpha.md","to":"01-projects/x.md"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn move_from_tooling_dir_is_400() {
+    let (_dir, router) = vault_router(None);
+    let (status, body) = send_authed(
+        &router,
+        "POST",
+        "/api/vault/move",
+        "application/json",
+        r#"{"from":".git/config","to":"01-projects/x.md"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(body.contains("tooling directory"), "body: {body}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Method-not-allowed on an existing route → 405 (auth passes first).
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn wrong_method_on_config_is_405() {
+    let (_dir, router) = vault_router(None);
+    // /api/config is GET-only; an authed PATCH matches the path but not the verb.
+    let (status, _body) = send_authed(&router, "PATCH", "/api/config", "text/plain", "").await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// No vault bound → 503 on EVERY remaining vault handler (tasks / raw / upload /
+// post / put / delete file / move / folder create+delete). Complements the
+// existing no_vault_{tree,file,config} tests so all require_vault_root guards
+// are exercised. Each carries the curated "no vault bound" message.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn no_vault_remaining_endpoints_all_503() {
+    let router = no_vault_router();
+    // (method, uri, content-type, body) — every path is NON-tooling + well-formed
+    // so the handler reaches `require_vault_root` (the 503 guard) rather than
+    // tripping an earlier reject_tooling_path / Json rejection.
+    let cases: &[(&str, &str, &str, &str)] = &[
+        ("GET", "/api/vault/tasks", "text/plain", ""),
+        ("GET", "/api/vault/raw?path=a.png", "text/plain", ""),
+        (
+            "POST",
+            "/api/vault/upload?path=a.bin",
+            "application/octet-stream",
+            "x",
+        ),
+        ("POST", "/api/vault/file?path=n.md", "text/markdown", "x"),
+        ("PUT", "/api/vault/file?path=n.md", "text/markdown", "x"),
+        ("DELETE", "/api/vault/file?path=n.md", "text/plain", ""),
+        (
+            "POST",
+            "/api/vault/move",
+            "application/json",
+            r#"{"from":"a.md","to":"b.md"}"#,
+        ),
+        ("POST", "/api/vault/folder?path=f", "text/plain", ""),
+        ("DELETE", "/api/vault/folder?path=f", "text/plain", ""),
+    ];
+    for (method, uri, ctype, body) in cases {
+        let (status, b) = send_authed(&router, method, uri, ctype, body).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{method} {uri} should be 503 with no vault; body: {b}"
+        );
+        assert!(
+            b.contains("no vault bound"),
+            "{method} {uri} body should carry the no-vault message: {b}"
+        );
+    }
 }
