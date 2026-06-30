@@ -86,6 +86,16 @@ const COMMANDS: &[Cmd<'static>] = &[
         hook_protocol_shape: false,
         allow_nonzero_exit: true,
     },
+    Cmd {
+        // `task list` inside a vault with no task notes → empty list, but still
+        // the canonical envelope; exercises text/json/yaml format parity for
+        // the v3.3.14-surfaced verb.
+        name: "task list · inside vault",
+        args: &["task", "list"],
+        cwd_setup: write_vault_yml,
+        hook_protocol_shape: false,
+        allow_nonzero_exit: false,
+    },
 ];
 
 #[test]

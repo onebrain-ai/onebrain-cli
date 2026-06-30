@@ -1,5 +1,5 @@
 ---
-latest_version: 3.3.13
+latest_version: 3.3.14
 released: 2026-06-29
 ---
 
@@ -9,6 +9,12 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.14] — 2026-06-29 — surface note + task in --help
+
+- **feat(cli): surface the `note` and `task` command groups in `onebrain --help`** — both were implemented but `#[command(hide = true)]`, so users couldn't discover them. All 14 `note` verbs + `task list` are real; they now appear (with descriptions) under the resource-group cluster.
+- Stub verbs `task add` / `task done` stay hidden until implemented; the all-stub groups (avatar, bookmark, daemon, …) and v3.0 legacy aliases remain hidden as before.
+- Added unit + integration tests asserting `note`/`task` are visible, `task list` shows under `task --help`, and `task add`/`done` + stub groups stay hidden.
 
 ## [3.3.13] — 2026-06-29 — fence-aware task scan + task list verb
 
