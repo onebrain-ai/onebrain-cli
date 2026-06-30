@@ -1,5 +1,5 @@
 ---
-latest_version: 3.3.14
+latest_version: 3.3.15
 released: 2026-06-29
 ---
 
@@ -9,6 +9,15 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.15] — 2026-06-29 — categorized root --help
+
+- **feat(cli): group root `--help` commands into named category sections** — `onebrain --help` now renders four sections (Setup & Maintenance, Vault & Content, Session & Automation, AI & Serving) instead of one flat Commands list.
+- Descriptions are pulled live from clap `about` annotations — no hardcoded strings; the block can never drift from the source of truth.
+- Subcommand help (`onebrain note --help`, etc.) is untouched — clap handles those paths unchanged.
+- Drift-guard test: CI fails if any visible root subcommand is missing from CATEGORIES, or any category entry is stale.
+- Options section preserves compact format (description inline, `[default:]` wraps) — not affected by the categorized block injection.
+- Fixed `is_root_help_request` to not intercept `--version` / `-V` (was returning categorized help instead of version output).
 
 ## [3.3.14] — 2026-06-29 — surface note + task in --help
 
