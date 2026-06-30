@@ -614,6 +614,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn read_failure_increments_skipped() {
+        // Permission bits are advisory under root → the error branch never fires.
+        // Skip rather than pass vacuously (CI runs non-root; this only affects root/Docker).
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
         // Covers the fs::read_to_string Err arm in run_backfill_recapped.
         use std::os::unix::fs::PermissionsExt;
         let d = tempdir().unwrap();
@@ -639,6 +647,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unreadable_month_dir_produces_no_files() {
+        // Permission bits are advisory under root → the error branch never fires.
+        // Skip rather than pass vacuously (CI runs non-root; this only affects root/Docker).
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
         // list_md_files returns Vec::new() when fs::read_dir fails on the dir.
         use std::os::unix::fs::PermissionsExt;
         let d = tempdir().unwrap();
@@ -663,6 +679,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unreadable_year_dir_is_skipped() {
+        // Permission bits are advisory under root → the error branch never fires.
+        // Skip rather than pass vacuously (CI runs non-root; this only affects root/Docker).
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
         // Covers the `Err(_) => continue` branch when fs::read_dir on a year
         // directory fails.
         use std::os::unix::fs::PermissionsExt;

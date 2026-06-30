@@ -192,6 +192,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn read_settings_permission_denied_returns_io_error() {
+        // Permission bits are advisory under root → the error branch never fires.
+        // Skip rather than pass vacuously (CI runs non-root; this only affects root/Docker).
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
         // Covers the last `Err(e)` arm of read_settings (non-NotFound I/O error).
         use std::os::unix::fs::PermissionsExt;
         let d = tempdir().unwrap();

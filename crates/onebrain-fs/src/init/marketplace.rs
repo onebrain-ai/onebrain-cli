@@ -427,6 +427,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn force_treats_unreadable_file_as_non_canonical() {
+        // Permission bits are advisory under root → the error branch never fires.
+        // Skip rather than pass vacuously (CI runs non-root; this only affects root/Docker).
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         let d = tempdir().unwrap();
         let dir = d.path().join(".claude-plugin");
@@ -442,7 +450,7 @@ mod tests {
 
         let out = write_marketplace_json_with_force(d.path(), true);
         // Restore permissions before any assertions so tempdir cleanup works.
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         // read_to_string fails → is_canonical_existing returns false → repair branch.
         // The rewrite may succeed (Repaired) or fail if the dir itself restricts

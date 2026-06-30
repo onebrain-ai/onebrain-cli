@@ -282,6 +282,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn archive_mkdir_failure_propagates() {
+        // Permission bits are advisory under root → the error branch never fires.
+        // Skip rather than pass vacuously (CI runs non-root; this only affects root/Docker).
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempdir().unwrap();
@@ -320,6 +328,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn archive_rename_non_exdev_failure_propagates() {
+        // Permission bits are advisory under root → the error branch never fires.
+        // Skip rather than pass vacuously (CI runs non-root; this only affects root/Docker).
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempdir().unwrap();
