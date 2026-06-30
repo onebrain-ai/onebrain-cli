@@ -46,18 +46,20 @@ the call site.
 ## Status (2026-06-29)
 
 - Whole-workspace baseline (no exclusions): **89.58% line** (`cargo llvm-cov --workspace`).
-- **Core baseline (this initiative's target surface, exclusions applied): 92.59% line** /
-  93.23% region — `scripts/coverage.sh`. ~1,711 missed lines remain on core code.
+- **Core (this initiative's target surface, exclusions applied): 93.65% line** / 94.16% region —
+  `scripts/coverage.sh`. ~1,512 missed lines remain on core code (down from 1,711 baseline).
 
 Closed so far:
-- `v31/dispatch.rs` 76.94% → 86.70% (stub/verb exit-code tests).
+- Phase 1 — `v31/dispatch.rs` 76.94% → 86.70% (stub/verb exit-code tests).
+- Phase 2 — `commands/doctor.rs` 87.55% → 94.28%, `commands/register_schedule.rs` 72.08% →
+  91.30%, `vault_ctx.rs` 51.35% → 100%, `commands/run_skill.rs` 78.82% → 79.17%.
 
 A ratcheting CI coverage gate (fail under the current core %) will be added in the final phase,
-once the core is at or near 100%, so it doesn't fight a moving target while phases 2–3 land.
+once the core is at or near 100%, so it doesn't fight a moving target while the remaining phases land.
 
 Remaining core gaps to close to reach the target (tracked, in priority order by missed lines):
-`commands/doctor.rs`, `commands/register_schedule.rs`, `commands/run_skill.rs`,
-`vault_ctx.rs`, then the `onebrain-fs` 90–96% cluster (`note/archive.rs`, `note/move.rs`,
-`migrate.rs`, `register_hooks/*`, `init/{mod,marketplace}.rs`, `doctor/vault_yml_keys.rs`,
-`vault_sync/*` non-progress, `v31/hook_rewriter.rs`). See
+the `onebrain-fs` 90–96% cluster (`note/archive.rs`, `note/move.rs`, `migrate.rs`,
+`register_hooks/*`, `init/{mod,marketplace}.rs`, `doctor/vault_yml_keys.rs`, `vault_sync/*`
+non-progress, `v31/hook_rewriter.rs`), plus the residual interactive-spinner paths in
+`commands/run_skill.rs` (needs a pty harness — likely promoted to the exclusion list). See
 `01-projects/onebrain/cli/2026-06-29-cli-coverage-100-design.md` in the vault for the phased plan.

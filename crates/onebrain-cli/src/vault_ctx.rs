@@ -146,7 +146,13 @@ mod tests {
         let info = info_from(&resolved);
 
         assert_eq!(info.name, "my-vault");
-        assert_eq!(info.path, vault_dir.canonicalize().unwrap_or(vault_dir));
+        // Canonicalize BOTH sides: on macOS the tempdir resolves through the
+        // /var → /private/var symlink, so comparing a raw path against a
+        // canonicalized one is flaky. Compare the canonical forms.
+        assert_eq!(
+            info.path.canonicalize().unwrap(),
+            vault_dir.canonicalize().unwrap()
+        );
     }
 
     // ---- print_vault_not_found_help ----
