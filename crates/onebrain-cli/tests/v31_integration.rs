@@ -70,7 +70,7 @@ fn root_help_renders_compact_with_wrapped_defaults() {
     // attribute pushed EVERY arg into long format (name on its own line) and
     // made `--help` read as "ดูยาก" per user testing. The new shape:
     //   - Commands: categorized block (`    init          Initialize a new vault
-    //     (interactive setup)`) with 4-space indent inside category sections.
+    //     (interactive setup)`) with 2-space indent inside category sections.
     //   - Options without defaults: compact
     //   - Options WITH `[default]` + `[possible values]`: description still
     //     inline, the bracketed value block wraps to a new line indented to
@@ -174,14 +174,10 @@ fn top_level_help_hides_stub_groups() {
         "qmd",
         "serve",
     ] {
-        // v3.3.15 categorized-help format: commands appear as `    {name}  ` or
-        // `    {name} ` (4-space indent inside category sections, inline description).
-        // Also accept 2-space variants for defensive future-proofing.
+        // v3.3.17 categorized-help format: commands appear as `  {name}  `
+        // (2-space indent inside category sections, inline description).
         assert!(
-            stdout.contains(&format!("    {visible}  "))
-                || stdout.contains(&format!("    {visible} "))
-                || stdout.contains(&format!("  {visible}\n"))
-                || stdout.contains(&format!("  {visible} ")),
+            stdout.contains(&format!("  {visible}  ")) || stdout.contains(&format!("  {visible} ")),
             "expected visible command `{visible}` in --help. Got:\n{stdout}"
         );
     }
@@ -288,11 +284,11 @@ fn top_level_help_is_production_grade() {
     // Item E: category-section ordering. v3.3.15: commands appear in named
     // category sections (System Management → Vault Management → Session
     // Management → Launch Management). Find the byte offset of each entry in the
-    // rendered help (4-space indent inside category) and assert the ordering
+    // rendered help (2-space indent inside category) and assert the ordering
     // matches the declared CATEGORIES constant. Piped `--help` (this test
     // captures non-tty output) renders category names WITHOUT emoji.
     //
-    // The anchor pattern is `    {name} ` (4-space indent + name + at least
+    // The anchor pattern is `  {name} ` (2-space indent + name + at least
     // one space before the description column). Fall back to 2-space variants
     // so the test remains correct if a future renderer tweak changes the indent.
     fn offset_of(haystack: &str, needle: &str) -> usize {

@@ -12,7 +12,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [3.3.17] — 2026-06-29 — fix `onebrain update` hang on Homebrew + tighter --help indent
 
-- **fix(update): `onebrain update` no longer hangs on Homebrew.** Homebrew 4.4+/6.x made `brew upgrade` prompt "Do you want to proceed? [y/n]" by default; the install spinner redrew the TTY over brew's readline, corrupting the y/n input into an endless "Invalid input" loop. `brew_upgrade` now sets `HOMEBREW_NO_ASK=1` so brew auto-proceeds (the user already opted in by running `onebrain update`). Version-safe — older brew without ask-mode ignores it; the `--yes` flag is deliberately NOT used because it errors on pre-ask-mode brew.
+- **fix(update): `onebrain update` no longer hangs on Homebrew.** Homebrew 4.4+ made `brew upgrade` prompt "Do you want to proceed? [y/n]" by default; the install spinner redrew the TTY over brew's readline, corrupting the y/n input into an endless "Invalid input" loop. `brew_upgrade` now sets `HOMEBREW_NO_ASK=1` so brew auto-proceeds (the user already opted in by running `onebrain update`). Version-safe — older brew without ask-mode ignores it; the `--yes` flag is deliberately NOT used because it errors on pre-ask-mode brew.
 - **style(cli): tighter `--help` layout** — category headings now sit flush at the left margin and commands indent 2 spaces (was 2-space heading / 4-space commands), so the grouped command list reads closer to the edge.
 
 ## [3.3.16] — 2026-06-29 — coverage foundation + dispatch tests
