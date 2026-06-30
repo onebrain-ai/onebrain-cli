@@ -22,9 +22,14 @@
 
 use clap::Command;
 
-/// One category heading + the ordered list of subcommand names that belong to it.
+/// One category: an emoji, a name, and the ordered subcommand names in it.
+///
+/// The `emoji` is rendered only when stdout is a terminal (see
+/// [`build_categorized_commands_block`]'s `use_emoji` parameter) so piped /
+/// redirected `--help` stays plain ASCII.
 pub struct Category {
-    pub heading: &'static str,
+    pub emoji: &'static str,
+    pub name: &'static str,
     pub commands: &'static [&'static str],
 }
 
@@ -36,20 +41,24 @@ pub struct Category {
 ///   drift-guard test enforces this).
 pub const CATEGORIES: &[Category] = &[
     Category {
-        heading: "Setup & Maintenance",
-        commands: &["init", "update", "doctor", "plugin", "qmd"],
+        emoji: "⚙️",
+        name: "System Management",
+        commands: &["init", "update", "doctor", "plugin", "qmd", "schedule"],
     },
     Category {
-        heading: "Vault & Content",
+        emoji: "🧠",
+        name: "Vault Management",
         commands: &["vault", "note", "task"],
     },
     Category {
-        heading: "Session & Automation",
-        commands: &["session", "checkpoint", "schedule", "skill"],
+        emoji: "🔄",
+        name: "Session Management",
+        commands: &["session", "checkpoint"],
     },
     Category {
-        heading: "AI & Serving",
-        commands: &["harness", "serve"],
+        emoji: "🚀",
+        name: "Launch Management",
+        commands: &["harness", "serve", "skill"],
     },
 ];
 
@@ -62,7 +71,11 @@ pub const CATEGORIES: &[Category] = &[
 /// Only **visible** subcommands (i.e. `!cmd.is_hide_set()`) are included;
 /// the category map already omits hidden commands, but the visibility filter
 /// here is a belt-and-suspenders guard.
-pub fn build_categorized_commands_block(root: &Command) -> String {
+///
+/// `use_emoji` controls whether each heading is prefixed with its category
+/// emoji. Callers pass `false` when stdout is not a terminal so piped help
+/// stays plain ASCII.
+pub fn build_categorized_commands_block(root: &Command, use_emoji: bool) -> String {
     // Collect visible subcommands into a name → owned-about map.
     let subcmds: std::collections::HashMap<String, String> = root
         .get_subcommands()
@@ -94,7 +107,11 @@ pub fn build_categorized_commands_block(root: &Command) -> String {
 
         out.push('\n');
         out.push_str("  ");
-        out.push_str(cat.heading);
+        if use_emoji {
+            out.push_str(cat.emoji);
+            out.push_str("  ");
+        }
+        out.push_str(cat.name);
         out.push('\n');
 
         for (name, about) in &visible_in_cat {
@@ -162,33 +179,45 @@ pub fn is_root_help_request(args: &[String]) -> bool {
     !found_subcmd && (has_help_flag || after_bin.is_empty())
 }
 
+/// Root-help template: conventional layout — about, `Usage:`, then the
+/// categorized command block (injected via `{before-help}`), then the Options
+/// section. clap v4 has no `{options}`/`{subcommands}` tokens (only `{all-args}`),
+/// so we hide every subcommand on the render clone — that makes `{all-args}`
+/// render the Options section ALONE — and supply the categorized commands
+/// ourselves through `before_help`. `{usage}` is overridden so it keeps
+/// `<COMMAND>` despite the hidden subcommands.
+const ROOT_HELP_TEMPLATE: &str = "\
+{about-with-newline}{usage-heading} {usage}
+
+{before-help}{all-args}{after-help}";
+
 /// Print the categorized root `--help` and exit 0.
-///
-/// Strategy: inject the categorized commands block via `before_help`, then
-/// hide all subcommands on a render-only clone so clap's default `{all-args}`
-/// token renders only the Options section (with its original compact format).
-/// The `Commands:` heading disappears when all subcommands are hidden, leaving
-/// our `{before-help}` block as the sole commands display.
-///
-/// This preserves the original Options section formatting (compact rows,
-/// wrapped defaults) because we use the default template unchanged.
 ///
 /// Called from `main` when [`is_root_help_request`] is true. Subcommand help
 /// (`onebrain note --help`) never reaches this function — clap handles those
-/// paths through its normal derive-driven flow.
+/// paths through its normal derive-driven flow, so their help is unchanged.
 pub fn print_root_help() {
     use crate::cli::Cli;
     use clap::CommandFactory;
+    use std::io::IsTerminal;
 
     let original = Cli::command();
-    let categorized = build_categorized_commands_block(&original);
+    // Emoji headings only when stdout is a real terminal — piped / redirected
+    // `--help` (e.g. `onebrain --help | cat`) stays plain ASCII.
+    let use_emoji = std::io::stdout().is_terminal();
+    let categorized = build_categorized_commands_block(&original, use_emoji);
 
-    // Inject the categorized block before the (now-empty) Commands section.
-    let mut render_cmd = original.clone().before_help(categorized);
+    let mut render_cmd = original
+        .clone()
+        .help_template(ROOT_HELP_TEMPLATE)
+        // Keep `<COMMAND>` in the usage line even though we hide subcommands
+        // below (hiding them would otherwise collapse usage to `[OPTIONS]`).
+        .override_usage("onebrain [OPTIONS] <COMMAND>")
+        .before_help(categorized);
 
-    // Hide all subcommands on the render clone so clap's `{subcommands}`
-    // block (part of `{all-args}`) renders empty. We use `mut_subcommand`
-    // to toggle the hide flag per name.
+    // Hide all subcommands so `{all-args}` renders the Options section only
+    // (clap has no standalone `{options}` token). Our categorized block above
+    // is the sole Commands display.
     let subcmd_names: Vec<String> = render_cmd
         .get_subcommands()
         .map(|c| c.get_name().to_owned())
@@ -273,27 +302,47 @@ mod tests {
         let mut seen: HashMap<&str, &str> = HashMap::new();
         for cat in CATEGORIES {
             for &name in cat.commands {
-                if let Some(prev_cat) = seen.insert(name, cat.heading) {
+                if let Some(prev_cat) = seen.insert(name, cat.name) {
                     panic!(
                         "Command `{name}` appears in both `{prev_cat}` and `{}` — \
                          each command must be in exactly one category",
-                        cat.heading
+                        cat.name
                     );
                 }
             }
         }
     }
 
-    /// Assert the rendered root help block contains all four category headings.
+    /// Assert the rendered root help block contains all four category names.
     #[test]
     fn rendered_block_contains_all_category_headings() {
         let root = Cli::command();
-        let block = build_categorized_commands_block(&root);
+        let block = build_categorized_commands_block(&root, false);
         for cat in CATEGORIES {
             assert!(
-                block.contains(cat.heading),
-                "category heading `{}` missing from rendered block:\n{block}",
-                cat.heading
+                block.contains(cat.name),
+                "category name `{}` missing from rendered block:\n{block}",
+                cat.name
+            );
+        }
+    }
+
+    /// Emoji is rendered when `use_emoji` is true and omitted otherwise.
+    #[test]
+    fn emoji_is_tty_gated() {
+        let root = Cli::command();
+        let with = build_categorized_commands_block(&root, true);
+        let without = build_categorized_commands_block(&root, false);
+        for cat in CATEGORIES {
+            assert!(
+                with.contains(cat.emoji),
+                "emoji `{}` missing when use_emoji=true",
+                cat.emoji
+            );
+            assert!(
+                !without.contains(cat.emoji),
+                "emoji `{}` leaked into plain (use_emoji=false) output",
+                cat.emoji
             );
         }
     }
@@ -302,31 +351,42 @@ mod tests {
     #[test]
     fn spot_check_command_placement() {
         let root = Cli::command();
-        let block = build_categorized_commands_block(&root);
+        let block = build_categorized_commands_block(&root, false);
 
-        // qmd must appear under "Setup & Maintenance".
-        let setup_pos = block
-            .find("Setup & Maintenance")
-            .expect("Setup & Maintenance heading present");
+        // qmd must appear under "System Management".
+        let system_pos = block
+            .find("System Management")
+            .expect("System Management heading present");
         let vault_pos = block
-            .find("Vault & Content")
-            .expect("Vault & Content heading present");
+            .find("Vault Management")
+            .expect("Vault Management heading present");
         let qmd_pos = block.find("\n    qmd").expect("`qmd` entry present");
         assert!(
-            qmd_pos > setup_pos && qmd_pos < vault_pos,
-            "`qmd` must appear between `Setup & Maintenance` and `Vault & Content`; \
-             positions: setup={setup_pos} qmd={qmd_pos} vault={vault_pos}"
+            qmd_pos > system_pos && qmd_pos < vault_pos,
+            "`qmd` must appear between `System Management` and `Vault Management`; \
+             positions: system={system_pos} qmd={qmd_pos} vault={vault_pos}"
         );
 
-        // task must appear under "Vault & Content".
+        // task must appear under "Vault Management".
         let session_pos = block
-            .find("Session & Automation")
-            .expect("Session & Automation heading present");
+            .find("Session Management")
+            .expect("Session Management heading present");
         let task_pos = block.find("\n    task").expect("`task` entry present");
         assert!(
             task_pos > vault_pos && task_pos < session_pos,
-            "`task` must appear between `Vault & Content` and `Session & Automation`; \
+            "`task` must appear between `Vault Management` and `Session Management`; \
              positions: vault={vault_pos} task={task_pos} session={session_pos}"
+        );
+
+        // skill must appear under "Launch Management" (last category).
+        let launch_pos = block
+            .find("Launch Management")
+            .expect("Launch Management heading present");
+        let skill_pos = block.find("\n    skill").expect("`skill` entry present");
+        assert!(
+            skill_pos > launch_pos,
+            "`skill` must appear under `Launch Management`; \
+             positions: launch={launch_pos} skill={skill_pos}"
         );
     }
 
@@ -335,7 +395,7 @@ mod tests {
     #[test]
     fn about_text_is_pulled_from_clap_not_hardcoded() {
         let root = Cli::command();
-        let block = build_categorized_commands_block(&root);
+        let block = build_categorized_commands_block(&root, false);
 
         // Pull the real `qmd` about from clap.
         let qmd_about = root

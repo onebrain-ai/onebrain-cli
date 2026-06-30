@@ -285,10 +285,11 @@ fn top_level_help_is_production_grade() {
     }
 
     // Item E: category-section ordering. v3.3.15: commands appear in named
-    // category sections (Setup & Maintenance → Vault & Content → Session &
-    // Automation → AI & Serving). Find the byte offset of each entry in the
+    // category sections (System Management → Vault Management → Session
+    // Management → Launch Management). Find the byte offset of each entry in the
     // rendered help (4-space indent inside category) and assert the ordering
-    // matches the declared CATEGORIES constant.
+    // matches the declared CATEGORIES constant. Piped `--help` (this test
+    // captures non-tty output) renders category names WITHOUT emoji.
     //
     // The anchor pattern is `    {name} ` (4-space indent + name + at least
     // one space before the description column). Fall back to 2-space variants
@@ -300,41 +301,44 @@ fn top_level_help_is_production_grade() {
             .or_else(|| haystack.find(&format!("  {needle} ")))
             .unwrap_or_else(|| panic!("expected `{needle}` in --help"))
     }
-    // Setup & Maintenance (init, update, doctor, plugin, qmd).
+    // System Management (init, update, doctor, plugin, qmd, schedule).
     let init = offset_of(&stdout, "init");
     let update = offset_of(&stdout, "update");
     let doctor = offset_of(&stdout, "doctor");
     let plugin = offset_of(&stdout, "plugin");
     let qmd = offset_of(&stdout, "qmd");
-    // Vault & Content (vault, note, task).
+    let schedule = offset_of(&stdout, "schedule");
+    // Vault Management (vault, note, task).
     let vault = offset_of(&stdout, "vault");
-    // Session & Automation (session, checkpoint, schedule, skill).
+    let note = offset_of(&stdout, "note");
+    let task = offset_of(&stdout, "task");
+    // Session Management (session, checkpoint).
     let session = offset_of(&stdout, "session");
     let checkpoint = offset_of(&stdout, "checkpoint");
-    let schedule = offset_of(&stdout, "schedule");
-    let skill = offset_of(&stdout, "skill");
-    // AI & Serving (harness, serve).
+    // Launch Management (harness, serve, skill).
     let harness = offset_of(&stdout, "harness");
+    let serve = offset_of(&stdout, "serve");
+    let skill = offset_of(&stdout, "skill");
 
-    // Setup & Maintenance section: init → update → doctor → plugin → qmd.
+    // System Management: init → update → doctor → plugin → qmd → schedule.
     assert!(
-        init < update && update < doctor && doctor < plugin && plugin < qmd,
-        "Setup & Maintenance section mis-ordered"
+        init < update && update < doctor && doctor < plugin && plugin < qmd && qmd < schedule,
+        "System Management section mis-ordered"
     );
-    // Setup & Maintenance precedes Vault & Content.
+    // System precedes Vault: vault → note → task.
     assert!(
-        qmd < vault,
-        "Setup & Maintenance should precede Vault & Content"
+        schedule < vault && vault < note && note < task,
+        "System should precede Vault Management, ordered vault→note→task"
     );
-    // Session & Automation section: session → checkpoint → schedule → skill.
+    // Vault precedes Session: session → checkpoint.
     assert!(
-        vault < session && session < checkpoint && checkpoint < schedule && schedule < skill,
-        "Session & Automation section mis-ordered"
+        task < session && session < checkpoint,
+        "Vault should precede Session Management, ordered session→checkpoint"
     );
-    // AI & Serving comes last.
+    // Launch Management last: harness → serve → skill.
     assert!(
-        skill < harness,
-        "AI & Serving (harness) should come after Session & Automation"
+        checkpoint < harness && harness < serve && serve < skill,
+        "Launch Management should come last, ordered harness→serve→skill"
     );
 }
 

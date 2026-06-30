@@ -12,7 +12,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [3.3.15] — 2026-06-29 — categorized root --help
 
-- **feat(cli): group root `--help` commands into named category sections** — `onebrain --help` now renders four sections (Setup & Maintenance, Vault & Content, Session & Automation, AI & Serving) instead of one flat Commands list.
+- **feat(cli): group root `--help` commands into named category sections** — `onebrain --help` now renders four sections (⚙️ System Management, 🧠 Vault Management, 🔄 Session Management, 🚀 Launch Management) instead of one flat Commands list.
+- Category headings show their emoji on a terminal and render plain (no emoji) when stdout is piped/redirected, so `onebrain --help | cat` stays clean. The usage line keeps `<COMMAND>` and the Options section is unchanged.
 - Descriptions are pulled live from clap `about` annotations — no hardcoded strings; the block can never drift from the source of truth.
 - Subcommand help (`onebrain note --help`, etc.) is untouched — clap handles those paths unchanged.
 - Drift-guard test: CI fails if any visible root subcommand is missing from CATEGORIES, or any category entry is stale.
