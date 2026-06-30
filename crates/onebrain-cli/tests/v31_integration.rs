@@ -145,10 +145,12 @@ fn top_level_help_hides_stub_groups() {
     // v3.1.0 final UX (user-decided 2026-05-25): only groups with ≥1 real
     // user-facing verb are visible at root `--help`. Stub-only groups
     // (`avatar`, `bookmark`, `bundle`, `config`, `daemon`, `date`, `dream`,
-    // `frontmatter`, `gateway`, `inbox`, `log`, `memory`, `note`, `pause`,
-    // `task`) are hidden — they still parse + dispatch (see
-    // `hidden_stub_still_dispatches`), they just don't clutter the help.
+    // `frontmatter`, `gateway`, `inbox`, `log`, `memory`, `pause`) are hidden
+    // — they still parse + dispatch (see `hidden_stub_still_dispatches`),
+    // they just don't clutter the help.
     // `serve` became VISIBLE in v3.3 step 2 (foreground HTTP surface).
+    // `note` and `task` became VISIBLE in v3.3.14 (all 14 note verbs + task
+    // list are implemented; task add/done stub verbs stay hidden).
     let out = Command::cargo_bin("onebrain")
         .unwrap()
         .arg("--help")
@@ -164,9 +166,11 @@ fn top_level_help_hides_stub_groups() {
         "session",
         "checkpoint",
         "harness",
+        "note",
         "plugin",
         "schedule",
         "skill",
+        "task",
         "qmd",
         "serve",
     ] {
@@ -194,9 +198,7 @@ fn top_level_help_hides_stub_groups() {
         "inbox",
         "log",
         "memory",
-        "note",
         "pause",
-        "task",
     ] {
         assert!(
             !stdout.contains(&format!("  {stub}\n"))

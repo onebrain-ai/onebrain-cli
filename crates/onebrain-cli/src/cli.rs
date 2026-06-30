@@ -120,7 +120,7 @@ pub enum Cmd {
     Log(LogCmd),
     #[command(hide = true)]
     Memory(MemoryCmd),
-    #[command(hide = true)]
+    #[command(display_order = 15)]
     Note(NoteCmd),
     #[command(hide = true)]
     Pause(PauseCmd),
@@ -137,7 +137,7 @@ pub enum Cmd {
     Session(SessionCmd),
     #[command(display_order = 23)]
     Skill(SkillCmd),
-    #[command(hide = true)]
+    #[command(display_order = 16)]
     Task(TaskCmd),
     #[command(display_order = 10)]
     Vault(VaultCmd),
@@ -679,7 +679,10 @@ pub enum MemoryVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
-#[command(disable_help_subcommand = true)]
+#[command(
+    about = "Vault note operations (search · read · edit · move · archive · …)",
+    disable_help_subcommand = true
+)]
 pub struct NoteCmd {
     #[command(subcommand)]
     pub verb: NoteVerb,
@@ -1193,7 +1196,10 @@ pub enum SkillVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
-#[command(disable_help_subcommand = true)]
+#[command(
+    about = "List dated vault tasks (fence-aware)",
+    disable_help_subcommand = true
+)]
 pub struct TaskCmd {
     #[command(subcommand)]
     pub verb: TaskVerb,
@@ -1201,7 +1207,6 @@ pub struct TaskCmd {
 #[derive(Subcommand, Debug)]
 pub enum TaskVerb {
     /// List dated tasks across the vault (fence-aware), filterable by due date.
-    #[command(hide = true)]
     List(TaskListArgs),
     /// Add a task (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
@@ -1365,15 +1370,47 @@ mod tests {
         for g in [
             "checkpoint",
             "harness",
+            "note",
             "plugin",
             "qmd",
             "schedule",
             "session",
             "skill",
+            "task",
             "vault",
         ] {
             assert!(help.contains(g), "group `{g}` missing from root --help");
         }
+    }
+
+    #[test]
+    fn note_and_task_surface_but_stub_verbs_stay_hidden() {
+        let mut cmd = Cli::command();
+        let root_help = cmd.render_long_help().to_string();
+        assert!(root_help.contains("note"), "note missing from root --help");
+        assert!(root_help.contains("task"), "task missing from root --help");
+        // A known-hidden stub group must NOT appear.
+        assert!(
+            !root_help.contains("  avatar "),
+            "hidden stub group `avatar` leaked into root --help"
+        );
+
+        // `task --help`: `list` visible; `add` and `done` must stay hidden.
+        let mut cmd = Cli::command();
+        let task_help = cmd
+            .find_subcommand_mut("task")
+            .expect("task subcommand must exist")
+            .render_long_help()
+            .to_string();
+        assert!(task_help.contains("list"), "list missing from task --help");
+        assert!(
+            !task_help.contains("  add "),
+            "stub verb `add` leaked into task --help"
+        );
+        assert!(
+            !task_help.contains("  done "),
+            "stub verb `done` leaked into task --help"
+        );
     }
 
     #[test]
