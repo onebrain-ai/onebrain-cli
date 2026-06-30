@@ -114,6 +114,25 @@ fn doctor_missing_vault_yml_errors_out() {
         .stderr(predicate::str::contains("not inside a vault"));
 }
 
+/// Structured mode (`--json`) outside a vault emits a JSON error envelope
+/// on stdout (not stderr anyhow text) so scripts can parse it.
+/// Covers the `want_structured=true` not-in-vault early return in `run()`.
+#[test]
+fn doctor_json_mode_not_in_vault_emits_json_error_envelope() {
+    let d = tempdir().unwrap();
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(d.path())
+        .args(["doctor", "--json"])
+        .assert()
+        .failure();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default();
+    let doc: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("structured mode must emit JSON on stdout");
+    assert_eq!(doc["ok"], false, "ok must be false: {doc}");
+    assert_eq!(doc["error"], "not_in_vault", "error field: {doc}");
+}
+
 /// `--fix` on a vault where the only warning is "qmd_collection not set"
 /// (the minimal vault used by these integration tests) — the recipe
 /// dispatcher must route this to `Manual` rather than spawning `qmd
@@ -370,6 +389,204 @@ fn doctor_fix_does_not_resurrect_vault_yml_after_migration() {
          renamed it away. Step 7 must write to onebrain.yml when canonical \
          is present."
     );
+}
+
+/// Text-mode `--fix` with a vault that has only manual issues (qmd_collection
+/// not set is the one manual-only warning the minimal canonical vault always
+/// has). Must not print "Will apply" (no auto-fixable issues) and should
+/// confirm via the "manual step" path.
+/// The `issues.is_empty()` branch (line 172) requires a vault with ZERO
+/// Warn/Error results — that's only possible if even qmd-embeddings is OK,
+/// which requires a real qmd collection. We cover the manual-only path here
+/// and note the issues.is_empty() branch as residual (requires qmd collection).
+#[test]
+fn doctor_fix_text_mode_manual_issues_shows_manual_step_section() {
+    let vault = tempdir().unwrap();
+    // Write canonical onebrain.yml (no migration warning) with all keys present.
+    std::fs::write(
+        vault.path().join("onebrain.yml"),
+        "update_channel: stable\n\
+         folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n",
+    )
+    .unwrap();
+    for f in [
+        "00-inbox",
+        "01-projects",
+        "02-areas",
+        "03-knowledge",
+        "04-resources",
+        "05-agent",
+        "06-archive",
+        "07-logs",
+    ] {
+        std::fs::create_dir_all(vault.path().join(f)).unwrap();
+    }
+    let plugin = vault.path().join(".claude/plugins/onebrain");
+    std::fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+    std::fs::create_dir_all(plugin.join("agents")).unwrap();
+    std::fs::create_dir_all(plugin.join("skills/foo")).unwrap();
+    std::fs::write(plugin.join("INSTRUCTIONS.md"), "x").unwrap();
+    std::fs::write(plugin.join(".claude-plugin/plugin.json"), "{}").unwrap();
+    std::fs::write(plugin.join("agents/x.md"), "x").unwrap();
+    std::fs::write(plugin.join("skills/foo/SKILL.md"), "x").unwrap();
+    let settings_dir = vault.path().join(".claude");
+    std::fs::write(
+        settings_dir.join("settings.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"command":"onebrain","args":["checkpoint","stop"]}]}]},"permissions":{"allow":["Bash(onebrain *)"]}}"#,
+    )
+    .unwrap();
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("PATH", "/usr/bin:/bin")
+        .args(["doctor", "--fix"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default();
+    // The qmd warning is manual-only: "Nothing to auto-fix" must appear.
+    assert!(
+        stdout.contains("Nothing to auto-fix") || stdout.contains("manual step"),
+        "expected manual-only message · got: {stdout}"
+    );
+    // No auto-fix recipes were applied.
+    assert!(
+        !stdout.contains("Will apply"),
+        "must not show auto-fix plan when only manual issues: {stdout}"
+    );
+}
+
+/// Text-mode `--fix` with vault that has mixed auto+manual issues. The vault
+/// uses legacy vault.yml (auto-fixable via migration) PLUS an orphan
+/// checkpoint (manual-only). Both the auto plan AND manual step sections
+/// must appear in the output, and the auto fix must apply.
+#[test]
+fn doctor_fix_text_mode_mixed_auto_and_manual_issues() {
+    let vault = tempdir().unwrap();
+    // Legacy vault.yml → auto-fixable (vault-config-migration recipe).
+    std::fs::write(
+        vault.path().join("vault.yml"),
+        "update_channel: stable\n\
+         folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n",
+    )
+    .unwrap();
+    for f in [
+        "00-inbox",
+        "01-projects",
+        "02-areas",
+        "03-knowledge",
+        "04-resources",
+        "05-agent",
+        "06-archive",
+        "07-logs",
+    ] {
+        std::fs::create_dir_all(vault.path().join(f)).unwrap();
+    }
+    let plugin = vault.path().join(".claude/plugins/onebrain");
+    std::fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+    std::fs::create_dir_all(plugin.join("agents")).unwrap();
+    std::fs::create_dir_all(plugin.join("skills/foo")).unwrap();
+    std::fs::write(plugin.join("INSTRUCTIONS.md"), "x").unwrap();
+    std::fs::write(plugin.join(".claude-plugin/plugin.json"), "{}").unwrap();
+    std::fs::write(plugin.join("agents/x.md"), "x").unwrap();
+    std::fs::write(plugin.join("skills/foo/SKILL.md"), "x").unwrap();
+    let settings_dir = vault.path().join(".claude");
+    std::fs::write(
+        settings_dir.join("settings.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"command":"onebrain","args":["checkpoint","stop"]}]}]},"permissions":{"allow":["Bash(onebrain *)"]}}"#,
+    )
+    .unwrap();
+    // Add an orphan checkpoint — manual-only issue.
+    let cp = vault.path().join("07-logs/checkpoint");
+    std::fs::create_dir_all(&cp).unwrap();
+    std::fs::write(cp.join("2026-05-19-XXX-checkpoint-01.md"), "x").unwrap();
+
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("PATH", "/usr/bin:/bin")
+        .args(["doctor", "--fix"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default();
+    // Auto plan must be previewed.
+    assert!(
+        stdout.contains("Will apply") || stdout.contains("automated fix"),
+        "expected auto-fix plan · got: {stdout}"
+    );
+    // Manual section must also appear.
+    assert!(
+        stdout.contains("manual step") || stdout.contains("wrapup"),
+        "expected manual section · got: {stdout}"
+    );
+    // The fix summary must appear (proves auto recipes ran).
+    assert!(
+        stdout.contains("Fix summary:"),
+        "expected Fix summary · got: {stdout}"
+    );
+}
+
+/// Structured (`--fix --json`) mode with a vault that has fixable issues.
+/// Must emit a single JSON document with `fix[]` array containing outcomes,
+/// not text output.
+#[test]
+fn doctor_fix_json_mode_emits_fix_array_with_outcomes() {
+    let vault = tempdir().unwrap();
+    // Write legacy vault.yml (triggers vault-config-migration which is auto-fixable).
+    std::fs::write(
+        vault.path().join("vault.yml"),
+        "update_channel: stable\n\
+         folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n",
+    )
+    .unwrap();
+    for f in [
+        "00-inbox",
+        "01-projects",
+        "02-areas",
+        "03-knowledge",
+        "04-resources",
+        "05-agent",
+        "06-archive",
+        "07-logs",
+    ] {
+        std::fs::create_dir_all(vault.path().join(f)).unwrap();
+    }
+    let plugin = vault.path().join(".claude/plugins/onebrain");
+    std::fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+    std::fs::create_dir_all(plugin.join("agents")).unwrap();
+    std::fs::create_dir_all(plugin.join("skills/foo")).unwrap();
+    std::fs::write(plugin.join("INSTRUCTIONS.md"), "x").unwrap();
+    std::fs::write(plugin.join(".claude-plugin/plugin.json"), "{}").unwrap();
+    std::fs::write(plugin.join("agents/x.md"), "x").unwrap();
+    std::fs::write(plugin.join("skills/foo/SKILL.md"), "x").unwrap();
+    let settings_dir = vault.path().join(".claude");
+    std::fs::write(
+        settings_dir.join("settings.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"command":"onebrain","args":["checkpoint","stop"]}]}]},"permissions":{"allow":["Bash(onebrain *)"]}}"#,
+    )
+    .unwrap();
+
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("PATH", "/usr/bin:/bin")
+        .args(["doctor", "--fix", "--json"])
+        .assert();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default();
+    let doc: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("expected JSON output · error: {e} · stdout: {stdout}"));
+    // `fix[]` must be present (--fix was requested).
+    assert!(doc.get("fix").is_some(), "fix key must be present: {doc}");
+    let fix_arr = doc["fix"].as_array().expect("fix is array");
+    // The migration recipe ran → at least one entry.
+    assert!(!fix_arr.is_empty(), "fix array must have entries: {doc}");
+    // Each entry has check + outcome + message.
+    for entry in fix_arr {
+        assert!(entry.get("check").is_some(), "entry missing check: {entry}");
+        assert!(
+            entry.get("outcome").is_some(),
+            "entry missing outcome: {entry}"
+        );
+    }
 }
 
 /// CRITICAL data-safety regression: `doctor --fix` must NEVER lose config

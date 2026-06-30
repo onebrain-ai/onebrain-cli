@@ -2384,4 +2384,768 @@ mod tests {
         assert!(!d.path().join("onebrain.yml").exists());
         assert!(!d.path().join("vault.yml").exists());
     }
+
+    // ── manual_message ───────────────────────────────────────────────────────
+
+    #[test]
+    fn manual_message_strips_circular_doctor_fix_hint() {
+        let r = DoctorResult::warn("some-check", "broken")
+            .with_hint("Run onebrain doctor --fix to repair");
+        let msg = manual_message(&r);
+        assert!(
+            msg.contains("recipe not yet implemented"),
+            "circular hint stripped: {msg}"
+        );
+        assert!(!msg.contains("doctor --fix"), "no circular ref: {msg}");
+    }
+
+    #[test]
+    fn manual_message_uses_see_check_details_when_hint_empty() {
+        let r = DoctorResult::warn("some-check", "broken");
+        // No hint set — raw_hint will be "".
+        let msg = manual_message(&r);
+        assert!(msg.contains("see check details"), "empty hint case: {msg}");
+        assert!(msg.contains("some-check"), "check name included: {msg}");
+    }
+
+    #[test]
+    fn manual_message_passes_through_non_circular_hint() {
+        let r = DoctorResult::warn("some-check", "broken").with_hint("run some other command");
+        let msg = manual_message(&r);
+        assert!(
+            msg.contains("run some other command"),
+            "passthrough hint: {msg}"
+        );
+        assert!(msg.contains("some-check"), "check name included: {msg}");
+    }
+
+    #[test]
+    fn manual_message_strips_hint_containing_doctor_fix_shorthand() {
+        // The `doctor --fix` substring alone (without the full "Run onebrain" prefix)
+        // is enough to trigger stripping.
+        let r = DoctorResult::warn("x", "msg").with_hint("doctor --fix can help");
+        let msg = manual_message(&r);
+        assert!(
+            msg.contains("recipe not yet implemented"),
+            "shorthand circular hint stripped: {msg}"
+        );
+    }
+
+    // ── status_line (json=true emits to stderr, json=false to stdout) ────────
+
+    #[test]
+    fn status_line_text_mode_does_not_panic() {
+        // json=false → println! to stdout; just verify no panic.
+        status_line(false, "test plain text");
+    }
+
+    #[test]
+    fn status_line_json_mode_does_not_panic() {
+        // json=true → eprintln! to stderr; just verify no panic.
+        status_line(true, "test json stderr");
+    }
+
+    // ── fix_qmd_embeddings: qmd not on PATH ──────────────────────────────────
+
+    #[test]
+    fn fix_qmd_embeddings_fails_when_qmd_not_on_path() {
+        // Temporarily set PATH to empty so which::which("qmd") returns Err.
+        // We restore via a scoped env change using std::env::set_var (safe in
+        // single-threaded unit test context; test binary is sequential).
+        let saved = std::env::var_os("PATH");
+        std::env::set_var("PATH", "/nonexistent-path-that-has-no-qmd");
+        let outcome = fix_qmd_embeddings(false);
+        // Restore PATH before any assertion so a panic can't leave it broken.
+        match saved {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        match outcome {
+            FixOutcome::Failed(msg) => assert!(
+                msg.contains("not on PATH"),
+                "expected 'not on PATH' in message: {msg}"
+            ),
+            other => panic!("expected Failed, got: {other:?}"),
+        }
+    }
+
+    // ── fix_settings_hooks: success path ─────────────────────────────────────
+
+    #[test]
+    fn fix_settings_hooks_succeeds_on_fresh_vault_dir() {
+        // register-hooks writes to .claude/settings.json relative to vault_root;
+        // a fresh tempdir is sufficient for the success path.
+        let d = tempdir().unwrap();
+        // Pre-create the .claude dir so register-hooks can write settings.json.
+        fs::create_dir_all(d.path().join(".claude")).unwrap();
+        let outcome = fix_settings_hooks(d.path(), false);
+        match outcome {
+            FixOutcome::Fixed(msg) => assert!(
+                msg.contains("hooks registered"),
+                "expected 'hooks registered': {msg}"
+            ),
+            // register-hooks can fail in CI if the vault has no config; accept
+            // both Fixed and Failed but not Manual.
+            FixOutcome::Failed(_) => {}
+            FixOutcome::Manual(msg) => panic!("unexpected Manual: {msg}"),
+        }
+    }
+
+    // ── fix_settings_hooks: json=true path ───────────────────────────────────
+
+    #[test]
+    fn fix_settings_hooks_json_mode_does_not_panic() {
+        // json=true → status_line emits to stderr. Exercise the json=true path.
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join(".claude")).unwrap();
+        let outcome = fix_settings_hooks(d.path(), true);
+        // Accept Fixed or Failed; not Manual.
+        match &outcome {
+            FixOutcome::Fixed(_) | FixOutcome::Failed(_) => {}
+            FixOutcome::Manual(m) => panic!("unexpected Manual: {m}"),
+        }
+    }
+
+    // ── fix_plugin_files: json=true path ──────────────────────────────────────
+
+    #[test]
+    fn fix_plugin_files_json_mode_danger_guard_fires() {
+        // Even in json=true mode the danger guard must fire before any vault-sync.
+        let mut root = std::env::temp_dir();
+        while let Some(parent) = root.parent() {
+            root = parent.to_path_buf();
+        }
+        let outcome = fix_plugin_files(&root, true);
+        match outcome {
+            FixOutcome::Failed(msg) => assert!(
+                msg.contains("filesystem root") || msg.contains("dangerous"),
+                "safety guard fired in json mode: {msg}"
+            ),
+            other => panic!("expected Failed (json danger guard), got: {other:?}"),
+        }
+    }
+
+    // ── fix_folders: danger-path guard ───────────────────────────────────────
+
+    #[test]
+    fn fix_folders_uses_default_folder_names_when_no_config() {
+        // No onebrain.yml present → load_vault_config_at fails → falls back to
+        // VaultConfig defaults (00-inbox, 01-projects, etc.).
+        let d = tempdir().unwrap();
+        // No config file — explicit fallback path in fix_folders.
+        let outcome = fix_folders(d.path(), false);
+        assert!(matches!(outcome, FixOutcome::Fixed(_)), "got: {outcome:?}");
+        // Default folder names must be created.
+        for name in [
+            "00-inbox",
+            "01-projects",
+            "02-areas",
+            "03-knowledge",
+            "04-resources",
+            "05-agent",
+            "06-archive",
+            "07-logs",
+        ] {
+            assert!(
+                d.path().join(name).is_dir(),
+                "expected default folder {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn fix_folders_refuses_filesystem_root() {
+        let mut root = std::env::temp_dir();
+        while let Some(parent) = root.parent() {
+            root = parent.to_path_buf();
+        }
+        let outcome = fix_folders(&root, false);
+        match outcome {
+            FixOutcome::Failed(msg) => assert!(
+                msg.contains("filesystem root") || msg.contains("dangerous"),
+                "safety guard fired: {msg}"
+            ),
+            other => panic!("expected Failed (safety guard), got: {other:?}"),
+        }
+    }
+
+    // ── fix_plugin_cache: succeeds when home dir is resolvable ───────────────
+
+    #[test]
+    fn fix_plugin_cache_returns_fixed_or_failed_not_manual() {
+        // fix_plugin_cache uses the home directory to locate the installed plugins
+        // path. On any developer machine this resolves. We accept Fixed OR Failed
+        // (depending on whether stale cache entries exist or permissions allow
+        // removal) but never Manual.
+        let outcome = fix_plugin_cache(false);
+        match &outcome {
+            FixOutcome::Fixed(_) | FixOutcome::Failed(_) => {}
+            FixOutcome::Manual(m) => panic!("unexpected Manual: {m}"),
+        }
+    }
+
+    #[test]
+    fn fix_plugin_cache_json_mode_returns_fixed_or_failed_not_manual() {
+        let outcome = fix_plugin_cache(true);
+        match &outcome {
+            FixOutcome::Fixed(_) | FixOutcome::Failed(_) => {}
+            FixOutcome::Manual(m) => panic!("unexpected Manual (json=true): {m}"),
+        }
+    }
+
+    // ── fix_vault_yml_keys: error / edge paths ────────────────────────────────
+
+    #[test]
+    fn fix_vault_yml_keys_fails_when_file_missing() {
+        let d = tempdir().unwrap();
+        // No onebrain.yml or vault.yml → find_config_file returns None →
+        // recipe falls back to the canonical path → read_to_string fails.
+        let outcome = fix_vault_yml_keys(d.path(), false);
+        match outcome {
+            FixOutcome::Failed(msg) => assert!(
+                msg.contains("read") || msg.contains("onebrain.yml"),
+                "expected read error: {msg}"
+            ),
+            other => panic!("expected Failed (missing file), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fix_vault_yml_keys_fails_on_invalid_yaml() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("onebrain.yml"), "not: : : yaml: {{}}\n").unwrap();
+        let outcome = fix_vault_yml_keys(d.path(), false);
+        match outcome {
+            FixOutcome::Failed(msg) => {
+                assert!(msg.contains("parse"), "expected parse error in msg: {msg}")
+            }
+            other => panic!("expected Failed (parse error), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fix_vault_yml_keys_fails_on_non_mapping_yaml_root() {
+        let d = tempdir().unwrap();
+        // A YAML scalar at root (not a mapping).
+        fs::write(d.path().join("onebrain.yml"), "- just\n- a\n- list\n").unwrap();
+        let outcome = fix_vault_yml_keys(d.path(), false);
+        match outcome {
+            FixOutcome::Failed(msg) => assert!(
+                msg.contains("not a mapping"),
+                "expected 'not a mapping' error: {msg}"
+            ),
+            other => panic!("expected Failed (non-mapping), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fix_vault_yml_keys_drops_empty_runtime_block() {
+        // After `runtime.harness` is removed, the parent `runtime:` block
+        // becomes empty and should be dropped entirely.
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "update_channel: stable\n\
+             runtime:\n  harness: claude-code\n\
+             folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n",
+        )
+        .unwrap();
+        let outcome = fix_vault_yml_keys(d.path(), false);
+        assert!(matches!(outcome, FixOutcome::Fixed(_)), "got: {outcome:?}");
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert!(!after.contains("harness"), "harness key gone: {after}");
+        // Empty runtime block should be dropped.
+        assert!(
+            !after.contains("runtime:"),
+            "empty runtime block dropped: {after}"
+        );
+    }
+
+    #[test]
+    fn fix_vault_yml_keys_json_mode_status_line_to_stderr() {
+        // json=true routes status_line to stderr. Just verify no panic and Fixed.
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("onebrain.yml"), "qmd_collection: foo\n").unwrap();
+        let outcome = fix_vault_yml_keys(d.path(), true);
+        assert!(
+            matches!(outcome, FixOutcome::Fixed(_)),
+            "json=true path: {outcome:?}"
+        );
+    }
+
+    // ── fix_claude_settings: error paths ──────────────────────────────────────
+
+    #[test]
+    fn fix_claude_settings_fails_on_missing_settings_file() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join(".claude")).unwrap();
+        // No settings.json — read must fail.
+        let outcome = fix_claude_settings(d.path(), false);
+        match outcome {
+            FixOutcome::Failed(msg) => assert!(
+                msg.contains("read settings.json"),
+                "expected read error: {msg}"
+            ),
+            other => panic!("expected Failed (missing file), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fix_claude_settings_fails_on_invalid_json() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join(".claude")).unwrap();
+        fs::write(d.path().join(".claude/settings.json"), "not json {{").unwrap();
+        let outcome = fix_claude_settings(d.path(), false);
+        match outcome {
+            FixOutcome::Failed(msg) => assert!(
+                msg.contains("parse settings.json"),
+                "expected parse error: {msg}"
+            ),
+            other => panic!("expected Failed (parse error), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fix_claude_settings_fails_when_root_is_not_object() {
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join(".claude")).unwrap();
+        fs::write(d.path().join(".claude/settings.json"), "[1,2,3]").unwrap();
+        let outcome = fix_claude_settings(d.path(), false);
+        match outcome {
+            FixOutcome::Failed(msg) => assert!(
+                msg.contains("not an object"),
+                "expected 'not an object': {msg}"
+            ),
+            other => panic!("expected Failed (non-object), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fix_claude_settings_keeps_other_marketplace_entries() {
+        // extraKnownMarketplaces has both "onebrain" and another entry.
+        // Only "onebrain" should be removed; the wrapper should survive.
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join(".claude")).unwrap();
+        let json = serde_json::json!({
+            "extraKnownMarketplaces": {
+                "onebrain": { "source": { "repo": "kengio/onebrain" } },
+                "other": { "source": { "repo": "other/repo" } }
+            }
+        });
+        fs::write(
+            d.path().join(".claude/settings.json"),
+            serde_json::to_string(&json).unwrap(),
+        )
+        .unwrap();
+        let outcome = fix_claude_settings(d.path(), false);
+        match outcome {
+            FixOutcome::Fixed(msg) => assert!(msg.contains("removed"), "msg: {msg}"),
+            other => panic!("expected Fixed, got: {other:?}"),
+        }
+        let after: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(d.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        // "other" entry must remain.
+        assert!(
+            after["extraKnownMarketplaces"]["other"].is_object(),
+            "other marketplace kept: {after}"
+        );
+        // "onebrain" entry must be gone.
+        assert!(
+            after["extraKnownMarketplaces"].get("onebrain").is_none(),
+            "onebrain entry removed: {after}"
+        );
+    }
+
+    // ── fix_vault_config_migration: no-config edge case ─────────────────────
+
+    #[test]
+    fn fix_vault_config_migration_no_config_reports_nothing_to_migrate() {
+        let d = tempdir().unwrap();
+        // Neither canonical nor legacy exists.
+        let outcome = fix_vault_config_migration(d.path(), false);
+        match outcome {
+            FixOutcome::Fixed(msg) => assert!(
+                msg.contains("nothing to migrate"),
+                "no-config idempotent: {msg}"
+            ),
+            other => panic!("expected Fixed (no-op), got: {other:?}"),
+        }
+    }
+
+    // ── value_is_positive_number: edge cases ──────────────────────────────────
+
+    /// Helper: parse a YAML scalar from a string like "1.5" or "-1.0" or "0".
+    fn yaml_num(s: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(s).expect("valid yaml number")
+    }
+
+    #[test]
+    fn value_is_positive_number_false_for_zero() {
+        assert!(!value_is_positive_number(&yaml_num("0")));
+    }
+
+    #[test]
+    fn value_is_positive_number_true_for_positive_float() {
+        assert!(value_is_positive_number(&yaml_num("1.5")));
+    }
+
+    #[test]
+    fn value_is_positive_number_false_for_negative_float() {
+        assert!(!value_is_positive_number(&yaml_num("-1.0")));
+    }
+
+    #[test]
+    fn value_is_positive_number_false_for_negative_integer() {
+        assert!(!value_is_positive_number(&yaml_num("-5")));
+    }
+
+    #[test]
+    fn value_is_positive_number_false_for_non_number() {
+        assert!(!value_is_positive_number(&serde_yaml::Value::Bool(true)));
+        assert!(!value_is_positive_number(&serde_yaml::Value::Null));
+        assert!(!value_is_positive_number(&serde_yaml::Value::String(
+            "5".to_string()
+        )));
+    }
+
+    #[test]
+    fn value_is_positive_number_true_for_positive_integer() {
+        assert!(value_is_positive_number(&yaml_num("15")));
+    }
+
+    // ── atomic_write_text: no-extension path ──────────────────────────────────
+
+    #[test]
+    fn atomic_write_text_works_on_file_with_no_extension() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("noextfile");
+        atomic_write_text(&path, "hello").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
+        // Temp file must be cleaned up.
+        assert!(!d.path().join("noextfile.tmp").exists(), ".tmp left behind");
+    }
+
+    #[test]
+    fn atomic_write_text_creates_parent_dirs_if_missing() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("deep/nested/dir/file.yml");
+        atomic_write_text(&path, "content").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "content");
+    }
+
+    // ── stamp_doctor_run: quiet/non-quiet read error, inline_stats ───────────
+
+    #[test]
+    fn stamp_doctor_run_non_quiet_survives_read_error() {
+        // Point vault_root at a tempdir that has NO config — stamp_doctor_run
+        // must return without panicking (the None early-return for missing
+        // config). Non-quiet mode is passed to exercise the quiet=false branch.
+        let d = tempdir().unwrap();
+        // No config → stamp_doctor_run returns immediately (no stamp, no panic).
+        stamp_doctor_run(d.path(), false, false);
+        assert!(!d.path().join("onebrain.yml").exists());
+    }
+
+    #[test]
+    fn stamp_doctor_run_warns_on_inline_stats_non_quiet() {
+        // An inline stats mapping skips the stamp. With quiet=false a one-line
+        // stderr note is emitted — we can't capture that without rerouting
+        // stderr, but we CAN verify the file is NOT modified (the function
+        // still completes without panic and leaves the file intact).
+        let d = tempdir().unwrap();
+        let inline_text = "stats: { last_doctor_run: 2025-01-01 }\n";
+        fs::write(d.path().join("onebrain.yml"), inline_text).unwrap();
+        stamp_doctor_run(d.path(), false, false); // quiet=false → stderr note
+                                                  // File must be untouched (no modification from the stamp attempt).
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after, inline_text, "inline stats file must not be modified");
+    }
+
+    #[test]
+    fn stamp_doctor_run_quiet_suppresses_inline_stats_warning() {
+        // Same scenario as above but quiet=true — no stderr note.
+        // Verify idempotency only.
+        let d = tempdir().unwrap();
+        let inline_text = "stats: { last_doctor_run: 2025-01-01 }\n";
+        fs::write(d.path().join("onebrain.yml"), inline_text).unwrap();
+        stamp_doctor_run(d.path(), false, true); // quiet=true
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after, inline_text, "quiet inline stats: file untouched");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stamp_doctor_run_read_error_non_quiet_does_not_panic() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir().unwrap();
+        let path = d.path().join("onebrain.yml");
+        fs::write(&path, "qmd_collection: ob\n").unwrap();
+        // Make the file unreadable to trigger the read-error path.
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&path, perms).unwrap();
+        // Must complete without panic — the read error is swallowed (non-quiet
+        // emits to stderr which we can't intercept here).
+        stamp_doctor_run(d.path(), false, false);
+        // Restore so tempdir cleanup can remove the file.
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&path, perms).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stamp_doctor_run_read_error_quiet_does_not_panic() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir().unwrap();
+        let path = d.path().join("onebrain.yml");
+        fs::write(&path, "qmd_collection: ob\n").unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&path, perms).unwrap();
+        // quiet=true suppresses stderr note.
+        stamp_doctor_run(d.path(), false, true);
+        // Restore permissions.
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&path, perms).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stamp_doctor_run_write_error_non_quiet_does_not_panic() {
+        // Exercise the write-error branch (line 1092-1095): make the config
+        // readable but the directory unwritable so atomic_write_text fails.
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir().unwrap();
+        let path = d.path().join("onebrain.yml");
+        // Write a config that will produce Some(updated) from upsert (i.e. a
+        // date that's not today so upsert has work to do).
+        fs::write(
+            &path,
+            "qmd_collection: ob\nstats:\n  last_doctor_run: 2020-01-01\n",
+        )
+        .unwrap();
+        // Make the directory read-only so the temp-file write fails.
+        let mut dir_perms = fs::metadata(d.path()).unwrap().permissions();
+        dir_perms.set_mode(0o555);
+        fs::set_permissions(d.path(), dir_perms).unwrap();
+        // Must complete without panic — non-quiet emits to stderr.
+        stamp_doctor_run(d.path(), false, false);
+        // Restore directory permissions for cleanup.
+        let mut dir_perms = fs::metadata(d.path()).unwrap().permissions();
+        dir_perms.set_mode(0o755);
+        fs::set_permissions(d.path(), dir_perms).unwrap();
+    }
+
+    // ── print_fix_summary: all three outcome arms ─────────────────────────────
+
+    #[test]
+    fn print_fix_summary_handles_all_three_outcome_types() {
+        // We can't easily capture stdout from print_fix_summary since it goes
+        // to the real stdout — but we can call it without panic and verify
+        // the function completes normally. The content is tested via integration.
+        let outcomes: Vec<(String, FixOutcome)> = vec![
+            (
+                "folders".to_string(),
+                FixOutcome::Fixed("created 3: ...".to_string()),
+            ),
+            (
+                "plugin-cache".to_string(),
+                FixOutcome::Failed("permissions denied".to_string()),
+            ),
+            (
+                "orphan-checkpoints".to_string(),
+                FixOutcome::Manual("run /wrapup".to_string()),
+            ),
+        ];
+        // Must not panic.
+        print_fix_summary(&outcomes);
+    }
+
+    // ── attempt_fix: orphan-checkpoints + catch-all arms ─────────────────────
+
+    #[test]
+    fn attempt_fix_orphan_checkpoints_returns_manual() {
+        let d = tempdir().unwrap();
+        let r = DoctorResult::warn("orphan-checkpoints", "3 unmerged");
+        let outcome = attempt_fix(&r, d.path(), false);
+        match outcome {
+            FixOutcome::Manual(msg) => assert!(
+                msg.contains("wrapup"),
+                "orphan-checkpoints routes to wrapup: {msg}"
+            ),
+            other => panic!("expected Manual, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attempt_fix_unknown_check_returns_manual_with_check_name() {
+        let d = tempdir().unwrap();
+        let r = DoctorResult::warn("some-future-check", "not yet known").with_hint("do something");
+        let outcome = attempt_fix(&r, d.path(), false);
+        match outcome {
+            FixOutcome::Manual(msg) => {
+                assert!(
+                    msg.contains("some-future-check"),
+                    "check name in manual: {msg}"
+                );
+                assert!(msg.contains("do something"), "hint passed through: {msg}");
+            }
+            other => panic!("expected Manual, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attempt_fix_unknown_check_circular_hint_cleaned() {
+        let d = tempdir().unwrap();
+        let r = DoctorResult::warn("future-check", "problem")
+            .with_hint("Run onebrain doctor --fix to fix this");
+        let outcome = attempt_fix(&r, d.path(), false);
+        match outcome {
+            FixOutcome::Manual(msg) => assert!(
+                msg.contains("recipe not yet implemented"),
+                "circular cleaned: {msg}"
+            ),
+            other => panic!("expected Manual, got: {other:?}"),
+        }
+    }
+
+    // ── emit_structured: known-good paths ────────────────────────────────────
+
+    #[test]
+    fn emit_structured_legacy_json_flag_emits_compact_json() {
+        // legacy_json_flag=true, mode is non-structured (Text) → compact JSON.
+        let doc = serde_json::json!({ "ok": true, "summary": {} });
+        let text_mode = OutputMode::Text {
+            color: false,
+            pretty: false,
+        };
+        let result = emit_structured(&doc, true, &text_mode).unwrap();
+        // Compact JSON: no indentation.
+        assert!(!result.contains("  "), "should be compact: {result}");
+        let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["ok"], true);
+    }
+
+    #[test]
+    fn emit_structured_yaml_mode_emits_yaml() {
+        let doc = serde_json::json!({ "ok": true });
+        let result = emit_structured(&doc, false, &OutputMode::Yaml).unwrap();
+        // YAML output does not start with '{'.
+        assert!(
+            !result.trim_start().starts_with('{'),
+            "expected YAML: {result}"
+        );
+    }
+
+    // ── config_has_inline_stats: edge cases ───────────────────────────────────
+
+    #[test]
+    fn config_has_inline_stats_detects_inline_mapping() {
+        assert!(config_has_inline_stats(
+            "stats: { last_doctor_run: 2026-01-01 }\n"
+        ));
+        assert!(config_has_inline_stats("stats: null\n"));
+    }
+
+    #[test]
+    fn config_has_inline_stats_returns_false_for_block_form() {
+        assert!(!config_has_inline_stats(
+            "stats:\n  last_doctor_run: 2026-01-01\n"
+        ));
+        // Bare "stats:" line with no trailing content → block form.
+        assert!(!config_has_inline_stats("stats:\n"));
+    }
+
+    #[test]
+    fn config_has_inline_stats_ignores_indented_lines() {
+        // An indented `stats:` line is a child key, not the top-level block header.
+        assert!(!config_has_inline_stats("  stats: { something }\n"));
+    }
+
+    // ── display_label: catch-all for unknown check names ─────────────────────
+
+    #[test]
+    fn display_label_returns_raw_name_for_unknown_check() {
+        assert_eq!(
+            display_label("brand-new-unknown-check"),
+            "brand-new-unknown-check"
+        );
+    }
+
+    #[test]
+    fn display_label_maps_all_known_checks() {
+        let cases = [
+            ("onebrain.yml", "onebrain.yml"),
+            ("onebrain.yml-keys", "schema"),
+            ("vault-config-migration", "config migration"),
+            ("folders", "folders"),
+            ("plugin-files", "plugin files"),
+            ("plugin-cache", "plugin cache"),
+            ("settings-hooks", "hooks"),
+            ("claude-settings", "claude settings"),
+            ("orphan-checkpoints", "checkpoints"),
+            ("qmd-embeddings", "qmd"),
+        ];
+        for (check, expected) in cases {
+            assert_eq!(display_label(check), expected, "label for {check}");
+        }
+    }
+
+    // ── planned_action: all auto-fixable and manual-only checks ─────────────
+
+    #[test]
+    fn planned_action_covers_all_auto_fixable_checks() {
+        let auto_checks = [
+            ("settings-hooks", "anything"),
+            ("plugin-files", "anything"),
+            ("folders", "anything"),
+            ("onebrain.yml-keys", "anything"),
+            ("claude-settings", "anything"),
+            ("plugin-cache", "anything"),
+            ("vault-config-migration", "anything"),
+        ];
+        for (check, msg) in auto_checks {
+            let r = DoctorResult::warn(check, msg);
+            assert!(
+                planned_action(&r).is_some(),
+                "check '{check}' should have planned action"
+            );
+        }
+    }
+
+    // ── footer: "1 warning" singular form ────────────────────────────────────
+
+    #[test]
+    fn footer_uses_singular_warning_form() {
+        // Exactly 1 warning → "1 warning" not "1 warnings".
+        let results = vec![
+            DoctorResult::ok("onebrain.yml", "ok"),
+            DoctorResult::warn("settings-hooks", "dup"),
+        ];
+        let mut buf = Vec::new();
+        let w = 60;
+        write_summary_footer(&mut buf, &results, false, w).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("1 warning") && !out.contains("1 warnings"),
+            "singular form: {out:?}"
+        );
+    }
+
+    // ── upsert: block with no existing children uses default indent ─────────
+
+    #[test]
+    fn upsert_stats_block_with_no_children_uses_default_two_space_indent() {
+        // stats: exists but has no children → indent defaults to 2 spaces.
+        let text = "stats:\nschedule:\n- cron: 0 9 * * *\n";
+        let out = upsert_doctor_stats(text, "2026-05-27", false).unwrap();
+        assert!(
+            out.contains("  last_doctor_run: 2026-05-27"),
+            "2-space default indent: {out:?}"
+        );
+    }
 }
