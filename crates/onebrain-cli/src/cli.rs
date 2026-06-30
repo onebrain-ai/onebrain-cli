@@ -1389,9 +1389,11 @@ mod tests {
         let root_help = cmd.render_long_help().to_string();
         assert!(root_help.contains("note"), "note missing from root --help");
         assert!(root_help.contains("task"), "task missing from root --help");
-        // A known-hidden stub group must NOT appear.
+        // A known-hidden stub group must NOT appear. `render_long_help` omits
+        // hidden commands entirely, and no visible group's text contains the
+        // word, so a bare-name check is both strong and spacing-independent.
         assert!(
-            !root_help.contains("  avatar "),
+            !root_help.contains("avatar"),
             "hidden stub group `avatar` leaked into root --help"
         );
 
@@ -1403,12 +1405,15 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(task_help.contains("list"), "list missing from task --help");
+        // `add` / `done` are hidden stubs — neither the verb names nor the
+        // group/verb `about` text contain those words, so a bare-name check is
+        // strong and spacing-independent.
         assert!(
-            !task_help.contains("  add "),
+            !task_help.contains("add"),
             "stub verb `add` leaked into task --help"
         );
         assert!(
-            !task_help.contains("  done "),
+            !task_help.contains("done"),
             "stub verb `done` leaked into task --help"
         );
     }
