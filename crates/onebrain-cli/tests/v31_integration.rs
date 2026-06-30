@@ -38,15 +38,15 @@ fn root_help_shows_3_root_verbs_and_visible_groups() {
         .success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
 
-    // 3 root verbs. v3.3.15: categorized help renders as `    {name}  `
-    // (4-space indent inside category, then name aligned to description column).
+    // 3 root verbs. v3.3.17: categorized help renders as `  {name}  `
+    // (2-space indent inside category, then name aligned to description column).
     for v in ["init", "update", "doctor"] {
         assert!(
-            stdout.contains(&format!("    {v}  ")) || stdout.contains(&format!("\n    {v} ")),
+            stdout.contains(&format!("  {v}  ")) || stdout.contains(&format!("\n  {v} ")),
             "root verb `{v}` missing from --help. Got:\n{stdout}"
         );
     }
-    // Visible groups only — appear in categorized block with 4-space indent.
+    // Visible groups only — appear in categorized block with 2-space indent.
     for g in [
         "checkpoint",
         "harness",
@@ -58,7 +58,7 @@ fn root_help_shows_3_root_verbs_and_visible_groups() {
         "vault",
     ] {
         assert!(
-            stdout.contains(&format!("    {g}  ")) || stdout.contains(&format!("\n    {g} ")),
+            stdout.contains(&format!("  {g}  ")) || stdout.contains(&format!("\n  {g} ")),
             "group `{g}` missing from --help. Got:\n{stdout}"
         );
     }
@@ -70,7 +70,7 @@ fn root_help_renders_compact_with_wrapped_defaults() {
     // attribute pushed EVERY arg into long format (name on its own line) and
     // made `--help` read as "ดูยาก" per user testing. The new shape:
     //   - Commands: categorized block (`    init          Initialize a new vault
-    //     (interactive setup)`) with 4-space indent inside category sections.
+    //     (interactive setup)`) with 2-space indent inside category sections.
     //   - Options without defaults: compact
     //   - Options WITH `[default]` + `[possible values]`: description still
     //     inline, the bracketed value block wraps to a new line indented to
@@ -86,12 +86,11 @@ fn root_help_renders_compact_with_wrapped_defaults() {
         .assert()
         .success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
-    // Commands: categorized block with 4-space indent.
-    // v3.3.15: `  init  ...` (2-space) replaced by `    init  ...` (4-space)
-    // inside category sections.
+    // Commands: categorized block with 2-space command indent (v3.3.17 — the
+    // category heading is flush-left, commands sit 2 spaces under it).
     assert!(
-        stdout.contains("    init          Initialize a new vault (interactive setup)"),
-        "expected categorized command row `    init          Initialize a new vault \
+        stdout.contains("  init          Initialize a new vault (interactive setup)"),
+        "expected categorized command row `  init          Initialize a new vault \
          (interactive setup)`; wrong indent or description. Got:\n{stdout}"
     );
     // `-o, --output` description on the same line; `[default: text, \
@@ -175,14 +174,10 @@ fn top_level_help_hides_stub_groups() {
         "qmd",
         "serve",
     ] {
-        // v3.3.15 categorized-help format: commands appear as `    {name}  ` or
-        // `    {name} ` (4-space indent inside category sections, inline description).
-        // Also accept 2-space variants for defensive future-proofing.
+        // v3.3.17 categorized-help format: commands appear as `  {name}  `
+        // (2-space indent inside category sections, inline description).
         assert!(
-            stdout.contains(&format!("    {visible}  "))
-                || stdout.contains(&format!("    {visible} "))
-                || stdout.contains(&format!("  {visible}\n"))
-                || stdout.contains(&format!("  {visible} ")),
+            stdout.contains(&format!("  {visible}  ")) || stdout.contains(&format!("  {visible} ")),
             "expected visible command `{visible}` in --help. Got:\n{stdout}"
         );
     }
@@ -203,13 +198,11 @@ fn top_level_help_hides_stub_groups() {
         "pause",
     ] {
         assert!(
+            // 2-space indent is the categorized-block command row form
+            // (v3.3.17); a leaked stub would appear there.
             !stdout.contains(&format!("  {stub}\n"))
                 && !stdout.contains(&format!("  {stub}  "))
-                && !stdout.contains(&format!("  {stub} "))
-                // 4-space indent is the categorized-block command row form;
-                // a leaked stub would appear there post-v3.3.15.
-                && !stdout.contains(&format!("    {stub}  "))
-                && !stdout.contains(&format!("    {stub} ")),
+                && !stdout.contains(&format!("  {stub} ")),
             "stub group `{stub}` leaked into top-level --help. Got:\n{stdout}"
         );
     }
@@ -291,18 +284,17 @@ fn top_level_help_is_production_grade() {
     // Item E: category-section ordering. v3.3.15: commands appear in named
     // category sections (System Management → Vault Management → Session
     // Management → Launch Management). Find the byte offset of each entry in the
-    // rendered help (4-space indent inside category) and assert the ordering
+    // rendered help (2-space indent inside category) and assert the ordering
     // matches the declared CATEGORIES constant. Piped `--help` (this test
     // captures non-tty output) renders category names WITHOUT emoji.
     //
-    // The anchor pattern is `    {name} ` (4-space indent + name + at least
+    // The anchor pattern is `  {name} ` (2-space indent + name + at least
     // one space before the description column). Fall back to 2-space variants
     // so the test remains correct if a future renderer tweak changes the indent.
     fn offset_of(haystack: &str, needle: &str) -> usize {
         haystack
-            .find(&format!("    {needle} "))
+            .find(&format!("  {needle} "))
             .or_else(|| haystack.find(&format!("  {needle}\n")))
-            .or_else(|| haystack.find(&format!("  {needle} ")))
             .unwrap_or_else(|| panic!("expected `{needle}` in --help"))
     }
     // System Management (init, update, doctor, plugin, qmd, schedule).

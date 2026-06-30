@@ -526,11 +526,22 @@ fn refresh_onebrain_tap() {
 /// no-op when already current); stdio is inherited so the user sees brew's own
 /// output. We never swap a Cellar binary in place — that would leave brew's
 /// metadata pointing at a version it no longer manages.
+///
+/// `HOMEBREW_NO_ASK=1` is set so brew does NOT prompt "Do you want to proceed
+/// with the upgrade? [y/n]". Homebrew 4.4+/6.x made that confirmation the
+/// default for `brew upgrade`, and it deadlocked `onebrain update`: the
+/// `indicatif` install spinner redraws the TTY concurrently and corrupts brew's
+/// interactive y/n readline ("Invalid input" loops forever). The env var is
+/// version-safe — older brew without ask-mode simply ignores it — and the
+/// `--yes`/`--no-ask` *flag* is NOT used because it errors on pre-ask-mode brew.
+/// The user already opted into the update by running `onebrain update`, so
+/// auto-confirming is the right behavior.
 pub(crate) fn brew_upgrade() -> Result<(), UpdateError> {
     use std::process::Command;
     refresh_onebrain_tap();
     let status = Command::new("brew")
         .args(["upgrade", "onebrain"])
+        .env("HOMEBREW_NO_ASK", "1")
         .status()
         .map_err(|e| {
             UpdateError::Install(format!(
