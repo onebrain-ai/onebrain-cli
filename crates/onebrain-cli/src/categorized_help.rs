@@ -62,7 +62,7 @@ pub const CATEGORIES: &[Category] = &[
     },
 ];
 
-/// Build the multi-section `Commands:\n\n  <Heading>\n    name   about\n…`
+/// Build the multi-section `Commands:\n\n<Heading>\n  name   about\n…`
 /// string that replaces the flat command list in root `--help`.
 ///
 /// Descriptions are pulled live from the [`clap::Command`] objects so they
@@ -105,8 +105,9 @@ pub fn build_categorized_commands_block(root: &Command, use_emoji: bool) -> Stri
             continue;
         }
 
+        // Category heading sits flush at the left margin (no indent); commands
+        // are indented 2 spaces under it.
         out.push('\n');
-        out.push_str("  ");
         if use_emoji {
             out.push_str(cat.emoji);
             out.push_str("  ");
@@ -115,8 +116,8 @@ pub fn build_categorized_commands_block(root: &Command, use_emoji: bool) -> Stri
         out.push('\n');
 
         for (name, about) in &visible_in_cat {
-            // Indent 4 spaces (inside category), then name left-padded to `col`.
-            out.push_str("    ");
+            // Indent 2 spaces (inside category), then name left-padded to `col`.
+            out.push_str("  ");
             out.push_str(name);
             let pad = col.saturating_sub(name.len());
             for _ in 0..pad {
@@ -362,7 +363,7 @@ mod tests {
         let vault_pos = block
             .find("Vault Management")
             .expect("Vault Management heading present");
-        let qmd_pos = block.find("\n    qmd").expect("`qmd` entry present");
+        let qmd_pos = block.find("\n  qmd").expect("`qmd` entry present");
         assert!(
             qmd_pos > system_pos && qmd_pos < vault_pos,
             "`qmd` must appear between `System Management` and `Vault Management`; \
@@ -373,7 +374,7 @@ mod tests {
         let session_pos = block
             .find("Session Management")
             .expect("Session Management heading present");
-        let task_pos = block.find("\n    task").expect("`task` entry present");
+        let task_pos = block.find("\n  task").expect("`task` entry present");
         assert!(
             task_pos > vault_pos && task_pos < session_pos,
             "`task` must appear between `Vault Management` and `Session Management`; \
@@ -384,7 +385,7 @@ mod tests {
         let launch_pos = block
             .find("Launch Management")
             .expect("Launch Management heading present");
-        let skill_pos = block.find("\n    skill").expect("`skill` entry present");
+        let skill_pos = block.find("\n  skill").expect("`skill` entry present");
         assert!(
             skill_pos > launch_pos,
             "`skill` must appear under `Launch Management`; \
