@@ -1583,4 +1583,214 @@ mod tests {
         assert_eq!(env["data"]["plists_rewritten"], serde_json::json!(true));
         assert_eq!(env["data"]["dry_run"], serde_json::json!(false));
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // plugin_update_vault_detail — branch coverage for uncovered arms
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn vault_detail_dry_run_with_known_version_emits_current_skipped() {
+        // dry_run=true + before=Some → "current vX · skipped"
+        // This arm was the only uncovered branch in the dry_run block
+        // (the None arm is hit by the dry-run integration test above).
+        let s = plugin_update_vault_detail(false, true, Some("3.1.3"), None);
+        assert_eq!(s, "current v3.1.3 · skipped");
+    }
+
+    #[test]
+    fn vault_detail_same_version_shows_up_to_date() {
+        // vault_synced=true, not dry-run, before==after → "vX · up-to-date"
+        let s = plugin_update_vault_detail(true, false, Some("3.1.4"), Some("3.1.4"));
+        assert_eq!(s, "v3.1.4 · up-to-date");
+    }
+
+    #[test]
+    fn vault_detail_fresh_install_no_before_version() {
+        // vault_synced=true, not dry-run, before=None, after=Some → "installed vY"
+        let s = plugin_update_vault_detail(true, false, None, Some("3.1.4"));
+        assert_eq!(s, "installed v3.1.4");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // plugin_update_verdict_text — branch coverage for uncovered arms
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn verdict_text_dry_run_with_known_version() {
+        // dry_run=true + before=Some → "dry-run · current vX"
+        // The None arm ("dry-run · no changes written") is hit by the
+        // dry-run integration test; this arm was uncovered.
+        let s = plugin_update_verdict_text(false, true, false, 0, false, Some("3.1.3"), None);
+        assert_eq!(s, "dry-run · current v3.1.3");
+    }
+
+    #[test]
+    fn verdict_text_update_complete_with_version_suffix() {
+        // vault_synced=true, same versions (no bump) → any_change=true,
+        // suffix=" · v3.1.4" → "update complete · v3.1.4"
+        let s =
+            plugin_update_verdict_text(false, false, true, 0, false, Some("3.1.4"), Some("3.1.4"));
+        assert_eq!(s, "update complete · v3.1.4");
+    }
+
+    #[test]
+    fn verdict_text_already_up_to_date_with_version_suffix() {
+        // No changes at all, but version known → "already up-to-date · vX"
+        // The no-suffix variant is covered by the text integration test
+        // (version_before/after = None); this covers the suffix arm.
+        let s =
+            plugin_update_verdict_text(false, false, false, 0, false, Some("3.1.4"), Some("3.1.4"));
+        assert_eq!(s, "already up-to-date · v3.1.4");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // JSON envelope — uncovered code paths
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn plugin_update_json_partial_failure_sets_ok_false_and_error_code() {
+        // Exercises the `Envelope::partial` branch in emit_plugin_update_summary_to.
+        // The happy-path test above only exercises `Envelope::ok`.
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 2,
+            plists_rewritten: false,
+            plists_count: None,
+            version_before: None,
+            version_after: None,
+            partial_failure: Some("launchctl exit 1".to_string()),
+            warnings: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        let mode = OutputMode::Json { pretty: false };
+        emit_plugin_update_summary_to(&report, &mode, &mut buf).unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(
+            env["ok"],
+            serde_json::json!(false),
+            "partial failure must set ok=false"
+        );
+        assert_eq!(
+            env["error"]["code"],
+            serde_json::json!("E_PLUGIN_UPDATE_PARTIAL"),
+            "partial failure must carry canonical error code"
+        );
+        // data must be preserved so consumers can see which steps succeeded
+        assert_eq!(
+            env["data"]["vault_synced"],
+            serde_json::json!(true),
+            "partial failure must preserve data.vault_synced"
+        );
+    }
+
+    #[test]
+    fn plugin_update_json_version_fields_serialized_when_present() {
+        // version_before and version_after are Option<String> with
+        // skip_serializing_if; exercise the Some(_) path for both.
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 1,
+            plists_rewritten: false,
+            plists_count: Some(1),
+            version_before: Some("3.1.3".to_string()),
+            version_after: Some("3.1.4".to_string()),
+            partial_failure: None,
+            warnings: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        let mode = OutputMode::Json { pretty: false };
+        emit_plugin_update_summary_to(&report, &mode, &mut buf).unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(env["data"]["version_before"], serde_json::json!("3.1.3"));
+        assert_eq!(env["data"]["version_after"], serde_json::json!("3.1.4"));
+        assert_eq!(env["ok"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn plugin_update_json_dry_run_note_field_is_present() {
+        // The `note` field in PluginUpdateData is Some("dry-run · no changes written")
+        // when dry_run=true and None otherwise; None is omitted via
+        // skip_serializing_if. Exercise the Some path through a dry-run JSON call.
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: true,
+            vault_synced: false,
+            hooks_rewritten: 0,
+            plists_rewritten: false,
+            plists_count: None,
+            version_before: None,
+            version_after: None,
+            partial_failure: None,
+            warnings: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        let mode = OutputMode::Json { pretty: false };
+        emit_plugin_update_summary_to(&report, &mode, &mut buf).unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(
+            env["data"]["note"],
+            serde_json::json!("dry-run · no changes written"),
+            "dry-run must include note field in JSON envelope"
+        );
+        assert_eq!(env["data"]["dry_run"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn plugin_update_json_warnings_plumbed_into_envelope() {
+        // Exercises the `for w in &report.warnings { env.with_warning(...) }` loop.
+        // The loop body is a distinct coverage line; all other tests pass an empty
+        // warnings Vec and thus skip it entirely.
+        use crate::v31::hook_rewriter::RewriteWarning;
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 1,
+            plists_rewritten: false,
+            plists_count: Some(0),
+            version_before: None,
+            version_after: None,
+            partial_failure: None,
+            warnings: vec![RewriteWarning {
+                code: "W_MALFORMED_HOOK_ENTRY".to_string(),
+                message: "unexpected hook shape at index 2".to_string(),
+            }],
+        };
+        let mut buf = Vec::new();
+        let mode = OutputMode::Json { pretty: false };
+        emit_plugin_update_summary_to(&report, &mode, &mut buf).unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(env["ok"], serde_json::json!(true));
+        let warnings = env["warnings"]
+            .as_array()
+            .expect("envelope must contain a warnings array");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly one warning must appear in envelope"
+        );
+        assert_eq!(
+            warnings[0]["code"],
+            serde_json::json!("W_MALFORMED_HOOK_ENTRY")
+        );
+        assert!(
+            warnings[0]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("unexpected hook shape"),
+            "warning message must be forwarded verbatim"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // AlreadyReported Display impl
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn already_reported_display_formats_expected_message() {
+        // The `fmt` impl (line 35) is not exercised by the downcast tests above
+        // because `downcast_ref` doesn't call Display.
+        let sentinel = AlreadyReported;
+        assert_eq!(format!("{sentinel}"), "envelope already emitted to stdout");
+    }
 }

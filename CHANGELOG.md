@@ -1,5 +1,5 @@
 ---
-latest_version: 3.3.19
+latest_version: 3.3.20
 released: 2026-06-30
 ---
 
@@ -9,6 +9,14 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.20] — 2026-06-30 — coverage phase 3b + 3c (server/api.rs + command residuals)
+
+- **test(server): cover the JSON API handlers** (+28 oneshot/unit tests) — `server/api.rs` 69.56% → **87.06%**. Extends the `tower::oneshot` harness in `server/tests.rs`: no-vault 503 for every vault handler, byte-range 206 + `Content-Range`, forced-attachment, raw upload, `If-Match` overwrite, move/folder 404/409/415/422, method 405, plus `ApiError`/`From<FsError>` mapping.
+- **test(cli/fs): close residual branches in the command layer** (+47 tests) — `v31/dispatch.rs` 88.69% → **91.08%** (plugin-update detail/verdict/JSON-envelope helpers), `onebrain-fs/src/update/mod.rs` 89.62% → **92.62%** (release-payload parse, date/version extraction, cache, env-override), `commands/register_schedule.rs` 91.30% → **93.09%** (collision labels, schedulable validation, status/remove/resume, quiet branches), `commands/doctor.rs` → 94.21% (json-mode fix paths, runtime-block edge cases).
+- Core line coverage 94.28% → **95.03%** (`scripts/coverage.sh`).
+- **Documented the realistic coverage ceiling** in `docs/coverage.md`: literal 100% is unreachable on stable (no inline `// coverage:ignore`; `#[coverage(off)]` is nightly-only, rust-lang/rust#84605). Genuinely-unreachable lines (`spawn_blocking` `JoinError` closures, `process::exit` dispatch arms, real network/subprocess paths, TTY-only renders, post-`canonicalize` I/O faults) are listed as residuals, not ignored. Target: ≈99% core + documented residuals + a ratcheting CI gate.
+- No behavior change — tests + docs only.
 
 ## [3.3.19] — 2026-06-30 — coverage phase 3 (fs cluster)
 

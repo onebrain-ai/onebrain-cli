@@ -1134,4 +1134,280 @@ mod tests {
             "got: {err}"
         );
     }
+
+    // ── detect_collisions: command-mode label arms ────────────────────────────
+
+    #[test]
+    fn detect_collisions_errors_with_command_mode_labels() {
+        // Two command-mode entries sharing the same binary basename → same plist
+        // label → collision. Exercises the `is_command_mode(existing/entry)`
+        // arms that format `"command:..."` labels in the error message.
+        use onebrain_core::scheduler::{LaunchdContext, ScheduleEntry};
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = LaunchdContext {
+            vault_path: dir.path().to_path_buf(),
+            skill_cli_path: "onebrain".to_string(),
+            log_base_path: dir.path().join("logs"),
+            homedir: dir.path().to_path_buf(),
+            uid: 501,
+        };
+        let entries = vec![
+            ScheduleEntry {
+                cron: Some("0 9 * * *".to_string()),
+                command: Some("/usr/local/bin/backup".to_string()),
+                ..Default::default()
+            },
+            ScheduleEntry {
+                cron: Some("0 18 * * *".to_string()),
+                command: Some("/usr/local/bin/backup".to_string()),
+                ..Default::default()
+            },
+        ];
+        let err = detect_collisions(&entries, &ctx).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("normalize to the same plist path"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("command:"),
+            "expected command: prefix, got: {msg}"
+        );
+    }
+
+    // ── read_vault_config: YAML parse error ───────────────────────────────────
+
+    #[test]
+    fn read_vault_config_errors_on_malformed_yaml() {
+        // Exercises the `serde_yaml::from_str` error path (line ~227).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("onebrain.yml"), "schedule: [unclosed\n").unwrap();
+        let err = read_vault_config(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("parse"), "got: {err}");
+    }
+
+    // ── validate_schedulable: caller-bug and list-args branches ───────────────
+
+    #[test]
+    fn validate_schedulable_caller_bug_no_skill_returns_error() {
+        // Exercises the `ok_or_else(|| anyhow!("... caller bug"))` arm:
+        // validate_schedulable invoked on an entry with skill = None.
+        use onebrain_core::scheduler::ScheduleEntry;
+        let dir = tempfile::tempdir().unwrap();
+        let entry = ScheduleEntry {
+            cron: Some("0 9 * * *".to_string()),
+            skill: None,
+            ..Default::default()
+        };
+        let err = validate_schedulable(dir.path(), &entry).unwrap_err();
+        assert!(err.to_string().contains("caller bug"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_schedulable_with_args_list_args_treated_as_missing() {
+        // When `schedulable_with_args: true` but entry.args is Args::List
+        // (not Map), the `_ => Vec::new()` arm fires → all required args
+        // are "missing" → SkillMissingArgs error.
+        use onebrain_core::scheduler::ScheduleEntry;
+        let dir = tempfile::tempdir().unwrap();
+        write_skill_file(
+            dir.path(),
+            "distill",
+            "schedulable_with_args: true\nrequired_args:\n  - topic",
+        );
+        let entry: ScheduleEntry =
+            serde_yaml::from_str("cron: \"0 9 * * *\"\nskill: /distill\nargs:\n  - list-val\n")
+                .unwrap();
+        let err = validate_schedulable(dir.path(), &entry).unwrap_err();
+        assert!(err.to_string().contains("requires args"), "got: {err}");
+    }
+
+    // ── run_embedded: quiet-mode branches ─────────────────────────────────────
+
+    #[test]
+    fn run_embedded_empty_schedule_returns_zero() {
+        // `run_embedded` hardcodes quiet=true internally, so the empty-schedule
+        // `if !quiet { println!(...) }` TRUE arm is unreachable here (it's only
+        // covered via `run()`, which passes quiet=false). This exercises the
+        // false arm: the println is skipped and Ok(0) is still returned.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("onebrain.yml"), "# no schedule entries\n").unwrap();
+        let count = run_embedded(Some(dir.path().to_path_buf()), false, false).unwrap();
+        assert_eq!(count, 0, "empty schedule → Ok(0) in quiet mode");
+    }
+
+    #[test]
+    fn run_embedded_refresh_quiet_no_entries_returns_zero() {
+        // Exercises the `if refresh && !quiet { println!(...) }` false branch:
+        // refresh=true but quiet=true suppresses the message; still Ok(0).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("onebrain.yml"), "# no schedule\n").unwrap();
+        let count = run_embedded(Some(dir.path().to_path_buf()), false, true).unwrap();
+        assert_eq!(count, 0, "refresh + quiet + no entries → Ok(0)");
+    }
+
+    // Unix-only: uses /bin/sh which doesn't exist on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn run_embedded_dry_run_quiet_returns_entry_count() {
+        // Exercises `dry_run=true, quiet=true`: the inner `if !quiet { println!... }`
+        // is skipped, `continue` fires, no plist is written, Ok(N) is returned.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "schedule:\n- cron: \"0 9 * * *\"\n  command: /bin/sh\n",
+        )
+        .unwrap();
+        let count = run_embedded(Some(dir.path().to_path_buf()), true, false).unwrap();
+        assert_eq!(
+            count, 1,
+            "dry_run quiet mode returns entry count without writing"
+        );
+    }
+
+    // ── print_status: command-mode and skill-with-args paths ──────────────────
+
+    #[test]
+    fn run_status_command_mode_with_list_args_succeeds() {
+        // Exercises the `is_command_mode(entry)` arm in print_status, including
+        // the non-empty argv branch: `Some(Args::List(v))` → `format!(" {}", ...)`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "schedule:\n- cron: \"0 9 * * *\"\n  command: /bin/backup\n  args:\n    - --verbose\n",
+        )
+        .unwrap();
+        let result = run(
+            Some(dir.path().to_path_buf()),
+            false,
+            false,
+            false,
+            None,
+            true,
+            None,
+        );
+        assert!(
+            result.is_ok(),
+            "status with command entry+list-args: {result:?}"
+        );
+    }
+
+    #[test]
+    fn run_status_skill_with_map_args_succeeds() {
+        // Exercises the `Some(Args::Map(m)) if !m.is_empty()` arm in print_status's
+        // skill branch, building the `" (key=val)"` arg-str.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "schedule:\n- cron: \"0 9 * * *\"\n  skill: /distill\n  args:\n    topic: weekly\n",
+        )
+        .unwrap();
+        let result = run(
+            Some(dir.path().to_path_buf()),
+            false,
+            false,
+            false,
+            None,
+            true,
+            None,
+        );
+        assert!(result.is_ok(), "status with skill+map-args: {result:?}");
+    }
+
+    #[test]
+    fn run_status_with_at_entry_renders_without_error() {
+        // Exercises the `entry.at.is_some()` → `"[once]"` branch in print_status.
+        // (print_status writes to stdout with no writer seam, so a unit test can
+        // only assert the path runs cleanly — not the rendered `[once]` text.)
+        // Far-future date avoids any time-sensitivity; `_ => String::new()` skill
+        // arm is hit since no args are set.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "schedule:\n- at: \"2099-01-01 09:00\"\n  skill: /daily\n",
+        )
+        .unwrap();
+        let result = run(
+            Some(dir.path().to_path_buf()),
+            false,
+            false,
+            false,
+            None,
+            true,
+            None,
+        );
+        assert!(result.is_ok(), "status with at-entry: {result:?}");
+    }
+
+    // ── remove_all: plist-not-on-disk branch ──────────────────────────────────
+
+    #[test]
+    fn run_remove_when_plist_not_on_disk_is_noop() {
+        // Exercises the `if target.exists()` false branch in remove_all:
+        // plist absent → silently skip, return Ok(()).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "schedule:\n- cron: \"0 9 * * *\"\n  skill: /daily\n",
+        )
+        .unwrap();
+        let result = run(
+            Some(dir.path().to_path_buf()),
+            false,
+            true,
+            false,
+            None,
+            false,
+            None,
+        );
+        assert!(result.is_ok(), "remove with no plist on disk: {result:?}");
+    }
+
+    // ── resume_skill: not-paused and paused paths ─────────────────────────────
+
+    #[test]
+    fn run_resume_not_paused_succeeds() {
+        // Exercises the `else` arm of `if marker.exists()` in resume_skill:
+        // no marker file → prints "not paused" and returns Ok(()).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("onebrain.yml"), "# vault\n").unwrap();
+        let result = run(
+            Some(dir.path().to_path_buf()),
+            false,
+            false,
+            false,
+            Some("/daily".to_string()),
+            false,
+            None,
+        );
+        assert!(result.is_ok(), "resume when not paused: {result:?}");
+    }
+
+    #[test]
+    fn run_resume_paused_removes_marker_file() {
+        // Exercises the `if marker.exists()` true arm in resume_skill:
+        // marker present → remove it and print "✓ Resumed".
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("onebrain.yml"), "# vault\n").unwrap();
+        // resolve_logs_folder returns "07-logs" when no folders.logs in config.
+        let marker_dir = dir.path().join("07-logs/scheduler/.paused");
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        let marker = marker_dir.join("daily.txt");
+        std::fs::write(&marker, "").unwrap();
+
+        let result = run(
+            Some(dir.path().to_path_buf()),
+            false,
+            false,
+            false,
+            Some("/daily".to_string()),
+            false,
+            None,
+        );
+        assert!(result.is_ok(), "resume when paused: {result:?}");
+        assert!(
+            !marker.exists(),
+            "pause marker should be removed after resume"
+        );
+    }
 }
