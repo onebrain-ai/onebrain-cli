@@ -38,17 +38,15 @@ fn root_help_shows_3_root_verbs_and_visible_groups() {
         .success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
 
-    // 3 root verbs. v3.2.12: long-format renders verbs as `  init\n` (verb
-    // name on its own line, description indented on next line). Match either
-    // shape so the test survives if clap's renderer changes the trailing
-    // whitespace (it might be `\n` or `  ` depending on alignment column).
+    // 3 root verbs. v3.3.15: categorized help renders as `    {name}  `
+    // (4-space indent inside category, then name aligned to description column).
     for v in ["init", "update", "doctor"] {
         assert!(
-            stdout.contains(&format!("  {v}\n")) || stdout.contains(&format!("  {v}  ")),
+            stdout.contains(&format!("    {v}  ")) || stdout.contains(&format!("\n    {v} ")),
             "root verb `{v}` missing from --help. Got:\n{stdout}"
         );
     }
-    // Visible groups only.
+    // Visible groups only — appear in categorized block with 4-space indent.
     for g in [
         "checkpoint",
         "harness",
@@ -60,7 +58,7 @@ fn root_help_shows_3_root_verbs_and_visible_groups() {
         "vault",
     ] {
         assert!(
-            stdout.contains(g),
+            stdout.contains(&format!("    {g}  ")) || stdout.contains(&format!("\n    {g} ")),
             "group `{g}` missing from --help. Got:\n{stdout}"
         );
     }
@@ -71,7 +69,8 @@ fn root_help_renders_compact_with_wrapped_defaults() {
     // v3.2.15 reverts the v3.2.12 `next_line_help = true` blanket — that
     // attribute pushed EVERY arg into long format (name on its own line) and
     // made `--help` read as "ดูยาก" per user testing. The new shape:
-    //   - Commands: compact (`  init        Initialize a new vault`)
+    //   - Commands: categorized block (`    init          Initialize a new vault
+    //     (interactive setup)`) with 4-space indent inside category sections.
     //   - Options without defaults: compact
     //   - Options WITH `[default]` + `[possible values]`: description still
     //     inline, the bracketed value block wraps to a new line indented to
@@ -87,11 +86,13 @@ fn root_help_renders_compact_with_wrapped_defaults() {
         .assert()
         .success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
-    // Commands compact — `  init        Initialize...` on one line.
+    // Commands: categorized block with 4-space indent.
+    // v3.3.15: `  init  ...` (2-space) replaced by `    init  ...` (4-space)
+    // inside category sections.
     assert!(
-        stdout.contains("  init        Initialize a new vault"),
-        "expected compact command row `  init        Initialize a new vault`; \
-         `next_line_help = true` may have crept back. Got:\n{stdout}"
+        stdout.contains("    init          Initialize a new vault (interactive setup)"),
+        "expected categorized command row `    init          Initialize a new vault \
+         (interactive setup)`; wrong indent or description. Got:\n{stdout}"
     );
     // `-o, --output` description on the same line; `[default: text, \
     // possible values: ...]` wrapped to a new aligned line below.
@@ -174,13 +175,14 @@ fn top_level_help_hides_stub_groups() {
         "qmd",
         "serve",
     ] {
-        // v3.2.12 long-format: `  {name}\n` is the canonical shape; legacy
-        // compact `  {name} ` / `  {name}  ` retained as fallback should a
-        // future renderer change put the description on the same line again.
+        // v3.3.15 categorized-help format: commands appear as `    {name}  ` or
+        // `    {name} ` (4-space indent inside category sections, inline description).
+        // Also accept 2-space variants for defensive future-proofing.
         assert!(
-            stdout.contains(&format!("  {visible}\n"))
-                || stdout.contains(&format!("  {visible} "))
-                || stdout.contains(&format!("  {visible}  ")),
+            stdout.contains(&format!("    {visible}  "))
+                || stdout.contains(&format!("    {visible} "))
+                || stdout.contains(&format!("  {visible}\n"))
+                || stdout.contains(&format!("  {visible} ")),
             "expected visible command `{visible}` in --help. Got:\n{stdout}"
         );
     }
@@ -282,53 +284,58 @@ fn top_level_help_is_production_grade() {
         );
     }
 
-    // Item E: domain-clustered ordering via `display_order`. Find the byte
-    // offset of each command-line entry in the rendered help and assert the
-    // cluster boundaries.
+    // Item E: category-section ordering. v3.3.15: commands appear in named
+    // category sections (Setup & Maintenance → Vault & Content → Session &
+    // Automation → AI & Serving). Find the byte offset of each entry in the
+    // rendered help (4-space indent inside category) and assert the ordering
+    // matches the declared CATEGORIES constant.
     //
-    // v3.2.12 long-format: command name appears as `  {name}\n` (verb on its
-    // own line, description indented below). Pre-3.2.12 compact form was
-    // `  {name} ` (two spaces, name, trailing space alignment). Match the
-    // long-format anchor first, fall back to compact if a future renderer
-    // tweak reverts it — keeps the ordering invariant decoupled from the
-    // renderer's exact whitespace.
+    // The anchor pattern is `    {name} ` (4-space indent + name + at least
+    // one space before the description column). Fall back to 2-space variants
+    // so the test remains correct if a future renderer tweak changes the indent.
     fn offset_of(haystack: &str, needle: &str) -> usize {
         haystack
-            .find(&format!("  {needle}\n"))
+            .find(&format!("    {needle} "))
+            .or_else(|| haystack.find(&format!("  {needle}\n")))
             .or_else(|| haystack.find(&format!("  {needle} ")))
             .unwrap_or_else(|| panic!("expected `{needle}` in --help"))
     }
-    // System cluster (1-3).
+    // Setup & Maintenance (init, update, doctor, plugin, qmd).
     let init = offset_of(&stdout, "init");
     let update = offset_of(&stdout, "update");
     let doctor = offset_of(&stdout, "doctor");
-    // Vault & session cluster (10-13).
+    let plugin = offset_of(&stdout, "plugin");
+    let qmd = offset_of(&stdout, "qmd");
+    // Vault & Content (vault, note, task).
     let vault = offset_of(&stdout, "vault");
+    // Session & Automation (session, checkpoint, schedule, skill).
     let session = offset_of(&stdout, "session");
     let checkpoint = offset_of(&stdout, "checkpoint");
-    let harness = offset_of(&stdout, "harness");
-    // Config & maintenance cluster (20-23).
-    let plugin = offset_of(&stdout, "plugin");
     let schedule = offset_of(&stdout, "schedule");
     let skill = offset_of(&stdout, "skill");
-    // Search cluster (30).
-    let qmd = offset_of(&stdout, "qmd");
+    // AI & Serving (harness, serve).
+    let harness = offset_of(&stdout, "harness");
 
+    // Setup & Maintenance section: init → update → doctor → plugin → qmd.
     assert!(
-        init < update && update < doctor,
-        "system cluster mis-ordered"
+        init < update && update < doctor && doctor < plugin && plugin < qmd,
+        "Setup & Maintenance section mis-ordered"
     );
-    assert!(doctor < vault, "doctor should precede vault cluster");
+    // Setup & Maintenance precedes Vault & Content.
     assert!(
-        vault < session && session < checkpoint && checkpoint < harness,
-        "vault/session cluster mis-ordered"
+        qmd < vault,
+        "Setup & Maintenance should precede Vault & Content"
     );
-    assert!(harness < plugin, "harness should precede plugin cluster");
+    // Session & Automation section: session → checkpoint → schedule → skill.
     assert!(
-        plugin < schedule && schedule < skill,
-        "plugin/schedule/skill cluster mis-ordered"
+        vault < session && session < checkpoint && checkpoint < schedule && schedule < skill,
+        "Session & Automation section mis-ordered"
     );
-    assert!(skill < qmd, "qmd should come last in clusters");
+    // AI & Serving comes last.
+    assert!(
+        skill < harness,
+        "AI & Serving (harness) should come after Session & Automation"
+    );
 }
 
 #[test]
