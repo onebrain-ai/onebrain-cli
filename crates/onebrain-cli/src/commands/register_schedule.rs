@@ -638,11 +638,26 @@ fn _unused_marker() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use onebrain_core::scheduler::SchedulerError;
 
     #[test]
     fn normalize_path_strips_curdir_and_pops_parentdir() {
         let p = normalize_path(Path::new("/a/b/./c/../d"));
         assert_eq!(p, PathBuf::from("/a/b/d"));
+    }
+
+    // Additional normalize_path branches
+    #[test]
+    fn normalize_path_parent_dir_pops_prefix() {
+        // ../x relative to /a/b should yield /a/x
+        let p = normalize_path(Path::new("/a/b/../x"));
+        assert_eq!(p, PathBuf::from("/a/x"));
+    }
+
+    #[test]
+    fn normalize_path_plain_absolute_unchanged() {
+        let p = normalize_path(Path::new("/usr/local/bin/foo"));
+        assert_eq!(p, PathBuf::from("/usr/local/bin/foo"));
     }
 
     #[test]
@@ -664,6 +679,125 @@ mod tests {
     fn extract_frontmatter_none_when_no_fences() {
         assert!(extract_frontmatter("# Just a heading\n").is_none());
     }
+
+    // ── inner_reason ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn inner_reason_invalid_cron_returns_reason_field() {
+        let e = SchedulerError::InvalidCron {
+            cron: "bad".to_string(),
+            reason: "expected 5 fields".to_string(),
+        };
+        assert_eq!(inner_reason(&e), "expected 5 fields");
+    }
+
+    #[test]
+    fn inner_reason_invalid_at_returns_reason_field() {
+        let e = SchedulerError::InvalidAt {
+            at: "bad".to_string(),
+            reason: "bad timestamp".to_string(),
+        };
+        assert_eq!(inner_reason(&e), "bad timestamp");
+    }
+
+    #[test]
+    fn inner_reason_invalid_entry_returns_reason_field() {
+        let e = SchedulerError::InvalidEntry {
+            reason: "must have skill or command".to_string(),
+        };
+        assert_eq!(inner_reason(&e), "must have skill or command");
+    }
+
+    #[test]
+    fn inner_reason_other_variant_uses_display() {
+        // Exercises the `other => other.to_string()` arm (line 208).
+        let e = SchedulerError::CommandNotFoundInPath("nope".to_string());
+        let s = inner_reason(&e);
+        assert!(s.contains("nope"), "got: {s}");
+    }
+
+    // ── is_safe_relative_folder ───────────────────────────────────────────────
+
+    #[test]
+    fn is_safe_relative_folder_accepts_normal_paths() {
+        assert!(is_safe_relative_folder("07-logs"));
+        assert!(is_safe_relative_folder("logs/sub"));
+        assert!(is_safe_relative_folder("./logs"));
+    }
+
+    #[test]
+    fn is_safe_relative_folder_rejects_absolute() {
+        assert!(!is_safe_relative_folder("/var/logs"));
+        assert!(!is_safe_relative_folder("/07-logs"));
+    }
+
+    #[test]
+    fn is_safe_relative_folder_rejects_parent_traversal() {
+        assert!(!is_safe_relative_folder("../etc"));
+        assert!(!is_safe_relative_folder("logs/../../etc"));
+    }
+
+    // ── sanitize_args_for_one_shot ────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_args_for_one_shot_accepts_clean_list_args() {
+        use onebrain_core::scheduler::{Args, ScheduleEntry};
+        let entry = ScheduleEntry {
+            at: Some("2026-05-13 14:30".to_string()),
+            command: Some("/bin/echo".to_string()),
+            args: Some(Args::List(vec!["hello".to_string(), "world".to_string()])),
+            ..Default::default()
+        };
+        assert!(sanitize_args_for_one_shot(&entry).is_ok());
+    }
+
+    #[test]
+    fn sanitize_args_for_one_shot_rejects_shell_special_in_list() {
+        use onebrain_core::scheduler::{Args, ScheduleEntry};
+        let entry = ScheduleEntry {
+            at: Some("2026-05-13 14:30".to_string()),
+            command: Some("/bin/echo".to_string()),
+            args: Some(Args::List(vec!["$EVIL".to_string()])),
+            ..Default::default()
+        };
+        assert!(sanitize_args_for_one_shot(&entry).is_err());
+    }
+
+    #[test]
+    fn sanitize_args_for_one_shot_accepts_clean_map_args() {
+        use onebrain_core::scheduler::ScheduleEntry;
+        // Build the entry via YAML deserialization to avoid a direct
+        // `indexmap` dependency in this crate (indexmap lives in onebrain-core).
+        let entry: ScheduleEntry = serde_yaml::from_str(
+            "at: \"2026-05-13 14:30\"\nskill: /distill\nargs:\n  topic: safe-value\n",
+        )
+        .unwrap();
+        assert!(sanitize_args_for_one_shot(&entry).is_ok());
+    }
+
+    #[test]
+    fn sanitize_args_for_one_shot_rejects_shell_special_in_map_value() {
+        use onebrain_core::scheduler::ScheduleEntry;
+        let entry: ScheduleEntry = serde_yaml::from_str(
+            "at: \"2026-05-13 14:30\"\nskill: /distill\nargs:\n  topic: \"bad`value\"\n",
+        )
+        .unwrap();
+        assert!(sanitize_args_for_one_shot(&entry).is_err());
+    }
+
+    #[test]
+    fn sanitize_args_for_one_shot_accepts_no_args() {
+        use onebrain_core::scheduler::ScheduleEntry;
+        let entry = ScheduleEntry {
+            at: Some("2026-05-13 14:30".to_string()),
+            command: Some("/bin/true".to_string()),
+            args: None,
+            ..Default::default()
+        };
+        assert!(sanitize_args_for_one_shot(&entry).is_ok());
+    }
+
+    // ── read_vault_config ─────────────────────────────────────────────────────
 
     #[test]
     fn read_vault_config_reads_canonical_onebrain_yml() {
@@ -702,6 +836,33 @@ mod tests {
         let cfg = read_vault_config(dir.path()).unwrap();
         assert!(cfg.schedule.is_empty(), "no config → empty schedule");
     }
+
+    // ── resolve_vault_root ────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_vault_root_returns_cwd_when_no_vault_found() {
+        // A tempdir with no vault config → falls back to cwd.
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_vault_root(dir.path()).unwrap();
+        assert_eq!(result, dir.path());
+    }
+
+    #[test]
+    fn resolve_vault_root_finds_onebrain_yml_ancestor() {
+        // Create vault root with onebrain.yml, then call from a subdir.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("onebrain.yml"), "# vault\n").unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let result = resolve_vault_root(&sub).unwrap();
+        // Must walk up from `sub` to the ancestor holding onebrain.yml.
+        // `find_vault_root` walks via `Path::pop` without canonicalizing, so
+        // the popped path equals `dir.path()` exactly — no macOS
+        // `/var`→`/private/var` mismatch to guard against here.
+        assert_eq!(result, dir.path());
+    }
+
+    // ── resolve_command_binary ────────────────────────────────────────────────
 
     // POSIX-only: uses `/bin/sh` which doesn't exist on Windows.
     #[cfg(unix)]
@@ -756,5 +917,221 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Command not found at relative path"));
+    }
+
+    // relative path with no vault root → falls back to cwd
+    #[cfg(unix)]
+    #[test]
+    fn resolve_relative_path_without_vault_root_uses_cwd() {
+        // Use a path that does not exist so we get the "relative" error, which
+        // proves the no-vault_root branch at line 341-342 was exercised.
+        let err = resolve_command_binary("./definitely-not-here.sh", None).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Command not found at relative path"));
+    }
+
+    // ── validate_schedulable ──────────────────────────────────────────────────
+
+    fn write_skill_file(dir: &std::path::Path, name: &str, frontmatter: &str) {
+        let skill_dir = dir.join(".claude/plugins/onebrain/skills").join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\n{frontmatter}\n---\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn validate_schedulable_passes_for_schedulable_true() {
+        use onebrain_core::scheduler::ScheduleEntry;
+        let dir = tempfile::tempdir().unwrap();
+        write_skill_file(dir.path(), "daily", "schedulable: true");
+        let entry = ScheduleEntry {
+            cron: Some("0 9 * * *".to_string()),
+            skill: Some("/daily".to_string()),
+            ..Default::default()
+        };
+        assert!(validate_schedulable(dir.path(), &entry).is_ok());
+    }
+
+    #[test]
+    fn validate_schedulable_rejects_skill_not_found() {
+        use onebrain_core::scheduler::ScheduleEntry;
+        let dir = tempfile::tempdir().unwrap();
+        // No SKILL.md written
+        let entry = ScheduleEntry {
+            cron: Some("0 9 * * *".to_string()),
+            skill: Some("/missing-skill".to_string()),
+            ..Default::default()
+        };
+        let err = validate_schedulable(dir.path(), &entry).unwrap_err();
+        assert!(err.to_string().contains("missing-skill"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_schedulable_rejects_no_frontmatter() {
+        use onebrain_core::scheduler::ScheduleEntry;
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".claude/plugins/onebrain/skills/bare");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        // SKILL.md with no frontmatter fences
+        std::fs::write(skill_dir.join("SKILL.md"), "# No frontmatter\n").unwrap();
+        let entry = ScheduleEntry {
+            cron: Some("0 9 * * *".to_string()),
+            skill: Some("/bare".to_string()),
+            ..Default::default()
+        };
+        let err = validate_schedulable(dir.path(), &entry).unwrap_err();
+        assert!(
+            err.to_string().contains("no YAML frontmatter")
+                || err.to_string().contains("frontmatter"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_schedulable_rejects_schedulable_false() {
+        use onebrain_core::scheduler::ScheduleEntry;
+        let dir = tempfile::tempdir().unwrap();
+        write_skill_file(dir.path(), "interactive", "schedulable: false");
+        let entry = ScheduleEntry {
+            cron: Some("0 9 * * *".to_string()),
+            skill: Some("/interactive".to_string()),
+            ..Default::default()
+        };
+        let err = validate_schedulable(dir.path(), &entry).unwrap_err();
+        assert!(
+            err.to_string().contains("requires user input"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_schedulable_rejects_missing_schedulable_key() {
+        use onebrain_core::scheduler::ScheduleEntry;
+        let dir = tempfile::tempdir().unwrap();
+        // Frontmatter present but schedulable key absent
+        write_skill_file(dir.path(), "nodecl", "name: nodecl");
+        let entry = ScheduleEntry {
+            cron: Some("0 9 * * *".to_string()),
+            skill: Some("/nodecl".to_string()),
+            ..Default::default()
+        };
+        let err = validate_schedulable(dir.path(), &entry).unwrap_err();
+        assert!(
+            err.to_string().contains("does not declare schedulable"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_schedulable_with_args_passes_when_required_args_provided() {
+        use onebrain_core::scheduler::ScheduleEntry;
+        let dir = tempfile::tempdir().unwrap();
+        write_skill_file(
+            dir.path(),
+            "distill",
+            "schedulable_with_args: true\nrequired_args:\n  - topic",
+        );
+        // Build via YAML to avoid direct indexmap dependency.
+        let entry: ScheduleEntry = serde_yaml::from_str(
+            "cron: \"0 9 * * *\"\nskill: /distill\nargs:\n  topic: this-week\n",
+        )
+        .unwrap();
+        assert!(validate_schedulable(dir.path(), &entry).is_ok());
+    }
+
+    #[test]
+    fn validate_schedulable_with_args_rejects_missing_required_arg() {
+        use onebrain_core::scheduler::ScheduleEntry;
+        let dir = tempfile::tempdir().unwrap();
+        write_skill_file(
+            dir.path(),
+            "distill",
+            "schedulable_with_args: true\nrequired_args:\n  - topic",
+        );
+        let entry = ScheduleEntry {
+            cron: Some("0 9 * * *".to_string()),
+            skill: Some("/distill".to_string()),
+            args: None, // topic is missing
+            ..Default::default()
+        };
+        let err = validate_schedulable(dir.path(), &entry).unwrap_err();
+        assert!(err.to_string().contains("requires args"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_schedulable_rejects_shell_special_in_recurring_args() {
+        use onebrain_core::scheduler::ScheduleEntry;
+        let dir = tempfile::tempdir().unwrap();
+        write_skill_file(dir.path(), "distill", "schedulable: true");
+        // Build via YAML to avoid direct indexmap dependency.
+        let entry: ScheduleEntry = serde_yaml::from_str(
+            "cron: \"0 9 * * *\"\nskill: /distill\nargs:\n  topic: \"$(evil)\"\n",
+        )
+        .unwrap();
+        let err = validate_schedulable(dir.path(), &entry).unwrap_err();
+        assert!(err.to_string().contains("shell-special"), "got: {err}");
+    }
+
+    // ── detect_collisions ─────────────────────────────────────────────────────
+
+    #[test]
+    fn detect_collisions_ok_when_no_duplicates() {
+        use onebrain_core::scheduler::{LaunchdContext, ScheduleEntry};
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = LaunchdContext {
+            vault_path: dir.path().to_path_buf(),
+            skill_cli_path: "onebrain".to_string(),
+            log_base_path: dir.path().join("logs"),
+            homedir: dir.path().to_path_buf(),
+            uid: 501,
+        };
+        let entries = vec![
+            ScheduleEntry {
+                cron: Some("0 9 * * *".to_string()),
+                skill: Some("/daily".to_string()),
+                ..Default::default()
+            },
+            ScheduleEntry {
+                cron: Some("0 17 * * 5".to_string()),
+                skill: Some("/weekly".to_string()),
+                ..Default::default()
+            },
+        ];
+        assert!(detect_collisions(&entries, &ctx).is_ok());
+    }
+
+    #[test]
+    fn detect_collisions_errors_on_duplicate_plist_path() {
+        use onebrain_core::scheduler::{LaunchdContext, ScheduleEntry};
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = LaunchdContext {
+            vault_path: dir.path().to_path_buf(),
+            skill_cli_path: "onebrain".to_string(),
+            log_base_path: dir.path().join("logs"),
+            homedir: dir.path().to_path_buf(),
+            uid: 501,
+        };
+        // Two entries with the same skill name → same plist label → collision.
+        let entries = vec![
+            ScheduleEntry {
+                cron: Some("0 9 * * *".to_string()),
+                skill: Some("/daily".to_string()),
+                ..Default::default()
+            },
+            ScheduleEntry {
+                cron: Some("0 12 * * *".to_string()),
+                skill: Some("/daily".to_string()),
+                ..Default::default()
+            },
+        ];
+        let err = detect_collisions(&entries, &ctx).unwrap_err();
+        assert!(
+            err.to_string().contains("normalize to the same plist path"),
+            "got: {err}"
+        );
     }
 }

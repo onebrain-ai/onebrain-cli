@@ -1,5 +1,5 @@
 ---
-latest_version: 3.3.17
+latest_version: 3.3.18
 released: 2026-06-29
 ---
 
@@ -9,6 +9,13 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.18] — 2026-06-29 — coverage phase 2 (command modules)
+
+- **test(cli): close coverage gaps in the command-module layer** — `commands/doctor.rs` 87.55% → 94.20%, `commands/register_schedule.rs` 72.08% → 91.30%, `vault_ctx.rs` 51.35% → 100%, `commands/run_skill.rs` 78.82% → 79.17% (+110 tests across health-check branches, plist render/status/remove paths, vault resolution, and the headless skill-run argv shapes).
+- Core line coverage (per `scripts/coverage.sh`, exclusions applied) 92.59% → **93.62%**. Residuals are documented in `docs/coverage.md` — all interactive-TTY spinners, real subprocess/network calls, or OS-specific branches.
+- Test isolation hardening — the `plugin-cache`/`qmd-embeddings` fix paths now run via subprocess with a tempdir `$HOME`/`PATH` so the destructive cache sweep can never touch the real `~/.claude` cache; dropped a thread-unsafe process-`PATH` mutation and tightened two assertions that didn't verify their result.
+- No behavior change — tests only.
 
 ## [3.3.17] — 2026-06-29 — fix `onebrain update` hang on Homebrew + tighter --help indent
 

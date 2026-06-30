@@ -355,3 +355,345 @@ fn claude_bin_env_missing_emits_warning() {
             "CLAUDE_BIN points to a missing file",
         ));
 }
+
+// ── Gemini harness ─────────────────────────────────────────────────────────
+//
+// These tests use `skill run --harness gemini` (the modern subcommand).
+// The legacy `run-skill` alias always forces Claude; `--harness` / `--model` /
+// `--json` flags only exist on `skill run`.
+
+/// Minimal mock script for gemini — same argv-log contract as ARGV_LOG_SCRIPT.
+const GEMINI_ARGV_LOG_SCRIPT: &str = r#"#!/bin/bash
+: > "$ARGV_LOG"
+for a in "$@"; do
+  printf '%s\n' "$a" >> "$ARGV_LOG"
+done
+exit "${MOCK_EXIT:-0}"
+"#;
+
+#[cfg(unix)]
+#[test]
+fn gemini_harness_passes_include_directories_and_yolo() {
+    let d = tempdir().unwrap();
+    let vault = d.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    write_minimal_vault(&vault);
+    let mock = write_mock_claude(d.path(), GEMINI_ARGV_LOG_SCRIPT);
+    let argv_log = d.path().join("argv.log");
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        // `skill run` accepts `--harness`; the legacy `run-skill` does not.
+        .args([
+            "skill",
+            "run",
+            "--vault-dir",
+            vault.to_str().unwrap(),
+            "/daily",
+            "--harness",
+            "gemini",
+        ])
+        .env("GEMINI_BIN", &mock)
+        .env("ARGV_LOG", &argv_log)
+        .assert()
+        .success()
+        .code(0);
+
+    let logged = fs::read_to_string(&argv_log).unwrap();
+    let lines: Vec<&str> = logged.lines().collect();
+    let joined = lines.join(" ");
+    // Scan by flag rather than fixed argv slot, so prepending any flag before
+    // `-p` in a future change can't silently break these assertions.
+    let p_idx = lines
+        .iter()
+        .position(|a| *a == "-p")
+        .unwrap_or_else(|| panic!("no -p flag in argv: {joined}"));
+    assert!(
+        lines
+            .get(p_idx + 1)
+            .is_some_and(|p| p.starts_with("/onebrain:daily")),
+        "expected /onebrain:daily prompt after -p: {joined}"
+    );
+    // Gemini uses `--include-directories <vault>`, NOT `--add-dir`.
+    let inc_idx = lines
+        .iter()
+        .position(|a| *a == "--include-directories")
+        .unwrap_or_else(|| panic!("no --include-directories in argv: {joined}"));
+    assert_eq!(
+        lines.get(inc_idx + 1).copied(),
+        Some(vault.to_str().unwrap()),
+        "vault must follow --include-directories: {joined}"
+    );
+    assert!(
+        !lines.contains(&"--add-dir"),
+        "gemini harness must not use --add-dir: {joined}"
+    );
+    // `--approval-mode yolo` must be present (stdin is null for headless runs).
+    assert!(
+        joined.contains("--approval-mode yolo"),
+        "expected --approval-mode yolo in argv: {joined}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn gemini_harness_propagates_non_zero_exit() {
+    let d = tempdir().unwrap();
+    let vault = d.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    write_minimal_vault(&vault);
+    let mock = write_mock_claude(d.path(), GEMINI_ARGV_LOG_SCRIPT);
+    let argv_log = d.path().join("argv.log");
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args([
+            "skill",
+            "run",
+            "--vault-dir",
+            vault.to_str().unwrap(),
+            "/daily",
+            "--harness",
+            "gemini",
+        ])
+        .env("GEMINI_BIN", &mock)
+        .env("MOCK_EXIT", "55")
+        .env("ARGV_LOG", &argv_log)
+        .assert()
+        .failure()
+        .code(55);
+}
+
+#[cfg(unix)]
+#[test]
+fn gemini_harness_spawn_failure_maps_to_127() {
+    let d = tempdir().unwrap();
+    let vault = d.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    write_minimal_vault(&vault);
+
+    let non_executable = d.path().join("not-executable-gemini");
+    fs::write(&non_executable, "").unwrap();
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args([
+            "skill",
+            "run",
+            "--vault-dir",
+            vault.to_str().unwrap(),
+            "/daily",
+            "--harness",
+            "gemini",
+        ])
+        .env("GEMINI_BIN", &non_executable)
+        .assert()
+        .failure()
+        .code(127)
+        .stderr(predicate::str::contains("Failed to spawn gemini"));
+}
+
+#[cfg(unix)]
+#[test]
+fn gemini_harness_appends_model_flag() {
+    let d = tempdir().unwrap();
+    let vault = d.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    write_minimal_vault(&vault);
+    let mock = write_mock_claude(d.path(), GEMINI_ARGV_LOG_SCRIPT);
+    let argv_log = d.path().join("argv.log");
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args([
+            "skill",
+            "run",
+            "--vault-dir",
+            vault.to_str().unwrap(),
+            "/daily",
+            "--harness",
+            "gemini",
+            "--model",
+            "gemini-2.5-flash",
+        ])
+        .env("GEMINI_BIN", &mock)
+        .env("ARGV_LOG", &argv_log)
+        .assert()
+        .success()
+        .code(0);
+
+    let logged = fs::read_to_string(&argv_log).unwrap();
+    let lines: Vec<&str> = logged.lines().collect();
+    // `-m gemini-2.5-flash` must appear (Gemini uses short `-m`, not `--model`).
+    let joined = lines.join(" ");
+    assert!(
+        joined.contains("-m gemini-2.5-flash"),
+        "expected -m gemini-2.5-flash in argv: {joined}"
+    );
+}
+
+// ── Non-interactive spawn path ──────────────────────────────────────────────
+//
+// `cargo test` pipes stderr to the test harness, so `std::io::stderr().is_terminal()`
+// is false. Every `spawn_harness` call in these tests therefore exercises the
+// non-interactive branch (lines 179-186), not the spinner branch. The spinner /
+// indicatif path (lines 188-295) genuinely requires an interactive tty, which
+// cannot be provided in `cargo test` without a pty crate; it is listed in the
+// residual section of the coverage report.
+
+#[cfg(unix)]
+#[test]
+fn non_interactive_path_propagates_child_stdout() {
+    // Verify that in non-interactive mode the child's stdout reaches our
+    // stdout without truncation. The mock writes a fixed string to stdout;
+    // assert_cmd captures it.
+    let d = tempdir().unwrap();
+    let vault = d.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    write_minimal_vault(&vault);
+    let mock = write_mock_claude(d.path(), "#!/bin/bash\nprintf 'hello from child'\nexit 0\n");
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args([
+            "run-skill",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--skill",
+            "/daily",
+        ])
+        .env("CLAUDE_BIN", &mock)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello from child"));
+}
+
+#[cfg(unix)]
+#[test]
+fn non_interactive_path_child_stderr_reaches_stderr() {
+    let d = tempdir().unwrap();
+    let vault = d.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    write_minimal_vault(&vault);
+    let mock = write_mock_claude(
+        d.path(),
+        "#!/bin/bash\nprintf 'warning from child' >&2\nexit 0\n",
+    );
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args([
+            "run-skill",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--skill",
+            "/daily",
+        ])
+        .env("CLAUDE_BIN", &mock)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("warning from child"));
+}
+
+#[cfg(unix)]
+#[test]
+fn headless_env_var_is_set_on_child() {
+    // The child must see ONEBRAIN_HEADLESS=1 so session-init skips the
+    // interactive startup ceremony. We verify this by having the mock echo
+    // the variable to stdout.
+    let d = tempdir().unwrap();
+    let vault = d.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    write_minimal_vault(&vault);
+    let mock = write_mock_claude(
+        d.path(),
+        "#!/bin/bash\nprintf '%s' \"$ONEBRAIN_HEADLESS\"\nexit 0\n",
+    );
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args([
+            "run-skill",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--skill",
+            "/daily",
+        ])
+        .env("CLAUDE_BIN", &mock)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1"));
+}
+
+#[cfg(unix)]
+#[test]
+fn skill_run_passes_json_flag_to_claude() {
+    // `skill run --json` maps to `--output-format json` in the claude argv.
+    // Must use `skill run` (not `run-skill`): the legacy alias has no --json flag.
+    let d = tempdir().unwrap();
+    let vault = d.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    write_minimal_vault(&vault);
+    let mock = write_mock_claude(d.path(), ARGV_LOG_SCRIPT);
+    let argv_log = d.path().join("argv.log");
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args([
+            "skill",
+            "run",
+            "--vault-dir",
+            vault.to_str().unwrap(),
+            "/daily",
+            "--json",
+        ])
+        .env("CLAUDE_BIN", &mock)
+        .env("ARGV_LOG", &argv_log)
+        .assert()
+        .success()
+        .code(0);
+
+    let logged = fs::read_to_string(&argv_log).unwrap();
+    let joined = logged.lines().collect::<Vec<_>>().join(" ");
+    assert!(
+        joined.contains("--output-format json"),
+        "expected --output-format json in argv: {joined}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn skill_run_passes_model_to_claude() {
+    // `skill run --model <m>` injects `--model <m>` into the claude argv.
+    // Must use `skill run`: the legacy `run-skill` alias has no `--model` flag.
+    let d = tempdir().unwrap();
+    let vault = d.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    write_minimal_vault(&vault);
+    let mock = write_mock_claude(d.path(), ARGV_LOG_SCRIPT);
+    let argv_log = d.path().join("argv.log");
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args([
+            "skill",
+            "run",
+            "--vault-dir",
+            vault.to_str().unwrap(),
+            "/daily",
+            "--model",
+            "claude-haiku-4-5",
+        ])
+        .env("CLAUDE_BIN", &mock)
+        .env("ARGV_LOG", &argv_log)
+        .assert()
+        .success()
+        .code(0);
+
+    let logged = fs::read_to_string(&argv_log).unwrap();
+    let joined = logged.lines().collect::<Vec<_>>().join(" ");
+    assert!(
+        joined.contains("--model claude-haiku-4-5"),
+        "expected --model claude-haiku-4-5 in argv: {joined}"
+    );
+}
