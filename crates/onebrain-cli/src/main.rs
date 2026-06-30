@@ -4,6 +4,7 @@
 //! [`v31::dispatch`]. Exit-code mapping is centralised in [`exit`].
 
 mod banner;
+mod categorized_help;
 mod cli;
 mod commands;
 mod exit;
@@ -43,6 +44,18 @@ fn main() {
             &raw_args,
             &pre_parse_env,
         );
+    }
+
+    // v3.3.15: categorized root help. When the user requests root-level help
+    // (`onebrain --help` or bare `onebrain`), intercept before clap prints the
+    // flat Commands list and emit the categorized version instead.
+    // Subcommand help (`onebrain note --help`) is NOT intercepted — clap handles
+    // those paths normally through its derive-driven flow.
+    if categorized_help::is_root_help_request(&raw_args) {
+        categorized_help::print_root_help();
+        // print_root_help exits; the line below is unreachable but makes the
+        // control-flow explicit to the compiler.
+        unreachable!("print_root_help exits with std::process::exit(0)");
     }
 
     // `try_parse` so we can intercept the `arg_required_else_help` path —
