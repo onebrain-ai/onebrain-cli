@@ -14,7 +14,7 @@ set -euo pipefail
 # Files excluded from the coverage target — keep in sync with docs/coverage.md.
 # Each entry is unreachable in tests without mocking the network, spawning a real
 # subprocess, running a blocking server, or driving a TTY.
-IGNORE_REGEX='(src/main\.rs|commands/(serve|daemon|update|qmd_reindex|harness_run)\.rs|server/(chat|search)\.rs|update/install\.rs|init/wizard\.rs|(vault_sync|output)/progress\.rs|session_token\.rs)'
+IGNORE_REGEX='(src/main\.rs|commands/(serve|daemon|update|qmd_reindex|harness_run)\.rs|server/(chat|search)\.rs|update/install\.rs|init/wizard\.rs|(vault_sync|output)/progress\.rs|cache/src/session_token\.rs)'
 
 mode="${1:---summary-only}"
 case "$mode" in

@@ -19,10 +19,12 @@ use tempfile::tempdir;
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Create a minimal vault (vault.yml sentinel).
+/// Create a minimal vault (onebrain.yml sentinel — the canonical name; using
+/// the legacy `vault.yml` would fire a deprecation warning on every subprocess
+/// and clutter test stderr).
 fn vault_dir() -> tempfile::TempDir {
     let d = tempdir().unwrap();
-    fs::write(d.path().join("vault.yml"), "method: onebrain\n").unwrap();
+    fs::write(d.path().join("onebrain.yml"), "method: onebrain\n").unwrap();
     d
 }
 
@@ -358,5 +360,12 @@ fn daemon_stop_graceful_when_not_running() {
     assert!(
         !stderr.contains("panicked at"),
         "daemon stop panicked:\nstderr: {stderr}"
+    );
+    // Graceful = a clean status code (0 = stopped/none-running, 1 = handled
+    // "not running" report), never a crash/abort code.
+    let code = out.status.code().unwrap_or(-1);
+    assert!(
+        code == 0 || code == 1,
+        "daemon stop should exit 0 or 1 when no daemon runs, got {code}"
     );
 }
