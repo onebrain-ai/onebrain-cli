@@ -219,3 +219,348 @@ fn one_shot_command_rejects_shell_special_chars() {
         .failure()
         .stderr(predicate::str::contains("shell-special"));
 }
+
+/// `--refresh` prints a notice line before writing plists.
+#[test]
+fn refresh_emits_notice_line() {
+    // Use onebrain.yml (canonical v3.1+ format).
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("onebrain.yml"),
+        "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n",
+    )
+    .unwrap();
+    write_skill(v.path(), "daily", "name: daily\nschedulable: true");
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--refresh", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--refresh: re-emitting"));
+}
+
+/// `--status` reports `[once]` tag for one-shot entries.
+#[test]
+fn status_shows_once_tag_for_at_entries() {
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("onebrain.yml"),
+        "schedule:\n  - at: \"2026-05-13 14:30\"\n    skill: /daily\n",
+    )
+    .unwrap();
+    write_skill(v.path(), "daily", "name: daily\nschedulable: true");
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--status"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[once]"));
+}
+
+/// `--status` shows skill args in parentheses when present.
+#[test]
+fn status_shows_skill_args_in_parens() {
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("onebrain.yml"),
+        "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /distill\n    args:\n      topic: this-week\n",
+    )
+    .unwrap();
+    write_skill(v.path(), "distill", "name: distill\nschedulable: true");
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--status"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        // Args formatted as "(topic=this-week)"
+        .stdout(predicate::str::contains("topic=this-week"));
+}
+
+/// `--status` shows `cmd:` label for command-mode entries (no args).
+///
+/// Unix-only: relies on `/bin/echo` existing.
+#[cfg(unix)]
+#[test]
+fn status_shows_cmd_label_for_command_mode_entry() {
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("onebrain.yml"),
+        "schedule:\n  - cron: \"0 3 * * 0\"\n    command: /bin/echo\n",
+    )
+    .unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--status"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cmd: /bin/echo"));
+}
+
+/// `--status` shows `cmd:` with args for command-mode entries.
+///
+/// Unix-only: relies on `/bin/echo` existing.
+#[cfg(unix)]
+#[test]
+fn status_shows_cmd_with_args() {
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("onebrain.yml"),
+        "schedule:\n  - cron: \"0 3 * * 0\"\n    command: /bin/echo\n    args:\n      - hello\n",
+    )
+    .unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--status"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cmd: /bin/echo hello"));
+}
+
+/// `--resume` when no paused marker exists prints "not paused".
+#[test]
+fn resume_when_not_paused_prints_not_paused() {
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("onebrain.yml"),
+        "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n",
+    )
+    .unwrap();
+    // No marker file created — skill is not paused.
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--resume", "/daily"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is not paused"));
+}
+
+/// Empty schedule in onebrain.yml → prints a notice, exits 0.
+#[test]
+fn empty_schedule_block_exits_cleanly() {
+    let v = tempdir().unwrap();
+    std::fs::write(v.path().join("onebrain.yml"), "# no schedule key\n").unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Nothing to register"));
+}
+
+/// Invalid cron expression produces a friendly error message.
+#[test]
+fn invalid_cron_produces_error() {
+    let v = tempdir().unwrap();
+    write_skill(v.path(), "daily", "name: daily\nschedulable: true");
+    std::fs::write(
+        v.path().join("onebrain.yml"),
+        "schedule:\n  - cron: \"0 9 * *\"\n    skill: /daily\n",
+    )
+    .unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Invalid cron").or(predicate::str::contains("cron")));
+}
+
+/// Skill with schedulable_with_args: true but missing required arg is rejected.
+#[test]
+fn schedulable_with_args_missing_required_arg_fails() {
+    let v = tempdir().unwrap();
+    let skill_dir = v.path().join(".claude/plugins/onebrain/skills/distill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nschedulable_with_args: true\nrequired_args:\n  - topic\n---\n",
+    )
+    .unwrap();
+    std::fs::write(
+        v.path().join("onebrain.yml"),
+        "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /distill\n",
+    )
+    .unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires args").or(predicate::str::contains("topic")));
+}
+
+/// Skill with no schedulable key in frontmatter is rejected.
+#[test]
+fn skill_no_schedulable_key_fails() {
+    let v = tempdir().unwrap();
+    let skill_dir = v.path().join(".claude/plugins/onebrain/skills/nodecl");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(skill_dir.join("SKILL.md"), "---\nname: nodecl\n---\n").unwrap();
+    std::fs::write(
+        v.path().join("onebrain.yml"),
+        "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /nodecl\n",
+    )
+    .unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("does not declare schedulable"));
+}
+
+/// skill-mode args with shell-special chars are rejected at register time.
+#[test]
+fn skill_mode_args_with_shell_special_rejected() {
+    let v = tempdir().unwrap();
+    write_skill(v.path(), "distill", "name: distill\nschedulable: true");
+    std::fs::write(
+        v.path().join("onebrain.yml"),
+        "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /distill\n    args:\n      topic: \"$(evil)\"\n",
+    )
+    .unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("shell-special"));
+}
+
+/// `--test` with a skill that isn't in the schedule fails with a helpful error.
+#[test]
+fn test_run_missing_skill_fails_with_message() {
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("onebrain.yml"),
+        "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n",
+    )
+    .unwrap();
+    write_skill(v.path(), "daily", "name: daily\nschedulable: true");
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--test", "/nonexistent"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "no `schedule:` entry matching skill",
+        ));
+}
+
+/// `--remove` when no plists exist exits cleanly (nothing to delete).
+#[cfg(unix)]
+#[test]
+fn remove_when_no_plists_exits_cleanly() {
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("onebrain.yml"),
+        "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n",
+    )
+    .unwrap();
+    write_skill(v.path(), "daily", "name: daily\nschedulable: true");
+    // No plist was ever written → remove should be a no-op exit 0.
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--remove"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success();
+}
+
+/// Actual registration (no --dry-run) writes plist to LaunchAgents.
+///
+/// Unix-only: LaunchAgents is macOS/Linux HOME convention.
+#[cfg(unix)]
+#[test]
+fn registration_writes_plist_file() {
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("onebrain.yml"),
+        "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n",
+    )
+    .unwrap();
+    write_skill(v.path(), "daily", "name: daily\nschedulable: true");
+    let home = tempdir().unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule"])
+        .current_dir(v.path())
+        .env("HOME", home.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\u{2713} Wrote"))
+        .stdout(predicate::str::contains("Registered 1 schedule entries"));
+
+    let plist = home
+        .path()
+        .join("Library/LaunchAgents/com.onebrain.daily.plist");
+    assert!(plist.exists(), "plist must exist at {}", plist.display());
+}
+
+/// `--status` marks installed plist with ✓ and uninstalled with ✗.
+#[cfg(unix)]
+#[test]
+fn status_marks_installed_and_uninstalled() {
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("onebrain.yml"),
+        "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n",
+    )
+    .unwrap();
+    write_skill(v.path(), "daily", "name: daily\nschedulable: true");
+    let home = tempdir().unwrap();
+
+    // Before registration → uninstalled (✗)
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--status"])
+        .current_dir(v.path())
+        .env("HOME", home.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\u{2717}"));
+
+    // Register it
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule"])
+        .current_dir(v.path())
+        .env("HOME", home.path())
+        .assert()
+        .success();
+
+    // After registration → installed (✓)
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--status"])
+        .current_dir(v.path())
+        .env("HOME", home.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\u{2713}"));
+}
