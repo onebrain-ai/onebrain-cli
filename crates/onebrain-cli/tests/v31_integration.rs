@@ -205,7 +205,11 @@ fn top_level_help_hides_stub_groups() {
         assert!(
             !stdout.contains(&format!("  {stub}\n"))
                 && !stdout.contains(&format!("  {stub}  "))
-                && !stdout.contains(&format!("  {stub} ")),
+                && !stdout.contains(&format!("  {stub} "))
+                // 4-space indent is the categorized-block command row form;
+                // a leaked stub would appear there post-v3.3.15.
+                && !stdout.contains(&format!("    {stub}  "))
+                && !stdout.contains(&format!("    {stub} ")),
             "stub group `{stub}` leaked into top-level --help. Got:\n{stdout}"
         );
     }
@@ -339,6 +343,25 @@ fn top_level_help_is_production_grade() {
     assert!(
         checkpoint < harness && harness < serve && serve < skill,
         "Launch Management should come last, ordered harness→serve→skill"
+    );
+
+    // Item F: emoji are tty-gated. This test captures PIPED stdout (non-tty),
+    // so category headings must render WITHOUT emoji. Guards against the
+    // `std::io::stdout().is_terminal()` gate in `print_root_help` being
+    // accidentally removed/hardcoded — the categorized_help unit test only
+    // exercises the pure builder, not the binary's gate.
+    for emoji in ["\u{2699}", "\u{1F9E0}", "\u{1F504}", "\u{1F680}"] {
+        assert!(
+            !stdout.contains(emoji),
+            "piped --help must not contain category emoji `{emoji}` (tty-gate regression):\n{stdout}"
+        );
+    }
+
+    // Item G: usage line keeps `<COMMAND>` even though the render clone hides
+    // every subcommand — pins the `override_usage` string against silent drift.
+    assert!(
+        stdout.contains("Usage: onebrain [OPTIONS] <COMMAND>"),
+        "usage line must read `Usage: onebrain [OPTIONS] <COMMAND>`:\n{stdout}"
     );
 }
 

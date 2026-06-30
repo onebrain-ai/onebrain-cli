@@ -236,7 +236,9 @@ pub fn print_root_help() {
     // description on the same line with `[default: …]` wrapped) rather than
     // the one-flag-per-block long format that `print_long_help()` forces when
     // `use_long = true` regardless of `long_help_exists`.
-    render_cmd.print_help().expect("help output failed");
+    // Ignore a write failure (e.g. a closed pipe from `onebrain --help | head`):
+    // the help request itself succeeded, so we still exit 0 rather than panic.
+    let _ = render_cmd.print_help();
     std::process::exit(0);
 }
 
