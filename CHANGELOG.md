@@ -1,5 +1,5 @@
 ---
-latest_version: 3.3.15
+latest_version: 3.3.16
 released: 2026-06-29
 ---
 
@@ -9,6 +9,12 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.16] — 2026-06-29 — coverage foundation + dispatch tests
+
+- **test(cli): coverage tooling** — add `scripts/coverage.sh` (wraps `cargo llvm-cov --workspace` with a documented `--ignore-filename-regex` exclusion allowlist) and `docs/coverage.md` (the excluded-files list + rationale + measured baselines). Targets 100% line coverage on testable "core" code; genuinely-unreachable code (network installs, blocking servers, TTY wizards, OS probes) is excluded explicitly, not silently.
+- **test(cli): cover `v31/dispatch.rs` stub + verb arms** — parametric exit-code tests over all hidden stub verbs (72 inside a vault / 64 outside) plus real daemon/schedule/completions arms. dispatch.rs 76.94% → 86.70% line.
+- Measured baselines: whole-workspace 89.58% line; core (exclusions applied) 92.59% line. No behavior change — tests + docs only.
 
 ## [3.3.15] — 2026-06-29 — categorized root --help
 
