@@ -2445,29 +2445,14 @@ mod tests {
         status_line(true, "test json stderr");
     }
 
-    // ── fix_qmd_embeddings: qmd not on PATH ──────────────────────────────────
-
-    #[test]
-    fn fix_qmd_embeddings_fails_when_qmd_not_on_path() {
-        // Temporarily set PATH to empty so which::which("qmd") returns Err.
-        // We restore via a scoped env change using std::env::set_var (safe in
-        // single-threaded unit test context; test binary is sequential).
-        let saved = std::env::var_os("PATH");
-        std::env::set_var("PATH", "/nonexistent-path-that-has-no-qmd");
-        let outcome = fix_qmd_embeddings(false);
-        // Restore PATH before any assertion so a panic can't leave it broken.
-        match saved {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
-        match outcome {
-            FixOutcome::Failed(msg) => assert!(
-                msg.contains("not on PATH"),
-                "expected 'not on PATH' in message: {msg}"
-            ),
-            other => panic!("expected Failed, got: {other:?}"),
-        }
-    }
+    // The `fix_qmd_embeddings` "qmd not on PATH" branch is intentionally NOT
+    // unit-tested: forcing `which::which("qmd")` to fail requires mutating the
+    // process-global `PATH`, which is unsound in the parallel test binary. It
+    // is also not reachable via a `doctor --fix` subprocess — the
+    // `qmd-embeddings` check only emits a fixable "N unembedded" finding when
+    // qmd IS present, the exact opposite of what this branch needs. The recipe
+    // shells out to the `qmd` binary, the same rationale that excludes
+    // `qmd_reindex.rs` from the coverage target (see docs/coverage.md).
 
     // ── fix_settings_hooks: success path ─────────────────────────────────────
 
@@ -2569,29 +2554,12 @@ mod tests {
         }
     }
 
-    // ── fix_plugin_cache: succeeds when home dir is resolvable ───────────────
-
-    #[test]
-    fn fix_plugin_cache_returns_fixed_or_failed_not_manual() {
-        // fix_plugin_cache uses the home directory to locate the installed plugins
-        // path. On any developer machine this resolves. We accept Fixed OR Failed
-        // (depending on whether stale cache entries exist or permissions allow
-        // removal) but never Manual.
-        let outcome = fix_plugin_cache(false);
-        match &outcome {
-            FixOutcome::Fixed(_) | FixOutcome::Failed(_) => {}
-            FixOutcome::Manual(m) => panic!("unexpected Manual: {m}"),
-        }
-    }
-
-    #[test]
-    fn fix_plugin_cache_json_mode_returns_fixed_or_failed_not_manual() {
-        let outcome = fix_plugin_cache(true);
-        match &outcome {
-            FixOutcome::Fixed(_) | FixOutcome::Failed(_) => {}
-            FixOutcome::Manual(m) => panic!("unexpected Manual (json=true): {m}"),
-        }
-    }
+    // `fix_plugin_cache` is exercised end-to-end in
+    // tests/doctor_integration.rs::doctor_fix_prunes_stale_plugin_cache_under_fake_home,
+    // which pins `$HOME` to a tempdir so the destructive cache sweep can never
+    // touch the real developer cache. A direct unit call against the live
+    // `$HOME` (the previous approach) could delete real plugin-cache entries
+    // during `cargo test`.
 
     // ── fix_vault_yml_keys: error / edge paths ────────────────────────────────
 

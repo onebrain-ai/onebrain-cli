@@ -401,17 +401,34 @@ fn gemini_harness_passes_include_directories_and_yolo() {
 
     let logged = fs::read_to_string(&argv_log).unwrap();
     let lines: Vec<&str> = logged.lines().collect();
-    // Must include `--include-directories <vault>` (not `--add-dir`).
-    assert_eq!(lines[0], "-p");
-    assert!(
-        lines[1].starts_with("/onebrain:daily"),
-        "prompt: {}",
-        lines[1]
-    );
-    assert_eq!(lines[2], "--include-directories");
-    assert_eq!(lines[3], vault.to_str().unwrap());
-    // `--approval-mode yolo` must be present (stdin is null for headless runs).
     let joined = lines.join(" ");
+    // Scan by flag rather than fixed argv slot, so prepending any flag before
+    // `-p` in a future change can't silently break these assertions.
+    let p_idx = lines
+        .iter()
+        .position(|a| *a == "-p")
+        .unwrap_or_else(|| panic!("no -p flag in argv: {joined}"));
+    assert!(
+        lines
+            .get(p_idx + 1)
+            .is_some_and(|p| p.starts_with("/onebrain:daily")),
+        "expected /onebrain:daily prompt after -p: {joined}"
+    );
+    // Gemini uses `--include-directories <vault>`, NOT `--add-dir`.
+    let inc_idx = lines
+        .iter()
+        .position(|a| *a == "--include-directories")
+        .unwrap_or_else(|| panic!("no --include-directories in argv: {joined}"));
+    assert_eq!(
+        lines.get(inc_idx + 1).copied(),
+        Some(vault.to_str().unwrap()),
+        "vault must follow --include-directories: {joined}"
+    );
+    assert!(
+        !lines.contains(&"--add-dir"),
+        "gemini harness must not use --add-dir: {joined}"
+    );
+    // `--approval-mode yolo` must be present (stdin is null for headless runs).
     assert!(
         joined.contains("--approval-mode yolo"),
         "expected --approval-mode yolo in argv: {joined}"

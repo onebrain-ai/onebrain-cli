@@ -46,12 +46,12 @@ the call site.
 ## Status (2026-06-29)
 
 - Whole-workspace baseline (no exclusions): **89.58% line** (`cargo llvm-cov --workspace`).
-- **Core (this initiative's target surface, exclusions applied): 93.65% line** / 94.16% region —
-  `scripts/coverage.sh`. ~1,512 missed lines remain on core code (down from 1,711 baseline).
+- **Core (this initiative's target surface, exclusions applied): 93.62% line** / 94.16% region —
+  `scripts/coverage.sh`. ~1,517 missed lines remain on core code (down from 1,711 baseline).
 
 Closed so far:
 - Phase 1 — `v31/dispatch.rs` 76.94% → 86.70% (stub/verb exit-code tests).
-- Phase 2 — `commands/doctor.rs` 87.55% → 94.28%, `commands/register_schedule.rs` 72.08% →
+- Phase 2 — `commands/doctor.rs` 87.55% → 94.20%, `commands/register_schedule.rs` 72.08% →
   91.30%, `vault_ctx.rs` 51.35% → 100%, `commands/run_skill.rs` 78.82% → 79.17%.
 
 A ratcheting CI coverage gate (fail under the current core %) will be added in the final phase,

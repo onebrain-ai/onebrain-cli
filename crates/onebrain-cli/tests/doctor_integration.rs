@@ -650,3 +650,66 @@ fn doctor_fix_preserves_custom_keys_and_backs_up() {
     let count = std::fs::read_dir(&backups).unwrap().count();
     assert!(count >= 1, "expected at least one timestamped backup");
 }
+
+/// Safety + coverage for the `plugin-cache` `--fix` recipe (`fix_plugin_cache`).
+/// `$HOME` is pinned to a tempdir so the destructive cache sweep operates on a
+/// synthetic home and can NEVER touch the real developer cache — the inline
+/// unit test this replaces called `fix_plugin_cache` directly against the live
+/// `$HOME` and could delete real `~/.claude/plugins/cache` entries on every
+/// `cargo test`. A stale orphan version dir is planted under the fake cache;
+/// after `--fix` the recipe must report `fixed` and the orphan must be gone.
+///
+/// `#[cfg(unix)]`: the isolation hinges on `$HOME` steering
+/// `dirs::home_dir()`, which only holds on unix. On Windows `home_dir()` reads
+/// the profile known-folder (not the env), so the fake-home redirect would not
+/// take and the recipe would resolve the real home — gate to the platforms
+/// where the sweep provably can't escape the tempdir.
+#[cfg(unix)]
+#[test]
+fn doctor_fix_prunes_stale_plugin_cache_under_fake_home() {
+    let home = tempdir().unwrap();
+    // Any version dir under `<cache>/<marketplace>/onebrain/` is a prunable
+    // orphan (the active plugin is the vault-local pin, never a cache copy).
+    let stale = home
+        .path()
+        .join(".claude/plugins/cache/test-marketplace/onebrain/2.2.4");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("plugin.json"), "{}").unwrap();
+    // Registry present but empty — the unconditional `<cache>/*/onebrain/` glob
+    // still discovers the orphan under the unregistered marketplace.
+    std::fs::write(
+        home.path().join(".claude/plugins/installed_plugins.json"),
+        r#"{"plugins":{}}"#,
+    )
+    .unwrap();
+
+    let vault = tempdir().unwrap();
+    write_minimal_vault(vault.path());
+
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .args(["doctor", "--fix", "--json"])
+        .assert();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default();
+    let doc: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("expected JSON · error: {e} · stdout: {stdout}"));
+    let fix_arr = doc["fix"].as_array().expect("fix is array");
+    let pc = fix_arr
+        .iter()
+        .find(|e| e["check"] == "plugin-cache")
+        .unwrap_or_else(|| panic!("no plugin-cache fix entry · fix: {fix_arr:?}"));
+    assert_eq!(
+        pc["outcome"], "fixed",
+        "plugin-cache recipe must report fixed · entry: {pc}"
+    );
+    // The sweep actually removed the orphan — proves the destructive path ran
+    // against the fake home, not just that a finding was reported.
+    assert!(
+        !stale.exists(),
+        "stale cache dir must be pruned by --fix: {}",
+        stale.display()
+    );
+}

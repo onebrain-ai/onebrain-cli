@@ -855,9 +855,11 @@ mod tests {
         let sub = dir.path().join("sub");
         std::fs::create_dir_all(&sub).unwrap();
         let result = resolve_vault_root(&sub).unwrap();
-        // Either the vault root (dir.path()) or the sub is fine depending on
-        // find_vault_root implementation; what matters is it doesn't error.
-        assert!(result.exists());
+        // Must walk up from `sub` to the ancestor holding onebrain.yml.
+        // `find_vault_root` walks via `Path::pop` without canonicalizing, so
+        // the popped path equals `dir.path()` exactly — no macOS
+        // `/var`→`/private/var` mismatch to guard against here.
+        assert_eq!(result, dir.path());
     }
 
     // ── resolve_command_binary ────────────────────────────────────────────────
