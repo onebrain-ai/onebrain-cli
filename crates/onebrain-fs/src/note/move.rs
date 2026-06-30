@@ -787,6 +787,121 @@ mod tests {
         assert_eq!(n, 3);
     }
 
+    #[test]
+    fn rewrite_links_unclosed_wikilink_passthrough() {
+        // When `[[` is found but no matching `]]` follows, the content is not
+        // treated as a wikilink — exercises the None arm of the inner
+        // `if let Some(rel_end) = content[..].find("]]")` branch.
+        let (out, n) = rewrite_links("see [[unclosed link here", "unclosed", "new");
+        assert_eq!(out, "see [[unclosed link here");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn basename_no_ext_empty_path_returns_empty_string() {
+        // Path::new("").file_stem() is None; unwrap_or_default() returns "".
+        // Exercises the None → unwrap_or_default() arm of basename_no_ext.
+        assert_eq!(basename_no_ext(Path::new("")), "");
+    }
+
+    #[test]
+    fn libc_exdev_is_18() {
+        // EXDEV is errno 18 on Linux and macOS/BSD — document and pin this.
+        assert_eq!(libc_exdev(), 18);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dest_mkdir_failure_propagates() {
+        // Permission bits are advisory under root → the error branch never fires.
+        // Skip rather than pass vacuously (CI runs non-root; this only affects root/Docker).
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "old.md", "# Old\n");
+
+        // "locked/" exists and is write-denied; create_dir_all("locked/sub")
+        // fails → exercises the Err path in execute_plan's mkdir guard (lines 196-200).
+        let locked = root.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        let mut perms = fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&locked, perms).unwrap();
+
+        let err = move_note(
+            root,
+            Path::new("old.md"),
+            Path::new("locked/sub/new.md"),
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        let mut perms = fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&locked, perms).unwrap();
+
+        assert!(matches!(err, FsError::Io { .. }));
+        assert!(
+            root.join("old.md").exists(),
+            "source not moved when mkdir fails"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_non_exdev_error_propagates() {
+        // Permission bits are advisory under root → the error branch never fires.
+        // Skip rather than pass vacuously (CI runs non-root; this only affects root/Docker).
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "old.md", "# Old\n");
+
+        // dest_ro/ already exists and is read-only. create_dir_all on an existing
+        // directory is a no-op (Ok), but rename into the read-only directory then
+        // fails with EACCES (errno 13, not EXDEV=18) → hits the else branch in
+        // move_file (lines 276-279).
+        let dest_ro = root.join("dest_ro");
+        fs::create_dir_all(&dest_ro).unwrap();
+        let mut perms = fs::metadata(&dest_ro).unwrap().permissions();
+        perms.set_mode(0o555);
+        fs::set_permissions(&dest_ro, perms).unwrap();
+
+        let err = move_note(
+            root,
+            Path::new("old.md"),
+            Path::new("dest_ro/new.md"),
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        let mut perms = fs::metadata(&dest_ro).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&dest_ro, perms).unwrap();
+
+        assert!(matches!(err, FsError::Io { .. }));
+        assert!(
+            root.join("old.md").exists(),
+            "source not moved when rename fails"
+        );
+    }
+
     /// An unreadable note that might hold a `[[old]]` link is recorded in
     /// `skipped` (it would dangle after the move) rather than silently dropped.
     /// The move of readable notes still proceeds.

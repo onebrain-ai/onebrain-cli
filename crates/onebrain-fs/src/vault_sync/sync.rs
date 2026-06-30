@@ -299,4 +299,81 @@ mod tests {
         assert_eq!(sync_obsidian(&extracted, &vault), 0);
         assert!(!vault.join(".obsidian").exists());
     }
+
+    #[test]
+    fn obsidian_overwrites_existing_dest_file() {
+        let dir = tempdir().unwrap();
+        let extracted = dir.path().join("extracted");
+        let vault = dir.path().join("vault");
+        write(
+            &extracted.join(".obsidian/app.json"),
+            r#"{"newVersion":true}"#,
+        );
+        // Pre-populate dest with stale content.
+        write(&vault.join(".obsidian/app.json"), r#"{"old":true}"#);
+        let added = sync_obsidian(&extracted, &vault);
+        assert_eq!(added, 1);
+        let content = fs::read_to_string(vault.join(".obsidian/app.json")).unwrap();
+        assert!(
+            content.contains("newVersion"),
+            "dest file should be overwritten: {content}"
+        );
+        assert!(
+            !content.contains("old"),
+            "old content should be gone: {content}"
+        );
+    }
+
+    #[test]
+    fn obsidian_skips_file_when_dest_parent_is_a_blocking_file() {
+        // create_dir_all fails when a component of the path is an existing file.
+        let dir = tempdir().unwrap();
+        let extracted = dir.path().join("extracted");
+        let vault = dir.path().join("vault");
+        // Source has a file nested under sub/.
+        write(&extracted.join(".obsidian/sub/config.json"), "{}");
+        // In dest, .obsidian/sub exists as a regular FILE — create_dir_all can't
+        // create it as a directory → is_err() → continue → file is skipped.
+        write(&vault.join(".obsidian/sub"), "I am a file, not a directory");
+        let added = sync_obsidian(&extracted, &vault);
+        assert_eq!(
+            added, 0,
+            "no files should be added when dest parent is a file"
+        );
+        // The blocking file must still be there.
+        assert!(vault.join(".obsidian/sub").is_file());
+    }
+
+    #[test]
+    fn obsidian_skips_file_when_dest_path_is_a_directory() {
+        // fs::write to a path that is already a directory fails (EISDIR / EACCES).
+        let dir = tempdir().unwrap();
+        let extracted = dir.path().join("extracted");
+        let vault = dir.path().join("vault");
+        write(&extracted.join(".obsidian/app.json"), "{}");
+        // Create vault/.obsidian/app.json as a directory — write will fail.
+        fs::create_dir_all(vault.join(".obsidian/app.json")).unwrap();
+        let added = sync_obsidian(&extracted, &vault);
+        assert_eq!(added, 0, "write to a directory should be skipped");
+        assert!(vault.join(".obsidian/app.json").is_dir());
+    }
+
+    #[test]
+    fn gemini_empty_source_dir_removes_all_stale_dest_files() {
+        // Source .gemini/ exists but is empty — all dest files are stale.
+        let dir = tempdir().unwrap();
+        let extracted = dir.path().join("extracted");
+        let vault = dir.path().join("vault");
+        // Empty source dir (exists → passes the early-return guard in sync_gemini_config).
+        fs::create_dir_all(extracted.join(".gemini")).unwrap();
+        // Dest has two stale files.
+        write(&vault.join(".gemini/old-a.toml"), "stale");
+        write(&vault.join(".gemini/old-b.toml"), "stale");
+        let unlink: UnlinkFn = default_unlink_fn();
+        let (added, removed) = sync_gemini_config(&extracted, &vault, &unlink).unwrap();
+        assert_eq!(added, 0);
+        assert_eq!(removed, 2);
+        assert!(!vault.join(".gemini/old-a.toml").exists());
+        assert!(!vault.join(".gemini/old-b.toml").exists());
+    }
 }

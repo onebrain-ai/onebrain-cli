@@ -276,6 +276,7 @@ fn _silence_write<W: Write>(_: W) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{env_override_cache_dir, env_override_installed_plugins_path};
     use crate::vault_sync::types::FetchFn;
     use chrono::TimeZone;
     use flate2::write::GzEncoder;
@@ -487,6 +488,195 @@ mod tests {
         let yml = fs::read_to_string(vault.join("vault.yml")).unwrap();
         assert!(yml.contains("update_channel: stable"));
         assert!(!yml.contains("onebrain_version"));
+    }
+
+    // ---- read_plugin_version ----
+
+    #[test]
+    fn read_plugin_version_missing_file_returns_none() {
+        let dir = tempdir().unwrap();
+        // No plugin.json — exercises the first .ok()? None path.
+        assert!(read_plugin_version(dir.path()).is_none());
+    }
+
+    #[test]
+    fn read_plugin_version_invalid_json_returns_none() {
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join(".claude/plugins/onebrain/.claude-plugin/plugin.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{ not valid json").unwrap();
+        // Bad JSON — exercises the second .ok()? None path.
+        assert!(read_plugin_version(dir.path()).is_none());
+    }
+
+    #[test]
+    fn read_plugin_version_no_version_field_returns_none() {
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join(".claude/plugins/onebrain/.claude-plugin/plugin.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"id": "onebrain"}"#).unwrap();
+        // Valid JSON but no "version" key — and_then returns None.
+        assert!(read_plugin_version(dir.path()).is_none());
+    }
+
+    // ---- default_installed_plugins_path ----
+
+    #[test]
+    fn default_installed_plugins_path_ends_with_known_suffix() {
+        match default_installed_plugins_path() {
+            Some(p) => {
+                let s = p.to_string_lossy();
+                assert!(
+                    s.contains("installed_plugins.json"),
+                    "expected path to include installed_plugins.json, got: {s}"
+                );
+            }
+            None => {
+                // home_dir() returns None in some exotic envs — that's a valid result.
+            }
+        }
+    }
+
+    // ---- env_override helpers ----
+
+    #[test]
+    fn env_override_installed_plugins_path_none_when_var_absent() {
+        // Only assert when the var is genuinely absent to avoid thread-safety
+        // issues with set_var in parallel tests.
+        if std::env::var_os("ONEBRAIN_INSTALLED_PLUGINS_PATH").is_none() {
+            assert!(env_override_installed_plugins_path().is_none());
+        }
+    }
+
+    #[test]
+    fn env_override_cache_dir_none_when_var_absent() {
+        if std::env::var_os("ONEBRAIN_INSTALLED_PLUGINS_CACHE_DIR").is_none() {
+            assert!(env_override_cache_dir().is_none());
+        }
+    }
+
+    // ---- progress_writer option ----
+
+    #[test]
+    fn progress_writer_option_routes_output_to_writer() {
+        let dir = tempdir().unwrap();
+        let vault = make_vault(dir.path());
+        let bytes = build_tarball("onebrain-ai-onebrain-abc1234", "1.11.0");
+        let isolated = vault.join(".isolated-installed_plugins.json");
+        // Box<Cursor<Vec<u8>>> satisfies `Box<dyn Write + Send>`.
+        let writer: Box<dyn std::io::Write + Send> =
+            Box::new(std::io::Cursor::new(Vec::<u8>::new()));
+        let result = run_vault_sync(
+            &vault,
+            VaultSyncOptions {
+                fetch_fn: Some(mock_fetch_with(bytes)),
+                installed_plugins_path: Some(isolated),
+                is_tty: Some(false),
+                now_fn: Some(fixed_now()),
+                progress_writer: Some(writer),
+                ..Default::default()
+            },
+        );
+        assert!(
+            result.ok,
+            "sync should succeed with a custom progress_writer: {result:?}"
+        );
+    }
+
+    // ---- include_obsidian flag ----
+
+    #[test]
+    fn include_obsidian_flag_copies_obsidian_dir() {
+        let dir = tempdir().unwrap();
+        let vault = make_vault(dir.path());
+        let isolated = vault.join(".isolated-installed_plugins.json");
+
+        // Build a tarball that includes an .obsidian/ file.
+        let mut bytes = Vec::new();
+        {
+            let enc = GzEncoder::new(&mut bytes, Compression::default());
+            let mut b = tar::Builder::new(enc);
+            let files: &[(&str, &str)] = &[
+                (
+                    "onebrain-ai-onebrain-abc/.claude/plugins/onebrain/.claude-plugin/plugin.json",
+                    r#"{"id":"onebrain","version":"1.11.0","name":"OneBrain"}"#,
+                ),
+                (
+                    "onebrain-ai-onebrain-abc/CLAUDE.md",
+                    "@.claude/plugins/onebrain/INSTRUCTIONS.md\n",
+                ),
+                (
+                    "onebrain-ai-onebrain-abc/GEMINI.md",
+                    "@.claude/plugins/onebrain/INSTRUCTIONS.md\n",
+                ),
+                (
+                    "onebrain-ai-onebrain-abc/AGENTS.md",
+                    "@.claude/plugins/onebrain/INSTRUCTIONS.md\n",
+                ),
+                ("onebrain-ai-onebrain-abc/.obsidian/app.json", "{}"),
+            ];
+            for (p, c) in files {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(c.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_data(&mut h, p, c.as_bytes()).unwrap();
+            }
+            b.finish().unwrap();
+        }
+
+        let result = run_vault_sync(
+            &vault,
+            VaultSyncOptions {
+                fetch_fn: Some(mock_fetch_with(bytes)),
+                installed_plugins_path: Some(isolated),
+                is_tty: Some(false),
+                now_fn: Some(fixed_now()),
+                include_obsidian: true,
+                ..Default::default()
+            },
+        );
+        assert!(result.ok, "sync should succeed: {result:?}");
+        assert!(
+            vault.join(".obsidian/app.json").exists(),
+            ".obsidian/app.json should be synced when include_obsidian=true"
+        );
+    }
+
+    // ---- pin error is non-fatal ----
+
+    #[test]
+    fn pin_error_is_non_fatal_result_ok_and_pin_skipped() {
+        let dir = tempdir().unwrap();
+        let vault = make_vault(dir.path());
+        let bytes = build_tarball("onebrain-ai-onebrain-abc1234", "1.11.0");
+        // Malformed installed_plugins.json → pin_to_vault returns Err(InvalidData).
+        // The orchestrator should treat this as non-fatal and set pin_skipped = true.
+        let bad_plugins = dir.path().join("bad-installed_plugins.json");
+        fs::write(&bad_plugins, "{ malformed json").unwrap();
+
+        let result = run_vault_sync(
+            &vault,
+            VaultSyncOptions {
+                fetch_fn: Some(mock_fetch_with(bytes)),
+                installed_plugins_path: Some(bad_plugins),
+                is_tty: Some(false),
+                now_fn: Some(fixed_now()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            result.ok,
+            "overall sync must succeed even when pin errors: {result:?}"
+        );
+        assert!(
+            result.pin_skipped,
+            "pin_skipped must be true when pin_to_vault returns Err"
+        );
     }
 
     #[test]

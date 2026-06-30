@@ -605,6 +605,113 @@ mod tests {
     }
 
     #[test]
+    fn parse_fm_yaml_parse_error_returns_none() {
+        // An unclosed YAML flow mapping "{" is syntactically invalid.
+        // serde_yaml returns Err → .ok()? propagates None before the match.
+        assert!(parse_frontmatter_with_rest("---\n{\n---\nbody").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_failure_increments_skipped() {
+        // Permission bits are advisory under root → the error branch never fires.
+        // Skip rather than pass vacuously (CI runs non-root; this only affects root/Docker).
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
+        // Covers the fs::read_to_string Err arm in run_backfill_recapped.
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir().unwrap();
+        let logs = d.path().join("07-logs");
+        let m = make_month_dir(&logs, "2026", "05");
+        let fpath = m.join("2026-05-01-session-01.md");
+        fs::write(&fpath, "---\ntags: session-log\n---\nContent\n").unwrap();
+        let mut perms = fs::metadata(&fpath).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&fpath, perms.clone()).unwrap();
+        let mut warnings = Vec::new();
+        let r = run_backfill_recapped(&logs, None, "2026-06-01", |msg| {
+            warnings.push(msg.to_string())
+        });
+        // Restore before assertion so tempdir cleanup succeeds.
+        perms.set_mode(0o644);
+        fs::set_permissions(&fpath, perms).unwrap();
+        assert_eq!(r.skipped, 1);
+        assert_eq!(r.backfilled, 0);
+        assert!(warnings.iter().any(|w| w.contains("error processing")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_month_dir_produces_no_files() {
+        // Permission bits are advisory under root → the error branch never fires.
+        // Skip rather than pass vacuously (CI runs non-root; this only affects root/Docker).
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
+        // list_md_files returns Vec::new() when fs::read_dir fails on the dir.
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir().unwrap();
+        let logs = d.path().join("07-logs");
+        let m = make_month_dir(&logs, "2026", "05");
+        fs::write(
+            m.join("2026-05-01-session-01.md"),
+            "---\ntags: session-log\n---\nContent\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&m).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&m, perms.clone()).unwrap();
+        let r = run_backfill_recapped(&logs, None, "2026-06-01", no_warn());
+        // Restore before assertion so tempdir cleanup succeeds.
+        perms.set_mode(0o755);
+        fs::set_permissions(&m, perms).unwrap();
+        assert_eq!(r.backfilled, 0);
+        assert_eq!(r.skipped, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_year_dir_is_skipped() {
+        // Permission bits are advisory under root → the error branch never fires.
+        // Skip rather than pass vacuously (CI runs non-root; this only affects root/Docker).
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
+        // Covers the `Err(_) => continue` branch when fs::read_dir on a year
+        // directory fails.
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir().unwrap();
+        let logs = d.path().join("07-logs");
+        let year_path = logs.join("session").join("2026");
+        let month_path = year_path.join("04");
+        fs::create_dir_all(&month_path).unwrap();
+        fs::write(
+            month_path.join("2026-04-01-session-01.md"),
+            "---\ntags: session-log\n---\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&year_path).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&year_path, perms.clone()).unwrap();
+        let r = run_backfill_recapped(&logs, None, "2026-06-01", no_warn());
+        // Restore before assertion.
+        perms.set_mode(0o755);
+        fs::set_permissions(&year_path, perms).unwrap();
+        assert_eq!(r.backfilled, 0);
+        assert_eq!(r.skipped, 0);
+    }
+
+    #[test]
     fn idempotent_rerun() {
         let d = tempdir().unwrap();
         let logs = d.path().join("07-logs");

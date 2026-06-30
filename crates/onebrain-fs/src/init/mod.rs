@@ -938,4 +938,222 @@ mod tests {
         // confirm_fn must NOT have been called (--force bypasses both prompts)
         assert_eq!(*counter.lock().unwrap(), 0);
     }
+
+    /// `DirState::Missing` branch: when the target vault_dir doesn't exist yet,
+    /// init must create it via `create_dir_all` and then proceed normally.
+    #[test]
+    fn missing_vault_dir_is_created_by_init() {
+        let d = tempdir().unwrap();
+        let vault_dir = d.path().join("new-vault"); // does not exist
+        assert!(!vault_dir.exists());
+        let (opts, _stdout_buf) = test_opts(&vault_dir);
+
+        let r = run_init(opts).unwrap();
+        assert!(r.ok);
+        assert!(vault_dir.is_dir(), "init must create the missing vault dir");
+        assert!(vault_dir.join("onebrain.yml").is_file());
+        assert!(r.vault_yml_written);
+        assert_eq!(r.folders_created, 9);
+    }
+
+    /// `NonEmptyNonVault` + no `confirm_fn` + no force + not structured_output:
+    /// the `else` branch surfaces `InitTargetNotEmpty` so the caller gets a
+    /// clear "pass --force" error rather than a silent no-op.
+    #[test]
+    fn non_empty_dir_no_confirm_fn_returns_init_target_not_empty() {
+        let d = tempdir().unwrap();
+        std::fs::write(d.path().join("README.md"), "hello").unwrap();
+        // test_opts: no confirm_fn, force=false, structured_output=false
+        let (opts, _stdout_buf) = test_opts(d.path());
+
+        let err = run_init(opts).expect_err("expected InitTargetNotEmpty");
+        match err {
+            FsError::Core(CoreError::InitTargetNotEmpty(msg)) => {
+                assert!(
+                    msg.contains("not empty") || msg.contains("force"),
+                    "error message should mention non-empty or --force: {msg}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+        // No partial state written.
+        assert!(!d.path().join("onebrain.yml").exists());
+        assert!(!d.path().join("00-inbox").exists());
+    }
+
+    /// `NonEmptyNonVault` + `structured_output=true`: surfaces the machine-readable
+    /// `InitTargetNotEmpty` error so the envelope renderer can emit `E_INIT_TARGET_NOT_EMPTY`
+    /// without ever reaching an interactive TTY prompt.
+    #[test]
+    fn structured_output_non_empty_dir_returns_error() {
+        let d = tempdir().unwrap();
+        std::fs::write(d.path().join("existing.txt"), "data").unwrap();
+        let (stdout_sink, _stdout_buf) = capture_sink();
+        let opts = InitOptions {
+            vault_dir: Some(d.path().to_path_buf()),
+            structured_output: true,
+            stdout_lines: Some(stdout_sink),
+            register_hooks_fn: Some(Box::new(|_| true)),
+            vault_sync_fn: Some(Box::new(|_| true)),
+            ..Default::default()
+        };
+
+        let err = run_init(opts).expect_err("expected InitTargetNotEmpty for structured output");
+        match err {
+            FsError::Core(CoreError::InitTargetNotEmpty(msg)) => {
+                assert!(
+                    msg.contains("force"),
+                    "structured-output error must mention --force: {msg}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+        assert!(!d.path().join("onebrain.yml").exists());
+    }
+
+    /// Existing config + `confirm_fn` says yes to overwrite: init proceeds past
+    /// Step 1 but Step 4 still preserves the config verbatim (no clobber). This
+    /// tests the confirm-yes path that the existing `confirm_fn_overwrite_no_aborts`
+    /// test misses (it only exercises the "no" path).
+    #[test]
+    fn existing_config_confirm_yes_proceeds_preserves_config() {
+        let d = tempdir().unwrap();
+        let original = "qmd_collection: my-collection\n";
+        std::fs::write(d.path().join("onebrain.yml"), original).unwrap();
+        let (mut opts, _stdout_buf) = test_opts(d.path());
+        opts.confirm_fn = Some(Box::new(|_q: &str| true)); // always yes
+
+        let r = run_init(opts).unwrap();
+        assert!(r.ok);
+        assert!(!r.aborted);
+        // Config preserved — vault_yml_written must be false even though we confirmed.
+        assert!(
+            !r.vault_yml_written,
+            "vault_yml_written must be false when config pre-existed"
+        );
+        let content = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(content, original, "existing config must not be overwritten");
+        // Structural scaffold still applied.
+        assert!(d.path().join("00-inbox").is_dir());
+    }
+
+    /// `skip_vault_sync=true`: vault_sync_ok=false and the done message tells
+    /// the user to run `vault-sync` manually rather than reporting a failure.
+    #[test]
+    fn skip_vault_sync_emits_vault_sync_done_message() {
+        let d = tempdir().unwrap();
+        let (stdout_sink, stdout_buf) = capture_sink();
+        let opts = InitOptions {
+            vault_dir: Some(d.path().to_path_buf()),
+            skip_vault_sync: true,
+            stdout_lines: Some(stdout_sink),
+            register_hooks_fn: Some(Box::new(|_| true)),
+            // vault_sync_fn intentionally absent — skip_vault_sync bypasses it.
+            ..Default::default()
+        };
+
+        let r = run_init(opts).unwrap();
+        assert!(r.ok);
+        assert!(!r.vault_sync_ok, "vault_sync_ok must be false when skipped");
+        let lines = stdout_buf.lock().unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("vault-sync")),
+            "done message must mention vault-sync: {lines:?}"
+        );
+    }
+
+    /// `vault_sync_fn` returns false: vault_sync_ok=false and the "done (partial)"
+    /// message is emitted so the user knows to re-run vault-sync manually.
+    #[test]
+    fn vault_sync_failure_reports_partial_done_message() {
+        let d = tempdir().unwrap();
+        let (stdout_sink, stdout_buf) = capture_sink();
+        let opts = InitOptions {
+            vault_dir: Some(d.path().to_path_buf()),
+            stdout_lines: Some(stdout_sink),
+            register_hooks_fn: Some(Box::new(|_| true)),
+            vault_sync_fn: Some(Box::new(|_| false)), // simulate failure
+            ..Default::default()
+        };
+
+        let r = run_init(opts).unwrap();
+        assert!(r.ok);
+        assert!(!r.vault_sync_ok);
+        let lines = stdout_buf.lock().unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("partial")),
+            "done message must say 'partial' on vault-sync failure: {lines:?}"
+        );
+    }
+
+    /// `MarketplaceOutcome::Repaired` inside `run_init`: a pre-existing malformed
+    /// marketplace.json under `--force` triggers a repair, emits a stderr warning,
+    /// and writes "marketplace.json: repaired" to stdout.
+    #[test]
+    fn marketplace_repaired_emits_stderr_warning_and_repaired_stdout_line() {
+        let d = tempdir().unwrap();
+        // Pre-create a malformed marketplace.json.
+        let plugin_dir = d.path().join(".claude-plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("marketplace.json"), "{not valid json}").unwrap();
+
+        let (stdout_sink, stdout_buf) = capture_sink();
+        let (stderr_sink, stderr_buf) = capture_sink();
+        let opts = InitOptions {
+            vault_dir: Some(d.path().to_path_buf()),
+            force: true,
+            stdout_lines: Some(stdout_sink),
+            stderr_lines: Some(stderr_sink),
+            register_hooks_fn: Some(Box::new(|_| true)),
+            vault_sync_fn: Some(Box::new(|_| true)),
+            ..Default::default()
+        };
+
+        let r = run_init(opts).unwrap();
+        assert!(r.ok);
+        assert!(
+            r.marketplace_written,
+            "Repaired must count as marketplace_written=true"
+        );
+        let stdout = stdout_buf.lock().unwrap();
+        assert!(
+            stdout.iter().any(|l| l == "marketplace.json: repaired"),
+            "expected 'marketplace.json: repaired' in stdout: {stdout:?}"
+        );
+        let stderr = stderr_buf.lock().unwrap();
+        assert!(
+            stderr.iter().any(|l| l.contains("repaired")),
+            "expected repair warning in stderr: {stderr:?}"
+        );
+    }
+
+    /// Step 2 directory prompt is skipped when `--yes` is set, even when a
+    /// `confirm_fn` is provided. `--yes` implies "accept all defaults" so no
+    /// interactive prompt should fire on a clean empty vault.
+    #[test]
+    fn yes_flag_with_confirm_fn_does_not_prompt_for_directory() {
+        let d = tempdir().unwrap();
+        let (mut opts, _stdout_buf) = test_opts(d.path());
+        opts.yes = true;
+        let counter = Arc::new(Mutex::new(0_u32));
+        let counter_clone = counter.clone();
+        opts.confirm_fn = Some(Box::new(move |_q: &str| {
+            *counter_clone.lock().unwrap() += 1;
+            true
+        }));
+
+        let r = run_init(opts).unwrap();
+        assert!(r.ok);
+        // Empty dir + no existing config + yes=true → zero confirm prompts:
+        //   Step 0: DirState::Empty → no prompt
+        //   Step 1: no config exists → no prompt
+        //   Step 2: yes=true → prompt skipped
+        assert_eq!(
+            *counter.lock().unwrap(),
+            0,
+            "confirm_fn must not be called when --yes is set on a fresh empty vault"
+        );
+        // yes=true implies Essentials preset.
+        assert_eq!(r.preset_installed, Some(SchedulePreset::Essentials));
+    }
 }
