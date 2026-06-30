@@ -1399,4 +1399,271 @@ mod tests {
             std::env::remove_var(GITHUB_ENV_OVERRIDE);
         });
     }
+
+    // -----------------------------------------------------------------
+    // check mode — already-up-to-date inner branch (lines 688-693)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn check_flag_up_to_date_emits_already_up_to_date_line() {
+        // The `if version_at_least` branch inside `opts.check` (line 689):
+        // when current >= latest the "already up to date" stdout line fires
+        // *before* "done: dry run complete". Previously only the current <
+        // latest path was exercised by `check_flag_only_fetches`.
+        let (stdout_sink, stdout_lines) = capturing_sink();
+        let opts = UpdateOptions {
+            check: true,
+            fetch_fn: Some(mock_fetch("v2.0.0")),
+            current_version_fn: Some(current("v2.0.0")),
+            stdout_lines: Some(stdout_sink),
+            ..Default::default()
+        };
+        let result = run_update(opts);
+        assert!(result.ok);
+        assert_eq!(result.exit_code, 0);
+        let out = stdout_lines.lock().unwrap().join("\n");
+        assert!(
+            out.contains("already up to date: @onebrain-ai/cli v2.0.0"),
+            "missing up-to-date line: {out}"
+        );
+        assert!(
+            out.contains("done: dry run complete"),
+            "missing dry-run line: {out}"
+        );
+    }
+
+    #[test]
+    fn check_flag_ahead_of_latest_also_shows_up_to_date() {
+        // An alpha user whose version is *ahead* of the latest stable tag
+        // (current > latest semver) must also see "already up to date" and
+        // must not trigger an install even in check mode.
+        let install_called = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let install_called_c = install_called.clone();
+        let (stdout_sink, stdout_lines) = capturing_sink();
+        let opts = UpdateOptions {
+            check: true,
+            fetch_fn: Some(mock_fetch("v2.0.0")),
+            install_fn: Some(Box::new(move |_| {
+                *install_called_c.lock().unwrap() = true;
+                Ok(())
+            })),
+            current_version_fn: Some(current("v3.0.0-alpha.5")),
+            stdout_lines: Some(stdout_sink),
+            ..Default::default()
+        };
+        let result = run_update(opts);
+        assert!(result.ok);
+        assert!(
+            !*install_called.lock().unwrap(),
+            "install must not run in check mode"
+        );
+        let out = stdout_lines.lock().unwrap().join("\n");
+        assert!(out.contains("already up to date"), "{out}");
+        assert!(out.contains("done: dry run complete"), "{out}");
+    }
+
+    // -----------------------------------------------------------------
+    // format_release_date — remaining months (only Jan + Apr were tested)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn format_release_date_remaining_months() {
+        // Exercises the 10 month-match arms not yet covered by
+        // `format_release_date_matches_en_gb` (Apr=4, Jan=1).
+        let cases = [
+            ("2026-02-15T00:00:00Z", "15 Feb 2026"),
+            ("2026-03-15T00:00:00Z", "15 Mar 2026"),
+            ("2026-05-15T00:00:00Z", "15 May 2026"),
+            ("2026-06-15T00:00:00Z", "15 Jun 2026"),
+            ("2026-07-15T00:00:00Z", "15 Jul 2026"),
+            ("2026-08-15T00:00:00Z", "15 Aug 2026"),
+            ("2026-09-15T00:00:00Z", "15 Sep 2026"),
+            ("2026-10-15T00:00:00Z", "15 Oct 2026"),
+            ("2026-11-15T00:00:00Z", "15 Nov 2026"),
+            ("2026-12-15T00:00:00Z", "15 Dec 2026"),
+        ];
+        for (rfc, expected) in cases {
+            let d = DateTime::parse_from_rfc3339(rfc)
+                .unwrap()
+                .with_timezone(&Utc);
+            assert_eq!(format_release_date(d), expected, "input: {rfc}");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // extract_release_date — edge-case None paths
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn extract_release_date_too_short_after_needle() {
+        // Exercises `if bytes.len() < 10 { return None }` (line 619):
+        // needle found but fewer than 10 bytes follow it.
+        assert!(extract_release_date("released 2026").is_none()); // 4 bytes
+        assert!(extract_release_date("released 2026-0").is_none()); // 6 bytes
+        assert!(extract_release_date("released 2026-04-2").is_none()); // 9 bytes
+        assert!(extract_release_date("released ").is_none()); // 0 bytes
+    }
+
+    #[test]
+    fn extract_release_date_invalid_format_returns_none() {
+        // Exercises the digit + separator validation checks (lines 623-630):
+        // non-digit characters in year, wrong separators.
+        assert!(extract_release_date("released 202X-04-26").is_none()); // letter in year
+        assert!(extract_release_date("released 2026/04/26").is_none()); // '/' not '-'
+        assert!(extract_release_date("released 2026-0X-26").is_none()); // letter in month
+        assert!(extract_release_date("released 2026-04=26").is_none()); // '=' not '-'
+    }
+
+    // -----------------------------------------------------------------
+    // extract_version_token — '+' build-metadata tail (line 570)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn extract_version_token_plus_build_metadata() {
+        // The existing tests only exercise the `-prerelease` branch (b'-').
+        // This covers the b'+' arm of `(bytes[k] == b'-' || bytes[k] == b'+')`.
+        assert_eq!(
+            extract_version_token("v1.0.0+build.42").as_deref(),
+            Some("v1.0.0+build.42")
+        );
+        // Combined prerelease + build — '+' is also consumed inside the inner
+        // while because `matches!(bytes[k], b'.' | b'-' | b'+')` includes it.
+        assert_eq!(
+            extract_version_token("v3.0.0-alpha.1+20260424").as_deref(),
+            Some("v3.0.0-alpha.1+20260424")
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // parse_release_payload — published_at None paths
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_release_payload_null_published_at_returns_none() {
+        // `"published_at": null` → JSON Value::Null → as_str() is None.
+        let json = serde_json::json!({ "tag_name": "v3.0.0", "published_at": null });
+        let info = parse_release_payload(&json).unwrap();
+        assert_eq!(info.version, "v3.0.0");
+        assert!(info.published_at.is_none());
+    }
+
+    #[test]
+    fn parse_release_payload_missing_published_at_key_returns_none() {
+        // Key absent entirely → `.get("published_at")` is None.
+        let json = serde_json::json!({ "tag_name": "v3.0.0" });
+        let info = parse_release_payload(&json).unwrap();
+        assert_eq!(info.version, "v3.0.0");
+        assert!(info.published_at.is_none());
+    }
+
+    #[test]
+    fn parse_release_payload_invalid_date_string_returns_none() {
+        // Invalid RFC3339 → `DateTime::parse_from_rfc3339(s).ok()` is None.
+        let json = serde_json::json!({ "tag_name": "v3.0.0", "published_at": "not-a-date" });
+        let info = parse_release_payload(&json).unwrap();
+        assert_eq!(info.version, "v3.0.0");
+        assert!(info.published_at.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // write_release_cache — Some(published_at) branch (line 347)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cache_write_preserves_published_at() {
+        // `cache_write_then_read_round_trips` only tests `published_at: None`.
+        // This test exercises `info.published_at.map(|d| d.to_rfc3339())` Some arm.
+        with_cache_path(|| {
+            let dt = DateTime::parse_from_rfc3339("2026-04-24T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc);
+            let info = ReleaseInfo {
+                version: "v3.0.0".to_string(),
+                published_at: Some(dt),
+            };
+            write_release_cache(&info).unwrap();
+            let cached = read_release_cache().expect("cache must be readable");
+            assert_eq!(cached.version, "v3.0.0");
+            let cached_dt = cached.published_at.expect("published_at must round-trip");
+            assert_eq!(cached_dt.year(), 2026);
+            assert_eq!(cached_dt.month(), 4);
+            assert_eq!(cached_dt.day(), 24);
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // read_release_cache — GITHUB_ENV_OVERRIDE bypass (lines 320-322)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn read_release_cache_bypassed_when_github_url_override_set() {
+        // Directly tests the early-return: even with a warm valid cache file
+        // on disk, read_release_cache must return None when
+        // ONEBRAIN_GITHUB_RELEASES_URL is set (intent = "hit this URL now").
+        with_cache_path(|| {
+            let info = ReleaseInfo {
+                version: "v-warm".to_string(),
+                published_at: None,
+            };
+            write_release_cache(&info).unwrap();
+            // Pre-condition: cache is warm and readable without the override.
+            assert!(read_release_cache().is_some(), "pre-condition: warm cache");
+
+            let _guard = EnvGuard {
+                key: GITHUB_ENV_OVERRIDE,
+                previous: std::env::var_os(GITHUB_ENV_OVERRIDE),
+            };
+            std::env::set_var(GITHUB_ENV_OVERRIDE, "http://localhost:9999/fake");
+            assert!(
+                read_release_cache().is_none(),
+                "warm cache must be bypassed when override URL env var is set"
+            );
+            // EnvGuard Drop restores GITHUB_ENV_OVERRIDE on the way out.
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // run_update — stderr sink content assertions
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn run_update_stderr_captures_install_error_detail() {
+        // Verifies write_stderr delivers the formatted install-failure message
+        // to the injected sink (lines 733-734 in run_update).
+        let (stderr_sink, stderr_lines) = capturing_sink();
+        let opts = UpdateOptions {
+            fetch_fn: Some(mock_fetch("v2.0.0")),
+            install_fn: Some(Box::new(|_| {
+                Err(UpdateError::Install("disk full".to_string()))
+            })),
+            current_version_fn: Some(current("v1.0.0")),
+            stderr_lines: Some(stderr_sink),
+            ..Default::default()
+        };
+        let result = run_update(opts);
+        assert!(!result.ok);
+        let err_out = stderr_lines.lock().unwrap().join("\n");
+        assert!(err_out.contains("Binary install failed"), "{err_out}");
+        assert!(err_out.contains("disk full"), "{err_out}");
+    }
+
+    #[test]
+    fn run_update_stderr_captures_validate_error_detail() {
+        // Verifies write_stderr delivers the formatted validation-failure
+        // message to the injected sink (lines 754-755 in run_update).
+        let (stderr_sink, stderr_lines) = capturing_sink();
+        let opts = UpdateOptions {
+            fetch_fn: Some(mock_fetch("v2.0.0")),
+            install_fn: Some(Box::new(|_| Ok(()))),
+            validate_fn: Some(Box::new(|_| Err("binary not on PATH".to_string()))),
+            current_version_fn: Some(current("v1.0.0")),
+            stderr_lines: Some(stderr_sink),
+            ..Default::default()
+        };
+        let result = run_update(opts);
+        assert!(!result.ok);
+        let err_out = stderr_lines.lock().unwrap().join("\n");
+        assert!(err_out.contains("Binary validation failed"), "{err_out}");
+        assert!(err_out.contains("binary not on PATH"), "{err_out}");
+    }
 }

@@ -3116,4 +3116,245 @@ mod tests {
             "2-space default indent: {out:?}"
         );
     }
+
+    // ── vault_display_name: "vault" fallback ─────────────────────────────────
+
+    #[test]
+    fn vault_display_name_returns_vault_for_empty_path() {
+        // An empty path has no file_name component → unwrap_or("vault") fires.
+        // This also covers the OsStr::to_str() → None arm (no str conversion
+        // attempted since file_name() itself returns None for "").
+        assert_eq!(vault_display_name(std::path::Path::new("")), "vault");
+    }
+
+    // ── attempt_fix: qmd-embeddings without "unembedded" → catch-all arm ─────
+
+    #[test]
+    fn attempt_fix_qmd_embeddings_no_unembedded_falls_to_manual() {
+        // "qmd_collection not set" does NOT contain "unembedded" → the message
+        // guard fails → falls to the `_ =>` Manual arm (no automated recipe).
+        let d = tempdir().unwrap();
+        let r = DoctorResult::warn("qmd-embeddings", "qmd_collection not set in onebrain.yml")
+            .with_hint("add qmd_collection to onebrain.yml");
+        let outcome = attempt_fix(&r, d.path(), false);
+        match outcome {
+            FixOutcome::Manual(msg) => {
+                assert!(msg.contains("qmd-embeddings"), "check name in msg: {msg}");
+                // Hint is non-circular so it should be passed through.
+                assert!(
+                    msg.contains("onebrain.yml"),
+                    "hint passed through in msg: {msg}"
+                );
+            }
+            other => {
+                panic!("expected Manual (no recipe for non-unembedded variant), got: {other:?}")
+            }
+        }
+    }
+
+    // ── fix_claude_settings: json=true routes status_line to stderr ──────────
+
+    #[test]
+    fn fix_claude_settings_json_mode_removes_stale_marketplace() {
+        // json=true → status_line emits to stderr so stdout stays clean JSON.
+        // Verify the recipe still applies the fix correctly in json=true mode.
+        let d = tempdir().unwrap();
+        fs::create_dir_all(d.path().join(".claude")).unwrap();
+        let original = serde_json::json!({
+            "extraKnownMarketplaces": {
+                "onebrain": { "source": { "repo": "kengio/onebrain" } }
+            }
+        });
+        fs::write(
+            d.path().join(".claude/settings.json"),
+            serde_json::to_string_pretty(&original).unwrap(),
+        )
+        .unwrap();
+        let outcome = fix_claude_settings(d.path(), true);
+        match outcome {
+            FixOutcome::Fixed(msg) => {
+                assert!(msg.contains("removed"), "json=true path: {msg}")
+            }
+            other => panic!("expected Fixed in json=true mode, got: {other:?}"),
+        }
+        let after: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(d.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            after.get("extraKnownMarketplaces").is_none(),
+            "marketplace removed: {after}"
+        );
+    }
+
+    // ── fix_folders: json=true routes status_line to stderr ──────────────────
+
+    #[test]
+    fn fix_folders_json_mode_creates_dirs() {
+        // json=true → status_line emits to stderr. Creation logic is unchanged.
+        let d = tempdir().unwrap();
+        let outcome = fix_folders(d.path(), true);
+        assert!(
+            matches!(outcome, FixOutcome::Fixed(_)),
+            "json=true must still create folders: {outcome:?}"
+        );
+        assert!(d.path().join("00-inbox").is_dir(), "00-inbox created");
+        assert!(d.path().join("07-logs").is_dir(), "07-logs created");
+        assert!(
+            d.path().join("00-inbox/imports").is_dir(),
+            "inbox/imports created"
+        );
+    }
+
+    // ── fix_vault_config_migration: json=true routes status_line to stderr ───
+
+    #[test]
+    fn fix_vault_config_migration_json_mode_renames_legacy() {
+        // json=true → status_line emits to stderr. Rename logic is unchanged.
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("vault.yml"), "qmd_collection: legacy\n").unwrap();
+        let outcome = fix_vault_config_migration(d.path(), true);
+        match outcome {
+            FixOutcome::Fixed(msg) => assert!(msg.contains("renamed"), "json=true: {msg}"),
+            other => panic!("expected Fixed in json=true mode, got: {other:?}"),
+        }
+        assert!(d.path().join("onebrain.yml").is_file(), "canonical exists");
+        assert!(!d.path().join("vault.yml").exists(), "legacy removed");
+    }
+
+    // ── fix_vault_yml_keys: runtime block kept when other keys remain ─────────
+
+    #[test]
+    fn fix_vault_yml_keys_runtime_block_kept_when_not_empty_after_harness_removal() {
+        // `runtime` has both `harness` (deprecated) and another key. After
+        // removing `harness`, `is_empty()` = false → `mapping.remove(&runtime_key)`
+        // is NOT called — the block stays (the non-deprecated key is untouched).
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "update_channel: stable\n\
+             runtime:\n  harness: claude-code\n  custom_setting: value\n\
+             folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n",
+        )
+        .unwrap();
+        let outcome = fix_vault_yml_keys(d.path(), false);
+        match outcome {
+            FixOutcome::Fixed(msg) => assert!(msg.contains("runtime.harness"), "msg: {msg}"),
+            other => panic!("expected Fixed, got: {other:?}"),
+        }
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert!(!after.contains("harness:"), "harness key removed: {after}");
+        // Block still present because custom_setting remains.
+        assert!(after.contains("runtime:"), "runtime block kept: {after}");
+        assert!(
+            after.contains("custom_setting:"),
+            "other runtime key kept: {after}"
+        );
+    }
+
+    // ── fix_vault_yml_keys: runtime without harness → no removal ─────────────
+
+    #[test]
+    fn fix_vault_yml_keys_runtime_without_harness_key_is_untouched() {
+        // `runtime` present but has no `harness` key → `remove(&harness_key)` returns
+        // None → `is_some()` is false → removed list stays empty → recipe is a no-op.
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "update_channel: stable\n\
+             runtime:\n  custom_setting: value\n\
+             folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n",
+        )
+        .unwrap();
+        // Nothing added, removed, or repaired → early-return with "already" message.
+        let outcome = fix_vault_yml_keys(d.path(), false);
+        match outcome {
+            FixOutcome::Fixed(msg) => assert!(msg.contains("already"), "no-op result: {msg}"),
+            other => panic!("expected Fixed (no-op), got: {other:?}"),
+        }
+        // File is NOT rewritten on a no-op, so the original content is intact.
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert!(
+            after.contains("runtime:"),
+            "runtime block untouched: {after}"
+        );
+        assert!(
+            after.contains("custom_setting:"),
+            "custom key untouched: {after}"
+        );
+    }
+
+    // ── write_summary_footer: manual-only warns → no fix pointer ─────────────
+
+    #[test]
+    fn write_summary_footer_manual_only_warn_shows_no_fix_action() {
+        // orphan-checkpoints is manual-only (planned_action returns None).
+        // any_auto_fixable = false even though there is a Warn → no fix pointer.
+        let results = vec![
+            DoctorResult::ok("onebrain.yml", "ok"),
+            DoctorResult::warn("orphan-checkpoints", "2 orphans").with_hint("run /wrapup"),
+        ];
+        let mut buf = Vec::new();
+        write_summary_footer(&mut buf, &results, false, 60).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("1 warning"),
+            "warning counted in footer: {out:?}"
+        );
+        assert!(
+            !out.contains("to auto-repair"),
+            "no fix pointer for manual-only warn: {out:?}"
+        );
+    }
+
+    // ── step_status_of: all three DoctorStatus → StepStatus arms ────────────
+
+    #[test]
+    fn step_status_of_maps_all_three_doctor_statuses_to_distinct_glyphs() {
+        // Exercises all three match arms; each must produce a distinct glyph
+        // so the rendered report can visually distinguish ok / warn / fail.
+        let ok = step_status_of(DoctorStatus::Ok);
+        let warn = step_status_of(DoctorStatus::Warn);
+        let err = step_status_of(DoctorStatus::Error);
+        assert_ne!(ok.glyph(), warn.glyph(), "ok vs warn glyphs differ");
+        assert_ne!(warn.glyph(), err.glyph(), "warn vs error glyphs differ");
+        assert_ne!(ok.glyph(), err.glyph(), "ok vs error glyphs differ");
+    }
+
+    // ── stamp_doctor_run: write error with quiet=true ─────────────────────────
+
+    #[test]
+    #[cfg(unix)]
+    fn stamp_doctor_run_write_error_quiet_true_does_not_panic() {
+        // Complement to stamp_doctor_run_write_error_non_quiet_does_not_panic:
+        // quiet=true suppresses the eprintln! — covers the `if !quiet` false arm
+        // at the write-error site. Must complete without panicking.
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            // Under root, chmod 0o555 doesn't prevent writes → skip.
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir().unwrap();
+        let path = d.path().join("onebrain.yml");
+        // Stale date ensures upsert_doctor_stats returns Some(updated) so the
+        // write path (not the idempotent None path) is reached.
+        fs::write(
+            &path,
+            "qmd_collection: ob\nstats:\n  last_doctor_run: 2020-01-01\n",
+        )
+        .unwrap();
+        // Make the directory read-only so atomic_write_text fails (can't create .tmp).
+        let mut dir_perms = fs::metadata(d.path()).unwrap().permissions();
+        dir_perms.set_mode(0o555);
+        fs::set_permissions(d.path(), dir_perms).unwrap();
+        // quiet=true → the `if !quiet { eprintln!(...) }` branch is NOT taken.
+        stamp_doctor_run(d.path(), false, true);
+        // Restore for tempdir cleanup.
+        let mut dir_perms = fs::metadata(d.path()).unwrap().permissions();
+        dir_perms.set_mode(0o755);
+        fs::set_permissions(d.path(), dir_perms).unwrap();
+    }
 }
