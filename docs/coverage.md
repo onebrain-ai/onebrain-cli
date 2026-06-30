@@ -14,8 +14,8 @@ wizards, OS-specific probes).
 > So genuinely-unreachable lines — defensive `match` arms, `spawn_blocking` panic-only
 > `JoinError` closures, post-`canonicalize` TOCTOU I/O errors, body-limit-middleware dead
 > branches, platform-defensive arms — can be neither covered nor ignored. The target is
-> therefore **≈99% core + a documented residual list (below) + a ratcheting CI gate set at
-> the achieved %**. (Decided over switching to nightly `#[coverage(off)]` or grcov, to keep
+> therefore **≈99% core + a documented residual list (below) + a ratcheting CI gate set
+> conservatively below the achieved % and raised over time**. (Decided over switching to nightly `#[coverage(off)]` or grcov, to keep
 > the stable toolchain.)
 
 Measure with:
@@ -112,10 +112,13 @@ Closed so far:
   spawn — note onebrain probes absolute harness paths so stripping `PATH` can't force a fail), `daemon
   start`/`run` (process fork / blocking server), `plugin update` TTY-animated render.
 
-A ratcheting CI coverage gate (fail-under the achieved core %) lands in the final phase — once
-the remaining testable gaps are closed and the residuals are documented, so it doesn't fight a
-moving target. Literal 100% is not the bar (see the ceiling note up top); the gate locks in
-whatever % the documented-residual set leaves.
+**Ratcheting CI coverage gate — ACTIVE (Phase 4).** The `coverage` job in
+`.github/workflows/ci.yml` runs `scripts/coverage.sh --ci-gate` on Linux and fails the build if
+core line coverage drops below `CORE_LINE_THRESHOLD` (in `scripts/coverage.sh`). It starts at a
+conservative **94%** — below the achieved ~95.2% to absorb platform/measurement jitter — and is
+**ratcheted UP, never down**, as coverage climbs (raise the threshold in a follow-up PR whenever a
+new floor is comfortably held). Literal 100% is not the bar (see the ceiling note up top); the gate
+locks in whatever % the documented-residual set leaves.
 
 Remaining core gaps to close (tracked, by reachable missed lines):
 - The fs-cluster residuals not yet maxed (`register_hooks/settings.rs` ~86%, `init/{mod,marketplace}.rs`
@@ -132,6 +135,6 @@ Remaining core gaps to close (tracked, by reachable missed lines):
 
 `commands/doctor.rs`, `v31/dispatch.rs` (95.64%), `onebrain-fs/src/update/mod.rs`,
 `commands/register_schedule.rs`, and `server/api.rs` were advanced in phases 3b–3d and are now near
-their testable ceilings. The next milestone is **Phase 4**: add the ratcheting CI `--fail-under-lines`
-gate at the achieved core % and lock the initiative. See
+their testable ceilings. **Phase 4 (the ratcheting CI gate) is done** — the initiative is locked at
+core ~95.2%; further phases are optional fs-cluster/long-tail mop-up, each free to raise the gate. See
 `01-projects/onebrain/cli/2026-06-29-cli-coverage-100-design.md`.
