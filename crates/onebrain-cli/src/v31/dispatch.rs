@@ -487,11 +487,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             }
             SearchVerb::Model(SearchModelCmd { verb }) => match verb {
                 None => commands::search_model::run_bare(vault_flag.clone(), &mode),
-                Some(SearchModelVerb::List) => {
-                    commands::search_model::run_list(vault_flag.clone(), &mode)
+                Some(SearchModelVerb::List(args)) => {
+                    commands::search_model::run_list(vault_flag.clone(), &mode, &args)
                 }
                 Some(SearchModelVerb::Set(args)) => {
                     commands::search_model::run_set(vault_flag.clone(), &mode, &args)
+                }
+                Some(SearchModelVerb::Remove(args)) => {
+                    commands::search_model::run_remove(vault_flag.clone(), &mode, &args)
                 }
             },
         },

@@ -102,60 +102,12 @@ pub fn open_engine(vault_flag: Option<PathBuf>) -> Result<(Engine, ResolvedVault
 
 /// Persist `search.collection = collection` into the vault's config file
 /// (`onebrain.yml`, or legacy `vault.yml` if that's what's present),
-/// preserving every other key. Mirrors `search_model::persist_embed_model`'s
-/// read → mutate mapping → backup → atomic-write pattern:
-/// `onebrain_fs::backup_config_file` is a hard precondition (no write
-/// proceeds without a successful backup, or a confirmed-absent file for a
-/// fresh vault).
+/// preserving every other key. Thin wrapper over the shared
+/// `onebrain_fs::persist_search_key` (read → mutate `search.*` → backup →
+/// atomic-write; `backup_config_file` is a hard precondition), which
+/// `search_model::persist_embed_model` also uses.
 fn persist_collection(vault_root: &Path, collection: &str) -> Result<()> {
-    use onebrain_core::{find_config_file, CONFIG_FILENAME};
-
-    let path = find_config_file(vault_root).unwrap_or_else(|| vault_root.join(CONFIG_FILENAME));
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-
-    let mut yaml: serde_yaml::Value = if text.trim().is_empty() {
-        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
-    } else {
-        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
-    };
-    if !yaml.is_mapping() {
-        yaml = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-    }
-    let mapping = yaml.as_mapping_mut().expect("normalized to mapping above");
-
-    let search_key = serde_yaml::Value::String("search".to_string());
-    let needs_replace = match mapping.get(&search_key) {
-        Some(v) => !v.is_mapping(),
-        None => true,
-    };
-    if needs_replace {
-        mapping.insert(
-            search_key.clone(),
-            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
-        );
-    }
-    let search = mapping
-        .get_mut(&search_key)
-        .and_then(|v| v.as_mapping_mut())
-        .expect("search key was just ensured to be a mapping");
-    search.insert(
-        serde_yaml::Value::String("collection".to_string()),
-        serde_yaml::Value::String(collection.to_string()),
-    );
-
-    let serialized = serde_yaml::to_string(&yaml).context("serializing updated config")?;
-
-    // Defense-in-depth: back up the existing config before overwriting it.
-    // Hard precondition — refuse the write if the backup couldn't be made.
-    onebrain_fs::backup_config_file(&path)
-        .with_context(|| format!("backing up {} before write", path.display()))?;
-
-    onebrain_fs::atomic_write_text(&path, &serialized)
-        .with_context(|| format!("writing {}", path.display()))
+    onebrain_fs::persist_search_key(vault_root, "collection", collection)
 }
 
 /// `true` when the collection's cache dir already exists on disk (used by

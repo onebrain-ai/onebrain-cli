@@ -442,6 +442,228 @@ fn search_model_set_already_current_is_a_noop() {
     assert!(!model_cache.exists());
 }
 
+/// The on-disk model dir a downloaded model would occupy under the collection
+/// cache. `intfloat/multilingual-e5-small` → `models--intfloat--multilingual-e5-small`.
+fn seed_fake_model(
+    cache: &Path,
+    collection: &str,
+    dir_name: &str,
+    bytes: usize,
+) -> std::path::PathBuf {
+    // `ONEBRAIN_CACHE_DIR` replaces the state dir wholesale (see
+    // `migration::default_state_dir`), so the search cache root is
+    // `<cache>/search/<collection>/`.
+    let model_dir = cache.join("search").join(collection).join(dir_name);
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(model_dir.join("model.onnx"), vec![0u8; bytes]).unwrap();
+    model_dir
+}
+
+#[test]
+fn search_model_list_json_reports_downloaded_and_disk_fields() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n  embed_model: bge-m3\n",
+    );
+    seed_fake_model(
+        cache.path(),
+        "t-vault",
+        "models--intfloat--multilingual-e5-small",
+        4096,
+    );
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "model", "list"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let models = v["data"]["models"].as_array().unwrap();
+
+    let small = models
+        .iter()
+        .find(|m| m["name"] == "multilingual-e5-small")
+        .unwrap();
+    assert_eq!(small["downloaded"], true);
+    assert_eq!(small["disk_bytes"], 4096);
+
+    let bge = models.iter().find(|m| m["name"] == "bge-m3").unwrap();
+    assert_eq!(bge["downloaded"], false);
+    assert_eq!(bge["disk_bytes"], serde_json::Value::Null);
+
+    assert!(v["data"]["cache_dir"].as_str().unwrap().contains("t-vault"));
+}
+
+#[test]
+fn search_model_list_sort_by_dim_desc_orders_rows() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "model", "list", "--sort", "dim", "--desc"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let dims: Vec<u64> = v["data"]["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["dims"].as_u64().unwrap())
+        .collect();
+    let mut sorted = dims.clone();
+    sorted.sort_unstable();
+    sorted.reverse();
+    assert_eq!(dims, sorted);
+}
+
+#[test]
+fn search_model_remove_unknown_name_errors() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "model", "remove", "not-a-real-model"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("unsupported embedding model"));
+}
+
+#[test]
+fn search_model_remove_not_downloaded_is_friendly_noop() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n  embed_model: bge-m3\n",
+    );
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "model", "remove", "multilingual-e5-large"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "search.model.remove");
+    assert_eq!(v["data"]["removed"], false);
+    assert_eq!(v["data"]["freed_bytes"], serde_json::Value::Null);
+}
+
+#[test]
+fn search_model_remove_deletes_non_current_downloaded_model() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n  embed_model: bge-m3\n",
+    );
+    let model_dir = seed_fake_model(
+        cache.path(),
+        "t-vault",
+        "models--intfloat--multilingual-e5-small",
+        8192,
+    );
+    assert!(model_dir.exists());
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "model", "remove", "multilingual-e5-small"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["data"]["removed"], true);
+    assert_eq!(v["data"]["freed_bytes"], 8192);
+    assert_eq!(v["data"]["was_current"], false);
+    assert!(!model_dir.exists(), "model dir should be gone");
+}
+
+#[test]
+fn search_model_remove_current_refuses_without_force_non_tty() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n  embed_model: multilingual-e5-small\n",
+    );
+    let model_dir = seed_fake_model(
+        cache.path(),
+        "t-vault",
+        "models--intfloat--multilingual-e5-small",
+        4096,
+    );
+
+    // Non-TTY (piped) + active model + no --force → refuse, exit non-zero,
+    // and leave the model dir intact.
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "model", "remove", "multilingual-e5-small"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("--force"));
+    assert!(model_dir.exists(), "refused remove must not delete files");
+}
+
+#[test]
+fn search_model_remove_current_with_force_deletes() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n  embed_model: multilingual-e5-small\n",
+    );
+    let model_dir = seed_fake_model(
+        cache.path(),
+        "t-vault",
+        "models--intfloat--multilingual-e5-small",
+        2048,
+    );
+
+    let out = onebrain(vault.path(), cache.path())
+        .args([
+            "search",
+            "model",
+            "remove",
+            "multilingual-e5-small",
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["data"]["removed"], true);
+    assert_eq!(v["data"]["was_current"], true);
+    assert_eq!(v["data"]["freed_bytes"], 2048);
+    assert!(!model_dir.exists());
+}
+
 // ── Gated: real embeddings (reindex + query + vsearch) ─────────────────────
 
 #[test]

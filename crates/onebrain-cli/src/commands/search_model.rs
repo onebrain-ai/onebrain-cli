@@ -18,11 +18,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
-use crate::cli::SearchModelSetArgs;
-use crate::commands::search_common::open_engine;
+use crate::cli::{ModelSortCol, SearchModelListArgs, SearchModelRemoveArgs, SearchModelSetArgs};
+use crate::commands::search_common::{collection_cache_dir, collection_for, open_engine};
 use crate::output::{emit, Envelope, OutputMode};
 use onebrain_core::load_vault_config;
-use onebrain_search::embed::{is_supported_model, model_registry, ModelInfo};
+use onebrain_search::embed::{
+    is_supported_model, model_download_status, model_registry, ModelInfo,
+};
 
 #[derive(Debug, Serialize)]
 struct ModelListEntry {
@@ -33,10 +35,15 @@ struct ModelListEntry {
     thai_miracl: Option<f32>,
     note: &'static str,
     current: bool,
+    /// Whether the model's `models--*` dir exists under the cache dir.
+    downloaded: bool,
+    /// On-disk byte size of the downloaded model, `None` if not downloaded.
+    disk_bytes: Option<u64>,
 }
 
 impl ModelListEntry {
-    fn from_info(info: &ModelInfo, current_model: &str) -> Self {
+    fn from_info(info: &ModelInfo, current_model: &str, cache_dir: &Path) -> Self {
+        let status = model_download_status(info, cache_dir);
         Self {
             name: info.name,
             dims: info.dims,
@@ -45,6 +52,8 @@ impl ModelListEntry {
             thai_miracl: info.thai_miracl,
             note: info.note,
             current: info.name == current_model,
+            downloaded: status.downloaded,
+            disk_bytes: status.disk_size,
         }
     }
 }
@@ -52,55 +61,174 @@ impl ModelListEntry {
 #[derive(Debug, Serialize)]
 struct ModelListData {
     models: Vec<ModelListEntry>,
+    /// Collection cache dir where downloaded models live (footer + JSON).
+    cache_dir: PathBuf,
 }
 
 /// `onebrain search model list` — never opens the engine / downloads
-/// anything: pure registry metadata + a `current` flag from config.
-pub fn run_list(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
+/// anything: pure registry metadata + a `current` flag from config, plus
+/// per-model download status (`downloaded` / `disk_bytes`) computed by a pure
+/// `std::fs` scan of the collection cache dir. Optional `--sort <col>`
+/// reorders the rows.
+pub fn run_list(
+    vault_flag: Option<PathBuf>,
+    mode: &OutputMode,
+    args: &SearchModelListArgs,
+) -> Result<()> {
     let resolved = crate::vault_ctx::require(vault_flag)?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
     let config = load_vault_config(&resolved.root).context("load vault config")?;
+    let collection = collection_for(&resolved).context("resolve collection")?;
+    let cache_dir = collection_cache_dir(&collection);
 
-    let models: Vec<ModelListEntry> = model_registry()
+    let mut models: Vec<ModelListEntry> = model_registry()
         .iter()
-        .map(|m| ModelListEntry::from_info(m, &config.search.embed_model))
+        .map(|m| ModelListEntry::from_info(m, &config.search.embed_model, &cache_dir))
         .collect();
+
+    if let Some(col) = args.sort {
+        sort_rows(&mut models, col, args.desc);
+    }
 
     let envelope = Envelope::ok(
         "search.model.list",
         Some(vault_info),
-        ModelListData { models },
+        ModelListData { models, cache_dir },
     );
     emit(&envelope, mode, std::io::stdout().lock(), render_list_text)?;
     Ok(())
 }
 
+/// Sort list rows by `col`. Default (unsorted) is registry order; this is
+/// only called when `--sort` is passed. Models that lack a value for the
+/// column (no Thai score, not downloaded) always sort last regardless of
+/// direction, so `--desc` never floats a `—` to the top.
+fn sort_rows(rows: &mut [ModelListEntry], col: ModelSortCol, desc: bool) {
+    use std::cmp::Ordering;
+    // Approx registry size is a human string ("~470 MB", "~1.1 GB"); parse it
+    // to bytes for a meaningful numeric sort.
+    rows.sort_by(|a, b| {
+        let ord = match col {
+            ModelSortCol::Name => a.name.cmp(b.name),
+            ModelSortCol::Dim => a.dims.cmp(&b.dims),
+            ModelSortCol::Size => {
+                parse_approx_size(a.approx_size).cmp(&parse_approx_size(b.approx_size))
+            }
+            ModelSortCol::Thai => cmp_option_last(a.thai_miracl, b.thai_miracl, desc),
+            ModelSortCol::Disk => cmp_option_last(a.disk_bytes, b.disk_bytes, desc),
+        };
+        // For the "missing sorts last" columns we've already folded direction
+        // into `cmp_option_last`; don't reverse them again.
+        match col {
+            ModelSortCol::Thai | ModelSortCol::Disk => ord,
+            _ if desc => ord.reverse(),
+            _ => ord,
+        }
+        .then(Ordering::Equal)
+    });
+}
+
+/// Compare two `Option`s so that `None` always sorts LAST, while `Some`
+/// values honour `desc`. Keeps not-downloaded / no-score rows at the bottom
+/// of both ascending and descending sorts.
+fn cmp_option_last<T: PartialOrd + Copy>(
+    a: Option<T>,
+    b: Option<T>,
+    desc: bool,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(x), Some(y)) => {
+            // Total order over the compared values (NaN treated as Equal —
+            // registry scores are never NaN, this is just defensive).
+            let base = x.partial_cmp(&y).unwrap_or(Ordering::Equal);
+            if desc {
+                base.reverse()
+            } else {
+                base
+            }
+        }
+    }
+}
+
+/// Parse a registry `approx_size` string like `"~470 MB"` / `"~1.1 GB"` /
+/// `"~180 MB"` into an approximate byte count for sorting. Unparseable
+/// strings sort as `0`.
+fn parse_approx_size(s: &str) -> u64 {
+    let cleaned = s.trim_start_matches('~').trim();
+    let (num_part, unit) = match cleaned.split_once(' ') {
+        Some((n, u)) => (n, u.trim().to_ascii_uppercase()),
+        None => (cleaned, String::new()),
+    };
+    let Ok(num) = num_part.parse::<f64>() else {
+        return 0;
+    };
+    let mult = match unit.as_str() {
+        "GB" => 1024.0 * 1024.0 * 1024.0,
+        "MB" => 1024.0 * 1024.0,
+        "KB" => 1024.0,
+        _ => 1.0,
+    };
+    (num * mult) as u64
+}
+
+/// Human-readable byte size (`471 MB`, `1.2 GB`, `840 KB`, `12 B`). Mirrors
+/// `search_status::format_size`.
+fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.0} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn render_list_text(env: &Envelope<ModelListData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
-    // Marker column is 2 chars wide: `●` for the active model, `⭐` for the
-    // registry default (first entry — see `embed::model_registry`). A model
-    // that is both active and default shows `●` (active wins the slot).
-    let mut lines = vec![format!(
-        "{:<4}{:<24}{:<10}{:<6}{:<7}{}",
-        "", "MODEL", "SIZE", "DIM", "THAI", "NOTE"
-    )];
-    for (i, m) in d.models.iter().enumerate() {
-        let marker = if m.current {
-            "●"
-        } else if i == 0 {
-            "⭐"
-        } else {
-            ""
-        };
+    // Fixed-width columns: marker · MODEL · DOWNLOADED · DISK · DIM · THAI ·
+    // NOTE. The marker column is `●` for the active model, blank otherwise.
+    const MARKER: usize = 2;
+    const NAME: usize = 24;
+    const DL: usize = 12;
+    const DISK: usize = 10;
+    const DIM: usize = 6;
+    const THAI: usize = 6;
+
+    let header = format!(
+        "{:<MARKER$}{:<NAME$}{:<DL$}{:<DISK$}{:<DIM$}{:<THAI$}{}",
+        "", "MODEL", "DOWNLOADED", "DISK", "DIM", "THAI", "NOTE"
+    );
+    // Light underline header (hand-rolled, no deps).
+    let underline = "─".repeat(header.chars().count());
+
+    let mut lines = vec![header, underline];
+    for m in &d.models {
+        let marker = if m.current { "●" } else { "" };
+        let downloaded = if m.downloaded { "✓" } else { "⬜" };
+        let disk = m
+            .disk_bytes
+            .map(format_size)
+            .unwrap_or_else(|| "—".to_string());
         let thai = m
             .thai_miracl
             .map(|v| format!("{v:.1}"))
             .unwrap_or_else(|| "—".to_string());
         lines.push(format!(
-            "{:<4}{:<24}{:<10}{:<6}{:<7}{}",
-            marker, m.name, m.approx_size, m.dims, thai, m.note
+            "{:<MARKER$}{:<NAME$}{:<DL$}{:<DISK$}{:<DIM$}{:<THAI$}{}",
+            marker, m.name, downloaded, disk, m.dims, thai, m.note
         ));
     }
+    lines.push(format!("📁 models: {}", d.cache_dir.display()));
     lines.join("\n")
 }
 
@@ -198,6 +326,140 @@ fn render_set_text(env: &Envelope<ModelSetData>) -> String {
             d.model,
             d.chunks_reembedded.unwrap_or(0)
         )
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ModelRemoveData {
+    model: String,
+    /// `true` when files were actually deleted from disk.
+    removed: bool,
+    /// Bytes freed by the removal, `None` when nothing was removed.
+    freed_bytes: Option<u64>,
+    /// `true` when `<name>` was the active `search.embed_model`.
+    was_current: bool,
+}
+
+/// `onebrain search model remove <name>` — delete a downloaded model's cache
+/// dir (`models--*`).
+///
+/// - Unknown name → error listing supported names (mirrors `set`).
+/// - Not downloaded → friendly "nothing to remove", exit 0.
+/// - Active model guard: on a TTY, `inquire::Confirm` warns before deleting;
+///   on non-TTY, refuse unless `--force`.
+pub fn run_remove(
+    vault_flag: Option<PathBuf>,
+    mode: &OutputMode,
+    args: &SearchModelRemoveArgs,
+) -> Result<()> {
+    use std::io::IsTerminal;
+
+    if !is_supported_model(&args.name) {
+        bail!(
+            "unsupported embedding model '{}': supported names are {}",
+            args.name,
+            supported_model_names()
+        );
+    }
+
+    let resolved = crate::vault_ctx::require(vault_flag)?;
+    let vault_info = crate::vault_ctx::info_from(&resolved);
+    let config = load_vault_config(&resolved.root).context("load vault config")?;
+    let collection = collection_for(&resolved).context("resolve collection")?;
+    let cache_dir = collection_cache_dir(&collection);
+
+    let info = model_registry()
+        .iter()
+        .find(|m| m.name == args.name)
+        .expect("name validated as supported above");
+    let status = model_download_status(info, &cache_dir);
+    let was_current = config.search.embed_model == args.name;
+
+    // Nothing on disk → friendly no-op, exit 0.
+    if !status.downloaded {
+        let data = ModelRemoveData {
+            model: args.name.clone(),
+            removed: false,
+            freed_bytes: None,
+            was_current,
+        };
+        let envelope = Envelope::ok("search.model.remove", Some(vault_info), data);
+        emit(
+            &envelope,
+            mode,
+            std::io::stdout().lock(),
+            render_remove_text,
+        )?;
+        return Ok(());
+    }
+
+    // Active-model guard: never silently delete the model the next search
+    // would use. On a TTY, confirm; on a pipe/agent/hook, refuse unless
+    // `--force`.
+    if was_current && !args.force {
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            let confirmed = inquire::Confirm::new(&format!(
+                "'{}' is the current model; removing means the next search re-downloads it — continue?",
+                args.name
+            ))
+            .with_default(false)
+            .prompt()
+            .unwrap_or(false);
+            if !confirmed {
+                let data = ModelRemoveData {
+                    model: args.name.clone(),
+                    removed: false,
+                    freed_bytes: None,
+                    was_current,
+                };
+                let envelope = Envelope::ok("search.model.remove", Some(vault_info), data);
+                emit(
+                    &envelope,
+                    mode,
+                    std::io::stdout().lock(),
+                    render_remove_text,
+                )?;
+                return Ok(());
+            }
+        } else {
+            bail!(
+                "'{}' is the current embedding model — refusing to remove it non-interactively. \
+                 Re-run with --force to override (the next search will re-download it).",
+                args.name
+            );
+        }
+    }
+
+    let freed = status.disk_size.unwrap_or(0);
+    std::fs::remove_dir_all(&status.path)
+        .with_context(|| format!("removing {}", status.path.display()))?;
+
+    let data = ModelRemoveData {
+        model: args.name.clone(),
+        removed: true,
+        freed_bytes: Some(freed),
+        was_current,
+    };
+    let envelope = Envelope::ok("search.model.remove", Some(vault_info), data);
+    emit(
+        &envelope,
+        mode,
+        std::io::stdout().lock(),
+        render_remove_text,
+    )?;
+    Ok(())
+}
+
+fn render_remove_text(env: &Envelope<ModelRemoveData>) -> String {
+    let d = env.data.as_ref().expect("ok envelope always has data");
+    if d.removed {
+        format!(
+            "🗑️  removed {} · freed {}",
+            d.model,
+            format_size(d.freed_bytes.unwrap_or(0))
+        )
+    } else {
+        format!("nothing to remove — {} is not downloaded", d.model)
     }
 }
 
@@ -336,60 +598,12 @@ fn format_picker_row(info: &ModelInfo, current: &str) -> String {
 
 /// Persist `search.embed_model = model_name` into the vault's config file
 /// (`onebrain.yml`, or legacy `vault.yml` if that's what's present),
-/// preserving every other key. Mirrors
-/// `commands::doctor::fix_vault_yml_keys`'s read → mutate mapping →
-/// backup → atomic-write pattern: `onebrain_fs::backup_config_file` is a
-/// hard precondition (no write proceeds without a successful backup, or a
-/// confirmed-absent file for a fresh vault).
+/// preserving every other key. Thin wrapper over the shared
+/// `onebrain_fs::persist_search_key` (read → mutate `search.*` → backup →
+/// atomic-write; `backup_config_file` is a hard precondition), which
+/// `search_common::persist_collection` also uses.
 fn persist_embed_model(vault_root: &Path, model_name: &str) -> Result<()> {
-    use onebrain_core::{find_config_file, CONFIG_FILENAME};
-
-    let path = find_config_file(vault_root).unwrap_or_else(|| vault_root.join(CONFIG_FILENAME));
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-
-    let mut yaml: serde_yaml::Value = if text.trim().is_empty() {
-        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
-    } else {
-        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
-    };
-    if !yaml.is_mapping() {
-        yaml = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-    }
-    let mapping = yaml.as_mapping_mut().expect("normalized to mapping above");
-
-    let search_key = serde_yaml::Value::String("search".to_string());
-    let needs_replace = match mapping.get(&search_key) {
-        Some(v) => !v.is_mapping(),
-        None => true,
-    };
-    if needs_replace {
-        mapping.insert(
-            search_key.clone(),
-            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
-        );
-    }
-    let search = mapping
-        .get_mut(&search_key)
-        .and_then(|v| v.as_mapping_mut())
-        .expect("search key was just ensured to be a mapping");
-    search.insert(
-        serde_yaml::Value::String("embed_model".to_string()),
-        serde_yaml::Value::String(model_name.to_string()),
-    );
-
-    let serialized = serde_yaml::to_string(&yaml).context("serializing updated config")?;
-
-    // Defense-in-depth: back up the existing config before overwriting it.
-    // Hard precondition — refuse the write if the backup couldn't be made.
-    onebrain_fs::backup_config_file(&path)
-        .with_context(|| format!("backing up {} before write", path.display()))?;
-
-    onebrain_fs::atomic_write_text(&path, &serialized)
-        .with_context(|| format!("writing {}", path.display()))
+    onebrain_fs::persist_search_key(vault_root, "embed_model", model_name)
 }
 
 #[cfg(test)]
@@ -398,11 +612,17 @@ mod tests {
     use tempfile::tempdir;
 
     fn list_env(current: &str) -> Envelope<ModelListData> {
+        // Empty cache dir → nothing downloaded (pure-render tests).
+        let cache_dir = PathBuf::from("/tmp/onebrain-test-cache/my-collection");
         let models: Vec<ModelListEntry> = model_registry()
             .iter()
-            .map(|m| ModelListEntry::from_info(m, current))
+            .map(|m| ModelListEntry::from_info(m, current, &cache_dir))
             .collect();
-        Envelope::ok("search.model.list", None, ModelListData { models })
+        Envelope::ok(
+            "search.model.list",
+            None,
+            ModelListData { models, cache_dir },
+        )
     }
 
     #[test]
@@ -419,28 +639,184 @@ mod tests {
     }
 
     #[test]
-    fn list_text_marks_default_model_when_not_current() {
-        // Current is bge-m3, so the default (first registry entry) is not the
-        // active one — it should carry the ⭐ default marker instead.
+    fn list_text_only_current_row_has_marker() {
         let s = render_list_text(&list_env("bge-m3"));
+        // The non-active default (first registry entry) row must not carry a
+        // marker anymore — only the active model does.
         let default_name = model_registry()[0].name;
+        assert_ne!(default_name, "bge-m3");
         let default_line = s
             .lines()
             .find(|l| l.contains(default_name))
             .expect("default row present");
         assert!(
-            default_line.trim_start().starts_with('⭐'),
-            "expected default-model marker on: {default_line}"
+            !default_line.trim_start().starts_with('●'),
+            "non-active row should not carry the active marker: {default_line}"
         );
     }
 
     #[test]
-    fn list_text_has_header_and_all_models() {
+    fn list_text_has_header_footer_and_all_models() {
         let s = render_list_text(&list_env("multilingual-e5-small"));
         assert!(s.contains("MODEL"));
+        assert!(s.contains("DOWNLOADED"));
+        assert!(s.contains("DISK"));
+        assert!(s.contains("📁 models:"), "footer with cache dir present");
         for m in model_registry() {
             assert!(s.contains(m.name), "missing {} in rendered list", m.name);
         }
+    }
+
+    #[test]
+    fn list_text_shows_downloaded_and_disk_for_present_model() {
+        let cache = tempdir().unwrap();
+        let info = model_registry()
+            .iter()
+            .find(|m| m.name == "multilingual-e5-small")
+            .unwrap();
+        let mdir = cache.path().join(info.cache_dir_name());
+        std::fs::create_dir_all(&mdir).unwrap();
+        std::fs::write(mdir.join("model.onnx"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+
+        let models: Vec<ModelListEntry> = model_registry()
+            .iter()
+            .map(|m| ModelListEntry::from_info(m, "bge-m3", cache.path()))
+            .collect();
+        let env = Envelope::ok(
+            "search.model.list",
+            None,
+            ModelListData {
+                models,
+                cache_dir: cache.path().to_path_buf(),
+            },
+        );
+        let s = render_list_text(&env);
+        let row = s
+            .lines()
+            .find(|l| l.contains("multilingual-e5-small"))
+            .unwrap();
+        assert!(row.contains('✓'), "downloaded check missing: {row}");
+        assert!(row.contains("3 MB"), "disk size missing: {row}");
+        // Not-downloaded models show ⬜ + —.
+        let other = s.lines().find(|l| l.contains("bge-m3")).unwrap();
+        assert!(
+            other.contains('⬜'),
+            "not-downloaded marker missing: {other}"
+        );
+    }
+
+    #[test]
+    fn sort_by_dim_ascending_and_descending() {
+        let mut rows: Vec<ModelListEntry> = model_registry()
+            .iter()
+            .map(|m| ModelListEntry::from_info(m, "bge-m3", Path::new("/nope")))
+            .collect();
+        sort_rows(&mut rows, ModelSortCol::Dim, false);
+        let dims: Vec<usize> = rows.iter().map(|r| r.dims).collect();
+        let mut sorted = dims.clone();
+        sorted.sort_unstable();
+        assert_eq!(dims, sorted, "ascending dim sort");
+
+        sort_rows(&mut rows, ModelSortCol::Dim, true);
+        let dims_desc: Vec<usize> = rows.iter().map(|r| r.dims).collect();
+        sorted.reverse();
+        assert_eq!(dims_desc, sorted, "descending dim sort");
+    }
+
+    #[test]
+    fn sort_by_name_ascending() {
+        let mut rows: Vec<ModelListEntry> = model_registry()
+            .iter()
+            .map(|m| ModelListEntry::from_info(m, "bge-m3", Path::new("/nope")))
+            .collect();
+        sort_rows(&mut rows, ModelSortCol::Name, false);
+        let names: Vec<&str> = rows.iter().map(|r| r.name).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
+    }
+
+    #[test]
+    fn sort_by_thai_keeps_none_last_in_both_directions() {
+        for desc in [false, true] {
+            let mut rows: Vec<ModelListEntry> = model_registry()
+                .iter()
+                .map(|m| ModelListEntry::from_info(m, "bge-m3", Path::new("/nope")))
+                .collect();
+            sort_rows(&mut rows, ModelSortCol::Thai, desc);
+            // embeddinggemma has thai_miracl == None → must be last.
+            assert_eq!(
+                rows.last().unwrap().name,
+                "embeddinggemma-300m-q",
+                "None-thai model should sort last (desc={desc})"
+            );
+        }
+    }
+
+    #[test]
+    fn sort_by_disk_keeps_not_downloaded_last() {
+        let mut rows: Vec<ModelListEntry> = model_registry()
+            .iter()
+            .map(|m| ModelListEntry::from_info(m, "bge-m3", Path::new("/nope")))
+            .collect();
+        // Nothing is downloaded → all disk_bytes None → order stable, none
+        // panics, and every row is "last-eligible".
+        sort_rows(&mut rows, ModelSortCol::Disk, true);
+        assert!(rows.iter().all(|r| r.disk_bytes.is_none()));
+    }
+
+    #[test]
+    fn sort_by_size_parses_registry_strings() {
+        let mut rows: Vec<ModelListEntry> = model_registry()
+            .iter()
+            .map(|m| ModelListEntry::from_info(m, "bge-m3", Path::new("/nope")))
+            .collect();
+        sort_rows(&mut rows, ModelSortCol::Size, false);
+        // Smallest approx size first: embeddinggemma (~180 MB).
+        assert_eq!(rows.first().unwrap().name, "embeddinggemma-300m-q");
+    }
+
+    #[test]
+    fn parse_approx_size_units() {
+        assert_eq!(parse_approx_size("~470 MB"), 470 * 1024 * 1024);
+        assert_eq!(
+            parse_approx_size("~1.1 GB"),
+            (1.1 * 1024.0 * 1024.0 * 1024.0) as u64
+        );
+        assert_eq!(parse_approx_size("~180 MB"), 180 * 1024 * 1024);
+        assert_eq!(parse_approx_size("garbage"), 0);
+    }
+
+    #[test]
+    fn remove_text_reports_freed_size() {
+        let env = Envelope::ok(
+            "search.model.remove",
+            None,
+            ModelRemoveData {
+                model: "bge-m3".to_string(),
+                removed: true,
+                freed_bytes: Some(2 * 1024 * 1024),
+                was_current: false,
+            },
+        );
+        let s = render_remove_text(&env);
+        assert!(s.contains("removed bge-m3"), "{s}");
+        assert!(s.contains("2 MB"), "{s}");
+    }
+
+    #[test]
+    fn remove_text_reports_nothing_to_remove() {
+        let env = Envelope::ok(
+            "search.model.remove",
+            None,
+            ModelRemoveData {
+                model: "bge-m3".to_string(),
+                removed: false,
+                freed_bytes: None,
+                was_current: false,
+            },
+        );
+        assert!(render_remove_text(&env).contains("nothing to remove"));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! underlying models already emit near-unit vectors: normalizing explicitly
 //! lets the vector store assume unit-length vectors unconditionally.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{bail, Result};
@@ -55,6 +55,80 @@ pub struct ModelInfo {
     pub thai_miracl: Option<f32>,
     /// Short human-readable guidance shown alongside the entry.
     pub note: &'static str,
+    /// The Hugging Face repo id fastembed downloads this model from, e.g.
+    /// `"intfloat/multilingual-e5-small"`. Used to compute the on-disk cache
+    /// subdirectory name — see [`ModelInfo::cache_dir_name`].
+    pub hf_repo: &'static str,
+}
+
+impl ModelInfo {
+    /// The `models--{org}--{repo}` subdirectory name fastembed (via `hf-hub`)
+    /// uses for this model's download, under the collection cache dir.
+    /// `hf-hub` maps a repo id `org/repo` to `models--org--repo` by replacing
+    /// every `/` with `--`.
+    pub fn cache_dir_name(&self) -> String {
+        format!("models--{}", self.hf_repo.replace('/', "--"))
+    }
+}
+
+/// Per-model download status computed from a collection's cache dir: whether
+/// the model's `models--*` dir exists, its total on-disk size, and its path.
+/// Pure `std::fs` — never downloads, never opens the engine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelDownloadStatus {
+    /// `true` when the model's `models--*` dir exists under the cache dir.
+    pub downloaded: bool,
+    /// Total byte size of all files under the model dir, `None` if not
+    /// downloaded.
+    pub disk_size: Option<u64>,
+    /// Absolute path to the model's `models--*` dir (whether or not it
+    /// exists — callers can show the expected location).
+    pub path: PathBuf,
+}
+
+/// Compute the download status of `info` given the collection's `cache_dir`.
+/// Pure filesystem: checks whether the model's `models--*` dir exists and
+/// sums file sizes natively (no `du`, no subprocess, no model download).
+pub fn model_download_status(info: &ModelInfo, cache_dir: &Path) -> ModelDownloadStatus {
+    let path = cache_dir.join(info.cache_dir_name());
+    if path.is_dir() {
+        ModelDownloadStatus {
+            downloaded: true,
+            disk_size: Some(dir_size_bytes(&path)),
+            path,
+        }
+    } else {
+        ModelDownloadStatus {
+            downloaded: false,
+            disk_size: None,
+            path,
+        }
+    }
+}
+
+/// Recursively sum the byte sizes of every regular file under `root`
+/// (hand-rolled stack walk — no new crate dep). Unreadable dirs/files are
+/// skipped. Symlinks are not followed.
+fn dir_size_bytes(root: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => stack.push(entry.path()),
+                Ok(ft) if ft.is_file() => {
+                    if let Ok(meta) = entry.metadata() {
+                        total += meta.len();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    total
 }
 
 /// The full set of embedding models `onebrain search` supports, in the
@@ -71,6 +145,7 @@ pub fn model_registry() -> &'static [ModelInfo] {
             context: 512,
             thai_miracl: Some(75.0),
             note: "default · small + fast",
+            hf_repo: "intfloat/multilingual-e5-small",
         },
         ModelInfo {
             name: "multilingual-e5-base",
@@ -79,6 +154,7 @@ pub fn model_registry() -> &'static [ModelInfo] {
             context: 512,
             thai_miracl: Some(75.2),
             note: "larger · better recall",
+            hf_repo: "intfloat/multilingual-e5-base",
         },
         ModelInfo {
             name: "multilingual-e5-large",
@@ -87,6 +163,7 @@ pub fn model_registry() -> &'static [ModelInfo] {
             context: 512,
             thai_miracl: Some(80.2),
             note: "high accuracy",
+            hf_repo: "Qdrant/multilingual-e5-large-onnx",
         },
         ModelInfo {
             name: "bge-m3",
@@ -95,6 +172,7 @@ pub fn model_registry() -> &'static [ModelInfo] {
             context: 8192,
             thai_miracl: Some(82.6),
             note: "best Thai/accuracy · fp32",
+            hf_repo: "BAAI/bge-m3",
         },
         ModelInfo {
             name: "embeddinggemma-300m-q",
@@ -103,6 +181,7 @@ pub fn model_registry() -> &'static [ModelInfo] {
             context: 2048,
             thai_miracl: None,
             note: "smallest · Thai unverified",
+            hf_repo: "onnx-community/embeddinggemma-300m-ONNX",
         },
     ];
     REGISTRY
@@ -271,6 +350,55 @@ mod tests {
     fn resolve_model_rejects_unknown_name() {
         let err = resolve_model("not-a-real-model").unwrap_err();
         assert!(err.to_string().contains("unsupported embedding model"));
+    }
+
+    fn info(name: &str) -> &'static ModelInfo {
+        model_registry().iter().find(|m| m.name == name).unwrap()
+    }
+
+    #[test]
+    fn cache_dir_name_maps_slashes_to_double_dash() {
+        assert_eq!(
+            info("multilingual-e5-small").cache_dir_name(),
+            "models--intfloat--multilingual-e5-small"
+        );
+        assert_eq!(info("bge-m3").cache_dir_name(), "models--BAAI--bge-m3");
+        assert_eq!(
+            info("embeddinggemma-300m-q").cache_dir_name(),
+            "models--onnx-community--embeddinggemma-300m-ONNX"
+        );
+    }
+
+    #[test]
+    fn every_registry_entry_has_a_models_prefixed_cache_dir() {
+        for m in model_registry() {
+            let name = m.cache_dir_name();
+            assert!(name.starts_with("models--"), "{name}");
+            assert!(!name.contains('/'), "slash not mapped in {name}");
+        }
+    }
+
+    #[test]
+    fn download_status_not_downloaded_when_dir_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = model_download_status(info("bge-m3"), dir.path());
+        assert!(!st.downloaded);
+        assert_eq!(st.disk_size, None);
+        assert!(st.path.ends_with("models--BAAI--bge-m3"));
+    }
+
+    #[test]
+    fn download_status_sums_file_sizes_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = info("multilingual-e5-small");
+        let model_dir = dir.path().join(m.cache_dir_name());
+        std::fs::create_dir_all(model_dir.join("snapshots/abc")).unwrap();
+        std::fs::write(model_dir.join("snapshots/abc/model.onnx"), vec![0u8; 2048]).unwrap();
+        std::fs::write(model_dir.join("config.json"), vec![0u8; 100]).unwrap();
+        let st = model_download_status(m, dir.path());
+        assert!(st.downloaded);
+        assert_eq!(st.disk_size, Some(2148));
+        assert_eq!(st.path, model_dir);
     }
 
     #[test]

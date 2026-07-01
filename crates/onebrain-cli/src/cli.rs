@@ -933,18 +933,55 @@ pub struct SearchModelCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum SearchModelVerb {
-    /// List supported embedding models — never opens the engine or
-    /// downloads anything.
-    List,
+    /// List supported embedding models with download/disk status — never
+    /// opens the engine or downloads anything.
+    List(SearchModelListArgs),
     /// Switch the vault's embedding model, persist it to `onebrain.yml`,
     /// and re-embed the index (downloads the new model if not cached).
     Set(SearchModelSetArgs),
+    /// Remove a downloaded model's cached files from disk. Refuses to touch
+    /// the active model without `--force` (or a TTY confirm).
+    Remove(SearchModelRemoveArgs),
 }
 
 #[derive(Args, Debug)]
 pub struct SearchModelSetArgs {
     /// Model name (see `search model list`).
     pub name: String,
+}
+
+/// Column to sort `search model list` rows by.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
+pub enum ModelSortCol {
+    /// Model name (alphabetical).
+    Name,
+    /// Registry approx download size.
+    Size,
+    /// Embedding dimensionality.
+    Dim,
+    /// Thai MIRACL-th score (models without a score sort last).
+    Thai,
+    /// On-disk size of the downloaded model (not-downloaded sorts last).
+    Disk,
+}
+
+#[derive(Args, Debug)]
+pub struct SearchModelListArgs {
+    /// Sort rows by a column (default: registry order).
+    #[arg(long = "sort", value_enum)]
+    pub sort: Option<ModelSortCol>,
+    /// Sort descending (only meaningful with `--sort`).
+    #[arg(long = "desc", default_value_t = false)]
+    pub desc: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct SearchModelRemoveArgs {
+    /// Model name (see `search model list`).
+    pub name: String,
+    /// Remove without confirmation, even for the active model.
+    #[arg(long = "force", default_value_t = false)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]
