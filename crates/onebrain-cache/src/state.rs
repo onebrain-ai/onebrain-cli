@@ -154,4 +154,81 @@ mod tests {
         );
         assert!(entries[0].file_name().to_str().unwrap().ends_with(".state"));
     }
+
+    // --- parse_state rejection branches ---
+
+    #[test]
+    fn parse_state_rejects_non_numeric_count() {
+        // count field must parse as u32; "abc" fails → fresh state.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("onebrain-tok.state"), "abc:1700000000:03").unwrap();
+        assert_eq!(read_state("tok", dir.path()), CheckpointState::fresh());
+    }
+
+    #[test]
+    fn parse_state_rejects_non_numeric_ts() {
+        // last_ts field must parse as u64; "abc" fails → fresh state.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("onebrain-tok.state"), "7:abc:03").unwrap();
+        assert_eq!(read_state("tok", dir.path()), CheckpointState::fresh());
+    }
+
+    #[test]
+    fn parse_state_rejects_nn_too_short() {
+        // nn must be exactly 2 characters; "3" (len=1) → fresh state.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("onebrain-tok.state"), "7:1700000000:3").unwrap();
+        assert_eq!(read_state("tok", dir.path()), CheckpointState::fresh());
+    }
+
+    #[test]
+    fn parse_state_rejects_nn_too_long() {
+        // nn must be exactly 2 characters; "012" (len=3) → fresh state.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("onebrain-tok.state"), "7:1700000000:012").unwrap();
+        assert_eq!(read_state("tok", dir.path()), CheckpointState::fresh());
+    }
+
+    #[test]
+    fn parse_state_rejects_nn_non_digit_chars() {
+        // nn must be all ASCII digits; "ab" (len=2, not digits) → fresh state.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("onebrain-tok.state"), "7:1700000000:ab").unwrap();
+        assert_eq!(read_state("tok", dir.path()), CheckpointState::fresh());
+    }
+
+    #[test]
+    fn parse_state_rejects_nn_mixed_digit_and_alpha() {
+        // "0Z" is len=2 but contains a non-digit → fresh state.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("onebrain-tok.state"), "0:0:0Z").unwrap();
+        assert_eq!(read_state("tok", dir.path()), CheckpointState::fresh());
+    }
+
+    #[test]
+    fn malformed_read_rewrites_file_to_fresh_on_disk() {
+        // read_state eagerly rewrites malformed file to FRESH_STATE_DISK so subsequent
+        // reads short-circuit cleanly (matches Bun behaviour).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("onebrain-tok.state");
+        fs::write(&path, "garbage").unwrap();
+        let _ = read_state("tok", dir.path());
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            on_disk, "0:0:00",
+            "rewritten file must equal FRESH_STATE_DISK"
+        );
+    }
+
+    #[test]
+    fn write_state_does_not_panic_when_tmp_dir_missing() {
+        // When the directory doesn't exist the fs::write of the tmp file fails;
+        // write_state must log to stderr and return without panicking.
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("nonexistent_subdir");
+        // `missing` was never created — write_state hits the error branch and swallows it.
+        write_state("tok", &CheckpointState::fresh(), &missing);
+        // If we reach here the error was swallowed correctly.
+        assert!(!missing.exists(), "write_state must not create directories");
+    }
 }

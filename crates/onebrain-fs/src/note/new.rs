@@ -520,4 +520,84 @@ mod tests {
         assert_eq!(slug("New Topic 2026!"), "new-topic-2026");
         assert_eq!(slug("  Hello---World  "), "hello-world");
     }
+
+    #[test]
+    fn yaml_scalar_quotes_empty_value() {
+        // value.is_empty() → quoted with double-quotes.
+        assert_eq!(yaml_scalar(""), "\"\"");
+    }
+
+    #[test]
+    fn yaml_scalar_quotes_special_yaml_chars() {
+        // '#' and '!' are in the needs_quote starts_with list.
+        assert_eq!(yaml_scalar("#tag"), "\"#tag\"");
+        assert_eq!(yaml_scalar("!important"), "\"!important\"");
+        // Leading or trailing space also triggers quoting.
+        assert_eq!(yaml_scalar(" spaced"), "\" spaced\"");
+        assert_eq!(yaml_scalar("trailing "), "\"trailing \"");
+    }
+
+    #[test]
+    fn yaml_scalar_escapes_internal_double_quotes() {
+        // A leading '"' triggers `needs_quote`; the internal quotes are then
+        // escaped via `replace('"', "\\\"")`. Input `"hi"` → `"\"hi\""`.
+        // (An internal quote alone does NOT trigger quoting — the starts_with
+        // list only checks the first char — so `say "hello"` stays unquoted.)
+        assert_eq!(yaml_scalar("\"hi\""), "\"\\\"hi\\\"\"");
+        assert_eq!(yaml_scalar("say \"hello\""), "say \"hello\"");
+    }
+
+    #[test]
+    fn split_frontmatter_fence_at_eof_without_trailing_newline() {
+        // Closing "---" is at the end of string with no trailing newline:
+        // exercises the strip_suffix("\n---") branch (the Some(idx) branch is skipped).
+        let content = "---\ntags: ai\n---";
+        let result = split_frontmatter(content);
+        assert!(
+            result.is_some(),
+            "should parse frontmatter without trailing newline"
+        );
+        let (pairs, rest) = result.unwrap();
+        assert_eq!(pairs, vec![("tags".to_string(), "ai".to_string())]);
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn parse_frontmatter_empty_key_errors() {
+        // "=value" has an empty key — exercises the key.is_empty() error branch.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let err = new_note(
+            root,
+            Path::new("note.md"),
+            None,
+            &["=value".to_string()],
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, FsError::Core(CoreError::InvalidTarget(_))));
+    }
+
+    #[test]
+    fn template_frontmatter_without_created_gets_created_appended() {
+        // Template has frontmatter but no `created` key, and caller supplies no pairs:
+        // exercises merge_frontmatter's `merged.push(("created"...))` branch.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_template(root, "nocreated", "---\ntags: rust\n---\n# {{title}}\n");
+
+        new_note(root, Path::new("note.md"), Some("nocreated"), &[], false).unwrap();
+
+        let out = read(root, "note.md");
+        // A `created:` line was appended exactly once (the target branch), with a
+        // date-shaped value. We don't pin the exact date to a pre-call `Utc::now()`
+        // capture — a UTC midnight crossing between it and new_note()'s own now()
+        // would false-fail an exact match.
+        assert_eq!(out.matches("created:").count(), 1, "got: {out}");
+        assert!(
+            out.contains("created: 20"),
+            "created line missing/mis-shaped: {out}"
+        );
+        assert!(out.contains("tags: rust"), "got: {out}");
+    }
 }

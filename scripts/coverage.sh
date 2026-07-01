@@ -19,9 +19,10 @@ set -euo pipefail
 IGNORE_REGEX='(src/main\.rs|commands/(serve|daemon|update|qmd_reindex|harness_run)\.rs|server/(chat|search)\.rs|update/install\.rs|init/wizard\.rs|(vault_sync|output)/progress\.rs|cache/src/session_token\.rs)'
 
 # Ratchet gate: CI fails if core line coverage drops below this. Set conservatively
-# below the achieved % (≈95.2% as of v3.3.21) to absorb platform/measurement jitter;
-# RAISE this number as coverage climbs — never lower it. See docs/coverage.md.
-CORE_LINE_THRESHOLD="${CORE_LINE_THRESHOLD:-94}"
+# below the achieved % (≈95.6% macOS / ≈95.5% Linux after the long-tail mop-up) to
+# absorb platform/measurement jitter; RAISE this number as coverage climbs — never
+# lower it. Raised 94 → 95 once the mop-up gave ~0.5% headroom. See docs/coverage.md.
+CORE_LINE_THRESHOLD="${CORE_LINE_THRESHOLD:-95}"
 
 mode="${1:---summary-only}"
 case "$mode" in

@@ -183,4 +183,13 @@ mod tests {
         );
         assert_eq!(r.message, "qmd status unavailable");
     }
+
+    /// `QmdProbe::Error` (spawn succeeded but the process exited non-zero or
+    /// produced an unexpected error) must degrade to non-fatal `ok`, same as
+    /// `NotFound` and `Timeout`. Covers the `QmdProbe::Error =>` arm.
+    #[test]
+    fn error_probe_is_ok_non_fatal() {
+        let r = QmdEmbeddingsCheck::run_with(|| QmdProbe::Error, &cfg_with_collection("ob-1"));
+        assert_eq!(r.message, "qmd status unavailable");
+    }
 }

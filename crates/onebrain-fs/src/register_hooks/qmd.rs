@@ -780,4 +780,129 @@ mod tests {
         let mut s = json!({"hooks": {"Stop": []}});
         assert!(!strip_qmd_hook(&mut s));
     }
+
+    /// `strip_qmd_hook` on a non-object JSON value (e.g. an array) must return
+    /// false immediately. Covers the first `settings.as_object_mut() else { return false }`.
+    #[test]
+    fn strip_qmd_hook_returns_false_for_non_object_settings() {
+        let mut s = json!([]);
+        assert!(!strip_qmd_hook(&mut s));
+    }
+
+    /// `strip_qmd_hook` when `"hooks"` is present but is not a JSON object
+    /// (e.g. a string) must return false. Covers the
+    /// `hooks_val.as_object_mut() else { return false }` branch.
+    #[test]
+    fn strip_qmd_hook_returns_false_when_hooks_value_is_not_object() {
+        let mut s = json!({"hooks": "not-an-object"});
+        assert!(!strip_qmd_hook(&mut s));
+    }
+
+    /// When `"hooks"` key exists but holds a non-object value, `apply_qmd_hook`
+    /// must reset it to an empty object and then add the canonical entry.
+    /// Covers the `if !hooks_val.is_object() { *hooks_val = … }` branch.
+    #[test]
+    fn apply_qmd_hook_resets_non_object_hooks_value() {
+        let mut s = json!({"hooks": "invalid"});
+        let st = apply_qmd_hook(&mut s);
+        assert_eq!(st, HookStatus::Added);
+        assert!(s["hooks"]["PostToolUse"].is_array());
+        let entries: Vec<_> = s["hooks"]["PostToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+            .collect();
+        assert_eq!(entries[0]["command"], "onebrain");
+        assert_eq!(entries[0]["args"], json!(["qmd", "reindex", "--json"]));
+    }
+
+    /// When `"PostToolUse"` exists but holds a non-array value, `apply_qmd_hook`
+    /// must reset it to an empty array and add the canonical entry.
+    /// Covers the `if !entry_val.is_array() { *entry_val = … }` branch.
+    #[test]
+    fn apply_qmd_hook_resets_non_array_post_tool_use() {
+        let mut s = json!({"hooks": {"PostToolUse": "not-an-array"}});
+        let st = apply_qmd_hook(&mut s);
+        assert_eq!(st, HookStatus::Added);
+        let entries: Vec<_> = s["hooks"]["PostToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["command"], "onebrain");
+        assert_eq!(entries[0]["args"], json!(["qmd", "reindex", "--json"]));
+    }
+
+    /// A group that has no `"hooks"` key is silently skipped in
+    /// `migrate_legacy_qmd_entries` (both keep and strip paths).
+    /// Covers the `else { continue; }` inside the group iteration.
+    #[test]
+    fn migrate_groups_keep_canonical_skips_group_without_hooks_key() {
+        let mut groups = vec![
+            json!({"matcher": "Write|Edit"}), // no "hooks" key → skipped in Pass 1
+            json!({"matcher": "Write|Edit", "hooks": [
+                {"type": "command", "command": "qmd update -c x"}
+            ]}),
+        ];
+        let changed = migrate_legacy_qmd_entries(&mut groups, true);
+        assert!(changed);
+        // The hookless group is spliced out in Pass 4; the migrated group remains.
+        let all_entries: Vec<_> = groups
+            .iter()
+            .filter_map(|g| g.get("hooks").and_then(|v| v.as_array()))
+            .flat_map(|arr| arr.iter())
+            .collect();
+        assert_eq!(all_entries.len(), 1);
+        assert_eq!(all_entries[0]["command"], "onebrain");
+        assert_eq!(all_entries[0]["args"], json!(["qmd", "reindex", "--json"]));
+    }
+
+    #[test]
+    fn migrate_groups_strip_skips_group_without_hooks_key() {
+        let mut groups = vec![
+            json!({"matcher": "Write|Edit"}), // no "hooks" key → continue in strip pass
+            json!({"matcher": "Write|Edit", "hooks": [
+                {"type": "command", "command": "qmd update -c x"}
+            ]}),
+        ];
+        let changed = migrate_legacy_qmd_entries(&mut groups, false);
+        assert!(changed);
+        // Both groups end up empty (hookless group removed by Pass 4; the other's
+        // sole entry was stripped → empty → also removed).
+        assert!(groups.is_empty(), "groups after strip: {groups:?}");
+    }
+
+    /// An exec-form `onebrain` hook in PostToolUse whose first arg is NOT
+    /// `"qmd-reindex"` must be preserved by `strip_qmd_hook`.
+    /// Exercises the `is_legacy_alias_qmd_entry` `Some(args)` branch returning
+    /// false when `cmd == "onebrain"` but `args[0] != "qmd-reindex"`.
+    #[test]
+    fn strip_qmd_hook_does_not_remove_non_qmd_onebrain_entry() {
+        let mut s = json!({
+            "hooks": {
+                "PostToolUse": [{
+                    "matcher": "Write|Edit",
+                    "hooks": [
+                        {"type": "command", "command": "onebrain", "args": ["checkpoint", "stop"]},
+                        {"type": "command", "command": "qmd update -c x"},
+                    ]
+                }]
+            }
+        });
+        let changed = strip_qmd_hook(&mut s);
+        assert!(changed);
+        let entries: Vec<_> = s["hooks"]["PostToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+            .collect();
+        // legacy qmd entry removed; non-qmd onebrain entry preserved
+        assert_eq!(entries.len(), 1, "entries: {entries:?}");
+        assert_eq!(entries[0]["command"], "onebrain");
+        assert_eq!(entries[0]["args"], json!(["checkpoint", "stop"]));
+    }
 }

@@ -112,4 +112,35 @@ mod tests {
         let dir = tempdir().unwrap();
         assert!(delete_note(dir.path(), Path::new("nope.md")).is_err());
     }
+
+    #[test]
+    fn collision_extensionless_gets_timestamp_suffix() {
+        // Exercises the `None => format!("{stem} ({stamp})")` branch in trash_dest
+        // when the colliding file has no extension.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".trash")).unwrap();
+        std::fs::write(root.join(".trash/noext"), "old").unwrap();
+        std::fs::write(root.join("noext"), "new").unwrap();
+
+        let res = delete_note(root, Path::new("noext")).unwrap();
+        // Should differ from the plain path and carry a timestamp suffix.
+        assert_ne!(res.trashed_to, ".trash/noext");
+        assert!(
+            res.trashed_to.starts_with(".trash/noext ("),
+            "expected timestamp suffix, got: {}",
+            res.trashed_to
+        );
+        // No file extension in the suffixed name.
+        assert!(
+            res.trashed_to.ends_with(')'),
+            "expected no extension, got: {}",
+            res.trashed_to
+        );
+        // Original trashed file is untouched.
+        assert_eq!(
+            std::fs::read_to_string(root.join(".trash/noext")).unwrap(),
+            "old"
+        );
+    }
 }

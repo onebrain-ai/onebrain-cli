@@ -218,4 +218,62 @@ mod tests {
         let res = list_notes(root, &list_opts(ListSort::Name, 20)).unwrap();
         assert_eq!(res.notes[0].size_bytes, 5);
     }
+
+    #[test]
+    fn created_sort_arm_returns_all_notes() {
+        // Exercises the `ListSort::Created` sort arm and asserts completeness
+        // (both notes returned). Order is NOT asserted: the sort key is the fs
+        // birthtime (`meta.created()`), which isn't settable in a test (filetime
+        // only controls mtime/atime), so back-to-back writes have no deterministic
+        // created order.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.md", "x");
+        write(root, "b.md", "x");
+
+        let res = list_notes(root, &list_opts(ListSort::Created, 20)).unwrap();
+        assert_eq!(res.total, 2);
+        assert_eq!(res.notes.len(), 2);
+        let paths: Vec<_> = res.notes.iter().map(|n| n.path.as_str()).collect();
+        assert!(paths.contains(&"a.md"));
+        assert!(paths.contains(&"b.md"));
+    }
+
+    #[test]
+    fn empty_h1_falls_back_to_stem() {
+        // "# " with no content after stripping is filtered → filename stem used.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "my-note.md", "# \nsome body text\n");
+        let res = list_notes(root, &list_opts(ListSort::Name, 20)).unwrap();
+        assert_eq!(res.notes[0].title, "my-note");
+    }
+
+    #[test]
+    fn list_with_folder_scope() {
+        // Tests the folder: Some(...) option path through walk_notes.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "top.md", "x");
+        write(root, "sub/scoped.md", "x");
+
+        let opts = ListOptions {
+            folder: Some(std::path::PathBuf::from("sub")),
+            limit: 20,
+            sort: ListSort::Name,
+        };
+        let res = list_notes(root, &opts).unwrap();
+        assert_eq!(res.total, 1);
+        assert_eq!(res.notes[0].path, "sub/scoped.md");
+        assert!(!res.truncated);
+    }
+
+    #[test]
+    fn empty_vault_returns_zero_total() {
+        let dir = tempdir().unwrap();
+        let res = list_notes(dir.path(), &list_opts(ListSort::Name, 20)).unwrap();
+        assert_eq!(res.total, 0);
+        assert!(res.notes.is_empty());
+        assert!(!res.truncated);
+    }
 }

@@ -345,4 +345,96 @@ mod tests {
         let code = info_run(&vault, "/daily", &text_mode()).unwrap();
         assert_eq!(code, 0);
     }
+
+    #[test]
+    fn split_frontmatter_strips_bom() {
+        // UTF-8 BOM (\u{feff}) must be stripped before frontmatter detection so
+        // the `---\n` sentinel can be recognised at position 0.
+        let text = "\u{feff}---\nname: daily\n---\n# Body";
+        let (front, body) = split_frontmatter(text).unwrap();
+        assert_eq!(front.name.as_deref(), Some("daily"));
+        assert!(
+            body.starts_with("# Body"),
+            "body must not retain the BOM prefix"
+        );
+    }
+
+    #[test]
+    fn split_frontmatter_open_fence_without_close_treated_as_body() {
+        // `---\n` at the start but no closing `\n---\n` → `rest.find("\n---\n")`
+        // returns None, so the entire text becomes the body with default frontmatter.
+        let text = "---\nname: daily\n# No closing fence";
+        let (front, body) = split_frontmatter(text).unwrap();
+        assert!(
+            front.name.is_none(),
+            "no frontmatter should be parsed without a closing delimiter"
+        );
+        assert_eq!(
+            body, text,
+            "entire text should be the body when the closing fence is absent"
+        );
+    }
+
+    #[test]
+    fn format_info_text_includes_schedulable_with_args_and_required_args() {
+        // Exercises the two optional branches not covered by existing tests.
+        let out = super::SkillInfoOutput {
+            name: "distill".to_string(),
+            description: None,
+            schedulable: None,
+            schedulable_with_args: Some(true),
+            required_args: Some(vec!["topic".to_string(), "since".to_string()]),
+        };
+        let s = super::format_info(&out, &text_mode());
+        assert!(s.contains("schedulable_with_args: true"));
+        assert!(s.contains("required_args: topic, since"));
+    }
+
+    #[test]
+    fn format_info_json_mode_serializes_structured_output() {
+        // Non-text mode exits the early `if let OutputMode::Text` arm and falls
+        // through to `serialize_for_mode`.
+        let out = super::SkillInfoOutput {
+            name: "daily".to_string(),
+            description: Some("D".to_string()),
+            schedulable: Some(true),
+            schedulable_with_args: None,
+            required_args: None,
+        };
+        let json = super::format_info(&out, &json_mode());
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["name"], "daily");
+        assert_eq!(v["schedulable"], true);
+        // None fields must be omitted by skip_serializing_if.
+        assert!(v.get("schedulable_with_args").is_none());
+    }
+
+    #[test]
+    fn format_show_non_text_mode_serializes_body() {
+        // The `format_show` text branch short-circuits; non-text mode calls
+        // `serialize_for_mode`, which this test exercises.
+        let out = super::SkillShowOutput {
+            name: "recap".to_string(),
+            body: "# Recap\n\nBody content.".to_string(),
+        };
+        let json = super::format_show(&out, &json_mode());
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["name"], "recap");
+        assert!(v["body"].as_str().unwrap().contains("Body content."));
+    }
+
+    #[test]
+    fn load_skill_sets_name_from_directory_when_frontmatter_name_absent() {
+        // SKILL.md with no frontmatter → `split_frontmatter` returns
+        // `SkillFrontmatter::default()` (name=None). `load_skill` must set
+        // `frontmatter.name = Some(directory_name)` to cover the
+        // `if frontmatter.name.is_none()` guard.
+        let (_dir, vault) = make_vault_with_skill("weekly", "# Weekly Review\n\nBody.");
+        let skill = super::load_skill(&vault, "weekly").unwrap().unwrap();
+        assert_eq!(
+            skill.frontmatter.name.as_deref(),
+            Some("weekly"),
+            "load_skill must populate frontmatter.name from the directory name"
+        );
+    }
 }

@@ -105,4 +105,49 @@ mod tests {
         // Guard against accidental edit to STANDARD_FOLDERS.
         assert_eq!(STANDARD_FOLDERS.len(), 8);
     }
+
+    /// When `vault_dir` is a regular file, `path.exists()` on any sub-path
+    /// returns false (ENOTDIR is treated as not-found), so the loop attempts
+    /// `create_dir_all` and fails. The error must surface rather than be
+    /// swallowed.
+    #[test]
+    fn create_folders_errors_when_vault_dir_is_a_regular_file() {
+        let d = tempdir().unwrap();
+        let vault = d.path().join("vault");
+        std::fs::write(&vault, "not-a-dir").unwrap();
+        // "vault/00-inbox" → path.exists() = false → create_dir_all(vault/00-inbox) → ENOTDIR
+        let result = create_folders(&vault);
+        assert!(
+            result.is_err(),
+            "expected Err when vault is a file, got {result:?}"
+        );
+        let err = result.unwrap_err();
+        let debug = format!("{err:?}");
+        assert!(
+            debug.contains("00-inbox"),
+            "expected 00-inbox in error path, got: {debug}"
+        );
+    }
+
+    /// When `00-inbox` exists as a regular file, the loop skips it
+    /// (`path.exists()` → true), but the subsequent `00-inbox/imports`
+    /// creation fails because the parent is not a directory. The error must
+    /// surface via the imports error path.
+    #[test]
+    fn imports_error_when_inbox_is_a_file() {
+        let d = tempdir().unwrap();
+        // A file at the inbox path: the loop skips it, but imports fails.
+        std::fs::write(d.path().join(STANDARD_FOLDERS[0]), "block").unwrap();
+        let result = create_folders(d.path());
+        assert!(
+            result.is_err(),
+            "expected Err when inbox is a file, got {result:?}"
+        );
+        let err = result.unwrap_err();
+        let debug = format!("{err:?}");
+        assert!(
+            debug.contains(INBOX_IMPORTS_SUBDIR),
+            "expected imports in error path, got: {debug}"
+        );
+    }
 }

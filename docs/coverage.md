@@ -73,8 +73,8 @@ it is untestable.
 ## Status (2026-06-30)
 
 - Whole-workspace baseline (no exclusions): **89.58% line** (`cargo llvm-cov --workspace`).
-- **Core (this initiative's target surface, exclusions applied): 95.21% line** —
-  `scripts/coverage.sh`. ~1,226 missed lines remain on core code (down from 1,711 baseline).
+- **Core (this initiative's target surface, exclusions applied): 95.59% line** (macOS; ~95.5% Linux CI) —
+  `scripts/coverage.sh`. ~1,166 missed lines remain on core code (down from 1,711 baseline).
 
 Closed so far:
 - Phase 1 — `v31/dispatch.rs` 76.94% → 86.70% (stub/verb exit-code tests).
@@ -111,14 +111,25 @@ Closed so far:
   safely invocable): `vault sync` (git clone/pull), `skill run`/`harness run` real path (claude/gemini
   spawn — note onebrain probes absolute harness paths so stripping `PATH` can't force a fail), `daemon
   start`/`run` (process fork / blocking server), `plugin update` TTY-animated render.
+- Long-tail mop-up (+80 unit tests) — core 95.21% → **95.59%**. Swept the many small-gap files:
+  `note/{folder,delete,list,walker,stat,new}.rs`, `init/{safety,folders,enable_plugin}.rs`,
+  `backup.rs`, `doctor/{settings_hooks,qmd,plugin}.rs`, `register_hooks/qmd.rs`, `orphan.rs`,
+  `v31/{vault_current,plugin_update}.rs`, `commands/skill_inspect.rs`, `exit.rs`, `cli.rs`,
+  `migration.rs`, `onebrain-cache/{state,qmd_reindex}.rs`. Gate raised 94 → 95.
 
 **Ratcheting CI coverage gate — ACTIVE (Phase 4).** The `coverage` job in
 `.github/workflows/ci.yml` runs `scripts/coverage.sh --ci-gate` on Linux and fails the build if
-core line coverage drops below `CORE_LINE_THRESHOLD` (in `scripts/coverage.sh`). It starts at a
-conservative **94%** — below the achieved ~95.2% to absorb platform/measurement jitter — and is
+core line coverage drops below `CORE_LINE_THRESHOLD` (in `scripts/coverage.sh`). It is
 **ratcheted UP, never down**, as coverage climbs (raise the threshold in a follow-up PR whenever a
-new floor is comfortably held). Literal 100% is not the bar (see the ceiling note up top); the gate
-locks in whatever % the documented-residual set leaves.
+new floor is comfortably held): started at **94** (v3.3.21), raised to **95** after the long-tail
+mop-up gave ~0.5% Linux headroom (achieved ~95.5% Linux / 95.59% macOS). Literal 100% is not the
+bar (see the ceiling note up top); the gate locks in whatever % the documented-residual set leaves.
+
+**No dead code inflates the residuals.** An audit traced every logically-unreachable "residual"
+to its call sites: all are legitimate — compiler-required exhaustiveness arms, panic-avoiding
+`unwrap_or_else` fallbacks guarding runtime-enforced invariants, and real OS-fault / network /
+subprocess / `cfg(windows)` paths that execute at runtime but are impractical to trigger in a unit
+test. None is removable dead code (deleting would break `match` totality or reintroduce panic risk).
 
 Remaining core gaps to close (tracked, by reachable missed lines):
 - The fs-cluster residuals not yet maxed (`register_hooks/settings.rs` ~86%, `init/{mod,marketplace}.rs`

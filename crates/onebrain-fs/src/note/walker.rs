@@ -179,4 +179,68 @@ mod tests {
         let got = walk_notes(root, Some(Path::new("03-knowledge"))).unwrap();
         assert_eq!(rel_strings(root, &got), vec!["03-knowledge/note2.md"]);
     }
+
+    #[test]
+    fn walk_all_lists_files_and_dirs_skipping_tooling_and_root() {
+        // Covers walk_all: files + dirs returned, depth-0 root excluded,
+        // is_dir flag set correctly, tooling dirs pruned.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        touch(root, "note.md");
+        touch(root, "sub/child.txt");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git/HEAD"), "ref").unwrap();
+
+        let got = walk_all(root).unwrap();
+
+        // note.md → file
+        assert!(
+            got.iter()
+                .any(|(p, is_dir)| p == &root.join("note.md") && !is_dir),
+            "note.md should appear as a file"
+        );
+        // "sub" directory → is_dir = true
+        assert!(
+            got.iter()
+                .any(|(p, is_dir)| p == &root.join("sub") && *is_dir),
+            "sub/ should appear as a directory"
+        );
+        // sub/child.txt → file
+        assert!(
+            got.iter()
+                .any(|(p, is_dir)| p == &root.join("sub").join("child.txt") && !is_dir),
+            "sub/child.txt should appear as a file"
+        );
+        // .git and its contents are pruned by filter_entry
+        assert!(
+            got.iter().all(|(p, _)| !p.starts_with(root.join(".git"))),
+            ".git should be pruned"
+        );
+        // The vault root itself (depth 0) must not appear
+        assert!(
+            got.iter().all(|(p, _)| p != root),
+            "vault root must be excluded from walk_all results"
+        );
+    }
+
+    #[test]
+    fn walk_all_includes_non_md_files() {
+        // walk_all returns ALL file types, not just .md — unlike walk_notes.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        touch(root, "note.md");
+        fs::write(root.join("script.sh"), "#!/bin/sh").unwrap();
+        fs::write(root.join("data.json"), "{}").unwrap();
+
+        let got = walk_all(root).unwrap();
+        let filenames: Vec<String> = got
+            .iter()
+            .filter(|(_, is_dir)| !is_dir)
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(filenames.contains(&"note.md".to_string()));
+        assert!(filenames.contains(&"script.sh".to_string()));
+        assert!(filenames.contains(&"data.json".to_string()));
+    }
 }

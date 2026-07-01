@@ -156,4 +156,76 @@ mod tests {
         let r = backup_config_file(&cfg);
         assert!(r.is_err(), "broken-symlink config must error, got {r:?}");
     }
+
+    /// A regular file placed where `.onebrain-backups/` must be created
+    /// prevents `create_dir_all` from succeeding — the error must propagate
+    /// rather than being silently swallowed.
+    #[test]
+    fn backup_dir_blocked_by_existing_file_propagates_error() {
+        let d = tempdir().unwrap();
+        let cfg = d.path().join("onebrain.yml");
+        std::fs::write(&cfg, "key: val\n").unwrap();
+        // Drop a regular file at the backup-dir path so create_dir_all fails.
+        std::fs::write(d.path().join(BACKUP_DIR), "obstacle").unwrap();
+        let result = backup_config_file(&cfg);
+        assert!(
+            result.is_err(),
+            "expected Err when backup_dir is a file, got {result:?}"
+        );
+    }
+
+    /// `symlink_metadata` returning a non-NotFound error (e.g. EACCES on the
+    /// parent directory) must surface as an FsError, NOT be treated as "absent".
+    #[cfg(unix)]
+    #[test]
+    fn stat_error_non_notfound_propagates() {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir().unwrap();
+        let restricted = d.path().join("restricted");
+        std::fs::create_dir_all(&restricted).unwrap();
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // stat("restricted/onebrain.yml") → EACCES, not ENOENT.
+        let cfg = restricted.join("onebrain.yml");
+        let result = backup_config_file(&cfg);
+        // Restore before asserting so tempdir cleanup succeeds.
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            result.is_err(),
+            "EACCES on parent must propagate as Err, not become Ok(None); got {result:?}"
+        );
+    }
+
+    /// `fs::copy` failing on an unreadable source must surface as an error;
+    /// `symlink_metadata` (lstat) succeeds even when the file's read-bit is
+    /// cleared, so the failure is isolated to the copy step.
+    #[cfg(unix)]
+    #[test]
+    fn copy_fails_on_unreadable_source_propagates_error() {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir().unwrap();
+        let cfg = d.path().join("onebrain.yml");
+        std::fs::write(&cfg, "key: val\n").unwrap();
+        // symlink_metadata (lstat) only needs parent x-bit — succeeds.
+        // fs::copy opens the source for reading — fails on mode 000.
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = backup_config_file(&cfg);
+        // Restore before asserting so tempdir cleanup succeeds.
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            result.is_err(),
+            "unreadable source must propagate error, got {result:?}"
+        );
+    }
 }
