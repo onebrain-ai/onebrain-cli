@@ -918,6 +918,30 @@ pub enum SearchVerb {
     Status,
     /// Reindex the whole vault, or specific doc paths.
     Reindex(SearchReindexArgs),
+    /// Manage the embedding model (list supported models · switch model).
+    Model(SearchModelCmd),
+}
+
+#[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
+pub struct SearchModelCmd {
+    #[command(subcommand)]
+    pub verb: SearchModelVerb,
+}
+#[derive(Subcommand, Debug)]
+pub enum SearchModelVerb {
+    /// List supported embedding models — never opens the engine or
+    /// downloads anything.
+    List,
+    /// Switch the vault's embedding model, persist it to `onebrain.yml`,
+    /// and re-embed the index (downloads the new model if not cached).
+    Set(SearchModelSetArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SearchModelSetArgs {
+    /// Model name (see `search model list`).
+    pub name: String,
 }
 
 #[derive(Args, Debug)]

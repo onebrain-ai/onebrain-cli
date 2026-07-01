@@ -20,17 +20,94 @@ pub struct Embedder {
     pub model_name: String,
 }
 
+/// One entry in the supported-model registry (see [`model_registry`]):
+/// static metadata used both by the CLI's `search model list`/`set` verbs
+/// and (later) an interactive picker. Thai MIRACL-th nDCG@10 scores are from
+/// each model's public multilingual eval where available; `None` means the
+/// figure hasn't been independently verified for Thai.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelInfo {
+    /// Config-facing name (`search.embed_model` value), e.g.
+    /// `"multilingual-e5-small"`.
+    pub name: &'static str,
+    /// Embedding vector dimensionality.
+    pub dims: usize,
+    /// Approximate on-disk download size, human-readable.
+    pub approx_size: &'static str,
+    /// Max input context length, in tokens.
+    pub context: usize,
+    /// Thai MIRACL-th nDCG@10, if verified for this model.
+    pub thai_miracl: Option<f32>,
+    /// Short human-readable guidance shown alongside the entry.
+    pub note: &'static str,
+}
+
+/// The full set of embedding models `onebrain search` supports, in the
+/// order they should be displayed (smallest/default first). This is the
+/// single source of truth for model names — [`model_dims`] and
+/// [`is_supported_model`] both derive from it rather than duplicating the
+/// name list.
+pub fn model_registry() -> &'static [ModelInfo] {
+    const REGISTRY: &[ModelInfo] = &[
+        ModelInfo {
+            name: "multilingual-e5-small",
+            dims: 384,
+            approx_size: "~470 MB",
+            context: 512,
+            thai_miracl: Some(75.0),
+            note: "default · small + fast",
+        },
+        ModelInfo {
+            name: "multilingual-e5-base",
+            dims: 768,
+            approx_size: "~1.1 GB",
+            context: 512,
+            thai_miracl: Some(75.2),
+            note: "larger · better recall",
+        },
+        ModelInfo {
+            name: "multilingual-e5-large",
+            dims: 1024,
+            approx_size: "~2.1 GB",
+            context: 512,
+            thai_miracl: Some(80.2),
+            note: "high accuracy",
+        },
+        ModelInfo {
+            name: "bge-m3",
+            dims: 1024,
+            approx_size: "~2.2 GB",
+            context: 8192,
+            thai_miracl: Some(82.6),
+            note: "best Thai/accuracy · fp32",
+        },
+        ModelInfo {
+            name: "embeddinggemma-300m-q",
+            dims: 768,
+            approx_size: "~180 MB",
+            context: 2048,
+            thai_miracl: None,
+            note: "smallest · Thai unverified",
+        },
+    ];
+    REGISTRY
+}
+
+/// `true` when `name` matches a model in [`model_registry`].
+pub fn is_supported_model(name: &str) -> bool {
+    model_registry().iter().any(|m| m.name == name)
+}
+
 /// Pure lookup: embedding dimensionality for a supported model name.
 /// Unknown names return `0` (callers needing strict validation should use
-/// [`new`], which bails on unknown names).
+/// [`new`], which bails on unknown names). Derived from [`model_registry`]
+/// so the dims are never out of sync with the registry entries.
 pub fn model_dims(model_name: &str) -> usize {
-    match model_name {
-        "bge-m3" => 1024,
-        "multilingual-e5-large" => 1024,
-        "multilingual-e5-base" => 768,
-        "multilingual-e5-small" => 384,
-        _ => 0,
-    }
+    model_registry()
+        .iter()
+        .find(|m| m.name == model_name)
+        .map(|m| m.dims)
+        .unwrap_or(0)
 }
 
 fn resolve_model(model_name: &str) -> Result<EmbeddingModel> {
@@ -39,9 +116,18 @@ fn resolve_model(model_name: &str) -> Result<EmbeddingModel> {
         "multilingual-e5-large" => Ok(EmbeddingModel::MultilingualE5Large),
         "multilingual-e5-base" => Ok(EmbeddingModel::MultilingualE5Base),
         "multilingual-e5-small" => Ok(EmbeddingModel::MultilingualE5Small),
+        "embeddinggemma-300m-q" => Ok(EmbeddingModel::EmbeddingGemma300MQ),
+        other if is_supported_model(other) => bail!(
+            "'{other}' is listed in the model registry but has no fastembed \
+             mapping yet — this is a bug, please report it"
+        ),
         other => bail!(
-            "unsupported embedding model '{other}': supported names are \
-             bge-m3, multilingual-e5-large, multilingual-e5-base, multilingual-e5-small"
+            "unsupported embedding model '{other}': supported names are {}",
+            model_registry()
+                .iter()
+                .map(|m| m.name)
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     }
 }
@@ -99,6 +185,67 @@ mod tests {
     fn dims_lookup() {
         assert_eq!(model_dims("bge-m3"), 1024);
         assert_eq!(model_dims("multilingual-e5-small"), 384);
+    }
+
+    #[test]
+    fn dims_lookup_unknown_returns_zero() {
+        assert_eq!(model_dims("not-a-real-model"), 0);
+    }
+
+    #[test]
+    fn registry_has_exactly_five_seeded_models() {
+        let names: Vec<&str> = model_registry().iter().map(|m| m.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "multilingual-e5-small",
+                "multilingual-e5-base",
+                "multilingual-e5-large",
+                "bge-m3",
+                "embeddinggemma-300m-q",
+            ]
+        );
+    }
+
+    #[test]
+    fn registry_dims_match_model_dims_lookup() {
+        for m in model_registry() {
+            assert_eq!(
+                model_dims(m.name),
+                m.dims,
+                "model_dims must stay in sync with the registry for {}",
+                m.name
+            );
+        }
+    }
+
+    #[test]
+    fn is_supported_model_true_for_registry_entries() {
+        for m in model_registry() {
+            assert!(is_supported_model(m.name), "{} should be supported", m.name);
+        }
+    }
+
+    #[test]
+    fn is_supported_model_false_for_unknown_name() {
+        assert!(!is_supported_model("not-a-real-model"));
+    }
+
+    #[test]
+    fn resolve_model_supports_every_registry_entry() {
+        for m in model_registry() {
+            assert!(
+                resolve_model(m.name).is_ok(),
+                "resolve_model must map every registry entry, missing: {}",
+                m.name
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_model_rejects_unknown_name() {
+        let err = resolve_model("not-a-real-model").unwrap_err();
+        assert!(err.to_string().contains("unsupported embedding model"));
     }
 
     #[test]

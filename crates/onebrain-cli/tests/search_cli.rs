@@ -174,6 +174,144 @@ fn search_status_errors_outside_a_vault() {
     assert!(!out.status.success());
 }
 
+#[test]
+fn search_model_list_json_reports_all_models_with_current_marked() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n  embed_model: bge-m3\n",
+    );
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "model", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "search.model.list");
+    assert_eq!(v["ok"], true);
+    let models = v["data"]["models"].as_array().unwrap();
+    assert_eq!(models.len(), 5);
+
+    let names: Vec<&str> = models.iter().map(|m| m["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"multilingual-e5-small"));
+    assert!(names.contains(&"multilingual-e5-base"));
+    assert!(names.contains(&"multilingual-e5-large"));
+    assert!(names.contains(&"bge-m3"));
+    assert!(names.contains(&"embeddinggemma-300m-q"));
+
+    let current: Vec<&str> = models
+        .iter()
+        .filter(|m| m["current"].as_bool().unwrap())
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(current, vec!["bge-m3"]);
+
+    // `list` must never touch the engine's on-disk state — no download.
+    let model_cache = cache.path().join("onebrain").join("search").join("t-vault");
+    assert!(
+        !model_cache.exists(),
+        "model list must not touch the engine's on-disk state"
+    );
+}
+
+#[test]
+fn search_model_list_defaults_current_to_multilingual_e5_small() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "model", "list"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let models = v["data"]["models"].as_array().unwrap();
+    let current: Vec<&str> = models
+        .iter()
+        .filter(|m| m["current"].as_bool().unwrap())
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(current, vec!["multilingual-e5-small"]);
+}
+
+#[test]
+fn search_model_set_unknown_name_errors_without_downloading() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "model", "set", "not-a-real-model"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    // `--json` mode routes the error envelope to stdout, not stderr.
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    let message = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("unsupported embedding model"),
+        "message: {message}"
+    );
+
+    // Config must be left untouched, and no model cache created.
+    let yaml = std::fs::read_to_string(vault.path().join("onebrain.yml")).unwrap();
+    assert!(!yaml.contains("not-a-real-model"));
+    let model_cache = cache.path().join("onebrain").join("search").join("t-vault");
+    assert!(
+        !model_cache.exists(),
+        "an unsupported model must never trigger engine open / download"
+    );
+}
+
+#[test]
+fn search_model_set_already_current_is_a_noop() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n  embed_model: multilingual-e5-small\n",
+    );
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "model", "set", "multilingual-e5-small"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "search.model.set");
+    assert_eq!(v["data"]["already_current"], true);
+    assert_eq!(v["data"]["chunks_reembedded"], serde_json::Value::Null);
+
+    // No engine cache dir should be created for a no-op set.
+    let model_cache = cache.path().join("onebrain").join("search").join("t-vault");
+    assert!(!model_cache.exists());
+}
+
 // ── Gated: real embeddings (reindex + query + vsearch) ─────────────────────
 
 #[test]
@@ -241,4 +379,55 @@ fn search_reindex_then_query_and_vsearch_end_to_end() {
         .as_str()
         .unwrap()
         .contains("memory safety"));
+}
+
+#[test]
+fn search_model_set_rebuilds_index_with_new_model() {
+    if std::env::var("ONEBRAIN_TEST_EMBED").is_err() {
+        return; // gated: downloads models (e5-small + e5-base)
+    }
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n  embed_model: multilingual-e5-small\n",
+    );
+    write(
+        vault.path(),
+        "rust.md",
+        "# Rust\nerror handling and memory safety",
+    );
+
+    let reindex_out = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex"])
+        .output()
+        .unwrap();
+    assert!(reindex_out.status.success());
+
+    let set_out = onebrain(vault.path(), cache.path())
+        .args(["search", "model", "set", "multilingual-e5-base"])
+        .output()
+        .unwrap();
+    assert!(
+        set_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&set_out.stderr)
+    );
+    let sv: serde_json::Value = serde_json::from_slice(&set_out.stdout).unwrap();
+    assert_eq!(sv["command"], "search.model.set");
+    assert_eq!(sv["data"]["already_current"], false);
+    assert_eq!(sv["data"]["chunks_reembedded"], 1);
+
+    // Config now records the new model.
+    let yaml = std::fs::read_to_string(vault.path().join("onebrain.yml")).unwrap();
+    assert!(yaml.contains("embed_model: multilingual-e5-base"));
+
+    // Status reflects the switched model too.
+    let status_out = onebrain(vault.path(), cache.path())
+        .args(["search", "status"])
+        .output()
+        .unwrap();
+    let stv: serde_json::Value = serde_json::from_slice(&status_out.stdout).unwrap();
+    assert_eq!(stv["data"]["embed_model"], "multilingual-e5-base");
 }

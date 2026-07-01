@@ -485,6 +485,14 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             SearchVerb::Reindex(args) => {
                 commands::search_reindex::run(vault_flag.clone(), &mode, &args)
             }
+            SearchVerb::Model(SearchModelCmd { verb }) => match verb {
+                SearchModelVerb::List => {
+                    commands::search_model::run_list(vault_flag.clone(), &mode)
+                }
+                SearchModelVerb::Set(args) => {
+                    commands::search_model::run_set(vault_flag.clone(), &mode, &args)
+                }
+            },
         },
         Cmd::Pause(PauseCmd { verb }) => match verb {
             PauseVerb::List => {
