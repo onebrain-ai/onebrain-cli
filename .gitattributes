@@ -1,0 +1,6 @@
+# Keep shell/python scripts LF even when checked out on Windows (runner
+# `core.autocrlf=true`). A CRLF `scripts/gzip-embed-assets.sh` run under git-bash
+# would break its path handling and silently skip gzipping on the Windows release
+# legs — so the embedded web UI must stay LF for a correct build everywhere.
+*.sh text eol=lf
+*.py text eol=lf

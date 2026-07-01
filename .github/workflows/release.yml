@@ -124,6 +124,14 @@ jobs:
           name: webui-dist
           path: crates/onebrain-cli/webui/
 
+      # Gzip the web UI's hashed assets in place so the embed stays small and
+      # `serve` can ship them with Content-Encoding: gzip (see server::static).
+      # Idempotent; runs on every target (bash + gzip are present on all runners,
+      # incl. Windows git-bash).
+      - name: Gzip embedded web UI assets
+        shell: bash
+        run: bash scripts/gzip-embed-assets.sh
+
       - name: Build release binary
         shell: bash
         run: cargo build --release --target "$TARGET" -p onebrain-cli

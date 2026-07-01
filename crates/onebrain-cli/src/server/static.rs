@@ -118,18 +118,96 @@ pub async fn serve_static(State(state): State<Arc<AppState>>, request: Request) 
 /// `serve_from_dist`: the entry shell + any unknown route returns the
 /// token-injected `index.html`; real assets are returned by name.
 async fn serve_from_embedded(token: &str, request: Request) -> Response {
-    let path = request.uri().path().trim_start_matches('/');
+    let path = request.uri().path().trim_start_matches('/').to_owned();
     if path.is_empty() || path == "index.html" {
         return embedded_index(token);
     }
-    match WebAssets::get(path) {
+    let accepts_gzip = accepts_gzip(&request);
+    match WebAssets::get(&path) {
         Some(file) => {
             let mime = file.metadata.mimetype().to_string();
-            ([(header::CONTENT_TYPE, mime)], file.data.into_owned()).into_response()
+            let data = file.data.into_owned();
+            // `assets/` files are gzip-precompressed at build time — detect the
+            // gzip magic and hand them back with `Content-Encoding: gzip` (the
+            // browser inflates; no server-side work), else inflate for a
+            // non-gzip client. Raw files (version.json, …) fall through unchanged.
+            if is_gzip(&data) {
+                serve_maybe_gzipped(mime, data, accepts_gzip)
+            } else {
+                ([(header::CONTENT_TYPE, mime)], data).into_response()
+            }
         }
         // Unknown route → SPA fallback to the injected entry shell.
         None => embedded_index(token),
     }
+}
+
+/// True if `data` begins with the gzip magic (RFC 1952 `1f 8b`). Web assets are
+/// text or binary that never start with these two bytes, so this reliably tells
+/// a build-time-gzipped asset apart from a raw one — no path/extension guessing,
+/// so serving stays correct whether or not the build gzipped anything.
+fn is_gzip(data: &[u8]) -> bool {
+    data.starts_with(&[0x1f, 0x8b])
+}
+
+/// Whether the client's `Accept-Encoding` accepts gzip (all browsers do).
+/// Case-insensitive, and honours an explicit `;q=0` refusal (RFC 9110 §12.5.3).
+fn accepts_gzip(request: &Request) -> bool {
+    request
+        .headers()
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').any(gzip_is_acceptable))
+        .unwrap_or(false)
+}
+
+/// True if one `Accept-Encoding` entry names gzip without a `q=0` (refusal).
+fn gzip_is_acceptable(entry: &str) -> bool {
+    let mut parts = entry.split(';').map(str::trim);
+    if !parts
+        .next()
+        .map(|coding| coding.eq_ignore_ascii_case("gzip"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    // A `q=0` qualifier means "not acceptable".
+    !parts.any(|p| p.strip_prefix("q=").and_then(|q| q.parse::<f32>().ok()) == Some(0.0))
+}
+
+/// Serve gzip-precompressed `data`: pass it through with `Content-Encoding: gzip`
+/// when the client accepts gzip (the common browser path — zero server work),
+/// otherwise inflate so a non-gzip client still receives valid bytes.
+fn serve_maybe_gzipped(mime: String, data: Vec<u8>, accepts_gzip: bool) -> Response {
+    // The body varies by Accept-Encoding (gzipped vs inflated) — advertise it so
+    // any cache keys on the encoding (correct even though a localhost daemon has
+    // no shared cache today).
+    let vary = (header::VARY, "accept-encoding".to_string());
+    if accepts_gzip {
+        return (
+            [
+                (header::CONTENT_TYPE, mime),
+                (header::CONTENT_ENCODING, "gzip".to_string()),
+                vary,
+            ],
+            data,
+        )
+            .into_response();
+    }
+    match inflate(&data) {
+        Some(raw) => ([(header::CONTENT_TYPE, mime), vary], raw).into_response(),
+        None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Inflate a gzip stream with flate2 (pure-Rust `miniz_oxide` — no C, so it
+/// cross-compiles cleanly to every release target). Only the rare non-gzip
+/// client hits this path.
+fn inflate(gz: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut decoder = flate2::read::GzDecoder::new(gz);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).ok().map(|_| out)
 }
 
 /// The embedded `index.html`, token-injected. `None` (no bundled UI) → placeholder.
@@ -261,6 +339,70 @@ mod tests {
         let out = inject_token(html, "f00d");
         assert!(out.starts_with("<script>window.__ONEBRAIN_TOKEN__=\"f00d\""));
         assert!(out.contains("just a fragment"));
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn is_gzip_detects_the_magic_bytes() {
+        assert!(is_gzip(&gzip(b"payload")));
+        assert!(is_gzip(&[0x1f, 0x8b, 0x08, 0x00]));
+        assert!(!is_gzip(b"<!doctype html>")); // raw HTML
+        assert!(!is_gzip(br#"{"version":"0.1.1"}"#)); // raw JSON
+        assert!(!is_gzip(b"")); // empty
+        assert!(!is_gzip(&[0x1f])); // one byte, not enough
+    }
+
+    #[test]
+    fn inflate_roundtrips_a_gzip_stream() {
+        let gz = gzip(b"console.log('hi')");
+        assert_eq!(inflate(&gz).as_deref(), Some(&b"console.log('hi')"[..]));
+        assert_eq!(inflate(b"not a gzip stream"), None); // garbage → None, no panic
+    }
+
+    #[test]
+    fn accepts_gzip_reads_the_header() {
+        use axum::body::Body;
+        use axum::http::Request as HttpRequest;
+        let req = |accept_encoding: Option<&str>| {
+            let mut b = HttpRequest::builder().uri("/assets/x.js");
+            if let Some(v) = accept_encoding {
+                b = b.header(header::ACCEPT_ENCODING, v);
+            }
+            b.body(Body::empty()).unwrap()
+        };
+        assert!(accepts_gzip(&req(Some("gzip, deflate, br"))));
+        assert!(accepts_gzip(&req(Some("gzip"))));
+        assert!(accepts_gzip(&req(Some("deflate, gzip;q=0.5")))); // q>0 acceptable
+        assert!(accepts_gzip(&req(Some("GZIP")))); // case-insensitive
+        assert!(!accepts_gzip(&req(Some("gzip;q=0")))); // explicit refusal
+        assert!(!accepts_gzip(&req(Some("gzip;q=0.0")))); // explicit refusal
+        assert!(!accepts_gzip(&req(Some("deflate, br")))); // no gzip
+        assert!(!accepts_gzip(&req(None))); // header absent
+    }
+
+    #[test]
+    fn serve_maybe_gzipped_honors_accept_encoding() {
+        let gz = gzip(b"console.log(1)");
+        // Accepts gzip → passthrough + Content-Encoding: gzip (no server inflate),
+        // with Vary: accept-encoding.
+        let resp = serve_maybe_gzipped("text/javascript".into(), gz.clone(), true);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
+        assert_eq!(resp.headers().get(header::VARY).unwrap(), "accept-encoding");
+        // Doesn't accept gzip → inflated, no Content-Encoding, still Vary.
+        let resp = serve_maybe_gzipped("text/javascript".into(), gz, false);
+        assert!(resp.headers().get(header::CONTENT_ENCODING).is_none());
+        assert_eq!(resp.headers().get(header::VARY).unwrap(), "accept-encoding");
     }
 
     #[test]
