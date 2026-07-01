@@ -24,7 +24,7 @@ Build a native **`onebrain-search`** engine crate and remove qmd. Key sub-decisi
 - **Chunking** is heading-aware + size-split, carrying each chunk's heading path.
 - **Phasing (v3.4.x):** v3.4.0 engine + CLI verbs (alongside qmd, for validation) → v3.4.1 native MCP + swap plugin MCP config → **v3.4.2 cutover** (auto reindex/embed via hook, `/qmd`→`/search` skill, re-embed migration, **remove qmd** — 0 node/python dep) → v3.4.3 polish (rerank, query expansion, bge-m3 sparse). The `/qmd` **skill is removed** (merged into `/search`) — plugin-repo (`onebrain-ai/onebrain`) work, each milestone with its own plan.
 
-Full design + benchmarks live in the vault project notes (`01-projects/onebrain/cli/2026-07-01-native-search-design.md` and siblings).
+The engine architecture and module layout are documented in the `onebrain-search` crate's own docs (`crates/onebrain-search/src/lib.rs`, `cargo doc -p onebrain-search`).
 
 ## Consequences
 

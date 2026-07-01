@@ -24,8 +24,10 @@ tantivy = { version = "0.26", default-features = false, features = [
     "stemmer",
 ] }
 
-# Thai word-segmentation tokenizer (native Rust binding).
-nlpo3 = "1.4"
+# Thai word segmentation (nlpo3 NewmmTokenizer) is deferred: the published
+# nlpo3 crate excludes its word dictionary (words_th.txt), so v3.4.0 uses a
+# dictionary-free character-bigram fallback in `lex.rs`. Re-add `nlpo3` here
+# once PyThaiNLP's word list is vendored (Phase 2 Thai upgrade).
 
 # ONNX-backed local embedding models.
 fastembed = "5.17"
