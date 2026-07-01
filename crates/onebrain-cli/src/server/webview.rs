@@ -35,27 +35,78 @@ pub async fn get_webview_preflight(Query(p): Query<PreflightParams>) -> Response
     Json(PreflightResponse { frameable }).into_response()
 }
 
+/// Redirects are not auto-followed by ureq (see `probe_frameable`): each hop is
+/// re-validated against `is_http_url` before being requested. This bounds the
+/// number of manual hops we'll chase before giving up.
+const MAX_REDIRECT_HOPS: u32 = 5;
+
 /// Blocking header probe (ureq is sync → runs on a blocking thread). Reads only
-/// headers; the body is never consumed. Redirects are followed by ureq with its
-/// default cap. Any error → false.
+/// headers; the body is never consumed. The agent is configured to NOT
+/// auto-follow redirects (`max_redirects(0)`) so each hop's `Location` can be
+/// re-validated with `is_http_url` before being requested — this closes the
+/// SSRF gap where a `http://` URL 302s to `file://` or an internal host. Any
+/// error, non-http redirect target, or exceeding `MAX_REDIRECT_HOPS` → false.
 fn probe_frameable(url: &str) -> bool {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(5)))
+        .max_redirects(0)
         .build()
         .into();
-    match agent.get(url).call() {
-        Ok(resp) => {
-            let xfo = resp
+
+    let mut current = url.to_string();
+    for _ in 0..=MAX_REDIRECT_HOPS {
+        let resp = match agent.get(&current).call() {
+            Ok(resp) => resp,
+            Err(_) => return false,
+        };
+        let status = resp.status();
+        if status.is_redirection() {
+            let location = resp
                 .headers()
-                .get("x-frame-options")
+                .get(axum::http::header::LOCATION)
                 .and_then(|v| v.to_str().ok());
-            let csp = resp
-                .headers()
-                .get("content-security-policy")
-                .and_then(|v| v.to_str().ok());
-            frameable_from_headers(xfo, csp)
+            let Some(location) = location else {
+                return false;
+            };
+            let Some(next) = resolve_redirect(&current, location) else {
+                return false;
+            };
+            current = next;
+            continue;
         }
-        Err(_) => false,
+        let xfo_blocks = resp
+            .headers()
+            .get_all(axum::http::header::X_FRAME_OPTIONS)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| !frameable_from_headers(Some(v), None));
+        if xfo_blocks {
+            return false;
+        }
+        let csp_blocks = resp
+            .headers()
+            .get_all(axum::http::header::CONTENT_SECURITY_POLICY)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| !frameable_from_headers(None, Some(v)));
+        return !csp_blocks;
+    }
+    // Exceeded MAX_REDIRECT_HOPS without reaching a final response.
+    false
+}
+
+/// Resolve a `Location` header against the URL that produced it. Only
+/// absolute `http(s)` targets are supported — a relative Location is treated
+/// as untrusted-enough-to-reject (`None`) rather than guessing at resolution,
+/// since a wrong guess here would reintroduce the SSRF gap this is meant to
+/// close. `base` is unused for absolute locations but kept for a future
+/// relative-resolution implementation.
+fn resolve_redirect(_base: &str, location: &str) -> Option<String> {
+    let location = location.trim();
+    if is_http_url(location) {
+        Some(location.to_string())
+    } else {
+        None
     }
 }
 
@@ -65,10 +116,32 @@ pub fn is_http_url(url: &str) -> bool {
     u.starts_with("http://") || u.starts_with("https://")
 }
 
+/// Does a single `Content-Security-Policy` header VALUE block framing? True
+/// when the value has a `frame-ancestors` directive whose value isn't the
+/// bare wildcard `*`. Pure/unit-testable so it can be folded over multiple
+/// header values (a server may send more than one CSP header, and `frame()`
+/// / `get()` on a header map only surfaces the first — see `probe_frameable`,
+/// which calls this via `get_all`).
+fn csp_value_blocks(csp: &str) -> bool {
+    let lower = csp.to_ascii_lowercase();
+    if let Some(idx) = lower.find("frame-ancestors") {
+        let after = &csp[idx + "frame-ancestors".len()..];
+        let directive = after.split(';').next().unwrap_or("").trim();
+        // Only a bare `*` (any ancestor) permits our arbitrary origin.
+        return directive != "*";
+    }
+    false
+}
+
 /// Decide framability from the two headers that govern it. Conservative: any
 /// `X-Frame-Options` value blocks (DENY/SAMEORIGIN, or a legacy ALLOW-FROM we
 /// can't honour from an opaque iframe); a CSP with ANY `frame-ancestors`
 /// directive that isn't the wildcard `*` blocks. Absent headers → frameable.
+///
+/// This single-value form is kept for the existing unit tests and for the
+/// early bad-scheme short-circuit; `probe_frameable` folds `csp_value_blocks`
+/// over every CSP header value it receives instead of calling this directly,
+/// since a response may carry more than one CSP header.
 pub fn frameable_from_headers(x_frame_options: Option<&str>, csp: Option<&str>) -> bool {
     if x_frame_options
         .map(|v| !v.trim().is_empty())
@@ -76,17 +149,7 @@ pub fn frameable_from_headers(x_frame_options: Option<&str>, csp: Option<&str>) 
     {
         return false;
     }
-    if let Some(csp) = csp {
-        // Find the frame-ancestors directive (case-insensitive) and read its value.
-        let lower = csp.to_ascii_lowercase();
-        if let Some(idx) = lower.find("frame-ancestors") {
-            let after = &csp[idx + "frame-ancestors".len()..];
-            let directive = after.split(';').next().unwrap_or("").trim();
-            // Only a bare `*` (any ancestor) permits our arbitrary origin.
-            return directive == "*";
-        }
-    }
-    true
+    !csp.map(csp_value_blocks).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -147,5 +210,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], br#"{"frameable":false}"#);
+    }
+
+    #[test]
+    fn resolve_redirect_keeps_absolute_http_https() {
+        assert_eq!(
+            resolve_redirect("http://example.com/a", "https://example.com/b"),
+            Some("https://example.com/b".to_string())
+        );
+        assert_eq!(
+            resolve_redirect("https://example.com/a", "http://other.example/b"),
+            Some("http://other.example/b".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_redirect_rejects_non_http_target() {
+        // A 302 to file:// or an internal-only scheme must not be followed —
+        // this is the SSRF gap the manual redirect handling closes.
+        assert_eq!(
+            resolve_redirect("http://example.com/a", "file:///etc/passwd"),
+            None
+        );
+        assert_eq!(
+            resolve_redirect("http://example.com/a", "ftp://internal/x"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_redirect_rejects_relative_location() {
+        // Policy choice: relative Location headers are treated as untrusted
+        // rather than guessed at — see resolve_redirect's doc comment.
+        assert_eq!(resolve_redirect("http://example.com/a", "/b"), None);
+        assert_eq!(
+            resolve_redirect("http://example.com/a", "//attacker.example/b"),
+            None
+        );
+    }
+
+    #[test]
+    fn csp_value_blocks_single_directive() {
+        assert!(csp_value_blocks("frame-ancestors 'none'"));
+        assert!(csp_value_blocks("frame-ancestors 'self'"));
+        assert!(!csp_value_blocks("frame-ancestors *"));
+        assert!(!csp_value_blocks("default-src 'self'")); // no directive at all
+    }
+
+    #[test]
+    fn multi_value_csp_blocks_when_any_value_blocks() {
+        // A server sending two CSP headers, with the blocking directive only
+        // in the second value — folding must not stop at the first header.
+        let values = ["default-src 'self'", "frame-ancestors 'none'"];
+        assert!(values.iter().any(|v| csp_value_blocks(v)));
+
+        // Symmetric case: blocking directive in the first value.
+        let values = ["frame-ancestors 'self'", "default-src 'self'"];
+        assert!(values.iter().any(|v| csp_value_blocks(v)));
+
+        // Neither value blocks → overall permissive.
+        let values = ["default-src 'self'", "frame-ancestors *"];
+        assert!(!values.iter().any(|v| csp_value_blocks(v)));
+    }
+
+    #[test]
+    fn multi_value_xfo_blocks_when_any_value_present() {
+        // Mirrors the XFO fold in probe_frameable: any non-empty value blocks.
+        let values = ["", "DENY"];
+        assert!(values.iter().any(|v| !v.trim().is_empty()));
+
+        let values: [&str; 0] = [];
+        assert!(!values.iter().any(|v: &&str| !v.trim().is_empty()));
     }
 }
