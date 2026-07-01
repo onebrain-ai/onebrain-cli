@@ -22,6 +22,15 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # Fails the build on a broken doc link or a stale reference-doc source path.
+  # Pure-stdlib Python (no third-party action → no new supply-chain surface); the
+  # checker understands the reference docs' crate-relative `src/…` convention.
+  links:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: python3 scripts/check-links.py
+
   clippy:
     runs-on: ubuntu-latest
     steps:
