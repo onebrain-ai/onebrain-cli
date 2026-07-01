@@ -131,7 +131,8 @@ pub struct SearchConfig {
     /// `qmd_collection` when unset (legacy vaults).
     #[serde(default)]
     pub collection: Option<String>,
-    /// Embedding model name. Default `"bge-m3"`.
+    /// Embedding model name. Default `"multilingual-e5-small"` (small + fast;
+    /// fastembed has no quantized bge-m3, so bge-m3 fp32 is opt-in via set-model).
     #[serde(default = "default_embed_model")]
     pub embed_model: String,
     /// Auto-embed gate (thresholds transferred from the folded auto-embed
@@ -141,7 +142,7 @@ pub struct SearchConfig {
 }
 
 fn default_embed_model() -> String {
-    "bge-m3".to_string()
+    "multilingual-e5-small".to_string()
 }
 
 impl Default for SearchConfig {
@@ -377,7 +378,7 @@ mod tests {
     fn search_config_defaults() {
         let (_dir, root) = write_vault("qmd_collection: ob-1-441565\n");
         let cfg = load_vault_config(&root).unwrap();
-        assert_eq!(cfg.search.embed_model, "bge-m3");
+        assert_eq!(cfg.search.embed_model, "multilingual-e5-small");
         assert!(cfg.search.embed.auto);
         assert_eq!(cfg.search.embed.threshold, 10);
         assert_eq!(cfg.search.collection.as_deref(), Some("ob-1-441565"));

@@ -1,6 +1,8 @@
 //! Wraps `fastembed` to turn chunk texts into L2-normalized embedding vectors.
 //!
-//! Default model is `bge-m3` (multilingual, 1024-dim). Vectors returned by
+//! Default model is `multilingual-e5-small` (384-dim, ~470MB, fast); `bge-m3`
+//! (fp32, ~2.2GB — fastembed has no quantized bge-m3) is the accuracy upgrade
+//! via `set-model`. Vectors returned by
 //! [`Embedder::embed`] are always L2-normalized, even though several
 //! underlying models already emit near-unit vectors: normalizing explicitly
 //! lets the vector store assume unit-length vectors unconditionally.
@@ -50,7 +52,9 @@ pub fn new(model_name: &str, cache_dir: &Path) -> Result<Embedder> {
     let model = resolve_model(model_name)?;
     let dims = model_dims(model_name);
 
-    let init = InitOptions::new(model).with_cache_dir(cache_dir.to_path_buf());
+    let init = InitOptions::new(model)
+        .with_cache_dir(cache_dir.to_path_buf())
+        .with_show_download_progress(true);
     let embedding = TextEmbedding::try_new(init)?;
 
     Ok(Embedder {

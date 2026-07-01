@@ -80,7 +80,7 @@ pub fn chunk_markdown(
             .join(" > ")
     };
 
-    let mut flush =
+    let flush =
         |buf: &mut String, stack: &[(usize, String)], chunks: &mut Vec<Chunk>, idx: &mut usize| {
             if buf.trim().is_empty() {
                 buf.clear();
