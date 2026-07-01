@@ -1,37 +1,41 @@
-//! Tantivy-backed BM25 lexical index with a Thai-aware tokenizer.
+//! Tantivy-backed BM25 lexical index with a script-aware tokenizer.
 //!
 //! tantivy's built-in tokenizers split on whitespace/punctuation, which is
-//! useless for Thai: Thai script has no spaces between words, so an entire
-//! run of Thai text collapses into a single (unsearchable) token under the
-//! default analyzer. [`ThaiAwareTokenizer`] fixes this by splitting input
-//! into alternating Thai / non-Thai runs (Unicode block check, Thai is
-//! U+0E00..=U+0E7F) and routing each run through the appropriate
-//! sub-tokenizer: Thai runs get word-segmented, non-Thai runs get the
-//! default lowercased alphanumeric tokenizer.
+//! useless for scripts that don't use spaces between words — Thai, Lao,
+//! Khmer, Myanmar, and the CJK family (Chinese, Japanese, Korean): an entire
+//! run of such text collapses into a single (unsearchable) token under the
+//! default analyzer. [`ScriptAwareTokenizer`] fixes this by splitting input
+//! into alternating no-space-script / other runs (Unicode block checks —
+//! see [`is_no_space_char`]) and routing each run through the appropriate
+//! sub-tokenizer: no-space-script runs get character-bigrammed, other runs
+//! get the default lowercased alphanumeric tokenizer.
 //!
-//! ## Thai segmentation: bigram fallback (not nlpo3 word-segmentation)
+//! ## No-space-script segmentation: bigram fallback (not word-segmentation)
 //!
-//! `nlpo3`'s `newmm` (maximal-matching) word segmenter needs a Thai word
-//! dictionary (`words_th.txt`) to build its trie. That dictionary is
-//! **not bundled** in the published `nlpo3` crate: `Cargo.toml.orig`
-//! explicitly lists `words_th.txt` under `exclude`, and
+//! For Thai specifically, `nlpo3`'s `newmm` (maximal-matching) word
+//! segmenter needs a Thai word dictionary (`words_th.txt`) to build its
+//! trie. That dictionary is **not bundled** in the published `nlpo3` crate:
+//! `Cargo.toml.orig` explicitly lists `words_th.txt` under `exclude`, and
 //! `NewmmTokenizer::new(dict_path: &str)` / `DictSource::FilePath` expect an
 //! external file on disk that we do not have and are not vendoring in this
 //! task. `NewmmTokenizer::from_word_list` / `DictSource::WordList` would let
 //! us supply a dictionary in-process, but we'd still need to source the
 //! word list content, which is a separate follow-up (vendoring PyThaiNLP's
-//! dictionary asset + license review).
+//! dictionary asset + license review). CJK scripts have their own
+//! per-language segmenters too (e.g. `jieba` for Chinese, `lindera` for
+//! Japanese), with the same "needs an external dictionary asset" shape.
 //!
-//! Per this task's fallback rule, Thai runs are instead tokenized as
-//! overlapping **character bigrams** (2-Thai-char sliding windows, byte
-//! offsets tracked precisely). This has no dictionary dependency, needs no
-//! new crates, and is a well-known technique for CJK/Thai substring search:
-//! a multi-character query segments into overlapping bigrams too, so a
-//! bigram-indexed document and a bigram-tokenized query naturally share
-//! terms without any segmentation ambiguity. It trades some precision
-//! (bigrams are coarser than real word boundaries) for zero setup cost.
-//! Revisit with true `nlpo3` word segmentation once the dictionary is
-//! vendored.
+//! Per this task's fallback rule, no-space-script runs are instead
+//! tokenized as overlapping **character bigrams** (2-char sliding windows,
+//! byte offsets tracked precisely). This has no dictionary dependency,
+//! needs no new crates, and is the standard technique for CJK/Thai
+//! substring search: a multi-character query segments into overlapping
+//! bigrams too, so a bigram-indexed document and a bigram-tokenized query
+//! naturally share terms without any segmentation ambiguity. It trades some
+//! precision (bigrams are coarser than real word boundaries) for zero setup
+//! cost. Revisit with true per-language word segmenters (nlpo3 for Thai,
+//! jieba for Chinese, lindera for Japanese, ...) once the dictionary assets
+//! are vendored.
 
 use std::path::Path;
 
@@ -47,56 +51,80 @@ use tantivy::{doc, Index, IndexWriter, Term};
 
 use crate::chunk::Chunk;
 
-/// Name under which the Thai-aware analyzer is registered on the index's
+/// Name under which the script-aware analyzer is registered on the index's
 /// [`tantivy::tokenizer::TokenizerManager`]. Used for both the `body`
 /// field's schema-declared tokenizer and query-time segmentation, so
 /// index-time and query-time tokenization always match.
-const THAI_AWARE_TOKENIZER: &str = "thai_aware";
+const SCRIPT_AWARE_TOKENIZER: &str = "script_aware";
 
-/// Smallest Unicode scalar value in the Thai script block.
-const THAI_BLOCK_START: char = '\u{0E00}';
-/// Largest Unicode scalar value in the Thai script block (inclusive).
-const THAI_BLOCK_END: char = '\u{0E7F}';
+/// Unicode blocks for scripts that don't use spaces between words. Each
+/// tuple is an inclusive `(start, end)` character range.
+const NO_SPACE_SCRIPT_BLOCKS: &[(char, char)] = &[
+    // Thai
+    ('\u{0E00}', '\u{0E7F}'),
+    // Lao
+    ('\u{0E80}', '\u{0EFF}'),
+    // Myanmar
+    ('\u{1000}', '\u{109F}'),
+    // Khmer
+    ('\u{1780}', '\u{17FF}'),
+    // CJK Unified Ideographs
+    ('\u{4E00}', '\u{9FFF}'),
+    // CJK Unified Ideographs Extension A
+    ('\u{3400}', '\u{4DBF}'),
+    // Hiragana
+    ('\u{3040}', '\u{309F}'),
+    // Katakana
+    ('\u{30A0}', '\u{30FF}'),
+    // Hangul Syllables
+    ('\u{AC00}', '\u{D7A3}'),
+];
 
-fn is_thai(c: char) -> bool {
-    (THAI_BLOCK_START..=THAI_BLOCK_END).contains(&c)
+/// True if `c` belongs to a script that is conventionally written without
+/// spaces between words (Thai, Lao, Myanmar, Khmer, or CJK). Such scripts
+/// need bigram tokenization instead of tantivy's default whitespace split
+/// (see module docs).
+fn is_no_space_char(c: char) -> bool {
+    NO_SPACE_SCRIPT_BLOCKS
+        .iter()
+        .any(|(start, end)| (*start..=*end).contains(&c))
 }
 
-/// Split `text` into byte-offset-tagged runs of consecutive Thai /
-/// non-Thai characters, e.g. `"abc กขค def"` ->
-/// `[(0,3,false), (3,4,false)/* space stays non-Thai */, (4,10,true), ...]`
+/// Split `text` into byte-offset-tagged runs of consecutive no-space-script
+/// / other characters, e.g. `"abc กขค def"` ->
+/// `[(0,3,false), (3,4,false)/* space stays non-script */, (4,10,true), ...]`
 /// (exact boundaries depend on byte lengths; the point is runs never mix
 /// scripts).
-fn split_thai_runs(text: &str) -> Vec<(usize, usize, bool)> {
+fn split_script_runs(text: &str) -> Vec<(usize, usize, bool)> {
     let mut runs = Vec::new();
     let mut start = 0usize;
-    let mut current_is_thai: Option<bool> = None;
+    let mut current_is_script: Option<bool> = None;
 
     for (idx, ch) in text.char_indices() {
-        let thai = is_thai(ch);
-        match current_is_thai {
-            None => current_is_thai = Some(thai),
-            Some(prev) if prev != thai => {
+        let is_script = is_no_space_char(ch);
+        match current_is_script {
+            None => current_is_script = Some(is_script),
+            Some(prev) if prev != is_script => {
                 runs.push((start, idx, prev));
                 start = idx;
-                current_is_thai = Some(thai);
+                current_is_script = Some(is_script);
             }
             _ => {}
         }
     }
-    if let Some(thai) = current_is_thai {
-        runs.push((start, text.len(), thai));
+    if let Some(is_script) = current_is_script {
+        runs.push((start, text.len(), is_script));
     }
     runs
 }
 
-/// Emit overlapping 2-char (bigram) tokens for a Thai run, with correct
-/// byte offsets relative to the *original* input string (`run_offset` is
-/// where this run starts in that original string).
+/// Emit overlapping 2-char (bigram) tokens for a no-space-script run, with
+/// correct byte offsets relative to the *original* input string
+/// (`run_offset` is where this run starts in that original string).
 ///
-/// A single-character run emits one unigram token so short Thai runs are
-/// still searchable (a lone Thai character can't form a bigram).
-fn thai_bigrams(run: &str, run_offset: usize) -> Vec<(String, usize, usize)> {
+/// A single-character run emits one unigram token so short runs are still
+/// searchable (a lone character can't form a bigram).
+fn script_bigrams(run: &str, run_offset: usize) -> Vec<(String, usize, usize)> {
     let chars: Vec<(usize, char)> = run.char_indices().collect();
     if chars.is_empty() {
         return Vec::new();
@@ -121,11 +149,11 @@ fn thai_bigrams(run: &str, run_offset: usize) -> Vec<(String, usize, usize)> {
     tokens
 }
 
-/// Emit tokens for a non-Thai run using the same rules as tantivy's
+/// Emit tokens for a non-script run using the same rules as tantivy's
 /// built-in `default` analyzer (split on non-alphanumeric, drop
 /// tokens > 40 chars, lowercase), with offsets translated back to the
 /// original input string.
-fn non_thai_tokens(run: &str, run_offset: usize) -> Vec<(String, usize, usize)> {
+fn other_tokens(run: &str, run_offset: usize) -> Vec<(String, usize, usize)> {
     let mut analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
         .filter(RemoveLongFilter::limit(40))
         .filter(LowerCaser)
@@ -142,45 +170,45 @@ fn non_thai_tokens(run: &str, run_offset: usize) -> Vec<(String, usize, usize)> 
     tokens
 }
 
-/// Segment arbitrary text (Thai + non-Thai mixed) into `(token, offset_from,
-/// offset_to)` triples, byte offsets relative to the whole input. Shared by
-/// the tantivy [`Tokenizer`] impl (index-time) and query-time segmentation,
-/// so both sides always agree on tokenization.
+/// Segment arbitrary text (no-space-script + other mixed) into `(token,
+/// offset_from, offset_to)` triples, byte offsets relative to the whole
+/// input. Shared by the tantivy [`Tokenizer`] impl (index-time) and
+/// query-time segmentation, so both sides always agree on tokenization.
 fn segment(text: &str) -> Vec<(String, usize, usize)> {
     let mut out = Vec::new();
-    for (start, end, thai) in split_thai_runs(text) {
+    for (start, end, is_script) in split_script_runs(text) {
         let run = &text[start..end];
-        if thai {
-            out.extend(thai_bigrams(run, start));
+        if is_script {
+            out.extend(script_bigrams(run, start));
         } else {
-            out.extend(non_thai_tokens(run, start));
+            out.extend(other_tokens(run, start));
         }
     }
     out
 }
 
-/// A [`tantivy::tokenizer::Tokenizer`] that splits text into Thai vs
-/// non-Thai runs and tokenizes each appropriately (see module docs).
+/// A [`tantivy::tokenizer::Tokenizer`] that splits text into no-space-script
+/// vs other runs and tokenizes each appropriately (see module docs).
 #[derive(Clone, Default)]
-struct ThaiAwareTokenizer;
+struct ScriptAwareTokenizer;
 
-struct ThaiAwareTokenStream {
+struct ScriptAwareTokenStream {
     tokens: std::vec::IntoIter<(String, usize, usize)>,
     token: tantivy::tokenizer::Token,
 }
 
-impl Tokenizer for ThaiAwareTokenizer {
-    type TokenStream<'a> = ThaiAwareTokenStream;
+impl Tokenizer for ScriptAwareTokenizer {
+    type TokenStream<'a> = ScriptAwareTokenStream;
 
     fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
-        ThaiAwareTokenStream {
+        ScriptAwareTokenStream {
             tokens: segment(text).into_iter(),
             token: tantivy::tokenizer::Token::default(),
         }
     }
 }
 
-impl TokenStream for ThaiAwareTokenStream {
+impl TokenStream for ScriptAwareTokenStream {
     fn advance(&mut self) -> bool {
         match self.tokens.next() {
             Some((text, offset_from, offset_to)) => {
@@ -204,7 +232,7 @@ impl TokenStream for ThaiAwareTokenStream {
     }
 }
 
-/// Tantivy-backed BM25 lexical index over [`Chunk`]s, with Thai-aware
+/// Tantivy-backed BM25 lexical index over [`Chunk`]s, with script-aware
 /// tokenization on the `body` field.
 pub struct LexIndex {
     index: Index,
@@ -217,9 +245,9 @@ pub struct LexIndex {
 
 impl LexIndex {
     /// Open the lexical index rooted at `dir`, creating it (and `dir`) if
-    /// it doesn't already exist. Registers the Thai-aware tokenizer on the
-    /// index before opening a writer so index-time tokenization is always
-    /// consistent with what [`Self::search`] uses at query time.
+    /// it doesn't already exist. Registers the script-aware tokenizer on
+    /// the index before opening a writer so index-time tokenization is
+    /// always consistent with what [`Self::search`] uses at query time.
     pub fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
 
@@ -229,7 +257,7 @@ impl LexIndex {
         let heading_path = schema_builder.add_text_field("heading_path", TEXT | STORED);
         let body_options = TEXT.set_indexing_options(
             tantivy::schema::TextFieldIndexing::default()
-                .set_tokenizer(THAI_AWARE_TOKENIZER)
+                .set_tokenizer(SCRIPT_AWARE_TOKENIZER)
                 .set_index_option(IndexRecordOption::WithFreqsAndPositions),
         );
         let body = schema_builder.add_text_field("body", body_options);
@@ -241,7 +269,7 @@ impl LexIndex {
             .open_or_create(mmap_directory)?;
         index
             .tokenizers()
-            .register(THAI_AWARE_TOKENIZER, ThaiAwareTokenizer);
+            .register(SCRIPT_AWARE_TOKENIZER, ScriptAwareTokenizer);
 
         let writer: IndexWriter = index.writer(50_000_000)?;
 
@@ -283,10 +311,11 @@ impl LexIndex {
     }
 
     /// BM25 search over the `body` field. `query` is segmented with the
-    /// same Thai-aware routine used at index time and turned into a
+    /// same script-aware routine used at index time and turned into a
     /// `Should`-combined [`BooleanQuery`] of per-term [`TermQuery`]s
     /// (deliberately bypassing tantivy's `QueryParser`, which pre-tokenizes
-    /// as English and would mis-tokenize Thai). Returns `(chunk_id, score)`
+    /// as English and would mis-tokenize no-space scripts). Returns
+    /// `(chunk_id, score)`
     /// pairs, highest score first.
     pub fn search(&self, query: &str, top_k: usize) -> Result<Vec<(String, f32)>> {
         let terms = segment(query);
@@ -359,5 +388,21 @@ mod tests {
         ix.delete("d1#0").unwrap();
         ix.commit().unwrap();
         assert!(ix.search("zorp", 1).unwrap().is_empty());
+    }
+    #[test]
+    fn chinese_bigram_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ix = LexIndex::open(dir.path()).unwrap();
+        ix.add(&chunk("z1#0", "机器学习与人工智能")).unwrap(); // "machine learning and AI"
+        ix.commit().unwrap();
+        assert_eq!(ix.search("机器学习", 1).unwrap()[0].0, "z1#0"); // "machine learning"
+    }
+    #[test]
+    fn japanese_bigram_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ix = LexIndex::open(dir.path()).unwrap();
+        ix.add(&chunk("j1#0", "日本語の全文検索")).unwrap(); // "Japanese full-text search"
+        ix.commit().unwrap();
+        assert_eq!(ix.search("全文検索", 1).unwrap()[0].0, "j1#0"); // "full-text search"
     }
 }
