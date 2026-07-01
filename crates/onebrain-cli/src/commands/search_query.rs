@@ -87,8 +87,9 @@ pub fn run_lex(
 
     let Some(collection) = collection else {
         anyhow::bail!(
-            "no search collection configured — set `search.collection` (or legacy \
-             `qmd_collection`) in onebrain.yml, then run `onebrain search reindex`"
+            "❌ no search collection configured\n\
+             💡 set `search.collection` in onebrain.yml (or run `onebrain init`), \
+             then run `onebrain search reindex`"
         );
     };
     let cache_dir = collection_cache_dir(&collection);
@@ -139,23 +140,26 @@ fn emit_hits(
 fn render_text(env: &Envelope<SearchHitsData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     if d.hits.is_empty() {
-        return "No matches.".to_string();
+        return "🔍 no results".to_string();
     }
-    let mut out = String::new();
-    for h in &d.hits {
-        if h.heading_path.is_empty() {
-            out.push_str(&format!("{} ({:.3})\n", h.doc_path, h.score));
+    let mut blocks = Vec::with_capacity(d.hits.len());
+    for (i, h) in d.hits.iter().enumerate() {
+        let rank = i + 1;
+        let mut block = if h.heading_path.is_empty() {
+            format!("📄 {rank}. {}  ({:.3})", h.doc_path, h.score)
         } else {
-            out.push_str(&format!(
-                "{} › {} ({:.3})\n",
+            format!(
+                "📄 {rank}. {} › {}  ({:.3})",
                 h.doc_path, h.heading_path, h.score
-            ));
-        }
+            )
+        };
         if !h.snippet.is_empty() {
-            out.push_str(&format!("    {}\n", h.snippet));
+            block.push_str(&format!("\n     {}", h.snippet));
         }
+        blocks.push(block);
     }
-    out
+    // Blank line between hits so each result reads as its own block.
+    blocks.join("\n\n")
 }
 
 #[cfg(test)]
@@ -168,7 +172,7 @@ mod tests {
 
     #[test]
     fn text_handles_no_matches() {
-        assert_eq!(render_text(&env(Vec::new())), "No matches.");
+        assert_eq!(render_text(&env(Vec::new())), "🔍 no results");
     }
 
     #[test]
@@ -180,7 +184,7 @@ mod tests {
             score: 0.5,
             snippet: "hello world".into(),
         }]));
-        assert!(s.contains("a.md › Intro (0.500)"));
+        assert!(s.contains("📄 1. a.md › Intro  (0.500)"));
         assert!(s.contains("hello world"));
     }
 
@@ -193,7 +197,31 @@ mod tests {
             score: 0.5,
             snippet: String::new(),
         }]));
-        assert!(s.contains("a.md (0.500)"));
+        assert!(s.contains("📄 1. a.md  (0.500)"));
         assert!(!s.contains("›"));
+    }
+
+    #[test]
+    fn text_ranks_and_separates_multiple_hits() {
+        let s = render_text(&env(vec![
+            HitData {
+                chunk_id: "a.md#0".into(),
+                doc_path: "a.md".into(),
+                heading_path: String::new(),
+                score: 0.9,
+                snippet: "first".into(),
+            },
+            HitData {
+                chunk_id: "b.md#0".into(),
+                doc_path: "b.md".into(),
+                heading_path: String::new(),
+                score: 0.5,
+                snippet: "second".into(),
+            },
+        ]));
+        assert!(s.contains("📄 1. a.md"));
+        assert!(s.contains("📄 2. b.md"));
+        // Blank line separates the two hit blocks.
+        assert!(s.contains("first\n\n📄 2."));
     }
 }

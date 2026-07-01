@@ -59,8 +59,9 @@ pub fn open_engine(vault_flag: Option<PathBuf>) -> Result<(Engine, ResolvedVault
 
     let Some(collection) = config.search.collection else {
         bail!(
-            "no search collection configured — set `search.collection` (or legacy \
-             `qmd_collection`) in onebrain.yml, then run `onebrain search reindex`"
+            "❌ no search collection configured\n\
+             💡 set `search.collection` in onebrain.yml (or run `onebrain init`), \
+             then run `onebrain search reindex`"
         );
     };
 

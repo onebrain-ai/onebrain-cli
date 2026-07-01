@@ -53,18 +53,20 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     let mut lines = vec!["search index status".to_string()];
     match &d.collection {
-        Some(c) => lines.push(format!("  collection:  {c}")),
-        None => lines
-            .push("  collection:  (not set — set `search.collection` in onebrain.yml)".to_string()),
+        Some(c) => lines.push(format!("🔍 collection   {c}")),
+        None => lines.push(
+            "🔍 collection   not set\n💡 set `search.collection` in onebrain.yml".to_string(),
+        ),
     }
-    lines.push(format!("  embed model: {}", d.embed_model));
+    lines.push(format!("🧠 model        {}", d.embed_model));
     if let Some(dir) = &d.cache_dir {
-        lines.push(format!("  cache dir:   {}", dir.display()));
+        lines.push(format!("📁 cache        {}", dir.display()));
     }
-    lines.push(format!(
-        "  indexed:     {}",
-        if d.indexed { "yes" } else { "no" }
-    ));
+    if d.indexed {
+        lines.push("✅ indexed".to_string());
+    } else {
+        lines.push("⬜ not indexed — run `onebrain search reindex`".to_string());
+    }
     lines.join("\n")
 }
 
@@ -88,16 +90,17 @@ mod tests {
     #[test]
     fn text_shows_collection_and_model() {
         let s = render_text(&env(Some("ob-1"), true));
-        assert!(s.contains("collection:  ob-1"));
-        assert!(s.contains("embed model: multilingual-e5-small"));
-        assert!(s.contains("indexed:     yes"));
+        assert!(s.contains("🔍 collection   ob-1"));
+        assert!(s.contains("🧠 model        multilingual-e5-small"));
+        assert!(s.contains("✅ indexed"));
     }
 
     #[test]
     fn text_flags_missing_collection() {
         let s = render_text(&env(None, false));
         assert!(s.contains("not set"));
-        assert!(s.contains("indexed:     no"));
+        assert!(s.contains("💡 set `search.collection`"));
+        assert!(s.contains("⬜ not indexed"));
     }
 
     #[test]

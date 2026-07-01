@@ -234,9 +234,17 @@ impl TokenStream for ScriptAwareTokenStream {
 
 /// Tantivy-backed BM25 lexical index over [`Chunk`]s, with script-aware
 /// tokenization on the `body` field.
+///
+/// The [`IndexWriter`] holds tantivy's **exclusive** directory lock
+/// (`Failed to acquire Lockfile: LockBusy` if a second writer opens the same
+/// dir). Read verbs (`search`) never need it, so the writer is created
+/// **lazily** — [`Self::open`] acquires no writer lock, and only the write
+/// paths ([`Self::add`], [`Self::delete`], [`Self::commit`]) materialize it
+/// on first use via [`Self::writer_mut`]. This lets read-only opens run
+/// concurrently with a writer (or after a killed writer left a stale lock).
 pub struct LexIndex {
     index: Index,
-    writer: IndexWriter,
+    writer: Option<IndexWriter>,
     chunk_id: Field,
     doc_path: Field,
     heading_path: Field,
@@ -246,8 +254,10 @@ pub struct LexIndex {
 impl LexIndex {
     /// Open the lexical index rooted at `dir`, creating it (and `dir`) if
     /// it doesn't already exist. Registers the script-aware tokenizer on
-    /// the index before opening a writer so index-time tokenization is
-    /// always consistent with what [`Self::search`] uses at query time.
+    /// the index so index-time tokenization is always consistent with what
+    /// [`Self::search`] uses at query time. **No writer is created here**, so
+    /// no writer lock is acquired — the writer is materialized lazily on the
+    /// first write (see the struct docs).
     pub fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
 
@@ -271,11 +281,9 @@ impl LexIndex {
             .tokenizers()
             .register(SCRIPT_AWARE_TOKENIZER, ScriptAwareTokenizer);
 
-        let writer: IndexWriter = index.writer(50_000_000)?;
-
         Ok(Self {
             index,
-            writer,
+            writer: None,
             chunk_id,
             doc_path,
             heading_path,
@@ -283,15 +291,30 @@ impl LexIndex {
         })
     }
 
+    /// Return the [`IndexWriter`], creating it on first call. This is where
+    /// tantivy's exclusive writer lock is acquired — deferred out of
+    /// [`Self::open`] so read-only opens stay lock-free (see struct docs).
+    fn writer_mut(&mut self) -> Result<&mut IndexWriter> {
+        if self.writer.is_none() {
+            self.writer = Some(self.index.writer(50_000_000)?);
+        }
+        // Safe: just ensured `Some` above.
+        Ok(self.writer.as_mut().expect("writer just initialized"))
+    }
+
     /// Add a chunk as a new document. Does not delete any prior document
     /// with the same `chunk_id` — call [`Self::delete`] first if
     /// re-indexing an updated chunk.
     pub fn add(&mut self, chunk: &Chunk) -> Result<()> {
-        self.writer.add_document(doc!(
-            self.chunk_id => chunk.chunk_id.clone(),
-            self.doc_path => chunk.doc_path.clone(),
-            self.heading_path => chunk.heading_path.clone(),
-            self.body => chunk.text.clone(),
+        let chunk_id = self.chunk_id;
+        let doc_path = self.doc_path;
+        let heading_path = self.heading_path;
+        let body = self.body;
+        self.writer_mut()?.add_document(doc!(
+            chunk_id => chunk.chunk_id.clone(),
+            doc_path => chunk.doc_path.clone(),
+            heading_path => chunk.heading_path.clone(),
+            body => chunk.text.clone(),
         ))?;
         Ok(())
     }
@@ -300,13 +323,18 @@ impl LexIndex {
     /// `STRING`-indexed id field).
     pub fn delete(&mut self, chunk_id: &str) -> Result<()> {
         let term = Term::from_field_text(self.chunk_id, chunk_id);
-        self.writer.delete_term(term);
+        self.writer_mut()?.delete_term(term);
         Ok(())
     }
 
     /// Commit pending adds/deletes so they become visible to [`Self::search`].
+    ///
+    /// If no write has happened yet the writer was never created, so there is
+    /// nothing to commit and no lock is acquired.
     pub fn commit(&mut self) -> Result<()> {
-        self.writer.commit()?;
+        if let Some(writer) = self.writer.as_mut() {
+            writer.commit()?;
+        }
         Ok(())
     }
 
@@ -443,5 +471,76 @@ mod tests {
         ix.add(&chunk("r1#0", "машинное обучение и поиск")).unwrap(); // "machine learning and search"
         ix.commit().unwrap();
         assert_eq!(ix.search("обучение", 1).unwrap()[0].0, "r1#0"); // "learning"
+    }
+
+    /// A read-only `open` must not acquire tantivy's writer lock, so a second
+    /// reader can open the same directory (while the first is alive) and
+    /// `search` — no `LockBusy`. Regression test for read verbs failing
+    /// concurrently with (or after) a writer.
+    #[test]
+    fn read_only_open_does_not_lock_writer() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // First: write and commit via one index, then keep it alive.
+        let mut writer_ix = LexIndex::open(dir.path()).unwrap();
+        writer_ix.add(&chunk("d1#0", "shared token quux")).unwrap();
+        writer_ix.commit().unwrap();
+
+        // Second: a fresh read-only open of the same dir must succeed and
+        // search without acquiring the writer lock. `writer_ix` (which now
+        // holds the writer lock) is still alive at this point.
+        let reader_ix = LexIndex::open(dir.path()).unwrap();
+        assert_eq!(reader_ix.search("quux", 1).unwrap()[0].0, "d1#0");
+
+        // A third read-only open alongside both also works — multiple readers
+        // coexist because none of them touch the writer.
+        let reader_ix2 = LexIndex::open(dir.path()).unwrap();
+        assert_eq!(reader_ix2.search("quux", 1).unwrap()[0].0, "d1#0");
+    }
+
+    /// A read-only open + `search` must succeed even when a stale writer lock
+    /// file is present on disk (e.g. left behind by a killed `reindex`). Since
+    /// `open`/`search` never acquire the writer lock, the stale file is
+    /// irrelevant to them. Regression test for the `LockBusy` failure.
+    #[test]
+    fn search_succeeds_with_stale_writer_lock_present() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Seed the index so it exists on disk.
+        {
+            let mut seed = LexIndex::open(dir.path()).unwrap();
+            seed.add(&chunk("d1#0", "lonely token wibble")).unwrap();
+            seed.commit().unwrap();
+        }
+
+        // Simulate a stale writer lock left by a crashed/killed writer.
+        let stale_lock = dir.path().join(".tantivy-writer.lock");
+        std::fs::write(&stale_lock, b"").unwrap();
+        assert!(stale_lock.exists());
+
+        // A read-only open + search must still work: it never touches the
+        // writer, so the stale lock does not cause `LockBusy`.
+        let reader = LexIndex::open(dir.path()).unwrap();
+        assert_eq!(reader.search("wibble", 1).unwrap()[0].0, "d1#0");
+    }
+
+    /// A freshly-opened index that is only ever read must not create the
+    /// writer at all — `search` goes through the writer-free reader path.
+    #[test]
+    fn read_only_open_leaves_writer_uninitialized() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut seed = LexIndex::open(dir.path()).unwrap();
+            seed.add(&chunk("d1#0", "token flurb")).unwrap();
+            seed.commit().unwrap();
+        }
+        let reader = LexIndex::open(dir.path()).unwrap();
+        // Nothing has written, so the lazy writer was never materialized.
+        assert!(
+            reader.writer.is_none(),
+            "read-only open must not create a writer"
+        );
+        assert_eq!(reader.search("flurb", 1).unwrap()[0].0, "d1#0");
+        assert!(reader.writer.is_none(), "search must not create a writer");
     }
 }

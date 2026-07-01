@@ -77,18 +77,27 @@ pub fn run_list(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
 
 fn render_list_text(env: &Envelope<ModelListData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
+    // Marker column is 2 chars wide: `●` for the active model, `⭐` for the
+    // registry default (first entry — see `embed::model_registry`). A model
+    // that is both active and default shows `●` (active wins the slot).
     let mut lines = vec![format!(
-        "{:<3}{:<24}{:<10}{:<6}{:<7}{}",
+        "{:<4}{:<24}{:<10}{:<6}{:<7}{}",
         "", "MODEL", "SIZE", "DIM", "THAI", "NOTE"
     )];
-    for m in &d.models {
-        let marker = if m.current { "*" } else { " " };
+    for (i, m) in d.models.iter().enumerate() {
+        let marker = if m.current {
+            "●"
+        } else if i == 0 {
+            "⭐"
+        } else {
+            ""
+        };
         let thai = m
             .thai_miracl
             .map(|v| format!("{v:.1}"))
             .unwrap_or_else(|| "—".to_string());
         lines.push(format!(
-            "{:<3}{:<24}{:<10}{:<6}{:<7}{}",
+            "{:<4}{:<24}{:<10}{:<6}{:<7}{}",
             marker, m.name, m.approx_size, m.dims, thai, m.note
         ));
     }
@@ -182,10 +191,10 @@ fn apply_model_change(
 fn render_set_text(env: &Envelope<ModelSetData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     if d.already_current {
-        format!("already using {}", d.model)
+        format!("✅ already using {}", d.model)
     } else {
         format!(
-            "switched to {} · {} chunk(s) re-embedded",
+            "✅ switched to {} · 🧠 {} chunk(s) re-embedded",
             d.model,
             d.chunks_reembedded.unwrap_or(0)
         )
@@ -404,8 +413,24 @@ mod tests {
             .find(|l| l.contains("bge-m3"))
             .expect("bge-m3 row present");
         assert!(
-            marked_line.trim_start().starts_with('*'),
+            marked_line.trim_start().starts_with('●'),
             "expected current-model marker on: {marked_line}"
+        );
+    }
+
+    #[test]
+    fn list_text_marks_default_model_when_not_current() {
+        // Current is bge-m3, so the default (first registry entry) is not the
+        // active one — it should carry the ⭐ default marker instead.
+        let s = render_list_text(&list_env("bge-m3"));
+        let default_name = model_registry()[0].name;
+        let default_line = s
+            .lines()
+            .find(|l| l.contains(default_name))
+            .expect("default row present");
+        assert!(
+            default_line.trim_start().starts_with('⭐'),
+            "expected default-model marker on: {default_line}"
         );
     }
 
@@ -429,7 +454,7 @@ mod tests {
                 chunks_reembedded: None,
             },
         );
-        assert_eq!(render_set_text(&env), "already using bge-m3");
+        assert_eq!(render_set_text(&env), "✅ already using bge-m3");
     }
 
     #[test]
