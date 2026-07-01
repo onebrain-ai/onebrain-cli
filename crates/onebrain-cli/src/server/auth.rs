@@ -18,7 +18,7 @@
 
 use axum::{
     extract::{Request, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -56,6 +56,18 @@ pub async fn require_token(
     request: Request,
     next: Next,
 ) -> Response {
+    // `/robots.txt` is the single route served WITHOUT a token (GET/HEAD only).
+    // It's static boilerplate — no vault data, no filesystem access — and the
+    // well-known-file convention is that crawlers fetch it unauthenticated. The
+    // "unauthenticated browser gets nothing of value" property is intact: the SPA
+    // shell, every asset, and every `/api` route still 401. Verb-restricted so it
+    // never widens the CSRF surface the token gate protects.
+    if request.uri().path() == "/robots.txt"
+        && matches!(*request.method(), Method::GET | Method::HEAD)
+    {
+        return robots_txt();
+    }
+
     let outcome = check_token(&state.token, &request);
     // Read before `request` is consumed by `next`: behind a TLS tunnel/proxy the
     // edge sets `X-Forwarded-Proto: https`, and only then is `Secure` correct (a
@@ -84,6 +96,18 @@ pub async fn require_token(
         // machine/SPA boundary, not an interactive browser-prompt login.
         AuthOutcome::Denied => StatusCode::UNAUTHORIZED.into_response(),
     }
+}
+
+/// The private-instance `robots.txt`: tell every crawler to index nothing. Static
+/// boilerplate served without a token (see the exemption in [`require_token`]) —
+/// it carries no vault data and touches no filesystem, so it leaks nothing the
+/// bare `401` didn't already reveal.
+fn robots_txt() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        "User-agent: *\nDisallow: /\n",
+    )
+        .into_response()
 }
 
 /// True when the browser↔edge hop was HTTPS (a TLS tunnel / reverse proxy sets
