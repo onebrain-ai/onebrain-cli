@@ -28,6 +28,9 @@ use crate::vector::VectorStore;
 const CHUNK_META: TableDefinition<&str, &str> = TableDefinition::new("chunk_meta");
 const DOC_CHUNKS: TableDefinition<&str, &str> = TableDefinition::new("doc_chunks");
 const DOC_HASHES: TableDefinition<&str, &str> = TableDefinition::new("doc_hashes");
+const ENGINE_HEADER: TableDefinition<&str, &str> = TableDefinition::new("engine_header");
+
+const ACTIVE_MODEL_KEY: &str = "active_model";
 
 const CHUNK_MAX_TOKENS: usize = 512;
 const CHUNK_OVERLAP_TOKENS: usize = 64;
@@ -181,6 +184,12 @@ impl Engine {
             write_txn.open_table(CHUNK_META)?;
             write_txn.open_table(DOC_CHUNKS)?;
             write_txn.open_table(DOC_HASHES)?;
+            {
+                let mut header = write_txn.open_table(ENGINE_HEADER)?;
+                if header.get(ACTIVE_MODEL_KEY)?.is_none() {
+                    header.insert(ACTIVE_MODEL_KEY, embed_model)?;
+                }
+            }
             write_txn.commit()?;
         }
 
@@ -192,6 +201,91 @@ impl Engine {
             embedder: OnceCell::new(),
             meta,
         })
+    }
+
+    /// Path to the vector store directory, rooted at `cache_dir`.
+    fn vectors_dir(&self) -> PathBuf {
+        self.cache_dir.join("vectors")
+    }
+
+    /// The active embedding model recorded in `engine_header`, if any has
+    /// been recorded yet.
+    fn stored_active_model(&self) -> Result<Option<String>> {
+        let read_txn = self.meta.begin_read()?;
+        let header = read_txn.open_table(ENGINE_HEADER)?;
+        Ok(header.get(ACTIVE_MODEL_KEY)?.map(|v| v.value().to_string()))
+    }
+
+    /// True if the engine's stored active-model matches `cfg_model` (i.e. no
+    /// rebuild needed). When no model has been recorded yet (fresh index —
+    /// shouldn't normally happen since `open` always records one), treat the
+    /// current `self.model_name` as active.
+    pub fn active_model_matches(&self, cfg_model: &str) -> Result<bool> {
+        let active = self
+            .stored_active_model()?
+            .unwrap_or_else(|| self.model_name.clone());
+        Ok(active == cfg_model)
+    }
+
+    /// Switch the embedding model: record the new active model, wipe ONLY
+    /// the vector store (dropping all vectors), and re-embed every existing
+    /// chunk from `chunk_meta` with the new model. The lex/BM25 index and
+    /// `chunk_meta`/`doc_chunks` are model-independent and are NOT touched.
+    /// Returns how many chunks were re-embedded.
+    pub fn rebuild(&mut self, new_model: &str) -> Result<usize> {
+        // 1. Collect every chunk (id, text) from chunk_meta up front, before
+        // wiping anything, so we have the full re-embed worklist.
+        let chunks: Vec<(String, String)> = {
+            let read_txn = self.meta.begin_read()?;
+            let chunk_meta = read_txn.open_table(CHUNK_META)?;
+            let mut out = Vec::new();
+            for entry in chunk_meta.iter()? {
+                let (chunk_id_guard, encoded_guard) = entry?;
+                let chunk_id = chunk_id_guard.value().to_string();
+                let record: ChunkMeta = serde_json::from_str(encoded_guard.value())?;
+                out.push((chunk_id, record.text));
+            }
+            out
+        };
+
+        // 2. Delete the old vector store directory so it can be recreated
+        // fresh at the new model's dims (VectorStore::open errors on a dims
+        // mismatch against what's on disk).
+        let vectors_dir = self.vectors_dir();
+        match std::fs::remove_dir_all(&vectors_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("removing vector store dir {}", vectors_dir.display())
+                })
+            }
+        }
+
+        // 3. Swap in the new model: update model_name, reset the lazy
+        // embedder so the next embed() call builds one for the new model,
+        // and reopen the vector store at the new dims.
+        self.model_name = new_model.to_string();
+        self.embedder = OnceCell::new();
+        let new_dims = embed::model_dims(new_model);
+        self.vec = VectorStore::open(&vectors_dir, new_dims)?;
+
+        // 4. Re-embed each chunk's text with the new embedder and add it to
+        // the fresh vector store.
+        for (chunk_id, text) in &chunks {
+            let vectors = self.embedder()?.embed(std::slice::from_ref(text))?;
+            self.vec.add(chunk_id, &vectors[0])?;
+        }
+
+        // 5. Record the new active model.
+        let write_txn = self.meta.begin_write()?;
+        {
+            let mut header = write_txn.open_table(ENGINE_HEADER)?;
+            header.insert(ACTIVE_MODEL_KEY, new_model)?;
+        }
+        write_txn.commit()?;
+
+        Ok(chunks.len())
     }
 
     /// Lazily construct (on first call) and return the embedder. This is
@@ -606,6 +700,43 @@ mod tests {
                        // cross-doc multilingual semantics.
         let hits = e.query("下雨天气", 3).unwrap();
         assert_eq!(hits[0].doc_path, "zh.md");
+    }
+
+    #[test]
+    fn active_model_matches_detects_change() {
+        // No network needed: `open` never downloads a model, it only
+        // records the requested model name in engine_header.
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::open(dir.path(), "multilingual-e5-small").unwrap();
+        assert!(e.active_model_matches("multilingual-e5-small").unwrap());
+        assert!(!e.active_model_matches("bge-m3").unwrap());
+    }
+
+    #[test]
+    fn rebuild_reembeds_all() {
+        if std::env::var("ONEBRAIN_TEST_EMBED").is_err() {
+            return; // gated: downloads models (e5-small + e5-base)
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), "multilingual-e5-small").unwrap();
+        e.index_doc("rust.md", "# Rust\nerror handling and memory safety")
+            .unwrap();
+        e.index_doc("cook.md", "# Cooking\npasta recipe with tomato")
+            .unwrap();
+
+        assert!(e.active_model_matches("multilingual-e5-small").unwrap());
+
+        // Real dims change: e5-small is 384, e5-base is 768.
+        let reembedded = e.rebuild("multilingual-e5-base").unwrap();
+        assert_eq!(reembedded, 2);
+
+        assert!(e.active_model_matches("multilingual-e5-base").unwrap());
+        assert!(!e.active_model_matches("multilingual-e5-small").unwrap());
+
+        // Vector store was rebuilt at the new dims and re-embedded: a query
+        // still returns hits.
+        let hits = e.query("memory safety", 3).unwrap();
+        assert!(!hits.is_empty());
     }
 
     #[test]
