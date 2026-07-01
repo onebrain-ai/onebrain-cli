@@ -38,5 +38,6 @@ ADRs are immutable once accepted — if a decision changes, write a new ADR that
 | [0008](0008-self-update-hardening.md) | Self-update hardening: SHA-256 + Homebrew-aware | accepted |
 | [0009](0009-raspberry-pi-arm-matrix.md) | Full Raspberry Pi / ARM matrix (ARMv6-first) | accepted |
 | [0010](0010-npm-supply-chain.md) | npm supply chain: Trusted Publishers + checksum postinstall | accepted |
+| [0011](0011-release-opt-level.md) | Release build stays `opt-level = "z"` (size over speed) | accepted |
 
 > These ADRs distill the public-facing rationale; the full design notes live in the project tracker. Numbers are stable IDs assigned at authoring time — see each ADR's **Date** for chronology.

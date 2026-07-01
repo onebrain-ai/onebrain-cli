@@ -144,7 +144,10 @@ mockito           = "1"
 # `opt-level = "z"` + `lto = "fat"` for the v3.2.x final cut. Trims ~20–30%
 # off the release binary (~5.4 MB → ~3.8–4.3 MB). The CLI's hot paths are
 # I/O-bound (HTTP fetches, file IO, regex scans on note-search), so size-
-# optimised codegen carries no measurable runtime hit for sub-second runs.
+# optimised codegen carries only a negligible runtime hit — benchmarked at up
+# to ~21% on the scan/search commands, i.e. 1–3 ms absolute, imperceptible for
+# interactive use, vs a +46–55% binary for `opt-level = 2`/`3`. See the data +
+# "when to revisit" in docs/decisions/0011-release-opt-level.md before changing.
 opt-level   = "z"
 strip       = "symbols"
 lto         = "fat"
