@@ -52,6 +52,50 @@ pub fn has_embedded_ui() -> bool {
     WebAssets::get("index.html").is_some()
 }
 
+/// The version of the bundled web UI, read from the embedded `version.json`
+/// (emitted by the onebrain-webui build). `None` when no UI is bundled, or the
+/// marker is absent/malformed (a pre-`version.json` dist) — `serve` then just
+/// omits the version line rather than guessing.
+pub fn webui_version() -> Option<String> {
+    parse_webui_version(&WebAssets::get("version.json")?.data)
+}
+
+/// Extract the `version` field from a `version.json` body. Split out from
+/// [`webui_version`] so it's unit-testable without an embedded asset and
+/// reusable for a `--dir` dist read.
+pub fn parse_webui_version(bytes: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Marker {
+        version: String,
+    }
+    serde_json::from_slice::<Marker>(bytes)
+        .ok()
+        .map(|m| m.version)
+        .filter(|v| !v.is_empty()) // an empty version would render a bare "v"
+}
+
+/// The release date of the bundled web UI, from the embedded `changelog.json`'s
+/// top-level `released` field (onebrain-webui ≥ 0.1.1 emits it next to the same
+/// build's `version.json`). `None` when absent/malformed — `serve` then shows
+/// the version without a date.
+pub fn webui_released() -> Option<String> {
+    parse_webui_released(&WebAssets::get("changelog.json")?.data)
+}
+
+/// Extract the top-level `released` date from a `changelog.json` body. Split out
+/// from [`webui_released`] so it's unit-testable without an embedded asset and
+/// reusable for a `--dir` dist read.
+pub fn parse_webui_released(bytes: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Changelog {
+        released: Option<String>,
+    }
+    serde_json::from_slice::<Changelog>(bytes)
+        .ok()
+        .and_then(|c| c.released)
+        .filter(|d| !d.is_empty())
+}
+
 /// The catch-all static handler, wired into the router via `Router::fallback`
 /// so it answers every non-`/api` route. We can't hand a bare `ServeDir` to
 /// `fallback` because we need to intercept `index.html` for token injection;
@@ -217,6 +261,64 @@ mod tests {
         let out = inject_token(html, "f00d");
         assert!(out.starts_with("<script>window.__ONEBRAIN_TOKEN__=\"f00d\""));
         assert!(out.contains("just a fragment"));
+    }
+
+    #[test]
+    fn parse_webui_version_reads_the_version_field() {
+        assert_eq!(
+            parse_webui_version(br#"{"version":"0.1.1"}"#).as_deref(),
+            Some("0.1.1")
+        );
+        // The build emits a trailing newline — serde_json tolerates it.
+        assert_eq!(
+            parse_webui_version(b"{\"version\":\"1.2.3\"}\n").as_deref(),
+            Some("1.2.3")
+        );
+        // Extra fields are ignored.
+        assert_eq!(
+            parse_webui_version(br#"{"version":"9.9.9","built":"today"}"#).as_deref(),
+            Some("9.9.9")
+        );
+    }
+
+    #[test]
+    fn parse_webui_version_rejects_malformed_or_missing() {
+        assert_eq!(parse_webui_version(b""), None); // empty body
+        assert_eq!(parse_webui_version(b"not json"), None); // not JSON
+        assert_eq!(parse_webui_version(br#"{"other":"x"}"#), None); // no `version`
+        assert_eq!(parse_webui_version(br#"{"version":123}"#), None); // wrong type
+        assert_eq!(parse_webui_version(br#"{"version":""}"#), None); // empty string
+    }
+
+    #[test]
+    fn parse_webui_released_reads_the_date() {
+        assert_eq!(
+            parse_webui_released(br#"{"latest":"0.1.1","released":"2026-07-01","entries":[]}"#)
+                .as_deref(),
+            Some("2026-07-01")
+        );
+    }
+
+    #[test]
+    fn parse_webui_released_rejects_missing_or_malformed() {
+        assert_eq!(parse_webui_released(b""), None); // empty body
+        assert_eq!(parse_webui_released(b"not json"), None); // not JSON
+        assert_eq!(parse_webui_released(br#"{"latest":"0.1.1"}"#), None); // no `released`
+        assert_eq!(parse_webui_released(br#"{"released":null}"#), None); // explicit null
+        assert_eq!(parse_webui_released(br#"{"released":""}"#), None); // empty string
+        assert_eq!(parse_webui_released(br#"{"released":123}"#), None); // wrong type
+    }
+
+    #[test]
+    fn webui_version_absent_when_no_ui_embedded() {
+        // A fresh checkout embeds only `.gitkeep` (the CI test/coverage build),
+        // so no `version.json` is present and the accessor reports None. Guarded
+        // by `has_embedded_ui` so a locally dist-embedded build — where a real
+        // `version.json` IS bundled — still passes.
+        if !has_embedded_ui() {
+            assert_eq!(webui_version(), None);
+            assert_eq!(webui_released(), None);
+        }
     }
 
     #[tokio::test]

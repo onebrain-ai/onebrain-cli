@@ -25,6 +25,15 @@ use std::net::{IpAddr, Ipv4Addr};
 /// collided with. The daemon uses the same default (one surface, one port).
 pub const DEFAULT_PORT: u16 = 6789;
 
+/// Format the web UI label for the serve banner: `OneBrain Web UI v0.1.1
+/// (2026-07-01)`, or without the ` (date)` when the release date isn't known.
+fn ui_label(version: &str, released: Option<&str>) -> String {
+    match released {
+        Some(date) => format!("OneBrain Web UI v{version} ({date})"),
+        None => format!("OneBrain Web UI v{version}"),
+    }
+}
+
 /// Run the foreground serve command. `mode` is currently unused for output
 /// shaping (serve streams `tracing` lines, not an envelope) but is accepted for
 /// signature parity with the other command handlers and future `--json`
@@ -60,16 +69,42 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
     // Jupyter-style URL — the token rides in the query string so a copy-paste
     // (or the `--open` browser launch) authenticates the SPA on first load.
     // Printed to stdout (not just the tracing log) so the user sees it
-    // immediately in the foreground console.
+    // immediately in the foreground console. The framed, emoji-prefixed banner
+    // mirrors OneBrain's session-greeting look (a `────` rule + fields).
     let url = format!("http://{host}:{port}/?token={token}");
-    println!("OneBrain serving on {url}");
-    println!("  vault: {}", resolved.root.as_path().display());
-    match &cfg.dist_dir {
-        Some(d) => println!("  dist:  {}", d.display()),
-        None if server::has_embedded_ui() => println!("  dist:  (embedded web UI)"),
-        None => println!("  dist:  (none — API only, placeholder page)"),
-    }
-    println!("  press Ctrl-C to stop");
+    // The 🎨 line reports the web UI source and, when the dist exposes a
+    // `version.json` (onebrain-webui ≥ 0.1.1), the live UI version + release date
+    // inline as `OneBrain Web UI vX.Y.Z (YYYY-MM-DD)` — read from the `--dir`
+    // dist on disk, else the embedded assets. The date comes from the sibling
+    // `changelog.json`; an absent marker degrades gracefully (version without
+    // date, or the plain source description).
+    let ui_line = match &cfg.dist_dir {
+        Some(d) => match std::fs::read(d.join("version.json"))
+            .ok()
+            .and_then(|bytes| server::parse_webui_version(&bytes))
+        {
+            Some(v) => {
+                let released = std::fs::read(d.join("changelog.json"))
+                    .ok()
+                    .and_then(|bytes| server::parse_webui_released(&bytes));
+                format!("{} — {}", d.display(), ui_label(&v, released.as_deref()))
+            }
+            None => d.display().to_string(),
+        },
+        None if server::has_embedded_ui() => match server::webui_version() {
+            Some(v) => ui_label(&v, server::webui_released().as_deref()),
+            None => "embedded web UI".to_string(),
+        },
+        None => "no UI — API only (placeholder page)".to_string(),
+    };
+    let rule = "────────────────────────────────────────";
+    println!("{rule}");
+    println!("  🧠  OneBrain  ·  serving");
+    println!("{rule}");
+    println!("  🔗  {url}");
+    println!("  📂  {}", resolved.root.as_path().display());
+    println!("  🎨  {ui_line}");
+    println!("  ⏹️   Ctrl-C to stop");
 
     // Binding beyond loopback exposes the daemon on the network over PLAIN HTTP
     // — the token + vault content would travel unencrypted. Warn loudly and
