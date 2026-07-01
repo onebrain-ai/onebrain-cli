@@ -1,5 +1,5 @@
 ---
-latest_version: 3.3.22
+latest_version: 3.3.23
 released: 2026-07-01
 ---
 
@@ -9,6 +9,12 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.23] — 2026-07-01 — gzip-precompress the embedded web UI
+
+- **Precompressed web UI assets.** The embedded UI's hashed `assets/` are gzipped at build time (`scripts/gzip-embed-assets.sh`, wired into the release workflow); `serve` detects the gzip magic and hands them back with `Content-Encoding: gzip` (the browser inflates). Release binary **~16.2 MB → ~9.3 MB (−43%, ~6.9 MB)** — smaller downloads (npm/brew) + disk.
+- **Zero new dependencies, cross-compiles cleanly.** Uses pure-Rust `flate2` (miniz_oxide — already linked via onebrain-fs) only as a fallback for the rare client without `Accept-Encoding: gzip`; browsers get the bytes gzipped over the wire (smaller transfer, no server-side work). No C library, so it builds on every release target unchanged.
+- **No effect on non-`serve` commands** (they never touch the embed) and non-`assets/` files (`index.html`, `version.json`, `changelog.json`) stay raw. Detection is by gzip magic bytes, so serving is correct whether or not a given build gzipped the assets.
 
 ## [3.3.22] — 2026-07-01 — serve banner + embedded web UI version
 

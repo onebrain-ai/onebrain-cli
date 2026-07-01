@@ -41,7 +41,17 @@ async-stream       = { workspace = true }
 futures-core       = { workspace = true }
 # v3.3.10 — embed the built web UI into the binary so `onebrain serve` ships a
 # standalone UI (dist built by CI / scripts, NOT committed; see .gitignore).
+# The `assets/` files are gzip-precompressed at build time (see the release
+# workflow); `serve` detects the gzip magic bytes and returns them with
+# `Content-Encoding: gzip` (the browser inflates), so the embed stays small
+# WITHOUT any runtime-compression dependency — no rust-embed `compression`, which
+# transitively drags an unused zstd C lib and hurts clean cross-compilation.
+# Non-`assets/` files (index.html, version.json, changelog.json) stay raw.
 rust-embed         = { version = "8", features = ["mime-guess"] }
+# Pure-Rust gzip (miniz_oxide, no C) — inflate a precompressed embedded asset for
+# the rare client that doesn't send `Accept-Encoding: gzip`. Already linked via
+# onebrain-fs, so this adds no new crate.
+flate2             = { workspace = true }
 # Hex-encode the random session token (read from /dev/urandom on unix). `urlencoding`
 # is already a dep for vault-sync; it does NOT do hex, so we hand-roll a 1-liner
 # instead of pulling `hex`/`getrandom`/`rand` (see server::token).
@@ -58,7 +68,6 @@ assert_cmd        = { workspace = true }
 predicates        = { workspace = true }
 insta             = { workspace = true }
 pretty_assertions = { workspace = true }
-flate2            = { workspace = true }
 tar               = { workspace = true }
 mockito           = { workspace = true }
 # Server handler tests drive the axum `Router` directly via `ServiceExt::oneshot`
