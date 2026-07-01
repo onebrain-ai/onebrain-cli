@@ -13,6 +13,21 @@ use std::sync::Mutex;
 use anyhow::{bail, Result};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
+/// An embedding backend: turns a batch of texts into one L2-normalized
+/// vector each. [`Embedder`] is the real `fastembed`-backed implementation;
+/// tests inject a deterministic in-memory fake behind this trait so the
+/// engine's index/query/rebuild logic can be exercised without a multi-GB
+/// model download (see `Engine::open_with_embedder`).
+pub trait Embed {
+    /// Embed a batch of texts, returning one vector per input text in the
+    /// same order. Implementations must return L2-normalized vectors of
+    /// length [`Embed::dims`].
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+    /// Embedding vector dimensionality (the vector store is opened at this
+    /// width).
+    fn dims(&self) -> usize;
+}
+
 /// Wraps a loaded `fastembed` text embedding model.
 pub struct Embedder {
     model: Mutex<TextEmbedding>,
@@ -174,6 +189,16 @@ impl Embedder {
             l2_normalize(v);
         }
         Ok(vectors)
+    }
+}
+
+impl Embed for Embedder {
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        Embedder::embed(self, texts)
+    }
+
+    fn dims(&self) -> usize {
+        self.dims
     }
 }
 

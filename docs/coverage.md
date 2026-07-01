@@ -44,8 +44,11 @@ the exclusion is an explicit decision, not a silent skip.
 | `crates/onebrain-cli/src/commands/update.rs` | GitHub releases API + binary self-replace (network) |
 | `crates/onebrain-cli/src/commands/qmd_reindex.rs` | Shells out to the `qmd` binary |
 | `crates/onebrain-cli/src/commands/harness_run.rs` | Spawns `claude` / `gemini` |
+| `crates/onebrain-cli/src/commands/search_query.rs` | Embedding-backed query verb — opens the real engine (model download); non-embedding paths tested, embed path validated by gated tests |
+| `crates/onebrain-cli/src/commands/search_reindex.rs` | Embedding-backed reindex verb — model download in the CLI binary path |
 | `crates/onebrain-cli/src/server/chat.rs` | SSE streaming proxy to a live AI subprocess |
 | `crates/onebrain-cli/src/server/search.rs` | Live qmd-backed search path |
+| `crates/onebrain-search/src/embed.rs` | fastembed model download + ONNX inference (multi-GB model, network) — logic exercised via the `Embed` trait + `FakeEmbedder`; real path validated by embed-gated tests |
 | `crates/onebrain-fs/src/update/install.rs` | npm/bun/brew install subprocess + network |
 | `crates/onebrain-fs/src/init/wizard.rs` | Interactive TTY prompts |
 | `crates/onebrain-fs/src/vault_sync/progress.rs` | Terminal progress-bar rendering |

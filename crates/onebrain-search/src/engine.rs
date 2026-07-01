@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::chunk::chunk_markdown;
-use crate::embed::{self, Embedder};
+use crate::embed::{self, Embed};
 use crate::hybrid::rrf_fuse;
 use crate::lex::LexIndex;
 use crate::vector::VectorStore;
@@ -140,20 +140,41 @@ struct ChunkMeta {
     text: String,
 }
 
+/// How an [`Engine`] obtains its embedder. Production opens via
+/// [`Engine::open`] and gets [`EmbedSource::Lazy`], which defers the
+/// (multi-GB, network) `fastembed` model download until the first
+/// `index_doc`/`query`/`vector_search`/`rebuild` that actually needs it —
+/// so lex-only search, `status`, and `get` never pay for a download. Tests
+/// open via [`Engine::open_with_embedder`] and get [`EmbedSource::Injected`],
+/// a pre-built (typically fake) embedder with no download at all.
+enum EmbedSource {
+    /// Real embedder, constructed lazily from `model_name` + `cache_dir` on
+    /// first use (see [`Engine::embedder`]).
+    Lazy(OnceCell<Box<dyn Embed>>),
+    /// Pre-built embedder, used directly with no lazy construction. Only
+    /// constructed by the test-only [`Engine::open_with_embedder`] /
+    /// [`Engine::rebuild_with_embedder`] seams, so it reads as dead code in a
+    /// non-test build even though `embedder()`/`rebuild_inner` handle it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Injected(Box<dyn Embed>),
+}
+
 /// The assembled search engine: lexical index, vector store, embedder, and
 /// a `redb` metadata database, all rooted at one `cache_dir`.
 ///
-/// The embedder is created lazily (on first call to [`Engine::embedder`]),
-/// not in [`Engine::open`] — `fastembed` downloads the model file on first
-/// construction, so eager construction would make every command (including
-/// lex-only search, `status`, and `get`) pay for a model download. Only
-/// `index_doc` and `query` actually need the embedder.
+/// The embedder is obtained via [`EmbedSource`]: production ([`Engine::open`])
+/// constructs the real `fastembed` embedder lazily on first use — `fastembed`
+/// downloads the model file on first construction, so eager construction
+/// would make every command (including lex-only search, `status`, and `get`)
+/// pay for a model download. Only `index_doc`, `query`, `vector_search`, and
+/// `rebuild` actually need the embedder. Tests inject a fake via
+/// [`Engine::open_with_embedder`].
 pub struct Engine {
     lex: LexIndex,
     vec: VectorStore,
     model_name: String,
     cache_dir: PathBuf,
-    embedder: OnceCell<Embedder>,
+    embedder: EmbedSource,
     meta: Database,
 }
 
@@ -170,14 +191,59 @@ fn truncate_snippet(text: &str, max_chars: usize) -> String {
 
 impl Engine {
     /// Open/create an engine rooted at `cache_dir`. `embed_model` selects
-    /// the embedding model (dims resolved via [`embed::model_dims`]).
+    /// the embedding model (dims resolved via [`embed::model_dims`]). The
+    /// real embedder is constructed lazily on first use — `open` itself never
+    /// downloads a model.
     pub fn open(cache_dir: &Path, embed_model: &str) -> Result<Self> {
+        let dims = embed::model_dims(embed_model);
+        Self::open_inner(
+            cache_dir,
+            embed_model,
+            dims,
+            EmbedSource::Lazy(OnceCell::new()),
+        )
+    }
+
+    /// Open/create an engine rooted at `cache_dir` with a caller-supplied
+    /// embedder, used directly (no lazy download). The vector store is opened
+    /// at `embedder.dims()`, and the recorded active-model name is
+    /// `embed_model`.
+    ///
+    /// This is the crate-visible test seam: it lets tests exercise the full
+    /// index/query/rebuild logic against a deterministic in-memory embedder
+    /// without pulling a multi-GB model over the network. Production always
+    /// uses [`Engine::open`] (lazy real embedder).
+    #[cfg(test)]
+    pub(crate) fn open_with_embedder(
+        cache_dir: &Path,
+        embed_model: &str,
+        embedder: Box<dyn Embed>,
+    ) -> Result<Self> {
+        let dims = embedder.dims();
+        Self::open_inner(
+            cache_dir,
+            embed_model,
+            dims,
+            EmbedSource::Injected(embedder),
+        )
+    }
+
+    /// Shared open/create path for both [`Engine::open`] and
+    /// [`Engine::open_with_embedder`]: create the cache dir, open the lex
+    /// index, open the vector store at `dims`, and open/seed the redb
+    /// metadata database (recording `embed_model` as the active model if
+    /// none is recorded yet).
+    fn open_inner(
+        cache_dir: &Path,
+        embed_model: &str,
+        dims: usize,
+        embedder: EmbedSource,
+    ) -> Result<Self> {
         std::fs::create_dir_all(cache_dir)
             .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
 
         let lex = LexIndex::open(&cache_dir.join("tantivy"))?;
 
-        let dims = embed::model_dims(embed_model);
         let vec = VectorStore::open(&cache_dir.join("vectors"), dims)?;
 
         let meta_path = cache_dir.join("engine.redb");
@@ -202,7 +268,7 @@ impl Engine {
             vec,
             model_name: embed_model.to_string(),
             cache_dir: cache_dir.to_path_buf(),
-            embedder: OnceCell::new(),
+            embedder,
             meta,
         })
     }
@@ -236,7 +302,40 @@ impl Engine {
     /// chunk from `chunk_meta` with the new model. The lex/BM25 index and
     /// `chunk_meta`/`doc_chunks` are model-independent and are NOT touched.
     /// Returns how many chunks were re-embedded.
+    ///
+    /// The new vector store is opened at the new model's dims (resolved via
+    /// [`embed::model_dims`]) and the embedder is reset to a fresh lazy one,
+    /// so the real model download happens on the first re-embed here — the
+    /// production behavior is unchanged from before the [`Embed`]-trait
+    /// refactor.
     pub fn rebuild(&mut self, new_model: &str) -> Result<usize> {
+        let new_dims = embed::model_dims(new_model);
+        self.rebuild_inner(new_model, new_dims, EmbedSource::Lazy(OnceCell::new()))
+    }
+
+    /// Like [`Engine::rebuild`] but with a caller-supplied embedder used
+    /// directly at its own `dims()` (no lazy download). Crate-visible test
+    /// seam mirroring [`Engine::open_with_embedder`].
+    #[cfg(test)]
+    pub(crate) fn rebuild_with_embedder(
+        &mut self,
+        new_model: &str,
+        embedder: Box<dyn Embed>,
+    ) -> Result<usize> {
+        let new_dims = embedder.dims();
+        self.rebuild_inner(new_model, new_dims, EmbedSource::Injected(embedder))
+    }
+
+    /// Shared rebuild path: collect the re-embed worklist, wipe the vector
+    /// store, swap in `new_source` + `new_dims`, re-embed, and record
+    /// `new_model` as active. `new_dims` must match `new_source`'s embedding
+    /// width.
+    fn rebuild_inner(
+        &mut self,
+        new_model: &str,
+        new_dims: usize,
+        new_source: EmbedSource,
+    ) -> Result<usize> {
         // 1. Collect every chunk (id, text) from chunk_meta up front, before
         // wiping anything, so we have the full re-embed worklist.
         let chunks: Vec<(String, String)> = {
@@ -266,12 +365,11 @@ impl Engine {
             }
         }
 
-        // 3. Swap in the new model: update model_name, reset the lazy
-        // embedder so the next embed() call builds one for the new model,
-        // and reopen the vector store at the new dims.
+        // 3. Swap in the new model: update model_name, install the new
+        // embedder source (a fresh lazy embedder in production, or an injected
+        // one in tests), and reopen the vector store at the new dims.
         self.model_name = new_model.to_string();
-        self.embedder = OnceCell::new();
-        let new_dims = embed::model_dims(new_model);
+        self.embedder = new_source;
         self.vec = VectorStore::open(&vectors_dir, new_dims)?;
 
         // 4. Batch-embed every chunk's text with the new embedder in ONE
@@ -297,23 +395,31 @@ impl Engine {
         Ok(chunks.len())
     }
 
-    /// Lazily construct (on first call) and return the embedder. This is
-    /// the ONLY place `embed::new` is called — the first call to `index_doc`
-    /// or `query` (or `vector_search`) is when a model download actually
-    /// happens, not `Engine::open`.
+    /// Return the embedder, constructing the real one lazily on first use
+    /// for [`EmbedSource::Lazy`] (production) or handing back the injected
+    /// one for [`EmbedSource::Injected`] (tests).
+    ///
+    /// For the lazy case this is the ONLY place `embed::new` is called — the
+    /// first call to `index_doc`/`query`/`vector_search`/`rebuild` is when a
+    /// model download actually happens, not `Engine::open`.
     ///
     /// `std::cell::OnceCell::get_or_try_init` is nightly-only
     /// (`once_cell_try`, #109737), so init is spelled out manually: check
     /// `get()`, and on miss build the embedder and `set()` it (the `Ok(())`
     /// from `set` is discarded — another thread can't have raced us since
     /// `Engine` isn't `Sync`/shared across threads here).
-    fn embedder(&self) -> Result<&Embedder> {
-        if let Some(e) = self.embedder.get() {
-            return Ok(e);
+    fn embedder(&self) -> Result<&dyn Embed> {
+        match &self.embedder {
+            EmbedSource::Injected(e) => Ok(e.as_ref()),
+            EmbedSource::Lazy(cell) => {
+                if let Some(e) = cell.get() {
+                    return Ok(e.as_ref());
+                }
+                let e: Box<dyn Embed> = Box::new(embed::new(&self.model_name, &self.cache_dir)?);
+                let _ = cell.set(e);
+                Ok(cell.get().expect("embedder was just set above").as_ref())
+            }
         }
-        let e = embed::new(&self.model_name, &self.cache_dir)?;
-        let _ = self.embedder.set(e);
-        Ok(self.embedder.get().expect("embedder was just set above"))
     }
 
     /// Chunk `content`, index into lex + embed + vector, and record chunk
@@ -610,6 +716,272 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embed::Embed;
+
+    /// A deterministic in-memory embedder for tests. No network, no model
+    /// download — it hashes each whitespace-separated token into one of
+    /// `dims` buckets, accumulates a count per bucket, then L2-normalizes.
+    ///
+    /// Properties the engine tests rely on:
+    /// - identical input text → identical vector (deterministic);
+    /// - distinct texts get distinguishable vectors (different token sets map
+    ///   to different bucket distributions);
+    /// - a chunk's exact text embeds to the same vector it was indexed with,
+    ///   so cosine similarity is 1.0 and that chunk is the top vector hit for
+    ///   a query using its text.
+    struct FakeEmbedder {
+        dims: usize,
+    }
+
+    impl FakeEmbedder {
+        fn embed_one(&self, text: &str) -> Vec<f32> {
+            let mut v = vec![0.0f32; self.dims];
+            for token in text.split_whitespace() {
+                // Simple, stable FNV-1a-ish hash over the token's bytes.
+                let mut h: u64 = 1469598103934665603;
+                for b in token.bytes() {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(1099511628211);
+                }
+                let bucket = (h % self.dims as u64) as usize;
+                v[bucket] += 1.0;
+            }
+            // L2-normalize (leave an all-zero vector — e.g. empty text — as-is
+            // to avoid dividing by zero).
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for x in v.iter_mut() {
+                    *x /= norm;
+                }
+            }
+            v
+        }
+    }
+
+    impl Embed for FakeEmbedder {
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|t| self.embed_one(t)).collect())
+        }
+
+        fn dims(&self) -> usize {
+            self.dims
+        }
+    }
+
+    fn fake_engine(dir: &Path) -> Engine {
+        Engine::open_with_embedder(dir, "fake-model", Box::new(FakeEmbedder { dims: 16 })).unwrap()
+    }
+
+    #[test]
+    fn fake_embedder_is_deterministic_and_distinguishes_texts() {
+        let f = FakeEmbedder { dims: 16 };
+        let a1 = f.embed(&["memory safety".to_string()]).unwrap();
+        let a2 = f.embed(&["memory safety".to_string()]).unwrap();
+        assert_eq!(a1, a2, "same text must embed identically");
+
+        let b = f.embed(&["pasta recipe".to_string()]).unwrap();
+        assert_ne!(a1[0], b[0], "distinct texts must embed differently");
+
+        // L2-normalized.
+        let norm: f32 = a1[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn fake_index_doc_then_query_returns_expected_top_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        e.index_doc("rust.md", "# Rust\nerror handling and memory safety")
+            .unwrap();
+        e.index_doc("cook.md", "# Cooking\npasta recipe with tomato")
+            .unwrap();
+
+        // Query with text drawn from the rust doc; it should top the fused
+        // hybrid ranking (both lex and vector favour it).
+        let hits = e.query("memory safety", 3).unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].doc_path, "rust.md");
+    }
+
+    #[test]
+    fn fake_vector_search_ranks_matching_doc_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        e.index_doc("rust.md", "error handling and memory safety")
+            .unwrap();
+        e.index_doc("cook.md", "pasta recipe with tomato").unwrap();
+
+        // Vector-only path: querying with a chunk's exact text yields a
+        // cosine of 1.0 for that chunk, so it must rank first.
+        let hits = e
+            .vector_search("error handling and memory safety", 2)
+            .unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].doc_path, "rust.md");
+        // Exact-text match → cosine ~1.0.
+        assert!(hits[0].score > 0.99, "score was {}", hits[0].score);
+    }
+
+    #[test]
+    fn fake_remove_doc_excludes_it_from_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        e.index_doc("rust.md", "error handling and memory safety")
+            .unwrap();
+        e.index_doc("cook.md", "pasta recipe with tomato").unwrap();
+        assert!(e.get("rust.md").is_ok());
+
+        e.remove_doc("rust.md").unwrap();
+        assert!(e.get("rust.md").is_err(), "get must fail after removal");
+
+        let hits = e.query("memory safety", 5).unwrap();
+        assert!(
+            hits.iter().all(|h| h.doc_path != "rust.md"),
+            "removed doc must not appear in results"
+        );
+    }
+
+    #[test]
+    fn fake_get_concatenates_chunks_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        e.index_doc("a.md", "# Heading\nalpha beta gamma").unwrap();
+        let text = e.get("a.md").unwrap();
+        assert!(text.contains("alpha beta gamma"));
+    }
+
+    #[test]
+    fn fake_reindex_detects_add_update_unchanged_remove() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        let doc_path = vault_dir.path().join("a.md");
+        std::fs::write(&doc_path, "# A\noriginal content").unwrap();
+
+        // Added.
+        let stats = e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(
+            stats,
+            ReindexStats {
+                added: 1,
+                updated: 0,
+                removed: 0,
+                unchanged: 0,
+                failed: 0,
+            }
+        );
+
+        // Unchanged (no edit).
+        let stats = e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(
+            stats,
+            ReindexStats {
+                added: 0,
+                updated: 0,
+                removed: 0,
+                unchanged: 1,
+                failed: 0,
+            }
+        );
+
+        // Updated (bytes differ).
+        std::fs::write(&doc_path, "# A\nedited content, different bytes").unwrap();
+        let stats = e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(
+            stats,
+            ReindexStats {
+                added: 0,
+                updated: 1,
+                removed: 0,
+                unchanged: 0,
+                failed: 0,
+            }
+        );
+        assert!(e.get("a.md").is_ok());
+
+        // Removed (file deleted).
+        std::fs::remove_file(&doc_path).unwrap();
+        let stats = e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(
+            stats,
+            ReindexStats {
+                added: 0,
+                updated: 0,
+                removed: 1,
+                unchanged: 0,
+                failed: 0,
+            }
+        );
+        assert!(e.get("a.md").is_err());
+    }
+
+    #[test]
+    fn fake_reindex_paths_targets_specific_docs() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        let a = vault_dir.path().join("a.md");
+        std::fs::write(&a, "# A\nalpha content").unwrap();
+
+        // Add via targeted path.
+        let stats = e
+            .reindex_paths(vault_dir.path(), &["a.md".to_string()])
+            .unwrap();
+        assert_eq!(stats.added, 1);
+        assert!(e.get("a.md").is_ok());
+
+        // A path that is neither on disk nor indexed is ignored (no-op).
+        let stats = e
+            .reindex_paths(vault_dir.path(), &["ghost.md".to_string()])
+            .unwrap();
+        assert_eq!(stats, ReindexStats::default());
+
+        // Delete on disk, then a targeted reindex removes it.
+        std::fs::remove_file(&a).unwrap();
+        let stats = e
+            .reindex_paths(vault_dir.path(), &["a.md".to_string()])
+            .unwrap();
+        assert_eq!(stats.removed, 1);
+        assert!(e.get("a.md").is_err());
+    }
+
+    #[test]
+    fn fake_rebuild_to_different_dims_reembeds_and_query_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path()); // dims 16
+        e.index_doc("rust.md", "error handling and memory safety")
+            .unwrap();
+        e.index_doc("cook.md", "pasta recipe with tomato").unwrap();
+        assert!(e.active_model_matches("fake-model").unwrap());
+
+        // Rebuild to a different-dims fake embedder: vector store is dropped
+        // and re-created at 32 dims, every chunk re-embedded.
+        let reembedded = e
+            .rebuild_with_embedder("fake-model-2", Box::new(FakeEmbedder { dims: 32 }))
+            .unwrap();
+        assert_eq!(reembedded, 2);
+        assert!(e.active_model_matches("fake-model-2").unwrap());
+        assert!(!e.active_model_matches("fake-model").unwrap());
+
+        // Query still works against the re-embedded (32-dim) store.
+        let hits = e.query("memory safety", 3).unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].doc_path, "rust.md");
+    }
+
+    #[test]
+    fn fake_rebuild_empty_index_reembeds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        // No docs indexed → rebuild re-embeds 0 chunks.
+        let reembedded = e
+            .rebuild_with_embedder("fake-model-2", Box::new(FakeEmbedder { dims: 8 }))
+            .unwrap();
+        assert_eq!(reembedded, 0);
+        assert!(e.active_model_matches("fake-model-2").unwrap());
+    }
 
     #[test]
     fn index_then_query_roundtrip() {
