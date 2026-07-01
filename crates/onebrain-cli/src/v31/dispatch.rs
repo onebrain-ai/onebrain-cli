@@ -486,10 +486,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 commands::search_reindex::run(vault_flag.clone(), &mode, &args)
             }
             SearchVerb::Model(SearchModelCmd { verb }) => match verb {
-                SearchModelVerb::List => {
+                None => commands::search_model::run_bare(vault_flag.clone(), &mode),
+                Some(SearchModelVerb::List) => {
                     commands::search_model::run_list(vault_flag.clone(), &mode)
                 }
-                SearchModelVerb::Set(args) => {
+                Some(SearchModelVerb::Set(args)) => {
                     commands::search_model::run_set(vault_flag.clone(), &mode, &args)
                 }
             },

@@ -2425,6 +2425,7 @@ dependencies = [
  "futures-core",
  "http-body-util",
  "indicatif 0.17.11",
+ "inquire",
  "insta",
  "is-terminal",
  "libc",

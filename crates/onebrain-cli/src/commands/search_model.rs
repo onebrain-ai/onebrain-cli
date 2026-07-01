@@ -1,5 +1,5 @@
-//! `onebrain search model list` / `onebrain search model set` — inspect and
-//! switch the vault's embedding model.
+//! `onebrain search model list` / `onebrain search model set` / bare
+//! `onebrain search model` — inspect and switch the vault's embedding model.
 //!
 //! `list` is pure metadata (the registry in [`onebrain_search::embed`]) plus
 //! a `current` flag from config — it MUST NOT open the engine or trigger a
@@ -7,6 +7,11 @@
 //! (reusing the vault's config-write + backup pattern — see
 //! `commands::doctor::fix_vault_yml_keys` for the sibling implementation
 //! this mirrors) and then opens the engine to re-embed the index.
+//!
+//! Bare `model` (no subcommand) is an interactive picker on a real TTY
+//! (`inquire::Select` + a re-embed confirm, both reusing the exact same
+//! apply logic as `set`) and a non-hanging informational fallback
+//! otherwise — see [`run_bare`].
 
 use std::path::{Path, PathBuf};
 
@@ -106,47 +111,65 @@ pub fn run_set(
     args: &SearchModelSetArgs,
 ) -> Result<()> {
     if !is_supported_model(&args.name) {
-        let supported = model_registry()
-            .iter()
-            .map(|m| m.name)
-            .collect::<Vec<_>>()
-            .join(", ");
         bail!(
-            "unsupported embedding model '{}': supported names are {supported}",
-            args.name
+            "unsupported embedding model '{}': supported names are {}",
+            args.name,
+            supported_model_names()
         );
     }
 
-    let resolved = crate::vault_ctx::require(vault_flag.clone())?;
+    let resolved = crate::vault_ctx::require(vault_flag)?;
+    let envelope = apply_model_change(resolved, &args.name)?;
+    emit(&envelope, mode, std::io::stdout().lock(), render_set_text)?;
+    Ok(())
+}
+
+/// Comma-joined list of every registry model name — used in "unsupported
+/// model" error messages and the non-TTY fallback hint.
+fn supported_model_names() -> String {
+    model_registry()
+        .iter()
+        .map(|m| m.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Apply a model switch for an already-resolved, already-validated vault:
+/// no-op if `model_name` is already current, else persist to `onebrain.yml`
+/// (with a config backup) and re-embed the index via `Engine::rebuild`.
+///
+/// Single shared code path for both `model set <name>` ([`run_set`]) and the
+/// interactive picker's confirm step ([`run_picker`]) — callers are
+/// responsible for name validation before calling this.
+fn apply_model_change(
+    resolved: onebrain_core::ResolvedVault,
+    model_name: &str,
+) -> Result<Envelope<ModelSetData>> {
     let vault_info = crate::vault_ctx::info_from(&resolved);
     let config = load_vault_config(&resolved.root).context("load vault config")?;
 
-    if config.search.embed_model == args.name {
+    if config.search.embed_model == model_name {
         let data = ModelSetData {
-            model: args.name.clone(),
+            model: model_name.to_string(),
             already_current: true,
             chunks_reembedded: None,
         };
-        let envelope = Envelope::ok("search.model.set", Some(vault_info), data);
-        emit(&envelope, mode, std::io::stdout().lock(), render_set_text)?;
-        return Ok(());
+        return Ok(Envelope::ok("search.model.set", Some(vault_info), data));
     }
 
-    persist_embed_model(resolved.root.as_path(), &args.name)
-        .with_context(|| format!("persisting search.embed_model = {}", args.name))?;
+    persist_embed_model(resolved.root.as_path(), model_name)
+        .with_context(|| format!("persisting search.embed_model = {model_name}"))?;
 
     let (mut engine, resolved) = open_engine(Some(resolved.root.as_path().to_path_buf()))?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
-    let reembedded = engine.rebuild(&args.name)?;
+    let reembedded = engine.rebuild(model_name)?;
 
     let data = ModelSetData {
-        model: args.name.clone(),
+        model: model_name.to_string(),
         already_current: false,
         chunks_reembedded: Some(reembedded),
     };
-    let envelope = Envelope::ok("search.model.set", Some(vault_info), data);
-    emit(&envelope, mode, std::io::stdout().lock(), render_set_text)?;
-    Ok(())
+    Ok(Envelope::ok("search.model.set", Some(vault_info), data))
 }
 
 fn render_set_text(env: &Envelope<ModelSetData>) -> String {
@@ -160,6 +183,139 @@ fn render_set_text(env: &Envelope<ModelSetData>) -> String {
             d.chunks_reembedded.unwrap_or(0)
         )
     }
+}
+
+/// `onebrain search model` (bare, no subcommand) — interactive picker on a
+/// real TTY, non-hanging informational fallback otherwise.
+///
+/// TTY gate mirrors `commands::doctor::confirm_fix` /
+/// `onebrain_fs::init::wizard`'s closed-stdin contract: both stdin AND
+/// stdout must be real terminals, otherwise this never prompts — piped
+/// output, agent/hook invocation, and CI must always take the fallback
+/// branch and return immediately.
+pub fn run_bare(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
+    use std::io::IsTerminal;
+
+    let resolved = crate::vault_ctx::require(vault_flag)?;
+    let config = load_vault_config(&resolved.root).context("load vault config")?;
+    let current = config.search.embed_model.clone();
+
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        run_picker(resolved, mode, &current)
+    } else {
+        run_non_tty_fallback(resolved, mode, &current)
+    }
+}
+
+/// Non-TTY fallback: print the current model + available names + a hint to
+/// use `list` / `set` explicitly. Never opens the engine, never prompts,
+/// never blocks — safe for pipes, agents, hooks, and scheduled runs.
+fn run_non_tty_fallback(
+    resolved: onebrain_core::ResolvedVault,
+    mode: &OutputMode,
+    current: &str,
+) -> Result<()> {
+    let vault_info = crate::vault_ctx::info_from(&resolved);
+    let data = ModelBareFallbackData {
+        model: current.to_string(),
+        available: model_registry().iter().map(|m| m.name).collect(),
+        hint: "run 'onebrain search model list' for details, or 'onebrain search model set <name>' to switch."
+            .to_string(),
+    };
+    let envelope = Envelope::ok("search.model.bare", Some(vault_info), data);
+    emit(
+        &envelope,
+        mode,
+        std::io::stdout().lock(),
+        render_bare_fallback_text,
+    )?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct ModelBareFallbackData {
+    model: String,
+    available: Vec<&'static str>,
+    hint: String,
+}
+
+fn render_bare_fallback_text(env: &Envelope<ModelBareFallbackData>) -> String {
+    let d = env.data.as_ref().expect("ok envelope always has data");
+    format!(
+        "current model: {}\navailable models: {}\n{}",
+        d.model,
+        d.available.join(", "),
+        d.hint
+    )
+}
+
+/// Interactive picker (real TTY only): arrow-key `Select` over the
+/// registry, current model marked; on Enter, no-op if unchanged, else a
+/// `Confirm` warning that switching re-embeds the whole vault (and may
+/// download the new model), then — on yes — the SAME apply path `model set`
+/// uses. Esc/cancel does nothing and exits 0.
+fn run_picker(
+    resolved: onebrain_core::ResolvedVault,
+    mode: &OutputMode,
+    current: &str,
+) -> Result<()> {
+    let options: Vec<String> = model_registry()
+        .iter()
+        .map(|m| format_picker_row(m, current))
+        .collect();
+    let starting_cursor = model_registry()
+        .iter()
+        .position(|m| m.name == current)
+        .unwrap_or(0);
+
+    let selection = match inquire::Select::new("Select embedding model:", options)
+        .with_starting_cursor(starting_cursor)
+        .prompt()
+    {
+        Ok(choice) => choice,
+        Err(_) => return Ok(()), // Esc / Ctrl-C / cancel — do nothing, exit 0.
+    };
+
+    let Some(chosen) = model_registry()
+        .iter()
+        .find(|m| format_picker_row(m, current) == selection)
+    else {
+        return Ok(()); // Defensive: selection didn't match a known row.
+    };
+
+    if chosen.name == current {
+        println!("already using {current}");
+        return Ok(());
+    }
+
+    let confirmed = inquire::Confirm::new(&format!(
+        "Switch to {}? This re-embeds the whole vault (and downloads the model if not cached).",
+        chosen.name
+    ))
+    .with_default(false)
+    .prompt()
+    .unwrap_or(false);
+
+    if !confirmed {
+        return Ok(());
+    }
+
+    let envelope = apply_model_change(resolved, chosen.name)?;
+    emit(&envelope, mode, std::io::stdout().lock(), render_set_text)?;
+    Ok(())
+}
+
+/// `MODEL · SIZE · DIM · THAI · NOTE`, current model marked with `●`.
+fn format_picker_row(info: &ModelInfo, current: &str) -> String {
+    let marker = if info.name == current { "●" } else { " " };
+    let thai = info
+        .thai_miracl
+        .map(|v| format!("{v:.1}"))
+        .unwrap_or_else(|| "—".to_string());
+    format!(
+        "{marker} {} · {} · {}d · {} · {}",
+        info.name, info.approx_size, info.dims, thai, info.note
+    )
 }
 
 /// Persist `search.embed_model = model_name` into the vault's config file

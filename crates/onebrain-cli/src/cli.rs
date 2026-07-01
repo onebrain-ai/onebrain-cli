@@ -925,8 +925,11 @@ pub enum SearchVerb {
 #[derive(Args, Debug)]
 #[command(disable_help_subcommand = true)]
 pub struct SearchModelCmd {
+    /// Omitted (bare `search model`) → interactive picker on a TTY, or a
+    /// non-hanging informational fallback otherwise (see
+    /// `commands::search_model::run_bare`).
     #[command(subcommand)]
-    pub verb: SearchModelVerb,
+    pub verb: Option<SearchModelVerb>,
 }
 #[derive(Subcommand, Debug)]
 pub enum SearchModelVerb {
