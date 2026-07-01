@@ -39,6 +39,32 @@ const VEC_TOP_K: usize = 50;
 const RRF_K: f64 = 60.0;
 const SNIPPET_MAX_CHARS: usize = 200;
 
+/// Live progress events emitted during a reindex so a caller (the CLI) can
+/// render a progress bar without the engine knowing anything about terminals.
+///
+/// The engine is UI-free: it only reports *what* happened, never *how* to draw
+/// it. See [`Engine::reindex_all_with_progress`] /
+/// [`Engine::reindex_paths_with_progress`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReindexProgress {
+    /// Emitted exactly once, right before the first embed call of the run —
+    /// i.e. before the first doc that is actually added or updated. On a first
+    /// index this is where `fastembed` downloads the (~470 MB) model, so the
+    /// CLI can announce the download before the long stall. Docs that are
+    /// unchanged (no embed) never trigger this; a run with nothing to (re)embed
+    /// never emits it at all.
+    LoadingModel,
+    /// Emitted after each doc has been processed (added / updated / unchanged /
+    /// removed / failed). `done` counts docs handled so far (1-based, up to
+    /// `total`); `total` is the doc count computed up front from the file walk
+    /// so a percentage is possible.
+    Indexing {
+        done: usize,
+        total: usize,
+        doc_path: String,
+    },
+}
+
 /// Outcome counts of a [`Engine::reindex_paths`] / [`Engine::reindex_all`] run.
 #[derive(Debug, Default, PartialEq)]
 pub struct ReindexStats {
@@ -612,11 +638,18 @@ impl Engine {
 
     /// Reindex one doc (already known to exist on disk at `abs_path`)
     /// against its stored hash, updating `stats` in place.
+    ///
+    /// `on_first_embed` is invoked exactly once across a whole run — right
+    /// before the first embed call (the first Added / Updated doc). Callers
+    /// pass a closure that emits [`ReindexProgress::LoadingModel`] and flips a
+    /// shared "already announced" flag so it fires at most once. Unchanged docs
+    /// don't embed, so they never trigger it.
     fn reindex_existing_doc(
         &mut self,
         doc_path: &str,
         abs_path: &Path,
         stats: &mut ReindexStats,
+        on_first_embed: &mut dyn FnMut(),
     ) -> Result<()> {
         let bytes =
             std::fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
@@ -629,12 +662,14 @@ impl Engine {
             }
             HashDiff::Added => {
                 let content = String::from_utf8_lossy(&bytes).into_owned();
+                on_first_embed();
                 self.index_doc(doc_path, &content)?;
                 self.store_hash(doc_path, &current_hash)?;
                 stats.added += 1;
             }
             HashDiff::Updated => {
                 let content = String::from_utf8_lossy(&bytes).into_owned();
+                on_first_embed();
                 self.remove_doc(doc_path)?;
                 self.index_doc(doc_path, &content)?;
                 self.store_hash(doc_path, &current_hash)?;
@@ -653,17 +688,43 @@ impl Engine {
         vault_root: &Path,
         doc_paths: &[String],
     ) -> Result<ReindexStats> {
+        self.reindex_paths_with_progress(vault_root, doc_paths, &mut |_| {})
+    }
+
+    /// Like [`Engine::reindex_paths`] but reports live [`ReindexProgress`]
+    /// events through `progress`. See [`Engine::reindex_all_with_progress`] for
+    /// the emission contract (`LoadingModel` once before the first embed, then
+    /// `Indexing` after each doc).
+    pub fn reindex_paths_with_progress(
+        &mut self,
+        vault_root: &Path,
+        doc_paths: &[String],
+        progress: &mut dyn FnMut(ReindexProgress),
+    ) -> Result<ReindexStats> {
+        let total = doc_paths.len();
+        let mut model_announced = false;
         let mut stats = ReindexStats::default();
-        for doc_path in doc_paths {
+        for (i, doc_path) in doc_paths.iter().enumerate() {
             let abs_path = vault_root.join(doc_path);
             if abs_path.is_file() {
-                self.reindex_existing_doc(doc_path, &abs_path, &mut stats)?;
+                let mut on_first_embed = || {
+                    if !model_announced {
+                        model_announced = true;
+                        progress(ReindexProgress::LoadingModel);
+                    }
+                };
+                self.reindex_existing_doc(doc_path, &abs_path, &mut stats, &mut on_first_embed)?;
             } else if self.stored_hash(doc_path)?.is_some() {
                 self.remove_doc(doc_path)?;
                 self.drop_hash(doc_path)?;
                 stats.removed += 1;
             }
             // Neither on disk nor indexed: ignore.
+            progress(ReindexProgress::Indexing {
+                done: i + 1,
+                total,
+                doc_path: doc_path.clone(),
+            });
         }
         Ok(stats)
     }
@@ -672,21 +733,58 @@ impl Engine {
     /// (recursively), reindex each, and remove any previously-indexed doc
     /// whose file no longer exists.
     pub fn reindex_all(&mut self, vault_root: &Path) -> Result<ReindexStats> {
+        self.reindex_all_with_progress(vault_root, &mut |_| {})
+    }
+
+    /// Like [`Engine::reindex_all`] but reports live [`ReindexProgress`] events
+    /// through `progress` so a caller can render a progress bar.
+    ///
+    /// Emission contract:
+    /// - [`ReindexProgress::LoadingModel`] fires at most once, right before the
+    ///   first embed call (the first Added / Updated doc) — the model-download
+    ///   point on a first index. A run that only sees unchanged / removed docs
+    ///   never emits it.
+    /// - [`ReindexProgress::Indexing`] fires once per walked doc after it's
+    ///   processed, with `done` counting up to `total` (the walked file count).
+    ///
+    /// The trailing stale-doc sweep (files gone from disk) is not part of the
+    /// walked `total` and does not emit progress — it's bounded by prior index
+    /// state, not the current walk, and typically empty.
+    pub fn reindex_all_with_progress(
+        &mut self,
+        vault_root: &Path,
+        progress: &mut dyn FnMut(ReindexProgress),
+    ) -> Result<ReindexStats> {
         let files = walk_markdown_files(vault_root)?;
         let doc_paths: Vec<String> = files
             .iter()
             .filter_map(|f| vault_relative_path(vault_root, f))
             .collect();
 
+        let total = doc_paths.len();
+        let mut model_announced = false;
         let mut stats = ReindexStats::default();
-        for (doc_path, abs_path) in doc_paths.iter().zip(files.iter()) {
+        for (i, (doc_path, abs_path)) in doc_paths.iter().zip(files.iter()).enumerate() {
             // A single unreadable/failing file must not abort the whole vault
             // reindex (walk_markdown_files already tolerates bad dirs — keep
             // the file loop consistent). Count the failure and continue.
-            if let Err(e) = self.reindex_existing_doc(doc_path, abs_path, &mut stats) {
+            let mut on_first_embed = || {
+                if !model_announced {
+                    model_announced = true;
+                    progress(ReindexProgress::LoadingModel);
+                }
+            };
+            if let Err(e) =
+                self.reindex_existing_doc(doc_path, abs_path, &mut stats, &mut on_first_embed)
+            {
                 stats.failed += 1;
                 eprintln!("onebrain-search: skipping {doc_path}: {e:#}");
             }
+            progress(ReindexProgress::Indexing {
+                done: i + 1,
+                total,
+                doc_path: doc_path.clone(),
+            });
         }
 
         // Sweep: any stored hash whose doc_path wasn't just seen on disk
@@ -914,6 +1012,106 @@ mod tests {
             }
         );
         assert!(e.get("a.md").is_err());
+    }
+
+    #[test]
+    fn fake_reindex_all_with_progress_reports_increasing_done_and_model_load() {
+        // Drives the progress-aware reindex with the fake embedder (no model
+        // download) and asserts the callback fired: `LoadingModel` once before
+        // the first embed, then `Indexing` with `done` climbing 1..=total.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
+        std::fs::write(vault_dir.path().join("b.md"), "# B\nbeta content").unwrap();
+        std::fs::write(vault_dir.path().join("c.md"), "# C\ngamma content").unwrap();
+
+        let mut events = Vec::new();
+        let stats = e
+            .reindex_all_with_progress(vault_dir.path(), &mut |p| events.push(p))
+            .unwrap();
+        assert_eq!(stats.added, 3);
+
+        // Exactly one LoadingModel, emitted before any Indexing event.
+        let loading = events
+            .iter()
+            .filter(|p| matches!(p, ReindexProgress::LoadingModel))
+            .count();
+        assert_eq!(loading, 1, "LoadingModel must fire exactly once");
+        let first_loading = events
+            .iter()
+            .position(|p| matches!(p, ReindexProgress::LoadingModel))
+            .unwrap();
+        let first_indexing = events
+            .iter()
+            .position(|p| matches!(p, ReindexProgress::Indexing { .. }))
+            .unwrap();
+        assert!(
+            first_loading < first_indexing,
+            "LoadingModel must precede the first Indexing event"
+        );
+
+        // Indexing events count 1..=total with a stable total.
+        let indexing: Vec<(usize, usize)> = events
+            .iter()
+            .filter_map(|p| match p {
+                ReindexProgress::Indexing { done, total, .. } => Some((*done, *total)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(indexing.len(), 3);
+        assert!(indexing.iter().all(|(_, total)| *total == 3));
+        let dones: Vec<usize> = indexing.iter().map(|(done, _)| *done).collect();
+        assert_eq!(dones, vec![1, 2, 3], "done must climb 1..=total in order");
+
+        // A second run with no edits is all-unchanged: no embed, so no
+        // LoadingModel, but every doc still emits an Indexing event.
+        let mut events2 = Vec::new();
+        let stats2 = e
+            .reindex_all_with_progress(vault_dir.path(), &mut |p| events2.push(p))
+            .unwrap();
+        assert_eq!(stats2.unchanged, 3);
+        assert!(
+            !events2
+                .iter()
+                .any(|p| matches!(p, ReindexProgress::LoadingModel)),
+            "all-unchanged run must not announce a model load"
+        );
+        assert_eq!(
+            events2
+                .iter()
+                .filter(|p| matches!(p, ReindexProgress::Indexing { .. }))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn fake_reindex_paths_with_progress_reports_events() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
+
+        let mut events = Vec::new();
+        let stats = e
+            .reindex_paths_with_progress(vault_dir.path(), &["a.md".to_string()], &mut |p| {
+                events.push(p)
+            })
+            .unwrap();
+        assert_eq!(stats.added, 1);
+        assert!(events
+            .iter()
+            .any(|p| matches!(p, ReindexProgress::LoadingModel)));
+        assert_eq!(
+            events.last(),
+            Some(&ReindexProgress::Indexing {
+                done: 1,
+                total: 1,
+                doc_path: "a.md".to_string(),
+            })
+        );
     }
 
     #[test]

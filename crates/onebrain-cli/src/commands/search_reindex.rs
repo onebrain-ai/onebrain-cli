@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::cli::SearchReindexArgs;
 use crate::commands::search_common::open_engine;
 use crate::output::{emit, Envelope, OutputMode};
-use onebrain_search::engine::ReindexStats;
+use onebrain_search::engine::{ReindexProgress, ReindexStats};
 
 #[derive(Debug, Serialize)]
 struct ReindexData {
@@ -40,15 +40,120 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchReindexA
     let (mut engine, resolved) = open_engine(vault_flag)?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
 
+    // Live progress goes to STDERR (never stdout — stdout carries only the
+    // envelope). Rendered only when stderr is a real TTY AND we're in text mode
+    // (not `--json` / `--yaml`, which must stay silent except the final
+    // envelope). Piped / agent / hook runs get a couple of plain milestone
+    // lines instead of a cursor-controlled bar.
+    let mut reporter = ProgressReporter::new(mode);
+    let mut on_progress = |p: ReindexProgress| reporter.handle(p);
+
     let stats = if args.paths.is_empty() {
-        engine.reindex_all(resolved.root.as_path())?
+        engine.reindex_all_with_progress(resolved.root.as_path(), &mut on_progress)?
     } else {
-        engine.reindex_paths(resolved.root.as_path(), &args.paths)?
+        engine.reindex_paths_with_progress(
+            resolved.root.as_path(),
+            &args.paths,
+            &mut on_progress,
+        )?
     };
+    reporter.finish();
 
     let envelope = Envelope::ok("search.reindex", Some(vault_info), ReindexData::from(stats));
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
+}
+
+/// How live reindex progress is surfaced, chosen once from the output mode +
+/// stderr TTY state:
+/// - `Bar` — an in-place `indicatif` progress bar on a real TTY in text mode.
+/// - `PlainLines` — a few plain milestone lines to stderr on a non-TTY text run
+///   (piped / agent / hook): the model-load notice plus a ~10%-throttled counter
+///   and a final "indexed N" line, so a log never gets thousands of lines.
+/// - `Silent` — nothing (structured `--json` / `--yaml`: only the final
+///   envelope is emitted).
+enum ProgressReporter {
+    Bar(indicatif::ProgressBar),
+    PlainLines { last_pct_bucket: Option<usize> },
+    Silent,
+}
+
+impl ProgressReporter {
+    fn new(mode: &OutputMode) -> Self {
+        use is_terminal::IsTerminal;
+        // Structured modes stay silent regardless of TTY.
+        if mode.is_structured() {
+            return Self::Silent;
+        }
+        if std::io::stderr().is_terminal() {
+            let pb = indicatif::ProgressBar::new(0);
+            // Bar while total is known; the template degrades gracefully before
+            // the first `set_length` (spinner-ish) too.
+            pb.set_style(
+                indicatif::ProgressStyle::with_template(
+                    "📇 indexing  {pos}/{len}  ({percent}%)  {wide_msg}",
+                )
+                .expect("static template is valid")
+                .progress_chars("=>-"),
+            );
+            Self::Bar(pb)
+        } else {
+            Self::PlainLines {
+                last_pct_bucket: None,
+            }
+        }
+    }
+
+    fn handle(&mut self, p: ReindexProgress) {
+        match p {
+            ReindexProgress::LoadingModel => match self {
+                Self::Bar(pb) => {
+                    // fastembed prints its own download bar; suspend ours so the
+                    // notice + that bar aren't clobbered by our redraw.
+                    pb.suspend(|| {
+                        eprintln!("⏬ downloading embedding model (~470 MB, first run)…");
+                    });
+                }
+                Self::PlainLines { .. } => {
+                    eprintln!("⏬ downloading embedding model (~470 MB, first run)…");
+                }
+                Self::Silent => {}
+            },
+            ReindexProgress::Indexing {
+                done,
+                total,
+                doc_path,
+            } => match self {
+                Self::Bar(pb) => {
+                    if pb.length() != Some(total as u64) {
+                        pb.set_length(total as u64);
+                    }
+                    pb.set_position(done as u64);
+                    pb.set_message(doc_path);
+                }
+                Self::PlainLines { last_pct_bucket } => {
+                    // Throttle to ~every 10% so a piped log stays readable.
+                    // `checked_div` guards total == 0 (an empty vault emits no
+                    // Indexing events anyway, so this branch is really total>0).
+                    if let Some(bucket) = (done * 10).checked_div(total) {
+                        if *last_pct_bucket != Some(bucket) {
+                            *last_pct_bucket = Some(bucket);
+                            let pct = (done * 100) / total;
+                            eprintln!("📇 indexing {done}/{total} ({pct}%)");
+                        }
+                    }
+                }
+                Self::Silent => {}
+            },
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Self::Bar(pb) = self {
+            // Clear the bar so the final ✅ summary prints on a clean line.
+            pb.finish_and_clear();
+        }
+    }
 }
 
 fn render_text(env: &Envelope<ReindexData>) -> String {
