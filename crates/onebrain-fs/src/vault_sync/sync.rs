@@ -25,7 +25,7 @@ pub fn sync_plugin_files(
 ) -> std::io::Result<(u64, u64)> {
     let source_plugin = extracted_dir.join(".claude/plugins/onebrain");
     let dest_plugin = vault_root.join(".claude/plugins/onebrain");
-    overlay_directory(&source_plugin, &dest_plugin, unlink_fn, false)
+    overlay_directory(&source_plugin, &dest_plugin, unlink_fn)
 }
 
 /// Step 3 · sync `.gemini/` project config tree. Source-absent → no-op.
@@ -39,7 +39,7 @@ pub fn sync_gemini_config(
     if !source_gemini.exists() {
         return Ok((0, 0));
     }
-    overlay_directory(&source_gemini, &dest_gemini, unlink_fn, false)
+    overlay_directory(&source_gemini, &dest_gemini, unlink_fn)
 }
 
 /// Step 4 · sync `.obsidian/` directory (init only). Errors are non-fatal.
@@ -73,14 +73,11 @@ pub fn sync_obsidian(extracted_dir: &Path, vault_root: &Path) -> u64 {
 
 /// Internal — copy everything from `source_dir` into `dest_dir` and remove
 /// anything in dest that's not in source. Counts only successful unlinks.
-///
-/// `_strict` parameter reserved for a future opt-in mode that propagates
-/// per-file errors instead of swallowing them. Currently always best-effort.
+/// Best-effort per file: an unlink failure is counted out, not propagated.
 fn overlay_directory(
     source_dir: &Path,
     dest_dir: &Path,
     unlink_fn: &UnlinkFn,
-    _strict: bool,
 ) -> std::io::Result<(u64, u64)> {
     fs::create_dir_all(dest_dir)?;
 
