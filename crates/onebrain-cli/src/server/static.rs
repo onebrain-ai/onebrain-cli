@@ -97,7 +97,9 @@ pub fn parse_webui_released(bytes: &[u8]) -> Option<String> {
 }
 
 /// The catch-all static handler, wired into the router via `Router::fallback`
-/// so it answers every non-`/api` route. We can't hand a bare `ServeDir` to
+/// so it answers every non-`/api` route (except `GET`/`HEAD /robots.txt`, which
+/// the auth middleware serves directly, before this handler). We can't hand a
+/// bare `ServeDir` to
 /// `fallback` because we need to intercept `index.html` for token injection;
 /// this handler:
 /// - for the SPA entry (`/` or `/index.html`, or any unknown route via 404

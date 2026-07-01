@@ -25,8 +25,10 @@
 //!   (`--host 0.0.0.0`) is single-tenant only and MUST run behind TLS.
 //! - EVERY route — `/api/*` AND the static SPA — requires the per-session token
 //!   (header, `?token=` query, or the `onebrain_token` cookie seeded by the
-//!   first `?token=` load). Gating the static shell too is what stops an
-//!   unauthenticated browser from loading the page (which carries the token).
+//!   first `?token=` load), the **sole** exception being `GET`/`HEAD /robots.txt`
+//!   (static public boilerplate, no vault data). Gating the static shell too is
+//!   what stops an unauthenticated browser from loading the page (which carries
+//!   the token).
 //! - `GET /api/vault/file` canonicalises the requested path and rejects
 //!   anything that escapes the vault root (`..`, absolute paths, symlinks out).
 
@@ -142,8 +144,9 @@ pub const MAX_CONCURRENT_CHATS: usize = 2;
 ///   /api/config            GET   → onebrain.yml as JSON
 ///   /api/vault/tree        GET   → recursive folder/file listing
 ///   /api/vault/file?path=  GET   → one note's content + rev
+///   /robots.txt            GET   → static "Disallow: /" (the ONE public route)
 ///   /* (everything else)   GET   → static dist (SPA fallback to index.html)
-///       └─ EVERY route (API + static) gated by the auth-token middleware
+///       └─ every route EXCEPT /robots.txt gated by the auth-token middleware
 ///          (401 without a header / ?token= / onebrain_token cookie)
 /// ```
 pub fn build_router(cfg: ServeConfig) -> Router {

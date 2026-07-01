@@ -1,7 +1,10 @@
-//! Token-gating middleware for the ENTIRE HTTP surface — both `/api/*` and the
-//! static SPA. Gating the static routes too means an unauthenticated browser
-//! can't even load the page shell (which carries the token), closing the hole
-//! where opening the URL with no `?token=` still let you in.
+//! Token-gating middleware for (almost) the ENTIRE HTTP surface — both `/api/*`
+//! and the static SPA. Gating the static routes too means an unauthenticated
+//! browser can't even load the page shell (which carries the token), closing the
+//! hole where opening the URL with no `?token=` still let you in.
+//!
+//! The **one** unauthenticated route is `GET`/`HEAD /robots.txt` (see
+//! [`require_token`]) — static public boilerplate with no vault data.
 //!
 //! The token is accepted four ways:
 //!
@@ -47,7 +50,8 @@ enum AuthOutcome {
 /// session token; otherwise short-circuit with `401`. Applied to the WHOLE
 /// router (API **and** static), so an unauthenticated browser can't even load
 /// the SPA shell (which carries the token) — closing the "open the page with no
-/// `?token=` and you're in" hole.
+/// `?token=` and you're in" hole. The sole exception is `GET`/`HEAD /robots.txt`
+/// (static public boilerplate, handled at the top of the body before the gate).
 ///
 /// Wired via `axum::middleware::from_fn_with_state` so it sees the shared
 /// [`AppState`] (which holds the expected token) without a global.
@@ -56,6 +60,17 @@ pub async fn require_token(
     request: Request,
     next: Next,
 ) -> Response {
+    // `/robots.txt` is the single route served WITHOUT a token (GET/HEAD only).
+    // It's static boilerplate — no vault data, no filesystem access — and the
+    // well-known-file convention is that crawlers fetch it unauthenticated. The
+    // "unauthenticated browser gets nothing of value" property is intact: the SPA
+    // shell, every asset, and every `/api` route still 401. Verb-restricted so it
+    // never widens the CSRF surface the token gate protects.
+    if request.uri().path() == "/robots.txt" && matches!(request.method().as_str(), "GET" | "HEAD")
+    {
+        return robots_txt();
+    }
+
     let outcome = check_token(&state.token, &request);
     // Read before `request` is consumed by `next`: behind a TLS tunnel/proxy the
     // edge sets `X-Forwarded-Proto: https`, and only then is `Secure` correct (a
@@ -84,6 +99,18 @@ pub async fn require_token(
         // machine/SPA boundary, not an interactive browser-prompt login.
         AuthOutcome::Denied => StatusCode::UNAUTHORIZED.into_response(),
     }
+}
+
+/// The private-instance `robots.txt`: tell every crawler to index nothing. Static
+/// boilerplate served without a token (see the exemption in [`require_token`]) —
+/// it carries no vault data and touches no filesystem, so it leaks nothing the
+/// bare `401` didn't already reveal.
+fn robots_txt() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        "User-agent: *\nDisallow: /\n",
+    )
+        .into_response()
 }
 
 /// True when the browser↔edge hop was HTTPS (a TLS tunnel / reverse proxy sets

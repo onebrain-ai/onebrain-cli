@@ -309,6 +309,47 @@ async fn api_with_wrong_token_is_401() {
 }
 
 #[tokio::test]
+async fn robots_txt_is_served_without_a_token() {
+    // The single unauthenticated route: a token-less GET /robots.txt returns the
+    // private-instance robots.txt (Disallow: /), NOT a 401 like every other route.
+    let (_dir, router) = vault_router(None);
+    let req = Request::builder()
+        .uri("/robots.txt")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send(&router, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("User-agent: *"), "body: {body}");
+    assert!(body.contains("Disallow: /"), "body: {body}");
+}
+
+#[tokio::test]
+async fn robots_txt_head_is_served_without_a_token() {
+    let (_dir, router) = vault_router(None);
+    let req = Request::builder()
+        .method("HEAD")
+        .uri("/robots.txt")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _body) = send(&router, req).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn robots_txt_post_without_token_is_still_401() {
+    // The exemption is GET/HEAD only — a mutating verb on the same path must NOT
+    // slip past the token gate (keeps the exemption off the CSRF surface).
+    let (_dir, router) = vault_router(None);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/robots.txt")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _body) = send(&router, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn api_with_bearer_token_is_200() {
     let (_dir, router) = vault_router(None);
     let req = Request::builder()

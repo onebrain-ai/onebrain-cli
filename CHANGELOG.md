@@ -1,5 +1,5 @@
 ---
-latest_version: 3.3.23
+latest_version: 3.3.24
 released: 2026-07-01
 ---
 
@@ -9,6 +9,11 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.24] — 2026-07-01 — serve robots.txt (the one unauthenticated route)
+
+- **`GET /robots.txt` is served without a token** (a private-instance `User-agent: * / Disallow: /`). It's the single exemption to the whole-surface token gate: static boilerplate with no vault data and no filesystem access, so it leaks nothing the bare `401` didn't, and it satisfies the well-known-file convention that crawlers fetch `robots.txt` unauthenticated. The SPA shell, every asset, and every `/api` route still require a token.
+- **Verb-restricted (GET/HEAD only)** so the exemption never widens the CSRF surface — a `POST /robots.txt` still `401`s. Fixes the Lighthouse SEO `robots-txt` audit (desktop SEO 91 → 100).
 
 ## [3.3.23] — 2026-07-01 — gzip-precompress the embedded web UI
 
