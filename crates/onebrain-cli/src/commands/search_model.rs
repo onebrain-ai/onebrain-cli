@@ -157,12 +157,19 @@ fn apply_model_change(
         return Ok(Envelope::ok("search.model.set", Some(vault_info), data));
     }
 
-    persist_embed_model(resolved.root.as_path(), model_name)
-        .with_context(|| format!("persisting search.embed_model = {model_name}"))?;
-
+    // Order matters for crash-safety. Open the engine while `onebrain.yml`
+    // still points at the CURRENT model, so the vector store opens at its
+    // existing on-disk dims (a dims-changing switch would otherwise `bail!`
+    // in `VectorStore::open`). `rebuild` then wipes+recreates the vector dir
+    // at the new model's dims and re-embeds. Only AFTER the rebuild succeeds
+    // do we persist the new model name — so a failed switch never leaves
+    // `onebrain.yml` pointing at a model whose index can't open.
     let (mut engine, resolved) = open_engine(Some(resolved.root.as_path().to_path_buf()))?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
     let reembedded = engine.rebuild(model_name)?;
+
+    persist_embed_model(resolved.root.as_path(), model_name)
+        .with_context(|| format!("persisting search.embed_model = {model_name}"))?;
 
     let data = ModelSetData {
         model: model_name.to_string(),
@@ -372,26 +379,8 @@ fn persist_embed_model(vault_root: &Path, model_name: &str) -> Result<()> {
     onebrain_fs::backup_config_file(&path)
         .with_context(|| format!("backing up {} before write", path.display()))?;
 
-    atomic_write_text(&path, &serialized).with_context(|| format!("writing {}", path.display()))
-}
-
-/// Atomic text write: `path.tmp` → rename. Same pattern as
-/// `commands::doctor::atomic_write_text`; duplicated locally rather than
-/// shared across command modules since it's a two-line helper with no
-/// existing shared home. Creates parent dirs as needed.
-fn atomic_write_text(path: &Path, contents: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut tmp = path.to_path_buf();
-    let new_ext = match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => format!("{ext}.tmp"),
-        None => "tmp".to_string(),
-    };
-    tmp.set_extension(new_ext);
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    onebrain_fs::atomic_write_text(&path, &serialized)
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 #[cfg(test)]

@@ -29,7 +29,9 @@ pub fn rrf_fuse(
     let mut fused: Vec<(String, f64)> = scores.into_iter().collect();
     // Sort by score descending; break ties by chunk_id ascending for a
     // deterministic, stable output regardless of HashMap iteration order.
-    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then_with(|| a.0.cmp(&b.0)));
+    // `total_cmp` (a total order over f64) avoids the latent NaN panic of
+    // `partial_cmp().unwrap()` — matching `vector.rs`'s sort.
+    fused.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     fused.truncate(top_k);
     fused
 }

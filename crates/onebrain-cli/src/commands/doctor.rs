@@ -794,7 +794,7 @@ fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
     if let Err(e) = onebrain_fs::backup_config_file(&path) {
         return FixOutcome::Failed(format!("backup {filename} before write: {e}"));
     }
-    if let Err(e) = atomic_write_text(&path, &serialized) {
+    if let Err(e) = onebrain_fs::atomic_write_text(&path, &serialized) {
         return FixOutcome::Failed(format!("write {filename}: {e}"));
     }
 
@@ -937,25 +937,6 @@ fn value_is_positive_number(v: &serde_yaml::Value) -> bool {
     }
 }
 
-/// Atomic text write: `path.tmp` → rename. Same pattern as
-/// `register_hooks::write_settings` (and `onebrain-cache::state`); used
-/// here for YAML where the canonical helper is JSON-specific. Creates
-/// parent dirs as needed.
-fn atomic_write_text(path: &Path, contents: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut tmp = path.to_path_buf();
-    let new_ext = match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => format!("{ext}.tmp"),
-        None => "tmp".to_string(),
-    };
-    tmp.set_extension(new_ext);
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}
-
 /// True when the config's top-level `stats` key is an inline mapping or
 /// scalar (`stats: {…}` / `stats: null`) rather than the block form that
 /// [`upsert_doctor_stats`] can extend — such a file is left untouched.
@@ -1091,7 +1072,7 @@ fn stamp_doctor_run(vault_root: &Path, fix: bool, quiet: bool) {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     match upsert_doctor_stats(&text, &today, fix) {
         Some(updated) => {
-            if let Err(e) = atomic_write_text(&path, &updated) {
+            if let Err(e) = onebrain_fs::atomic_write_text(&path, &updated) {
                 if !quiet {
                     eprintln!("doctor: could not update last_doctor_run: {e}");
                 }
@@ -2783,26 +2764,6 @@ mod tests {
     #[test]
     fn value_is_positive_number_true_for_positive_integer() {
         assert!(value_is_positive_number(&yaml_num("15")));
-    }
-
-    // ── atomic_write_text: no-extension path ──────────────────────────────────
-
-    #[test]
-    fn atomic_write_text_works_on_file_with_no_extension() {
-        let d = tempdir().unwrap();
-        let path = d.path().join("noextfile");
-        atomic_write_text(&path, "hello").unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
-        // Temp file must be cleaned up.
-        assert!(!d.path().join("noextfile.tmp").exists(), ".tmp left behind");
-    }
-
-    #[test]
-    fn atomic_write_text_creates_parent_dirs_if_missing() {
-        let d = tempdir().unwrap();
-        let path = d.path().join("deep/nested/dir/file.yml");
-        atomic_write_text(&path, "content").unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "content");
     }
 
     // ── stamp_doctor_run: quiet/non-quiet read error, inline_stats ───────────

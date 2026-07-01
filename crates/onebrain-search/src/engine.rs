@@ -46,6 +46,10 @@ pub struct ReindexStats {
     pub updated: usize,
     pub removed: usize,
     pub unchanged: usize,
+    /// Docs that could not be (re)indexed because reading/indexing them
+    /// failed. `reindex_all` counts these and continues instead of aborting
+    /// the whole batch on the first bad file.
+    pub failed: usize,
 }
 
 /// Decision for a single doc when comparing its freshly computed content
@@ -270,11 +274,16 @@ impl Engine {
         let new_dims = embed::model_dims(new_model);
         self.vec = VectorStore::open(&vectors_dir, new_dims)?;
 
-        // 4. Re-embed each chunk's text with the new embedder and add it to
-        // the fresh vector store.
-        for (chunk_id, text) in &chunks {
-            let vectors = self.embedder()?.embed(std::slice::from_ref(text))?;
-            self.vec.add(chunk_id, &vectors[0])?;
+        // 4. Batch-embed every chunk's text with the new embedder in ONE
+        // `embed` call (it batches internally), then add each returned vector
+        // by index. Skipped entirely when there are no chunks, so an empty
+        // index never constructs the embedder (no model download).
+        if !chunks.is_empty() {
+            let texts: Vec<String> = chunks.iter().map(|(_, text)| text.clone()).collect();
+            let vectors = self.embedder()?.embed(&texts)?;
+            for ((chunk_id, _text), vector) in chunks.iter().zip(vectors.iter()) {
+                self.vec.add(chunk_id, vector)?;
+            }
         }
 
         // 5. Record the new active model.
@@ -312,15 +321,25 @@ impl Engine {
     pub fn index_doc(&mut self, doc_path: &str, content: &str) -> Result<usize> {
         let chunks = chunk_markdown(doc_path, content, CHUNK_MAX_TOKENS, CHUNK_OVERLAP_TOKENS);
 
+        // Batch-embed ALL chunk texts in one call — `Embedder::embed` takes a
+        // slice and batches internally, so one call per doc is far cheaper
+        // than one call per chunk. The returned vectors are index-aligned with
+        // `chunks`.
+        let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+        let vectors = if texts.is_empty() {
+            Vec::new()
+        } else {
+            self.embedder()?.embed(&texts)?
+        };
+
         let mut chunk_ids: Vec<String> = Vec::with_capacity(chunks.len());
         let write_txn = self.meta.begin_write()?;
         {
             let mut chunk_meta = write_txn.open_table(CHUNK_META)?;
-            for chunk in &chunks {
+            for (i, chunk) in chunks.iter().enumerate() {
                 self.lex.add(chunk)?;
 
-                let vectors = self.embedder()?.embed(std::slice::from_ref(&chunk.text))?;
-                self.vec.add(&chunk.chunk_id, &vectors[0])?;
+                self.vec.add(&chunk.chunk_id, &vectors[i])?;
 
                 let record = ChunkMeta {
                     doc_path: chunk.doc_path.clone(),
@@ -555,11 +574,19 @@ impl Engine {
 
         let mut stats = ReindexStats::default();
         for (doc_path, abs_path) in doc_paths.iter().zip(files.iter()) {
-            self.reindex_existing_doc(doc_path, abs_path, &mut stats)?;
+            // A single unreadable/failing file must not abort the whole vault
+            // reindex (walk_markdown_files already tolerates bad dirs — keep
+            // the file loop consistent). Count the failure and continue.
+            if let Err(e) = self.reindex_existing_doc(doc_path, abs_path, &mut stats) {
+                stats.failed += 1;
+                eprintln!("onebrain-search: skipping {doc_path}: {e:#}");
+            }
         }
 
         // Sweep: any stored hash whose doc_path wasn't just seen on disk
-        // means the file is gone.
+        // means the file is gone. Membership is tested against a HashSet built
+        // once (O(N) total) rather than `Vec::contains` per entry (O(N²)).
+        let seen: std::collections::HashSet<&String> = doc_paths.iter().collect();
         let stale: Vec<String> = {
             let read_txn = self.meta.begin_read()?;
             let doc_hashes = read_txn.open_table(DOC_HASHES)?;
@@ -567,7 +594,7 @@ impl Engine {
                 .iter()?
                 .filter_map(|entry| entry.ok())
                 .map(|(k, _)| k.value().to_string())
-                .filter(|k| !doc_paths.contains(k))
+                .filter(|k| !seen.contains(k))
                 .collect()
         };
         for doc_path in stale {
@@ -635,6 +662,7 @@ mod tests {
                 updated: 0,
                 removed: 0,
                 unchanged: 0,
+                failed: 0,
             }
         );
 
@@ -647,6 +675,7 @@ mod tests {
                 updated: 0,
                 removed: 0,
                 unchanged: 1,
+                failed: 0,
             }
         );
 
@@ -660,6 +689,7 @@ mod tests {
                 updated: 1,
                 removed: 0,
                 unchanged: 0,
+                failed: 0,
             }
         );
         assert!(e.get("a.md").is_ok());
@@ -674,6 +704,7 @@ mod tests {
                 updated: 0,
                 removed: 1,
                 unchanged: 0,
+                failed: 0,
             }
         );
         assert!(e.get("a.md").is_err());
@@ -737,6 +768,42 @@ mod tests {
         // still returns hits.
         let hits = e.query("memory safety", 3).unwrap();
         assert!(!hits.is_empty());
+    }
+
+    /// A single unreadable `.md` file must NOT abort the whole vault
+    /// reindex: it's counted in `failed` and the loop continues. Non-gated —
+    /// the failure happens at the file read, before any embedding, so no
+    /// model download is triggered.
+    #[cfg(unix)]
+    #[test]
+    fn reindex_all_counts_failed_and_continues() {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        // chmod 000 is a no-op under root (read still succeeds), so the test
+        // would spuriously see `failed: 0`. Skip when running as root.
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(cache_dir.path(), "multilingual-e5-small").unwrap();
+
+        // One unreadable file (mode 000). Empty content would still need the
+        // embedder if readable, but this file is never read past the failing
+        // `std::fs::read`, so `failed` is incremented with no download.
+        let bad = vault_dir.path().join("bad.md");
+        std::fs::write(&bad, "# unreadable").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let stats = e.reindex_all(vault_dir.path()).unwrap();
+        // Restore perms so tempdir cleanup succeeds.
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(stats.failed, 1, "unreadable file should count as failed");
+        assert_eq!(stats.added, 0);
     }
 
     #[test]

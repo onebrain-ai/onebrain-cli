@@ -13,6 +13,25 @@ use chrono::Local;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+/// Atomic text write: write to `path.tmp` then rename over `path`. Creates
+/// parent dirs as needed. Shared home for the helper formerly duplicated in
+/// `onebrain-cli`'s `commands::doctor` and `commands::search_model`, which
+/// both already depend on this crate (via [`backup_config_file`]).
+pub fn atomic_write_text(path: &Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut tmp = path.to_path_buf();
+    let new_ext = match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{ext}.tmp"),
+        None => "tmp".to_string(),
+    };
+    tmp.set_extension(new_ext);
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Upper bound on the same-second `-N` uniquifier search. Generous enough that
 /// it can't be hit by real usage, but bounds the loop so a wedged backup dir
 /// can't spin forever.
@@ -227,5 +246,20 @@ mod tests {
             result.is_err(),
             "unreadable source must propagate error, got {result:?}"
         );
+    }
+
+    #[test]
+    fn atomic_write_text_writes_and_cleans_tmp() {
+        let d = tempdir().unwrap();
+        // No-extension path exercises the "tmp" fallback branch.
+        let noext = d.path().join("noextfile");
+        atomic_write_text(&noext, "hello").unwrap();
+        assert_eq!(std::fs::read_to_string(&noext).unwrap(), "hello");
+        assert!(!d.path().join("noextfile.tmp").exists(), ".tmp left behind");
+
+        // With-extension path + missing parent dirs are created.
+        let nested = d.path().join("deep/nested/file.yml");
+        atomic_write_text(&nested, "content").unwrap();
+        assert_eq!(std::fs::read_to_string(&nested).unwrap(), "content");
     }
 }

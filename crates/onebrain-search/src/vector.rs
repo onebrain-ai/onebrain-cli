@@ -67,6 +67,21 @@ impl VectorStore {
         fs::create_dir_all(dir)
             .with_context(|| format!("creating vector store dir {}", dir.display()))?;
 
+        // Discard any leftover `vectors.bin.tmp` from a `compact` that crashed
+        // before its final rename. At that point the committed metadata still
+        // describes the intact `vectors.bin`, so the tmp is unreferenced
+        // scratch and safe to remove. (If it were kept, a later same-named tmp
+        // would be created via File::create, so leaving it is harmless either
+        // way — removing it just keeps the dir clean and makes intent clear.)
+        let tmp_path = dir.join(format!("{VECTORS_FILE}.tmp"));
+        match fs::remove_file(&tmp_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("removing stale {}", tmp_path.display()));
+            }
+        }
+
         let vectors_path = dir.join(VECTORS_FILE);
         if !vectors_path.exists() {
             File::create(&vectors_path)
@@ -125,11 +140,16 @@ impl VectorStore {
     fn read_row(&self, row: u64) -> Result<Vec<f32>> {
         let path = self.vectors_path();
         let file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-        // SAFETY: the file is not concurrently truncated by another process
-        // while this store instance is alive; all mutation goes through
-        // `add`/`compact` on `&mut self`, which don't run concurrently with
-        // `search`/`read_row` (`&self`) per Rust's borrow rules within a
-        // single process.
+        // SAFETY: `Mmap::map` is unsound if the mapped file is mutated (in
+        // particular truncated) by ANOTHER process while the mapping is live —
+        // Rust's borrow rules do NOT prevent that; they only govern access
+        // within this process. This store therefore assumes a single writer
+        // per collection as a precondition: no other process mutates this
+        // collection's `vectors.bin` concurrently. Within this process, all
+        // mutation goes through `add`/`compact` (`&mut self`), which the
+        // borrow checker keeps from overlapping with `search`/`read_row`
+        // (`&self`). Under that single-writer precondition the mapping is
+        // stable for its (short) lifetime here.
         let mmap = unsafe { Mmap::map(&file) }.with_context(|| "mmap vectors.bin")?;
 
         let stride = self.stride();
@@ -217,9 +237,15 @@ impl VectorStore {
             row_to_chunk.insert(row, chunk_id)?;
             row
         };
-        write_txn.commit()?;
 
+        // Write the vector row to the file BEFORE committing the metadata
+        // transaction. On a reused free-row, committing first and crashing
+        // before `write_row` would leave the mapping pointing at the PREVIOUS
+        // occupant's vector (wrong results). Writing the row first means a
+        // failure leaves the new row unreferenced (the metadata isn't
+        // committed) rather than referenced-but-wrong.
         self.write_row(row, vec)?;
+        write_txn.commit()?;
         Ok(())
     }
 
@@ -252,37 +278,70 @@ impl VectorStore {
             return Vec::new();
         }
 
+        // The return type stays infallible (an empty result on a corrupt
+        // store is the least-surprising behavior for a search), but a silent
+        // empty/partial result hides corruption. So we log a warning to stderr
+        // whenever the transaction/table open fails or any row is skipped
+        // during the scan, naming the count, so the corruption is detectable.
         let read_txn = match self.db.begin_read() {
             Ok(txn) => txn,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                eprintln!("onebrain-search: vector search aborted — begin_read failed: {e}");
+                return Vec::new();
+            }
         };
         let row_to_chunk = match read_txn.open_table(ROW_TO_CHUNK) {
             Ok(t) => t,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                eprintln!("onebrain-search: vector search aborted — open row_to_chunk failed: {e}");
+                return Vec::new();
+            }
         };
         let tombstones = match read_txn.open_table(TOMBSTONES) {
             Ok(t) => t,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                eprintln!("onebrain-search: vector search aborted — open tombstones failed: {e}");
+                return Vec::new();
+            }
         };
 
         let mut scored: Vec<(String, f32)> = Vec::new();
-        let Ok(iter) = row_to_chunk.iter() else {
-            return Vec::new();
+        let mut skipped: usize = 0;
+        let iter = match row_to_chunk.iter() {
+            Ok(iter) => iter,
+            Err(e) => {
+                eprintln!("onebrain-search: vector search aborted — row_to_chunk iter failed: {e}");
+                return Vec::new();
+            }
         };
         for entry in iter {
-            let Ok((row_guard, chunk_guard)) = entry else {
-                continue;
+            let (row_guard, chunk_guard) = match entry {
+                Ok(pair) => pair,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
             };
             let row = row_guard.value();
             if tombstones.get(row).ok().flatten().is_some() {
                 continue;
             }
             let chunk_id = chunk_guard.value().to_string();
-            let Ok(row_vec) = self.read_row(row) else {
-                continue;
+            let row_vec = match self.read_row(row) {
+                Ok(v) => v,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
             };
             let score = f32::dot(query_vec, &row_vec).unwrap_or(f64::NEG_INFINITY) as f32;
             scored.push((chunk_id, score));
+        }
+
+        if skipped > 0 {
+            eprintln!(
+                "onebrain-search: vector search skipped {skipped} unreadable row(s) — index may be corrupt (consider a reindex)"
+            );
         }
 
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -292,7 +351,17 @@ impl VectorStore {
 
     /// Rewrites `vectors.bin` dropping tombstoned rows and renumbering the
     /// remaining rows contiguously from 0, then clears the free-list.
-    /// Writes to a temp file and atomically renames over the original.
+    ///
+    /// Crash-safety: the new (compacted) vectors are written to
+    /// `vectors.bin.tmp`, the redb metadata is committed to the NEW row
+    /// numbering, and ONLY THEN is the tmp file renamed over `vectors.bin`.
+    /// This ordering keeps a crash recoverable — a crash before the metadata
+    /// commit leaves the committed metadata still describing the OLD, intact
+    /// `vectors.bin` (the tmp is unreferenced scratch), and [`Self::open`]
+    /// discards any leftover `vectors.bin.tmp` on the next open. (The prior
+    /// order renamed the file first, so a crash between the rename and the
+    /// commit left the old row numbers indexing into the new compacted file —
+    /// silent, irrecoverable corruption.)
     pub fn compact(&mut self) -> Result<()> {
         let write_txn = self.db.begin_write()?;
         let mut remap: HashMap<u64, u64> = HashMap::new();
@@ -312,8 +381,9 @@ impl VectorStore {
         }
         live_chunks.sort_by_key(|(row, _)| *row);
 
-        // Read old rows (old vectors.bin, before rewrite) and write them
-        // into a tmp file at their new contiguous row indices.
+        // Read old rows (from the still-live vectors.bin) and write them into
+        // a tmp file at their new contiguous row indices. The live file is
+        // NOT touched yet.
         let tmp_path = self.dir.join(format!("{VECTORS_FILE}.tmp"));
         {
             let mut tmp_file = File::create(&tmp_path)
@@ -329,10 +399,11 @@ impl VectorStore {
             }
             tmp_file.flush()?;
         }
-        fs::rename(&tmp_path, self.vectors_path())
-            .with_context(|| "renaming vectors.bin.tmp over vectors.bin")?;
 
-        // Rebuild metadata tables against the new row numbering.
+        // Rebuild metadata tables against the new row numbering and COMMIT,
+        // before swapping the file. A crash before this commit leaves the
+        // metadata pointing at the untouched old vectors.bin (recoverable);
+        // the orphaned tmp is discarded on the next open.
         {
             let mut header = write_txn.open_table(HEADER)?;
             let mut chunk_to_row = write_txn.open_table(CHUNK_TO_ROW)?;
@@ -353,6 +424,10 @@ impl VectorStore {
             header.insert(NEXT_ROW_KEY, live_chunks.len() as u64)?;
         }
         write_txn.commit()?;
+
+        // Metadata (new numbering) is now durable; swap the compacted file in.
+        fs::rename(&tmp_path, self.vectors_path())
+            .with_context(|| "renaming vectors.bin.tmp over vectors.bin")?;
 
         Ok(())
     }
@@ -425,5 +500,27 @@ mod tests {
         s.compact().unwrap();
         assert_eq!(s.len(), 1);
         assert_eq!(s.search(&norm(&[0.0, 1.0, 0.0]), 1)[0].0, "b#0");
+        // compact's final rename consumes the tmp — nothing left behind.
+        assert!(!dir.path().join("vectors.bin.tmp").exists());
+    }
+
+    /// A leftover `vectors.bin.tmp` (a `compact` that crashed before its final
+    /// rename) must be discarded on the next `open`, leaving the committed
+    /// metadata + intact `vectors.bin` fully queryable.
+    #[test]
+    fn open_discards_leftover_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut s = VectorStore::open(dir.path(), 3).unwrap();
+            s.add("a#0", &norm(&[1.0, 0.0, 0.0])).unwrap();
+        }
+        // Simulate a crashed compact: metadata + vectors.bin are intact, but a
+        // stale tmp remains on disk.
+        let tmp = dir.path().join("vectors.bin.tmp");
+        std::fs::write(&tmp, b"garbage").unwrap();
+
+        let s = VectorStore::open(dir.path(), 3).unwrap();
+        assert!(!tmp.exists(), "stale tmp must be discarded on open");
+        assert_eq!(s.search(&norm(&[1.0, 0.0, 0.0]), 1)[0].0, "a#0");
     }
 }

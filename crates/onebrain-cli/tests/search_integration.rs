@@ -31,6 +31,76 @@ fn onebrain(vault_root: &Path, cache_dir: &Path) -> Command {
     cmd
 }
 
+/// Regression test for the dims-changing `search model set` bug: switching
+/// to a model with different embedding dims used to corrupt `onebrain.yml`
+/// (persisted the new model first, then bailed reopening the stale-dims
+/// vector store, so `rebuild` never ran). With an EMPTY index (0 chunks) the
+/// switch must still succeed — wiping and reopening the vector store at the
+/// new dims and recording the new active model — without downloading any
+/// model (0 chunks => the embedder is never constructed).
+///
+/// NON-GATED: runs in normal CI. e5-small is 384-dim, e5-base is 768-dim, so
+/// this is a genuine dims change; no reindex is run so there is nothing to
+/// re-embed.
+#[test]
+fn search_model_set_empty_index_dims_change_succeeds() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n  embed_model: multilingual-e5-small\n",
+    );
+
+    // No reindex: the index is empty. Switch to a different-dims model.
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "model", "set", "multilingual-e5-base"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "dims-changing model set on an empty index must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "search.model.set");
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["data"]["already_current"], false);
+    assert_eq!(
+        v["data"]["chunks_reembedded"], 0,
+        "empty index => nothing to re-embed: {v}"
+    );
+
+    // Config was updated only after the successful rebuild.
+    let yaml = std::fs::read_to_string(vault.path().join("onebrain.yml")).unwrap();
+    assert!(
+        yaml.contains("embed_model: multilingual-e5-base"),
+        "config should point at the new model after a successful switch: {yaml}"
+    );
+
+    // The vector store must have been recreated at the new dims (768). A
+    // SECOND dims-changing switch (e5-base 768 -> e5-large 1024) forces
+    // `open_engine` -> `VectorStore::open(768)` against the now-768 on-disk
+    // store: if the first switch had left a stale-dims store, this reopen
+    // would bail. Its success proves the wipe+reopen+header-update worked.
+    let out2 = onebrain(vault.path(), cache.path())
+        .args(["search", "model", "set", "multilingual-e5-large"])
+        .output()
+        .unwrap();
+    assert!(
+        out2.status.success(),
+        "second dims-changing switch must reopen the store at the prior new dims; stderr: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    let v2: serde_json::Value = serde_json::from_slice(&out2.stdout).unwrap();
+    assert_eq!(v2["data"]["chunks_reembedded"], 0);
+    let yaml2 = std::fs::read_to_string(vault.path().join("onebrain.yml")).unwrap();
+    assert!(
+        yaml2.contains("embed_model: multilingual-e5-large"),
+        "{yaml2}"
+    );
+}
+
 #[test]
 fn search_reindex_and_query_multilingual_end_to_end() {
     if std::env::var("ONEBRAIN_TEST_EMBED").is_err() {
