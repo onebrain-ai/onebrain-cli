@@ -11,11 +11,12 @@
 //!   heading path, so this database is the only place [`Engine::get`] and
 //!   [`Hit`] snippets can source that data from.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::chunk::chunk_markdown;
 use crate::embed::{self, Embedder};
@@ -25,6 +26,7 @@ use crate::vector::VectorStore;
 
 const CHUNK_META: TableDefinition<&str, &str> = TableDefinition::new("chunk_meta");
 const DOC_CHUNKS: TableDefinition<&str, &str> = TableDefinition::new("doc_chunks");
+const DOC_HASHES: TableDefinition<&str, &str> = TableDefinition::new("doc_hashes");
 
 const CHUNK_MAX_TOKENS: usize = 512;
 const CHUNK_OVERLAP_TOKENS: usize = 64;
@@ -32,6 +34,84 @@ const LEX_TOP_K: usize = 50;
 const VEC_TOP_K: usize = 50;
 const RRF_K: f64 = 60.0;
 const SNIPPET_MAX_CHARS: usize = 200;
+
+/// Outcome counts of a [`Engine::reindex_paths`] / [`Engine::reindex_all`] run.
+#[derive(Debug, Default, PartialEq)]
+pub struct ReindexStats {
+    pub added: usize,
+    pub updated: usize,
+    pub removed: usize,
+    pub unchanged: usize,
+}
+
+/// Decision for a single doc when comparing its freshly computed content
+/// hash against the previously stored one. Pure and side-effect free so it
+/// can be unit tested without touching disk or the redb database.
+#[derive(Debug, PartialEq)]
+enum HashDiff {
+    /// No hash was stored yet for this doc.
+    Added,
+    /// A hash was stored but it differs from the current content.
+    Updated,
+    /// The stored hash matches the current content.
+    Unchanged,
+}
+
+/// Compare a stored hash (if any) against the freshly computed `current`
+/// hash and classify the outcome. Pure: no I/O.
+fn diff_hash(stored: Option<&str>, current: &str) -> HashDiff {
+    match stored {
+        None => HashDiff::Added,
+        Some(prev) if prev == current => HashDiff::Unchanged,
+        Some(_) => HashDiff::Updated,
+    }
+}
+
+/// Hex-encoded SHA-256 of `bytes`.
+fn hash_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Derive `file_path`'s path relative to `vault_root`, using forward
+/// slashes regardless of platform, for use as a stable `doc_path` /
+/// `doc_hashes` key. Returns `None` if `file_path` is not under
+/// `vault_root`. Pure: no I/O (works on the path strings only).
+fn vault_relative_path(vault_root: &Path, file_path: &Path) -> Option<String> {
+    let rel = file_path.strip_prefix(vault_root).ok()?;
+    let components: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if components.is_empty() {
+        return None;
+    }
+    Some(components.join("/"))
+}
+
+/// Recursively collect every `*.md` file under `root` (hand-rolled
+/// stack-based walk — no new crate dep).
+fn walk_markdown_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue, // vault_root itself missing, or unreadable subdir: skip
+        };
+        for entry in entries {
+            let entry = entry.with_context(|| format!("reading dir entry in {}", dir.display()))?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "md") {
+                out.push(path);
+            }
+        }
+    }
+    Ok(out)
+}
 
 /// A single fused, resolved search hit.
 pub struct Hit {
@@ -93,6 +173,7 @@ impl Engine {
             let write_txn = meta.begin_write()?;
             write_txn.open_table(CHUNK_META)?;
             write_txn.open_table(DOC_CHUNKS)?;
+            write_txn.open_table(DOC_HASHES)?;
             write_txn.commit()?;
         }
 
@@ -232,6 +313,129 @@ impl Engine {
             .collect::<Vec<_>>()
             .join("\n\n"))
     }
+
+    /// Stored content hash for `doc_path`, if any.
+    fn stored_hash(&self, doc_path: &str) -> Result<Option<String>> {
+        let read_txn = self.meta.begin_read()?;
+        let doc_hashes = read_txn.open_table(DOC_HASHES)?;
+        Ok(doc_hashes.get(doc_path)?.map(|v| v.value().to_string()))
+    }
+
+    /// Store `hash` as `doc_path`'s content hash.
+    fn store_hash(&mut self, doc_path: &str, hash: &str) -> Result<()> {
+        let write_txn = self.meta.begin_write()?;
+        {
+            let mut doc_hashes = write_txn.open_table(DOC_HASHES)?;
+            doc_hashes.insert(doc_path, hash)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Drop `doc_path`'s stored content hash, if any.
+    fn drop_hash(&mut self, doc_path: &str) -> Result<()> {
+        let write_txn = self.meta.begin_write()?;
+        {
+            let mut doc_hashes = write_txn.open_table(DOC_HASHES)?;
+            doc_hashes.remove(doc_path)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Reindex one doc (already known to exist on disk at `abs_path`)
+    /// against its stored hash, updating `stats` in place.
+    fn reindex_existing_doc(
+        &mut self,
+        doc_path: &str,
+        abs_path: &Path,
+        stats: &mut ReindexStats,
+    ) -> Result<()> {
+        let bytes =
+            std::fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
+        let current_hash = hash_bytes(&bytes);
+        let stored = self.stored_hash(doc_path)?;
+
+        match diff_hash(stored.as_deref(), &current_hash) {
+            HashDiff::Unchanged => {
+                stats.unchanged += 1;
+            }
+            HashDiff::Added => {
+                let content = String::from_utf8_lossy(&bytes).into_owned();
+                self.index_doc(doc_path, &content)?;
+                self.store_hash(doc_path, &current_hash)?;
+                stats.added += 1;
+            }
+            HashDiff::Updated => {
+                let content = String::from_utf8_lossy(&bytes).into_owned();
+                self.remove_doc(doc_path)?;
+                self.index_doc(doc_path, &content)?;
+                self.store_hash(doc_path, &current_hash)?;
+                stats.updated += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reindex specific docs. `doc_paths` are vault-relative paths (also
+    /// the meta keys). For each: read `vault_root.join(doc_path)`, sha256
+    /// its bytes, and compare to the stored hash — see the module-level
+    /// task doc for the four cases (added/updated/unchanged/removed).
+    pub fn reindex_paths(
+        &mut self,
+        vault_root: &Path,
+        doc_paths: &[String],
+    ) -> Result<ReindexStats> {
+        let mut stats = ReindexStats::default();
+        for doc_path in doc_paths {
+            let abs_path = vault_root.join(doc_path);
+            if abs_path.is_file() {
+                self.reindex_existing_doc(doc_path, &abs_path, &mut stats)?;
+            } else if self.stored_hash(doc_path)?.is_some() {
+                self.remove_doc(doc_path)?;
+                self.drop_hash(doc_path)?;
+                stats.removed += 1;
+            }
+            // Neither on disk nor indexed: ignore.
+        }
+        Ok(stats)
+    }
+
+    /// Reindex the whole vault: walk `vault_root` for `*.md` files
+    /// (recursively), reindex each, and remove any previously-indexed doc
+    /// whose file no longer exists.
+    pub fn reindex_all(&mut self, vault_root: &Path) -> Result<ReindexStats> {
+        let files = walk_markdown_files(vault_root)?;
+        let doc_paths: Vec<String> = files
+            .iter()
+            .filter_map(|f| vault_relative_path(vault_root, f))
+            .collect();
+
+        let mut stats = ReindexStats::default();
+        for (doc_path, abs_path) in doc_paths.iter().zip(files.iter()) {
+            self.reindex_existing_doc(doc_path, abs_path, &mut stats)?;
+        }
+
+        // Sweep: any stored hash whose doc_path wasn't just seen on disk
+        // means the file is gone.
+        let stale: Vec<String> = {
+            let read_txn = self.meta.begin_read()?;
+            let doc_hashes = read_txn.open_table(DOC_HASHES)?;
+            doc_hashes
+                .iter()?
+                .filter_map(|entry| entry.ok())
+                .map(|(k, _)| k.value().to_string())
+                .filter(|k| !doc_paths.contains(k))
+                .collect()
+        };
+        for doc_path in stale {
+            self.remove_doc(&doc_path)?;
+            self.drop_hash(&doc_path)?;
+            stats.removed += 1;
+        }
+
+        Ok(stats)
+    }
 }
 
 #[cfg(test)]
@@ -267,6 +471,91 @@ mod tests {
         assert!(e.get("rust.md").is_err());
         let hits = e.query("memory safety", 3).unwrap();
         assert!(hits.iter().all(|h| h.doc_path != "rust.md"));
+    }
+
+    #[test]
+    fn reindex_detects_add_update_unchanged_remove() {
+        if std::env::var("ONEBRAIN_TEST_EMBED").is_err() {
+            return; // gated: downloads a model
+        }
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(cache_dir.path(), "multilingual-e5-small").unwrap();
+
+        let doc_path = vault_dir.path().join("a.md");
+        std::fs::write(&doc_path, "# A\noriginal content").unwrap();
+
+        let stats = e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(
+            stats,
+            ReindexStats {
+                added: 1,
+                updated: 0,
+                removed: 0,
+                unchanged: 0,
+            }
+        );
+
+        // Reindexing again with no changes -> unchanged.
+        let stats = e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(
+            stats,
+            ReindexStats {
+                added: 0,
+                updated: 0,
+                removed: 0,
+                unchanged: 1,
+            }
+        );
+
+        // Edit the file -> updated.
+        std::fs::write(&doc_path, "# A\nedited content, different bytes").unwrap();
+        let stats = e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(
+            stats,
+            ReindexStats {
+                added: 0,
+                updated: 1,
+                removed: 0,
+                unchanged: 0,
+            }
+        );
+        assert!(e.get("a.md").is_ok());
+
+        // Delete the file -> removed.
+        std::fs::remove_file(&doc_path).unwrap();
+        let stats = e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(
+            stats,
+            ReindexStats {
+                added: 0,
+                updated: 0,
+                removed: 1,
+                unchanged: 0,
+            }
+        );
+        assert!(e.get("a.md").is_err());
+    }
+
+    #[test]
+    fn vault_relative_path_strips_prefix_and_normalizes_slashes() {
+        let root = Path::new("/vault/root");
+        let file = Path::new("/vault/root/01-projects/onebrain/Project.md");
+        assert_eq!(
+            vault_relative_path(root, file).as_deref(),
+            Some("01-projects/onebrain/Project.md")
+        );
+
+        // A path outside vault_root has no relative form.
+        let outside = Path::new("/other/place.md");
+        assert_eq!(vault_relative_path(root, outside), None);
+    }
+
+    #[test]
+    fn hash_diff_decision_covers_all_cases() {
+        assert_eq!(diff_hash(None, "abc"), HashDiff::Added);
+        assert_eq!(diff_hash(Some("abc"), "abc"), HashDiff::Unchanged);
+        assert_eq!(diff_hash(Some("abc"), "def"), HashDiff::Updated);
     }
 
     #[test]
