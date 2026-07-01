@@ -54,18 +54,43 @@ fn search_status_json_reports_collection_and_model_without_downloading() {
     assert_eq!(v["data"]["collection"], "t-vault");
     assert!(v["data"]["embed_model"].is_string());
     assert_eq!(v["data"]["indexed"], false);
+    // Enriched status fields present, all zero/absent on a fresh vault.
+    assert_eq!(v["data"]["doc_count"], 0);
+    assert_eq!(v["data"]["pending_new"], 0);
+    assert!(v["data"]["last_indexed_at"].is_null());
+    assert!(v["data"]["model_size_bytes"].is_null());
 
-    // The model cache dir must NOT have been created/populated by `status` —
-    // if it were, that would mean a download was attempted.
+    // `status` now opens the engine read-only to read the doc count / drift,
+    // so the cache dir (tantivy/vectors/redb) may exist — but NO embedding
+    // model must ever be downloaded. Assert the real invariant: no ONNX model
+    // files and no `models--*` download dir under the collection cache.
     let model_cache = cache.path().join("onebrain").join("search").join("t-vault");
-    assert!(
-        !model_cache.exists(),
-        "status must not touch the engine's on-disk state"
-    );
+    if model_cache.exists() {
+        assert!(
+            !walkdir_has_onnx(&model_cache),
+            "status must not download an embedding model"
+        );
+        let has_model_dir = std::fs::read_dir(&model_cache)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok()).any(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with("models--"))
+                })
+            })
+            .unwrap_or(false);
+        assert!(
+            !has_model_dir,
+            "status must not create a model download dir"
+        );
+    }
 }
 
 #[test]
-fn search_status_reports_unconfigured_collection() {
+fn search_status_autogenerates_and_persists_collection_when_unset() {
+    // A vault with no `search.collection` and no legacy `qmd_collection`:
+    // `status` auto-generates `<dir>-<hash>` and persists it to onebrain.yml
+    // (headless-safe, no prompt) so the index is stable across runs.
     let vault = tempdir().unwrap();
     let cache = tempdir().unwrap();
     write(
@@ -81,8 +106,32 @@ fn search_status_reports_unconfigured_collection() {
     assert!(out.status.success());
 
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert!(v["data"]["collection"].is_null());
+    let collection = v["data"]["collection"]
+        .as_str()
+        .expect("collection auto-generated, not null");
+    // `<dir>-<6 hex>`.
+    let dir_name = vault.path().file_name().unwrap().to_str().unwrap();
+    assert!(
+        collection.starts_with(&format!("{dir_name}-")),
+        "expected `<dir>-<hash>`, got {collection}"
+    );
     assert_eq!(v["data"]["indexed"], false);
+
+    // Persisted to config, and preserving the existing folders key.
+    let yaml = std::fs::read_to_string(vault.path().join("onebrain.yml")).unwrap();
+    assert!(
+        yaml.contains(&format!("collection: {collection}")),
+        "collection must be persisted: {yaml}"
+    );
+    assert!(yaml.contains("inbox: 00-inbox"));
+
+    // Second run reads the persisted value (stable, no re-derivation).
+    let out2 = onebrain(vault.path(), cache.path())
+        .args(["search", "status"])
+        .output()
+        .unwrap();
+    let v2: serde_json::Value = serde_json::from_slice(&out2.stdout).unwrap();
+    assert_eq!(v2["data"]["collection"].as_str().unwrap(), collection);
 }
 
 #[test]

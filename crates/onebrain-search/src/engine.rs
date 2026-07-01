@@ -31,6 +31,7 @@ const DOC_HASHES: TableDefinition<&str, &str> = TableDefinition::new("doc_hashes
 const ENGINE_HEADER: TableDefinition<&str, &str> = TableDefinition::new("engine_header");
 
 const ACTIVE_MODEL_KEY: &str = "active_model";
+const LAST_INDEXED_KEY: &str = "last_indexed_at";
 
 const CHUNK_MAX_TOKENS: usize = 512;
 const CHUNK_OVERLAP_TOKENS: usize = 64;
@@ -78,6 +79,36 @@ pub struct ReindexStats {
     pub failed: usize,
 }
 
+/// Read-only snapshot of the index for `status` reporting: how many docs are
+/// indexed, when the index was last (re)built, and how far the on-disk vault
+/// has drifted from the index. Computed WITHOUT constructing the embedder —
+/// no model download, no embed calls.
+///
+/// The three `pending_*` counts are exactly the diff a reindex would act on
+/// (add / update / remove), MINUS the actual indexing: a pure hash walk.
+#[derive(Debug, Default, PartialEq)]
+pub struct IndexStatus {
+    /// Number of docs currently indexed (distinct `doc_hashes` keys).
+    pub doc_count: usize,
+    /// Epoch seconds of the last `reindex_all` / `reindex_paths` run, or
+    /// `None` if the index has never been (re)built.
+    pub last_indexed_at: Option<u64>,
+    /// Docs on disk with no stored hash (would be added).
+    pub pending_new: usize,
+    /// Docs on disk whose content hash differs from the stored one (would be
+    /// re-indexed).
+    pub pending_changed: usize,
+    /// Indexed docs whose file is gone from disk (would be removed).
+    pub pending_removed: usize,
+}
+
+impl IndexStatus {
+    /// Total pending drift across all three categories.
+    pub fn pending_total(&self) -> usize {
+        self.pending_new + self.pending_changed + self.pending_removed
+    }
+}
+
 /// Decision for a single doc when comparing its freshly computed content
 /// hash against the previously stored one. Pure and side-effect free so it
 /// can be unit tested without touching disk or the redb database.
@@ -106,6 +137,16 @@ fn hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
+}
+
+/// Short, stable, hex collection-hash for a vault's absolute path: the first
+/// 6 hex chars of sha256(path bytes). Deterministic per path, so a vault
+/// always maps to the same auto-generated collection name. Exposed so the CLI
+/// can derive a default collection name (`<dir>-<hash>`) without duplicating
+/// the sha2 hashing, and unit-tested here alongside the other hash helpers.
+pub fn short_path_hash(path: &Path) -> String {
+    let full = hash_bytes(path.as_os_str().to_string_lossy().as_bytes());
+    full.chars().take(6).collect()
 }
 
 /// Derive `file_path`'s path relative to `vault_root`, using forward
@@ -625,6 +666,29 @@ impl Engine {
         Ok(())
     }
 
+    /// Record `epoch_secs` as the index's `last_indexed_at` in the engine
+    /// header. Called by the reindex paths at the end of a successful run.
+    fn record_last_indexed(&mut self, epoch_secs: u64) -> Result<()> {
+        let write_txn = self.meta.begin_write()?;
+        {
+            let mut header = write_txn.open_table(ENGINE_HEADER)?;
+            header.insert(LAST_INDEXED_KEY, epoch_secs.to_string().as_str())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Stored `last_indexed_at` epoch seconds, if a reindex has ever run.
+    /// Unparseable values are treated as absent (defensive — the field is
+    /// only ever written as a decimal string by [`Self::record_last_indexed`]).
+    fn stored_last_indexed(&self) -> Result<Option<u64>> {
+        let read_txn = self.meta.begin_read()?;
+        let header = read_txn.open_table(ENGINE_HEADER)?;
+        Ok(header
+            .get(LAST_INDEXED_KEY)?
+            .and_then(|v| v.value().parse::<u64>().ok()))
+    }
+
     /// Drop `doc_path`'s stored content hash, if any.
     fn drop_hash(&mut self, doc_path: &str) -> Result<()> {
         let write_txn = self.meta.begin_write()?;
@@ -726,6 +790,7 @@ impl Engine {
                 doc_path: doc_path.clone(),
             });
         }
+        self.record_last_indexed(now_epoch_secs())?;
         Ok(stats)
     }
 
@@ -807,8 +872,76 @@ impl Engine {
             stats.removed += 1;
         }
 
+        self.record_last_indexed(now_epoch_secs())?;
         Ok(stats)
     }
+
+    /// Read-only index status: doc count, last-indexed timestamp, and the
+    /// pending drift between the on-disk vault and the index.
+    ///
+    /// Never constructs the embedder — it only reads stored hashes and
+    /// re-hashes the vault's `*.md` files (one sha256 per file). Safe to call
+    /// before any model has been downloaded. The drift walk is the same
+    /// add/update/unchanged/remove classification a reindex does, MINUS the
+    /// indexing side-effects.
+    pub fn status(&self, vault_root: &Path) -> Result<IndexStatus> {
+        // Snapshot every stored (doc_path -> hash) once. Doc count is the
+        // number of distinct stored hashes.
+        let stored: std::collections::HashMap<String, String> = {
+            let read_txn = self.meta.begin_read()?;
+            let doc_hashes = read_txn.open_table(DOC_HASHES)?;
+            let mut out = std::collections::HashMap::new();
+            for entry in doc_hashes.iter()? {
+                let (k, v) = entry?;
+                out.insert(k.value().to_string(), v.value().to_string());
+            }
+            out
+        };
+
+        let files = walk_markdown_files(vault_root)?;
+        let mut pending_new = 0usize;
+        let mut pending_changed = 0usize;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for abs_path in &files {
+            let Some(doc_path) = vault_relative_path(vault_root, abs_path) else {
+                continue;
+            };
+            let bytes = match std::fs::read(abs_path) {
+                Ok(b) => b,
+                // Unreadable file: skip it (a reindex would count it as
+                // `failed`, not as drift). Keep status read-only + resilient.
+                Err(_) => continue,
+            };
+            let current_hash = hash_bytes(&bytes);
+            match diff_hash(stored.get(&doc_path).map(String::as_str), &current_hash) {
+                HashDiff::Added => pending_new += 1,
+                HashDiff::Updated => pending_changed += 1,
+                HashDiff::Unchanged => {}
+            }
+            seen.insert(doc_path);
+        }
+
+        // Indexed docs whose file is gone from disk (would be removed).
+        let pending_removed = stored.keys().filter(|k| !seen.contains(*k)).count();
+
+        Ok(IndexStatus {
+            doc_count: stored.len(),
+            last_indexed_at: self.stored_last_indexed()?,
+            pending_new,
+            pending_changed,
+            pending_removed,
+        })
+    }
+}
+
+/// Current wall-clock time as whole epoch seconds. Clamps a
+/// before-epoch clock (never happens in practice) to 0 rather than
+/// panicking.
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1012,6 +1145,95 @@ mod tests {
             }
         );
         assert!(e.get("a.md").is_err());
+    }
+
+    #[test]
+    fn fake_status_reports_doc_count_last_indexed_and_no_drift_after_reindex() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        // Fresh index: nothing stored, so status walks the (empty) vault and
+        // reports a clean, never-indexed state.
+        let fresh = e.status(vault_dir.path()).unwrap();
+        assert_eq!(fresh.doc_count, 0);
+        assert_eq!(fresh.last_indexed_at, None);
+        assert_eq!(fresh.pending_total(), 0);
+
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
+        std::fs::write(vault_dir.path().join("b.md"), "# B\nbeta content").unwrap();
+
+        // Before reindex, both files are pending-new drift and there's still
+        // no last_indexed timestamp.
+        let before = e.status(vault_dir.path()).unwrap();
+        assert_eq!(before.doc_count, 0);
+        assert_eq!(before.pending_new, 2);
+        assert_eq!(before.pending_changed, 0);
+        assert_eq!(before.pending_removed, 0);
+        assert_eq!(before.last_indexed_at, None);
+
+        e.reindex_all(vault_dir.path()).unwrap();
+
+        // After reindex: both docs indexed, timestamp set, no drift.
+        let after = e.status(vault_dir.path()).unwrap();
+        assert_eq!(after.doc_count, 2);
+        assert!(after.last_indexed_at.is_some());
+        assert_eq!(after.pending_total(), 0);
+    }
+
+    #[test]
+    fn fake_status_detects_changed_and_removed_drift() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        let a = vault_dir.path().join("a.md");
+        let b = vault_dir.path().join("b.md");
+        std::fs::write(&a, "# A\nalpha content").unwrap();
+        std::fs::write(&b, "# B\nbeta content").unwrap();
+        e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(e.status(vault_dir.path()).unwrap().pending_total(), 0);
+
+        // Edit a, delete b, add c → 1 changed, 1 removed, 1 new.
+        std::fs::write(&a, "# A\nalpha content EDITED").unwrap();
+        std::fs::remove_file(&b).unwrap();
+        std::fs::write(vault_dir.path().join("c.md"), "# C\ngamma").unwrap();
+
+        let s = e.status(vault_dir.path()).unwrap();
+        assert_eq!(s.doc_count, 2, "still 2 indexed until next reindex");
+        assert_eq!(s.pending_new, 1);
+        assert_eq!(s.pending_changed, 1);
+        assert_eq!(s.pending_removed, 1);
+        assert_eq!(s.pending_total(), 3);
+    }
+
+    #[test]
+    fn fake_reindex_paths_sets_last_indexed() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha").unwrap();
+
+        assert_eq!(e.status(vault_dir.path()).unwrap().last_indexed_at, None);
+        e.reindex_paths(vault_dir.path(), &["a.md".to_string()])
+            .unwrap();
+        assert!(e
+            .status(vault_dir.path())
+            .unwrap()
+            .last_indexed_at
+            .is_some());
+    }
+
+    #[test]
+    fn index_status_pending_total_sums_categories() {
+        let s = IndexStatus {
+            doc_count: 10,
+            last_indexed_at: Some(123),
+            pending_new: 2,
+            pending_changed: 3,
+            pending_removed: 1,
+        };
+        assert_eq!(s.pending_total(), 6);
     }
 
     #[test]
@@ -1388,6 +1610,21 @@ mod tests {
         // A path outside vault_root has no relative form.
         let outside = Path::new("/other/place.md");
         assert_eq!(vault_relative_path(root, outside), None);
+    }
+
+    #[test]
+    fn short_path_hash_is_stable_and_six_hex_chars() {
+        let p = Path::new("/Users/keng/vaults/ob-1");
+        let h1 = short_path_hash(p);
+        let h2 = short_path_hash(p);
+        assert_eq!(h1, h2, "same path must hash identically");
+        assert_eq!(h1.len(), 6);
+        assert!(
+            h1.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash must be hex: {h1}"
+        );
+        // Different paths give (with overwhelming probability) different hashes.
+        assert_ne!(h1, short_path_hash(Path::new("/Users/keng/vaults/ob-2")));
     }
 
     #[test]
