@@ -27,7 +27,7 @@ use super::UpdateError;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 const DOWNLOAD_TIMEOUT_SECS: u64 = 90;
 const RELEASES_DOWNLOAD_BASE: &str =
@@ -253,7 +253,9 @@ fn extract_tar_gz(archive_bytes: &[u8], target_name: &str) -> Result<Vec<u8>, Up
 /// then move the new binary into place. The `.old` file is left behind for
 /// the OS to clean up on next reboot (rustup uses the same pattern).
 fn swap_binary(current_exe: &Path, new_bytes: &[u8]) -> Result<(), UpdateError> {
-    let _parent = current_exe
+    // Precondition: `current_exe` must have a parent dir — every sibling path
+    // below (`.new`, `.old`) is derived from it. Guard only; value unused.
+    current_exe
         .parent()
         .ok_or_else(|| UpdateError::Install("current binary has no parent dir".to_string()))?;
     let new_path: PathBuf = {
@@ -459,29 +461,54 @@ pub(crate) fn detect_install_channel(current_exe: &Path) -> InstallChannel {
 
 /// Pure path classifier. A Homebrew install canonicalizes into
 /// `…/Cellar/onebrain/<version>/bin/onebrain` on `/opt/homebrew`,
-/// `/usr/local`, and Linuxbrew alike, so the `/Cellar/onebrain/` segment is
-/// the reliable signal. Split out so it's testable without a real filesystem.
+/// `/usr/local`, and Linuxbrew alike, so `Cellar` followed by `onebrain` as
+/// consecutive path *components* is the reliable signal. Split out so it's
+/// testable without a real filesystem.
 ///
-/// brew is Unix-only, so the forward-slash literal is correct: a Windows path
-/// never matches and always resolves to `Direct` (the Windows update path is
-/// unwired anyway — see `AssetInfo::extract_binary`).
+/// Matching whole components (via [`has_consecutive_components`]) rather than a
+/// substring means a segment like `Cellar-backup` or `my-node_modules` can't
+/// partially match. Component matching is also separator-agnostic: unlike the
+/// old forward-slash substring, it will match a real npm/brew layout on Windows
+/// too. That's harmless — and arguably more correct — since the Windows
+/// self-update path is gated separately and unwired (see
+/// `AssetInfo::extract_binary`); a `Direct` Windows install still has no
+/// `Cellar`/`node_modules` components and stays `Direct`.
 fn classify_path(resolved: &Path) -> InstallChannel {
-    let s = resolved.to_string_lossy();
-    if s.contains("/Cellar/onebrain/") {
+    if has_consecutive_components(resolved, &["Cellar", "onebrain"]) {
         InstallChannel::Homebrew
-    } else if s.contains("/node_modules/@onebrain-ai/") {
+    } else if has_consecutive_components(resolved, &["node_modules", "@onebrain-ai"]) {
         // The npm wrapper's native binary canonicalizes to
         // `<prefix>/lib/node_modules/@onebrain-ai/cli/bin/onebrain`; pnpm/yarn
         // and `bun add -g` nest it under `.../node_modules/@onebrain-ai/cli`
-        // too (bun via its bin symlink). The scoped `@onebrain-ai` segment is
+        // too (bun via its bin symlink). The scoped `@onebrain-ai` component is
         // the precise signal — a bare `node_modules` check would over-match
-        // unrelated binaries. Unix path separator: Windows npm globals use
-        // backslashes and fall through to Direct (Windows update is unwired —
-        // see `AssetInfo::extract_binary`).
+        // unrelated binaries.
         InstallChannel::Npm
     } else {
         InstallChannel::Direct
     }
+}
+
+/// True if `needle` appears as a run of consecutive path components in `path`
+/// (order-sensitive, whole-segment). Only `Normal` components can match — a
+/// root, `..`, or Windows prefix yields `None`, which equals no needle element,
+/// so a run broken by one of them does not match.
+fn has_consecutive_components(path: &Path, needle: &[&str]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let comps: Vec<Option<&str>> = path
+        .components()
+        .map(|c| match c {
+            Component::Normal(os) => os.to_str(),
+            _ => None,
+        })
+        .collect();
+    comps.windows(needle.len()).any(|w| {
+        w.iter()
+            .zip(needle)
+            .all(|(comp, want)| *comp == Some(*want))
+    })
 }
 
 /// The Homebrew tap that ships the `onebrain` formula.
@@ -786,6 +813,19 @@ mod tests {
             classify_path(Path::new("/opt/homebrew/Cellar/ripgrep/14.0/bin/onebrain")),
             InstallChannel::Direct
         );
+        // Whole-component matching: a superstring segment (`onebrain-tools`,
+        // `Cellar-backup`) must resolve to Direct, never Homebrew — the check
+        // matches `Cellar` then `onebrain` as whole components, not substrings.
+        assert_eq!(
+            classify_path(Path::new(
+                "/opt/homebrew/Cellar/onebrain-tools/1.0/bin/onebrain"
+            )),
+            InstallChannel::Direct
+        );
+        assert_eq!(
+            classify_path(Path::new("/home/user/Cellar-backup/onebrain/bin/onebrain")),
+            InstallChannel::Direct
+        );
     }
 
     #[test]
@@ -817,6 +857,16 @@ mod tests {
         // scope is required, so a bare node_modules path stays Direct.
         assert_eq!(
             classify_path(Path::new("/proj/node_modules/.bin/onebrain")),
+            InstallChannel::Direct
+        );
+        // Whole-component matching: superstring segments (`my-node_modules`,
+        // `@onebrain-ai-backup`) must resolve to Direct, never Npm — the scope
+        // is matched as a whole component, not a substring. (This is the AI
+        // code-quality finding's own example path.)
+        assert_eq!(
+            classify_path(Path::new(
+                "/home/user/my-node_modules/@onebrain-ai-backup/bin/onebrain"
+            )),
             InstallChannel::Direct
         );
     }
