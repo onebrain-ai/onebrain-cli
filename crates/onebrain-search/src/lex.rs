@@ -405,4 +405,28 @@ mod tests {
         ix.commit().unwrap();
         assert_eq!(ix.search("全文検索", 1).unwrap()[0].0, "j1#0"); // "full-text search"
     }
+    #[test]
+    fn korean_bigram_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ix = LexIndex::open(dir.path()).unwrap();
+        ix.add(&chunk("k1#0", "기계학습론")).unwrap(); // "theory of machine learning"
+        ix.commit().unwrap();
+        assert_eq!(ix.search("학습", 1).unwrap()[0].0, "k1#0"); // "learning"
+    }
+    #[test]
+    fn lao_bigram_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ix = LexIndex::open(dir.path()).unwrap();
+        ix.add(&chunk("l1#0", "ການຮຽນຮູ້ຂອງເຄື່ອງຈັກ")).unwrap(); // "machine learning"
+        ix.commit().unwrap();
+        assert_eq!(ix.search("ຮຽນຮູ້", 1).unwrap()[0].0, "l1#0"); // "learning"
+    }
+    #[test]
+    fn russian_default_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ix = LexIndex::open(dir.path()).unwrap();
+        ix.add(&chunk("r1#0", "машинное обучение и поиск")).unwrap(); // "machine learning and search"
+        ix.commit().unwrap();
+        assert_eq!(ix.search("обучение", 1).unwrap()[0].0, "r1#0"); // "learning"
+    }
 }

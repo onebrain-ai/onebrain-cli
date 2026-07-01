@@ -538,6 +538,29 @@ mod tests {
     }
 
     #[test]
+    fn multilingual_semantic_search() {
+        if std::env::var("ONEBRAIN_TEST_EMBED").is_err() {
+            return; // gated: downloads a model
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = Engine::open(dir.path(), "multilingual-e5-small").unwrap();
+        e.index_doc(
+            "en.md",
+            "# Machine learning\nneural networks and model training",
+        )
+        .unwrap();
+        e.index_doc("th.md", "# การทำอาหาร\nสูตรผัดไทยและส่วนผสม")
+            .unwrap(); // Thai: cooking / pad thai recipe
+        e.index_doc("zh.md", "# 天气\n今天下雨很冷需要带伞")
+            .unwrap(); // Chinese: weather / rain
+                       // A Chinese query about weather should rank the Chinese weather doc
+                       // first, over the English ML doc and Thai cooking doc — proving
+                       // cross-doc multilingual semantics.
+        let hits = e.query("下雨天气", 3).unwrap();
+        assert_eq!(hits[0].doc_path, "zh.md");
+    }
+
+    #[test]
     fn vault_relative_path_strips_prefix_and_normalizes_slashes() {
         let root = Path::new("/vault/root");
         let file = Path::new("/vault/root/01-projects/onebrain/Project.md");
