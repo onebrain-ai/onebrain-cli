@@ -21,6 +21,7 @@
 //! | `POST   /api/vault/folder?path=` | create a folder                              |
 //! | `DELETE /api/vault/folder?path=` | delete a folder                              |
 //! | `GET    /api/vault/tasks`        | dated Obsidian-Tasks lines across the vault |
+//! | `GET    /api/webview/preflight`  | `{ frameable }` — header-only iframe probe  |
 //! | `POST   /api/chat`               | SSE stream over a `claude -p` agent turn    |
 //!
 //! `rev` is a cheap revision tag (mtime in whole nanoseconds since the epoch)
@@ -69,6 +70,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/vault/tasks", get(get_vault_tasks))
         // Vault search backed by the qmd index (BM25 lex + hybrid lex/vec).
         .route("/vault/search", get(super::search::get_vault_search))
+        // Internal webview: header-only preflight to decide iframe vs new-tab.
+        .route(
+            "/webview/preflight",
+            get(super::webview::get_webview_preflight),
+        )
         // v3.3 chat — SSE stream over a `claude -p` agent turn. Inherits the auth
         // middleware + body limit applied to this whole sub-router.
         .route("/chat", post(super::chat::post_chat))
