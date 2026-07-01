@@ -228,4 +228,63 @@ mod tests {
         assert!(r.message.contains("missing"));
         assert!(!r.message.contains("stale"));
     }
+
+    /// `agents/` exists but contains only non-.md files → `has_any_md` returns
+    /// false → error "agents/ (empty)". Covers the `.push(format!("{}/ (empty)",
+    /// dir))` branch for the agents directory.
+    #[test]
+    fn empty_agents_dir_no_md_is_error() {
+        let d = tempdir().unwrap();
+        build_clean_plugin(d.path());
+        let base = d.path().join(".claude/plugins/onebrain/agents");
+        std::fs::remove_file(base.join("a.md")).unwrap();
+        std::fs::remove_file(base.join("b.md")).unwrap();
+        std::fs::remove_file(base.join("c.md")).unwrap();
+        std::fs::write(base.join("notes.txt"), "x").unwrap();
+        let r = PluginFilesCheck.run(d.path(), &cfg());
+        assert!(r.message.contains("agents/ (empty)"), "msg: {}", r.message);
+        assert_eq!(
+            r.hint.as_deref(),
+            Some("Run onebrain update to restore plugin files")
+        );
+    }
+
+    /// `skills/` has a subdir WITHOUT a `SKILL.md` file: `count_skill_md` must
+    /// not count it. Covers the `p.is_dir() && p.join("SKILL.md").is_file()`
+    /// false branch inside `count_skill_md`.
+    #[test]
+    fn skill_subdir_without_skill_md_is_not_counted() {
+        let d = tempdir().unwrap();
+        build_clean_plugin(d.path());
+        // Add a skills subdir that has a .md file but no SKILL.md
+        let orphan = d.path().join(".claude/plugins/onebrain/skills/baz");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("README.md"), "x").unwrap();
+        let r = PluginFilesCheck.run(d.path(), &cfg());
+        assert_eq!(r.message, "all required files present");
+        // baz/ has no SKILL.md → only foo and bar count
+        assert!(
+            r.details.iter().any(|s| s.contains("2 skills")),
+            "details: {:?}",
+            r.details
+        );
+    }
+
+    /// A subdirectory inside `agents/` is not a file and must not be counted
+    /// by `count_agents_md`. Covers the `e.file_type().map(|t| t.is_file())`
+    /// false branch (subdirs filtered out).
+    #[test]
+    fn agents_subdir_is_not_counted_as_agent() {
+        let d = tempdir().unwrap();
+        build_clean_plugin(d.path());
+        std::fs::create_dir_all(d.path().join(".claude/plugins/onebrain/agents/subdir")).unwrap();
+        let r = PluginFilesCheck.run(d.path(), &cfg());
+        assert_eq!(r.message, "all required files present");
+        // subdir is not a file → filtered; the 3 original .md agent files remain
+        assert!(
+            r.details.iter().any(|s| s.contains("3 agents")),
+            "details: {:?}",
+            r.details
+        );
+    }
 }

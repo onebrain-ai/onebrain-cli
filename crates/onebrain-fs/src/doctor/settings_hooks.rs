@@ -787,4 +787,106 @@ mod tests {
         assert_eq!(r.status, DoctorStatus::Warn);
         assert!(r.details.iter().any(|s| s == "Stop hook missing"));
     }
+
+    /// Empty `command: ""` must NOT be pushed to the effective-command string.
+    /// Only non-empty command strings contribute (covers the `if !c.is_empty()`
+    /// false branch in `effective_command`).
+    #[test]
+    fn effective_command_skips_empty_command_string() {
+        let hook = json!({ "command": "", "args": ["checkpoint", "stop"] });
+        assert_eq!(effective_command(&hook), "checkpoint stop");
+    }
+
+    /// A group entry that has no `"hooks"` array key is silently skipped inside
+    /// `detect_hook_form`; the subsequent group with the canonical entry wins.
+    /// Covers the `else { continue; }` branch.
+    #[test]
+    fn detect_hook_form_skips_group_missing_hooks_key() {
+        let settings = json!({
+            "hooks": {
+                "Stop": [
+                    { "matcher": "" },  // no "hooks" key → skipped
+                    {
+                        "matcher": "",
+                        "hooks": [
+                            { "command": "onebrain", "args": ["checkpoint", "stop"] }
+                        ]
+                    }
+                ]
+            }
+        });
+        assert_eq!(
+            detect_hook_form(&settings, "Stop", "onebrain checkpoint stop"),
+            HookForm::Exec
+        );
+    }
+
+    /// When the top-level `"permissions"` key is absent entirely, the
+    /// `unwrap_or(false)` fallback fires and the missing-permission warning
+    /// is raised. Distinct from `"allow": []` (empty array) — here the whole
+    /// pointer `/permissions/allow` resolves to `None`.
+    #[test]
+    fn permissions_key_entirely_absent_warns() {
+        let d = tempdir().unwrap();
+        let s = json!({
+            "hooks": {
+                "Stop": [{
+                    "matcher": "",
+                    "hooks": [{ "command": "onebrain", "args": ["checkpoint", "stop"] }]
+                }]
+            }
+            // no "permissions" key at all
+        });
+        write_settings(d.path(), &s);
+        let r = SettingsHooksCheck.run(d.path(), &cfg(None));
+        assert_eq!(r.status, DoctorStatus::Warn);
+        assert!(r
+            .details
+            .iter()
+            .any(|s| s.contains("missing permission: Bash(onebrain *)")));
+    }
+
+    /// A hook event whose value is a non-array JSON value (e.g. a string) must
+    /// be silently skipped by the stale-hooks scan without panicking.
+    /// Covers the `let Some(groups) = groups_val.as_array() else { continue }` branch.
+    #[test]
+    fn stale_check_skips_non_array_hook_event_value() {
+        let d = tempdir().unwrap();
+        let s = json!({
+            "hooks": {
+                "Stop": [{
+                    "matcher": "",
+                    "hooks": [{ "command": "onebrain", "args": ["checkpoint", "stop"] }]
+                }],
+                "UserPromptSubmit": "not-an-array"
+            },
+            "permissions": { "allow": ["Bash(onebrain *)"] }
+        });
+        write_settings(d.path(), &s);
+        let r = SettingsHooksCheck.run(d.path(), &cfg(None));
+        assert_eq!(r.status, DoctorStatus::Ok, "details: {:?}", r.details);
+    }
+
+    /// A group inside an allowed hook event that has no `"hooks"` array key
+    /// must be silently skipped by the stale-hooks scan.
+    /// Covers the inner `let Some(hs) = g.get("hooks") … else { continue }` branch.
+    #[test]
+    fn stale_check_skips_group_without_hooks_key() {
+        let d = tempdir().unwrap();
+        let s = json!({
+            "hooks": {
+                "Stop": [
+                    { "matcher": "" },  // no "hooks" key → skipped
+                    {
+                        "matcher": "",
+                        "hooks": [{ "command": "onebrain", "args": ["checkpoint", "stop"] }]
+                    }
+                ]
+            },
+            "permissions": { "allow": ["Bash(onebrain *)"] }
+        });
+        write_settings(d.path(), &s);
+        let r = SettingsHooksCheck.run(d.path(), &cfg(None));
+        assert_eq!(r.status, DoctorStatus::Ok, "details: {:?}", r.details);
+    }
 }

@@ -97,4 +97,23 @@ mod tests {
             "x"
         );
     }
+
+    #[test]
+    fn delete_folder_nonexistent_errors() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // Path does not exist at all → !src.is_dir() → error.
+        let err = delete_folder(root, Path::new("ghost")).unwrap_err();
+        assert!(matches!(err, FsError::Core(..)));
+    }
+
+    #[test]
+    fn delete_folder_on_file_errors() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // A regular file is not a directory → !src.is_dir() → error.
+        std::fs::write(root.join("notadir"), "content").unwrap();
+        let err = delete_folder(root, Path::new("notadir")).unwrap_err();
+        assert!(matches!(err, FsError::Core(..)));
+    }
 }

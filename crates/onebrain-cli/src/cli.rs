@@ -1706,6 +1706,67 @@ mod tests {
     }
 
     #[test]
+    fn harness_arg_as_str_both_variants() {
+        // HarnessArg::as_str() has two match arms; both must be reachable.
+        assert_eq!(HarnessArg::Claude.as_str(), "claude");
+        assert_eq!(HarnessArg::Gemini.as_str(), "gemini");
+    }
+
+    #[test]
+    fn harness_run_parses_harness_and_model_flags() {
+        let cli = Cli::try_parse_from([
+            "onebrain",
+            "harness",
+            "run",
+            "--harness",
+            "gemini",
+            "--model",
+            "gemini-2.0-flash",
+            "summarize this",
+        ])
+        .unwrap();
+        match cli.command {
+            Cmd::Harness(HarnessCmd {
+                verb:
+                    HarnessVerb::Run {
+                        harness,
+                        model,
+                        prompt,
+                        ..
+                    },
+            }) => {
+                assert_eq!(harness, HarnessArg::Gemini);
+                assert_eq!(model.as_deref(), Some("gemini-2.0-flash"));
+                assert_eq!(prompt.as_deref(), Some("summarize this"));
+            }
+            _ => panic!("expected harness run"),
+        }
+    }
+
+    #[test]
+    fn remaining_legacy_aliases_all_parse() {
+        // register-hooks alias (v3.0 back-compat).
+        let cli = Cli::try_parse_from(["onebrain", "register-hooks"]).unwrap();
+        assert!(matches!(cli.command, Cmd::RegisterHooksAlias(_)));
+
+        // register-schedule alias.
+        let cli = Cli::try_parse_from(["onebrain", "register-schedule"]).unwrap();
+        assert!(matches!(cli.command, Cmd::RegisterScheduleAlias(_)));
+
+        // migrate alias (positional name required).
+        let cli = Cli::try_parse_from(["onebrain", "migrate", "logs-v2"]).unwrap();
+        assert!(matches!(cli.command, Cmd::MigrateAlias(_)));
+
+        // vault-sync alias.
+        let cli = Cli::try_parse_from(["onebrain", "vault-sync"]).unwrap();
+        assert!(matches!(cli.command, Cmd::VaultSyncAlias(_)));
+
+        // run-skill alias (--skill is required).
+        let cli = Cli::try_parse_from(["onebrain", "run-skill", "--skill", "/daily"]).unwrap();
+        assert!(matches!(cli.command, Cmd::RunSkillAlias(_)));
+    }
+
+    #[test]
     fn task_list_parses_filters() {
         let cli = Cli::try_parse_from([
             "onebrain",

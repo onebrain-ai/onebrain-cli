@@ -117,6 +117,15 @@ mod tests {
         // "2026-05-19--checkpoint-01.md" has empty token between date and -checkpoint-
         assert!(parse_checkpoint_filename("2026-05-19--checkpoint-01.md").is_none());
     }
+
+    /// Valid digit/dash pattern in the first 10 bytes but the character at
+    /// position 10 is not `'-'`. Covers the `bytes[10] != b'-'` branch which
+    /// is distinct from the `!valid_date_chars` branch.
+    #[test]
+    fn rejects_valid_date_chars_but_no_dash_at_position_10() {
+        // "2026-05-19" is a valid date prefix but 'X' at position 10 is not '-'.
+        assert!(parse_checkpoint_filename("2026-05-19Xcheckpoint-01.md").is_none());
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +211,21 @@ mod manual_log_tests {
         fs::write(
             dir.path().join("2026-05-19-session-01.md"),
             "no frontmatter here",
+        )
+        .unwrap();
+        assert!(has_manual_session_log(dir.path(), "2026-05-19"));
+    }
+
+    /// `auto-saved` with a YAML value that is neither `bool(true)` nor the
+    /// string `"true"` (e.g. an integer) is NOT truthy: `is_auto = false` →
+    /// the log counts as manual. Covers the residual match arms of the
+    /// `is_auto` check (`Some(_)` that is neither Bool(true) nor String("true")).
+    #[test]
+    fn auto_saved_with_non_bool_yaml_value_counts_as_manual() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("2026-05-19-session-01.md"),
+            "---\nauto-saved: 1\n---\nbody",
         )
         .unwrap();
         assert!(has_manual_session_log(dir.path(), "2026-05-19"));
@@ -877,6 +901,20 @@ mod collect_groups_tests {
         touch(&cp, "random_file.md", "x");
         touch(&cp, "2026-05-18-no-cp-marker-01.md", "x");
         touch(&cp, "not-even-a-date.md", "x");
+        let groups = collect_candidate_groups(&cp, &sess, "abc12345", "2026-05-19");
+        assert!(groups.is_empty());
+    }
+
+    /// Non-`.md` files in the checkpoint directory must be skipped before the
+    /// filename-shape check. Covers the `!name.ends_with(".md")` early-continue.
+    #[test]
+    fn skips_non_md_files_in_checkpoint_dir() {
+        let dir = tempdir().unwrap();
+        let cp = dir.path().join("checkpoint");
+        let sess = dir.path().join("session");
+        fs::create_dir_all(&cp).unwrap();
+        // A properly-shaped name but .txt extension — must be filtered out.
+        touch(cp.as_path(), "2026-05-18-tok-checkpoint-01.txt", "x");
         let groups = collect_candidate_groups(&cp, &sess, "abc12345", "2026-05-19");
         assert!(groups.is_empty());
     }

@@ -207,4 +207,32 @@ mod tests {
         assert!(s.contains("session init"));
         assert!(s.contains("ONEBRAIN_QUIET_MIGRATION"));
     }
+
+    /// Exercises the `if let Err(e) = fs::write(&state_file, body)` arm in
+    /// `record()` — `create_dir_all` succeeds but the subsequent `fs::write`
+    /// fails because the directory is read-only.
+    #[test]
+    #[cfg(unix)]
+    fn record_returns_false_when_state_file_write_fails() {
+        // Skip if running as root (root ignores read-only permission bits).
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        // Remove write permission so fs::write inside record() will fail.
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let result = record(&state_dir, "test-alias");
+        // Restore before TempDir drops so the cleanup can remove the directory.
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            !result,
+            "record must return false when the state file write fails"
+        );
+    }
 }

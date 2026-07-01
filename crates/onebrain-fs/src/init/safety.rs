@@ -185,4 +185,87 @@ mod tests {
             other => panic!("unexpected state: {other:?}"),
         }
     }
+
+    /// `symlink_metadata` returning a non-NotFound error (e.g. EACCES when the
+    /// parent directory has no x-bit) must propagate as `Err`, never as
+    /// `Ok(DirState::Missing)`.
+    #[cfg(unix)]
+    #[test]
+    fn stat_error_non_notfound_propagates() {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir().unwrap();
+        let restricted = d.path().join("restricted");
+        std::fs::create_dir_all(&restricted).unwrap();
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // stat("restricted/vault") → EACCES (not ENOENT).
+        let target = restricted.join("vault");
+        let result = classify(&target);
+        // Restore before asserting so tempdir cleanup succeeds.
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            result.is_err(),
+            "EACCES must propagate as Err, not become DirState::Missing; got {result:?}"
+        );
+    }
+
+    /// `read_dir` failing (e.g. EACCES when the directory has no r-bit) must
+    /// propagate as `Err`. `symlink_metadata` (lstat) still succeeds because it
+    /// only needs x-bit on the *parent* directory, not the target itself.
+    #[cfg(unix)]
+    #[test]
+    fn read_dir_error_propagates() {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir().unwrap();
+        // chmod 000: lstat(dir) succeeds (needs x on parent only),
+        // read_dir(dir) fails (needs r on the dir itself).
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = classify(d.path());
+        // Restore before asserting so tempdir cleanup succeeds.
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            result.is_err(),
+            "read_dir EACCES must propagate as Err; got {result:?}"
+        );
+    }
+
+    /// A directory with more than 3 entries: the summary's sample list is
+    /// capped at 3 names, and the total count reflects all entries.
+    #[test]
+    fn more_than_three_entries_sample_is_capped() {
+        let d = tempdir().unwrap();
+        for i in 0..5 {
+            std::fs::write(d.path().join(format!("file{i}.txt")), "").unwrap();
+        }
+        match classify(d.path()).unwrap() {
+            DirState::NonEmptyNonVault { summary } => {
+                // 5 files, 0 folders
+                assert!(
+                    summary.contains("5 file(s)"),
+                    "unexpected summary: {summary}"
+                );
+                // Sample in "e.g., ..." contains at most 3 items (split by ", ")
+                let sample_start = summary.find("e.g., ").expect("summary has e.g., section");
+                let sample = &summary[sample_start + 6..]; // after "e.g., "
+                let sample_names: Vec<&str> = sample.split(", ").collect();
+                assert!(
+                    sample_names.len() <= 3,
+                    "sample must be capped at 3, got {}: {summary}",
+                    sample_names.len()
+                );
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
+    }
 }

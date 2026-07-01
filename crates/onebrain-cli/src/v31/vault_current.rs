@@ -211,4 +211,43 @@ mod tests {
         assert!(s.contains("E_INVALID_YAML"));
         assert!(s.contains("/tmp/ob-1"));
     }
+
+    #[test]
+    fn text_render_detected_with_missing_optional_fields_uses_question_mark() {
+        // Defensive: `detected=true` but name/path/source are all None. Each
+        // `unwrap_or("?")` / `unwrap_or_else(|| "?")` fallback arm must fire so
+        // the output degrades gracefully rather than panicking.
+        let data = VaultCurrentData {
+            detected: true,
+            name: None,
+            path: None,
+            source: None,
+            cwd: PathBuf::from("/tmp"),
+            error: None,
+        };
+        let env = Envelope::ok("vault.current", None, data);
+        let s = render_text(&env);
+        assert!(s.contains("vault: ?"), "name fallback must render '?'");
+        assert!(s.contains("path:  ?"), "path fallback must render '?'");
+        assert!(s.contains("via:   ?"), "source fallback must render '?'");
+    }
+
+    #[test]
+    fn text_render_error_branch_with_no_path_uses_question_mark() {
+        // Error branch with `path: None` exercises the `map(...).unwrap_or_else`
+        // fallback inside the `else if let Some(err)` arm of `render_text`.
+        let data = VaultCurrentData {
+            detected: false,
+            name: Some("ob-1".into()),
+            path: None,
+            source: Some("walk-up".into()),
+            cwd: PathBuf::from("/tmp"),
+            error: Some(ErrorInfo::new("E_INVALID_YAML", "bad syntax")),
+        };
+        let env = Envelope::ok("vault.current", None, data);
+        let s = render_text(&env);
+        assert!(s.contains("(resolved but invalid)"));
+        assert!(s.contains("path:  ?"), "path must degrade to '?' when None");
+        assert!(s.contains("E_INVALID_YAML"));
+    }
 }

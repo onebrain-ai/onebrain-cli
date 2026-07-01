@@ -83,6 +83,24 @@ where
 mod tests {
     use super::*;
 
+    // --- SpawnOs::from_env() ---
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn from_env_returns_unix_on_non_windows() {
+        // Covers the `_ => SpawnOs::Unix` arm of from_env().
+        assert_eq!(SpawnOs::from_env(), SpawnOs::Unix);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn from_env_returns_windows_on_windows() {
+        // Covers the `"windows" => SpawnOs::Windows` arm of from_env().
+        assert_eq!(SpawnOs::from_env(), SpawnOs::Windows);
+    }
+
+    // --- build_qmd_spawn_args ---
+
     #[test]
     fn build_args_unix_returns_direct_qmd() {
         let args = build_qmd_spawn_args("my-collection", SpawnOs::Unix);

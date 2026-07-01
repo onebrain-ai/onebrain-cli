@@ -209,6 +209,43 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_with_existing_plugin_version_mirrors_version_before_to_after() {
+        // When dry_run=true the vault-sync tarball fetch is skipped. The
+        // `report.version_after = report.version_before.clone()` line must be
+        // exercised when a plugin.json already exists (version_before = Some).
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("vault.yml"), "method: onebrain\n").unwrap();
+        let claude = root.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(claude.join("settings.json"), "{}").unwrap();
+        // Write plugin.json so read_plugin_version returns Some("3.2.15").
+        let plugin_dir = root
+            .join(".claude")
+            .join("plugins")
+            .join("onebrain")
+            .join(".claude-plugin");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(plugin_dir.join("plugin.json"), r#"{"version":"3.2.15"}"#).unwrap();
+        let report = run(Some(root.to_path_buf()), None, true).unwrap();
+        assert_eq!(report.version_before.as_deref(), Some("3.2.15"));
+        // In dry-run, version_after must mirror version_before (not a post-sync read).
+        assert_eq!(
+            report.version_after, report.version_before,
+            "dry-run must set version_after = version_before"
+        );
+        assert!(
+            !report.vault_synced,
+            "vault_synced must be false in dry-run"
+        );
+        assert!(
+            report.plists_count.is_none(),
+            "plists_count must be None in dry-run (schedule step skipped)"
+        );
+    }
+
+    #[test]
     fn rewriter_warnings_plumbed_into_report() {
         // R2-H1: a malformed `.claude/settings.json` hook entry should
         // surface as a W_MALFORMED_HOOK_ENTRY warning inside the report's

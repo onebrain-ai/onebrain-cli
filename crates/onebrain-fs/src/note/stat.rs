@@ -262,4 +262,51 @@ plain [[Single Link]] line\n";
         let err = stat_note(root, Path::new("nope.md")).unwrap_err();
         assert!(matches!(err, FsError::Io { .. }));
     }
+
+    #[test]
+    fn task_mark_missing_space_after_closing_bracket_not_counted() {
+        // "- [x]nospace" — no space between ] and text → task_mark returns None (line 111).
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.md", "- [x]nospace\n");
+        let s = stat_note(root, Path::new("a.md")).unwrap();
+        assert_eq!(s.tasks_total, 0, "no valid task — missing space after ]");
+        assert_eq!(s.tasks_done, 0);
+    }
+
+    #[test]
+    fn task_mark_non_standard_symbol_not_counted() {
+        // "- [/] text" — custom mark is not ' ', 'x', or 'X' → `_ => None` branch (line 116).
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.md", "- [/] custom status marker\n");
+        let s = stat_note(root, Path::new("a.md")).unwrap();
+        assert_eq!(s.tasks_total, 0, "custom mark should not count as a task");
+    }
+
+    #[test]
+    fn heading_level_six_counts() {
+        // Exactly 6 hashes followed by a space is valid (is_heading: (1..=6).contains(&6)).
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.md", "###### Level Six\n");
+        let s = stat_note(root, Path::new("a.md")).unwrap();
+        assert_eq!(s.headings, 1);
+    }
+
+    #[test]
+    fn empty_file_zeros_all_counts() {
+        // Empty content exercises the trivial path through count_content and count_wikilinks.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.md", "");
+        let s = stat_note(root, Path::new("a.md")).unwrap();
+        assert_eq!(s.lines, 0);
+        assert_eq!(s.words, 0);
+        assert_eq!(s.chars, 0);
+        assert_eq!(s.headings, 0);
+        assert_eq!(s.wikilinks, 0);
+        assert_eq!(s.tasks_total, 0);
+        assert_eq!(s.size_bytes, 0);
+    }
 }

@@ -336,4 +336,147 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text, "{not valid json");
     }
+
+    /// When `settings.json` contains valid JSON that is NOT an object (e.g. an
+    /// array), `set_enabled` hits the defensive `if !settings.is_object()`
+    /// branch and promotes the value to an empty object before inserting the
+    /// plugin key.
+    #[test]
+    fn non_object_settings_json_is_promoted_to_object() {
+        let d = tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".claude")).unwrap();
+        let path = settings_path(d.path());
+        std::fs::write(&path, "[]").unwrap(); // valid JSON, wrong shape
+        let outcome = enable_onebrain_plugin_with_force(d.path(), false).unwrap();
+        assert!(outcome.wrote);
+        assert!(outcome.warning.is_none());
+        assert_eq!(
+            read_back(d.path())["enabledPlugins"][PLUGIN_KEY],
+            json!(true)
+        );
+    }
+
+    /// When `enabledPlugins` itself is a non-object value (e.g. a legacy
+    /// string), `set_enabled` hits the `if !enabled.is_object()` branch,
+    /// promotes the entry to an object, then inserts the plugin key.
+    #[test]
+    fn non_object_enabled_plugins_value_is_promoted() {
+        let d = tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".claude")).unwrap();
+        let path = settings_path(d.path());
+        std::fs::write(
+            &path,
+            serde_json::to_string(&json!({"enabledPlugins": "legacy"})).unwrap(),
+        )
+        .unwrap();
+        let outcome = enable_onebrain_plugin_with_force(d.path(), false).unwrap();
+        assert!(outcome.wrote);
+        assert!(outcome.warning.is_none());
+        assert_eq!(
+            read_back(d.path())["enabledPlugins"][PLUGIN_KEY],
+            json!(true)
+        );
+    }
+
+    /// A `null` value for `enabledPlugins.onebrain@onebrain` is refused
+    /// without `--force` and replaced with a "null"-type warning under
+    /// `--force`. Covers the `Value::Null => "null"` arm of `value_type_name`.
+    #[test]
+    fn null_plugin_key_value_refused_without_force_named_in_error() {
+        let d = tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".claude")).unwrap();
+        let path = settings_path(d.path());
+        std::fs::write(
+            &path,
+            serde_json::to_string(&json!({"enabledPlugins": {PLUGIN_KEY: null}})).unwrap(),
+        )
+        .unwrap();
+        let err = enable_onebrain_plugin_with_force(d.path(), false).unwrap_err();
+        match err {
+            crate::FsError::Core(onebrain_core::CoreError::InitTargetNotEmpty(msg)) => {
+                assert!(msg.contains("null"), "expected 'null' in error: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        // --force: overwrites and warns with "null"
+        let outcome = enable_onebrain_plugin_with_force(d.path(), true).unwrap();
+        assert!(outcome.wrote);
+        assert!(
+            outcome.warning.as_deref().unwrap_or("").contains("null"),
+            "warning must name the null type: {:?}",
+            outcome.warning
+        );
+        assert_eq!(
+            read_back(d.path())["enabledPlugins"][PLUGIN_KEY],
+            json!(true)
+        );
+    }
+
+    /// `Bool(false)` satisfies `matches!(v, Value::Bool(_))` so the guard
+    /// condition is false: no error, no warning — just upgrade to `true`.
+    #[test]
+    fn false_bool_plugin_key_is_upgraded_to_true_without_error() {
+        let d = tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".claude")).unwrap();
+        let path = settings_path(d.path());
+        std::fs::write(
+            &path,
+            serde_json::to_string(&json!({"enabledPlugins": {PLUGIN_KEY: false}})).unwrap(),
+        )
+        .unwrap();
+        let outcome = enable_onebrain_plugin_with_force(d.path(), false).unwrap();
+        assert!(outcome.wrote);
+        assert!(
+            outcome.warning.is_none(),
+            "no warning expected for Bool(false)"
+        );
+        assert_eq!(
+            read_back(d.path())["enabledPlugins"][PLUGIN_KEY],
+            json!(true)
+        );
+    }
+
+    /// A numeric value for `enabledPlugins.onebrain@onebrain` is refused
+    /// without `--force`. Covers the `Value::Number => "number"` arm of
+    /// `value_type_name`.
+    #[test]
+    fn number_plugin_key_value_refused_without_force_names_type() {
+        let d = tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".claude")).unwrap();
+        let path = settings_path(d.path());
+        std::fs::write(
+            &path,
+            serde_json::to_string(&json!({"enabledPlugins": {PLUGIN_KEY: 42}})).unwrap(),
+        )
+        .unwrap();
+        let err = enable_onebrain_plugin_with_force(d.path(), false).unwrap_err();
+        match err {
+            crate::FsError::Core(onebrain_core::CoreError::InitTargetNotEmpty(msg)) => {
+                assert!(msg.contains("number"), "expected 'number' in error: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// An array value for `enabledPlugins.onebrain@onebrain` is refused
+    /// without `--force`. Covers the `Value::Array => "array"` arm of
+    /// `value_type_name`.
+    #[test]
+    fn array_plugin_key_value_refused_without_force_names_type() {
+        let d = tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".claude")).unwrap();
+        let path = settings_path(d.path());
+        std::fs::write(
+            &path,
+            serde_json::to_string(&json!({"enabledPlugins": {PLUGIN_KEY: [1, 2]}})).unwrap(),
+        )
+        .unwrap();
+        let err = enable_onebrain_plugin_with_force(d.path(), false).unwrap_err();
+        match err {
+            crate::FsError::Core(onebrain_core::CoreError::InitTargetNotEmpty(msg)) => {
+                assert!(msg.contains("array"), "expected 'array' in error: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
 }

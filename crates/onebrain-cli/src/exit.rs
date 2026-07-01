@@ -272,6 +272,74 @@ mod tests {
     }
 
     #[test]
+    fn vault_yaml_missing_maps_to_64() {
+        let e = CoreError::VaultYamlMissing {
+            path: PathBuf::from("/x/onebrain.yml"),
+            source: std::io::Error::other("not found"),
+        };
+        assert_eq!(exit_code_for_core(&e), EXIT_VAULT_NOT_FOUND);
+    }
+
+    #[test]
+    fn not_a_vault_maps_to_64() {
+        let e = CoreError::NotAVault {
+            path: PathBuf::from("/x"),
+        };
+        assert_eq!(exit_code_for_core(&e), EXIT_VAULT_NOT_FOUND);
+    }
+
+    #[test]
+    fn plain_fs_io_error_maps_to_66_via_downcast_fallback() {
+        // FsError::Io does NOT wrap a CoreError, so the chain walk finds nothing.
+        // The fallback `downcast_ref::<FsError>().is_some()` check must fire and
+        // return EXIT_FS_ERROR rather than falling through to EXIT_GENERIC.
+        let fs_err = onebrain_fs::FsError::Io {
+            path: PathBuf::from("/tmp/x"),
+            source: std::io::Error::other("disk full"),
+        };
+        let e: anyhow::Error = anyhow::Error::from(fs_err);
+        assert_eq!(exit_code_for(&e), EXIT_FS_ERROR);
+    }
+
+    #[test]
+    fn plain_cache_io_error_maps_to_67_via_downcast_fallback() {
+        // CacheError::CacheIo does NOT wrap a CoreError, so the chain walk finds
+        // nothing and the FsError check is also None. The fallback
+        // `downcast_ref::<CacheError>().is_some()` check must return EXIT_CACHE_ERROR.
+        let cache_err = onebrain_cache::CacheError::CacheIo {
+            path: PathBuf::from("/tmp/cache"),
+            source: std::io::Error::other("cache fail"),
+        };
+        let e: anyhow::Error = anyhow::Error::from(cache_err);
+        assert_eq!(exit_code_for(&e), EXIT_CACHE_ERROR);
+    }
+
+    #[test]
+    fn serde_json_permission_denied_classifies_to_fs_error() {
+        // R2-M4 extension: serde_json wraps the io::Error in its own enum so
+        // the plain `downcast_ref::<io::Error>` walk misses it. `io_error_kind()`
+        // must recover PermissionDenied → EXIT_FS_ERROR (66).
+        struct PermissionDeniedWriter;
+        impl std::io::Write for PermissionDeniedWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            }
+        }
+        let json_err: serde_json::Error =
+            serde_json::to_writer(PermissionDeniedWriter, &serde_json::json!({"x": 1}))
+                .unwrap_err();
+        assert_eq!(
+            json_err.io_error_kind(),
+            Some(std::io::ErrorKind::PermissionDenied)
+        );
+        let e: anyhow::Error = anyhow::Error::from(json_err);
+        assert_eq!(exit_code_for(&e), EXIT_FS_ERROR);
+    }
+
+    #[test]
     fn serde_json_broken_pipe_classifies_to_zero() {
         // R2-M4: serde_json wraps the io::Error in its own enum so the
         // plain io::Error chain walk misses it; io_error_kind() recovers
