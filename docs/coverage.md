@@ -147,5 +147,6 @@ Remaining core gaps to close (tracked, by reachable missed lines):
 `commands/doctor.rs`, `v31/dispatch.rs` (95.64%), `onebrain-fs/src/update/mod.rs`,
 `commands/register_schedule.rs`, and `server/api.rs` were advanced in phases 3b–3d and are now near
 their testable ceilings. **Phase 4 (the ratcheting CI gate) is done** — the initiative is locked at
-core ~95.2%; further phases are optional fs-cluster/long-tail mop-up, each free to raise the gate. See
-`01-projects/onebrain/cli/2026-06-29-cli-coverage-100-design.md`.
+core ~95.2%; further phases are optional fs-cluster/long-tail mop-up, each free to raise the gate.
+The full phase history is the "Closed so far" list above; the detailed design lives in the
+maintainer's project notes (not tracked in this repo).
