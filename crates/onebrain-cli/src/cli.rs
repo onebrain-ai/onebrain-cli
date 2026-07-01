@@ -1,5 +1,7 @@
-//! Clap subcommand tree — 3 root verbs + 24 resource groups + hidden v3.0
-//! aliases. Locked at v3.1 per [[cli/specs/01-architecture §2.4]].
+//! Clap subcommand tree — 3 root verbs + 25 resource groups + hidden v3.0
+//! aliases. Locked at v3.1 per [[cli/specs/01-architecture §2.4]]; `search`
+//! (v3.4.0) is the first post-lock addition — a new native-search command
+//! surface, not a v3.1 tree-shape change.
 //!
 //! Every group's verb list is captured as a `Subcommand` enum even when the
 //! body is `unimplemented!()` — the tree shape itself is the v3.1 deliverable
@@ -130,6 +132,8 @@ pub enum Cmd {
     Qmd(QmdCmd),
     #[command(display_order = 21)]
     Schedule(ScheduleCmd),
+    #[command(display_order = 17)]
+    Search(SearchCmd),
     /// Serve the local web UI + vault JSON API (foreground · Ctrl-C to stop).
     #[command(display_order = 14)]
     Serve(ServeArgs),
@@ -884,6 +888,58 @@ pub struct NoteMkdirArgs {
     /// Folder path, relative to the vault root. Parent directories are created
     /// as needed. Errors if the path already exists.
     pub path: PathBuf,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// search (6 verbs · v3.4.0 · native search engine, replaces external qmd)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[derive(Args, Debug)]
+#[command(
+    about = "Native vault search (hybrid query · lex · vector · reindex · …)",
+    disable_help_subcommand = true
+)]
+pub struct SearchCmd {
+    #[command(subcommand)]
+    pub verb: SearchVerb,
+}
+#[derive(Subcommand, Debug)]
+pub enum SearchVerb {
+    /// Hybrid search (lex + vector, RRF-fused).
+    Query(SearchQueryArgs),
+    /// Lexical (BM25) search only — never triggers a model download.
+    Search(SearchQueryArgs),
+    /// Semantic (vector) search only.
+    Vsearch(SearchQueryArgs),
+    /// Fetch a doc's full indexed text.
+    Get(SearchGetArgs),
+    /// Report index status (collection, embed model, cache dir) — never
+    /// triggers a model download.
+    Status,
+    /// Reindex the whole vault, or specific doc paths.
+    Reindex(SearchReindexArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SearchQueryArgs {
+    /// Query text.
+    pub text: String,
+    /// Maximum hits to return.
+    #[arg(long = "top-k", default_value_t = 10)]
+    pub top_k: usize,
+}
+
+#[derive(Args, Debug)]
+pub struct SearchGetArgs {
+    /// Doc path, relative to the vault root (as indexed).
+    pub doc_path: String,
+}
+
+#[derive(Args, Debug)]
+pub struct SearchReindexArgs {
+    /// Specific doc paths to reindex (relative to the vault root). Omit to
+    /// reindex the whole vault.
+    pub paths: Vec<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────

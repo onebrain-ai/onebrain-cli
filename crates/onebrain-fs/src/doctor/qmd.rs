@@ -93,6 +93,7 @@ mod tests {
             qmd_collection: Some(c.to_string()),
             checkpoint: Default::default(),
             folders: Default::default(),
+            search: Default::default(),
         }
     }
     fn cfg_no_collection() -> VaultConfig {
@@ -100,6 +101,7 @@ mod tests {
             qmd_collection: None,
             checkpoint: Default::default(),
             folders: Default::default(),
+            search: Default::default(),
         }
     }
 

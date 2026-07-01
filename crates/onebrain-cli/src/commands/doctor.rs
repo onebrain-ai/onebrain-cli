@@ -106,6 +106,7 @@ pub fn run(
             qmd_collection: None,
             checkpoint: Default::default(),
             folders: Default::default(),
+            search: Default::default(),
         }
     });
 
@@ -538,6 +539,7 @@ fn fix_folders(vault_root: &Path, json: bool) -> FixOutcome {
         qmd_collection: None,
         checkpoint: Default::default(),
         folders: Default::default(),
+        search: Default::default(),
     });
     let f = &config.folders;
     // Order mirrors FoldersCheck so the post-fix re-check reports 8/8.

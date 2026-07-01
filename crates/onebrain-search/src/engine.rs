@@ -11,6 +11,7 @@
 //!   heading path, so this database is the only place [`Engine::get`] and
 //!   [`Hit`] snippets can source that data from.
 
+use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -134,10 +135,18 @@ struct ChunkMeta {
 
 /// The assembled search engine: lexical index, vector store, embedder, and
 /// a `redb` metadata database, all rooted at one `cache_dir`.
+///
+/// The embedder is created lazily (on first call to [`Engine::embedder`]),
+/// not in [`Engine::open`] — `fastembed` downloads the model file on first
+/// construction, so eager construction would make every command (including
+/// lex-only search, `status`, and `get`) pay for a model download. Only
+/// `index_doc` and `query` actually need the embedder.
 pub struct Engine {
     lex: LexIndex,
     vec: VectorStore,
-    embedder: Embedder,
+    model_name: String,
+    cache_dir: PathBuf,
+    embedder: OnceCell<Embedder>,
     meta: Database,
 }
 
@@ -164,8 +173,6 @@ impl Engine {
         let dims = embed::model_dims(embed_model);
         let vec = VectorStore::open(&cache_dir.join("vectors"), dims)?;
 
-        let embedder = embed::new(embed_model, cache_dir)?;
-
         let meta_path = cache_dir.join("engine.redb");
         let meta = Database::create(&meta_path)
             .with_context(|| format!("opening redb database {}", meta_path.display()))?;
@@ -180,9 +187,30 @@ impl Engine {
         Ok(Engine {
             lex,
             vec,
-            embedder,
+            model_name: embed_model.to_string(),
+            cache_dir: cache_dir.to_path_buf(),
+            embedder: OnceCell::new(),
             meta,
         })
+    }
+
+    /// Lazily construct (on first call) and return the embedder. This is
+    /// the ONLY place `embed::new` is called — the first call to `index_doc`
+    /// or `query` (or `vector_search`) is when a model download actually
+    /// happens, not `Engine::open`.
+    ///
+    /// `std::cell::OnceCell::get_or_try_init` is nightly-only
+    /// (`once_cell_try`, #109737), so init is spelled out manually: check
+    /// `get()`, and on miss build the embedder and `set()` it (the `Ok(())`
+    /// from `set` is discarded — another thread can't have raced us since
+    /// `Engine` isn't `Sync`/shared across threads here).
+    fn embedder(&self) -> Result<&Embedder> {
+        if let Some(e) = self.embedder.get() {
+            return Ok(e);
+        }
+        let e = embed::new(&self.model_name, &self.cache_dir)?;
+        let _ = self.embedder.set(e);
+        Ok(self.embedder.get().expect("embedder was just set above"))
     }
 
     /// Chunk `content`, index into lex + embed + vector, and record chunk
@@ -197,7 +225,7 @@ impl Engine {
             for chunk in &chunks {
                 self.lex.add(chunk)?;
 
-                let vectors = self.embedder.embed(std::slice::from_ref(&chunk.text))?;
+                let vectors = self.embedder()?.embed(std::slice::from_ref(&chunk.text))?;
                 self.vec.add(&chunk.chunk_id, &vectors[0])?;
 
                 let record = ChunkMeta {
@@ -254,20 +282,16 @@ impl Engine {
         Ok(())
     }
 
-    /// Hybrid search: lex + vec (top ~50 each) fused via RRF, resolved to
-    /// `top_k` [`Hit`]s. Fused ids whose meta is missing are skipped.
-    pub fn query(&self, text: &str, top_k: usize) -> Result<Vec<Hit>> {
-        let query_vec = self.embedder.embed(&[text.to_string()])?;
-        let vec_hits = self.vec.search(&query_vec[0], VEC_TOP_K);
-        let lex_hits = self.lex.search(text, LEX_TOP_K)?;
-
-        let fused = rrf_fuse(&lex_hits, &vec_hits, RRF_K, top_k);
-
+    /// Resolve a list of `(chunk_id, score)` pairs (already ranked, already
+    /// truncated to the caller's desired top-k) into full [`Hit`]s by
+    /// looking up each chunk's stored meta. Ids whose meta is missing are
+    /// skipped. Shared by [`Self::query`] and [`Self::vector_search`].
+    fn resolve_hits(&self, ranked: Vec<(String, f64)>) -> Result<Vec<Hit>> {
         let read_txn = self.meta.begin_read()?;
         let chunk_meta = read_txn.open_table(CHUNK_META)?;
 
-        let mut hits = Vec::with_capacity(fused.len());
-        for (chunk_id, score) in fused {
+        let mut hits = Vec::with_capacity(ranked.len());
+        for (chunk_id, score) in ranked {
             let Some(encoded) = chunk_meta
                 .get(chunk_id.as_str())?
                 .map(|v| v.value().to_string())
@@ -284,6 +308,30 @@ impl Engine {
             });
         }
         Ok(hits)
+    }
+
+    /// Hybrid search: lex + vec (top ~50 each) fused via RRF, resolved to
+    /// `top_k` [`Hit`]s. Fused ids whose meta is missing are skipped.
+    pub fn query(&self, text: &str, top_k: usize) -> Result<Vec<Hit>> {
+        let query_vec = self.embedder()?.embed(&[text.to_string()])?;
+        let vec_hits = self.vec.search(&query_vec[0], VEC_TOP_K);
+        let lex_hits = self.lex.search(text, LEX_TOP_K)?;
+
+        let fused = rrf_fuse(&lex_hits, &vec_hits, RRF_K, top_k);
+        self.resolve_hits(fused)
+    }
+
+    /// Vector-only semantic search (no lex/RRF fusion): embed `text` and
+    /// return the top-k nearest chunks by cosine similarity, resolved to
+    /// full [`Hit`]s. Used by the CLI's `search vsearch` verb.
+    pub fn vector_search(&self, text: &str, top_k: usize) -> Result<Vec<Hit>> {
+        let query_vec = self.embedder()?.embed(&[text.to_string()])?;
+        let vec_hits = self.vec.search(&query_vec[0], top_k);
+        let ranked: Vec<(String, f64)> = vec_hits
+            .into_iter()
+            .map(|(id, score)| (id, score as f64))
+            .collect();
+        self.resolve_hits(ranked)
     }
 
     /// Full stored text of a doc (its chunks concatenated in

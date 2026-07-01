@@ -12,9 +12,10 @@ name = "onebrain"
 path = "src/main.rs"
 
 [dependencies]
-onebrain-core  = { workspace = true }
-onebrain-fs    = { workspace = true }
-onebrain-cache = { workspace = true }
+onebrain-core   = { workspace = true }
+onebrain-fs     = { workspace = true }
+onebrain-cache  = { workspace = true }
+onebrain-search = { workspace = true }
 clap           = { workspace = true }
 clap_complete  = { workspace = true }
 serde          = { workspace = true }

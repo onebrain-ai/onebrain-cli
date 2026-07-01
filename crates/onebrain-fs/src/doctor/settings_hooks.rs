@@ -332,6 +332,7 @@ mod tests {
             qmd_collection: qmd.map(|s| s.to_string()),
             checkpoint: Default::default(),
             folders: Default::default(),
+            search: Default::default(),
         }
     }
 
