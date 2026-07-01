@@ -1,6 +1,6 @@
 ---
-latest_version: 3.3.21
-released: 2026-06-30
+latest_version: 3.3.22
+released: 2026-07-01
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,13 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.22] — 2026-07-01 — serve banner + embedded web UI version
+
+- **`onebrain serve` reports the bundled web UI version + release date.** Reads `version.json` (embedded assets, or a `--dir` dist on disk) plus the sibling `changelog.json`'s `released` date, shown inline as `OneBrain Web UI vX.Y.Z (YYYY-MM-DD)` — onebrain-webui ≥ 0.1.1 emits both. An absent marker degrades gracefully (version without date, or the plain source description).
+- **Prettier startup banner.** Framed, emoji-prefixed layout (`🧠 🔗 📂 🎨 ⏹️`) mirroring OneBrain's session-greeting look, replacing the flat `serving on … / vault: / dist:` lines.
+- `server::{webui_version, webui_released}` + their pure `parse_*` helpers added (split out + unit-tested). The dist's `version.json`/`changelog.json` are served as static assets by the existing catch-all handler, so the web UI can fetch them too.
+- No behavior change to routing/auth — startup output only.
 
 ## [3.3.21] — 2026-06-30 — coverage phase 3d (dispatch.rs exit-code integration tests)
 
