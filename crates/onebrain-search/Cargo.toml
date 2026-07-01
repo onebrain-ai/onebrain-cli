@@ -1,0 +1,43 @@
+[package]
+name = "onebrain-search"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+publish.workspace    = true
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+anyhow     = { workspace = true }
+sha2       = { workspace = true }
+
+# Full-text lexical search index. Defaults disabled to avoid the C zstd build
+# dep pulled in by the (non-default) `zstd-compression` feature; re-enable
+# only what's needed: `mmap` (memory-mapped index segments), `lz4-compression`
+# (pure-Rust `lz4_flex`, no C dep), `stopwords` + `stemmer` (tokenizer support).
+tantivy = { version = "0.26", default-features = false, features = [
+    "mmap",
+    "lz4-compression",
+    "stopwords",
+    "stemmer",
+] }
+
+# Thai word-segmentation tokenizer (native Rust binding).
+nlpo3 = "1.4"
+
+# ONNX-backed local embedding models.
+fastembed = "5.17"
+
+# SIMD-accelerated vector similarity (cosine/dot/etc.) for the vector index.
+simsimd = "6.5"
+
+# Memory-mapped file access for on-disk index/vector stores.
+memmap2 = { workspace = true }
+
+# Embedded KV store for chunk/doc metadata.
+redb = "4.1"
+
+[dev-dependencies]
+tempfile = { workspace = true }

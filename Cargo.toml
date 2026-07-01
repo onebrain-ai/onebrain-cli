@@ -13,9 +13,10 @@ publish = false
 
 [workspace.dependencies]
 # Internal path deps
-onebrain-core  = { path = "crates/onebrain-core" }
-onebrain-fs    = { path = "crates/onebrain-fs" }
-onebrain-cache = { path = "crates/onebrain-cache" }
+onebrain-core   = { path = "crates/onebrain-core" }
+onebrain-fs     = { path = "crates/onebrain-fs" }
+onebrain-cache  = { path = "crates/onebrain-cache" }
+onebrain-search = { path = "crates/onebrain-search" }
 
 # Foundation (Slice 1)
 serde       = { version = "1", features = ["derive"] }
@@ -55,6 +56,9 @@ percent-encoding = "2"
 
 # SHA-256 verification of the self-update binary (v3.1.4 · onebrain-fs update install path)
 sha2 = "0.10"
+
+# Memory-mapped file access (v3.4 · onebrain-search on-disk index/vector stores)
+memmap2 = "0.9"
 
 # Regex (Slice 8 scheduler · cron + at field validation · pre-compiled with OnceLock · v3.2 note search --mode regex)
 regex     = "1"
