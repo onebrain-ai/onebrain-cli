@@ -318,6 +318,12 @@ impl LexIndex {
     /// `(chunk_id, score)`
     /// pairs, highest score first.
     pub fn search(&self, query: &str, top_k: usize) -> Result<Vec<(String, f32)>> {
+        // Guard top_k == 0: tantivy's `TopDocs::with_limit` asserts limit > 0
+        // and would panic. Mirror `VectorStore::search`'s guard so a raw
+        // `--top-k 0` on the CLI returns empty rather than aborting.
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
         let terms = segment(query);
         if terms.is_empty() {
             return Ok(Vec::new());
@@ -388,6 +394,15 @@ mod tests {
         ix.delete("d1#0").unwrap();
         ix.commit().unwrap();
         assert!(ix.search("zorp", 1).unwrap().is_empty());
+    }
+    #[test]
+    fn top_k_zero_returns_empty_no_panic() {
+        // `TopDocs::with_limit(0)` panics in tantivy; the guard must intercept.
+        let dir = tempfile::tempdir().unwrap();
+        let mut ix = LexIndex::open(dir.path()).unwrap();
+        ix.add(&chunk("d1#0", "error handling in rust")).unwrap();
+        ix.commit().unwrap();
+        assert!(ix.search("error", 0).unwrap().is_empty());
     }
     #[test]
     fn chinese_bigram_match() {
