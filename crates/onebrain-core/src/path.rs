@@ -429,8 +429,16 @@ mod tests {
         assert_eq!(cfg.file_name().unwrap(), CONFIG_FILENAME);
     }
 
+    /// Serializes the two tests that mutate the process-global
+    /// `LEGACY_WARNING_EMITTED` sentinel (both `reset` then `assert`). Without
+    /// it, parallel test execution lets one test's `reset` flip the flag off
+    /// between the other's emit and its assert — an order-dependent flake
+    /// surfaced under the coverage run's test scheduling.
+    static SENTINEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn find_vault_root_falls_back_to_vault_yml_with_warning() {
+        let _sentinel_guard = SENTINEL_TEST_LOCK.lock().unwrap();
         reset_legacy_warning_for_test();
         let dir = tempdir().unwrap();
         make_legacy_vault(dir.path());
@@ -451,6 +459,7 @@ mod tests {
 
     #[test]
     fn deprecation_warning_emits_once_per_process() {
+        let _sentinel_guard = SENTINEL_TEST_LOCK.lock().unwrap();
         reset_legacy_warning_for_test();
         let dir = tempdir().unwrap();
         make_legacy_vault(dir.path());
