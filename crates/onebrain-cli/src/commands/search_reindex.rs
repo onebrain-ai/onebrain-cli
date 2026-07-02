@@ -15,7 +15,7 @@ use crate::commands::search_common::{
     collection_cache_dir, collection_for, index_size_bytes, model_not_chosen, open_engine,
     reindex_progress_path,
 };
-use crate::output::{emit, item, Envelope, OutputMode};
+use crate::output::{emit, item, section, Envelope, OutputMode};
 use onebrain_search::engine::{ReindexProgress, ReindexStats};
 
 #[derive(Debug, Serialize)]
@@ -381,10 +381,10 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// The `📊  index <size> (<delta>)` suffix appended to the summary line when the
+/// The `<size> (<delta>)` value for the Index section's Size row when the
 /// index size is known. A zero delta renders without the parenthetical; a
 /// negative delta uses a minus sign (`−0.8 MB`). Returns `None` when the size
-/// couldn't be measured (so the summary just omits it).
+/// couldn't be measured (so the summary just omits the section).
 fn index_size_suffix(size: Option<u64>, delta: Option<i64>) -> Option<String> {
     let size = size?;
     let paren = match delta {
@@ -397,42 +397,42 @@ fn index_size_suffix(size: Option<u64>, delta: Option<i64>) -> Option<String> {
 
 fn render_text(env: &Envelope<ReindexData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
-    // Same grouped style as `search status`: a ✅  header, then indented
-    // label/value rows. Zero categories are omitted so the section stays
-    // readable; `failed` carries a ⚠️  so it stands out.
-    let mut lines: Vec<String> = Vec::new();
+    // Grouped convention, exactly like `search status`: a ✅  confirm line,
+    // then emoji-headed sections of indented label/value rows. Zero categories
+    // are omitted (a section with no rows is omitted entirely); `failed`
+    // carries a ⚠️  so it stands out.
+    let mut doc_rows: Vec<String> = Vec::new();
     if d.added > 0 {
-        lines.push(item("Added", &d.added.to_string()));
+        doc_rows.push(item("Added", &d.added.to_string()));
     }
     if d.updated > 0 {
-        lines.push(item("Updated", &d.updated.to_string()));
+        doc_rows.push(item("Updated", &d.updated.to_string()));
     }
     if d.removed > 0 {
-        lines.push(item("Removed", &d.removed.to_string()));
+        doc_rows.push(item("Removed", &d.removed.to_string()));
     }
     if d.unchanged > 0 {
-        lines.push(item("Unchanged", &d.unchanged.to_string()));
+        doc_rows.push(item("Unchanged", &d.unchanged.to_string()));
     }
     if d.failed > 0 {
-        lines.push(item("Failed", &format!("⚠️  {}", d.failed)));
+        doc_rows.push(item("Failed", &format!("⚠️  {}", d.failed)));
     }
-    let index_line = index_size_suffix(d.index_size_bytes, d.index_size_delta_bytes)
-        .map(|v| item("Index size", &v));
 
-    if lines.is_empty() {
+    let mut out = if doc_rows.is_empty() {
         // Nothing to do — an already-current index reindexed to a no-op.
-        let mut out = "✅  Reindexed — nothing to update".to_string();
-        if let Some(idx) = index_line {
-            out.push_str(&format!("\n{idx}"));
+        "✅  Reindexed — nothing to update".to_string()
+    } else {
+        let mut s = "✅  Reindexed".to_string();
+        s.push_str(&format!("\n\n{}", section("📄", "Docs")));
+        for row in doc_rows {
+            s.push_str(&format!("\n{row}"));
         }
-        return out;
-    }
-    let mut out = "✅  Reindexed".to_string();
-    for l in lines {
-        out.push_str(&format!("\n{l}"));
-    }
-    if let Some(idx) = index_line {
-        out.push_str(&format!("\n{idx}"));
+        s
+    };
+
+    if let Some(size) = index_size_suffix(d.index_size_bytes, d.index_size_delta_bytes) {
+        out.push_str(&format!("\n\n{}", section("📊", "Index")));
+        out.push_str(&format!("\n{}", item("Size", &size)));
     }
     out
 }
@@ -492,13 +492,17 @@ mod tests {
     fn text_summarizes_all_four_counts() {
         let e = Envelope::ok("search.reindex", None, data(1, 2, 3, 4, 0));
         let s = render_text(&e);
-        assert!(s.contains("✅  Reindexed"), "{s}");
+        assert!(s.starts_with("✅  Reindexed\n"), "{s}");
+        // Counts sit under the 📄  Docs section header.
+        assert!(s.contains("\n\n📄  Docs\n"), "{s}");
         assert!(s.contains("    Added         1"), "{s}");
         assert!(s.contains("    Updated       2"), "{s}");
         assert!(s.contains("    Removed       3"), "{s}");
         assert!(s.contains("    Unchanged     4"), "{s}");
-        // failed == 0 is omitted from the summary line.
-        assert!(!s.contains("failed"));
+        // failed == 0 is omitted from the summary.
+        assert!(!s.contains("Failed"));
+        // No index size known → no 📊  Index section.
+        assert!(!s.contains("📊  Index"), "{s}");
     }
 
     #[test]
@@ -508,14 +512,28 @@ mod tests {
         assert!(s.contains("    Added         5"), "{s}");
         assert!(s.contains("    Unchanged     700"), "{s}");
         // Zero categories are not shown.
-        assert!(!s.contains("updated"));
-        assert!(!s.contains("removed"));
+        assert!(!s.contains("Updated"));
+        assert!(!s.contains("Removed"));
     }
 
     #[test]
     fn text_reports_noop_when_all_zero() {
+        // No counts and no size → just the confirm line, no sections at all.
         let e = Envelope::ok("search.reindex", None, data(0, 0, 0, 0, 0));
         assert_eq!(render_text(&e), "✅  Reindexed — nothing to update");
+    }
+
+    #[test]
+    fn text_noop_still_shows_index_section_when_size_known() {
+        let mut d = data(0, 0, 0, 0, 0);
+        d.index_size_bytes = Some(5 * 1024 * 1024);
+        let e = Envelope::ok("search.reindex", None, d);
+        let s = render_text(&e);
+        assert!(s.starts_with("✅  Reindexed — nothing to update"), "{s}");
+        // The Docs section stays omitted (no rows), but the Index section
+        // still reports the size.
+        assert!(!s.contains("📄  Docs"), "{s}");
+        assert!(s.contains("\n\n📊  Index\n    Size          5.0 MB"), "{s}");
     }
 
     #[test]
@@ -531,8 +549,13 @@ mod tests {
         d.index_size_delta_bytes = Some(1_300_000); // +~1.2 MB
         let e = Envelope::ok("search.reindex", None, d);
         let s = render_text(&e);
-        assert!(s.contains("    Index size    16.2 MB"), "{s}");
+        // Size lands in its own 📊  Index section, after the Docs section.
+        assert!(s.contains("\n\n📊  Index\n"), "{s}");
+        assert!(s.contains("    Size          16.2 MB"), "{s}");
         assert!(s.contains("(+1.2 MB)"), "{s}");
+        let docs_at = s.find("📄  Docs").expect("Docs section");
+        let index_at = s.find("📊  Index").expect("Index section");
+        assert!(docs_at < index_at, "Docs before Index: {s}");
     }
 
     #[test]

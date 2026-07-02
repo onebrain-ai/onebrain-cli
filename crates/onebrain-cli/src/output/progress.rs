@@ -141,9 +141,14 @@ impl Step {
 
 /// A header + the steps rendered under it. `update` (linear steps) can pass a
 /// section with an empty header to skip the header line.
+///
+/// `emoji` opts the header into the grouped-status convention
+/// (`{emoji}  {Title}` — see `output::layout`): doctor sets it; headerless /
+/// legacy callers leave it `None` and keep the plain ` {header}` line.
 #[derive(Debug, Clone)]
 pub struct Section {
     pub header: String,
+    pub emoji: Option<String>,
     pub steps: Vec<Step>,
 }
 
@@ -151,6 +156,21 @@ impl Section {
     pub fn new(header: impl Into<String>, steps: Vec<Step>) -> Self {
         Self {
             header: header.into(),
+            emoji: None,
+            steps,
+        }
+    }
+
+    /// A section whose header renders in the grouped convention:
+    /// `{emoji}  {header}` (two spaces after the emoji, no leading space).
+    pub fn with_emoji(
+        emoji: impl Into<String>,
+        header: impl Into<String>,
+        steps: Vec<Step>,
+    ) -> Self {
+        Self {
+            header: header.into(),
+            emoji: Some(emoji.into()),
             steps,
         }
     }
@@ -233,6 +253,11 @@ pub struct ProgressRenderer<W: Write> {
     /// the animated branch can be exercised with `Duration::ZERO` and no sleep.
     /// Only consulted when `animate` is true.
     step_delay_override: Option<Duration>,
+    /// Leading indent for step rows (and the transient spinner line). The
+    /// default two spaces match the legacy framed layout (`update` dispatch);
+    /// doctor sets four spaces via [`set_row_indent`] for the grouped-status
+    /// convention body rows.
+    row_indent: &'static str,
 }
 
 impl ProgressRenderer<std::io::Stdout> {
@@ -253,6 +278,7 @@ impl ProgressRenderer<std::io::Stdout> {
             animate,
             color,
             step_delay_override: None,
+            row_indent: "  ",
         }
     }
 }
@@ -268,7 +294,15 @@ impl<W: Write> ProgressRenderer<W> {
             animate: !force_static,
             color,
             step_delay_override: None,
+            row_indent: "  ",
         }
+    }
+
+    /// Set the leading indent for step rows (grouped-status convention body
+    /// rows use four spaces; the default two spaces keep legacy callers
+    /// byte-stable). Hint `└` sub-lines indent three columns deeper.
+    pub fn set_row_indent(&mut self, indent: &'static str) {
+        self.row_indent = indent;
     }
 
     /// Pin the per-step pacing to a fixed duration. **Test seam only**: production
@@ -287,16 +321,23 @@ impl<W: Write> ProgressRenderer<W> {
 
     /// Render a section header line: a blank spacer then the header. Skipped
     /// entirely when the header is empty (headerless / linear-run callers).
-    fn section_header(&mut self, header: &str) -> std::io::Result<()> {
+    ///
+    /// With an emoji the header renders in the grouped-status convention —
+    /// `{emoji}  {Title}` (two spaces after the emoji, no leading space, title
+    /// bold in colour mode). Without one it keeps the legacy ` {header}` line.
+    fn section_header(&mut self, header: &str, emoji: Option<&str>) -> std::io::Result<()> {
         if header.is_empty() {
             return Ok(());
         }
         writeln!(self.writer)?;
-        if self.color {
-            // Bold header.
-            writeln!(self.writer, " \x1b[1m{header}\x1b[0m")?;
+        let (bold, reset) = if self.color {
+            ("\x1b[1m", "\x1b[0m")
         } else {
-            writeln!(self.writer, " {header}")?;
+            ("", "")
+        };
+        match emoji {
+            Some(e) => writeln!(self.writer, "{e}  {bold}{header}{reset}")?,
+            None => writeln!(self.writer, " {bold}{header}{reset}")?,
         }
         Ok(())
     }
@@ -332,7 +373,8 @@ impl<W: Write> ProgressRenderer<W> {
         for frame in 0..frame_count {
             write!(
                 self.writer,
-                "\r  {} {}",
+                "\r{}{} {}",
+                self.row_indent,
                 SPINNER_FRAMES[frame % SPINNER_FRAMES.len()],
                 label
             )?;
@@ -348,6 +390,7 @@ impl<W: Write> ProgressRenderer<W> {
 
     /// Static status line(s) for a resolved step. Shared by both paths.
     fn write_resolved_step(&mut self, step: &Step) -> std::io::Result<()> {
+        let indent = self.row_indent;
         let prefix = step.status.ansi_prefix(self.color);
         let reset = if self.color { "\x1b[0m" } else { "" };
         let glyph = step.status.glyph();
@@ -356,13 +399,13 @@ impl<W: Write> ProgressRenderer<W> {
         if detail.is_empty() {
             writeln!(
                 self.writer,
-                "  {prefix}{glyph}{reset} {label}",
+                "{indent}{prefix}{glyph}{reset} {label}",
                 label = step.label
             )?;
         } else {
             writeln!(
                 self.writer,
-                "  {prefix}{glyph}{reset} {label:<18} {detail}",
+                "{indent}{prefix}{glyph}{reset} {label:<18} {detail}",
                 label = step.label,
             )?;
         }
@@ -372,9 +415,9 @@ impl<W: Write> ProgressRenderer<W> {
         if step.status != StepStatus::Ok {
             if let Some(hint) = &step.hint {
                 if self.color {
-                    writeln!(self.writer, "     \x1b[2m└ {hint}\x1b[0m")?;
+                    writeln!(self.writer, "{indent}   \x1b[2m└ {hint}\x1b[0m")?;
                 } else {
-                    writeln!(self.writer, "     └ {hint}")?;
+                    writeln!(self.writer, "{indent}   └ {hint}")?;
                 }
             }
         }
@@ -383,7 +426,7 @@ impl<W: Write> ProgressRenderer<W> {
 
     /// Convenience: render a whole section (header + each step).
     pub fn render_section(&mut self, section: &Section) -> std::io::Result<()> {
-        self.section_header(&section.header)?;
+        self.section_header(&section.header, section.emoji.as_deref())?;
         for step in &section.steps {
             self.step(step)?;
         }
@@ -608,6 +651,76 @@ mod tests {
         assert!(
             first.contains("step one"),
             "first line is the step: {out:?}"
+        );
+    }
+
+    #[test]
+    fn emoji_section_header_renders_grouped_convention() {
+        // `with_emoji` → `{emoji}  {Title}`: no leading space, two spaces
+        // after the emoji.
+        let section = Section::with_emoji(
+            "⚙️",
+            "Config",
+            vec![Step::new("onebrain.yml", StepStatus::Ok, None, None)],
+        );
+        let out = render_static(&section, false);
+        let header = out.lines().find(|l| l.contains("Config")).unwrap();
+        assert_eq!(header, "⚙️  Config", "grouped header shape: {out:?}");
+    }
+
+    #[test]
+    fn plain_section_header_keeps_legacy_leading_space() {
+        let section = Section::new(
+            "Config",
+            vec![Step::new("onebrain.yml", StepStatus::Ok, None, None)],
+        );
+        let out = render_static(&section, false);
+        let header = out.lines().find(|l| l.contains("Config")).unwrap();
+        assert_eq!(header, " Config", "legacy header unchanged: {out:?}");
+    }
+
+    #[test]
+    fn row_indent_is_configurable_for_rows_and_hints() {
+        let section = Section::with_emoji(
+            "🔌",
+            "Integration",
+            vec![Step::new(
+                "hooks",
+                StepStatus::Warn,
+                Some("dup".into()),
+                Some("fix it".into()),
+            )],
+        );
+        let mut r = ProgressRenderer::with_writer(Vec::new(), true, false);
+        r.set_row_indent("    ");
+        r.render_section(&section).unwrap();
+        let out = String::from_utf8(r.writer.clone()).unwrap();
+        assert!(
+            out.contains("\n    ⚠ hooks"),
+            "four-space row indent: {out:?}"
+        );
+        assert!(
+            out.contains("\n       └ fix it"),
+            "hint indents three deeper than the row: {out:?}"
+        );
+    }
+
+    #[test]
+    fn default_row_indent_stays_two_spaces() {
+        // Legacy consumers (update dispatch) must stay byte-stable.
+        let section = Section::new(
+            "",
+            vec![Step::new(
+                "step one",
+                StepStatus::Ok,
+                Some("done".into()),
+                None,
+            )],
+        );
+        let out = render_static(&section, false);
+        assert!(
+            out.starts_with("  ✓ step one"),
+            "two-space default indent: {out:?}"
         );
     }
 
