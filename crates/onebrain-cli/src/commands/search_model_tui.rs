@@ -1,5 +1,7 @@
-//! `onebrain search model` (bare, on a TTY) — a full-screen interactive
-//! ratatui table of the embedding-model registry.
+//! `onebrain search model` (bare, on a TTY) — a compact interactive ratatui
+//! table of the embedding-model registry, drawn inline right below the
+//! command (no alternate screen / full-screen takeover); the final frame
+//! stays in the scrollback after quitting.
 //!
 //! Columns: current-marker (`●`) · MODEL · DOWNLOADED (`✓`/`⬜`) · DISK · DIM ·
 //! THAI · NOTE — matching the static `search model list` table's emoji/columns
@@ -259,16 +261,21 @@ impl AppState {
 // Raw-mode event loop (TTY-only; excluded from coverage — see docs/coverage.md)
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Height of the inline viewport: table borders (2) + header (1) + one line
+/// per registry row + the single footer line.
+pub fn viewport_height(row_count: usize) -> u16 {
+    (row_count as u16).saturating_add(4)
+}
+
 /// Launch the interactive model TUI for `vault_flag`'s vault. Resolves the
 /// collection + cache dir, builds the row model, enters raw mode, runs the
 /// event loop, and always restores the terminal on the way out (even on
-/// error). Caller guarantees a real TTY (see `search_model::run_bare`).
+/// error). Draws in a small INLINE viewport right below the command — no
+/// alternate screen — so the last frame stays visible after quitting.
+/// Caller guarantees a real TTY (see `search_model::run_bare`).
 pub fn run(vault_flag: Option<PathBuf>) -> Result<()> {
-    use ratatui::crossterm::{
-        event::{DisableMouseCapture, EnableMouseCapture},
-        execute,
-        terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-    };
+    use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+    use ratatui::{TerminalOptions, Viewport};
 
     let resolved = crate::vault_ctx::require(vault_flag)?;
     let config = load_vault_config(&resolved.root).context("load vault config")?;
@@ -277,26 +284,27 @@ pub fn run(vault_flag: Option<PathBuf>) -> Result<()> {
     let cache_dir = collection_cache_dir(&collection);
 
     let rows = build_rows(&current, &cache_dir);
+    let height = viewport_height(rows.len());
     let mut state = AppState::new(rows);
 
     enable_raw_mode().context("entering raw mode")?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .context("entering alternate screen")?;
-    let backend = ratatui::backend::CrosstermBackend::new(stdout);
-    let mut terminal = ratatui::Terminal::new(backend).context("building terminal")?;
+    let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+    let mut terminal = ratatui::Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(height),
+        },
+    )
+    .context("building terminal")?;
 
     let loop_result = event_loop(&mut terminal, &mut state, resolved);
 
-    // Always restore the terminal, regardless of how the loop ended.
+    // Always restore the terminal, regardless of how the loop ended. The
+    // inline viewport's final frame intentionally stays in the scrollback;
+    // just drop the cursor onto a fresh line below it for the shell prompt.
     disable_raw_mode().ok();
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )
-    .ok();
     terminal.show_cursor().ok();
+    println!();
 
     loop_result
 }
@@ -425,7 +433,7 @@ fn render(f: &mut ratatui::Frame, state: &AppState) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
         .split(f.area());
 
     let header = Row::new([
@@ -492,8 +500,8 @@ fn render(f: &mut ratatui::Frame, state: &AppState) {
         .status
         .clone()
         .unwrap_or_else(|| footer_text(state.sort, state.desc));
-    let footer =
-        ratatui::widgets::Paragraph::new(footer_line).block(Block::default().borders(Borders::ALL));
+    let footer = ratatui::widgets::Paragraph::new(footer_line)
+        .style(Style::default().add_modifier(Modifier::DIM));
     f.render_widget(footer, chunks[1]);
 }
 
@@ -605,6 +613,14 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort_unstable();
         assert_eq!(names, sorted);
+    }
+
+    #[test]
+    fn viewport_height_is_rows_plus_chrome() {
+        // 2 table borders + 1 header + N rows + 1 footer line.
+        assert_eq!(viewport_height(5), 9);
+        assert_eq!(viewport_height(0), 4);
+        assert_eq!(viewport_height(usize::MAX), u16::MAX);
     }
 
     #[test]
