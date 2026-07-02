@@ -536,6 +536,37 @@ mod tests {
     /// `open`/`search` never acquire the writer lock, the stale file is
     /// irrelevant to them. Regression test for the `LockBusy` failure.
     #[test]
+    fn search_empty_and_punctuation_queries_return_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = LexIndex::open(dir.path()).unwrap();
+        s.add(&chunk("d1#0", "some indexed text สุขภาพ")).unwrap();
+        s.commit().unwrap();
+        assert!(s.search("", 5).unwrap().is_empty(), "empty query");
+        assert!(
+            s.search("!!! ??? ---", 5).unwrap().is_empty(),
+            "punctuation-only query yields no units"
+        );
+        assert!(s.search("text", 0).unwrap().is_empty(), "top_k 0");
+    }
+
+    #[test]
+    fn search_single_thai_word_requires_the_whole_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = LexIndex::open(dir.path()).unwrap();
+        s.add(&chunk("health#0", "บันทึกเรื่องสุขภาพประจำวัน")).unwrap();
+        s.add(&chunk("pic#0", "รูปภาพจากทริปเชียงใหม่")).unwrap();
+        s.commit().unwrap();
+        // Full word only in health#0 — the doc sharing only the ภา/าพ pairs
+        // (ภาพ in pic#0) must NOT match.
+        let hits = s.search("สุขภาพ", 5).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].0, "health#0");
+        // Substring query still hits both docs containing ภาพ.
+        let hits = s.search("ภาพ", 5).unwrap();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+    }
+
+    #[test]
     fn search_succeeds_with_stale_writer_lock_present() {
         let dir = tempfile::tempdir().unwrap();
 
