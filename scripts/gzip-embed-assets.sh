@@ -21,15 +21,30 @@ fi
 
 gzipped=0
 while IFS= read -r -d '' f; do
-  # Already a gzip stream? (idempotent re-runs / partial builds) → skip.
-  if gzip -t "$f" 2>/dev/null; then
-    continue
+  # Check the gzip magic bytes (1f 8b) FIRST, before `gzip -t`. Gating solely on
+  # `gzip -t` conflates two cases: a raw file (no magic → re-gzip, correct) and a
+  # *corrupt* gzip (has the magic but fails integrity → `gzip -t` also fails, so
+  # it would get re-gzipped into a double-wrapped stream the server can't inflate).
+  # Split them: has magic + valid → skip (idempotent); has magic + corrupt → fail
+  # fast; no magic → gzip below.
+  magic=$(head -c2 "$f" | od -An -tx1 | tr -d ' \n')
+  if [ "$magic" = "1f8b" ]; then
+    if gzip -t "$f" 2>/dev/null; then
+      continue # already a valid gzip stream → idempotent skip
+    fi
+    echo "gzip-embed-assets: $f has the gzip magic but fails integrity (corrupt) — aborting" >&2
+    exit 1
   fi
   # -9 max ratio, -n omit name/timestamp (reproducible builds). Separate
   # statements (not `&&`) so a gzip failure aborts under `set -e` rather than
   # silently skipping the file and miscounting.
   gzip -9 -n -c "$f" >"$f.gz"
-  mv "$f.gz" "$f"
+  # If the in-place swap fails, remove the stray `.gz` so a re-run doesn't trip
+  # over a leftover partial artifact, then abort.
+  if ! mv "$f.gz" "$f"; then
+    rm -f "$f.gz"
+    exit 1
+  fi
   gzipped=$((gzipped + 1))
 done < <(find "$assets_dir" -type f -print0)
 

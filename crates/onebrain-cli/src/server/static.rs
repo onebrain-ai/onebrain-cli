@@ -148,6 +148,12 @@ async fn serve_from_embedded(token: &str, request: Request) -> Response {
 /// text or binary that never start with these two bytes, so this reliably tells
 /// a build-time-gzipped asset apart from a raw one — no path/extension guessing,
 /// so serving stays correct whether or not the build gzipped anything.
+///
+/// This is a magic-byte sniff, not gzip validation: it's only ever applied to
+/// the trusted assets baked into the binary at build time (`WebAssets`), never
+/// to user- or network-supplied bytes. A two-byte prefix match is sufficient
+/// there — the build either gzipped a file or it didn't. Do not repurpose this
+/// as a content-integrity or untrusted-input check.
 fn is_gzip(data: &[u8]) -> bool {
     data.starts_with(&[0x1f, 0x8b])
 }
@@ -173,8 +179,15 @@ fn gzip_is_acceptable(entry: &str) -> bool {
     {
         return false;
     }
-    // A `q=0` qualifier means "not acceptable".
-    !parts.any(|p| p.strip_prefix("q=").and_then(|q| q.parse::<f32>().ok()) == Some(0.0))
+    // A `q=0` qualifier means "not acceptable". Compare with `<= 0.0` rather
+    // than `== 0.0`: exact float equality is fragile, and any non-positive
+    // q-value (0, 0.0, 0.00) equally means "refused".
+    !parts.any(|p| {
+        p.strip_prefix("q=")
+            .and_then(|q| q.parse::<f32>().ok())
+            .map(|q| q <= 0.0)
+            .unwrap_or(false)
+    })
 }
 
 /// Serve gzip-precompressed `data`: pass it through with `Content-Encoding: gzip`
@@ -386,6 +399,8 @@ mod tests {
         assert!(accepts_gzip(&req(Some("GZIP")))); // case-insensitive
         assert!(!accepts_gzip(&req(Some("gzip;q=0")))); // explicit refusal
         assert!(!accepts_gzip(&req(Some("gzip;q=0.0")))); // explicit refusal
+        assert!(!accepts_gzip(&req(Some("gzip;q=0.00")))); // non-canonical zero → refused (<= 0.0, not == 0.0)
+        assert!(!accepts_gzip(&req(Some("gzip;q=-1")))); // any non-positive q → refused
         assert!(!accepts_gzip(&req(Some("deflate, br")))); // no gzip
         assert!(!accepts_gzip(&req(None))); // header absent
     }

@@ -18,6 +18,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Swappable embedding model** via `search model set` — rebuilds the vector store and re-embeds; `bge-m3` is the best-accuracy upgrade path.
 - **Platform-tiered semantic search** (rustls, not openssl): targets with no ONNX Runtime prebuilt — x64 macOS, musl, 32-bit ARM (Raspberry Pi) — ship a lex-only binary (full CLI + keyword search; `query` degrades, `vsearch`/`model set` error). Gated by the `semantic` cargo feature (default ON). See [ADR 0017](docs/decisions/0017-platform-tiered-semantic-search.md) + the README platform-support matrix.
 - Runs **alongside qmd** (engine milestone only) — MCP swap and qmd removal land in follow-up milestones.
+- **Release cross-toolchains fixed** so all 9 targets build: `aarch64-unknown-linux-gnu` installs `g++-*` for onnxruntime's C++ runtime (`-lstdc++`); `aarch64-pc-windows-msvc` activates the arm64 MSVC toolset so simsimd's C build links. Plus a main-branch review sweep (webview redirect-hop off-by-one, translate error logging, static gzip q-value robustness, gzip-embed script hardening).
 
 ## [3.3.27] — 2026-07-02 — translate bridge for select-to-lookup
 

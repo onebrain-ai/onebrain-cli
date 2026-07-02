@@ -49,7 +49,12 @@ pub async fn post_translate(Json(req): Json<TranslateRequest>) -> Response {
     if text.is_empty() {
         return err(StatusCode::BAD_REQUEST, "text is empty");
     }
-    if !is_lang_code(&req.to) || !req.from.as_deref().is_none_or(is_lang_code) {
+    // `to` is required; `from` is optional but, when present, must also be a
+    // valid language code. Restructured as an explicit if-let rather than
+    // `!from.is_none_or(is_lang_code)` (a double negative that reads as its
+    // own opposite).
+    let from_invalid = matches!(req.from.as_deref(), Some(from) if !is_lang_code(from));
+    if !is_lang_code(&req.to) || from_invalid {
         return err(StatusCode::BAD_REQUEST, "invalid language code");
     }
     let truncated = text.chars().count() > MAX_TEXT_CHARS;
@@ -127,14 +132,18 @@ fn fetch_translation_from(
         .build()
         .into();
     let url = format!("{base}{}", gtx_url(text, from, to));
-    let mut resp = agent
-        .get(&url)
-        .call()
-        .map_err(|_| "translate service unreachable".to_string())?;
-    let body = resp
-        .body_mut()
-        .read_to_string()
-        .map_err(|_| "translate service unreachable".to_string())?;
+    // Log the underlying ureq error before collapsing it to the generic
+    // user-facing message: the caller only ever sees "translate service
+    // unreachable" (selection text is never logged), so without this the real
+    // cause — DNS, TLS, timeout, HTTP status — is lost for debugging.
+    let mut resp = agent.get(&url).call().map_err(|e| {
+        eprintln!("translate: request failed: {e}");
+        "translate service unreachable".to_string()
+    })?;
+    let body = resp.body_mut().read_to_string().map_err(|e| {
+        eprintln!("translate: reading response body failed: {e}");
+        "translate service unreachable".to_string()
+    })?;
     parse_gtx(&body)
 }
 
