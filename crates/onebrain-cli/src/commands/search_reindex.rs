@@ -392,44 +392,53 @@ fn index_size_suffix(size: Option<u64>, delta: Option<i64>) -> Option<String> {
         Some(d) if d > 0 => format!(" (+{})", format_size(d as u64)),
         Some(d) => format!(" (−{})", format_size(d.unsigned_abs())),
     };
-    Some(format!("📊  Index {}{paren}", format_size(size)))
+    Some(format!("{}{paren}", format_size(size)))
+}
+
+/// One indented `label → value` line, mirroring `search status`'s grouped
+/// layout (fixed-width label column, no emoji inside the section body).
+fn item(label: &str, value: &str) -> String {
+    format!("    {label:<14}{value}")
 }
 
 fn render_text(env: &Envelope<ReindexData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
-    // Only surface non-zero categories so the line stays readable; keep a
-    // fixed order. `failed` gets a ⚠️  so it stands out from the happy path.
-    let mut parts: Vec<String> = Vec::new();
+    // Same grouped style as `search status`: a ✅  header, then indented
+    // label/value rows. Zero categories are omitted so the section stays
+    // readable; `failed` carries a ⚠️  so it stands out.
+    let mut lines: Vec<String> = Vec::new();
     if d.added > 0 {
-        parts.push(format!("📄  {} added", d.added));
+        lines.push(item("Added", &d.added.to_string()));
     }
     if d.updated > 0 {
-        parts.push(format!("♻️  {} updated", d.updated));
+        lines.push(item("Updated", &d.updated.to_string()));
     }
     if d.removed > 0 {
-        parts.push(format!("🗑️  {} removed", d.removed));
+        lines.push(item("Removed", &d.removed.to_string()));
     }
     if d.unchanged > 0 {
-        parts.push(format!("⏭️  {} unchanged", d.unchanged));
+        lines.push(item("Unchanged", &d.unchanged.to_string()));
     }
     if d.failed > 0 {
-        parts.push(format!("⚠️  {} failed", d.failed));
+        lines.push(item("Failed", &format!("⚠️  {}", d.failed)));
     }
-    let index_line = index_size_suffix(d.index_size_bytes, d.index_size_delta_bytes);
+    let index_line = index_size_suffix(d.index_size_bytes, d.index_size_delta_bytes)
+        .map(|v| item("Index size", &v));
 
-    if parts.is_empty() {
+    if lines.is_empty() {
         // Nothing to do — an already-current index reindexed to a no-op.
         let mut out = "✅  Reindexed — nothing to update".to_string();
         if let Some(idx) = index_line {
-            out.push_str(&format!("\n    {idx}"));
+            out.push_str(&format!("\n{idx}"));
         }
         return out;
     }
-    // Headline, then counts and index size each on their own indented line.
     let mut out = "✅  Reindexed".to_string();
-    out.push_str(&format!("\n    {}", parts.join(" · ")));
+    for l in lines {
+        out.push_str(&format!("\n{l}"));
+    }
     if let Some(idx) = index_line {
-        out.push_str(&format!("\n    {idx}"));
+        out.push_str(&format!("\n{idx}"));
     }
     out
 }
@@ -490,10 +499,10 @@ mod tests {
         let e = Envelope::ok("search.reindex", None, data(1, 2, 3, 4, 0));
         let s = render_text(&e);
         assert!(s.contains("✅  Reindexed"), "{s}");
-        assert!(s.contains("1 added"));
-        assert!(s.contains("2 updated"));
-        assert!(s.contains("3 removed"));
-        assert!(s.contains("4 unchanged"));
+        assert!(s.contains("    Added         1"), "{s}");
+        assert!(s.contains("    Updated       2"), "{s}");
+        assert!(s.contains("    Removed       3"), "{s}");
+        assert!(s.contains("    Unchanged     4"), "{s}");
         // failed == 0 is omitted from the summary line.
         assert!(!s.contains("failed"));
     }
@@ -502,8 +511,8 @@ mod tests {
     fn text_omits_zero_categories() {
         let e = Envelope::ok("search.reindex", None, data(5, 0, 0, 700, 0));
         let s = render_text(&e);
-        assert!(s.contains("5 added"));
-        assert!(s.contains("700 unchanged"));
+        assert!(s.contains("    Added         5"), "{s}");
+        assert!(s.contains("    Unchanged     700"), "{s}");
         // Zero categories are not shown.
         assert!(!s.contains("updated"));
         assert!(!s.contains("removed"));
@@ -518,7 +527,7 @@ mod tests {
     #[test]
     fn text_appends_failed_count_when_nonzero() {
         let e = Envelope::ok("search.reindex", None, data(0, 0, 0, 0, 2));
-        assert!(render_text(&e).contains("2 failed"));
+        assert!(render_text(&e).contains("    Failed        ⚠️  2"));
     }
 
     #[test]
@@ -528,21 +537,21 @@ mod tests {
         d.index_size_delta_bytes = Some(1_300_000); // +~1.2 MB
         let e = Envelope::ok("search.reindex", None, d);
         let s = render_text(&e);
-        assert!(s.contains("📊  Index 16.2 MB"), "{s}");
+        assert!(s.contains("    Index size    16.2 MB"), "{s}");
         assert!(s.contains("(+1.2 MB)"), "{s}");
     }
 
     #[test]
     fn text_renders_negative_delta_with_minus_sign() {
         let s = index_size_suffix(Some(10 * 1024 * 1024), Some(-800 * 1024)).unwrap();
-        assert!(s.contains("📊  Index 10.0 MB"), "{s}");
+        assert!(s.contains("10.0 MB"), "{s}");
         assert!(s.contains("(−800 KB)"), "{s}");
     }
 
     #[test]
     fn text_omits_parenthetical_on_zero_delta() {
         let s = index_size_suffix(Some(5 * 1024 * 1024), Some(0)).unwrap();
-        assert!(s.contains("📊  Index 5.0 MB"), "{s}");
+        assert!(s.contains("5.0 MB"), "{s}");
         assert!(
             !s.contains('('),
             "zero delta must render no parenthetical: {s}"
