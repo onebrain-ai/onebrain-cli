@@ -276,10 +276,10 @@ fn render_list_text(env: &Envelope<ModelListData>) -> String {
 
     // Wrap the table in a plain single-line box with the title embedded in
     // the top border — same look as the interactive TUI's ratatui block
-    // (`┌ Embedding Model Selection ────┐` … `└────┘`). Width fits the
+    // (`┌ Available Embedding Models ────┐` … `└────┘`). Width fits the
     // widest row (not the terminal); every content line gets one space of
     // breathing room inside each border.
-    const TITLE: &str = " Embedding Model Selection ";
+    const TITLE: &str = " Available Embedding Models ";
     let inner = content
         .iter()
         .map(|l| l.width())
@@ -719,7 +719,7 @@ mod tests {
         let lines: Vec<&str> = s.lines().collect();
         // Title embedded in the plain top border, ratatui-style.
         assert!(
-            lines[0].starts_with("┌ Embedding Model Selection ─"),
+            lines[0].starts_with("┌ Available Embedding Models ─"),
             "top border with title: {}",
             lines[0]
         );
