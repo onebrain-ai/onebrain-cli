@@ -905,11 +905,11 @@ pub struct SearchCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum SearchVerb {
-    /// Hybrid search (lex + vector, RRF-fused).
+    /// Hybrid search (lex + vector, RRF-fused) · flags: --top-k, --min-score.
     Query(SearchQueryArgs),
-    /// Lexical (BM25) search only — never triggers a model download.
+    /// Lexical (BM25) search only — never triggers a model download · flags: --top-k, --min-score.
     Search(SearchQueryArgs),
-    /// Semantic (vector) search only.
+    /// Semantic (vector) search only · flags: --top-k, --min-score.
     Vsearch(SearchQueryArgs),
     /// Fetch a doc's full indexed text.
     Get(SearchGetArgs),
@@ -1005,6 +1005,11 @@ pub struct SearchQueryArgs {
     /// Maximum hits to return.
     #[arg(long = "top-k", default_value_t = 10)]
     pub top_k: usize,
+    /// Drop hits scoring below this value. Scales differ per verb: `vsearch`
+    /// is cosine similarity (≈0.86+ is a confident e5 match), `search` is a
+    /// raw BM25 score, `query` is an RRF-fused rank score.
+    #[arg(long = "min-score")]
+    pub min_score: Option<f64>,
 }
 
 #[derive(Args, Debug)]

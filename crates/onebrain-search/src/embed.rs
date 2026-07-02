@@ -75,6 +75,12 @@ pub struct ModelInfo {
     pub thai_miracl: Option<f32>,
     /// Short human-readable guidance shown alongside the entry.
     pub note: &'static str,
+    /// Minimum cosine similarity for a vector hit to count as a real match
+    /// (measured per model family; `None` = no floor). Below it, hits are
+    /// noise — the nearest neighbors of a query about something the vault
+    /// simply doesn't contain. e5-family: unrelated text clusters ≈0.84,
+    /// related ≥0.87, so 0.85 splits them with margin.
+    pub vec_floor: Option<f32>,
     /// Prefix prepended to QUERY text before embedding (e.g. `"query: "`
     /// for the e5 family, which was trained with instruction prefixes —
     /// omitting them measurably degrades retrieval). Empty = none.
@@ -175,6 +181,7 @@ pub fn model_registry() -> &'static [ModelInfo] {
             context: 512,
             thai_miracl: Some(75.0),
             note: "default · small + fast",
+            vec_floor: Some(0.85),
             query_prefix: "query: ",
             passage_prefix: "passage: ",
             hf_repo: "intfloat/multilingual-e5-small",
@@ -187,6 +194,7 @@ pub fn model_registry() -> &'static [ModelInfo] {
             context: 512,
             thai_miracl: Some(75.2),
             note: "larger · better recall",
+            vec_floor: Some(0.85),
             query_prefix: "query: ",
             passage_prefix: "passage: ",
             hf_repo: "intfloat/multilingual-e5-base",
@@ -199,6 +207,7 @@ pub fn model_registry() -> &'static [ModelInfo] {
             context: 512,
             thai_miracl: Some(80.2),
             note: "high accuracy",
+            vec_floor: Some(0.85),
             query_prefix: "query: ",
             passage_prefix: "passage: ",
             hf_repo: "Qdrant/multilingual-e5-large-onnx",
@@ -211,6 +220,7 @@ pub fn model_registry() -> &'static [ModelInfo] {
             context: 8192,
             thai_miracl: Some(82.6),
             note: "best Thai/accuracy · fp32",
+            vec_floor: None,
             query_prefix: "",
             passage_prefix: "",
             hf_repo: "BAAI/bge-m3",
@@ -223,6 +233,7 @@ pub fn model_registry() -> &'static [ModelInfo] {
             context: 2048,
             thai_miracl: None,
             note: "smallest · Thai unverified",
+            vec_floor: None,
             query_prefix: "task: search result | query: ",
             passage_prefix: "title: none | text: ",
             hf_repo: "onnx-community/embeddinggemma-300m-ONNX",

@@ -365,7 +365,16 @@ impl LexIndex {
                 (Occur::Should, tq)
             })
             .collect();
-        let query = BooleanQuery::new(subqueries);
+        // Require at least a quarter of the query terms (rounded up) to
+        // match. A pure OR would surface docs sharing only COMMON bigrams
+        // with a no-space-script query — e.g. `สุขภาพ` segments to
+        // สุ|ุข|ขภ|ภา|าพ, and docs containing just `ภาพ` (image) matched.
+        // 25% keeps single-concept recall in multi-word queries (each word
+        // contributes its own bigram run) while dropping shared-pair noise.
+        // The real fix for Thai is dictionary word-segmentation (nlpo3,
+        // tracked follow-up).
+        let min_match = subqueries.len().div_ceil(4).max(1);
+        let query = BooleanQuery::with_minimum_required_clauses(subqueries, min_match);
 
         let reader = self.index.reader()?;
         let searcher = reader.searcher();

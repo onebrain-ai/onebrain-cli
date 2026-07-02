@@ -229,6 +229,17 @@ fn walk_markdown_files(root: &Path, exclude: &[String]) -> Result<Vec<PathBuf>> 
     Ok(out)
 }
 
+/// Drop vector hits whose cosine similarity is below the model's measured
+/// confidence floor (see `ModelInfo::vec_floor`). Without this, a query
+/// about something the vault doesn't contain still surfaces its top-k
+/// nearest neighbors — pure noise with authoritative-looking ranks.
+fn drop_below_floor(hits: Vec<(String, f32)>, floor: Option<f32>) -> Vec<(String, f32)> {
+    match floor {
+        Some(f) => hits.into_iter().filter(|(_, s)| *s >= f).collect(),
+        None => hits,
+    }
+}
+
 /// A single fused, resolved search hit.
 pub struct Hit {
     pub chunk_id: String,
@@ -544,6 +555,15 @@ impl Engine {
         Ok(chunks.len())
     }
 
+    /// The active model's vector-confidence floor from the registry
+    /// (`None` for unknown/test models and models without a measured floor).
+    fn vec_floor(&self) -> Option<f32> {
+        embed::model_registry()
+            .iter()
+            .find(|m| m.name == self.model_name)
+            .and_then(|m| m.vec_floor)
+    }
+
     /// Install the vault's `search.exclude` patterns — applied by every
     /// vault walk on top of the built-in skips (hidden dirs, node_modules).
     pub fn set_exclude_patterns(&mut self, patterns: Vec<String>) {
@@ -688,7 +708,7 @@ impl Engine {
     /// `top_k` [`Hit`]s. Fused ids whose meta is missing are skipped.
     pub fn query(&self, text: &str, top_k: usize) -> Result<Vec<Hit>> {
         let query_vec = self.embedder()?.embed_query(text)?;
-        let vec_hits = self.vec.search(&query_vec, VEC_TOP_K);
+        let vec_hits = drop_below_floor(self.vec.search(&query_vec, VEC_TOP_K), self.vec_floor());
         let lex_hits = self.lex.search(text, LEX_TOP_K)?;
 
         let fused = rrf_fuse(&lex_hits, &vec_hits, RRF_K, top_k);
@@ -700,7 +720,7 @@ impl Engine {
     /// full [`Hit`]s. Used by the CLI's `search vsearch` verb.
     pub fn vector_search(&self, text: &str, top_k: usize) -> Result<Vec<Hit>> {
         let query_vec = self.embedder()?.embed_query(text)?;
-        let vec_hits = self.vec.search(&query_vec, top_k);
+        let vec_hits = drop_below_floor(self.vec.search(&query_vec, top_k), self.vec_floor());
         let ranked: Vec<(String, f64)> = vec_hits
             .into_iter()
             .map(|(id, score)| (id, score as f64))
@@ -1736,6 +1756,33 @@ mod tests {
 
         assert_eq!(stats.failed, 1, "unreadable file should count as failed");
         assert_eq!(stats.added, 0);
+    }
+
+    #[test]
+    fn drop_below_floor_filters_only_with_floor() {
+        let hits = vec![("a".to_string(), 0.88f32), ("b".to_string(), 0.84)];
+        let kept = drop_below_floor(hits.clone(), Some(0.85));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0, "a");
+        assert_eq!(
+            drop_below_floor(hits, None).len(),
+            2,
+            "no floor → untouched"
+        );
+    }
+
+    #[test]
+    fn e5_family_has_vec_floor_bge_does_not() {
+        for m in embed::model_registry() {
+            if m.name.starts_with("multilingual-e5") {
+                assert_eq!(m.vec_floor, Some(0.85), "{}", m.name);
+            }
+        }
+        let bge = embed::model_registry()
+            .iter()
+            .find(|m| m.name == "bge-m3")
+            .unwrap();
+        assert!(bge.vec_floor.is_none());
     }
 
     #[test]

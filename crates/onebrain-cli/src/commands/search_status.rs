@@ -242,11 +242,7 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
     }
 
     if let Some(r) = &d.reindexing {
-        let pct = if r.total > 0 {
-            r.done * 100 / r.total
-        } else {
-            0
-        };
+        let pct = (r.done * 100).checked_div(r.total).unwrap_or(0);
         lines.push(format!(
             "🔄  reindexing    {}/{} ({pct}%) — running now; counts below may lag",
             r.done, r.total

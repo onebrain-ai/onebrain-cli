@@ -80,7 +80,7 @@ pub fn run_query(
 ) -> Result<()> {
     let (engine, resolved) = open_engine(vault_flag)?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
-    let hits = engine.query(&args.text, args.top_k)?;
+    let hits = apply_min_score(engine.query(&args.text, args.top_k)?, args.min_score);
     let hint = hits
         .is_empty()
         .then(|| index_hint_for(&engine, &resolved))
@@ -97,7 +97,10 @@ pub fn run_vsearch(
 ) -> Result<()> {
     let (engine, resolved) = open_engine(vault_flag)?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
-    let hits = engine.vector_search(&args.text, args.top_k)?;
+    let hits = apply_min_score(
+        engine.vector_search(&args.text, args.top_k)?,
+        args.min_score,
+    );
     let hint = hits
         .is_empty()
         .then(|| index_hint_for(&engine, &resolved))
@@ -128,7 +131,10 @@ pub fn run_lex(
     let lex = LexIndex::open(&cache_dir.join("tantivy"))
         .with_context(|| format!("opening lex index at {}", cache_dir.display()))?;
 
-    let raw_hits = lex.search(&args.text, args.top_k)?;
+    let mut raw_hits = lex.search(&args.text, args.top_k)?;
+    if let Some(min) = args.min_score {
+        raw_hits.retain(|(_, score)| f64::from(*score) >= min);
+    }
     // LexIndex::search returns bare (chunk_id, score) pairs — no doc_path,
     // heading_path, or snippet (those live in the engine's redb metadata,
     // which this verb deliberately never opens). chunk_id already encodes
@@ -163,6 +169,14 @@ pub fn run_lex(
     );
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
+}
+
+/// Apply the optional `--min-score` floor to engine hits.
+fn apply_min_score(mut hits: Vec<Hit>, min_score: Option<f64>) -> Vec<Hit> {
+    if let Some(min) = min_score {
+        hits.retain(|h| h.score >= min);
+    }
+    hits
 }
 
 fn emit_hits(
