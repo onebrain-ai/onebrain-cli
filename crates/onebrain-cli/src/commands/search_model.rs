@@ -116,6 +116,11 @@ fn sort_rows(rows: &mut [ModelListEntry], col: ModelSortCol, desc: bool) {
             }
             ModelSortCol::Thai => cmp_option_last(a.thai_miracl, b.thai_miracl, desc),
             ModelSortCol::Disk => cmp_option_last(a.disk_bytes, b.disk_bytes, desc),
+            // Ascending = downloaded first (✓ on top), ties break by name.
+            ModelSortCol::Downloaded => b
+                .downloaded
+                .cmp(&a.downloaded)
+                .then_with(|| a.name.cmp(b.name)),
         };
         // For the "missing sorts last" columns we've already folded direction
         // into `cmp_option_last`; don't reverse them again.

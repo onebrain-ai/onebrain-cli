@@ -9,8 +9,10 @@
 //!
 //! Keybindings:
 //! - `↑`/`↓` (or `k`/`j`) — move the selection
-//! - `s` — cycle the sort column (name → disk → dim → thai → back to name)
-//! - `r` — reverse the sort direction
+//! - `s` — cycle the sort column following the on-screen order (MODEL →
+//!   DOWNLOADED → DISK → DIM → THAI → back to MODEL); the active column shows
+//!   an ↑/↓ indicator in the header. Default sort: MODEL name, ascending.
+//! - `r` — reverse the sort direction (ASC ↔ DESC) on the active column
 //! - `Enter` — switch the active model to the selected row: downloads the
 //!   model IMMEDIATELY if missing (an in-table progress bar with % replaces
 //!   the row's NOTE while the `models--*` dir fills), then re-embeds via the
@@ -82,10 +84,12 @@ pub fn build_rows(current: &str, cache_dir: &std::path::Path) -> Vec<TuiRow> {
         .collect()
 }
 
-/// The next sort column in the `s`-key cycle: name → disk → dim → thai → name.
+/// The next sort column in the `s`-key cycle, following the on-screen column
+/// order: MODEL → DOWNLOADED → DISK → DIM → THAI → back to MODEL.
 pub fn next_sort(col: ModelSortCol) -> ModelSortCol {
     match col {
-        ModelSortCol::Name => ModelSortCol::Disk,
+        ModelSortCol::Name => ModelSortCol::Downloaded,
+        ModelSortCol::Downloaded => ModelSortCol::Disk,
         ModelSortCol::Disk => ModelSortCol::Dim,
         ModelSortCol::Dim => ModelSortCol::Thai,
         ModelSortCol::Thai => ModelSortCol::Name,
@@ -105,6 +109,11 @@ pub fn sort_rows(rows: &mut [TuiRow], col: ModelSortCol, desc: bool) {
             ModelSortCol::Dim => a.dims.cmp(&b.dims),
             ModelSortCol::Thai => cmp_option_last(a.thai, b.thai, desc),
             ModelSortCol::Disk => cmp_option_last(a.disk_bytes, b.disk_bytes, desc),
+            // Ascending = downloaded first (✓ on top), ties break by name.
+            ModelSortCol::Downloaded => b
+                .downloaded
+                .cmp(&a.downloaded)
+                .then_with(|| a.name.cmp(b.name)),
             // Not a TUI sort column — treat as name so the comparator is total.
             ModelSortCol::Size => a.name.cmp(b.name),
         };
@@ -125,6 +134,17 @@ pub fn sort_label(col: ModelSortCol) -> &'static str {
         ModelSortCol::Dim => "dim",
         ModelSortCol::Thai => "thai",
         ModelSortCol::Disk => "disk",
+        ModelSortCol::Downloaded => "downloaded",
+    }
+}
+
+/// Header label for a column, with the active sort column carrying an
+/// inline direction indicator (e.g. `MODEL ↑`).
+pub fn header_label(base: &str, active: bool, desc: bool) -> String {
+    if active {
+        format!("{base} {}", if desc { "↓" } else { "↑" })
+    } else {
+        base.to_string()
     }
 }
 
@@ -185,7 +205,8 @@ pub fn download_pct(current: u64, expected: u64) -> u8 {
     if expected == 0 {
         return 0;
     }
-    ((current.saturating_mul(100) / expected).min(99)) as u8
+    // u128 math: `current * 100` can't overflow, even at u64::MAX.
+    ((current as u128 * 100 / expected as u128).min(99)) as u8
 }
 
 /// A fixed-width text progress bar like `▓▓▓▓▓░░░░░░░  42%`.
@@ -200,8 +221,9 @@ pub fn progress_bar(pct: u8, width: usize) -> String {
 
 impl AppState {
     /// Build initial state from rows, selecting the CURRENT model if present
-    /// (else the first row). Starts unsorted (registry order), ascending.
-    pub fn new(rows: Vec<TuiRow>, cache_dir: PathBuf) -> Self {
+    /// (else the first row). Default sort: MODEL name, ascending.
+    pub fn new(mut rows: Vec<TuiRow>, cache_dir: PathBuf) -> Self {
+        sort_rows(&mut rows, ModelSortCol::Name, false);
         let selected = rows.iter().position(|r| r.current).unwrap_or(0);
         Self {
             rows,
@@ -424,8 +446,11 @@ enum SwitchMsg {
     /// The model files are on disk (either they already were, or the forced
     /// download just finished); the re-embed phase is starting.
     DownloadDone,
-    /// The whole switch finished (config persisted on success).
-    Finished(anyhow::Result<crate::output::Envelope<crate::commands::search_model::ModelSetData>>),
+    /// The whole switch finished (config persisted on success). Boxed: the
+    /// envelope is much larger than the other variant.
+    Finished(
+        Box<anyhow::Result<crate::output::Envelope<crate::commands::search_model::ModelSetData>>>,
+    ),
 }
 
 /// Enter-key handler: switch the active model to the selected row. The
@@ -441,7 +466,7 @@ fn perform_switch<B: ratatui::backend::Backend>(
     state: &mut AppState,
     resolved: &onebrain_core::ResolvedVault,
 ) {
-    use ratatui::crossterm::event::{self, Event};
+    use ratatui::crossterm::event;
     use std::sync::mpsc::TryRecvError;
     use std::time::Duration;
 
@@ -470,15 +495,15 @@ fn perform_switch<B: ratatui::backend::Backend>(
             // raw mode). With the cache warm, apply's own embedder init is a
             // no-op download-wise.
             if let Err(e) = onebrain_search::embed::new_quiet(name, &worker_cache) {
-                let _ = tx.send(SwitchMsg::Finished(Err(e)));
+                let _ = tx.send(SwitchMsg::Finished(Box::new(Err(e))));
                 return;
             }
         }
         let _ = tx.send(SwitchMsg::DownloadDone);
-        let _ = tx.send(SwitchMsg::Finished(apply_model_change(
+        let _ = tx.send(SwitchMsg::Finished(Box::new(apply_model_change(
             worker_resolved,
             name,
-        )));
+        ))));
     });
 
     if needs_download {
@@ -523,7 +548,7 @@ fn perform_switch<B: ratatui::backend::Backend>(
             }
             Ok(SwitchMsg::Finished(result)) => {
                 state.downloading = None;
-                match result {
+                match *result {
                     Ok(envelope) => {
                         // Re-scan download status and reflect the new active
                         // model in the table.
@@ -601,13 +626,18 @@ fn render(f: &mut ratatui::Frame, state: &AppState) {
         .constraints([Constraint::Min(3), Constraint::Length(1)])
         .split(f.area());
 
+    let (col, desc) = (state.sort, state.desc);
     let header = Row::new([
         Cell::from(""),
-        Cell::from("MODEL"),
-        Cell::from("DOWNLOADED"),
-        Cell::from("DISK"),
-        Cell::from("DIM"),
-        Cell::from("THAI"),
+        Cell::from(header_label("MODEL", col == ModelSortCol::Name, desc)),
+        Cell::from(header_label(
+            "DOWNLOADED",
+            col == ModelSortCol::Downloaded,
+            desc,
+        )),
+        Cell::from(header_label("DISK", col == ModelSortCol::Disk, desc)),
+        Cell::from(header_label("DIM", col == ModelSortCol::Dim, desc)),
+        Cell::from(header_label("THAI", col == ModelSortCol::Thai, desc)),
         Cell::from("NOTE"),
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
@@ -664,15 +694,19 @@ fn render(f: &mut ratatui::Frame, state: &AppState) {
     let widths = [
         Constraint::Length(2),
         Constraint::Length(24),
-        Constraint::Length(11),
+        Constraint::Length(13),
         Constraint::Length(10),
         Constraint::Length(6),
-        Constraint::Length(6),
+        Constraint::Length(7),
         Constraint::Min(20),
     ];
+    // QuadrantOutside borders are half-block glyphs (▌▐▀▄) that span the full
+    // character cell, so vertical borders render SOLID even in terminals that
+    // add line spacing (plain `│` box-drawing shows as a dashed line there).
     let table = Table::new(body, widths).header(header).block(
         Block::default()
             .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::QuadrantOutside)
             .title(" embedding models "),
     );
     f.render_widget(table, chunks[0]);
@@ -734,13 +768,63 @@ mod tests {
     }
 
     #[test]
-    fn next_sort_cycles_name_disk_dim_thai_back() {
-        assert_eq!(next_sort(ModelSortCol::Name), ModelSortCol::Disk);
+    fn next_sort_cycles_in_on_screen_column_order() {
+        assert_eq!(next_sort(ModelSortCol::Name), ModelSortCol::Downloaded);
+        assert_eq!(next_sort(ModelSortCol::Downloaded), ModelSortCol::Disk);
         assert_eq!(next_sort(ModelSortCol::Disk), ModelSortCol::Dim);
         assert_eq!(next_sort(ModelSortCol::Dim), ModelSortCol::Thai);
         assert_eq!(next_sort(ModelSortCol::Thai), ModelSortCol::Name);
         // Size (not in the cycle) folds back to the start.
         assert_eq!(next_sort(ModelSortCol::Size), ModelSortCol::Name);
+    }
+
+    #[test]
+    fn sort_rows_downloaded_puts_downloaded_first_ties_by_name() {
+        let cache = tempfile::tempdir().unwrap();
+        // Download exactly one model.
+        let info = model_registry()
+            .iter()
+            .find(|m| m.name == "multilingual-e5-base")
+            .unwrap();
+        let mdir = cache.path().join(info.cache_dir_name());
+        std::fs::create_dir_all(&mdir).unwrap();
+        std::fs::write(mdir.join("model.onnx"), vec![0u8; 64]).unwrap();
+
+        let mut rows = build_rows("bge-m3", cache.path());
+        sort_rows(&mut rows, ModelSortCol::Downloaded, false);
+        assert_eq!(rows[0].name, "multilingual-e5-base", "✓ first ascending");
+        // The undownloaded tail is name-ordered (tie-break).
+        let tail: Vec<&str> = rows[1..].iter().map(|r| r.name).collect();
+        let mut sorted_tail = tail.clone();
+        sorted_tail.sort_unstable();
+        assert_eq!(tail, sorted_tail);
+
+        sort_rows(&mut rows, ModelSortCol::Downloaded, true);
+        assert_eq!(
+            rows.last().unwrap().name,
+            "multilingual-e5-base",
+            "descending flips ✓ to the bottom"
+        );
+    }
+
+    #[test]
+    fn header_label_marks_only_active_column() {
+        assert_eq!(header_label("MODEL", true, false), "MODEL ↑");
+        assert_eq!(header_label("MODEL", true, true), "MODEL ↓");
+        assert_eq!(header_label("DISK", false, true), "DISK");
+    }
+
+    #[test]
+    fn app_new_default_sorts_by_name_ascending() {
+        let st = state_for("bge-m3");
+        let names: Vec<&str> = st.rows.iter().map(|r| r.name).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "initial rows are name-sorted");
+        assert_eq!(st.sort, ModelSortCol::Name);
+        assert!(!st.desc);
+        // Selection still lands on the current model after the initial sort.
+        assert_eq!(st.selected_row().unwrap().name, "bge-m3");
     }
 
     #[test]
@@ -949,7 +1033,7 @@ mod tests {
         let mut st = state_for("bge-m3");
         let before = st.selected_row().unwrap().name;
         st.cycle_sort();
-        assert_eq!(st.sort, ModelSortCol::Disk);
+        assert_eq!(st.sort, ModelSortCol::Downloaded);
         assert_eq!(
             st.selected_row().unwrap().name,
             before,
