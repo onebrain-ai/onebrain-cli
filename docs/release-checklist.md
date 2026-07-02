@@ -91,3 +91,14 @@ For each of `session init` and `checkpoint orphans .`:
 | `cargo clippy`    |        |       |
 | `cargo fmt`       |        |       |
 | Reviewer · date   |        |       |
+
+## Release-matrix gate (added 2026-07-03 — see ADR 0018)
+
+The v3.4.0 tag failed 5/9 release builds that regular CI could not see. Before pushing a tag, when the release since the last tag **adds or reconfigures any native build-script dependency** (`*-sys` crates, `cc`-compiled C like simsimd, prebuilt-binary downloaders like ort):
+
+- [ ] Run the release workflow **without a tag** (workflow_dispatch / a throwaway branch run) and get all 9 targets green first.
+- [ ] Check new deps' *default features* for TLS/openssl assumptions (prefer rustls — ADR 0017).
+- [ ] Check prebuilt-binary coverage for every matrix target (e.g. ort's `dist.txt`) — tier targets accordingly.
+- [ ] Cross Linux targets need `g++-<triple>` when any dep links C++ (onnxruntime does).
+- [ ] windows-arm64 builds via amd64_arm64 cross from x64 — do not move it to a native arm64 runner without re-validating simsimd/`cc` and PATH sanity (ADR 0018).
+- [ ] If a tag's run failed before the GitHub Release was created: delete + re-push the tag is safe. After a Release/npm/brew publish exists: never re-point — ship a patch version.

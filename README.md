@@ -180,7 +180,7 @@ onebrain
 
 ### Platform support — semantic vs keyword search
 
-Every release target ships a binary with the **full CLI** and **keyword (lexical/BM25) search**. **Semantic** search (vector + hybrid `query`, plus `vsearch` and `model set`) additionally needs an ONNX Runtime prebuilt, which isn't available on every platform — so some targets ship **keyword-only**. The tiering is driven by the `ort-sys` prebuilt list ([ADR 0017](docs/decisions/0017-platform-tiered-semantic-search.md)); this table, the release-workflow matrix, and the ADR all agree.
+Every release target ships a binary with the **full CLI** and **keyword (lexical/BM25) search**. **Semantic** search (vector + hybrid `query`, plus `vsearch` and `model set`) additionally needs an ONNX Runtime prebuilt, which isn't available on every platform — so some targets ship **keyword-only**. The tiering is driven by the `ort-sys` prebuilt list ([ADR 0017](docs/decisions/0017-platform-tiered-semantic-search.md)); this table, the release-workflow matrix, and the ADR all agree. Windows-arm64 is cross-compiled from x64 and native-dep changes are matrix-tested before tagging ([ADR 0018](docs/decisions/0018-release-build-strategy-lessons.md)).
 
 | Target | Binary | Keyword search (lex) | Semantic search (vector/hybrid) | Notes |
 |---|---|---|---|---|

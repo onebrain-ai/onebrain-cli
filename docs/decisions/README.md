@@ -45,5 +45,6 @@ ADRs are immutable once accepted — if a decision changes, write a new ADR that
 | [0015](0015-grouped-output-convention.md) | Grouped text-output convention (emoji sections, no frames) | accepted |
 | [0016](0016-qmd-collection-config-migration.md) | `qmd_collection` → `search.collection` via `doctor --fix` | accepted |
 | [0017](0017-platform-tiered-semantic-search.md) | Platform-tiered semantic search (`semantic` feature; lex-only fallback) | accepted |
+| [0018](0018-release-build-strategy-lessons.md) | Release build strategy: win-arm64 cross-compile + pre-tag matrix rule | accepted |
 
 > These ADRs distill the public-facing rationale; the full design notes live in the project tracker. Numbers are stable IDs assigned at authoring time — see each ADR's **Date** for chronology.
