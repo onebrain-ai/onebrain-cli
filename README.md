@@ -50,7 +50,7 @@ Point an AI agent at a vault and it improvises — a different pile of `grep` / 
 
 ## Status
 
-**v3.3.x — stable & production-ready, in active maintenance.** GA since v3.0.0 (2026-05-22), shipping ~weekly themed minors. The v3.3 line landed the daemon foundation — `onebrain serve` hosts a local web UI (embedded in the binary) over a token-gated vault JSON API. Version history + direction in the [Roadmap](#roadmap); full detail in [CHANGELOG.md](CHANGELOG.md).
+**v3.4.x — stable & production-ready, in active maintenance.** GA since v3.0.0 (2026-05-22), shipping ~weekly themed minors. The v3.3 line landed the daemon foundation — `onebrain serve` hosts a local web UI (embedded in the binary) over a token-gated vault JSON API. The v3.4 line introduces the native Rust search engine (the `onebrain-search` crate + `onebrain search` verbs), replacing the external qmd Node dependency across v3.4.x with full cutover — **0 node/python deps** — at v3.4.2. Version history + direction in the [Roadmap](#roadmap); full detail in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quickstart
 
@@ -144,19 +144,22 @@ Requires a recent stable Rust toolchain (`rustup default stable`). The only `uns
 
 ## Command surface
 
-v3.1 locks a singular-noun, two-level grammar — `onebrain <noun> <verb>` — so every command path is predictable. Four root verbs handle the common flow; eight resource groups cluster the rest.
+v3.1 locks a singular-noun, two-level grammar — `onebrain <noun> <verb>` — so every command path is predictable. Four root verbs handle the common flow; ten resource groups cluster the rest.
 
 ```text
 onebrain
 ├── init                       create / re-scaffold a vault (--yes · --force · --no-sync)
 ├── update                     self-update the binary (--check · --plan)
-├── doctor [--fix]             9 health checks + auto-repair recipes
+├── doctor [--fix]             11 health checks + auto-repair recipes
 ├── serve                      local web UI + vault JSON API (--port · --host · --open)
 │
 ├── vault       sync · current
 ├── session     init
 ├── checkpoint  stop · reset · orphans
-├── qmd         reindex · embed · status
+├── search      query · search · vsearch · get · status · reindex · model
+├── note        read · list · find · search · stat · new · append · edit
+│               · move · mkdir · archive · delete · orphans · backlinks
+├── qmd         reindex · embed · status        (legacy — removed in v3.4.2)
 ├── plugin      install · update · migrate
 ├── schedule    register
 ├── skill       run
@@ -167,9 +170,10 @@ onebrain
 |---|---|---|
 | **Setup** | `init`, `plugin install`, `vault sync` | Scaffold `onebrain.yml` + PARA folders, register the plugin with the harness, overlay the latest plugin tarball. |
 | **Runtime** (hook protocol) | `session init`, `checkpoint stop · reset · orphans`, `qmd reindex` | Called by the harness `SessionStart` / `Stop` / `PostToolUse` hooks. Emit hard-wired JSON; banner suppressed for clean machine stdio. |
-| **Search** | `qmd reindex · embed · status` | Rebuild the qmd index, re-embed documents, report index + embedding health. |
-| **Web UI** | `serve` | Host the binary-embedded web UI + token-gated vault JSON API on `127.0.0.1:6789` — file explorer, reading view, qmd search, agent chat; `--open` launches the browser. |
-| **Maintenance** | `doctor [--fix]`, `plugin update · migrate`, `schedule register` | Nine read-only checks + `--fix` recipes, self-update the binary + rewrite hooks + rebind launchd plists, compile the `onebrain.yml schedule:` block into OS scheduler artifacts. |
+| **Search** | `search query · search · vsearch · get · status · reindex · model` | Native hybrid search (tantivy BM25 + fastembed embeddings, RRF-fused) over the vault's `*.md` notes, plus embedding-model management with an interactive TUI. The legacy `qmd reindex · embed · status` verbs remain until the v3.4.2 cutover. |
+| **Notes** | `note read · list · find · search · stat · new · append · edit · move · mkdir · archive · delete · orphans · backlinks` | Structured vault-note operations — wikilink-aware moves, dated archiving, orphan/backlink graph queries. |
+| **Web UI** | `serve` | Host the binary-embedded web UI + token-gated vault JSON API on `127.0.0.1:6789` — file explorer, reading view, search panel, agent chat; `--open` launches the browser. |
+| **Maintenance** | `doctor [--fix]`, `plugin update · migrate`, `schedule register` | Eleven read-only checks + `--fix` recipes, self-update the binary + rewrite hooks + rebind launchd plists, compile the `onebrain.yml schedule:` block into OS scheduler artifacts. |
 | **Diagnostics** | `vault current`, `harness detect` | Report which mechanism resolved the active vault, and which AI harness is running. |
 
 > The tree shape is **locked for v3.2+** — 200+ verbs beyond the working set above are stubbed with a stable `E_NOT_IMPLEMENTED` (exit 72) so the grammar can't drift while features land. Hidden v3.0 flat aliases (`session-init`, `qmd-reindex`, `register-hooks`, …) still dispatch, printing a one-time migration notice (silence with `ONEBRAIN_QUIET_MIGRATION=1`); they're removed no earlier than v4.
@@ -230,21 +234,26 @@ Figures from the v3.0.0 rewrite-milestone dogfood; the binary has since grown to
 
 ## Architecture
 
-Four-crate Cargo workspace:
+Five-crate Cargo workspace:
 
 ```text
-onebrain-cli         Binary crate — clap dispatch over the v3.1 command tree
+onebrain-cli          Binary crate — clap dispatch over the v3.1 command tree
   │
-  ├─ onebrain-fs     Vault walks · frontmatter parsing · plugin tarball overlay
-  │                  · init bootstrap · doctor checks · update install path · backups
+  ├─ onebrain-search  Native vault search — tantivy BM25 · fastembed embeddings
+  │                   · flat vector store · RRF hybrid. Knows about the index.
   │
-  ├─ onebrain-cache  Session token resolution · launchd plist generation
-  │                  · qmd status detection
+  ├─ onebrain-fs      Vault walks · frontmatter parsing · plugin tarball overlay
+  │                   · init bootstrap · doctor checks · update install path · backups
   │
-  └─ onebrain-core   Types · config parsing · path resolution (zero filesystem deps)
+  ├─ onebrain-cache   Session token resolution · launchd plist generation
+  │                   · qmd status detection
+  │
+  └─ onebrain-core    Types · config parsing · path resolution (zero filesystem deps)
 ```
 
-Workspace inheritance keeps `[workspace.package]` fields (`version`, `edition`, `license`, `repository`) in one place. The root sets `publish = false`; all four crates inherit it via `publish.workspace = true` — only the compiled binary ships.
+(`onebrain-search` is deliberately standalone — it depends on no other workspace crate, only the CLI depends on it.)
+
+Workspace inheritance keeps `[workspace.package]` fields (`version`, `edition`, `license`, `repository`) in one place. The root sets `publish = false`; all five crates inherit it via `publish.workspace = true` — only the compiled binary ships.
 
 Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `insta` snapshots, 900+ tests passing. CI gates on `fmt` + `clippy -D warnings` + a 3-platform matrix (Ubuntu, macOS, Windows). The v2.x Bun golden-master parity layer was retired in v3.1.0; the v3.1 `Envelope` shape and the output-format matrix now own the canonical-contract role.
 

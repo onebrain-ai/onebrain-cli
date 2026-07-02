@@ -95,7 +95,13 @@ pub fn run_list(
         Some(vault_info),
         ModelListData { models, cache_dir },
     );
-    emit(&envelope, mode, std::io::stdout().lock(), render_list_text)?;
+    // Resolve the colour bit once from the mode (single source of truth with
+    // the banner/doctor gate) and capture it — `emit` only invokes the
+    // renderer in text mode.
+    let color = crate::output::is_color_text(mode);
+    emit(&envelope, mode, std::io::stdout().lock(), |e| {
+        render_list_text(e, color)
+    })?;
     Ok(())
 }
 
@@ -217,7 +223,19 @@ fn pad_display(s: &str, w: usize) -> String {
     format!("{s}{}", " ".repeat(w.saturating_sub(vis)))
 }
 
-fn render_list_text(env: &Envelope<ModelListData>) -> String {
+/// Bold-green SGR prefix for the active model's row — the same styling the
+/// interactive TUI gives the ● row (`Color::Green + BOLD`).
+const ACTIVE_ROW_ANSI: &str = "\x1b[1;32m";
+const ANSI_RESET: &str = "\x1b[0m";
+
+/// Render the boxed model table. `color` is the resolved colour bit
+/// (`output::is_color_text` on the active mode — the same gate the banner
+/// and doctor use, so `--no-color` / `NO_COLOR` / piped stdout all drop the
+/// styling automatically). When set, the ACTIVE model's row renders
+/// bold-green like the TUI; padding is always computed on the UNCOLORED cell
+/// text and the SGR codes wrap the padded content INSIDE the `│ … │` borders,
+/// so the right border stays flush in both modes.
+fn render_list_text(env: &Envelope<ModelListData>, color: bool) -> String {
     use unicode_width::UnicodeWidthStr;
 
     let d = env.data.as_ref().expect("ok envelope always has data");
@@ -244,14 +262,11 @@ fn render_list_text(env: &Envelope<ModelListData>) -> String {
             )
         };
 
-    let mut content = vec![row(
-        "",
-        "MODEL",
-        "DOWNLOADED",
-        "DISK",
-        "DIM",
-        "THAI",
-        "NOTE",
+    // (uncolored content line, is the active-model row) — colouring is applied
+    // at box-assembly time so width math never sees ANSI codes.
+    let mut content = vec![(
+        row("", "MODEL", "DOWNLOADED", "DISK", "DIM", "THAI", "NOTE"),
+        false,
     )];
     for m in &d.models {
         let marker = if m.current { "●" } else { "" };
@@ -263,14 +278,17 @@ fn render_list_text(env: &Envelope<ModelListData>) -> String {
             .thai_miracl
             .map(|v| format!("{v:.1}"))
             .unwrap_or_else(|| "—".to_string());
-        content.push(row(
-            marker,
-            m.name,
-            downloaded,
-            &disk,
-            &m.dims.to_string(),
-            &thai,
-            m.note,
+        content.push((
+            row(
+                marker,
+                m.name,
+                downloaded,
+                &disk,
+                &m.dims.to_string(),
+                &thai,
+                m.note,
+            ),
+            m.current,
         ));
     }
 
@@ -282,7 +300,7 @@ fn render_list_text(env: &Envelope<ModelListData>) -> String {
     const TITLE: &str = " Available Embedding Models ";
     let inner = content
         .iter()
-        .map(|l| l.width())
+        .map(|(l, _)| l.width())
         .max()
         .unwrap_or(0)
         .max(TITLE.width());
@@ -293,8 +311,15 @@ fn render_list_text(env: &Envelope<ModelListData>) -> String {
         "┌{TITLE}{}┐",
         "─".repeat(boxed.saturating_sub(TITLE.width()))
     ));
-    for l in &content {
-        lines.push(format!("│ {} │", pad_display(l, inner)));
+    for (l, active) in &content {
+        let padded = pad_display(l, inner);
+        if color && *active {
+            // SGR wraps the padded content only — the borders stay unstyled
+            // and the visible width is identical to the mono row.
+            lines.push(format!("│ {ACTIVE_ROW_ANSI}{padded}{ANSI_RESET} │"));
+        } else {
+            lines.push(format!("│ {padded} │"));
+        }
     }
     lines.push(format!("└{}┘", "─".repeat(boxed)));
     lines.push(format!("📁  Cache dir: {}", d.cache_dir.display()));
@@ -669,7 +694,7 @@ mod tests {
 
     #[test]
     fn list_text_marks_current_model() {
-        let s = render_list_text(&list_env("bge-m3"));
+        let s = render_list_text(&list_env("bge-m3"), false);
         let marked_line = s
             .lines()
             .find(|l| l.contains("bge-m3"))
@@ -682,7 +707,7 @@ mod tests {
 
     #[test]
     fn list_text_only_current_row_has_marker() {
-        let s = render_list_text(&list_env("bge-m3"));
+        let s = render_list_text(&list_env("bge-m3"), false);
         // The non-active default (first registry entry) row must not carry a
         // marker anymore — only the active model does.
         let default_name = model_registry()[0].name;
@@ -699,7 +724,7 @@ mod tests {
 
     #[test]
     fn list_text_has_header_footer_and_all_models() {
-        let s = render_list_text(&list_env("multilingual-e5-small"));
+        let s = render_list_text(&list_env("multilingual-e5-small"), false);
         assert!(s.contains("MODEL"));
         assert!(s.contains("DOWNLOADED"));
         assert!(s.contains("DISK"));
@@ -715,7 +740,7 @@ mod tests {
     #[test]
     fn list_text_boxes_the_table_like_the_tui() {
         use unicode_width::UnicodeWidthStr;
-        let s = render_list_text(&list_env("bge-m3"));
+        let s = render_list_text(&list_env("bge-m3"), false);
         let lines: Vec<&str> = s.lines().collect();
         // Title embedded in the plain top border, ratatui-style.
         assert!(
@@ -753,6 +778,52 @@ mod tests {
                 "row not │-wrapped: {l}"
             );
         }
+        // No-color render never carries ANSI escapes.
+        assert!(!s.contains('\x1b'), "mono render must be ANSI-free: {s:?}");
+    }
+
+    #[test]
+    fn list_text_colors_only_the_active_row_and_keeps_borders_flush() {
+        use unicode_width::UnicodeWidthStr;
+        let s = render_list_text(&list_env("bge-m3"), true);
+        for line in s.lines() {
+            if line.contains("bge-m3") {
+                // Active row: bold-green SGR wraps the padded content INSIDE
+                // the borders, so the line still starts/ends with │ and the
+                // reset lands before the right border.
+                assert!(
+                    line.contains(ACTIVE_ROW_ANSI),
+                    "active row must be bold-green: {line:?}"
+                );
+                assert!(
+                    line.starts_with('│') && line.ends_with('│'),
+                    "borders unstyled: {line:?}"
+                );
+                assert!(
+                    line.ends_with(&format!("{ANSI_RESET} │")),
+                    "reset before the right border: {line:?}"
+                );
+            } else {
+                assert!(
+                    !line.contains('\x1b'),
+                    "only the active row is coloured: {line:?}"
+                );
+            }
+        }
+        // Stripping the SGR codes yields the exact mono render — the colour
+        // layer never changes layout, so the box stays flush.
+        let stripped = s.replace(ACTIVE_ROW_ANSI, "").replace(ANSI_RESET, "");
+        let mono = render_list_text(&list_env("bge-m3"), false);
+        assert_eq!(stripped, mono, "colour must be layout-neutral");
+        let widths: Vec<usize> = stripped
+            .lines()
+            .filter(|l| l.starts_with('│') || l.starts_with('┌') || l.starts_with('└'))
+            .map(|l| l.width())
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "box lines share one display width after stripping ANSI: {widths:?}"
+        );
     }
 
     #[test]
@@ -778,7 +849,7 @@ mod tests {
                 cache_dir: cache.path().to_path_buf(),
             },
         );
-        let s = render_list_text(&env);
+        let s = render_list_text(&env, false);
         let row = s
             .lines()
             .find(|l| l.contains("multilingual-e5-small"))
@@ -1060,6 +1131,37 @@ mod tests {
         assert_eq!(
             format_size(2 * 1024 * 1024 * 1024 + 200 * 1024 * 1024),
             "2.2 GB"
+        );
+    }
+
+    #[test]
+    fn supported_model_names_joins_the_whole_registry() {
+        let csv = supported_model_names();
+        for m in model_registry() {
+            assert!(csv.contains(m.name), "missing {} in: {csv}", m.name);
+        }
+        assert_eq!(
+            csv.matches(", ").count(),
+            model_registry().len() - 1,
+            "comma-joined: {csv}"
+        );
+    }
+
+    #[test]
+    fn remove_text_reports_not_downloaded_noop() {
+        let env = Envelope::ok(
+            "search.model.remove",
+            None,
+            ModelRemoveData {
+                model: "bge-m3".to_string(),
+                removed: false,
+                freed_bytes: None,
+                was_current: false,
+            },
+        );
+        assert_eq!(
+            render_remove_text(&env),
+            "Nothing to remove — bge-m3 is not downloaded"
         );
     }
 

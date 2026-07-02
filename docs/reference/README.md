@@ -11,6 +11,7 @@ A file/module-level map of the source, so you can land in any crate and follow t
 | `onebrain-core` | Pure types · config · path resolution · scheduler model. Zero filesystem I/O. | [onebrain-core.md](onebrain-core.md) |
 | `onebrain-cache` | Host/runtime state — session tokens · checkpoints · qmd status · launchd. | [onebrain-cache.md](onebrain-cache.md) |
 | `onebrain-fs` | Filesystem effects — vault walks · init · doctor · update install · vault sync. | [onebrain-fs.md](onebrain-fs.md) |
+| `onebrain-search` | Native vault search — tantivy BM25 · fastembed vectors · RRF hybrid engine. | [onebrain-search.md](onebrain-search.md) |
 | `onebrain-cli` | Binary — clap dispatch · output rendering · TTY/banner · command wiring. | [onebrain-cli.md](onebrain-cli.md) |
 
 ## Dependency direction
@@ -20,10 +21,11 @@ Higher crates depend on lower ones, never the reverse:
 ```
 onebrain-cli ──▶ onebrain-fs ──▶ onebrain-core
        │                              ▲
-       └────────▶ onebrain-cache ─────┘
+       ├────────▶ onebrain-cache ─────┘
+       └────────▶ onebrain-search     (standalone — no workspace deps)
 ```
 
-Read order for a newcomer: **core → cache → fs → cli** (each builds on the one before).
+Read order for a newcomer: **core → cache → fs → search → cli** (each builds on the one before; `onebrain-search` stands alone — read it any time before `cli`).
 
 ## How each crate doc is laid out
 

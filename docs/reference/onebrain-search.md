@@ -1,0 +1,154 @@
+# onebrain-search
+
+## Purpose & dependencies
+`onebrain-search` is OneBrain's native, in-binary vault search engine — the v3.4.0 replacement for the external `qmd` (Node) dependency. It owns the full retrieval stack over a vault of markdown notes: heading-aware chunking, BM25 lexical search (`tantivy`) with a script-aware tokenizer for no-space scripts (Thai, Lao, Myanmar, Khmer, CJK), local ONNX embeddings (`fastembed`), a flat memory-mapped vector store with exact cosine top-k, Reciprocal Rank Fusion of the two rankings, and the `Engine` that ties them together (index/remove/query/status/reindex/rebuild). It depends on **nothing in-workspace** — only external crates: `tantivy` 0.26 (BM25; feature-trimmed to `mmap`, `lz4-compression`, `stopwords`, `stemmer` — default features are disabled to avoid the C zstd build dep pulled in by the non-default `zstd-compression` feature, per the Cargo.toml comment), `fastembed` 5.17 (ONNX-backed local embedding models), `simsimd` 6.5 (SIMD dot-product similarity), `memmap2` (mmap access to the vector file), `redb` 4.1 (embedded KV metadata), plus `serde`/`serde_json`, `anyhow`, `sha2` (content hashing). `nlpo3` (Thai word segmentation) is deliberately **not** a dependency yet — the published crate excludes its word dictionary, so v3.4.0 ships a dictionary-free character-bigram fallback in `src/lex.rs` (Phase 2 Thai upgrade re-adds it). The only downstream crate is **`onebrain-cli`**: the `search` verb group (`search_query`, `search_reindex`, `search_status`, `search_get`, `search_model`, `search_model_tui`), the `search_common.rs` collection→cache-dir plumbing, and `doctor`'s native-search index check. `onebrain-fs` does not depend on it.
+
+## Module map
+```
+src/
+├── lib.rs       Crate root · module declarations + crate-level architecture/scope/storage docs (no re-exports)
+├── chunk.rs     Heading-aware + size-split markdown chunker → Chunk (heading_path "A > B > C")
+├── embed.rs     Embed trait · fastembed Embedder · 6-entry ModelInfo registry · download-status helpers
+├── lex.rs       tantivy BM25 index (LexIndex) · script-aware tokenizer · char-bigrams for no-space scripts
+├── vector.rs    Flat mmap f32 vector store (VectorStore) · redb metadata · tombstones/free-list · compact
+├── hybrid.rs    rrf_fuse — Reciprocal Rank Fusion of the lex and vector rankings
+└── engine.rs    Engine — open/index_doc/remove_doc/query/vector_search/get/status/reindex/rebuild
+```
+
+## On-disk layout (per collection)
+Everything lives outside the vault, under the collection cache dir — `<cache_dir>/onebrain/search/<collection>/` (e.g. `~/.cache/onebrain/search/<collection>/`), resolved by the CLI's `search_common::collection_cache_dir` from the `search.collection` config value:
+- `tantivy/` — the BM25 lexical index (`src/lex.rs`).
+- `vectors/` — the flat vector store (`src/vector.rs`): `vectors.bin` (packed little-endian `f32`, row-major, stride = `dims * 4` bytes) + `meta.redb` (chunk↔row mapping, tombstones, free-list, header).
+- `engine.redb` — engine metadata (`src/engine.rs`): chunk text/heading meta, per-doc chunk lists, doc content hashes, active model + last-indexed header.
+- `models--*` dirs — embedding models downloaded by `fastembed`/`hf-hub` (e.g. `models--intfloat--multilingual-e5-small`), named via `ModelInfo::cache_dir_name`.
+- `reindex-progress.json` — transient live marker for an in-flight reindex. Written/removed by the CLI (`reindex_progress_path` in `crates/onebrain-cli/src/commands/search_common.rs`), **not** by this crate — `search status` reads it to report a running reindex.
+
+Model download behavior: only the paths that actually embed — `index_doc`, `query`, `vector_search`, `rebuild` (via the lazy `Engine::embedder`) — construct the real `fastembed` embedder and can trigger a first-time model download. `Engine::open`, `status`, `get`, and the CLI's model `list`/download-status views never download.
+
+## `src/lib.rs`
+Crate root. Declares the six modules (`chunk`, `embed`, `engine`, `hybrid`, `lex`, `vector`) — **no re-exports**: consumers use full paths (`onebrain_search::engine::Engine`, `onebrain_search::embed::model_registry`, …). The crate-level doc comment carries the architecture diagram (markdown → chunk → lex + embed/vector → RRF), the `.md`-only indexing scope, the per-collection storage layout, and the frontends note (driven by the `onebrain-cli` `search` command group; OneBrain's own MCP server from v3.4.1 — the engine core stays synchronous, async lives only at the MCP boundary in the CLI crate).
+**Connections** — module declarations only; called by: `onebrain-cli` (entry surface).
+
+## `src/chunk.rs`
+Heading-aware + size-split markdown chunker. Splits a document along ATX heading boundaries (`#`…`######`, space-after-hash required), tracking the active heading stack so each chunk carries its full `heading_path` (`"A > B > C"`); any section body exceeding `max_tokens` is further sliced into overlapping windows. Token counting is a whitespace-word approximation (`split_whitespace().count()`), not a real tokenizer. The size parameters are owned by the caller — `engine.rs` passes `CHUNK_MAX_TOKENS = 512` / `CHUNK_OVERLAP_TOKENS = 64`.
+**Key types**
+- `Chunk` — `{ chunk_id, doc_path, heading_path, chunk_index, text }`; `chunk_id` is `"<doc_path>#<chunk_index>"` (e.g. `n.md#0`).
+
+**Key functions**
+- `chunk_markdown(doc_path, content, max_tokens, overlap_tokens) -> Vec<Chunk>` — flush the accumulated section text on every heading (popping stack entries with level ≥ the new heading's before pushing it), then size-split each section.
+- (private: `parse_heading(line) -> Option<(usize, &str)>` — ATX detection; `split_body_into_windows(body, max_tokens, overlap_tokens)` — the last `overlap_tokens` words of window k reappear as the first words of window k+1, stride = `max - overlap`.)
+
+**Connections** — calls: nothing (pure); called by: `engine::index_doc`.
+**Tests** — `#[cfg(test)]` covers heading-path nesting, size-split overlap (last-64-words-of-k = first-64-of-k+1), empty input, and heading-less prose (empty `heading_path`).
+
+## `src/embed.rs`
+Wraps `fastembed` to turn chunk texts into **L2-normalized** embedding vectors, and owns the swappable-model registry. Normalization is unconditional (even for models that already emit near-unit vectors) so the vector store can assume unit length and use a plain dot product as cosine.
+**Key types**
+- `trait Embed` — the embedding seam: `embed(texts)`, `dims()`, plus `embed_passages` / `embed_query` with pass-through defaults. `Embedder` is the real implementation; engine tests inject a deterministic in-memory fake (`FakeEmbedder`, defined in `src/engine.rs`'s `#[cfg(test)]` module) via `Engine::open_with_embedder` so index/query/rebuild logic runs without a multi-GB download.
+- `Embedder` — `Mutex<TextEmbedding>` + `dims`, `model_name`, and the model's `query_prefix`/`passage_prefix`. `embed_passages` prepends the passage prefix, `embed_query` the query prefix (stored chunk text stays raw — prefixes apply at embed time only).
+- `ModelInfo` — one registry entry: `name` (config-facing `search.embed_model` value), `dims`, `approx_size`/`approx_bytes` (the denominator for download-progress %), `context` (max input tokens), `thai_miracl` (`Option` — `None` = unverified for Thai), `note`, `vec_floor` (minimum cosine for a vector hit to count as a real match; `None` = no floor), `query_prefix`/`passage_prefix`, `hf_repo`.
+- `ModelDownloadStatus` — `{ downloaded, disk_size: Option<u64>, path }`, computed per model from a collection cache dir.
+
+**The registry** (`model_registry()` — display order, smallest/default first; the single source of truth for model names):
+
+| name | dims | context | approx size | note | prefixes (query · passage) | vec_floor |
+|---|---|---|---|---|---|---|
+| `multilingual-e5-small` | 384 | 512 | ~470 MB | default · small + fast | `query: ` · `passage: ` | 0.85 |
+| `multilingual-e5-base` | 768 | 512 | ~1.1 GB | larger · better recall | `query: ` · `passage: ` | 0.85 |
+| `multilingual-e5-large` | 1024 | 512 | ~2.1 GB | high accuracy | `query: ` · `passage: ` | 0.85 |
+| `bge-m3` | 1024 | 8192 | ~2.2 GB | best Thai/accuracy · fp32 | (none) | — |
+| `embeddinggemma-300m-q` | 768 | 2048 | ~310 MB | small · int8 · Thai unverified | `task: search result \| query: ` · `title: none \| text: ` | — |
+| `embeddinggemma-300m-q4` | 768 | 2048 | ~200 MB | smallest · 4-bit · Thai unverified | `task: search result \| query: ` · `title: none \| text: ` | — |
+
+The e5 family was trained with instruction prefixes (omitting them measurably degrades retrieval); its 0.85 floor splits unrelated (≈0.84) from related (≥0.87) clusters with margin. The two embeddinggemma variants **share one HF repo** (`onnx-community/embeddinggemma-300m-ONNX`) and therefore one `models--onnx-community--embeddinggemma-300m-ONNX` cache dir — `model_download_status` can't tell them apart, so downloading either marks both as downloaded and the reported disk size is the dir total.
+
+**Key functions**
+- `new(model_name, cache_dir) -> Result<Embedder>` / `new_quiet(..)` — load the fastembed model, caching downloads under `cache_dir` (`InitOptions::with_cache_dir` + `with_show_download_progress`). `new` prints fastembed's stdout download bar on a first-time download; `new_quiet` disables it (the interactive model TUI runs the terminal in raw mode and draws its own in-table progress — a stray stdout print would corrupt it).
+- `resolve_model(model_name) -> Result<EmbeddingModel>` (private) — registry name → fastembed enum (`BGEM3`, `MultilingualE5Small/Base/Large`, `EmbeddingGemma300MQ`, `EmbeddingGemma300MQ4`); a registry entry with no mapping is reported as a bug, unknown names get the supported-name list.
+- `is_supported_model(name) -> bool` / `model_dims(name) -> usize` — both derived from `model_registry` (never out of sync); `model_dims` returns `0` for unknown names (strict validation is `new`'s job).
+- `ModelInfo::cache_dir_name() -> String` — `models--{org}--{repo}` (hf-hub maps `org/repo` by replacing `/` with `--`).
+- `model_download_status(info, cache_dir) -> ModelDownloadStatus` — pure `std::fs`: dir-exists check + size sum; never downloads, never opens the engine.
+- `dir_size_bytes(root) -> u64` — hand-rolled stack walk summing regular-file sizes (no `du`, no subprocess; symlinks not followed). Public so the CLI's TUI can poll a model dir's growth as download progress.
+- (private: `l2_normalize` — no-op on a zero vector to avoid dividing by zero.)
+
+**Connections** — calls: `fastembed::{TextEmbedding, InitOptions, EmbeddingModel}`; called by: `engine::embedder` (lazy construction), and directly by onebrain-cli's `search model` verbs / model TUI (registry, download status, `new_quiet`).
+**Tests** — registry invariants (exactly six models, prefixes, dims↔registry sync, gemma repo/cache-dir conflation, every entry resolvable), cache-dir naming, download-status with/without dir, plus a network-gated real-embed normalization test (`ONEBRAIN_TEST_EMBED`).
+
+## `src/lex.rs`
+Tantivy-backed BM25 lexical index with a script-aware tokenizer. tantivy's built-in tokenizers split on whitespace/punctuation — useless for scripts written without spaces between words (Thai, Lao, Khmer, Myanmar, CJK), where an entire run collapses into one unsearchable token. `ScriptAwareTokenizer` splits input into alternating no-space-script / other runs (Unicode block checks over `NO_SPACE_SCRIPT_BLOCKS`: Thai, Lao, Myanmar, Khmer, CJK Unified Ideographs + Extension A, Hiragana, Katakana, Hangul Syllables) and routes each run appropriately: no-space runs become overlapping **character bigrams** (2-char sliding windows with precise byte offsets; a single-char run emits one unigram), other runs go through the default pipeline (`SimpleTokenizer` + `RemoveLongFilter(40)` + `LowerCaser`). The bigram fallback exists because `nlpo3`'s `newmm` Thai segmenter needs a word dictionary (`words_th.txt`) that the published crate excludes — bigrams need no dictionary and are the standard CJK/Thai substring-search technique; real per-language segmenters (nlpo3, jieba, lindera) are a tracked follow-up.
+**Key types**
+- `ScriptAwareTokenizer` (private) + `ScriptAwareTokenStream` — the tantivy `Tokenizer`/`TokenStream` impls; registered on the index under `SCRIPT_AWARE_TOKENIZER = "script_aware"` and shared with query-time segmentation (`segment()`), so index-time and query-time tokenization always match.
+- `LexIndex` — the index handle: schema fields `chunk_id` (`STRING | STORED`), `doc_path` (`STRING | STORED`), `heading_path` (`TEXT | STORED`), `body` (`TEXT`, script-aware tokenizer, `WithFreqsAndPositions`). The `IndexWriter` holds tantivy's **exclusive** directory lock, so it is created **lazily**: `open` acquires no writer lock; only the write paths materialize it on first use (`writer_mut`, 50 MB heap). Read-only opens therefore run concurrently with a writer — and past a stale lock left by a killed reindex.
+
+**Key functions**
+- `LexIndex::open(dir) -> Result<Self>` — open/create the index at `dir`, register the tokenizer; no writer lock.
+- `add(&mut self, chunk: &Chunk)` — add as a new document (no dedup — callers `delete` first when re-indexing).
+- `delete(&mut self, chunk_id)` — delete by exact `chunk_id` term.
+- `commit(&mut self)` — make pending adds/deletes searchable; a never-written index has no writer and commits nothing.
+- `search(&self, query, top_k) -> Result<Vec<(String, f32)>>` — BM25 over `body`, highest score first. Deliberately bypasses tantivy's `QueryParser` (which pre-tokenizes as English): the query is segmented with the same script-aware routine, then each **no-space-script run** (a pseudo-word like `สุขภาพ`) becomes a nested `BooleanQuery` requiring **all** of its bigrams (`with_minimum_required_clauses = n`) — exact substring-style semantics, so a hit means the document really contains the queried word, while a substring query (`ภาพ`) still matches any doc containing it; each token of an **other** run becomes one `Should` `TermQuery`. Multi-word Thai should be spaced (OR of runs); fuzzy recall is the vector side's job. Guards `top_k == 0` (tantivy's `TopDocs::with_limit` panics on 0).
+
+**Connections** — calls: `tantivy`, `crate::chunk::Chunk`; called by: `engine::{index_doc, remove_doc, query}`.
+**Tests** — English BM25, bigram matches in Thai/Chinese/Japanese/Korean/Lao, Russian via the default path, delete, whole-Thai-word-required vs substring semantics, empty/punctuation queries, `top_k == 0`, and the lazy-writer contract (concurrent read-only opens, stale `.tantivy-writer.lock` tolerated, `search` never materializes a writer).
+
+## `src/vector.rs`
+Flat mmap-backed vector store: packed `f32` rows on disk, `redb` metadata, and exact cosine top-k via `simsimd`. Vectors are assumed already L2-normalized by the embedder, so cosine reduces to a plain dot product — this store never re-normalizes.
+**On-disk layout** (under the store directory): `vectors.bin` — packed little-endian `f32`, row-major, fixed stride `dims * 4` bytes (row `i` at byte offset `i * dims * 4`); `meta.redb` — tables `chunk_to_row` (chunk id → row), `row_to_chunk` (row → chunk id), `tombstones` (row → `()`; presence = deleted), `free_rows` (row → `()`; presence = reusable slot), `header` (`dims` = dimensionality, `next_row` = append cursor). Rows are read via mmap but **copied** out through `f32::from_le_bytes` into an owned `Vec<f32>` rather than cast — a `&[u8] as &[f32]` cast is unsound per Rust's alignment/aliasing rules, and one row is a few KB at most. The mmap safety comment states the store's precondition: a single writer per collection (no other process mutating `vectors.bin` concurrently).
+**Key types**
+- `VectorStore` — `{ dir, dims, db }`.
+
+**Key functions**
+- `open(dir, dims) -> Result<Self>` — create/open; discards a stale `vectors.bin.tmp` left by a crashed `compact`; seeds tables + header on first open; **bails if the stored `dims` differs from the requested one** (a model switch must go through `Engine::rebuild`, which recreates the store).
+- `add(&mut self, chunk_id, vec)` — rejects wrong-width vectors; an existing `chunk_id` is a **replace** (old row tombstoned + freed, never a duplicate); reuses a free row if available, else appends (`next_row`). The row bytes are written **before** the metadata commit — on a reused row, committing first and crashing before the write would leave the mapping pointing at the previous occupant's vector (wrong results); write-first leaves a failure as an unreferenced row instead.
+- `remove(&mut self, chunk_id)` — tombstone + push onto the free-list; no-op if absent.
+- `search(&self, query_vec, top_k) -> Vec<(String, f32)>` — exact dot-product scan over all non-tombstoned rows (`simsimd` `f32::dot`), sorted descending (`total_cmp`), truncated to `top_k`. Infallible by design (empty result on a corrupt store) but never silent: transaction/table failures and skipped unreadable rows are warned to stderr with counts. `top_k == 0` or a query-dims mismatch returns empty.
+- `compact(&mut self)` — rewrite `vectors.bin` dropping tombstoned rows, renumbering contiguously from 0, clearing the free-list. Crash-safe write ordering: live rows are copied into `vectors.bin.tmp`, the redb metadata is committed against the **new** numbering, and **only then** is the tmp renamed over `vectors.bin` — a crash before the commit leaves the old metadata describing the old, intact file (the tmp is unreferenced scratch discarded by the next `open`). The prior order (rename first) could leave old row numbers indexing the new file: silent, irrecoverable corruption.
+- `len()` / `is_empty()` — live (non-tombstoned) row count.
+
+**Connections** — calls: `memmap2`, `redb`, `simsimd`; called by: `engine::{index_doc, remove_doc, query, vector_search, rebuild_inner}`.
+**Tests** — add/search/remove roundtrip, reopen persistence, dims-mismatch rejection (open and add), replace-not-duplicate, free-row reuse (the file doesn't grow a third row: `2 * 3 * 4` bytes asserted), remove-missing no-op, search edge cases, compact (drops tombstones, no-op, empty store, tmp consumed), and leftover-tmp discard on open.
+
+## `src/hybrid.rs`
+Reciprocal Rank Fusion of the lexical and vector result lists. RRF uses only each result's *rank* (0-based position) within its own list, never its raw score — sidestepping the fact that BM25 scores and cosine similarities live on incomparable scales.
+**Key functions**
+- `rrf_fuse(lex, vec, k, top_k) -> Vec<(String, f64)>` — each list contributes `1.0 / (k + rank)` per chunk_id, summed across lists; sorted by fused score descending with a chunk_id tiebreak for deterministic output (`total_cmp` — no NaN panic, matching `src/vector.rs`'s sort), truncated to `top_k`. `k` is a parameter here; the production constant `RRF_K = 60.0` lives in `src/engine.rs`.
+
+**Connections** — calls: nothing (pure); called by: `engine::query`.
+**Tests** — both-lists ranking (a chunk present in both lists ranks first), `top_k` truncation, empty inputs.
+
+## `src/engine.rs`
+Ties `chunk` + `embed` + `vector` + `lex` + `hybrid` into one synchronous engine. Owns the tuning constants: `CHUNK_MAX_TOKENS = 512`, `CHUNK_OVERLAP_TOKENS = 64`, `LEX_TOP_K = 50`, `VEC_TOP_K = 50`, `RRF_K = 60.0`, `SNIPPET_MAX_CHARS = 200`. Its `engine.redb` holds four tables — `chunk_meta` (chunk id → serialized `ChunkMeta`), `doc_chunks` (doc path → JSON chunk-id list), `doc_hashes` (doc path → sha256 hex), `engine_header` (`active_model`, `last_indexed_at`) — all string-keyed, values serialized with `serde_json`. Neither `lex` nor `vector` stores the chunk's text or heading path, so `engine.redb` is the only source `get` and `Hit` snippets can draw from.
+**Key types**
+- `Engine` — `{ lex: LexIndex, vec: VectorStore, exclude_patterns, model_name, cache_dir, embedder: EmbedSource, meta: Database }`.
+- `EmbedSource` (private) — how the engine obtains its embedder: `Lazy(OnceCell<Box<dyn Embed>>)` in production (deferred `fastembed` construction) or `Injected(Box<dyn Embed>)` via the `#[cfg(test)]` seams. `Engine::embedder()` is the **only** place `embed::new` is called — the first `index_doc`/`query`/`vector_search`/`rebuild` is when a model download actually happens, never `open`.
+- `Hit` — a fused, resolved result: `{ chunk_id, doc_path, heading_path, score, snippet }` (snippet char-boundary-truncated to 200 chars + `…` — safe for multibyte Thai).
+- `ChunkMeta` (private) — the stored per-chunk record `{ doc_path, heading_path, chunk_index, text }`.
+- `ReindexProgress` — live progress events (the engine is UI-free): `Walked { total }` (exactly once, right after the file walk), `LoadingModel` (at most once, right before the run's **first** embed call — the model-download/load stall point; a run with nothing to (re)embed never emits it), `Indexing { done, total, doc_path }` (after each processed doc).
+- `ReindexStats` — `{ added, updated, removed, unchanged, failed }` (`failed`: unreadable/failing files are counted and skipped, never abort the batch).
+- `IndexStatus` — `status` snapshot: `{ doc_count, last_indexed_at: Option<u64>, pending_new, pending_changed, pending_removed }` + `pending_total()`; the `pending_*` counts are exactly the diff a reindex would act on (add/update/remove), minus the indexing.
+- `HashDiff` (private) — `Added | Updated | Unchanged`, from the pure `diff_hash(stored, current)` classifier.
+
+**Key functions**
+- `Engine::open(cache_dir, embed_model) -> Result<Self>` — open/create everything under `cache_dir` (`tantivy/`, `vectors/` at `embed::model_dims(embed_model)`, `engine.redb`), record `embed_model` as active if none recorded; embedder stays lazy — **never downloads**.
+- `Engine::open_with_embedder(..)` / `rebuild_with_embedder(..)` — `#[cfg(test)]` seams injecting a pre-built embedder; the deterministic fake (`FakeEmbedder`: hashes whitespace tokens into `dims` buckets, then L2-normalizes — identical text ⇒ identical vector, cosine 1.0 for exact-text queries) lives in this file's test module.
+- `set_exclude_patterns(&mut self, patterns)` — install the vault's `search.exclude` patterns, applied by every vault walk on top of the built-in skips.
+- `index_doc(&mut self, doc_path, content) -> Result<usize>` — chunk (512/64), batch-embed all chunk texts in **one** `embed_passages` call, add each chunk to lex + vector, record `ChunkMeta` + the doc's chunk-id list, commit lex; returns the chunk count.
+- `remove_doc(&mut self, doc_path)` — look up the doc's chunk ids, delete each from lex + vector + `chunk_meta`, drop the `doc_chunks` entry.
+- `query(&self, text, top_k) -> Result<Vec<Hit>>` — hybrid search: `embed_query` → vector top-50 filtered by the model's `vec_floor` (`drop_below_floor` — without it, a query about something the vault doesn't contain still surfaces authoritative-looking nearest neighbors) + lex top-50 → `rrf_fuse(.., RRF_K, top_k)` → `resolve_hits`.
+- `vector_search(&self, text, top_k)` — vector-only semantic search (no fusion); the CLI's `search vsearch` verb.
+- `get(&self, doc_path) -> Result<String>` — full stored text: the doc's chunks concatenated in `chunk_index` order; error if absent.
+- `status(&self, vault_root) -> Result<IndexStatus>` — read-only drift report: snapshot stored hashes, walk + re-hash the vault's `*.md` files, classify each via `diff_hash`, count indexed docs whose file is gone. Never constructs the embedder.
+- `reindex_paths(&mut self, vault_root, doc_paths)` / `reindex_paths_with_progress(..)` — reindex specific vault-relative paths: on-disk files go through the added/updated/unchanged hash logic; missing-but-indexed paths are removed; neither-on-disk-nor-indexed is ignored.
+- `reindex_all(&mut self, vault_root)` / `reindex_all_with_progress(..)` — walk the whole vault (`walk_markdown_files`: `*.md` **only**; hidden dirs and `node_modules` always skipped; `exclude` patterns applied — entries containing `/` are path prefixes, bare names match any path component), reindex each (per-file failures counted in `stats.failed` + stderr, never aborting), then sweep stale docs (stored hashes not seen on disk — `HashSet` membership, O(N)) and record `last_indexed_at`.
+- `rebuild(&mut self, new_model)` / `rebuild_with_progress(..)` — model switch: collect the re-embed worklist from `chunk_meta`, delete + recreate **only** the vector store at the new model's dims, reset to a fresh lazy embedder, re-embed in batches of 64 (progress `(0, total)` fires before the first embed — the download/load stall), record the new active model. The lex index and `chunk_meta`/`doc_chunks` are model-independent and untouched; an empty index never constructs the embedder.
+- `active_model_matches(&self, cfg_model) -> Result<bool>` — compares the `engine_header` active model against config (the CLI's rebuild-needed probe).
+- `short_path_hash(path) -> String` — first 6 hex chars of sha256(path); public so the CLI derives the default collection name (`<dir>-<hash>`) without duplicating the hashing.
+- (private helpers: `hash_bytes` (sha256 hex), `diff_hash`, `vault_relative_path` (forward slashes on every platform — the stable `doc_path` key), `is_skipped_dir`, `is_excluded`, `walk_markdown_files`, `drop_below_floor`, `truncate_snippet`, `now_epoch_secs`.)
+
+**Connections** — calls: every sibling module + `redb`, `sha2`, `serde_json`; called by: onebrain-cli's `search` verb group via `search_common.rs` (`Engine::open(collection_cache_dir(..), config.search.embed_model)`) and `doctor`'s `native_search_check`.
+**Tests** — 28 tests, almost all against `FakeEmbedder` (no network): index→query→get→remove roundtrips, add/update/unchanged/remove drift detection for both reindex paths, `status` doc-count/last-indexed/drift, `ReindexProgress` event contracts (increasing `done`, `LoadingModel` before the first embed), rebuild (re-embeds all, dims change, empty index embeds nothing, batched progress), failed-file counting (root-guarded chmod test), `vec_floor` filtering + registry floor expectations, exclude-pattern and hidden-dir/`node_modules` walk behavior, and the pure helpers (`vault_relative_path`, `short_path_hash`, `diff_hash`, snippet truncation on a char boundary).
+
+## Entry points
+The public surface other crates (chiefly `onebrain-cli`) reach for first:
+- **Engine** — `engine::Engine` (`open`, `set_exclude_patterns`, `index_doc`, `remove_doc`, `query`, `vector_search`, `get`, `status`, `reindex_all[_with_progress]`, `reindex_paths[_with_progress]`, `rebuild[_with_progress]`, `active_model_matches`), `engine::{Hit, IndexStatus, ReindexStats, ReindexProgress}`, `engine::short_path_hash`
+- **Model registry** — `embed::{model_registry, ModelInfo, is_supported_model, model_dims, model_download_status, ModelDownloadStatus, dir_size_bytes}`, `embed::{new, new_quiet, Embedder, Embed}`
+- **Building blocks** (rarely used directly) — `chunk::{chunk_markdown, Chunk}`, `lex::LexIndex`, `vector::VectorStore`, `hybrid::rrf_fuse`

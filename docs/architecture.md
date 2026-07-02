@@ -1,20 +1,23 @@
 # Architecture
 
-OneBrain CLI is a four-crate Cargo workspace. Only the binary ships; the library crates exist to keep responsibilities separated and testable.
+OneBrain CLI is a five-crate Cargo workspace. Only the binary ships; the library crates exist to keep responsibilities separated and testable.
 
 ```
-onebrain-cli         Binary crate — clap dispatch over the v3.1 command tree,
-  │                  output rendering, TTY/spinner concerns. Knows about the user.
+onebrain-cli          Binary crate — clap dispatch over the v3.1 command tree,
+  │                   output rendering, TTY/spinner concerns. Knows about the user.
   │
-  ├─ onebrain-fs     Vault walks · frontmatter parsing · plugin tarball overlay
-  │                  · init bootstrap · doctor checks · update install path · backups.
-  │                  Knows about the filesystem.
+  ├─ onebrain-search  Native vault search — tantivy BM25 · fastembed embeddings
+  │                   · flat vector store · RRF hybrid. Knows about the index.
   │
-  ├─ onebrain-cache  Session token resolution · launchd plist generation
-  │                  · qmd status detection. Host/runtime state.
+  ├─ onebrain-fs      Vault walks · frontmatter parsing · plugin tarball overlay
+  │                   · init bootstrap · doctor checks · update install path · backups.
+  │                   Knows about the filesystem.
   │
-  └─ onebrain-core   Types · config parsing · path resolution. Zero filesystem deps —
-                     pure logic, the easiest crate to unit-test.
+  ├─ onebrain-cache   Session token resolution · launchd plist generation
+  │                   · qmd status detection. Host/runtime state.
+  │
+  └─ onebrain-core    Types · config parsing · path resolution. Zero filesystem deps —
+                      pure logic, the easiest crate to unit-test.
 ```
 
 ## Dependency direction
@@ -24,11 +27,14 @@ The arrow points *down* — higher crates depend on lower ones, never the revers
 ```
 onebrain-cli ──▶ onebrain-fs ──▶ onebrain-core
        │                              ▲
-       └────────▶ onebrain-cache ─────┘
+       ├────────▶ onebrain-cache ─────┘
+       │
+       └────────▶ onebrain-search     (standalone — no workspace deps)
 ```
 
 - **`onebrain-core` depends on nothing in the workspace.** It holds the config types (`VaultConfig`), error types, and path/vault resolution (`resolve_vault`). Because it touches no filesystem, its tests are fast and deterministic. (The `Envelope<T>` output shape lives one layer up, in the `onebrain-cli` binary — see [How a command flows](#how-a-command-flows).)
 - **`onebrain-fs` and `onebrain-cache` depend only on `onebrain-core`.** They turn pure types into real effects (reading a vault, writing a plist, swapping a binary).
+- **`onebrain-search` depends on nothing in the workspace either** — it wraps its vendored search stack (tantivy, fastembed, redb) behind one `Engine` type and knows nothing about vault config or output shapes. Only the binary depends on it; the CLI's `search_common` module maps `search.collection` config to the engine's on-disk cache dir.
 - **`onebrain-cli` is the only crate that talks to the user.** clap parsing, output formatting, colors, and the `indicatif` spinner all live here. The library crates emit data; the binary decides how to render it.
 
 This is the classic "push side effects to the edges" layering: the testable core has no I/O, the I/O crates have no UI, and the UI crate orchestrates.
