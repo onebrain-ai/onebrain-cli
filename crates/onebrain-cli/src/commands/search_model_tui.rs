@@ -40,7 +40,9 @@ use anyhow::{Context, Result};
 
 use crate::cli::ModelSortCol;
 use crate::commands::search_common::{collection_cache_dir, collection_for};
-use crate::commands::search_model::{apply_model_change, cmp_option_last, disk_cell, format_size};
+#[cfg(feature = "semantic")]
+use crate::commands::search_model::apply_model_change;
+use crate::commands::search_model::{cmp_option_last, disk_cell, format_size};
 use onebrain_core::load_vault_config;
 use onebrain_search::embed::{dir_size_bytes, model_download_status, model_registry};
 
@@ -479,10 +481,14 @@ fn event_loop<B: ratatui::backend::Backend>(
 /// Messages from the background switch worker back to the UI loop.
 enum SwitchMsg {
     /// The model files are on disk (either they already were, or the forced
-    /// download just finished); the re-embed phase is starting.
+    /// download just finished); the re-embed phase is starting. Only sent by
+    /// the semantic-build worker (a lex-only build refuses the switch outright),
+    /// though the UI loop still matches it in both builds.
+    #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
     DownloadDone,
     /// Live re-embed progress from `Engine::rebuild_with_progress`:
-    /// `(chunks done, total chunks)`.
+    /// `(chunks done, total chunks)`. Semantic-build only (see `DownloadDone`).
+    #[cfg_attr(not(feature = "semantic"), allow(dead_code))]
     Reembed { done: usize, total: usize },
     /// The whole switch finished (config persisted on success). Boxed: the
     /// envelope is much larger than the other variant.
@@ -528,24 +534,36 @@ fn perform_switch<B: ratatui::backend::Backend>(
     let worker_resolved = resolved.clone();
     let worker_cache = state.cache_dir.clone();
     std::thread::spawn(move || {
-        if needs_download {
-            // Force the download up front (quiet: no stdout bar — we're in
-            // raw mode). With the cache warm, apply's own embedder init is a
-            // no-op download-wise.
-            if let Err(e) = onebrain_search::embed::new_quiet(name, &worker_cache) {
-                let _ = tx.send(SwitchMsg::Finished(Box::new(Err(e))));
-                return;
-            }
+        // Lex-only build (no `semantic` feature): there's no embedder to switch
+        // to, so refuse the switch cleanly rather than pretend to download.
+        #[cfg(not(feature = "semantic"))]
+        {
+            let _ = (&worker_cache, &worker_resolved, name, needs_download);
+            let _ = tx.send(SwitchMsg::Finished(Box::new(Err(anyhow::anyhow!(
+                onebrain_search::engine::SEMANTIC_UNAVAILABLE
+            )))));
         }
-        let _ = tx.send(SwitchMsg::DownloadDone);
-        let progress_tx = tx.clone();
-        let _ = tx.send(SwitchMsg::Finished(Box::new(apply_model_change(
-            worker_resolved,
-            name,
-            &mut |done, total| {
-                let _ = progress_tx.send(SwitchMsg::Reembed { done, total });
-            },
-        ))));
+        #[cfg(feature = "semantic")]
+        {
+            if needs_download {
+                // Force the download up front (quiet: no stdout bar — we're in
+                // raw mode). With the cache warm, apply's own embedder init is a
+                // no-op download-wise.
+                if let Err(e) = onebrain_search::embed::new_quiet(name, &worker_cache) {
+                    let _ = tx.send(SwitchMsg::Finished(Box::new(Err(e))));
+                    return;
+                }
+            }
+            let _ = tx.send(SwitchMsg::DownloadDone);
+            let progress_tx = tx.clone();
+            let _ = tx.send(SwitchMsg::Finished(Box::new(apply_model_change(
+                worker_resolved,
+                name,
+                &mut |done, total| {
+                    let _ = progress_tx.send(SwitchMsg::Reembed { done, total });
+                },
+            ))));
+        }
     });
 
     if needs_download {

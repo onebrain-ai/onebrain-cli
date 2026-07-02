@@ -29,8 +29,20 @@ tantivy = { version = "0.26", default-features = false, features = [
 # dictionary-free character-bigram fallback in `lex.rs`. Re-add `nlpo3` here
 # once PyThaiNLP's word list is vendored (Phase 2 Thai upgrade).
 
-# ONNX-backed local embedding models.
-fastembed = "5.17"
+# ONNX-backed local embedding models. Gated behind the `semantic` feature
+# (default ON) so lex-only builds can be produced for platforms with no ONNX
+# Runtime prebuilt (musl, ARM32, x86_64 macOS, arm64 Windows) — see
+# docs/decisions/0017-platform-tiered-semantic-search.md.
+#
+# `default-features = false` + rustls features: fastembed's DEFAULT features are
+# `hf-hub-native-tls` + `ort-download-binaries-native-tls`, which pull openssl-sys
+# (breaks musl/ARM cross-compiles). The repo standardizes on rustls, so use the
+# `-rustls-tls` variants. Dropping default features also drops `image-models`
+# (rav1e/image codec tree) — we only use `TextEmbedding`, never the image APIs.
+fastembed = { version = "5.17", default-features = false, features = [
+    "hf-hub-rustls-tls",
+    "ort-download-binaries-rustls-tls",
+], optional = true }
 
 # SIMD-accelerated vector similarity (cosine/dot/etc.) for the vector index.
 simsimd = "6.5"
@@ -40,6 +52,16 @@ memmap2 = { workspace = true }
 
 # Embedded KV store for chunk/doc metadata.
 redb = "4.1"
+
+[features]
+# `semantic` (default ON) compiles the fastembed/ONNX-backed embedding path:
+# the real `Embedder`, model download/switch, and vector/hybrid query ranking.
+# WITHOUT it the crate still provides chunking, the lex/BM25 (tantivy) index,
+# the portable vector store, the `Embed` trait + fake embedders, and the model
+# registry metadata — so keyword search and the full index lifecycle work on
+# platforms with no ONNX Runtime prebuilt. See ADR 0017.
+default = ["semantic"]
+semantic = ["dep:fastembed"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -16,7 +16,12 @@ publish = false
 onebrain-core   = { path = "crates/onebrain-core" }
 onebrain-fs     = { path = "crates/onebrain-fs" }
 onebrain-cache  = { path = "crates/onebrain-cache" }
-onebrain-search = { path = "crates/onebrain-search" }
+# `default-features = false` so the (default-ON) `semantic` feature is opted
+# into explicitly by the consumer (onebrain-cli, via its own `semantic`
+# feature). Lets `cargo build -p onebrain-cli --no-default-features` produce a
+# lex-only binary with no fastembed/ONNX dep for platforms with no ONNX Runtime
+# prebuilt — see docs/decisions/0017-platform-tiered-semantic-search.md.
+onebrain-search = { path = "crates/onebrain-search", default-features = false }
 
 # Foundation (Slice 1)
 serde       = { version = "1", features = ["derive"] }

@@ -60,6 +60,10 @@ struct SearchStatusData {
     /// While set, `doc_count`/pending below may lag the in-flight run.
     #[serde(skip_serializing_if = "Option::is_none")]
     reindexing: Option<ReindexLiveProgress>,
+    /// `false` in a lex-only build (no `semantic` feature): no ONNX runtime,
+    /// so embedding-backed verbs (`vsearch`, hybrid `query`, `model set`) are
+    /// unavailable and `reindex` indexes keyword-only. See ADR 0017.
+    semantic_available: bool,
 }
 
 pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
@@ -123,6 +127,7 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
         pending_removed,
         cache_size_bytes,
         reindexing,
+        semantic_available: cfg!(feature = "semantic"),
     };
 
     let envelope = Envelope::ok("search.status", Some(vault_info), data);
@@ -214,14 +219,20 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
 
     lines.push(section("🧠", "Model"));
     lines.push(item("Name", &d.embed_model));
-    match d.model_size_bytes {
-        Some(size) => {
-            lines.push(item("Size", &format_size(size)));
-            if let Some(downloaded) = d.model_downloaded_at.and_then(format_local) {
-                lines.push(item("Downloaded", &downloaded));
+    if d.semantic_available {
+        match d.model_size_bytes {
+            Some(size) => {
+                lines.push(item("Size", &format_size(size)));
+                if let Some(downloaded) = d.model_downloaded_at.and_then(format_local) {
+                    lines.push(item("Downloaded", &downloaded));
+                }
             }
+            None => lines.push(item("Size", "not downloaded")),
         }
-        None => lines.push(item("Size", "not downloaded")),
+    } else {
+        // Lex-only build: no ONNX runtime for this platform, so the model is
+        // never downloaded and semantic verbs are unavailable.
+        lines.push(item("Semantic", "unavailable in this build (keyword-only)"));
     }
 
     lines.push(String::new());
@@ -305,8 +316,21 @@ mod tests {
                 pending_changed: 0,
                 pending_removed: 0,
                 reindexing: None,
+                semantic_available: true,
             },
         )
+    }
+
+    #[test]
+    fn text_flags_lex_only_build_in_model_section() {
+        let mut e = env(Some("ob-1"), true);
+        e.data.as_mut().unwrap().semantic_available = false;
+        let s = render_text(&e);
+        assert!(s.contains("🧠  Model"), "{s}");
+        assert!(s.contains("Semantic"), "{s}");
+        assert!(s.contains("unavailable in this build"), "{s}");
+        // The model download line is suppressed when semantic is unavailable.
+        assert!(!s.contains("not downloaded"), "{s}");
     }
 
     #[test]

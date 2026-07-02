@@ -16,6 +16,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **`onebrain search query/search/vsearch/get/status/reindex`** (`--json`) plus `search model list/set` and an interactive TTY model picker.
 - **Multilingual**: ~100-language semantic search (default `multilingual-e5-small`, swappable) + no-space-script keyword bigrams for Thai/CJK/Lao/Khmer/Myanmar.
 - **Swappable embedding model** via `search model set` — rebuilds the vector store and re-embeds; `bge-m3` is the best-accuracy upgrade path.
+- **Platform-tiered semantic search** (rustls, not openssl): targets with no ONNX Runtime prebuilt — x64 macOS, musl, 32-bit ARM (Raspberry Pi) — ship a lex-only binary (full CLI + keyword search; `query` degrades, `vsearch`/`model set` error). Gated by the `semantic` cargo feature (default ON). See [ADR 0017](docs/decisions/0017-platform-tiered-semantic-search.md) + the README platform-support matrix.
 - Runs **alongside qmd** (engine milestone only) — MCP swap and qmd removal land in follow-up milestones.
 
 ## [3.3.27] — 2026-07-02 — translate bridge for select-to-lookup

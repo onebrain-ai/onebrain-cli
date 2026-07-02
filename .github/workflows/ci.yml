@@ -41,6 +41,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # Lex-only tier gate: the `--no-default-features` build drops the `semantic`
+  # feature (no fastembed / ONNX runtime) and is what ships on release targets
+  # with no ONNX Runtime prebuilt (musl, ARM32, x86_64 macOS, arm64 Windows —
+  # see docs/decisions/0017-platform-tiered-semantic-search.md and the tier
+  # table in .github/workflows/release.yml). This keeps that build compiling +
+  # clippy-clean so a lex-only release target can't silently break on `main`.
+  lex-only:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p onebrain-cli -p onebrain-search --no-default-features --all-targets -- -D warnings
+
   test:
     strategy:
       fail-fast: false
