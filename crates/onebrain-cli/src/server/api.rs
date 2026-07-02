@@ -75,6 +75,8 @@ pub fn router() -> Router<Arc<AppState>> {
             "/webview/preflight",
             get(super::webview::get_webview_preflight),
         )
+        // Select-to-lookup: server-side translate bridge (Google gtx, free tier).
+        .route("/translate", post(super::translate::post_translate))
         // v3.3 chat — SSE stream over a `claude -p` agent turn. Inherits the auth
         // middleware + body limit applied to this whole sub-router.
         .route("/chat", post(super::chat::post_chat))

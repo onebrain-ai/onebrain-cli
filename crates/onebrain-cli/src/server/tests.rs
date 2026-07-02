@@ -1786,3 +1786,35 @@ async fn no_vault_remaining_endpoints_all_503() {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// POST /api/translate — Google gtx bridge for select-to-lookup
+// ─────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn translate_requires_token() {
+    let (_d, router) = vault_router(None);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/translate")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"text":"hi","to":"th"}"#))
+        .unwrap();
+    let (status, _) = send(&router, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn translate_rejects_empty_text_authed() {
+    let (_d, router) = vault_router(None);
+    let (status, body) = send_authed(
+        &router,
+        "POST",
+        "/api/translate",
+        "application/json",
+        r#"{"text":"","to":"th"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("error"));
+}

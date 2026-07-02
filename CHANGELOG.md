@@ -1,6 +1,6 @@
 ---
-latest_version: 3.3.26
-released: 2026-07-01
+latest_version: 3.3.27
+released: 2026-07-02
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,10 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.27] — 2026-07-02 — translate bridge for select-to-lookup
+
+- **`POST /api/translate`** — server-side bridge to Google's free gtx endpoint (`{text, from?, to}` → `{translated, detected_from, truncated}`); 5,000-char cap, 8 s timeout, fixed host (no SSRF surface). Powers the WebUI select-to-lookup Translate action.
 
 ## [3.3.26] — 2026-07-02 — release embeds the prebuilt webui dist
 

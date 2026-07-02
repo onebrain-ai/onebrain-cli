@@ -1112,7 +1112,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onebrain-cache"
-version = "3.3.26"
+version = "3.3.27"
 dependencies = [
  "chrono",
  "onebrain-core",
@@ -1127,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "onebrain-cli"
-version = "3.3.26"
+version = "3.3.27"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1149,6 +1149,7 @@ dependencies = [
  "onebrain-cache",
  "onebrain-core",
  "onebrain-fs",
+ "percent-encoding",
  "predicates",
  "pretty_assertions",
  "rust-embed",
@@ -1169,7 +1170,7 @@ dependencies = [
 
 [[package]]
 name = "onebrain-core"
-version = "3.3.26"
+version = "3.3.27"
 dependencies = [
  "chrono",
  "indexmap",
@@ -1185,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "onebrain-fs"
-version = "3.3.26"
+version = "3.3.27"
 dependencies = [
  "chrono",
  "dirs",
