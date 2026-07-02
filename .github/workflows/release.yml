@@ -192,6 +192,26 @@ jobs:
       # operand …`). rust-lld ships with the toolchain, links arm64 PE
       # natively, and never consults PATH. (simsimd's cl.exe compile still
       # comes from the dev env above.)
+      # …and compile C deps with clang-cl instead of MSVC cl.exe. SimSIMD's C
+      # is GCC/Clang-flavored (attribute-based SIMD dispatch, fp16 types) and
+      # cl.exe rejects it for arm64 even with every SIMD backend disabled —
+      # its build.rs then continues WITHOUT producing simsimd.lib (silent),
+      # so the final link dies with "could not open 'simsimd.lib'". clang-cl
+      # (preinstalled on windows-latest) accepts the dialect and targets
+      # arm64; the `cc` crate picks it up via the per-target CC/CXX env, with
+      # an explicit --target for safety. Applies to all cc-built C for this
+      # target (ring, onig_sys, …) — clang-cl is MSVC-ABI compatible.
+      - name: Compile windows-arm64 C deps with clang-cl
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: bash
+        run: |
+          {
+            echo "CC_aarch64_pc_windows_msvc=clang-cl"
+            echo "CXX_aarch64_pc_windows_msvc=clang-cl"
+            echo "CFLAGS_aarch64_pc_windows_msvc=--target=arm64-pc-windows-msvc"
+            echo "CXXFLAGS_aarch64_pc_windows_msvc=--target=arm64-pc-windows-msvc"
+          } >> "$GITHUB_ENV"
+
       - name: Link windows-arm64 with rust-lld
         if: matrix.target == 'aarch64-pc-windows-msvc'
         shell: bash
