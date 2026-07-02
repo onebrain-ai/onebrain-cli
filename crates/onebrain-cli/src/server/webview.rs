@@ -37,7 +37,9 @@ pub async fn get_webview_preflight(Query(p): Query<PreflightParams>) -> Response
 
 /// Redirects are not auto-followed by ureq (see `probe_frameable`): each hop is
 /// re-validated against `is_http_url` before being requested. This bounds the
-/// number of manual hops we'll chase before giving up.
+/// number of requests we'll make before giving up: the probe loop runs at most
+/// `MAX_REDIRECT_HOPS` times, so it will follow up to `MAX_REDIRECT_HOPS - 1`
+/// redirects and must reach a final (non-redirect) response on the last request.
 const MAX_REDIRECT_HOPS: u32 = 5;
 
 /// Blocking header probe (ureq is sync → runs on a blocking thread). Reads only
@@ -54,7 +56,7 @@ fn probe_frameable(url: &str) -> bool {
         .into();
 
     let mut current = url.to_string();
-    for _ in 0..=MAX_REDIRECT_HOPS {
+    for _ in 0..MAX_REDIRECT_HOPS {
         let resp = match agent.get(&current).call() {
             Ok(resp) => resp,
             Err(_) => return false,
@@ -63,7 +65,7 @@ fn probe_frameable(url: &str) -> bool {
         if status.is_redirection() {
             let location = resp
                 .headers()
-                .get(axum::http::header::LOCATION)
+                .get(ureq::http::header::LOCATION)
                 .and_then(|v| v.to_str().ok());
             let Some(location) = location else {
                 return false;
@@ -76,7 +78,7 @@ fn probe_frameable(url: &str) -> bool {
         }
         let xfo_blocks = resp
             .headers()
-            .get_all(axum::http::header::X_FRAME_OPTIONS)
+            .get_all(ureq::http::header::X_FRAME_OPTIONS)
             .iter()
             .filter_map(|v| v.to_str().ok())
             .any(|v| !frameable_from_headers(Some(v), None));
@@ -85,7 +87,7 @@ fn probe_frameable(url: &str) -> bool {
         }
         let csp_blocks = resp
             .headers()
-            .get_all(axum::http::header::CONTENT_SECURITY_POLICY)
+            .get_all(ureq::http::header::CONTENT_SECURITY_POLICY)
             .iter()
             .filter_map(|v| v.to_str().ok())
             .any(|v| !frameable_from_headers(None, Some(v)));
@@ -325,5 +327,67 @@ mod tests {
 
         let values: [&str; 0] = [];
         assert!(!values.iter().any(|v: &&str| !v.trim().is_empty()));
+    }
+
+    /// Spawn a local HTTP server that answers `chain_len` sequential requests
+    /// with a `302` whose `Location` points back at itself (a self-redirect
+    /// loop), then answers every subsequent request with a plain framable
+    /// `200`. Returns the `http://127.0.0.1:<port>/` base. Used to pin the exact
+    /// redirect-hop budget in `probe_frameable`.
+    fn spawn_redirect_chain_server(redirects: usize) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let base = format!("http://{addr}/");
+        let self_url = base.clone();
+        std::thread::spawn(move || {
+            // Serve enough connections to cover the whole probe budget plus slack.
+            for served in 0..(redirects + 4) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf); // drain request
+                let response = if served < redirects {
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {self_url}\r\nContent-Length: 0\r\n\r\n"
+                    )
+                } else {
+                    // Final hop: a framable 200 (no XFO / CSP frame-ancestors).
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string()
+                };
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        base
+    }
+
+    #[test]
+    fn probe_follows_up_to_max_minus_one_redirects() {
+        // A chain of exactly MAX_REDIRECT_HOPS - 1 redirects lands its final
+        // 200 on the last permitted request → framable. This pins the boundary:
+        // the loop runs MAX_REDIRECT_HOPS times, so the deepest tolerable chain
+        // is MAX-1 redirects followed by a final response.
+        let redirects = (MAX_REDIRECT_HOPS - 1) as usize;
+        let base = spawn_redirect_chain_server(redirects);
+        assert!(
+            probe_frameable(&base),
+            "a chain of MAX-1 redirects should reach its final 200 within budget"
+        );
+    }
+
+    #[test]
+    fn probe_gives_up_at_max_redirects() {
+        // One redirect deeper (MAX_REDIRECT_HOPS redirects) exhausts the budget
+        // before a final response is ever seen → not framable.
+        let redirects = MAX_REDIRECT_HOPS as usize;
+        let base = spawn_redirect_chain_server(redirects);
+        assert!(
+            !probe_frameable(&base),
+            "a chain of MAX redirects must exceed the hop budget and fail closed"
+        );
     }
 }
