@@ -72,12 +72,14 @@ pub async fn post_translate(Json(req): Json<TranslateRequest>) -> Response {
 
 /// 2-8 chars, ascii alphanumeric or '-' — covers "en", "th", "zh-CN", "auto".
 fn is_lang_code(s: &str) -> bool {
-    (1..=8).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    (2..=8).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
+/// `from`/`to` are pre-validated by `is_lang_code` (only `[A-Za-z0-9-]`), so
+/// they need no percent-encoding; only `text` is encoded.
 fn gtx_url(text: &str, from: &str, to: &str) -> String {
     format!(
-        "https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl={from}&tl={to}&q={}",
+        "/translate_a/single?client=gtx&dt=t&sl={from}&tl={to}&q={}",
         utf8_percent_encode(text, NON_ALPHANUMERIC)
     )
 }
@@ -109,12 +111,24 @@ fn parse_gtx(body: &str) -> Result<(String, String), String> {
 }
 
 fn fetch_translation(text: &str, from: &str, to: &str) -> Result<(String, String), String> {
+    fetch_translation_from("https://translate.googleapis.com", text, from, to)
+}
+
+/// Test seam: `base` replaces the fixed `https://translate.googleapis.com`
+/// host so unit tests can point at a local `TcpListener` instead.
+fn fetch_translation_from(
+    base: &str,
+    text: &str,
+    from: &str,
+    to: &str,
+) -> Result<(String, String), String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(8)))
         .build()
         .into();
+    let url = format!("{base}{}", gtx_url(text, from, to));
     let mut resp = agent
-        .get(&gtx_url(text, from, to))
+        .get(&url)
         .call()
         .map_err(|_| "translate service unreachable".to_string())?;
     let body = resp
@@ -131,9 +145,7 @@ mod tests {
     #[test]
     fn gtx_url_encodes_query_and_langs() {
         let u = gtx_url("hello world", "auto", "th");
-        assert!(u.starts_with(
-            "https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl=auto&tl=th&q="
-        ));
+        assert!(u.starts_with("/translate_a/single?client=gtx&dt=t&sl=auto&tl=th&q="));
         assert!(u.ends_with("hello%20world"));
     }
 
@@ -162,6 +174,7 @@ mod tests {
                 && is_lang_code("zh-CN")
         );
         assert!(!is_lang_code("") && !is_lang_code("th th") && !is_lang_code("verylonglangcode"));
+        assert!(!is_lang_code("a"));
     }
 
     #[tokio::test]
@@ -184,5 +197,61 @@ mod tests {
         }))
         .await;
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// Binds an ephemeral local listener, accepts exactly one connection on a
+    /// background thread, and writes `raw_response` verbatim. Returns the
+    /// `http://127.0.0.1:<port>` base for use with `fetch_translation_from`.
+    fn spawn_one_shot_server(raw_response: &'static str) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf); // drain the request so the client doesn't block on write
+                let _ = stream.write_all(raw_response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn fetch_translation_from_maps_non_2xx_to_err() {
+        let body = "server error";
+        let raw = format!(
+            "HTTP/1.1 500 Internal Server Error\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let base = spawn_one_shot_server(Box::leak(raw.into_boxed_str()));
+        let result = fetch_translation_from(&base, "hi", "auto", "th");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fetch_translation_from_maps_malformed_json_to_err() {
+        let body = "not json";
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let base = spawn_one_shot_server(Box::leak(raw.into_boxed_str()));
+        let result = fetch_translation_from(&base, "hi", "auto", "th");
+        assert_eq!(result, Err("unexpected translate response".to_string()));
+    }
+
+    #[test]
+    fn fetch_translation_from_parses_valid_gtx_body() {
+        let body = r#"[[["สวัสดี","hello",null,null,3]],null,"en",null,null,null,null,[]]"#;
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let base = spawn_one_shot_server(Box::leak(raw.into_boxed_str()));
+        let result = fetch_translation_from(&base, "hello", "auto", "th");
+        assert_eq!(result, Ok(("สวัสดี".to_string(), "en".to_string())));
     }
 }
