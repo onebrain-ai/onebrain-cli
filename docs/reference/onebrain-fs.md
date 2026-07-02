@@ -15,12 +15,13 @@ src/
 ├── orphan.rs             scan_orphans — unmerged-checkpoint scan with Active-Session Guard
 ├── run_skill.rs          build_prompt + resolve_claude_bin/resolve_gemini_bin — pure helpers for `onebrain skill run`
 ├── doctor/               health checks (Box<dyn Check> set)
-│   ├── mod.rs            Check trait + run_all_checks orchestrator (qmd probe on bg thread)
+│   ├── mod.rs            Check trait + run_all_checks orchestrator (serial)
 │   ├── folders.rs        FoldersCheck — 8 PARA folders present
+│   ├── legacy_qmd_collection.rs  LegacyQmdCollectionCheck — deprecated top-level qmd_collection key (v3.4)
 │   ├── marketplace.rs    ClaudeSettingsCheck — stale marketplace repo in settings.json
 │   ├── orphans.rs        OrphanCheckpointsCheck — count unmerged checkpoint files
 │   ├── plugin.rs         PluginFilesCheck — required plugin files/dirs + stale bash scripts
-│   ├── qmd.rs            QmdEmbeddingsCheck — non-fatal `qmd status` probe
+│   ├── plugin_cache.rs   PluginCacheCheck — stale marketplace-cache plugin versions
 │   ├── settings_hooks.rs SettingsHooksCheck — Stop/qmd hooks + permission validation
 │   ├── vault_config_migration.rs  VaultConfigMigrationCheck — legacy vault.yml → onebrain.yml
 │   ├── vault_yml.rs      VaultYmlCheck — config file present + valid YAML
@@ -140,13 +141,13 @@ Pure helpers for `onebrain run-skill` (the scheduler's headless skill launcher).
 **Tests** — full prompt-build matrix + claude/gemini bin-resolution priority.
 
 ## `doctor/` — health checks
-Each check is a zero-sized unit struct implementing the sync `Check` trait. `run_all_checks` builds a `Vec<Box<dyn Check>>`, runs them serially, and splices in the qmd result. The plugin `/doctor` skill matches on the reported `check` name strings; `--fix` recipes (in the CLI) key off the hints these checks emit.
+Each check is a zero-sized unit struct implementing the sync `Check` trait. `run_all_checks` builds a `Vec<Box<dyn Check>>` and runs them serially. The CLI layer appends one more row after these — the native-search index check (`check` = `"search"`) — because it needs the `onebrain-search` engine, which this crate doesn't depend on. The plugin `/doctor` skill matches on the reported `check` name strings; `--fix` recipes (in the CLI) key off the hints these checks emit.
 
 `trait Check { fn name(&self) -> &'static str; fn run(&self, vault_root: &Path, config: &VaultConfig) -> DoctorResult; }`
 
 ### `src/doctor/mod.rs`
-Defines `Check` and `run_all_checks`. Canonical order: `onebrain.yml` · `onebrain.yml-keys` · `vault-config-migration` · `folders` · `plugin-files` · `settings-hooks` · `orphan-checkpoints` · `qmd-embeddings` · `claude-settings`.
-**Key functions** — `run_all_checks(vault_root, config) -> Vec<DoctorResult>` — spawns `QmdEmbeddingsCheck` on a background thread first (it dominates wall time via `qmd status`), runs the 8 serial checks, then splices the qmd row at `QMD_SPLICE_POSITION = 7` (`debug_assert_eq!` guards order drift). A panicked qmd worker becomes a `warn` row, not `ok`.
+Defines `Check` and `run_all_checks`. Canonical order: `onebrain.yml` · `onebrain.yml-keys` · `vault-config-migration` · `legacy-qmd-collection` · `folders` · `plugin-files` · `settings-hooks` · `claude-settings` · `orphan-checkpoints` · `plugin-cache`.
+**Key functions** — `run_all_checks(vault_root, config) -> Vec<DoctorResult>` — a plain serial pass over the 10 checks. (v3.4 removed the legacy `qmd-embeddings` probe — the former dominant cost that ran on a background thread; the native-search replacement lives in the CLI layer and is appended there.)
 **Connections** — re-exports every check struct; called by: `onebrain-cli` `doctor` command.
 
 ### `src/doctor/folders.rs`
@@ -165,9 +166,13 @@ Defines `Check` and `run_all_checks`. Canonical order: `onebrain.yml` · `onebra
 **Reports `check` = `"plugin-files"`.** Checks `.claude/plugins/onebrain/` for required files (`INSTRUCTIONS.md`, `.claude-plugin/plugin.json`) and non-empty dirs (`agents/`, `skills/`); also flags 7 stale bash scripts (`session-init.sh`, `orphan-scan.sh`, …). Missing → `error` (takes precedence); stale → `warn`; clean → `ok` with "N skills · M agents · INSTRUCTIONS.md ✓". Hint points at `onebrain update`. **Remediated by `onebrain update`/`vault-sync`, not `doctor --fix`.**
 **Connections** — calls: `walkdir`, `fs::read_dir`.
 
-### `src/doctor/qmd.rs`
-**Reports `check` = `"qmd-embeddings"`.** Non-fatal `qmd status` probe; parses `Total: N` / `Pending: M`. Missing `qmd_collection` → `warn` ("Run /qmd to set up search index"); pending>0 → `warn` with advisory hint ("run /qmd embed … or onebrain doctor --fix"); pending 0 → `ok`; any spawn/timeout/parse failure → `ok` (never blocks doctor). **Has `--fix`** for the pending case (advisory). `run_with(probe, config)` injects a stub `QmdProbe { NotFound, Timeout, Stdout, Error }` for tests. The real probe + parse are delegated to `onebrain_cache::{probe_qmd_status, QmdStatus::parse}` — the shared single source of truth (15-second `wait-timeout` since a real multi-MB index can take ~10 s; `qmd` resolved via `which` with a `~/.bun/bin` fallback on Unix, `powershell.exe` on Windows) so doctor and session-init can't drift.
-**Connections** — calls: `onebrain_cache::{probe_qmd_status, QmdProbe, QmdStatus}`.
+### `src/doctor/legacy_qmd_collection.rs`
+**Reports `check` = `"legacy-qmd-collection"`.** Flags a deprecated top-level `qmd_collection` key in the vault config (v3.3 and earlier; the native search engine reads `search.collection`). Key present → `warn` with the value in the message; absent → `ok`. **Has `--fix`** (CLI recipe migrates the value to `search.collection` — unless one is already set — and removes the legacy key). Replaced the v3.3 `qmd-embeddings` check (its module was removed in v3.4).
+**Connections** — reads `config.qmd_collection`.
+
+### `src/doctor/plugin_cache.rs`
+**Reports `check` = `"plugin-cache"`.** Flags stale OneBrain version dirs in the Claude Code marketplace cache (`~/.claude/plugins/cache/<mkt>/onebrain/`) — orphans there can shadow the vault-local pinned copy and load old skills. Stale versions → `warn`; clean / no cache → `ok`. **Has `--fix`** (prunes via the shared `vault_sync::cache_clean::clean_plugin_cache`).
+**Connections** — calls: `vault_sync::cache_clean::detect_stale_plugin_cache`, `vault_sync::default_installed_plugins_path`.
 
 ### `src/doctor/settings_hooks.rs`
 **Reports `check` = `"settings-hooks"`.** Validates `.claude/settings.json`: Stop hook present in canonical exec form, qmd PostToolUse hook present when `qmd_collection` set, no onebrain commands under disallowed events, no stale `*.sh` wrapper references, and `Bash(onebrain *)` permission granted. Missing file → `warn`; invalid JSON → `error`; any issues → `warn` ("N issue(s)"); clean → `ok`. **Has `--fix`** (hint: "repair/register hooks"). Internals: `HookForm { Exec, Legacy, Absent }`, `effective_command`, `is_canonical`, `detect_hook_form` (canonical beats a legacy duplicate).

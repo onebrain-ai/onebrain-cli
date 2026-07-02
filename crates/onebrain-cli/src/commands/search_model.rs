@@ -893,4 +893,94 @@ mod tests {
             "expected at least one backup file"
         );
     }
+
+    #[test]
+    fn sort_by_downloaded_puts_downloaded_first_then_name() {
+        let mut rows: Vec<ModelListEntry> = model_registry()
+            .iter()
+            .map(|m| ModelListEntry::from_info(m, "bge-m3", Path::new("/nope")))
+            .collect();
+        // Mark one non-first (alphabetically) model as downloaded.
+        rows.iter_mut()
+            .find(|r| r.name == "multilingual-e5-small")
+            .unwrap()
+            .downloaded = true;
+        sort_rows(&mut rows, ModelSortCol::Downloaded, false);
+        assert_eq!(
+            rows[0].name, "multilingual-e5-small",
+            "downloaded rows sort first"
+        );
+        // The not-downloaded remainder is name-ordered (the tie-break).
+        let rest: Vec<&str> = rows[1..].iter().map(|r| r.name).collect();
+        let mut sorted = rest.clone();
+        sorted.sort_unstable();
+        assert_eq!(rest, sorted, "ties break by name");
+    }
+
+    #[test]
+    fn cmp_option_last_orders_none_last_and_honours_desc() {
+        use std::cmp::Ordering;
+        // None always sorts AFTER Some, in both directions.
+        assert_eq!(
+            cmp_option_last::<f32>(None, Some(1.0), false),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cmp_option_last::<f32>(Some(1.0), None, false),
+            Ordering::Less
+        );
+        assert_eq!(cmp_option_last::<f32>(None, None, true), Ordering::Equal);
+        // Some/Some honours desc.
+        assert_eq!(cmp_option_last(Some(1.0), Some(2.0), false), Ordering::Less);
+        assert_eq!(
+            cmp_option_last(Some(1.0), Some(2.0), true),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn parse_approx_size_handles_units_and_garbage() {
+        assert_eq!(parse_approx_size("~470 MB"), 470 * 1024 * 1024);
+        assert_eq!(
+            parse_approx_size("~1.1 GB"),
+            (1.1 * 1024.0 * 1024.0 * 1024.0) as u64
+        );
+        assert_eq!(parse_approx_size("12 KB"), 12 * 1024);
+        // No-space form falls back to the bare-number arm (unit multiplier 1).
+        assert_eq!(parse_approx_size("512"), 512);
+        // Unparseable → 0 (sorts first, harmless).
+        assert_eq!(parse_approx_size("huge"), 0);
+    }
+
+    #[test]
+    fn format_size_covers_all_unit_arms() {
+        assert_eq!(format_size(12), "12 B");
+        assert_eq!(format_size(2048), "2 KB");
+        assert_eq!(format_size(471 * 1024 * 1024), "471 MB");
+        assert_eq!(
+            format_size(2 * 1024 * 1024 * 1024 + 200 * 1024 * 1024),
+            "2.2 GB"
+        );
+    }
+
+    #[test]
+    fn picker_row_marks_current_and_renders_missing_thai_as_dash() {
+        let registry = model_registry();
+        let current = registry
+            .iter()
+            .find(|m| m.name == "multilingual-e5-small")
+            .unwrap();
+        let row = format_picker_row(current, "multilingual-e5-small");
+        assert!(row.starts_with("● "), "current marker: {row}");
+        assert!(row.contains("multilingual-e5-small"), "{row}");
+        assert!(row.contains(current.approx_size), "{row}");
+
+        // A non-current model gets the blank marker; a model without a Thai
+        // score renders `—` in the THAI column.
+        if let Some(no_thai) = registry.iter().find(|m| m.thai_miracl.is_none()) {
+            let row = format_picker_row(no_thai, "multilingual-e5-small");
+            assert!(row.starts_with("  "), "non-current marker: {row}");
+            assert!(row.contains(" — "), "missing thai dash: {row}");
+        }
+    }
 }

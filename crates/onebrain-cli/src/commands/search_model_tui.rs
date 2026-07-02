@@ -738,11 +738,19 @@ fn render(f: &mut ratatui::Frame, state: &AppState) {
                 (None, Some(e)) => progress_bar(reembed_pct(e.done, e.total), 14),
                 (None, None) => r.note.to_string(),
             };
-            let style = if i == state.selected {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
+            // The ACTIVE model (●) always stands out: bold + green (reads well
+            // on dark terminals and doesn't clash with the REVERSED selection
+            // highlight). The selected row keeps REVERSED; when the selection
+            // sits on the active row, the modifiers combine.
+            let mut style = Style::default();
+            if r.current {
+                style = style
+                    .fg(ratatui::style::Color::Green)
+                    .add_modifier(Modifier::BOLD);
+            }
+            if i == state.selected {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
             Row::new([
                 Cell::from(marker),
                 Cell::from(r.name),
@@ -765,12 +773,16 @@ fn render(f: &mut ratatui::Frame, state: &AppState) {
         Constraint::Length(7),
         Constraint::Min(20),
     ];
-    // Horizontal rules only: side borders either render dashed (│ + terminal
-    // line-spacing) or too chunky (half-block glyphs), so drop them entirely.
+    // Full plain border: single thin verticals (│) matching the horizontal
+    // line weight. (History: the full-screen-era plain verticals looked
+    // dashed in one terminal and QuadrantOutside looked too chunky, so the
+    // sides were dropped for a while — the user has since switched terminals
+    // and asked for the plain single-line box back.)
     let table = Table::new(body, widths).header(header).block(
         Block::default()
-            .borders(Borders::TOP | Borders::BOTTOM)
-            .title(" embedding models "),
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Plain)
+            .title(" Embedding Model Selection "),
     );
     f.render_widget(table, chunks[0]);
 

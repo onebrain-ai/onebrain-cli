@@ -295,15 +295,15 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
     let model_downloaded = any_model_downloaded(&cache_dir);
 
     // No index on disk yet → advisory warn (a fresh vault hasn't reindexed).
+    // The model dirs live INSIDE the collection cache dir, so "no cache dir"
+    // implies "no model" — no need to qualify the note.
     if !is_indexed(&cache_dir) {
-        let model_note = if model_downloaded {
-            ""
-        } else {
-            " · model not downloaded"
-        };
-        return DoctorResult::warn("search", format!("no index yet ({collection}){model_note}"))
-            .with_hint("onebrain search reindex")
-            .with_details(vec![format!("collection: {collection}")]);
+        return DoctorResult::warn(
+            "search",
+            format!("no index yet ({collection}) · model not downloaded"),
+        )
+        .with_hint("onebrain search reindex")
+        .with_details(vec![format!("collection: {collection}")]);
     }
 
     // Index exists → open the engine (lazy embedder, no download) and read
@@ -2605,6 +2605,128 @@ mod tests {
             }
             other => panic!("expected Fixed no-op, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fix_legacy_qmd_collection_fails_when_config_missing() {
+        // No config file at all → the read arm fails cleanly (no panic).
+        let d = tempdir().unwrap();
+        match fix_legacy_qmd_collection(d.path(), false) {
+            FixOutcome::Failed(msg) => assert!(msg.contains("read"), "{msg}"),
+            other => panic!("expected Failed on missing config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fix_legacy_qmd_collection_fails_on_malformed_yaml() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("onebrain.yml"), "not: : valid").unwrap();
+        match fix_legacy_qmd_collection(d.path(), false) {
+            FixOutcome::Failed(msg) => assert!(msg.contains("parse"), "{msg}"),
+            other => panic!("expected Failed on malformed yaml, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fix_legacy_qmd_collection_fails_on_non_mapping_root() {
+        // A YAML sequence root has no mapping to mutate.
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("onebrain.yml"), "- just\n- a\n- list\n").unwrap();
+        match fix_legacy_qmd_collection(d.path(), false) {
+            FixOutcome::Failed(msg) => {
+                assert!(msg.contains("not a mapping"), "{msg}")
+            }
+            other => panic!("expected Failed on sequence root, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fix_legacy_qmd_collection_drops_non_string_value_without_seeding() {
+        // A non-string qmd_collection (nothing sensible to migrate) is
+        // removed without creating search.collection.
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "qmd_collection: [not, a, string]\nfolders:\n  inbox: 00-inbox\n",
+        )
+        .unwrap();
+        match fix_legacy_qmd_collection(d.path(), false) {
+            FixOutcome::Fixed(msg) => {
+                assert!(msg.contains("non-string value"), "{msg}")
+            }
+            other => panic!("expected Fixed, got {other:?}"),
+        }
+        let yaml = read_config_yaml(d.path());
+        assert!(yaml.get("qmd_collection").is_none(), "legacy key remained");
+        assert!(
+            yaml.get("search").is_none(),
+            "must not invent search.collection from a non-string value"
+        );
+        assert_eq!(yaml["folders"]["inbox"].as_str(), Some("00-inbox"));
+    }
+
+    #[test]
+    fn fix_legacy_qmd_collection_replaces_non_mapping_search_key() {
+        // `search` exists but is a scalar → replaced with a mapping so the
+        // migrated collection has somewhere to land.
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "qmd_collection: ob-1\nsearch: broken\n",
+        )
+        .unwrap();
+        match fix_legacy_qmd_collection(d.path(), false) {
+            FixOutcome::Fixed(msg) => assert!(msg.contains("migrated"), "{msg}"),
+            other => panic!("expected Fixed, got {other:?}"),
+        }
+        let yaml = read_config_yaml(d.path());
+        assert!(yaml.get("qmd_collection").is_none(), "legacy key remained");
+        assert_eq!(yaml["search"]["collection"].as_str(), Some("ob-1"));
+    }
+
+    // ── native_search_check: headlessly-testable arms ────────────────────────
+
+    #[test]
+    fn native_search_check_warns_when_vault_unresolvable() {
+        // A path with no config file can't resolve to a vault → advisory warn,
+        // never a panic or an error row.
+        let d = tempdir().unwrap();
+        let r = native_search_check(&d.path().join("does-not-exist"));
+        assert_eq!(r.check, "search");
+        assert_eq!(r.status, DoctorStatus::Warn);
+        assert!(r.message.contains("could not resolve vault"), "{r:?}");
+    }
+
+    #[test]
+    fn native_search_check_warns_no_index_for_fresh_collection() {
+        // A configured collection whose cache dir doesn't exist → the
+        // "no index yet" advisory arm, with the reindex hint and the
+        // collection in the details. The unique name guarantees no cache dir
+        // exists for it; the configured value also means nothing is persisted.
+        let d = tempdir().unwrap();
+        let collection = format!(
+            "doctor-unit-no-index-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        fs::write(
+            d.path().join("onebrain.yml"),
+            format!("search:\n  collection: {collection}\n"),
+        )
+        .unwrap();
+        let r = native_search_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Warn);
+        assert!(r.message.contains("no index yet"), "{r:?}");
+        assert!(r.message.contains(&collection), "{r:?}");
+        // No model downloaded for a fresh collection either.
+        assert!(r.message.contains("model not downloaded"), "{r:?}");
+        assert_eq!(r.hint.as_deref(), Some("onebrain search reindex"));
+        assert!(
+            r.details.iter().any(|d| d.contains(&collection)),
+            "collection in details: {r:?}"
+        );
     }
 
     // ── fix_settings_hooks: success path ─────────────────────────────────────

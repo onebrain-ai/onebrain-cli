@@ -20,6 +20,11 @@ use onebrain_search::engine::{ReindexProgress, ReindexStats};
 
 #[derive(Debug, Serialize)]
 struct ReindexData {
+    /// Active embedding model for this run (from `search.embed_model`, or the
+    /// default). Always present so an all-unchanged run names the model just
+    /// like a run that embedded (the load notice only fires when the engine
+    /// actually loads the model).
+    embed_model: String,
     added: usize,
     updated: usize,
     removed: usize,
@@ -37,12 +42,18 @@ struct ReindexData {
 }
 
 impl ReindexData {
-    fn from_stats(s: ReindexStats, before: Option<u64>, after: Option<u64>) -> Self {
+    fn from_stats(
+        s: ReindexStats,
+        embed_model: String,
+        before: Option<u64>,
+        after: Option<u64>,
+    ) -> Self {
         let delta = match (before, after) {
             (Some(b), Some(a)) => Some(a as i64 - b as i64),
             _ => None,
         };
         Self {
+            embed_model,
             added: s.added,
             updated: s.updated,
             removed: s.removed,
@@ -121,7 +132,13 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchReindexA
     // Re-measure after indexing so the summary can show the resulting size and
     // its delta vs. before the run.
     let size_after = cache_dir.as_deref().and_then(index_size_bytes);
-    let data = ReindexData::from_stats(stats, size_before, size_after);
+    // Active model for the summary's 🧠  Model section — read from vault
+    // config (same source `model_load_notice_for` uses); serde fills the
+    // default when the key is absent.
+    let embed_model = onebrain_core::load_vault_config(&resolved.root)
+        .map(|c| c.search.embed_model)
+        .unwrap_or_default();
+    let data = ReindexData::from_stats(stats, embed_model, size_before, size_after);
 
     let envelope = Envelope::ok("search.reindex", Some(vault_info), data);
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
@@ -228,10 +245,15 @@ enum ProgressReporter {
     Bar {
         pb: indicatif::ProgressBar,
         load_notice: String,
+        /// Whether anything was drawn/printed (bar or notice) — drives the
+        /// blank spacer line before the final summary in [`Self::finish`].
+        printed: bool,
     },
     PlainLines {
         last_pct_bucket: Option<usize>,
         load_notice: String,
+        /// Same spacer flag as `Bar` for the plain milestone lines.
+        printed: bool,
     },
     Silent,
 }
@@ -254,11 +276,16 @@ impl ProgressReporter {
                 .expect("static template is valid")
                 .progress_chars("=>-"),
             );
-            Self::Bar { pb, load_notice }
+            Self::Bar {
+                pb,
+                load_notice,
+                printed: false,
+            }
         } else {
             Self::PlainLines {
                 last_pct_bucket: None,
                 load_notice,
+                printed: false,
             }
         }
     }
@@ -268,25 +295,37 @@ impl ProgressReporter {
             // The walk finished: the total is known before any (slow) model
             // load / embed starts, so the bar reads 0/N instead of 0/0.
             ReindexProgress::Walked { total } => match self {
-                Self::Bar { pb, .. } => {
+                Self::Bar { pb, printed, .. } => {
                     pb.set_length(total as u64);
                     pb.set_position(0);
+                    *printed = true;
                 }
-                Self::PlainLines { .. } => {
+                Self::PlainLines { printed, .. } => {
                     eprintln!("📇  Indexing {total} doc(s)…");
+                    *printed = true;
                 }
                 Self::Silent => {}
             },
             ReindexProgress::LoadingModel => match self {
-                Self::Bar { pb, load_notice } => {
+                Self::Bar {
+                    pb,
+                    load_notice,
+                    printed,
+                } => {
                     // fastembed prints its own download bar; suspend ours so the
                     // notice + that bar aren't clobbered by our redraw.
                     pb.suspend(|| {
                         eprintln!("{load_notice}");
                     });
+                    *printed = true;
                 }
-                Self::PlainLines { load_notice, .. } => {
+                Self::PlainLines {
+                    load_notice,
+                    printed,
+                    ..
+                } => {
                     eprintln!("{load_notice}");
+                    *printed = true;
                 }
                 Self::Silent => {}
             },
@@ -295,15 +334,18 @@ impl ProgressReporter {
                 total,
                 doc_path,
             } => match self {
-                Self::Bar { pb, .. } => {
+                Self::Bar { pb, printed, .. } => {
                     if pb.length() != Some(total as u64) {
                         pb.set_length(total as u64);
                     }
                     pb.set_position(done as u64);
                     pb.set_message(doc_path);
+                    *printed = true;
                 }
                 Self::PlainLines {
-                    last_pct_bucket, ..
+                    last_pct_bucket,
+                    printed,
+                    ..
                 } => {
                     // Throttle to ~every 10% so a piped log stays readable.
                     // `checked_div` guards total == 0 (an empty vault emits no
@@ -313,6 +355,7 @@ impl ProgressReporter {
                             *last_pct_bucket = Some(bucket);
                             let pct = (done * 100) / total;
                             eprintln!("📇  Indexing {done}/{total} ({pct}%)");
+                            *printed = true;
                         }
                     }
                 }
@@ -322,9 +365,24 @@ impl ProgressReporter {
     }
 
     fn finish(&mut self) {
-        if let Self::Bar { pb, .. } = self {
-            // Clear the bar so the final ✅  summary prints on a clean line.
-            pb.finish_and_clear();
+        // One blank stderr line between the progress output (bar / notice /
+        // milestone lines) and the final summary, so the ✅  headline doesn't
+        // sit flush against it. Nothing printed (Silent, or a run that emitted
+        // no progress) → no spacer.
+        match self {
+            Self::Bar { pb, printed, .. } => {
+                // Clear the bar so the final ✅  summary prints on a clean line.
+                pb.finish_and_clear();
+                if *printed {
+                    eprintln!();
+                }
+            }
+            Self::PlainLines { printed, .. } => {
+                if *printed {
+                    eprintln!();
+                }
+            }
+            Self::Silent => {}
         }
     }
 }
@@ -398,9 +456,11 @@ fn index_size_suffix(size: Option<u64>, delta: Option<i64>) -> Option<String> {
 fn render_text(env: &Envelope<ReindexData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     // Grouped convention, exactly like `search status`: a ✅  confirm line,
-    // then emoji-headed sections of indented label/value rows. Zero categories
-    // are omitted (a section with no rows is omitted entirely); `failed`
-    // carries a ⚠️  so it stands out.
+    // then emoji-headed sections of indented label/value rows. The 🧠  Model
+    // section always renders (an all-unchanged run names the model exactly
+    // like a run that embedded); zero doc categories are omitted (a section
+    // with no rows is omitted entirely); `failed` carries a ⚠️  so it stands
+    // out.
     let mut doc_rows: Vec<String> = Vec::new();
     if d.added > 0 {
         doc_rows.push(item("Added", &d.added.to_string()));
@@ -422,13 +482,18 @@ fn render_text(env: &Envelope<ReindexData>) -> String {
         // Nothing to do — an already-current index reindexed to a no-op.
         "✅  Reindexed — nothing to update".to_string()
     } else {
-        let mut s = "✅  Reindexed".to_string();
-        s.push_str(&format!("\n\n{}", section("📄", "Docs")));
-        for row in doc_rows {
-            s.push_str(&format!("\n{row}"));
-        }
-        s
+        "✅  Reindexed".to_string()
     };
+
+    out.push_str(&format!("\n\n{}", section("🧠", "Model")));
+    out.push_str(&format!("\n{}", item("Name", &d.embed_model)));
+
+    if !doc_rows.is_empty() {
+        out.push_str(&format!("\n\n{}", section("📄", "Docs")));
+        for row in doc_rows {
+            out.push_str(&format!("\n{row}"));
+        }
+    }
 
     if let Some(size) = index_size_suffix(d.index_size_bytes, d.index_size_delta_bytes) {
         out.push_str(&format!("\n\n{}", section("📊", "Index")));
@@ -465,6 +530,7 @@ mod tests {
         failed: usize,
     ) -> ReindexData {
         ReindexData {
+            embed_model: "multilingual-e5-small".to_string(),
             added,
             updated,
             removed,
@@ -493,6 +559,11 @@ mod tests {
         let e = Envelope::ok("search.reindex", None, data(1, 2, 3, 4, 0));
         let s = render_text(&e);
         assert!(s.starts_with("✅  Reindexed\n"), "{s}");
+        // The model is always named, between the headline and the Docs section.
+        assert!(
+            s.contains("\n\n🧠  Model\n    Name          multilingual-e5-small"),
+            "{s}"
+        );
         // Counts sit under the 📄  Docs section header.
         assert!(s.contains("\n\n📄  Docs\n"), "{s}");
         assert!(s.contains("    Added         1"), "{s}");
@@ -518,20 +589,26 @@ mod tests {
 
     #[test]
     fn text_reports_noop_when_all_zero() {
-        // No counts and no size → just the confirm line, no sections at all.
+        // No counts and no size → the confirm line + the always-present
+        // Model section, no Docs / Index sections.
         let e = Envelope::ok("search.reindex", None, data(0, 0, 0, 0, 0));
-        assert_eq!(render_text(&e), "✅  Reindexed — nothing to update");
+        assert_eq!(
+            render_text(&e),
+            "✅  Reindexed — nothing to update\n\n🧠  Model\n    Name          multilingual-e5-small"
+        );
     }
 
     #[test]
-    fn text_noop_still_shows_index_section_when_size_known() {
+    fn text_noop_still_shows_model_and_index_sections_when_size_known() {
         let mut d = data(0, 0, 0, 0, 0);
         d.index_size_bytes = Some(5 * 1024 * 1024);
         let e = Envelope::ok("search.reindex", None, d);
         let s = render_text(&e);
         assert!(s.starts_with("✅  Reindexed — nothing to update"), "{s}");
-        // The Docs section stays omitted (no rows), but the Index section
-        // still reports the size.
+        // The Model section names the model even on a no-op run; the Docs
+        // section stays omitted (no rows); the Index section still reports
+        // the size.
+        assert!(s.contains("\n\n🧠  Model\n    Name          "), "{s}");
         assert!(!s.contains("📄  Docs"), "{s}");
         assert!(s.contains("\n\n📊  Index\n    Size          5.0 MB"), "{s}");
     }
@@ -586,15 +663,26 @@ mod tests {
             added: 1,
             ..Default::default()
         };
-        let d = ReindexData::from_stats(stats(), Some(100), Some(180));
+        let model = || "bge-m3".to_string();
+        let d = ReindexData::from_stats(stats(), model(), Some(100), Some(180));
+        assert_eq!(d.embed_model, "bge-m3");
         assert_eq!(d.index_size_bytes, Some(180));
         assert_eq!(d.index_size_delta_bytes, Some(80));
 
-        let d2 = ReindexData::from_stats(stats(), None, Some(180));
+        let d2 = ReindexData::from_stats(stats(), model(), None, Some(180));
         assert_eq!(d2.index_size_bytes, Some(180));
         assert_eq!(d2.index_size_delta_bytes, None);
 
-        let d3 = ReindexData::from_stats(stats(), Some(200), Some(120));
+        let d3 = ReindexData::from_stats(stats(), model(), Some(200), Some(120));
         assert_eq!(d3.index_size_delta_bytes, Some(-80));
+    }
+
+    #[test]
+    fn json_includes_embed_model_field() {
+        // Machine consumers can read the active model from the envelope even
+        // on an all-unchanged run.
+        let v = serde_json::to_value(data(0, 0, 0, 5, 0)).unwrap();
+        assert_eq!(v["embed_model"], "multilingual-e5-small");
+        assert_eq!(v["unchanged"], 5);
     }
 }

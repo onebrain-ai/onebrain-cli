@@ -88,6 +88,173 @@ fn doctor_clean_vault_exits_0() {
         .stdout(predicate::str::contains("unembedded").not());
 }
 
+/// The native `search` check's engine path, exercised without any model
+/// download: reindexing an EMPTY vault (zero `.md` docs) never constructs the
+/// lazy embedder, but it does create the on-disk index and stamp
+/// `last_indexed`. Doctor then opens the engine read-only and reads its
+/// status:
+///   1. after the empty reindex → up to date on disk but the model is absent
+///      → the "model not downloaded" advisory arm;
+///   2. after a note appears → the pending-drift arm ("1 pending").
+///
+/// `ONEBRAIN_CACHE_DIR` isolates the search cache in a tempdir so nothing
+/// touches the real user cache.
+#[test]
+fn doctor_search_check_reads_engine_status_after_reindex() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write_minimal_vault(vault.path());
+    // Pin the collection so the check and the reindex agree on the cache dir.
+    let cfg = vault.path().join("vault.yml");
+    let existing = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        format!("search:\n  collection: doctor-it-engine\n{existing}"),
+    )
+    .unwrap();
+
+    // 0. A cache dir that exists but was never reindexed (e.g. wiped index
+    //    markers): the engine opens fresh and reports no last_indexed stamp →
+    //    the "never reindexed" arm.
+    std::fs::create_dir_all(cache.path().join("search/doctor-it-engine")).unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("never reindexed"));
+
+    // Empty-vault reindex: builds the index files, downloads nothing.
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .args(["search", "reindex"])
+        .assert()
+        .success();
+
+    // 1. Index exists + up to date + model absent → advisory warn.
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .arg("doctor")
+        .assert()
+        .success() // warn-only — exit-code contract unchanged
+        .stdout(predicate::str::contains("0 indexed · model not downloaded"))
+        .stdout(predicate::str::contains("onebrain search reindex"));
+
+    // 2. A new note → pending drift reported from Engine::status.
+    std::fs::write(vault.path().join("00-inbox/note.md"), "# hello\n").unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0 indexed · 1 pending"));
+}
+
+/// The all-green path: index up to date AND the embedding model present (its
+/// dir is fabricated — `model_download_status` only checks the `models--*`
+/// dir exists, so no download is needed). The `search` row reports `ok`, the
+/// footer shows the ✅ verdict with zero warnings, and a `--fix` run finds
+/// nothing to do (the `issues.is_empty()` branch).
+#[test]
+fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write_minimal_vault(vault.path());
+    // All-green needs the CANONICAL config filename (a legacy vault.yml would
+    // trip the vault-config-migration warn).
+    let legacy = vault.path().join("vault.yml");
+    let existing = std::fs::read_to_string(&legacy).unwrap();
+    std::fs::remove_file(&legacy).unwrap();
+    std::fs::write(
+        vault.path().join("onebrain.yml"),
+        format!("search:\n  collection: doctor-it-green\n{existing}"),
+    )
+    .unwrap();
+
+    // Empty-vault reindex (no docs → no model download) + a fabricated
+    // downloaded-model dir for the default model.
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .args(["search", "reindex"])
+        .assert()
+        .success();
+    std::fs::create_dir_all(
+        cache
+            .path()
+            .join("search/doctor-it-green/models--intfloat--multilingual-e5-small"),
+    )
+    .unwrap();
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("indexed · up to date"))
+        .stdout(predicate::str::contains("0 warnings · 0 fail"));
+
+    // All checks pass → --fix has nothing to do.
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .args(["doctor", "--fix"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Nothing to fix — all checks pass.",
+        ));
+}
+
+/// Structured `--fix --json` runs every recipe without prompting and reports
+/// the outcomes in the `fix[]` array — here the legacy-qmd-collection
+/// migration lands as `fixed`, and the post-fix re-check feeds the final
+/// `checks` array (the legacy row flips to ok).
+#[test]
+fn doctor_fix_json_reports_legacy_qmd_collection_outcome() {
+    let vault = tempdir().unwrap();
+    write_minimal_vault(vault.path());
+    let cfg = vault.path().join("vault.yml");
+    let existing = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(&cfg, format!("qmd_collection: ob-json\n{existing}")).unwrap();
+
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("PATH", "/usr/bin:/bin")
+        .args(["doctor", "--fix", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default();
+    let doc: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("doctor --fix --json emits one JSON document");
+    let fixes = doc["fix"].as_array().expect("fix[] present");
+    let legacy = fixes
+        .iter()
+        .find(|f| f["check"] == "legacy-qmd-collection")
+        .expect("legacy-qmd-collection outcome present");
+    assert_eq!(legacy["outcome"], "fixed", "outcome: {legacy}");
+    // Post-fix re-check: the legacy row is now ok.
+    let checks = doc["checks"].as_array().expect("checks[] present");
+    let row = checks
+        .iter()
+        .find(|c| c["check"] == "legacy-qmd-collection")
+        .expect("legacy row present");
+    assert_eq!(row["status"], "ok", "row: {row}");
+}
+
 #[test]
 fn doctor_missing_folder_exits_1() {
     let d = tempdir().unwrap();
