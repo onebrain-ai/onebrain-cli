@@ -784,3 +784,96 @@ fn search_model_set_rebuilds_index_with_new_model() {
     let stv: serde_json::Value = serde_json::from_slice(&status_out.stdout).unwrap();
     assert_eq!(stv["data"]["embed_model"], "multilingual-e5-base");
 }
+
+#[test]
+fn search_reindex_force_rejects_specific_paths() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "a.md", "--force"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "--force + paths must error");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("--force"), "mentions the flag: {text}");
+}
+
+#[test]
+fn search_reindex_force_on_empty_vault_rebuilds_and_status_reports_index_size() {
+    // An empty vault embeds nothing, so --force runs the full wipe+rebuild
+    // path (LiveProgressFile, wipe_index_files, model-load notice wiring)
+    // without ever downloading a model.
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+
+    // Run twice: the second --force exercises the delete-existing arms.
+    for _ in 0..2 {
+        let out = onebrain(vault.path(), cache.path())
+            .args(["search", "reindex", "--force"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "force reindex on empty vault: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "status"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("status emits a JSON envelope");
+    let size = v["data"]["index_size_bytes"]
+        .as_u64()
+        .expect("index exists after --force → index_size_bytes present");
+    assert!(size > 0, "tantivy/redb files have real bytes: {size}");
+}
+
+#[test]
+fn search_get_rejects_absolute_path_outside_vault() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+    // Index must exist so the failure is the outside-vault check, not setup.
+    let ok = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "--force"])
+        .output()
+        .unwrap();
+    assert!(ok.status.success());
+
+    let outside = tempdir().unwrap();
+    let abs = outside.path().join("x.md");
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "get", abs.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("outside"), "outside-vault error: {text}");
+}

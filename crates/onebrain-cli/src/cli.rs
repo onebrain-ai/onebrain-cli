@@ -897,7 +897,7 @@ pub struct NoteMkdirArgs {
 #[derive(Args, Debug)]
 #[command(
     about = "Native vault search over `*.md` notes (hybrid query · lex · vector · reindex · …)",
-    after_help = SEARCH_AFTER_HELP,
+    help_template = SEARCH_HELP_TEMPLATE,
     disable_help_subcommand = true
 )]
 pub struct SearchCmd {
@@ -905,15 +905,23 @@ pub struct SearchCmd {
     pub verb: SearchVerb,
 }
 
-/// `search --help` footer: states the `.md`-only indexing scope, then lists the
-/// three query verbs' shared flags (attached here via `after_help` rather than
-/// repeated in each verb's one-liner, which kept the Commands: list noisy).
-const SEARCH_AFTER_HELP: &str = "\
-Only Markdown (`*.md`) files are indexed; other file types in the vault are never touched.
+/// `search --help` layout: the shared query-verb flags sit right below the
+/// Commands list (before Options) so they're seen next to the verbs they
+/// belong to; the `.md`-only indexing scope note closes the help.
+const SEARCH_HELP_TEMPLATE: &str = "\
+{about-with-newline}
+{usage-heading} {usage}
+
+Commands:
+{subcommands}
 
 Search flags (query · search · vsearch):
   --top-k <N>        Maximum hits to return (default 10)
-  --min-score <S>    Drop low-confidence hits (vsearch: cosine, ≈0.85+ is confident; search: BM25; query: RRF)";
+  --min-score <S>    Drop low-confidence hits (vsearch: cosine, ≈0.85+ is confident; search: BM25; query: RRF)
+
+Options:
+{options}
+Only Markdown (`*.md`) files are indexed; other file types in the vault are never touched.";
 
 #[derive(Subcommand, Debug)]
 pub enum SearchVerb {

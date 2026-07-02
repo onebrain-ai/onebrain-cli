@@ -392,7 +392,7 @@ fn index_size_suffix(size: Option<u64>, delta: Option<i64>) -> Option<String> {
         Some(d) if d > 0 => format!(" (+{})", format_size(d as u64)),
         Some(d) => format!(" (−{})", format_size(d.unsigned_abs())),
     };
-    Some(format!("📊  index {}{paren}", format_size(size)))
+    Some(format!("📊  Index {}{paren}", format_size(size)))
 }
 
 fn render_text(env: &Envelope<ReindexData>) -> String {
@@ -415,20 +415,42 @@ fn render_text(env: &Envelope<ReindexData>) -> String {
     if d.failed > 0 {
         parts.push(format!("⚠️  {} failed", d.failed));
     }
-    if let Some(suffix) = index_size_suffix(d.index_size_bytes, d.index_size_delta_bytes) {
-        parts.push(suffix);
-    }
+    let index_line = index_size_suffix(d.index_size_bytes, d.index_size_delta_bytes);
 
     if parts.is_empty() {
         // Nothing to do — an already-current index reindexed to a no-op.
-        return "✅  Reindexed — nothing to update".to_string();
+        let mut out = "✅  Reindexed — nothing to update".to_string();
+        if let Some(idx) = index_line {
+            out.push_str(&format!("\n    {idx}"));
+        }
+        return out;
     }
-    format!("✅  Reindexed — {}", parts.join(" · "))
+    // Headline, then counts and index size each on their own indented line.
+    let mut out = "✅  Reindexed".to_string();
+    out.push_str(&format!("\n    {}", parts.join(" · ")));
+    if let Some(idx) = index_line {
+        out.push_str(&format!("\n    {idx}"));
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_progress_file_records_json_and_removes_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reindex-progress.json");
+        {
+            let live = LiveProgressFile { path: path.clone() };
+            live.record(457, 761);
+            let body = std::fs::read_to_string(&path).unwrap();
+            assert!(body.contains("\"done\":457"), "{body}");
+            assert!(body.contains("\"total\":761"), "{body}");
+        }
+        assert!(!path.exists(), "marker removed on drop");
+    }
 
     /// Build `ReindexData` from counts only (no index-size fields) — the size
     /// suffix is covered by its own dedicated tests.
@@ -506,21 +528,21 @@ mod tests {
         d.index_size_delta_bytes = Some(1_300_000); // +~1.2 MB
         let e = Envelope::ok("search.reindex", None, d);
         let s = render_text(&e);
-        assert!(s.contains("📊  index 16.2 MB"), "{s}");
+        assert!(s.contains("📊  Index 16.2 MB"), "{s}");
         assert!(s.contains("(+1.2 MB)"), "{s}");
     }
 
     #[test]
     fn text_renders_negative_delta_with_minus_sign() {
         let s = index_size_suffix(Some(10 * 1024 * 1024), Some(-800 * 1024)).unwrap();
-        assert!(s.contains("📊  index 10.0 MB"), "{s}");
+        assert!(s.contains("📊  Index 10.0 MB"), "{s}");
         assert!(s.contains("(−800 KB)"), "{s}");
     }
 
     #[test]
     fn text_omits_parenthetical_on_zero_delta() {
         let s = index_size_suffix(Some(5 * 1024 * 1024), Some(0)).unwrap();
-        assert!(s.contains("📊  index 5.0 MB"), "{s}");
+        assert!(s.contains("📊  Index 5.0 MB"), "{s}");
         assert!(
             !s.contains('('),
             "zero delta must render no parenthetical: {s}"

@@ -200,69 +200,84 @@ fn format_local(secs: u64) -> Option<String> {
 /// is the longest label; 14 leaves two trailing spaces after it.
 const LABEL_W: usize = 14;
 
-/// One aligned status row: `{emoji}  {label:<LABEL_W}{value}`. Every emoji is
-/// followed by exactly TWO spaces (terminal fonts render emoji double-width),
-/// and the label is left-padded to `LABEL_W` so values line up in a column.
-fn row(emoji: &str, label: &str, value: &str) -> String {
-    format!("{emoji}  {label:<LABEL_W$}{value}")
-}
-
 fn render_text(env: &Envelope<SearchStatusData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
+    // Grouped layout: emoji only on section headers, values indented with
+    // plain spaces — alignment never depends on how wide a terminal font
+    // draws an emoji.
     let mut lines = Vec::new();
-    match &d.collection {
-        Some(c) => lines.push(row("🔍", "Collection", c)),
-        None => lines.push(format!(
-            "{}\n💡  Set `search.collection` in onebrain.yml",
-            row("🔍", "Collection", "not set")
-        )),
-    }
-    lines.push(row("🧠", "Model", &d.embed_model));
 
+    lines.push("🧠  Model".to_string());
+    lines.push(item("Name", &d.embed_model));
     match d.model_size_bytes {
         Some(size) => {
-            lines.push(row("📦", "Model size", &format_size(size)));
+            lines.push(item("Size", &format_size(size)));
             if let Some(downloaded) = d.model_downloaded_at.and_then(format_local) {
-                lines.push(row("⏬", "Downloaded", &downloaded));
+                lines.push(item("Downloaded", &downloaded));
             }
         }
-        None => lines.push(row("📦", "Model size", "not downloaded")),
+        None => lines.push(item("Size", "not downloaded")),
+    }
+
+    lines.push(String::new());
+    lines.push("📊  Index".to_string());
+    match &d.collection {
+        Some(c) => lines.push(item("Collection", c)),
+        None => lines.push(item(
+            "Collection",
+            "not set — set `search.collection` in onebrain.yml",
+        )),
+    }
+    lines.push(item("Docs", &d.doc_count.to_string()));
+    if let Some(size) = d.index_size_bytes {
+        lines.push(item("Size", &format_size(size)));
+    }
+    match d.last_indexed_at.and_then(format_local) {
+        Some(when) => lines.push(item("Last indexed", &when)),
+        None => lines.push(item("Last indexed", "never")),
+    }
+    if let Some(r) = &d.reindexing {
+        let pct = (r.done * 100).checked_div(r.total).unwrap_or(0);
+        lines.push(item(
+            "Reindexing",
+            &format!(
+                "🔄  {}/{} ({pct}%) — running now; counts may lag",
+                r.done, r.total
+            ),
+        ));
+    }
+    let pending = d.pending_new + d.pending_changed + d.pending_removed;
+    if pending > 0 {
+        lines.push(item(
+            "Status",
+            &format!(
+                "⚠️  {pending} pending ({} new · {} changed · {} removed)",
+                d.pending_new, d.pending_changed, d.pending_removed
+            ),
+        ));
+    } else {
+        lines.push(item("Status", "✅  up to date"));
     }
 
     if let Some(dir) = &d.cache_dir {
-        lines.push(row("📁", "Cache dir", &dir.display().to_string()));
+        lines.push(String::new());
+        lines.push("📁  Cache".to_string());
+        lines.push(item("Dir", &dir.display().to_string()));
     }
 
-    if let Some(size) = d.index_size_bytes {
-        lines.push(row("📊", "Index size", &format_size(size)));
-    }
-
-    match d.last_indexed_at.and_then(format_local) {
-        Some(when) => lines.push(row("🕐", "Last indexed", &when)),
-        None => lines.push(row("🕐", "Last indexed", "never")),
-    }
-
-    if let Some(r) = &d.reindexing {
-        let pct = (r.done * 100).checked_div(r.total).unwrap_or(0);
-        lines.push(format!(
-            "🔄  Reindexing    {}/{} ({pct}%) — running now; counts below may lag",
-            r.done, r.total
-        ));
-    }
-
-    lines.push(format!("✅  Indexed {} docs", d.doc_count));
-
-    let pending = d.pending_new + d.pending_changed + d.pending_removed;
     if pending > 0 {
-        lines.push(format!(
-            "⚠️  Pending {pending} ({} new · {} changed · {} removed) → run `onebrain search reindex`",
-            d.pending_new, d.pending_changed, d.pending_removed
-        ));
-    } else {
-        lines.push("✅  Up to date".to_string());
+        lines.push(String::new());
+        lines.push("💡  Run `onebrain search reindex` to index pending changes".to_string());
     }
 
     lines.join("\n")
+}
+
+/// One indented `label → value` line under a section header. Four leading
+/// spaces + a fixed-width label column keep every value flush regardless of
+/// emoji rendering.
+fn item(label: &str, value: &str) -> String {
+    format!("    {label:<LABEL_W$}{value}")
 }
 
 #[cfg(test)]
@@ -295,25 +310,28 @@ mod tests {
     #[test]
     fn text_shows_collection_and_model() {
         let s = render_text(&env(Some("ob-1"), true));
-        assert!(s.contains("🔍  Collection    ob-1"), "{s}");
-        assert!(s.contains("🧠  Model         multilingual-e5-small"), "{s}");
-        assert!(s.contains("✅  Indexed 0 docs"), "{s}");
+        assert!(s.contains("🧠  Model"), "{s}");
+        assert!(s.contains("    Name          multilingual-e5-small"), "{s}");
+        assert!(s.contains("📊  Index"), "{s}");
+        assert!(s.contains("    Collection    ob-1"), "{s}");
+        assert!(s.contains("    Docs          0"), "{s}");
+        assert!(s.contains("📁  Cache"), "{s}");
+        assert!(s.contains("    Dir           /cache/ob-1"), "{s}");
     }
 
     #[test]
     fn text_flags_missing_collection() {
         let s = render_text(&env(None, false));
-        assert!(s.contains("not set"));
-        assert!(s.contains("💡  Set `search.collection`"));
+        assert!(s.contains("not set — set `search.collection`"), "{s}");
     }
 
     #[test]
     fn text_shows_not_downloaded_and_never_indexed_when_absent() {
         let s = render_text(&env(Some("ob-1"), false));
-        assert!(s.contains("📦  Model size    not downloaded"), "{s}");
-        assert!(s.contains("🕐  Last indexed  never"), "{s}");
+        assert!(s.contains("    Size          not downloaded"), "{s}");
+        assert!(s.contains("    Last indexed  never"), "{s}");
         // No `⏬  Downloaded` line when the model isn't present.
-        assert!(!s.contains("⏬  Downloaded"));
+        assert!(!s.contains("    Downloaded"));
         // No `📊  Index size` line when there's no index.
         assert!(!s.contains("Index size"));
     }
@@ -321,8 +339,9 @@ mod tests {
     #[test]
     fn text_shows_up_to_date_when_no_drift() {
         let s = render_text(&env(Some("ob-1"), true));
-        assert!(s.contains("✅  Up to date"));
-        assert!(!s.contains("Pending"));
+        assert!(s.contains("    Status        ✅  up to date"), "{s}");
+        assert!(!s.contains("pending"), "{s}");
+        assert!(!s.contains("💡"), "no hint when up to date: {s}");
     }
 
     #[test]
@@ -336,14 +355,13 @@ mod tests {
             d.pending_removed = 3;
         }
         let s = render_text(&e);
-        assert!(s.contains("✅  Indexed 5 docs"), "{s}");
-        assert!(s.contains("⚠️"));
+        assert!(s.contains("    Docs          5"), "{s}");
         assert!(
-            s.contains("Pending 6 (2 new · 1 changed · 3 removed)"),
+            s.contains("    Status        ⚠️  6 pending (2 new · 1 changed · 3 removed)"),
             "{s}"
         );
-        assert!(s.contains("onebrain search reindex"));
-        assert!(!s.contains("Up to date"));
+        assert!(s.contains("💡  Run `onebrain search reindex`"), "{s}");
+        assert!(!s.contains("up to date"), "{s}");
     }
 
     #[test]
@@ -355,8 +373,8 @@ mod tests {
             d.model_downloaded_at = Some(1_700_000_000);
         }
         let s = render_text(&e);
-        assert!(s.contains("📦  Model size    471 MB"), "{s}");
-        assert!(s.contains("⏬  Downloaded    "), "{s}");
+        assert!(s.contains("    Size          471 MB"), "{s}");
+        assert!(s.contains("    Downloaded    "), "{s}");
     }
 
     #[test]
@@ -364,7 +382,7 @@ mod tests {
         let mut e = env(Some("ob-1"), true);
         e.data.as_mut().unwrap().index_size_bytes = Some(16 * 1024 * 1024);
         let s = render_text(&e);
-        assert!(s.contains("📊  Index size    16 MB"), "{s}");
+        assert!(s.contains("    Size          16 MB"), "{s}");
     }
 
     #[test]
@@ -429,8 +447,8 @@ mod tests {
             total: 761,
         });
         let s = render_text(&e);
-        assert!(s.contains("🔄  Reindexing    457/761 (60%)"), "{s}");
-        assert!(s.contains("counts below may lag"), "{s}");
+        assert!(s.contains("    Reindexing    🔄  457/761 (60%)"), "{s}");
+        assert!(s.contains("counts may lag"), "{s}");
     }
 
     #[test]
