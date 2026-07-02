@@ -263,10 +263,14 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
 ### 🚧 Phase 1 · perceptual speed + skill alignment (v3.2–v3.7)
 - [x] **v3.2** — `note` resource group (11 verbs) · grouped `doctor` UX with braille spinner + one-pass `--fix` · animated `onebrain update` · `skill run --harness {claude,gemini}` + `--model <m>` + headless startup-skip handshake + in-place spinner · `harness run [PROMPT] --mode {with-context,ad-hoc}` for ad-hoc prompts through claude / gemini (reads stdin when omitted) · auto-checkpoint hook fix (`CLAUDE_CODE_SESSION_ID` top-priority token + anchored `last_ts` so the time threshold actually fires) · `--vault` accepted everywhere.
 - [x] **v3.3** — Daemon foundation: `onebrain serve` — a local **web UI embedded in the binary** over a token-gated vault JSON API (file explorer · reading view · qmd-backed search · agent chat), on a security-hardened surface (whole-surface token gate · vault path confinement · CSP + forced-attachment · agent env isolation).
-- [ ] **v3.4** — RPC layer: stdio JSON-RPC 2.0 over a Unix socket with auto-spawn.
-- [ ] **v3.5** — Skill-speed rewrites (`/daily`, `/wrapup`) + `checkpoint recover`.
-- [ ] **v3.6** — Capture pipeline (`/capture`, `/bookmark`, `/braindump`).
-- [ ] **v3.7** — Inbox + tasks pipeline + `/consolidate`.
+- [ ] **v3.4** — **Native Rust search — replaces qmd** (mini-epic across v3.4.x; exit: **0 node/python deps**):
+  - [x] **v3.4.0** — `onebrain-search` engine (tantivy BM25 + fastembed embeddings + RRF hybrid, ~100-language semantic + Thai/CJK keyword) · `onebrain search` verbs (`query/search/vsearch/get/status/reindex/model` + interactive model TUI) · doctor native-search checks · `qmd_collection` → `search.collection` migration.
+  - [ ] **v3.4.1** — native MCP server (rmcp) + plugin MCP-config swap (qmd → onebrain).
+  - [ ] **v3.4.2** — `/qmd` → `/search` skill + auto reindex/embed hook + serve/WebUI search rewire + **remove `@tobilu/qmd`**.
+  - [ ] **v3.4.3** — relevance polish: rerank (bge-reranker-v2-m3) · query expansion · nlpo3 Thai word-seg · custom ONNX models.
+- [ ] **v3.5** — Bootstrap + native verbs: startup / wrapup / daily / tasks → 1 call per ceremony (import content-verbs anchored ~v3.5.x).
+- [ ] **v3.6** — Warm daemon + RPC: kill cold process-start; keeps the native index + embed model hot (absorbs the old RPC-layer milestone).
+- [ ] ~~**v3.7** — qmd native search~~ → absorbed into v3.4.
 
 ### 📦 Phase 2 · bundles (v3.8–v3.11)
 - [ ] Bundle CLI (`onebrain bundle install/list/info/lint/…`) · four first-party bundles (`dashboard` · `synthesis` · `research` · `scheduler`) · core skills slimmed 32 → 18 · `onebrain.run/bundles` portal.
