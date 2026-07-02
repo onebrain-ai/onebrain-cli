@@ -24,6 +24,10 @@ use axum::{
 /// the build emits, `data:`/`https:`/`blob:` images (vault data-URIs, README badges,
 /// and the pptx preview's media materialised as same-origin blob: URLs), and
 /// `data:` fonts (the web UI's Office-doc preview inlines slide/text fonts as data-URIs).
+/// `frame-src` permits `'self'` (same-origin PDF/HTML preview + `srcdoc`) plus
+/// `data:`/`blob:` and external `http(s)` so the internal webview can embed a
+/// user-clicked external link; per-site framability is still gated by the target
+/// site's own `X-Frame-Options`/`frame-ancestors` (checked by `/api/webview/preflight`).
 /// Tightening `script-src` to a nonce is a follow-up (would need the static
 /// handler + this layer to share a per-response nonce).
 const CSP: &str = "default-src 'self'; \
@@ -32,6 +36,7 @@ style-src 'self' 'unsafe-inline'; \
 img-src 'self' data: https: blob:; \
 font-src 'self' data:; \
 connect-src 'self'; \
+frame-src 'self' data: blob: https: http:; \
 object-src 'none'; \
 base-uri 'self'; \
 form-action 'self'; \
@@ -105,13 +110,18 @@ mod tests {
         assert_eq!(h.get(header::X_FRAME_OPTIONS).unwrap(), "SAMEORIGIN");
         assert_eq!(h.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
         assert_eq!(h.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
-        // CSP allows only same-origin framing (PDF preview) + forbids object embeds.
+        // CSP: only same-origin can frame US (frame-ancestors 'self', clickjacking),
+        // but WE may frame external http(s) (frame-src) so the internal webview works.
         let csp = h
             .get(header::CONTENT_SECURITY_POLICY)
             .unwrap()
             .to_str()
             .unwrap();
         assert!(csp.contains("frame-ancestors 'self'"));
+        // frame-src must permit external http(s) or the internal webview iframe is
+        // blocked by our own CSP regardless of the target site's headers.
+        assert!(csp.contains("frame-src"));
+        assert!(csp.contains("https:") && csp.contains("http:"));
         assert!(csp.contains("object-src 'none'"));
         // `data:` fonts are allowed so the web UI's Office-doc preview can render
         // the slide/text fonts PowerPoint/Word embed as data-URIs.
