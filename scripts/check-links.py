@@ -42,6 +42,7 @@ REFERENCE_CRATES = {
     "docs/reference/onebrain-fs.md": "crates/onebrain-fs",
     "docs/reference/onebrain-core.md": "crates/onebrain-core",
     "docs/reference/onebrain-cache.md": "crates/onebrain-cache",
+    "docs/reference/onebrain-search.md": "crates/onebrain-search",
 }
 
 LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")

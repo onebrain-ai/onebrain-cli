@@ -470,6 +470,34 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             NoteVerb::Delete(args) => commands::note_delete::run(vault_flag.clone(), &mode, &args),
             NoteVerb::Mkdir(args) => commands::note_mkdir::run(vault_flag.clone(), &mode, &args),
         },
+        Cmd::Search(SearchCmd { verb }) => match verb {
+            SearchVerb::Query(args) => {
+                commands::search_query::run_query(vault_flag.clone(), &mode, &args)
+            }
+            SearchVerb::Search(args) => {
+                commands::search_query::run_lex(vault_flag.clone(), &mode, &args)
+            }
+            SearchVerb::Vsearch(args) => {
+                commands::search_query::run_vsearch(vault_flag.clone(), &mode, &args)
+            }
+            SearchVerb::Get(args) => commands::search_get::run(vault_flag.clone(), &mode, &args),
+            SearchVerb::Status => commands::search_status::run(vault_flag.clone(), &mode),
+            SearchVerb::Reindex(args) => {
+                commands::search_reindex::run(vault_flag.clone(), &mode, &args)
+            }
+            SearchVerb::Model(SearchModelCmd { verb }) => match verb {
+                None => commands::search_model::run_bare(vault_flag.clone(), &mode),
+                Some(SearchModelVerb::List(args)) => {
+                    commands::search_model::run_list(vault_flag.clone(), &mode, &args)
+                }
+                Some(SearchModelVerb::Set(args)) => {
+                    commands::search_model::run_set(vault_flag.clone(), &mode, &args)
+                }
+                Some(SearchModelVerb::Remove(args)) => {
+                    commands::search_model::run_remove(vault_flag.clone(), &mode, &args)
+                }
+            },
+        },
         Cmd::Pause(PauseCmd { verb }) => match verb {
             PauseVerb::List => {
                 stubs::not_implemented_vault_required(vault_flag.clone(), "pause list")

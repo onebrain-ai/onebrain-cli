@@ -73,6 +73,7 @@ mod tests {
             qmd_collection: None,
             checkpoint: Default::default(),
             folders: Default::default(),
+            search: Default::default(),
         }
     }
 

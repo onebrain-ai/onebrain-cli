@@ -12,9 +12,10 @@ name = "onebrain"
 path = "src/main.rs"
 
 [dependencies]
-onebrain-core  = { workspace = true }
-onebrain-fs    = { workspace = true }
-onebrain-cache = { workspace = true }
+onebrain-core   = { workspace = true }
+onebrain-fs     = { workspace = true }
+onebrain-cache  = { workspace = true }
+onebrain-search = { workspace = true }
 clap           = { workspace = true }
 clap_complete  = { workspace = true }
 serde          = { workspace = true }
@@ -26,6 +27,16 @@ which          = { workspace = true }
 dirs           = { workspace = true }
 indicatif      = { workspace = true }
 is-terminal    = { workspace = true }
+# Task 10p — interactive `search model` picker (Select) + re-embed confirm
+# (Confirm). Reuses the same `inquire` workspace dep `onebrain-fs::init`
+# already ships, so this adds zero new crates to the dependency graph.
+inquire        = { workspace = true }
+# v3.4 UX-2b — full-screen interactive `search model` TUI (registry table +
+# sort/switch/delete keybindings). ratatui re-exports the crossterm backend it
+# pins (`ratatui::crossterm`), so no separate crossterm dep is needed.
+ratatui        = { workspace = true }
+# Static `search model list` box — display-width math for ✓ ● — cells.
+unicode-width  = { workspace = true }
 # v3.3 daemon — structured file logging for the detached `daemon __run` child.
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -1754,7 +1754,7 @@ fn qmd_status_requires_vault_and_reports_inside() {
         .args(["qmd", "status"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("qmd index status"));
+        .stdout(predicate::str::contains("Qmd index"));
 }
 
 /// `qmd status --json` inside a vault emits a parseable object carrying the

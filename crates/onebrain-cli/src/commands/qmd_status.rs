@@ -6,7 +6,7 @@
 //! `--yaml` emit the structured report for machine consumers.
 
 use crate::legacy_output::serialize_for_mode;
-use crate::output::OutputMode;
+use crate::output::{item, section, OutputMode};
 use crate::vault_ctx;
 use anyhow::{Context, Result};
 use onebrain_cache::{query_status, QmdStatus};
@@ -65,39 +65,47 @@ fn format_output(report: &QmdStatusReport, mode: &OutputMode) -> String {
 }
 
 fn render_text(report: &QmdStatusReport) -> String {
-    let mut lines = vec!["qmd index status".to_string()];
+    // Grouped-status convention (matches `search status`): a `🔍  Qmd index`
+    // section header, then indented fixed-width label rows, then an optional
+    // hint. Legacy qmd surface — kept in sync with the house style until qmd is
+    // removed in v3.4.2.
+    let mut lines = vec![section("🔍", "Qmd index")];
 
     match &report.collection {
-        Some(c) => lines.push(format!("  collection:  {c}")),
-        None => lines.push(
-            "  collection:  (not set — run /qmd to configure qmd_collection in onebrain.yml)"
-                .to_string(),
-        ),
+        Some(c) => lines.push(item("Collection", c)),
+        None => lines.push(item(
+            "Collection",
+            "not set — run /qmd to configure qmd_collection in onebrain.yml",
+        )),
     }
 
     if !report.qmd_available {
-        lines.push("  qmd:         not installed or not responding".to_string());
+        lines.push(item("Qmd", "not installed or not responding"));
         return lines.join("\n");
     }
 
     let idx = &report.index;
     let num = |n: Option<u64>| n.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string());
-    lines.push(format!(
-        "  documents:   {} indexed · {} embedded · {} pending",
-        num(idx.total_files),
-        num(idx.embedded_vectors),
-        num(idx.pending_embedding),
+    lines.push(item(
+        "Documents",
+        &format!(
+            "{} indexed · {} embedded · {} pending",
+            num(idx.total_files),
+            num(idx.embedded_vectors),
+            num(idx.pending_embedding),
+        ),
     ));
     if let Some(size) = &idx.index_size {
-        lines.push(format!("  index size:  {size}"));
+        lines.push(item("Index size", size));
     }
     if let Some(updated) = &idx.last_updated {
-        lines.push(format!("  updated:     {updated}"));
+        lines.push(item("Updated", updated));
     }
     if let Some(pending) = idx.pending_embedding {
         if pending > 0 {
+            lines.push(String::new());
             lines.push(format!(
-                "  → {pending} doc(s) need embedding · run `onebrain qmd embed`"
+                "💡  {pending} doc(s) need embedding — run `onebrain qmd embed`"
             ));
         }
     }
@@ -125,7 +133,8 @@ mod tests {
     #[test]
     fn text_lists_collection_and_counts() {
         let s = render_text(&full_report());
-        assert!(s.contains("collection:  ob-1"));
+        assert!(s.contains("🔍  Qmd index"), "{s}");
+        assert!(s.contains("    Collection    ob-1"), "{s}");
         assert!(s.contains("600 indexed · 7203 embedded · 29 pending"));
         assert!(s.contains("45.7 MB"));
         assert!(s.contains("need embedding"));

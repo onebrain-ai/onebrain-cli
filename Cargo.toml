@@ -4,7 +4,7 @@ default-members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "3.3.27"
+version = "3.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["OneBrain Contributors"]
@@ -13,9 +13,10 @@ publish = false
 
 [workspace.dependencies]
 # Internal path deps
-onebrain-core  = { path = "crates/onebrain-core" }
-onebrain-fs    = { path = "crates/onebrain-fs" }
-onebrain-cache = { path = "crates/onebrain-cache" }
+onebrain-core   = { path = "crates/onebrain-core" }
+onebrain-fs     = { path = "crates/onebrain-fs" }
+onebrain-cache  = { path = "crates/onebrain-cache" }
+onebrain-search = { path = "crates/onebrain-search" }
 
 # Foundation (Slice 1)
 serde       = { version = "1", features = ["derive"] }
@@ -55,6 +56,9 @@ percent-encoding = "2"
 
 # SHA-256 verification of the self-update binary (v3.1.4 · onebrain-fs update install path)
 sha2 = "0.10"
+
+# Memory-mapped file access (v3.4 · onebrain-search on-disk index/vector stores)
+memmap2 = "0.9"
 
 # Regex (Slice 8 scheduler · cron + at field validation · pre-compiled with OnceLock · v3.2 note search --mode regex)
 regex     = "1"
@@ -125,6 +129,15 @@ tower-http = { version = "0.6", features = ["fs"] }
 
 # Interactive prompts (Slice 10 · init wizard)
 inquire   = "0.7"
+
+# v3.4 UX-2b — full-screen interactive `search model` TUI. ratatui 0.29 bundles
+# its own crossterm backend (re-exported as `ratatui::crossterm`), so we don't
+# add a separate crossterm dep — the raw-mode terminal setup uses that
+# re-export to keep the crossterm version in lockstep with ratatui's backend.
+ratatui   = "0.29"
+# Display-width math for the static `search model list` box (✓ ● — cells)
+# — already in the graph via ratatui, so this adds no new crate.
+unicode-width = "0.2"
 
 # Slice 13 — vault-sync (tarball extraction + progress UI + url encoding)
 tar         = "0.4"

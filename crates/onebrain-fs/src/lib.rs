@@ -20,7 +20,7 @@ pub mod task;
 pub mod update;
 pub mod vault_sync;
 
-pub use backup::backup_config_file;
+pub use backup::{atomic_write_text, backup_config_file, persist_search_key};
 pub use error::{FsError, Result};
 pub use harness::{detect_harness, detect_harnesses};
 pub use init::{run_init, InitOptions, InitResult, ScheduleEntry, SchedulePreset};

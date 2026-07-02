@@ -16,7 +16,7 @@ set -euo pipefail
 # Files excluded from the coverage target — keep in sync with docs/coverage.md.
 # Each entry is unreachable in tests without mocking the network, spawning a real
 # subprocess, running a blocking server, or driving a TTY.
-IGNORE_REGEX='(src/main\.rs|commands/(serve|daemon|update|qmd_reindex|harness_run)\.rs|server/(chat|search)\.rs|update/install\.rs|init/wizard\.rs|(vault_sync|output)/progress\.rs|cache/src/session_token\.rs)'
+IGNORE_REGEX='(src/main\.rs|commands/(serve|daemon|update|qmd_reindex|harness_run|search_query|search_reindex|search_model_tui)\.rs|server/(chat|search)\.rs|update/install\.rs|init/wizard\.rs|(vault_sync|output)/progress\.rs|cache/src/session_token\.rs|onebrain-search/src/embed\.rs)'
 
 # Ratchet gate: CI fails if core line coverage drops below this. Set conservatively
 # below the achieved % (≈95.6% macOS / ≈95.5% Linux after the long-tail mop-up) to

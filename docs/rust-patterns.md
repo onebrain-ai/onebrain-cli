@@ -12,7 +12,7 @@ Line numbers drift as the code changes; the function/type names are the stable a
 
 `doctor` runs a list of independent health checks (config valid? folders present? hooks wired?). Each check implements a common `Check` trait, and the runner holds them as `Vec<Box<dyn Check>>` — a heterogeneous list of "things that can be checked," resolved at runtime (dynamic dispatch).
 
-**Why this over an enum:** an enum would force every check into one `match` arm and one file; the trait-object list lets each check live in its own module and be added without touching the runner. The cost is a vtable indirection per call — irrelevant for ~9 checks run once.
+**Why this over an enum:** an enum would force every check into one `match` arm and one file; the trait-object list lets each check live in its own module and be added without touching the runner. The cost is a vtable indirection per call — irrelevant for ~10 checks run once.
 
 **Learn:** this is the Rust answer to "I want a list of polymorphic handlers." Reach for `Box<dyn Trait>` when the set is open-ended and the per-call cost doesn't matter; reach for an `enum` when the set is closed and you want exhaustiveness checking.
 

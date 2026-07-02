@@ -1,5 +1,5 @@
 ---
-latest_version: 3.3.27
+latest_version: 3.4.0
 released: 2026-07-02
 ---
 
@@ -9,6 +9,14 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.0] — 2026-07-01 — native search engine (`onebrain-search`)
+
+- **Native Rust search engine**: tantivy BM25 + fastembed embeddings + flat mmap vector store + RRF hybrid ranking — no Node/Python runtime.
+- **`onebrain search query/search/vsearch/get/status/reindex`** (`--json`) plus `search model list/set` and an interactive TTY model picker.
+- **Multilingual**: ~100-language semantic search (default `multilingual-e5-small`, swappable) + no-space-script keyword bigrams for Thai/CJK/Lao/Khmer/Myanmar.
+- **Swappable embedding model** via `search model set` — rebuilds the vector store and re-embeds; `bge-m3` is the best-accuracy upgrade path.
+- Runs **alongside qmd** (engine milestone only) — MCP swap and qmd removal land in follow-up milestones.
 
 ## [3.3.27] — 2026-07-02 — translate bridge for select-to-lookup
 

@@ -10,10 +10,16 @@
 
 pub mod dispatcher;
 pub mod envelope;
+pub mod layout;
 pub mod mode;
 pub mod progress;
 
 pub use dispatcher::emit;
+// Shared grouped-status layout primitives — `section` / `item` build the
+// house-style header + indented rows used by `search status`, `search
+// reindex`, `serve`, and any other status-like text output.
+#[allow(unused_imports)]
+pub(crate) use layout::{item, section, LABEL_W};
 // Doctor's grouped-status renderer — braille spinner + sectioned status lines.
 // Re-exported at the `output` level so command modules use `output::…` without
 // the deep path. `is_color_text` / `SPINNER_FRAMES` are crate-internal (doctor +

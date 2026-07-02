@@ -15,6 +15,11 @@ pub struct VaultConfig {
     /// Folder layout · defaults supplied by `VaultFolders::default`.
     #[serde(default)]
     pub folders: VaultFolders,
+
+    /// Native search config (embedding model, collection, auto-embed gate).
+    /// Defaults supplied by `SearchConfig::default`.
+    #[serde(default)]
+    pub search: SearchConfig,
 }
 
 /// Checkpoint policy fields parsed from the config's `checkpoint:` block.
@@ -116,6 +121,102 @@ impl Default for VaultFolders {
     }
 }
 
+/// Native search config parsed from the config's `search:` block.
+///
+/// `collection` falls back to the legacy top-level `qmd_collection` when
+/// absent — see [`load_vault_config`] / [`load_vault_config_at`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchConfig {
+    /// Collection name for the native search index. Falls back to
+    /// `qmd_collection` when unset (legacy vaults).
+    #[serde(default)]
+    pub collection: Option<String>,
+    /// Embedding model name. Default `"multilingual-e5-small"` (small + fast;
+    /// fastembed has no quantized bge-m3, so bge-m3 fp32 is opt-in via set-model).
+    #[serde(default = "default_embed_model")]
+    pub embed_model: String,
+    /// Auto-embed gate (thresholds transferred from the folded auto-embed
+    /// design). Parsed here only — enforcement happens in a later task.
+    #[serde(default)]
+    pub embed: EmbedGate,
+    /// Extra index-exclusion patterns on top of the built-ins (hidden dirs
+    /// and `node_modules` are ALWAYS skipped). Each entry is either a
+    /// vault-relative path prefix (`attachments/demo`) or a bare directory
+    /// name matched at any depth (`drafts`). Defaults to `["attachments"]`
+    /// — the vault's copied-file staging area, not knowledge notes; set
+    /// `exclude: []` explicitly to index everything.
+    #[serde(default = "default_search_exclude")]
+    pub exclude: Vec<String>,
+}
+
+fn default_embed_model() -> String {
+    "multilingual-e5-small".to_string()
+}
+
+fn default_search_exclude() -> Vec<String> {
+    vec!["attachments".to_string()]
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            collection: None,
+            embed_model: default_embed_model(),
+            embed: EmbedGate::default(),
+            exclude: default_search_exclude(),
+        }
+    }
+}
+
+/// Auto-embed gate: controls when/how the native search index re-embeds
+/// changed documents. Parsed only in this task — enforcement is added later.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbedGate {
+    /// Whether auto-embed runs at all. Default `true`.
+    #[serde(default = "default_embed_auto")]
+    pub auto: bool,
+    /// Minimum number of changed docs before an auto-embed run triggers. Default 10.
+    #[serde(default = "default_embed_threshold")]
+    pub threshold: u32,
+    /// Debounce window (seconds) before an auto-embed run fires. Default 45.
+    #[serde(default = "default_embed_debounce_seconds")]
+    pub debounce_seconds: u64,
+    /// Max docs embedded per batch. Default 200.
+    #[serde(default = "default_embed_max_batch")]
+    pub max_batch: u32,
+    /// Optional cron-style schedule for a periodic full re-embed. Default `None`.
+    #[serde(default)]
+    pub schedule: Option<String>,
+}
+
+fn default_embed_auto() -> bool {
+    true
+}
+
+fn default_embed_threshold() -> u32 {
+    10
+}
+
+fn default_embed_debounce_seconds() -> u64 {
+    45
+}
+
+fn default_embed_max_batch() -> u32 {
+    200
+}
+
+impl Default for EmbedGate {
+    fn default() -> Self {
+        Self {
+            auto: default_embed_auto(),
+            threshold: default_embed_threshold(),
+            debounce_seconds: default_embed_debounce_seconds(),
+            max_batch: default_embed_max_batch(),
+            schedule: None,
+        }
+    }
+}
+
 /// Read and parse the active vault config (`onebrain.yml` preferred,
 /// legacy `vault.yml` as fallback with one-time deprecation warning).
 /// Returns [`CoreError::VaultYamlMissing`] when neither file exists and
@@ -126,7 +227,10 @@ pub fn load_vault_config(root: &VaultRoot) -> Result<VaultConfig> {
         path: path.clone(),
         source,
     })?;
-    let config: VaultConfig = serde_yaml::from_str(&content)?;
+    let mut config: VaultConfig = serde_yaml::from_str(&content)?;
+    if config.search.collection.is_none() {
+        config.search.collection = config.qmd_collection.clone();
+    }
     Ok(config)
 }
 
@@ -143,13 +247,28 @@ pub fn load_vault_config_at(path: &Path) -> Result<VaultConfig> {
         path: yml.clone(),
         source,
     })?;
-    let config: VaultConfig = serde_yaml::from_str(&content)?;
+    let mut config: VaultConfig = serde_yaml::from_str(&content)?;
+    if config.search.collection.is_none() {
+        config.search.collection = config.qmd_collection.clone();
+    }
     Ok(config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_exclude_defaults_to_attachments() {
+        let cfg = SearchConfig::default();
+        assert_eq!(cfg.exclude, vec!["attachments".to_string()]);
+        // YAML without the key gets the same default via serde.
+        let parsed: SearchConfig = serde_yaml::from_str("embed_model: bge-m3").unwrap();
+        assert_eq!(parsed.exclude, vec!["attachments".to_string()]);
+        // Explicit empty list opts out.
+        let parsed: SearchConfig = serde_yaml::from_str("exclude: []").unwrap();
+        assert!(parsed.exclude.is_empty());
+    }
     use tempfile::tempdir;
 
     fn write_vault(content: &str) -> (tempfile::TempDir, VaultRoot) {
@@ -278,5 +397,24 @@ mod tests {
         let cfg = load_vault_config(&root).unwrap();
         assert_eq!(cfg.folders.inbox, "my-inbox");
         assert_eq!(cfg.folders.projects, "01-projects"); // default preserved
+    }
+
+    #[test]
+    fn search_config_defaults() {
+        let (_dir, root) = write_vault("qmd_collection: ob-1-441565\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.search.embed_model, "multilingual-e5-small");
+        assert!(cfg.search.embed.auto);
+        assert_eq!(cfg.search.embed.threshold, 10);
+        assert_eq!(cfg.search.collection.as_deref(), Some("ob-1-441565"));
+    }
+
+    #[test]
+    fn search_config_overrides() {
+        let (_dir, root) =
+            write_vault("search:\n  embed_model: multilingual-e5-large\n  collection: c1\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.search.embed_model, "multilingual-e5-large");
+        assert_eq!(cfg.search.collection.as_deref(), Some("c1"));
     }
 }

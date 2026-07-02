@@ -13,6 +13,25 @@ use chrono::Local;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+/// Atomic text write: write to `path.tmp` then rename over `path`. Creates
+/// parent dirs as needed. Shared home for the helper formerly duplicated in
+/// `onebrain-cli`'s `commands::doctor` and `commands::search_model`, which
+/// both already depend on this crate (via [`backup_config_file`]).
+pub fn atomic_write_text(path: &Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut tmp = path.to_path_buf();
+    let new_ext = match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{ext}.tmp"),
+        None => "tmp".to_string(),
+    };
+    tmp.set_extension(new_ext);
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Upper bound on the same-second `-N` uniquifier search. Generous enough that
 /// it can't be hit by real usage, but bounds the loop so a wedged backup dir
 /// can't spin forever.
@@ -88,10 +107,123 @@ pub fn backup_config_file(config_path: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(target))
 }
 
+/// Persist a single `search.<key> = value` into the vault's config file
+/// (`onebrain.yml`, or legacy `vault.yml` if that's what's present),
+/// preserving every other key. Reads the file (treating a missing/empty file
+/// as an empty mapping), ensures a `search:` mapping exists, sets `key`,
+/// backs the file up ([`backup_config_file`] is a hard precondition), then
+/// atomically writes it back ([`atomic_write_text`]).
+///
+/// This is the shared home for the read → mutate `search.*` → backup →
+/// atomic-write pattern formerly duplicated in `onebrain-cli`'s
+/// `search_model::persist_embed_model` and `search_common::persist_collection`.
+pub fn persist_search_key(vault_root: &Path, key: &str, value: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use onebrain_core::{find_config_file, CONFIG_FILENAME};
+
+    let path = find_config_file(vault_root).unwrap_or_else(|| vault_root.join(CONFIG_FILENAME));
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+
+    let mut yaml: serde_yaml::Value = if text.trim().is_empty() {
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+    } else {
+        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
+    };
+    if !yaml.is_mapping() {
+        yaml = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    }
+    let mapping = yaml.as_mapping_mut().expect("normalized to mapping above");
+
+    let search_key = serde_yaml::Value::String("search".to_string());
+    let needs_replace = match mapping.get(&search_key) {
+        Some(v) => !v.is_mapping(),
+        None => true,
+    };
+    if needs_replace {
+        mapping.insert(
+            search_key.clone(),
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        );
+    }
+    let search = mapping
+        .get_mut(&search_key)
+        .and_then(|v| v.as_mapping_mut())
+        .expect("search key was just ensured to be a mapping");
+    search.insert(
+        serde_yaml::Value::String(key.to_string()),
+        serde_yaml::Value::String(value.to_string()),
+    );
+
+    let serialized = serde_yaml::to_string(&yaml).context("serializing updated config")?;
+
+    // Defense-in-depth: back up the existing config before overwriting it.
+    // Hard precondition — refuse the write if the backup couldn't be made.
+    backup_config_file(&path)
+        .with_context(|| format!("backing up {} before write", path.display()))?;
+
+    atomic_write_text(&path, &serialized).with_context(|| format!("writing {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn persist_search_key_creates_fresh_config() {
+        let dir = tempdir().unwrap();
+        persist_search_key(dir.path(), "embed_model", "bge-m3").unwrap();
+        let yaml = std::fs::read_to_string(dir.path().join("onebrain.yml")).unwrap();
+        assert!(yaml.contains("embed_model: bge-m3"));
+    }
+
+    #[test]
+    fn persist_search_key_preserves_other_keys() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "search:\n  collection: my-vault\n  embed_model: multilingual-e5-small\nfolders:\n  inbox: 00-inbox\n",
+        )
+        .unwrap();
+        persist_search_key(dir.path(), "embed_model", "bge-m3").unwrap();
+        let yaml = std::fs::read_to_string(dir.path().join("onebrain.yml")).unwrap();
+        assert!(yaml.contains("embed_model: bge-m3"));
+        assert!(yaml.contains("collection: my-vault"));
+        assert!(yaml.contains("inbox: 00-inbox"));
+    }
+
+    #[test]
+    fn persist_search_key_writes_backup() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "search:\n  embed_model: multilingual-e5-small\n",
+        )
+        .unwrap();
+        persist_search_key(dir.path(), "embed_model", "bge-m3").unwrap();
+        let backup_dir = dir.path().join(BACKUP_DIR);
+        assert!(
+            backup_dir.is_dir(),
+            "expected a config backup to be written"
+        );
+        assert!(
+            std::fs::read_dir(&backup_dir).unwrap().next().is_some(),
+            "expected at least one backup file"
+        );
+    }
+
+    #[test]
+    fn persist_search_key_replaces_non_mapping_search_value() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("onebrain.yml"), "search: not-a-mapping\n").unwrap();
+        persist_search_key(dir.path(), "collection", "c1").unwrap();
+        let yaml = std::fs::read_to_string(dir.path().join("onebrain.yml")).unwrap();
+        assert!(yaml.contains("collection: c1"));
+    }
 
     #[test]
     fn no_file_is_a_noop() {
@@ -227,5 +359,20 @@ mod tests {
             result.is_err(),
             "unreadable source must propagate error, got {result:?}"
         );
+    }
+
+    #[test]
+    fn atomic_write_text_writes_and_cleans_tmp() {
+        let d = tempdir().unwrap();
+        // No-extension path exercises the "tmp" fallback branch.
+        let noext = d.path().join("noextfile");
+        atomic_write_text(&noext, "hello").unwrap();
+        assert_eq!(std::fs::read_to_string(&noext).unwrap(), "hello");
+        assert!(!d.path().join("noextfile.tmp").exists(), ".tmp left behind");
+
+        // With-extension path + missing parent dirs are created.
+        let nested = d.path().join("deep/nested/file.yml");
+        atomic_write_text(&nested, "content").unwrap();
+        assert_eq!(std::fs::read_to_string(&nested).unwrap(), "content");
     }
 }

@@ -3,6 +3,13 @@
 - **Status:** accepted
 - **Date:** 2026-05-19
 
+> **Update (v3.4.0, 2026-07):** the workspace gained a fifth crate,
+> `onebrain-search` (native vault search — tantivy BM25 · fastembed
+> embeddings · RRF hybrid). It follows the same rules this ADR set: strictly
+> downward dependencies (it depends on nothing in the workspace; only the
+> binary depends on it) and `publish = false`. The decision below stands —
+> the record keeps its original four-crate wording.
+
 ## Context
 
 A single crate would mix three concerns that change for different reasons and want different tests: pure logic (config parsing, path rules), filesystem effects (vault walks, install), and the user-facing binary (argument parsing, output, colors). Mixing them makes the pure logic slow to test (it drags in I/O) and blurs where a change belongs.

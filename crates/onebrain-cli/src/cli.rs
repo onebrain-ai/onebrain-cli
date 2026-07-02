@@ -1,5 +1,7 @@
-//! Clap subcommand tree — 3 root verbs + 24 resource groups + hidden v3.0
-//! aliases. Locked at v3.1 per [[cli/specs/01-architecture §2.4]].
+//! Clap subcommand tree — 3 root verbs + 25 resource groups + hidden v3.0
+//! aliases. Locked at v3.1 per [[cli/specs/01-architecture §2.4]]; `search`
+//! (v3.4.0) is the first post-lock addition — a new native-search command
+//! surface, not a v3.1 tree-shape change.
 //!
 //! Every group's verb list is captured as a `Subcommand` enum even when the
 //! body is `unimplemented!()` — the tree shape itself is the v3.1 deliverable
@@ -130,6 +132,8 @@ pub enum Cmd {
     Qmd(QmdCmd),
     #[command(display_order = 21)]
     Schedule(ScheduleCmd),
+    #[command(display_order = 17)]
+    Search(SearchCmd),
     /// Serve the local web UI + vault JSON API (foreground · Ctrl-C to stop).
     #[command(display_order = 14)]
     Serve(ServeArgs),
@@ -884,6 +888,167 @@ pub struct NoteMkdirArgs {
     /// Folder path, relative to the vault root. Parent directories are created
     /// as needed. Errors if the path already exists.
     pub path: PathBuf,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// search (6 verbs · v3.4.0 · native search engine, replaces external qmd)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[derive(Args, Debug)]
+#[command(
+    about = "Native vault search over `*.md` notes (hybrid query · lex · vector · reindex · …)",
+    help_template = SEARCH_HELP_TEMPLATE,
+    disable_help_subcommand = true
+)]
+pub struct SearchCmd {
+    #[command(subcommand)]
+    pub verb: SearchVerb,
+}
+
+/// `search --help` layout: the shared query-verb flags sit right below the
+/// Commands list (before Options) so they're seen next to the verbs they
+/// belong to; the `.md`-only indexing scope note closes the help.
+const SEARCH_HELP_TEMPLATE: &str = "\
+{about-with-newline}
+Only Markdown (`*.md`) files are indexed; other file types in the vault are never touched.
+
+{usage-heading} {usage}
+
+Commands:
+{subcommands}
+
+Search flags (query · search · vsearch):
+  --top-k <N>        Maximum hits to return (default 10)
+  --min-score <S>    Drop low-confidence hits (vsearch: cosine, ≈0.85+ is confident; search: BM25; query: RRF)
+
+Options:
+{options}";
+
+#[derive(Subcommand, Debug)]
+pub enum SearchVerb {
+    /// Hybrid search (lex + vector, RRF-fused).
+    Query(SearchQueryArgs),
+    /// Lexical (BM25) search only — never triggers a model download.
+    Search(SearchQueryArgs),
+    /// Semantic (vector) search only.
+    Vsearch(SearchQueryArgs),
+    /// Fetch a doc's full indexed text.
+    Get(SearchGetArgs),
+    /// Report index status (collection, embed model, cache dir, index size) —
+    /// never triggers a model download.
+    Status,
+    /// Reindex the vault's `*.md` notes (whole vault, or specific doc paths).
+    Reindex(SearchReindexArgs),
+    /// Manage the embedding model (list supported models · switch model).
+    Model(SearchModelCmd),
+}
+
+#[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
+pub struct SearchModelCmd {
+    /// Omitted (bare `search model`) → interactive picker on a TTY, or a
+    /// non-hanging informational fallback otherwise (see
+    /// `commands::search_model::run_bare`).
+    #[command(subcommand)]
+    pub verb: Option<SearchModelVerb>,
+}
+#[derive(Subcommand, Debug)]
+pub enum SearchModelVerb {
+    /// List supported embedding models with download/disk status — never
+    /// opens the engine or downloads anything.
+    List(SearchModelListArgs),
+    /// Switch the vault's embedding model, persist it to `onebrain.yml`,
+    /// and re-embed the index (downloads the new model if not cached).
+    Set(SearchModelSetArgs),
+    /// Remove a downloaded model's cached files from disk. Refuses to touch
+    /// the active model without `--force` (or a TTY confirm).
+    Remove(SearchModelRemoveArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SearchModelSetArgs {
+    /// Model name (see `search model list`).
+    pub name: String,
+}
+
+/// Column to sort `search model list` rows by.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
+pub enum ModelSortCol {
+    /// Model name (alphabetical).
+    Name,
+    /// Registry approx download size.
+    Size,
+    /// Embedding dimensionality.
+    Dim,
+    /// Thai MIRACL-th score (models without a score sort last).
+    Thai,
+    /// On-disk size of the downloaded model (not-downloaded sorts last).
+    Disk,
+    /// Download status (downloaded models first; ties break by name).
+    Downloaded,
+}
+
+#[derive(Args, Debug)]
+pub struct SearchModelListArgs {
+    /// Sort rows by a column (default: registry order).
+    #[arg(long = "sort", value_enum)]
+    pub sort: Option<ModelSortCol>,
+    /// Sort descending (only meaningful with `--sort`).
+    #[arg(long = "desc", default_value_t = false)]
+    pub desc: bool,
+}
+
+impl SearchModelListArgs {
+    /// Default list args (registry order, ascending) — used by the bare
+    /// `search model` non-TTY / structured fallback, which renders the same
+    /// static table as an explicit `search model list` with no flags.
+    pub fn bare() -> Self {
+        Self {
+            sort: None,
+            desc: false,
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct SearchModelRemoveArgs {
+    /// Model name (see `search model list`).
+    pub name: String,
+    /// Remove without confirmation, even for the active model.
+    #[arg(long = "force", default_value_t = false)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct SearchQueryArgs {
+    /// Query text.
+    pub text: String,
+    /// Maximum hits to return.
+    #[arg(long = "top-k", default_value_t = 10)]
+    pub top_k: usize,
+    /// Drop hits scoring below this value. Scales differ per verb: `vsearch`
+    /// is cosine similarity (≈0.86+ is a confident e5 match), `search` is a
+    /// raw BM25 score, `query` is an RRF-fused rank score.
+    #[arg(long = "min-score")]
+    pub min_score: Option<f64>,
+}
+
+#[derive(Args, Debug)]
+pub struct SearchGetArgs {
+    /// Doc path, relative to the vault root (as indexed).
+    pub doc_path: String,
+}
+
+#[derive(Args, Debug)]
+pub struct SearchReindexArgs {
+    /// Specific doc paths to reindex (relative to the vault root). Omit to
+    /// reindex the whole vault.
+    pub paths: Vec<String>,
+    /// Wipe the whole index first (lex + vectors + metadata; downloaded
+    /// models are kept) and rebuild from scratch — needed after changes
+    /// that invalidate stored vectors. Whole-vault only.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
