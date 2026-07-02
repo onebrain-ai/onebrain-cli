@@ -352,29 +352,51 @@ impl LexIndex {
         if top_k == 0 {
             return Ok(Vec::new());
         }
-        let terms = segment(query);
-        if terms.is_empty() {
+        // Build one subquery per QUERY UNIT. Each no-space-script run (a
+        // pseudo-word like `สุขภาพ`) becomes a nested Boolean over its own
+        // bigrams requiring ~70% of them to match — so a doc sharing only
+        // COMMON pairs with a *different* word (การ/กำลัง inside
+        // `การออกกำลังกาย`) no longer surfaces, while substring queries
+        // (`ภาพ` inside `สุขภาพ`) still work because the substring's own
+        // bigrams are all present. Spaced-script words stay plain OR terms —
+        // BM25's IDF handles those fine. The real Thai fix is dictionary
+        // word-segmentation (nlpo3, tracked follow-up).
+        let mut units: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for (start, end, is_script) in split_script_runs(query) {
+            let run = &query[start..end];
+            if is_script {
+                let grams = script_bigrams(run, start);
+                if grams.is_empty() {
+                    continue;
+                }
+                let n = grams.len();
+                let subs: Vec<(Occur, Box<dyn Query>)> = grams
+                    .into_iter()
+                    .map(|(text, _, _)| {
+                        let term = Term::from_field_text(self.body, &text);
+                        let tq: Box<dyn Query> =
+                            Box::new(TermQuery::new(term, IndexRecordOption::Basic));
+                        (Occur::Should, tq)
+                    })
+                    .collect();
+                let min = (n * 7).div_ceil(10).max(1);
+                units.push((
+                    Occur::Should,
+                    Box::new(BooleanQuery::with_minimum_required_clauses(subs, min)),
+                ));
+            } else {
+                for (text, _, _) in other_tokens(run, start) {
+                    let term = Term::from_field_text(self.body, &text);
+                    let tq: Box<dyn Query> =
+                        Box::new(TermQuery::new(term, IndexRecordOption::Basic));
+                    units.push((Occur::Should, tq));
+                }
+            }
+        }
+        if units.is_empty() {
             return Ok(Vec::new());
         }
-
-        let subqueries: Vec<(Occur, Box<dyn Query>)> = terms
-            .into_iter()
-            .map(|(text, _, _)| {
-                let term = Term::from_field_text(self.body, &text);
-                let tq: Box<dyn Query> = Box::new(TermQuery::new(term, IndexRecordOption::Basic));
-                (Occur::Should, tq)
-            })
-            .collect();
-        // Require at least a quarter of the query terms (rounded up) to
-        // match. A pure OR would surface docs sharing only COMMON bigrams
-        // with a no-space-script query — e.g. `สุขภาพ` segments to
-        // สุ|ุข|ขภ|ภา|าพ, and docs containing just `ภาพ` (image) matched.
-        // 25% keeps single-concept recall in multi-word queries (each word
-        // contributes its own bigram run) while dropping shared-pair noise.
-        // The real fix for Thai is dictionary word-segmentation (nlpo3,
-        // tracked follow-up).
-        let min_match = subqueries.len().div_ceil(4).max(1);
-        let query = BooleanQuery::with_minimum_required_clauses(subqueries, min_match);
+        let query = BooleanQuery::new(units);
 
         let reader = self.index.reader()?;
         let searcher = reader.searcher();
