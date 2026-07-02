@@ -11,9 +11,12 @@
 //! - `↑`/`↓` (or `k`/`j`) — move the selection
 //! - `s` — cycle the sort column (name → disk → dim → thai → back to name)
 //! - `r` — reverse the sort direction
-//! - `Enter` — switch the active model to the selected row (reusing the SHARED
-//!   [`search_model::apply_model_change`] path — persist AFTER a successful
-//!   rebuild, never before); no-op with a footer hint if already active
+//! - `Enter` — switch the active model to the selected row: downloads the
+//!   model IMMEDIATELY if missing (an in-table progress bar with % replaces
+//!   the row's NOTE while the `models--*` dir fills), then re-embeds via the
+//!   SHARED [`search_model::apply_model_change`] path (persist AFTER a
+//!   successful rebuild, never before); no-op with a footer hint if already
+//!   active
 //! - `d` — delete the selected model's on-disk download, with an inline y/n
 //!   confirm row; refuses to delete the ACTIVE model (footer warning)
 //! - `q` / `Esc` — quit
@@ -37,7 +40,7 @@ use crate::cli::ModelSortCol;
 use crate::commands::search_common::{collection_cache_dir, collection_for};
 use crate::commands::search_model::{apply_model_change, cmp_option_last, format_size};
 use onebrain_core::load_vault_config;
-use onebrain_search::embed::{model_download_status, model_registry};
+use onebrain_search::embed::{dir_size_bytes, model_download_status, model_registry};
 
 /// One row in the interactive model table — a flattened, self-contained view
 /// of a registry entry plus its on-disk download status, carrying everything
@@ -155,6 +158,44 @@ pub struct AppState {
     /// The collection's model cache dir — kept so a successful switch can
     /// re-scan download status (DOWNLOADED/DISK go stale otherwise).
     pub cache_dir: PathBuf,
+    /// Set while an Enter-triggered download is running: the row named here
+    /// renders an in-table progress bar instead of its NOTE text.
+    pub downloading: Option<DownloadUi>,
+}
+
+/// In-table download progress for one model: the row to decorate, the
+/// expected total (registry `approx_bytes`), and the last polled percentage.
+/// The event loop refreshes `pct` from a disk scan each tick; render is pure.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DownloadUi {
+    pub name: &'static str,
+    pub expected_bytes: u64,
+    /// The model's `models--*` dir being polled.
+    pub model_dir: PathBuf,
+    /// Last computed progress percentage (0–99 while running).
+    pub pct: u8,
+    /// Last polled on-disk byte count (for the footer's "X / ~Y" line).
+    pub bytes: u64,
+}
+
+/// Download percentage from polled `current` bytes vs the registry's
+/// `expected` total, capped at 99 — only a finished download reads 100%
+/// (the estimate is approximate, so the bar must never claim done early).
+pub fn download_pct(current: u64, expected: u64) -> u8 {
+    if expected == 0 {
+        return 0;
+    }
+    ((current.saturating_mul(100) / expected).min(99)) as u8
+}
+
+/// A fixed-width text progress bar like `▓▓▓▓▓░░░░░░░  42%`.
+pub fn progress_bar(pct: u8, width: usize) -> String {
+    let filled = (pct as usize * width) / 100;
+    let mut bar = String::with_capacity(width + 6);
+    for i in 0..width {
+        bar.push(if i < filled { '▓' } else { '░' });
+    }
+    format!("{bar} {pct:>3}%")
 }
 
 impl AppState {
@@ -171,6 +212,7 @@ impl AppState {
             pending_delete: None,
             should_quit: false,
             cache_dir,
+            downloading: None,
         }
     }
 
@@ -377,15 +419,32 @@ fn event_loop<B: ratatui::backend::Backend>(
     }
 }
 
-/// Enter-key handler: switch the active model to the selected row via the
-/// SHARED `apply_model_change` path (open-old → rebuild → persist ordering
-/// preserved), showing a "switching…" status while the rebuild runs. No-op
-/// with a footer hint if the row is already active.
+/// Messages from the background switch worker back to the UI loop.
+enum SwitchMsg {
+    /// The model files are on disk (either they already were, or the forced
+    /// download just finished); the re-embed phase is starting.
+    DownloadDone,
+    /// The whole switch finished (config persisted on success).
+    Finished(anyhow::Result<crate::output::Envelope<crate::commands::search_model::ModelSetData>>),
+}
+
+/// Enter-key handler: switch the active model to the selected row. The
+/// download (forced via [`onebrain_search::embed::new_quiet`], so even an
+/// empty index downloads immediately) and the re-embed both run on a worker
+/// thread; this loop keeps drawing, polling the model dir's on-disk size into
+/// an in-table progress bar with % until the worker reports back. Keys are
+/// swallowed while the switch runs. The switch itself is the SHARED
+/// [`apply_model_change`] path (open-old → rebuild → persist ordering
+/// preserved). No-op with a footer hint if the row is already active.
 fn perform_switch<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     state: &mut AppState,
     resolved: &onebrain_core::ResolvedVault,
 ) {
+    use ratatui::crossterm::event::{self, Event};
+    use std::sync::mpsc::TryRecvError;
+    use std::time::Duration;
+
     let Some(row) = state.selected_row() else {
         return;
     };
@@ -394,22 +453,96 @@ fn perform_switch<B: ratatui::backend::Backend>(
         return;
     }
     let name = row.name;
+    let needs_download = !row.downloaded;
+    let model_dir = row.path.clone();
+    let expected = model_registry()
+        .iter()
+        .find(|m| m.name == name)
+        .map(|m| m.approx_bytes)
+        .unwrap_or(0);
 
-    // Surface a rebuild-in-progress line before the (potentially long,
-    // download+re-embed) apply call blocks the loop.
-    state.status = Some(format!("⏳ switching to {name} — re-embedding…"));
-    let _ = terminal.draw(|f| render(f, state));
-
-    match apply_model_change(resolved.clone(), name) {
-        Ok(envelope) => {
-            // Re-scan download status (a rebuild over a non-empty index just
-            // downloaded the new model) and reflect the new active model.
-            state.refresh_after_switch(name);
-            let chunks = envelope.data.and_then(|d| d.chunks_reembedded);
-            state.status = Some(switch_status(name, chunks));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker_resolved = resolved.clone();
+    let worker_cache = state.cache_dir.clone();
+    std::thread::spawn(move || {
+        if needs_download {
+            // Force the download up front (quiet: no stdout bar — we're in
+            // raw mode). With the cache warm, apply's own embedder init is a
+            // no-op download-wise.
+            if let Err(e) = onebrain_search::embed::new_quiet(name, &worker_cache) {
+                let _ = tx.send(SwitchMsg::Finished(Err(e)));
+                return;
+            }
         }
-        Err(e) => {
-            state.status = Some(format!("⚠️  switch failed: {e}"));
+        let _ = tx.send(SwitchMsg::DownloadDone);
+        let _ = tx.send(SwitchMsg::Finished(apply_model_change(
+            worker_resolved,
+            name,
+        )));
+    });
+
+    if needs_download {
+        state.downloading = Some(DownloadUi {
+            name,
+            expected_bytes: expected,
+            model_dir,
+            pct: 0,
+            bytes: 0,
+        });
+        state.status = Some(format!("⏬ downloading {name}…"));
+    } else {
+        state.status = Some(format!("🧠 re-embedding with {name}…"));
+    }
+
+    // Nested UI loop while the worker runs: poll disk → redraw → drain keys.
+    loop {
+        if let Some(dl) = state.downloading.as_mut() {
+            dl.bytes = dir_size_bytes(&dl.model_dir);
+            dl.pct = download_pct(dl.bytes, dl.expected_bytes);
+            state.status = Some(format!(
+                "⏬ downloading {name} · {} / {} ({}%)",
+                format_size(dl.bytes),
+                format_size(dl.expected_bytes),
+                dl.pct
+            ));
+        }
+        let _ = terminal.draw(|f| render(f, state));
+
+        // Swallow input while busy (no cancel mid-switch — config only
+        // persists after a successful rebuild, so killing the worker would
+        // at worst leave a partial cache, but half-handled keys are worse).
+        if event::poll(Duration::from_millis(150)).unwrap_or(false) {
+            let _ = event::read();
+        }
+
+        match rx.try_recv() {
+            Ok(SwitchMsg::DownloadDone) => {
+                if state.downloading.take().is_some() {
+                    state.status = Some(format!("✅ downloaded · 🧠 re-embedding with {name}…"));
+                }
+            }
+            Ok(SwitchMsg::Finished(result)) => {
+                state.downloading = None;
+                match result {
+                    Ok(envelope) => {
+                        // Re-scan download status and reflect the new active
+                        // model in the table.
+                        state.refresh_after_switch(name);
+                        let chunks = envelope.data.and_then(|d| d.chunks_reembedded);
+                        state.status = Some(switch_status(name, chunks));
+                    }
+                    Err(e) => {
+                        state.status = Some(format!("⚠️  switch failed: {e}"));
+                    }
+                }
+                return;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                state.downloading = None;
+                state.status = Some("⚠️  switch worker exited unexpectedly".to_string());
+                return;
+            }
         }
     }
 }
@@ -484,16 +617,32 @@ fn render(f: &mut ratatui::Frame, state: &AppState) {
         .iter()
         .enumerate()
         .map(|(i, r)| {
+            let dl = state.downloading.as_ref().filter(|d| d.name == r.name);
             let marker = if r.current { "●" } else { "" };
-            let downloaded = if r.downloaded { "✓" } else { "⬜" };
-            let disk = r
-                .disk_bytes
-                .map(format_size)
-                .unwrap_or_else(|| "—".to_string());
+            let downloaded = if dl.is_some() {
+                "⏬"
+            } else if r.downloaded {
+                "✓"
+            } else {
+                "⬜"
+            };
+            let disk = match dl {
+                // Live: the dir is filling up — show it growing.
+                Some(d) => format_size(d.bytes),
+                None => r
+                    .disk_bytes
+                    .map(format_size)
+                    .unwrap_or_else(|| "—".to_string()),
+            };
             let thai = r
                 .thai
                 .map(|v| format!("{v:.1}"))
                 .unwrap_or_else(|| "—".to_string());
+            // While this row downloads, its NOTE column becomes the bar.
+            let note = match dl {
+                Some(d) => progress_bar(d.pct, 14),
+                None => r.note.to_string(),
+            };
             let style = if i == state.selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
@@ -506,7 +655,7 @@ fn render(f: &mut ratatui::Frame, state: &AppState) {
                 Cell::from(disk),
                 Cell::from(r.dims.to_string()),
                 Cell::from(thai),
-                Cell::from(r.note),
+                Cell::from(note),
             ])
             .style(style)
         })
@@ -649,6 +798,37 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort_unstable();
         assert_eq!(names, sorted);
+    }
+
+    #[test]
+    fn download_pct_caps_at_99_and_handles_zero_expected() {
+        assert_eq!(download_pct(0, 1000), 0);
+        assert_eq!(download_pct(420, 1000), 42);
+        assert_eq!(download_pct(1000, 1000), 99, "capped until actually done");
+        assert_eq!(download_pct(5000, 1000), 99, "overshoot stays capped");
+        assert_eq!(download_pct(123, 0), 0, "zero expected → 0, no div-by-zero");
+        // No overflow on huge byte counts (saturating mul).
+        assert_eq!(download_pct(u64::MAX, u64::MAX), 99);
+    }
+
+    #[test]
+    fn progress_bar_fills_by_pct_and_shows_percent() {
+        let b = progress_bar(0, 10);
+        assert!(b.starts_with("░░░░░░░░░░"), "{b}");
+        assert!(b.ends_with("  0%"), "{b}");
+        let b = progress_bar(50, 10);
+        assert!(b.starts_with("▓▓▓▓▓░░░░░"), "{b}");
+        assert!(b.contains("50%"), "{b}");
+        let b = progress_bar(99, 10);
+        assert!(b.starts_with("▓▓▓▓▓▓▓▓▓░"), "{b}");
+        assert!(b.contains("99%"), "{b}");
+    }
+
+    #[test]
+    fn registry_has_positive_approx_bytes_for_every_model() {
+        for m in model_registry() {
+            assert!(m.approx_bytes > 0, "{} needs approx_bytes", m.name);
+        }
     }
 
     #[test]

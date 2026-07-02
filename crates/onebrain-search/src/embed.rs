@@ -49,6 +49,11 @@ pub struct ModelInfo {
     pub dims: usize,
     /// Approximate on-disk download size, human-readable.
     pub approx_size: &'static str,
+    /// Approximate download size in bytes — the denominator for download
+    /// progress (%) while the model dir fills up. Rough by design (matches
+    /// `approx_size`); progress is capped below 100 until the download
+    /// actually finishes.
+    pub approx_bytes: u64,
     /// Max input context length, in tokens.
     pub context: usize,
     /// Thai MIRACL-th nDCG@10, if verified for this model.
@@ -108,8 +113,9 @@ pub fn model_download_status(info: &ModelInfo, cache_dir: &Path) -> ModelDownloa
 
 /// Recursively sum the byte sizes of every regular file under `root`
 /// (hand-rolled stack walk — no new crate dep). Unreadable dirs/files are
-/// skipped. Symlinks are not followed.
-fn dir_size_bytes(root: &Path) -> u64 {
+/// skipped, a missing `root` totals 0. Symlinks are not followed. Public so
+/// the CLI's TUI can poll a model dir's growth for download progress.
+pub fn dir_size_bytes(root: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -142,6 +148,7 @@ pub fn model_registry() -> &'static [ModelInfo] {
             name: "multilingual-e5-small",
             dims: 384,
             approx_size: "~470 MB",
+            approx_bytes: 470_000_000,
             context: 512,
             thai_miracl: Some(75.0),
             note: "default · small + fast",
@@ -151,6 +158,7 @@ pub fn model_registry() -> &'static [ModelInfo] {
             name: "multilingual-e5-base",
             dims: 768,
             approx_size: "~1.1 GB",
+            approx_bytes: 1_100_000_000,
             context: 512,
             thai_miracl: Some(75.2),
             note: "larger · better recall",
@@ -160,6 +168,7 @@ pub fn model_registry() -> &'static [ModelInfo] {
             name: "multilingual-e5-large",
             dims: 1024,
             approx_size: "~2.1 GB",
+            approx_bytes: 2_100_000_000,
             context: 512,
             thai_miracl: Some(80.2),
             note: "high accuracy",
@@ -169,6 +178,7 @@ pub fn model_registry() -> &'static [ModelInfo] {
             name: "bge-m3",
             dims: 1024,
             approx_size: "~2.2 GB",
+            approx_bytes: 2_200_000_000,
             context: 8192,
             thai_miracl: Some(82.6),
             note: "best Thai/accuracy · fp32",
@@ -178,6 +188,7 @@ pub fn model_registry() -> &'static [ModelInfo] {
             name: "embeddinggemma-300m-q",
             dims: 768,
             approx_size: "~180 MB",
+            approx_bytes: 180_000_000,
             context: 2048,
             thai_miracl: None,
             note: "smallest · Thai unverified",
@@ -227,14 +238,26 @@ fn resolve_model(model_name: &str) -> Result<EmbeddingModel> {
 }
 
 /// Load a `fastembed` text embedding model, caching downloaded model files
-/// under `cache_dir`.
+/// under `cache_dir`. Prints fastembed's own download progress bar to stdout
+/// on a first-time download.
 pub fn new(model_name: &str, cache_dir: &Path) -> Result<Embedder> {
+    new_with_progress(model_name, cache_dir, true)
+}
+
+/// Same as [`new`] but SILENT: fastembed's stdout download bar is disabled.
+/// Used by the interactive model TUI, which runs the terminal in raw mode and
+/// draws its own in-table progress — a stray stdout print would corrupt it.
+pub fn new_quiet(model_name: &str, cache_dir: &Path) -> Result<Embedder> {
+    new_with_progress(model_name, cache_dir, false)
+}
+
+fn new_with_progress(model_name: &str, cache_dir: &Path, show_progress: bool) -> Result<Embedder> {
     let model = resolve_model(model_name)?;
     let dims = model_dims(model_name);
 
     let init = InitOptions::new(model)
         .with_cache_dir(cache_dir.to_path_buf())
-        .with_show_download_progress(true);
+        .with_show_download_progress(show_progress);
     let embedding = TextEmbedding::try_new(init)?;
 
     Ok(Embedder {

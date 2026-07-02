@@ -963,6 +963,8 @@ pub enum ModelSortCol {
     Thai,
     /// On-disk size of the downloaded model (not-downloaded sorts last).
     Disk,
+    /// Download status (downloaded models first; ties break by name).
+    Downloaded,
 }
 
 #[derive(Args, Debug)]
