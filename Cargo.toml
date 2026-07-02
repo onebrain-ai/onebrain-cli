@@ -135,6 +135,9 @@ inquire   = "0.7"
 # add a separate crossterm dep — the raw-mode terminal setup uses that
 # re-export to keep the crossterm version in lockstep with ratatui's backend.
 ratatui   = "0.29"
+# Display-width math for the static `search model list` box (✓ ● — cells)
+# — already in the graph via ratatui, so this adds no new crate.
+unicode-width = "0.2"
 
 # Slice 13 — vault-sync (tarball extraction + progress UI + url encoding)
 tar         = "0.4"

@@ -225,14 +225,34 @@ pub fn model_registry() -> &'static [ModelInfo] {
             passage_prefix: "",
             hf_repo: "BAAI/bge-m3",
         },
+        // NOTE: the two embeddinggemma variants share one HF repo (and thus
+        // one `models--onnx-community--embeddinggemma-300m-ONNX` cache dir) —
+        // `model_download_status` can't tell them apart, so their
+        // downloaded/disk stats conflate: downloading either marks both as
+        // downloaded, and the reported disk size is the dir total.
         ModelInfo {
             name: "embeddinggemma-300m-q",
             dims: 768,
-            approx_size: "~180 MB",
-            approx_bytes: 180_000_000,
+            // Real download: model_quantized.onnx_data = 308.9 MB.
+            approx_size: "~310 MB",
+            approx_bytes: 310_000_000,
             context: 2048,
             thai_miracl: None,
-            note: "smallest · Thai unverified",
+            note: "small · int8 · Thai unverified",
+            vec_floor: None,
+            query_prefix: "task: search result | query: ",
+            passage_prefix: "title: none | text: ",
+            hf_repo: "onnx-community/embeddinggemma-300m-ONNX",
+        },
+        ModelInfo {
+            name: "embeddinggemma-300m-q4",
+            dims: 768,
+            // Real download: model_q4.onnx_data = 196.7 MB.
+            approx_size: "~200 MB",
+            approx_bytes: 200_000_000,
+            context: 2048,
+            thai_miracl: None,
+            note: "smallest · 4-bit · Thai unverified",
             vec_floor: None,
             query_prefix: "task: search result | query: ",
             passage_prefix: "title: none | text: ",
@@ -266,6 +286,7 @@ fn resolve_model(model_name: &str) -> Result<EmbeddingModel> {
         "multilingual-e5-base" => Ok(EmbeddingModel::MultilingualE5Base),
         "multilingual-e5-small" => Ok(EmbeddingModel::MultilingualE5Small),
         "embeddinggemma-300m-q" => Ok(EmbeddingModel::EmbeddingGemma300MQ),
+        "embeddinggemma-300m-q4" => Ok(EmbeddingModel::EmbeddingGemma300MQ4),
         other if is_supported_model(other) => bail!(
             "'{other}' is listed in the model registry but has no fastembed \
              mapping yet — this is a bug, please report it"
@@ -406,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_exactly_five_seeded_models() {
+    fn registry_has_exactly_six_seeded_models() {
         let names: Vec<&str> = model_registry().iter().map(|m| m.name).collect();
         assert_eq!(
             names,
@@ -416,8 +437,24 @@ mod tests {
                 "multilingual-e5-large",
                 "bge-m3",
                 "embeddinggemma-300m-q",
+                "embeddinggemma-300m-q4",
             ]
         );
+    }
+
+    #[test]
+    fn gemma_variants_share_one_hf_repo_and_cache_dir() {
+        // Both quantizations download from the same repo, so their
+        // downloaded/disk stats conflate (documented on the registry entries).
+        let q = info("embeddinggemma-300m-q");
+        let q4 = info("embeddinggemma-300m-q4");
+        assert_eq!(q.hf_repo, q4.hf_repo);
+        assert_eq!(q.cache_dir_name(), q4.cache_dir_name());
+        // Same instruction prefixes across the family.
+        assert_eq!(q.query_prefix, q4.query_prefix);
+        assert_eq!(q.passage_prefix, q4.passage_prefix);
+        // q4 is the smaller download.
+        assert!(q4.approx_bytes < q.approx_bytes);
     }
 
     #[test]

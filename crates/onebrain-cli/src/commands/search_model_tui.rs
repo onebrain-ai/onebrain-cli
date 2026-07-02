@@ -933,10 +933,13 @@ mod tests {
         for desc in [false, true] {
             let mut rows = rows_for("bge-m3");
             sort_rows(&mut rows, ModelSortCol::Thai, desc);
+            // Both None-thai gemma variants sort after every scored model, in
+            // both directions (stable sort keeps their registry order).
+            let last_two: Vec<&str> = rows.iter().rev().take(2).map(|r| r.name).collect();
             assert_eq!(
-                rows.last().unwrap().name,
-                "embeddinggemma-300m-q",
-                "None-thai model sorts last (desc={desc})"
+                last_two,
+                vec!["embeddinggemma-300m-q4", "embeddinggemma-300m-q"],
+                "None-thai models sort last (desc={desc})"
             );
         }
     }
@@ -948,8 +951,8 @@ mod tests {
         sort_rows(&mut rows, ModelSortCol::Disk, false);
         assert_eq!(
             rows.first().unwrap().name,
-            "embeddinggemma-300m-q",
-            "~180 MB first ascending"
+            "embeddinggemma-300m-q4",
+            "~200 MB first ascending"
         );
         assert_eq!(rows.last().unwrap().name, "bge-m3", "~2.2 GB last asc");
         sort_rows(&mut rows, ModelSortCol::Disk, true);
@@ -959,15 +962,17 @@ mod tests {
     #[test]
     fn sort_rows_disk_mixes_real_and_approx_sizes() {
         let cache = tempfile::tempdir().unwrap();
-        // Give e5-small a REAL on-disk size bigger than gemma's approx but
-        // smaller than everything else.
+        // Give e5-small a REAL on-disk size bigger than gemma-q4's approx but
+        // smaller than everything else. (NB: writing into e5-small's own
+        // cache dir — the gemma pair share one dir, so faking THEIR size
+        // would flip both.)
         let info = model_registry()
             .iter()
             .find(|m| m.name == "multilingual-e5-small")
             .unwrap();
         let mdir = cache.path().join(info.cache_dir_name());
         std::fs::create_dir_all(&mdir).unwrap();
-        std::fs::write(mdir.join("model.onnx"), vec![0u8; 200 * 1024 * 1024]).unwrap();
+        std::fs::write(mdir.join("model.onnx"), vec![0u8; 250 * 1024 * 1024]).unwrap();
 
         let mut rows = build_rows("bge-m3", cache.path());
         sort_rows(&mut rows, ModelSortCol::Disk, false);
@@ -975,11 +980,12 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "embeddinggemma-300m-q", // ~180 MB approx
-                "multilingual-e5-small", // 200 MB real
-                "multilingual-e5-base",  // ~1.1 GB approx
-                "multilingual-e5-large", // ~2.1 GB approx
-                "bge-m3",                // ~2.2 GB approx
+                "embeddinggemma-300m-q4", // ~200 MB approx
+                "multilingual-e5-small",  // 250 MB real
+                "embeddinggemma-300m-q",  // ~310 MB approx
+                "multilingual-e5-base",   // ~1.1 GB approx
+                "multilingual-e5-large",  // ~2.1 GB approx
+                "bge-m3",                 // ~2.2 GB approx
             ]
         );
     }

@@ -247,7 +247,7 @@ fn search_model_list_json_reports_all_models_with_current_marked() {
     assert_eq!(v["command"], "search.model.list");
     assert_eq!(v["ok"], true);
     let models = v["data"]["models"].as_array().unwrap();
-    assert_eq!(models.len(), 5);
+    assert_eq!(models.len(), 6);
 
     let names: Vec<&str> = models.iter().map(|m| m["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"multilingual-e5-small"));
@@ -255,6 +255,7 @@ fn search_model_list_json_reports_all_models_with_current_marked() {
     assert!(names.contains(&"multilingual-e5-large"));
     assert!(names.contains(&"bge-m3"));
     assert!(names.contains(&"embeddinggemma-300m-q"));
+    assert!(names.contains(&"embeddinggemma-300m-q4"));
 
     let current: Vec<&str> = models
         .iter()
@@ -368,6 +369,7 @@ fn search_model_bare_non_tty_falls_back_to_static_list_without_prompting() {
     assert!(names.contains(&"multilingual-e5-large"));
     assert!(names.contains(&"bge-m3"));
     assert!(names.contains(&"embeddinggemma-300m-q"));
+    assert!(names.contains(&"embeddinggemma-300m-q4"));
     // The active model is flagged current.
     let bge = models.iter().find(|m| m["name"] == "bge-m3").unwrap();
     assert_eq!(bge["current"], true);

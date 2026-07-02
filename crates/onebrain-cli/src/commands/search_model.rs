@@ -208,7 +208,18 @@ pub(crate) fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Pad `s` with trailing spaces to `w` DISPLAY columns (not chars/bytes) —
+/// `unicode-width` keeps the box's right border flush even with the ✓ ● —
+/// cells and `·` note separators.
+fn pad_display(s: &str, w: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let vis = s.width();
+    format!("{s}{}", " ".repeat(w.saturating_sub(vis)))
+}
+
 fn render_list_text(env: &Envelope<ModelListData>) -> String {
+    use unicode_width::UnicodeWidthStr;
+
     let d = env.data.as_ref().expect("ok envelope always has data");
     // Fixed-width columns: marker · MODEL · DOWNLOADED · DISK · DIM · THAI ·
     // NOTE. The marker column is `●` for the active model, blank otherwise.
@@ -219,14 +230,29 @@ fn render_list_text(env: &Envelope<ModelListData>) -> String {
     const DIM: usize = 6;
     const THAI: usize = 6;
 
-    let header = format!(
-        "{:<MARKER$}{:<NAME$}{:<DL$}{:<DISK$}{:<DIM$}{:<THAI$}{}",
-        "", "MODEL", "DOWNLOADED", "DISK", "DIM", "THAI", "NOTE"
-    );
-    // Light underline header (hand-rolled, no deps).
-    let underline = "─".repeat(header.chars().count());
+    let row =
+        |marker: &str, name: &str, dl: &str, disk: &str, dim: &str, thai: &str, note: &str| {
+            format!(
+                "{}{}{}{}{}{}{}",
+                pad_display(marker, MARKER),
+                pad_display(name, NAME),
+                pad_display(dl, DL),
+                pad_display(disk, DISK),
+                pad_display(dim, DIM),
+                pad_display(thai, THAI),
+                note
+            )
+        };
 
-    let mut lines = vec![header, underline];
+    let mut content = vec![row(
+        "",
+        "MODEL",
+        "DOWNLOADED",
+        "DISK",
+        "DIM",
+        "THAI",
+        "NOTE",
+    )];
     for m in &d.models {
         let marker = if m.current { "●" } else { "" };
         // Plain "—" for not-downloaded: ⬜ renders as a huge white block in
@@ -237,11 +263,40 @@ fn render_list_text(env: &Envelope<ModelListData>) -> String {
             .thai_miracl
             .map(|v| format!("{v:.1}"))
             .unwrap_or_else(|| "—".to_string());
-        lines.push(format!(
-            "{:<MARKER$}{:<NAME$}{:<DL$}{:<DISK$}{:<DIM$}{:<THAI$}{}",
-            marker, m.name, downloaded, disk, m.dims, thai, m.note
+        content.push(row(
+            marker,
+            m.name,
+            downloaded,
+            &disk,
+            &m.dims.to_string(),
+            &thai,
+            m.note,
         ));
     }
+
+    // Wrap the table in a plain single-line box with the title embedded in
+    // the top border — same look as the interactive TUI's ratatui block
+    // (`┌ Embedding Model Selection ────┐` … `└────┘`). Width fits the
+    // widest row (not the terminal); every content line gets one space of
+    // breathing room inside each border.
+    const TITLE: &str = " Embedding Model Selection ";
+    let inner = content
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(0)
+        .max(TITLE.width());
+    // Padded content width between the two `│` (1-space pad each side).
+    let boxed = inner + 2;
+    let mut lines = Vec::with_capacity(content.len() + 3);
+    lines.push(format!(
+        "┌{TITLE}{}┐",
+        "─".repeat(boxed.saturating_sub(TITLE.width()))
+    ));
+    for l in &content {
+        lines.push(format!("│ {} │", pad_display(l, inner)));
+    }
+    lines.push(format!("└{}┘", "─".repeat(boxed)));
     lines.push(format!("📁  Cache dir: {}", d.cache_dir.display()));
     lines.join("\n")
 }
@@ -620,7 +675,7 @@ mod tests {
             .find(|l| l.contains("bge-m3"))
             .expect("bge-m3 row present");
         assert!(
-            marked_line.trim_start().starts_with('●'),
+            marked_line.starts_with("│ ●"),
             "expected current-model marker on: {marked_line}"
         );
     }
@@ -637,7 +692,7 @@ mod tests {
             .find(|l| l.contains(default_name))
             .expect("default row present");
         assert!(
-            !default_line.trim_start().starts_with('●'),
+            !default_line.contains('●'),
             "non-active row should not carry the active marker: {default_line}"
         );
     }
@@ -654,6 +709,49 @@ mod tests {
         );
         for m in model_registry() {
             assert!(s.contains(m.name), "missing {} in rendered list", m.name);
+        }
+    }
+
+    #[test]
+    fn list_text_boxes_the_table_like_the_tui() {
+        use unicode_width::UnicodeWidthStr;
+        let s = render_list_text(&list_env("bge-m3"));
+        let lines: Vec<&str> = s.lines().collect();
+        // Title embedded in the plain top border, ratatui-style.
+        assert!(
+            lines[0].starts_with("┌ Embedding Model Selection ─"),
+            "top border with title: {}",
+            lines[0]
+        );
+        assert!(lines[0].ends_with('┐'), "top-right corner: {}", lines[0]);
+        // Bottom border closes the box; the Cache dir footer stays OUTSIDE.
+        let bottom = lines[lines.len() - 2];
+        assert!(
+            bottom.starts_with('└') && bottom.ends_with('┘'),
+            "bottom border: {bottom}"
+        );
+        assert!(
+            bottom.chars().filter(|c| *c == '─').count() > 0,
+            "bottom rule dashes: {bottom}"
+        );
+        assert!(
+            lines.last().unwrap().starts_with("📁  Cache dir:"),
+            "footer outside the box: {:?}",
+            lines.last()
+        );
+        // Every box line — borders and │-wrapped rows — has the same display
+        // width, so the right border stays flush despite ✓ ● — cells.
+        let widths: Vec<usize> = lines[..lines.len() - 1].iter().map(|l| l.width()).collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "box lines must share one display width: {widths:?}\n{s}"
+        );
+        // Content rows are │-wrapped.
+        for l in &lines[1..lines.len() - 2] {
+            assert!(
+                l.starts_with('│') && l.ends_with('│'),
+                "row not │-wrapped: {l}"
+            );
         }
     }
 
@@ -738,11 +836,13 @@ mod tests {
                 .map(|m| ModelListEntry::from_info(m, "bge-m3", Path::new("/nope")))
                 .collect();
             sort_rows(&mut rows, ModelSortCol::Thai, desc);
-            // embeddinggemma has thai_miracl == None → must be last.
+            // Both embeddinggemma variants have thai_miracl == None → they
+            // must sort last (stable sort keeps their registry order).
+            let last_two: Vec<&str> = rows.iter().rev().take(2).map(|r| r.name).collect();
             assert_eq!(
-                rows.last().unwrap().name,
-                "embeddinggemma-300m-q",
-                "None-thai model should sort last (desc={desc})"
+                last_two,
+                vec!["embeddinggemma-300m-q4", "embeddinggemma-300m-q"],
+                "None-thai models should sort last (desc={desc})"
             );
         }
     }
@@ -759,11 +859,11 @@ mod tests {
         assert_eq!(rows.first().unwrap().name, "bge-m3", "~2.2 GB first desc");
         assert_eq!(
             rows.last().unwrap().name,
-            "embeddinggemma-300m-q",
-            "~180 MB last desc"
+            "embeddinggemma-300m-q4",
+            "~200 MB last desc"
         );
         sort_rows(&mut rows, ModelSortCol::Disk, false);
-        assert_eq!(rows.first().unwrap().name, "embeddinggemma-300m-q");
+        assert_eq!(rows.first().unwrap().name, "embeddinggemma-300m-q4");
     }
 
     #[test]
@@ -773,8 +873,8 @@ mod tests {
             .map(|m| ModelListEntry::from_info(m, "bge-m3", Path::new("/nope")))
             .collect();
         sort_rows(&mut rows, ModelSortCol::Size, false);
-        // Smallest approx size first: embeddinggemma (~180 MB).
-        assert_eq!(rows.first().unwrap().name, "embeddinggemma-300m-q");
+        // Smallest approx size first: embeddinggemma q4 (~200 MB).
+        assert_eq!(rows.first().unwrap().name, "embeddinggemma-300m-q4");
     }
 
     #[test]
