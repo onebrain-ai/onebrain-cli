@@ -679,6 +679,15 @@ mod tests {
         // Unit vectors dotted with themselves = 1.0.
         let u = norm(&[1.0, 2.0, 2.0]);
         assert!((dot_scalar(&u, &u) - 1.0).abs() < 1e-6);
+        // f64-accumulation guard at embedding width (384 dims): first product
+        // is 1e8, the remaining 383 are 1.0 each. Every value and partial sum
+        // is exactly representable in f64, so the result must be EXACT — while
+        // a naive f32 accumulator silently absorbs the +1.0s (f32 spacing at
+        // 1e8 is 8.0) and returns 1e8. This is the regression this test exists
+        // to catch.
+        let mut a = vec![1.0f32; 384];
+        a[0] = 1.0e4;
+        assert_eq!(dot_scalar(&a, &a), 100_000_383.0);
     }
 
     /// On hosts where simsimd is a dependency (everything except windows-arm64),
@@ -687,11 +696,25 @@ mod tests {
     #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
     #[test]
     fn dot_scalar_matches_simsimd() {
-        let cases: [(&[f32], &[f32]); 4] = [
+        // Realistic embedding width: two 384-dim unit vectors (e5-small dims).
+        // Unit-norm dots live in [-1, 1], where the 1e-5 tolerance is a
+        // meaningful ~1e-3% relative bound at production scale.
+        let big_a = norm(
+            &(0..384)
+                .map(|i| ((i as f32) * 0.37).sin())
+                .collect::<Vec<_>>(),
+        );
+        let big_b = norm(
+            &(0..384)
+                .map(|i| ((i as f32) * 0.61).cos())
+                .collect::<Vec<_>>(),
+        );
+        let cases: [(&[f32], &[f32]); 5] = [
             (&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]),
             (&[0.5, -0.25, 0.75, 1.5], &[-1.0, 2.0, 0.0, 0.5]),
             (&[0.1, 0.2, 0.3, 0.4, 0.5], &[0.5, 0.4, 0.3, 0.2, 0.1]),
             (&[-3.0, -2.0, -1.0], &[1.0, 2.0, 3.0]),
+            (&big_a, &big_b),
         ];
         for (a, b) in cases {
             let scalar = dot_scalar(a, b);
