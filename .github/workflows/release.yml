@@ -12,26 +12,43 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Build the web UI once and share it to every platform's binary build, which
-  # embeds it via rust-embed (see server/static.rs `WebAssets`). This runs on
-  # EVERY release tag, so a release always bundles the LATEST webui main — there's
-  # no manual embed step to forget. onebrain-webui is public → no token needed.
+  # Fetch the PREBUILT web UI dist and share it to every platform's binary
+  # build, which embeds it via rust-embed (see server/static.rs `WebAssets`).
+  # The dist is built exactly once, by onebrain-webui's own release workflow
+  # (every merged version lands as a GH Release tarball + sha256); this job
+  # downloads the release pinned in crates/onebrain-cli/Cargo.toml under
+  # `[package.metadata.webui]` and verifies its sha256 against that pin —
+  # reproducible (re-running an old tag embeds the same webui) and minutes
+  # faster than rebuilding from source. Bump the pin to ship a newer webui.
   webui:
-    name: Build web UI
+    name: Fetch prebuilt web UI
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # download-only job — override the workflow-wide write
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v6
-        with:
-          repository: onebrain-ai/onebrain-webui
-          ref: main
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-      - name: Drop source maps (not served at runtime — saves ~33 MB)
-        run: find dist -name '*.map' -delete
+      - name: download pinned dist release + verify sha256
+        run: |
+          set -euo pipefail
+          # Pin lives in the consuming crate's manifest: [package.metadata.webui]
+          # with `version = "vX.Y.Z"` and `sha256 = "<64 hex>"`.
+          MANIFEST="crates/onebrain-cli/Cargo.toml"
+          PIN_V="$(awk -F'"' '/^\[package\.metadata\.webui\]/{f=1;next} /^\[/{f=0} f && $1 ~ /^version[ \t]*=[ \t]*$/ {print $2; exit}' "$MANIFEST")"
+          PIN_SHA="$(awk -F'"' '/^\[package\.metadata\.webui\]/{f=1;next} /^\[/{f=0} f && $1 ~ /^sha256[ \t]*=[ \t]*$/ {print $2; exit}' "$MANIFEST")"
+          if ! printf '%s' "$PIN_V" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+            echo "webui pin (Cargo.toml metadata) has a suspicious version: $PIN_V" >&2; exit 1
+          fi
+          if ! printf '%s' "$PIN_SHA" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "webui pin (Cargo.toml metadata) has a malformed sha256: $PIN_SHA" >&2; exit 1
+          fi
+          ART="onebrain-webui-${PIN_V}-dist.tar.gz"
+          gh release download "$PIN_V" --repo onebrain-ai/onebrain-webui --pattern "$ART"
+          echo "$PIN_SHA  $ART" | sha256sum -c -
+          mkdir dist
+          tar -xzf "$ART" -C dist
+          echo "Embedding webui $PIN_V ($(du -sh dist | cut -f1))"
       - uses: actions/upload-artifact@v7
         with:
           name: webui-dist

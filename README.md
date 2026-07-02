@@ -11,7 +11,7 @@
 <p align="center"><em>Your AI Thinking Partner</em></p>
 
 <p align="center">
-  <strong>The local-first Rust CLI that powers the OneBrain personal AI OS for Obsidian.</strong><br>
+  <strong>The local-first Rust CLI that powers the OneBrain personal AI OS.</strong><br>
   <sub>Vault scaffolding · plugin sync · scheduled skills · diagnostics · self-update — across Claude Code and Gemini CLI.</sub>
 </p>
 
@@ -31,7 +31,7 @@
 
 ## What is OneBrain CLI?
 
-**`onebrain`** is the local-first Rust binary at the heart of [OneBrain](https://onebrain.run) — a personal AI operating system that lives in your Obsidian vault. It scaffolds new vaults, syncs the OneBrain plugin from GitHub, wires AI-harness hooks, runs scheduled skills through the OS scheduler, diagnoses vault health, and updates itself.
+**`onebrain`** is the local-first Rust binary at the heart of [OneBrain](https://onebrain.run) — a personal AI operating system that lives in your local knowledge vault (plain Markdown files on your machine). It scaffolds new vaults, syncs the OneBrain plugin from GitHub, wires AI-harness hooks, runs scheduled skills through the OS scheduler, diagnoses vault health, and updates itself.
 
 The CLI is **cross-harness**: paired with the [OneBrain plugin](https://github.com/onebrain-ai/onebrain) (slash commands, skills, agents), it runs under Claude Code and Gemini CLI against the same vault contract.
 
