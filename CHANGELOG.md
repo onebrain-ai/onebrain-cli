@@ -1,5 +1,5 @@
 ---
-latest_version: 3.3.25
+latest_version: 3.3.26
 released: 2026-07-01
 ---
 
@@ -9,6 +9,11 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.3.26] — 2026-07-02 — release embeds the prebuilt webui dist
+
+- **Release workflow downloads the prebuilt web UI instead of rebuilding it.** onebrain-webui now publishes its dist as a GH Release tarball (+sha256) on every merged version; our release's `webui` job fetches the version pinned in `crates/onebrain-cli/Cargo.toml` `[package.metadata.webui]` and verifies its sha256 against the pin — the dist is built exactly once (in its own repo), releases are minutes faster, and re-running an old tag embeds the same webui bytes (reproducible).
+- **Fail-closed:** missing/malformed pin metadata, malformed version/sha, missing release asset, or a hash mismatch all abort the release loudly — no silent fallback. Download job runs with `contents: read` only.
 
 ## [3.3.25] — 2026-07-01 — webview preflight route
 

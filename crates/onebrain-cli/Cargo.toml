@@ -80,3 +80,12 @@ mockito           = { workspace = true }
 tower             = { workspace = true, features = ["util"] }
 http-body-util    = "0.1"
 tokio             = { workspace = true, features = ["rt", "macros"] }
+
+# The prebuilt web UI release this binary embeds. The release workflow's
+# `webui` job downloads `onebrain-webui-<version>-dist.tar.gz` from
+# onebrain-ai/onebrain-webui's GitHub Releases and verifies it against this
+# sha256 before embedding (see .github/workflows/release.yml). Bump BOTH
+# fields together to ship a newer web UI.
+[package.metadata.webui]
+version = "v0.1.6"
+sha256 = "38827c0e0817860c682777ff513b1c078d7ec2980423f6e299176981fbb0dd75"
