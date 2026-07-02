@@ -27,7 +27,13 @@ while IFS= read -r -d '' f; do
   # it would get re-gzipped into a double-wrapped stream the server can't inflate).
   # Split them: has magic + valid → skip (idempotent); has magic + corrupt → fail
   # fast; no magic → gzip below.
-  magic=$(head -c2 "$f" | od -An -tx1 | tr -d ' \n')
+  # Portable magic extraction: prefer xxd, fall back to od where it's absent.
+  # Both emit lowercase hex, so a gzip file yields `1f8b` either way.
+  if command -v xxd >/dev/null 2>&1; then
+    magic=$(xxd -p -l 2 "$f" | tr -d ' \n')
+  else
+    magic=$(head -c2 "$f" | od -An -tx1 | tr -d ' \n')
+  fi
   if [ "$magic" = "1f8b" ]; then
     if gzip -t "$f" 2>/dev/null; then
       continue # already a valid gzip stream → idempotent skip

@@ -126,7 +126,7 @@ jobs:
             os: windows-latest
             archive: zip
           - target: aarch64-pc-windows-msvc
-            os: windows-11-arm
+            os: windows-latest # x64 host; cross to arm64 (see msvc-dev-cmd below)
             archive: zip
     runs-on: ${{ matrix.os }}
     env:
@@ -169,20 +169,21 @@ jobs:
             echo "linker = \"${CROSS_PREFIX}-gcc\""
           } >> .cargo/config.toml
 
-      # aarch64-pc-windows-msvc builds on a native ARM64 runner (windows-11-arm),
-      # but nothing in the job activates an MSVC dev environment, so simsimd's
-      # build.rs (which uses the `cc` crate to compile its C via cl.exe) can't
-      # reliably locate an arm64-targeting cl.exe. When the C compile silently
-      # produces no object, the final link fails with
-      # `LNK1181: cannot open input file 'simsimd.lib'`. This step activates the
-      # native arm64 MSVC toolset (host arm64 → target arm64), which `cc` honours
-      # through the standard MSVC env vars — so simsimd.lib is produced. Scoped to
-      # this one target.
-      - name: Set up arm64 MSVC environment
+      # aarch64-pc-windows-msvc is CROSS-compiled from the x64 windows-latest
+      # runner with the mature amd64_arm64 MSVC cross toolset. History:
+      # (a) building on the native windows-11-arm runner without a dev env
+      # left simsimd's cc-compiled C without an arm64 cl.exe →
+      # `LNK1181: cannot open input file 'simsimd.lib'`;
+      # (b) ilammy/msvc-dev-cmd `arch: arm64` on that runner broke PATH so
+      # rustc picked up Git-Bash's GNU /usr/bin/link.exe instead of MSVC
+      # link.exe and even host build scripts failed. Cross from x64 is the
+      # well-trodden path: host tools stay x64, `cc` targets arm64 via the
+      # amd64_arm64 environment. Scoped to this one target.
+      - name: Set up amd64_arm64 MSVC cross environment
         if: matrix.target == 'aarch64-pc-windows-msvc'
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: arm64
+          arch: amd64_arm64
 
       - name: Fetch the embedded web UI
         uses: actions/download-artifact@v7
