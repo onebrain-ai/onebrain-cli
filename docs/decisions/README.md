@@ -40,5 +40,9 @@ ADRs are immutable once accepted — if a decision changes, write a new ADR that
 | [0010](0010-npm-supply-chain.md) | npm supply chain: Trusted Publishers + checksum postinstall | accepted |
 | [0011](0011-release-opt-level.md) | Release build stays `opt-level = "z"` (size over speed) | accepted |
 | [0012](0012-native-search-replace-qmd.md) | Native Rust search engine (replace external qmd) | accepted |
+| [0013](0013-retrieval-semantics-confidence-gating.md) | Retrieval semantics: instruction prefixes, confidence floor, exact-word lex | accepted |
+| [0014](0014-index-scope-and-exclusion.md) | Index scope: Markdown-only, built-in skips, `search.exclude` | accepted |
+| [0015](0015-grouped-output-convention.md) | Grouped text-output convention (emoji sections, no frames) | accepted |
+| [0016](0016-qmd-collection-config-migration.md) | `qmd_collection` → `search.collection` via `doctor --fix` | accepted |
 
 > These ADRs distill the public-facing rationale; the full design notes live in the project tracker. Numbers are stable IDs assigned at authoring time — see each ADR's **Date** for chronology.
