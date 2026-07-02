@@ -22,6 +22,7 @@
 //! | `DELETE /api/vault/folder?path=` | delete a folder                              |
 //! | `GET    /api/vault/tasks`        | dated Obsidian-Tasks lines across the vault |
 //! | `GET    /api/webview/preflight`  | `{ frameable }` — header-only iframe probe  |
+//! | `POST   /api/translate`          | `{ translated, detected_from, truncated }`  |
 //! | `POST   /api/chat`               | SSE stream over a `claude -p` agent turn    |
 //!
 //! `rev` is a cheap revision tag (mtime in whole nanoseconds since the epoch)
