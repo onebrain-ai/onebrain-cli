@@ -105,12 +105,27 @@ mod tests {
 
     #[test]
     fn is_outside_vault_detects_absolute_paths_not_under_root() {
-        let root = std::path::Path::new("/vault/ob-1");
+        // `/…` counts as absolute only on unix; Windows needs a drive
+        // prefix, so build platform-appropriate paths.
+        #[cfg(unix)]
+        let (root, outside_a, outside_b, inside) = (
+            std::path::Path::new("/vault/ob-1"),
+            "/elsewhere/x.md",
+            "/vault/other/x.md",
+            "/vault/ob-1/00-inbox/note.md",
+        );
+        #[cfg(windows)]
+        let (root, outside_a, outside_b, inside) = (
+            std::path::Path::new("C:\\vault\\ob-1"),
+            "C:\\elsewhere\\x.md",
+            "C:\\vault\\other\\x.md",
+            "C:\\vault\\ob-1\\00-inbox\\note.md",
+        );
         // Absolute, outside the vault → true.
-        assert!(is_outside_vault("/elsewhere/x.md", root));
-        assert!(is_outside_vault("/vault/other/x.md", root));
+        assert!(is_outside_vault(outside_a, root));
+        assert!(is_outside_vault(outside_b, root));
         // Absolute, under the vault → false (normalize handles it).
-        assert!(!is_outside_vault("/vault/ob-1/00-inbox/note.md", root));
+        assert!(!is_outside_vault(inside, root));
         // Relative → always false here.
         assert!(!is_outside_vault("00-inbox/note.md", root));
         assert!(!is_outside_vault("./00-inbox/note.md", root));
