@@ -353,14 +353,16 @@ impl LexIndex {
             return Ok(Vec::new());
         }
         // Build one subquery per QUERY UNIT. Each no-space-script run (a
-        // pseudo-word like `สุขภาพ`) becomes a nested Boolean over its own
-        // bigrams requiring ~70% of them to match — so a doc sharing only
-        // COMMON pairs with a *different* word (การ/กำลัง inside
-        // `การออกกำลังกาย`) no longer surfaces, while substring queries
-        // (`ภาพ` inside `สุขภาพ`) still work because the substring's own
-        // bigrams are all present. Spaced-script words stay plain OR terms —
-        // BM25's IDF handles those fine. The real Thai fix is dictionary
-        // word-segmentation (nlpo3, tracked follow-up).
+        // pseudo-word like `สุขภาพ`) becomes a nested Boolean requiring ALL
+        // of its bigrams — lex semantics for no-space scripts are exact
+        // substring-style: a hit means the document really contains the
+        // queried word. (70% still let long common-syllable words like
+        // `การออกกำลังกาย` match docs that only contain การ+ออก+กำลัง from
+        // unrelated text.) Substring queries (`ภาพ` in `สุขภาพ`) still work
+        // — only the QUERY's own bigrams are required. Fuzzy/partial recall
+        // is the vector side's job. Multi-word Thai should be spaced
+        // (`สุขภาพ การออกกำลังกาย` = OR of two runs). Real fix: nlpo3
+        // dictionary segmentation (tracked follow-up).
         let mut units: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         for (start, end, is_script) in split_script_runs(query) {
             let run = &query[start..end];
@@ -379,7 +381,7 @@ impl LexIndex {
                         (Occur::Should, tq)
                     })
                     .collect();
-                let min = (n * 7).div_ceil(10).max(1);
+                let min = n;
                 units.push((
                     Occur::Should,
                     Box::new(BooleanQuery::with_minimum_required_clauses(subs, min)),
