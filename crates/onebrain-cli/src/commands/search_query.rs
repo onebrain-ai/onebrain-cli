@@ -44,6 +44,30 @@ impl From<Hit> for HitData {
 #[derive(Debug, Serialize)]
 struct SearchHitsData {
     hits: Vec<HitData>,
+    /// Present only when `hits` is empty AND the index state explains it
+    /// (empty or stale index) — so "no results" never silently means
+    /// "you forgot to reindex".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index_hint: Option<String>,
+}
+
+/// Why an empty result might not mean "no matching notes": an empty or
+/// stale index. Best-effort — a status probe failure degrades to no hint
+/// rather than failing the search.
+fn index_hint_for(
+    engine: &onebrain_search::engine::Engine,
+    resolved: &onebrain_core::ResolvedVault,
+) -> Option<String> {
+    let st = engine.status(resolved.root.as_path()).ok()?;
+    if st.doc_count == 0 {
+        return Some("index is empty — run `onebrain search reindex` first".to_string());
+    }
+    let pending = st.pending_total();
+    (pending > 0).then(|| {
+        format!(
+            "index is behind — {pending} doc(s) not yet indexed · run `onebrain search reindex`"
+        )
+    })
 }
 
 /// `onebrain search query` — hybrid (lex + vector, RRF-fused). Opens the
@@ -57,7 +81,11 @@ pub fn run_query(
     let (engine, resolved) = open_engine(vault_flag)?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
     let hits = engine.query(&args.text, args.top_k)?;
-    emit_hits("search.query", vault_info, hits, mode)
+    let hint = hits
+        .is_empty()
+        .then(|| index_hint_for(&engine, &resolved))
+        .flatten();
+    emit_hits("search.query", vault_info, hits, hint, mode)
 }
 
 /// `onebrain search vsearch` — vector-only semantic search. Also embeds the
@@ -70,7 +98,11 @@ pub fn run_vsearch(
     let (engine, resolved) = open_engine(vault_flag)?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
     let hits = engine.vector_search(&args.text, args.top_k)?;
-    emit_hits("search.vec", vault_info, hits, mode)
+    let hint = hits
+        .is_empty()
+        .then(|| index_hint_for(&engine, &resolved))
+        .flatten();
+    emit_hits("search.vec", vault_info, hits, hint, mode)
 }
 
 /// `onebrain search search` — lex-only (BM25) search. Deliberately does NOT
@@ -120,7 +152,15 @@ pub fn run_lex(
         })
         .collect();
 
-    let envelope = Envelope::ok("search.lex", Some(vault_info), SearchHitsData { hits });
+    // No engine here (deliberately — no embedder), so no index-state probe.
+    let envelope = Envelope::ok(
+        "search.lex",
+        Some(vault_info),
+        SearchHitsData {
+            hits,
+            index_hint: None,
+        },
+    );
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
 }
@@ -129,10 +169,15 @@ fn emit_hits(
     command: &str,
     vault_info: crate::output::VaultInfo,
     hits: Vec<Hit>,
+    index_hint: Option<String>,
     mode: &OutputMode,
 ) -> Result<()> {
     let hits: Vec<HitData> = hits.into_iter().map(HitData::from).collect();
-    let envelope = Envelope::ok(command, Some(vault_info), SearchHitsData { hits });
+    let envelope = Envelope::ok(
+        command,
+        Some(vault_info),
+        SearchHitsData { hits, index_hint },
+    );
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
 }
@@ -140,7 +185,10 @@ fn emit_hits(
 fn render_text(env: &Envelope<SearchHitsData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     if d.hits.is_empty() {
-        return "🔍 no results".to_string();
+        return match &d.index_hint {
+            Some(h) => format!("🔍 no results\nℹ️  {h}"),
+            None => "🔍 no results".to_string(),
+        };
     }
     let mut blocks = Vec::with_capacity(d.hits.len());
     for (i, h) in d.hits.iter().enumerate() {
@@ -167,12 +215,35 @@ mod tests {
     use super::*;
 
     fn env(hits: Vec<HitData>) -> Envelope<SearchHitsData> {
-        Envelope::ok("search.query", None, SearchHitsData { hits })
+        Envelope::ok(
+            "search.query",
+            None,
+            SearchHitsData {
+                hits,
+                index_hint: None,
+            },
+        )
     }
 
     #[test]
     fn text_handles_no_matches() {
         assert_eq!(render_text(&env(Vec::new())), "🔍 no results");
+    }
+
+    #[test]
+    fn text_surfaces_index_hint_on_no_matches() {
+        let e = Envelope::ok(
+            "search.query",
+            None,
+            SearchHitsData {
+                hits: Vec::new(),
+                index_hint: Some("index is empty — run `onebrain search reindex` first".into()),
+            },
+        );
+        let s = render_text(&e);
+        assert!(s.contains("🔍 no results"), "{s}");
+        assert!(s.contains("index is empty"), "{s}");
+        assert!(s.contains("search reindex"), "{s}");
     }
 
     #[test]

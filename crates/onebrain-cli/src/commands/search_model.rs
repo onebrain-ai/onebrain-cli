@@ -100,9 +100,11 @@ pub fn run_list(
 }
 
 /// Sort list rows by `col`. Default (unsorted) is registry order; this is
-/// only called when `--sort` is passed. Models that lack a value for the
-/// column (no Thai score, not downloaded) always sort last regardless of
-/// direction, so `--desc` never floats a `—` to the top.
+/// only called when `--sort` is passed. Models with no Thai score always
+/// sort last regardless of direction, so `--desc` never floats a `—` to the
+/// top. `disk` sorts by the DISPLAYED size — real on-disk bytes when
+/// downloaded, the parsed registry approx otherwise — so the order always
+/// matches the column.
 fn sort_rows(rows: &mut [ModelListEntry], col: ModelSortCol, desc: bool) {
     use std::cmp::Ordering;
     // Approx registry size is a human string ("~470 MB", "~1.1 GB"); parse it
@@ -115,17 +117,25 @@ fn sort_rows(rows: &mut [ModelListEntry], col: ModelSortCol, desc: bool) {
                 parse_approx_size(a.approx_size).cmp(&parse_approx_size(b.approx_size))
             }
             ModelSortCol::Thai => cmp_option_last(a.thai_miracl, b.thai_miracl, desc),
-            ModelSortCol::Disk => cmp_option_last(a.disk_bytes, b.disk_bytes, desc),
+            ModelSortCol::Disk => {
+                let ab = a
+                    .disk_bytes
+                    .unwrap_or_else(|| parse_approx_size(a.approx_size));
+                let bb = b
+                    .disk_bytes
+                    .unwrap_or_else(|| parse_approx_size(b.approx_size));
+                ab.cmp(&bb).then_with(|| a.name.cmp(b.name))
+            }
             // Ascending = downloaded first (✓ on top), ties break by name.
             ModelSortCol::Downloaded => b
                 .downloaded
                 .cmp(&a.downloaded)
                 .then_with(|| a.name.cmp(b.name)),
         };
-        // For the "missing sorts last" columns we've already folded direction
-        // into `cmp_option_last`; don't reverse them again.
+        // For the "missing sorts last" column we've already folded direction
+        // into `cmp_option_last`; don't reverse it again.
         match col {
-            ModelSortCol::Thai | ModelSortCol::Disk => ord,
+            ModelSortCol::Thai => ord,
             _ if desc => ord.reverse(),
             _ => ord,
         }
@@ -707,15 +717,22 @@ mod tests {
     }
 
     #[test]
-    fn sort_by_disk_keeps_not_downloaded_last() {
+    fn sort_by_disk_uses_displayed_size_for_not_downloaded() {
         let mut rows: Vec<ModelListEntry> = model_registry()
             .iter()
             .map(|m| ModelListEntry::from_info(m, "bge-m3", Path::new("/nope")))
             .collect();
-        // Nothing is downloaded → all disk_bytes None → order stable, none
-        // panics, and every row is "last-eligible".
+        // Nothing is downloaded → the DISK column shows approx sizes, so the
+        // sort follows them: descending puts the biggest approx first.
         sort_rows(&mut rows, ModelSortCol::Disk, true);
-        assert!(rows.iter().all(|r| r.disk_bytes.is_none()));
+        assert_eq!(rows.first().unwrap().name, "bge-m3", "~2.2 GB first desc");
+        assert_eq!(
+            rows.last().unwrap().name,
+            "embeddinggemma-300m-q",
+            "~180 MB last desc"
+        );
+        sort_rows(&mut rows, ModelSortCol::Disk, false);
+        assert_eq!(rows.first().unwrap().name, "embeddinggemma-300m-q");
     }
 
     #[test]

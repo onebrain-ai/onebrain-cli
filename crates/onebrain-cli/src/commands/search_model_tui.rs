@@ -57,6 +57,9 @@ pub struct TuiRow {
     /// Registry approx download size (`~470 MB`) — shown in DISK until the
     /// model is actually on disk.
     pub approx_size: &'static str,
+    /// Registry approx download size in bytes — the DISK sort key while the
+    /// model isn't downloaded (so the sort matches what the column shows).
+    pub approx_bytes: u64,
     pub dims: usize,
     pub thai: Option<f32>,
     pub note: &'static str,
@@ -79,6 +82,7 @@ pub fn build_rows(current: &str, cache_dir: &std::path::Path) -> Vec<TuiRow> {
                 downloaded: status.downloaded,
                 disk_bytes: status.disk_size,
                 approx_size: m.approx_size,
+                approx_bytes: m.approx_bytes,
                 dims: m.dims,
                 thai: m.thai_miracl,
                 note: m.note,
@@ -103,16 +107,21 @@ pub fn next_sort(col: ModelSortCol) -> ModelSortCol {
     }
 }
 
-/// Sort `rows` by `col`/`desc`. `disk` and `thai` keep missing values last in
-/// BOTH directions (via the shared [`cmp_option_last`]); `name`/`dim` are a
-/// plain total order reversed for `desc`.
+/// Sort `rows` by `col`/`desc`. `thai` keeps missing values last in BOTH
+/// directions (via the shared [`cmp_option_last`]); `disk` sorts by the
+/// DISPLAYED size — real on-disk bytes when downloaded, registry
+/// `approx_bytes` otherwise — so the order always matches the column.
 pub fn sort_rows(rows: &mut [TuiRow], col: ModelSortCol, desc: bool) {
     rows.sort_by(|a, b| {
         let ord = match col {
             ModelSortCol::Name => a.name.cmp(b.name),
             ModelSortCol::Dim => a.dims.cmp(&b.dims),
             ModelSortCol::Thai => cmp_option_last(a.thai, b.thai, desc),
-            ModelSortCol::Disk => cmp_option_last(a.disk_bytes, b.disk_bytes, desc),
+            ModelSortCol::Disk => {
+                let ab = a.disk_bytes.unwrap_or(a.approx_bytes);
+                let bb = b.disk_bytes.unwrap_or(b.approx_bytes);
+                ab.cmp(&bb).then_with(|| a.name.cmp(b.name))
+            }
             // Ascending = downloaded first (✓ on top), ties break by name.
             ModelSortCol::Downloaded => b
                 .downloaded
@@ -122,8 +131,8 @@ pub fn sort_rows(rows: &mut [TuiRow], col: ModelSortCol, desc: bool) {
             ModelSortCol::Size => a.name.cmp(b.name),
         };
         match col {
-            // Direction already folded into cmp_option_last for these.
-            ModelSortCol::Thai | ModelSortCol::Disk => ord,
+            // Direction already folded into cmp_option_last for this one.
+            ModelSortCol::Thai => ord,
             _ if desc => ord.reverse(),
             _ => ord,
         }
@@ -867,10 +876,46 @@ mod tests {
     }
 
     #[test]
-    fn sort_rows_disk_keeps_not_downloaded_last() {
+    fn sort_rows_disk_uses_displayed_size_for_not_downloaded() {
+        // Nothing downloaded → DISK shows approx sizes and sorts by them.
         let mut rows = rows_for("bge-m3");
+        sort_rows(&mut rows, ModelSortCol::Disk, false);
+        assert_eq!(
+            rows.first().unwrap().name,
+            "embeddinggemma-300m-q",
+            "~180 MB first ascending"
+        );
+        assert_eq!(rows.last().unwrap().name, "bge-m3", "~2.2 GB last asc");
         sort_rows(&mut rows, ModelSortCol::Disk, true);
-        assert!(rows.iter().all(|r| r.disk_bytes.is_none()));
+        assert_eq!(rows.first().unwrap().name, "bge-m3", "r flips to desc");
+    }
+
+    #[test]
+    fn sort_rows_disk_mixes_real_and_approx_sizes() {
+        let cache = tempfile::tempdir().unwrap();
+        // Give e5-small a REAL on-disk size bigger than gemma's approx but
+        // smaller than everything else.
+        let info = model_registry()
+            .iter()
+            .find(|m| m.name == "multilingual-e5-small")
+            .unwrap();
+        let mdir = cache.path().join(info.cache_dir_name());
+        std::fs::create_dir_all(&mdir).unwrap();
+        std::fs::write(mdir.join("model.onnx"), vec![0u8; 200 * 1024 * 1024]).unwrap();
+
+        let mut rows = build_rows("bge-m3", cache.path());
+        sort_rows(&mut rows, ModelSortCol::Disk, false);
+        let names: Vec<&str> = rows.iter().map(|r| r.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "embeddinggemma-300m-q", // ~180 MB approx
+                "multilingual-e5-small", // 200 MB real
+                "multilingual-e5-base",  // ~1.1 GB approx
+                "multilingual-e5-large", // ~2.1 GB approx
+                "bge-m3",                // ~2.2 GB approx
+            ]
+        );
     }
 
     #[test]
