@@ -139,6 +139,14 @@ jobs:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Key by TARGET: both windows targets share a runner OS since the
+          # arm64 cross move, and the default key (OS+arch+lockfile) let the
+          # x64 job's cache poison the arm64 build — a cached FAILED simsimd
+          # build-script result is treated as fresh (its build.rs only
+          # declares rerun-if-env-changed for SIMSIMD_* flags, so new
+          # CC/CFLAGS never trigger a rerun).
+          key: ${{ matrix.target }}
 
       - name: Install musl tools
         if: matrix.apt
@@ -211,6 +219,19 @@ jobs:
             echo "CFLAGS_aarch64_pc_windows_msvc=--target=arm64-pc-windows-msvc"
             echo "CXXFLAGS_aarch64_pc_windows_msvc=--target=arm64-pc-windows-msvc"
           } >> "$GITHUB_ENV"
+
+      # Force simsimd's build script to actually run with the clang-cl env
+      # (cargo would otherwise reuse a cached failed result — see the cache
+      # note above), and capture verbose compiler evidence so any remaining failure
+      # shows the real cl/clang invocation instead of a bare missing-lib link
+      # error.
+      - name: Prebuild simsimd with clang-cl (verbose)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo clean -p simsimd --release --target "$TARGET" 2>/dev/null || true
+          cargo build -p simsimd --release --target "$TARGET" -vv 2>&1 | tee /tmp/simsimd-build.log | grep -iE "clang|cl\.exe|simsimd|warning|error" | tail -80
 
       - name: Link windows-arm64 with rust-lld
         if: matrix.target == 'aarch64-pc-windows-msvc'
