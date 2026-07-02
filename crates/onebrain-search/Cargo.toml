@@ -44,14 +44,22 @@ fastembed = { version = "5.17", default-features = false, features = [
     "ort-download-binaries-rustls-tls",
 ], optional = true }
 
-# SIMD-accelerated vector similarity (cosine/dot/etc.) for the vector index.
-simsimd = "6.5"
-
 # Memory-mapped file access for on-disk index/vector stores.
 memmap2 = { workspace = true }
 
 # Embedded KV store for chunk/doc metadata.
 redb = "4.1"
+
+# SIMD-accelerated vector similarity (cosine/dot/etc.) for the vector index.
+# EXCLUDED on windows-arm64: after 8 release attempts, simsimd's C could not be
+# compiled for aarch64-pc-windows-msvc — MSVC `cl` rejects its GCC-flavored
+# dialect; clang-cl half-detects ARM so NEON paths miss `arm_neon.h`; disabling
+# all SIMD then trips the Windows SDK's own arch detection in winnt.h
+# (PSLIST_HEADER/PCONTEXT undefined). On that one target the crate uses the
+# pure-Rust `dot_scalar` fallback in `vector.rs` (LLVM auto-vectorizes it).
+# See ADR 0018 and the release.yml windows-arm64 history comment.
+[target.'cfg(not(all(target_os = "windows", target_arch = "aarch64")))'.dependencies]
+simsimd = "6.5"
 
 [features]
 # `semantic` (default ON) compiles the fastembed/ONNX-backed embedding path:
