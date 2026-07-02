@@ -22,6 +22,7 @@
 //! | `DELETE /api/vault/folder?path=` | delete a folder                              |
 //! | `GET    /api/vault/tasks`        | dated Obsidian-Tasks lines across the vault |
 //! | `GET    /api/webview/preflight`  | `{ frameable }` — header-only iframe probe  |
+//! | `POST   /api/translate`          | `{ translated, detected_from, truncated }`  |
 //! | `POST   /api/chat`               | SSE stream over a `claude -p` agent turn    |
 //!
 //! `rev` is a cheap revision tag (mtime in whole nanoseconds since the epoch)
@@ -75,6 +76,8 @@ pub fn router() -> Router<Arc<AppState>> {
             "/webview/preflight",
             get(super::webview::get_webview_preflight),
         )
+        // Select-to-lookup: server-side translate bridge (Google gtx, free tier).
+        .route("/translate", post(super::translate::post_translate))
         // v3.3 chat — SSE stream over a `claude -p` agent turn. Inherits the auth
         // middleware + body limit applied to this whole sub-router.
         .route("/chat", post(super::chat::post_chat))

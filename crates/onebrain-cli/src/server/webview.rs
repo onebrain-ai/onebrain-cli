@@ -95,19 +95,32 @@ fn probe_frameable(url: &str) -> bool {
     false
 }
 
-/// Resolve a `Location` header against the URL that produced it. Only
-/// absolute `http(s)` targets are supported — a relative Location is treated
-/// as untrusted-enough-to-reject (`None`) rather than guessing at resolution,
-/// since a wrong guess here would reintroduce the SSRF gap this is meant to
-/// close. `base` is unused for absolute locations but kept for a future
-/// relative-resolution implementation.
-fn resolve_redirect(_base: &str, location: &str) -> Option<String> {
+/// Resolve a `Location` header against the URL that produced it.
+/// Absolute `http(s)` targets pass through. Scheme-relative (`//host/…`) and
+/// absolute-path (`/…`) references resolve deterministically per RFC 3986
+/// against the hop that issued them — needed in the wild: th.wikipedia's
+/// `Special:Search` redirects with a scheme-relative Location (2026-07-02).
+/// This keeps the SSRF posture intact: every accepted target is still plain
+/// `http(s)` (a redirector could already name any host absolutely), and
+/// path-relative / non-http forms remain rejected.
+fn resolve_redirect(base: &str, location: &str) -> Option<String> {
     let location = location.trim();
     if is_http_url(location) {
-        Some(location.to_string())
-    } else {
-        None
+        return Some(location.to_string());
     }
+    if let Some(rest) = location.strip_prefix("//") {
+        let scheme = base.split("://").next()?;
+        let resolved = format!("{scheme}://{rest}");
+        return is_http_url(&resolved).then_some(resolved);
+    }
+    if location.starts_with('/') {
+        let scheme_end = base.find("://")? + 3;
+        let origin_end = base[scheme_end..]
+            .find('/')
+            .map_or(base.len(), |i| scheme_end + i);
+        return Some(format!("{}{}", &base[..origin_end], location));
+    }
+    None
 }
 
 /// http / https only — the only schemes we preflight or frame.
@@ -239,14 +252,45 @@ mod tests {
     }
 
     #[test]
-    fn resolve_redirect_rejects_relative_location() {
-        // Policy choice: relative Location headers are treated as untrusted
-        // rather than guessed at — see resolve_redirect's doc comment.
-        assert_eq!(resolve_redirect("http://example.com/a", "/b"), None);
+    fn resolve_redirect_resolves_scheme_relative_with_base_scheme() {
+        // th.wikipedia's Special:Search redirects with `//host/…` — resolve
+        // it with the issuing hop's scheme instead of rejecting.
         assert_eq!(
-            resolve_redirect("http://example.com/a", "//attacker.example/b"),
-            None
+            resolve_redirect(
+                "https://th.wikipedia.org/wiki/Special:Search?search=x",
+                "//th.wikipedia.org/w/index.php?title=y"
+            ),
+            Some("https://th.wikipedia.org/w/index.php?title=y".to_string())
         );
+        assert_eq!(
+            resolve_redirect("http://example.com/a", "//other.example/b"),
+            Some("http://other.example/b".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_redirect_resolves_absolute_path_against_origin() {
+        assert_eq!(
+            resolve_redirect("https://example.com/a/b?q=1", "/c/d"),
+            Some("https://example.com/c/d".to_string())
+        );
+        // Origin keeps an explicit port; a bare-origin base (no path) works too.
+        assert_eq!(
+            resolve_redirect("http://127.0.0.1:8080/x", "/y"),
+            Some("http://127.0.0.1:8080/y".to_string())
+        );
+        assert_eq!(
+            resolve_redirect("https://example.com", "/z"),
+            Some("https://example.com/z".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_redirect_still_rejects_path_relative_location() {
+        // Path-relative forms stay rejected — rare in the wild and the only
+        // shape where resolution would need real path arithmetic.
+        assert_eq!(resolve_redirect("http://example.com/a", "b/c"), None);
+        assert_eq!(resolve_redirect("http://example.com/a", "?q=1"), None);
     }
 
     #[test]

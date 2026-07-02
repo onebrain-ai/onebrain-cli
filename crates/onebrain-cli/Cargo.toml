@@ -42,6 +42,8 @@ futures-core       = { workspace = true }
 # v3.4 daemon — internal webview preflight: a blocking ureq GET (headers only,
 # body never read) run on `spawn_blocking` to decide if a URL may be iframed.
 ureq               = { workspace = true }
+# v3.3.27 daemon — translate bridge: URL query encoding for the Google gtx endpoint.
+percent-encoding   = { workspace = true }
 # v3.3.10 — embed the built web UI into the binary so `onebrain serve` ships a
 # standalone UI (dist built by CI / scripts, NOT committed; see .gitignore).
 # The `assets/` files are gzip-precompressed at build time (see the release
@@ -87,5 +89,5 @@ tokio             = { workspace = true, features = ["rt", "macros"] }
 # sha256 before embedding (see .github/workflows/release.yml). Bump BOTH
 # fields together to ship a newer web UI.
 [package.metadata.webui]
-version = "v0.1.6"
-sha256 = "38827c0e0817860c682777ff513b1c078d7ec2980423f6e299176981fbb0dd75"
+version = "v0.1.7"
+sha256 = "0118d75d843231578a7242d1f3b0dbb729c2d8ad8874bfc9aa3f6ec46228890a"

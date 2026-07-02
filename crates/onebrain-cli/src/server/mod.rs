@@ -39,6 +39,7 @@ mod headers;
 mod search;
 mod r#static;
 mod token;
+mod translate;
 mod webview;
 
 #[cfg(test)]

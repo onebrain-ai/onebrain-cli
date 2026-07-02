@@ -4,7 +4,7 @@ default-members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "3.3.26"
+version = "3.3.27"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["OneBrain Contributors"]
@@ -49,6 +49,9 @@ semver    = "1"
 # is left off. The daemon (v3.3) re-introduces tokio deliberately for its async
 # RPC server — keeping it out of the one-shot CLI hot path until then.
 ureq = "3"
+
+# URL query encoding for the translate bridge
+percent-encoding = "2"
 
 # SHA-256 verification of the self-update binary (v3.1.4 · onebrain-fs update install path)
 sha2 = "0.10"
