@@ -68,12 +68,12 @@ fn doctor_clean_vault_exits_0() {
     let d = tempdir().unwrap();
     write_minimal_vault(d.path());
     // Exit code 0 means no `Error` status emerged from any check.
-    // Note: this fixture omits `qmd_collection` (matching the plan), so the
-    // qmd-embeddings check returns Warn per Bun parity. That keeps the exit
-    // code at 0 but means the verdict will be the ⚠ glyph (warnings present,
-    // 0 fail) rather than ✓. The test asserts the no-error invariant by
-    // checking that no fail (`✗`) glyph row is rendered and the footer
-    // reports "0 fail" (v3.2.1 grouped layout).
+    // Note: this fixture has never run a reindex, so the native `search` check
+    // returns Warn ("no index yet"). That keeps the exit code at 0 (advisory)
+    // but means the verdict is the ⚠ glyph (warnings present, 0 fail) rather
+    // than ✓. The test asserts the no-error invariant by checking that no fail
+    // (`✗`) glyph row is rendered and the footer reports "0 fail" (v3.2.1
+    // grouped layout).
     Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(d.path())
@@ -81,7 +81,11 @@ fn doctor_clean_vault_exits_0() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\u{2717}").not())
-        .stdout(predicate::str::contains("0 fail"));
+        .stdout(predicate::str::contains("0 fail"))
+        // v3.4 content swap: the native search row is present; the old qmd
+        // embeddings row is gone.
+        .stdout(predicate::str::contains("search"))
+        .stdout(predicate::str::contains("unembedded").not());
 }
 
 #[test]
@@ -133,45 +137,51 @@ fn doctor_json_mode_not_in_vault_emits_json_error_envelope() {
     assert_eq!(doc["error"], "not_in_vault", "error field: {doc}");
 }
 
-/// `--fix` on a vault where the only warning is "qmd_collection not set"
-/// (the minimal vault used by these integration tests) — the recipe
-/// dispatcher must route this to `Manual` rather than spawning `qmd
-/// embed`, because no real qmd collection exists to embed against. The
-/// test runs with a scrubbed PATH so that even if dispatch is wrong the
-/// child can't accidentally execute a real `qmd` on the developer's box.
+/// v3.4: `doctor --fix` on a vault carrying the deprecated top-level
+/// `qmd_collection` key migrates it to `search.collection` and removes the
+/// legacy key. End-to-end proof of the `legacy-qmd-collection` check +
+/// migration recipe (the old qmd-embeddings `qmd embed` recipe is gone).
+/// PATH is scrubbed so no real qmd binary is ever consulted.
 #[test]
-fn doctor_fix_qmd_collection_not_set_routes_to_manual() {
+fn doctor_fix_migrates_legacy_qmd_collection() {
     let d = tempdir().unwrap();
     write_minimal_vault(d.path());
+    // Add the deprecated key to the (legacy-named) config the fixture wrote.
+    let cfg = d.path().join("vault.yml");
+    let existing = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(&cfg, format!("qmd_collection: ob-legacy\n{existing}")).unwrap();
+
     let assert = Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(d.path())
-        // Scrub PATH so `which::which("qmd")` returns NotFound even on
-        // developer machines where `qmd` is on the global PATH — this
-        // test must NOT spawn real qmd. The `/usr/bin:/bin` floor keeps
-        // basic POSIX utilities available in case any other code path
-        // needs them.
         .env("PATH", "/usr/bin:/bin")
         .args(["doctor", "--fix"])
         .assert()
         .success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default();
     // The fix summary must appear (proves the fix pass ran). Non-TTY runs
-    // (like this one) auto-proceed past the v3.2.4 confirmation prompt.
+    // (like this one) auto-proceed past the confirmation prompt.
     assert!(
         stdout.contains("Fix summary:"),
         "expected the fix summary in stdout · got: {stdout}"
     );
-    // Manual outcome should fire — no `running: qmd embed` line.
+    // No qmd-embed recipe exists anymore — it must never spawn.
     assert!(
         !stdout.contains("running: qmd embed"),
-        "qmd embed should NOT spawn for the 'qmd_collection not set' variant · got: {stdout}"
+        "qmd embed recipe should be gone · got: {stdout}"
     );
-    // No "deferred to v3.0.1" stub anymore — that was the alpha.4 placeholder.
-    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap_or_default();
+
+    // The config (migrated to canonical onebrain.yml by the config-migration
+    // recipe) has the legacy key removed and search.collection seeded.
+    let after =
+        std::fs::read_to_string(d.path().join("onebrain.yml")).expect("config present after --fix");
     assert!(
-        !stderr.contains("deferred to v3.0.1"),
-        "stub message should be gone in alpha.5"
+        !after.contains("qmd_collection"),
+        "legacy qmd_collection must be removed · got:\n{after}"
+    );
+    assert!(
+        after.contains("collection: ob-legacy"),
+        "value must be migrated to search.collection · got:\n{after}"
     );
 }
 
@@ -392,13 +402,13 @@ fn doctor_fix_does_not_resurrect_vault_yml_after_migration() {
 }
 
 /// Text-mode `--fix` with a vault that has only manual issues (qmd_collection
-/// not set is the one manual-only warning the minimal canonical vault always
-/// has). Must not print "Will apply" (no auto-fixable issues) and should
-/// confirm via the "manual step" path.
-/// The `issues.is_empty()` branch (line 172) requires a vault with ZERO
-/// Warn/Error results — that's only possible if even qmd-embeddings is OK,
-/// which requires a real qmd collection. We cover the manual-only path here
-/// and note the issues.is_empty() branch as residual (requires qmd collection).
+/// the native `search` "no index yet" warning is the one manual-only warning
+/// the minimal canonical vault always has). Must not print "Will apply" (no
+/// auto-fixable issues) and should confirm via the "manual step" path.
+/// The `issues.is_empty()` branch requires a vault with ZERO Warn/Error
+/// results — only possible once the search index has been built, which needs a
+/// reindex (model download). We cover the manual-only path here and leave the
+/// all-clean branch as residual (requires a real index).
 #[test]
 fn doctor_fix_text_mode_manual_issues_shows_manual_step_section() {
     let vault = tempdir().unwrap();
@@ -443,7 +453,7 @@ fn doctor_fix_text_mode_manual_issues_shows_manual_step_section() {
         .assert()
         .success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default();
-    // The qmd warning is manual-only: "Nothing to auto-fix" must appear.
+    // The native `search` warning is manual-only: "Nothing to auto-fix" appears.
     assert!(
         stdout.contains("Nothing to auto-fix") || stdout.contains("manual step"),
         "expected manual-only message · got: {stdout}"
@@ -591,14 +601,13 @@ fn doctor_fix_json_mode_emits_fix_array_with_outcomes() {
 
 /// CRITICAL data-safety regression: `doctor --fix` must NEVER lose config
 /// keys. The vault carries a legacy `vault.yml` holding `qmd_collection` and a
-/// custom key but MISSING `update_channel`, so both the
-/// `vault-config-migration` rename AND the `onebrain.yml-keys` backfill fire.
-/// After --fix the config lives at canonical `onebrain.yml`, the
-/// `qmd_collection` and unknown custom key both survive the re-serialization,
-/// the missing `update_channel` is backfilled, and a timestamped backup was
-/// written before any destructive write. Also pins the `onebrain.yml-keys`
-/// fix-dispatch string (a one-sided rename would silently route to "no recipe"
-/// and skip the backfill).
+/// custom key but MISSING `update_channel`, so the `vault-config-migration`
+/// rename, the `legacy-qmd-collection` migration, AND the `onebrain.yml-keys`
+/// backfill all fire. After --fix the config lives at canonical
+/// `onebrain.yml`; the deprecated `qmd_collection` is migrated to
+/// `search.collection` and its old key removed (v3.4); the unknown custom key
+/// survives the re-serialization; the missing `update_channel` is backfilled;
+/// and a timestamped backup was written before any destructive write.
 #[test]
 fn doctor_fix_preserves_custom_keys_and_backs_up() {
     let vault = tempdir().unwrap();
@@ -632,9 +641,14 @@ fn doctor_fix_preserves_custom_keys_and_backs_up() {
 
     let after = std::fs::read_to_string(vault.path().join("onebrain.yml"))
         .expect("config migrated to canonical onebrain.yml");
+    // v3.4: the deprecated qmd_collection is migrated away, not preserved.
     assert!(
-        after.contains("qmd_collection: ob-1-441565"),
-        "qmd_collection must survive --fix · got:\n{after}"
+        !after.contains("qmd_collection"),
+        "legacy qmd_collection must be removed by --fix · got:\n{after}"
+    );
+    assert!(
+        after.contains("collection: ob-1-441565"),
+        "qmd_collection value must be migrated to search.collection · got:\n{after}"
     );
     assert!(
         after.contains("custom_key: keepme"),

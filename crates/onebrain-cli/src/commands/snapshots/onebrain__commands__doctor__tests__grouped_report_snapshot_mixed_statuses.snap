@@ -7,9 +7,10 @@ expression: output
 ────────────────────────────────────────────────────────
 
  Config
-  ✓ onebrain.yml       valid · stable · qmd ob-1
+  ✓ onebrain.yml       valid · stable
   ✓ schema             all keys ok
   ✓ config migration   onebrain.yml in use
+  ✓ qmd_collection     no legacy qmd_collection key
 
  Vault structure
   ✗ folders            7/8 present
@@ -23,9 +24,9 @@ expression: output
 
  Index & state
   ✓ checkpoints        0 orphans
-  ✓ qmd                602 indexed · 0 unembedded
+  ✓ search             602 indexed · up to date
 
 ────────────────────────────────────────────────────────
- ✗  7 ok · 1 warning · 1 fail                   9 checks
+ ✗  8 ok · 1 warning · 1 fail                  10 checks
  →  onebrain doctor --fix  to auto-repair
 ────────────────────────────────────────────────────────

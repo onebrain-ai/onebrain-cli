@@ -13,7 +13,7 @@
 //          `serve` always starts its own ephemeral server.
 
 use crate::cli::ServeArgs;
-use crate::output::OutputMode;
+use crate::output::{item, section, OutputMode};
 use crate::server::{self, resolve_token, ServeConfig};
 use anyhow::{Context, Result};
 use std::net::{IpAddr, Ipv4Addr};
@@ -32,6 +32,38 @@ fn ui_label(version: &str, released: Option<&str>) -> String {
         Some(date) => format!("OneBrain Web UI v{version} ({date})"),
         None => format!("OneBrain Web UI v{version}"),
     }
+}
+
+/// Build the startup banner (no I/O) in the grouped-status convention:
+///
+/// ```text
+/// 🌐  Serving
+///     URL           http://127.0.0.1:6789/?token=…
+///     Vault         /Users/…/ob-1
+///     Web UI        <ui_line>
+///
+/// ⏹️   Ctrl-C to stop
+/// ```
+///
+/// Returns the whole block including a trailing newline so the caller can
+/// `print!` it verbatim. `⏹️` is followed by three spaces (one convention
+/// space plus two — the emoji is a variation-selector glyph that renders
+/// narrower than a full two-column emoji, so the extra space keeps the hint
+/// text visually aligned with the section body).
+fn build_banner(url: &str, vault: &str, ui_line: &str) -> String {
+    let mut out = String::new();
+    out.push_str(&section("🌐", "Serving"));
+    out.push('\n');
+    out.push_str(&item("URL", url));
+    out.push('\n');
+    out.push_str(&item("Vault", vault));
+    out.push('\n');
+    out.push_str(&item("Web UI", ui_line));
+    out.push('\n');
+    out.push('\n');
+    out.push_str("⏹️   Ctrl-C to stop");
+    out.push('\n');
+    out
 }
 
 /// Run the foreground serve command. `mode` is currently unused for output
@@ -97,14 +129,17 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
         },
         None => "no UI — API only (placeholder page)".to_string(),
     };
-    let rule = "────────────────────────────────────────";
-    println!("{rule}");
-    println!("  🧠  OneBrain  ·  serving");
-    println!("{rule}");
-    println!("  🔗  {url}");
-    println!("  📂  {}", resolved.root.as_path().display());
-    println!("  🎨  {ui_line}");
-    println!("  ⏹️   Ctrl-C to stop");
+    // Grouped-convention banner (matches `search status` / `doctor`): a
+    // `🌐  Serving` section header, then indented `Label  value` rows, a blank
+    // line, and the stop hint.
+    print!(
+        "{}",
+        build_banner(
+            &url,
+            &resolved.root.as_path().display().to_string(),
+            &ui_line
+        )
+    );
 
     // Binding beyond loopback exposes the daemon on the network over PLAIN HTTP
     // — the token + vault content would travel unencrypted. Warn loudly and
@@ -173,5 +208,79 @@ fn open_browser(url: &str) -> Result<()> {
     {
         let _ = url;
         anyhow::bail!("--open is not supported on this platform yet")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_label_with_and_without_date() {
+        assert_eq!(
+            ui_label("0.1.1", Some("2026-07-01")),
+            "OneBrain Web UI v0.1.1 (2026-07-01)"
+        );
+        assert_eq!(ui_label("0.1.1", None), "OneBrain Web UI v0.1.1");
+    }
+
+    #[test]
+    fn banner_uses_grouped_convention() {
+        let b = build_banner(
+            "http://127.0.0.1:6789/?token=abc",
+            "/Users/keng/ob-1",
+            "OneBrain Web UI v0.1.1 (2026-07-01)",
+        );
+        // Section header: emoji + two spaces + Capitalized title.
+        assert!(b.starts_with("🌐  Serving\n"), "{b:?}");
+        // Indented, fixed-width label rows carry every field.
+        assert!(
+            b.contains("    URL           http://127.0.0.1:6789/?token=abc"),
+            "{b:?}"
+        );
+        assert!(b.contains("    Vault         /Users/keng/ob-1"), "{b:?}");
+        assert!(
+            b.contains("    Web UI        OneBrain Web UI v0.1.1 (2026-07-01)"),
+            "{b:?}"
+        );
+        // A blank line separates the section from the stop hint.
+        assert!(b.contains("\n\n⏹️"), "{b:?}");
+        assert!(b.trim_end().ends_with("⏹️   Ctrl-C to stop"), "{b:?}");
+    }
+
+    #[test]
+    fn banner_no_ui_placeholder_line_preserved() {
+        // The "none — API only" description still flows into the Web UI row.
+        let b = build_banner(
+            "http://127.0.0.1:6789/?token=x",
+            "/v",
+            "no UI — API only (placeholder page)",
+        );
+        assert!(
+            b.contains("    Web UI        no UI — API only (placeholder page)"),
+            "{b:?}"
+        );
+    }
+
+    #[test]
+    fn banner_rows_share_one_value_column() {
+        // Every value must start at the same column (4 + LABEL_W) so the
+        // banner lines up regardless of label length.
+        let b = build_banner("URLVAL", "VAULTVAL", "UIVAL");
+        for (needle, value) in [
+            ("    URL", "URLVAL"),
+            ("    Vault", "VAULTVAL"),
+            ("    Web UI", "UIVAL"),
+        ] {
+            let line = b
+                .lines()
+                .find(|l| l.starts_with(needle))
+                .unwrap_or_else(|| panic!("missing {needle} row in {b:?}"));
+            assert_eq!(
+                line.find(value),
+                Some(4 + crate::output::LABEL_W),
+                "value column drifted: {line:?}"
+            );
+        }
     }
 }

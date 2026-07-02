@@ -58,6 +58,13 @@ pub fn resolve_collection(vault_flag: Option<PathBuf>) -> Result<(ResolvedVault,
 /// The effective collection name for a resolved vault: the configured value
 /// if present, otherwise a freshly generated `<dir>-<hash>` name persisted to
 /// `onebrain.yml`. Deterministic and headless-safe (never prompts).
+///
+/// The configured value comes from `search.collection`, falling back to the
+/// deprecated top-level `qmd_collection` (v3.3 and earlier) via
+/// [`load_vault_config`]. That legacy read-fallback stays so vaults that
+/// haven't migrated keep working, but it is transitional: `onebrain doctor
+/// --fix` migrates `qmd_collection` → `search.collection` and removes the old
+/// key (see `LegacyQmdCollectionCheck`).
 pub fn collection_for(resolved: &ResolvedVault) -> Result<String> {
     let config = load_vault_config(&resolved.root).context("load vault config")?;
     if let Some(existing) = config.search.collection {

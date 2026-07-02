@@ -15,7 +15,7 @@ use crate::commands::search_common::{
     collection_cache_dir, collection_for, index_size_bytes, model_not_chosen, open_engine,
     reindex_progress_path,
 };
-use crate::output::{emit, Envelope, OutputMode};
+use crate::output::{emit, item, Envelope, OutputMode};
 use onebrain_search::engine::{ReindexProgress, ReindexStats};
 
 #[derive(Debug, Serialize)]
@@ -393,12 +393,6 @@ fn index_size_suffix(size: Option<u64>, delta: Option<i64>) -> Option<String> {
         Some(d) => format!(" (−{})", format_size(d.unsigned_abs())),
     };
     Some(format!("{}{paren}", format_size(size)))
-}
-
-/// One indented `label → value` line, mirroring `search status`'s grouped
-/// layout (fixed-width label column, no emoji inside the section body).
-fn item(label: &str, value: &str) -> String {
-    format!("    {label:<14}{value}")
 }
 
 fn render_text(env: &Envelope<ReindexData>) -> String {

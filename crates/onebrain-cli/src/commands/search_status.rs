@@ -19,7 +19,7 @@ use crate::commands::search_common::{
     collection_cache_dir, index_size_bytes, is_indexed, open_engine, read_reindex_progress,
     resolve_collection, ReindexLiveProgress,
 };
-use crate::output::{emit, Envelope, OutputMode};
+use crate::output::{emit, item, section, Envelope, OutputMode};
 use onebrain_core::load_vault_config;
 use onebrain_search::embed::dir_size_bytes;
 
@@ -205,10 +205,6 @@ fn format_local(secs: u64) -> Option<String> {
     }
 }
 
-/// Width of the label column so every value aligns. `Last indexed` (12 chars)
-/// is the longest label; 14 leaves two trailing spaces after it.
-const LABEL_W: usize = 14;
-
 fn render_text(env: &Envelope<SearchStatusData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     // Grouped layout: emoji only on section headers, values indented with
@@ -216,7 +212,7 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
     // draws an emoji.
     let mut lines = Vec::new();
 
-    lines.push("🧠  Model".to_string());
+    lines.push(section("🧠", "Model"));
     lines.push(item("Name", &d.embed_model));
     match d.model_size_bytes {
         Some(size) => {
@@ -229,7 +225,7 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
     }
 
     lines.push(String::new());
-    lines.push("📊  Index".to_string());
+    lines.push(section("📊", "Index"));
     match &d.collection {
         Some(c) => lines.push(item("Collection", c)),
         None => lines.push(item(
@@ -270,7 +266,7 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
 
     if let Some(dir) = &d.cache_dir {
         lines.push(String::new());
-        lines.push("📁  Cache".to_string());
+        lines.push(section("📁", "Cache"));
         lines.push(item("Dir", &dir.display().to_string()));
         if let Some(size) = d.cache_size_bytes {
             lines.push(item("Size", &format_size(size)));
@@ -283,13 +279,6 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
     }
 
     lines.join("\n")
-}
-
-/// One indented `label → value` line under a section header. Four leading
-/// spaces + a fixed-width label column keep every value flush regardless of
-/// emoji rendering.
-fn item(label: &str, value: &str) -> String {
-    format!("    {label:<LABEL_W$}{value}")
 }
 
 #[cfg(test)]
