@@ -410,7 +410,7 @@ fn search_model_bare_non_tty_text_mode_renders_static_table() {
     assert!(stdout.contains("MODEL"));
     assert!(stdout.contains("DOWNLOADED"));
     assert!(stdout.contains("multilingual-e5-small"));
-    assert!(stdout.contains("📁 models:"));
+    assert!(stdout.contains("📁  models:"));
 }
 
 #[test]
