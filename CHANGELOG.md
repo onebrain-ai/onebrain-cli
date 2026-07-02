@@ -1,11 +1,6 @@
 ---
-<<<<<<< HEAD
-latest_version: 3.3.27
-released: 2026-07-02
-=======
 latest_version: 3.4.0
-released: 2026-07-01
->>>>>>> d12cb92 (chore: v3.4.0 — native search engine + CLI verbs (alongside qmd) + multilingual integration test)
+released: 2026-07-02
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
