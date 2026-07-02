@@ -236,7 +236,7 @@ fn render_list_text(env: &Envelope<ModelListData>) -> String {
 pub(crate) struct ModelSetData {
     model: String,
     already_current: bool,
-    chunks_reembedded: Option<usize>,
+    pub(crate) chunks_reembedded: Option<usize>,
 }
 
 /// `onebrain search model set <name>` — validate, no-op if already active,

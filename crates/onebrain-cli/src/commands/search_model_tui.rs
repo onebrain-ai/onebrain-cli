@@ -152,12 +152,15 @@ pub struct AppState {
     pub pending_delete: Option<usize>,
     /// Flipped by [`AppState::request_quit`]; the event loop reads it to exit.
     pub should_quit: bool,
+    /// The collection's model cache dir — kept so a successful switch can
+    /// re-scan download status (DOWNLOADED/DISK go stale otherwise).
+    pub cache_dir: PathBuf,
 }
 
 impl AppState {
     /// Build initial state from rows, selecting the CURRENT model if present
     /// (else the first row). Starts unsorted (registry order), ascending.
-    pub fn new(rows: Vec<TuiRow>) -> Self {
+    pub fn new(rows: Vec<TuiRow>, cache_dir: PathBuf) -> Self {
         let selected = rows.iter().position(|r| r.current).unwrap_or(0);
         Self {
             rows,
@@ -167,6 +170,22 @@ impl AppState {
             status: None,
             pending_delete: None,
             should_quit: false,
+            cache_dir,
+        }
+    }
+
+    /// After a successful model switch: rebuild every row from a fresh
+    /// cache-dir scan (download status may have changed — a dims-changing
+    /// rebuild downloads the new model), mark `name` current, and re-apply
+    /// the active sort while keeping the same model selected.
+    pub fn refresh_after_switch(&mut self, name: &str) {
+        let selected_name = self.selected_row().map(|r| r.name);
+        self.rows = build_rows(name, &self.cache_dir);
+        sort_rows(&mut self.rows, self.sort, self.desc);
+        if let Some(sel) = selected_name {
+            if let Some(idx) = self.rows.iter().position(|r| r.name == sel) {
+                self.selected = idx;
+            }
         }
     }
 
@@ -285,7 +304,7 @@ pub fn run(vault_flag: Option<PathBuf>) -> Result<()> {
 
     let rows = build_rows(&current, &cache_dir);
     let height = viewport_height(rows.len());
-    let mut state = AppState::new(rows);
+    let mut state = AppState::new(rows, cache_dir);
 
     enable_raw_mode().context("entering raw mode")?;
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
@@ -382,16 +401,29 @@ fn perform_switch<B: ratatui::backend::Backend>(
     let _ = terminal.draw(|f| render(f, state));
 
     match apply_model_change(resolved.clone(), name) {
-        Ok(_) => {
-            // Reflect the new active model in the table + selection.
-            for r in state.rows.iter_mut() {
-                r.current = r.name == name;
-            }
-            state.status = Some(format!("✅ switched to {name}"));
+        Ok(envelope) => {
+            // Re-scan download status (a rebuild over a non-empty index just
+            // downloaded the new model) and reflect the new active model.
+            state.refresh_after_switch(name);
+            let chunks = envelope.data.and_then(|d| d.chunks_reembedded);
+            state.status = Some(switch_status(name, chunks));
         }
         Err(e) => {
             state.status = Some(format!("⚠️  switch failed: {e}"));
         }
+    }
+}
+
+/// Post-switch status line: says what actually happened and what to do next.
+/// A rebuild over an EMPTY index embeds nothing (and downloads nothing —
+/// the embedder is lazy), so point the user at `search reindex`; otherwise
+/// report how many chunks were re-embedded with the new model.
+pub fn switch_status(name: &str, chunks_reembedded: Option<usize>) -> String {
+    match chunks_reembedded {
+        Some(0) | None => format!(
+            "✅ switched to {name} · index is empty — run `onebrain search reindex` to download + index"
+        ),
+        Some(n) => format!("✅ switched to {name} · 🧠 {n} chunk(s) re-embedded with the new model"),
     }
 }
 
@@ -514,6 +546,10 @@ mod tests {
         build_rows(current, Path::new("/nonexistent-cache"))
     }
 
+    fn state_for(current: &str) -> AppState {
+        AppState::new(rows_for(current), PathBuf::from("/nonexistent-cache"))
+    }
+
     #[test]
     fn build_rows_flags_current_and_undownloaded() {
         let rows = rows_for("bge-m3");
@@ -616,6 +652,60 @@ mod tests {
     }
 
     #[test]
+    fn switch_status_points_at_reindex_when_index_empty() {
+        for chunks in [Some(0), None] {
+            let s = switch_status("bge-m3", chunks);
+            assert!(s.contains("switched to bge-m3"), "{s}");
+            assert!(s.contains("search reindex"), "{s}");
+        }
+    }
+
+    #[test]
+    fn switch_status_reports_reembedded_chunks() {
+        let s = switch_status("multilingual-e5-base", Some(42));
+        assert!(s.contains("switched to multilingual-e5-base"), "{s}");
+        assert!(s.contains("42 chunk(s) re-embedded"), "{s}");
+        assert!(!s.contains("search reindex"), "{s}");
+    }
+
+    #[test]
+    fn refresh_after_switch_updates_current_and_download_status() {
+        let cache = tempfile::tempdir().unwrap();
+        // Start with an empty cache: nothing downloaded, bge-m3 active.
+        let mut st = AppState::new(
+            build_rows("bge-m3", cache.path()),
+            cache.path().to_path_buf(),
+        );
+        st.selected = st
+            .rows
+            .iter()
+            .position(|r| r.name == "multilingual-e5-base")
+            .unwrap();
+
+        // Simulate the switch having downloaded the new model on disk.
+        let info = model_registry()
+            .iter()
+            .find(|m| m.name == "multilingual-e5-base")
+            .unwrap();
+        let mdir = cache.path().join(info.cache_dir_name());
+        std::fs::create_dir_all(&mdir).unwrap();
+        std::fs::write(mdir.join("model.onnx"), vec![0u8; 4096]).unwrap();
+
+        st.refresh_after_switch("multilingual-e5-base");
+
+        let row = st.selected_row().unwrap();
+        assert_eq!(row.name, "multilingual-e5-base", "selection follows model");
+        assert!(row.current, "switched model is marked current");
+        assert!(row.downloaded, "download status re-scanned from disk");
+        assert_eq!(row.disk_bytes, Some(4096));
+        assert_eq!(
+            st.rows.iter().filter(|r| r.current).count(),
+            1,
+            "exactly one current model after refresh"
+        );
+    }
+
+    #[test]
     fn viewport_height_is_rows_plus_chrome() {
         // 2 table borders + 1 header + N rows + 1 footer line.
         assert_eq!(viewport_height(5), 9);
@@ -646,7 +736,7 @@ mod tests {
 
     #[test]
     fn app_new_selects_current_model() {
-        let st = AppState::new(rows_for("bge-m3"));
+        let st = state_for("bge-m3");
         assert_eq!(st.selected_row().unwrap().name, "bge-m3");
         assert!(!st.should_quit);
         assert!(!st.awaiting_delete_confirm());
@@ -655,13 +745,13 @@ mod tests {
     #[test]
     fn app_new_defaults_to_first_when_no_current() {
         // A current name not in the registry → first row selected.
-        let st = AppState::new(rows_for("not-a-real-model"));
+        let st = state_for("not-a-real-model");
         assert_eq!(st.selected, 0);
     }
 
     #[test]
     fn move_down_and_up_saturate() {
-        let mut st = AppState::new(rows_for("multilingual-e5-small"));
+        let mut st = state_for("multilingual-e5-small");
         st.selected = 0;
         st.move_up(); // already at top
         assert_eq!(st.selected, 0);
@@ -676,7 +766,7 @@ mod tests {
 
     #[test]
     fn cycle_sort_keeps_selected_model() {
-        let mut st = AppState::new(rows_for("bge-m3"));
+        let mut st = state_for("bge-m3");
         let before = st.selected_row().unwrap().name;
         st.cycle_sort();
         assert_eq!(st.sort, ModelSortCol::Disk);
@@ -689,7 +779,7 @@ mod tests {
 
     #[test]
     fn toggle_desc_flips_and_keeps_selection() {
-        let mut st = AppState::new(rows_for("bge-m3"));
+        let mut st = state_for("bge-m3");
         let before = st.selected_row().unwrap().name;
         assert!(!st.desc);
         st.toggle_desc();
@@ -701,14 +791,14 @@ mod tests {
 
     #[test]
     fn request_quit_sets_flag() {
-        let mut st = AppState::new(rows_for("bge-m3"));
+        let mut st = state_for("bge-m3");
         st.request_quit();
         assert!(st.should_quit);
     }
 
     #[test]
     fn begin_delete_refuses_active_model() {
-        let mut st = AppState::new(rows_for("bge-m3"));
+        let mut st = state_for("bge-m3");
         // Selection starts on the active model.
         assert!(!st.begin_delete());
         assert!(!st.awaiting_delete_confirm());
@@ -717,7 +807,7 @@ mod tests {
 
     #[test]
     fn begin_delete_refuses_not_downloaded() {
-        let mut st = AppState::new(rows_for("bge-m3"));
+        let mut st = state_for("bge-m3");
         // Move to a non-active, not-downloaded row.
         let idx = st
             .rows
@@ -742,7 +832,10 @@ mod tests {
         std::fs::create_dir_all(&mdir).unwrap();
         std::fs::write(mdir.join("model.onnx"), vec![0u8; 1024]).unwrap();
 
-        let mut st = AppState::new(build_rows("bge-m3", cache.path()));
+        let mut st = AppState::new(
+            build_rows("bge-m3", cache.path()),
+            cache.path().to_path_buf(),
+        );
         let idx = st
             .rows
             .iter()
@@ -756,7 +849,7 @@ mod tests {
 
     #[test]
     fn cancel_delete_clears_pending() {
-        let mut st = AppState::new(rows_for("bge-m3"));
+        let mut st = state_for("bge-m3");
         st.pending_delete = Some(0);
         st.cancel_delete();
         assert!(!st.awaiting_delete_confirm());
@@ -774,7 +867,10 @@ mod tests {
         std::fs::create_dir_all(&mdir).unwrap();
         std::fs::write(mdir.join("model.onnx"), vec![0u8; 2048]).unwrap();
 
-        let mut st = AppState::new(build_rows("bge-m3", cache.path()));
+        let mut st = AppState::new(
+            build_rows("bge-m3", cache.path()),
+            cache.path().to_path_buf(),
+        );
         let idx = st
             .rows
             .iter()
@@ -796,7 +892,7 @@ mod tests {
     fn perform_delete_reports_error_when_dir_missing() {
         // pending_delete points at a downloaded-flagged row whose dir doesn't
         // actually exist → remove_dir_all errors, surfaced in the status line.
-        let mut st = AppState::new(rows_for("bge-m3"));
+        let mut st = state_for("bge-m3");
         let idx = st.rows.iter().position(|r| !r.current).unwrap();
         st.rows[idx].downloaded = true; // pretend downloaded
         st.pending_delete = Some(idx);
@@ -806,7 +902,7 @@ mod tests {
 
     #[test]
     fn perform_delete_noop_when_nothing_pending() {
-        let mut st = AppState::new(rows_for("bge-m3"));
+        let mut st = state_for("bge-m3");
         st.pending_delete = None;
         perform_delete(&mut st);
         // No panic, status untouched.
