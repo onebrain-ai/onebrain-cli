@@ -383,8 +383,25 @@ impl Engine {
     /// production behavior is unchanged from before the [`Embed`]-trait
     /// refactor.
     pub fn rebuild(&mut self, new_model: &str) -> Result<usize> {
+        self.rebuild_with_progress(new_model, &mut |_, _| {})
+    }
+
+    /// Like [`Engine::rebuild`] but reports live `(re-embedded, total)` chunk
+    /// counts: once as `(0, total)` right before the first embed call (i.e.
+    /// before the potentially slow model download / load), then after every
+    /// internal batch. Never fires for an empty index (nothing to re-embed).
+    pub fn rebuild_with_progress(
+        &mut self,
+        new_model: &str,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<usize> {
         let new_dims = embed::model_dims(new_model);
-        self.rebuild_inner(new_model, new_dims, EmbedSource::Lazy(OnceCell::new()))
+        self.rebuild_inner(
+            new_model,
+            new_dims,
+            EmbedSource::Lazy(OnceCell::new()),
+            progress,
+        )
     }
 
     /// Like [`Engine::rebuild`] but with a caller-supplied embedder used
@@ -395,9 +412,15 @@ impl Engine {
         &mut self,
         new_model: &str,
         embedder: Box<dyn Embed>,
+        progress: &mut dyn FnMut(usize, usize),
     ) -> Result<usize> {
         let new_dims = embedder.dims();
-        self.rebuild_inner(new_model, new_dims, EmbedSource::Injected(embedder))
+        self.rebuild_inner(
+            new_model,
+            new_dims,
+            EmbedSource::Injected(embedder),
+            progress,
+        )
     }
 
     /// Shared rebuild path: collect the re-embed worklist, wipe the vector
@@ -409,6 +432,7 @@ impl Engine {
         new_model: &str,
         new_dims: usize,
         new_source: EmbedSource,
+        progress: &mut dyn FnMut(usize, usize),
     ) -> Result<usize> {
         // 1. Collect every chunk (id, text) from chunk_meta up front, before
         // wiping anything, so we have the full re-embed worklist.
@@ -446,15 +470,27 @@ impl Engine {
         self.embedder = new_source;
         self.vec = VectorStore::open(&vectors_dir, new_dims)?;
 
-        // 4. Batch-embed every chunk's text with the new embedder in ONE
-        // `embed` call (it batches internally), then add each returned vector
-        // by index. Skipped entirely when there are no chunks, so an empty
-        // index never constructs the embedder (no model download).
+        // 4. Re-embed in batches so progress can be reported between calls
+        // (fastembed also batches internally; the outer batch just bounds
+        // how long the UI goes without an update). Skipped entirely when
+        // there are no chunks, so an empty index never constructs the
+        // embedder (no model download).
         if !chunks.is_empty() {
-            let texts: Vec<String> = chunks.iter().map(|(_, text)| text.clone()).collect();
-            let vectors = self.embedder()?.embed(&texts)?;
-            for ((chunk_id, _text), vector) in chunks.iter().zip(vectors.iter()) {
-                self.vec.add(chunk_id, vector)?;
+            const REBUILD_EMBED_BATCH: usize = 64;
+            let total = chunks.len();
+            // (0, total) before the first embed call — the model download /
+            // load stall happens inside it, so the UI can show the total
+            // while that runs.
+            progress(0, total);
+            let mut done = 0usize;
+            for batch in chunks.chunks(REBUILD_EMBED_BATCH) {
+                let texts: Vec<String> = batch.iter().map(|(_, text)| text.clone()).collect();
+                let vectors = self.embedder()?.embed(&texts)?;
+                for ((chunk_id, _text), vector) in batch.iter().zip(vectors.iter()) {
+                    self.vec.add(chunk_id, vector)?;
+                }
+                done += batch.len();
+                progress(done, total);
             }
         }
 
@@ -1326,6 +1362,36 @@ mod tests {
     }
 
     #[test]
+    fn fake_rebuild_with_embedder_reports_batched_progress() {
+        // Index a few docs with the fake embedder, then rebuild and assert
+        // the progress callback fired (0, total) first and (total, total)
+        // last, with done strictly increasing.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+        e.index_doc("a.md", "# A\nalpha content").unwrap();
+        e.index_doc("b.md", "# B\nbeta content").unwrap();
+
+        let mut events: Vec<(usize, usize)> = Vec::new();
+        e.rebuild_with_embedder(
+            "fake-model-2",
+            Box::new(FakeEmbedder { dims: 16 }),
+            &mut |done, total| events.push((done, total)),
+        )
+        .unwrap();
+
+        assert!(events.len() >= 2, "at least (0,total) and (total,total)");
+        let total = events[0].1;
+        assert!(total >= 2, "two docs produce at least two chunks");
+        assert_eq!(events.first(), Some(&(0, total)));
+        assert_eq!(events.last(), Some(&(total, total)));
+        assert!(
+            events.windows(2).all(|w| w[0].0 < w[1].0),
+            "done strictly increases: {events:?}"
+        );
+        assert!(events.iter().all(|(_, t)| *t == total), "stable total");
+    }
+
+    #[test]
     fn fake_reindex_paths_with_progress_reports_events() {
         let cache_dir = tempfile::tempdir().unwrap();
         let vault_dir = tempfile::tempdir().unwrap();
@@ -1400,7 +1466,11 @@ mod tests {
         // Rebuild to a different-dims fake embedder: vector store is dropped
         // and re-created at 32 dims, every chunk re-embedded.
         let reembedded = e
-            .rebuild_with_embedder("fake-model-2", Box::new(FakeEmbedder { dims: 32 }))
+            .rebuild_with_embedder(
+                "fake-model-2",
+                Box::new(FakeEmbedder { dims: 32 }),
+                &mut |_, _| {},
+            )
             .unwrap();
         assert_eq!(reembedded, 2);
         assert!(e.active_model_matches("fake-model-2").unwrap());
@@ -1418,7 +1488,11 @@ mod tests {
         let mut e = fake_engine(dir.path());
         // No docs indexed → rebuild re-embeds 0 chunks.
         let reembedded = e
-            .rebuild_with_embedder("fake-model-2", Box::new(FakeEmbedder { dims: 8 }))
+            .rebuild_with_embedder(
+                "fake-model-2",
+                Box::new(FakeEmbedder { dims: 8 }),
+                &mut |_, _| {},
+            )
             .unwrap();
         assert_eq!(reembedded, 0);
         assert!(e.active_model_matches("fake-model-2").unwrap());

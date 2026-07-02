@@ -23,15 +23,32 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchGetArgs)
     let (engine, resolved) = open_engine(vault_flag)?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
 
-    let content = engine.get(&args.doc_path)?;
-    let data = SearchGetData {
-        doc_path: args.doc_path.clone(),
-        content,
-    };
+    // Index keys are vault-relative (forward-slash) paths; accept an
+    // absolute path under the vault root and normalize it so
+    // `search get /abs/vault/00-inbox/x.md` just works.
+    let doc_path = normalize_doc_path(&args.doc_path, resolved.root.as_path());
+    let content = engine.get(&doc_path).map_err(|e| {
+        anyhow::anyhow!(
+            "{e}\n💡 paths are vault-relative (e.g. `00-inbox/note.md`); \
+             if the doc is new, `onebrain search reindex` may not have indexed it yet"
+        )
+    })?;
+    let data = SearchGetData { doc_path, content };
 
     let envelope = Envelope::ok("search.get", Some(vault_info), data);
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
+}
+
+/// Normalize a user-supplied doc path to the index's key form: absolute
+/// paths under the vault root are made vault-relative, `./` prefixes are
+/// stripped, and platform back-slashes become forward slashes. Anything
+/// else is passed through unchanged.
+fn normalize_doc_path(input: &str, vault_root: &std::path::Path) -> String {
+    let p = std::path::Path::new(input);
+    let rel = p.strip_prefix(vault_root).unwrap_or(p);
+    let s = rel.to_string_lossy().replace('\\', "/");
+    s.trim_start_matches("./").to_string()
 }
 
 fn render_text(env: &Envelope<SearchGetData>) -> String {
@@ -42,6 +59,28 @@ fn render_text(env: &Envelope<SearchGetData>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_strips_vault_root_and_dot_prefix() {
+        let root = std::path::Path::new("/vault/ob-1");
+        assert_eq!(
+            normalize_doc_path("/vault/ob-1/00-inbox/note.md", root),
+            "00-inbox/note.md"
+        );
+        assert_eq!(
+            normalize_doc_path("./00-inbox/note.md", root),
+            "00-inbox/note.md"
+        );
+        assert_eq!(
+            normalize_doc_path("00-inbox/note.md", root),
+            "00-inbox/note.md"
+        );
+        // Absolute path OUTSIDE the vault passes through unchanged.
+        assert_eq!(
+            normalize_doc_path("/elsewhere/x.md", root),
+            "/elsewhere/x.md"
+        );
+    }
 
     #[test]
     fn text_prints_raw_content() {

@@ -281,7 +281,18 @@ pub fn run_set(
     }
 
     let resolved = crate::vault_ctx::require(vault_flag)?;
-    let envelope = apply_model_change(resolved, &args.name)?;
+    let pb = reembed_progress_bar(mode);
+    let envelope = apply_model_change(resolved, &args.name, &mut |done, total| {
+        if let Some(pb) = &pb {
+            if pb.length() != Some(total as u64) {
+                pb.set_length(total as u64);
+            }
+            pb.set_position(done as u64);
+        }
+    })?;
+    if let Some(pb) = &pb {
+        pb.finish_and_clear();
+    }
     emit(&envelope, mode, std::io::stdout().lock(), render_set_text)?;
     Ok(())
 }
@@ -306,6 +317,7 @@ fn supported_model_names() -> String {
 pub(crate) fn apply_model_change(
     resolved: onebrain_core::ResolvedVault,
     model_name: &str,
+    on_reembed: &mut dyn FnMut(usize, usize),
 ) -> Result<Envelope<ModelSetData>> {
     let vault_info = crate::vault_ctx::info_from(&resolved);
     let config = load_vault_config(&resolved.root).context("load vault config")?;
@@ -328,7 +340,7 @@ pub(crate) fn apply_model_change(
     // `onebrain.yml` pointing at a model whose index can't open.
     let (mut engine, resolved) = open_engine(Some(resolved.root.as_path().to_path_buf()))?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
-    let reembedded = engine.rebuild(model_name)?;
+    let reembedded = engine.rebuild_with_progress(model_name, on_reembed)?;
 
     persist_embed_model(resolved.root.as_path(), model_name)
         .with_context(|| format!("persisting search.embed_model = {model_name}"))?;
@@ -339,6 +351,22 @@ pub(crate) fn apply_model_change(
         chunks_reembedded: Some(reembedded),
     };
     Ok(Envelope::ok("search.model.set", Some(vault_info), data))
+}
+
+/// Stderr re-embed progress bar for `model set` / the picker: only on a real
+/// TTY in text mode (structured runs stay silent). `🧠 re-embedding p/t (%)`.
+fn reembed_progress_bar(mode: &OutputMode) -> Option<indicatif::ProgressBar> {
+    use is_terminal::IsTerminal;
+    if mode.is_structured() || !std::io::stderr().is_terminal() {
+        return None;
+    }
+    let pb = indicatif::ProgressBar::new(0);
+    pb.set_style(
+        indicatif::ProgressStyle::with_template("🧠 re-embedding  {pos}/{len}  ({percent}%)")
+            .expect("static template is valid")
+            .progress_chars("=>-"),
+    );
+    Some(pb)
 }
 
 pub(crate) fn render_set_text(env: &Envelope<ModelSetData>) -> String {

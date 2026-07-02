@@ -194,6 +194,27 @@ pub struct AppState {
     /// Set while an Enter-triggered download is running: the row named here
     /// renders an in-table progress bar instead of its NOTE text.
     pub downloading: Option<DownloadUi>,
+    /// Set while a switch's re-embed phase is running: the row named here
+    /// renders an in-table progress bar driven by chunk counts.
+    pub reembed: Option<ReembedUi>,
+}
+
+/// In-table re-embed progress for one model: exact chunk counts streamed
+/// from `Engine::rebuild_with_progress`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReembedUi {
+    pub name: &'static str,
+    pub done: usize,
+    pub total: usize,
+}
+
+/// Re-embed percentage from exact chunk counts (0–100; `total == 0` → 100,
+/// treated as already done).
+pub fn reembed_pct(done: usize, total: usize) -> u8 {
+    if total == 0 {
+        return 100;
+    }
+    ((done * 100 / total).min(100)) as u8
 }
 
 /// In-table download progress for one model: the row to decorate, the
@@ -248,6 +269,7 @@ impl AppState {
             should_quit: false,
             cache_dir,
             downloading: None,
+            reembed: None,
         }
     }
 
@@ -358,9 +380,9 @@ impl AppState {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Height of the inline viewport: table borders (2) + header (1) + one line
-/// per registry row + the single footer line.
+/// per registry row + the legend line + the status line.
 pub fn viewport_height(row_count: usize) -> u16 {
-    (row_count as u16).saturating_add(4)
+    (row_count as u16).saturating_add(5)
 }
 
 /// Launch the interactive model TUI for `vault_flag`'s vault. Resolves the
@@ -459,6 +481,9 @@ enum SwitchMsg {
     /// The model files are on disk (either they already were, or the forced
     /// download just finished); the re-embed phase is starting.
     DownloadDone,
+    /// Live re-embed progress from `Engine::rebuild_with_progress`:
+    /// `(chunks done, total chunks)`.
+    Reembed { done: usize, total: usize },
     /// The whole switch finished (config persisted on success). Boxed: the
     /// envelope is much larger than the other variant.
     Finished(
@@ -513,9 +538,13 @@ fn perform_switch<B: ratatui::backend::Backend>(
             }
         }
         let _ = tx.send(SwitchMsg::DownloadDone);
+        let progress_tx = tx.clone();
         let _ = tx.send(SwitchMsg::Finished(Box::new(apply_model_change(
             worker_resolved,
             name,
+            &mut |done, total| {
+                let _ = progress_tx.send(SwitchMsg::Reembed { done, total });
+            },
         ))));
     });
 
@@ -553,33 +582,48 @@ fn perform_switch<B: ratatui::backend::Backend>(
             let _ = event::read();
         }
 
-        match rx.try_recv() {
-            Ok(SwitchMsg::DownloadDone) => {
-                if state.downloading.take().is_some() {
-                    state.status = Some(format!("✅ downloaded · 🧠 re-embedding with {name}…"));
-                }
-            }
-            Ok(SwitchMsg::Finished(result)) => {
-                state.downloading = None;
-                match *result {
-                    Ok(envelope) => {
-                        // Re-scan download status and reflect the new active
-                        // model in the table.
-                        state.refresh_after_switch(name);
-                        let chunks = envelope.data.and_then(|d| d.chunks_reembedded);
-                        state.status = Some(switch_status(name, chunks));
-                    }
-                    Err(e) => {
-                        state.status = Some(format!("⚠️  switch failed: {e}"));
+        // Drain everything queued since the last tick (re-embed events can
+        // arrive faster than the 150ms redraw cadence).
+        loop {
+            match rx.try_recv() {
+                Ok(SwitchMsg::DownloadDone) => {
+                    if state.downloading.take().is_some() {
+                        state.status =
+                            Some(format!("✅ downloaded · 🧠 re-embedding with {name}…"));
                     }
                 }
-                return;
-            }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                state.downloading = None;
-                state.status = Some("⚠️  switch worker exited unexpectedly".to_string());
-                return;
+                Ok(SwitchMsg::Reembed { done, total }) => {
+                    state.downloading = None;
+                    state.reembed = Some(ReembedUi { name, done, total });
+                    state.status = Some(format!(
+                        "🧠 re-embedding with {name} — {done}/{total} chunk(s) ({}%)",
+                        reembed_pct(done, total)
+                    ));
+                }
+                Ok(SwitchMsg::Finished(result)) => {
+                    state.downloading = None;
+                    state.reembed = None;
+                    match *result {
+                        Ok(envelope) => {
+                            // Re-scan download status and reflect the new
+                            // active model in the table.
+                            state.refresh_after_switch(name);
+                            let chunks = envelope.data.and_then(|d| d.chunks_reembedded);
+                            state.status = Some(switch_status(name, chunks));
+                        }
+                        Err(e) => {
+                            state.status = Some(format!("⚠️  switch failed: {e}"));
+                        }
+                    }
+                    return;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    state.downloading = None;
+                    state.reembed = None;
+                    state.status = Some("⚠️  switch worker exited unexpectedly".to_string());
+                    return;
+                }
             }
         }
     }
@@ -636,7 +680,11 @@ fn render(f: &mut ratatui::Frame, state: &AppState) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(f.area());
 
     let (col, desc) = (state.sort, state.desc);
@@ -661,11 +709,14 @@ fn render(f: &mut ratatui::Frame, state: &AppState) {
         .enumerate()
         .map(|(i, r)| {
             let dl = state.downloading.as_ref().filter(|d| d.name == r.name);
+            let re = state.reembed.as_ref().filter(|d| d.name == r.name);
             let marker = if r.current { "●" } else { "" };
             // Plain "—" for not-downloaded: ⬜ renders as a huge white block
             // in some terminal fonts.
             let downloaded = if dl.is_some() {
                 "⏬"
+            } else if re.is_some() {
+                "🧠"
             } else if r.downloaded {
                 "✓"
             } else {
@@ -680,10 +731,12 @@ fn render(f: &mut ratatui::Frame, state: &AppState) {
                 .thai
                 .map(|v| format!("{v:.1}"))
                 .unwrap_or_else(|| "—".to_string());
-            // While this row downloads, its NOTE column becomes the bar.
-            let note = match dl {
-                Some(d) => progress_bar(d.pct, 14),
-                None => r.note.to_string(),
+            // While this row downloads or re-embeds, its NOTE column becomes
+            // the progress bar.
+            let note = match (dl, re) {
+                (Some(d), _) => progress_bar(d.pct, 14),
+                (None, Some(e)) => progress_bar(reembed_pct(e.done, e.total), 14),
+                (None, None) => r.note.to_string(),
             };
             let style = if i == state.selected {
                 Style::default().add_modifier(Modifier::REVERSED)
@@ -721,13 +774,14 @@ fn render(f: &mut ratatui::Frame, state: &AppState) {
     );
     f.render_widget(table, chunks[0]);
 
-    let footer_line = state
-        .status
-        .clone()
-        .unwrap_or_else(|| footer_text(state.sort, state.desc));
-    let footer = ratatui::widgets::Paragraph::new(footer_line)
+    // The keybinding legend gets its own permanent line so a transient
+    // status (switch result, re-embed progress, delete confirm) never
+    // hides the shortcuts.
+    let legend = ratatui::widgets::Paragraph::new(footer_text(state.sort, state.desc))
         .style(Style::default().add_modifier(Modifier::DIM));
-    f.render_widget(footer, chunks[1]);
+    f.render_widget(legend, chunks[1]);
+    let status = ratatui::widgets::Paragraph::new(state.status.clone().unwrap_or_default());
+    f.render_widget(status, chunks[2]);
 }
 
 #[cfg(test)]
@@ -939,6 +993,14 @@ mod tests {
     }
 
     #[test]
+    fn reembed_pct_exact_counts() {
+        assert_eq!(reembed_pct(0, 200), 0);
+        assert_eq!(reembed_pct(64, 200), 32);
+        assert_eq!(reembed_pct(200, 200), 100);
+        assert_eq!(reembed_pct(0, 0), 100, "empty re-embed is already done");
+    }
+
+    #[test]
     fn download_pct_caps_at_99_and_handles_zero_expected() {
         assert_eq!(download_pct(0, 1000), 0);
         assert_eq!(download_pct(420, 1000), 42);
@@ -1025,9 +1087,9 @@ mod tests {
 
     #[test]
     fn viewport_height_is_rows_plus_chrome() {
-        // 2 table borders + 1 header + N rows + 1 footer line.
-        assert_eq!(viewport_height(5), 9);
-        assert_eq!(viewport_height(0), 4);
+        // 2 table borders + 1 header + N rows + legend + status lines.
+        assert_eq!(viewport_height(5), 10);
+        assert_eq!(viewport_height(0), 5);
         assert_eq!(viewport_height(usize::MAX), u16::MAX);
     }
 
