@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::cli::SearchReindexArgs;
 use crate::commands::search_common::{
-    collection_cache_dir, collection_for, model_not_chosen, open_engine,
+    collection_cache_dir, collection_for, model_not_chosen, open_engine, reindex_progress_path,
 };
 use crate::output::{emit, Envelope, OutputMode};
 use onebrain_search::engine::{ReindexProgress, ReindexStats};
@@ -69,7 +69,18 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchReindexA
     // envelope). Piped / agent / hook runs get a couple of plain milestone
     // lines instead of a cursor-controlled bar.
     let mut reporter = ProgressReporter::new(mode, model_load_notice_for(&resolved));
-    let mut on_progress = |p: ReindexProgress| reporter.handle(p);
+
+    // Live progress marker: lets a `search status` in ANOTHER process see
+    // this run's (done, total) while it works. Removed on drop (any exit).
+    let live = LiveProgressFile::new(&resolved)?;
+    let mut on_progress = |p: ReindexProgress| {
+        match &p {
+            ReindexProgress::Walked { total } => live.record(0, *total),
+            ReindexProgress::Indexing { done, total, .. } => live.record(*done, *total),
+            ReindexProgress::LoadingModel => {}
+        }
+        reporter.handle(p);
+    };
 
     let stats = if args.paths.is_empty() {
         engine.reindex_all_with_progress(resolved.root.as_path(), &mut on_progress)?
@@ -81,10 +92,40 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchReindexA
         )?
     };
     reporter.finish();
+    drop(live); // remove the marker before printing the final summary
 
     let envelope = Envelope::ok("search.reindex", Some(vault_info), ReindexData::from(stats));
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
+}
+
+/// RAII live-progress marker (see `search_common::reindex_progress_path`):
+/// `record` rewrites the tiny JSON atomically; dropping removes the file so
+/// a finished (or failed) reindex never leaves a "running" marker behind.
+struct LiveProgressFile {
+    path: PathBuf,
+}
+
+impl LiveProgressFile {
+    fn new(resolved: &onebrain_core::ResolvedVault) -> Result<Self> {
+        let collection = collection_for(resolved)?;
+        Ok(Self {
+            path: reindex_progress_path(&collection_cache_dir(&collection)),
+        })
+    }
+
+    fn record(&self, done: usize, total: usize) {
+        let _ = onebrain_fs::atomic_write_text(
+            &self.path,
+            &format!("{{\"done\":{done},\"total\":{total}}}"),
+        );
+    }
+}
+
+impl Drop for LiveProgressFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Delete the collection's index files — `tantivy/`, `vectors/`, and

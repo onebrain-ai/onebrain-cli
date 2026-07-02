@@ -360,3 +360,63 @@ mod tests {
         assert!(!model_not_chosen(vault.path(), cache.path()));
     }
 }
+
+/// Path of the live reindex-progress marker inside a collection cache dir.
+/// Written by an in-flight `search reindex`, read by `search status` from
+/// any other process, removed when the reindex finishes.
+pub(crate) fn reindex_progress_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("reindex-progress.json")
+}
+
+/// A live reindex's `(done, total)` doc counts.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ReindexLiveProgress {
+    pub done: usize,
+    pub total: usize,
+}
+
+/// Read the live progress marker, if a reindex appears to be running.
+/// Fresh = touched within the last 30 minutes — a crashed reindex leaves the
+/// file behind, so stale markers are ignored (and best-effort removed).
+pub(crate) fn read_reindex_progress(cache_dir: &Path) -> Option<ReindexLiveProgress> {
+    let path = reindex_progress_path(cache_dir);
+    let meta = std::fs::metadata(&path).ok()?;
+    let fresh = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .is_some_and(|e| e.as_secs() < 30 * 60);
+    if !fresh {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()
+}
+
+#[cfg(test)]
+mod live_progress_tests {
+    use super::*;
+
+    #[test]
+    fn read_reindex_progress_roundtrip_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_reindex_progress(dir.path()).is_none(), "no marker yet");
+
+        let marker = reindex_progress_path(dir.path());
+        std::fs::write(&marker, r#"{"done":457,"total":761}"#).unwrap();
+        let p = read_reindex_progress(dir.path()).unwrap();
+        assert_eq!(
+            p,
+            ReindexLiveProgress {
+                done: 457,
+                total: 761
+            }
+        );
+
+        std::fs::write(&marker, "not json").unwrap();
+        assert!(
+            read_reindex_progress(dir.path()).is_none(),
+            "garbage → None"
+        );
+    }
+}

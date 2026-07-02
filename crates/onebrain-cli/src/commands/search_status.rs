@@ -16,7 +16,8 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::commands::search_common::{
-    collection_cache_dir, is_indexed, open_engine, resolve_collection,
+    collection_cache_dir, is_indexed, open_engine, read_reindex_progress, resolve_collection,
+    ReindexLiveProgress,
 };
 use crate::output::{emit, Envelope, OutputMode};
 use onebrain_core::load_vault_config;
@@ -43,6 +44,11 @@ struct SearchStatusData {
     pending_changed: usize,
     /// Pending drift: indexed docs whose file is gone.
     pending_removed: usize,
+    /// Present when a `search reindex` is running RIGHT NOW in another
+    /// process (live marker in the cache dir): its (done, total) counts.
+    /// While set, `doc_count`/pending below may lag the in-flight run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reindexing: Option<ReindexLiveProgress>,
 }
 
 pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
@@ -63,6 +69,7 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
         }
         None => (None, false, None, None),
     };
+    let reindexing = cache_dir.as_deref().and_then(read_reindex_progress);
 
     // Index status (doc count, last_indexed, drift) — opens the engine
     // read-only (lazy embedder → no model download) and re-hashes the vault.
@@ -95,6 +102,7 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
         pending_new,
         pending_changed,
         pending_removed,
+        reindexing,
     };
 
     let envelope = Envelope::ok("search.status", Some(vault_info), data);
@@ -233,6 +241,18 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
         None => lines.push("🕐 last indexed  never".to_string()),
     }
 
+    if let Some(r) = &d.reindexing {
+        let pct = if r.total > 0 {
+            r.done * 100 / r.total
+        } else {
+            0
+        };
+        lines.push(format!(
+            "🔄  reindexing    {}/{} ({pct}%) — running now; counts below may lag",
+            r.done, r.total
+        ));
+    }
+
     lines.push(format!("✅  indexed  {} docs", d.doc_count));
 
     let pending = d.pending_new + d.pending_changed + d.pending_removed;
@@ -269,6 +289,7 @@ mod tests {
                 pending_new: 0,
                 pending_changed: 0,
                 pending_removed: 0,
+                reindexing: None,
             },
         )
     }
@@ -357,6 +378,24 @@ mod tests {
         assert_eq!(v["pending_removed"], 0);
         assert_eq!(v["last_indexed_at"], 1_700_000_000u64);
         assert_eq!(v["model_size_bytes"], 1234);
+    }
+
+    #[test]
+    fn text_shows_live_reindex_line_when_marker_present() {
+        let mut e = env(Some("ob-1"), true);
+        e.data.as_mut().unwrap().reindexing = Some(ReindexLiveProgress {
+            done: 457,
+            total: 761,
+        });
+        let s = render_text(&e);
+        assert!(s.contains("🔄  reindexing    457/761 (60%)"), "{s}");
+        assert!(s.contains("counts below may lag"), "{s}");
+    }
+
+    #[test]
+    fn json_omits_reindexing_when_absent() {
+        let v = serde_json::to_value(env(Some("ob-1"), true).data.as_ref().unwrap()).unwrap();
+        assert!(v.get("reindexing").is_none());
     }
 
     #[test]
