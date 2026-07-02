@@ -179,15 +179,20 @@ fn gzip_is_acceptable(entry: &str) -> bool {
     {
         return false;
     }
-    // A `q=0` qualifier means "not acceptable". Compare with `<= 0.0` rather
-    // than `== 0.0`: exact float equality is fragile, and any non-positive
-    // q-value (0, 0.0, 0.00) equally means "refused".
+    // A `q=0` qualifier means "not acceptable".
     !parts.any(|p| {
         p.strip_prefix("q=")
             .and_then(|q| q.parse::<f32>().ok())
-            .map(|q| q <= 0.0)
+            .map(is_q_value_refused)
             .unwrap_or(false)
     })
+}
+
+/// Returns true when an HTTP quality value means the coding is refused. Per RFC
+/// semantics, q=0 means "not acceptable"; we treat any non-positive parsed value
+/// as refusal.
+fn is_q_value_refused(q: f32) -> bool {
+    q <= 0.0
 }
 
 /// Serve gzip-precompressed `data`: pass it through with `Content-Encoding: gzip`
@@ -221,7 +226,11 @@ fn serve_maybe_gzipped(mime: String, data: Vec<u8>, accepts_gzip: bool) -> Respo
 fn inflate(gz: &[u8]) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut decoder = flate2::read::GzDecoder::new(gz);
-    let mut out = Vec::new();
+    // The uncompressed size isn't always recoverable from the gzip stream, so
+    // pre-size the buffer with a conservative estimate (~3x the compressed size)
+    // to cut reallocations while inflating.
+    let estimated = gz.len().saturating_mul(3).max(1024);
+    let mut out = Vec::with_capacity(estimated);
     decoder.read_to_end(&mut out).ok().map(|_| out)
 }
 
@@ -403,6 +412,16 @@ mod tests {
         assert!(!accepts_gzip(&req(Some("gzip;q=-1")))); // any non-positive q → refused
         assert!(!accepts_gzip(&req(Some("deflate, br")))); // no gzip
         assert!(!accepts_gzip(&req(None))); // header absent
+    }
+
+    #[test]
+    fn is_q_value_refused_treats_non_positive_as_refused() {
+        assert!(is_q_value_refused(0.0)); // canonical q=0
+        assert!(is_q_value_refused(-0.0)); // negative zero
+        assert!(is_q_value_refused(-1.0)); // any negative
+        assert!(!is_q_value_refused(0.001)); // smallest meaningful preference
+        assert!(!is_q_value_refused(0.5));
+        assert!(!is_q_value_refused(1.0));
     }
 
     #[test]

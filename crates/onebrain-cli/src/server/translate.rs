@@ -53,8 +53,8 @@ pub async fn post_translate(Json(req): Json<TranslateRequest>) -> Response {
     // valid language code. Restructured as an explicit if-let rather than
     // `!from.is_none_or(is_lang_code)` (a double negative that reads as its
     // own opposite).
-    let from_invalid = matches!(req.from.as_deref(), Some(from) if !is_lang_code(from));
-    if !is_lang_code(&req.to) || from_invalid {
+    let has_invalid_from = matches!(req.from.as_deref(), Some(from) if !is_lang_code(from));
+    if !is_lang_code(&req.to) || has_invalid_from {
         return err(StatusCode::BAD_REQUEST, "invalid language code");
     }
     let truncated = text.chars().count() > MAX_TEXT_CHARS;

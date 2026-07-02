@@ -8,6 +8,18 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
+
+/// Shared ureq agent for the frameability preflight, built once. Configured to
+/// NOT auto-follow redirects (`max_redirects(0)`) so each hop's `Location` is
+/// re-validated by `probe_frameable`; a 5s global timeout bounds a slow origin.
+static WEBVIEW_PREFLIGHT_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(5)))
+        .max_redirects(0)
+        .build()
+        .into()
+});
 
 #[derive(Deserialize)]
 pub struct PreflightParams {
@@ -49,11 +61,7 @@ const MAX_REDIRECT_HOPS: u32 = 5;
 /// SSRF gap where a `http://` URL 302s to `file://` or an internal host. Any
 /// error, non-http redirect target, or exceeding `MAX_REDIRECT_HOPS` → false.
 fn probe_frameable(url: &str) -> bool {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(5)))
-        .max_redirects(0)
-        .build()
-        .into();
+    let agent = &*WEBVIEW_PREFLIGHT_AGENT;
 
     let mut current = url.to_string();
     for _ in 0..MAX_REDIRECT_HOPS {
@@ -111,7 +119,9 @@ fn resolve_redirect(base: &str, location: &str) -> Option<String> {
         return Some(location.to_string());
     }
     if let Some(rest) = location.strip_prefix("//") {
-        let scheme = base.split("://").next()?;
+        // Require the base to actually carry a `scheme://` — a schemeless base
+        // yields None (probe fails closed) rather than a malformed target.
+        let (scheme, _) = base.split_once("://")?;
         let resolved = format!("{scheme}://{rest}");
         return is_http_url(&resolved).then_some(resolved);
     }
@@ -268,6 +278,14 @@ mod tests {
             resolve_redirect("http://example.com/a", "//other.example/b"),
             Some("http://other.example/b".to_string())
         );
+    }
+
+    #[test]
+    fn resolve_redirect_scheme_relative_needs_scheme_in_base() {
+        // A schemeless base can't supply a scheme for a `//host/…` Location, so
+        // `split_once("://")` returns None → the redirect is not followed
+        // (probe fails closed) rather than producing a malformed target.
+        assert_eq!(resolve_redirect("example.com/a", "//other.example/b"), None);
     }
 
     #[test]
