@@ -56,7 +56,7 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchReindexA
     // (not `--json` / `--yaml`, which must stay silent except the final
     // envelope). Piped / agent / hook runs get a couple of plain milestone
     // lines instead of a cursor-controlled bar.
-    let mut reporter = ProgressReporter::new(mode);
+    let mut reporter = ProgressReporter::new(mode, model_load_notice_for(&resolved));
     let mut on_progress = |p: ReindexProgress| reporter.handle(p);
 
     let stats = if args.paths.is_empty() {
@@ -121,13 +121,19 @@ fn maybe_prompt_first_model(vault_flag: Option<PathBuf>, mode: &OutputMode) -> R
 /// - `Silent` — nothing (structured `--json` / `--yaml`: only the final
 ///   envelope is emitted).
 enum ProgressReporter {
-    Bar(indicatif::ProgressBar),
-    PlainLines { last_pct_bucket: Option<usize> },
+    Bar {
+        pb: indicatif::ProgressBar,
+        load_notice: String,
+    },
+    PlainLines {
+        last_pct_bucket: Option<usize>,
+        load_notice: String,
+    },
     Silent,
 }
 
 impl ProgressReporter {
-    fn new(mode: &OutputMode) -> Self {
+    fn new(mode: &OutputMode, load_notice: String) -> Self {
         use is_terminal::IsTerminal;
         // Structured modes stay silent regardless of TTY.
         if mode.is_structured() {
@@ -144,26 +150,39 @@ impl ProgressReporter {
                 .expect("static template is valid")
                 .progress_chars("=>-"),
             );
-            Self::Bar(pb)
+            Self::Bar { pb, load_notice }
         } else {
             Self::PlainLines {
                 last_pct_bucket: None,
+                load_notice,
             }
         }
     }
 
     fn handle(&mut self, p: ReindexProgress) {
         match p {
+            // The walk finished: the total is known before any (slow) model
+            // load / embed starts, so the bar reads 0/N instead of 0/0.
+            ReindexProgress::Walked { total } => match self {
+                Self::Bar { pb, .. } => {
+                    pb.set_length(total as u64);
+                    pb.set_position(0);
+                }
+                Self::PlainLines { .. } => {
+                    eprintln!("📇 indexing {total} doc(s)…");
+                }
+                Self::Silent => {}
+            },
             ReindexProgress::LoadingModel => match self {
-                Self::Bar(pb) => {
+                Self::Bar { pb, load_notice } => {
                     // fastembed prints its own download bar; suspend ours so the
                     // notice + that bar aren't clobbered by our redraw.
                     pb.suspend(|| {
-                        eprintln!("⏬ downloading embedding model (~470 MB, first run)…");
+                        eprintln!("{load_notice}");
                     });
                 }
-                Self::PlainLines { .. } => {
-                    eprintln!("⏬ downloading embedding model (~470 MB, first run)…");
+                Self::PlainLines { load_notice, .. } => {
+                    eprintln!("{load_notice}");
                 }
                 Self::Silent => {}
             },
@@ -172,14 +191,16 @@ impl ProgressReporter {
                 total,
                 doc_path,
             } => match self {
-                Self::Bar(pb) => {
+                Self::Bar { pb, .. } => {
                     if pb.length() != Some(total as u64) {
                         pb.set_length(total as u64);
                     }
                     pb.set_position(done as u64);
                     pb.set_message(doc_path);
                 }
-                Self::PlainLines { last_pct_bucket } => {
+                Self::PlainLines {
+                    last_pct_bucket, ..
+                } => {
                     // Throttle to ~every 10% so a piped log stays readable.
                     // `checked_div` guards total == 0 (an empty vault emits no
                     // Indexing events anyway, so this branch is really total>0).
@@ -197,10 +218,44 @@ impl ProgressReporter {
     }
 
     fn finish(&mut self) {
-        if let Self::Bar(pb) = self {
+        if let Self::Bar { pb, .. } = self {
             // Clear the bar so the final ✅ summary prints on a clean line.
             pb.finish_and_clear();
         }
+    }
+}
+
+/// What to announce when the engine signals `LoadingModel`: honest about
+/// whether this is a real first-run download or just loading an
+/// already-downloaded model into memory (both stall the bar; only one
+/// costs bandwidth).
+pub(crate) fn model_load_notice(model: &str, downloaded: bool, approx_size: &str) -> String {
+    if downloaded {
+        format!("🧠 loading {model} model…")
+    } else {
+        format!("⏬ downloading {model} model ({approx_size}, first run)…")
+    }
+}
+
+/// Best-effort wiring for [`model_load_notice`]: reads the active model from
+/// vault config and checks its on-disk download status under the collection
+/// cache dir. Any lookup failure degrades to the generic "loading" wording
+/// (never blocks the reindex over a status probe).
+fn model_load_notice_for(resolved: &onebrain_core::ResolvedVault) -> String {
+    use onebrain_search::embed::{model_download_status, model_registry};
+
+    let model = onebrain_core::load_vault_config(&resolved.root)
+        .map(|c| c.search.embed_model)
+        .unwrap_or_default();
+    let info = model_registry().iter().find(|m| m.name == model);
+    match info {
+        Some(i) => {
+            let downloaded = collection_for(resolved)
+                .map(|c| model_download_status(i, &collection_cache_dir(&c)).downloaded)
+                .unwrap_or(false);
+            model_load_notice(&model, downloaded, i.approx_size)
+        }
+        None => format!("🧠 loading {model} model…"),
     }
 }
 
@@ -235,6 +290,19 @@ fn render_text(env: &Envelope<ReindexData>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_notice_distinguishes_download_from_load() {
+        let dl = model_load_notice("bge-m3", false, "~2.2 GB");
+        assert!(dl.contains("downloading bge-m3"), "{dl}");
+        assert!(dl.contains("~2.2 GB"), "{dl}");
+        let ld = model_load_notice("bge-m3", true, "~2.2 GB");
+        assert!(ld.contains("loading bge-m3"), "{ld}");
+        assert!(
+            !ld.contains("downloading"),
+            "already-downloaded must not claim a download: {ld}"
+        );
+    }
 
     #[test]
     fn text_summarizes_all_four_counts() {

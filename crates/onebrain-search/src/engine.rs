@@ -48,12 +48,19 @@ const SNIPPET_MAX_CHARS: usize = 200;
 /// [`Engine::reindex_paths_with_progress`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReindexProgress {
+    /// Emitted exactly once, first, right after the file walk and before any
+    /// doc is processed — carries the run's `total` so a UI can show
+    /// `0/total` immediately instead of an empty bar while the (potentially
+    /// slow) model load / first embed happens.
+    Walked { total: usize },
     /// Emitted exactly once, right before the first embed call of the run —
     /// i.e. before the first doc that is actually added or updated. On a first
-    /// index this is where `fastembed` downloads the (~470 MB) model, so the
-    /// CLI can announce the download before the long stall. Docs that are
-    /// unchanged (no embed) never trigger this; a run with nothing to (re)embed
-    /// never emits it at all.
+    /// index this is where `fastembed` downloads the model (hundreds of MB to
+    /// a few GB), and where an already-downloaded model is loaded into
+    /// memory (seconds to minutes for the large ones), so the CLI can
+    /// announce the stall before it starts. Docs that are unchanged (no
+    /// embed) never trigger this; a run with nothing to (re)embed never
+    /// emits it at all.
     LoadingModel,
     /// Emitted after each doc has been processed (added / updated / unchanged /
     /// removed / failed). `done` counts docs handled so far (1-based, up to
@@ -766,6 +773,7 @@ impl Engine {
         progress: &mut dyn FnMut(ReindexProgress),
     ) -> Result<ReindexStats> {
         let total = doc_paths.len();
+        progress(ReindexProgress::Walked { total });
         let mut model_announced = false;
         let mut stats = ReindexStats::default();
         for (i, doc_path) in doc_paths.iter().enumerate() {
@@ -827,6 +835,7 @@ impl Engine {
             .collect();
 
         let total = doc_paths.len();
+        progress(ReindexProgress::Walked { total });
         let mut model_announced = false;
         let mut stats = ReindexStats::default();
         for (i, (doc_path, abs_path)) in doc_paths.iter().zip(files.iter()).enumerate() {
@@ -1255,6 +1264,13 @@ mod tests {
             .unwrap();
         assert_eq!(stats.added, 3);
 
+        // Walked fires first, carrying the run total, before anything else.
+        assert_eq!(
+            events.first(),
+            Some(&ReindexProgress::Walked { total: 3 }),
+            "Walked {{ total }} must be the first event"
+        );
+
         // Exactly one LoadingModel, emitted before any Indexing event.
         let loading = events
             .iter()
@@ -1323,6 +1339,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stats.added, 1);
+        assert_eq!(
+            events.first(),
+            Some(&ReindexProgress::Walked { total: 1 }),
+            "Walked {{ total }} must be the first event"
+        );
         assert!(events
             .iter()
             .any(|p| matches!(p, ReindexProgress::LoadingModel)));
