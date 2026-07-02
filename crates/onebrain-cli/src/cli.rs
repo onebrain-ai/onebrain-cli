@@ -1018,6 +1018,11 @@ pub struct SearchReindexArgs {
     /// Specific doc paths to reindex (relative to the vault root). Omit to
     /// reindex the whole vault.
     pub paths: Vec<String>,
+    /// Wipe the whole index first (lex + vectors + metadata; downloaded
+    /// models are kept) and rebuild from scratch — needed after changes
+    /// that invalidate stored vectors. Whole-vault only.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────

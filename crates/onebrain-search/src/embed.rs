@@ -26,6 +26,19 @@ pub trait Embed {
     /// Embedding vector dimensionality (the vector store is opened at this
     /// width).
     fn dims(&self) -> usize;
+
+    /// Embed DOCUMENT/passage texts. Default: same as [`Embed::embed`]
+    /// (models that need no instruction prefix, and test fakes). The real
+    /// [`Embedder`] prepends the model's `passage_prefix`.
+    fn embed_passages(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.embed(texts)
+    }
+
+    /// Embed a QUERY text. Default: same as [`Embed::embed`]. The real
+    /// [`Embedder`] prepends the model's `query_prefix`.
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        Ok(self.embed(&[text.to_string()])?.remove(0))
+    }
 }
 
 /// Wraps a loaded `fastembed` text embedding model.
@@ -33,6 +46,8 @@ pub struct Embedder {
     model: Mutex<TextEmbedding>,
     pub dims: usize,
     pub model_name: String,
+    query_prefix: &'static str,
+    passage_prefix: &'static str,
 }
 
 /// One entry in the supported-model registry (see [`model_registry`]):
@@ -60,6 +75,14 @@ pub struct ModelInfo {
     pub thai_miracl: Option<f32>,
     /// Short human-readable guidance shown alongside the entry.
     pub note: &'static str,
+    /// Prefix prepended to QUERY text before embedding (e.g. `"query: "`
+    /// for the e5 family, which was trained with instruction prefixes —
+    /// omitting them measurably degrades retrieval). Empty = none.
+    pub query_prefix: &'static str,
+    /// Prefix prepended to DOCUMENT/passage text before embedding
+    /// (`"passage: "` for e5). Only used at embed time — stored chunk text
+    /// stays raw. Empty = none.
+    pub passage_prefix: &'static str,
     /// The Hugging Face repo id fastembed downloads this model from, e.g.
     /// `"intfloat/multilingual-e5-small"`. Used to compute the on-disk cache
     /// subdirectory name — see [`ModelInfo::cache_dir_name`].
@@ -152,6 +175,8 @@ pub fn model_registry() -> &'static [ModelInfo] {
             context: 512,
             thai_miracl: Some(75.0),
             note: "default · small + fast",
+            query_prefix: "query: ",
+            passage_prefix: "passage: ",
             hf_repo: "intfloat/multilingual-e5-small",
         },
         ModelInfo {
@@ -162,6 +187,8 @@ pub fn model_registry() -> &'static [ModelInfo] {
             context: 512,
             thai_miracl: Some(75.2),
             note: "larger · better recall",
+            query_prefix: "query: ",
+            passage_prefix: "passage: ",
             hf_repo: "intfloat/multilingual-e5-base",
         },
         ModelInfo {
@@ -172,6 +199,8 @@ pub fn model_registry() -> &'static [ModelInfo] {
             context: 512,
             thai_miracl: Some(80.2),
             note: "high accuracy",
+            query_prefix: "query: ",
+            passage_prefix: "passage: ",
             hf_repo: "Qdrant/multilingual-e5-large-onnx",
         },
         ModelInfo {
@@ -182,6 +211,8 @@ pub fn model_registry() -> &'static [ModelInfo] {
             context: 8192,
             thai_miracl: Some(82.6),
             note: "best Thai/accuracy · fp32",
+            query_prefix: "",
+            passage_prefix: "",
             hf_repo: "BAAI/bge-m3",
         },
         ModelInfo {
@@ -192,6 +223,8 @@ pub fn model_registry() -> &'static [ModelInfo] {
             context: 2048,
             thai_miracl: None,
             note: "smallest · Thai unverified",
+            query_prefix: "task: search result | query: ",
+            passage_prefix: "title: none | text: ",
             hf_repo: "onnx-community/embeddinggemma-300m-ONNX",
         },
     ];
@@ -260,10 +293,16 @@ fn new_with_progress(model_name: &str, cache_dir: &Path, show_progress: bool) ->
         .with_show_download_progress(show_progress);
     let embedding = TextEmbedding::try_new(init)?;
 
+    let info = model_registry()
+        .iter()
+        .find(|m| m.name == model_name)
+        .expect("resolve_model already validated the name");
     Ok(Embedder {
         model: Mutex::new(embedding),
         dims,
         model_name: model_name.to_string(),
+        query_prefix: info.query_prefix,
+        passage_prefix: info.passage_prefix,
     })
 }
 
@@ -302,11 +341,47 @@ impl Embed for Embedder {
     fn dims(&self) -> usize {
         self.dims
     }
+
+    fn embed_passages(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if self.passage_prefix.is_empty() {
+            return self.embed(texts);
+        }
+        let prefixed: Vec<String> = texts
+            .iter()
+            .map(|t| format!("{}{t}", self.passage_prefix))
+            .collect();
+        self.embed(&prefixed)
+    }
+
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        let q = if self.query_prefix.is_empty() {
+            text.to_string()
+        } else {
+            format!("{}{text}", self.query_prefix)
+        };
+        Ok(self.embed(&[q])?.remove(0))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn e5_family_declares_instruction_prefixes() {
+        for m in model_registry() {
+            if m.name.starts_with("multilingual-e5") {
+                assert_eq!(m.query_prefix, "query: ", "{}", m.name);
+                assert_eq!(m.passage_prefix, "passage: ", "{}", m.name);
+            }
+        }
+        // bge-m3 needs no prefixes.
+        let bge = model_registry()
+            .iter()
+            .find(|m| m.name == "bge-m3")
+            .unwrap();
+        assert!(bge.query_prefix.is_empty() && bge.passage_prefix.is_empty());
+    }
 
     #[test]
     fn dims_lookup() {

@@ -95,8 +95,9 @@ pub fn open_engine(vault_flag: Option<PathBuf>) -> Result<(Engine, ResolvedVault
     let collection = collection_for(&resolved)?;
 
     let cache_dir = collection_cache_dir(&collection);
-    let engine = Engine::open(&cache_dir, &config.search.embed_model)
+    let mut engine = Engine::open(&cache_dir, &config.search.embed_model)
         .with_context(|| format!("opening search engine at {}", cache_dir.display()))?;
+    engine.set_exclude_patterns(config.search.exclude.clone());
     Ok((engine, resolved))
 }
 

@@ -242,7 +242,7 @@ fn render_list_text(env: &Envelope<ModelListData>) -> String {
             marker, m.name, downloaded, disk, m.dims, thai, m.note
         ));
     }
-    lines.push(format!("📁 models: {}", d.cache_dir.display()));
+    lines.push(format!("📁  models: {}", d.cache_dir.display()));
     lines.join("\n")
 }
 
@@ -354,7 +354,7 @@ pub(crate) fn apply_model_change(
 }
 
 /// Stderr re-embed progress bar for `model set` / the picker: only on a real
-/// TTY in text mode (structured runs stay silent). `🧠 re-embedding p/t (%)`.
+/// TTY in text mode (structured runs stay silent). `🧠  re-embedding p/t (%)`.
 fn reembed_progress_bar(mode: &OutputMode) -> Option<indicatif::ProgressBar> {
     use is_terminal::IsTerminal;
     if mode.is_structured() || !std::io::stderr().is_terminal() {
@@ -362,7 +362,7 @@ fn reembed_progress_bar(mode: &OutputMode) -> Option<indicatif::ProgressBar> {
     }
     let pb = indicatif::ProgressBar::new(0);
     pb.set_style(
-        indicatif::ProgressStyle::with_template("🧠 re-embedding  {pos}/{len}  ({percent}%)")
+        indicatif::ProgressStyle::with_template("🧠  re-embedding  {pos}/{len}  ({percent}%)")
             .expect("static template is valid")
             .progress_chars("=>-"),
     );
@@ -372,10 +372,10 @@ fn reembed_progress_bar(mode: &OutputMode) -> Option<indicatif::ProgressBar> {
 pub(crate) fn render_set_text(env: &Envelope<ModelSetData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     if d.already_current {
-        format!("✅ already using {}", d.model)
+        format!("✅  already using {}", d.model)
     } else {
         format!(
-            "✅ switched to {} · 🧠 {} chunk(s) re-embedded",
+            "✅  switched to {} · 🧠  {} chunk(s) re-embedded",
             d.model,
             d.chunks_reembedded.unwrap_or(0)
         )
@@ -648,7 +648,7 @@ mod tests {
         assert!(s.contains("MODEL"));
         assert!(s.contains("DOWNLOADED"));
         assert!(s.contains("DISK"));
-        assert!(s.contains("📁 models:"), "footer with cache dir present");
+        assert!(s.contains("📁  models:"), "footer with cache dir present");
         for m in model_registry() {
             assert!(s.contains(m.name), "missing {} in rendered list", m.name);
         }
@@ -828,7 +828,7 @@ mod tests {
                 chunks_reembedded: None,
             },
         );
-        assert_eq!(render_set_text(&env), "✅ already using bge-m3");
+        assert_eq!(render_set_text(&env), "✅  already using bge-m3");
     }
 
     #[test]

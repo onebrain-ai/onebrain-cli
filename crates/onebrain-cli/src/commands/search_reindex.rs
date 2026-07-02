@@ -48,6 +48,18 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchReindexA
     // no prompt fires.
     maybe_prompt_first_model(vault_flag.clone(), mode)?;
 
+    // --force: wipe the index files (NOT the downloaded models) before
+    // opening, so everything re-chunks + re-embeds from scratch. Needed
+    // when stored vectors go stale in ways a hash diff can't see (e.g.
+    // embedding-prefix changes).
+    if args.force {
+        anyhow::ensure!(
+            args.paths.is_empty(),
+            "--force rebuilds the whole index; it can't be combined with specific paths"
+        );
+        wipe_index_files(vault_flag.clone())?;
+    }
+
     let (mut engine, resolved) = open_engine(vault_flag)?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
 
@@ -72,6 +84,28 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchReindexA
 
     let envelope = Envelope::ok("search.reindex", Some(vault_info), ReindexData::from(stats));
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
+    Ok(())
+}
+
+/// Delete the collection's index files — `tantivy/`, `vectors/`, and
+/// `engine.redb` — while keeping the downloaded `models--*` dirs. The next
+/// `Engine::open` recreates everything empty.
+fn wipe_index_files(vault_flag: Option<PathBuf>) -> Result<()> {
+    let resolved = crate::vault_ctx::require(vault_flag)?;
+    let collection = collection_for(&resolved)?;
+    let cache_dir = collection_cache_dir(&collection);
+    for sub in ["tantivy", "vectors"] {
+        match std::fs::remove_dir_all(cache_dir.join(sub)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    match std::fs::remove_file(cache_dir.join("engine.redb")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
     Ok(())
 }
 
@@ -107,7 +141,7 @@ fn maybe_prompt_first_model(vault_flag: Option<PathBuf>, mode: &OutputMode) -> R
     let current = config.search.embed_model.clone();
     if let Some(chosen) = crate::commands::search_model::prompt_pick_model(&current) {
         onebrain_fs::persist_search_key(resolved.root.as_path(), "embed_model", chosen)?;
-        println!("✅ using {chosen} — indexing now…");
+        println!("✅  using {chosen} — indexing now…");
     }
     Ok(())
 }
@@ -145,7 +179,7 @@ impl ProgressReporter {
             // the first `set_length` (spinner-ish) too.
             pb.set_style(
                 indicatif::ProgressStyle::with_template(
-                    "📇 indexing  {pos}/{len}  ({percent}%)  {wide_msg}",
+                    "📇  indexing  {pos}/{len}  ({percent}%)  {wide_msg}",
                 )
                 .expect("static template is valid")
                 .progress_chars("=>-"),
@@ -169,7 +203,7 @@ impl ProgressReporter {
                     pb.set_position(0);
                 }
                 Self::PlainLines { .. } => {
-                    eprintln!("📇 indexing {total} doc(s)…");
+                    eprintln!("📇  indexing {total} doc(s)…");
                 }
                 Self::Silent => {}
             },
@@ -208,7 +242,7 @@ impl ProgressReporter {
                         if *last_pct_bucket != Some(bucket) {
                             *last_pct_bucket = Some(bucket);
                             let pct = (done * 100) / total;
-                            eprintln!("📇 indexing {done}/{total} ({pct}%)");
+                            eprintln!("📇  indexing {done}/{total} ({pct}%)");
                         }
                     }
                 }
@@ -219,7 +253,7 @@ impl ProgressReporter {
 
     fn finish(&mut self) {
         if let Self::Bar { pb, .. } = self {
-            // Clear the bar so the final ✅ summary prints on a clean line.
+            // Clear the bar so the final ✅  summary prints on a clean line.
             pb.finish_and_clear();
         }
     }
@@ -231,9 +265,9 @@ impl ProgressReporter {
 /// costs bandwidth).
 pub(crate) fn model_load_notice(model: &str, downloaded: bool, approx_size: &str) -> String {
     if downloaded {
-        format!("🧠 loading {model} model…")
+        format!("🧠  loading {model} model…")
     } else {
-        format!("⏬ downloading {model} model ({approx_size}, first run)…")
+        format!("⏬  downloading {model} model ({approx_size}, first run)…")
     }
 }
 
@@ -255,36 +289,36 @@ fn model_load_notice_for(resolved: &onebrain_core::ResolvedVault) -> String {
                 .unwrap_or(false);
             model_load_notice(&model, downloaded, i.approx_size)
         }
-        None => format!("🧠 loading {model} model…"),
+        None => format!("🧠  loading {model} model…"),
     }
 }
 
 fn render_text(env: &Envelope<ReindexData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     // Only surface non-zero categories so the line stays readable; keep a
-    // fixed order. `failed` gets a ⚠️ so it stands out from the happy path.
+    // fixed order. `failed` gets a ⚠️  so it stands out from the happy path.
     let mut parts: Vec<String> = Vec::new();
     if d.added > 0 {
-        parts.push(format!("📄 {} added", d.added));
+        parts.push(format!("📄  {} added", d.added));
     }
     if d.updated > 0 {
-        parts.push(format!("♻️ {} updated", d.updated));
+        parts.push(format!("♻️  {} updated", d.updated));
     }
     if d.removed > 0 {
-        parts.push(format!("🗑️ {} removed", d.removed));
+        parts.push(format!("🗑️  {} removed", d.removed));
     }
     if d.unchanged > 0 {
-        parts.push(format!("⏭️ {} unchanged", d.unchanged));
+        parts.push(format!("⏭️  {} unchanged", d.unchanged));
     }
     if d.failed > 0 {
-        parts.push(format!("⚠️ {} failed", d.failed));
+        parts.push(format!("⚠️  {} failed", d.failed));
     }
 
     if parts.is_empty() {
         // Nothing to do — an already-current index reindexed to a no-op.
-        return "✅ reindexed — nothing to update".to_string();
+        return "✅  reindexed — nothing to update".to_string();
     }
-    format!("✅ reindexed — {}", parts.join(" · "))
+    format!("✅  reindexed — {}", parts.join(" · "))
 }
 
 #[cfg(test)]
@@ -318,7 +352,7 @@ mod tests {
             },
         );
         let s = render_text(&e);
-        assert!(s.contains("✅ reindexed"));
+        assert!(s.contains("✅  reindexed"));
         assert!(s.contains("1 added"));
         assert!(s.contains("2 updated"));
         assert!(s.contains("3 removed"));
@@ -361,7 +395,7 @@ mod tests {
                 failed: 0,
             },
         );
-        assert_eq!(render_text(&e), "✅ reindexed — nothing to update");
+        assert_eq!(render_text(&e), "✅  reindexed — nothing to update");
     }
 
     #[test]

@@ -29,7 +29,7 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchGetArgs)
     let doc_path = normalize_doc_path(&args.doc_path, resolved.root.as_path());
     let content = engine.get(&doc_path).map_err(|e| {
         anyhow::anyhow!(
-            "{e}\n💡 paths are vault-relative (e.g. `00-inbox/note.md`); \
+            "{e}\n💡  paths are vault-relative (e.g. `00-inbox/note.md`); \
              if the doc is new, `onebrain search reindex` may not have indexed it yet"
         )
     })?;

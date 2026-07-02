@@ -139,10 +139,22 @@ pub struct SearchConfig {
     /// design). Parsed here only — enforcement happens in a later task.
     #[serde(default)]
     pub embed: EmbedGate,
+    /// Extra index-exclusion patterns on top of the built-ins (hidden dirs
+    /// and `node_modules` are ALWAYS skipped). Each entry is either a
+    /// vault-relative path prefix (`attachments/demo`) or a bare directory
+    /// name matched at any depth (`drafts`). Defaults to `["attachments"]`
+    /// — the vault's copied-file staging area, not knowledge notes; set
+    /// `exclude: []` explicitly to index everything.
+    #[serde(default = "default_search_exclude")]
+    pub exclude: Vec<String>,
 }
 
 fn default_embed_model() -> String {
     "multilingual-e5-small".to_string()
+}
+
+fn default_search_exclude() -> Vec<String> {
+    vec!["attachments".to_string()]
 }
 
 impl Default for SearchConfig {
@@ -151,6 +163,7 @@ impl Default for SearchConfig {
             collection: None,
             embed_model: default_embed_model(),
             embed: EmbedGate::default(),
+            exclude: default_search_exclude(),
         }
     }
 }
@@ -244,6 +257,18 @@ pub fn load_vault_config_at(path: &Path) -> Result<VaultConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_exclude_defaults_to_attachments() {
+        let cfg = SearchConfig::default();
+        assert_eq!(cfg.exclude, vec!["attachments".to_string()]);
+        // YAML without the key gets the same default via serde.
+        let parsed: SearchConfig = serde_yaml::from_str("embed_model: bge-m3").unwrap();
+        assert_eq!(parsed.exclude, vec!["attachments".to_string()]);
+        // Explicit empty list opts out.
+        let parsed: SearchConfig = serde_yaml::from_str("exclude: []").unwrap();
+        assert!(parsed.exclude.is_empty());
+    }
     use tempfile::tempdir;
 
     fn write_vault(content: &str) -> (tempfile::TempDir, VaultRoot) {

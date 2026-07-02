@@ -556,9 +556,9 @@ fn perform_switch<B: ratatui::backend::Backend>(
             pct: 0,
             bytes: 0,
         });
-        state.status = Some(format!("⏬ downloading {name}…"));
+        state.status = Some(format!("⏬  downloading {name}…"));
     } else {
-        state.status = Some(format!("🧠 re-embedding with {name}…"));
+        state.status = Some(format!("🧠  re-embedding with {name}…"));
     }
 
     // Nested UI loop while the worker runs: poll disk → redraw → drain keys.
@@ -567,7 +567,7 @@ fn perform_switch<B: ratatui::backend::Backend>(
             dl.bytes = dir_size_bytes(&dl.model_dir);
             dl.pct = download_pct(dl.bytes, dl.expected_bytes);
             state.status = Some(format!(
-                "⏬ downloading {name} · {} / {} ({}%)",
+                "⏬  downloading {name} · {} / {} ({}%)",
                 format_size(dl.bytes),
                 format_size(dl.expected_bytes),
                 dl.pct
@@ -589,14 +589,14 @@ fn perform_switch<B: ratatui::backend::Backend>(
                 Ok(SwitchMsg::DownloadDone) => {
                     if state.downloading.take().is_some() {
                         state.status =
-                            Some(format!("✅ downloaded · 🧠 re-embedding with {name}…"));
+                            Some(format!("✅  downloaded · 🧠  re-embedding with {name}…"));
                     }
                 }
                 Ok(SwitchMsg::Reembed { done, total }) => {
                     state.downloading = None;
                     state.reembed = Some(ReembedUi { name, done, total });
                     state.status = Some(format!(
-                        "🧠 re-embedding with {name} — {done}/{total} chunk(s) ({}%)",
+                        "🧠  re-embedding with {name} — {done}/{total} chunk(s) ({}%)",
                         reembed_pct(done, total)
                     ));
                 }
@@ -636,9 +636,9 @@ fn perform_switch<B: ratatui::backend::Backend>(
 pub fn switch_status(name: &str, chunks_reembedded: Option<usize>) -> String {
     match chunks_reembedded {
         Some(0) | None => format!(
-            "✅ switched to {name} · index is empty — run `onebrain search reindex` to download + index"
+            "✅  switched to {name} · index is empty — run `onebrain search reindex` to download + index"
         ),
-        Some(n) => format!("✅ switched to {name} · 🧠 {n} chunk(s) re-embedded with the new model"),
+        Some(n) => format!("✅  switched to {name} · 🧠  {n} chunk(s) re-embedded with the new model"),
     }
 }
 

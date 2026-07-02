@@ -172,9 +172,35 @@ fn vault_relative_path(vault_root: &Path, file_path: &Path) -> Option<String> {
     Some(components.join("/"))
 }
 
+/// `true` for directory names the vault walk must never descend into:
+/// hidden dirs (`.obsidian`, `.git`, `.claude`, …) and vendored
+/// `node_modules` trees (an attachment carrying a JS project would
+/// otherwise flood the index with library READMEs).
+fn is_skipped_dir(name: &str) -> bool {
+    name.starts_with('.') || name == "node_modules"
+}
+
+/// `true` when `rel_path` (vault-relative, forward slashes) matches one of
+/// the user's exclude `patterns`: entries containing `/` are path prefixes
+/// (`attachments/demo`), bare names match any path component (`drafts`).
+fn is_excluded(rel_path: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|p| {
+        let p = p.trim_matches('/');
+        if p.is_empty() {
+            false
+        } else if p.contains('/') {
+            rel_path == p || rel_path.starts_with(&format!("{p}/"))
+        } else {
+            rel_path.split('/').any(|c| c == p)
+        }
+    })
+}
+
 /// Recursively collect every `*.md` file under `root` (hand-rolled
-/// stack-based walk — no new crate dep).
-fn walk_markdown_files(root: &Path) -> Result<Vec<PathBuf>> {
+/// stack-based walk — no new crate dep). Hidden dirs and `node_modules`
+/// are always skipped ([`is_skipped_dir`]); `exclude` adds the vault's
+/// configured patterns ([`is_excluded`]).
+fn walk_markdown_files(root: &Path, exclude: &[String]) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -186,9 +212,17 @@ fn walk_markdown_files(root: &Path) -> Result<Vec<PathBuf>> {
             let entry = entry.with_context(|| format!("reading dir entry in {}", dir.display()))?;
             let path = entry.path();
             if path.is_dir() {
-                stack.push(path);
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let dir_rel = vault_relative_path(root, &path).unwrap_or_default();
+                if !is_skipped_dir(&name) && !is_excluded(&dir_rel, exclude) {
+                    stack.push(path);
+                }
             } else if path.extension().is_some_and(|ext| ext == "md") {
-                out.push(path);
+                let rel = vault_relative_path(root, &path).unwrap_or_default();
+                if !is_excluded(&rel, exclude) {
+                    out.push(path);
+                }
             }
         }
     }
@@ -246,6 +280,10 @@ enum EmbedSource {
 pub struct Engine {
     lex: LexIndex,
     vec: VectorStore,
+    /// Vault-configured index-exclusion patterns (`search.exclude`), applied
+    /// on top of the built-in skips by every vault walk (`reindex_all`,
+    /// `status`). Empty by default; set via [`Engine::set_exclude_patterns`].
+    exclude_patterns: Vec<String>,
     model_name: String,
     cache_dir: PathBuf,
     embedder: EmbedSource,
@@ -340,6 +378,7 @@ impl Engine {
         Ok(Engine {
             lex,
             vec,
+            exclude_patterns: Vec::new(),
             model_name: embed_model.to_string(),
             cache_dir: cache_dir.to_path_buf(),
             embedder,
@@ -485,7 +524,7 @@ impl Engine {
             let mut done = 0usize;
             for batch in chunks.chunks(REBUILD_EMBED_BATCH) {
                 let texts: Vec<String> = batch.iter().map(|(_, text)| text.clone()).collect();
-                let vectors = self.embedder()?.embed(&texts)?;
+                let vectors = self.embedder()?.embed_passages(&texts)?;
                 for ((chunk_id, _text), vector) in batch.iter().zip(vectors.iter()) {
                     self.vec.add(chunk_id, vector)?;
                 }
@@ -503,6 +542,12 @@ impl Engine {
         write_txn.commit()?;
 
         Ok(chunks.len())
+    }
+
+    /// Install the vault's `search.exclude` patterns — applied by every
+    /// vault walk on top of the built-in skips (hidden dirs, node_modules).
+    pub fn set_exclude_patterns(&mut self, patterns: Vec<String>) {
+        self.exclude_patterns = patterns;
     }
 
     /// Return the embedder, constructing the real one lazily on first use
@@ -545,7 +590,7 @@ impl Engine {
         let vectors = if texts.is_empty() {
             Vec::new()
         } else {
-            self.embedder()?.embed(&texts)?
+            self.embedder()?.embed_passages(&texts)?
         };
 
         let mut chunk_ids: Vec<String> = Vec::with_capacity(chunks.len());
@@ -642,8 +687,8 @@ impl Engine {
     /// Hybrid search: lex + vec (top ~50 each) fused via RRF, resolved to
     /// `top_k` [`Hit`]s. Fused ids whose meta is missing are skipped.
     pub fn query(&self, text: &str, top_k: usize) -> Result<Vec<Hit>> {
-        let query_vec = self.embedder()?.embed(&[text.to_string()])?;
-        let vec_hits = self.vec.search(&query_vec[0], VEC_TOP_K);
+        let query_vec = self.embedder()?.embed_query(text)?;
+        let vec_hits = self.vec.search(&query_vec, VEC_TOP_K);
         let lex_hits = self.lex.search(text, LEX_TOP_K)?;
 
         let fused = rrf_fuse(&lex_hits, &vec_hits, RRF_K, top_k);
@@ -654,8 +699,8 @@ impl Engine {
     /// return the top-k nearest chunks by cosine similarity, resolved to
     /// full [`Hit`]s. Used by the CLI's `search vsearch` verb.
     pub fn vector_search(&self, text: &str, top_k: usize) -> Result<Vec<Hit>> {
-        let query_vec = self.embedder()?.embed(&[text.to_string()])?;
-        let vec_hits = self.vec.search(&query_vec[0], top_k);
+        let query_vec = self.embedder()?.embed_query(text)?;
+        let vec_hits = self.vec.search(&query_vec, top_k);
         let ranked: Vec<(String, f64)> = vec_hits
             .into_iter()
             .map(|(id, score)| (id, score as f64))
@@ -864,7 +909,7 @@ impl Engine {
         vault_root: &Path,
         progress: &mut dyn FnMut(ReindexProgress),
     ) -> Result<ReindexStats> {
-        let files = walk_markdown_files(vault_root)?;
+        let files = walk_markdown_files(vault_root, &self.exclude_patterns)?;
         let doc_paths: Vec<String> = files
             .iter()
             .filter_map(|f| vault_relative_path(vault_root, f))
@@ -943,7 +988,7 @@ impl Engine {
             out
         };
 
-        let files = walk_markdown_files(vault_root)?;
+        let files = walk_markdown_files(vault_root, &self.exclude_patterns)?;
         let mut pending_new = 0usize;
         let mut pending_changed = 0usize;
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1691,6 +1736,76 @@ mod tests {
 
         assert_eq!(stats.failed, 1, "unreadable file should count as failed");
         assert_eq!(stats.added, 0);
+    }
+
+    #[test]
+    fn is_excluded_prefix_and_component_patterns() {
+        let pats = vec!["attachments/demo".to_string(), "drafts".to_string()];
+        assert!(is_excluded("attachments/demo/a.md", &pats));
+        assert!(is_excluded("attachments/demo", &pats));
+        assert!(
+            !is_excluded("attachments/demo2/a.md", &pats),
+            "no partial-prefix match"
+        );
+        assert!(
+            is_excluded("x/drafts/a.md", &pats),
+            "bare name matches any depth"
+        );
+        assert!(is_excluded("drafts/a.md", &pats));
+        assert!(
+            !is_excluded("notes/drafts.md", &pats),
+            "'drafts.md' component does not match bare pattern 'drafts'"
+        );
+        assert!(!is_excluded("real.md", &pats));
+        assert!(!is_excluded("real.md", &[]));
+    }
+
+    #[test]
+    fn walk_honors_configured_exclude_patterns() {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("real.md"), "# real").unwrap();
+        std::fs::create_dir_all(vault.path().join("attachments/demo")).unwrap();
+        std::fs::write(vault.path().join("attachments/demo/skip.md"), "# skip").unwrap();
+
+        let exclude = vec!["attachments".to_string()];
+        let files = walk_markdown_files(vault.path(), &exclude).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .filter_map(|f| vault_relative_path(vault.path(), f))
+            .collect();
+        assert_eq!(names, vec!["real.md".to_string()]);
+    }
+
+    #[test]
+    fn walk_skips_hidden_dirs_and_node_modules() {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("real.md"), "# real").unwrap();
+        for junk in [
+            ".obsidian",
+            ".git",
+            "node_modules",
+            "attachments/demo/node_modules",
+        ] {
+            let d = vault.path().join(junk);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("junk.md"), "# junk").unwrap();
+        }
+        std::fs::create_dir_all(vault.path().join("attachments/demo")).unwrap();
+        std::fs::write(vault.path().join("attachments/demo/kept.md"), "# kept").unwrap();
+
+        let files = walk_markdown_files(vault.path(), &[]).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .filter_map(|f| vault_relative_path(vault.path(), f))
+            .collect();
+        assert!(names.contains(&"real.md".to_string()));
+        assert!(names.contains(&"attachments/demo/kept.md".to_string()));
+        assert!(
+            names
+                .iter()
+                .all(|n| !n.contains("node_modules") && !n.starts_with('.')),
+            "junk dirs must be skipped: {names:?}"
+        );
     }
 
     #[test]

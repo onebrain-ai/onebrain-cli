@@ -207,25 +207,25 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     let mut lines = Vec::new();
     match &d.collection {
-        Some(c) => lines.push(format!("🔍 collection    {c}")),
+        Some(c) => lines.push(format!("🔍  collection    {c}")),
         None => lines.push(
-            "🔍 collection    not set\n💡 set `search.collection` in onebrain.yml".to_string(),
+            "🔍  collection    not set\n💡  set `search.collection` in onebrain.yml".to_string(),
         ),
     }
-    lines.push(format!("🧠 model         {}", d.embed_model));
+    lines.push(format!("🧠  model         {}", d.embed_model));
 
     match d.model_size_bytes {
         Some(size) => {
             lines.push(format!("📦 model size    {}", format_size(size)));
             if let Some(downloaded) = d.model_downloaded_at.and_then(format_local) {
-                lines.push(format!("⏬ downloaded    {downloaded}"));
+                lines.push(format!("⏬  downloaded    {downloaded}"));
             }
         }
         None => lines.push("📦 model size    not downloaded".to_string()),
     }
 
     if let Some(dir) = &d.cache_dir {
-        lines.push(format!("📁 cache         {}", dir.display()));
+        lines.push(format!("📁  cache         {}", dir.display()));
     }
 
     match d.last_indexed_at.and_then(format_local) {
@@ -233,7 +233,7 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
         None => lines.push("🕐 last indexed  never".to_string()),
     }
 
-    lines.push(format!("✅ indexed  {} docs", d.doc_count));
+    lines.push(format!("✅  indexed  {} docs", d.doc_count));
 
     let pending = d.pending_new + d.pending_changed + d.pending_removed;
     if pending > 0 {
@@ -242,7 +242,7 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
             d.pending_new, d.pending_changed, d.pending_removed
         ));
     } else {
-        lines.push("✅ up to date".to_string());
+        lines.push("✅  up to date".to_string());
     }
 
     lines.join("\n")
@@ -276,16 +276,16 @@ mod tests {
     #[test]
     fn text_shows_collection_and_model() {
         let s = render_text(&env(Some("ob-1"), true));
-        assert!(s.contains("🔍 collection    ob-1"));
-        assert!(s.contains("🧠 model         multilingual-e5-small"));
-        assert!(s.contains("✅ indexed  0 docs"));
+        assert!(s.contains("🔍  collection    ob-1"));
+        assert!(s.contains("🧠  model         multilingual-e5-small"));
+        assert!(s.contains("✅  indexed  0 docs"));
     }
 
     #[test]
     fn text_flags_missing_collection() {
         let s = render_text(&env(None, false));
         assert!(s.contains("not set"));
-        assert!(s.contains("💡 set `search.collection`"));
+        assert!(s.contains("💡  set `search.collection`"));
     }
 
     #[test]
@@ -293,14 +293,14 @@ mod tests {
         let s = render_text(&env(Some("ob-1"), false));
         assert!(s.contains("📦 model size    not downloaded"));
         assert!(s.contains("🕐 last indexed  never"));
-        // No `⏬ downloaded` line when the model isn't present.
-        assert!(!s.contains("⏬ downloaded"));
+        // No `⏬  downloaded` line when the model isn't present.
+        assert!(!s.contains("⏬  downloaded"));
     }
 
     #[test]
     fn text_shows_up_to_date_when_no_drift() {
         let s = render_text(&env(Some("ob-1"), true));
-        assert!(s.contains("✅ up to date"));
+        assert!(s.contains("✅  up to date"));
         assert!(!s.contains("pending"));
     }
 
@@ -315,7 +315,7 @@ mod tests {
             d.pending_removed = 3;
         }
         let s = render_text(&e);
-        assert!(s.contains("✅ indexed  5 docs"));
+        assert!(s.contains("✅  indexed  5 docs"));
         assert!(s.contains("⚠️"));
         assert!(s.contains("6 pending (2 new · 1 changed · 3 removed)"));
         assert!(s.contains("onebrain search reindex"));
@@ -332,7 +332,7 @@ mod tests {
         }
         let s = render_text(&e);
         assert!(s.contains("📦 model size    471 MB"));
-        assert!(s.contains("⏬ downloaded    "));
+        assert!(s.contains("⏬  downloaded    "));
     }
 
     #[test]

@@ -120,7 +120,7 @@ pub fn run_lex(
     let Some(collection) = collection else {
         anyhow::bail!(
             "❌ no search collection configured\n\
-             💡 set `search.collection` in onebrain.yml (or run `onebrain init`), \
+             💡  set `search.collection` in onebrain.yml (or run `onebrain init`), \
              then run `onebrain search reindex`"
         );
     };
@@ -186,18 +186,18 @@ fn render_text(env: &Envelope<SearchHitsData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     if d.hits.is_empty() {
         return match &d.index_hint {
-            Some(h) => format!("🔍 no results\nℹ️  {h}"),
-            None => "🔍 no results".to_string(),
+            Some(h) => format!("🔍  no results\nℹ️  {h}"),
+            None => "🔍  no results".to_string(),
         };
     }
     let mut blocks = Vec::with_capacity(d.hits.len());
     for (i, h) in d.hits.iter().enumerate() {
         let rank = i + 1;
         let mut block = if h.heading_path.is_empty() {
-            format!("📄 {rank}. {}  ({:.3})", h.doc_path, h.score)
+            format!("📄  {rank}. {}  ({:.3})", h.doc_path, h.score)
         } else {
             format!(
-                "📄 {rank}. {} › {}  ({:.3})",
+                "📄  {rank}. {} › {}  ({:.3})",
                 h.doc_path, h.heading_path, h.score
             )
         };
@@ -227,7 +227,7 @@ mod tests {
 
     #[test]
     fn text_handles_no_matches() {
-        assert_eq!(render_text(&env(Vec::new())), "🔍 no results");
+        assert_eq!(render_text(&env(Vec::new())), "🔍  no results");
     }
 
     #[test]
@@ -241,7 +241,7 @@ mod tests {
             },
         );
         let s = render_text(&e);
-        assert!(s.contains("🔍 no results"), "{s}");
+        assert!(s.contains("🔍  no results"), "{s}");
         assert!(s.contains("index is empty"), "{s}");
         assert!(s.contains("search reindex"), "{s}");
     }
@@ -255,7 +255,7 @@ mod tests {
             score: 0.5,
             snippet: "hello world".into(),
         }]));
-        assert!(s.contains("📄 1. a.md › Intro  (0.500)"));
+        assert!(s.contains("📄  1. a.md › Intro  (0.500)"));
         assert!(s.contains("hello world"));
     }
 
@@ -268,7 +268,7 @@ mod tests {
             score: 0.5,
             snippet: String::new(),
         }]));
-        assert!(s.contains("📄 1. a.md  (0.500)"));
+        assert!(s.contains("📄  1. a.md  (0.500)"));
         assert!(!s.contains("›"));
     }
 
@@ -290,9 +290,9 @@ mod tests {
                 snippet: "second".into(),
             },
         ]));
-        assert!(s.contains("📄 1. a.md"));
-        assert!(s.contains("📄 2. b.md"));
+        assert!(s.contains("📄  1. a.md"));
+        assert!(s.contains("📄  2. b.md"));
         // Blank line separates the two hit blocks.
-        assert!(s.contains("first\n\n📄 2."));
+        assert!(s.contains("first\n\n📄  2."));
     }
 }
