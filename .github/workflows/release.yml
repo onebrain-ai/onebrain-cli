@@ -195,7 +195,13 @@ jobs:
       - name: Link windows-arm64 with rust-lld
         if: matrix.target == 'aarch64-pc-windows-msvc'
         shell: bash
-        run: echo "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=rust-lld" >> "$GITHUB_ENV"
+        # Resolve the bundled rust-lld by full sysroot path (host tools dir)
+        # so nothing depends on PATH resolution; fall back to the bare name.
+        run: |
+          LLD="$(rustc --print sysroot)/lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
+          [ -f "$LLD" ] || LLD=rust-lld
+          echo "resolved linker: $LLD"
+          echo "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$LLD" >> "$GITHUB_ENV"
 
       - name: Fetch the embedded web UI
         uses: actions/download-artifact@v7
