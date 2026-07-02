@@ -910,6 +910,8 @@ pub struct SearchCmd {
 /// belong to; the `.md`-only indexing scope note closes the help.
 const SEARCH_HELP_TEMPLATE: &str = "\
 {about-with-newline}
+Only Markdown (`*.md`) files are indexed; other file types in the vault are never touched.
+
 {usage-heading} {usage}
 
 Commands:
@@ -920,8 +922,7 @@ Search flags (query · search · vsearch):
   --min-score <S>    Drop low-confidence hits (vsearch: cosine, ≈0.85+ is confident; search: BM25; query: RRF)
 
 Options:
-{options}
-Only Markdown (`*.md`) files are indexed; other file types in the vault are never touched.";
+{options}";
 
 #[derive(Subcommand, Debug)]
 pub enum SearchVerb {

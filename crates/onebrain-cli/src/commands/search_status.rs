@@ -51,6 +51,10 @@ struct SearchStatusData {
     pending_changed: usize,
     /// Pending drift: indexed docs whose file is gone.
     pending_removed: usize,
+    /// Total byte size of the whole collection cache dir (models + index +
+    /// live markers). `None` when no collection is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_size_bytes: Option<u64>,
     /// Present when a `search reindex` is running RIGHT NOW in another
     /// process (live marker in the cache dir): its (done, total) counts.
     /// While set, `doc_count`/pending below may lag the in-flight run.
@@ -80,6 +84,10 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
             None => (None, false, None, None, None),
         };
     let reindexing = cache_dir.as_deref().and_then(read_reindex_progress);
+    let cache_size_bytes = cache_dir
+        .as_deref()
+        .filter(|d| d.is_dir())
+        .map(onebrain_search::embed::dir_size_bytes);
 
     // Index status (doc count, last_indexed, drift) — opens the engine
     // read-only (lazy embedder → no model download) and re-hashes the vault.
@@ -113,6 +121,7 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
         pending_new,
         pending_changed,
         pending_removed,
+        cache_size_bytes,
         reindexing,
     };
 
@@ -263,6 +272,9 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
         lines.push(String::new());
         lines.push("📁  Cache".to_string());
         lines.push(item("Dir", &dir.display().to_string()));
+        if let Some(size) = d.cache_size_bytes {
+            lines.push(item("Size", &format_size(size)));
+        }
     }
 
     if pending > 0 {
@@ -298,6 +310,7 @@ mod tests {
                 model_downloaded_at: None,
                 last_indexed_at: None,
                 index_size_bytes: None,
+                cache_size_bytes: None,
                 doc_count: 0,
                 pending_new: 0,
                 pending_changed: 0,
@@ -449,6 +462,19 @@ mod tests {
         let s = render_text(&e);
         assert!(s.contains("    Reindexing    🔄  457/761 (60%)"), "{s}");
         assert!(s.contains("counts may lag"), "{s}");
+    }
+
+    #[test]
+    fn text_shows_cache_size_when_present() {
+        let mut e = env(Some("ob-1"), true);
+        e.data.as_mut().unwrap().cache_size_bytes = Some(512 * 1024 * 1024);
+        let s = render_text(&e);
+        assert!(s.contains("📁  Cache"), "{s}");
+        // Both Dir and Size sit in the Cache section.
+        let cache_at = s.find("📁  Cache").unwrap();
+        let tail = &s[cache_at..];
+        assert!(tail.contains("    Dir           /cache/ob-1"), "{tail}");
+        assert!(tail.contains("    Size          512 MB"), "{tail}");
     }
 
     #[test]
