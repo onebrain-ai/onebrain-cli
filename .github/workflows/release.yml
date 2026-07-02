@@ -58,6 +58,31 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     needs: webui
+    # Platform-tiered semantic search (ADR 0017). The `semantic` cargo feature
+    # (default ON) compiles the fastembed/ONNX-backed embedding path. It can
+    # only build on targets that have an ONNX Runtime prebuilt — the SINGLE
+    # SOURCE OF TRUTH is ort-sys 2.0.0-rc.12's `build/download/dist.txt` for our
+    # feature set (`none`: no CUDA/webgpu). This table, ADR 0017's tier table,
+    # and the README platform-support matrix are all derived from that list and
+    # MUST agree. Targets without a prebuilt build lex-only via
+    # `cargo_flags: --no-default-features` (keyword search + full CLI, no
+    # semantic verbs). Tier per release target:
+    #
+    #   Target                           ONNX prebuilt (ort `none`)  Tier
+    #   ────────────────────────────────────────────────────────────────────
+    #   aarch64-apple-darwin             ✅ yes                       semantic
+    #   x86_64-apple-darwin              ❌ no                        lex-only
+    #   aarch64-unknown-linux-gnu        ✅ yes                       semantic
+    #   armv7-unknown-linux-gnueabihf    ❌ no (ARM32, impossible)    lex-only
+    #   arm-unknown-linux-gnueabihf      ❌ no (ARM32, impossible)    lex-only
+    #   x86_64-unknown-linux-gnu         ✅ yes                       semantic
+    #   x86_64-unknown-linux-musl        ❌ no (gnu only, not musl)   lex-only
+    #   x86_64-pc-windows-msvc           ✅ yes                       semantic
+    #   aarch64-pc-windows-msvc          ✅ yes                       semantic
+    #
+    # `cargo_flags` is spliced into the build command below; absent = default
+    # (semantic) build. Only matrix-controlled values are interpolated — no
+    # untrusted input flows into the run scripts.
     strategy:
       fail-fast: false
       matrix:
@@ -68,6 +93,7 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: tar.gz
+            cargo_flags: --no-default-features
           # Linux cross-compile: matrix value `cross_prefix` is the toolchain
           # triple used to derive (a) the apt package `gcc-${cross_prefix}`,
           # (b) the linker `${cross_prefix}-gcc`, and (c) the strip binary
@@ -82,10 +108,12 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
             cross_prefix: arm-linux-gnueabihf
+            cargo_flags: --no-default-features
           - target: arm-unknown-linux-gnueabihf
             os: ubuntu-latest
             archive: tar.gz
             cross_prefix: arm-linux-gnueabihf
+            cargo_flags: --no-default-features
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
@@ -93,6 +121,7 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
             apt: musl-tools
+            cargo_flags: --no-default-features
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
@@ -151,7 +180,13 @@ jobs:
 
       - name: Build release binary
         shell: bash
-        run: cargo build --release --target "$TARGET" -p onebrain-cli
+        # CARGO_FLAGS is `--no-default-features` for lex-only tier targets (no
+        # ONNX Runtime prebuilt), empty otherwise — see the tier table on the
+        # matrix above. Matrix-controlled value; intentionally word-split (not
+        # quoted) so an empty value expands to nothing.
+        env:
+          CARGO_FLAGS: ${{ matrix.cargo_flags }}
+        run: cargo build --release --target "$TARGET" -p onebrain-cli $CARGO_FLAGS
 
       - name: Strip binary (native Unix)
         if: matrix.archive == 'tar.gz' && !matrix.cross_prefix

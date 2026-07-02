@@ -178,6 +178,24 @@ onebrain
 
 > The tree shape is **locked for v3.2+** — 200+ verbs beyond the working set above are stubbed with a stable `E_NOT_IMPLEMENTED` (exit 72) so the grammar can't drift while features land. Hidden v3.0 flat aliases (`session-init`, `qmd-reindex`, `register-hooks`, …) still dispatch, printing a one-time migration notice (silence with `ONEBRAIN_QUIET_MIGRATION=1`); they're removed no earlier than v4.
 
+### Platform support — semantic vs keyword search
+
+Every release target ships a binary with the **full CLI** and **keyword (lexical/BM25) search**. **Semantic** search (vector + hybrid `query`, plus `vsearch` and `model set`) additionally needs an ONNX Runtime prebuilt, which isn't available on every platform — so some targets ship **keyword-only**. The tiering is driven by the `ort-sys` prebuilt list ([ADR 0017](docs/decisions/0017-platform-tiered-semantic-search.md)); this table, the release-workflow matrix, and the ADR all agree.
+
+| Target | Binary | Keyword search (lex) | Semantic search (vector/hybrid) | Notes |
+|---|---|---|---|---|
+| macOS arm64 (Apple Silicon) — `aarch64-apple-darwin` | ✅ | ✅ | ✅ | |
+| macOS x64 (Intel) — `x86_64-apple-darwin` | ✅ | ✅ | ❌ lex-only | no ONNX Runtime prebuilt for darwin-x64 |
+| Linux x64 glibc — `x86_64-unknown-linux-gnu` | ✅ | ✅ | ✅ | |
+| Linux ARM64 glibc — `aarch64-unknown-linux-gnu` (Pi 3/4/5 64-bit) | ✅ | ✅ | ✅ | |
+| Linux x64 musl / Alpine — `x86_64-unknown-linux-musl` | ✅ | ✅ | ❌ lex-only | ONNX Runtime prebuilt is glibc-only, not musl |
+| Linux ARMv7 32-bit — `armv7-unknown-linux-gnueabihf` (Pi 2/3/4/5 32-bit OS) | ✅ | ✅ | ❌ lex-only | onnxruntime has no 32-bit ARM support |
+| Linux ARMv6 32-bit — `arm-unknown-linux-gnueabihf` (Pi 1 · Zero) | ✅ | ✅ | ❌ lex-only | onnxruntime has no 32-bit ARM support |
+| Windows x64 — `x86_64-pc-windows-msvc` | ✅ | ✅ | ✅ | |
+| Windows ARM64 — `aarch64-pc-windows-msvc` | ✅ | ✅ | ✅ | |
+
+On a keyword-only (lex-only) binary: `search search`, `get`, `status`, and `reindex` work fully; hybrid `query` falls back to keyword ranking with a one-line notice; `vsearch` and `model set` report that semantic search is unavailable in that build.
+
 ## Local web UI
 
 `onebrain serve` starts a local, token-gated HTTP server that hosts the **OneBrain web UI** — a file explorer, a reading view (markdown, code, PDF, Office docs, images, audio/video, Jupyter notebooks), a qmd-backed search panel, and an agent chat — over a small vault JSON API.

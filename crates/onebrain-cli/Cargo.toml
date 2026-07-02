@@ -15,6 +15,11 @@ path = "src/main.rs"
 onebrain-core   = { workspace = true }
 onebrain-fs     = { workspace = true }
 onebrain-cache  = { workspace = true }
+# The workspace dep pins `default-features = false`; onebrain-cli's own
+# `semantic` feature (default ON, see [features] below) forwards to
+# `onebrain-search/semantic`. So `cargo build -p onebrain-cli --no-default-features`
+# produces a lex-only binary with no fastembed/ONNX dep — the tier used on
+# release targets with no ONNX Runtime prebuilt (see ADR 0017).
 onebrain-search = { workspace = true }
 clap           = { workspace = true }
 clap_complete  = { workspace = true }
@@ -71,6 +76,17 @@ flate2             = { workspace = true }
 # Hex-encode the random session token (read from /dev/urandom on unix). `urlencoding`
 # is already a dep for vault-sync; it does NOT do hex, so we hand-roll a 1-liner
 # instead of pulling `hex`/`getrandom`/`rand` (see server::token).
+
+[features]
+# `semantic` (default ON) forwards to `onebrain-search/semantic`, compiling the
+# fastembed/ONNX-backed embedding path. Building `--no-default-features` yields a
+# lex-only binary: `search search`/`get`/`status`/`reindex` work fully, `query`
+# degrades to keyword ranking with a notice, and `vsearch`/`model set` error
+# clearly. This is the release tier for platforms with no ONNX Runtime prebuilt
+# (musl, ARM32, x86_64 macOS, arm64 Windows) — see ADR 0017. CI check:
+# `cargo check -p onebrain-cli --no-default-features`.
+default = ["semantic"]
+semantic = ["onebrain-search/semantic"]
 
 [target.'cfg(unix)'.dependencies]
 libc           = { workspace = true }

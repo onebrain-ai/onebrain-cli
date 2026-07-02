@@ -73,6 +73,13 @@ fn index_hint_for(
 /// `onebrain search query` — hybrid (lex + vector, RRF-fused). Opens the
 /// full engine; embeds the query text, so this is a model-download point on
 /// first use.
+///
+/// In a lex-only build (no `semantic` feature) there is no embedder, so hybrid
+/// isn't possible — this degrades to lex-only (BM25) ranking, printing a
+/// one-line notice on stderr so the result isn't silently narrower than the
+/// user expects. `vsearch` (vector-only) has no lex analogue, so it errors
+/// instead of degrading.
+#[cfg(feature = "semantic")]
 pub fn run_query(
     vault_flag: Option<PathBuf>,
     mode: &OutputMode,
@@ -86,6 +93,18 @@ pub fn run_query(
         .then(|| index_hint_for(&engine, &resolved))
         .flatten();
     emit_hits("search.query", vault_info, hits, hint, mode)
+}
+
+/// Lex-only build: hybrid degrades to keyword (BM25) ranking with a stderr
+/// notice. Delegates to [`run_lex`] so the exact same lex path/output is used.
+#[cfg(not(feature = "semantic"))]
+pub fn run_query(
+    vault_flag: Option<PathBuf>,
+    mode: &OutputMode,
+    args: &SearchQueryArgs,
+) -> Result<()> {
+    eprintln!("ℹ️  semantic search unavailable in this build — showing keyword (lex-only) results");
+    run_lex(vault_flag, mode, args)
 }
 
 /// `onebrain search vsearch` — vector-only semantic search. Also embeds the

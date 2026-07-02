@@ -48,6 +48,13 @@ const VEC_TOP_K: usize = 50;
 const RRF_K: f64 = 60.0;
 const SNIPPET_MAX_CHARS: usize = 200;
 
+/// Error message returned by embedder-backed operations (`query`,
+/// `vector_search`, model switch, and the lazy embedder) in a lex-only build
+/// compiled without the `semantic` feature — i.e. on a platform with no ONNX
+/// Runtime prebuilt. See docs/decisions/0017-platform-tiered-semantic-search.md.
+pub const SEMANTIC_UNAVAILABLE: &str =
+    "semantic search isn't available in this build (no ONNX runtime for this platform)";
+
 /// Live progress events emitted during a reindex so a caller (the CLI) can
 /// render a progress bar without the engine knowing anything about terminals.
 ///
@@ -598,11 +605,48 @@ impl Engine {
                 if let Some(e) = cell.get() {
                     return Ok(e.as_ref());
                 }
-                let e: Box<dyn Embed> = Box::new(embed::new(&self.model_name, &self.cache_dir)?);
-                let _ = cell.set(e);
-                Ok(cell.get().expect("embedder was just set above").as_ref())
+                #[cfg(feature = "semantic")]
+                {
+                    let e: Box<dyn Embed> =
+                        Box::new(embed::new(&self.model_name, &self.cache_dir)?);
+                    let _ = cell.set(e);
+                    Ok(cell.get().expect("embedder was just set above").as_ref())
+                }
+                #[cfg(not(feature = "semantic"))]
+                {
+                    // Silence unused-field warnings in the lex-only build; the
+                    // real embedder is what would consume these.
+                    let _ = &self.model_name;
+                    let _ = &self.cache_dir;
+                    anyhow::bail!(SEMANTIC_UNAVAILABLE)
+                }
             }
         }
+    }
+
+    /// Whether this engine can produce embeddings at all. Always `true` for an
+    /// injected embedder (tests). For the lazy production source it's `true`
+    /// only in a `semantic` build — a lex-only build has no ONNX runtime to
+    /// construct the real embedder, so callers skip the vector side entirely.
+    fn embedder_available(&self) -> bool {
+        match &self.embedder {
+            EmbedSource::Injected(_) => true,
+            EmbedSource::Lazy(_) => cfg!(feature = "semantic"),
+        }
+    }
+
+    /// Embed passage texts if an embedder is available, else `None` (lex-only
+    /// build with no injected embedder). `Some(vec![])` for an empty input so
+    /// index-alignment with `chunks` still holds. Used by [`Engine::index_doc`]
+    /// so a lex-only build indexes the doc without populating the vector store.
+    fn embed_passages_if_available(&self, texts: &[String]) -> Result<Option<Vec<Vec<f32>>>> {
+        if !self.embedder_available() {
+            return Ok(None);
+        }
+        if texts.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        Ok(Some(self.embedder()?.embed_passages(texts)?))
     }
 
     /// Chunk `content`, index into lex + embed + vector, and record chunk
@@ -614,12 +658,15 @@ impl Engine {
         // slice and batches internally, so one call per doc is far cheaper
         // than one call per chunk. The returned vectors are index-aligned with
         // `chunks`.
+        //
+        // `embed_passages_if_available` yields `None` in a lex-only build (no
+        // `semantic` feature and no injected embedder): the doc is then still
+        // fully lex-indexed and its meta/hash recorded — only the vector store
+        // is left unpopulated, so keyword search + the whole index lifecycle
+        // work unchanged. Tests inject a fake embedder, so they still get
+        // vectors regardless of the `semantic` feature.
         let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-        let vectors = if texts.is_empty() {
-            Vec::new()
-        } else {
-            self.embedder()?.embed_passages(&texts)?
-        };
+        let vectors = self.embed_passages_if_available(&texts)?;
 
         let mut chunk_ids: Vec<String> = Vec::with_capacity(chunks.len());
         let write_txn = self.meta.begin_write()?;
@@ -628,7 +675,9 @@ impl Engine {
             for (i, chunk) in chunks.iter().enumerate() {
                 self.lex.add(chunk)?;
 
-                self.vec.add(&chunk.chunk_id, &vectors[i])?;
+                if let Some(vectors) = &vectors {
+                    self.vec.add(&chunk.chunk_id, &vectors[i])?;
+                }
 
                 let record = ChunkMeta {
                     doc_path: chunk.doc_path.clone(),

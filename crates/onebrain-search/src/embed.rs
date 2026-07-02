@@ -8,9 +8,13 @@
 //! lets the vector store assume unit-length vectors unconditionally.
 
 use std::path::{Path, PathBuf};
+#[cfg(feature = "semantic")]
 use std::sync::Mutex;
 
-use anyhow::{bail, Result};
+#[cfg(feature = "semantic")]
+use anyhow::bail;
+use anyhow::Result;
+#[cfg(feature = "semantic")]
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 /// An embedding backend: turns a batch of texts into one L2-normalized
@@ -41,7 +45,9 @@ pub trait Embed {
     }
 }
 
-/// Wraps a loaded `fastembed` text embedding model.
+/// Wraps a loaded `fastembed` text embedding model. Only compiled with the
+/// `semantic` feature — lex-only builds have no ONNX runtime to back it.
+#[cfg(feature = "semantic")]
 pub struct Embedder {
     model: Mutex<TextEmbedding>,
     pub dims: usize,
@@ -279,6 +285,7 @@ pub fn model_dims(model_name: &str) -> usize {
         .unwrap_or(0)
 }
 
+#[cfg(feature = "semantic")]
 fn resolve_model(model_name: &str) -> Result<EmbeddingModel> {
     match model_name {
         "bge-m3" => Ok(EmbeddingModel::BGEM3),
@@ -305,6 +312,7 @@ fn resolve_model(model_name: &str) -> Result<EmbeddingModel> {
 /// Load a `fastembed` text embedding model, caching downloaded model files
 /// under `cache_dir`. Prints fastembed's own download progress bar to stdout
 /// on a first-time download.
+#[cfg(feature = "semantic")]
 pub fn new(model_name: &str, cache_dir: &Path) -> Result<Embedder> {
     new_with_progress(model_name, cache_dir, true)
 }
@@ -312,10 +320,12 @@ pub fn new(model_name: &str, cache_dir: &Path) -> Result<Embedder> {
 /// Same as [`new`] but SILENT: fastembed's stdout download bar is disabled.
 /// Used by the interactive model TUI, which runs the terminal in raw mode and
 /// draws its own in-table progress — a stray stdout print would corrupt it.
+#[cfg(feature = "semantic")]
 pub fn new_quiet(model_name: &str, cache_dir: &Path) -> Result<Embedder> {
     new_with_progress(model_name, cache_dir, false)
 }
 
+#[cfg(feature = "semantic")]
 fn new_with_progress(model_name: &str, cache_dir: &Path, show_progress: bool) -> Result<Embedder> {
     let model = resolve_model(model_name)?;
     let dims = model_dims(model_name);
@@ -340,6 +350,7 @@ fn new_with_progress(model_name: &str, cache_dir: &Path, show_progress: bool) ->
 
 /// L2-normalize a single vector in place. No-op on a zero vector (left
 /// as-is to avoid dividing by zero).
+#[cfg(feature = "semantic")]
 fn l2_normalize(v: &mut [f32]) {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
@@ -349,6 +360,7 @@ fn l2_normalize(v: &mut [f32]) {
     }
 }
 
+#[cfg(feature = "semantic")]
 impl Embedder {
     /// Embed a batch of texts, returning one L2-normalized vector per input
     /// text (same order as `texts`).
@@ -365,6 +377,7 @@ impl Embedder {
     }
 }
 
+#[cfg(feature = "semantic")]
 impl Embed for Embedder {
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         Embedder::embed(self, texts)
@@ -481,6 +494,7 @@ mod tests {
         assert!(!is_supported_model("not-a-real-model"));
     }
 
+    #[cfg(feature = "semantic")]
     #[test]
     fn resolve_model_supports_every_registry_entry() {
         for m in model_registry() {
@@ -492,6 +506,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "semantic")]
     #[test]
     fn resolve_model_rejects_unknown_name() {
         let err = resolve_model("not-a-real-model").unwrap_err();
@@ -547,6 +562,7 @@ mod tests {
         assert_eq!(st.path, model_dir);
     }
 
+    #[cfg(feature = "semantic")]
     #[test]
     fn embed_normalizes() {
         if std::env::var("ONEBRAIN_TEST_EMBED").is_err() {
