@@ -219,11 +219,10 @@ fn render_list_text(env: &Envelope<ModelListData>) -> String {
     let mut lines = vec![header, underline];
     for m in &d.models {
         let marker = if m.current { "●" } else { "" };
-        let downloaded = if m.downloaded { "✓" } else { "⬜" };
-        let disk = m
-            .disk_bytes
-            .map(format_size)
-            .unwrap_or_else(|| "—".to_string());
+        // Plain "—" for not-downloaded: ⬜ renders as a huge white block in
+        // some terminal fonts.
+        let downloaded = if m.downloaded { "✓" } else { "—" };
+        let disk = disk_cell(m.downloaded, m.disk_bytes, m.approx_size);
         let thai = m
             .thai_miracl
             .map(|v| format!("{v:.1}"))
@@ -235,6 +234,17 @@ fn render_list_text(env: &Envelope<ModelListData>) -> String {
     }
     lines.push(format!("📁 models: {}", d.cache_dir.display()));
     lines.join("\n")
+}
+
+/// DISK column text: the real on-disk size once downloaded, else the
+/// registry's approximate download size (`~470 MB`) so the user can see how
+/// big a model is BEFORE choosing to download it. Shared by the static list
+/// table and the interactive TUI.
+pub(crate) fn disk_cell(downloaded: bool, disk_bytes: Option<u64>, approx_size: &str) -> String {
+    match (downloaded, disk_bytes) {
+        (true, Some(b)) => format_size(b),
+        _ => approx_size.to_string(),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -636,12 +646,16 @@ mod tests {
             .unwrap();
         assert!(row.contains('✓'), "downloaded check missing: {row}");
         assert!(row.contains("3 MB"), "disk size missing: {row}");
-        // Not-downloaded models show ⬜ + —.
+        // Not-downloaded models show a plain "—" marker (no ⬜ — it renders
+        // as a huge white block in some terminal fonts) and the registry's
+        // approx size in DISK.
         let other = s.lines().find(|l| l.contains("bge-m3")).unwrap();
         assert!(
-            other.contains('⬜'),
+            other.contains('—'),
             "not-downloaded marker missing: {other}"
         );
+        assert!(!other.contains('⬜'), "white-block glyph banned: {other}");
+        assert!(other.contains("~2.2 GB"), "approx size missing: {other}");
     }
 
     #[test]

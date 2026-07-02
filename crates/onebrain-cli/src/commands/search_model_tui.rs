@@ -40,7 +40,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::ModelSortCol;
 use crate::commands::search_common::{collection_cache_dir, collection_for};
-use crate::commands::search_model::{apply_model_change, cmp_option_last, format_size};
+use crate::commands::search_model::{apply_model_change, cmp_option_last, disk_cell, format_size};
 use onebrain_core::load_vault_config;
 use onebrain_search::embed::{dir_size_bytes, model_download_status, model_registry};
 
@@ -54,6 +54,9 @@ pub struct TuiRow {
     pub current: bool,
     pub downloaded: bool,
     pub disk_bytes: Option<u64>,
+    /// Registry approx download size (`~470 MB`) — shown in DISK until the
+    /// model is actually on disk.
+    pub approx_size: &'static str,
     pub dims: usize,
     pub thai: Option<f32>,
     pub note: &'static str,
@@ -75,6 +78,7 @@ pub fn build_rows(current: &str, cache_dir: &std::path::Path) -> Vec<TuiRow> {
                 current: m.name == current,
                 downloaded: status.downloaded,
                 disk_bytes: status.disk_size,
+                approx_size: m.approx_size,
                 dims: m.dims,
                 thai: m.thai_miracl,
                 note: m.note,
@@ -649,20 +653,19 @@ fn render(f: &mut ratatui::Frame, state: &AppState) {
         .map(|(i, r)| {
             let dl = state.downloading.as_ref().filter(|d| d.name == r.name);
             let marker = if r.current { "●" } else { "" };
+            // Plain "—" for not-downloaded: ⬜ renders as a huge white block
+            // in some terminal fonts.
             let downloaded = if dl.is_some() {
                 "⏬"
             } else if r.downloaded {
                 "✓"
             } else {
-                "⬜"
+                "—"
             };
             let disk = match dl {
                 // Live: the dir is filling up — show it growing.
                 Some(d) => format_size(d.bytes),
-                None => r
-                    .disk_bytes
-                    .map(format_size)
-                    .unwrap_or_else(|| "—".to_string()),
+                None => disk_cell(r.downloaded, r.disk_bytes, r.approx_size),
             };
             let thai = r
                 .thai
@@ -700,13 +703,11 @@ fn render(f: &mut ratatui::Frame, state: &AppState) {
         Constraint::Length(7),
         Constraint::Min(20),
     ];
-    // QuadrantOutside borders are half-block glyphs (▌▐▀▄) that span the full
-    // character cell, so vertical borders render SOLID even in terminals that
-    // add line spacing (plain `│` box-drawing shows as a dashed line there).
+    // Horizontal rules only: side borders either render dashed (│ + terminal
+    // line-spacing) or too chunky (half-block glyphs), so drop them entirely.
     let table = Table::new(body, widths).header(header).block(
         Block::default()
-            .borders(Borders::ALL)
-            .border_type(ratatui::widgets::BorderType::QuadrantOutside)
+            .borders(Borders::TOP | Borders::BOTTOM)
             .title(" embedding models "),
     );
     f.render_widget(table, chunks[0]);
@@ -882,6 +883,14 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort_unstable();
         assert_eq!(names, sorted);
+    }
+
+    #[test]
+    fn disk_cell_shows_approx_size_until_downloaded() {
+        assert_eq!(disk_cell(false, None, "~470 MB"), "~470 MB");
+        assert_eq!(disk_cell(true, Some(1024 * 1024), "~470 MB"), "1 MB");
+        // Downloaded but size unreadable → still fall back to approx.
+        assert_eq!(disk_cell(true, None, "~470 MB"), "~470 MB");
     }
 
     #[test]
