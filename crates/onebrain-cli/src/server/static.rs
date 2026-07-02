@@ -229,7 +229,9 @@ fn inflate(gz: &[u8]) -> Option<Vec<u8>> {
     // The uncompressed size isn't always recoverable from the gzip stream, so
     // pre-size the buffer with a conservative estimate (~3x the compressed size)
     // to cut reallocations while inflating.
-    let estimated = gz.len().saturating_mul(3).max(1024);
+    // Capped so a pathological input can't panic Vec::with_capacity or
+    // pre-allocate unbounded memory — read_to_end grows past the hint anyway.
+    let estimated = gz.len().saturating_mul(3).clamp(1024, 64 * 1024 * 1024);
     let mut out = Vec::with_capacity(estimated);
     decoder.read_to_end(&mut out).ok().map(|_| out)
 }
