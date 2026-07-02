@@ -504,6 +504,104 @@ mod tests {
         assert!(!dir.path().join("vectors.bin.tmp").exists());
     }
 
+    #[test]
+    fn open_rejects_dims_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(VectorStore::open(dir.path(), 3).unwrap());
+        let err = match VectorStore::open(dir.path(), 8) {
+            Ok(_) => panic!("dims mismatch must error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("dims=3"), "{err}");
+        assert!(err.contains("dims=8"), "{err}");
+    }
+
+    #[test]
+    fn add_rejects_wrong_width_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = VectorStore::open(dir.path(), 3).unwrap();
+        let err = s.add("a#0", &[1.0, 0.0]).unwrap_err().to_string();
+        assert!(err.contains("2 dims"), "{err}");
+        assert!(err.contains("expects 3"), "{err}");
+    }
+
+    #[test]
+    fn add_same_chunk_id_replaces_not_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = VectorStore::open(dir.path(), 3).unwrap();
+        s.add("a#0", &norm(&[1.0, 0.0, 0.0])).unwrap();
+        s.add("a#0", &norm(&[0.0, 1.0, 0.0])).unwrap();
+        assert_eq!(s.len(), 1, "replace, not duplicate");
+        let hits = s.search(&norm(&[0.0, 1.0, 0.0]), 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "a#0");
+        assert!(hits[0].1 > 0.99, "newest vector wins: {}", hits[0].1);
+    }
+
+    #[test]
+    fn add_reuses_freed_row_after_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = VectorStore::open(dir.path(), 3).unwrap();
+        s.add("a#0", &norm(&[1.0, 0.0, 0.0])).unwrap();
+        s.add("b#0", &norm(&[0.0, 1.0, 0.0])).unwrap();
+        s.remove("a#0").unwrap();
+        // The freed row is recycled: the file doesn't grow a third row.
+        s.add("c#0", &norm(&[0.0, 0.0, 1.0])).unwrap();
+        assert_eq!(s.len(), 2);
+        let bytes = std::fs::metadata(dir.path().join("vectors.bin"))
+            .unwrap()
+            .len();
+        assert_eq!(bytes, 2 * 3 * 4, "two rows × three f32s");
+        assert_eq!(s.search(&norm(&[0.0, 0.0, 1.0]), 1)[0].0, "c#0");
+    }
+
+    #[test]
+    fn remove_missing_chunk_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = VectorStore::open(dir.path(), 3).unwrap();
+        s.add("a#0", &norm(&[1.0, 0.0, 0.0])).unwrap();
+        s.remove("nope#9").unwrap();
+        assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn search_edge_cases_return_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = VectorStore::open(dir.path(), 3).unwrap();
+        assert!(
+            s.search(&norm(&[1.0, 0.0, 0.0]), 5).is_empty(),
+            "empty store"
+        );
+        s.add("a#0", &norm(&[1.0, 0.0, 0.0])).unwrap();
+        assert!(s.search(&norm(&[1.0, 0.0, 0.0]), 0).is_empty(), "top_k=0");
+        assert!(s.search(&[1.0, 0.0], 5).is_empty(), "query dims mismatch");
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn compact_noop_when_nothing_tombstoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = VectorStore::open(dir.path(), 3).unwrap();
+        s.add("a#0", &norm(&[1.0, 0.0, 0.0])).unwrap();
+        s.add("b#0", &norm(&[0.0, 1.0, 0.0])).unwrap();
+        s.compact().unwrap();
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.search(&norm(&[1.0, 0.0, 0.0]), 1)[0].0, "a#0");
+        // Reopen still healthy after a rewrite-in-place compact.
+        drop(s);
+        let s = VectorStore::open(dir.path(), 3).unwrap();
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn compact_empty_store_is_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = VectorStore::open(dir.path(), 3).unwrap();
+        s.compact().unwrap();
+        assert_eq!(s.len(), 0);
+        assert!(s.is_empty());
+    }
+
     /// A leftover `vectors.bin.tmp` (a `compact` that crashed before its final
     /// rename) must be discarded on the next `open`, leaving the committed
     /// metadata + intact `vectors.bin` fully queryable.
