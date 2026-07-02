@@ -975,6 +975,18 @@ pub struct SearchModelListArgs {
     pub desc: bool,
 }
 
+impl SearchModelListArgs {
+    /// Default list args (registry order, ascending) — used by the bare
+    /// `search model` non-TTY / structured fallback, which renders the same
+    /// static table as an explicit `search model list` with no flags.
+    pub fn bare() -> Self {
+        Self {
+            sort: None,
+            desc: false,
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 pub struct SearchModelRemoveArgs {
     /// Model name (see `search model list`).

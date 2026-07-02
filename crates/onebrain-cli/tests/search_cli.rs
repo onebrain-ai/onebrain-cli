@@ -332,12 +332,12 @@ fn search_model_set_unknown_name_errors_without_downloading() {
 }
 
 #[test]
-fn search_model_bare_non_tty_prints_current_and_available_without_prompting() {
+fn search_model_bare_non_tty_falls_back_to_static_list_without_prompting() {
     // `onebrain search model` with no subcommand, run via `Command::output()`
     // (stdout/stdin are pipes here, never a real TTY under any test harness),
-    // must take the non-interactive fallback branch: print the current model
-    // + available model names + the hint, exit 0, and never block waiting on
-    // stdin or touch the engine's on-disk state (no download).
+    // must NOT launch the interactive TUI: it falls back to the same static
+    // `search model list` output (envelope command `search.model.list`), exits
+    // 0, never blocks on stdin, and never touches the engine's on-disk state.
     let vault = tempdir().unwrap();
     let cache = tempdir().unwrap();
     write(
@@ -357,23 +357,22 @@ fn search_model_bare_non_tty_prints_current_and_available_without_prompting() {
     );
 
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["command"], "search.model.bare");
+    assert_eq!(v["command"], "search.model.list");
     assert_eq!(v["ok"], true);
-    assert_eq!(v["data"]["model"], "bge-m3");
 
-    let available = v["data"]["available"].as_array().unwrap();
-    let names: Vec<&str> = available.iter().map(|m| m.as_str().unwrap()).collect();
+    // Same rows the explicit `list` verb emits.
+    let models = v["data"]["models"].as_array().unwrap();
+    let names: Vec<&str> = models.iter().map(|m| m["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"multilingual-e5-small"));
     assert!(names.contains(&"multilingual-e5-base"));
     assert!(names.contains(&"multilingual-e5-large"));
     assert!(names.contains(&"bge-m3"));
     assert!(names.contains(&"embeddinggemma-300m-q"));
+    // The active model is flagged current.
+    let bge = models.iter().find(|m| m["name"] == "bge-m3").unwrap();
+    assert_eq!(bge["current"], true);
 
-    let hint = v["data"]["hint"].as_str().unwrap();
-    assert!(hint.contains("search model list"));
-    assert!(hint.contains("search model set"));
-
-    // No engine cache dir should be created — the fallback must never open
+    // No engine cache dir should be created — the static list must never open
     // the engine or trigger a model download.
     let model_cache = cache.path().join("onebrain").join("search").join("t-vault");
     assert!(
@@ -383,9 +382,9 @@ fn search_model_bare_non_tty_prints_current_and_available_without_prompting() {
 }
 
 #[test]
-fn search_model_bare_non_tty_text_mode_shows_current_and_hint() {
+fn search_model_bare_non_tty_text_mode_renders_static_table() {
     // Same fallback path, but in the default text (non-JSON) output mode —
-    // exercises `render_bare_fallback_text` end-to-end.
+    // renders the same static table as `search model list`.
     let vault = tempdir().unwrap();
     let cache = tempdir().unwrap();
     write(
@@ -407,9 +406,11 @@ fn search_model_bare_non_tty_text_mode_shows_current_and_hint() {
     );
 
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // The static-list header + rows + footer, not a TUI or a hint string.
+    assert!(stdout.contains("MODEL"));
+    assert!(stdout.contains("DOWNLOADED"));
     assert!(stdout.contains("multilingual-e5-small"));
-    assert!(stdout.contains("search model list"));
-    assert!(stdout.contains("search model set"));
+    assert!(stdout.contains("📁 models:"));
 }
 
 #[test]

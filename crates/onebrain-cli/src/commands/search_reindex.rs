@@ -11,7 +11,9 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::cli::SearchReindexArgs;
-use crate::commands::search_common::open_engine;
+use crate::commands::search_common::{
+    collection_cache_dir, collection_for, model_not_chosen, open_engine,
+};
 use crate::output::{emit, Envelope, OutputMode};
 use onebrain_search::engine::{ReindexProgress, ReindexStats};
 
@@ -37,6 +39,15 @@ impl From<ReindexStats> for ReindexData {
 }
 
 pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchReindexArgs) -> Result<()> {
+    // First-run model choice: if no model has been chosen yet (no persisted
+    // `search.embed_model` key AND nothing downloaded), prompt the user to pick
+    // one BEFORE `open_engine` triggers a download — but only on a real TTY in
+    // text mode. Non-TTY / structured runs (pipes, agents, hooks, scheduled
+    // reindex) silently keep the `multilingual-e5-small` default so a headless
+    // reindex never blocks on a prompt. If a model is already chosen/downloaded,
+    // no prompt fires.
+    maybe_prompt_first_model(vault_flag.clone(), mode)?;
+
     let (mut engine, resolved) = open_engine(vault_flag)?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
 
@@ -61,6 +72,43 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchReindexA
 
     let envelope = Envelope::ok("search.reindex", Some(vault_info), ReindexData::from(stats));
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
+    Ok(())
+}
+
+/// First-run model prompt (Feature B). On a real TTY in text mode, when no
+/// model has been chosen yet, ask the user to pick one via the shared
+/// `inquire::Select` picker and persist the choice to `onebrain.yml` BEFORE the
+/// reindex downloads anything. Any other case (already chosen, non-TTY,
+/// structured output) is a silent no-op — the caller proceeds with the
+/// configured/default model.
+///
+/// Persists the choice directly (not via `apply_model_change`, which would open
+/// the old index + rebuild — pointless on a first run with nothing indexed
+/// yet): the subsequent normal reindex downloads + embeds the chosen model
+/// exactly once.
+fn maybe_prompt_first_model(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
+    use std::io::IsTerminal;
+
+    // Structured output or non-TTY → never prompt (headless-safe default).
+    if mode.is_structured() || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(());
+    }
+
+    let resolved = crate::vault_ctx::require(vault_flag)?;
+    let collection = collection_for(&resolved)?;
+    let cache_dir = collection_cache_dir(&collection);
+
+    if !model_not_chosen(resolved.root.as_path(), &cache_dir) {
+        return Ok(()); // A model is already chosen or downloaded.
+    }
+
+    // Prompt starting on the default model; Esc/cancel keeps the default.
+    let config = onebrain_core::load_vault_config(&resolved.root)?;
+    let current = config.search.embed_model.clone();
+    if let Some(chosen) = crate::commands::search_model::prompt_pick_model(&current) {
+        onebrain_fs::persist_search_key(resolved.root.as_path(), "embed_model", chosen)?;
+        println!("✅ using {chosen} — indexing now…");
+    }
     Ok(())
 }
 

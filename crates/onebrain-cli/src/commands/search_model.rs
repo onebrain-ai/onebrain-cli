@@ -131,7 +131,7 @@ fn sort_rows(rows: &mut [ModelListEntry], col: ModelSortCol, desc: bool) {
 /// Compare two `Option`s so that `None` always sorts LAST, while `Some`
 /// values honour `desc`. Keeps not-downloaded / no-score rows at the bottom
 /// of both ascending and descending sorts.
-fn cmp_option_last<T: PartialOrd + Copy>(
+pub(crate) fn cmp_option_last<T: PartialOrd + Copy>(
     a: Option<T>,
     b: Option<T>,
     desc: bool,
@@ -157,7 +157,7 @@ fn cmp_option_last<T: PartialOrd + Copy>(
 /// Parse a registry `approx_size` string like `"~470 MB"` / `"~1.1 GB"` /
 /// `"~180 MB"` into an approximate byte count for sorting. Unparseable
 /// strings sort as `0`.
-fn parse_approx_size(s: &str) -> u64 {
+pub(crate) fn parse_approx_size(s: &str) -> u64 {
     let cleaned = s.trim_start_matches('~').trim();
     let (num_part, unit) = match cleaned.split_once(' ') {
         Some((n, u)) => (n, u.trim().to_ascii_uppercase()),
@@ -177,7 +177,7 @@ fn parse_approx_size(s: &str) -> u64 {
 
 /// Human-readable byte size (`471 MB`, `1.2 GB`, `840 KB`, `12 B`). Mirrors
 /// `search_status::format_size`.
-fn format_size(bytes: u64) -> String {
+pub(crate) fn format_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = 1024.0 * 1024.0;
     const GB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -233,7 +233,7 @@ fn render_list_text(env: &Envelope<ModelListData>) -> String {
 }
 
 #[derive(Debug, Serialize)]
-struct ModelSetData {
+pub(crate) struct ModelSetData {
     model: String,
     already_current: bool,
     chunks_reembedded: Option<usize>,
@@ -278,7 +278,7 @@ fn supported_model_names() -> String {
 /// Single shared code path for both `model set <name>` ([`run_set`]) and the
 /// interactive picker's confirm step ([`run_picker`]) — callers are
 /// responsible for name validation before calling this.
-fn apply_model_change(
+pub(crate) fn apply_model_change(
     resolved: onebrain_core::ResolvedVault,
     model_name: &str,
 ) -> Result<Envelope<ModelSetData>> {
@@ -316,7 +316,7 @@ fn apply_model_change(
     Ok(Envelope::ok("search.model.set", Some(vault_info), data))
 }
 
-fn render_set_text(env: &Envelope<ModelSetData>) -> String {
+pub(crate) fn render_set_text(env: &Envelope<ModelSetData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     if d.already_current {
         format!("✅ already using {}", d.model)
@@ -463,80 +463,40 @@ fn render_remove_text(env: &Envelope<ModelRemoveData>) -> String {
     }
 }
 
-/// `onebrain search model` (bare, no subcommand) — interactive picker on a
-/// real TTY, non-hanging informational fallback otherwise.
+/// `onebrain search model` (bare, no subcommand) — full-screen interactive
+/// ratatui TUI on a real TTY (browse / sort / switch / delete models), or the
+/// static `search model list` table otherwise.
 ///
 /// TTY gate mirrors `commands::doctor::confirm_fix` /
-/// `onebrain_fs::init::wizard`'s closed-stdin contract: both stdin AND
-/// stdout must be real terminals, otherwise this never prompts — piped
-/// output, agent/hook invocation, and CI must always take the fallback
-/// branch and return immediately.
+/// `onebrain_fs::init::wizard`'s closed-stdin contract: both stdin AND stdout
+/// must be real terminals, otherwise the TUI never launches — piped output,
+/// agent/hook invocation, and CI fall straight through to the static table
+/// (same output as the explicit `search model list`), which never blocks and
+/// stays script-stable. Structured `--json` / `--yaml` also take the static
+/// path so the machine-readable envelope is unchanged.
 pub fn run_bare(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
     use std::io::IsTerminal;
 
-    let resolved = crate::vault_ctx::require(vault_flag)?;
-    let config = load_vault_config(&resolved.root).context("load vault config")?;
-    let current = config.search.embed_model.clone();
-
-    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        run_picker(resolved, mode, &current)
+    let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if tty && !mode.is_structured() {
+        crate::commands::search_model_tui::run(vault_flag)
     } else {
-        run_non_tty_fallback(resolved, mode, &current)
+        // Non-TTY / structured: identical to `search model list` with no sort
+        // — a stable static table (or JSON/YAML envelope), never the TUI.
+        run_list(vault_flag, mode, &SearchModelListArgs::bare())
     }
 }
 
-/// Non-TTY fallback: print the current model + available names + a hint to
-/// use `list` / `set` explicitly. Never opens the engine, never prompts,
-/// never blocks — safe for pipes, agents, hooks, and scheduled runs.
-fn run_non_tty_fallback(
-    resolved: onebrain_core::ResolvedVault,
-    mode: &OutputMode,
-    current: &str,
-) -> Result<()> {
-    let vault_info = crate::vault_ctx::info_from(&resolved);
-    let data = ModelBareFallbackData {
-        model: current.to_string(),
-        available: model_registry().iter().map(|m| m.name).collect(),
-        hint: "run 'onebrain search model list' for details, or 'onebrain search model set <name>' to switch."
-            .to_string(),
-    };
-    let envelope = Envelope::ok("search.model.bare", Some(vault_info), data);
-    emit(
-        &envelope,
-        mode,
-        std::io::stdout().lock(),
-        render_bare_fallback_text,
-    )?;
-    Ok(())
-}
-
-#[derive(Debug, Serialize)]
-struct ModelBareFallbackData {
-    model: String,
-    available: Vec<&'static str>,
-    hint: String,
-}
-
-fn render_bare_fallback_text(env: &Envelope<ModelBareFallbackData>) -> String {
-    let d = env.data.as_ref().expect("ok envelope always has data");
-    format!(
-        "current model: {}\navailable models: {}\n{}",
-        d.model,
-        d.available.join(", "),
-        d.hint
-    )
-}
-
-/// Interactive picker (real TTY only): arrow-key `Select` over the
-/// registry, current model marked; on Enter, no-op if unchanged, else a
-/// `Confirm` warning that switching re-embeds the whole vault (and may
-/// download the new model), then — on yes — the SAME apply path `model set`
-/// uses. Esc/cancel does nothing and exits 0.
-fn run_picker(
-    resolved: onebrain_core::ResolvedVault,
-    mode: &OutputMode,
-    current: &str,
-) -> Result<()> {
+/// Prompt the user to choose a model via an `inquire::Select` picker
+/// (registry rows, `current` marked, starting cursor on the current model).
+/// Returns the chosen model's registry name, or `None` on Esc / Ctrl-C /
+/// cancel.
+///
+/// Shared entry point so `search reindex`'s first-run "pick a model before we
+/// download anything" prompt (see `search_reindex`) reuses the exact picker
+/// wording and row format, rather than reinventing a second `Select`. Callers
+/// are responsible for the TTY gate — this always prompts.
+pub(crate) fn prompt_pick_model(current: &str) -> Option<&'static str> {
     let options: Vec<String> = model_registry()
         .iter()
         .map(|m| format_picker_row(m, current))
@@ -546,41 +506,15 @@ fn run_picker(
         .position(|m| m.name == current)
         .unwrap_or(0);
 
-    let selection = match inquire::Select::new("Select embedding model:", options)
+    let selection = inquire::Select::new("Select embedding model:", options)
         .with_starting_cursor(starting_cursor)
         .prompt()
-    {
-        Ok(choice) => choice,
-        Err(_) => return Ok(()), // Esc / Ctrl-C / cancel — do nothing, exit 0.
-    };
+        .ok()?;
 
-    let Some(chosen) = model_registry()
+    model_registry()
         .iter()
         .find(|m| format_picker_row(m, current) == selection)
-    else {
-        return Ok(()); // Defensive: selection didn't match a known row.
-    };
-
-    if chosen.name == current {
-        println!("already using {current}");
-        return Ok(());
-    }
-
-    let confirmed = inquire::Confirm::new(&format!(
-        "Switch to {}? This re-embeds the whole vault (and downloads the model if not cached).",
-        chosen.name
-    ))
-    .with_default(false)
-    .prompt()
-    .unwrap_or(false);
-
-    if !confirmed {
-        return Ok(());
-    }
-
-    let envelope = apply_model_change(resolved, chosen.name)?;
-    emit(&envelope, mode, std::io::stdout().lock(), render_set_text)?;
-    Ok(())
+        .map(|m| m.name)
 }
 
 /// `MODEL · SIZE · DIM · THAI · NOTE`, current model marked with `●`.

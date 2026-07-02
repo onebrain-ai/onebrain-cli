@@ -117,6 +117,47 @@ pub fn is_indexed(cache_dir: &Path) -> bool {
     cache_dir.is_dir()
 }
 
+/// `true` when the vault's config file physically contains a
+/// `search.embed_model` key. Distinct from `config.search.embed_model`, which
+/// serde fills with the `multilingual-e5-small` default even when the key is
+/// absent — so this raw-YAML check is the only way to tell "user has chosen a
+/// model" from "user hasn't touched it yet".
+///
+/// Missing config / unreadable file / non-mapping YAML all count as "not
+/// present" (a fresh vault hasn't chosen a model). Pure `std::fs` + parse.
+pub fn embed_model_key_present(vault_root: &Path) -> bool {
+    use onebrain_core::{find_config_file, CONFIG_FILENAME};
+
+    let path = find_config_file(vault_root).unwrap_or_else(|| vault_root.join(CONFIG_FILENAME));
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
+        return false;
+    };
+    yaml.get("search")
+        .and_then(|s| s.get("embed_model"))
+        .is_some()
+}
+
+/// `true` when at least one registry model's `models--*` dir exists under the
+/// collection cache dir. Pure `std::fs` scan — never downloads.
+pub fn any_model_downloaded(cache_dir: &Path) -> bool {
+    use onebrain_search::embed::{model_download_status, model_registry};
+    model_registry()
+        .iter()
+        .any(|m| model_download_status(m, cache_dir).downloaded)
+}
+
+/// Whether the vault has *no* embedding model chosen yet: neither a
+/// physically-present `search.embed_model` key NOR any downloaded model. This
+/// is the gate for the first-run "pick a model before we download" prompt in
+/// `search reindex` — a `false` here means the user has already committed to a
+/// model (explicitly configured or already on disk), so no prompt is shown.
+pub fn model_not_chosen(vault_root: &Path, cache_dir: &Path) -> bool {
+    !embed_model_key_present(vault_root) && !any_model_downloaded(cache_dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +262,100 @@ mod tests {
     fn is_indexed_true_when_dir_present() {
         let dir = tempdir().unwrap();
         assert!(is_indexed(dir.path()));
+    }
+
+    #[test]
+    fn embed_model_key_present_true_when_configured() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "search:\n  embed_model: bge-m3\n",
+        )
+        .unwrap();
+        assert!(embed_model_key_present(dir.path()));
+    }
+
+    #[test]
+    fn embed_model_key_present_false_when_absent() {
+        let dir = tempdir().unwrap();
+        // `search:` block with a collection but no embed_model.
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "search:\n  collection: t\n",
+        )
+        .unwrap();
+        assert!(!embed_model_key_present(dir.path()));
+    }
+
+    #[test]
+    fn embed_model_key_present_false_when_no_config_file() {
+        let dir = tempdir().unwrap();
+        assert!(!embed_model_key_present(dir.path()));
+    }
+
+    #[test]
+    fn embed_model_key_present_false_on_unparseable_yaml() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("onebrain.yml"), "search: : : not yaml\n").unwrap();
+        assert!(!embed_model_key_present(dir.path()));
+    }
+
+    #[test]
+    fn any_model_downloaded_false_on_empty_cache() {
+        let dir = tempdir().unwrap();
+        assert!(!any_model_downloaded(dir.path()));
+    }
+
+    #[test]
+    fn any_model_downloaded_true_when_one_present() {
+        use onebrain_search::embed::model_registry;
+        let dir = tempdir().unwrap();
+        let m = &model_registry()[0];
+        let mdir = dir.path().join(m.cache_dir_name());
+        std::fs::create_dir_all(&mdir).unwrap();
+        std::fs::write(mdir.join("model.onnx"), vec![0u8; 16]).unwrap();
+        assert!(any_model_downloaded(dir.path()));
+    }
+
+    #[test]
+    fn model_not_chosen_true_on_fresh_vault() {
+        let vault = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "folders:\n  inbox: 00-inbox\n",
+        )
+        .unwrap();
+        assert!(model_not_chosen(vault.path(), cache.path()));
+    }
+
+    #[test]
+    fn model_not_chosen_false_when_key_configured() {
+        let vault = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  embed_model: bge-m3\n",
+        )
+        .unwrap();
+        assert!(!model_not_chosen(vault.path(), cache.path()));
+    }
+
+    #[test]
+    fn model_not_chosen_false_when_model_downloaded() {
+        use onebrain_search::embed::model_registry;
+        let vault = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        // No embed_model key, but a model already on disk → already committed.
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "folders:\n  inbox: 00-inbox\n",
+        )
+        .unwrap();
+        let m = &model_registry()[0];
+        let mdir = cache.path().join(m.cache_dir_name());
+        std::fs::create_dir_all(&mdir).unwrap();
+        std::fs::write(mdir.join("model.onnx"), vec![0u8; 16]).unwrap();
+        assert!(!model_not_chosen(vault.path(), cache.path()));
     }
 }

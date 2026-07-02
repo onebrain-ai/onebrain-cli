@@ -130,6 +130,12 @@ tower-http = { version = "0.6", features = ["fs"] }
 # Interactive prompts (Slice 10 · init wizard)
 inquire   = "0.7"
 
+# v3.4 UX-2b — full-screen interactive `search model` TUI. ratatui 0.29 bundles
+# its own crossterm backend (re-exported as `ratatui::crossterm`), so we don't
+# add a separate crossterm dep — the raw-mode terminal setup uses that
+# re-export to keep the crossterm version in lockstep with ratatui's backend.
+ratatui   = "0.29"
+
 # Slice 13 — vault-sync (tarball extraction + progress UI + url encoding)
 tar         = "0.4"
 flate2      = "1"
