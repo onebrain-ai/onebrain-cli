@@ -200,8 +200,8 @@ fn render_text(env: &Envelope<SearchHitsData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     if d.hits.is_empty() {
         return match &d.index_hint {
-            Some(h) => format!("🔍  no results\nℹ️  {h}"),
-            None => "🔍  no results".to_string(),
+            Some(h) => format!("🔍  No results\nℹ️  {h}"),
+            None => "🔍  No results".to_string(),
         };
     }
     let mut blocks = Vec::with_capacity(d.hits.len());
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn text_handles_no_matches() {
-        assert_eq!(render_text(&env(Vec::new())), "🔍  no results");
+        assert_eq!(render_text(&env(Vec::new())), "🔍  No results");
     }
 
     #[test]
@@ -255,7 +255,7 @@ mod tests {
             },
         );
         let s = render_text(&e);
-        assert!(s.contains("🔍  no results"), "{s}");
+        assert!(s.contains("🔍  No results"), "{s}");
         assert!(s.contains("index is empty"), "{s}");
         assert!(s.contains("search reindex"), "{s}");
     }

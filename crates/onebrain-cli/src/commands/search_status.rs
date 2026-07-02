@@ -16,11 +16,12 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::commands::search_common::{
-    collection_cache_dir, is_indexed, open_engine, read_reindex_progress, resolve_collection,
-    ReindexLiveProgress,
+    collection_cache_dir, index_size_bytes, is_indexed, open_engine, read_reindex_progress,
+    resolve_collection, ReindexLiveProgress,
 };
 use crate::output::{emit, Envelope, OutputMode};
 use onebrain_core::load_vault_config;
+use onebrain_search::embed::dir_size_bytes;
 
 #[derive(Debug, Serialize)]
 struct SearchStatusData {
@@ -36,6 +37,12 @@ struct SearchStatusData {
     model_downloaded_at: Option<u64>,
     /// Epoch seconds of the last `reindex` run. `None` if never indexed.
     last_indexed_at: Option<u64>,
+    /// Total on-disk size in bytes of the index itself (the `tantivy/` and
+    /// `vectors/` dirs plus `engine.redb`, under the collection cache dir) — the
+    /// downloaded models are NOT counted here (see `model_size_bytes`). `None`
+    /// when no index exists yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index_size_bytes: Option<u64>,
     /// Number of docs currently indexed.
     doc_count: usize,
     /// Pending drift: docs on disk with no stored hash.
@@ -56,19 +63,22 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
     let vault_info = crate::vault_ctx::info_from(&resolved);
     let config = load_vault_config(&resolved.root)?;
 
-    // Cache dir + on-disk model stats (pure fs reads — never a download).
-    let (cache_dir, indexed, model_size_bytes, model_downloaded_at) = match &collection {
-        Some(c) => {
-            let dir = collection_cache_dir(c);
-            let indexed = is_indexed(&dir);
-            let (size, downloaded) = match model_dir_stats(&dir) {
-                Some((size, mtime)) => (Some(size), mtime),
-                None => (None, None),
-            };
-            (Some(dir), indexed, size, downloaded)
-        }
-        None => (None, false, None, None),
-    };
+    // Cache dir + on-disk model stats + index size (pure fs reads — never a
+    // download).
+    let (cache_dir, indexed, model_size_bytes, model_downloaded_at, index_size_bytes) =
+        match &collection {
+            Some(c) => {
+                let dir = collection_cache_dir(c);
+                let indexed = is_indexed(&dir);
+                let (size, downloaded) = match model_dir_stats(&dir) {
+                    Some((size, mtime)) => (Some(size), mtime),
+                    None => (None, None),
+                };
+                let idx_size = index_size_bytes(&dir);
+                (Some(dir), indexed, size, downloaded, idx_size)
+            }
+            None => (None, false, None, None, None),
+        };
     let reindexing = cache_dir.as_deref().and_then(read_reindex_progress);
 
     // Index status (doc count, last_indexed, drift) — opens the engine
@@ -98,6 +108,7 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
         model_size_bytes,
         model_downloaded_at,
         last_indexed_at,
+        index_size_bytes,
         doc_count,
         pending_new,
         pending_changed,
@@ -148,32 +159,6 @@ fn model_dirs(cache_dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Recursively sum the byte sizes of every regular file under `root`
-/// (hand-rolled stack walk — no new crate dep; mirrors engine.rs's
-/// `walk_markdown_files`). Unreadable dirs/files are skipped.
-fn dir_size_bytes(root: &Path) -> u64 {
-    let mut total = 0u64;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            match entry.file_type() {
-                Ok(ft) if ft.is_dir() => stack.push(path),
-                Ok(ft) if ft.is_file() => {
-                    if let Ok(meta) = entry.metadata() {
-                        total += meta.len();
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    total
-}
-
 /// `root`'s own mtime as epoch seconds, or `None` if unreadable.
 fn dir_mtime_secs(root: &Path) -> Option<u64> {
     let meta = std::fs::metadata(root).ok()?;
@@ -211,54 +196,70 @@ fn format_local(secs: u64) -> Option<String> {
     }
 }
 
+/// Width of the label column so every value aligns. `Last indexed` (12 chars)
+/// is the longest label; 14 leaves two trailing spaces after it.
+const LABEL_W: usize = 14;
+
+/// One aligned status row: `{emoji}  {label:<LABEL_W}{value}`. Every emoji is
+/// followed by exactly TWO spaces (terminal fonts render emoji double-width),
+/// and the label is left-padded to `LABEL_W` so values line up in a column.
+fn row(emoji: &str, label: &str, value: &str) -> String {
+    format!("{emoji}  {label:<LABEL_W$}{value}")
+}
+
 fn render_text(env: &Envelope<SearchStatusData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     let mut lines = Vec::new();
     match &d.collection {
-        Some(c) => lines.push(format!("🔍  collection    {c}")),
-        None => lines.push(
-            "🔍  collection    not set\n💡  set `search.collection` in onebrain.yml".to_string(),
-        ),
+        Some(c) => lines.push(row("🔍", "Collection", c)),
+        None => lines.push(format!(
+            "{}\n💡  Set `search.collection` in onebrain.yml",
+            row("🔍", "Collection", "not set")
+        )),
     }
-    lines.push(format!("🧠  model         {}", d.embed_model));
+    lines.push(row("🧠", "Model", &d.embed_model));
 
     match d.model_size_bytes {
         Some(size) => {
-            lines.push(format!("📦 model size    {}", format_size(size)));
+            lines.push(row("📦", "Model size", &format_size(size)));
             if let Some(downloaded) = d.model_downloaded_at.and_then(format_local) {
-                lines.push(format!("⏬  downloaded    {downloaded}"));
+                lines.push(row("⏬", "Downloaded", &downloaded));
             }
         }
-        None => lines.push("📦 model size    not downloaded".to_string()),
+        None => lines.push(row("📦", "Model size", "not downloaded")),
     }
 
     if let Some(dir) = &d.cache_dir {
-        lines.push(format!("📁  cache         {}", dir.display()));
+        lines.push(row("📁", "Cache dir", &dir.display().to_string()));
+    }
+
+    if let Some(size) = d.index_size_bytes {
+        lines.push(row("📊", "Index size", &format_size(size)));
     }
 
     match d.last_indexed_at.and_then(format_local) {
-        Some(when) => lines.push(format!("🕐 last indexed  {when}")),
-        None => lines.push("🕐 last indexed  never".to_string()),
+        Some(when) => lines.push(row("🕐", "Last indexed", &when)),
+        None => lines.push(row("🕐", "Last indexed", "never")),
     }
 
     if let Some(r) = &d.reindexing {
         let pct = (r.done * 100).checked_div(r.total).unwrap_or(0);
         lines.push(format!(
-            "🔄  reindexing    {}/{} ({pct}%) — running now; counts below may lag",
+            "🔄  Reindexing    {}/{} ({pct}%) — running now; counts below may lag",
             r.done, r.total
         ));
     }
 
-    lines.push(format!("✅  indexed  {} docs", d.doc_count));
+    lines.push(format!("✅  Indexed {} docs", d.doc_count));
 
     let pending = d.pending_new + d.pending_changed + d.pending_removed;
     if pending > 0 {
         lines.push(format!(
-            "⚠️  {pending} pending ({} new · {} changed · {} removed) → run `onebrain search reindex`",
+            "⚠️  Pending {pending} ({} new · {} changed · {} removed) → run `onebrain search reindex`",
             d.pending_new, d.pending_changed, d.pending_removed
         ));
     } else {
-        lines.push("✅  up to date".to_string());
+        lines.push("✅  Up to date".to_string());
     }
 
     lines.join("\n")
@@ -281,6 +282,7 @@ mod tests {
                 model_size_bytes: None,
                 model_downloaded_at: None,
                 last_indexed_at: None,
+                index_size_bytes: None,
                 doc_count: 0,
                 pending_new: 0,
                 pending_changed: 0,
@@ -293,32 +295,34 @@ mod tests {
     #[test]
     fn text_shows_collection_and_model() {
         let s = render_text(&env(Some("ob-1"), true));
-        assert!(s.contains("🔍  collection    ob-1"));
-        assert!(s.contains("🧠  model         multilingual-e5-small"));
-        assert!(s.contains("✅  indexed  0 docs"));
+        assert!(s.contains("🔍  Collection    ob-1"), "{s}");
+        assert!(s.contains("🧠  Model         multilingual-e5-small"), "{s}");
+        assert!(s.contains("✅  Indexed 0 docs"), "{s}");
     }
 
     #[test]
     fn text_flags_missing_collection() {
         let s = render_text(&env(None, false));
         assert!(s.contains("not set"));
-        assert!(s.contains("💡  set `search.collection`"));
+        assert!(s.contains("💡  Set `search.collection`"));
     }
 
     #[test]
     fn text_shows_not_downloaded_and_never_indexed_when_absent() {
         let s = render_text(&env(Some("ob-1"), false));
-        assert!(s.contains("📦 model size    not downloaded"));
-        assert!(s.contains("🕐 last indexed  never"));
-        // No `⏬  downloaded` line when the model isn't present.
-        assert!(!s.contains("⏬  downloaded"));
+        assert!(s.contains("📦  Model size    not downloaded"), "{s}");
+        assert!(s.contains("🕐  Last indexed  never"), "{s}");
+        // No `⏬  Downloaded` line when the model isn't present.
+        assert!(!s.contains("⏬  Downloaded"));
+        // No `📊  Index size` line when there's no index.
+        assert!(!s.contains("Index size"));
     }
 
     #[test]
     fn text_shows_up_to_date_when_no_drift() {
         let s = render_text(&env(Some("ob-1"), true));
-        assert!(s.contains("✅  up to date"));
-        assert!(!s.contains("pending"));
+        assert!(s.contains("✅  Up to date"));
+        assert!(!s.contains("Pending"));
     }
 
     #[test]
@@ -332,11 +336,14 @@ mod tests {
             d.pending_removed = 3;
         }
         let s = render_text(&e);
-        assert!(s.contains("✅  indexed  5 docs"));
+        assert!(s.contains("✅  Indexed 5 docs"), "{s}");
         assert!(s.contains("⚠️"));
-        assert!(s.contains("6 pending (2 new · 1 changed · 3 removed)"));
+        assert!(
+            s.contains("Pending 6 (2 new · 1 changed · 3 removed)"),
+            "{s}"
+        );
         assert!(s.contains("onebrain search reindex"));
-        assert!(!s.contains("up to date"));
+        assert!(!s.contains("Up to date"));
     }
 
     #[test]
@@ -348,8 +355,38 @@ mod tests {
             d.model_downloaded_at = Some(1_700_000_000);
         }
         let s = render_text(&e);
-        assert!(s.contains("📦 model size    471 MB"));
-        assert!(s.contains("⏬  downloaded    "));
+        assert!(s.contains("📦  Model size    471 MB"), "{s}");
+        assert!(s.contains("⏬  Downloaded    "), "{s}");
+    }
+
+    #[test]
+    fn text_shows_index_size_when_present() {
+        let mut e = env(Some("ob-1"), true);
+        e.data.as_mut().unwrap().index_size_bytes = Some(16 * 1024 * 1024);
+        let s = render_text(&e);
+        assert!(s.contains("📊  Index size    16 MB"), "{s}");
+    }
+
+    #[test]
+    fn text_uses_two_spaces_after_every_emoji_and_aligned_values() {
+        let mut e = env(Some("ob-1"), true);
+        {
+            let d = e.data.as_mut().unwrap();
+            d.model_size_bytes = Some(471 * 1024 * 1024);
+            d.index_size_bytes = Some(1024);
+        }
+        let s = render_text(&e);
+        // Every rendered emoji row starts with `<emoji>  ` (two spaces).
+        for line in s.lines() {
+            for emoji in ["🔍", "🧠", "📦", "📁", "📊", "🕐"] {
+                if let Some(rest) = line.strip_prefix(emoji) {
+                    assert!(
+                        rest.starts_with("  ") && !rest.starts_with("   "),
+                        "row `{line}` must have exactly two spaces after {emoji}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -361,6 +398,7 @@ mod tests {
             d.pending_new = 1;
             d.last_indexed_at = Some(1_700_000_000);
             d.model_size_bytes = Some(1234);
+            d.index_size_bytes = Some(5678);
         }
         let v = serde_json::to_value(e.data.as_ref().unwrap()).unwrap();
         // Existing fields preserved.
@@ -374,6 +412,13 @@ mod tests {
         assert_eq!(v["pending_removed"], 0);
         assert_eq!(v["last_indexed_at"], 1_700_000_000u64);
         assert_eq!(v["model_size_bytes"], 1234);
+        assert_eq!(v["index_size_bytes"], 5678);
+    }
+
+    #[test]
+    fn json_omits_index_size_when_absent() {
+        let v = serde_json::to_value(env(Some("ob-1"), true).data.as_ref().unwrap()).unwrap();
+        assert!(v.get("index_size_bytes").is_none());
     }
 
     #[test]
@@ -384,7 +429,7 @@ mod tests {
             total: 761,
         });
         let s = render_text(&e);
-        assert!(s.contains("🔄  reindexing    457/761 (60%)"), "{s}");
+        assert!(s.contains("🔄  Reindexing    457/761 (60%)"), "{s}");
         assert!(s.contains("counts below may lag"), "{s}");
     }
 

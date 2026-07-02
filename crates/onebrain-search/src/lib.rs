@@ -5,6 +5,14 @@
 //! vault of markdown notes, with no Node/Python and no separate install. See
 //! `docs/decisions/0012-native-search-replace-qmd.md` for the rationale.
 //!
+//! # Indexing scope
+//!
+//! The engine indexes **Markdown (`*.md`) files only**. The vault walk
+//! ([`engine::reindex_all_with_progress`]) collects nothing but `*.md` files;
+//! every other file type in the vault (images, PDFs, code, …) is never read,
+//! chunked, embedded, or stored. Hidden directories and `node_modules` are
+//! skipped, plus any `search.exclude` patterns from `onebrain.yml`.
+//!
 //! # Architecture
 //!
 //! One sync engine, assembled from focused modules:
@@ -39,8 +47,9 @@
 //! # Storage
 //!
 //! Per collection, under `~/.cache/onebrain/search/<collection>/`: a `tantivy/`
-//! index directory, a `vectors.bin` flat vector file, and a `meta.redb`
-//! metadata database. All outside the vault.
+//! index directory, a `vectors/` flat vector store, and an `engine.redb`
+//! metadata database. Downloaded embedding models live alongside them in
+//! `models--*` dirs. All outside the vault.
 
 pub mod chunk;
 pub mod embed;

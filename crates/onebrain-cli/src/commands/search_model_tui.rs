@@ -346,7 +346,7 @@ impl AppState {
             return false;
         };
         if row.current {
-            self.status = Some("⚠️  can't delete the active model — switch away first".to_string());
+            self.status = Some("⚠️  Can't delete the active model — switch away first".to_string());
             return false;
         }
         if !row.downloaded {
@@ -355,7 +355,7 @@ impl AppState {
         }
         self.pending_delete = Some(self.selected);
         self.status = Some(format!(
-            "delete {}'s files? (y/n)",
+            "Delete {}'s files? (y/n)",
             self.rows[self.selected].name
         ));
         true
@@ -364,7 +364,7 @@ impl AppState {
     /// Cancel a staged delete confirm.
     pub fn cancel_delete(&mut self) {
         self.pending_delete = None;
-        self.status = Some("delete cancelled".to_string());
+        self.status = Some("Delete cancelled".to_string());
     }
 }
 
@@ -512,7 +512,7 @@ fn perform_switch<B: ratatui::backend::Backend>(
         return;
     };
     if row.current {
-        state.status = Some(format!("already using {}", row.name));
+        state.status = Some(format!("Already using {}", row.name));
         return;
     }
     let name = row.name;
@@ -556,9 +556,9 @@ fn perform_switch<B: ratatui::backend::Backend>(
             pct: 0,
             bytes: 0,
         });
-        state.status = Some(format!("⏬  downloading {name}…"));
+        state.status = Some(format!("⏬  Downloading {name}…"));
     } else {
-        state.status = Some(format!("🧠  re-embedding with {name}…"));
+        state.status = Some(format!("🧠  Re-embedding with {name}…"));
     }
 
     // Nested UI loop while the worker runs: poll disk → redraw → drain keys.
@@ -567,7 +567,7 @@ fn perform_switch<B: ratatui::backend::Backend>(
             dl.bytes = dir_size_bytes(&dl.model_dir);
             dl.pct = download_pct(dl.bytes, dl.expected_bytes);
             state.status = Some(format!(
-                "⏬  downloading {name} · {} / {} ({}%)",
+                "⏬  Downloading {name} · {} / {} ({}%)",
                 format_size(dl.bytes),
                 format_size(dl.expected_bytes),
                 dl.pct
@@ -589,14 +589,14 @@ fn perform_switch<B: ratatui::backend::Backend>(
                 Ok(SwitchMsg::DownloadDone) => {
                     if state.downloading.take().is_some() {
                         state.status =
-                            Some(format!("✅  downloaded · 🧠  re-embedding with {name}…"));
+                            Some(format!("✅  Downloaded · 🧠  re-embedding with {name}…"));
                     }
                 }
                 Ok(SwitchMsg::Reembed { done, total }) => {
                     state.downloading = None;
                     state.reembed = Some(ReembedUi { name, done, total });
                     state.status = Some(format!(
-                        "🧠  re-embedding with {name} — {done}/{total} chunk(s) ({}%)",
+                        "🧠  Re-embedding with {name} — {done}/{total} chunk(s) ({}%)",
                         reembed_pct(done, total)
                     ));
                 }
@@ -612,7 +612,7 @@ fn perform_switch<B: ratatui::backend::Backend>(
                             state.status = Some(switch_status(name, chunks));
                         }
                         Err(e) => {
-                            state.status = Some(format!("⚠️  switch failed: {e}"));
+                            state.status = Some(format!("⚠️  Switch failed: {e}"));
                         }
                     }
                     return;
@@ -621,7 +621,7 @@ fn perform_switch<B: ratatui::backend::Backend>(
                 Err(TryRecvError::Disconnected) => {
                     state.downloading = None;
                     state.reembed = None;
-                    state.status = Some("⚠️  switch worker exited unexpectedly".to_string());
+                    state.status = Some("⚠️  Switch worker exited unexpectedly".to_string());
                     return;
                 }
             }
@@ -636,9 +636,9 @@ fn perform_switch<B: ratatui::backend::Backend>(
 pub fn switch_status(name: &str, chunks_reembedded: Option<usize>) -> String {
     match chunks_reembedded {
         Some(0) | None => format!(
-            "✅  switched to {name} · index is empty — run `onebrain search reindex` to download + index"
+            "✅  Switched to {name} · index is empty — run `onebrain search reindex` to download + index"
         ),
-        Some(n) => format!("✅  switched to {name} · 🧠  {n} chunk(s) re-embedded with the new model"),
+        Some(n) => format!("✅  Switched to {name} · 🧠  {n} chunk(s) re-embedded with the new model"),
     }
 }
 
@@ -1035,7 +1035,7 @@ mod tests {
     fn switch_status_points_at_reindex_when_index_empty() {
         for chunks in [Some(0), None] {
             let s = switch_status("bge-m3", chunks);
-            assert!(s.contains("switched to bge-m3"), "{s}");
+            assert!(s.contains("Switched to bge-m3"), "{s}");
             assert!(s.contains("search reindex"), "{s}");
         }
     }
@@ -1043,7 +1043,7 @@ mod tests {
     #[test]
     fn switch_status_reports_reembedded_chunks() {
         let s = switch_status("multilingual-e5-base", Some(42));
-        assert!(s.contains("switched to multilingual-e5-base"), "{s}");
+        assert!(s.contains("Switched to multilingual-e5-base"), "{s}");
         assert!(s.contains("42 chunk(s) re-embedded"), "{s}");
         assert!(!s.contains("search reindex"), "{s}");
     }

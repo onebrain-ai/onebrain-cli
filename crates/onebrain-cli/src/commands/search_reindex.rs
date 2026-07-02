@@ -12,7 +12,8 @@ use serde::Serialize;
 
 use crate::cli::SearchReindexArgs;
 use crate::commands::search_common::{
-    collection_cache_dir, collection_for, model_not_chosen, open_engine, reindex_progress_path,
+    collection_cache_dir, collection_for, index_size_bytes, model_not_chosen, open_engine,
+    reindex_progress_path,
 };
 use crate::output::{emit, Envelope, OutputMode};
 use onebrain_search::engine::{ReindexProgress, ReindexStats};
@@ -24,16 +25,31 @@ struct ReindexData {
     removed: usize,
     unchanged: usize,
     failed: usize,
+    /// Total on-disk size in bytes of the index (the `tantivy/` and `vectors/`
+    /// dirs plus `engine.redb`) AFTER this run. `None` if the size couldn't be
+    /// measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index_size_bytes: Option<u64>,
+    /// Change in index size (bytes) vs. before this run: positive = grew,
+    /// negative = shrank. `None` if either measurement was unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index_size_delta_bytes: Option<i64>,
 }
 
-impl From<ReindexStats> for ReindexData {
-    fn from(s: ReindexStats) -> Self {
+impl ReindexData {
+    fn from_stats(s: ReindexStats, before: Option<u64>, after: Option<u64>) -> Self {
+        let delta = match (before, after) {
+            (Some(b), Some(a)) => Some(a as i64 - b as i64),
+            _ => None,
+        };
         Self {
             added: s.added,
             updated: s.updated,
             removed: s.removed,
             unchanged: s.unchanged,
             failed: s.failed,
+            index_size_bytes: after,
+            index_size_delta_bytes: delta,
         }
     }
 }
@@ -62,6 +78,14 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchReindexA
 
     let (mut engine, resolved) = open_engine(vault_flag)?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
+
+    // Measure the index size before the run so we can report the delta after.
+    // Best-effort: a collection-resolution hiccup degrades to "no delta"
+    // rather than failing the reindex.
+    let cache_dir = collection_for(&resolved)
+        .ok()
+        .map(|c| collection_cache_dir(&c));
+    let size_before = cache_dir.as_deref().and_then(index_size_bytes);
 
     // Live progress goes to STDERR (never stdout — stdout carries only the
     // envelope). Rendered only when stderr is a real TTY AND we're in text mode
@@ -94,7 +118,12 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchReindexA
     reporter.finish();
     drop(live); // remove the marker before printing the final summary
 
-    let envelope = Envelope::ok("search.reindex", Some(vault_info), ReindexData::from(stats));
+    // Re-measure after indexing so the summary can show the resulting size and
+    // its delta vs. before the run.
+    let size_after = cache_dir.as_deref().and_then(index_size_bytes);
+    let data = ReindexData::from_stats(stats, size_before, size_after);
+
+    let envelope = Envelope::ok("search.reindex", Some(vault_info), data);
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
 }
@@ -182,7 +211,7 @@ fn maybe_prompt_first_model(vault_flag: Option<PathBuf>, mode: &OutputMode) -> R
     let current = config.search.embed_model.clone();
     if let Some(chosen) = crate::commands::search_model::prompt_pick_model(&current) {
         onebrain_fs::persist_search_key(resolved.root.as_path(), "embed_model", chosen)?;
-        println!("✅  using {chosen} — indexing now…");
+        println!("✅  Using {chosen} — indexing now…");
     }
     Ok(())
 }
@@ -220,7 +249,7 @@ impl ProgressReporter {
             // the first `set_length` (spinner-ish) too.
             pb.set_style(
                 indicatif::ProgressStyle::with_template(
-                    "📇  indexing  {pos}/{len}  ({percent}%)  {wide_msg}",
+                    "📇  Indexing  {pos}/{len}  ({percent}%)  {wide_msg}",
                 )
                 .expect("static template is valid")
                 .progress_chars("=>-"),
@@ -244,7 +273,7 @@ impl ProgressReporter {
                     pb.set_position(0);
                 }
                 Self::PlainLines { .. } => {
-                    eprintln!("📇  indexing {total} doc(s)…");
+                    eprintln!("📇  Indexing {total} doc(s)…");
                 }
                 Self::Silent => {}
             },
@@ -283,7 +312,7 @@ impl ProgressReporter {
                         if *last_pct_bucket != Some(bucket) {
                             *last_pct_bucket = Some(bucket);
                             let pct = (done * 100) / total;
-                            eprintln!("📇  indexing {done}/{total} ({pct}%)");
+                            eprintln!("📇  Indexing {done}/{total} ({pct}%)");
                         }
                     }
                 }
@@ -306,9 +335,9 @@ impl ProgressReporter {
 /// costs bandwidth).
 pub(crate) fn model_load_notice(model: &str, downloaded: bool, approx_size: &str) -> String {
     if downloaded {
-        format!("🧠  loading {model} model…")
+        format!("🧠  Loading {model} model…")
     } else {
-        format!("⏬  downloading {model} model ({approx_size}, first run)…")
+        format!("⏬  Downloading {model} model ({approx_size}, first run)…")
     }
 }
 
@@ -330,8 +359,40 @@ fn model_load_notice_for(resolved: &onebrain_core::ResolvedVault) -> String {
                 .unwrap_or(false);
             model_load_notice(&model, downloaded, i.approx_size)
         }
-        None => format!("🧠  loading {model} model…"),
+        None => format!("🧠  Loading {model} model…"),
     }
+}
+
+/// Human-readable byte size (`471 MB`, `1.2 GB`, `840 KB`, `12 B`). Matches
+/// `search_status::format_size`.
+fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// The `📊  index <size> (<delta>)` suffix appended to the summary line when the
+/// index size is known. A zero delta renders without the parenthetical; a
+/// negative delta uses a minus sign (`−0.8 MB`). Returns `None` when the size
+/// couldn't be measured (so the summary just omits it).
+fn index_size_suffix(size: Option<u64>, delta: Option<i64>) -> Option<String> {
+    let size = size?;
+    let paren = match delta {
+        Some(0) | None => String::new(),
+        Some(d) if d > 0 => format!(" (+{})", format_size(d as u64)),
+        Some(d) => format!(" (−{})", format_size(d.unsigned_abs())),
+    };
+    Some(format!("📊  index {}{paren}", format_size(size)))
 }
 
 fn render_text(env: &Envelope<ReindexData>) -> String {
@@ -354,46 +415,59 @@ fn render_text(env: &Envelope<ReindexData>) -> String {
     if d.failed > 0 {
         parts.push(format!("⚠️  {} failed", d.failed));
     }
+    if let Some(suffix) = index_size_suffix(d.index_size_bytes, d.index_size_delta_bytes) {
+        parts.push(suffix);
+    }
 
     if parts.is_empty() {
         // Nothing to do — an already-current index reindexed to a no-op.
-        return "✅  reindexed — nothing to update".to_string();
+        return "✅  Reindexed — nothing to update".to_string();
     }
-    format!("✅  reindexed — {}", parts.join(" · "))
+    format!("✅  Reindexed — {}", parts.join(" · "))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Build `ReindexData` from counts only (no index-size fields) — the size
+    /// suffix is covered by its own dedicated tests.
+    fn data(
+        added: usize,
+        updated: usize,
+        removed: usize,
+        unchanged: usize,
+        failed: usize,
+    ) -> ReindexData {
+        ReindexData {
+            added,
+            updated,
+            removed,
+            unchanged,
+            failed,
+            index_size_bytes: None,
+            index_size_delta_bytes: None,
+        }
+    }
+
     #[test]
     fn load_notice_distinguishes_download_from_load() {
         let dl = model_load_notice("bge-m3", false, "~2.2 GB");
-        assert!(dl.contains("downloading bge-m3"), "{dl}");
+        assert!(dl.contains("Downloading bge-m3"), "{dl}");
         assert!(dl.contains("~2.2 GB"), "{dl}");
         let ld = model_load_notice("bge-m3", true, "~2.2 GB");
-        assert!(ld.contains("loading bge-m3"), "{ld}");
+        assert!(ld.contains("Loading bge-m3"), "{ld}");
         assert!(
-            !ld.contains("downloading"),
+            !ld.contains("Downloading"),
             "already-downloaded must not claim a download: {ld}"
         );
     }
 
     #[test]
     fn text_summarizes_all_four_counts() {
-        let e = Envelope::ok(
-            "search.reindex",
-            None,
-            ReindexData {
-                added: 1,
-                updated: 2,
-                removed: 3,
-                unchanged: 4,
-                failed: 0,
-            },
-        );
+        let e = Envelope::ok("search.reindex", None, data(1, 2, 3, 4, 0));
         let s = render_text(&e);
-        assert!(s.contains("✅  reindexed"));
+        assert!(s.contains("✅  Reindexed"), "{s}");
         assert!(s.contains("1 added"));
         assert!(s.contains("2 updated"));
         assert!(s.contains("3 removed"));
@@ -404,17 +478,7 @@ mod tests {
 
     #[test]
     fn text_omits_zero_categories() {
-        let e = Envelope::ok(
-            "search.reindex",
-            None,
-            ReindexData {
-                added: 5,
-                updated: 0,
-                removed: 0,
-                unchanged: 700,
-                failed: 0,
-            },
-        );
+        let e = Envelope::ok("search.reindex", None, data(5, 0, 0, 700, 0));
         let s = render_text(&e);
         assert!(s.contains("5 added"));
         assert!(s.contains("700 unchanged"));
@@ -425,33 +489,64 @@ mod tests {
 
     #[test]
     fn text_reports_noop_when_all_zero() {
-        let e = Envelope::ok(
-            "search.reindex",
-            None,
-            ReindexData {
-                added: 0,
-                updated: 0,
-                removed: 0,
-                unchanged: 0,
-                failed: 0,
-            },
-        );
-        assert_eq!(render_text(&e), "✅  reindexed — nothing to update");
+        let e = Envelope::ok("search.reindex", None, data(0, 0, 0, 0, 0));
+        assert_eq!(render_text(&e), "✅  Reindexed — nothing to update");
     }
 
     #[test]
     fn text_appends_failed_count_when_nonzero() {
-        let e = Envelope::ok(
-            "search.reindex",
-            None,
-            ReindexData {
-                added: 0,
-                updated: 0,
-                removed: 0,
-                unchanged: 0,
-                failed: 2,
-            },
-        );
+        let e = Envelope::ok("search.reindex", None, data(0, 0, 0, 0, 2));
         assert!(render_text(&e).contains("2 failed"));
+    }
+
+    #[test]
+    fn text_appends_index_size_and_positive_delta() {
+        let mut d = data(23, 3, 19, 744, 0);
+        d.index_size_bytes = Some(16 * 1024 * 1024 + 200 * 1024); // ~16.2 MB
+        d.index_size_delta_bytes = Some(1_300_000); // +~1.2 MB
+        let e = Envelope::ok("search.reindex", None, d);
+        let s = render_text(&e);
+        assert!(s.contains("📊  index 16.2 MB"), "{s}");
+        assert!(s.contains("(+1.2 MB)"), "{s}");
+    }
+
+    #[test]
+    fn text_renders_negative_delta_with_minus_sign() {
+        let s = index_size_suffix(Some(10 * 1024 * 1024), Some(-800 * 1024)).unwrap();
+        assert!(s.contains("📊  index 10.0 MB"), "{s}");
+        assert!(s.contains("(−800 KB)"), "{s}");
+    }
+
+    #[test]
+    fn text_omits_parenthetical_on_zero_delta() {
+        let s = index_size_suffix(Some(5 * 1024 * 1024), Some(0)).unwrap();
+        assert!(s.contains("📊  index 5.0 MB"), "{s}");
+        assert!(
+            !s.contains('('),
+            "zero delta must render no parenthetical: {s}"
+        );
+    }
+
+    #[test]
+    fn text_omits_index_suffix_when_size_unknown() {
+        assert!(index_size_suffix(None, Some(100)).is_none());
+    }
+
+    #[test]
+    fn from_stats_computes_delta_only_when_both_known() {
+        let stats = || ReindexStats {
+            added: 1,
+            ..Default::default()
+        };
+        let d = ReindexData::from_stats(stats(), Some(100), Some(180));
+        assert_eq!(d.index_size_bytes, Some(180));
+        assert_eq!(d.index_size_delta_bytes, Some(80));
+
+        let d2 = ReindexData::from_stats(stats(), None, Some(180));
+        assert_eq!(d2.index_size_bytes, Some(180));
+        assert_eq!(d2.index_size_delta_bytes, None);
+
+        let d3 = ReindexData::from_stats(stats(), Some(200), Some(120));
+        assert_eq!(d3.index_size_delta_bytes, Some(-80));
     }
 }

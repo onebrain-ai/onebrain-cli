@@ -242,7 +242,7 @@ fn render_list_text(env: &Envelope<ModelListData>) -> String {
             marker, m.name, downloaded, disk, m.dims, thai, m.note
         ));
     }
-    lines.push(format!("📁  models: {}", d.cache_dir.display()));
+    lines.push(format!("📁  Cache dir: {}", d.cache_dir.display()));
     lines.join("\n")
 }
 
@@ -372,10 +372,10 @@ fn reembed_progress_bar(mode: &OutputMode) -> Option<indicatif::ProgressBar> {
 pub(crate) fn render_set_text(env: &Envelope<ModelSetData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     if d.already_current {
-        format!("✅  already using {}", d.model)
+        format!("✅  Already using {}", d.model)
     } else {
         format!(
-            "✅  switched to {} · 🧠  {} chunk(s) re-embedded",
+            "✅  Switched to {} · 🧠  {} chunk(s) re-embedded",
             d.model,
             d.chunks_reembedded.unwrap_or(0)
         )
@@ -507,12 +507,12 @@ fn render_remove_text(env: &Envelope<ModelRemoveData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     if d.removed {
         format!(
-            "🗑️  removed {} · freed {}",
+            "🗑️  Removed {} · freed {}",
             d.model,
             format_size(d.freed_bytes.unwrap_or(0))
         )
     } else {
-        format!("nothing to remove — {} is not downloaded", d.model)
+        format!("Nothing to remove — {} is not downloaded", d.model)
     }
 }
 
@@ -648,7 +648,10 @@ mod tests {
         assert!(s.contains("MODEL"));
         assert!(s.contains("DOWNLOADED"));
         assert!(s.contains("DISK"));
-        assert!(s.contains("📁  models:"), "footer with cache dir present");
+        assert!(
+            s.contains("📁  Cache dir:"),
+            "footer with cache dir present"
+        );
         for m in model_registry() {
             assert!(s.contains(m.name), "missing {} in rendered list", m.name);
         }
@@ -798,7 +801,7 @@ mod tests {
             },
         );
         let s = render_remove_text(&env);
-        assert!(s.contains("removed bge-m3"), "{s}");
+        assert!(s.contains("Removed bge-m3"), "{s}");
         assert!(s.contains("2 MB"), "{s}");
     }
 
@@ -814,7 +817,7 @@ mod tests {
                 was_current: false,
             },
         );
-        assert!(render_remove_text(&env).contains("nothing to remove"));
+        assert!(render_remove_text(&env).contains("Nothing to remove"));
     }
 
     #[test]
@@ -828,7 +831,7 @@ mod tests {
                 chunks_reembedded: None,
             },
         );
-        assert_eq!(render_set_text(&env), "✅  already using bge-m3");
+        assert_eq!(render_set_text(&env), "✅  Already using bge-m3");
     }
 
     #[test]
@@ -843,7 +846,7 @@ mod tests {
             },
         );
         let s = render_set_text(&env);
-        assert!(s.contains("switched to bge-m3"));
+        assert!(s.contains("Switched to bge-m3"));
         assert!(s.contains("7 chunk(s) re-embedded"));
     }
 

@@ -896,27 +896,39 @@ pub struct NoteMkdirArgs {
 
 #[derive(Args, Debug)]
 #[command(
-    about = "Native vault search (hybrid query · lex · vector · reindex · …)",
+    about = "Native vault search over `*.md` notes (hybrid query · lex · vector · reindex · …)",
+    after_help = SEARCH_AFTER_HELP,
     disable_help_subcommand = true
 )]
 pub struct SearchCmd {
     #[command(subcommand)]
     pub verb: SearchVerb,
 }
+
+/// `search --help` footer: states the `.md`-only indexing scope, then lists the
+/// three query verbs' shared flags (attached here via `after_help` rather than
+/// repeated in each verb's one-liner, which kept the Commands: list noisy).
+const SEARCH_AFTER_HELP: &str = "\
+Only Markdown (`*.md`) files are indexed; other file types in the vault are never touched.
+
+Search flags (query · search · vsearch):
+  --top-k <N>        Maximum hits to return (default 10)
+  --min-score <S>    Drop low-confidence hits (vsearch: cosine, ≈0.85+ is confident; search: BM25; query: RRF)";
+
 #[derive(Subcommand, Debug)]
 pub enum SearchVerb {
-    /// Hybrid search (lex + vector, RRF-fused) · flags: --top-k, --min-score.
+    /// Hybrid search (lex + vector, RRF-fused).
     Query(SearchQueryArgs),
-    /// Lexical (BM25) search only — never triggers a model download · flags: --top-k, --min-score.
+    /// Lexical (BM25) search only — never triggers a model download.
     Search(SearchQueryArgs),
-    /// Semantic (vector) search only · flags: --top-k, --min-score.
+    /// Semantic (vector) search only.
     Vsearch(SearchQueryArgs),
     /// Fetch a doc's full indexed text.
     Get(SearchGetArgs),
-    /// Report index status (collection, embed model, cache dir) — never
-    /// triggers a model download.
+    /// Report index status (collection, embed model, cache dir, index size) —
+    /// never triggers a model download.
     Status,
-    /// Reindex the whole vault, or specific doc paths.
+    /// Reindex the vault's `*.md` notes (whole vault, or specific doc paths).
     Reindex(SearchReindexArgs),
     /// Manage the embedding model (list supported models · switch model).
     Model(SearchModelCmd),

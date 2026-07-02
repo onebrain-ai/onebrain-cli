@@ -2,6 +2,14 @@
 //! synchronous search engine: index a document, remove a document, and run a
 //! hybrid (lex + vector, RRF-fused) query.
 //!
+//! ## Indexing scope
+//!
+//! Only Markdown (`*.md`) files are indexed. The vault walk
+//! ([`walk_markdown_files`]) collects nothing but `*.md` files — any other file
+//! type in the vault is never read, chunked, embedded, or stored. Hidden dirs
+//! and `node_modules` are always skipped, plus the vault's configured
+//! `search.exclude` patterns.
+//!
 //! ## On-disk layout (under `cache_dir`)
 //! - `<cache_dir>/tantivy/` — [`crate::lex::LexIndex`] (BM25 lexical index).
 //! - `<cache_dir>/vectors/` — [`crate::vector::VectorStore`] (flat mmap vector store).

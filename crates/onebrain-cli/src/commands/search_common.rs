@@ -118,6 +118,31 @@ pub fn is_indexed(cache_dir: &Path) -> bool {
     cache_dir.is_dir()
 }
 
+/// Total on-disk bytes of the index itself under `cache_dir`: the `tantivy/`
+/// and `vectors/` directories plus the `engine.redb` file. The downloaded
+/// `models--*` dirs are deliberately excluded — those are the model's size,
+/// reported separately. Returns `None` when none of the three exist yet (no
+/// index). Pure fs; reuses the shared `onebrain_search::embed::dir_size_bytes`.
+pub fn index_size_bytes(cache_dir: &Path) -> Option<u64> {
+    use onebrain_search::embed::dir_size_bytes;
+    let mut total = 0u64;
+    let mut any = false;
+    for sub in ["tantivy", "vectors"] {
+        let dir = cache_dir.join(sub);
+        if dir.is_dir() {
+            any = true;
+            total += dir_size_bytes(&dir);
+        }
+    }
+    if let Ok(meta) = std::fs::metadata(cache_dir.join("engine.redb")) {
+        if meta.is_file() {
+            any = true;
+            total += meta.len();
+        }
+    }
+    any.then_some(total)
+}
+
 /// `true` when the vault's config file physically contains a
 /// `search.embed_model` key. Distinct from `config.search.embed_model`, which
 /// serde fills with the `multilingual-e5-small` default even when the key is
@@ -257,6 +282,25 @@ mod tests {
         let dir = tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
         assert!(!is_indexed(&missing));
+    }
+
+    #[test]
+    fn index_size_bytes_sums_index_dirs_and_redb_excluding_models() {
+        let dir = tempdir().unwrap();
+        // No index yet → None.
+        assert!(index_size_bytes(dir.path()).is_none());
+
+        std::fs::create_dir_all(dir.path().join("tantivy")).unwrap();
+        std::fs::write(dir.path().join("tantivy/meta.json"), vec![0u8; 100]).unwrap();
+        std::fs::create_dir_all(dir.path().join("vectors")).unwrap();
+        std::fs::write(dir.path().join("vectors/data.bin"), vec![0u8; 200]).unwrap();
+        std::fs::write(dir.path().join("engine.redb"), vec![0u8; 44]).unwrap();
+        // A model dir must NOT be counted toward the index size.
+        let model = dir.path().join("models--intfloat--multilingual-e5-small");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(model.join("model.onnx"), vec![0u8; 9999]).unwrap();
+
+        assert_eq!(index_size_bytes(dir.path()), Some(344));
     }
 
     #[test]
