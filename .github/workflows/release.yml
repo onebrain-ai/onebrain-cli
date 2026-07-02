@@ -218,6 +218,22 @@ jobs:
             echo "CXX_aarch64_pc_windows_msvc=clang-cl"
             echo "CFLAGS_aarch64_pc_windows_msvc=--target=arm64-pc-windows-msvc"
             echo "CXXFLAGS_aarch64_pc_windows_msvc=--target=arm64-pc-windows-msvc"
+            # Scalar-only SimSIMD on this target: under clang-cl its ARM
+            # compiler detection half-fires (clang-cl defines both _MSC_VER
+            # and __clang__) — NEON code paths compile without arm_neon.h
+            # ("call to undeclared function 'vaddq_u8'"). Its build.rs
+            # honours these flags (and declares rerun-if-env-changed for
+            # them, which also guarantees the build script reruns). Scalar
+            # C is correct, just unvectorized — acceptable for this target.
+            echo "SIMSIMD_TARGET_SVE2=0"
+            echo "SIMSIMD_TARGET_SVE_BF16=0"
+            echo "SIMSIMD_TARGET_SVE_F16=0"
+            echo "SIMSIMD_TARGET_SVE_I8=0"
+            echo "SIMSIMD_TARGET_SVE=0"
+            echo "SIMSIMD_TARGET_NEON_BF16=0"
+            echo "SIMSIMD_TARGET_NEON_F16=0"
+            echo "SIMSIMD_TARGET_NEON_I8=0"
+            echo "SIMSIMD_TARGET_NEON=0"
           } >> "$GITHUB_ENV"
 
       # Force simsimd's build script to actually run with the clang-cl env
