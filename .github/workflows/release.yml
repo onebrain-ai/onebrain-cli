@@ -138,15 +138,31 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # macOS: simsimd's build script bakes the active Xcode's clang runtime
+      # dir (…/lib/clang/<ver>/lib/darwin, for -lclang_rt.osx) into its cached
+      # output. When the runner image rotates Xcode versions, a restored cache
+      # points at a path that no longer exists → `ld: library 'clang_rt.osx'
+      # not found`. This hit the RELEASE workflow (aarch64-apple-darwin) once
+      # caches were re-keyed; port ci.yml's fix here — append the Xcode version
+      # to the cache key so caches never cross images, and export the CURRENT
+      # runtime dir as a fallback search path. XCODE_KEY is empty on non-macOS
+      # runners (the key just ends in `-`), which is harmless.
+      - name: Key cache by Xcode version (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "XCODE_KEY=$(xcodebuild -version | head -1 | tr -d ' ')" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$(cd "$(dirname "$(xcrun -f clang)")/../lib/clang" && echo "$PWD"/*/lib/darwin)" >> "$GITHUB_ENV"
+
       - uses: Swatinem/rust-cache@v2
         with:
           # Key by TARGET: both windows targets share a runner OS since the
           # arm64 cross move, and the default key (OS+arch+lockfile) let the
-          # x64 job's cache poison the arm64 build — a cached FAILED simsimd
-          # build-script result is treated as fresh (its build.rs only
-          # declares rerun-if-env-changed for SIMSIMD_* flags, so new
-          # CC/CFLAGS never trigger a rerun).
-          key: ${{ matrix.target }}
+          # x64 job's cache poison the arm64 build — a cached FAILED build-script
+          # result would be treated as fresh (build scripts only declare
+          # rerun-if-env-changed for their own flags, so new CC/CFLAGS never
+          # trigger a rerun). The `-${{ env.XCODE_KEY }}` suffix further splits
+          # macOS caches per Xcode version (empty on other OSes — see above).
+          key: ${{ matrix.target }}-${{ env.XCODE_KEY }}
 
       - name: Install musl tools
         if: matrix.apt
@@ -187,6 +203,17 @@ jobs:
       # link.exe and even host build scripts failed. Cross from x64 is the
       # well-trodden path: host tools stay x64, `cc` targets arm64 via the
       # amd64_arm64 environment. Scoped to this one target.
+      #
+      # Final resolution (release attempt 9): simsimd's C is UNBUILDABLE on this
+      # target and is now excluded from the dependency graph — MSVC `cl` rejects
+      # its GCC-flavored dialect; clang-cl half-detects ARM so NEON paths miss
+      # arm_neon.h; disabling all SIMD then trips the Windows SDK's own arch
+      # detection in winnt.h (PSLIST_HEADER/PCONTEXT undefined). After 8 attempts
+      # to make the C compile, it's replaced on windows-arm64 by a pure-Rust
+      # scalar dot product (LLVM auto-vectorizes it) — see
+      # crates/onebrain-search/{Cargo.toml,src/vector.rs} and ADR 0018. The
+      # earlier clang-cl compile + prebuild steps are gone; ring / onig_sys
+      # still build with the amd64_arm64 arm64 `cl.exe` below.
       - name: Set up amd64_arm64 MSVC cross environment
         if: matrix.target == 'aarch64-pc-windows-msvc'
         uses: ilammy/msvc-dev-cmd@v1
@@ -198,57 +225,10 @@ jobs:
       # takes `link.exe` from PATH — where Git-Bash's GNU coreutils link.exe
       # shadows MSVC's on GitHub's windows images (`/usr/bin/link: extra
       # operand …`). rust-lld ships with the toolchain, links arm64 PE
-      # natively, and never consults PATH. (simsimd's cl.exe compile still
-      # comes from the dev env above.)
-      # …and compile C deps with clang-cl instead of MSVC cl.exe. SimSIMD's C
-      # is GCC/Clang-flavored (attribute-based SIMD dispatch, fp16 types) and
-      # cl.exe rejects it for arm64 even with every SIMD backend disabled —
-      # its build.rs then continues WITHOUT producing simsimd.lib (silent),
-      # so the final link dies with "could not open 'simsimd.lib'". clang-cl
-      # (preinstalled on windows-latest) accepts the dialect and targets
-      # arm64; the `cc` crate picks it up via the per-target CC/CXX env, with
-      # an explicit --target for safety. Applies to all cc-built C for this
-      # target (ring, onig_sys, …) — clang-cl is MSVC-ABI compatible.
-      - name: Compile windows-arm64 C deps with clang-cl
-        if: matrix.target == 'aarch64-pc-windows-msvc'
-        shell: bash
-        run: |
-          {
-            echo "CC_aarch64_pc_windows_msvc=clang-cl"
-            echo "CXX_aarch64_pc_windows_msvc=clang-cl"
-            echo "CFLAGS_aarch64_pc_windows_msvc=--target=arm64-pc-windows-msvc"
-            echo "CXXFLAGS_aarch64_pc_windows_msvc=--target=arm64-pc-windows-msvc"
-            # Scalar-only SimSIMD on this target: under clang-cl its ARM
-            # compiler detection half-fires (clang-cl defines both _MSC_VER
-            # and __clang__) — NEON code paths compile without arm_neon.h
-            # ("call to undeclared function 'vaddq_u8'"). Its build.rs
-            # honours these flags (and declares rerun-if-env-changed for
-            # them, which also guarantees the build script reruns). Scalar
-            # C is correct, just unvectorized — acceptable for this target.
-            echo "SIMSIMD_TARGET_SVE2=0"
-            echo "SIMSIMD_TARGET_SVE_BF16=0"
-            echo "SIMSIMD_TARGET_SVE_F16=0"
-            echo "SIMSIMD_TARGET_SVE_I8=0"
-            echo "SIMSIMD_TARGET_SVE=0"
-            echo "SIMSIMD_TARGET_NEON_BF16=0"
-            echo "SIMSIMD_TARGET_NEON_F16=0"
-            echo "SIMSIMD_TARGET_NEON_I8=0"
-            echo "SIMSIMD_TARGET_NEON=0"
-          } >> "$GITHUB_ENV"
-
-      # Force simsimd's build script to actually run with the clang-cl env
-      # (cargo would otherwise reuse a cached failed result — see the cache
-      # note above), and capture verbose compiler evidence so any remaining failure
-      # shows the real cl/clang invocation instead of a bare missing-lib link
-      # error.
-      - name: Prebuild simsimd with clang-cl (verbose)
-        if: matrix.target == 'aarch64-pc-windows-msvc'
-        shell: bash
-        run: |
-          set -o pipefail
-          cargo clean -p simsimd --release --target "$TARGET" 2>/dev/null || true
-          cargo build -p simsimd --release --target "$TARGET" -vv 2>&1 | tee /tmp/simsimd-build.log | grep -iE "clang|cl\.exe|simsimd|warning|error" | tail -80
-
+      # natively, and never consults PATH. The amd64_arm64 dev env still
+      # supplies the arm64 `cl.exe` that ring / onig_sys need — those C deps
+      # build fine; only simsimd couldn't (now excluded on this target, see
+      # below), so no clang-cl override is needed here anymore.
       - name: Link windows-arm64 with rust-lld
         if: matrix.target == 'aarch64-pc-windows-msvc'
         shell: bash

@@ -16,7 +16,8 @@ The first v3.4.0 tag failed release builds on 5 of 9 targets, and it took three 
 ## Decision
 
 - **windows-arm64 is cross-compiled from the x64 `windows-latest` runner** with the mature `amd64_arm64` MSVC toolset — host tools stay canonical x64; only `cc`-compiled target C goes through the cross environment. Native arm64 runners are revisited when the image + action ecosystem stabilizes.
-- **macOS caches are keyed by Xcode version** (plus a `LIBRARY_PATH` fallback to the current clang runtime dir).
+- **simsimd is excluded on windows-arm64 (release attempt 9); its dot product is replaced by a pure-Rust scalar fallback.** After 8 attempts, simsimd's C proved unbuildable for `aarch64-pc-windows-msvc`: MSVC `cl` rejects its GCC-flavored dialect; clang-cl half-detects ARM so NEON paths miss `arm_neon.h`; disabling all SIMD then trips the Windows SDK's own arch detection in `winnt.h` (`PSLIST_HEADER`/`PCONTEXT` undefined). `simsimd` is now a `[target.'cfg(not(all(target_os = "windows", target_arch = "aarch64")))'.dependencies]` entry, and `crates/onebrain-search/src/vector.rs` dispatches to a `dot_scalar` (LLVM auto-vectorized, `f64` accumulation to match simsimd) on that target. A parity unit test asserts the two agree within `1e-5` wherever simsimd is present. The dead clang-cl compile/prebuild steps were removed from `release.yml`.
+- **macOS caches are keyed by Xcode version** (plus a `LIBRARY_PATH` fallback to the current clang runtime dir) — in **both** `ci.yml` and `release.yml` (attempt 9 ported the fix into the release matrix after the same poisoning hit `aarch64-apple-darwin`).
 - **Process rule:** any change that adds or reconfigures a native build-script dependency (`-sys` crates, `cc`-built C, prebuilt-binary downloaders like ort) must be exercised against the release matrix — a tag-less `workflow_dispatch` run or equivalent — *before* the version tag is pushed. Regular CI green is not evidence the matrix builds.
 
 ## Consequences

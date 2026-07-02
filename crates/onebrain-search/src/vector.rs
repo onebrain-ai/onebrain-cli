@@ -1,6 +1,7 @@
 //! Flat mmap-backed vector store: packed `f32` rows on disk, `redb` metadata
 //! (chunk id <-> row mapping, tombstones, free-list), and exact cosine
-//! (dot-product) top-k search via `simsimd`.
+//! (dot-product) top-k search via `simsimd` (with a pure-Rust `dot_scalar`
+//! fallback on windows-arm64, where `simsimd`'s C can't build — see `dot`).
 //!
 //! Vectors are assumed to already be L2-normalized by the embedder (see
 //! [`crate::embed`]), so cosine similarity reduces to a plain dot product —
@@ -38,7 +39,52 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use memmap2::Mmap;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+// simsimd is excluded on windows-arm64 (its C can't build there — see Cargo.toml
+// and `dot_scalar` below); import it only where it's actually a dependency.
+#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 use simsimd::SpatialSimilarity;
+
+/// Pure-Rust scalar dot product, compiled on **all** targets.
+///
+/// Accumulates in `f64` to mirror `simsimd`'s `f32::dot` (which returns
+/// `Option<f64>`), so the two agree within the `1e-5` tolerance asserted by the
+/// parity test below. LLVM auto-vectorizes this loop, so the scalar path is not
+/// meaningfully slower than the SIMD one at our vector widths — it exists solely
+/// because `simsimd`'s C cannot be compiled for `aarch64-pc-windows-msvc` (MSVC
+/// `cl` rejects its GCC-flavored dialect; clang-cl half-detects ARM so NEON
+/// paths miss `arm_neon.h`; disabling all SIMD then trips the Windows SDK's own
+/// arch detection in `winnt.h`). See ADR 0018 and the windows-arm64 history
+/// comment in `.github/workflows/release.yml`.
+///
+/// Kept compiled on ALL targets so the parity test runs everywhere simsimd
+/// exists — but on those targets the production `dot` uses simsimd, not this, so
+/// the library build has no non-test caller. `allow(dead_code)` is scoped OFF
+/// windows-arm64 (where `dot_scalar` IS the live path and the lint stays on).
+#[cfg_attr(
+    not(all(target_os = "windows", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+fn dot_scalar(a: &[f32], b: &[f32]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum()
+}
+
+/// Dispatches the dot product: `simsimd` where it builds, the pure-Rust
+/// `dot_scalar` on windows-arm64 where it doesn't. Both accumulate in `f64` and
+/// the caller casts the result to `f32`, so the two paths are interchangeable.
+#[inline]
+fn dot(a: &[f32], b: &[f32]) -> f64 {
+    #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+    {
+        f32::dot(a, b).unwrap_or(f64::NEG_INFINITY)
+    }
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    {
+        dot_scalar(a, b)
+    }
+}
 
 const CHUNK_TO_ROW: TableDefinition<&str, u64> = TableDefinition::new("chunk_to_row");
 const ROW_TO_CHUNK: TableDefinition<u64, &str> = TableDefinition::new("row_to_chunk");
@@ -334,7 +380,7 @@ impl VectorStore {
                     continue;
                 }
             };
-            let score = f32::dot(query_vec, &row_vec).unwrap_or(f64::NEG_INFINITY) as f32;
+            let score = dot(query_vec, &row_vec) as f32;
             scored.push((chunk_id, score));
         }
 
@@ -620,5 +666,63 @@ mod tests {
         let s = VectorStore::open(dir.path(), 3).unwrap();
         assert!(!tmp.exists(), "stale tmp must be discarded on open");
         assert_eq!(s.search(&norm(&[1.0, 0.0, 0.0]), 1)[0].0, "a#0");
+    }
+
+    /// Plain correctness of the pure-Rust scalar dot product, compiled on all
+    /// targets (this is the ONLY dot path on windows-arm64, where simsimd is
+    /// absent).
+    #[test]
+    fn dot_scalar_is_correct() {
+        assert_eq!(dot_scalar(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]), 32.0);
+        assert_eq!(dot_scalar(&[], &[]), 0.0);
+        assert_eq!(dot_scalar(&[1.0, 0.0, 0.0], &[0.0, 1.0, 0.0]), 0.0);
+        // Unit vectors dotted with themselves = 1.0.
+        let u = norm(&[1.0, 2.0, 2.0]);
+        assert!((dot_scalar(&u, &u) - 1.0).abs() < 1e-6);
+        // f64-accumulation guard at embedding width (384 dims): first product
+        // is 1e8, the remaining 383 are 1.0 each. Every value and partial sum
+        // is exactly representable in f64, so the result must be EXACT — while
+        // a naive f32 accumulator silently absorbs the +1.0s (f32 spacing at
+        // 1e8 is 8.0) and returns 1e8. This is the regression this test exists
+        // to catch.
+        let mut a = vec![1.0f32; 384];
+        a[0] = 1.0e4;
+        assert_eq!(dot_scalar(&a, &a), 100_000_383.0);
+    }
+
+    /// On hosts where simsimd is a dependency (everything except windows-arm64),
+    /// the scalar fallback must agree with simsimd within 1e-5 — this is what
+    /// justifies swapping in `dot_scalar` on the target that can't build simsimd.
+    #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+    #[test]
+    fn dot_scalar_matches_simsimd() {
+        // Realistic embedding width: two 384-dim unit vectors (e5-small dims).
+        // Unit-norm dots live in [-1, 1], where the 1e-5 tolerance is a
+        // meaningful ~1e-3% relative bound at production scale.
+        let big_a = norm(
+            &(0..384)
+                .map(|i| ((i as f32) * 0.37).sin())
+                .collect::<Vec<_>>(),
+        );
+        let big_b = norm(
+            &(0..384)
+                .map(|i| ((i as f32) * 0.61).cos())
+                .collect::<Vec<_>>(),
+        );
+        let cases: [(&[f32], &[f32]); 5] = [
+            (&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]),
+            (&[0.5, -0.25, 0.75, 1.5], &[-1.0, 2.0, 0.0, 0.5]),
+            (&[0.1, 0.2, 0.3, 0.4, 0.5], &[0.5, 0.4, 0.3, 0.2, 0.1]),
+            (&[-3.0, -2.0, -1.0], &[1.0, 2.0, 3.0]),
+            (&big_a, &big_b),
+        ];
+        for (a, b) in cases {
+            let scalar = dot_scalar(a, b);
+            let simd = f32::dot(a, b).unwrap();
+            assert!(
+                (scalar - simd).abs() < 1e-5,
+                "scalar {scalar} vs simsimd {simd} for {a:?}·{b:?}"
+            );
+        }
     }
 }
