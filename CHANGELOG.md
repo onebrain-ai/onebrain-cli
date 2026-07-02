@@ -13,6 +13,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [3.3.27] — 2026-07-02 — translate bridge for select-to-lookup
 
 - **`POST /api/translate`** — server-side bridge to Google's free gtx endpoint (`{text, from?, to}` → `{translated, detected_from, truncated}`); 5,000-char cap, 8 s timeout, fixed host (no SSRF surface). Powers the WebUI select-to-lookup Translate action.
+- **Webview preflight now resolves scheme-relative and absolute-path redirect `Location`s** (RFC 3986) — th.wikipedia's `Special:Search` redirects with `//host/…` and was wrongly reported unframeable; SSRF posture unchanged (targets stay http(s), path-relative still rejected).
 
 ## [3.3.26] — 2026-07-02 — release embeds the prebuilt webui dist
 
