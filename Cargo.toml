@@ -4,7 +4,7 @@ default-members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "3.4.1"
+version = "3.4.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["OneBrain Contributors"]
@@ -131,6 +131,13 @@ axum  = "0.8"
 tower = "0.5"
 # tower-http `fs` feature — `ServeDir`/`ServeFile` for the static SPA dist.
 tower-http = { version = "0.6", features = ["fs"] }
+
+# Cryptographically-secure RNG for the server session token (server/token.rs).
+# Uses the OS CSPRNG on every platform — getrandom(2)/`/dev/urandom` on Unix,
+# BCryptGenRandom on Windows — replacing a hand-rolled `/dev/urandom` read whose
+# Windows and error-fallback paths emitted a WEAK time-seeded token. Already in
+# the dependency graph transitively; this promotes it to a direct dep.
+getrandom = "0.3"
 
 # Interactive prompts (Slice 10 · init wizard)
 inquire   = "0.7"
