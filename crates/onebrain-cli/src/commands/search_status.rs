@@ -17,8 +17,8 @@ use onebrain_core::path::ResolvedVault;
 use serde::Serialize;
 
 use crate::commands::search_common::{
-    collection_cache_dir, collection_for, index_size_bytes, is_indexed, open_engine,
-    read_reindex_progress, resolve_collection, ReindexLiveProgress,
+    collection_cache_dir, collection_for, index_size_bytes, is_indexed, read_reindex_progress,
+    resolve_collection, ReindexLiveProgress,
 };
 use crate::output::{emit, item, section, Envelope, OutputMode};
 use onebrain_core::load_vault_config;
@@ -123,21 +123,31 @@ pub(crate) fn status_data(
 
     // Index status (doc count, last_indexed, drift) — opens the engine
     // read-only (lazy embedder → no model download) and re-hashes the vault.
-    // Best-effort: if the engine can't open (shouldn't happen once a
-    // collection is resolved), fall back to zeros rather than failing status.
+    // Open directly at the already-resolved `cache_dir` instead of via
+    // `open_engine`, which would redundantly re-resolve the vault + collection
+    // we already have. `set_exclude_patterns` still mirrors `open_engine` so
+    // `status`'s drift walk honours `search.exclude` (else excluded files would
+    // inflate `pending_new`). Best-effort: fall back to zeros on any failure
+    // rather than failing status.
     let (last_indexed_at, doc_count, pending_new, pending_changed, pending_removed) =
-        match open_engine(Some(resolved.root.as_path().to_path_buf())) {
-            Ok((engine, _)) => match engine.status(resolved.root.as_path()) {
-                Ok(s) => (
-                    s.last_indexed_at,
-                    s.doc_count,
-                    s.pending_new,
-                    s.pending_changed,
-                    s.pending_removed,
-                ),
+        match cache_dir.as_deref() {
+            Some(dir) => match Engine::open(dir, &config.search.embed_model) {
+                Ok(mut engine) => {
+                    engine.set_exclude_patterns(config.search.exclude.clone());
+                    match engine.status(resolved.root.as_path()) {
+                        Ok(s) => (
+                            s.last_indexed_at,
+                            s.doc_count,
+                            s.pending_new,
+                            s.pending_changed,
+                            s.pending_removed,
+                        ),
+                        Err(_) => (None, 0, 0, 0, 0),
+                    }
+                }
                 Err(_) => (None, 0, 0, 0, 0),
             },
-            Err(_) => (None, 0, 0, 0, 0),
+            None => (None, 0, 0, 0, 0),
         };
 
     Ok(SearchStatusData {

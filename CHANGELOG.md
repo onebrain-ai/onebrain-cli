@@ -16,6 +16,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - The old generator read `/dev/urandom` under `#[cfg(unix)]` and fell back to a **time-seeded, guessable** token — so **every Windows token** (and any Unix run where the read failed) was weak. That path is removed entirely.
 - No fallback remains: if the OS RNG is unavailable the server panics rather than emit a predictable token (a loud abort, never a silent downgrade).
 - `getrandom` promoted from a transitive to a direct dependency (already in the graph — no new crate).
+- Review follow-ups on the 3.4.1 MCP work: `query`'s camelCase wire test now covers all three `lex`/`vec`/`hyde` sub-query variants (a `rename_all` typo would have silently broken vec/hyde before).
+- `search status` opens the engine at the already-resolved cache dir instead of re-resolving the vault + collection (still applies `search.exclude` so drift counts are unchanged).
+- Test fixtures write the canonical `onebrain.yml` instead of the legacy `vault.yml`, so runs no longer emit a deprecation warning.
 
 ## [3.4.1] — 2026-07-03 — native search MCP server
 

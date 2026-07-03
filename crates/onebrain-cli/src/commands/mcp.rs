@@ -643,15 +643,26 @@ mod tests {
 
     #[test]
     fn query_params_deserialize_camelcase_wire_keys() {
+        // Exercise all three `SubQueryType` variants — a typo in the
+        // `rename_all = "lowercase"` attribute would silently break the vec/hyde
+        // sub-queries a real client sends while a lex-only test still passed.
         let p: QueryParams = serde_json::from_value(serde_json::json!({
-            "searches": [{"type": "lex", "query": "foo"}],
+            "searches": [
+                {"type": "lex", "query": "foo"},
+                {"type": "vec", "query": "bar"},
+                {"type": "hyde", "query": "baz"}
+            ],
             "minScore": 0.5,
             "candidateLimit": 100
         }))
         .unwrap();
-        assert_eq!(p.searches.len(), 1);
+        assert_eq!(p.searches.len(), 3);
         assert!(matches!(p.searches[0].r#type, SubQueryType::Lex));
         assert_eq!(p.searches[0].query, "foo");
+        assert!(matches!(p.searches[1].r#type, SubQueryType::Vec));
+        assert_eq!(p.searches[1].query, "bar");
+        assert!(matches!(p.searches[2].r#type, SubQueryType::Hyde));
+        assert_eq!(p.searches[2].query, "baz");
         assert_eq!(p.min_score, Some(0.5));
         assert_eq!(p.candidate_limit, Some(100));
     }
