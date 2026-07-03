@@ -1,5 +1,5 @@
 ---
-latest_version: 3.4.2
+latest_version: 3.4.3
 released: 2026-07-03
 ---
 
@@ -9,6 +9,14 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.3] — 2026-07-03 — scheduler fixes + housekeeping
+
+- **Scheduler cron** now accepts step (`*/N`), list (`a,b,c`), and range (`a-b`) syntax per field (previously only a bare integer or `*`); multi-value fields are emitted as a launchd `StartCalendarInterval` array (#116).
+- **Scheduler command-mode plists** are now disambiguated by their args, so two `command:` entries for the same binary (e.g. two `onebrain` cron jobs) no longer collide on one plist path (#116). **Migration:** an already-registered command-mode entry gets a new plist filename — re-run `onebrain schedule register --refresh`; the old plist is not auto-removed.
+- **`onebrain schedule list`** is implemented (was a "not implemented" stub) — reuses the existing status view (#116).
+- **CI** now runs the lex-only (`--no-default-features`) test suite, not just clippy, so the semantic-off code paths (MCP `query` degradation, `vsearch` unavailability) are actually exercised (#119).
+- **Polish (#120):** internal `SearchMcpServer` renamed to `McpServer`; `get` tool documents its out-of-range line clamping; added direct `status_data_for` + outside-a-vault `onebrain mcp` tests; `QueryParams` dead-code allowance tightened to per-field.
 
 ## [3.4.2] — 2026-07-03 — fix: weak server auth token on Windows
 
