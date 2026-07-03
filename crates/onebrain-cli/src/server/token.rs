@@ -1,12 +1,15 @@
 //! Per-session auth token generation.
 //!
-//! **Dependency choice.** The brief asked to avoid pulling a new crate just for
-//! random bytes. `getrandom`/`rand` ARE transitive deps (via tokio/axum), but
-//! exposing them as a *direct* dep is still a new line in `Cargo.toml`. On Unix
-//! we already lean on raw syscalls for the daemon (setsid, kill, getpgid), so
-//! reading 16 bytes from `/dev/urandom` via `std::fs` is in keeping with the
-//! crate's style and adds nothing. We hex-encode by hand (one fold) rather than
-//! pull `hex`.
+//! **Randomness source.** Bytes come from the OS CSPRNG via `getrandom`, which
+//! maps to the right primitive on every platform — `getrandom(2)` / `/dev/urandom`
+//! on Unix, `BCryptGenRandom` on Windows. An earlier version read `/dev/urandom`
+//! by hand and fell back to a *time-seeded* token whenever that read failed —
+//! and, because the read was `#[cfg(unix)]`, it took that weak fallback on
+//! **every** Windows run. A wall-clock-derived token is guessable, so that path
+//! made the API token predictable. There is no fallback now: if the CSPRNG is
+//! unavailable we panic rather than emit a weak token (the process aborts under
+//! the release `panic = "abort"` profile — a loud failure, never a silent
+//! downgrade). We hex-encode by hand (one fold) rather than pull `hex`.
 //!
 //! 16 random bytes → 32 hex chars. That is 128 bits of entropy — far more than
 //! enough for a localhost, single-session token whose only job is to stop other
@@ -44,60 +47,20 @@ fn resolve_token_from(env: Option<String>) -> String {
     generate_token()
 }
 
-/// Generate a fresh 32-hex-char (128-bit) session token.
+/// Generate a fresh 32-hex-char (128-bit) session token from the OS CSPRNG.
 ///
-/// Unix: reads 16 bytes from `/dev/urandom`. If that read fails (extraordinarily
-/// rare — `/dev/urandom` is always present on a functioning Unix host), we fall
-/// back to a time-seeded value so the server can still start; the fallback is
-/// clearly weaker but a dead `/dev/urandom` means much bigger problems exist.
-///
-/// Non-Unix: time-seeded fallback only (the daemon itself is Unix-only for now;
-/// this keeps the module compiling on Windows for `serve`'s router tests).
+/// `getrandom::fill` pulls from the platform's cryptographic RNG on every target
+/// (`getrandom(2)` / `/dev/urandom` on Unix, `BCryptGenRandom` on Windows). It
+/// only errors if the OS RNG is genuinely unavailable — a broken environment in
+/// which the server has no business handing out a security token. We panic
+/// rather than fall back to anything weaker: no predictable token ever ships.
 pub fn generate_token() -> String {
-    #[cfg(unix)]
-    {
-        if let Some(tok) = read_urandom() {
-            return tok;
-        }
-    }
-    // Reaching here means the strong source was unavailable (or this is a
-    // non-Unix build). The time-seeded fallback is predictable enough that a
-    // determined local attacker could guess it, so flag it loudly (fix K) — on
-    // the daemon this lands in `daemon.log`; on `serve` it's on stderr.
-    #[cfg(unix)]
-    tracing::warn!(
-        "/dev/urandom unavailable — falling back to a WEAK time-seeded session \
-         token; the API token is guessable until the server restarts with a \
-         working random source"
-    );
-    time_seeded_token()
-}
-
-/// Read 16 bytes from `/dev/urandom` and hex-encode them. `None` on any I/O
-/// error so the caller can fall back.
-#[cfg(unix)]
-fn read_urandom() -> Option<String> {
-    use std::io::Read;
-    let mut f = std::fs::File::open("/dev/urandom").ok()?;
     let mut buf = [0u8; 16];
-    f.read_exact(&mut buf).ok()?;
-    Some(hex_encode(&buf))
-}
-
-/// Weak fallback: mix the wall clock + a per-process address into 16 bytes.
-/// Only reached if `/dev/urandom` is unavailable. Not cryptographically strong,
-/// but the token is a localhost secondary boundary, not a primary one.
-fn time_seeded_token() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    // Stir in a stack address so two starts in the same nanosecond still differ.
-    let stir = &nanos as *const u128 as u128;
-    let mixed = nanos ^ stir.rotate_left(64);
-    let bytes = mixed.to_le_bytes(); // 16 bytes
-    hex_encode(&bytes)
+    getrandom::fill(&mut buf).expect(
+        "OS CSPRNG (getrandom) is unavailable — refusing to emit a weak session \
+         token; the server cannot start without a working random source",
+    );
+    hex_encode(&buf)
 }
 
 /// Lowercase hex-encode a byte slice. `2 * n` chars for `n` bytes.
@@ -132,6 +95,25 @@ mod tests {
         let a = generate_token();
         let b = generate_token();
         assert_ne!(a, b, "two generated tokens collided: {a}");
+    }
+
+    #[test]
+    fn batch_of_tokens_has_no_collisions() {
+        // Regression guard for the removed weak fallback. The old time-seeded
+        // token derived from the wall clock + a (constant, per-function) stack
+        // address, so a tight generation loop could repeat a value when the
+        // clock didn't advance between calls. A real CSPRNG makes 1024 draws of
+        // 128-bit tokens collision-free (birthday odds ≈ 2⁻¹⁰⁷). This runs on
+        // every CI target, so it also proves the Windows path is no longer weak.
+        use std::collections::HashSet;
+        const N: usize = 1024;
+        let mut seen = HashSet::with_capacity(N);
+        for _ in 0..N {
+            assert!(
+                seen.insert(generate_token()),
+                "token collision within a batch of {N} — RNG is not cryptographic"
+            );
+        }
     }
 
     #[test]

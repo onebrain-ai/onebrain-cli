@@ -51,6 +51,8 @@ tokio              = { workspace = true }
 axum               = { workspace = true }
 tower              = { workspace = true }
 tower-http         = { workspace = true }
+# OS CSPRNG for the session auth token (server/token.rs) — every platform.
+getrandom          = { workspace = true }
 walkdir            = { workspace = true }
 # v3.4 daemon — chat SSE stream (`stream!{}` body) + `Stream` trait in the handler.
 async-stream       = { workspace = true }
@@ -84,9 +86,9 @@ schemars           = "1.2.1"
 # (pulled by `onebrain-fs` — pure Rust, no `-sys` crates), so this only
 # promotes an existing transitive dep to direct rather than adding a new one.
 globset            = { workspace = true }
-# Hex-encode the random session token (read from /dev/urandom on unix). `urlencoding`
-# is already a dep for vault-sync; it does NOT do hex, so we hand-roll a 1-liner
-# instead of pulling `hex`/`getrandom`/`rand` (see server::token).
+# The session token (server::token) sources its bytes from `getrandom` (above)
+# and hex-encodes them with a hand-rolled 1-liner rather than pulling the `hex`
+# crate — a 32-char encode isn't worth a new dependency.
 
 [features]
 # `semantic` (default ON) forwards to `onebrain-search/semantic`, compiling the

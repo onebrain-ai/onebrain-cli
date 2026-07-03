@@ -1,5 +1,5 @@
 ---
-latest_version: 3.4.1
+latest_version: 3.4.2
 released: 2026-07-03
 ---
 
@@ -9,6 +9,16 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.2] — 2026-07-03 — fix: weak server auth token on Windows
+
+- **Security fix.** The `serve`/daemon session auth token now comes from the OS CSPRNG on every platform via `getrandom` (`getrandom(2)`/`/dev/urandom` on Unix, `BCryptGenRandom` on Windows).
+- The old generator read `/dev/urandom` under `#[cfg(unix)]` and fell back to a **time-seeded, guessable** token — so **every Windows token** (and any Unix run where the read failed) was weak. That path is removed entirely.
+- No fallback remains: if the OS RNG is unavailable the server panics rather than emit a predictable token (a loud abort, never a silent downgrade).
+- `getrandom` promoted from a transitive to a direct dependency (already in the graph — no new crate).
+- Review follow-ups on the 3.4.1 MCP work: `query`'s camelCase wire test now covers all three `lex`/`vec`/`hyde` sub-query variants (a `rename_all` typo would have silently broken vec/hyde before).
+- `search status` opens the engine at the already-resolved cache dir instead of re-resolving the vault + collection (still applies `search.exclude` so drift counts are unchanged).
+- Test fixtures write the canonical `onebrain.yml` instead of the legacy `vault.yml`, so runs no longer emit a deprecation warning.
 
 ## [3.4.1] — 2026-07-03 — native search MCP server
 

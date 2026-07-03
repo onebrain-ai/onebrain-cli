@@ -65,7 +65,10 @@ fn normalise_key(v: &mut Value, key: &str, placeholder: &str) {
 }
 
 fn make_vault(dir: &std::path::Path) {
-    fs::write(dir.join("vault.yml"), "method: onebrain\n").unwrap();
+    // Canonical config filename since v3.1.0. Writing the legacy `vault.yml`
+    // here would trip the deprecation warning on every run and drown out real
+    // warnings in the snapshot/CI output.
+    fs::write(dir.join("onebrain.yml"), "method: onebrain\n").unwrap();
 }
 
 fn run_json(args: &[&str], dir: &std::path::Path) -> Value {
