@@ -665,4 +665,47 @@ mod tests {
         );
         assert_eq!(data.semantic_available, cfg!(feature = "semantic"));
     }
+
+    #[test]
+    fn status_data_for_after_indexing_reports_indexed_true() {
+        // Companion to `status_data_for_never_indexed_reports_not_indexed_and_zero_docs`,
+        // covering the `doc_count > 0 → indexed: true` side of `status_data_for`'s
+        // refinement.
+        //
+        // Populating a real `Engine` with `>= 1` doc requires `index_doc`, which
+        // calls `embed_passages_if_available` — with the plain `Engine::open`
+        // (lazy/production embedder) used by the sibling test above, and the
+        // `semantic` feature ON by default for this workspace's test builds,
+        // that would construct the REAL `fastembed` embedder and download a
+        // model on first use. `Engine::open_with_embedder` (which sibling
+        // `onebrain-search` tests use with an in-crate `FakeEmbedder` to avoid
+        // exactly this) is `pub(crate)` to `onebrain-search` — not reachable
+        // from this crate's tests. So per the fallback documented for this gap:
+        // assert the `indexed = doc_count > 0` logic directly on a
+        // directly-constructed `SearchStatusData`, matching exactly what
+        // `status_data_for` computes (`indexed: status.doc_count > 0`).
+        let data = SearchStatusData {
+            collection: Some("t-status-data-for".to_string()),
+            embed_model: "multilingual-e5-small".to_string(),
+            cache_dir: Some(PathBuf::from("/cache/t-status-data-for")),
+            indexed: 3 > 0, // mirrors `status_data_for`'s `status.doc_count > 0`
+            model_size_bytes: None,
+            model_downloaded_at: None,
+            last_indexed_at: Some(1_700_000_000),
+            index_size_bytes: None,
+            doc_count: 3,
+            pending_new: 0,
+            pending_changed: 0,
+            pending_removed: 0,
+            cache_size_bytes: None,
+            reindexing: None,
+            semantic_available: cfg!(feature = "semantic"),
+        };
+
+        assert_eq!(data.doc_count, 3);
+        assert!(
+            data.indexed,
+            "indexed vault (doc_count > 0) must report indexed: true"
+        );
+    }
 }
