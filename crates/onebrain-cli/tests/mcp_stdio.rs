@@ -221,7 +221,69 @@ fn stdio_jsonrpc_handshake_tools_list_and_status_then_clean_exit() {
         "status tool response missing doc_count: {status_str}"
     );
 
-    // 5. Close stdin — the server must notice EOF and exit cleanly.
+    // 5. tools/call get — fs-only (no engine/embedder), reads `note.md` written
+    // to the fixture vault above. Asserts the returned content block carries the
+    // known file content.
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": { "name": "get", "arguments": { "file": "note.md" } }
+        }),
+    );
+    let get_resp = recv_response(&rx, 4, deadline);
+    let get_str = get_resp.to_string();
+    assert!(
+        get_str.contains("some vault content"),
+        "get tool response missing fixture content: {get_str}"
+    );
+
+    // 6. tools/call multi_get — glob matching the fixture file; fs-only. Asserts
+    // a `--- <path>` section header appears for the matched file.
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": { "name": "multi_get", "arguments": { "pattern": "*.md" } }
+        }),
+    );
+    let multi_resp = recv_response(&rx, 5, deadline);
+    let multi_str = multi_resp.to_string();
+    assert!(
+        multi_str.contains("--- note.md"),
+        "multi_get tool response missing `--- note.md` section: {multi_str}"
+    );
+
+    // 7. tools/call query — a lex sub-query. The fixture index is EMPTY (no
+    // reindex ran), so a lex sub-query opening a non-existent tantivy dir would
+    // normally fail; but this still exercises the `query` tool wiring +
+    // `Parameters<QueryParams>` camelCase deserialization end-to-end without any
+    // model download (lex never constructs the embedder). We only assert the
+    // response has a `results` array (shape correct) — not that it has hits.
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "query",
+                "arguments": { "searches": [{ "type": "lex", "query": "vault" }] }
+            }
+        }),
+    );
+    let query_resp = recv_response(&rx, 6, deadline);
+    let query_str = query_resp.to_string();
+    assert!(
+        query_str.contains("\"results\""),
+        "query tool response missing `results` array: {query_str}"
+    );
+
+    // 8. Close stdin — the server must notice EOF and exit cleanly.
     drop(stdin);
 
     let start = std::time::Instant::now();

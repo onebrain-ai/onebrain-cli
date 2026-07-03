@@ -164,6 +164,8 @@ Show the status of the search index: collection, embed model, document counts, p
 
 `index_size_bytes`, `cache_size_bytes`, and `reindexing` are omitted (not `null`) when there's nothing to report.
 
+> **Note:** the MCP `status` tool's `indexed` reflects `doc_count > 0` (the engine is already open on this path), a deliberate refinement over `onebrain search status`'s cache-dir-existence `indexed` — an empty-but-present cache dir reads as `indexed: true` there but `indexed: false` here.
+
 **Example call**
 
 ```json

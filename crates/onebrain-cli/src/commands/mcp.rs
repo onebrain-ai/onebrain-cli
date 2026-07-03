@@ -17,7 +17,7 @@ use rmcp::transport::stdio;
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
 
 use onebrain_core::path::ResolvedVault;
-use onebrain_search::engine::{Engine, Hit, SEMANTIC_UNAVAILABLE};
+use onebrain_search::engine::{Engine, Hit};
 use onebrain_search::lex::LexIndex;
 
 use super::search_common::{collection_cache_dir, collection_for, open_engine};
@@ -247,6 +247,13 @@ const RRF_K: f64 = 60.0;
 /// result list (already truncated to its own over-fetch limit). Fuses by
 /// `chunk_id`, accumulating `weight / (RRF_K + rank + 1)` across lists,
 /// then sorts descending and normalizes so the top hit scores exactly 1.0.
+///
+/// NOTE: this is intentionally a DIFFERENT formula from the engine-internal
+/// `onebrain_search::hybrid::rrf_fuse` — do NOT "unify" them. This one is a
+/// weighted (first sub-query ×2), multi-sub-query fusion normalized to 1.0 for
+/// qmd-compatible `query`-tool output; the engine's is the fixed two-list
+/// (lex + vec) hybrid fusion. They serve different callers and must stay
+/// separate.
 fn rrf_fuse(ranked: Vec<(f64, Vec<Hit>)>) -> Vec<(f64, Hit)> {
     use std::collections::HashMap;
     let mut acc: HashMap<String, (f64, Hit)> = HashMap::new();
@@ -303,6 +310,32 @@ fn lex_subquery(resolved: &ResolvedVault, text: &str, top_k: usize) -> anyhow::R
         .collect())
 }
 
+/// Degradation policy for a vec/hyde sub-query's `vector_search` result inside
+/// the `query` tool. When a lex sub-query is present (`has_lex`), ANY error
+/// from the vector side (embedder-unavailable in a lex-only build, OR a
+/// mid-query model-download failure in a semantic build) is swallowed and the
+/// sub-query degrades to empty hits — the lex sub-query still answers, mirroring
+/// `run_query`'s hybrid-to-lex-only degradation. The error is logged to stderr
+/// (never stdout — this is a JSON-RPC stdio server; stdout carries the protocol
+/// frame). When there is NO lex sub-query, the error propagates: an all-vec
+/// query with no embedding capability must error, matching `run_vsearch`
+/// (vector-only has no lex analogue, so it errors instead of degrading).
+///
+/// Split out of the tool body so the degradation branch is unit-testable
+/// without a running engine. Note: guarding on the exact `SEMANTIC_UNAVAILABLE`
+/// string would be dead code in the shipped (semantic-on) build, where that
+/// string never occurs — hence the `has_lex`-only guard here.
+fn degrade_vec_error(has_lex: bool, result: anyhow::Result<Vec<Hit>>) -> anyhow::Result<Vec<Hit>> {
+    match result {
+        Ok(hits) => Ok(hits),
+        Err(e) if has_lex => {
+            eprintln!("onebrain mcp: vec/hyde sub-query degraded to lex (skipping): {e:#}");
+            Ok(Vec::new())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// File stem of a vault-relative doc path, for `QueryHit::title`.
 fn title_from_doc_path(doc_path: &str) -> String {
     std::path::Path::new(doc_path)
@@ -342,9 +375,12 @@ impl SearchMcpServer {
     {
         let engine = self.engine.clone();
         tokio::task::spawn_blocking(move || {
-            let mut eng = engine
-                .lock()
-                .map_err(|_| anyhow::anyhow!("engine mutex poisoned"))?;
+            // Recover the guard on poison (a prior closure panicked) instead of
+            // erroring forever — matches the rest of the codebase
+            // (`update.rs`'s `.lock().unwrap_or_else(|e| e.into_inner())`) so a
+            // single panicking tool call doesn't brick every subsequent
+            // engine-backed call for the server's lifetime.
+            let mut eng = engine.lock().unwrap_or_else(|e| e.into_inner());
             f(&mut eng)
         })
         .await
@@ -395,16 +431,7 @@ impl SearchMcpServer {
                     let hits = match sub.r#type {
                         SubQueryType::Lex => lex_subquery(&resolved, &sub.query, fetch_k)?,
                         SubQueryType::Vec | SubQueryType::Hyde => {
-                            match eng.vector_search(&sub.query, fetch_k) {
-                                Ok(hits) => hits,
-                                Err(e) if has_lex && e.to_string() == SEMANTIC_UNAVAILABLE => {
-                                    // Degrade: skip this sub-query, same as
-                                    // `run_query`'s hybrid-to-lex-only degradation,
-                                    // since at least one lex sub-query is present.
-                                    Vec::new()
-                                }
-                                Err(e) => return Err(e),
-                            }
+                            degrade_vec_error(has_lex, eng.vector_search(&sub.query, fetch_k))?
                         }
                     };
                     ranked.push((weight, hits));
@@ -720,5 +747,106 @@ mod tests {
         .unwrap();
 
         assert!(resolve_under_vault(vault.path(), "link.md").is_err());
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // `degrade_vec_error` — the query tool's vec/hyde degradation policy.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn degrade_vec_error_with_lex_swallows_error_returns_empty() {
+        // has_lex=true + any vec/hyde error → degrade to empty hits (the lex
+        // sub-query still answers), NOT a propagated error. This is the branch
+        // that was previously dead in the shipped semantic build.
+        let err: anyhow::Result<Vec<Hit>> = Err(anyhow::anyhow!("model download failed mid-query"));
+        let out = degrade_vec_error(true, err).expect("should degrade, not error");
+        assert!(out.is_empty(), "degraded sub-query must yield empty hits");
+    }
+
+    #[test]
+    fn degrade_vec_error_with_lex_passes_through_ok_hits() {
+        let ok: anyhow::Result<Vec<Hit>> = Ok(vec![hit("a")]);
+        let out = degrade_vec_error(true, ok).expect("ok result must pass through");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].chunk_id, "a");
+    }
+
+    #[test]
+    fn degrade_vec_error_without_lex_propagates_error() {
+        // No lex sub-query to fall back to → an all-vec query with no embedding
+        // capability must error (matches `run_vsearch`).
+        let err: anyhow::Result<Vec<Hit>> = Err(anyhow::anyhow!("no ONNX runtime"));
+        match degrade_vec_error(false, err) {
+            Ok(_) => panic!("no-lex vec error must propagate, not degrade"),
+            Err(e) => assert!(e.to_string().contains("no ONNX runtime")),
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // `expand_multi_get_pattern` — comma-list parsing + glob walking.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn expand_multi_get_pattern_splits_and_trims_comma_list() {
+        // A comma in the pattern → explicit path list, trimmed, no globbing;
+        // the vault_root is irrelevant for the comma-list branch.
+        let dir = tempfile::tempdir().unwrap();
+        let out =
+            expand_multi_get_pattern(dir.path(), " notes/a.md , notes/b.md ,notes/c.md ").unwrap();
+        assert_eq!(out, vec!["notes/a.md", "notes/b.md", "notes/c.md"]);
+    }
+
+    #[test]
+    fn expand_multi_get_pattern_drops_empty_comma_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = expand_multi_get_pattern(dir.path(), "a.md,, ,b.md").unwrap();
+        assert_eq!(out, vec!["a.md", "b.md"]);
+    }
+
+    #[test]
+    fn expand_multi_get_pattern_glob_matches_multiple_files_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("2026-07-01.md"), "x").unwrap();
+        std::fs::write(dir.path().join("2026-07-02.md"), "y").unwrap();
+        std::fs::write(dir.path().join("2026-08-01.md"), "z").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "t").unwrap();
+        let out = expand_multi_get_pattern(dir.path(), "2026-07*.md").unwrap();
+        assert_eq!(out, vec!["2026-07-01.md", "2026-07-02.md"]);
+    }
+
+    #[test]
+    fn expand_multi_get_pattern_glob_matches_nested_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("journals")).unwrap();
+        std::fs::write(dir.path().join("journals/day.md"), "x").unwrap();
+        std::fs::write(dir.path().join("top.md"), "y").unwrap();
+        let out = expand_multi_get_pattern(dir.path(), "**/*.md").unwrap();
+        // Forward-slash, POSIX-style rel paths on every platform.
+        assert!(out.contains(&"journals/day.md".to_string()));
+        assert!(out.contains(&"top.md".to_string()));
+    }
+
+    #[test]
+    fn expand_multi_get_pattern_glob_excludes_hidden_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".obsidian")).unwrap();
+        std::fs::write(dir.path().join(".git/config.md"), "x").unwrap();
+        std::fs::write(dir.path().join(".obsidian/app.md"), "y").unwrap();
+        std::fs::write(dir.path().join("real.md"), "z").unwrap();
+        let out = expand_multi_get_pattern(dir.path(), "**/*.md").unwrap();
+        assert_eq!(
+            out,
+            vec!["real.md"],
+            "dot-dirs must be excluded from glob walk"
+        );
+    }
+
+    #[test]
+    fn expand_multi_get_pattern_glob_no_match_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("real.md"), "z").unwrap();
+        let out = expand_multi_get_pattern(dir.path(), "nomatch-*.md").unwrap();
+        assert!(out.is_empty(), "no-match glob must return empty vec");
     }
 }
