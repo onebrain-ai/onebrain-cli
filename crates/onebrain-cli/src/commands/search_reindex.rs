@@ -13,7 +13,7 @@ use serde::Serialize;
 use crate::cli::SearchReindexArgs;
 use crate::commands::search_common::{
     collection_cache_dir, collection_for, index_size_bytes, model_not_chosen, open_engine,
-    reindex_progress_path,
+    reconcile_missing_model, reindex_progress_path,
 };
 use crate::output::{emit, item, section, Envelope, OutputMode};
 use onebrain_search::engine::{ReindexProgress, ReindexStats};
@@ -66,6 +66,23 @@ impl ReindexData {
 }
 
 pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchReindexArgs) -> Result<()> {
+    // A purged model download should re-open the first-run pick: clear the
+    // stale key so `model_not_chosen` becomes true and the TTY-prompt /
+    // headless-default split below fires correctly. Runs unconditionally
+    // (before the TTY/structured gate in `maybe_prompt_first_model`) so a
+    // headless reindex also drops the stale key and falls back to the
+    // `multilingual-e5-small` default instead of trying to load a model
+    // that's no longer on disk.
+    if let Ok(resolved) = crate::vault_ctx::require(vault_flag.clone()) {
+        if let Ok(collection) = collection_for(&resolved) {
+            let cache_dir = collection_cache_dir(&collection);
+            let embed_model = onebrain_core::load_vault_config(&resolved.root)
+                .map(|c| c.search.embed_model)
+                .unwrap_or_default();
+            reconcile_missing_model(resolved.root.as_path(), &cache_dir, &embed_model);
+        }
+    }
+
     // First-run model choice: if no model has been chosen yet (no persisted
     // `search.embed_model` key AND nothing downloaded), prompt the user to pick
     // one BEFORE `open_engine` triggers a download — but only on a real TTY in
