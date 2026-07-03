@@ -69,19 +69,19 @@ fn make_vault(dir: &std::path::Path) {
 }
 
 fn run_json(args: &[&str], dir: &std::path::Path) -> Value {
+    // Isolated, never-populated cache dir so the native-search `qmd_unembedded`
+    // probe (v3.4.1: reads the local index directly, no more `qmd` subprocess)
+    // deterministically finds no index for the fixture's collection → `null`
+    // ("unknown"), regardless of what any real vault on this machine has
+    // indexed under the same collection name. Mirrors `snapshots.rs`.
+    let cache = tempdir().unwrap();
     let output = Command::cargo_bin("onebrain")
         .unwrap()
         .args(args)
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
         // Hermetic `headless`: clear ONEBRAIN_HEADLESS so session-init snapshots
         // read `false` even when the test runner is itself under `skill run`.
         .env_remove("ONEBRAIN_HEADLESS")
-        // Hermetic `qmd_unembedded`: scrub PATH *and* HOME so the spawned `qmd`
-        // probe finds nothing → unembedded count is a deterministic `null` (v3.4:
-        // "unknown"). PATH alone is insufficient — the probe also falls back to
-        // `$HOME/.bun/bin` (`bun install -g qmd`); without clearing HOME a
-        // bun-installed qmd would read the live index. Mirrors `snapshots.rs`.
-        .env("PATH", "/usr/bin:/bin")
-        .env_remove("HOME")
         .current_dir(dir)
         .output()
         .expect("spawn failed");
@@ -155,8 +155,9 @@ fn plugin_update_json_envelope_snapshot_dry_run() {
 fn session_init_json_envelope_snapshot_inside_vault() {
     let dir = tempdir().unwrap();
     // Same fixture shape as legacy session_init snapshot — qmd_collection
-    // present so the qmd_unembedded probe runs; with PATH scrubbed (no qmd
-    // binary on it) it reports `null` (v3.4: "unknown" rather than a false 0).
+    // present so the qmd_unembedded probe runs; with the cache dir isolated
+    // to an empty tempdir, the collection has no index yet and the probe
+    // reports `null` (v3.4: "unknown" rather than a false 0).
     fs::write(dir.path().join("vault.yml"), "qmd_collection: x\n").unwrap();
     // v3.1: machine consumers must opt into JSON explicitly now that text
     // is the default for interactive use.

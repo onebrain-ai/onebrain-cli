@@ -18,16 +18,16 @@ fn fixture_orphan(name: &str) -> PathBuf {
 }
 
 fn run_json(args: &[&str], dir: &std::path::Path) -> Value {
+    // Isolated, never-populated cache dir so the native-search `qmd_unembedded`
+    // probe (v3.4.1: reads the local index directly, no more `qmd` subprocess)
+    // deterministically finds no index for the fixture's collection → `null`
+    // ("unknown"), regardless of what any real vault on this machine has
+    // indexed under the same collection name.
+    let cache = tempdir().unwrap();
     let output = Command::cargo_bin("onebrain")
         .unwrap()
         .args(args)
-        // Scrub PATH *and* HOME so the spawned `qmd` probe finds nothing → the
-        // unembedded count is reported as `null` (v3.4: "unknown", deterministic).
-        // PATH alone is insufficient: the probe also falls back to `$HOME/.bun/bin`
-        // (`bun install -g qmd`), so without clearing HOME a contributor with a
-        // bun-installed qmd would read the live index and break this snapshot.
-        .env("PATH", "/usr/bin:/bin")
-        .env_remove("HOME")
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
         // Hermetic `headless`: clear ONEBRAIN_HEADLESS so the snapshot reads
         // `false` even when the test runner is itself under `skill run`.
         .env_remove("ONEBRAIN_HEADLESS")
