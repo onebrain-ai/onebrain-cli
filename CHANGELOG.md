@@ -13,7 +13,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [3.4.1] — 2026-07-03 — native search MCP server
 
 - **`onebrain mcp`** — MCP stdio server (rmcp) over the native engine: `query` (lex/vec/hyde sub-queries, RRF-fused), `get`, `multi_get`, `status` — qmd-compatible tool surface.
-- **`session init`** now probes the native index for `qmd_unembedded` (no qmd subprocess; same JSON contract).
+- **`session init`** now probes the native index for `qmd_unembedded` (no qmd subprocess; same JSON contract, 300ms time-boxed).
+- **Model picker**: pressing Enter on the active model whose files are missing (e.g. an OS-purged cache) now re-downloads them without re-embedding, instead of a silent no-op.
+- **`search status`** reports the active model's on-disk size only (was summing every `models--*` dir); the whole-cache total stays in `cache_size_bytes`.
 - `dot_scalar` gains a debug-build equal-length assertion; simsimd fallback now logs before returning NEG_INFINITY.
 - ADR 0018 polish: sysroot typo + win-arm64 decision restructured into sub-bullets.
 
