@@ -1,10 +1,7 @@
-<!-- Banner pinned to a plugin-repo commit SHA (not the mutable `main` branch)
-     so a future asset restructure on onebrain-ai/onebrain can't silently
-     404 this image. Bump the SHA when refreshing the brand assets. -->
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/onebrain-ai/onebrain/c391f40e1881e4a07586a564efd1db40d3920b26/assets/header-dark.png">
-    <img alt="OneBrain — Your AI Thinking Partner" src="https://raw.githubusercontent.com/onebrain-ai/onebrain/c391f40e1881e4a07586a564efd1db40d3920b26/assets/header-light.png" width="640">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/banner-dark.svg">
+    <img alt="OneBrain CLI — Your AI Thinking Partner" src="assets/banner-light.svg" width="640">
   </picture>
 </p>
 
