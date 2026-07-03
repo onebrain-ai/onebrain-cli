@@ -22,7 +22,7 @@ use crate::commands::search_common::{
 };
 use crate::output::{emit, item, section, Envelope, OutputMode};
 use onebrain_core::load_vault_config;
-use onebrain_search::embed::dir_size_bytes;
+use onebrain_search::embed::{model_download_status, model_registry};
 use onebrain_search::engine::Engine;
 
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
@@ -31,10 +31,12 @@ pub(crate) struct SearchStatusData {
     embed_model: String,
     cache_dir: Option<PathBuf>,
     indexed: bool,
-    /// Total size in bytes of the downloaded model dir(s) (`models--*`) under
-    /// the collection cache dir. `None` if the model isn't downloaded yet.
+    /// Size in bytes of the ACTIVE model's dir (`models--*`) under the
+    /// collection cache dir. `None` if the active model isn't downloaded yet.
+    /// (The whole-cache total, including any lingering other-model dirs, is
+    /// `cache_size_bytes`.)
     model_size_bytes: Option<u64>,
-    /// Epoch seconds of the model dir's mtime (when it was downloaded).
+    /// Epoch seconds of the active model dir's mtime (when it was downloaded).
     /// `None` if not downloaded.
     model_downloaded_at: Option<u64>,
     /// Epoch seconds of the last `reindex` run. `None` if never indexed.
@@ -103,10 +105,11 @@ pub(crate) fn status_data(
             Some(c) => {
                 let dir = collection_cache_dir(c);
                 let indexed = is_indexed(&dir);
-                let (size, downloaded) = match model_dir_stats(&dir) {
-                    Some((size, mtime)) => (Some(size), mtime),
-                    None => (None, None),
-                };
+                let (size, downloaded) =
+                    match active_model_dir_stats(&dir, &config.search.embed_model) {
+                        Some((size, mtime)) => (Some(size), mtime),
+                        None => (None, None),
+                    };
                 let idx_size = index_size_bytes(&dir);
                 (Some(dir), indexed, size, downloaded, idx_size)
             }
@@ -172,7 +175,7 @@ pub(crate) fn status_data_for(
 
     let (cache_dir, model_size_bytes, model_downloaded_at, index_size_bytes) = {
         let dir = collection_cache_dir(&collection);
-        let (size, downloaded) = match model_dir_stats(&dir) {
+        let (size, downloaded) = match active_model_dir_stats(&dir, &config.search.embed_model) {
             Some((size, mtime)) => (Some(size), mtime),
             None => (None, None),
         };
@@ -206,42 +209,21 @@ pub(crate) fn status_data_for(
     })
 }
 
-/// Total size in bytes + newest mtime (epoch secs) of the downloaded model
-/// dir(s) (`models--*`) directly under `cache_dir`. Returns `None` when no
-/// such dir exists (model not downloaded). Pure fs: no subprocess, no
-/// download.
-fn model_dir_stats(cache_dir: &Path) -> Option<(u64, Option<u64>)> {
-    let dirs = model_dirs(cache_dir);
-    if dirs.is_empty() {
-        return None;
-    }
-    let mut total = 0u64;
-    let mut newest: Option<u64> = None;
-    for dir in &dirs {
-        total += dir_size_bytes(dir);
-        if let Some(mtime) = dir_mtime_secs(dir) {
-            newest = Some(newest.map_or(mtime, |n| n.max(mtime)));
-        }
-    }
-    Some((total, newest))
-}
-
-/// The `models--*` subdirectories directly under `cache_dir` (fastembed's
-/// per-model download layout, e.g. `models--intfloat--multilingual-e5-small`).
-fn model_dirs(cache_dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(cache_dir) else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_dir()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("models--"))
-        })
-        .collect()
+/// Size in bytes + mtime (epoch secs) of the ACTIVE model's `models--*` dir
+/// only. Returns `None` when the active model isn't on disk (or isn't a known
+/// registry model). Pure fs: no subprocess, no download.
+///
+/// This is reported under the active model's name in `status`, so it must
+/// reflect the active model alone. An earlier version summed EVERY `models--*`
+/// dir under the cache, which inflated the figure — and falsely implied "a
+/// model is present" — whenever a previously-active model's dir lingered next
+/// to the current one (#21). The whole-cache total is surfaced separately as
+/// `cache_size_bytes`.
+fn active_model_dir_stats(cache_dir: &Path, active_model: &str) -> Option<(u64, Option<u64>)> {
+    let info = model_registry().iter().find(|m| m.name == active_model)?;
+    let status = model_download_status(info, cache_dir);
+    let size = status.disk_size?;
+    Some((size, dir_mtime_secs(&status.path)))
 }
 
 /// `root`'s own mtime as epoch seconds, or `None` if unreadable.
@@ -579,16 +561,16 @@ mod tests {
     }
 
     #[test]
-    fn model_dir_stats_none_when_no_model_dir() {
+    fn active_model_dir_stats_none_when_active_model_not_on_disk() {
         let dir = tempdir().unwrap();
         // A cache dir with unrelated subdirs but no `models--*`.
         std::fs::create_dir(dir.path().join("tantivy")).unwrap();
         std::fs::create_dir(dir.path().join("vectors")).unwrap();
-        assert!(model_dir_stats(dir.path()).is_none());
+        assert!(active_model_dir_stats(dir.path(), "multilingual-e5-small").is_none());
     }
 
     #[test]
-    fn model_dir_stats_sums_sizes_across_model_dir() {
+    fn active_model_dir_stats_sums_only_the_active_model_dir() {
         let dir = tempdir().unwrap();
         let model = dir.path().join("models--intfloat--multilingual-e5-small");
         std::fs::create_dir_all(model.join("snapshots/abc")).unwrap();
@@ -598,9 +580,27 @@ mod tests {
         std::fs::create_dir(dir.path().join("tantivy")).unwrap();
         std::fs::write(dir.path().join("tantivy/meta.json"), vec![0u8; 5000]).unwrap();
 
-        let (size, mtime) = model_dir_stats(dir.path()).unwrap();
-        assert_eq!(size, 1024, "should sum only the model dir's files");
+        let (size, mtime) = active_model_dir_stats(dir.path(), "multilingual-e5-small").unwrap();
+        assert_eq!(size, 1024, "should sum only the active model dir's files");
         assert!(mtime.is_some());
+    }
+
+    #[test]
+    fn active_model_dir_stats_ignores_other_model_dirs() {
+        // Two models on disk; status must report ONLY the active one (#21).
+        let dir = tempdir().unwrap();
+        let active = dir.path().join("models--intfloat--multilingual-e5-small");
+        std::fs::create_dir_all(&active).unwrap();
+        std::fs::write(active.join("model.onnx"), vec![0u8; 1000]).unwrap();
+        let stale = dir.path().join("models--intfloat--multilingual-e5-base");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("model.onnx"), vec![0u8; 999_000]).unwrap();
+
+        let (size, _) = active_model_dir_stats(dir.path(), "multilingual-e5-small").unwrap();
+        assert_eq!(
+            size, 1000,
+            "must report only the active model's bytes, not the lingering base model's"
+        );
     }
 
     #[test]
