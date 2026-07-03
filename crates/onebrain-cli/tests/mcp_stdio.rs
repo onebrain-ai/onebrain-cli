@@ -18,6 +18,17 @@ use std::time::Duration;
 
 use tempfile::tempdir;
 
+/// Kills the spawned server on drop so panicking assertion/timeout paths
+/// never leak an orphan `onebrain mcp` process on CI.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn write(root: &Path, rel: &str, body: &str) {
     let p = root.join(rel);
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -126,12 +137,14 @@ fn stdio_jsonrpc_handshake_tools_list_and_status_then_clean_exit() {
     );
     write(vault.path(), "note.md", "# Hello\nsome vault content\n");
 
-    let mut child = onebrain_mcp(vault.path(), cache.path())
-        .spawn()
-        .expect("spawn onebrain mcp");
+    let mut child = KillOnDrop(
+        onebrain_mcp(vault.path(), cache.path())
+            .spawn()
+            .expect("spawn onebrain mcp"),
+    );
 
-    let mut stdin = child.stdin.take().expect("child stdin");
-    let stdout = child.stdout.take().expect("child stdout");
+    let mut stdin = child.0.stdin.take().expect("child stdin");
+    let stdout = child.0.stdout.take().expect("child stdout");
     let rx = spawn_line_reader(stdout);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -213,7 +226,7 @@ fn stdio_jsonrpc_handshake_tools_list_and_status_then_clean_exit() {
 
     let start = std::time::Instant::now();
     loop {
-        if let Some(status) = child.try_wait().expect("polling child status") {
+        if let Some(status) = child.0.try_wait().expect("polling child status") {
             assert!(
                 status.success(),
                 "onebrain mcp did not exit 0 after stdin close: {status:?}"
@@ -221,8 +234,8 @@ fn stdio_jsonrpc_handshake_tools_list_and_status_then_clean_exit() {
             break;
         }
         if start.elapsed() > Duration::from_secs(30) {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.0.kill();
+            let _ = child.0.wait();
             panic!("onebrain mcp did not exit within 30s of stdin close");
         }
         std::thread::sleep(Duration::from_millis(50));
