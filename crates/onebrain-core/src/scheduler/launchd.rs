@@ -7,7 +7,7 @@
 //! contract. The escape helper [`xml_escape`] mirrors Bun's exact
 //! `.replace(/&/g, '&amp;')...` chain.
 
-use crate::scheduler::cron_parse::{at_to_launchd, cron_fields_to_launchd};
+use crate::scheduler::cron_parse::{at_to_launchd, cron_fields_to_launchd_expanded, CronFields};
 use crate::scheduler::entry::{is_command_mode, is_one_shot};
 use crate::scheduler::types::{Args, ScheduleEntry};
 use std::path::{Path, PathBuf};
@@ -225,13 +225,60 @@ fn one_shot_command_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &s
     )
 }
 
-/// Build the `<StartCalendarInterval>` body — cron emits any non-wildcard
-/// fields in (Minute, Hour, Day, Month, Weekday) insertion order; one-shot
-/// emits all five (Year, Month, Day, Hour, Minute).
+/// Format one `CronFields` combination's non-wildcard keys, in (Minute,
+/// Hour, Day, Month, Weekday) insertion order, indented as the contents of
+/// a single `<dict>`.
+fn single_combination_dict_body(f: &CronFields) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(m) = f.minute {
+        parts.push(format!(
+            "        <key>Minute</key>\n        <integer>{m}</integer>"
+        ));
+    }
+    if let Some(h) = f.hour {
+        parts.push(format!(
+            "        <key>Hour</key>\n        <integer>{h}</integer>"
+        ));
+    }
+    if let Some(d) = f.day {
+        parts.push(format!(
+            "        <key>Day</key>\n        <integer>{d}</integer>"
+        ));
+    }
+    if let Some(mo) = f.month {
+        parts.push(format!(
+            "        <key>Month</key>\n        <integer>{mo}</integer>"
+        ));
+    }
+    if let Some(w) = f.weekday {
+        parts.push(format!(
+            "        <key>Weekday</key>\n        <integer>{w}</integer>"
+        ));
+    }
+    parts.join("\n")
+}
+
+/// Re-indent a block of lines by `indent` extra spaces (used to nest a
+/// `<dict>` body one level deeper inside `<array>...</array>`).
+fn indent_lines(body: &str, indent: &str) -> String {
+    body.lines()
+        .map(|line| format!("{indent}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Build the complete `<key>StartCalendarInterval</key>` block (key +
+/// value) — cron emits either a single `<dict>` (the common case: every
+/// field is a bare value or wildcard, byte-identical to the pre-#116
+/// shape) or an `<array>` of `<dict>`s (#116 bug 1: step/list/range fields
+/// that expand to more than one concrete combination — launchd ORs across
+/// array entries, which is exactly cron's "any of these values" semantics).
+/// One-shot entries always emit a single `<dict>` (a one-shot fires once —
+/// its Year/Month/Day/Hour/Minute are always fully concrete).
 fn calendar_block(entry: &ScheduleEntry) -> String {
     if is_one_shot(entry) {
         let f = at_to_launchd(entry.at.as_deref().unwrap());
-        format!(
+        let body = format!(
             "        <key>Year</key>\n\
              \x20       <integer>{}</integer>\n\
              \x20       <key>Month</key>\n\
@@ -243,36 +290,38 @@ fn calendar_block(entry: &ScheduleEntry) -> String {
              \x20       <key>Minute</key>\n\
              \x20       <integer>{}</integer>",
             f.year, f.month, f.day, f.hour, f.minute
-        )
+        );
+        format!("    <key>StartCalendarInterval</key>\n    <dict>\n{body}\n    </dict>")
     } else {
-        let f = cron_fields_to_launchd(entry.cron.as_deref().unwrap());
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(m) = f.minute {
-            parts.push(format!(
-                "        <key>Minute</key>\n        <integer>{m}</integer>"
-            ));
+        let set = cron_fields_to_launchd_expanded(entry.cron.as_deref().unwrap());
+        let combos = set
+            .combinations()
+            .expect("validate_cron failed to gate the StartCalendarInterval combination cap");
+        if combos.len() <= 1 {
+            // Single combination — identical shape to the pre-#116 plist
+            // (byte-parity snapshot depends on this staying a plain
+            // `<dict>`, not a one-element `<array>`).
+            let body = combos
+                .first()
+                .map(single_combination_dict_body)
+                .unwrap_or_default();
+            format!("    <key>StartCalendarInterval</key>\n    <dict>\n{body}\n    </dict>")
+        } else {
+            let dicts: Vec<String> = combos
+                .iter()
+                .map(|f| {
+                    let body = single_combination_dict_body(f);
+                    format!(
+                        "        <dict>\n{}\n        </dict>",
+                        indent_lines(&body, "    ")
+                    )
+                })
+                .collect();
+            format!(
+                "    <key>StartCalendarInterval</key>\n    <array>\n{}\n    </array>",
+                dicts.join("\n")
+            )
         }
-        if let Some(h) = f.hour {
-            parts.push(format!(
-                "        <key>Hour</key>\n        <integer>{h}</integer>"
-            ));
-        }
-        if let Some(d) = f.day {
-            parts.push(format!(
-                "        <key>Day</key>\n        <integer>{d}</integer>"
-            ));
-        }
-        if let Some(mo) = f.month {
-            parts.push(format!(
-                "        <key>Month</key>\n        <integer>{mo}</integer>"
-            ));
-        }
-        if let Some(w) = f.weekday {
-            parts.push(format!(
-                "        <key>Weekday</key>\n        <integer>{w}</integer>"
-            ));
-        }
-        parts.join("\n")
     }
 }
 
@@ -302,10 +351,7 @@ pub fn generate_plist(entry: &ScheduleEntry, ctx: &LaunchdContext) -> String {
          \x20   <array>\n\
          {}\n\
          \x20   </array>\n\
-         \x20   <key>StartCalendarInterval</key>\n\
-         \x20   <dict>\n\
          {}\n\
-         \x20   </dict>\n\
          \x20   <key>StandardOutPath</key>\n\
          \x20   <string>{}/onebrain-{}.stdout</string>\n\
          \x20   <key>StandardErrorPath</key>\n\
@@ -652,6 +698,68 @@ mod tests {
     #[test]
     fn generate_plist_snapshot_recurring_skill() {
         let out = generate_plist(&skill_entry("/daily", "0 9 * * *"), &test_ctx());
+        insta::assert_snapshot!(out);
+    }
+
+    // ── #116 bug 1: step/list/range → array-form StartCalendarInterval ────────
+
+    #[test]
+    fn calendar_block_single_combination_stays_plain_dict() {
+        // A bare-value/wildcard cron (the common case) must still produce
+        // a single `<dict>`, not a one-element `<array>` — byte parity
+        // with the existing snapshot depends on this.
+        let out = generate_plist(&skill_entry("/daily", "0 9 * * *"), &test_ctx());
+        assert!(out.contains("<key>StartCalendarInterval</key>\n    <dict>"));
+        assert!(!out.contains("<key>StartCalendarInterval</key>\n    <array>"));
+    }
+
+    #[test]
+    fn calendar_block_step_hour_emits_array_of_dicts() {
+        // `*/2` on hour → 12 combinations → array form, one <dict> per hour.
+        let out = generate_plist(&skill_entry("/daily", "0 */2 * * *"), &test_ctx());
+        assert!(out.contains("<key>StartCalendarInterval</key>\n    <array>"));
+        assert!(out.contains("<key>Hour</key>\n            <integer>0</integer>"));
+        assert!(out.contains("<key>Hour</key>\n            <integer>22</integer>"));
+        // Every combination keeps Minute fixed at 0.
+        let minute_count = out
+            .matches("<key>Minute</key>\n            <integer>0</integer>")
+            .count();
+        assert_eq!(
+            minute_count, 12,
+            "expected 12 Minute keys (one per hour dict), out:\n{out}"
+        );
+    }
+
+    #[test]
+    fn calendar_block_list_weekday_emits_one_dict_per_value() {
+        let out = generate_plist(&skill_entry("/daily", "0 9 * * 1,3,5"), &test_ctx());
+        assert!(out.contains("<key>StartCalendarInterval</key>\n    <array>"));
+        assert!(out.contains("<key>Weekday</key>\n            <integer>1</integer>"));
+        assert!(out.contains("<key>Weekday</key>\n            <integer>3</integer>"));
+        assert!(out.contains("<key>Weekday</key>\n            <integer>5</integer>"));
+        let dict_count = out.matches("<dict>").count();
+        // 1 top-level <dict> (the plist root) + 3 StartCalendarInterval dicts.
+        assert_eq!(dict_count, 4, "out:\n{out}");
+    }
+
+    #[test]
+    fn calendar_block_range_weekday_emits_inclusive_dicts() {
+        let out = generate_plist(&skill_entry("/daily", "0 9 * * 1-5"), &test_ctx());
+        for w in 1..=5 {
+            assert!(
+                out.contains(&format!(
+                    "<key>Weekday</key>\n            <integer>{w}</integer>"
+                )),
+                "missing weekday {w}, out:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_plist_snapshot_recurring_skill_array_form() {
+        // New insta snapshot (#116 bug 1) covering the multi-value array
+        // shape — distinct from the single-`<dict>` snapshot above.
+        let out = generate_plist(&skill_entry("/daily", "0 */6 * * *"), &test_ctx());
         insta::assert_snapshot!(out);
     }
 }

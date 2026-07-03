@@ -621,3 +621,88 @@ fn status_marks_installed_and_uninstalled() {
         .success()
         .stdout(predicate::str::contains("\u{2713}"));
 }
+
+// ── #116 bug 1: cron step/list/range end-to-end ────────────────────────────
+
+/// A `*/N` step cron expression is accepted end-to-end and emits an
+/// array-form `StartCalendarInterval` in the dry-run plist output.
+#[test]
+fn step_cron_dry_run_emits_array_form_calendar_interval() {
+    let v = write_skill_vault("schedule:\n  - cron: \"0 */6 * * *\"\n    skill: /daily\n");
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<key>StartCalendarInterval</key>"))
+        .stdout(predicate::str::contains("<array>"))
+        .stdout(predicate::str::contains("<integer>0</integer>"))
+        .stdout(predicate::str::contains("<integer>6</integer>"))
+        .stdout(predicate::str::contains("<integer>12</integer>"))
+        .stdout(predicate::str::contains("<integer>18</integer>"));
+}
+
+/// A list (`1,3,5`) cron expression is accepted end-to-end.
+#[test]
+fn list_cron_dry_run_succeeds() {
+    let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * 1,3,5\"\n    skill: /daily\n");
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<array>"));
+}
+
+/// A range (`1-5`) cron expression is accepted end-to-end.
+#[test]
+fn range_cron_dry_run_succeeds() {
+    let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * 1-5\"\n    skill: /daily\n");
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<array>"));
+}
+
+/// A single-value cron expression (the common case) still emits the plain
+/// single-`<dict>` calendar interval form, not an array — byte-parity
+/// regression guard at the CLI-integration layer.
+#[test]
+fn plain_cron_dry_run_still_emits_single_dict_form() {
+    let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n");
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "<key>StartCalendarInterval</key>\n    <dict>",
+        ))
+        .stdout(predicate::str::contains("<array>").count(1)); // only ProgramArguments' array
+}
+
+/// A pathologically-expanding cron (two simultaneously multi-valued fields)
+/// is rejected with a clear error rather than silently emitting a huge
+/// plist.
+#[test]
+fn pathological_cron_expansion_rejected() {
+    let v = write_skill_vault("schedule:\n  - cron: \"*/1 */1 * * *\"\n    skill: /daily\n");
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("exceeding the cap"));
+}
