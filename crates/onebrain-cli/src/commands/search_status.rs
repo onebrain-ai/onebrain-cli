@@ -17,7 +17,7 @@ use onebrain_core::path::ResolvedVault;
 use serde::Serialize;
 
 use crate::commands::search_common::{
-    collection_cache_dir, collection_for, index_size_bytes, is_indexed, read_reindex_progress,
+    collection_cache_dir, collection_for, index_size_bytes, read_reindex_progress,
     resolve_collection, ReindexLiveProgress,
 };
 use crate::output::{emit, item, section, Envelope, OutputMode};
@@ -87,11 +87,16 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
 /// caller, e.g. via [`resolve_collection`] or [`collection_for`]) so callers
 /// that already have it don't re-derive it.
 ///
-/// Order matters here: the on-disk cache stats (`indexed`, model/index sizes)
-/// are read from the filesystem *before* the engine is opened, because
-/// `Engine::open` creates the cache dir as a side effect — checking
-/// `is_indexed` afterwards would always see a freshly-created (but empty)
-/// dir and report `true` on a never-indexed vault.
+/// Order matters here: the on-disk model/index sizes are read from the
+/// filesystem *before* the engine is opened, because `Engine::open` creates
+/// the cache dir (with an empty index) as a side effect — reading
+/// `index_size_bytes` afterwards would count the freshly-created empty redb
+/// and report a non-zero index size on a never-indexed vault.
+///
+/// `indexed` is derived from the engine's `doc_count` (below), NOT from the
+/// cache dir's existence: an existing-but-empty dir — one left behind by a
+/// prior status probe's `Engine::open`, or a cache purged and recreated empty
+/// — must still report `indexed: false`.
 pub(crate) fn status_data(
     resolved: &ResolvedVault,
     collection: Option<String>,
@@ -100,21 +105,19 @@ pub(crate) fn status_data(
 
     // Cache dir + on-disk model stats + index size (pure fs reads — never a
     // download). Must run before the engine is opened (see doc comment).
-    let (cache_dir, indexed, model_size_bytes, model_downloaded_at, index_size_bytes) =
-        match &collection {
-            Some(c) => {
-                let dir = collection_cache_dir(c);
-                let indexed = is_indexed(&dir);
-                let (size, downloaded) =
-                    match active_model_dir_stats(&dir, &config.search.embed_model) {
-                        Some((size, mtime)) => (Some(size), mtime),
-                        None => (None, None),
-                    };
-                let idx_size = index_size_bytes(&dir);
-                (Some(dir), indexed, size, downloaded, idx_size)
-            }
-            None => (None, false, None, None, None),
-        };
+    let (cache_dir, model_size_bytes, model_downloaded_at, index_size_bytes) = match &collection {
+        Some(c) => {
+            let dir = collection_cache_dir(c);
+            let (size, downloaded) = match active_model_dir_stats(&dir, &config.search.embed_model)
+            {
+                Some((size, mtime)) => (Some(size), mtime),
+                None => (None, None),
+            };
+            let idx_size = index_size_bytes(&dir);
+            (Some(dir), size, downloaded, idx_size)
+        }
+        None => (None, None, None, None),
+    };
     let reindexing = cache_dir.as_deref().and_then(read_reindex_progress);
     let cache_size_bytes = cache_dir
         .as_deref()
@@ -154,7 +157,7 @@ pub(crate) fn status_data(
         collection,
         embed_model: config.search.embed_model,
         cache_dir,
-        indexed,
+        indexed: doc_count > 0,
         model_size_bytes,
         model_downloaded_at,
         last_indexed_at,

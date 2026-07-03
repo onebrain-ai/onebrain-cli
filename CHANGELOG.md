@@ -16,6 +16,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Existing state migrates automatically and transparently** on the next command: a one-time same-volume rename of `<cache>/onebrain/search` → `<data>/onebrain/search` (atomic, instant, no re-download / re-embed). Best-effort — a failure warns on stderr but never aborts, leaving the old data for manual recovery.
 - **Only the `search/` subtree moves**; the disposable `latest-release.json` update-check cache stays in the cache dir by design.
 - **`doctor` now flags a purge:** an already-configured collection with a missing index reports "search cache may have been removed by OS storage cleanup — `onebrain search reindex`" instead of the neutral "no index yet."
+- **`search status` no longer reports `indexed: true` on an empty index.** `indexed` now derives from the actual doc count (`doc_count > 0`) rather than mere cache-dir existence — so a dir left behind by a prior status probe's `Engine::open` (or a purged-then-recreated cache) correctly reports `indexed: false`, and the CLI `search status` output now agrees with the MCP `status` tool.
 - See [ADR 0021](docs/decisions/0021-search-state-persistent-data-dir.md).
 
 ## [3.4.4] — 2026-07-03 — scheduler runs actually fire

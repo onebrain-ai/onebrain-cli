@@ -86,6 +86,68 @@ fn search_status_json_reports_collection_and_model_without_downloading() {
     }
 }
 
+/// Regression (v3.4.5): `indexed` must reflect whether docs are actually
+/// indexed (`doc_count > 0`), NOT merely whether the cache dir exists on disk.
+///
+/// `search status` opens the engine read-only, which CREATES the cache dir as
+/// a side effect. So a *second* `status` on a never-indexed vault used to see
+/// the dir left behind by the first run and flip `indexed` false → true, while
+/// `doc_count` stayed 0 and `last_indexed_at` stayed null — an incoherent
+/// "indexed but empty" report (the same false-positive a purged-then-recreated
+/// cache dir produces).
+#[test]
+fn search_status_indexed_stays_false_until_docs_are_indexed() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+    write(
+        vault.path(),
+        "note.md",
+        "---\ntitle: N\n---\nalpha bravo charlie.\n",
+    );
+
+    // Run 1: cache dir absent → engine.open creates it as a side effect.
+    let out1 = onebrain(vault.path(), cache.path())
+        .args(["search", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        out1.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    let v1: serde_json::Value = serde_json::from_slice(&out1.stdout).unwrap();
+    assert_eq!(v1["data"]["indexed"], false, "run 1 data: {}", v1["data"]);
+
+    // Run 2: cache dir now exists (from run 1) but still holds zero docs.
+    // `indexed` must stay false — nothing was ever indexed.
+    let out2 = onebrain(vault.path(), cache.path())
+        .args(["search", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        out2.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    let v2: serde_json::Value = serde_json::from_slice(&out2.stdout).unwrap();
+    assert_eq!(v2["data"]["doc_count"], 0, "run 2 data: {}", v2["data"]);
+    assert!(
+        v2["data"]["last_indexed_at"].is_null(),
+        "run 2 data: {}",
+        v2["data"]
+    );
+    assert_eq!(
+        v2["data"]["indexed"], false,
+        "indexed must stay false when doc_count is 0 (dir exists but empty): {}",
+        v2["data"]
+    );
+}
+
 #[test]
 fn search_status_autogenerates_and_persists_collection_when_unset() {
     // A vault with no `search.collection` and no legacy `qmd_collection`:
