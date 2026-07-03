@@ -108,7 +108,11 @@ fn rrf_fuse(ranked: Vec<(f64, Vec<Hit>)>) -> Vec<(f64, Hit)> {
         }
     }
     let mut out: Vec<_> = acc.into_values().collect();
-    out.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.chunk_id.cmp(&b.1.chunk_id))
+    });
     if let Some(max) = out.first().map(|(s, _)| *s).filter(|s| *s > 0.0) {
         for (s, _) in &mut out {
             *s /= max;
@@ -332,13 +336,32 @@ mod tests {
 
     #[test]
     fn rrf_fuse_dedupes_by_chunk_id_accumulating_score() {
-        let fused = rrf_fuse(vec![(1.0, vec![hit("x"), hit("y")]), (1.0, vec![hit("x")])]);
+        // x: weight 2.0 at rank 0 (2/61) + weight 1.0 at rank 1 (1/62) = 0.048921
+        // y: weight 1.0 at rank 0 (1/61)                              = 0.016393
+        // normalized: x = 1.0, y = 0.016393 / 0.048921 = 0.33510
+        // A last-write-wins bug would instead leave x = 1/62 and flip the ranking.
+        let fused = rrf_fuse(vec![(2.0, vec![hit("x")]), (1.0, vec![hit("y"), hit("x")])]);
         assert_eq!(fused.len(), 2);
-        assert_eq!(fused[0].1.chunk_id, "x"); // appears in both lists → highest
+        assert_eq!(fused[0].1.chunk_id, "x");
+        assert!((fused[0].0 - 1.0).abs() < 1e-9);
+        assert!(
+            (fused[1].0 - 0.33510).abs() < 1e-4,
+            "y normalized score was {}",
+            fused[1].0
+        );
     }
 
     #[test]
     fn rrf_fuse_empty_input_is_empty() {
         assert!(rrf_fuse(vec![]).is_empty());
+    }
+
+    #[test]
+    fn rrf_fuse_breaks_score_ties_by_chunk_id() {
+        // Two hits that only ever appear at the same weight and rank in
+        // separate lists → identical RRF scores; order must be deterministic.
+        let fused = rrf_fuse(vec![(1.0, vec![hit("b")]), (1.0, vec![hit("a")])]);
+        assert_eq!(fused[0].1.chunk_id, "a");
+        assert_eq!(fused[1].1.chunk_id, "b");
     }
 }
