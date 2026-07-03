@@ -233,6 +233,10 @@ pub struct QueryParams {
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct QueryOut {
     pub results: Vec<QueryHit>,
+    /// Set when there's no search index yet (e.g. never reindexed) instead of
+    /// erroring — lets the calling agent degrade to filesystem search.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -282,6 +286,19 @@ fn rrf_fuse(ranked: Vec<(f64, Vec<Hit>)>) -> Vec<(f64, Hit)> {
         }
     }
     out
+}
+
+/// The `tantivy/` lexical index dir exists under a collection cache dir.
+/// Pure fs — the cheapest "is there an index to search?" probe.
+fn tantivy_index_present(cache_dir: &Path) -> bool {
+    cache_dir.join("tantivy").is_dir()
+}
+
+/// Agent-facing note returned by `query` when the vault has no index yet, so
+/// the caller degrades to filesystem search instead of treating it as an error.
+fn no_index_note() -> String {
+    "No search index for this vault yet — run `onebrain search reindex`, or fall back to filesystem search (grep/Read)."
+        .to_string()
 }
 
 /// Run a single lex sub-query. Reuses `run_lex`'s exact engine call
@@ -427,6 +444,15 @@ impl McpServer {
             .iter()
             .any(|s| matches!(s.r#type, SubQueryType::Lex));
 
+        let collection = collection_for(&self.resolved).map_err(internal)?;
+        let cache_dir = collection_cache_dir(&collection);
+        if !tantivy_index_present(&cache_dir) {
+            return Ok(Json(QueryOut {
+                results: vec![],
+                note: Some(no_index_note()),
+            }));
+        }
+
         let resolved = self.resolved.clone();
         let ranked: Vec<(f64, Vec<Hit>)> = self
             .with_engine(move |eng| {
@@ -456,7 +482,10 @@ impl McpServer {
             })
             .collect();
 
-        Ok(Json(QueryOut { results }))
+        Ok(Json(QueryOut {
+            results,
+            note: None,
+        }))
     }
 
     #[tool(
@@ -864,5 +893,28 @@ mod tests {
         std::fs::write(dir.path().join("real.md"), "z").unwrap();
         let out = expand_multi_get_pattern(dir.path(), "nomatch-*.md").unwrap();
         assert!(out.is_empty(), "no-match glob must return empty vec");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // No-index fallback signal for the `query` tool.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn no_index_note_mentions_reindex_and_fallback() {
+        let n = no_index_note();
+        assert!(n.contains("onebrain search reindex"), "{n}");
+        assert!(
+            n.to_lowercase().contains("fall back") || n.to_lowercase().contains("filesystem"),
+            "{n}"
+        );
+    }
+
+    #[test]
+    fn index_present_false_when_tantivy_dir_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        // A cache dir with no `tantivy/` subdir → no index.
+        assert!(!tantivy_index_present(dir.path()));
+        std::fs::create_dir_all(dir.path().join("tantivy")).unwrap();
+        assert!(tantivy_index_present(dir.path()));
     }
 }
