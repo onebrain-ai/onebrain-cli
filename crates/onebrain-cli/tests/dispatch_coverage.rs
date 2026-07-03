@@ -165,8 +165,9 @@ fn vault_required_stubs_exit_72_inside_64_outside() {
         // qmd (vault-required stubs)
         &["qmd", "setup"],
         &["qmd", "search", "my query"],
-        // schedule (vault-required stubs)
-        &["schedule", "list"],
+        // schedule (vault-required stubs) — `list` is wired to the real
+        // status path (see `schedule_list_...` tests below), so it is no
+        // longer a stub.
         &["schedule", "add", "daily"],
         &["schedule", "remove", "daily"],
         &["schedule", "status"],
@@ -311,6 +312,41 @@ fn schedule_register_dry_run_exits_0_inside_vault() {
     assert_eq!(
         code, 0,
         "schedule register --dry-run inside vault should exit 0"
+    );
+}
+
+/// `schedule list` (#116 bug 3) is wired to the same status path as
+/// `schedule register --status` — it must exit 0 inside a vault and print
+/// the schedule summary, not fall through to the not-implemented stub.
+#[test]
+fn schedule_list_exits_0_and_prints_schedule_inside_vault() {
+    let vault = vault_dir();
+    std::fs::write(
+        vault.path().join("onebrain.yml"),
+        "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n",
+    )
+    .unwrap();
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env_remove("ONEBRAIN_VAULT")
+        .args(["schedule", "list"])
+        .output()
+        .expect("spawn failed");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "schedule list inside vault should exit 0. stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Registered schedules: 1"),
+        "expected schedule summary in stdout, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("[cron]"),
+        "expected [cron] tag in stdout, got: {stdout}"
     );
 }
 

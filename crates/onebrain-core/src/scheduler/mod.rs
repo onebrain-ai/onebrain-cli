@@ -22,7 +22,8 @@ pub mod log_paths;
 pub mod types;
 
 pub use cron_parse::{
-    at_to_launchd, cron_fields_to_launchd, validate_at, validate_cron, AtFields, CronFields,
+    at_to_launchd, cron_fields_to_launchd, cron_fields_to_launchd_expanded, validate_at,
+    validate_cron, AtFields, CronFieldSet, CronFields,
 };
 pub use entry::{is_command_mode, is_one_shot, is_skill_mode, validate_entry};
 pub use error::SchedulerError;

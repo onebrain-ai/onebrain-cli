@@ -7,7 +7,7 @@
 //! contract. The escape helper [`xml_escape`] mirrors Bun's exact
 //! `.replace(/&/g, '&amp;')...` chain.
 
-use crate::scheduler::cron_parse::{at_to_launchd, cron_fields_to_launchd};
+use crate::scheduler::cron_parse::{at_to_launchd, cron_fields_to_launchd_expanded, CronFields};
 use crate::scheduler::entry::{is_command_mode, is_one_shot};
 use crate::scheduler::types::{Args, ScheduleEntry};
 use std::path::{Path, PathBuf};
@@ -47,25 +47,65 @@ pub fn xml_escape(s: &str) -> String {
 ///
 /// Command-mode label uses the basename of `entry.command` so
 /// `command: onebrain` and `command: /opt/homebrew/bin/onebrain` produce
-/// the same plist file path (the collision detector relies on this).
-/// Skill-mode strips the leading `/`. Non-`[a-zA-Z0-9-]` chars become `-`.
+/// the same plist file path when everything else about the entry matches
+/// (the collision detector relies on this: same binary, different
+/// spelling, is intentionally one label).
+///
+/// Two `command:` entries invoking the *same* binary with *different* args
+/// or cron/at expressions are distinct schedules and must NOT collapse to
+/// one plist — see #116 bug 2. We append a short discriminator derived
+/// from the entry's args (preferred) or, if args are absent/empty, from
+/// its cron/at expression, so they land on different plist paths. If
+/// command + args + cron/at are all identical, the discriminator is also
+/// identical and the entries correctly collapse to one label (a genuine
+/// duplicate, still caught by `detect_collisions`).
+///
+/// Skill-mode strips the leading `/` and is left unchanged (`com.onebrain.daily`
+/// etc.) — this discriminator only applies to command mode.
+///
+/// Note: a skill-mode label and a command-mode label are never derived from
+/// the same input space in a way that could collide in practice — a skill
+/// name always starts as a real `SKILL.md` directory name under
+/// `.claude/plugins/onebrain/skills/`, validated by `validate_schedulable`
+/// before registration, whereas a command-mode label is a binary basename
+/// plus an args/cron discriminator suffix. `detect_collisions` still checks
+/// the final plist PATH regardless of mode, so even a hypothetical
+/// literal-string collision between the two would be caught there, not
+/// silently accepted.
 pub fn label_for_entry(entry: &ScheduleEntry) -> String {
-    let raw = if is_command_mode(entry) {
+    if is_command_mode(entry) {
         let cmd = entry.command.as_deref().unwrap_or("");
-        Path::new(cmd)
+        let basename = Path::new(cmd)
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or(cmd)
-            .to_string()
+            .unwrap_or(cmd);
+        match command_discriminator(entry) {
+            Some(disc) => sanitize_label(&format!("{basename}-{disc}")),
+            None => sanitize_label(basename),
+        }
     } else {
-        entry
-            .skill
-            .as_deref()
-            .unwrap_or("")
-            .trim_start_matches('/')
-            .to_string()
+        let raw = entry.skill.as_deref().unwrap_or("").trim_start_matches('/');
+        sanitize_label(raw)
+    }
+}
+
+/// Derive a short label discriminator for a command-mode entry from its
+/// args (preferred, since args are the more common source of distinction
+/// between two entries sharing a binary — e.g. `rsync -av src dst` vs
+/// `rsync -av other-src other-dst`) or, when args are absent/empty, from
+/// its schedule expression (cron or at). Returns `None` when neither is
+/// present (nothing to discriminate on — label falls back to the bare
+/// basename, matching the pre-#116 behavior for the common single-entry
+/// case).
+fn command_discriminator(entry: &ScheduleEntry) -> Option<String> {
+    let from_args = match &entry.args {
+        Some(Args::List(argv)) if !argv.is_empty() => Some(argv.join("-")),
+        _ => None,
     };
-    sanitize_label(&raw)
+    let raw = from_args.or_else(|| entry.cron.clone().or_else(|| entry.at.clone()))?;
+    const MAX_LEN: usize = 40;
+    let truncated: String = raw.chars().take(MAX_LEN).collect();
+    Some(sanitize_label(&truncated))
 }
 
 fn sanitize_label(raw: &str) -> String {
@@ -195,13 +235,60 @@ fn one_shot_command_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &s
     )
 }
 
-/// Build the `<StartCalendarInterval>` body — cron emits any non-wildcard
-/// fields in (Minute, Hour, Day, Month, Weekday) insertion order; one-shot
-/// emits all five (Year, Month, Day, Hour, Minute).
+/// Format one `CronFields` combination's non-wildcard keys, in (Minute,
+/// Hour, Day, Month, Weekday) insertion order, indented as the contents of
+/// a single `<dict>`.
+fn single_combination_dict_body(f: &CronFields) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(m) = f.minute {
+        parts.push(format!(
+            "        <key>Minute</key>\n        <integer>{m}</integer>"
+        ));
+    }
+    if let Some(h) = f.hour {
+        parts.push(format!(
+            "        <key>Hour</key>\n        <integer>{h}</integer>"
+        ));
+    }
+    if let Some(d) = f.day {
+        parts.push(format!(
+            "        <key>Day</key>\n        <integer>{d}</integer>"
+        ));
+    }
+    if let Some(mo) = f.month {
+        parts.push(format!(
+            "        <key>Month</key>\n        <integer>{mo}</integer>"
+        ));
+    }
+    if let Some(w) = f.weekday {
+        parts.push(format!(
+            "        <key>Weekday</key>\n        <integer>{w}</integer>"
+        ));
+    }
+    parts.join("\n")
+}
+
+/// Re-indent a block of lines by `indent` extra spaces (used to nest a
+/// `<dict>` body one level deeper inside `<array>...</array>`).
+fn indent_lines(body: &str, indent: &str) -> String {
+    body.lines()
+        .map(|line| format!("{indent}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Build the complete `<key>StartCalendarInterval</key>` block (key +
+/// value) — cron emits either a single `<dict>` (the common case: every
+/// field is a bare value or wildcard, byte-identical to the pre-#116
+/// shape) or an `<array>` of `<dict>`s (#116 bug 1: step/list/range fields
+/// that expand to more than one concrete combination — launchd ORs across
+/// array entries, which is exactly cron's "any of these values" semantics).
+/// One-shot entries always emit a single `<dict>` (a one-shot fires once —
+/// its Year/Month/Day/Hour/Minute are always fully concrete).
 fn calendar_block(entry: &ScheduleEntry) -> String {
     if is_one_shot(entry) {
         let f = at_to_launchd(entry.at.as_deref().unwrap());
-        format!(
+        let body = format!(
             "        <key>Year</key>\n\
              \x20       <integer>{}</integer>\n\
              \x20       <key>Month</key>\n\
@@ -213,36 +300,38 @@ fn calendar_block(entry: &ScheduleEntry) -> String {
              \x20       <key>Minute</key>\n\
              \x20       <integer>{}</integer>",
             f.year, f.month, f.day, f.hour, f.minute
-        )
+        );
+        format!("    <key>StartCalendarInterval</key>\n    <dict>\n{body}\n    </dict>")
     } else {
-        let f = cron_fields_to_launchd(entry.cron.as_deref().unwrap());
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(m) = f.minute {
-            parts.push(format!(
-                "        <key>Minute</key>\n        <integer>{m}</integer>"
-            ));
+        let set = cron_fields_to_launchd_expanded(entry.cron.as_deref().unwrap());
+        let combos = set
+            .combinations()
+            .expect("validate_cron failed to gate the StartCalendarInterval combination cap");
+        if combos.len() <= 1 {
+            // Single combination — identical shape to the pre-#116 plist
+            // (byte-parity snapshot depends on this staying a plain
+            // `<dict>`, not a one-element `<array>`).
+            let body = combos
+                .first()
+                .map(single_combination_dict_body)
+                .unwrap_or_default();
+            format!("    <key>StartCalendarInterval</key>\n    <dict>\n{body}\n    </dict>")
+        } else {
+            let dicts: Vec<String> = combos
+                .iter()
+                .map(|f| {
+                    let body = single_combination_dict_body(f);
+                    format!(
+                        "        <dict>\n{}\n        </dict>",
+                        indent_lines(&body, "    ")
+                    )
+                })
+                .collect();
+            format!(
+                "    <key>StartCalendarInterval</key>\n    <array>\n{}\n    </array>",
+                dicts.join("\n")
+            )
         }
-        if let Some(h) = f.hour {
-            parts.push(format!(
-                "        <key>Hour</key>\n        <integer>{h}</integer>"
-            ));
-        }
-        if let Some(d) = f.day {
-            parts.push(format!(
-                "        <key>Day</key>\n        <integer>{d}</integer>"
-            ));
-        }
-        if let Some(mo) = f.month {
-            parts.push(format!(
-                "        <key>Month</key>\n        <integer>{mo}</integer>"
-            ));
-        }
-        if let Some(w) = f.weekday {
-            parts.push(format!(
-                "        <key>Weekday</key>\n        <integer>{w}</integer>"
-            ));
-        }
-        parts.join("\n")
     }
 }
 
@@ -272,10 +361,7 @@ pub fn generate_plist(entry: &ScheduleEntry, ctx: &LaunchdContext) -> String {
          \x20   <array>\n\
          {}\n\
          \x20   </array>\n\
-         \x20   <key>StartCalendarInterval</key>\n\
-         \x20   <dict>\n\
          {}\n\
-         \x20   </dict>\n\
          \x20   <key>StandardOutPath</key>\n\
          \x20   <string>{}/onebrain-{}.stdout</string>\n\
          \x20   <key>StandardErrorPath</key>\n\
@@ -338,13 +424,15 @@ mod tests {
     }
 
     #[test]
-    fn label_for_command_uses_basename() {
+    fn label_for_command_uses_basename_plus_cron_discriminator() {
+        // No args → falls back to a cron-derived discriminator (#116 bug 2)
+        // so two `command:` entries on different schedules don't collide.
         let e = ScheduleEntry {
             cron: Some("0 3 * * 0".into()),
             command: Some("/opt/homebrew/bin/onebrain".into()),
             ..Default::default()
         };
-        assert_eq!(label_for_entry(&e), "onebrain");
+        assert_eq!(label_for_entry(&e), "onebrain-0-3-----0");
     }
 
     #[test]
@@ -491,6 +579,9 @@ mod tests {
 
     #[test]
     fn command_label_consistent_between_absolute_and_bare_form() {
+        // Same binary (bare vs absolute spelling), same args, same cron →
+        // same label. This is the "intentionally one label" case #116 bug 2
+        // must preserve: only *differing* args/cron should split the label.
         let bare = ScheduleEntry {
             cron: Some("0 3 * * 0".into()),
             command: Some("onebrain".into()),
@@ -505,8 +596,60 @@ mod tests {
         };
         let out_bare = generate_plist(&bare, &test_ctx());
         let out_abs = generate_plist(&abs, &test_ctx());
-        assert!(out_bare.contains("<string>com.onebrain.onebrain</string>"));
-        assert!(out_abs.contains("<string>com.onebrain.onebrain</string>"));
+        assert!(out_bare.contains("<string>com.onebrain.onebrain-qmd-reindex</string>"));
+        assert!(out_abs.contains("<string>com.onebrain.onebrain-qmd-reindex</string>"));
+    }
+
+    #[test]
+    fn command_label_differs_when_args_differ() {
+        // #116 bug 2: two `command: onebrain` entries with different args
+        // must land on DISTINCT plist labels (not silently collapse into a
+        // false collision).
+        let a = ScheduleEntry {
+            cron: Some("0 3 * * 0".into()),
+            command: Some("onebrain".into()),
+            args: Some(Args::List(vec!["qmd-reindex".into()])),
+            ..Default::default()
+        };
+        let b = ScheduleEntry {
+            cron: Some("0 3 * * 0".into()),
+            command: Some("onebrain".into()),
+            args: Some(Args::List(vec!["backup".into()])),
+            ..Default::default()
+        };
+        assert_ne!(label_for_entry(&a), label_for_entry(&b));
+    }
+
+    #[test]
+    fn command_label_differs_when_cron_differs_and_args_absent() {
+        // #116 bug 2: no args to discriminate on → fall back to the cron
+        // expression so two same-binary entries on different schedules
+        // still land on distinct labels.
+        let a = ScheduleEntry {
+            cron: Some("0 9 * * *".into()),
+            command: Some("/usr/local/bin/backup".into()),
+            ..Default::default()
+        };
+        let b = ScheduleEntry {
+            cron: Some("0 18 * * *".into()),
+            command: Some("/usr/local/bin/backup".into()),
+            ..Default::default()
+        };
+        assert_ne!(label_for_entry(&a), label_for_entry(&b));
+    }
+
+    #[test]
+    fn command_label_identical_when_command_args_cron_all_match() {
+        // Genuine duplicate: identical command + args + cron must still
+        // collapse to the same label so `detect_collisions` catches it.
+        let a = ScheduleEntry {
+            cron: Some("0 9 * * *".into()),
+            command: Some("/usr/local/bin/backup".into()),
+            args: Some(Args::List(vec!["--full".into()])),
+            ..Default::default()
+        };
+        let b = a.clone();
+        assert_eq!(label_for_entry(&a), label_for_entry(&b));
     }
 
     #[test]
@@ -520,7 +663,7 @@ mod tests {
         let out = generate_plist(&e, &test_ctx());
         assert!(out.contains("<string>/bin/sh</string>"));
         assert!(out.contains("&quot;/opt/homebrew/bin/onebrain&quot; &quot;qmd-reindex&quot;"));
-        assert!(out.contains("launchctl bootout gui/501/com.onebrain.onebrain"));
+        assert!(out.contains("launchctl bootout gui/501/com.onebrain.onebrain-qmd-reindex"));
         assert!(out.contains("rm -f"));
     }
 
@@ -566,5 +709,95 @@ mod tests {
     fn generate_plist_snapshot_recurring_skill() {
         let out = generate_plist(&skill_entry("/daily", "0 9 * * *"), &test_ctx());
         insta::assert_snapshot!(out);
+    }
+
+    // ── #116 bug 1: step/list/range → array-form StartCalendarInterval ────────
+
+    #[test]
+    fn calendar_block_single_combination_stays_plain_dict() {
+        // A bare-value/wildcard cron (the common case) must still produce
+        // a single `<dict>`, not a one-element `<array>` — byte parity
+        // with the existing snapshot depends on this.
+        let out = generate_plist(&skill_entry("/daily", "0 9 * * *"), &test_ctx());
+        assert!(out.contains("<key>StartCalendarInterval</key>\n    <dict>"));
+        assert!(!out.contains("<key>StartCalendarInterval</key>\n    <array>"));
+    }
+
+    #[test]
+    fn calendar_block_step_hour_emits_array_of_dicts() {
+        // `*/2` on hour → 12 combinations → array form, one <dict> per hour.
+        let out = generate_plist(&skill_entry("/daily", "0 */2 * * *"), &test_ctx());
+        assert!(out.contains("<key>StartCalendarInterval</key>\n    <array>"));
+        assert!(out.contains("<key>Hour</key>\n            <integer>0</integer>"));
+        assert!(out.contains("<key>Hour</key>\n            <integer>22</integer>"));
+        // Every combination keeps Minute fixed at 0.
+        let minute_count = out
+            .matches("<key>Minute</key>\n            <integer>0</integer>")
+            .count();
+        assert_eq!(
+            minute_count, 12,
+            "expected 12 Minute keys (one per hour dict), out:\n{out}"
+        );
+    }
+
+    #[test]
+    fn calendar_block_list_weekday_emits_one_dict_per_value() {
+        let out = generate_plist(&skill_entry("/daily", "0 9 * * 1,3,5"), &test_ctx());
+        assert!(out.contains("<key>StartCalendarInterval</key>\n    <array>"));
+        assert!(out.contains("<key>Weekday</key>\n            <integer>1</integer>"));
+        assert!(out.contains("<key>Weekday</key>\n            <integer>3</integer>"));
+        assert!(out.contains("<key>Weekday</key>\n            <integer>5</integer>"));
+        let dict_count = out.matches("<dict>").count();
+        // 1 top-level <dict> (the plist root) + 3 StartCalendarInterval dicts.
+        assert_eq!(dict_count, 4, "out:\n{out}");
+    }
+
+    #[test]
+    fn calendar_block_weekday_seven_emits_zero() {
+        // Standard cron 7 = Sunday, but launchd's `Weekday` key only
+        // understands 0-6 — must be normalized before it reaches the plist.
+        let out = generate_plist(&skill_entry("/daily", "0 9 * * 7"), &test_ctx());
+        assert!(out.contains("<key>Weekday</key>\n        <integer>0</integer>"));
+        // Single value → stays plain <dict>, not <array>.
+        assert!(out.contains("<key>StartCalendarInterval</key>\n    <dict>"));
+    }
+
+    #[test]
+    fn calendar_block_range_weekday_emits_inclusive_dicts() {
+        let out = generate_plist(&skill_entry("/daily", "0 9 * * 1-5"), &test_ctx());
+        for w in 1..=5 {
+            assert!(
+                out.contains(&format!(
+                    "<key>Weekday</key>\n            <integer>{w}</integer>"
+                )),
+                "missing weekday {w}, out:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_plist_snapshot_recurring_skill_array_form() {
+        // New insta snapshot (#116 bug 1) covering the multi-value array
+        // shape — distinct from the single-`<dict>` snapshot above.
+        let out = generate_plist(&skill_entry("/daily", "0 */6 * * *"), &test_ctx());
+        insta::assert_snapshot!(out);
+    }
+
+    // ── DOM/DOW: day-only restricted still works (weekday-only already
+    // covered above by `calendar_block_list_weekday_emits_one_dict_per_value`
+    // and `calendar_block_range_weekday_emits_inclusive_dicts`). The
+    // both-restricted case is rejected upstream by
+    // `cron_parse::validate_cron` — `generate_plist`/`calendar_block` assume
+    // pre-validated input (see their doc comments), so a both-restricted
+    // cron string never reaches this module in practice. ─────────────────
+
+    #[test]
+    fn calendar_block_day_only_restricted_emits_array_of_day_dicts() {
+        let out = generate_plist(&skill_entry("/daily", "0 9 1,15 * *"), &test_ctx());
+        assert!(out.contains("<key>StartCalendarInterval</key>\n    <array>"));
+        assert!(out.contains("<key>Day</key>\n            <integer>1</integer>"));
+        assert!(out.contains("<key>Day</key>\n            <integer>15</integer>"));
+        // No Weekday key at all — day-of-month is the only restricted field.
+        assert!(!out.contains("<key>Weekday</key>"));
     }
 }

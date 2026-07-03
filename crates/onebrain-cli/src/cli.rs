@@ -1176,8 +1176,7 @@ pub struct ScheduleCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum ScheduleVerb {
-    /// List scheduled skills (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
+    /// Show scheduled entries from `onebrain.yml` (or legacy `vault.yml`) with cron/at expression and installed status.
     List,
     /// Add a scheduled skill (not yet implemented · v3.x roadmap · edit `onebrain.yml` directly meanwhile).
     #[command(hide = true)]

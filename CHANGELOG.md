@@ -1,5 +1,5 @@
 ---
-latest_version: 3.4.2
+latest_version: 3.4.3
 released: 2026-07-03
 ---
 
@@ -9,6 +9,17 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.3] — 2026-07-03 — scheduler fixes + housekeeping
+
+- **Scheduler cron** now accepts step (`*/N`), list (`a,b,c`), and range (`a-b`) syntax per field (previously only a bare integer or `*`); multi-value fields are emitted as a launchd `StartCalendarInterval` array (#116).
+- **Scheduler command-mode plists** are now disambiguated by their args, so two `command:` entries for the same binary (e.g. two `onebrain` cron jobs) no longer collide on one plist path (#116). **Migration:** an already-registered command-mode entry gets a new plist filename; `onebrain schedule register` (or `--refresh`) now automatically unloads and removes the stale pre-#116 legacy-labeled plist as part of registering the new one, so re-running register is enough — no manual cleanup step needed. (The best-effort `launchctl bootout` may occasionally fail to unload an already-running job in unusual sandboxes; the stale plist file is still deleted in that case so it won't reload on next login, but the currently-loaded instance keeps running until the next logout/login cycle.)
+- **Scheduler cron `weekday`** now accepts the standard `0`-`7` range (both `0` and `7` mean Sunday, matching Vixie cron); `7` normalizes to `0` so `0,7` dedupes to a single combination instead of being wrongly rejected as out-of-range.
+- **Scheduler cron** now rejects a cron string that restricts BOTH day-of-month and day-of-week (neither is `*`), e.g. `0 9 1,15 * 1,5` — standard cron ORs the two fields, but launchd's `StartCalendarInterval` ANDs keys within one dict, so such an entry previously fired far less often than intended. Use two separate `schedule:` entries instead (no longer collide as of this release).
+- **Scheduler cron combination cap** raised from 366 to 1000, so the benign "every day of every month" idiom `0 0 1-31 1-12 *` (372 combinations) is accepted; the pathological `*/1 */1 * * *` (1440) is still rejected.
+- **`onebrain schedule list`** is implemented (was a "not implemented" stub) — reuses the existing status view (#116).
+- **CI** now runs the lex-only (`--no-default-features`) test suite, not just clippy, so the semantic-off code paths (MCP `query` degradation, `vsearch` unavailability) are actually exercised (#119).
+- **Polish (#120):** internal `SearchMcpServer` renamed to `McpServer`; `get` tool documents its out-of-range line clamping; added direct `status_data_for` + outside-a-vault `onebrain mcp` tests; `QueryParams` dead-code allowance tightened to per-field.
 
 ## [3.4.2] — 2026-07-03 — fix: weak server auth token on Windows
 

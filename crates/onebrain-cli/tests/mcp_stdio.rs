@@ -126,6 +126,68 @@ fn recv_response(
     }
 }
 
+/// `onebrain mcp` run with NO vault anywhere above `cwd` must fail fast with
+/// `E_VAULT_NOT_FOUND` (exit 64) — the SAME vault-resolution guard `open_engine`
+/// runs before doing anything else (see `commands/mcp.rs::run`, which calls
+/// `open_engine(vault_flag)` as its first statement). This must happen
+/// *before* any MCP handshake: the server never even reaches `serve(stdio())`,
+/// so no JSON-RPC frame is ever written to stdout. Mirrors the
+/// `serve_without_vault_exits_64` pattern in `dispatch_coverage.rs` (another
+/// long-running-server command with the identical early vault-resolve guard).
+#[test]
+fn mcp_without_vault_exits_64_before_any_handshake() {
+    let neutral = tempdir().unwrap(); // no onebrain.yml anywhere above
+    let cache = tempdir().unwrap();
+
+    let mut child = KillOnDrop(
+        onebrain_mcp(neutral.path(), cache.path())
+            .spawn()
+            .expect("spawn onebrain mcp"),
+    );
+
+    // Close stdin immediately — if the process somehow did reach the MCP
+    // stdio loop, EOF would make it exit cleanly (0) rather than hang; this
+    // keeps the test bounded even if the vault guard were ever removed.
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+    {
+        use std::io::Read;
+        drop(child.0.stdin.take());
+        child
+            .0
+            .stdout
+            .take()
+            .expect("child stdout")
+            .read_to_end(&mut stdout_buf)
+            .expect("read stdout");
+        child
+            .0
+            .stderr
+            .take()
+            .expect("child stderr")
+            .read_to_end(&mut stderr_buf)
+            .expect("read stderr");
+    }
+    let status = child.0.wait().expect("wait for onebrain mcp to exit");
+
+    assert_eq!(
+        status.code(),
+        Some(64),
+        "onebrain mcp outside a vault should exit 64 (E_VAULT_NOT_FOUND) before any MCP handshake, got status {:?}, stderr: {}",
+        status,
+        String::from_utf8_lossy(&stderr_buf)
+    );
+
+    // No MCP handshake ever started: stdout must not contain a JSON-RPC frame
+    // (e.g. an `initialize` response's `serverInfo`) — the vault check must
+    // fire before `serve(stdio())` is ever reached.
+    let stdout = String::from_utf8_lossy(&stdout_buf);
+    assert!(
+        !stdout.contains("jsonrpc") && !stdout.contains("serverInfo"),
+        "no JSON-RPC frame should ever be written outside a vault: stdout: {stdout}"
+    );
+}
+
 #[test]
 fn stdio_jsonrpc_handshake_tools_list_and_status_then_clean_exit() {
     let vault = tempdir().unwrap();

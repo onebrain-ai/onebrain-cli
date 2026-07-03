@@ -130,13 +130,18 @@ fn resume_clears_paused_marker_file() {
     assert!(!marker.exists(), "paused marker should be cleared");
 }
 
-/// Skill+command collision (same basename) is rejected with the verbatim
-/// Bun error string.
+/// Prior to #116 bug 2, a command-mode label was the binary basename alone,
+/// so a skill `/echo` and a command `/bin/echo` on different schedules
+/// collided on the same plist path (`com.onebrain.echo`) even though they
+/// were entirely unrelated entries. Command-mode labels now always carry an
+/// args- or cron-derived discriminator (every valid entry has a cron/at),
+/// so this basename-only false-positive collision no longer happens — the
+/// two entries register cleanly onto distinct plist paths.
 ///
 /// Unix-only: relies on `/bin/echo` existing.
 #[cfg(unix)]
 #[test]
-fn collision_skill_and_command_with_same_basename_fails() {
+fn skill_and_command_with_same_basename_no_longer_collide() {
     let v = tempdir().unwrap();
     write_skill(v.path(), "echo", "name: echo\nschedulable: true");
     std::fs::write(
@@ -144,6 +149,58 @@ fn collision_skill_and_command_with_same_basename_fails() {
         "schedule:\n  \
          - cron: \"0 9 * * *\"\n    skill: /echo\n  \
          - cron: \"0 3 * * 0\"\n    command: /bin/echo\n",
+    )
+    .unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("com.onebrain.echo"))
+        .stdout(predicate::str::contains("com.onebrain.echo-0-3-----0"));
+}
+
+/// Two `command:` entries sharing a binary basename but with different args
+/// must land on distinct plist paths (#116 bug 2 core regression test).
+///
+/// Unix-only: relies on `/bin/echo` existing.
+#[cfg(unix)]
+#[test]
+fn command_mode_entries_same_binary_different_args_no_collision() {
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("vault.yml"),
+        "schedule:\n  \
+         - cron: \"0 9 * * *\"\n    command: /bin/echo\n    args:\n      - hello\n  \
+         - cron: \"0 9 * * *\"\n    command: /bin/echo\n    args:\n      - world\n",
+    )
+    .unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("com.onebrain.echo-hello"))
+        .stdout(predicate::str::contains("com.onebrain.echo-world"));
+}
+
+/// Two `command:` entries with IDENTICAL command + args + cron are a
+/// genuine duplicate and must still be rejected as a collision.
+///
+/// Unix-only: relies on `/bin/echo` existing.
+#[cfg(unix)]
+#[test]
+fn command_mode_entries_fully_identical_still_collide() {
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("vault.yml"),
+        "schedule:\n  \
+         - cron: \"0 9 * * *\"\n    command: /bin/echo\n    args:\n      - hello\n  \
+         - cron: \"0 9 * * *\"\n    command: /bin/echo\n    args:\n      - hello\n",
     )
     .unwrap();
     Command::cargo_bin("onebrain")
@@ -199,6 +256,54 @@ fn unschedulable_skill_rejected() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("requires user input"));
+}
+
+/// #116 bug 2 fix (this release): a command-mode entry registered under the
+/// OLD basename-only label scheme leaves a stale plist on disk once the
+/// entry starts carrying an args/cron discriminator. Registering again must
+/// remove the stale legacy-labeled plist file so the user doesn't end up
+/// with both the old and new jobs loaded.
+///
+/// Unix-only: relies on `/bin/echo` existing and writes to a tempdir HOME.
+#[cfg(unix)]
+#[test]
+fn stale_legacy_plist_removed_on_reregister() {
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("vault.yml"),
+        "schedule:\n  - cron: \"0 3 * * 0\"\n    command: /bin/echo\n    args:\n      - hello\n",
+    )
+    .unwrap();
+    let home = tempdir().unwrap();
+    let agents_dir = home.path().join("Library/LaunchAgents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+
+    // Simulate a pre-#116 registration: a plist at the OLD basename-only
+    // label (no discriminator) — this is what `onebrain register-schedule`
+    // would have written before the args discriminator existed.
+    let legacy_plist = agents_dir.join("com.onebrain.echo.plist");
+    std::fs::write(&legacy_plist, "<!-- stale pre-#116 plist -->").unwrap();
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule"])
+        .current_dir(v.path())
+        .env("HOME", home.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Removed stale legacy plist"));
+
+    assert!(
+        !legacy_plist.exists(),
+        "stale legacy plist must be removed on re-register"
+    );
+    // The new discriminator-bearing plist must exist alongside the cleanup.
+    let new_plist = agents_dir.join("com.onebrain.echo-hello.plist");
+    assert!(
+        new_plist.exists(),
+        "expected new plist at {}",
+        new_plist.display()
+    );
 }
 
 /// One-shot args containing shell-special chars are rejected.
@@ -563,4 +668,89 @@ fn status_marks_installed_and_uninstalled() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\u{2713}"));
+}
+
+// ── #116 bug 1: cron step/list/range end-to-end ────────────────────────────
+
+/// A `*/N` step cron expression is accepted end-to-end and emits an
+/// array-form `StartCalendarInterval` in the dry-run plist output.
+#[test]
+fn step_cron_dry_run_emits_array_form_calendar_interval() {
+    let v = write_skill_vault("schedule:\n  - cron: \"0 */6 * * *\"\n    skill: /daily\n");
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<key>StartCalendarInterval</key>"))
+        .stdout(predicate::str::contains("<array>"))
+        .stdout(predicate::str::contains("<integer>0</integer>"))
+        .stdout(predicate::str::contains("<integer>6</integer>"))
+        .stdout(predicate::str::contains("<integer>12</integer>"))
+        .stdout(predicate::str::contains("<integer>18</integer>"));
+}
+
+/// A list (`1,3,5`) cron expression is accepted end-to-end.
+#[test]
+fn list_cron_dry_run_succeeds() {
+    let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * 1,3,5\"\n    skill: /daily\n");
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<array>"));
+}
+
+/// A range (`1-5`) cron expression is accepted end-to-end.
+#[test]
+fn range_cron_dry_run_succeeds() {
+    let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * 1-5\"\n    skill: /daily\n");
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<array>"));
+}
+
+/// A single-value cron expression (the common case) still emits the plain
+/// single-`<dict>` calendar interval form, not an array — byte-parity
+/// regression guard at the CLI-integration layer.
+#[test]
+fn plain_cron_dry_run_still_emits_single_dict_form() {
+    let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n");
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "<key>StartCalendarInterval</key>\n    <dict>",
+        ))
+        .stdout(predicate::str::contains("<array>").count(1)); // only ProgramArguments' array
+}
+
+/// A pathologically-expanding cron (two simultaneously multi-valued fields)
+/// is rejected with a clear error rather than silently emitting a huge
+/// plist.
+#[test]
+fn pathological_cron_expansion_rejected() {
+    let v = write_skill_vault("schedule:\n  - cron: \"*/1 */1 * * *\"\n    skill: /daily\n");
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("exceeding the cap"));
 }
