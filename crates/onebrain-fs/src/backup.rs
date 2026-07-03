@@ -168,6 +168,42 @@ pub fn persist_search_key(vault_root: &Path, key: &str, value: &str) -> anyhow::
     atomic_write_text(&path, &serialized).with_context(|| format!("writing {}", path.display()))
 }
 
+/// Remove a single `search.<key>` from the vault's config, preserving every
+/// other key. No-op (returns `Ok(())` without touching the file) when the
+/// config is missing, has no `search` mapping, or doesn't contain `key`. Backs
+/// the file up before any real write, exactly like `persist_search_key`.
+pub fn remove_search_key(vault_root: &Path, key: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use onebrain_core::{find_config_file, CONFIG_FILENAME};
+
+    let path = find_config_file(vault_root).unwrap_or_else(|| vault_root.join(CONFIG_FILENAME));
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut yaml: serde_yaml::Value =
+        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let Some(search) = yaml
+        .as_mapping_mut()
+        .and_then(|m| m.get_mut(serde_yaml::Value::String("search".to_string())))
+        .and_then(|v| v.as_mapping_mut())
+    else {
+        return Ok(());
+    };
+    if search
+        .remove(serde_yaml::Value::String(key.to_string()))
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    let serialized = serde_yaml::to_string(&yaml).context("serializing updated config")?;
+    backup_config_file(&path)
+        .with_context(|| format!("backing up {} before write", path.display()))?;
+    atomic_write_text(&path, &serialized).with_context(|| format!("writing {}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,5 +410,34 @@ mod tests {
         let nested = d.path().join("deep/nested/file.yml");
         atomic_write_text(&nested, "content").unwrap();
         assert_eq!(std::fs::read_to_string(&nested).unwrap(), "content");
+    }
+
+    #[test]
+    fn remove_search_key_removes_key_and_preserves_others() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "search:\n  collection: my-vault\n  embed_model: bge-m3\nfolders:\n  inbox: 00-inbox\n",
+        )
+        .unwrap();
+        remove_search_key(dir.path(), "embed_model").unwrap();
+        let yaml = std::fs::read_to_string(dir.path().join("onebrain.yml")).unwrap();
+        assert!(!yaml.contains("embed_model"), "key must be gone: {yaml}");
+        assert!(yaml.contains("collection: my-vault"), "{yaml}");
+        assert!(yaml.contains("inbox: 00-inbox"), "{yaml}");
+    }
+
+    #[test]
+    fn remove_search_key_is_noop_when_absent() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "search:\n  collection: my-vault\n",
+        )
+        .unwrap();
+        remove_search_key(dir.path(), "embed_model").unwrap();
+        remove_search_key(&dir.path().join("nope"), "embed_model").unwrap();
+        let yaml = std::fs::read_to_string(dir.path().join("onebrain.yml")).unwrap();
+        assert!(yaml.contains("collection: my-vault"), "{yaml}");
     }
 }
