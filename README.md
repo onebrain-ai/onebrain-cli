@@ -41,7 +41,7 @@ Point an AI agent at a vault and it improvises — a different pile of `grep` / 
 - **Yours to extend, no waiting** — add a capability the harness/LLM doesn't have yet and every agent can use it immediately; they only learn the command, not implement the feature.
 - **No re-deriving solved workflows** — search, capture, consolidate, checkpoint live in the binary, so the agent calls one command instead of re-reasoning the recipe each session. Fewer tokens, no drift.
 - **Deterministic & safe** — a typed command with a frozen `Envelope` can't half-finish or quietly differ like an ad-hoc `rm` / `sed` pipeline. Same input → same output, scriptable by hooks.
-- **Fast** — a ~5 MB binary returns in under 50 ms, skipping the latency of several tool calls for what's already one operation.
+- **Fast** — the binary returns in under 50 ms, skipping the latency of several tool calls for what's already one operation.
 - **Local-first** — your vault, your data, your AI memory; no cloud round-trip.
 - **Trustworthy install** — self-update verifies the binary's SHA-256 before swapping.
 
@@ -49,7 +49,7 @@ Point an AI agent at a vault and it improvises — a different pile of `grep` / 
 
 - **🔍 Built-in native search** — hybrid keyword + semantic search over your vault's Markdown, multilingual (Thai/CJK-aware keyword bigrams + ~100-language embeddings), zero external dependencies: no Node, no Python, no separate `qmd` install.
 - **🔌 Built-in MCP server** — `onebrain mcp` plugs OneBrain into Claude Code, Cursor, or any MCP client as a vault search engine; see [Use as a standalone vault-search MCP](#use-as-a-standalone-vault-search-mcp).
-- **Single static binary** — one ~5 MB file, no runtime to install, cross-platform down to a Raspberry Pi Zero.
+- **Single static binary** — one self-contained file, no runtime to install, cross-platform down to a Raspberry Pi Zero.
 - **Embedded web UI** — `onebrain serve` hosts a local, token-gated file explorer + reading view + search panel + agent chat, with nothing extra to install.
 - **Interactive model picker** — a TUI over 6 embedding models (see [Choosing an embedding model](docs/reference/onebrain-search.md#choosing-an-embedding-model)) to trade off speed, accuracy, and Thai support.
 - **Vault doctor + config migration** — eleven health checks with `--fix` recipes, plus automatic `onebrain.yml` schema migration.
@@ -69,7 +69,7 @@ brew install onebrain-ai/onebrain/onebrain
 
 # 2. Verify
 onebrain --version
-# → onebrain 3.3.12
+# → onebrain 3.4.3
 
 # 3. Scaffold a vault and let init pull the OneBrain plugin
 mkdir my-vault && cd my-vault
@@ -285,7 +285,7 @@ The Rust rewrite milestone, measured against the v2.3.3 TypeScript/Bun CLI on th
 | Warm `doctor` wall time | ~980 ms | ~890 ms | ~9% faster |
 | `update --check` (warm cache) | ~480 ms | ~10 ms | **~48× faster** |
 
-Figures from the v3.0.0 rewrite-milestone dogfood; the binary has since grown to ~5 MB as v3.1 added the branded banner and `qmd status`/`embed`. Reproduce the size with the release profile (`lto = "thin"`, `strip = "symbols"`, `codegen-units = 1`, `panic = "abort"`).
+Figures are the v3.0.0 rewrite-milestone dogfood (against the v2.3.3 Bun CLI). The binary has since grown well past 4.6 MB — v3.4 embedded the native search engine (tantivy + fastembed + ONNX Runtime), so a full semantic-search build is ~27 MB while keyword-only targets stay smaller (see the [platform table](#platform-support--semantic-vs-keyword-search)). The memory / cold-start / update-check wins above still hold. Reproduce with the release profile (`lto = "thin"`, `strip = "symbols"`, `codegen-units = 1`, `panic = "abort"`).
 
 ## Architecture
 
@@ -331,7 +331,7 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
   - [x] **v3.4.0** — `onebrain-search` engine (tantivy BM25 + fastembed embeddings + RRF hybrid, ~100-language semantic + Thai/CJK keyword) · `onebrain search` verbs (`query/search/vsearch/get/status/reindex/model` + interactive model TUI) · doctor native-search checks · `qmd_collection` → `search.collection` migration.
   - [x] **v3.4.1** — native MCP server (`onebrain mcp`, rmcp): qmd-compatible `query/get/multi_get/status` tools, client-side RRF fusion, native `session init` probe (drops the qmd subprocess). Plugin `.mcp.json` server-key rename (`qmd` → `search`) is staged for the v3.4.4 cutover — see [ADR 0019](docs/decisions/0019-native-mcp-server-staged-qmd-cutover.md).
   - [x] **v3.4.2** — **security fix**: the `serve`/daemon session auth token now comes from the OS CSPRNG on every platform (`getrandom`), removing the time-seeded, guessable Windows fallback. *(Interleaved ahead of the qmd epic — see below.)*
-  - [ ] **v3.4.3** — housekeeping bundle: scheduler polish (cron steps/lists · plist collision · `schedule list`) · CI `lex-only` test job · minor fixes.
+  - [x] **v3.4.3** — housekeeping bundle: scheduler polish (cron steps/lists · plist collision · `schedule list`) · CI `lex-only` test job · minor fixes.
   - [ ] **v3.4.4** — `/qmd` → `/search` skill + auto reindex/embed hook + serve/WebUI search rewire + **remove `@tobilu/qmd`** *(was v3.4.2 — shifted by the v3.4.2 security fix + v3.4.3 housekeeping)*.
   - [ ] **v3.4.5** — relevance polish: rerank (bge-reranker-v2-m3) · query expansion · nlpo3 Thai word-seg · custom ONNX models *(was v3.4.3)*.
 - [ ] **v3.5** — Bootstrap + native verbs: startup / wrapup / daily / tasks → 1 call per ceremony (import content-verbs anchored ~v3.5.x).
