@@ -1,8 +1,8 @@
 //! Migration notice — print v3.0→v3.1 rename guidance once per command.
 //!
-//! State file: `migration-shown.txt` under the platform cache dir
-//! (`~/Library/Caches/onebrain/` on macOS · `$XDG_CACHE_HOME/onebrain/` or
-//! `~/.cache/onebrain/` on Linux · `%LOCALAPPDATA%\onebrain\` on Windows),
+//! State file: `migration-shown.txt` under the platform data dir
+//! (`~/Library/Application Support/onebrain/` on macOS · `$XDG_DATA_HOME/onebrain/`
+//! or `~/.local/share/onebrain/` on Linux · `%APPDATA%\onebrain\` on Windows),
 //! one alias name per line. On first invocation of each v3.0 alias we
 //! append the name and print a stderr notice; subsequent invocations
 //! within or across processes find the name in the file and stay silent.
@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const STATE_FILENAME: &str = "migration-shown.txt";
@@ -85,23 +85,86 @@ fn warn_persist_failure(state_file: &std::path::Path, err: &std::io::Error) {
     }
 }
 
-/// Default state directory: `~/Library/Caches/onebrain/` on macOS ·
-/// `$XDG_CACHE_HOME/onebrain/` or `~/.cache/onebrain/` on Linux ·
-/// `%LOCALAPPDATA%\onebrain\` on Windows.
+/// Default state directory: `~/Library/Application Support/onebrain/` on macOS ·
+/// `$XDG_DATA_HOME/onebrain/` or `~/.local/share/onebrain/` on Linux ·
+/// `%APPDATA%\onebrain\` on Windows.
 ///
-/// **Test override:** `ONEBRAIN_CACHE_DIR` env var, when set, replaces the
-/// `dirs::cache_dir()` lookup entirely. Cross-platform — `HOME` /
-/// `XDG_CACHE_HOME` don't influence `dirs::cache_dir()` on Windows (which
-/// reads `%LOCALAPPDATA%` via the Known Folders API), so tests need an
-/// explicit knob to redirect state into a tempdir. Production should never
-/// set this.
+/// Relocated from the OS-purgeable cache dir (`dirs::cache_dir()`) to the
+/// persistent data dir (`dirs::data_dir()`) in v3.4.5 — `~/Library/Caches` &
+/// friends can be wiped by OS storage cleanup, which silently destroyed an
+/// expensive model download + index (issue #114). The one-time move of
+/// pre-existing state is handled by [`migrate_search_cache`]; see ADR 0021.
+///
+/// **Test override:** `ONEBRAIN_CACHE_DIR` env var (name kept for
+/// compatibility with the existing test suite), when set, replaces the
+/// `dirs::data_dir()` lookup entirely — which also collapses the cache→data
+/// migration to a no-op. Cross-platform — `HOME` / `XDG_DATA_HOME` don't
+/// influence `dirs::data_dir()` on Windows (which reads `%APPDATA%` via the
+/// Known Folders API), so tests need an explicit knob to redirect state into a
+/// tempdir. Production should never set this.
 pub fn default_state_dir() -> PathBuf {
     if let Some(override_dir) = std::env::var_os("ONEBRAIN_CACHE_DIR") {
         return PathBuf::from(override_dir);
     }
-    dirs::cache_dir()
+    dirs::data_dir()
         .map(|d| d.join("onebrain"))
         .unwrap_or_else(|| PathBuf::from("/tmp/onebrain"))
+}
+
+/// One-time relocation of the native-search state (`search/` subtree — models,
+/// tantivy index, vector store, `engine.redb`) from the legacy OS-purgeable
+/// cache location to the persistent data dir (issue #114 · ADR 0021).
+///
+/// Moves `<cache_dir>/onebrain/search` → `<data_dir>/onebrain/search` exactly
+/// once, and **only** the `search/` subtree — the sibling
+/// `latest-release.json` update-check cache is resolved independently via
+/// `dirs::cache_dir()` (see `onebrain_fs::update`) and is genuinely disposable,
+/// so it deliberately stays in the cache dir and must not be swept along.
+///
+/// No-op when: the `ONEBRAIN_CACHE_DIR` test override is set (cache and data
+/// roots collapse to one dir), the platform dirs can't be resolved, there's
+/// nothing at the old path, or the destination already exists. Best-effort —
+/// a move failure is reported to stderr but never aborts the command; the
+/// engine recreates an empty index at the new location and the old data is
+/// left intact for manual recovery.
+pub fn migrate_search_cache() {
+    // Test override collapses cache and data to one dir → nothing to migrate.
+    if std::env::var_os("ONEBRAIN_CACHE_DIR").is_some() {
+        return;
+    }
+    let (Some(cache_root), Some(data_root)) = (dirs::cache_dir(), dirs::data_dir()) else {
+        return;
+    };
+    let old = cache_root.join("onebrain").join("search");
+    let new = data_root.join("onebrain").join("search");
+    migrate_dir_once(&old, &new);
+}
+
+/// Rename `old` → `new` iff `old` exists and `new` does not, creating `new`'s
+/// parent first. Pure over its path arguments (no platform-dir lookups), so
+/// unit tests exercise it against tempdirs. Emits one stderr warning on
+/// failure and returns without panicking; never overwrites an existing `new`.
+fn migrate_dir_once(old: &Path, new: &Path) {
+    if !old.exists() || new.exists() {
+        return;
+    }
+    if let Some(parent) = new.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            eprintln!(
+                "onebrain: warning: could not create {} for search-cache relocation: {e}",
+                parent.display()
+            );
+            return;
+        }
+    }
+    if let Err(e) = fs::rename(old, new) {
+        eprintln!(
+            "onebrain: warning: could not relocate search cache {} → {}: {e} \
+             (old data preserved — run `onebrain search reindex` if search is empty)",
+            old.display(),
+            new.display()
+        );
+    }
 }
 
 /// Print the user-facing notice. Stderr only — stdout stays clean for JSON
@@ -233,6 +296,51 @@ mod tests {
         assert!(
             !result,
             "record must return false when the state file write fails"
+        );
+    }
+
+    #[test]
+    fn migrate_moves_when_old_exists_and_new_absent() {
+        let root = tempdir().unwrap();
+        let old = root.path().join("cache/onebrain/search");
+        let new = root.path().join("data/onebrain/search");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("engine.redb"), b"index").unwrap();
+
+        migrate_dir_once(&old, &new);
+
+        assert!(!old.exists(), "old search dir should be gone after move");
+        assert_eq!(fs::read(new.join("engine.redb")).unwrap(), b"index");
+    }
+
+    #[test]
+    fn migrate_is_noop_when_new_already_exists() {
+        let root = tempdir().unwrap();
+        let old = root.path().join("cache/onebrain/search");
+        let new = root.path().join("data/onebrain/search");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("engine.redb"), b"OLD").unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::write(new.join("engine.redb"), b"NEW").unwrap();
+
+        migrate_dir_once(&old, &new);
+
+        // Destination is never clobbered; source is left untouched.
+        assert_eq!(fs::read(new.join("engine.redb")).unwrap(), b"NEW");
+        assert_eq!(fs::read(old.join("engine.redb")).unwrap(), b"OLD");
+    }
+
+    #[test]
+    fn migrate_is_noop_when_old_absent() {
+        let root = tempdir().unwrap();
+        let old = root.path().join("cache/onebrain/search");
+        let new = root.path().join("data/onebrain/search");
+
+        migrate_dir_once(&old, &new);
+
+        assert!(
+            !new.exists(),
+            "nothing to migrate → new must not be created"
         );
     }
 }

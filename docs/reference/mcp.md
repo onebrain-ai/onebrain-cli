@@ -147,7 +147,7 @@ Show the status of the search index: collection, embed model, document counts, p
 {
   "collection": "my-vault-a1b2c3",
   "embed_model": "multilingual-e5-small",
-  "cache_dir": "/Users/you/Library/Caches/onebrain/search/my-vault-a1b2c3",
+  "cache_dir": "/Users/you/Library/Application Support/onebrain/search/my-vault-a1b2c3",
   "indexed": true,
   "model_size_bytes": 493921024,
   "model_downloaded_at": 1751500000,

@@ -4,7 +4,7 @@
 //! ## Collection resolution
 //!
 //! The engine's on-disk state (tantivy index, vector store, redb metadata)
-//! lives under `<cache_dir>/onebrain/search/<collection>/`, keyed by the
+//! lives under `<data_dir>/onebrain/search/<collection>/`, keyed by the
 //! `search.collection` config value (falling back to the legacy
 //! `qmd_collection` — see `onebrain_core::load_vault_config`).
 //!
@@ -29,13 +29,14 @@ use onebrain_search::engine::{short_path_hash, Engine};
 
 use crate::vault_ctx;
 
-/// Base cache directory for all native-search state:
-/// `<cache_dir>/onebrain/search/`. Shares the same root as
-/// `crate::migration::default_state_dir` (`~/Library/Caches/onebrain/` on
-/// macOS · `$XDG_CACHE_HOME/onebrain/` or `~/.cache/onebrain/` on Linux ·
-/// `%LOCALAPPDATA%\onebrain\` on Windows), honouring the same
-/// `ONEBRAIN_CACHE_DIR` test override so search-engine tests can redirect
-/// index state into a tempdir exactly like the migration-notice tests do.
+/// Base directory for all native-search state:
+/// `<data_dir>/onebrain/search/`. Shares the same root as
+/// `crate::migration::default_state_dir` (`~/Library/Application Support/onebrain/`
+/// on macOS · `$XDG_DATA_HOME/onebrain/` or `~/.local/share/onebrain/` on Linux ·
+/// `%APPDATA%\onebrain\` on Windows — relocated out of the OS-purgeable cache
+/// dir in v3.4.5, issue #114), honouring the same `ONEBRAIN_CACHE_DIR` test
+/// override so search-engine tests can redirect index state into a tempdir
+/// exactly like the migration-notice tests do.
 pub fn search_cache_root() -> PathBuf {
     crate::migration::default_state_dir().join("search")
 }

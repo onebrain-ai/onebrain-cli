@@ -54,6 +54,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     // NO_COLOR, CI, TERM=dumb). See `banner::should_show_banner` for the
     // full gating table.
     banner::emit_banner(std::io::stderr().lock(), &cli, &mode);
+    // One-time relocation of the native-search state out of the OS-purgeable
+    // cache dir into the persistent data dir (issue #114 · ADR 0021). Runs
+    // before any command touches the search cache; idempotent + cheap (a single
+    // stat once the move is done), so it's safe on every invocation including
+    // the hot-path hook verbs (`session init`, `checkpoint`).
+    migration::migrate_search_cache();
     let vault_flag = cli.vault.clone();
     let quiet = cli.quiet;
 
