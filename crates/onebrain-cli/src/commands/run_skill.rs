@@ -440,7 +440,10 @@ mod tests {
         // function's dedup guard checks the platform-specific `{exe_dir}{sep}`.
         let sep = if cfg!(windows) { ";" } else { ":" };
         let existing = format!("/opt/homebrew/bin{sep}/usr/bin");
-        assert_eq!(child_path_with_exe_dir("/opt/homebrew/bin", &existing), existing);
+        assert_eq!(
+            child_path_with_exe_dir("/opt/homebrew/bin", &existing),
+            existing
+        );
     }
 
     #[test]
