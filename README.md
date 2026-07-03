@@ -57,7 +57,7 @@ Point an AI agent at a vault and it improvises — a different pile of `grep` / 
 
 ## Status
 
-**v3.4.x — stable & production-ready, in active maintenance.** GA since v3.0.0 (2026-05-22), shipping ~weekly themed minors. The v3.3 line landed the daemon foundation — `onebrain serve` hosts a local web UI (embedded in the binary) over a token-gated vault JSON API. The v3.4 line introduces the native Rust search engine (the `onebrain-search` crate + `onebrain search` verbs) and a native MCP server (`onebrain mcp`, v3.4.1), replacing the external qmd Node dependency across v3.4.x with full cutover — **0 node/python deps** — at v3.4.2. Version history + direction in the [Roadmap](#roadmap); full detail in [CHANGELOG.md](CHANGELOG.md).
+**v3.4.x — stable & production-ready, in active maintenance.** GA since v3.0.0 (2026-05-22), shipping ~weekly themed minors. The v3.3 line landed the daemon foundation — `onebrain serve` hosts a local web UI (embedded in the binary) over a token-gated vault JSON API. The v3.4 line introduces the native Rust search engine (the `onebrain-search` crate + `onebrain search` verbs) and a native MCP server (`onebrain mcp`, v3.4.1), replacing the external qmd Node dependency across v3.4.x with full cutover — **0 node/python deps** — at v3.4.4. Version history + direction in the [Roadmap](#roadmap); full detail in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quickstart
 
@@ -178,7 +178,7 @@ onebrain
 |---|---|---|
 | **Setup** | `init`, `plugin install`, `vault sync` | Scaffold `onebrain.yml` + PARA folders, register the plugin with the harness, overlay the latest plugin tarball. |
 | **Runtime** (hook protocol) | `session init`, `checkpoint stop · reset · orphans`, `qmd reindex` | Called by the harness `SessionStart` / `Stop` / `PostToolUse` hooks. Emit hard-wired JSON; banner suppressed for clean machine stdio. |
-| **Search** | `search query · search · vsearch · get · status · reindex · model` | Native hybrid search (tantivy BM25 + fastembed embeddings, RRF-fused) over the vault's `*.md` notes, plus embedding-model management with an interactive TUI. The legacy `qmd reindex · embed · status` verbs remain until the v3.4.2 cutover. |
+| **Search** | `search query · search · vsearch · get · status · reindex · model` | Native hybrid search (tantivy BM25 + fastembed embeddings, RRF-fused) over the vault's `*.md` notes, plus embedding-model management with an interactive TUI. The legacy `qmd reindex · embed · status` verbs remain until the v3.4.4 cutover. |
 | **MCP** | `mcp` | Stdio [Model Context Protocol](docs/reference/mcp.md) server exposing `query`/`get`/`multi_get`/`status` over the native search engine — for Claude Code, Cursor, or any MCP client. See [`docs/reference/mcp.md`](docs/reference/mcp.md) for the full tool reference. |
 | **Notes** | `note read · list · find · search · stat · new · append · edit · move · mkdir · archive · delete · orphans · backlinks` | Structured vault-note operations — wikilink-aware moves, dated archiving, orphan/backlink graph queries. |
 | **Web UI** | `serve` | Host the binary-embedded web UI + token-gated vault JSON API on `127.0.0.1:6789` — file explorer, reading view, search panel, agent chat; `--open` launches the browser. |
@@ -341,7 +341,7 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
 
 ### 🔭 Signal-driven (Tier 2/3)
 - [ ] Broader harness support — Codex, Qwen, and other agentic harnesses beyond today's Claude Code + Gemini CLI.
-- [ ] Tiered memory + behavior tracking · proactive surfacing · daemon background synthesis · Avatar Mesh (one agent identity across machines) · Telegram / MCP gateway · OneBrain Studio.
+- [ ] Tiered memory + behavior tracking · proactive surfacing · daemon background synthesis · Avatar Mesh (one agent identity across machines) · Telegram / MCP gateway · OneBrain Studio · OneBrain Sync (cross-machine continuity for vault + memory + live session — harness-independent, end-to-end encrypted; sync + storage only, no hosted agent runtime).
 
 ### 🏁 v4.0 · breaking
 - [ ] Drop `vault.yml` dual-read (canonical `onebrain.yml` only) · retire the hidden v3.0 aliases.
@@ -370,6 +370,7 @@ PR conventions: feature branch → git worktree → 3-round parallel review (cor
 
 - **[onebrain-ai/onebrain](https://github.com/onebrain-ai/onebrain)** — OneBrain plugin (slash commands, skills, agents, hooks). Pairs with this CLI.
 - **[onebrain.run](https://onebrain.run)** — Marketing site, install one-liner, public roadmap.
+- **OneBrain Sync** *(planned)* — Cross-machine continuity for your vault, memory, and live session — harness-independent, end-to-end encrypted. Sync + storage only, no hosted agent runtime. Idea stage (replaces the dropped OneBrain Cloud).
 
 ## Contributing
 
