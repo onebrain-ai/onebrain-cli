@@ -321,11 +321,12 @@ fn stdio_jsonrpc_handshake_tools_list_and_status_then_clean_exit() {
     );
 
     // 7. tools/call query — a lex sub-query. The fixture index is EMPTY (no
-    // reindex ran), so a lex sub-query opening a non-existent tantivy dir would
-    // normally fail; but this still exercises the `query` tool wiring +
-    // `Parameters<QueryParams>` camelCase deserialization end-to-end without any
-    // model download (lex never constructs the embedder). We only assert the
-    // response has a `results` array (shape correct) — not that it has hits.
+    // reindex ran), so the `query` tool short-circuits to an empty `results`
+    // array plus a no-index `note` (rather than erroring on the absent tantivy
+    // dir). This still exercises the tool wiring + `Parameters<QueryParams>`
+    // camelCase deserialization end-to-end without any model download (lex never
+    // constructs the embedder). We only assert the response has a `results`
+    // array (shape correct) — not that it has hits.
     send(
         &mut stdin,
         &serde_json::json!({
