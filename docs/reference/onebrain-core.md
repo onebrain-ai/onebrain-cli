@@ -92,14 +92,14 @@ The data model a user writes in the `onebrain.yml` `schedule:` block.
 **Tests** — `#[cfg(test)]` covers untagged map vs list deserialization, insertion-order preservation, minimal/command entries, and frontmatter defaults.
 
 ### `src/scheduler/cron_parse.rs`
-Cron + at-string validation and conversion to launchd `StartCalendarInterval` fields. Only single integers and `*` are supported per field (no step/range/list).
+Cron + at-string validation and conversion to launchd `StartCalendarInterval` fields. Each field accepts `*`, a single integer, a step (`*/N`), a list (`a,b,c`), or a range (`a-b`) within the field's valid bounds. Single-value fields map to one launchd dict (`CronFields`); when any field expands to multiple values, the entry is emitted as a launchd `StartCalendarInterval` **array of dicts** (launchd ORs across the array).
 **Key types**
 - `CronFields` — `{ minute, hour, day, month, weekday: Option<u32> }`; `None` = launchd wildcard.
 - `AtFields` — `{ year, month, day, hour, minute: u32 }`; all five required (omitting any would re-fire a one-shot).
 
 **Key functions**
-- `validate_cron(cron: &str) -> Result<(), SchedulerError>` — enforce 5 fields, each `*` or integer; Bun-matched reason strings.
-- `cron_fields_to_launchd(cron: &str) -> CronFields` — convert a *validated* cron string; **panics** on unvalidated input.
+- `validate_cron(cron: &str) -> Result<(), SchedulerError>` — enforce 5 fields, each `*`/integer/step/list/range within bounds; reason strings for invalid syntax.
+- `cron_fields_to_launchd(cron: &str) -> CronFields` — convert a *validated* single-value cron string; **panics** on unvalidated input. Multi-value fields go through the expander (a set of value-combinations, one launchd dict each).
 - `validate_at(at: &str) -> Result<(), SchedulerError>` — validate `YYYY-MM-DD HH:MM` form + month/day/hour/minute ranges.
 - `at_to_launchd(at: &str) -> AtFields` — convert a *validated* at-string; **panics** on unvalidated input.
 
