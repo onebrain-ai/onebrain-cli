@@ -151,7 +151,7 @@ Requires a recent stable Rust toolchain (`rustup default stable`). The only `uns
 
 ## Command surface
 
-v3.1 locks a singular-noun, two-level grammar — `onebrain <noun> <verb>` — so every command path is predictable. Five root verbs handle the common flow; ten resource groups cluster the rest.
+v3.1 locks a singular-noun, two-level grammar — `onebrain <noun> <verb>` — so every command path is predictable. Five root verbs handle the common flow; eleven resource groups cluster the rest.
 
 ```text
 onebrain
@@ -167,9 +167,10 @@ onebrain
 ├── search      query · search · vsearch · get · status · reindex · model
 ├── note        read · list · find · search · stat · new · append · edit
 │               · move · mkdir · archive · delete · orphans · backlinks
+├── task        list
 ├── qmd         reindex · embed · status        (legacy — removed in v3.4.4)
 ├── plugin      install · update · migrate
-├── schedule    register
+├── schedule    register · list
 ├── skill       run
 └── harness     detect
 ```
@@ -181,6 +182,7 @@ onebrain
 | **Search** | `search query · search · vsearch · get · status · reindex · model` | Native hybrid search (tantivy BM25 + fastembed embeddings, RRF-fused) over the vault's `*.md` notes, plus embedding-model management with an interactive TUI. The legacy `qmd reindex · embed · status` verbs remain until the v3.4.4 cutover. |
 | **MCP** | `mcp` | Stdio [Model Context Protocol](docs/reference/mcp.md) server exposing `query`/`get`/`multi_get`/`status` over the native search engine — for Claude Code, Cursor, or any MCP client. See [`docs/reference/mcp.md`](docs/reference/mcp.md) for the full tool reference. |
 | **Notes** | `note read · list · find · search · stat · new · append · edit · move · mkdir · archive · delete · orphans · backlinks` | Structured vault-note operations — wikilink-aware moves, dated archiving, orphan/backlink graph queries. |
+| **Tasks** | `task list` | List dated vault tasks (fence-aware), filterable by due date and folder. |
 | **Web UI** | `serve` | Host the binary-embedded web UI + token-gated vault JSON API on `127.0.0.1:6789` — file explorer, reading view, search panel, agent chat; `--open` launches the browser. |
 | **Maintenance** | `doctor [--fix]`, `plugin update · migrate`, `schedule register` | Eleven read-only checks + `--fix` recipes, self-update the binary + rewrite hooks + rebind launchd plists, compile the `onebrain.yml schedule:` block into OS scheduler artifacts. |
 | **Diagnostics** | `vault current`, `harness detect` | Report which mechanism resolved the active vault, and which AI harness is running. |

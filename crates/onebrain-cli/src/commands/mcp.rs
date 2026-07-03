@@ -24,7 +24,7 @@ use super::search_common::{collection_cache_dir, collection_for, open_engine};
 use super::search_status::{status_data_for, SearchStatusData};
 
 #[derive(Clone)]
-pub struct SearchMcpServer {
+pub struct McpServer {
     engine: Arc<Mutex<Engine>>,
     resolved: ResolvedVault,
     tool_router: ToolRouter<Self>,
@@ -202,10 +202,11 @@ pub enum SubQueryType {
 /// Params for the `query` tool. Mirrors the qmd MCP tool surface — several
 /// fields (`candidateLimit`, `collections`, `intent`, `rerank`) are accepted
 /// for compatibility but not yet used by the native engine (see field docs).
-/// `#[allow(dead_code)]`: these are deserialize-only — populated by callers'
-/// JSON payloads (schema compatibility), not read by Rust code yet.
+/// The genuinely inert fields (deserialize-only, never read by Rust code yet)
+/// carry their own `#[allow(dead_code)]` so a FUTURE field that's actually
+/// unused would still trip clippy instead of hiding behind a blanket
+/// struct-level allow.
 #[derive(serde::Deserialize, schemars::JsonSchema)]
-#[allow(dead_code)]
 pub struct QueryParams {
     /// Typed sub-queries to execute (1-10). The first gets 2x weight in fusion.
     pub searches: Vec<SubQuery>,
@@ -215,13 +216,17 @@ pub struct QueryParams {
     #[serde(rename = "minScore")]
     pub min_score: Option<f64>,
     /// Accepted for qmd compatibility; not used by the native engine.
+    #[allow(dead_code)]
     #[serde(rename = "candidateLimit")]
     pub candidate_limit: Option<usize>,
     /// Accepted for qmd compatibility; the native index is single-collection per vault.
+    #[allow(dead_code)]
     pub collections: Option<Vec<String>>,
     /// Background context to disambiguate. Accepted for compatibility; not yet used in ranking (relevance phase, v3.4.3).
+    #[allow(dead_code)]
     pub intent: Option<String>,
     /// Accepted for qmd compatibility; native rerank lands in v3.4.3.
+    #[allow(dead_code)]
     pub rerank: Option<bool>,
 }
 
@@ -358,7 +363,7 @@ impl From<Hit> for QueryHit {
 }
 
 #[tool_router]
-impl SearchMcpServer {
+impl McpServer {
     pub fn new(engine: Engine, resolved: ResolvedVault) -> Self {
         Self {
             engine: Arc::new(Mutex::new(engine)),
@@ -456,7 +461,7 @@ impl SearchMcpServer {
 
     #[tool(
         name = "get",
-        description = "Read a file's contents by vault-relative path (from search results). Supports 'path:N' to start at line N, and fromLine/maxLines/lineNumbers for windowing."
+        description = "Read a file's contents by vault-relative path (from search results). Supports 'path:N' to start at line N, and fromLine/maxLines/lineNumbers for windowing. Out-of-range line numbers are clamped rather than erroring: fromLine 0 is treated as line 1, and a fromLine past the end of the file returns an empty result."
     )]
     async fn get(
         &self,
@@ -564,7 +569,7 @@ impl SearchMcpServer {
 }
 
 #[tool_handler(router = self.tool_router.clone())]
-impl ServerHandler for SearchMcpServer {
+impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
@@ -584,7 +589,7 @@ pub fn run(vault_flag: Option<PathBuf>) -> Result<()> {
         .build()
         .context("build tokio runtime for onebrain mcp")?;
     runtime.block_on(async move {
-        let service = SearchMcpServer::new(engine, resolved)
+        let service = McpServer::new(engine, resolved)
             .serve(stdio())
             .await
             .context("initialize MCP stdio server")?;
