@@ -620,4 +620,49 @@ mod tests {
         assert_eq!(s.len(), "2023-11-14 22:13".len());
         assert!(s.contains('-') && s.contains(':'));
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // `status_data_for` — the MCP `status` tool's data builder. Directly
+    // exercises the `indexed = doc_count > 0` refinement (vs. `status_data`'s
+    // cache-dir-existence `indexed`), which until now was only asserted in a
+    // doc comment.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Build a `ResolvedVault` rooted at `dir` (which must already contain an
+    /// `onebrain.yml`), as the flag-resolved source — mirrors the identical
+    /// helper in `search_common.rs`'s test module.
+    fn resolved_at(dir: &Path) -> onebrain_core::ResolvedVault {
+        onebrain_core::ResolvedVault {
+            root: onebrain_core::VaultRoot::from_path(dir).unwrap(),
+            source: onebrain_core::VaultSource::Flag,
+        }
+    }
+
+    #[test]
+    fn status_data_for_never_indexed_reports_not_indexed_and_zero_docs() {
+        let vault = tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: t-status-data-for\n",
+        )
+        .unwrap();
+        let resolved = resolved_at(vault.path());
+
+        // `Engine::open` is lazy-embedder (never downloads a model) and just
+        // creates/opens the cache dir — cheap, no network, matches every
+        // other `search_status`/`search_common` test's use of a bare tempdir
+        // as the cache dir.
+        let cache = tempdir().unwrap();
+        let engine = Engine::open(cache.path(), "multilingual-e5-small").unwrap();
+
+        let data = status_data_for(&engine, &resolved).unwrap();
+
+        assert_eq!(data.collection, Some("t-status-data-for".to_string()));
+        assert_eq!(data.doc_count, 0);
+        assert!(
+            !data.indexed,
+            "never-indexed vault (doc_count == 0) must report indexed: false"
+        );
+        assert_eq!(data.semantic_available, cfg!(feature = "semantic"));
+    }
 }
