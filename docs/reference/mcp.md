@@ -172,6 +172,25 @@ Show the status of the search index: collection, embed model, document counts, p
 { "name": "status", "arguments": {} }
 ```
 
+## Long-running operations (sync vs async)
+
+A common question for tools like a future `reindex`: can an agent kick off long work and *not* block on the result? Yes — but that is modelled at the application level, not the protocol level.
+
+**MCP tool calls are request/response.** Every `tools/call` carries an `id` and the client waits for the response with the matching `id`; there is no protocol-level "fire and forget with no reply." Long-running work is expressed with one of three patterns:
+
+| Pattern | Mechanism | Fits |
+|---|---|---|
+| **Return-immediately + poll** | The tool starts the work on a detached thread and returns a short "started" acknowledgement immediately; the agent polls a status tool for progress/completion. | Reindex and other long batch jobs — the agent isn't blocked and isn't blind. |
+| **Progress notifications** | `notifications/progress` (requires the client to pass a `progressToken`) streams progress while the request stays open, so the call still resolves at the end but the agent sees intermediate percentages. | Work whose final result the agent needs, but wants visible progress meanwhile. |
+| **Concurrent transport + cancellation** | The transport is duplex: the client can issue other requests while one is in flight (each has its own `id`), and `notifications/cancelled` can cancel an in-flight request. | Keeping a slow call from blocking other tool calls. |
+
+**Today, all four shipped tools are fast and effectively synchronous** — none starts background work. There is no `reindex` MCP tool yet; reindexing is a CLI/cron operation. However, the engine already provides the primitive for the *return-immediately + poll* pattern: `onebrain search reindex` writes an on-disk progress marker, and the `status` tool reports `reindexing: { done, total }` live — even when the reindex is running in a **separate** process. So a client can already observe reindex progress through `status` while a CLI/cron reindex runs.
+
+**Forward design (roadmap, not a commitment):** when a `reindex` MCP tool lands (v3.4.2, alongside the auto-reindex work), the natural shape is the return-immediately + poll pattern above: `reindex` spawns the work and returns a "started" acknowledgement, and the agent polls `status` for `reindexing: { done, total }`. Two design constraints apply and are tracked for that milestone:
+
+- The server holds the engine behind a single `Arc<Mutex<Engine>>`, so a `reindex` that held the lock for its whole duration would serialize (block) concurrent `query`/`status` calls. A long-running tool must run its work off the shared lock, not inside a single `with_engine` critical section.
+- A long-lived server's in-memory readers (tantivy `IndexReader`, the vector mmap) must be reloaded after an external reindex commits, or the server would keep answering from the pre-reindex index until restart.
+
 ## Versioning & compatibility
 
 - **qmd-compat contract**: the tool names (`query`/`get`/`multi_get`/`status`) and most parameter names deliberately match the external `qmd` MCP server this replaces, so agent instructions written against qmd need no rewrite to call this server instead. Params the native engine doesn't yet use are still accepted (see each tool's table above) rather than rejected — a client sending them gets normal behavior, not a schema error.
