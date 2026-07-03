@@ -102,3 +102,7 @@ The v3.4.0 tag failed 5/9 release builds that regular CI could not see. Before p
 - [ ] Cross Linux targets need `g++-<triple>` when any dep links C++ (onnxruntime does).
 - [ ] windows-arm64 builds via amd64_arm64 cross from x64 — do not move it to a native arm64 runner without re-validating simsimd/`cc` and PATH sanity (ADR 0018).
 - [ ] If a tag's run failed before the GitHub Release was created: delete + re-push the tag is safe. After a Release/npm/brew publish exists: never re-point — ship a patch version.
+
+## Docs gate (added 2026-07-03 — see ADR 0019)
+
+- [ ] MCP surface changed? → `docs/reference/mcp.md` updated in the same PR.

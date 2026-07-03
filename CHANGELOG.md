@@ -1,6 +1,6 @@
 ---
-latest_version: 3.4.0
-released: 2026-07-02
+latest_version: 3.4.1
+released: 2026-07-03
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,13 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.1] — 2026-07-03 — native search MCP server
+
+- **`onebrain mcp`** — MCP stdio server (rmcp) over the native engine: `query` (lex/vec/hyde sub-queries, RRF-fused), `get`, `multi_get`, `status` — qmd-compatible tool surface.
+- **`session init`** now probes the native index for `qmd_unembedded` (no qmd subprocess; same JSON contract).
+- `dot_scalar` gains a debug-build equal-length assertion; simsimd fallback now logs before returning NEG_INFINITY.
+- ADR 0018 polish: sysroot typo + win-arm64 decision restructured into sub-bullets.
 
 ## [3.4.0] — 2026-07-01 — native search engine (`onebrain-search`)
 

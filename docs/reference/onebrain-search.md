@@ -155,3 +155,55 @@ The public surface other crates (chiefly `onebrain-cli`) reach for first:
 - **Engine** — `engine::Engine` (`open`, `set_exclude_patterns`, `index_doc`, `remove_doc`, `query`, `vector_search`, `get`, `status`, `reindex_all[_with_progress]`, `reindex_paths[_with_progress]`, `rebuild[_with_progress]`, `active_model_matches`), `engine::{Hit, IndexStatus, ReindexStats, ReindexProgress}`, `engine::short_path_hash`
 - **Model registry** — `embed::{model_registry, ModelInfo, is_supported_model, model_dims, model_download_status, ModelDownloadStatus, dir_size_bytes}`, `embed::{new, new_quiet, Embedder, Embed}`
 - **Building blocks** (rarely used directly) — `chunk::{chunk_markdown, Chunk}`, `lex::LexIndex`, `vector::VectorStore`, `hybrid::rrf_fuse`
+
+## MCP server
+
+The engine is also reachable over MCP (Model Context Protocol) via the `onebrain mcp` stdio server, hosted in `onebrain-cli` (`commands/mcp.rs`) — tool handlers drive this crate's synchronous `Engine` through `spawn_blocking`, so the engine itself stays async-free. Tool schemas, parameter tables, result shapes, and client-registration snippets are documented separately as an API reference, not a code map: see **[`docs/reference/mcp.md`](mcp.md)**. Architecture rationale (why a top-level command, the qmd-compatible tool surface, the staged plugin-config cutover) is in [ADR 0019](../decisions/0019-native-mcp-server-staged-qmd-cutover.md).
+
+## Choosing an embedding model
+
+`search.embed_model` in `onebrain.yml` selects which of the six [registry](#srcembedrs) models embeds your vault. Switching later means a full re-embed (the vector store is opened at the new model's `dims`, so nothing carries over) — a one-time, minutes-scale cost on a personal vault, not something irreversible, but still worth picking deliberately rather than churning.
+
+### Comparison
+
+Every column below traces to the registry entry in `crates/onebrain-search/src/embed.rs` (dims, download size, and Thai MIRACL score are read directly from `ModelInfo`; nothing here is invented). The two speed columns are **not** measured — they're parameter-count-based estimates, labeled accordingly.
+
+| Model | Dims | Download | Approx RAM loaded | Embed/reindex speed (est.) | Query latency (est.) | THAI (MIRACL nDCG@10) | Note |
+|---|---|---|---|---|---|---|---|
+| `multilingual-e5-small` | 384 | ~470 MB | ~0.5–1 GB | ×1 (baseline) | ×1 (baseline) | 75.0 | default · small + fast |
+| `multilingual-e5-base` | 768 | ~1.1 GB | ~1–1.5 GB | ×2–2.5 | ×2–2.5 | 75.2 | larger · better recall |
+| `multilingual-e5-large` | 1024 | ~2.1 GB | ~2–2.5 GB | ×4–5 | ×4–5 | 80.2 | high accuracy |
+| `bge-m3` | 1024 | ~2.2 GB | ~2.5–3 GB | ×4–5 | ×4–5 | 82.6 | best Thai/accuracy · fp32 |
+| `embeddinggemma-300m-q` | 768 | ~310 MB | ~0.5–1 GB | ×0.5–1 | ×0.5–1 | unverified | small · int8 · Thai unverified |
+| `embeddinggemma-300m-q4` | 768 | ~200 MB | ~0.5 GB | ×0.5–1 | ×0.5–1 | unverified | smallest · 4-bit · Thai unverified |
+
+RAM-while-loaded figures are rough (model weights + ONNX Runtime session overhead); they scale with download size, not dims, since dims only affects the (much smaller) per-vector storage cost.
+
+### Where the cost actually goes
+
+| Cost | Bound by | Notes |
+|---|---|---|
+| Reindex / embed | **model size** (dominant cost) | Paid on every reindex, and in full again on any model switch (`rebuild` re-embeds everything). |
+| Query latency | **model size** | One forward pass per query — cheap in absolute terms even for large models, since it's a single short string, not a batch. |
+| Vector scan | dims | Negligible at personal-vault scale (thousands of chunks, exact scan) — dims only matters at a scale this engine isn't targeting. |
+| RAM / disk | model size + `dims × 4 bytes` per chunk | Model size dominates; per-chunk vector storage is a rounding error by comparison. |
+
+### Decision guide
+
+- **Default**: `multilingual-e5-small` — fast, light, fine for general multilingual use including baseline Thai.
+- **Thai-accuracy-first, ≥16 GB RAM**: `bge-m3` (THAI 82.6) or `multilingual-e5-large` (80.2). Note `multilingual-e5-base`'s THAI 75.2 vs. small's 75.0 is **not** a meaningful Thai upgrade — pick `base` for better English/general multilingual recall on a budget, not for Thai specifically.
+- **Low-RAM (8 GB)**: `multilingual-e5-small` or an `embeddinggemma` variant (Thai unverified for gemma — don't pick it for Thai accuracy without testing your own corpus).
+- **Big vaults (10k+ docs)**: embed time scales linearly with doc count — prefer `small`/`base` unless you've already budgeted for a large-model reindex.
+- **Switching later** = a full re-embed (dims change invalidates the existing vector store). Budget minutes, not hours, on a personal vault — but choose deliberately rather than switching repeatedly.
+
+### Hardware & acceleration
+
+Embedding inference runs on **CPU**, via ONNX Runtime's CPU execution provider — a deliberate packaging choice, not an architecture ceiling and not related to multilingual support (language capability lives in the model, not the compute device). Why CPU-only: the single-binary/no-runtime-deps principle (a GPU build would bind CUDA/cuDNN dynamic libraries on every user's machine, whether or not they have a compatible GPU) plus release-matrix cost — see [ADR 0018](../decisions/0018-release-build-strategy-lessons.md) on how much a single added native dependency multiplies the 9-target release matrix. Full rationale: [ADR 0020](../decisions/0020-cpu-only-embedding-runtime.md).
+
+In practice: Apple Silicon's CPU inference is well-optimized (NEON), and query-time cost is one forward pass per query, so the latency-sensitive path is cheap regardless of accelerator. Reindex/embed of a large vault on a large model is where CPU-only inference costs the most wall-clock time.
+
+**Future acceleration ladder** (roadmap — not a commitment, not scheduled):
+
+1. **CoreML execution provider** on macOS via an `ort` feature flag — no extra user-facing dependency.
+2. **CUDA / DirectML builds** as separate release artifacts, produced only on demand.
+3. **External embedding endpoints** (e.g. MLX, Ollama) via the engine's existing `Embed` trait seam (`crates/onebrain-search/src/embed.rs`) — an additive integration point, not a rearchitecture.
