@@ -497,14 +497,43 @@ enum SwitchMsg {
     ),
 }
 
-/// Enter-key handler: switch the active model to the selected row. The
-/// download (forced via [`onebrain_search::embed::new_quiet`], so even an
+/// The three things `Enter` can do to the selected row, decided purely from
+/// its `current`/`downloaded` flags (see [`enter_action`]).
+#[derive(Debug, PartialEq)]
+pub(crate) enum EnterAction {
+    /// Active model with files on disk — nothing to do.
+    NoOp,
+    /// Different model — normal switch (download if needed + rebuild).
+    Switch,
+    /// Active model whose files are gone (e.g. OS purged the cache, #114):
+    /// re-download ONLY. The index was embedded by this same model, so no
+    /// rebuild/re-embed is needed.
+    RedownloadActive,
+}
+
+/// Pure decision function for the `Enter` keybinding: given whether the
+/// selected row is the active model and whether its files are on disk,
+/// decide what `Enter` should do. See [`EnterAction`] for what each variant
+/// means.
+pub(crate) fn enter_action(is_current: bool, is_downloaded: bool) -> EnterAction {
+    match (is_current, is_downloaded) {
+        (true, true) => EnterAction::NoOp,
+        (true, false) => EnterAction::RedownloadActive,
+        (false, _) => EnterAction::Switch,
+    }
+}
+
+/// Enter-key handler: switch the active model to the selected row, or (see
+/// [`enter_action`]) re-download the active model's missing files, or no-op.
+/// The download (forced via [`onebrain_search::embed::new_quiet`], so even an
 /// empty index downloads immediately) and the re-embed both run on a worker
 /// thread; this loop keeps drawing, polling the model dir's on-disk size into
 /// an in-table progress bar with % until the worker reports back. Keys are
-/// swallowed while the switch runs. The switch itself is the SHARED
+/// swallowed while the switch/download runs. A genuine switch is the SHARED
 /// [`apply_model_change`] path (open-old → rebuild → persist ordering
-/// preserved). No-op with a footer hint if the row is already active.
+/// preserved); re-downloading the ACTIVE model's files skips `apply_model_change`
+/// entirely — the config and vector store already reflect this model, so
+/// only the download phase runs.
 fn perform_switch<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     state: &mut AppState,
@@ -517,11 +546,19 @@ fn perform_switch<B: ratatui::backend::Backend>(
     let Some(row) = state.selected_row() else {
         return;
     };
-    if row.current {
-        state.status = Some(format!("Already using {}", row.name));
-        return;
-    }
     let name = row.name;
+    match enter_action(row.current, row.downloaded) {
+        EnterAction::NoOp => {
+            state.status = Some(format!("Already using {name} ✓"));
+            return;
+        }
+        EnterAction::RedownloadActive => {
+            perform_redownload_active(terminal, state, name);
+            return;
+        }
+        EnterAction::Switch => {}
+    }
+    let row = state.selected_row().expect("checked above");
     let needs_download = !row.downloaded;
     let model_dir = row.path.clone();
     let expected = model_registry()
@@ -642,6 +679,115 @@ fn perform_switch<B: ratatui::backend::Backend>(
                     state.status = Some("⚠️  Switch worker exited unexpectedly".to_string());
                     return;
                 }
+            }
+        }
+    }
+}
+
+/// `EnterAction::RedownloadActive` handler: the active model's files are
+/// missing from disk (e.g. the OS purged the cache — #114), so re-download
+/// them ONLY. Reuses the exact quiet-download call
+/// ([`onebrain_search::embed::new_quiet`]) and the same in-table
+/// progress-bar polling loop the [`Switch`](EnterAction::Switch) path uses,
+/// but deliberately does NOT call [`apply_model_change`] — the vector index
+/// was already embedded by this same model (same dims), so there's nothing
+/// to rebuild; restoring the files alone restores query capability.
+fn perform_redownload_active<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    state: &mut AppState,
+    name: &'static str,
+) {
+    use ratatui::crossterm::event;
+    use std::sync::mpsc::TryRecvError;
+    use std::time::Duration;
+
+    let model_dir = state.cache_dir.join(
+        model_registry()
+            .iter()
+            .find(|m| m.name == name)
+            .map(|m| m.cache_dir_name())
+            .unwrap_or_default(),
+    );
+    let expected = model_registry()
+        .iter()
+        .find(|m| m.name == name)
+        .map(|m| m.approx_bytes)
+        .unwrap_or(0);
+
+    let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
+    let worker_cache = state.cache_dir.clone();
+    std::thread::spawn(move || {
+        #[cfg(not(feature = "semantic"))]
+        {
+            let _ = (&worker_cache, name);
+            let _ = tx.send(Err(anyhow::anyhow!(
+                onebrain_search::engine::SEMANTIC_UNAVAILABLE
+            )));
+        }
+        #[cfg(feature = "semantic")]
+        {
+            // Same quiet-download call the Switch path uses — no stdout bar,
+            // we're in raw mode.
+            let result = onebrain_search::embed::new_quiet(name, &worker_cache).map(|_| ());
+            let _ = tx.send(result);
+        }
+    });
+
+    state.downloading = Some(DownloadUi {
+        name,
+        expected_bytes: expected,
+        model_dir,
+        pct: 0,
+        bytes: 0,
+    });
+    state.status = Some(format!("⏬  Re-downloading {name}…"));
+
+    loop {
+        if let Some(dl) = state.downloading.as_mut() {
+            dl.bytes = dir_size_bytes(&dl.model_dir);
+            dl.pct = download_pct(dl.bytes, dl.expected_bytes);
+            state.status = Some(format!(
+                "⏬  Re-downloading {name} · {} / {} ({}%)",
+                format_size(dl.bytes),
+                format_size(dl.expected_bytes),
+                dl.pct
+            ));
+        }
+        let _ = terminal.draw(|f| render(f, state));
+
+        if event::poll(Duration::from_millis(150)).unwrap_or(false) {
+            let _ = event::read();
+        }
+
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                state.downloading = None;
+                // Refresh just this row's download status from disk — no
+                // rebuild happened, so `current` and every other row is
+                // untouched.
+                if let (Some(idx), Some(info)) = (
+                    state.rows.iter().position(|r| r.name == name),
+                    model_registry().iter().find(|m| m.name == name),
+                ) {
+                    let st = model_download_status(info, &state.cache_dir);
+                    if let Some(r) = state.rows.get_mut(idx) {
+                        r.downloaded = st.downloaded;
+                        r.disk_bytes = st.disk_size;
+                    }
+                }
+                state.status = Some(format!("✅  re-downloaded {name}"));
+                return;
+            }
+            Ok(Err(e)) => {
+                state.downloading = None;
+                state.status = Some(format!("⚠️  Re-download failed: {e}"));
+                return;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                state.downloading = None;
+                state.status = Some("⚠️  Download worker exited unexpectedly".to_string());
+                return;
             }
         }
     }
@@ -821,6 +967,25 @@ mod tests {
 
     fn rows_for(current: &str) -> Vec<TuiRow> {
         build_rows(current, Path::new("/nonexistent-cache"))
+    }
+
+    #[test]
+    fn enter_on_active_downloaded_is_noop() {
+        assert!(matches!(enter_action(true, true), EnterAction::NoOp));
+    }
+
+    #[test]
+    fn enter_on_active_missing_files_redownloads() {
+        assert!(matches!(
+            enter_action(true, false),
+            EnterAction::RedownloadActive
+        ));
+    }
+
+    #[test]
+    fn enter_on_other_model_switches() {
+        assert!(matches!(enter_action(false, true), EnterAction::Switch));
+        assert!(matches!(enter_action(false, false), EnterAction::Switch));
     }
 
     fn state_for(current: &str) -> AppState {

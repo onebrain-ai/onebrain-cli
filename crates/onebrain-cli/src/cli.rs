@@ -1,7 +1,10 @@
 //! Clap subcommand tree — 3 root verbs + 25 resource groups + hidden v3.0
 //! aliases. Locked at v3.1 per [[cli/specs/01-architecture §2.4]]; `search`
 //! (v3.4.0) is the first post-lock addition — a new native-search command
-//! surface, not a v3.1 tree-shape change.
+//! surface, not a v3.1 tree-shape change. `mcp` (v3.4.1) promotes the MCP
+//! stdio server from `search mcp` to a top-level command — it hosts search
+//! tools today, with more vault tool groups mounting on the same command
+//! later.
 //!
 //! Every group's verb list is captured as a `Subcommand` enum even when the
 //! body is `unimplemented!()` — the tree shape itself is the v3.1 deliverable
@@ -71,6 +74,7 @@ pub enum Cmd {
     // `display_order` clusters commands by domain in `--help`:
     //   1-3  · system / lifecycle (init, update, doctor)
     //   10-13 · vault & session ops (vault, session, checkpoint, harness)
+    //   14-18 · content & serving (serve, note, task, search, mcp)
     //   20-23 · config & maintenance (plugin, schedule, config, skill)
     //   30   · search/index (qmd)
     //   99   · clap-managed `help` meta
@@ -89,7 +93,7 @@ pub enum Cmd {
     #[command(hide = true)]
     Completions(CompletionsArgs),
 
-    // ───── Resource groups (24 · alphabetical) ─────────────────────────
+    // ───── Resource groups (25 · alphabetical) ─────────────────────────
     // v3.1.0 UX: groups whose every verb still returns `E_NOT_IMPLEMENTED`
     // are marked `hide = true` so they don't clutter `onebrain --help`. The
     // tree shape stays locked per spec §2.4 — typed commands still parse and
@@ -120,6 +124,10 @@ pub enum Cmd {
     Inbox(InboxCmd),
     #[command(hide = true)]
     Log(LogCmd),
+    /// Serve OneBrain over MCP (stdio) — search tools today, more vault tool
+    /// groups to come.
+    #[command(display_order = 18)]
+    Mcp,
     #[command(hide = true)]
     Memory(MemoryCmd),
     #[command(display_order = 15)]
@@ -510,9 +518,6 @@ pub enum GatewayVerb {
     /// Telegram gateway (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
     Telegram,
-    /// MCP gateway (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Mcp,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -892,6 +897,8 @@ pub struct NoteMkdirArgs {
 
 // ─────────────────────────────────────────────────────────────────────────
 // search (6 verbs · v3.4.0 · native search engine, replaces external qmd)
+// `mcp` (the search engine's stdio server) moved to a top-level `Cmd::Mcp`
+// in v3.4.1 — see `commands::mcp`.
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]

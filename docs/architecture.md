@@ -58,3 +58,4 @@ The workspace root sets `publish = false` and every crate inherits it via `publi
 
 - The *why* behind specific choices: [`decisions/`](decisions/).
 - The Rust idioms these crates use: [`rust-patterns.md`](rust-patterns.md).
+- Crate-by-crate source map, plus the [`onebrain mcp` API reference](reference/mcp.md): [`reference/`](reference/).

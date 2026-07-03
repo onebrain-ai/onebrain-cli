@@ -22,7 +22,14 @@ use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 /// tests inject a deterministic in-memory fake behind this trait so the
 /// engine's index/query/rebuild logic can be exercised without a multi-GB
 /// model download (see `Engine::open_with_embedder`).
-pub trait Embed {
+///
+/// `Send + Sync`: [`Engine`](crate::engine::Engine) is held behind an
+/// `Arc<Mutex<_>>` and driven from `tokio::task::spawn_blocking` by the
+/// `onebrain mcp` server, so its boxed embedder must be safely shareable
+/// across threads. Both real implementors (`Embedder`, backed by
+/// `fastembed::TextEmbedding` behind a `Mutex`) and test fakes already
+/// satisfy this.
+pub trait Embed: Send + Sync {
     /// Embed a batch of texts, returning one vector per input text in the
     /// same order. Implementations must return L2-normalized vectors of
     /// length [`Embed::dims`].

@@ -5,6 +5,7 @@ pub mod doctor;
 pub mod harness;
 pub mod harness_run;
 pub mod init;
+pub mod mcp;
 pub mod migrate;
 pub mod note_append;
 pub mod note_archive;

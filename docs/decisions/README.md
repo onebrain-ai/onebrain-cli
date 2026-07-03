@@ -46,5 +46,7 @@ ADRs are immutable once accepted — if a decision changes, write a new ADR that
 | [0016](0016-qmd-collection-config-migration.md) | `qmd_collection` → `search.collection` via `doctor --fix` | accepted |
 | [0017](0017-platform-tiered-semantic-search.md) | Platform-tiered semantic search (`semantic` feature; lex-only fallback) | accepted |
 | [0018](0018-release-build-strategy-lessons.md) | Release build strategy: win-arm64 cross-compile + pre-tag matrix rule | accepted |
+| [0019](0019-native-mcp-server-staged-qmd-cutover.md) | Native MCP server (`onebrain mcp`) + staged qmd cutover | accepted |
+| [0020](0020-cpu-only-embedding-runtime.md) | CPU-only embedding runtime, by packaging choice | accepted |
 
 > These ADRs distill the public-facing rationale; the full design notes live in the project tracker. Numbers are stable IDs assigned at authoring time — see each ADR's **Date** for chronology.

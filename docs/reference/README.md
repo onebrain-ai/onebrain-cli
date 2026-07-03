@@ -14,6 +14,8 @@ A file/module-level map of the source, so you can land in any crate and follow t
 | `onebrain-search` | Native vault search — tantivy BM25 · fastembed vectors · RRF hybrid engine. | [onebrain-search.md](onebrain-search.md) |
 | `onebrain-cli` | Binary — clap dispatch · output rendering · TTY/banner · command wiring. | [onebrain-cli.md](onebrain-cli.md) |
 
+Also see [`mcp.md`](mcp.md) — the API reference for `onebrain mcp` (tool schemas, not source structure; kept separate because it's a client-facing contract, not a code map).
+
 ## Dependency direction
 
 Higher crates depend on lower ones, never the reverse:

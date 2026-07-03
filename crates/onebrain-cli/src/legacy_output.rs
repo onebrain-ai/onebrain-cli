@@ -6,12 +6,22 @@ use serde::Serialize;
 /// (`ONEBRAIN_HEADLESS=1`), letting INSTRUCTIONS.md skip the interactive
 /// startup ceremony. Unknown to older consumers, which ignore extra fields.
 ///
-/// `qmd_unembedded` is `Option` (v3.4): `null` means the qmd probe could not
-/// determine the count (qmd missing, timed out, errored, or output
-/// unparseable), `0` means a genuine zero (or a vault without qmd), `N` means N
-/// pending. The field is always serialised (never skipped) so the hook contract
-/// keeps the key. A false `0` on probe failure silently hid pending embeddings
-/// at startup — `null` lets the SessionStart consumer surface "unknown" instead.
+/// `qmd_unembedded` is `Option` (v3.4): `null` means the probe could not
+/// determine the count (index dir missing, or the engine failed to open /
+/// report status), `0` means a genuine zero (or a vault with no search
+/// collection configured), `N` means N pending. Field name and semantics are
+/// a stable wire contract kept from the v3.4 `qmd` era; as of v3.4.1 the
+/// value is sourced from the native search index directly (`Engine::status`
+/// under `crate::commands::session_init::native_pending`) rather than
+/// shelling out to the external `qmd` binary — the JSON shape is unchanged.
+/// Note the value is total index drift (`pending_new + pending_changed +
+/// pending_removed`), not strictly *unembedded* docs as the legacy name
+/// implies — a vault with only pending deletions reports a nonzero count.
+/// This is intentional: any drift means the index is stale and warrants a
+/// reindex, which is exactly what the startup warning nudges.
+/// The field is always serialised (never skipped) so the hook contract keeps
+/// the key. A false `0` on probe failure silently hid pending embeddings at
+/// startup — `null` lets the SessionStart consumer surface "unknown" instead.
 /// Consumers MUST treat `null` as "couldn't check" rather than a count: the
 /// OneBrain INSTRUCTIONS.md startup status keys its embed warning on `= 0` /
 /// `> 0`, both of which `null` correctly falls outside of (see the companion

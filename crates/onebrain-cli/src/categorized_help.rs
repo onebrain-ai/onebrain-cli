@@ -48,7 +48,7 @@ pub const CATEGORIES: &[Category] = &[
     Category {
         emoji: "🧠",
         name: "Vault Management",
-        commands: &["vault", "note", "task", "search"],
+        commands: &["vault", "note", "task", "search", "mcp"],
     },
     Category {
         emoji: "🔄",

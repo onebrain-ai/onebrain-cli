@@ -83,7 +83,6 @@ fn non_vault_stubs_always_exit_72() {
         (&["date", "parse", "2026-01-01"], &[]),
         // gateway — vault-free
         (&["gateway", "telegram"], &[]),
-        (&["gateway", "mcp"], &[]),
         // plugin non-update stubs
         (&["plugin", "uninstall"], &[]),
         (&["plugin", "status"], &[]),
