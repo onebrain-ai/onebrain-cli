@@ -350,7 +350,19 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
         }
     }
 
-    if pending > 0 {
+    // Hint priority: a missing current model blocks all search, so surface it
+    // ahead of pending drift (a reindex downloads the model AND indexes). Only
+    // meaningful with a collection + a semantic build — otherwise a null model
+    // size means "no cache dir" / "lex-only", not "chosen model is missing".
+    let model_missing =
+        d.semantic_available && d.collection.is_some() && d.model_size_bytes.is_none();
+    if model_missing {
+        lines.push(String::new());
+        lines.push(format!(
+            "💡  Current model `{}` not downloaded — run `onebrain search reindex` to download + index",
+            d.embed_model
+        ));
+    } else if pending > 0 {
         lines.push(String::new());
         lines.push("💡  Run `onebrain search reindex` to index pending changes".to_string());
     }
@@ -430,10 +442,40 @@ mod tests {
 
     #[test]
     fn text_shows_up_to_date_when_no_drift() {
-        let s = render_text(&env(Some("ob-1"), true));
+        // Truly healthy: no drift AND the current model is downloaded — so no
+        // hint. (A missing model would itself warrant a reindex hint; see
+        // `text_hints_to_reindex_when_current_model_not_downloaded`.)
+        let mut e = env(Some("ob-1"), true);
+        e.data.as_mut().unwrap().model_size_bytes = Some(493_921_024);
+        let s = render_text(&e);
         assert!(s.contains("    Status        ✅  up to date"), "{s}");
         assert!(!s.contains("pending"), "{s}");
         assert!(!s.contains("💡"), "no hint when up to date: {s}");
+    }
+
+    #[test]
+    fn text_hints_to_reindex_when_current_model_not_downloaded() {
+        // Collection set, semantic build, but the model file is absent (never
+        // downloaded, or the cache was purged by OS storage cleanup). Even with
+        // no pending drift, status must point the user at reindex — search
+        // can't run without the model.
+        let e = env(Some("ob-1"), true); // model_size_bytes defaults to None
+        let s = render_text(&e);
+        assert!(s.contains("    Size          not downloaded"), "{s}");
+        assert!(
+            s.contains("💡")
+                && s.contains("not downloaded")
+                && s.contains("onebrain search reindex"),
+            "expected a model-not-downloaded reindex hint: {s}"
+        );
+    }
+
+    #[test]
+    fn text_no_model_hint_without_collection() {
+        // No collection → `model_size_bytes` is None for lack of a cache dir,
+        // NOT because a chosen model is missing. Don't emit a reindex hint.
+        let s = render_text(&env(None, false));
+        assert!(!s.contains("💡"), "no model hint without a collection: {s}");
     }
 
     #[test]
@@ -441,6 +483,9 @@ mod tests {
         let mut e = env(Some("ob-1"), true);
         {
             let d = e.data.as_mut().unwrap();
+            // 5 docs indexed ⇒ the model was downloaded to embed them; set it so
+            // the pending-drift hint (not the model-missing hint) is exercised.
+            d.model_size_bytes = Some(493_921_024);
             d.doc_count = 5;
             d.pending_new = 2;
             d.pending_changed = 1;
