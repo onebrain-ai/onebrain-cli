@@ -164,6 +164,13 @@ fn run_with(
                 format!("create LaunchAgents directory at {}", parent.display())
             })?;
         }
+        // #116 bug 2 introduced an args/cron discriminator into command-mode
+        // labels, so a command entry registered before this release has a
+        // stale plist sitting at the OLD basename-only path — still on disk
+        // AND still loaded in launchd. Clean it up before writing the new
+        // plist so a `--refresh` doesn't leave both the old and new jobs
+        // firing. Best-effort: never blocks registration on failure.
+        cleanup_stale_legacy_plist(entry, &target, &ctx, quiet);
         std::fs::write(&target, &plist)
             .with_context(|| format!("write plist to {}", target.display()))?;
         if !quiet {
@@ -476,6 +483,111 @@ fn detect_collisions(resolved: &[ScheduleEntry], ctx: &LaunchdContext) -> Result
         seen.insert(target, entry.clone());
     }
     Ok(())
+}
+
+/// Compute the pre-#116 basename-only label for a command-mode entry — the
+/// label `label_for_entry` would have produced before the args/cron
+/// discriminator was added. Skill-mode entries never had a discriminator
+/// (only command-mode labels changed), so this returns `None` for them —
+/// there's nothing legacy to clean up.
+///
+/// Mirrors the `basename`-only branch of
+/// [`onebrain_core::scheduler::label_for_entry`] exactly (same
+/// `Path::file_name` + `sanitize_label` steps), intentionally NOT calling
+/// through to it, since that function now always appends the discriminator
+/// when one is available — we need the OLD (pre-discriminator) shape here.
+fn legacy_command_label(entry: &ScheduleEntry) -> Option<String> {
+    if !is_command_mode(entry) {
+        return None;
+    }
+    let cmd = entry.command.as_deref().unwrap_or("");
+    let basename = Path::new(cmd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(cmd);
+    Some(sanitize_label_for_migration(basename))
+}
+
+/// Local copy of `launchd::sanitize_label`'s replace-non-alphanumeric rule
+/// (that function is private to the `onebrain_core` crate). Kept in lockstep
+/// deliberately: this is used ONLY to reconstruct the pre-#116 legacy label
+/// for migration cleanup, so it must sanitize identically to how
+/// `label_for_entry` sanitized a bare basename before the discriminator was
+/// introduced.
+fn sanitize_label_for_migration(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// During registration, remove a stale pre-#116 legacy-labeled plist for a
+/// command-mode entry whose NEW (discriminator-bearing) label differs from
+/// the legacy one. Without this, `--refresh` would leave the old plist both
+/// on disk AND still loaded in launchd, so the same command fires twice
+/// (old schedule + new schedule) until the user manually cleans it up.
+///
+/// Best-effort in both steps — never fails registration:
+/// - `launchctl bootout gui/<uid>/<legacy-label>` unloads the running job
+///   (ignored if launchd doesn't have it loaded, or `launchctl` itself is
+///   unavailable in the test/CI sandbox).
+/// - The stale plist FILE is always removed when present, independent of
+///   whether bootout succeeded — this is the one step that matters for "does
+///   it fire again after the next login", since a file-only bootout failure
+///   just means the CURRENTLY loaded instance keeps running until the user's
+///   next logout/login cycle (the residual caveat callers should surface).
+fn cleanup_stale_legacy_plist(
+    entry: &ScheduleEntry,
+    new_target: &Path,
+    ctx: &LaunchdContext,
+    quiet: bool,
+) {
+    let Some(legacy_label_safe) = legacy_command_label(entry) else {
+        return;
+    };
+    let legacy_label = format!("com.onebrain.{legacy_label_safe}");
+    let legacy_target = ctx
+        .homedir
+        .join("Library/LaunchAgents")
+        .join(format!("{legacy_label}.plist"));
+
+    if legacy_target == *new_target || !legacy_target.exists() {
+        return;
+    }
+
+    // Best-effort unload — ignore failure (job may not be loaded, or
+    // `launchctl` may be unavailable in a sandboxed/CI environment).
+    let _ = std::process::Command::new("launchctl")
+        .arg("bootout")
+        .arg(format!("gui/{}", ctx.uid))
+        .arg(&legacy_target)
+        .output();
+
+    match std::fs::remove_file(&legacy_target) {
+        Ok(()) => {
+            if !quiet {
+                println!(
+                    "\u{2713} Removed stale legacy plist {} (superseded by {})",
+                    legacy_target.display(),
+                    new_target.display()
+                );
+            }
+        }
+        Err(e) => {
+            if !quiet {
+                eprintln!(
+                    "warning: could not remove stale legacy plist {}: {e} — it may keep firing \
+                     until manually removed",
+                    legacy_target.display()
+                );
+            }
+        }
+    }
 }
 
 fn remove_all(vault: &Path) -> Result<()> {
@@ -1450,5 +1562,120 @@ mod tests {
             !marker.exists(),
             "pause marker should be removed after resume"
         );
+    }
+
+    // ── legacy_command_label / cleanup_stale_legacy_plist ─────────────────────
+
+    #[test]
+    fn legacy_command_label_none_for_skill_mode() {
+        use onebrain_core::scheduler::ScheduleEntry;
+        let e = ScheduleEntry {
+            cron: Some("0 9 * * *".to_string()),
+            skill: Some("/daily".to_string()),
+            ..Default::default()
+        };
+        assert!(legacy_command_label(&e).is_none());
+    }
+
+    #[test]
+    fn legacy_command_label_is_bare_basename_no_discriminator() {
+        use onebrain_core::scheduler::{Args, ScheduleEntry};
+        let e = ScheduleEntry {
+            cron: Some("0 3 * * 0".to_string()),
+            command: Some("/opt/homebrew/bin/onebrain".to_string()),
+            args: Some(Args::List(vec!["qmd-reindex".to_string()])),
+            ..Default::default()
+        };
+        // Legacy label ignores args/cron entirely — just the basename.
+        assert_eq!(legacy_command_label(&e), Some("onebrain".to_string()));
+    }
+
+    #[test]
+    fn cleanup_stale_legacy_plist_removes_file_when_labels_differ() {
+        use onebrain_core::scheduler::{Args, LaunchdContext, ScheduleEntry};
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("Library/LaunchAgents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let legacy = agents_dir.join("com.onebrain.echo.plist");
+        std::fs::write(&legacy, "stale").unwrap();
+
+        let ctx = LaunchdContext {
+            vault_path: dir.path().to_path_buf(),
+            skill_cli_path: "onebrain".to_string(),
+            log_base_path: dir.path().join("logs"),
+            homedir: dir.path().to_path_buf(),
+            uid: 501,
+        };
+        let entry = ScheduleEntry {
+            cron: Some("0 3 * * 0".to_string()),
+            command: Some("/bin/echo".to_string()),
+            args: Some(Args::List(vec!["hello".to_string()])),
+            ..Default::default()
+        };
+        let new_target = agents_dir.join("com.onebrain.echo-hello.plist");
+        cleanup_stale_legacy_plist(&entry, &new_target, &ctx, true);
+
+        assert!(!legacy.exists(), "stale legacy plist must be removed");
+    }
+
+    #[test]
+    fn cleanup_stale_legacy_plist_noop_when_new_target_equals_legacy() {
+        // No discriminator (no args, no distinguishing cron collision risk in
+        // this synthetic case) → new label == legacy label → nothing to clean.
+        use onebrain_core::scheduler::{LaunchdContext, ScheduleEntry};
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("Library/LaunchAgents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let legacy = agents_dir.join("com.onebrain.true.plist");
+        std::fs::write(&legacy, "not actually stale").unwrap();
+
+        let ctx = LaunchdContext {
+            vault_path: dir.path().to_path_buf(),
+            skill_cli_path: "onebrain".to_string(),
+            log_base_path: dir.path().join("logs"),
+            homedir: dir.path().to_path_buf(),
+            uid: 501,
+        };
+        // No args and no cron discriminator possible here since command_discriminator
+        // falls back to cron when args are absent — use a bare command with a cron
+        // that still produces a discriminator UNLESS we bypass by pointing
+        // new_target at the same legacy path directly (simulating "no change").
+        let entry = ScheduleEntry {
+            cron: Some("0 9 * * *".to_string()),
+            command: Some("/usr/bin/true".to_string()),
+            ..Default::default()
+        };
+        cleanup_stale_legacy_plist(&entry, &legacy, &ctx, true);
+
+        assert!(
+            legacy.exists(),
+            "must not remove the plist when new_target IS the legacy path"
+        );
+    }
+
+    #[test]
+    fn cleanup_stale_legacy_plist_noop_when_no_legacy_file_present() {
+        use onebrain_core::scheduler::{Args, LaunchdContext, ScheduleEntry};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Library/LaunchAgents")).unwrap();
+
+        let ctx = LaunchdContext {
+            vault_path: dir.path().to_path_buf(),
+            skill_cli_path: "onebrain".to_string(),
+            log_base_path: dir.path().join("logs"),
+            homedir: dir.path().to_path_buf(),
+            uid: 501,
+        };
+        let entry = ScheduleEntry {
+            cron: Some("0 3 * * 0".to_string()),
+            command: Some("/bin/echo".to_string()),
+            args: Some(Args::List(vec!["hello".to_string()])),
+            ..Default::default()
+        };
+        let new_target = dir
+            .path()
+            .join("Library/LaunchAgents/com.onebrain.echo-hello.plist");
+        // No legacy file on disk — must be a silent no-op, no panic.
+        cleanup_stale_legacy_plist(&entry, &new_target, &ctx, true);
     }
 }

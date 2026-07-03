@@ -258,6 +258,54 @@ fn unschedulable_skill_rejected() {
         .stderr(predicate::str::contains("requires user input"));
 }
 
+/// #116 bug 2 fix (this release): a command-mode entry registered under the
+/// OLD basename-only label scheme leaves a stale plist on disk once the
+/// entry starts carrying an args/cron discriminator. Registering again must
+/// remove the stale legacy-labeled plist file so the user doesn't end up
+/// with both the old and new jobs loaded.
+///
+/// Unix-only: relies on `/bin/echo` existing and writes to a tempdir HOME.
+#[cfg(unix)]
+#[test]
+fn stale_legacy_plist_removed_on_reregister() {
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("vault.yml"),
+        "schedule:\n  - cron: \"0 3 * * 0\"\n    command: /bin/echo\n    args:\n      - hello\n",
+    )
+    .unwrap();
+    let home = tempdir().unwrap();
+    let agents_dir = home.path().join("Library/LaunchAgents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+
+    // Simulate a pre-#116 registration: a plist at the OLD basename-only
+    // label (no discriminator) — this is what `onebrain register-schedule`
+    // would have written before the args discriminator existed.
+    let legacy_plist = agents_dir.join("com.onebrain.echo.plist");
+    std::fs::write(&legacy_plist, "<!-- stale pre-#116 plist -->").unwrap();
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule"])
+        .current_dir(v.path())
+        .env("HOME", home.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Removed stale legacy plist"));
+
+    assert!(
+        !legacy_plist.exists(),
+        "stale legacy plist must be removed on re-register"
+    );
+    // The new discriminator-bearing plist must exist alongside the cleanup.
+    let new_plist = agents_dir.join("com.onebrain.echo-hello.plist");
+    assert!(
+        new_plist.exists(),
+        "expected new plist at {}",
+        new_plist.display()
+    );
+}
+
 /// One-shot args containing shell-special chars are rejected.
 #[test]
 fn one_shot_command_rejects_shell_special_chars() {
