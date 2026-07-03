@@ -57,7 +57,7 @@ Point an AI agent at a vault and it improvises — a different pile of `grep` / 
 
 ## Status
 
-**v3.4.x — stable & production-ready, in active maintenance.** GA since v3.0.0 (2026-05-22), shipping ~weekly themed minors. The v3.3 line landed the daemon foundation — `onebrain serve` hosts a local web UI (embedded in the binary) over a token-gated vault JSON API. The v3.4 line introduces the native Rust search engine (the `onebrain-search` crate + `onebrain search` verbs) and a native MCP server (`onebrain mcp`, v3.4.1), replacing the external qmd Node dependency across v3.4.x with full cutover — **0 node/python deps** — at v3.4.4. Version history + direction in the [Roadmap](#roadmap); full detail in [CHANGELOG.md](CHANGELOG.md).
+**v3.4.x — stable & production-ready, in active maintenance.** GA since v3.0.0 (2026-05-22), shipping ~weekly themed minors. The v3.3 line landed the daemon foundation — `onebrain serve` hosts a local web UI (embedded in the binary) over a token-gated vault JSON API. The v3.4 line introduces the native Rust search engine (the `onebrain-search` crate + `onebrain search` verbs) and a native MCP server (`onebrain mcp`, v3.4.1), replacing the external qmd Node dependency across v3.4.x with full cutover — **0 node/python deps** — at v3.4.5. Version history + direction in the [Roadmap](#roadmap); full detail in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quickstart
 
@@ -69,7 +69,7 @@ brew install onebrain-ai/onebrain/onebrain
 
 # 2. Verify
 onebrain --version
-# → onebrain 3.4.3
+# → onebrain 3.4.4
 
 # 3. Scaffold a vault and let init pull the OneBrain plugin
 mkdir my-vault && cd my-vault
@@ -168,7 +168,7 @@ onebrain
 ├── note        read · list · find · search · stat · new · append · edit
 │               · move · mkdir · archive · delete · orphans · backlinks
 ├── task        list
-├── qmd         reindex · embed · status        (legacy — removed in v3.4.4)
+├── qmd         reindex · embed · status        (legacy — removed in v3.4.5)
 ├── plugin      install · update · migrate
 ├── schedule    register · list
 ├── skill       run
@@ -329,11 +329,12 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
 - [x] **v3.3** — Daemon foundation: `onebrain serve` — a local **web UI embedded in the binary** over a token-gated vault JSON API (file explorer · reading view · qmd-backed search · agent chat), on a security-hardened surface (whole-surface token gate · vault path confinement · CSP + forced-attachment · agent env isolation).
 - [ ] **v3.4** — **Native Rust search — replaces qmd** (mini-epic across v3.4.x; exit: **0 node/python deps**):
   - [x] **v3.4.0** — `onebrain-search` engine (tantivy BM25 + fastembed embeddings + RRF hybrid, ~100-language semantic + Thai/CJK keyword) · `onebrain search` verbs (`query/search/vsearch/get/status/reindex/model` + interactive model TUI) · doctor native-search checks · `qmd_collection` → `search.collection` migration.
-  - [x] **v3.4.1** — native MCP server (`onebrain mcp`, rmcp): qmd-compatible `query/get/multi_get/status` tools, client-side RRF fusion, native `session init` probe (drops the qmd subprocess). Plugin `.mcp.json` server-key rename (`qmd` → `search`) is staged for the v3.4.4 cutover — see [ADR 0019](docs/decisions/0019-native-mcp-server-staged-qmd-cutover.md).
+  - [x] **v3.4.1** — native MCP server (`onebrain mcp`, rmcp): qmd-compatible `query/get/multi_get/status` tools, client-side RRF fusion, native `session init` probe (drops the qmd subprocess). Plugin `.mcp.json` server-key rename (`qmd` → `search`) is staged for the v3.4.5 cutover — see [ADR 0019](docs/decisions/0019-native-mcp-server-staged-qmd-cutover.md).
   - [x] **v3.4.2** — **security fix**: the `serve`/daemon session auth token now comes from the OS CSPRNG on every platform (`getrandom`), removing the time-seeded, guessable Windows fallback. *(Interleaved ahead of the qmd epic — see below.)*
   - [x] **v3.4.3** — housekeeping bundle: scheduler polish (cron steps/lists · plist collision · `schedule list`) · CI `lex-only` test job · minor fixes.
-  - [ ] **v3.4.4** — `/qmd` → `/search` skill + auto reindex/embed hook + serve/WebUI search rewire + **remove `@tobilu/qmd`** *(was v3.4.2 — shifted by the v3.4.2 security fix + v3.4.3 housekeeping)*.
-  - [ ] **v3.4.5** — relevance polish: rerank (bge-reranker-v2-m3) · query expansion · nlpo3 Thai word-seg · custom ONNX models *(was v3.4.3)*.
+  - [x] **v3.4.4** — scheduler runs actually fire: `onebrain` is now put on the headless-`claude` child's PATH so cron skills no longer exit 78 (#124) · generated plists emit `skill run`, not the deprecated `run-skill` (#125). *(Interleaved scheduler-fix patch, ahead of the qmd epic.)*
+  - [ ] **v3.4.5** — `/qmd` → `/search` skill + auto reindex/embed hook + serve/WebUI search rewire + **remove `@tobilu/qmd`** + relocate the search cache off OS-purgeable `~/Library/Caches` (#114) *(the qmd epic; shifted by the v3.4.2 security fix, v3.4.3 housekeeping, and v3.4.4 scheduler patch)*.
+  - [ ] **v3.4.6** — relevance polish: rerank (bge-reranker-v2-m3) · query expansion · nlpo3 Thai word-seg · custom ONNX models.
 - [ ] **v3.5** — Bootstrap + native verbs: startup / wrapup / daily / tasks → 1 call per ceremony (import content-verbs anchored ~v3.5.x).
 - [ ] **v3.6** — Warm daemon + RPC: kill cold process-start; keeps the native index + embed model hot (absorbs the old RPC-layer milestone).
 - [ ] ~~**v3.7** — qmd native search~~ → absorbed into v3.4.
