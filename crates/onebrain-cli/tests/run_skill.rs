@@ -627,6 +627,53 @@ fn headless_env_var_is_set_on_child() {
 
 #[cfg(unix)]
 #[test]
+fn onebrain_bindir_is_prepended_to_child_path() {
+    // #124: under launchd the parent `onebrain` process has a minimal PATH,
+    // so a headless `claude`/`gemini` child can't resolve bare `onebrain`
+    // calls from its own skill hooks (session-init, checkpoint, etc.),
+    // failing with exit 78. `spawn_harness` must prepend the running
+    // `onebrain` binary's own directory to the child's PATH so nested
+    // `onebrain` invocations resolve regardless of the parent's PATH.
+    let d = tempdir().unwrap();
+    let vault = d.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    write_minimal_vault(&vault);
+    let mock = write_mock_claude(d.path(), "#!/bin/bash\nprintf '%s' \"$PATH\"\nexit 0\n");
+
+    // Emulate launchd's minimal PATH on the parent · only `/usr/bin:/bin`,
+    // deliberately excluding the test binary's own directory so we can prove
+    // it gets added back rather than merely surviving inheritance.
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .args([
+            "run-skill",
+            "--vault",
+            vault.to_str().unwrap(),
+            "--skill",
+            "/daily",
+        ])
+        .env("CLAUDE_BIN", &mock)
+        .env("PATH", "/usr/bin:/bin")
+        .assert()
+        .success();
+
+    let onebrain_bin = assert_cmd::cargo::cargo_bin("onebrain");
+    let bindir = onebrain_bin.parent().unwrap();
+    let output = assert.get_output();
+    let child_path = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        child_path.starts_with(bindir.to_str().unwrap()),
+        "expected child PATH to start with the onebrain bindir {}: got {child_path}",
+        bindir.display()
+    );
+    assert!(
+        child_path.contains("/usr/bin:/bin") || child_path.ends_with("/usr/bin:/bin"),
+        "expected the original minimal PATH to still be present: got {child_path}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn skill_run_passes_json_flag_to_claude() {
     // `skill run --json` maps to `--output-format json` in the claude argv.
     // Must use `skill run` (not `run-skill`): the legacy alias has no --json flag.

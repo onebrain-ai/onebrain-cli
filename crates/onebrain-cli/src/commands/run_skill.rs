@@ -1,7 +1,11 @@
 //! `onebrain skill run` — spawn a headless agent harness on a OneBrain skill
 //! with the vault as `cwd`, inheriting the parent process env (so PATH/HOME
-//! survive for Homebrew lookups). Used by the launchd scheduler to dispatch
-//! OneBrain skills headlessly, and runnable manually from inside a vault.
+//! survive for Homebrew lookups) with the `onebrain` binary's own directory
+//! prepended to PATH (see [`child_path_with_exe_dir`] — under launchd the
+//! parent has a minimal PATH, so this keeps nested `onebrain` calls from the
+//! skill's own hooks resolving; #124). Used by the launchd scheduler to
+//! dispatch OneBrain skills headlessly, and runnable manually from inside a
+//! vault.
 //!
 //! Harnesses (`--harness`, default `claude`):
 //!   - claude → `claude -p "<prompt>" --add-dir <vault> [--model <m>]`
@@ -146,6 +150,21 @@ fn parse_args(raw: &[String]) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
+/// Prepend `exe_dir` to `existing_path` (the child process PATH) so a headless
+/// `claude` can find the `onebrain` binary even under launchd's minimal PATH.
+/// Idempotent: if `existing_path` already starts with `exe_dir`, returns it
+/// unchanged. Uses the platform PATH separator.
+fn child_path_with_exe_dir(exe_dir: &str, existing_path: &str) -> String {
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    if existing_path.is_empty() {
+        exe_dir.to_string()
+    } else if existing_path == exe_dir || existing_path.starts_with(&format!("{exe_dir}{sep}")) {
+        existing_path.to_string()
+    } else {
+        format!("{exe_dir}{sep}{existing_path}")
+    }
+}
+
 /// Spawn the chosen harness binary on the prepared argv. Shared by `skill run`
 /// and `harness run` — `subject` is the noun in the spinner message
 /// ("the skill" vs "the prompt") so the watched-run UI matches whichever
@@ -171,6 +190,23 @@ pub(crate) fn spawn_harness(
         .current_dir(cwd)
         .env("ONEBRAIN_HEADLESS", "1")
         .stdin(Stdio::null());
+
+    // Under launchd, the parent `onebrain` process (spawned by launchd itself)
+    // has a minimal PATH without e.g. `/opt/homebrew/bin`. The headless
+    // `claude`/`gemini` child then can't resolve bare `onebrain` invocations
+    // from its own skill hooks (session-init, checkpoint, etc.), which fail
+    // with exit 78 (#124). Prepend our own binary's directory to the child's
+    // PATH so nested `onebrain` calls resolve. Safe for interactive runs too
+    // (the user's PATH already has it, so this is a no-op there).
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+    {
+        if let Some(dir) = exe_dir.to_str() {
+            let existing = std::env::var("PATH").unwrap_or_default();
+            command.env("PATH", child_path_with_exe_dir(dir, &existing));
+        }
+    }
 
     // Non-interactive (launchd scheduler, piped, CI): block and let the
     // captured StandardOutPath / pipe collect the output. No progress lines —
@@ -367,6 +403,56 @@ mod tests {
     fn parse_args_rejects_empty_key() {
         let err = parse_args(&["=value".to_string()]).unwrap_err();
         assert!(err.to_string().contains("empty key"));
+    }
+
+    // ---- child_path_with_exe_dir (#124) ----
+
+    #[test]
+    fn child_path_empty_existing_returns_exe_dir() {
+        assert_eq!(
+            child_path_with_exe_dir("/opt/homebrew/bin", ""),
+            "/opt/homebrew/bin"
+        );
+    }
+
+    #[test]
+    fn child_path_prepends_with_platform_separator() {
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        assert_eq!(
+            child_path_with_exe_dir("/opt/homebrew/bin", "/usr/bin:/bin"),
+            format!("/opt/homebrew/bin{sep}/usr/bin:/bin")
+        );
+    }
+
+    #[test]
+    fn child_path_idempotent_when_existing_equals_exe_dir() {
+        // Already exactly the exe dir · no change.
+        assert_eq!(
+            child_path_with_exe_dir("/opt/homebrew/bin", "/opt/homebrew/bin"),
+            "/opt/homebrew/bin"
+        );
+    }
+
+    #[test]
+    fn child_path_idempotent_when_existing_already_prefixed() {
+        // exe_dir already leads the PATH · no double-prepend.
+        assert_eq!(
+            child_path_with_exe_dir("/opt/homebrew/bin", "/opt/homebrew/bin:/usr/bin"),
+            "/opt/homebrew/bin:/usr/bin"
+        );
+    }
+
+    #[test]
+    fn child_path_does_not_false_dedup_on_shared_prefix() {
+        // `/opt/homebrew/bin2` merely *starts with* the string
+        // "/opt/homebrew/bin" but is a different directory · must still
+        // prepend. This is why the guard checks `== exe_dir` or
+        // `starts_with("{exe_dir}{sep}")`, not a bare `starts_with(exe_dir)`.
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        assert_eq!(
+            child_path_with_exe_dir("/opt/homebrew/bin", "/opt/homebrew/bin2:/usr/bin"),
+            format!("/opt/homebrew/bin{sep}/opt/homebrew/bin2:/usr/bin")
+        );
     }
 
     // ---- harness_argv ----
