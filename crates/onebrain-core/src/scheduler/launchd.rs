@@ -62,6 +62,16 @@ pub fn xml_escape(s: &str) -> String {
 ///
 /// Skill-mode strips the leading `/` and is left unchanged (`com.onebrain.daily`
 /// etc.) — this discriminator only applies to command mode.
+///
+/// Note: a skill-mode label and a command-mode label are never derived from
+/// the same input space in a way that could collide in practice — a skill
+/// name always starts as a real `SKILL.md` directory name under
+/// `.claude/plugins/onebrain/skills/`, validated by `validate_schedulable`
+/// before registration, whereas a command-mode label is a binary basename
+/// plus an args/cron discriminator suffix. `detect_collisions` still checks
+/// the final plist PATH regardless of mode, so even a hypothetical
+/// literal-string collision between the two would be caught there, not
+/// silently accepted.
 pub fn label_for_entry(entry: &ScheduleEntry) -> String {
     if is_command_mode(entry) {
         let cmd = entry.command.as_deref().unwrap_or("");
@@ -743,6 +753,16 @@ mod tests {
     }
 
     #[test]
+    fn calendar_block_weekday_seven_emits_zero() {
+        // Standard cron 7 = Sunday, but launchd's `Weekday` key only
+        // understands 0-6 — must be normalized before it reaches the plist.
+        let out = generate_plist(&skill_entry("/daily", "0 9 * * 7"), &test_ctx());
+        assert!(out.contains("<key>Weekday</key>\n        <integer>0</integer>"));
+        // Single value → stays plain <dict>, not <array>.
+        assert!(out.contains("<key>StartCalendarInterval</key>\n    <dict>"));
+    }
+
+    #[test]
     fn calendar_block_range_weekday_emits_inclusive_dicts() {
         let out = generate_plist(&skill_entry("/daily", "0 9 * * 1-5"), &test_ctx());
         for w in 1..=5 {
@@ -761,5 +781,23 @@ mod tests {
         // shape — distinct from the single-`<dict>` snapshot above.
         let out = generate_plist(&skill_entry("/daily", "0 */6 * * *"), &test_ctx());
         insta::assert_snapshot!(out);
+    }
+
+    // ── DOM/DOW: day-only restricted still works (weekday-only already
+    // covered above by `calendar_block_list_weekday_emits_one_dict_per_value`
+    // and `calendar_block_range_weekday_emits_inclusive_dicts`). The
+    // both-restricted case is rejected upstream by
+    // `cron_parse::validate_cron` — `generate_plist`/`calendar_block` assume
+    // pre-validated input (see their doc comments), so a both-restricted
+    // cron string never reaches this module in practice. ─────────────────
+
+    #[test]
+    fn calendar_block_day_only_restricted_emits_array_of_day_dicts() {
+        let out = generate_plist(&skill_entry("/daily", "0 9 1,15 * *"), &test_ctx());
+        assert!(out.contains("<key>StartCalendarInterval</key>\n    <array>"));
+        assert!(out.contains("<key>Day</key>\n            <integer>1</integer>"));
+        assert!(out.contains("<key>Day</key>\n            <integer>15</integer>"));
+        // No Weekday key at all — day-of-month is the only restricted field.
+        assert!(!out.contains("<key>Weekday</key>"));
     }
 }

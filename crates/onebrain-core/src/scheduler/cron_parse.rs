@@ -11,6 +11,17 @@
 //! step, an `a-b` inclusive range, and an `a,b,c` list. These compose —
 //! e.g. `1-5/2` is accepted (nice-to-have combination) — but the common
 //! cases named in #116 are steps and lists.
+//!
+//! Weekday also accepts the standard cron `0`-`7` range (both `0` and `7`
+//! mean Sunday); `7` is normalized to `0` during expansion so launchd's
+//! `Weekday` key never receives an out-of-range value and `0,7` dedupes
+//! to a single combination.
+//!
+//! Day-of-month and day-of-week are mutually exclusive: `validate_cron`
+//! rejects a cron string that restricts BOTH (neither is `*`), because
+//! standard cron ORs the two fields but our launchd `<dict>` emitter ANDs
+//! same-dict keys — see `validate_cron`'s day/weekday check for the full
+//! rationale.
 
 use crate::scheduler::error::SchedulerError;
 use regex::Regex;
@@ -28,7 +39,11 @@ const MINUTE_RANGE: FieldRange = FieldRange { min: 0, max: 59 };
 const HOUR_RANGE: FieldRange = FieldRange { min: 0, max: 23 };
 const DAY_RANGE: FieldRange = FieldRange { min: 1, max: 31 };
 const MONTH_RANGE: FieldRange = FieldRange { min: 1, max: 12 };
-const WEEKDAY_RANGE: FieldRange = FieldRange { min: 0, max: 6 };
+// Standard/Vixie cron accepts weekday 0-7, where BOTH 0 and 7 mean Sunday
+// (launchd's own `Weekday` key only understands 0-6, so a bare 7 is
+// normalized to 0 during expansion — see `expand_item`'s post-processing
+// in `expand_field`/`expand_field_or_wildcard`).
+const WEEKDAY_RANGE: FieldRange = FieldRange { min: 0, max: 7 };
 
 fn cron_field_re() -> &'static Regex {
     // A single cron field: one comma-separated list of items, where each
@@ -83,11 +98,14 @@ pub fn validate_cron(cron: &str) -> Result<(), SchedulerError> {
         // Syntax matched — now check semantic validity (step nonzero,
         // range order, values in bounds) via the same expansion path the
         // launchd emitter uses, surfacing its error as the reason string.
-        let expanded =
+        let mut expanded =
             expand_field_or_wildcard(f, *range).map_err(|reason| SchedulerError::InvalidCron {
                 cron: cron.to_string(),
                 reason,
             })?;
+        if i == 4 {
+            normalize_weekday_seven(&mut expanded);
+        }
         match i {
             0 => set.minute = expanded,
             1 => set.hour = expanded,
@@ -95,6 +113,26 @@ pub fn validate_cron(cron: &str) -> Result<(), SchedulerError> {
             3 => set.month = expanded,
             _ => set.weekday = expanded,
         }
+    }
+    // Standard cron ORs day-of-month and day-of-week when BOTH are
+    // restricted (neither is `*`) — e.g. `0 9 1,15 * 1,5` fires on the
+    // 1st/15th of the month OR every Mon/Fri. Our launchd emitter instead
+    // ANDs the two keys within one `<dict>` (launchd has no native OR-across-
+    // keys construct), so a both-restricted cron would silently fire far
+    // less often than the user's cron string implies. Reject rather than
+    // silently emit the wrong (AND) semantics — the #116 collision fix in
+    // this same release makes splitting into two separate `schedule:`
+    // entries (one day-restricted, one weekday-restricted) a viable
+    // workaround, since same-binary/skill entries on different schedules no
+    // longer collide on one plist path.
+    if fields[2] != "*" && fields[4] != "*" {
+        return Err(SchedulerError::InvalidCron {
+            cron: cron.to_string(),
+            reason: "restricting both day-of-month and day-of-week is not supported by the \
+                     launchd backend; use separate `schedule:` entries (which no longer \
+                     collide as of this release)"
+                .to_string(),
+        });
     }
     if let Err(reason) = set.combinations() {
         return Err(SchedulerError::InvalidCron {
@@ -118,6 +156,21 @@ fn expand_field(field: &str, range: FieldRange) -> Result<Vec<u32>, String> {
     values.sort_unstable();
     values.dedup();
     Ok(values)
+}
+
+/// Standard/Vixie cron accepts weekday `0`-`7`, where both `0` and `7` mean
+/// Sunday — but launchd's `Weekday` key only understands `0`-`6`. Map any
+/// `7` in the expanded value set down to `0`, then re-sort + dedup so
+/// `0,7` (both meaning Sunday) collapses to a single `[0]` rather than
+/// emitting two combinations (or, worse, an out-of-range `Weekday` key).
+fn normalize_weekday_seven(values: &mut Vec<u32>) {
+    for v in values.iter_mut() {
+        if *v == 7 {
+            *v = 0;
+        }
+    }
+    values.sort_unstable();
+    values.dedup();
 }
 
 /// Same as [`expand_field`], but a bare `*` collapses to the empty-vec
@@ -216,12 +269,17 @@ pub struct CronFieldSet {
 
 impl CronFieldSet {
     /// Cartesian product cap — a plain `* * * * *` would otherwise expand
-    /// to 60×24×31×12×7 combinations. Any single multi-valued field is
-    /// fine (e.g. `*/2` on hour → 12 combinations); the product only
-    /// grows large when MULTIPLE fields are simultaneously multi-valued,
-    /// which is a pathological/unintended configuration worth rejecting
-    /// with a clear error rather than silently writing a huge plist.
-    const MAX_COMBINATIONS: usize = 366;
+    /// to 60×24×31×12×7 combinations (wildcards aren't enumerated, so this
+    /// never actually happens, but the cap must still admit legitimate
+    /// multi-field expressions). Any single multi-valued field is fine
+    /// (e.g. `*/2` on hour → 12 combinations); the product only grows large
+    /// when MULTIPLE fields are simultaneously multi-valued.
+    ///
+    /// 1000 accepts the benign "every day of every month" idiom
+    /// `0 0 1-31 1-12 *` (31×12 = 372 combinations) while still rejecting
+    /// the pathological `*/1 */1 * * *` (1440 combinations) — a clear
+    /// error rather than silently writing a huge plist.
+    const MAX_COMBINATIONS: usize = 1000;
 
     /// True when every field has at most one concrete value — the plist
     /// emitter can use the existing single-`<dict>` form.
@@ -345,12 +403,14 @@ pub fn cron_fields_to_launchd_expanded(cron: &str) -> CronFieldSet {
     let expand = |s: &str, range: FieldRange| -> Vec<u32> {
         expand_field_or_wildcard(s, range).expect("validate_cron failed to gate")
     };
+    let mut weekday = expand(f[4], WEEKDAY_RANGE);
+    normalize_weekday_seven(&mut weekday);
     CronFieldSet {
         minute: expand(f[0], MINUTE_RANGE),
         hour: expand(f[1], HOUR_RANGE),
         day: expand(f[2], DAY_RANGE),
         month: expand(f[3], MONTH_RANGE),
-        weekday: expand(f[4], WEEKDAY_RANGE),
+        weekday,
     }
 }
 
@@ -518,6 +578,90 @@ mod tests {
         assert!(msg.contains("exceeding the cap"), "msg was: {msg}");
     }
 
+    // ── weekday=7 regression (standard/Vixie cron: 0 AND 7 both mean Sunday) ──
+
+    #[test]
+    fn validate_cron_accepts_weekday_seven_as_sunday() {
+        assert!(validate_cron("0 9 * * 7").is_ok());
+    }
+
+    #[test]
+    fn expanded_weekday_seven_normalizes_to_zero() {
+        let set = cron_fields_to_launchd_expanded("0 9 * * 7");
+        assert_eq!(set.weekday, vec![0]);
+    }
+
+    #[test]
+    fn expanded_weekday_zero_and_seven_dedupe_to_single_zero() {
+        let set = cron_fields_to_launchd_expanded("0 9 * * 0,7");
+        assert_eq!(set.weekday, vec![0]);
+    }
+
+    #[test]
+    fn validate_cron_rejects_weekday_eight() {
+        let e = validate_cron("0 9 * * 8").unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("out of range"), "msg was: {msg}");
+    }
+
+    #[test]
+    fn cron_fields_to_launchd_weekday_seven_collapses_to_single_dict_zero() {
+        // 0,7 dedupes to exactly one value → single-combination form.
+        let f = cron_fields_to_launchd("0 9 * * 0,7");
+        assert_eq!(f.weekday, Some(0));
+    }
+
+    // ── DOM/DOW both-restricted: rejected (launchd ANDs, cron ORs) ────────────
+
+    #[test]
+    fn validate_cron_rejects_both_day_and_weekday_restricted() {
+        let e = validate_cron("0 9 1,15 * 1,5").unwrap_err();
+        let msg = e.to_string();
+        assert!(
+            msg.contains("restricting both day-of-month and day-of-week"),
+            "msg was: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_cron_rejects_both_restricted_single_values() {
+        // Even single (non-list/range) values on both fields must be
+        // rejected — the restriction is "field != wildcard", not "field is
+        // a list/range".
+        let e = validate_cron("0 9 1 * 1").unwrap_err();
+        let msg = e.to_string();
+        assert!(
+            msg.contains("restricting both day-of-month and day-of-week"),
+            "msg was: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_cron_accepts_day_only_restricted() {
+        assert!(validate_cron("0 9 1,15 * *").is_ok());
+    }
+
+    #[test]
+    fn validate_cron_accepts_weekday_only_restricted() {
+        assert!(validate_cron("0 9 * * 1,5").is_ok());
+    }
+
+    // ── MAX_COMBINATIONS: cap raised from 366 to 1000 (#116 follow-up) ────────
+
+    #[test]
+    fn validate_cron_accepts_every_day_of_every_month() {
+        // 31 days × 12 months = 372 combinations — benign, must be accepted
+        // now that the cap is 1000 (was 366, which wrongly rejected this).
+        assert!(validate_cron("0 0 1-31 1-12 *").is_ok());
+    }
+
+    #[test]
+    fn validate_cron_still_rejects_pathological_1440() {
+        // Cap raised to 1000 but 1440 must still be rejected.
+        let e = validate_cron("*/1 */1 * * *").unwrap_err();
+        assert!(e.to_string().contains("exceeding the cap"));
+    }
+
     // ── cron_fields_to_launchd: single-combination form ───────────────────────
 
     #[test]
@@ -625,6 +769,37 @@ mod tests {
         // sentinel, never enumerated), so it must use an explicit
         // every-value step to force real enumeration here.
         let set = cron_fields_to_launchd_expanded("*/1 */1 * * *");
+        let err = set.combinations().unwrap_err();
+        assert!(err.contains("exceeding the cap"), "got: {err}");
+    }
+
+    // ── MAX_COMBINATIONS exact-boundary (guards `>` vs `>=` regressions) ──────
+
+    #[test]
+    fn combinations_exactly_at_cap_succeeds() {
+        // 1000 minute values × 1 everything-else = exactly
+        // CronFieldSet::MAX_COMBINATIONS (1000) — must succeed.
+        let set = CronFieldSet {
+            minute: (0..1000).collect(),
+            hour: vec![],
+            day: vec![],
+            month: vec![],
+            weekday: vec![],
+        };
+        let combos = set.combinations().unwrap();
+        assert_eq!(combos.len(), 1000);
+    }
+
+    #[test]
+    fn combinations_one_over_cap_rejected() {
+        // 1001 > MAX_COMBINATIONS (1000) — must be rejected.
+        let set = CronFieldSet {
+            minute: (0..1001).collect(),
+            hour: vec![],
+            day: vec![],
+            month: vec![],
+            weekday: vec![],
+        };
         let err = set.combinations().unwrap_err();
         assert!(err.contains("exceeding the cap"), "got: {err}");
     }
