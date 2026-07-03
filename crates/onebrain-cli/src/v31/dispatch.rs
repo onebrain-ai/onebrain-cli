@@ -134,11 +134,16 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 let v = vault_dir.or(vault_flag.clone());
                 commands::register_schedule::run(v, dry_run, remove, refresh, resume, status, test)
             }
+            // `List` reuses the existing `--status` path (reads onebrain.yml
+            // schedule block, prints each entry with cron/at + installed
+            // ✓/✗). Previously only reachable via `schedule register
+            // --status`; #116 asked for a plain `schedule list` too.
+            ScheduleVerb::List => {
+                let v = vault_flag.clone();
+                commands::register_schedule::run(v, false, false, false, None, true, None)
+            }
             // Non-protocol verbs are vault-required (need to know which
             // vault's plists to list / which YAML to modify).
-            ScheduleVerb::List => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "schedule list")
-            }
             ScheduleVerb::Add { .. } => {
                 stubs::not_implemented_vault_required(vault_flag.clone(), "schedule add")
             }
