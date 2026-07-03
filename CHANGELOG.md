@@ -1,5 +1,5 @@
 ---
-latest_version: 3.4.4
+latest_version: 3.4.5
 released: 2026-07-03
 ---
 
@@ -9,6 +9,14 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.5] — 2026-07-03 — search state moves to the persistent data dir (#114)
+
+- **Native-search state (embedding model + tantivy/vector index + `engine.redb`) now lives in the OS data dir** — `~/Library/Application Support/onebrain/search/` (macOS) · `$XDG_DATA_HOME/onebrain/search/` (Linux) · `%APPDATA%\onebrain\search\` (Windows) — instead of the OS-**purgeable** cache dir. macOS storage cleanup silently wiped a ~536 MB model + index from `~/Library/Caches` (#114); expensive-to-recreate data must not live somewhere the OS may evict.
+- **Existing state migrates automatically and transparently** on the next command: a one-time same-volume rename of `<cache>/onebrain/search` → `<data>/onebrain/search` (atomic, instant, no re-download / re-embed). Best-effort — a failure warns on stderr but never aborts, leaving the old data for manual recovery.
+- **Only the `search/` subtree moves**; the disposable `latest-release.json` update-check cache stays in the cache dir by design.
+- **`doctor` now flags a purge:** an already-configured collection with a missing index reports "search cache may have been removed by OS storage cleanup — `onebrain search reindex`" instead of the neutral "no index yet."
+- See [ADR 0021](docs/decisions/0021-search-state-persistent-data-dir.md).
 
 ## [3.4.4] — 2026-07-03 — scheduler runs actually fire
 

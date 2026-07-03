@@ -294,13 +294,18 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
     let cache_dir = collection_cache_dir(&collection);
     let model_downloaded = any_model_downloaded(&cache_dir);
 
-    // No index on disk yet → advisory warn (a fresh vault hasn't reindexed).
-    // The model dirs live INSIDE the collection cache dir, so "no cache dir"
-    // implies "no model" — no need to qualify the note.
+    // No index on disk → advisory warn. Two causes look identical from here
+    // (there's no marker that survives a cache purge — `last_indexed_at` lives
+    // inside the very `engine.redb` that gets wiped): either a fresh vault that
+    // never reindexed, or an established collection whose index/model vanished
+    // (the OS-purgeable cache location that v3.4.5 moved away from — issue
+    // #114). The message names both honestly rather than mis-asserting a purge
+    // on a fresh vault. The model dirs live INSIDE the collection cache dir, so
+    // "no cache dir" implies "no model" — no need to qualify that separately.
     if !is_indexed(&cache_dir) {
         return DoctorResult::warn(
             "search",
-            format!("no index yet ({collection}) · model not downloaded"),
+            format!("no index for {collection} · model not downloaded — never reindexed, or the search cache was cleared by OS storage cleanup"),
         )
         .with_hint("onebrain search reindex")
         .with_details(vec![format!("collection: {collection}")]);
@@ -2718,10 +2723,13 @@ mod tests {
         .unwrap();
         let r = native_search_check(d.path());
         assert_eq!(r.status, DoctorStatus::Warn);
-        assert!(r.message.contains("no index yet"), "{r:?}");
+        assert!(r.message.contains("no index for"), "{r:?}");
         assert!(r.message.contains(&collection), "{r:?}");
         // No model downloaded for a fresh collection either.
         assert!(r.message.contains("model not downloaded"), "{r:?}");
+        // The message surfaces the OS-cache-purge possibility (issue #114)
+        // without falsely asserting it happened on this fresh vault.
+        assert!(r.message.contains("storage cleanup"), "{r:?}");
         assert_eq!(r.hint.as_deref(), Some("onebrain search reindex"));
         assert!(
             r.details.iter().any(|d| d.contains(&collection)),

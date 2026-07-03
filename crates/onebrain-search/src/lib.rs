@@ -46,10 +46,15 @@
 //!
 //! # Storage
 //!
-//! Per collection, under `~/.cache/onebrain/search/<collection>/`: a `tantivy/`
-//! index directory, a `vectors/` flat vector store, and an `engine.redb`
-//! metadata database. Downloaded embedding models live alongside them in
-//! `models--*` dirs. All outside the vault.
+//! Per collection, under the platform data dir
+//! (`~/Library/Application Support/onebrain/search/<collection>/` on macOS ·
+//! `$XDG_DATA_HOME/onebrain/search/<collection>/` on Linux ·
+//! `%APPDATA%\onebrain\search\<collection>\` on Windows): a `tantivy/` index
+//! directory, a `vectors/` flat vector store, and an `engine.redb` metadata
+//! database. Downloaded embedding models live alongside them in `models--*`
+//! dirs. All outside the vault, and outside the OS-purgeable cache dir (moved
+//! there in v3.4.5, issue #114). The CLI owns the concrete path
+//! (`onebrain_cli::commands::search_common::search_cache_root`).
 
 pub mod chunk;
 pub mod embed;
