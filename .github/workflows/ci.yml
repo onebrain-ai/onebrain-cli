@@ -56,6 +56,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy -p onebrain-cli -p onebrain-search --no-default-features --all-targets -- -D warnings
+      # Also RUN the lex-only tests, not just clippy — the semantic-off code
+      # paths (e.g. the MCP `query` tool's vec/hyde degradation, `vsearch`
+      # unavailability, `semantic_available: false`) are only executed here.
+      # Without this, those branches compile but never run in any CI job (#119).
+      - run: cargo test -p onebrain-cli -p onebrain-search --no-default-features --no-fail-fast
 
   test:
     strategy:
