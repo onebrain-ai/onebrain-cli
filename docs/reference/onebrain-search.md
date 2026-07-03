@@ -16,7 +16,7 @@ src/
 ```
 
 ## On-disk layout (per collection)
-Everything lives outside the vault, under the collection cache dir — `<cache_dir>/onebrain/search/<collection>/` (e.g. `~/.cache/onebrain/search/<collection>/`), resolved by the CLI's `search_common::collection_cache_dir` from the `search.collection` config value:
+Everything lives outside the vault, under the persistent data dir — `<data_dir>/onebrain/search/<collection>/` (macOS `~/Library/Application Support/onebrain/search/<collection>/` · Linux `$XDG_DATA_HOME/onebrain/search/<collection>/` · Windows `%APPDATA%\onebrain\search\<collection>\`), resolved by the CLI's `search_common::collection_cache_dir` from the `search.collection` config value. (Relocated out of the OS-purgeable cache dir in v3.4.5 — issue #114, [ADR 0021](../decisions/0021-search-state-persistent-data-dir.md).)
 - `tantivy/` — the BM25 lexical index (`src/lex.rs`).
 - `vectors/` — the flat vector store (`src/vector.rs`): `vectors.bin` (packed little-endian `f32`, row-major, stride = `dims * 4` bytes) + `meta.redb` (chunk↔row mapping, tombstones, free-list, header).
 - `engine.redb` — engine metadata (`src/engine.rs`): chunk text/heading meta, per-doc chunk lists, doc content hashes, active model + last-indexed header.
