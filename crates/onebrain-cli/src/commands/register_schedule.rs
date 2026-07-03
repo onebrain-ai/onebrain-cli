@@ -1139,9 +1139,11 @@ mod tests {
 
     #[test]
     fn detect_collisions_errors_with_command_mode_labels() {
-        // Two command-mode entries sharing the same binary basename → same plist
-        // label → collision. Exercises the `is_command_mode(existing/entry)`
-        // arms that format `"command:..."` labels in the error message.
+        // Two command-mode entries with IDENTICAL command + args + cron →
+        // same plist label → collision (a genuine duplicate; #116 bug 2
+        // only splits labels when args or cron actually differ). Exercises
+        // the `is_command_mode(existing/entry)` arms that format
+        // `"command:..."` labels in the error message.
         use onebrain_core::scheduler::{LaunchdContext, ScheduleEntry};
         let dir = tempfile::tempdir().unwrap();
         let ctx = LaunchdContext {
@@ -1158,7 +1160,7 @@ mod tests {
                 ..Default::default()
             },
             ScheduleEntry {
-                cron: Some("0 18 * * *".to_string()),
+                cron: Some("0 9 * * *".to_string()),
                 command: Some("/usr/local/bin/backup".to_string()),
                 ..Default::default()
             },
@@ -1172,6 +1174,45 @@ mod tests {
         assert!(
             msg.contains("command:"),
             "expected command: prefix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn detect_collisions_ok_when_command_mode_entries_differ_by_args() {
+        // #116 bug 2 regression: two `command:` entries sharing a binary
+        // basename but with DIFFERENT args must land on distinct plist
+        // paths — no false-positive collision.
+        use onebrain_core::scheduler::{LaunchdContext, ScheduleEntry};
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = LaunchdContext {
+            vault_path: dir.path().to_path_buf(),
+            skill_cli_path: "onebrain".to_string(),
+            log_base_path: dir.path().join("logs"),
+            homedir: dir.path().to_path_buf(),
+            uid: 501,
+        };
+        let entries = vec![
+            ScheduleEntry {
+                cron: Some("0 9 * * *".to_string()),
+                command: Some("onebrain".to_string()),
+                args: Some(onebrain_core::scheduler::Args::List(vec![
+                    "qmd".to_string(),
+                    "reindex".to_string(),
+                ])),
+                ..Default::default()
+            },
+            ScheduleEntry {
+                cron: Some("0 9 * * *".to_string()),
+                command: Some("onebrain".to_string()),
+                args: Some(onebrain_core::scheduler::Args::List(vec![
+                    "backup".to_string()
+                ])),
+                ..Default::default()
+            },
+        ];
+        assert!(
+            detect_collisions(&entries, &ctx).is_ok(),
+            "same binary, different args must not collide"
         );
     }
 

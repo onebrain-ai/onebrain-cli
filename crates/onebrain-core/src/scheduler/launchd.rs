@@ -47,25 +47,55 @@ pub fn xml_escape(s: &str) -> String {
 ///
 /// Command-mode label uses the basename of `entry.command` so
 /// `command: onebrain` and `command: /opt/homebrew/bin/onebrain` produce
-/// the same plist file path (the collision detector relies on this).
-/// Skill-mode strips the leading `/`. Non-`[a-zA-Z0-9-]` chars become `-`.
+/// the same plist file path when everything else about the entry matches
+/// (the collision detector relies on this: same binary, different
+/// spelling, is intentionally one label).
+///
+/// Two `command:` entries invoking the *same* binary with *different* args
+/// or cron/at expressions are distinct schedules and must NOT collapse to
+/// one plist — see #116 bug 2. We append a short discriminator derived
+/// from the entry's args (preferred) or, if args are absent/empty, from
+/// its cron/at expression, so they land on different plist paths. If
+/// command + args + cron/at are all identical, the discriminator is also
+/// identical and the entries correctly collapse to one label (a genuine
+/// duplicate, still caught by `detect_collisions`).
+///
+/// Skill-mode strips the leading `/` and is left unchanged (`com.onebrain.daily`
+/// etc.) — this discriminator only applies to command mode.
 pub fn label_for_entry(entry: &ScheduleEntry) -> String {
-    let raw = if is_command_mode(entry) {
+    if is_command_mode(entry) {
         let cmd = entry.command.as_deref().unwrap_or("");
-        Path::new(cmd)
+        let basename = Path::new(cmd)
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or(cmd)
-            .to_string()
+            .unwrap_or(cmd);
+        match command_discriminator(entry) {
+            Some(disc) => sanitize_label(&format!("{basename}-{disc}")),
+            None => sanitize_label(basename),
+        }
     } else {
-        entry
-            .skill
-            .as_deref()
-            .unwrap_or("")
-            .trim_start_matches('/')
-            .to_string()
+        let raw = entry.skill.as_deref().unwrap_or("").trim_start_matches('/');
+        sanitize_label(raw)
+    }
+}
+
+/// Derive a short label discriminator for a command-mode entry from its
+/// args (preferred, since args are the more common source of distinction
+/// between two entries sharing a binary — e.g. `rsync -av src dst` vs
+/// `rsync -av other-src other-dst`) or, when args are absent/empty, from
+/// its schedule expression (cron or at). Returns `None` when neither is
+/// present (nothing to discriminate on — label falls back to the bare
+/// basename, matching the pre-#116 behavior for the common single-entry
+/// case).
+fn command_discriminator(entry: &ScheduleEntry) -> Option<String> {
+    let from_args = match &entry.args {
+        Some(Args::List(argv)) if !argv.is_empty() => Some(argv.join("-")),
+        _ => None,
     };
-    sanitize_label(&raw)
+    let raw = from_args.or_else(|| entry.cron.clone().or_else(|| entry.at.clone()))?;
+    const MAX_LEN: usize = 40;
+    let truncated: String = raw.chars().take(MAX_LEN).collect();
+    Some(sanitize_label(&truncated))
 }
 
 fn sanitize_label(raw: &str) -> String {
@@ -338,13 +368,15 @@ mod tests {
     }
 
     #[test]
-    fn label_for_command_uses_basename() {
+    fn label_for_command_uses_basename_plus_cron_discriminator() {
+        // No args → falls back to a cron-derived discriminator (#116 bug 2)
+        // so two `command:` entries on different schedules don't collide.
         let e = ScheduleEntry {
             cron: Some("0 3 * * 0".into()),
             command: Some("/opt/homebrew/bin/onebrain".into()),
             ..Default::default()
         };
-        assert_eq!(label_for_entry(&e), "onebrain");
+        assert_eq!(label_for_entry(&e), "onebrain-0-3-----0");
     }
 
     #[test]
@@ -491,6 +523,9 @@ mod tests {
 
     #[test]
     fn command_label_consistent_between_absolute_and_bare_form() {
+        // Same binary (bare vs absolute spelling), same args, same cron →
+        // same label. This is the "intentionally one label" case #116 bug 2
+        // must preserve: only *differing* args/cron should split the label.
         let bare = ScheduleEntry {
             cron: Some("0 3 * * 0".into()),
             command: Some("onebrain".into()),
@@ -505,8 +540,60 @@ mod tests {
         };
         let out_bare = generate_plist(&bare, &test_ctx());
         let out_abs = generate_plist(&abs, &test_ctx());
-        assert!(out_bare.contains("<string>com.onebrain.onebrain</string>"));
-        assert!(out_abs.contains("<string>com.onebrain.onebrain</string>"));
+        assert!(out_bare.contains("<string>com.onebrain.onebrain-qmd-reindex</string>"));
+        assert!(out_abs.contains("<string>com.onebrain.onebrain-qmd-reindex</string>"));
+    }
+
+    #[test]
+    fn command_label_differs_when_args_differ() {
+        // #116 bug 2: two `command: onebrain` entries with different args
+        // must land on DISTINCT plist labels (not silently collapse into a
+        // false collision).
+        let a = ScheduleEntry {
+            cron: Some("0 3 * * 0".into()),
+            command: Some("onebrain".into()),
+            args: Some(Args::List(vec!["qmd-reindex".into()])),
+            ..Default::default()
+        };
+        let b = ScheduleEntry {
+            cron: Some("0 3 * * 0".into()),
+            command: Some("onebrain".into()),
+            args: Some(Args::List(vec!["backup".into()])),
+            ..Default::default()
+        };
+        assert_ne!(label_for_entry(&a), label_for_entry(&b));
+    }
+
+    #[test]
+    fn command_label_differs_when_cron_differs_and_args_absent() {
+        // #116 bug 2: no args to discriminate on → fall back to the cron
+        // expression so two same-binary entries on different schedules
+        // still land on distinct labels.
+        let a = ScheduleEntry {
+            cron: Some("0 9 * * *".into()),
+            command: Some("/usr/local/bin/backup".into()),
+            ..Default::default()
+        };
+        let b = ScheduleEntry {
+            cron: Some("0 18 * * *".into()),
+            command: Some("/usr/local/bin/backup".into()),
+            ..Default::default()
+        };
+        assert_ne!(label_for_entry(&a), label_for_entry(&b));
+    }
+
+    #[test]
+    fn command_label_identical_when_command_args_cron_all_match() {
+        // Genuine duplicate: identical command + args + cron must still
+        // collapse to the same label so `detect_collisions` catches it.
+        let a = ScheduleEntry {
+            cron: Some("0 9 * * *".into()),
+            command: Some("/usr/local/bin/backup".into()),
+            args: Some(Args::List(vec!["--full".into()])),
+            ..Default::default()
+        };
+        let b = a.clone();
+        assert_eq!(label_for_entry(&a), label_for_entry(&b));
     }
 
     #[test]
@@ -520,7 +607,7 @@ mod tests {
         let out = generate_plist(&e, &test_ctx());
         assert!(out.contains("<string>/bin/sh</string>"));
         assert!(out.contains("&quot;/opt/homebrew/bin/onebrain&quot; &quot;qmd-reindex&quot;"));
-        assert!(out.contains("launchctl bootout gui/501/com.onebrain.onebrain"));
+        assert!(out.contains("launchctl bootout gui/501/com.onebrain.onebrain-qmd-reindex"));
         assert!(out.contains("rm -f"));
     }
 

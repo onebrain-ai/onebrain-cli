@@ -130,13 +130,18 @@ fn resume_clears_paused_marker_file() {
     assert!(!marker.exists(), "paused marker should be cleared");
 }
 
-/// Skill+command collision (same basename) is rejected with the verbatim
-/// Bun error string.
+/// Prior to #116 bug 2, a command-mode label was the binary basename alone,
+/// so a skill `/echo` and a command `/bin/echo` on different schedules
+/// collided on the same plist path (`com.onebrain.echo`) even though they
+/// were entirely unrelated entries. Command-mode labels now always carry an
+/// args- or cron-derived discriminator (every valid entry has a cron/at),
+/// so this basename-only false-positive collision no longer happens — the
+/// two entries register cleanly onto distinct plist paths.
 ///
 /// Unix-only: relies on `/bin/echo` existing.
 #[cfg(unix)]
 #[test]
-fn collision_skill_and_command_with_same_basename_fails() {
+fn skill_and_command_with_same_basename_no_longer_collide() {
     let v = tempdir().unwrap();
     write_skill(v.path(), "echo", "name: echo\nschedulable: true");
     std::fs::write(
@@ -144,6 +149,58 @@ fn collision_skill_and_command_with_same_basename_fails() {
         "schedule:\n  \
          - cron: \"0 9 * * *\"\n    skill: /echo\n  \
          - cron: \"0 3 * * 0\"\n    command: /bin/echo\n",
+    )
+    .unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("com.onebrain.echo"))
+        .stdout(predicate::str::contains("com.onebrain.echo-0-3-----0"));
+}
+
+/// Two `command:` entries sharing a binary basename but with different args
+/// must land on distinct plist paths (#116 bug 2 core regression test).
+///
+/// Unix-only: relies on `/bin/echo` existing.
+#[cfg(unix)]
+#[test]
+fn command_mode_entries_same_binary_different_args_no_collision() {
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("vault.yml"),
+        "schedule:\n  \
+         - cron: \"0 9 * * *\"\n    command: /bin/echo\n    args:\n      - hello\n  \
+         - cron: \"0 9 * * *\"\n    command: /bin/echo\n    args:\n      - world\n",
+    )
+    .unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("com.onebrain.echo-hello"))
+        .stdout(predicate::str::contains("com.onebrain.echo-world"));
+}
+
+/// Two `command:` entries with IDENTICAL command + args + cron are a
+/// genuine duplicate and must still be rejected as a collision.
+///
+/// Unix-only: relies on `/bin/echo` existing.
+#[cfg(unix)]
+#[test]
+fn command_mode_entries_fully_identical_still_collide() {
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("vault.yml"),
+        "schedule:\n  \
+         - cron: \"0 9 * * *\"\n    command: /bin/echo\n    args:\n      - hello\n  \
+         - cron: \"0 9 * * *\"\n    command: /bin/echo\n    args:\n      - hello\n",
     )
     .unwrap();
     Command::cargo_bin("onebrain")
