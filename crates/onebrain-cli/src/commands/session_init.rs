@@ -7,7 +7,7 @@ use onebrain_core::{find_vault_root, load_vault_config, CoreError};
 use onebrain_search::engine::Engine;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Result of `session init` — either the happy-path metadata or one of two
 /// block variants. Kept private; rendering goes through `format_output`.
@@ -22,7 +22,7 @@ pub fn run(vault_dir: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
         Some(dir) => dir,
         None => env::current_dir().context("read current directory")?,
     };
-    let line = build_output(&start, mode, native_pending)?;
+    let line = build_output(&start, mode, native_pending_bounded)?;
     println!("{line}");
     Ok(())
 }
@@ -144,6 +144,48 @@ fn native_pending(vault_root: &onebrain_core::VaultRoot, collection: &str) -> Op
         .map(|s| s.pending_total())
 }
 
+/// Bounded probe: the drift scan walks + hashes every note, which is too
+/// slow for the SessionStart hot path on large vaults (~1s at 10k notes).
+/// Cap it — timing out yields `None` (wire `null` = could not determine),
+/// mirroring the old qmd subprocess probe's 5s cap philosophy at in-process
+/// scale. See task-6 review.
+const NATIVE_PENDING_CAP: Duration = Duration::from_millis(300);
+
+/// Production wiring: runs [`native_pending`] on a background thread and
+/// waits at most [`NATIVE_PENDING_CAP`]. The `is_indexed` filesystem
+/// pre-check inside `native_pending` (which avoids `Engine::open`'s
+/// dir-creation side effect) still runs before/inside the spawned thread —
+/// read-only either way, so a slow probe finishing after the deadline is
+/// harmless; its result is simply discarded.
+fn native_pending_bounded(
+    vault_root: &onebrain_core::VaultRoot,
+    collection: &str,
+) -> Option<usize> {
+    let vault_root = vault_root.clone();
+    let collection = collection.to_string();
+    bounded(
+        move || native_pending(&vault_root, &collection),
+        NATIVE_PENDING_CAP,
+    )
+}
+
+/// Generic time-boxed executor: runs `f` on a spawned thread and waits at
+/// most `cap` for a result via an `mpsc` channel. Returns `None` on timeout
+/// (the spawned thread is left to finish on its own; harmless for read-only
+/// probes). Kept generic + thin so it's directly unit-testable without
+/// touching the filesystem or a real search index.
+fn bounded<F, T>(f: F, cap: Duration) -> Option<T>
+where
+    F: FnOnce() -> Option<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(cap).unwrap_or(None)
+}
+
 /// Render `result` for the requested output mode.
 ///
 /// v3.1: text is the default. Machine consumers (Claude Code SessionStart
@@ -169,7 +211,7 @@ fn render_text(result: &SessionInitResult) -> String {
             // say so rather than printing a misleading "0 unembedded".
             let qmd = match out.qmd_unembedded {
                 Some(n) => format!("{n} unembedded"),
-                None => "unknown (qmd unavailable)".to_string(),
+                None => "unknown (search index unavailable)".to_string(),
             };
             format!(
                 "Session ready · token={token} · datetime={datetime}\nqmd index: {qmd}",
@@ -564,6 +606,30 @@ mod tests {
             result,
             Some(0),
             "an indexed-but-empty vault must report a determined Some(0), not None"
+        );
+    }
+
+    // ── bounded: generic time-boxed executor ─────────────────────────────
+
+    #[test]
+    fn bounded_returns_fast_probe_result() {
+        let result = bounded(|| Some(42), Duration::from_millis(300));
+        assert_eq!(result, Some(42));
+    }
+
+    #[test]
+    fn bounded_returns_none_when_probe_exceeds_cap() {
+        let cap = Duration::from_millis(50);
+        let result = bounded(
+            move || {
+                std::thread::sleep(cap * 3);
+                Some(42)
+            },
+            cap,
+        );
+        assert_eq!(
+            result, None,
+            "a probe that outlives the cap must yield None, not block startup"
         );
     }
 }
