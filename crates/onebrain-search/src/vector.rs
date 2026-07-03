@@ -65,6 +65,7 @@ use simsimd::SpatialSimilarity;
     allow(dead_code)
 )]
 fn dot_scalar(a: &[f32], b: &[f32]) -> f64 {
+    debug_assert_eq!(a.len(), b.len(), "dot_scalar requires equal-length inputs");
     a.iter()
         .zip(b)
         .map(|(x, y)| f64::from(*x) * f64::from(*y))
@@ -78,7 +79,12 @@ fn dot_scalar(a: &[f32], b: &[f32]) -> f64 {
 fn dot(a: &[f32], b: &[f32]) -> f64 {
     #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
     {
-        f32::dot(a, b).unwrap_or(f64::NEG_INFINITY)
+        f32::dot(a, b).unwrap_or_else(|| {
+            eprintln!(
+                "warning: simsimd dot product failed; falling back to NEG_INFINITY similarity"
+            );
+            f64::NEG_INFINITY
+        })
     }
     #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
     {
@@ -688,6 +694,15 @@ mod tests {
         let mut a = vec![1.0f32; 384];
         a[0] = 1.0e4;
         assert_eq!(dot_scalar(&a, &a), 100_000_383.0);
+    }
+
+    /// Finding #15: length mismatch must be loud in debug builds instead of
+    /// silently zip-truncating. Upstream guards make mismatch unreachable in
+    /// production (see PR #113 review); this is defense-in-depth.
+    #[test]
+    #[should_panic(expected = "dot_scalar requires equal-length inputs")]
+    fn dot_scalar_rejects_length_mismatch_in_debug() {
+        let _ = dot_scalar(&[1.0, 2.0], &[1.0]);
     }
 
     /// On hosts where simsimd is a dependency (everything except windows-arm64),
