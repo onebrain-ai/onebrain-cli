@@ -137,7 +137,8 @@ pub fn plist_path(skill_or_label: &str, homedir: &Path) -> PathBuf {
 fn recurring_skill_block(entry: &ScheduleEntry, ctx: &LaunchdContext) -> String {
     let mut out = format!(
         "        <string>{}</string>\n\
-         \x20       <string>run-skill</string>\n\
+         \x20       <string>skill</string>\n\
+         \x20       <string>run</string>\n\
          \x20       <string>--vault</string>\n\
          \x20       <string>{}</string>\n\
          \x20       <string>--skill</string>\n\
@@ -188,7 +189,7 @@ fn one_shot_skill_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &str
         _ => String::new(),
     };
     let shell = format!(
-        "\"{}\" run-skill --vault=\"{}\" --skill=\"{}\"{}; launchctl bootout gui/{}/{}; rm -f \"{}\"",
+        "\"{}\" skill run --vault=\"{}\" --skill=\"{}\"{}; launchctl bootout gui/{}/{}; rm -f \"{}\"",
         ctx.skill_cli_path,
         ctx.vault_path.to_string_lossy(),
         entry.skill.as_deref().unwrap_or(""),
@@ -461,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn recurring_skill_emits_run_skill_subcommand() {
+    fn recurring_skill_emits_skill_run_subcommand() {
         let out = generate_plist(&skill_entry("/daily", "0 9 * * *"), &test_ctx());
         assert!(out.contains("<string>com.onebrain.daily</string>"));
         assert!(
@@ -469,7 +470,7 @@ mod tests {
             "out:\n{out}"
         );
         assert!(out.contains("<string>/opt/homebrew/bin/onebrain</string>"));
-        assert!(out.contains("<string>run-skill</string>"));
+        assert!(out.contains("<string>skill</string>\n        <string>run</string>"));
         assert!(out.contains("<string>--vault</string>"));
         assert!(out.contains("<string>/Users/test/vault</string>"));
         assert!(out.contains("<string>--skill</string>"));
@@ -530,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_skill_shell_wrapper_invokes_run_skill_and_self_deletes() {
+    fn one_shot_skill_shell_wrapper_invokes_skill_run_and_self_deletes() {
         let e = ScheduleEntry {
             at: Some("2026-05-13 14:30".into()),
             skill: Some("/reminder".into()),
@@ -539,7 +540,7 @@ mod tests {
         let out = generate_plist(&e, &test_ctx());
         assert!(out.contains("<string>/bin/sh</string>"));
         assert!(out.contains("<string>-c</string>"));
-        assert!(out.contains("run-skill"));
+        assert!(out.contains("skill run"));
         assert!(out.contains("--vault=&quot;/Users/test/vault&quot;"));
         assert!(out.contains("--skill=&quot;/reminder&quot;"));
         assert!(out.contains("launchctl bootout gui/501/com.onebrain.reminder"));
@@ -574,7 +575,7 @@ mod tests {
         assert!(out.contains("<string>qmd-reindex</string>"));
         assert!(!out.contains("<string>--skill</string>"));
         assert!(!out.contains("<string>--vault</string>"));
-        assert!(!out.contains("<string>run-skill</string>"));
+        assert!(!out.contains("<string>skill</string>\n        <string>run</string>"));
     }
 
     #[test]
