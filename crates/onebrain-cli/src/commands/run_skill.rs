@@ -435,11 +435,12 @@ mod tests {
 
     #[test]
     fn child_path_idempotent_when_existing_already_prefixed() {
-        // exe_dir already leads the PATH · no double-prepend.
-        assert_eq!(
-            child_path_with_exe_dir("/opt/homebrew/bin", "/opt/homebrew/bin:/usr/bin"),
-            "/opt/homebrew/bin:/usr/bin"
-        );
+        // exe_dir already leads the PATH · no double-prepend. Build the input
+        // with the platform separator so this holds on Windows (`;`) too — the
+        // function's dedup guard checks the platform-specific `{exe_dir}{sep}`.
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let existing = format!("/opt/homebrew/bin{sep}/usr/bin");
+        assert_eq!(child_path_with_exe_dir("/opt/homebrew/bin", &existing), existing);
     }
 
     #[test]
