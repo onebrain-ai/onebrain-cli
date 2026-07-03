@@ -497,6 +497,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     commands::search_model::run_remove(vault_flag.clone(), &mode, &args)
                 }
             },
+            SearchVerb::Mcp => commands::search_mcp::run(vault_flag.clone()),
         },
         Cmd::Pause(PauseCmd { verb }) => match verb {
             PauseVerb::List => {

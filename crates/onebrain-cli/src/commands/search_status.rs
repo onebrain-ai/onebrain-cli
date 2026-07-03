@@ -13,18 +13,20 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use onebrain_core::path::ResolvedVault;
 use serde::Serialize;
 
 use crate::commands::search_common::{
-    collection_cache_dir, index_size_bytes, is_indexed, open_engine, read_reindex_progress,
-    resolve_collection, ReindexLiveProgress,
+    collection_cache_dir, collection_for, index_size_bytes, is_indexed, open_engine,
+    read_reindex_progress, resolve_collection, ReindexLiveProgress,
 };
 use crate::output::{emit, item, section, Envelope, OutputMode};
 use onebrain_core::load_vault_config;
 use onebrain_search::embed::dir_size_bytes;
+use onebrain_search::engine::Engine;
 
-#[derive(Debug, Serialize)]
-struct SearchStatusData {
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub(crate) struct SearchStatusData {
     collection: Option<String>,
     embed_model: String,
     cache_dir: Option<PathBuf>,
@@ -69,10 +71,33 @@ struct SearchStatusData {
 pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
     let (resolved, collection) = resolve_collection(vault_flag)?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
+
+    let data = status_data(&resolved, collection)?;
+
+    let envelope = Envelope::ok("search.status", Some(vault_info), data);
+    emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
+    Ok(())
+}
+
+/// Build the `search status` payload for an already-resolved vault.
+///
+/// `collection` is the effective collection name (already resolved by the
+/// caller, e.g. via [`resolve_collection`] or [`collection_for`]) so callers
+/// that already have it don't re-derive it.
+///
+/// Order matters here: the on-disk cache stats (`indexed`, model/index sizes)
+/// are read from the filesystem *before* the engine is opened, because
+/// `Engine::open` creates the cache dir as a side effect — checking
+/// `is_indexed` afterwards would always see a freshly-created (but empty)
+/// dir and report `true` on a never-indexed vault.
+pub(crate) fn status_data(
+    resolved: &ResolvedVault,
+    collection: Option<String>,
+) -> Result<SearchStatusData> {
     let config = load_vault_config(&resolved.root)?;
 
     // Cache dir + on-disk model stats + index size (pure fs reads — never a
-    // download).
+    // download). Must run before the engine is opened (see doc comment).
     let (cache_dir, indexed, model_size_bytes, model_downloaded_at, index_size_bytes) =
         match &collection {
             Some(c) => {
@@ -99,7 +124,7 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
     // collection is resolved), fall back to zeros rather than failing status.
     let (last_indexed_at, doc_count, pending_new, pending_changed, pending_removed) =
         match open_engine(Some(resolved.root.as_path().to_path_buf())) {
-            Ok((engine, r)) => match engine.status(r.root.as_path()) {
+            Ok((engine, _)) => match engine.status(resolved.root.as_path()) {
                 Ok(s) => (
                     s.last_indexed_at,
                     s.doc_count,
@@ -112,7 +137,7 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
             Err(_) => (None, 0, 0, 0, 0),
         };
 
-    let data = SearchStatusData {
+    Ok(SearchStatusData {
         collection,
         embed_model: config.search.embed_model,
         cache_dir,
@@ -128,11 +153,57 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
         cache_size_bytes,
         reindexing,
         semantic_available: cfg!(feature = "semantic"),
-    };
+    })
+}
 
-    let envelope = Envelope::ok("search.status", Some(vault_info), data);
-    emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
-    Ok(())
+/// Build status data for an already-open engine (used by the MCP `status`
+/// tool, which holds a live `Engine` and doesn't want to open a second one).
+///
+/// Unlike [`status_data`], the cache dir will already exist by the time this
+/// runs (the caller's engine opened it), so `indexed` reports whether the
+/// index has actually been populated (`doc_count > 0` after the status
+/// query) rather than merely whether the cache dir exists.
+pub(crate) fn status_data_for(
+    engine: &Engine,
+    resolved: &ResolvedVault,
+) -> Result<SearchStatusData> {
+    let collection = collection_for(resolved)?;
+    let config = load_vault_config(&resolved.root)?;
+
+    let (cache_dir, model_size_bytes, model_downloaded_at, index_size_bytes) = {
+        let dir = collection_cache_dir(&collection);
+        let (size, downloaded) = match model_dir_stats(&dir) {
+            Some((size, mtime)) => (Some(size), mtime),
+            None => (None, None),
+        };
+        let idx_size = index_size_bytes(&dir);
+        (Some(dir), size, downloaded, idx_size)
+    };
+    let reindexing = cache_dir.as_deref().and_then(read_reindex_progress);
+    let cache_size_bytes = cache_dir
+        .as_deref()
+        .filter(|d| d.is_dir())
+        .map(onebrain_search::embed::dir_size_bytes);
+
+    let status = engine.status(resolved.root.as_path())?;
+
+    Ok(SearchStatusData {
+        collection: Some(collection),
+        embed_model: config.search.embed_model,
+        cache_dir,
+        indexed: status.doc_count > 0,
+        model_size_bytes,
+        model_downloaded_at,
+        last_indexed_at: status.last_indexed_at,
+        index_size_bytes,
+        doc_count: status.doc_count,
+        pending_new: status.pending_new,
+        pending_changed: status.pending_changed,
+        pending_removed: status.pending_removed,
+        cache_size_bytes,
+        reindexing,
+        semantic_available: cfg!(feature = "semantic"),
+    })
 }
 
 /// Total size in bytes + newest mtime (epoch secs) of the downloaded model

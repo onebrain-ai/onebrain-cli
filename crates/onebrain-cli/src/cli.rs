@@ -941,6 +941,8 @@ pub enum SearchVerb {
     Reindex(SearchReindexArgs),
     /// Manage the embedding model (list supported models · switch model).
     Model(SearchModelCmd),
+    /// Serve the search engine over MCP (stdio) — for agent/editor integration.
+    Mcp,
 }
 
 #[derive(Args, Debug)]

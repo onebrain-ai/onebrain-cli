@@ -420,7 +420,9 @@ pub(crate) fn reindex_progress_path(cache_dir: &Path) -> PathBuf {
 }
 
 /// A live reindex's `(done, total)` doc counts.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub(crate) struct ReindexLiveProgress {
     pub done: usize,
     pub total: usize,

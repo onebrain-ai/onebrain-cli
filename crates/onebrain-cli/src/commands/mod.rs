@@ -30,6 +30,7 @@ pub mod register_schedule;
 pub mod run_skill;
 pub mod search_common;
 pub mod search_get;
+pub mod search_mcp;
 pub mod search_model;
 pub mod search_model_tui;
 pub mod search_query;
