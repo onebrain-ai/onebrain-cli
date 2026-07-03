@@ -269,7 +269,12 @@ fn render_list_text(env: &Envelope<ModelListData>, color: bool) -> String {
         false,
     )];
     for m in &d.models {
-        let marker = if m.current { "●" } else { "" };
+        // The active marker/highlight only means something if the chosen
+        // model is actually usable — i.e. downloaded. A configured-but-not-
+        // downloaded model gets no marker; see the no-model guidance line
+        // pushed after the table below.
+        let active = m.current && m.downloaded;
+        let marker = if active { "●" } else { "" };
         // Plain "—" for not-downloaded: ⬜ renders as a huge white block in
         // some terminal fonts.
         let downloaded = if m.downloaded { "✓" } else { "—" };
@@ -288,7 +293,7 @@ fn render_list_text(env: &Envelope<ModelListData>, color: bool) -> String {
                 &thai,
                 m.note,
             ),
-            m.current,
+            active,
         ));
     }
 
@@ -323,6 +328,14 @@ fn render_list_text(env: &Envelope<ModelListData>, color: bool) -> String {
     }
     lines.push(format!("└{}┘", "─".repeat(boxed)));
     lines.push(format!("📁  Cache dir: {}", d.cache_dir.display()));
+    // No downloaded active model (never chosen, or the chosen model's download
+    // was purged) → tell the user how to get a working index.
+    if !d.models.iter().any(|m| m.current && m.downloaded) {
+        lines.push(
+            "⚠️  No model downloaded — run `onebrain search model` to pick + download, or `onebrain search reindex`."
+                .to_string(),
+        );
+    }
     lines.join("\n")
 }
 
@@ -679,17 +692,51 @@ mod tests {
     use tempfile::tempdir;
 
     fn list_env(current: &str) -> Envelope<ModelListData> {
-        // Empty cache dir → nothing downloaded (pure-render tests).
+        // Empty cache dir → nothing downloaded (pure-render tests), except the
+        // current model, which we force-mark downloaded so the ●/color tests
+        // keep exercising the "active AND downloaded" path.
         let cache_dir = PathBuf::from("/tmp/onebrain-test-cache/my-collection");
         let models: Vec<ModelListEntry> = model_registry()
             .iter()
-            .map(|m| ModelListEntry::from_info(m, current, &cache_dir))
+            .map(|m| {
+                let mut e = ModelListEntry::from_info(m, current, &cache_dir);
+                if e.current {
+                    e.downloaded = true;
+                    e.disk_bytes = Some(1_000_000);
+                }
+                e
+            })
             .collect();
         Envelope::ok(
             "search.model.list",
             None,
             ModelListData { models, cache_dir },
         )
+    }
+
+    #[test]
+    fn list_no_marker_and_guidance_when_current_model_not_downloaded() {
+        // Configured model (bge-m3) but nothing on disk → no active marker anywhere,
+        // plus a guidance line.
+        let cache_dir = PathBuf::from("/tmp/onebrain-test-cache/empty-collection");
+        let models: Vec<ModelListEntry> = model_registry()
+            .iter()
+            .map(|m| ModelListEntry::from_info(m, "bge-m3", &cache_dir))
+            .collect();
+        let env = Envelope::ok(
+            "search.model.list",
+            None,
+            ModelListData { models, cache_dir },
+        );
+        let s = render_list_text(&env, false);
+        assert!(
+            !s.contains('●'),
+            "no active marker when not downloaded: {s}"
+        );
+        assert!(
+            s.contains("No model downloaded"),
+            "expected guidance line: {s}"
+        );
     }
 
     #[test]

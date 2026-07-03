@@ -39,7 +39,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use crate::cli::ModelSortCol;
-use crate::commands::search_common::{collection_cache_dir, collection_for};
+use crate::commands::search_common::{
+    collection_cache_dir, collection_for, reconcile_missing_model,
+};
 #[cfg(feature = "semantic")]
 use crate::commands::search_model::apply_model_change;
 use crate::commands::search_model::{cmp_option_last, disk_cell, format_size};
@@ -163,13 +165,20 @@ pub fn header_label(base: &str, active: bool, desc: bool) -> String {
     }
 }
 
-/// The footer legend + current sort indicator shown under the table.
-pub fn footer_text(col: ModelSortCol, desc: bool) -> String {
+/// The footer legend + current sort indicator shown under the table. When
+/// `no_active_model` is set (no row is both `current` and `downloaded`), a
+/// warning is prepended so the user knows to select a row and download it.
+pub fn footer_text(col: ModelSortCol, desc: bool, no_active_model: bool) -> String {
     let dir = if desc { "↓" } else { "↑" };
-    format!(
+    let legend = format!(
         "↑/↓ move · s sort · r reverse · enter switch · d delete · q quit    sort: {} {dir}",
         sort_label(col)
-    )
+    );
+    if no_active_model {
+        format!("⚠️  No model downloaded — select a row and press enter to download    {legend}")
+    } else {
+        legend
+    }
 }
 
 /// The interactive TUI's mutable state: the sorted rows, current selection,
@@ -402,6 +411,10 @@ pub fn run(vault_flag: Option<PathBuf>) -> Result<()> {
     let current = config.search.embed_model.clone();
     let collection = collection_for(&resolved).context("resolve collection")?;
     let cache_dir = collection_cache_dir(&collection);
+
+    // Drop a stale choice whose download was purged before we open, so no row
+    // renders as the active model and the user re-selects + downloads.
+    reconcile_missing_model(resolved.root.as_path(), &cache_dir, &current);
 
     let rows = build_rows(&current, &cache_dir);
     let height = viewport_height(rows.len());
@@ -874,7 +887,8 @@ fn render(f: &mut ratatui::Frame, state: &AppState) {
         .map(|(i, r)| {
             let dl = state.downloading.as_ref().filter(|d| d.name == r.name);
             let re = state.reembed.as_ref().filter(|d| d.name == r.name);
-            let marker = if r.current { "●" } else { "" };
+            let active = r.current && r.downloaded;
+            let marker = if active { "●" } else { "" };
             // Plain "—" for not-downloaded: ⬜ renders as a huge white block
             // in some terminal fonts.
             let downloaded = if dl.is_some() {
@@ -907,7 +921,7 @@ fn render(f: &mut ratatui::Frame, state: &AppState) {
             // highlight). The selected row keeps REVERSED; when the selection
             // sits on the active row, the modifiers combine.
             let mut style = Style::default();
-            if r.current {
+            if active {
                 style = style
                     .fg(ratatui::style::Color::Green)
                     .add_modifier(Modifier::BOLD);
@@ -953,8 +967,10 @@ fn render(f: &mut ratatui::Frame, state: &AppState) {
     // The keybinding legend gets its own permanent line so a transient
     // status (switch result, re-embed progress, delete confirm) never
     // hides the shortcuts.
-    let legend = ratatui::widgets::Paragraph::new(footer_text(state.sort, state.desc))
-        .style(Style::default().add_modifier(Modifier::DIM));
+    let no_active_model = !state.rows.iter().any(|r| r.current && r.downloaded);
+    let legend =
+        ratatui::widgets::Paragraph::new(footer_text(state.sort, state.desc, no_active_model))
+            .style(Style::default().add_modifier(Modifier::DIM));
     f.render_widget(legend, chunks[1]);
     let status = ratatui::widgets::Paragraph::new(state.status.clone().unwrap_or_default());
     f.render_widget(status, chunks[2]);
@@ -1296,14 +1312,23 @@ mod tests {
 
     #[test]
     fn footer_text_shows_legend_and_sort() {
-        let f = footer_text(ModelSortCol::Disk, true);
+        let f = footer_text(ModelSortCol::Disk, true, false);
         assert!(f.contains("s sort"));
         assert!(f.contains("enter switch"));
         assert!(f.contains("d delete"));
         assert!(f.contains("q quit"));
         assert!(f.contains("sort: disk ↓"), "{f}");
-        let up = footer_text(ModelSortCol::Name, false);
+        assert!(!f.contains("No model downloaded"), "{f}");
+        let up = footer_text(ModelSortCol::Name, false, false);
         assert!(up.contains("sort: name ↑"), "{up}");
+    }
+
+    #[test]
+    fn footer_text_warns_when_no_active_model() {
+        let f = footer_text(ModelSortCol::Name, false, true);
+        assert!(f.contains("No model downloaded"), "{f}");
+        assert!(f.contains("press enter to download"), "{f}");
+        assert!(f.contains("q quit"), "{f}"); // legend still present
     }
 
     #[test]

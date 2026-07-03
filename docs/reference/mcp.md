@@ -79,6 +79,12 @@ Search the vault with typed sub-queries (`lex` = BM25 keywords, `vec` = semantic
 
 `context` is omitted entirely (not `null`) when the hit has no heading path.
 
+When the vault has **no search index yet** (never reindexed, or the cache was purged), `query` does not error — it returns an empty `results` array plus a `note` string telling the agent to run `onebrain search reindex` or fall back to filesystem search (grep/read). `note` is omitted entirely once an index exists:
+
+```json
+{ "results": [], "note": "No search index for this vault yet — run `onebrain search reindex`, or fall back to filesystem search (grep/Read)." }
+```
+
 **Example call**
 
 ```json

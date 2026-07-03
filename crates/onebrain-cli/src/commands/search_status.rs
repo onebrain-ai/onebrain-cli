@@ -31,6 +31,12 @@ pub(crate) struct SearchStatusData {
     embed_model: String,
     cache_dir: Option<PathBuf>,
     indexed: bool,
+    /// `true` when this is a semantic build with a configured collection whose
+    /// current embedding model is NOT downloaded (a fresh vault, or a purged
+    /// cache) — search is blocked until a reindex. Lets machine consumers tell
+    /// this apart from a lex-only build or a collection-less vault, both of
+    /// which also report a null model size.
+    current_model_missing: bool,
     /// Size in bytes of the ACTIVE model's dir (`models--*`) under the
     /// collection cache dir. `None` if the active model isn't downloaded yet.
     /// (The whole-cache total, including any lingering other-model dirs, is
@@ -153,11 +159,15 @@ pub(crate) fn status_data(
             None => (None, 0, 0, 0, 0),
         };
 
+    let current_model_missing =
+        cfg!(feature = "semantic") && collection.is_some() && model_size_bytes.is_none();
+
     Ok(SearchStatusData {
         collection,
         embed_model: config.search.embed_model,
         cache_dir,
         indexed: doc_count > 0,
+        current_model_missing,
         model_size_bytes,
         model_downloaded_at,
         last_indexed_at,
@@ -203,11 +213,16 @@ pub(crate) fn status_data_for(
 
     let status = engine.status(resolved.root.as_path())?;
 
+    // Collection is always set on this path, so the signal hinges only on a
+    // semantic build with no downloaded model.
+    let current_model_missing = cfg!(feature = "semantic") && model_size_bytes.is_none();
+
     Ok(SearchStatusData {
         collection: Some(collection),
         embed_model: config.search.embed_model,
         cache_dir,
         indexed: status.doc_count > 0,
+        current_model_missing,
         model_size_bytes,
         model_downloaded_at,
         last_indexed_at: status.last_indexed_at,
@@ -350,18 +365,15 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
         }
     }
 
-    // Hint priority: a missing current model blocks all search, so surface it
-    // ahead of pending drift (a reindex downloads the model AND indexes). Only
-    // meaningful with a collection + a semantic build — otherwise a null model
-    // size means "no cache dir" / "lex-only", not "chosen model is missing".
-    let model_missing =
-        d.semantic_available && d.collection.is_some() && d.model_size_bytes.is_none();
-    if model_missing {
+    // A missing model blocks all search — surface it ahead of pending drift (a
+    // reindex selects/downloads the model AND indexes). Suppressed while a
+    // reindex is already running (the model is being fetched right now).
+    if d.current_model_missing && d.reindexing.is_none() {
         lines.push(String::new());
-        lines.push(format!(
-            "💡  Current model `{}` not downloaded — run `onebrain search reindex` to download + index",
-            d.embed_model
-        ));
+        lines.push(
+            "💡  No embedding model downloaded — run `onebrain search reindex` to select, download + index"
+                .to_string(),
+        );
     } else if pending > 0 {
         lines.push(String::new());
         lines.push("💡  Run `onebrain search reindex` to index pending changes".to_string());
@@ -384,6 +396,7 @@ mod tests {
                 embed_model: "multilingual-e5-small".to_string(),
                 cache_dir: collection.map(|c| PathBuf::from(format!("/cache/{c}"))),
                 indexed,
+                current_model_missing: false,
                 model_size_bytes: None,
                 model_downloaded_at: None,
                 last_indexed_at: None,
@@ -459,15 +472,49 @@ mod tests {
         // downloaded, or the cache was purged by OS storage cleanup). Even with
         // no pending drift, status must point the user at reindex — search
         // can't run without the model.
-        let e = env(Some("ob-1"), true); // model_size_bytes defaults to None
+        let mut e = env(Some("ob-1"), true); // model_size_bytes defaults to None
+        e.data.as_mut().unwrap().current_model_missing = true;
         let s = render_text(&e);
         assert!(s.contains("    Size          not downloaded"), "{s}");
         assert!(
             s.contains("💡")
-                && s.contains("not downloaded")
+                && s.contains("No embedding model downloaded")
                 && s.contains("onebrain search reindex"),
             "expected a model-not-downloaded reindex hint: {s}"
         );
+    }
+
+    #[test]
+    fn text_hints_when_current_model_missing() {
+        let mut e = env(Some("ob-1"), true);
+        {
+            let d = e.data.as_mut().unwrap();
+            d.current_model_missing = true;
+            d.pending_new = 2; // drift present too
+        }
+        let s = render_text(&e);
+        assert!(
+            s.contains("💡")
+                && s.contains("No embedding model downloaded")
+                && s.contains("onebrain search reindex"),
+            "{s}"
+        );
+        assert!(
+            !s.contains("index pending changes"),
+            "model hint suppresses pending hint: {s}"
+        );
+    }
+
+    #[test]
+    fn text_no_model_hint_while_reindex_running() {
+        let mut e = env(Some("ob-1"), true);
+        {
+            let d = e.data.as_mut().unwrap();
+            d.current_model_missing = true;
+            d.reindexing = Some(ReindexLiveProgress { done: 3, total: 10 });
+        }
+        let s = render_text(&e);
+        assert!(!s.contains("💡"), "no reindex hint while reindexing: {s}");
     }
 
     #[test]
@@ -737,6 +784,7 @@ mod tests {
             embed_model: "multilingual-e5-small".to_string(),
             cache_dir: Some(PathBuf::from("/cache/t-status-data-for")),
             indexed: 3 > 0, // mirrors `status_data_for`'s `status.doc_count > 0`
+            current_model_missing: cfg!(feature = "semantic"), // model_size_bytes is None here
             model_size_bytes: None,
             model_downloaded_at: None,
             last_indexed_at: Some(1_700_000_000),

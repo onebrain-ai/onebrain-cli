@@ -333,7 +333,12 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
   - [x] **v3.4.2** — **security fix**: the `serve`/daemon session auth token now comes from the OS CSPRNG on every platform (`getrandom`), removing the time-seeded, guessable Windows fallback. *(Interleaved ahead of the qmd epic — see below.)*
   - [x] **v3.4.3** — housekeeping bundle: scheduler polish (cron steps/lists · plist collision · `schedule list`) · CI `lex-only` test job · minor fixes.
   - [x] **v3.4.4** — scheduler runs actually fire: `onebrain` is now put on the headless-`claude` child's PATH so cron skills no longer exit 78 (#124) · generated plists emit `skill run`, not the deprecated `run-skill` (#125). *(Interleaved scheduler-fix patch, ahead of the qmd epic.)*
-  - [ ] **v3.4.5** — `/qmd` → `/search` skill + auto reindex/embed hook + serve/WebUI search rewire + **remove `@tobilu/qmd`** + relocate the search cache off OS-purgeable `~/Library/Caches` (#114) *(the qmd epic; shifted by the v3.4.2 security fix, v3.4.3 housekeeping, and v3.4.4 scheduler patch)*.
+  - [ ] **v3.4.5** — **native search · no dependency · auto reindex/embed · model reindex ux/ui** (the qmd epic — [milestone 1](https://github.com/onebrain-ai/onebrain-cli/milestone/1); accumulates several PRs, tagged once all tracks land):
+    - [x] relocate the search cache off OS-purgeable `~/Library/Caches` → persistent data dir (#114 → #129)
+    - [ ] no-model reindex UX — active only when downloaded, e5-small default, MCP no-index fallback signal (#130)
+    - [ ] remove **`@tobilu/qmd`** — 0 node/python deps: serve/WebUI search → native, drop `qmd embed`/probe (#131)
+    - [ ] plugin cutover — `.mcp.json` key + `/qmd` → `/search` skill (onebrain-ai/onebrain#206, ADR 0019)
+    - [ ] auto reindex/embed hook (#133)
   - [ ] **v3.4.6** — relevance polish: rerank (bge-reranker-v2-m3) · query expansion · nlpo3 Thai word-seg · custom ONNX models.
 - [ ] **v3.5** — Bootstrap + native verbs: startup / wrapup / daily / tasks → 1 call per ceremony (import content-verbs anchored ~v3.5.x).
 - [ ] **v3.6** — Warm daemon + RPC: kill cold process-start; keeps the native index + embed model hot (absorbs the old RPC-layer milestone).

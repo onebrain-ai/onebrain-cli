@@ -192,6 +192,33 @@ pub fn model_not_chosen(vault_root: &Path, cache_dir: &Path) -> bool {
     !embed_model_key_present(vault_root) && !any_model_downloaded(cache_dir)
 }
 
+/// Reconcile a stale model choice after a cache purge (or a manual model
+/// deletion): when `search.embed_model` names a model that is no longer on
+/// disk, drop the key so the vault reverts to "no model chosen". `search
+/// reindex` then re-prompts for a selection and the UI stops marking a
+/// not-downloaded model as active.
+///
+/// Race-safe + best-effort — does nothing when a reindex is in progress (it
+/// downloads the model, so the dir is legitimately absent mid-run), when no
+/// model key is committed, or when the configured model IS downloaded. A write
+/// failure is swallowed: reconciliation is advisory, never fatal. Call only
+/// from mutating surfaces (`search model` TUI, `search reindex`) — NOT the
+/// read-only `search status` / `search model list` paths.
+pub(crate) fn reconcile_missing_model(vault_root: &Path, cache_dir: &Path, embed_model: &str) {
+    use onebrain_search::embed::{model_download_status, model_registry};
+
+    if read_reindex_progress(cache_dir).is_some() || !embed_model_key_present(vault_root) {
+        return;
+    }
+    let downloaded = model_registry()
+        .iter()
+        .find(|m| m.name == embed_model)
+        .is_some_and(|m| model_download_status(m, cache_dir).downloaded);
+    if !downloaded {
+        let _ = onebrain_fs::remove_search_key(vault_root, "embed_model");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +437,38 @@ mod tests {
         std::fs::create_dir_all(&mdir).unwrap();
         std::fs::write(mdir.join("model.onnx"), vec![0u8; 16]).unwrap();
         assert!(!model_not_chosen(vault.path(), cache.path()));
+    }
+
+    #[test]
+    fn reconcile_clears_a_stale_model_choice() {
+        let vault = tempdir().unwrap();
+        let cache = tempdir().unwrap(); // empty → the model isn't downloaded
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: c\n  embed_model: bge-m3\n",
+        )
+        .unwrap();
+        reconcile_missing_model(vault.path(), cache.path(), "bge-m3");
+        assert!(
+            !embed_model_key_present(vault.path()),
+            "a configured-but-undownloaded model must be cleared"
+        );
+        let yaml = std::fs::read_to_string(vault.path().join("onebrain.yml")).unwrap();
+        assert!(yaml.contains("collection: c"), "{yaml}");
+    }
+
+    #[test]
+    fn reconcile_is_noop_when_no_model_committed() {
+        let vault = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: c\n",
+        )
+        .unwrap();
+        reconcile_missing_model(vault.path(), cache.path(), "multilingual-e5-small");
+        let yaml = std::fs::read_to_string(vault.path().join("onebrain.yml")).unwrap();
+        assert!(yaml.contains("collection: c"), "{yaml}");
     }
 }
 
