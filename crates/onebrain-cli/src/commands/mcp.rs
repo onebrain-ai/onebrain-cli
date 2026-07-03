@@ -1,7 +1,9 @@
-//! `onebrain search mcp` — MCP stdio server over the native search engine.
+//! `onebrain mcp` — OneBrain's MCP stdio server.
 //!
-//! Mirrors the qmd MCP tool surface (`query`/`get`/`multi_get`/`status`) so the
-//! plugin's `.mcp.json` can swap `qmd mcp` -> `onebrain search mcp` without any
+//! Search tools (`query`/`get`/`multi_get`/`status`) are the first tool group
+//! hosted here; more vault tool groups (notes, tasks, ...) will mount on this
+//! same command over time. The current tool surface mirrors the qmd MCP tools
+//! so the plugin's `.mcp.json` can swap `qmd mcp` -> `onebrain mcp` without any
 //! instruction changes (tool namespace rename lands in v3.4.2). tokio lives only
 //! at this boundary; the sync engine is called via `spawn_blocking`.
 use std::path::{Path, PathBuf};
@@ -62,6 +64,13 @@ fn resolve_under_vault(vault_root: &Path, rel: &str) -> anyhow::Result<PathBuf> 
     let root = vault_root
         .canonicalize()
         .context("canonicalize vault root")?;
+    // Absolute `rel` inputs (e.g. `/etc/passwd`) are rejected too: `Path::join`
+    // with an absolute path discards `root` entirely and returns the absolute
+    // path unchanged, so the `starts_with(&root)` check below still catches it
+    // (the canonicalized absolute path won't start with the vault root) — but
+    // only for paths outside the vault; an absolute path that happens to fall
+    // *inside* the vault would incorrectly pass, which is why callers should
+    // always pass vault-relative paths, not attacker-controlled absolute ones.
     let joined = root.join(rel);
     let canon = joined
         .canonicalize()
@@ -454,7 +463,7 @@ impl SearchMcpServer {
 
     #[tool(
         name = "multi_get",
-        description = "Read multiple files at once by glob pattern (e.g. 'journals/2026-07*.md') or a comma-separated list of vault-relative paths. Files larger than maxBytes (default 10240) are skipped with a note."
+        description = "Read multiple files at once by glob pattern (e.g. 'journals/2026-07*.md') or a comma-separated list of vault-relative paths. Files larger than maxBytes (default 10240) are skipped with a note. Glob walks exclude hidden directories (dot-dirs, e.g. `.git`/`.obsidian`), mirroring the search engine's own indexing convention."
     )]
     async fn multi_get(
         &self,
@@ -546,7 +555,7 @@ pub fn run(vault_flag: Option<PathBuf>) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("build tokio runtime for search mcp")?;
+        .context("build tokio runtime for onebrain mcp")?;
     runtime.block_on(async move {
         let service = SearchMcpServer::new(engine, resolved)
             .serve(stdio())
@@ -570,6 +579,54 @@ mod tests {
             score: 0.0,
             snippet: String::new(),
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Wire-contract tests: deserialize from raw JSON using the camelCase
+    // wire keys an actual MCP client sends. These exist because the
+    // `#[serde(rename = "...")]`/`rename_all` attributes above are never
+    // exercised through real JSON in the other tests — a typo in a rename
+    // (e.g. `"fromline"` instead of `"fromLine"`) would silently pass every
+    // other test in this module while breaking every real client call.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn get_params_deserialize_camelcase_wire_keys() {
+        let p: GetParams = serde_json::from_value(serde_json::json!({
+            "file": "a.md:2", "fromLine": 5, "maxLines": 3, "lineNumbers": true
+        }))
+        .unwrap();
+        assert_eq!(p.file, "a.md:2");
+        assert_eq!(p.from_line, Some(5));
+        assert_eq!(p.max_lines, Some(3));
+        assert_eq!(p.line_numbers, Some(true));
+    }
+
+    #[test]
+    fn multi_get_params_deserialize_camelcase_wire_keys() {
+        let p: MultiGetParams = serde_json::from_value(serde_json::json!({
+            "pattern": "notes/*.md", "maxLines": 3, "maxBytes": 2048, "lineNumbers": true
+        }))
+        .unwrap();
+        assert_eq!(p.pattern, "notes/*.md");
+        assert_eq!(p.max_lines, Some(3));
+        assert_eq!(p.max_bytes, Some(2048));
+        assert_eq!(p.line_numbers, Some(true));
+    }
+
+    #[test]
+    fn query_params_deserialize_camelcase_wire_keys() {
+        let p: QueryParams = serde_json::from_value(serde_json::json!({
+            "searches": [{"type": "lex", "query": "foo"}],
+            "minScore": 0.5,
+            "candidateLimit": 100
+        }))
+        .unwrap();
+        assert_eq!(p.searches.len(), 1);
+        assert!(matches!(p.searches[0].r#type, SubQueryType::Lex));
+        assert_eq!(p.searches[0].query, "foo");
+        assert_eq!(p.min_score, Some(0.5));
+        assert_eq!(p.candidate_limit, Some(100));
     }
 
     #[test]
@@ -642,6 +699,8 @@ mod tests {
         std::fs::write(dir.path().join("ok.md"), "x").unwrap();
         assert!(resolve_under_vault(dir.path(), "ok.md").is_ok());
         assert!(resolve_under_vault(dir.path(), "../etc/passwd").is_err());
+        // Absolute inputs are rejected too — not just relative traversal.
+        assert!(resolve_under_vault(dir.path(), "/etc/passwd").is_err());
     }
 
     #[cfg(unix)]

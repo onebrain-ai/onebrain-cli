@@ -25,7 +25,7 @@ use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 ///
 /// `Send + Sync`: [`Engine`](crate::engine::Engine) is held behind an
 /// `Arc<Mutex<_>>` and driven from `tokio::task::spawn_blocking` by the
-/// `search mcp` server, so its boxed embedder must be safely shareable
+/// `onebrain mcp` server, so its boxed embedder must be safely shareable
 /// across threads. Both real implementors (`Embedder`, backed by
 /// `fastembed::TextEmbedding` behind a `Mutex`) and test fakes already
 /// satisfy this.

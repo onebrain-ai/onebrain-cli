@@ -401,7 +401,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         },
         Cmd::Gateway(GatewayCmd { verb }) => match verb {
             GatewayVerb::Telegram => stubs::not_implemented("gateway telegram"),
-            GatewayVerb::Mcp => stubs::not_implemented("gateway mcp"),
         },
         Cmd::Inbox(InboxCmd { verb }) => match verb {
             InboxVerb::List => {
@@ -497,8 +496,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     commands::search_model::run_remove(vault_flag.clone(), &mode, &args)
                 }
             },
-            SearchVerb::Mcp => commands::search_mcp::run(vault_flag.clone()),
         },
+        Cmd::Mcp => commands::mcp::run(vault_flag.clone()),
         Cmd::Pause(PauseCmd { verb }) => match verb {
             PauseVerb::List => {
                 stubs::not_implemented_vault_required(vault_flag.clone(), "pause list")
