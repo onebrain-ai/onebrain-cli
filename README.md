@@ -167,7 +167,7 @@ onebrain
 ├── search      query · search · vsearch · get · status · reindex · model
 ├── note        read · list · find · search · stat · new · append · edit
 │               · move · mkdir · archive · delete · orphans · backlinks
-├── qmd         reindex · embed · status        (legacy — removed in v3.4.2)
+├── qmd         reindex · embed · status        (legacy — removed in v3.4.4)
 ├── plugin      install · update · migrate
 ├── schedule    register
 ├── skill       run
@@ -327,9 +327,11 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
 - [x] **v3.3** — Daemon foundation: `onebrain serve` — a local **web UI embedded in the binary** over a token-gated vault JSON API (file explorer · reading view · qmd-backed search · agent chat), on a security-hardened surface (whole-surface token gate · vault path confinement · CSP + forced-attachment · agent env isolation).
 - [ ] **v3.4** — **Native Rust search — replaces qmd** (mini-epic across v3.4.x; exit: **0 node/python deps**):
   - [x] **v3.4.0** — `onebrain-search` engine (tantivy BM25 + fastembed embeddings + RRF hybrid, ~100-language semantic + Thai/CJK keyword) · `onebrain search` verbs (`query/search/vsearch/get/status/reindex/model` + interactive model TUI) · doctor native-search checks · `qmd_collection` → `search.collection` migration.
-  - [x] **v3.4.1** — native MCP server (`onebrain mcp`, rmcp): qmd-compatible `query/get/multi_get/status` tools, client-side RRF fusion, native `session init` probe (drops the qmd subprocess). Plugin `.mcp.json` server-key rename (`qmd` → `search`) is staged for v3.4.2 — see [ADR 0019](docs/decisions/0019-native-mcp-server-staged-qmd-cutover.md).
-  - [ ] **v3.4.2** — `/qmd` → `/search` skill + auto reindex/embed hook + serve/WebUI search rewire + **remove `@tobilu/qmd`**.
-  - [ ] **v3.4.3** — relevance polish: rerank (bge-reranker-v2-m3) · query expansion · nlpo3 Thai word-seg · custom ONNX models.
+  - [x] **v3.4.1** — native MCP server (`onebrain mcp`, rmcp): qmd-compatible `query/get/multi_get/status` tools, client-side RRF fusion, native `session init` probe (drops the qmd subprocess). Plugin `.mcp.json` server-key rename (`qmd` → `search`) is staged for the v3.4.4 cutover — see [ADR 0019](docs/decisions/0019-native-mcp-server-staged-qmd-cutover.md).
+  - [x] **v3.4.2** — **security fix**: the `serve`/daemon session auth token now comes from the OS CSPRNG on every platform (`getrandom`), removing the time-seeded, guessable Windows fallback. *(Interleaved ahead of the qmd epic — see below.)*
+  - [ ] **v3.4.3** — housekeeping bundle: scheduler polish (cron steps/lists · plist collision · `schedule list`) · CI `lex-only` test job · minor fixes.
+  - [ ] **v3.4.4** — `/qmd` → `/search` skill + auto reindex/embed hook + serve/WebUI search rewire + **remove `@tobilu/qmd`** *(was v3.4.2 — shifted by the v3.4.2 security fix + v3.4.3 housekeeping)*.
+  - [ ] **v3.4.5** — relevance polish: rerank (bge-reranker-v2-m3) · query expansion · nlpo3 Thai word-seg · custom ONNX models *(was v3.4.3)*.
 - [ ] **v3.5** — Bootstrap + native verbs: startup / wrapup / daily / tasks → 1 call per ceremony (import content-verbs anchored ~v3.5.x).
 - [ ] **v3.6** — Warm daemon + RPC: kill cold process-start; keeps the native index + embed model hot (absorbs the old RPC-layer milestone).
 - [ ] ~~**v3.7** — qmd native search~~ → absorbed into v3.4.
@@ -339,7 +341,7 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
 
 ### 🔭 Signal-driven (Tier 2/3)
 - [ ] Broader harness support — Codex, Qwen, and other agentic harnesses beyond today's Claude Code + Gemini CLI.
-- [ ] Tiered memory + behavior tracking · proactive surfacing · daemon background synthesis · Avatar Mesh (one agent identity across machines) · Telegram / MCP gateway · OneBrain Studio + [OneBrain Cloud](https://onebrain.run) federation.
+- [ ] Tiered memory + behavior tracking · proactive surfacing · daemon background synthesis · Avatar Mesh (one agent identity across machines) · Telegram / MCP gateway · OneBrain Studio.
 
 ### 🏁 v4.0 · breaking
 - [ ] Drop `vault.yml` dual-read (canonical `onebrain.yml` only) · retire the hidden v3.0 aliases.
@@ -368,7 +370,6 @@ PR conventions: feature branch → git worktree → 3-round parallel review (cor
 
 - **[onebrain-ai/onebrain](https://github.com/onebrain-ai/onebrain)** — OneBrain plugin (slash commands, skills, agents, hooks). Pairs with this CLI.
 - **[onebrain.run](https://onebrain.run)** — Marketing site, install one-liner, public roadmap.
-- **[OneBrain Cloud](https://onebrain.run) (waitlist)** — Hosted agent runtime + multi-device sync. Planning phase.
 
 ## Contributing
 
