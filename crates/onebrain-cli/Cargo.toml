@@ -79,6 +79,11 @@ flate2             = { workspace = true }
 # for the tools' structured (`Json<T>`) outputs.
 rmcp               = { version = "2.1.0", features = ["server", "macros", "transport-io"] }
 schemars           = "1.2.1"
+# `search mcp`'s `multi_get` tool: glob-match vault-relative paths walked via
+# `walkdir` (already a direct dep above). Already in the workspace tree
+# (pulled by `onebrain-fs` — pure Rust, no `-sys` crates), so this only
+# promotes an existing transitive dep to direct rather than adding a new one.
+globset            = { workspace = true }
 # Hex-encode the random session token (read from /dev/urandom on unix). `urlencoding`
 # is already a dep for vault-sync; it does NOT do hex, so we hand-roll a 1-liner
 # instead of pulling `hex`/`getrandom`/`rand` (see server::token).

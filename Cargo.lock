@@ -2092,6 +2092,7 @@ dependencies = [
  "dirs 5.0.1",
  "flate2",
  "futures-core",
+ "globset",
  "http-body-util",
  "indicatif 0.17.11",
  "inquire",

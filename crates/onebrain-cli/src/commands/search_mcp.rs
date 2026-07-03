@@ -4,13 +4,13 @@
 //! plugin's `.mcp.json` can swap `qmd mcp` -> `onebrain search mcp` without any
 //! instruction changes (tool namespace rename lands in v3.4.2). tokio lives only
 //! at this boundary; the sync engine is called via `spawn_blocking`.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::transport::stdio;
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
 
@@ -30,6 +30,148 @@ pub struct SearchMcpServer {
 
 fn internal(e: impl std::fmt::Display) -> ErrorData {
     ErrorData::internal_error(e.to_string(), None)
+}
+
+/// Default per-file byte cap for `multi_get` — files larger than this are
+/// skipped (with a one-line note in the output) rather than dumped whole.
+const DEFAULT_MAX_BYTES: u64 = 10_240;
+
+/// Splits a trailing `:N` line-number suffix off a path, e.g.
+/// `notes/a.md:100` -> (`notes/a.md`, `Some(100)`). Only a purely-numeric
+/// suffix counts as a line number — this keeps Windows drive letters
+/// (`a:b.md`) and any other non-numeric `:`-suffix intact as part of the
+/// path instead of misparsing them.
+fn split_line_suffix(input: &str) -> (&str, Option<usize>) {
+    if let Some((path, suffix)) = input.rsplit_once(':') {
+        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+            return (path, suffix.parse().ok());
+        }
+    }
+    (input, None)
+}
+
+/// Resolves a vault-relative path to an absolute, canonicalized path that is
+/// guaranteed to live under `vault_root` — the traversal guard for `get` /
+/// `multi_get`. Canonicalizing both sides (not just comparing the joined
+/// path textually) means `..` segments AND symlinks that point outside the
+/// vault are both caught: `starts_with` runs against the fully resolved
+/// target, so a symlink inside the vault pointing at `/etc/passwd` resolves
+/// to `/etc/passwd` before the check and is rejected exactly like a literal
+/// `../etc/passwd` would be.
+fn resolve_under_vault(vault_root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
+    let root = vault_root
+        .canonicalize()
+        .context("canonicalize vault root")?;
+    let joined = root.join(rel);
+    let canon = joined
+        .canonicalize()
+        .with_context(|| format!("not found: {rel}"))?;
+    anyhow::ensure!(canon.starts_with(&root), "path escapes the vault: {rel}");
+    Ok(canon)
+}
+
+/// Slices `text` to the `[from_line, from_line + max_lines)` window
+/// (1-indexed, inclusive start), optionally prefixing each line with its
+/// 1-indexed line number.
+fn slice_lines(
+    text: &str,
+    from_line: Option<usize>,
+    max_lines: Option<usize>,
+    line_numbers: bool,
+) -> String {
+    let start = from_line.unwrap_or(1).max(1);
+    let lines = text.lines().enumerate().skip(start - 1);
+    let lines: Box<dyn Iterator<Item = (usize, &str)>> = match max_lines {
+        Some(n) => Box::new(lines.take(n)),
+        None => Box::new(lines),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for (i, l) in lines {
+        out.push(if line_numbers {
+            format!("{}: {}", i + 1, l)
+        } else {
+            l.to_string()
+        });
+    }
+    out.join("\n")
+}
+
+/// Params for the `get` tool.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct GetParams {
+    /// Vault-relative file path from search results (e.g. 'notes/meeting.md', or 'notes/meeting.md:100' to start at line 100).
+    pub file: String,
+    /// Start from this line number (1-indexed).
+    #[serde(rename = "fromLine")]
+    pub from_line: Option<usize>,
+    /// Maximum number of lines to return.
+    #[serde(rename = "maxLines")]
+    pub max_lines: Option<usize>,
+    /// Add line numbers ('N: content').
+    #[serde(rename = "lineNumbers")]
+    pub line_numbers: Option<bool>,
+}
+
+/// Params for the `multi_get` tool.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct MultiGetParams {
+    /// Glob pattern (vault-relative, e.g. 'journals/2026-07*.md') or comma-separated list of paths.
+    pub pattern: String,
+    #[serde(rename = "maxLines")]
+    pub max_lines: Option<usize>,
+    /// Skip files larger than this many bytes (default 10240).
+    #[serde(rename = "maxBytes")]
+    pub max_bytes: Option<u64>,
+    #[serde(rename = "lineNumbers")]
+    pub line_numbers: Option<bool>,
+}
+
+/// Vault-relative paths (forward-slash, POSIX-style) matched by `pattern`
+/// under `vault_root`. A `,`-containing pattern is treated as an explicit
+/// comma-separated path list (trimmed, no globbing); otherwise `pattern` is
+/// compiled as a glob and matched against every file reachable by walking
+/// `vault_root` (hidden dirs like `.git` are skipped, matching the search
+/// engine's own indexing walk).
+fn expand_multi_get_pattern(vault_root: &Path, pattern: &str) -> anyhow::Result<Vec<String>> {
+    if pattern.contains(',') {
+        return Ok(pattern
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect());
+    }
+
+    let glob = globset::Glob::new(pattern)
+        .with_context(|| format!("invalid glob pattern: {pattern}"))?
+        .compile_matcher();
+
+    let mut matched = Vec::new();
+    for entry in walkdir::WalkDir::new(vault_root)
+        .into_iter()
+        .filter_entry(|e| {
+            // Skip dotfiles/dotdirs (e.g. `.git`, `.obsidian`) — same
+            // convention as the search engine's own indexing walk.
+            e.file_name()
+                .to_str()
+                .map(|name| e.depth() == 0 || !name.starts_with('.'))
+                .unwrap_or(true)
+        })
+    {
+        let entry = entry.context("walking vault tree")?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(vault_root)
+            .unwrap_or(entry.path());
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if glob.is_match(&rel_str) {
+            matched.push(rel_str);
+        }
+    }
+    matched.sort();
+    Ok(matched)
 }
 
 /// A single typed sub-query in a `query` tool call.
@@ -275,6 +417,114 @@ impl SearchMcpServer {
 
         Ok(Json(QueryOut { results }))
     }
+
+    #[tool(
+        name = "get",
+        description = "Read a file's contents by vault-relative path (from search results). Supports 'path:N' to start at line N, and fromLine/maxLines/lineNumbers for windowing."
+    )]
+    async fn get(
+        &self,
+        Parameters(params): Parameters<GetParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (path_part, suffix_line) = split_line_suffix(&params.file);
+        let path_part = path_part.to_string();
+        let vault_root = self.resolved.root.as_path().to_path_buf();
+
+        let resolved_path =
+            tokio::task::spawn_blocking(move || resolve_under_vault(&vault_root, &path_part))
+                .await
+                .map_err(internal)?
+                .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+
+        let text = tokio::fs::read_to_string(&resolved_path)
+            .await
+            .map_err(|e| {
+                ErrorData::invalid_params(format!("reading {}: {e}", params.file), None)
+            })?;
+
+        let from_line = suffix_line.or(params.from_line);
+        let sliced = slice_lines(
+            &text,
+            from_line,
+            params.max_lines,
+            params.line_numbers.unwrap_or(false),
+        );
+        Ok(CallToolResult::success(vec![ContentBlock::text(sliced)]))
+    }
+
+    #[tool(
+        name = "multi_get",
+        description = "Read multiple files at once by glob pattern (e.g. 'journals/2026-07*.md') or a comma-separated list of vault-relative paths. Files larger than maxBytes (default 10240) are skipped with a note."
+    )]
+    async fn multi_get(
+        &self,
+        Parameters(params): Parameters<MultiGetParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let vault_root = self.resolved.root.as_path().to_path_buf();
+        let max_bytes = params.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+        let line_numbers = params.line_numbers.unwrap_or(false);
+        let max_lines = params.max_lines;
+        let pattern = params.pattern.clone();
+
+        let paths = {
+            let vault_root = vault_root.clone();
+            tokio::task::spawn_blocking(move || expand_multi_get_pattern(&vault_root, &pattern))
+                .await
+                .map_err(internal)?
+                .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?
+        };
+
+        if paths.is_empty() {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                "no files matched",
+            )]));
+        }
+
+        let mut sections: Vec<String> = Vec::with_capacity(paths.len());
+        for rel in paths {
+            let vault_root = vault_root.clone();
+            let rel_for_resolve = rel.clone();
+            let resolved_path = match tokio::task::spawn_blocking(move || {
+                resolve_under_vault(&vault_root, &rel_for_resolve)
+            })
+            .await
+            .map_err(internal)?
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    sections.push(format!("--- {rel}\n(skipped: {e})"));
+                    continue;
+                }
+            };
+
+            let metadata = match tokio::fs::metadata(&resolved_path).await {
+                Ok(m) => m,
+                Err(e) => {
+                    sections.push(format!("--- {rel}\n(skipped: {e})"));
+                    continue;
+                }
+            };
+            if metadata.len() > max_bytes {
+                sections.push(format!(
+                    "--- {rel}\n(skipped: {} bytes exceeds maxBytes {max_bytes})",
+                    metadata.len()
+                ));
+                continue;
+            }
+
+            match tokio::fs::read_to_string(&resolved_path).await {
+                Ok(text) => {
+                    let sliced = slice_lines(&text, None, max_lines, line_numbers);
+                    sections.push(format!("--- {rel}\n{sliced}"));
+                }
+                Err(e) => sections.push(format!("--- {rel}\n(skipped: {e})")),
+            }
+        }
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            sections.join("\n\n"),
+        )]))
+    }
 }
 
 #[tool_handler(router = self.tool_router.clone())]
@@ -363,5 +613,53 @@ mod tests {
         let fused = rrf_fuse(vec![(1.0, vec![hit("b")]), (1.0, vec![hit("a")])]);
         assert_eq!(fused[0].1.chunk_id, "a");
         assert_eq!(fused[1].1.chunk_id, "b");
+    }
+
+    #[test]
+    fn split_line_suffix_parses_colon_line() {
+        assert_eq!(
+            split_line_suffix("notes/a.md:100"),
+            ("notes/a.md", Some(100))
+        );
+        assert_eq!(split_line_suffix("notes/a.md"), ("notes/a.md", None));
+        // Windows drive letters / non-numeric suffixes are not line numbers.
+        assert_eq!(split_line_suffix("a:b.md"), ("a:b.md", None));
+    }
+
+    #[test]
+    fn slice_lines_respects_from_max_and_numbers() {
+        let text = "l1\nl2\nl3\nl4";
+        assert_eq!(slice_lines(text, Some(2), Some(2), false), "l2\nl3");
+        assert_eq!(
+            slice_lines(text, None, None, true),
+            "1: l1\n2: l2\n3: l3\n4: l4"
+        );
+    }
+
+    #[test]
+    fn resolve_under_vault_rejects_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ok.md"), "x").unwrap();
+        assert!(resolve_under_vault(dir.path(), "ok.md").is_ok());
+        assert!(resolve_under_vault(dir.path(), "../etc/passwd").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_under_vault_rejects_symlink_escape() {
+        // A symlink that lives inside the vault but points outside it must
+        // be rejected too — canonicalize() follows the symlink before the
+        // `starts_with` check runs, so the escape is caught the same way a
+        // literal `../` would be.
+        let vault = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.md"), "SECRET").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.md"),
+            vault.path().join("link.md"),
+        )
+        .unwrap();
+
+        assert!(resolve_under_vault(vault.path(), "link.md").is_err());
     }
 }
