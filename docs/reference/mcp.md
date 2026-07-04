@@ -200,7 +200,7 @@ A common question for tools like a future `reindex`: can an agent kick off long 
 ## Versioning & compatibility
 
 - **qmd-compat contract**: the tool names (`query`/`get`/`multi_get`/`status`) and most parameter names deliberately match the external `qmd` MCP server this replaces, so agent instructions written against qmd need no rewrite to call this server instead. Params the native engine doesn't yet use are still accepted (see each tool's table above) rather than rejected — a client sending them gets normal behavior, not a schema error.
-- **Plugin config staging**: the OneBrain plugin's `.mcp.json` registers this server under the config key `qmd` through **v3.4.1** — this is why the example above uses `"qmd":` as the server key even though the binary command is `onebrain mcp`. The key renames to `search` (with a matching agent-instruction update) in **v3.4.4**. Until then, the `mcp__plugin_onebrain_qmd__*` tool namespace keeps working unchanged.
+- **Plugin config staging**: the OneBrain plugin's `.mcp.json` registered this server under the config key `qmd` from the **v3.4.1** native-backend swap onward — this is why the example above uses `"qmd":` as the server key even though the binary command is `onebrain mcp`. The key was renamed to `search` (with a matching agent-instruction update) in the **v3.4.5** epic — plugin PR onebrain-ai/onebrain#208 — after which the tool namespace is `mcp__plugin_onebrain_search__*`.
 - **Server version = CLI version**: the MCP `initialize` handshake's `serverInfo` reports `{ "name": "onebrain", "version": "<CLI version>" }` — there is no separate MCP-protocol version to track; it always matches `onebrain --version`.
 
 ## Roadmap

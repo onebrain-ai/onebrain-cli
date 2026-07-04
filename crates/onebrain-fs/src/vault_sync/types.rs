@@ -37,8 +37,6 @@ pub struct VaultSyncOptions {
     pub is_tty: Option<bool>,
     /// Injectable unlink — defaults to `std::fs::remove_file`.
     pub unlink_fn: Option<UnlinkFn>,
-    /// When true, also extract `.obsidian/` from the tarball (init only).
-    pub include_obsidian: bool,
     /// When true, suppress the intro/outro frame and use the embedded `▸ `
     /// step prefix (called as a sub-operation from `init`).
     pub embedded: bool,

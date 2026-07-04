@@ -1,5 +1,5 @@
-//! Recursive file listing helper · shared by `sync_plugin_files`,
-//! `sync_gemini_config`, and `sync_obsidian`.
+//! Recursive file listing helper · shared by `sync_plugin_files`
+//! and `sync_gemini_config`.
 //!
 //! Port of Bun's `listFilesRecursive` (vault-sync.ts) which:
 //!   - returns full paths (not relative)

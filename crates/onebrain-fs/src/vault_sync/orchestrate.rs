@@ -16,7 +16,7 @@ use super::download::{default_fetch_fn, download_tarball, extract_tarball};
 use super::harness_merge::merge_harness_files;
 use super::pin::pin_to_vault;
 use super::progress::build_progress;
-use super::sync::{default_unlink_fn, sync_gemini_config, sync_obsidian, sync_plugin_files};
+use super::sync::{default_unlink_fn, sync_gemini_config, sync_plugin_files};
 use super::types::{NowFn, VaultSyncOptions, VaultSyncResult};
 use super::vault_yml::update_vault_yml;
 use crate::harness::detect_harness;
@@ -115,15 +115,10 @@ pub fn run_vault_sync(vault_root: &Path, opts: VaultSyncOptions) -> VaultSyncRes
         if added == 1 { "" } else { "s" }
     ));
 
-    // ── Step 4 · .obsidian (init only) ─────────────────────────────────────
-    if opts.include_obsidian {
-        sync_obsidian(&extracted_dir, vault_root);
-    }
-
-    // ── Step 5 · root docs (non-fatal) ─────────────────────────────────────
+    // ── Step 4 · root docs (non-fatal) ─────────────────────────────────────
     copy_root_docs(&extracted_dir, vault_root);
 
-    // ── Step 6 · harness merge ─────────────────────────────────────────────
+    // ── Step 5 · harness merge ─────────────────────────────────────────────
     progress.start("🔧", "Updating harness");
     let imports_added = match merge_harness_files(&extracted_dir, vault_root) {
         Ok(n) => n,
@@ -144,7 +139,7 @@ pub fn run_vault_sync(vault_root: &Path, opts: VaultSyncOptions) -> VaultSyncRes
         progress.stop("harness files up-to-date");
     }
 
-    // ── Step 7 · onebrain.yml update ─────────────────────────────────────────
+    // ── Step 6 · onebrain.yml update ─────────────────────────────────────────
     if let Err(e) = update_vault_yml(vault_root, &update_channel) {
         eprintln!("vault-sync: onebrain.yml update failed: {e}");
         result.error = Some(e.to_string());
@@ -584,66 +579,6 @@ mod tests {
         assert!(
             result.ok,
             "sync should succeed with a custom progress_writer: {result:?}"
-        );
-    }
-
-    // ---- include_obsidian flag ----
-
-    #[test]
-    fn include_obsidian_flag_copies_obsidian_dir() {
-        let dir = tempdir().unwrap();
-        let vault = make_vault(dir.path());
-        let isolated = vault.join(".isolated-installed_plugins.json");
-
-        // Build a tarball that includes an .obsidian/ file.
-        let mut bytes = Vec::new();
-        {
-            let enc = GzEncoder::new(&mut bytes, Compression::default());
-            let mut b = tar::Builder::new(enc);
-            let files: &[(&str, &str)] = &[
-                (
-                    "onebrain-ai-onebrain-abc/.claude/plugins/onebrain/.claude-plugin/plugin.json",
-                    r#"{"id":"onebrain","version":"1.11.0","name":"OneBrain"}"#,
-                ),
-                (
-                    "onebrain-ai-onebrain-abc/CLAUDE.md",
-                    "@.claude/plugins/onebrain/INSTRUCTIONS.md\n",
-                ),
-                (
-                    "onebrain-ai-onebrain-abc/GEMINI.md",
-                    "@.claude/plugins/onebrain/INSTRUCTIONS.md\n",
-                ),
-                (
-                    "onebrain-ai-onebrain-abc/AGENTS.md",
-                    "@.claude/plugins/onebrain/INSTRUCTIONS.md\n",
-                ),
-                ("onebrain-ai-onebrain-abc/.obsidian/app.json", "{}"),
-            ];
-            for (p, c) in files {
-                let mut h = tar::Header::new_gnu();
-                h.set_size(c.len() as u64);
-                h.set_mode(0o644);
-                h.set_cksum();
-                b.append_data(&mut h, p, c.as_bytes()).unwrap();
-            }
-            b.finish().unwrap();
-        }
-
-        let result = run_vault_sync(
-            &vault,
-            VaultSyncOptions {
-                fetch_fn: Some(mock_fetch_with(bytes)),
-                installed_plugins_path: Some(isolated),
-                is_tty: Some(false),
-                now_fn: Some(fixed_now()),
-                include_obsidian: true,
-                ..Default::default()
-            },
-        );
-        assert!(result.ok, "sync should succeed: {result:?}");
-        assert!(
-            vault.join(".obsidian/app.json").exists(),
-            ".obsidian/app.json should be synced when include_obsidian=true"
         );
     }
 

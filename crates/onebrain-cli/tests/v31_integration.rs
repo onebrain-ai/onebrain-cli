@@ -472,11 +472,14 @@ fn session_init_alias_dispatches_to_session_init() {
         .success();
     let s_new = String::from_utf8_lossy(&out_new.get_output().stdout).to_string();
 
-    // Both must emit the same JSON keys (datetime+session_token+qmd_unembedded).
+    // Both must emit the same JSON keys (datetime + session_token +
+    // search_unembedded, with the deprecated qmd_unembedded alias alongside).
     let v_alias: serde_json::Value = serde_json::from_str(s_alias.trim()).unwrap();
     let v_new: serde_json::Value = serde_json::from_str(s_new.trim()).unwrap();
     assert!(v_alias.get("session_token").is_some());
     assert!(v_new.get("session_token").is_some());
+    assert!(v_alias.get("search_unembedded").is_some());
+    assert!(v_new.get("search_unembedded").is_some());
     assert!(v_alias.get("qmd_unembedded").is_some());
     assert!(v_new.get("qmd_unembedded").is_some());
 }
