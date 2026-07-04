@@ -51,8 +51,23 @@ impl Drop for EnvVarGuard {
         // Runs before `_lock` is released (fields drop after the body).
         for (key, prev) in self.saved.drain(..) {
             match prev {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
+                Some(value) => {
+                    // SAFETY: the guard still holds `ENV_LOCK` during Drop, so
+                    // restoration is serialized with other mutations that
+                    // follow this helper's contract.
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        std::env::set_var(key, value)
+                    };
+                }
+                None => {
+                    // SAFETY: same rationale — lock held while mutating the
+                    // process environment during restoration.
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        std::env::remove_var(key)
+                    };
+                }
             }
         }
     }

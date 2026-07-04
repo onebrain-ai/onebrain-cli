@@ -267,11 +267,11 @@ fn dir_mtime_secs(root: &Path) -> Option<u64> {
 /// Format epoch seconds as local `YYYY-MM-DD HH:MM`, or `None` on an
 /// out-of-range timestamp.
 fn format_local(secs: u64) -> Option<String> {
-    use chrono::TimeZone;
-    match chrono::Local.timestamp_opt(secs as i64, 0) {
-        chrono::LocalResult::Single(dt) => Some(dt.format("%Y-%m-%d %H:%M").to_string()),
-        _ => None,
-    }
+    chrono::DateTime::from_timestamp(secs as i64, 0).map(|dt| {
+        dt.with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string()
+    })
 }
 
 fn render_text(env: &Envelope<SearchStatusData>) -> String {
@@ -751,17 +751,21 @@ mod tests {
         // assert the `indexed = doc_count > 0` logic directly on a
         // directly-constructed `SearchStatusData`, matching exactly what
         // `status_data_for` computes (`indexed: status.doc_count > 0`).
+        // NOTE: This still does not execute `status_data_for` itself (coverage
+        // gap), but avoids a compile-time constant and keeps the invariant
+        // explicit.
+        let doc_count = 3usize;
         let data = SearchStatusData {
             collection: Some("t-status-data-for".to_string()),
             embed_model: "multilingual-e5-small".to_string(),
             cache_dir: Some(PathBuf::from("/cache/t-status-data-for")),
-            indexed: 3 > 0, // mirrors `status_data_for`'s `status.doc_count > 0`
+            indexed: doc_count > 0, // mirrors `status_data_for`'s `status.doc_count > 0`
             current_model_missing: cfg!(feature = "semantic"), // model_size_bytes is None here
             model_size_bytes: None,
             model_downloaded_at: None,
             last_indexed_at: Some(1_700_000_000),
             index_size_bytes: None,
-            doc_count: 3,
+            doc_count,
             pending_new: 0,
             pending_changed: 0,
             pending_removed: 0,
