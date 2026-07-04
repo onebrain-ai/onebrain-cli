@@ -267,10 +267,10 @@ fail the calling turn.** Every gate failure or runtime error emits an ok-envelop
 `{"skipped":true,"reason":…}` and exits 0. The gates, in order:
 
 1. `no-collection` — vault/collection unresolvable. Hooks use the **read-only** resolver
-   (`collection_name_readonly`) — they never persist an auto-generated collection name. (One
-   known wrinkle: past the gates, the progress-marker helper `LiveProgressFile::new` resolves
-   via the persisting `collection_for`; in practice gate 2 means an index — and thus normally a
-   persisted collection — already exists.)
+   (`collection_name_readonly`) — they never persist an auto-generated collection name. Past
+   the gates, the progress marker is built from the gate's already-resolved cache dir
+   (`LiveProgressFile::in_cache_dir`), so no part of the hook path re-resolves via the
+   persisting `collection_for`.
 2. `no-index` — `<cache_dir>/tantivy/` doesn't exist yet (the user hasn't run a first reindex).
 3. `model-not-downloaded` — the configured model's `models--*` dir is absent. Applies to *both*
    flags (even `--lex-only`, which needs no model) so a hook can never race a foreground
