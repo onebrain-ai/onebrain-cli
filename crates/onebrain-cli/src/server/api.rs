@@ -69,7 +69,7 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         // v3.3 — scan vault notes for Obsidian-Tasks lines (real Tasks panel).
         .route("/vault/tasks", get(get_vault_tasks))
-        // Vault search backed by the qmd index (BM25 lex + hybrid lex/vec).
+        // Vault search backed by the native search engine (BM25 lex + hybrid lex/vec).
         .route("/vault/search", get(super::search::get_vault_search))
         // Internal webview: header-only preflight to decide iframe vs new-tab.
         .route(
