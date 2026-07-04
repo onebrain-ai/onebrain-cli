@@ -202,6 +202,66 @@ fn render_skip_text(env: &Envelope<ReindexSkipData>) -> String {
     format!("⏭  Skipped — {}", d.reason)
 }
 
+/// Payload for a `--pending-only --json` run that detached a background
+/// child instead of embedding in the foreground: `{"detached":true}`. A
+/// dedicated struct (rather than reusing `ReindexSkipData`) keeps the two
+/// shapes independent — this is NOT a skip, the work is happening, just not
+/// in this process.
+///
+/// Detach only exists in `semantic` builds — a lex-only build has nothing to
+/// embed in the background, so it falls straight to `run_pending_only`'s
+/// `semantic-unavailable` skip.
+#[cfg(feature = "semantic")]
+#[derive(Debug, Serialize)]
+struct ReindexDetachData {
+    detached: bool,
+}
+
+#[cfg(feature = "semantic")]
+fn render_detach_text(env: &Envelope<ReindexDetachData>) -> String {
+    let _ = env.data.as_ref().expect("ok envelope always has data");
+    "🚀  Embedding pending docs in background".to_string()
+}
+
+/// Emit the "detached" envelope and return `Ok(())`.
+#[cfg(feature = "semantic")]
+fn emit_detached(mode: &OutputMode, vault_info: crate::output::VaultInfo) -> Result<()> {
+    let data = ReindexDetachData { detached: true };
+    let envelope = Envelope::ok("search.reindex", Some(vault_info), data);
+    emit(
+        &envelope,
+        mode,
+        std::io::stdout().lock(),
+        render_detach_text,
+    )?;
+    Ok(())
+}
+
+/// Re-exec the current binary as a detached background child that performs
+/// the real `--pending-only` embed, so the parent (the calling hook) can
+/// return immediately. Args are rebuilt explicitly (not forwarded from
+/// `argv`) so the child always runs exactly `search reindex --pending-only
+/// --json [--vault <path>]` regardless of how the parent was invoked. Stdin
+/// / stdout / stderr are all nulled — that (not `setsid`) is what lets the
+/// parent return without the hook waiting on the child. The child sets
+/// `ONEBRAIN_EMBED_FOREGROUND` so it runs the Task-3 foreground path instead
+/// of detaching again.
+#[cfg(feature = "semantic")]
+fn spawn_detached_pending_embed(vault_flag: Option<&PathBuf>) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["search", "reindex", "--pending-only", "--json"]);
+    if let Some(vault) = vault_flag {
+        cmd.arg("--vault").arg(vault);
+    }
+    cmd.env("ONEBRAIN_EMBED_FOREGROUND", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd.spawn()?;
+    Ok(())
+}
+
 /// Emit the skip envelope for `reason` and return `Ok(())` — the hook-path
 /// contract's single exit point for every gate failure / run error.
 /// `vault_info` is `None` when the vault itself couldn't be resolved (gate
@@ -282,6 +342,26 @@ fn run_hook_path(
         return run_lex_only(mode, &resolved, vault_info, &cache_dir, args);
     }
     debug_assert!(args.pending_only);
+
+    // Detach: a structured-mode `--pending-only` run (the Stop hook's call
+    // shape) must never let model load / embed delay the calling turn. Text
+    // mode stays foreground (manual debugging UX), and
+    // `ONEBRAIN_EMBED_FOREGROUND` — set by the detached child itself, and by
+    // tests — always forces the foreground path below. Only relevant when
+    // this build actually has an embedder to run in the background — a
+    // `--no-default-features` (lex-only) build has nothing to detach, so it
+    // falls straight through to `run_pending_only`'s `semantic-unavailable`
+    // skip.
+    #[cfg(feature = "semantic")]
+    if mode.is_structured() && std::env::var_os("ONEBRAIN_EMBED_FOREGROUND").is_none() {
+        return match spawn_detached_pending_embed(vault_flag.as_ref()) {
+            Ok(()) => emit_detached(mode, vault_info),
+            Err(e) => {
+                eprintln!("onebrain search reindex --pending-only: failed to detach: {e:#}");
+                emit_skip(mode, Some(vault_info), "detach-failed")
+            }
+        };
+    }
     run_pending_only(mode, &resolved, vault_info, &cache_dir)
 }
 

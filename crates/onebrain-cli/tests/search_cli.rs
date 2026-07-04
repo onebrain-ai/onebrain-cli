@@ -1093,10 +1093,10 @@ fn pending_only_with_nothing_pending_skips_fast() {
     std::fs::create_dir_all(cache.path().join("search/t-vault/tantivy")).unwrap();
     seed_fake_model(cache.path(), "t-vault", &first_model_dir_name(), 16);
 
-    let out = onebrain(vault.path(), cache.path())
-        .args(["search", "reindex", "--pending-only"])
-        .output()
-        .unwrap();
+    let mut cmd = onebrain(vault.path(), cache.path());
+    cmd.env("ONEBRAIN_EMBED_FOREGROUND", "1")
+        .args(["search", "reindex", "--pending-only"]);
+    let out = cmd.output().unwrap();
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -1105,6 +1105,52 @@ fn pending_only_with_nothing_pending_skips_fast() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["data"]["skipped"], true);
     assert_eq!(v["data"]["reason"], "no-pending");
+    assert!(
+        v["data"].get("detached").is_none(),
+        "foreground env must stay foreground: {v}"
+    );
+}
+
+/// Task 4: without `ONEBRAIN_EMBED_FOREGROUND`, a gate-passing `--pending-only
+/// --json` run must detach a background child and return immediately with
+/// `detached: true` — never blocking the calling turn on model load / embed.
+#[cfg(feature = "semantic")]
+#[test]
+fn pending_only_json_detaches() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+    std::fs::create_dir_all(cache.path().join("search/t-vault/tantivy")).unwrap();
+    seed_fake_model(cache.path(), "t-vault", &first_model_dir_name(), 16);
+
+    let start = std::time::Instant::now();
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "--pending-only"])
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "detach must return immediately, took {elapsed:?}"
+    );
+
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "search.reindex");
+    assert_eq!(v["data"]["detached"], true);
+    assert!(v["data"].get("decision").is_none(), "no decision key: {v}");
+
+    // Give the detached child (which will itself hit `no-pending` and exit
+    // silently) a moment to finish so it doesn't outlive the test process.
+    std::thread::sleep(std::time::Duration::from_millis(500));
 }
 
 #[cfg(not(feature = "semantic"))]
@@ -1200,6 +1246,74 @@ fn pending_only_embeds_exactly_what_lex_only_left_pending() {
         + sv["data"]["pending_changed"].as_u64().unwrap()
         + sv["data"]["pending_removed"].as_u64().unwrap();
     assert_eq!(pending, 0, "pending must be 0 after pending-only: {sv}");
+}
+
+/// Task 4 end-to-end: a REAL detached child (no `ONEBRAIN_EMBED_FOREGROUND`)
+/// actually finishes the embed in the background. Gated behind
+/// `ONEBRAIN_TEST_EMBED` — downloads a real model — and generously polls
+/// `search status` for up to ~30s (CI slack) before failing.
+#[test]
+fn pending_only_detach_end_to_end_embeds_in_background() {
+    if std::env::var("ONEBRAIN_TEST_EMBED").is_err() {
+        return; // gated: downloads a real model
+    }
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n  embed_model: multilingual-e5-small\n",
+    );
+    write(vault.path(), "a.md", "# A\nalpha bravo charlie.\n");
+    std::fs::create_dir_all(cache.path().join("search/t-vault/tantivy")).unwrap();
+
+    // Seed a downloaded model (foreground) so the gate passes, then lex-only
+    // index the doc so it's pending for the pending-only detach run.
+    let seed = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "--force"])
+        .output()
+        .unwrap();
+    assert!(seed.status.success());
+    write(vault.path(), "a.md", "# A\nalpha bravo charlie updated.\n");
+    let lex_out = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "--lex-only"])
+        .output()
+        .unwrap();
+    assert!(lex_out.status.success());
+
+    // No env var: this must detach.
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "--pending-only"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["data"]["detached"], true, "{v}");
+
+    // Poll `search status` until pending drops to 0, or time out.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let status_out = onebrain(vault.path(), cache.path())
+            .args(["search", "status"])
+            .output()
+            .unwrap();
+        assert!(status_out.status.success());
+        let sv: serde_json::Value = serde_json::from_slice(&status_out.stdout).unwrap();
+        let pending = sv["data"]["pending_new"].as_u64().unwrap_or(0)
+            + sv["data"]["pending_changed"].as_u64().unwrap_or(0)
+            + sv["data"]["pending_removed"].as_u64().unwrap_or(0);
+        if pending == 0 {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("background embed did not finish within 30s: {sv}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
 }
 
 #[test]
