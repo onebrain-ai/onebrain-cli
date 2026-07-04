@@ -658,6 +658,10 @@ mod tests {
         std::fs::write(dir.path().join("tantivy/meta.json"), vec![0u8; 5000]).unwrap();
 
         let (size, mtime) = active_model_dir_stats(dir.path(), "multilingual-e5-small").unwrap();
+        // Exact equality is intentional and portable: `dir_size_bytes` sums
+        // `metadata().len()` (logical file bytes, never filesystem blocks), and
+        // `==` is what catches contamination from a sibling model dir — `>=`
+        // would let that regression through.
         assert_eq!(size, 1024, "should sum only the active model dir's files");
         assert!(mtime.is_some());
     }
@@ -734,26 +738,19 @@ mod tests {
     }
 
     #[test]
-    fn status_data_for_after_indexing_reports_indexed_true() {
-        // Companion to `status_data_for_never_indexed_reports_not_indexed_and_zero_docs`,
-        // covering the `doc_count > 0 → indexed: true` side of `status_data_for`'s
-        // refinement.
+    fn indexed_flag_refinement_doc_count_gt_zero_is_true() {
+        // Companion invariant to
+        // `status_data_for_never_indexed_reports_not_indexed_and_zero_docs`.
         //
-        // Populating a real `Engine` with `>= 1` doc requires `index_doc`, which
-        // calls `embed_passages_if_available` — with the plain `Engine::open`
-        // (lazy/production embedder) used by the sibling test above, and the
-        // `semantic` feature ON by default for this workspace's test builds,
-        // that would construct the REAL `fastembed` embedder and download a
-        // model on first use. `Engine::open_with_embedder` (which sibling
-        // `onebrain-search` tests use with an in-crate `FakeEmbedder` to avoid
-        // exactly this) is `pub(crate)` to `onebrain-search` — not reachable
-        // from this crate's tests. So per the fallback documented for this gap:
-        // assert the `indexed = doc_count > 0` logic directly on a
-        // directly-constructed `SearchStatusData`, matching exactly what
-        // `status_data_for` computes (`indexed: status.doc_count > 0`).
-        // NOTE: This still does not execute `status_data_for` itself (coverage
-        // gap), but avoids a compile-time constant and keeps the invariant
-        // explicit.
+        // This test intentionally validates the refinement rule in isolation:
+        // `indexed` must be computed as `doc_count > 0`.
+        //
+        // We do not populate a real `Engine` with indexed docs here because
+        // that path requires embedding (`index_doc` ->
+        // `embed_passages_if_available`) and may trigger real model setup in
+        // this crate's test context. `Engine::open_with_embedder` is not
+        // accessible here (`pub(crate)` in `onebrain-search`), so this remains
+        // an explicit logic-contract test.
         let doc_count = 3usize;
         let data = SearchStatusData {
             collection: Some("t-status-data-for".to_string()),
