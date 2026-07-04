@@ -1283,6 +1283,48 @@ impl Engine {
     /// add/update/unchanged/remove classification a reindex does, MINUS the
     /// indexing side-effects.
     pub fn status(&self, vault_root: &Path) -> Result<IndexStatus> {
+        let drift = self.classify_doc_hashes_drift(vault_root)?;
+        Ok(IndexStatus {
+            doc_count: drift.doc_count,
+            last_indexed_at: self.stored_last_indexed()?,
+            pending_new: drift.added.len(),
+            pending_changed: drift.changed.len(),
+            pending_removed: drift.removed.len(),
+        })
+    }
+
+    /// The exact doc-path worklist a deferred embed pass must process: docs
+    /// on disk with no `DOC_HASHES` entry (new), docs whose stored
+    /// `DOC_HASHES` hash differs from disk (changed), and docs with a
+    /// `DOC_HASHES` entry whose file is gone (removed — included because
+    /// `reindex_paths` handles removal for missing files too).
+    ///
+    /// `LEX_HASHES` plays no role here: pending is defined purely by
+    /// `DOC_HASHES` drift, so a lex-only-indexed doc (see
+    /// [`Engine::reindex_all_lex_only_with_progress`]) is still reported as
+    /// pending until a real (Full) reindex/embed pass runs — same rule
+    /// [`Engine::status`] uses.
+    ///
+    /// Never constructs the embedder. Order: added/changed docs in
+    /// `walk_markdown_files` order, then removed docs sorted for stability.
+    pub fn pending_vector_paths(&self, vault_root: &Path) -> Result<Vec<String>> {
+        let drift = self.classify_doc_hashes_drift(vault_root)?;
+        let mut out = drift.added;
+        out.extend(drift.changed);
+        let mut removed = drift.removed;
+        removed.sort();
+        out.extend(removed);
+        Ok(out)
+    }
+
+    /// Shared walk-classify core of [`Engine::status`] and
+    /// [`Engine::pending_vector_paths`]: walks `*.md` files under
+    /// `vault_root` (honoring `exclude_patterns`), hashes each one, and
+    /// classifies it against the stored `DOC_HASHES` table. Unreadable files
+    /// are skipped (a reindex would count them as `failed`, not drift) to
+    /// keep this read-only and resilient. `added`/`changed` are in walk
+    /// order; `removed` is unordered (callers sort if they need stability).
+    fn classify_doc_hashes_drift(&self, vault_root: &Path) -> Result<DocHashesDrift> {
         // Snapshot every stored (doc_path -> hash) once. Doc count is the
         // number of distinct stored hashes.
         let stored: std::collections::HashMap<String, String> = {
@@ -1295,10 +1337,11 @@ impl Engine {
             }
             out
         };
+        let doc_count = stored.len();
 
         let files = walk_markdown_files(vault_root, &self.exclude_patterns)?;
-        let mut pending_new = 0usize;
-        let mut pending_changed = 0usize;
+        let mut added = Vec::new();
+        let mut changed = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for abs_path in &files {
             let Some(doc_path) = vault_relative_path(vault_root, abs_path) else {
@@ -1306,30 +1349,42 @@ impl Engine {
             };
             let bytes = match std::fs::read(abs_path) {
                 Ok(b) => b,
-                // Unreadable file: skip it (a reindex would count it as
-                // `failed`, not as drift). Keep status read-only + resilient.
                 Err(_) => continue,
             };
             let current_hash = hash_bytes(&bytes);
             match diff_hash(stored.get(&doc_path).map(String::as_str), &current_hash) {
-                HashDiff::Added => pending_new += 1,
-                HashDiff::Updated => pending_changed += 1,
+                HashDiff::Added => added.push(doc_path.clone()),
+                HashDiff::Updated => changed.push(doc_path.clone()),
                 HashDiff::Unchanged => {}
             }
             seen.insert(doc_path);
         }
 
         // Indexed docs whose file is gone from disk (would be removed).
-        let pending_removed = stored.keys().filter(|k| !seen.contains(*k)).count();
+        let removed: Vec<String> = stored
+            .keys()
+            .filter(|k| !seen.contains(*k))
+            .cloned()
+            .collect();
 
-        Ok(IndexStatus {
-            doc_count: stored.len(),
-            last_indexed_at: self.stored_last_indexed()?,
-            pending_new,
-            pending_changed,
-            pending_removed,
+        Ok(DocHashesDrift {
+            doc_count,
+            added,
+            changed,
+            removed,
         })
     }
+}
+
+/// Result of [`Engine::classify_doc_hashes_drift`]: the same
+/// add/update/unchanged/remove classification a reindex does against
+/// `DOC_HASHES`, minus the indexing side-effects. `doc_count` is the number
+/// of distinct stored `DOC_HASHES` keys (matches [`IndexStatus::doc_count`]).
+struct DocHashesDrift {
+    doc_count: usize,
+    added: Vec<String>,
+    changed: Vec<String>,
+    removed: Vec<String>,
 }
 
 /// Current wall-clock time as whole epoch seconds. Clamps a
@@ -2443,5 +2498,77 @@ mod tests {
             .unwrap();
         assert_eq!(stats.added, 1);
         assert!(e.get("a.md").unwrap().contains("alpha content"));
+    }
+
+    #[test]
+    fn pending_vector_paths_lists_lex_only_docs() {
+        // A lex-only reindex deliberately leaves DOC_HASHES untouched, so
+        // both docs must show up in the deferred-embed worklist even though
+        // they're fully lex-searchable.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
+        std::fs::write(vault_dir.path().join("b.md"), "# B\nbeta content").unwrap();
+
+        let stats = e
+            .reindex_all_lex_only_with_progress(vault_dir.path(), &mut |_| {})
+            .unwrap();
+        assert_eq!(stats.added, 2);
+
+        let mut pending = e.pending_vector_paths(vault_dir.path()).unwrap();
+        pending.sort();
+        assert_eq!(pending, vec!["a.md".to_string(), "b.md".to_string()]);
+
+        // A real (full) reindex embeds both docs and clears the worklist.
+        e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(
+            e.pending_vector_paths(vault_dir.path()).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn pending_vector_paths_includes_changed_and_removed() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        let a = vault_dir.path().join("a.md");
+        let b = vault_dir.path().join("b.md");
+        let c = vault_dir.path().join("c.md");
+        std::fs::write(&a, "# A\nalpha content").unwrap();
+        std::fs::write(&b, "# B\nbeta content").unwrap();
+        std::fs::write(&c, "# C\ngamma content").unwrap();
+        e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(
+            e.pending_vector_paths(vault_dir.path()).unwrap(),
+            Vec::<String>::new()
+        );
+
+        // Modify a, delete b, leave c untouched.
+        std::fs::write(&a, "# A\nalpha content EDITED").unwrap();
+        std::fs::remove_file(&b).unwrap();
+
+        let mut pending = e.pending_vector_paths(vault_dir.path()).unwrap();
+        pending.sort();
+        assert_eq!(pending, vec!["a.md".to_string(), "b.md".to_string()]);
+    }
+
+    #[test]
+    fn pending_vector_paths_empty_on_fresh_index_current_vault() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
+        std::fs::write(vault_dir.path().join("b.md"), "# B\nbeta content").unwrap();
+        e.reindex_all(vault_dir.path()).unwrap();
+
+        assert_eq!(
+            e.pending_vector_paths(vault_dir.path()).unwrap(),
+            Vec::<String>::new()
+        );
     }
 }
