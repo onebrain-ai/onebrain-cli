@@ -970,11 +970,14 @@ impl Engine {
     /// `on_first_embed` is never called at all — nothing is ever embedded.
     ///
     /// Mode behavior:
-    /// - [`IndexMode::Full`] (unchanged from before lex-only existed):
-    ///   diff against `DOC_HASHES`; on Added/Updated, `remove_doc` (Updated
-    ///   only), `index_doc` (full), store into `DOC_HASHES`, and drop any
-    ///   `LEX_HASHES` entry (keeps [`Engine::effective_lex_hash`]'s fallback
-    ///   correct — see that function's doc comment).
+    /// - [`IndexMode::Full`]: diff against `DOC_HASHES`; on Added/Updated,
+    ///   `remove_doc` (unconditionally — a no-op for a brand-new doc, but
+    ///   required on Added too since a prior lex-only pass may have already
+    ///   lex-indexed this doc under LEX_HASHES without a DOC_HASHES entry;
+    ///   "no DOC_HASHES ⟹ no lex entries" stopped holding once lex-only mode
+    ///   was introduced), `index_doc` (full), store into `DOC_HASHES`, and
+    ///   drop any `LEX_HASHES` entry (keeps [`Engine::effective_lex_hash`]'s
+    ///   fallback correct — see that function's doc comment).
     /// - [`IndexMode::LexOnly`]: diff against the *effective* lex hash
     ///   ([`Engine::effective_lex_hash`]); on Added/Updated, `remove_doc`
     ///   first (drops any stale lex+vec+meta; a no-op for brand-new docs),
@@ -1008,6 +1011,19 @@ impl Engine {
                 match mode {
                     IndexMode::Full => {
                         on_first_embed();
+                        // `remove_doc` here even though this is the `Added`
+                        // branch: a prior lex-only pass may have already
+                        // lex-indexed this doc (LEX_HASHES set, DOC_HASHES
+                        // never touched), so "no DOC_HASHES ⟹ no lex
+                        // entries" no longer holds now that lex-only mode
+                        // exists. Without this, `index_doc`'s deterministic
+                        // chunk_ids would collide with the still-present
+                        // lex-only tantivy docs (`LexIndex::add` never
+                        // deletes-first), duplicating lex hits. `remove_doc`
+                        // is keyed off `DOC_CHUNKS`, which lex-only indexing
+                        // also populates, so it finds and clears those
+                        // chunks; for a truly brand-new doc it's a no-op.
+                        self.remove_doc(doc_path)?;
                         self.index_doc(doc_path, &content)?;
                         self.store_hash(doc_path, &current_hash)?;
                         self.drop_lex_hash(doc_path)?;
@@ -2442,6 +2458,61 @@ mod tests {
         let status = e.status(vault_dir.path()).unwrap();
         assert_eq!(status.pending_changed, 1);
         assert_eq!(status.pending_total(), 1);
+    }
+
+    #[test]
+    fn full_reindex_after_lex_only_does_not_duplicate_lex_entries_for_new_doc() {
+        // Regression for the lex-only -> pending-only handoff on a NEW doc:
+        // (1) a lex-only pass indexes "a.md" and writes tantivy docs for
+        // `a.md#0`, `a.md#1`, ... (LEX_HASHES only, no DOC_HASHES entry);
+        // (2) a later Full reindex sees no DOC_HASHES entry, so it takes the
+        // `Added` branch. `chunk_id` is deterministic (`{doc_path}#{idx}`)
+        // and `LexIndex::add` never deletes-first, so without a `remove_doc`
+        // first, Full's `index_doc` call would add a SECOND tantivy doc per
+        // chunk_id on top of the lex-only one — corrupting the lex index
+        // with duplicates that would double-count in `rrf_fuse`.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        let doc_path = vault_dir.path().join("a.md");
+        std::fs::write(&doc_path, "# A\nalpha content unique_needle").unwrap();
+
+        // Step 1: lex-only index the new doc.
+        let stats = e
+            .reindex_all_lex_only_with_progress(vault_dir.path(), &mut |_| {})
+            .unwrap();
+        assert_eq!(stats.added, 1);
+        assert_eq!(e.status(vault_dir.path()).unwrap().pending_total(), 1);
+
+        // Step 2: Full reindex (the "pending-only" embed pass).
+        let stats2 = e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(stats2.added, 1);
+        assert_eq!(e.status(vault_dir.path()).unwrap().pending_total(), 0);
+
+        // Every chunk of a.md must appear exactly once in the lex index —
+        // not duplicated by the lex-only add followed by an un-deduped
+        // Full-mode add.
+        let lex_hits = e.lex.search("unique_needle", 50).unwrap();
+        let a_hits: Vec<&String> = lex_hits
+            .iter()
+            .map(|(chunk_id, _)| chunk_id)
+            .filter(|id| id.starts_with("a.md#"))
+            .collect();
+        assert_eq!(
+            a_hits.len(),
+            1,
+            "expected exactly one lex hit for a.md's single chunk, got {a_hits:?}"
+        );
+
+        let mut unique_ids: Vec<&&String> = a_hits.iter().collect();
+        unique_ids.sort();
+        unique_ids.dedup();
+        assert_eq!(
+            unique_ids.len(),
+            a_hits.len(),
+            "lex hits for a.md must not contain duplicate chunk_ids"
+        );
     }
 
     #[test]
