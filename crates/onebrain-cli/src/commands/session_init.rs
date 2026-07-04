@@ -637,17 +637,25 @@ mod tests {
 
     #[test]
     fn bounded_returns_none_when_probe_exceeds_cap() {
-        let cap = Duration::from_millis(50);
+        // The probe blocks on a channel this test releases only AFTER the
+        // assertion, so it is guaranteed to outlive the cap. A sleep-based
+        // fixture raced the runner instead: `bounded`'s gap between spawning
+        // the probe and starting its timed wait is unbounded, so a stall
+        // there longer than the fixture's sleep let the "slow" probe land in
+        // the channel first → Some(42) on a stalled macOS runner (#144).
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let result = bounded(
             move || {
-                std::thread::sleep(cap * 3);
+                let _ = release_rx.recv();
                 Some(42)
             },
-            cap,
+            Duration::from_millis(50),
         );
         assert_eq!(
             result, None,
             "a probe that outlives the cap must yield None, not block startup"
         );
+        // Unblock the detached probe thread so it exits promptly.
+        drop(release_tx);
     }
 }

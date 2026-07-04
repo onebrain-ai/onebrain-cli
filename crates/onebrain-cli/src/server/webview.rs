@@ -40,7 +40,7 @@ pub async fn get_webview_preflight(Query(p): Query<PreflightParams>) -> Response
         false
     } else {
         let url = p.url.clone();
-        tokio::task::spawn_blocking(move || probe_frameable(&url))
+        tokio::task::spawn_blocking(move || probe_frameable(&WEBVIEW_PREFLIGHT_AGENT, &url))
             .await
             .unwrap_or(false)
     };
@@ -55,14 +55,14 @@ pub async fn get_webview_preflight(Query(p): Query<PreflightParams>) -> Response
 const MAX_REDIRECT_HOPS: u32 = 5;
 
 /// Blocking header probe (ureq is sync → runs on a blocking thread). Reads only
-/// headers; the body is never consumed. The agent is configured to NOT
+/// headers; the body is never consumed. The `agent` must be configured to NOT
 /// auto-follow redirects (`max_redirects(0)`) so each hop's `Location` can be
 /// re-validated with `is_http_url` before being requested — this closes the
 /// SSRF gap where a `http://` URL 302s to `file://` or an internal host. Any
 /// error, non-http redirect target, or exceeding `MAX_REDIRECT_HOPS` → false.
-fn probe_frameable(url: &str) -> bool {
-    let agent = &*WEBVIEW_PREFLIGHT_AGENT;
-
+/// Production passes [`WEBVIEW_PREFLIGHT_AGENT`]; tests inject a timeout-free
+/// agent so the hop-budget assertions can't be flipped by a stalled runner.
+fn probe_frameable(agent: &ureq::Agent, url: &str) -> bool {
     let mut current = url.to_string();
     for _ in 0..MAX_REDIRECT_HOPS {
         let resp = match agent.get(&current).call() {
@@ -352,6 +352,11 @@ mod tests {
     /// loop), then answers every subsequent request with a plain framable
     /// `200`. Returns the `http://127.0.0.1:<port>/` base. Used to pin the exact
     /// redirect-hop budget in `probe_frameable`.
+    ///
+    /// Every response carries `Connection: close`: the accept-loop serves one
+    /// request per connection, so the client must not try to reuse a
+    /// kept-alive connection this thread has already dropped — that
+    /// reuse-vs-FIN race is runner-timing dependent (#143).
     fn spawn_redirect_chain_server(redirects: usize) -> String {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -370,17 +375,31 @@ mod tests {
                 let _ = stream.read(&mut buf); // drain request
                 let response = if served < redirects {
                     format!(
-                        "HTTP/1.1 302 Found\r\nLocation: {self_url}\r\nContent-Length: 0\r\n\r\n"
+                        "HTTP/1.1 302 Found\r\nLocation: {self_url}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
                     )
                 } else {
                     // Final hop: a framable 200 (no XFO / CSP frame-ancestors).
-                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string()
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_string()
                 };
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
             }
         });
         base
+    }
+
+    /// Agent for the hop-budget tests: same `max_redirects(0)` contract as
+    /// [`WEBVIEW_PREFLIGHT_AGENT`] (the probe re-validates each hop itself)
+    /// but NO global timeout. The production 5s timeout is a wall-clock
+    /// dependency these tests must not inherit: on a stalled CI runner a
+    /// within-budget chain can blow the timeout and flip the probe to `false`
+    /// (#143). What the tests pin is the HOP budget, not latency — a genuine
+    /// hang would still be caught by the harness-level test timeout.
+    fn hop_budget_test_agent() -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .max_redirects(0)
+            .build()
+            .into()
     }
 
     #[test]
@@ -392,7 +411,7 @@ mod tests {
         let redirects = (MAX_REDIRECT_HOPS - 1) as usize;
         let base = spawn_redirect_chain_server(redirects);
         assert!(
-            probe_frameable(&base),
+            probe_frameable(&hop_budget_test_agent(), &base),
             "a chain of MAX-1 redirects should reach its final 200 within budget"
         );
     }
@@ -404,7 +423,7 @@ mod tests {
         let redirects = MAX_REDIRECT_HOPS as usize;
         let base = spawn_redirect_chain_server(redirects);
         assert!(
-            !probe_frameable(&base),
+            !probe_frameable(&hop_budget_test_agent(), &base),
             "a chain of MAX redirects must exceed the hop budget and fail closed"
         );
     }
