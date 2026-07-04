@@ -1,23 +1,22 @@
-//! `GET /api/vault/search` — vault search backed by the user's `qmd` index
-//! (the SAME index the CLI + the qmd MCP server use).
+//! `GET /api/vault/search` — vault search backed by the native
+//! `onebrain-search` engine (the SAME index the CLI `onebrain search …`
+//! verbs and the native MCP server use).
 //!
-//! Two modes, both shelling out to the `qmd` binary and mapping its `--json`
-//! output to a small ranked list the webui can open in Preview:
+//! Two modes:
 //!
 //! ```text
-//!   mode=lex     → qmd search <q> --json               BM25 keyword, no LLM, ~0.6s
-//!   mode=hybrid  → qmd query "lex:<q>\nvec:<q>" --json  keyword + semantic, one
-//!                  query-embedding (~1-2s), local rerank — NO LLM expansion
+//!   mode=lex     → LexIndex (BM25 keyword, no model, fast as-you-type)
+//!   mode=hybrid  → Engine::query (lex + vector, one query embedding)
 //! ```
 //!
-//! The webui runs `lex` live as-you-type and upgrades to `hybrid` on a short
-//! pause (two-tier progressive), so this endpoint stays a thin, read-only
-//! translator: it never reads a note itself — it returns vault-relative paths
-//! the existing `GET /api/vault/file` (with its path-traversal guard) opens.
+//! Read-only translator: it returns vault-relative paths the existing
+//! `GET /api/vault/file` (with its path-traversal guard) opens; it never
+//! reads a note itself and never mutates config. A vault that has never
+//! been indexed returns an empty `hits` list (200) — not a 503 — mirroring
+//! the native MCP `query` no-index policy.
 
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::{Arc, OnceLock};
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
@@ -26,11 +25,12 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 
 use super::api::{require_vault_root, ApiError};
 use super::AppState;
+use crate::commands::search_common::{collection_cache_dir, collection_name_readonly};
+use onebrain_search::engine::Engine;
+use onebrain_search::lex::LexIndex;
 
 /// Query string for `GET /api/vault/search`.
 #[derive(Debug, Deserialize)]
@@ -42,8 +42,7 @@ pub(crate) struct SearchQuery {
     mode: Option<String>,
 }
 
-/// Response body: a ranked hit list plus the mode actually run (so the client
-/// can label which tier produced it).
+/// Response body: a ranked hit list plus the mode actually run.
 #[derive(Debug, Serialize)]
 struct SearchResponse {
     hits: Vec<SearchHit>,
@@ -55,30 +54,21 @@ struct SearchResponse {
 struct SearchHit {
     /// Vault-relative, slash-separated path (openable via `/api/vault/file`).
     path: String,
-    /// qmd's relevance score, roughly 0..1 (higher = better).
+    /// Relevance score (higher = better). Scale differs by mode.
     score: f64,
-    /// Note title (qmd's — usually the H1 or filename).
+    /// Note title — the heading path if present, else the file stem.
     title: String,
-    /// Short, cleaned one-line excerpt around the match (may be empty).
+    /// Short one-line excerpt (may be empty; lex results carry none).
     snippet: String,
 }
 
-/// The qmd `--json` row shape — only the fields we use (`docid`/`context` are
-/// ignored). Everything is `#[serde(default)]` so a future qmd that drops a
-/// field degrades to an empty value rather than a hard parse error.
-#[derive(Debug, Deserialize)]
-struct QmdRow {
-    #[serde(default)]
-    score: f64,
-    #[serde(default)]
-    file: String,
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    snippet: String,
-}
+/// Max top-k the webui asks for (qmd self-capped at ~20; keep parity).
+const TOP_K: usize = 20;
 
-/// Read-only: shell out to `qmd`, map its hits to vault-relative paths.
+/// Hard ceiling on one native search. Lex is ~ms; a cold hybrid embed can
+/// take seconds — this sits well above that and only trips on a genuine hang.
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(crate) async fn get_vault_search(
     State(state): State<Arc<AppState>>,
     Query(q): Query<SearchQuery>,
@@ -90,270 +80,181 @@ pub(crate) async fn get_vault_search(
         _ => "lex",
     };
 
-    // Empty query → empty result; don't pay a qmd spawn for nothing.
+    // Empty query → empty result; no work.
     if query.is_empty() {
         return Ok(Json(SearchResponse { hits: vec![], mode }).into_response());
     }
 
-    // qmd is "enabled" for a vault only when it names its collection (onebrain.yml
-    // `qmd_collection`). Absent/missing → qmd is off: 503 so the client falls back
-    // to its own filename/path search rather than running qmd unscoped (which would
-    // leak hits from other indexed collections). A genuine config-READ failure is a
-    // logged 500 — not silently conflated with "not configured".
-    let qmd_unconfigured = || {
-        ApiError::ServiceUnavailable(
-            "search unavailable — qmd is not configured for this vault".to_string(),
-        )
-    };
-    let collection = match onebrain_core::load_vault_config_at(&root) {
-        Ok(cfg) => cfg.qmd_collection.ok_or_else(qmd_unconfigured)?,
-        Err(onebrain_core::CoreError::VaultYamlMissing { .. }) => return Err(qmd_unconfigured()),
-        Err(e) => {
-            tracing::warn!(error = %e, "qmd search: vault config unreadable");
+    // Native search is synchronous (tantivy / embedding). Run it off the async
+    // runtime and bound it so a slow hybrid embed can't wedge a worker.
+    let search = tokio::task::spawn_blocking(move || run_native(&root, &query, mode));
+    let hits = match tokio::time::timeout(SEARCH_TIMEOUT, search).await {
+        Ok(Ok(Ok(hits))) => hits,
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(error = %e, "native search failed");
             return Err(ApiError::Internal("search failed".to_string()));
         }
-    };
-
-    let hits = run_qmd(&root, &query, mode, &collection).await?;
-    Ok(Json(SearchResponse { hits, mode }).into_response())
-}
-
-/// Build the qmd argv for a mode + query. Pure (no I/O) so it's unit-testable.
-///
-/// The query is ALWAYS a single argv element: `Command` execs qmd directly with
-/// no shell, so a query full of metacharacters (`;`, `$()`, backticks, newlines)
-/// is inert — it can never inject a second command.
-fn qmd_args(mode: &str, query: &str) -> Vec<String> {
-    match mode {
-        // Structured query document with explicit lex + vec lines. Supplying the
-        // typed lines skips qmd's LLM query-expansion, so the only slow step is a
-        // single query embedding; the rerank is local.
-        "hybrid" => vec![
-            "query".to_string(),
-            format!("lex:{query}\nvec:{query}"),
-            "--json".to_string(),
-        ],
-        // BM25 keyword — no LLM, fast enough to run on every keystroke.
-        _ => vec![
-            "search".to_string(),
-            query.to_string(),
-            "--json".to_string(),
-        ],
-    }
-}
-
-/// Hard ceiling on a single qmd invocation. Hybrid is normally ~1-5s but a cold
-/// embedding model can push it toward ~18s, so this sits well above that and only
-/// trips on a genuine hang.
-const QMD_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The resolved `qmd` binary, cached — a PATH walk on every keystroke would be
-/// wasteful (and a cheap DoS amplifier). Resolved once; `None` if qmd isn't
-/// installed (→ 503 → the client uses its own fallback search). Installing qmd
-/// after the server starts needs a restart to take effect.
-fn qmd_bin() -> Option<&'static PathBuf> {
-    static QMD_BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
-    QMD_BIN.get_or_init(|| which::which("qmd").ok()).as_ref()
-}
-
-async fn run_qmd(
-    root: &Path,
-    query: &str,
-    mode: &str,
-    collection: &str,
-) -> Result<Vec<SearchHit>, ApiError> {
-    let qmd = match qmd_bin() {
-        Some(q) => q,
-        None => {
-            tracing::warn!("qmd binary not on PATH — search disabled (install qmd, then restart)");
-            return Err(ApiError::ServiceUnavailable(
-                "search unavailable — the qmd binary is not installed".to_string(),
-            ));
-        }
-    };
-
-    // Spawn qmd and hold the Child handle (not `cmd.output()`) so that on timeout
-    // we can SIGKILL *and* reap it immediately — `kill_on_drop` alone defers reaping
-    // to the runtime, which can leave zombies under repeated timeouts (tokio #2685).
-    // `--json` goes to stdout (qmd self-caps at ~20 rows, so it stays small); stderr
-    // (qmd's tips/warnings) is discarded.
-    let mut child = Command::new(qmd)
-        .current_dir(root)
-        .args(qmd_args(mode, query))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| {
-            tracing::warn!(error = %e, "qmd spawn failed");
-            ApiError::Internal("search failed".to_string())
-        })?;
-    let mut stdout = child.stdout.take().expect("stdout was piped above");
-
-    // Read stdout to completion and reap the child, all bounded by QMD_TIMEOUT.
-    let collect = async {
-        let mut buf = Vec::new();
-        stdout.read_to_end(&mut buf).await?;
-        let status = child.wait().await?;
-        Ok::<_, std::io::Error>((status, buf))
-    };
-
-    let (status, stdout) = match tokio::time::timeout(QMD_TIMEOUT, collect).await {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "qmd i/o failed");
+        Ok(Err(join_err)) => {
+            tracing::warn!(error = %join_err, "native search task panicked");
             return Err(ApiError::Internal("search failed".to_string()));
         }
         Err(_) => {
-            // Hung qmd: kill and reap now so we don't leak a zombie.
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            tracing::warn!(timeout_s = QMD_TIMEOUT.as_secs(), "qmd search timed out");
+            tracing::warn!(
+                timeout_s = SEARCH_TIMEOUT.as_secs(),
+                "native search timed out"
+            );
             return Err(ApiError::Internal("search timed out".to_string()));
         }
     };
+    Ok(Json(SearchResponse { hits, mode }).into_response())
+}
 
-    if !status.success() {
-        tracing::warn!(code = ?status.code(), "qmd exited non-zero");
-        return Err(ApiError::Internal("search failed".to_string()));
+/// Synchronous native search. `mode` is `"hybrid"` or `"lex"`.
+fn run_native(root: &Path, query: &str, mode: &str) -> anyhow::Result<Vec<SearchHit>> {
+    let collection = collection_name_readonly(root)?;
+    let cache_dir = collection_cache_dir(&collection);
+
+    // Never-indexed vault → empty hits (200), not an error. The lex path
+    // would create an empty index and return nothing anyway; short-circuit
+    // so hybrid never opens the engine / embeds against an empty index.
+    if !cache_dir.join("tantivy").exists() {
+        return Ok(vec![]);
     }
 
-    let rows: Vec<QmdRow> = serde_json::from_slice(&stdout).map_err(|e| {
-        tracing::warn!(error = %e, "qmd --json parse failed");
-        ApiError::Internal("search failed".to_string())
-    })?;
+    if mode == "hybrid" {
+        run_hybrid(&cache_dir, root, query)
+    } else {
+        run_lex(&cache_dir, query)
+    }
+}
 
-    Ok(rows
+/// Lex (BM25) via `LexIndex` — no engine, no embedder, no model download.
+/// `LexIndex::search` returns bare `(chunk_id, score)`; `chunk_id` prefixes
+/// the doc path (`<doc_path>#N`), so surface that as the path + title, with
+/// no snippet (the snippet lives in engine metadata this path never opens).
+fn run_lex(cache_dir: &Path, query: &str) -> anyhow::Result<Vec<SearchHit>> {
+    let lex = LexIndex::open(&cache_dir.join("tantivy"))?;
+    let raw = lex.search(query, TOP_K)?;
+    Ok(raw
         .into_iter()
-        .filter_map(|r| map_row(r, Some(collection)))
+        .filter_map(|(chunk_id, score)| {
+            let doc_path = chunk_id
+                .rsplit_once('#')
+                .map(|(p, _)| p.to_string())
+                .unwrap_or(chunk_id);
+            if doc_path.is_empty() {
+                return None;
+            }
+            Some(SearchHit {
+                title: title_from_path(&doc_path),
+                path: doc_path,
+                score: f64::from(score),
+                snippet: String::new(),
+            })
+        })
         .collect())
 }
 
-/// Map a qmd `--json` row to a webui hit, or `None` if it isn't openable in this
-/// vault. qmd `file` is `qmd://<collection>/<vault-relative-path>[:line]`; strip
-/// the scheme, the collection, and any `:line` locator, and drop hits from a
-/// different collection so the webui never offers a result it can't open.
-fn map_row(row: QmdRow, collection: Option<&str>) -> Option<SearchHit> {
-    let rest = row.file.strip_prefix("qmd://")?;
-    let (col, path) = rest.split_once('/')?;
-    if let Some(want) = collection {
-        if col != want {
-            return None;
-        }
+/// Hybrid (lex + vector) via the engine. Guarded on `doc_count == 0` so an
+/// empty index never triggers a query embedding (and thus never a model
+/// download) — it returns empty hits instead.
+///
+/// `Engine::open`/`query`/`status` exist in both the default and
+/// `--no-default-features` (lex-only) builds — without the `semantic`
+/// feature the vector store degrades to lex-quality ranking internally, so
+/// this compiles and behaves sanely either way; no cfg-gating needed here.
+fn run_hybrid(cache_dir: &Path, root: &Path, query: &str) -> anyhow::Result<Vec<SearchHit>> {
+    let config = onebrain_core::load_vault_config_at(root)?;
+    let engine = Engine::open(cache_dir, &config.search.embed_model)?;
+    if engine.status(root)?.doc_count == 0 {
+        return Ok(vec![]);
     }
-    let path = strip_line_locator(path);
-    if path.is_empty() {
-        return None;
-    }
-    Some(SearchHit {
-        path: path.to_string(),
-        score: row.score,
-        title: row.title,
-        snippet: clean_snippet(&row.snippet),
-    })
+    Ok(engine
+        .query(query, TOP_K)?
+        .into_iter()
+        .filter(|h| !h.doc_path.is_empty())
+        .map(|h| SearchHit {
+            title: if h.heading_path.is_empty() {
+                title_from_path(&h.doc_path)
+            } else {
+                h.heading_path.clone()
+            },
+            path: h.doc_path,
+            score: h.score,
+            snippet: h.snippet,
+        })
+        .collect())
 }
 
-/// Drop a trailing `:<line>` locator (`a/b.md:42` → `a/b.md`). A colon that
-/// isn't followed by an all-digit run (unusual in a vault path) is left intact.
-fn strip_line_locator(path: &str) -> &str {
-    match path.rsplit_once(':') {
-        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
-        _ => path,
-    }
-}
-
-/// qmd snippets are diff hunks — a `@@ … @@ (n before, m after)` header line
-/// then the matched text. Drop the header, collapse whitespace to single spaces,
-/// and cap the length so the JSON response stays small.
-fn clean_snippet(raw: &str) -> String {
-    let body = if raw.starts_with("@@") {
-        raw.split_once('\n').map(|(_, rest)| rest).unwrap_or("")
-    } else {
-        raw
-    };
-    body.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(240)
-        .collect()
+/// File stem of a slash-separated vault path (`a/b/note.md` → `note`), used
+/// as a fallback title when there is no heading.
+fn title_from_path(path: &str) -> String {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    file.strip_suffix(".md").unwrap_or(file).to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn row(file: &str) -> QmdRow {
-        QmdRow {
-            score: 0.9,
-            file: file.to_string(),
-            title: "T".to_string(),
-            snippet: String::new(),
+    #[test]
+    fn title_from_path_strips_dirs_and_md_suffix() {
+        assert_eq!(title_from_path("01-projects/oma/x.md"), "x");
+        assert_eq!(title_from_path("note.md"), "note");
+        assert_eq!(title_from_path("no-extension"), "no-extension");
+    }
+
+    // `ONEBRAIN_CACHE_DIR` is a process-global env override (see
+    // `search_common::search_cache_root`); other modules (`session_init.rs`,
+    // `banner.rs`) that mutate it in tests each hold a private `ENV_LOCK`
+    // mutex for the mutation window — same pattern here, so this can't race
+    // those (or a future sibling test in this module) under `cargo test`'s
+    // default parallel-thread execution.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn run_native_no_index_returns_empty() {
+        // A vault dir with a config but no built index → empty hits, no error,
+        // for both modes. Pointing `ONEBRAIN_CACHE_DIR` at a fresh, empty
+        // tempdir guarantees `<cache>/search/never-indexed/tantivy` genuinely
+        // doesn't exist.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "search:\n  collection: never-indexed\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let result_lex = run_native(dir.path(), "anything", "lex");
+        let result_hybrid = run_native(dir.path(), "anything", "hybrid");
+        std::env::remove_var("ONEBRAIN_CACHE_DIR");
+        assert!(result_lex.unwrap().is_empty());
+        assert!(result_hybrid.unwrap().is_empty());
+    }
+
+    #[test]
+    fn run_lex_returns_hits_from_a_prebuilt_index() {
+        use onebrain_search::chunk::Chunk;
+        let cache = tempfile::tempdir().unwrap();
+        let tantivy_dir = cache.path().join("tantivy");
+        {
+            let mut lex = LexIndex::open(&tantivy_dir).unwrap();
+            lex.add(&Chunk {
+                chunk_id: "notes/alpha.md#0".to_string(),
+                doc_path: "notes/alpha.md".to_string(),
+                heading_path: String::new(),
+                text: "the quick brown fox jumps".to_string(),
+                chunk_index: 0,
+            })
+            .unwrap();
+            lex.commit().unwrap();
         }
-    }
-
-    #[test]
-    fn maps_qmd_uri_to_vault_relative_path() {
-        let h = map_row(row("qmd://ob-1/01-projects/oma/x.md"), Some("ob-1")).unwrap();
-        assert_eq!(h.path, "01-projects/oma/x.md");
-        assert_eq!(h.score, 0.9);
-    }
-
-    #[test]
-    fn strips_trailing_line_locator() {
-        let h = map_row(row("qmd://ob-1/a/b.md:42"), Some("ob-1")).unwrap();
-        assert_eq!(h.path, "a/b.md");
-    }
-
-    #[test]
-    fn colon_not_followed_by_digits_is_kept() {
-        assert_eq!(strip_line_locator("a/weird:name.md"), "a/weird:name.md");
-    }
-
-    #[test]
-    fn drops_hits_from_other_collections() {
-        assert!(map_row(row("qmd://other-vault/x.md"), Some("ob-1")).is_none());
-    }
-
-    #[test]
-    fn no_collection_filter_keeps_every_collection() {
-        let h = map_row(row("qmd://anything/x.md"), None).unwrap();
-        assert_eq!(h.path, "x.md");
-    }
-
-    #[test]
-    fn rejects_non_qmd_uris() {
-        assert!(map_row(row("file:///etc/passwd"), None).is_none());
-        assert!(map_row(row("/etc/passwd"), None).is_none());
-        assert!(map_row(row("qmd://no-slash-after-collection"), None).is_none());
-    }
-
-    #[test]
-    fn hybrid_passes_query_as_one_argv_element() {
-        let a = qmd_args("hybrid", "a; rm -rf ~");
-        assert_eq!(a[0], "query");
-        // The whole structured doc is ONE argv element → no shell, no injection.
-        assert_eq!(a[1], "lex:a; rm -rf ~\nvec:a; rm -rf ~");
-        assert_eq!(a[2], "--json");
-    }
-
-    #[test]
-    fn lex_is_the_default_mode() {
-        let a = qmd_args("lex", "foo");
-        assert_eq!(
-            a.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["search", "foo", "--json"]
-        );
-    }
-
-    #[test]
-    fn cleans_diff_hunk_snippet_to_one_line() {
-        let s = clean_snippet("@@ -1,4 @@ (0 before, 191 after)\n---\ntags: [a, b]\n");
-        assert_eq!(s, "--- tags: [a, b]");
-    }
-
-    #[test]
-    fn plain_snippet_without_hunk_header_is_collapsed() {
-        assert_eq!(clean_snippet("hello   world\n\nfoo"), "hello world foo");
+        let hits = run_lex(cache.path(), "quick fox").unwrap();
+        assert_eq!(hits.len(), 1, "hits: {hits:?}");
+        assert_eq!(hits[0].path, "notes/alpha.md");
+        assert_eq!(hits[0].title, "alpha");
+        assert!(hits[0].snippet.is_empty());
     }
 }

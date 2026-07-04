@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use onebrain_core::{load_vault_config, ResolvedVault};
+use onebrain_core::{load_vault_config, load_vault_config_at, ResolvedVault, VaultRoot};
 use onebrain_search::engine::{short_path_hash, Engine};
 
 use crate::vault_ctx;
@@ -76,6 +76,23 @@ pub fn collection_for(resolved: &ResolvedVault) -> Result<String> {
     persist_collection(resolved.root.as_path(), &name)
         .with_context(|| format!("persisting search.collection = {name}"))?;
     Ok(name)
+}
+
+/// Read-only collection resolver for surfaces that must NOT mutate config
+/// (the webui `GET /api/vault/search`). Returns the configured value
+/// (`search.collection`, else the legacy `qmd_collection`), or the
+/// deterministic auto-generated `<dir>-<hash>` name **without persisting**
+/// it. The generated name matches what [`collection_for`] would later write,
+/// so a webui search before the first `search reindex` uses the same
+/// collection reindex will adopt.
+pub fn collection_name_readonly(vault_root: &Path) -> Result<String> {
+    let config = load_vault_config_at(vault_root).context("load vault config")?;
+    if let Some(existing) = config.search.collection {
+        return Ok(existing);
+    }
+    let root = VaultRoot::from_path(vault_root)
+        .with_context(|| format!("resolving vault root at {}", vault_root.display()))?;
+    Ok(generate_collection_name(root.name(), vault_root))
 }
 
 /// Build the auto-generated collection name `<dir>-<short-hash>` for a vault
@@ -224,6 +241,42 @@ mod tests {
     use super::*;
     use onebrain_core::{ResolvedVault, VaultRoot, VaultSource};
     use tempfile::tempdir;
+
+    #[test]
+    fn collection_name_readonly_does_not_persist_generated_name() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "folders:\n  inbox: 00-inbox\n",
+        )
+        .unwrap();
+        let name = collection_name_readonly(dir.path()).unwrap();
+        // Deterministic <dir>-<hash>, same as the persisting resolver would generate.
+        assert_eq!(
+            name,
+            generate_collection_name(VaultRoot::from_path(dir.path()).unwrap().name(), dir.path())
+        );
+        // Config file must be UNCHANGED (no `collection:` written).
+        let yaml = std::fs::read_to_string(dir.path().join("onebrain.yml")).unwrap();
+        assert!(
+            !yaml.contains("collection:"),
+            "readonly resolver must not persist: {yaml}"
+        );
+    }
+
+    #[test]
+    fn collection_name_readonly_prefers_configured_value() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "search:\n  collection: explicit-name\n",
+        )
+        .unwrap();
+        assert_eq!(
+            collection_name_readonly(dir.path()).unwrap(),
+            "explicit-name"
+        );
+    }
 
     /// Build a `ResolvedVault` rooted at `dir` (which must already contain an
     /// `onebrain.yml`), as the flag-resolved source.
