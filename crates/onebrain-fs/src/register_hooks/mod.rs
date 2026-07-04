@@ -438,6 +438,6 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1, "entries: {entries:?}");
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["qmd", "reindex", "--json"]));
+        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
     }
 }

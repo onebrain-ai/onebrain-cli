@@ -1308,7 +1308,7 @@ mod tests {
                 cron: Some("0 9 * * *".to_string()),
                 command: Some("onebrain".to_string()),
                 args: Some(onebrain_core::scheduler::Args::List(vec![
-                    "qmd".to_string(),
+                    "search".to_string(),
                     "reindex".to_string(),
                 ])),
                 ..Default::default()
@@ -1583,7 +1583,7 @@ mod tests {
         let e = ScheduleEntry {
             cron: Some("0 3 * * 0".to_string()),
             command: Some("/opt/homebrew/bin/onebrain".to_string()),
-            args: Some(Args::List(vec!["qmd-reindex".to_string()])),
+            args: Some(Args::List(vec!["search-reindex".to_string()])),
             ..Default::default()
         };
         // Legacy label ignores args/cron entirely — just the basename.

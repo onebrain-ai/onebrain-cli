@@ -71,6 +71,22 @@ fn is_legacy_alias_qmd_entry(entry: &Value) -> bool {
     }
 }
 
+/// True when `entry` is the v3.2–v3.4 `qmd reindex` form (exec: command
+/// "onebrain", args starting ["qmd","reindex"]; or shell: command string
+/// "onebrain qmd reindex[ --json]"). This WAS canonical; v3.4.5 makes it a
+/// legacy form that migrates to `search reindex`.
+fn is_legacy_qmd_reindex_entry(entry: &Value) -> bool {
+    let cmd = entry.get("command").and_then(|v| v.as_str()).unwrap_or("");
+    match entry.get("args").and_then(|v| v.as_array()) {
+        Some(args) => {
+            cmd == "onebrain"
+                && args.first().and_then(|v| v.as_str()) == Some("qmd")
+                && args.get(1).and_then(|v| v.as_str()) == Some("reindex")
+        }
+        None => cmd == "onebrain qmd reindex" || cmd == "onebrain qmd reindex --json",
+    }
+}
+
 /// Rewrite a legacy-alias qmd entry in place to the canonical new form
 /// (`command: "onebrain", args: ["qmd", "reindex", "--json"]`). Returns true
 /// if the entry was a legacy alias and was rewritten.
@@ -131,6 +147,18 @@ pub(crate) fn migrate_legacy_qmd_entries(groups: &mut Vec<Value>, keep_canonical
                     group_touched = true;
                 } else if rewrite_legacy_alias_to_canonical(entry) {
                     group_touched = true;
+                } else if is_legacy_qmd_reindex_entry(entry) {
+                    let obj = entry.as_object_mut().unwrap();
+                    obj.insert("command".into(), Value::String(qmd.command.into()));
+                    let args: Vec<Value> = qmd
+                        .args
+                        .iter()
+                        .map(|s| Value::String((*s).to_string()))
+                        .collect();
+                    obj.insert("args".into(), Value::Array(args));
+                    obj.entry("type".to_string())
+                        .or_insert_with(|| Value::String("command".into()));
+                    group_touched = true;
                 }
             }
             if group_touched {
@@ -145,6 +173,7 @@ pub(crate) fn migrate_legacy_qmd_entries(groups: &mut Vec<Value>, keep_canonical
                 let cmd = h.get("command").and_then(|v| v.as_str()).unwrap_or("");
                 !is_legacy_qmd_cmd(cmd)
                     && !is_legacy_alias_qmd_entry(h)
+                    && !is_legacy_qmd_reindex_entry(h)
                     && !is_canonical_qmd_entry(h)
                     && !is_pre_json_qmd_entry(h)
             });
@@ -324,9 +353,9 @@ mod tests {
         assert_eq!(s["hooks"]["PostToolUse"][0]["matcher"], "Write|Edit");
         let entry = &s["hooks"]["PostToolUse"][0]["hooks"][0];
         assert_eq!(entry["command"], "onebrain");
-        // v3.2: canonical NEW form `qmd reindex` (space), not the legacy
-        // `qmd-reindex` alias.
-        assert_eq!(entry["args"], json!(["qmd", "reindex", "--json"]));
+        // v3.4.5: canonical NEW form `search reindex`, not the legacy
+        // `qmd reindex` / `qmd-reindex` forms.
+        assert_eq!(entry["args"], json!(["search", "reindex", "--json"]));
         assert_eq!(entry["type"], "command");
     }
 
@@ -350,7 +379,7 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["qmd", "reindex", "--json"]));
+        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
     }
 
     /// v3.1 legacy ALIAS exec form (`qmd-reindex` hyphen) migrates to the
@@ -378,7 +407,7 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["qmd", "reindex", "--json"]));
+        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
     }
 
     /// v3.0 legacy ALIAS exec form (`qmd-reindex`, no `--json`) migrates to
@@ -404,7 +433,7 @@ mod tests {
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["args"], json!(["qmd", "reindex", "--json"]));
+        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
     }
 
     /// Legacy alias shell form (`onebrain qmd-reindex`) migrates to new exec.
@@ -428,7 +457,7 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["qmd", "reindex", "--json"]));
+        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
     }
 
     /// Mixed legacy alias + new-form duplicate collapse to ONE canonical
@@ -456,7 +485,7 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1, "entries: {entries:?}");
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["qmd", "reindex", "--json"]));
+        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
     }
 
     /// Two NEW-form duplicates collapse to ONE.
@@ -466,10 +495,10 @@ mod tests {
             "hooks": {
                 "PostToolUse": [
                     {"matcher": "Write|Edit", "hooks": [{
-                        "type": "command", "command": "onebrain", "args": ["qmd", "reindex", "--json"]
+                        "type": "command", "command": "onebrain", "args": ["search", "reindex", "--json"]
                     }]},
                     {"matcher": "Write|Edit", "hooks": [{
-                        "type": "command", "command": "onebrain", "args": ["qmd", "reindex", "--json"]
+                        "type": "command", "command": "onebrain", "args": ["search", "reindex", "--json"]
                     }]},
                 ]
             }
@@ -482,7 +511,7 @@ mod tests {
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["args"], json!(["qmd", "reindex", "--json"]));
+        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
     }
 
     #[test]
@@ -515,7 +544,7 @@ mod tests {
                     "matcher": "Write|Edit",
                     "hooks": [{
                         "type": "command", "command": "onebrain",
-                        "args": ["qmd", "reindex", "--json"]
+                        "args": ["search", "reindex", "--json"]
                     }],
                 }]
             }
@@ -532,8 +561,30 @@ mod tests {
     }
 
     #[test]
-    fn apply_qmd_hook_v30_canonical_args_migrate_with_json_flag() {
-        // v3.0 NEW-form entry (no --json) gets the flag appended in place.
+    fn apply_qmd_hook_v31_canonical_args_migrate_with_json_flag() {
+        // v3.4.5 NEW-form entry (no --json) gets the flag appended in place.
+        let mut s = json!({
+            "hooks": {
+                "PostToolUse": [{
+                    "matcher": "Write|Edit",
+                    "hooks": [{
+                        "type": "command", "command": "onebrain",
+                        "args": ["search", "reindex"]
+                    }],
+                }]
+            }
+        });
+        let st = apply_qmd_hook(&mut s);
+        // Migrated because the args[] changed.
+        assert_eq!(st, HookStatus::Migrated);
+        let entry = &s["hooks"]["PostToolUse"][0]["hooks"][0];
+        assert_eq!(entry["args"], json!(["search", "reindex", "--json"]));
+    }
+
+    /// v3.2–v3.4 `qmd reindex` exec form (no `--json`) migrates directly to
+    /// `search reindex --json` via Pass 1, not the Pass 2b flag-append.
+    #[test]
+    fn apply_qmd_hook_legacy_qmd_reindex_no_json_migrates_to_search() {
         let mut s = json!({
             "hooks": {
                 "PostToolUse": [{
@@ -546,10 +597,9 @@ mod tests {
             }
         });
         let st = apply_qmd_hook(&mut s);
-        // Migrated because the args[] changed.
         assert_eq!(st, HookStatus::Migrated);
         let entry = &s["hooks"]["PostToolUse"][0]["hooks"][0];
-        assert_eq!(entry["args"], json!(["qmd", "reindex", "--json"]));
+        assert_eq!(entry["args"], json!(["search", "reindex", "--json"]));
     }
 
     #[test]
@@ -566,7 +616,7 @@ mod tests {
         assert_eq!(st, HookStatus::Migrated);
         let entry = &s["hooks"]["PostToolUse"][0]["hooks"][0];
         assert_eq!(entry["command"], "onebrain");
-        assert_eq!(entry["args"], json!(["qmd", "reindex", "--json"]));
+        assert_eq!(entry["args"], json!(["search", "reindex", "--json"]));
     }
 
     #[test]
@@ -591,7 +641,7 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["qmd", "reindex", "--json"]));
+        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
     }
 
     #[test]
@@ -612,7 +662,7 @@ mod tests {
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
         let want_args = vec![
-            Value::String("qmd".into()),
+            Value::String("search".into()),
             Value::String("reindex".into()),
             Value::String("--json".into()),
         ];
@@ -683,9 +733,10 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| e["command"] == "echo user-custom-hook"));
-        assert!(entries.iter().any(
-            |e| e["command"] == "onebrain" && e["args"] == json!(["qmd", "reindex", "--json"])
-        ));
+        assert!(entries
+            .iter()
+            .any(|e| e["command"] == "onebrain"
+                && e["args"] == json!(["search", "reindex", "--json"])));
     }
 
     #[test]
@@ -814,7 +865,7 @@ mod tests {
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["qmd", "reindex", "--json"]));
+        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
     }
 
     /// When `"PostToolUse"` exists but holds a non-array value, `apply_qmd_hook`
@@ -833,7 +884,7 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["qmd", "reindex", "--json"]));
+        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
     }
 
     /// A group that has no `"hooks"` key is silently skipped in
@@ -857,7 +908,10 @@ mod tests {
             .collect();
         assert_eq!(all_entries.len(), 1);
         assert_eq!(all_entries[0]["command"], "onebrain");
-        assert_eq!(all_entries[0]["args"], json!(["qmd", "reindex", "--json"]));
+        assert_eq!(
+            all_entries[0]["args"],
+            json!(["search", "reindex", "--json"])
+        );
     }
 
     #[test]
@@ -904,5 +958,33 @@ mod tests {
         assert_eq!(entries.len(), 1, "entries: {entries:?}");
         assert_eq!(entries[0]["command"], "onebrain");
         assert_eq!(entries[0]["args"], json!(["checkpoint", "stop"]));
+    }
+
+    /// v3.2–v3.4 `qmd reindex` exec form migrates to v3.4.5 `search reindex`.
+    #[test]
+    fn apply_qmd_hook_legacy_qmd_reindex_exec_migrates_to_search() {
+        let mut s = json!({
+            "hooks": { "PostToolUse": [{
+                "matcher": "Write|Edit",
+                "hooks": [{"type":"command","command":"onebrain","args":["qmd","reindex","--json"]}],
+            }]}
+        });
+        let st = apply_qmd_hook(&mut s);
+        assert_eq!(st, HookStatus::Migrated);
+        let e = &s["hooks"]["PostToolUse"][0]["hooks"][0];
+        assert_eq!(e["args"], json!(["search", "reindex", "--json"]));
+    }
+
+    /// Disabled qmd strips the old `qmd reindex` form too.
+    #[test]
+    fn strip_qmd_hook_removes_legacy_qmd_reindex_exec() {
+        let mut s = json!({
+            "hooks": { "PostToolUse": [{
+                "matcher": "Write|Edit",
+                "hooks": [{"type":"command","command":"onebrain","args":["qmd","reindex","--json"]}],
+            }]}
+        });
+        strip_qmd_hook(&mut s);
+        assert!(s["hooks"].get("PostToolUse").is_none());
     }
 }

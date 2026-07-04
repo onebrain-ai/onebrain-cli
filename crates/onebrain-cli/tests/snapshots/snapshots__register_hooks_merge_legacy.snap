@@ -29,7 +29,7 @@ expression: text
                         "type": "command",
                         "command": "onebrain",
                         "args": [
-                            "qmd",
+                            "search",
                             "reindex",
                             "--json"
                         ]
