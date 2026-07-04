@@ -1,7 +1,7 @@
 # onebrain-cache
 
 ## Purpose & dependencies
-`onebrain-cache` owns host/runtime state that lives outside the vault — session-token resolution, checkpoint cadence state (the `$TMPDIR/onebrain-{token}.state` file), checkpoint-NN derivation from on-disk checkpoint files, qmd index/embedding status detection, and detached qmd-reindex spawning. It depends only on `onebrain-core` (for `SessionToken`, `CoreError`, and `load_vault_config_at`). It is consumed by `onebrain-cli`, which reaches into it for `session init` (token resolve + stale-state cleanup), the Stop/reset checkpoint hooks, and the qmd `status`/`reindex` commands. All public surface is re-exported from `lib.rs`.
+`onebrain-cache` owns host/runtime state that lives outside the vault — session-token resolution, checkpoint cadence state (the `$TMPDIR/onebrain-{token}.state` file), and checkpoint-NN derivation from on-disk checkpoint files. It depends only on `onebrain-core` (for `SessionToken`, `CoreError`, and `load_vault_config_at`). It is consumed by `onebrain-cli`, which reaches into it for `session init` (token resolve + stale-state cleanup) and the Stop/reset checkpoint hooks. It no longer touches qmd in any form — the qmd status probe and detached qmd-reindex spawn were removed along with the external `qmd` binary; `session init`'s unembedded-doc count is now answered by a native search-index probe living in `onebrain-cli` (via `onebrain-search`), not by this crate. All public surface is re-exported from `lib.rs`.
 
 ## Module map
 ```
@@ -11,12 +11,10 @@ src/
   session_token.rs  session-token resolution chain (layer 0 = CLAUDE_CODE_SESSION_ID, then Bun's 1-8) + stale .state cleanup
   checkpoint.rs     Stop/reset hook logic · threshold checks · checkpoint-NN derivation
   state.rs          CheckpointState type + atomic read/write of the 3-field .state file
-  qmd.rs            qmd status query + text parsing (QmdStatus) + unembedded count
-  qmd_reindex.rs    detached `qmd update -c <collection>` spawn (cross-platform args)
 ```
 
 ## `src/lib.rs`
-Crate root. No logic — declares the six modules and re-exports their public items so callers use `onebrain_cache::{...}` directly.
+Crate root. No logic — declares the four modules and re-exports their public items so callers use `onebrain_cache::{...}` directly.
 **Connections** — calls: every module; called by: `onebrain-cli`.
 
 ## `src/error.rs`
@@ -80,44 +78,9 @@ Owns the on-disk checkpoint state file `$TMPDIR/onebrain-{token}.state` in 3-fie
 **Connections** — calls: `std::fs`; called by: `checkpoint.rs` (every state read/write) and re-exported for `onebrain-cli`.
 **Tests** — roundtrip, fresh-on-missing/malformed/wrong-field-count, atomic temp-file cleanup.
 
-## `src/qmd.rs`
-The **single source of truth** for probing `qmd status` — spawn, PATH resolution, timeout, and parse all live here. Every consumer (session-init's unembedded count, `onebrain qmd status`, and `onebrain doctor`'s qmd-embeddings check in `onebrain-fs`) goes through it, so they can't drift. Designed for silent fallback — a missing or hung qmd never blocks the caller.
-
-Two deadlines, one probe core (`probe_qmd_status_with(timeout)`), chosen by intent — compile-time `const _: () = assert!(…)` guards keep them sane (generous ≥ 15; startup ≤ generous):
-- `QMD_STATUS_TIMEOUT_SECS = 15` — explicit `onebrain qmd status` + `onebrain doctor`, where the user waits *for* the figure and a cold multi-MB index can take ~10 s. (`probe_qmd_status()` uses this; `doctor` reuses it rather than defining its own.)
-- `QMD_STARTUP_TIMEOUT_SECS = 5` — the interactive session-init probe (`query_unembedded_count`), which blocks the greeting. A timeout degrades to `None`/`null` ("unknown"), never a false `0`, so a slow/hung qmd can't freeze startup — the shorter cap trades "exact count on a cold index" for "snappy startup", never correctness.
-
-**Key types**
-- `QmdStatus` (`Serialize`, all `Option`) — `total_files`, `embedded_vectors`, `pending_embedding`, `index_size`, `last_updated`. `QmdStatus::parse(text)` is public so other crates parse identically.
-- `QmdProbe` — `NotFound | Timeout | Stdout(String) | Error`; the classified outcome of one spawn, so consumers can render failure modes differently and unit-test every branch without spawning.
-
-**How status is parsed** — `probe_qmd_status()` spawns `qmd status` (platform-wrapped: direct on Unix, `powershell.exe -Command "qmd status"` on Windows) with a `wait-timeout` deadline, then `parse_status` line-matches prefixes — `Total:` → `total_files`, `Vectors:` → `embedded_vectors`, `Pending:` → `pending_embedding`, `Size:` → `index_size`, `Updated:` → `last_updated`. Numeric fields take the first `u64` token; unmatched lines leave their field `None`. (Text parsing rather than `--json` because qmd ≤ 2.1.0 ignores `--json`.) On Unix the binary is resolved on PATH first, then the bun-global dir (`~/.bun/bin`); qmd runs with that dir on PATH so a located-but-interpreted qmd finds its own interpreter under a restricted launcher PATH.
-
-**Key functions**
-- `probe_qmd_status() -> QmdProbe` — the one spawn; never panics.
-- `query_status() -> Option<QmdStatus>` — `None` when qmd is unavailable/empty, else best-effort parsed struct.
-- `query_unembedded_count() -> Option<usize>` — `None` when the count can't be determined (probe failure / unparseable), `Some(n)` otherwise. `None` is deliberate: a false `0` is indistinguishable from "all embedded" and hides pending work at startup.
-
-**Connections** — calls: `qmd` subprocess (via `powershell.exe` on Windows); called by: `onebrain-cli` session-init (unembedded count) + qmd `status` command, and `onebrain-fs` doctor (qmd-embeddings check).
-**Tests** — verbatim qmd-2.1.0 sample parse (incl. full multi-block output), missing-field `None`, zero-pending vs none, all-garbage → all-`None`, probe→`None` for every non-stdout outcome, probe→count mapping, bun-dir on the search path, no-panic when qmd absent.
-
-## `src/qmd_reindex.rs`
-Fire-and-forget reindex: spawns a detached `qmd update -c <collection>` background process. Always returns `Ok(())` (matches Bun's exit-0 contract).
-
-**Spawn mechanism** — `qmd_reindex` loads vault config; silently returns `Ok(())` if config is missing/malformed or `qmd_collection` is absent/empty (Bun JS-truthiness parity). Otherwise it builds args via `build_qmd_spawn_args` and hands them to an injected `spawn_fn` closure (production passes a closure doing `Command::spawn` with platform detach flags; tests pass a recorder). Spawn failure writes `qmd-reindex: <error>` to stderr but still returns `Ok(())`.
-
-**Key types** — `SpawnOs` — `enum { Unix, Windows }`; `SpawnOs::from_env()` maps `std::env::consts::OS` (everything non-Windows → `Unix`).
-**Key functions**
-- `build_qmd_spawn_args(collection: &str, os: SpawnOs) -> Vec<String>` — Unix: `["qmd","update","-c",collection]`; Windows: `["powershell.exe","-NoProfile","-Command","qmd update -c '<collection>'"]` with embedded single quotes doubled (`''`).
-- `qmd_reindex<F>(vault_root: &Path, os: SpawnOs, spawn_fn: F) -> std::io::Result<()>` where `F: FnOnce(&[String]) -> std::io::Result<()>` — the entry point above.
-**Connections** — calls: `onebrain_core::load_vault_config_at`, the injected spawn closure; called by: `onebrain-cli` qmd `reindex` command.
-**Tests** — Unix/Windows arg shapes, single-quote doubling, no-spawn on missing/empty/malformed config, `Ok(())` on spawn failure.
-
 ## Entry points
 - `resolve_session_token(&ResolveInputs)` + `ResolveInputs::from_env()` — get the session token (CLI `session init`).
 - `clean_stale_state_file(&SessionToken, &Path, SystemTime)` — drop a stale prior-session state file at startup.
 - `handle_stop(token, vault_root, now, tmp_dir, stdout)` / `handle_reset(token, now, tmp_dir)` — Stop-hook cadence and post-wrapup reset.
 - `read_state` / `write_state` + `CheckpointState` — direct checkpoint-state access.
-- `query_status() -> Option<QmdStatus>` / `query_unembedded_count() -> usize` — qmd index health.
-- `qmd_reindex(vault_root, os, spawn_fn)` + `build_qmd_spawn_args` + `SpawnOs` — trigger a background reindex.
 - `CacheError` / `Result<T>` — error surface for all of the above.
