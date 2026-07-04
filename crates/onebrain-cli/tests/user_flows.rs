@@ -120,14 +120,23 @@ fn flow_established_user_inside_vault() {
         v.get("session_token").and_then(|s| s.as_str()).is_some(),
         "missing session_token: {v:?}"
     );
-    // v3.4 contract: `qmd_unembedded` is always present, but is `null` when the
-    // qmd probe can't determine the count (e.g. no qmd binary in CI) and a
-    // non-negative integer otherwise. This test is non-hermetic (PATH not
-    // scrubbed), so accept either — never absent.
-    let qmd = v.get("qmd_unembedded").expect("qmd_unembedded key missing");
+    // v3.4.5 contract: `search_unembedded` (canonical) is always present, and
+    // is `null` when the probe can't determine the count (e.g. no index in CI)
+    // or a non-negative integer otherwise. The deprecated `qmd_unembedded`
+    // alias is emitted alongside with the same value for one transition
+    // version. This test is non-hermetic (PATH not scrubbed), so accept either
+    // — never absent.
+    let unembedded = v
+        .get("search_unembedded")
+        .expect("search_unembedded key missing");
     assert!(
-        qmd.is_null() || qmd.is_u64(),
-        "qmd_unembedded must be null or a u64: {v:?}"
+        unembedded.is_null() || unembedded.is_u64(),
+        "search_unembedded must be null or a u64: {v:?}"
+    );
+    assert_eq!(
+        v.get("qmd_unembedded"),
+        Some(unembedded),
+        "deprecated qmd_unembedded alias must mirror search_unembedded: {v:?}"
     );
     assert!(
         v.get("decision").is_none(),
@@ -160,8 +169,14 @@ fn flow_hook_consumer_parses_session_init_json() {
         "expected pure JSON object, got: {stdout:?}"
     );
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    // Hook contract requires these three fields by name.
-    for k in &["datetime", "session_token", "qmd_unembedded"] {
+    // Hook contract requires these fields by name (search_unembedded is the
+    // canonical count; qmd_unembedded is the deprecated transition alias).
+    for k in &[
+        "datetime",
+        "session_token",
+        "search_unembedded",
+        "qmd_unembedded",
+    ] {
         assert!(
             parsed.get(*k).is_some(),
             "hook contract violated: `{k}` missing from {parsed:?}"

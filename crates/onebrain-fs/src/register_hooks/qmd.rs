@@ -11,13 +11,13 @@ use serde_json::{json, Map, Value};
 const QMD_MATCHER: &str = "Write|Edit";
 
 fn is_canonical_qmd_entry(entry: &Value) -> bool {
-    matches_spec(entry, &HookSpec::QMD)
+    matches_spec(entry, &HookSpec::REINDEX)
 }
 
 /// True when the entry is the pre-v3.1 (no `--json`) shape of the qmd hook.
 /// Used by strip_qmd_hook to clean both shapes.
 fn is_pre_json_qmd_entry(entry: &Value) -> bool {
-    matches_spec_pre_json(entry, &HookSpec::QMD)
+    matches_spec_pre_json(entry, &HookSpec::REINDEX)
 }
 
 /// Match legacy `qmd update <args>` patterns. Word-bounded so wrapped commands
@@ -92,7 +92,7 @@ fn is_legacy_qmd_reindex_entry(entry: &Value) -> bool {
 /// `"onebrain search reindex --json"` / `"onebrain search reindex"`, and the
 /// pre-json exec form `["search","reindex"]`). This WAS canonical before
 /// Track 4 introduced `--lex-only`; it is now legacy and migrates to the new
-/// canonical `HookSpec::QMD` (`--lex-only --json`).
+/// canonical `HookSpec::REINDEX` (`--lex-only --json`).
 ///
 /// Matches the EXACT arg list only (not a prefix) so this never matches the
 /// Stop `EMBED` entry (`--pending-only`), which also starts with
@@ -116,7 +116,7 @@ fn rewrite_legacy_alias_to_canonical(entry: &mut Value) -> bool {
     if !is_legacy_alias_qmd_entry(entry) {
         return false;
     }
-    let qmd = HookSpec::QMD;
+    let qmd = HookSpec::REINDEX;
     let Some(obj) = entry.as_object_mut() else {
         return false;
     };
@@ -137,7 +137,7 @@ fn rewrite_legacy_alias_to_canonical(entry: &mut Value) -> bool {
 /// changed.
 pub(crate) fn migrate_legacy_qmd_entries(groups: &mut Vec<Value>, keep_canonical: bool) -> bool {
     let mut touched = false;
-    let qmd = HookSpec::QMD;
+    let qmd = HookSpec::REINDEX;
 
     // Pass 1: rewrite or strip legacy `qmd update ...` entries.
     for g in groups.iter_mut() {
@@ -306,7 +306,7 @@ pub(crate) fn apply_qmd_hook(settings: &mut Value) -> HookStatus {
     }
     groups.push(json!({
         "matcher": QMD_MATCHER,
-        "hooks": [HookSpec::QMD.to_canonical_entry()],
+        "hooks": [HookSpec::REINDEX.to_canonical_entry()],
     }));
     HookStatus::Added
 }

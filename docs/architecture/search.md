@@ -247,7 +247,7 @@ stateDiagram-v2
 ### Auto reindex/embed hooks (v3.4.5 Track 4)
 
 > Sources: [`crates/onebrain-fs/src/register_hooks/hooks.rs`](../../crates/onebrain-fs/src/register_hooks/hooks.rs)
-> (`HookSpec::QMD`, `HookSpec::EMBED`) ·
+> (`HookSpec::REINDEX`, `HookSpec::EMBED`) ·
 > [`crates/onebrain-cli/src/commands/search_reindex.rs`](../../crates/onebrain-cli/src/commands/search_reindex.rs)
 > (`run_hook_path`)
 

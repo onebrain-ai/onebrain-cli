@@ -33,7 +33,12 @@ impl HookSpec {
     // lexical-only reindex (fast, no embedding) since it runs synchronously
     // after every Write/Edit. Full embedding is deferred to the Stop hook
     // (see `EMBED` below).
-    pub(crate) const QMD: HookSpec = HookSpec {
+    //
+    // v3.4.5 Track 3b: renamed from `QMD` — the hook has run native `search
+    // reindex` since Track 2, so the old `qmd` name was a misnomer. (The
+    // legacy-entry detection/migration helpers keep the `qmd` name because
+    // they match real `qmd …` command strings in users' settings.json.)
+    pub(crate) const REINDEX: HookSpec = HookSpec {
         command: "onebrain",
         args: &["search", "reindex", "--lex-only", "--json"],
     };
@@ -921,9 +926,9 @@ mod tests {
 
     #[test]
     fn qmd_spec_has_lex_only_json_args() {
-        assert_eq!(HookSpec::QMD.command, "onebrain");
+        assert_eq!(HookSpec::REINDEX.command, "onebrain");
         assert_eq!(
-            HookSpec::QMD.args,
+            HookSpec::REINDEX.args,
             &["search", "reindex", "--lex-only", "--json"]
         );
     }
@@ -941,7 +946,7 @@ mod tests {
             "command": "onebrain",
             "args": ["search", "reindex", "--pending-only", "--json"]
         });
-        assert!(!matches_spec(&embed_entry, &HookSpec::QMD));
+        assert!(!matches_spec(&embed_entry, &HookSpec::REINDEX));
     }
 
     #[test]

@@ -654,9 +654,9 @@ mod tests {
     }
 
     /// `detect_qmd_hook_form` directly on the exact entry shape emitted by
-    /// `apply_qmd_hook`'s `HookSpec::QMD` (`{"type":"command","command":
-    /// "onebrain","args":["search","reindex","--json"]}`) — classifies as
-    /// the present canonical form.
+    /// `apply_qmd_hook`'s `HookSpec::REINDEX` (`{"type":"command","command":
+    /// "onebrain","args":["search","reindex","--lex-only","--json"]}`) —
+    /// classifies as the present canonical form.
     #[test]
     fn apply_qmd_hook_emitted_entry_is_recognized_as_canonical() {
         let settings = json!({
@@ -666,7 +666,7 @@ mod tests {
                         {
                             "type": "command",
                             "command": "onebrain",
-                            "args": ["search", "reindex", "--json"]
+                            "args": ["search", "reindex", "--lex-only", "--json"]
                         }
                     ] }
                 ]

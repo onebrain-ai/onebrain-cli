@@ -87,7 +87,7 @@ fn compute_result(
     // engine open or status failed) — surfaced as `null` so a probe failure
     // is distinguishable from a true zero instead of silently hiding pending
     // embeddings at startup.
-    let qmd_unembedded = match &config.search.collection {
+    let unembedded = match &config.search.collection {
         Some(collection) => qmd_count(&vault_root, collection),
         None => Some(0),
     };
@@ -107,7 +107,11 @@ fn compute_result(
     Ok(SessionInitResult::Ok(SessionInitOutput {
         datetime,
         session_token: token.to_string(),
-        qmd_unembedded,
+        // Transition: emit the canonical `search_unembedded` and the
+        // deprecated `qmd_unembedded` alias with the same value (see
+        // `SessionInitOutput`).
+        search_unembedded: unembedded,
+        qmd_unembedded: unembedded,
         headless,
     }))
 }
@@ -207,14 +211,14 @@ fn render_text(result: &SessionInitResult) -> String {
         SessionInitResult::Ok(out) => {
             // Single-line happy path → keep tight; multi-line metadata risks
             // pushing useful info offscreen on narrow terminals. `None` ⟹ the
-            // qmd probe couldn't determine the count (missing / timed out);
+            // search probe couldn't determine the count (missing / timed out);
             // say so rather than printing a misleading "0 unembedded".
-            let qmd = match out.qmd_unembedded {
+            let unembedded = match out.search_unembedded {
                 Some(n) => format!("{n} unembedded"),
                 None => "unknown (search index unavailable)".to_string(),
             };
             format!(
-                "Session ready · token={token} · datetime={datetime}\nqmd index: {qmd}",
+                "Session ready · token={token} · datetime={datetime}\nsearch index: {unembedded}",
                 token = out.session_token,
                 datetime = out.datetime,
             )
@@ -265,6 +269,9 @@ mod tests {
 
         assert!(v.get("datetime").and_then(|d| d.as_str()).is_some());
         assert!(v.get("session_token").and_then(|s| s.as_str()).is_some());
+        // v3.4.5 transition: canonical `search_unembedded` + deprecated
+        // `qmd_unembedded` alias both emitted with the same value.
+        assert_eq!(v.get("search_unembedded").and_then(|n| n.as_u64()), Some(0));
         assert_eq!(v.get("qmd_unembedded").and_then(|n| n.as_u64()), Some(0));
         assert!(
             v.get("decision").is_none(),
@@ -339,9 +346,14 @@ mod tests {
         let line = build_output(dir.path(), &json_mode(), |_, _| Some(99)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(
+            v.get("search_unembedded").and_then(|n| n.as_u64()),
+            Some(0),
+            "collection-absent vault must not query the search index"
+        );
+        assert_eq!(
             v.get("qmd_unembedded").and_then(|n| n.as_u64()),
             Some(0),
-            "collection-absent vault must not query qmd"
+            "deprecated alias mirrors search_unembedded"
         );
     }
 
@@ -356,9 +368,14 @@ mod tests {
         let line = build_output(dir.path(), &json_mode(), |_, _| Some(7)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(
-            v.get("qmd_unembedded").and_then(|n| n.as_u64()),
+            v.get("search_unembedded").and_then(|n| n.as_u64()),
             Some(7),
             "collection-set vault must surface the queried count"
+        );
+        assert_eq!(
+            v.get("qmd_unembedded").and_then(|n| n.as_u64()),
+            Some(7),
+            "deprecated alias mirrors search_unembedded"
         );
     }
 
@@ -373,11 +390,18 @@ mod tests {
 
         let line = build_output(dir.path(), &json_mode(), |_, _| None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-        let field = v.get("qmd_unembedded").expect("key must be present");
+        let field = v
+            .get("search_unembedded")
+            .expect("canonical key must be present");
         assert!(
             field.is_null(),
             "probe failure must report null (unknown), not a false zero; got {field:?}"
         );
+        // Deprecated alias mirrors the null.
+        assert!(v
+            .get("qmd_unembedded")
+            .expect("alias key must be present")
+            .is_null());
     }
 
     #[test]
@@ -389,8 +413,8 @@ mod tests {
 
         let line = build_output(dir.path(), &text_mode(), |_, _| None).unwrap();
         assert!(
-            line.contains("qmd index: unknown"),
-            "expected unknown marker for unavailable qmd; got: {line}"
+            line.contains("search index: unknown"),
+            "expected unknown marker for unavailable search index; got: {line}"
         );
         assert!(
             !line.contains("0 unembedded"),
@@ -401,14 +425,14 @@ mod tests {
     #[test]
     fn text_mode_reports_count_when_probe_succeeds() {
         // Positive text path: a determined count renders as "N unembedded"
-        // (the same figure the JSON `qmd_unembedded` carries — both render from
-        // the one `SessionInitOutput` field, so text and --json agree).
+        // (the same figure the JSON `search_unembedded` carries — both render
+        // from the one `SessionInitOutput` field, so text and --json agree).
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "qmd_collection: ob-1\n").unwrap();
 
         let line = build_output(dir.path(), &text_mode(), |_, _| Some(7)).unwrap();
         assert!(
-            line.contains("qmd index: 7 unembedded"),
+            line.contains("search index: 7 unembedded"),
             "expected the determined count in text mode; got: {line}"
         );
     }
@@ -447,6 +471,7 @@ mod tests {
         let v: serde_yaml::Value = serde_yaml::from_str(&line).unwrap();
         assert!(v.get("datetime").and_then(|d| d.as_str()).is_some());
         assert!(v.get("session_token").and_then(|s| s.as_str()).is_some());
+        assert_eq!(v.get("search_unembedded").and_then(|n| n.as_u64()), Some(0));
         assert_eq!(v.get("qmd_unembedded").and_then(|n| n.as_u64()), Some(0));
         assert!(
             !line.trim_start().starts_with('{'),

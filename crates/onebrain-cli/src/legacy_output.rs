@@ -6,30 +6,38 @@ use serde::Serialize;
 /// (`ONEBRAIN_HEADLESS=1`), letting INSTRUCTIONS.md skip the interactive
 /// startup ceremony. Unknown to older consumers, which ignore extra fields.
 ///
-/// `qmd_unembedded` is `Option` (v3.4): `null` means the probe could not
-/// determine the count (index dir missing, or the engine failed to open /
+/// The unembedded-doc count is `Option` (v3.4): `null` means the probe could
+/// not determine the count (index dir missing, or the engine failed to open /
 /// report status), `0` means a genuine zero (or a vault with no search
-/// collection configured), `N` means N pending. Field name and semantics are
-/// a stable wire contract kept from the v3.4 `qmd` era; as of v3.4.1 the
-/// value is sourced from the native search index directly (`Engine::status`
-/// under `crate::commands::session_init::native_pending`) rather than
-/// shelling out to the external `qmd` binary — the JSON shape is unchanged.
-/// Note the value is total index drift (`pending_new + pending_changed +
-/// pending_removed`), not strictly *unembedded* docs as the legacy name
-/// implies — a vault with only pending deletions reports a nonzero count.
-/// This is intentional: any drift means the index is stale and warrants a
-/// reindex, which is exactly what the startup warning nudges.
-/// The field is always serialised (never skipped) so the hook contract keeps
-/// the key. A false `0` on probe failure silently hid pending embeddings at
-/// startup — `null` lets the SessionStart consumer surface "unknown" instead.
-/// Consumers MUST treat `null` as "couldn't check" rather than a count: the
-/// OneBrain INSTRUCTIONS.md startup status keys its embed warning on `= 0` /
-/// `> 0`, both of which `null` correctly falls outside of (see the companion
-/// INSTRUCTIONS.md update that renders `null` as "qmd status unknown").
+/// collection configured), `N` means N pending. The value is sourced from the
+/// native search index directly (`Engine::status` under
+/// `crate::commands::session_init::native_pending`). Note the value is total
+/// index drift (`pending_new + pending_changed + pending_removed`), not
+/// strictly *unembedded* docs as the name implies — a vault with only pending
+/// deletions reports a nonzero count. This is intentional: any drift means the
+/// index is stale and warrants a reindex, which is exactly what the startup
+/// warning nudges. The field is always serialised (never skipped) so the hook
+/// contract keeps the key. A false `0` on probe failure silently hid pending
+/// embeddings at startup — `null` lets the SessionStart consumer surface
+/// "unknown" instead. Consumers MUST treat `null` as "couldn't check" rather
+/// than a count: the OneBrain INSTRUCTIONS.md startup status keys its embed
+/// warning on `= 0` / `> 0`, both of which `null` correctly falls outside of.
+///
+/// **v3.4.5 field rename (transition):** the canonical key is now
+/// `search_unembedded`. The former name `qmd_unembedded` is emitted alongside
+/// it with the SAME value for one transition version, so plugins that still
+/// read `qmd_unembedded` keep working. Once the OneBrain plugin reads
+/// `search_unembedded` everywhere (with a fallback to the old key), the
+/// deprecated `qmd_unembedded` field is dropped.
 #[derive(Debug, Serialize)]
 pub struct SessionInitOutput {
     pub datetime: String,
     pub session_token: String,
+    /// Canonical unembedded/drift count (v3.4.5+).
+    pub search_unembedded: Option<usize>,
+    /// Deprecated alias for `search_unembedded`, emitted with the same value
+    /// for one transition version so pre-v3.4.5 plugins keep parsing. Remove
+    /// once the plugin reads `search_unembedded` everywhere.
     pub qmd_unembedded: Option<usize>,
     pub headless: bool,
 }

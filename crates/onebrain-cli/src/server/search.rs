@@ -66,7 +66,7 @@ struct SearchHit {
     snippet: String,
 }
 
-/// Max top-k the webui asks for (qmd self-capped at ~20; keep parity).
+/// Max top-k the webui asks for (native search engine caps at ~20; keep parity).
 const TOP_K: usize = 20;
 
 /// Hard ceiling on one native search. Lex is ~ms; a cold hybrid embed can

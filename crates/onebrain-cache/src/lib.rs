@@ -1,4 +1,4 @@
-//! Session token resolution · launchd plist generation · checkpoint state.
+//! Session token resolution · checkpoint cadence state · stale-state cleanup.
 
 pub mod checkpoint;
 pub mod error;
