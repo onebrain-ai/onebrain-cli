@@ -162,9 +162,6 @@ fn vault_required_stubs_exit_72_inside_64_outside() {
         &["pause", "list"],
         &["pause", "snapshot", "my-task"],
         &["pause", "resume"],
-        // qmd (vault-required stubs)
-        &["qmd", "setup"],
-        &["qmd", "search", "my query"],
         // schedule (vault-required stubs) — `list` is wired to the real
         // status path (see `schedule_list_...` tests below), so it is no
         // longer a stub.
@@ -414,19 +411,10 @@ fn daemon_stop_graceful_when_not_running() {
 // listener bind, no TTY. Each was previously uncovered because only the
 // hidden v3.0 *alias* spelling (or no spelling at all) had an integration test.
 
-/// `qmd reindex` with no `qmd_collection` configured is a clean no-op (the
-/// detached `qmd` spawn only fires when a collection is set). Exercises the
-/// real `QmdVerb::Reindex` arm — distinct from the already-covered hidden
-/// `qmd-reindex` alias.
-#[test]
-fn qmd_reindex_no_collection_exits_0() {
-    let vault = vault_dir(); // onebrain.yml has no `qmd_collection:` key
-    let code = exit_in(vault.path(), &["qmd", "reindex"]);
-    assert_eq!(
-        code, 0,
-        "qmd reindex with no collection should no-op and exit 0, got {code}"
-    );
-}
+// `onebrain qmd reindex` was removed in v3.4.5 — `Cmd::Qmd { .. }` is now a
+// hidden catch-all that bails with a helpful migration error (see
+// `tests/qmd_removed.rs`). The legacy `qmd-reindex` alias still exists but
+// now dispatches to the native `search reindex` handler.
 
 /// `plugin install` routes to `register_hooks::run` (the v3.0 `register-hooks`
 /// body) against the target vault. Filesystem-only — harness detection is

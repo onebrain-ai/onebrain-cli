@@ -404,7 +404,7 @@ mod tests {
     fn run_qmd_set_migrates_legacy_alias_and_dedupes_to_single_new_form() {
         // Real-world bug: vault ended up with the qmd hook duplicated, one in
         // the legacy `qmd-reindex` alias form. `--fix` (= register_hooks::run)
-        // must collapse to a single canonical `qmd reindex` entry.
+        // must collapse to a single canonical `search reindex` entry.
         let v = fresh_vault(true, Some("ob-1-test"));
         let settings_path = v.path().join(".claude").join("settings.json");
         fs::write(
@@ -438,6 +438,6 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1, "entries: {entries:?}");
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["qmd", "reindex", "--json"]));
+        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
     }
 }

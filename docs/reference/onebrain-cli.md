@@ -1,7 +1,7 @@
 # onebrain-cli
 
 ## Purpose & dependencies
-`onebrain-cli` is the binary crate at the top of the OneBrain CLI workspace — it owns everything between `argv` and a process exit code. It parses the locked v3.1 `<noun> <verb>` command tree (`clap`), dispatches each verb to a handler, renders results through the canonical `Envelope<T>` + `serialize_for_mode` output stack across five output modes (text/json/yaml/table/tsv), prints the TTY-only branded banner, resolves the active vault, and centralises `CoreError → exit code` mapping. It also carries the v3.0→v3.1 migration layer: hidden aliases that emit a one-time rename notice before dispatching, a `.claude/settings.json` hook-path rewriter, and `E_NOT_IMPLEMENTED` stubs for the forward-declared command surface. Depends on **all three** in-workspace library crates — `onebrain-core` (config, `CoreError`, vault resolution, scheduler model), `onebrain-fs` (init, vault-sync, register-hooks, doctor checks, update, harness detection), `onebrain-cache` (session token, checkpoint stop/reset, qmd queries) — plus `clap`, `anyhow`, `serde`, `serde_json`, `serde_yaml`, `chrono`, `indicatif`, `dirs`. Nothing in-workspace depends on it.
+`onebrain-cli` is the binary crate at the top of the OneBrain CLI workspace — it owns everything between `argv` and a process exit code. It parses the locked v3.1 `<noun> <verb>` command tree (`clap`), dispatches each verb to a handler, renders results through the canonical `Envelope<T>` + `serialize_for_mode` output stack across five output modes (text/json/yaml/table/tsv), prints the TTY-only branded banner, resolves the active vault, and centralises `CoreError → exit code` mapping. It also carries the v3.0→v3.1 migration layer: hidden aliases that emit a one-time rename notice before dispatching, a `.claude/settings.json` hook-path rewriter, and `E_NOT_IMPLEMENTED` stubs for the forward-declared command surface. Depends on **all three** in-workspace library crates — `onebrain-core` (config, `CoreError`, vault resolution, scheduler model), `onebrain-fs` (init, vault-sync, register-hooks, doctor checks, update, harness detection), `onebrain-cache` (session token, checkpoint stop/reset) — plus `clap`, `anyhow`, `serde`, `serde_json`, `serde_yaml`, `chrono`, `indicatif`, `dirs`. Nothing in-workspace depends on it.
 
 ## Module map
 ```
@@ -24,9 +24,6 @@ src/
 │   ├── session_init.rs  session init — hook-protocol session metadata JSON (incl. headless flag)
 │   ├── checkpoint.rs    checkpoint stop/reset — auto-save cadence
 │   ├── orphan_scan.rs   checkpoint orphans — orphan-checkpoint count
-│   ├── qmd_reindex.rs   qmd reindex — detached `qmd update` spawn (PostToolUse hook)
-│   ├── qmd_embed.rs     qmd embed — foreground `qmd embed`
-│   ├── qmd_status.rs    qmd status — index+embedding health report
 │   ├── harness.rs       harness detect — runtime detection
 │   ├── harness_run.rs   harness run — ad-hoc prompt through claude/gemini (--mode with-context | ad-hoc)
 │   ├── init.rs          init — vault scaffold wizard wiring
@@ -60,7 +57,7 @@ Binary entry point. `argv → help-banner pre-pass → Cli::parse() → dispatch
 The entire clap surface, locked at v3.1 per spec §2.4. `Cli` (global flags + `command: Cmd`) and `Cmd` (3 root verbs + 24 resource groups + 8 hidden v3.0 aliases). Every group's verb list is a `Subcommand` enum even when unimplemented — the tree shape itself is the v3.1 deliverable.
 **Key types**
 - `Cli` — global flags `--vault`, `--output {text,json,yaml,table,tsv}`, `--json`, `--yaml` (conflict), `--pretty`, `--no-color`, `--quiet`; all `global = true`.
-- `Cmd` — root: `Init/Update/Doctor`; visible groups: `Checkpoint/Harness/Plugin/Qmd/Schedule/Session/Skill/Vault`; `hide = true` stub-only groups: `Avatar/Bookmark/Bundle/Config/Daemon/Date/Dream/Frontmatter/Gateway/Inbox/Log/Memory/Note/Pause/Serve/Task`; hidden aliases: `SessionInitAlias/OrphanScanAlias/QmdReindexAlias/RegisterHooksAlias/RegisterScheduleAlias/MigrateAlias/VaultSyncAlias/RunSkillAlias`.
+- `Cmd` — root: `Init/Update/Doctor`; visible groups: `Checkpoint/Harness/Plugin/Schedule/Session/Skill/Vault`; `hide = true` stub-only groups: `Avatar/Bookmark/Bundle/Config/Daemon/Date/Dream/Frontmatter/Gateway/Inbox/Log/Memory/Note/Pause/Serve/Task`; hidden aliases: `SessionInitAlias/OrphanScanAlias/QmdReindexAlias/RegisterHooksAlias/RegisterScheduleAlias/MigrateAlias/VaultSyncAlias/RunSkillAlias`; `Qmd` (removed v3.4.5) is now a hidden catch-all that emits a migration error rather than a visible group.
 - Per-group `*Cmd { verb: *Verb }` arg structs + `Legacy*Args` structs holding the verbatim v3.0 arg surface for back-compat.
 **Connections** — parsed by: `main`; matched by: `v31::dispatch::dispatch`, `banner::is_hook_protocol`. Tests assert root help advertises exactly the 3 verbs + 8 visible groups, hidden aliases parse but don't surface in help, and new `<noun> <verb>` paths parse.
 
@@ -68,7 +65,7 @@ The entire clap surface, locked at v3.1 per spec §2.4. `Cli` (global flags + `c
 TTY-only branded `OneBrain` block-art wordmark + dim `Your AI Thinking Partner · vX.Y.Z` tagline, emitted to **stderr**. Truecolor terminals get a continuous horizontal cyan→purple→pink hue gradient (matching the brain logo) with a top-lit vertical shade layered on; non-truecolor terminals fall back to a vertical-only xterm-256 gray ramp. Suppressed for `--quiet`, non-color/structured modes, and all hook-protocol commands.
 **Key functions**
 - `should_show_banner(cli, mode) -> bool` — pure gate: only `Text{color:true,..}` and non-hook-protocol commands qualify.
-- `is_hook_protocol(cmd) -> bool` — true for `session init`, all `checkpoint *`, `qmd reindex`, and their hidden aliases.
+- `is_hook_protocol(cmd) -> bool` — true for `session init`, all `checkpoint *`, and their hidden aliases (incl. the legacy `qmd-reindex` alias, which now dispatches to native `search reindex` but stays banner-suppressed for un-migrated hooks); plain `search reindex` is not part of this gate.
 - `render_banner() -> String` / `emit_banner<W>(w, cli, mode)` — build + gated stderr write.
 - `argv_requests_help` / `argv_requests_version` — pre-parse argv scanners (clap prints help/version in-process before dispatch).
 - `should_show_banner_for_help(mode, args, env: &HelpBannerEnv)` + `HelpBannerEnv::from_env` — pure help-path gate mirroring the color-suppression subset of the 6-rule chain.
@@ -89,7 +86,7 @@ CLI-side wiring for `onebrain_core::resolve_vault` — snapshots `--vault` flag 
 - `resolve(flag) -> Result<Option<ResolvedVault>>` — vault-free/informational, never errors.
 - `require(flag) -> Result<ResolvedVault>` — vault-required, errors `E_VAULT_NOT_FOUND` (exit 64).
 - `resolve_for_hook` / `info_from` / `print_vault_not_found_help` — reserved for v3.2+ hook-protocol and vault-required handlers (dead-code-allowed in v3.1).
-**Connections** — calls: `onebrain_core::{resolve_vault, require_vault}`; called by: `stubs::not_implemented_vault_required`, `plugin_update`, `vault_current`, `doctor`, `qmd_status`, `qmd_embed`.
+**Connections** — calls: `onebrain_core::{resolve_vault, require_vault}`; called by: `stubs::not_implemented_vault_required`, `plugin_update`, `vault_current`, `doctor`.
 
 ### `src/safety.rs`
 Shared filesystem-mutation guard.
@@ -103,9 +100,9 @@ Prints the v3.0→v3.1 rename notice once per alias, persisting shown aliases to
 
 ### `src/legacy_output.rs`
 Byte-stable v3.0 output shapes + the structured-mode serializer shared by the hook-protocol commands.
-**Key types** — `SessionInitOutput {datetime, session_token, qmd_unembedded, headless}` — extends the Bun v2.3.3 shape; `qmd_unembedded` is `Option<usize>` (v3.4: `null` when the qmd probe can't determine the count — missing / timed out / unparseable — distinct from a genuine `0`), the key is always present; `SessionInitBlock {decision, reason, error_detail}` with `init_required()` (`onebrain-vault-not-found`) and `vault_malformed(detail)` (`onebrain-vault-malformed`) constructors.
+**Key types** — `SessionInitOutput {datetime, session_token, qmd_unembedded, headless}` — extends the Bun v2.3.3 shape; `qmd_unembedded` is `Option<usize>` — the field name is kept for wire back-compat, but it now reports the **native** search index's pending/unembedded count (no qmd subprocess involved); `null` when the native probe can't determine the count (index missing / timed out) — distinct from a genuine `0` — the key is always present; `SessionInitBlock {decision, reason, error_detail}` with `init_required()` (`onebrain-vault-not-found`) and `vault_malformed(detail)` (`onebrain-vault-malformed`) constructors.
 **Key functions** — `serialize_for_mode<T>(value, mode) -> String` — JSON (compact/pretty), YAML, Table/Tsv→compact-JSON fallback; Text-mode arrival is a caller bug (`debug_assert!`, compact-JSON fallback in release). Serde failures are loud on stderr (avoids the v3.0 empty-stdout regression).
-**Connections** — called by: `session_init`, `orphan_scan`, `harness`, `qmd_status`, `update`, `doctor`.
+**Connections** — called by: `session_init`, `orphan_scan`, `harness`, `update`, `doctor`.
 
 ## `output/` — rendering & the Envelope
 Every v3.1 command body builds typed `data`, wraps it in an `Envelope<T>`, and hands it to `dispatcher::emit`, which picks the serializer from the `OutputMode` resolved from CLI flags + env + TTY state. The envelope is the canonical machine contract; the legacy hook-protocol commands instead use `legacy_output::serialize_for_mode` for their byte-stable shapes.
@@ -134,25 +131,16 @@ Single emit point for envelopes.
 **Connections** — called by: `vault_current::run`, `main::render_error`, `dispatch::emit_plugin_update_summary_to`. Tests cover each mode + double-newline avoidance.
 
 ## `commands/` — command handlers
-One handler module per working v3.0/legacy verb; `commands/mod.rs` just declares them. The clap subcommand enum is **not** matched here — `v31::dispatch::dispatch` maps each `Cmd` variant to the right `commands::*::run`, passing the resolved `OutputMode` and vault flag. These handlers predate the envelope; the hook-protocol ones (`session_init`, `orphan_scan`, `harness`, `qmd_status`) render via `legacy_output::serialize_for_mode` and own per-command text renderers, while lifecycle handlers (`init`, `update`, `doctor`, `vault_sync`, `register_*`, `run_skill`) return an `i32` exit code that the dispatcher passes straight to `process::exit`.
+One handler module per working v3.0/legacy verb; `commands/mod.rs` just declares them. The clap subcommand enum is **not** matched here — `v31::dispatch::dispatch` maps each `Cmd` variant to the right `commands::*::run`, passing the resolved `OutputMode` and vault flag. These handlers predate the envelope; the hook-protocol ones (`session_init`, `orphan_scan`, `harness`) render via `legacy_output::serialize_for_mode` and own per-command text renderers, while lifecycle handlers (`init`, `update`, `doctor`, `vault_sync`, `register_*`, `run_skill`) return an `i32` exit code that the dispatcher passes straight to `process::exit`.
 
 ### `src/commands/session_init.rs`
-Implements `session init` (hook-protocol; SessionStart hook). Walks up for the vault, loads config, resolves the session token, queries qmd unembedded count (only if `qmd_collection` set), emits `SessionInitOutput` or a `SessionInitBlock`. Library calls: `onebrain_core::{find_vault_root, load_vault_config}`, `onebrain_cache::{resolve_session_token, query_unembedded_count, clean_stale_state_file}`. Output: text default, `--json`/`--yaml` structured (machine consumers must pass `--json`).
+Implements `session init` (hook-protocol; SessionStart hook). Walks up for the vault, loads config, resolves the session token, and — only when the vault has a `search.collection` configured (falling back to the legacy `qmd_collection` key) — probes the **native** search index for the pending/unembedded doc count via `native_pending_bounded` (a time-boxed wrapper over `native_pending`, which checks the collection's cache dir exists via `commands::search_common::{collection_cache_dir, is_indexed}` before opening `onebrain_search::engine::Engine` and calling `.status(..).pending_total()`); no `qmd` subprocess is spawned. Emits `SessionInitOutput` (still carrying the `qmd_unembedded` field name for wire back-compat) or a `SessionInitBlock`. Library calls: `onebrain_core::{find_vault_root, load_vault_config}`, `onebrain_cache::{resolve_session_token, clean_stale_state_file}`, `onebrain_search::engine::Engine`. Output: text default, `--json`/`--yaml` structured (machine consumers must pass `--json`).
 
 ### `src/commands/checkpoint.rs`
 Implements `checkpoint stop` and `checkpoint reset`. Resolves the session token, then delegates to `onebrain_cache::{handle_stop, handle_reset}` against `std::env::temp_dir()` cache. `stop` writes checkpoint metadata to stdout; `reset` clears the cadence counter. Library: `onebrain_cache`. Output: handled inside the cache crate (hook-protocol).
 
 ### `src/commands/orphan_scan.rs`
 Implements `checkpoint orphans` (and the `orphan-scan` alias; SessionStart hook). Calls `onebrain_fs::scan_orphans(logs_folder, session_token, now, vault_root) -> OrphanScanResult`. Output: text (`N orphan checkpoints found …`) default, structured via `serialize_for_mode` (`{"orphan_count":N}`).
-
-### `src/commands/qmd_reindex.rs`
-Implements `qmd reindex` (and the `qmd-reindex` alias; PostToolUse hook). Calls `onebrain_cache::qmd_reindex(vault_root, SpawnOs::from_env(), spawn_detached)` which spawns `qmd update` as a **detached** background process (platform-specific detach flags). No wait, no stdout. Library: `onebrain_cache`.
-
-### `src/commands/qmd_embed.rs`
-Implements `qmd embed`. Vault-required (`vault_ctx::require` → exit 64). Runs `qmd embed` in the **foreground** with inherited stdio so progress streams; surfaces a non-zero qmd exit as an error. Windows routes through `powershell.exe`. Library: `vault_ctx`.
-
-### `src/commands/qmd_status.rs`
-Implements `qmd status`. Vault-required. Reads `qmd_collection` from config, shells to `onebrain_cache::query_status() -> Option<QmdStatus>`, builds `QmdStatusReport {collection, qmd_available, #[flatten] index}`. Library: `vault_ctx`, `onebrain_core::load_vault_config`, `onebrain_cache::query_status`. Output: text (collection · indexed · embedded · pending) default, structured via `serialize_for_mode`.
 
 ### `src/commands/harness.rs`
 Implements `harness detect` (default verb when none given). Calls `onebrain_fs::detect_harnesses(&cwd)`, emits `HarnessOutput {harnesses}`. Library: `onebrain_fs`. Output: text (`Detected harnesses: …`) default, structured via `serialize_for_mode`.
@@ -173,7 +161,7 @@ Implements `plugin migrate` (and the `migrate` alias). Resolves vault root, load
 Implements `vault sync` (and the `vault-sync` alias). Resolves vault root (positional/flag/walk-up), passes through `safety::refuse_dangerous_vault_path`, then `onebrain_fs::run_vault_sync(root, VaultSyncOptions{branch,..})` overlays the upstream release tarball. Returns `Ok(0)` / `Ok(1)`. Library: `onebrain_fs`, `onebrain_core::find_vault_root`, `safety`.
 
 ### `src/commands/register_hooks.rs`
-Implements `plugin install` (and the `register-hooks` alias). Idempotent `.claude/settings.json` wiring via `onebrain_fs::register_hooks::run(RegisterHooksOptions{vault_dir,dry_run,remove})` — adds the Stop hook, optional PostToolUse qmd hook, and the OneBrain permission set. Prints a summary; returns 0 / 1. Library: `onebrain_fs::register_hooks`.
+Implements `plugin install` (and the `register-hooks` alias). Idempotent `.claude/settings.json` wiring via `onebrain_fs::register_hooks::run(RegisterHooksOptions{vault_dir,dry_run,remove})` — adds the Stop hook, an optional PostToolUse reindex hook (registered when `search.collection`/legacy `qmd_collection` is configured; internally still called the "qmd hook" for legacy naming, but its `HookSpec` now dispatches to native `onebrain search reindex --json`), and the OneBrain permission set. Prints a summary; returns 0 / 1. Library: `onebrain_fs::register_hooks`.
 
 ### `src/commands/register_schedule.rs`
 Implements `schedule register` (and the `register-schedule` alias). Six flags route at the top (`--remove`/`--status`/`--test`/`--resume`/`--refresh`/`--dry-run`); otherwise validates each `schedule:` entry and emits launchd plists. Library: `onebrain_core::scheduler::*` (validate/generate/label/plist helpers + `LaunchdContext`). Output: plain status lines. Also invoked internally by `plugin_update` (`--refresh`).
@@ -198,7 +186,7 @@ Central dispatcher.
 
 ### `src/v31/hook_rewriter.rs`
 Rewrites v3.0 hook entries in `.claude/settings.json` to v3.1 paths during `plugin update`. Strictly additive + fully idempotent; only touches entries whose `command == "onebrain"`.
-**Key items** — `REWRITES` (`session-init`→`session init`, `orphan-scan`→`checkpoint orphans`, `qmd-reindex`→`qmd reindex`, preserving trailing args); `JSON_REQUIRED_PREFIXES` (`session init`, `checkpoint orphans`, `checkpoint stop`, `qmd reindex` must carry `--json` since the v3.1 default is now text); `RewriteReport {rewrites, total, json_flag_added, warnings}`; `RewriteWarning {code, message}`. `rewrite_hooks(&mut Value) -> RewriteReport`, `rewrite_settings_file(path, dry_run) -> Result<RewriteReport>` (load→rewrite→write-back, no-op on missing file). Malformed entries (non-string `command` / non-array `args`) emit `W_MALFORMED_HOOK_ENTRY` and are skipped; `--json` injection is gated by `has_explicit_format_flag` so an explicit `--yaml`/`--output` is never clobbered.
+**Key items** — `REWRITES` (`session-init`→`session init`, `orphan-scan`→`checkpoint orphans`, `qmd-reindex`→`search reindex`, `qmd reindex`→`search reindex`, preserving trailing args); `JSON_REQUIRED_PREFIXES` (`session init`, `checkpoint orphans`, `checkpoint stop`, `search reindex` must carry `--json` since the v3.1 default is now text); `RewriteReport {rewrites, total, json_flag_added, warnings}`; `RewriteWarning {code, message}`. `rewrite_hooks(&mut Value) -> RewriteReport`, `rewrite_settings_file(path, dry_run) -> Result<RewriteReport>` (load→rewrite→write-back, no-op on missing file). Malformed entries (non-string `command` / non-array `args`) emit `W_MALFORMED_HOOK_ENTRY` and are skipped; `--json` injection is gated by `has_explicit_format_flag` so an explicit `--yaml`/`--output` is never clobbered.
 **Connections** — called by: `plugin_update::run`. Extensive `#[cfg(test)]` over path rewrites, flag injection, idempotency, and malformed-entry warnings.
 
 ### `src/v31/plugin_update.rs`
@@ -220,13 +208,10 @@ Turns the forward-declared command surface into clean exits.
 
 | `onebrain <noun> <verb>` | Handler file | Library crate it drives |
 |---|---|---|
-| `session init` | `commands/session_init.rs` | onebrain-core (config, vault) · onebrain-cache (token, qmd count) |
+| `session init` | `commands/session_init.rs` | onebrain-core (config, vault) · onebrain-cache (token) · onebrain-search (native pending-count probe) |
 | `checkpoint stop` | `commands/checkpoint.rs` | onebrain-cache (`handle_stop`) |
 | `checkpoint reset` | `commands/checkpoint.rs` | onebrain-cache (`handle_reset`) |
 | `checkpoint orphans` | `commands/orphan_scan.rs` | onebrain-fs (`scan_orphans`) |
-| `qmd reindex` | `commands/qmd_reindex.rs` | onebrain-cache (`qmd_reindex`, detached spawn) |
-| `qmd embed` | `commands/qmd_embed.rs` | (vault_ctx) + external `qmd` binary, foreground |
-| `qmd status` | `commands/qmd_status.rs` | onebrain-core (config) · onebrain-cache (`query_status`) |
 | `harness detect` | `commands/harness.rs` | onebrain-fs (`detect_harnesses`) |
 | `vault sync` | `commands/vault_sync.rs` | onebrain-fs (`run_vault_sync`) · onebrain-core (`find_vault_root`) |
 | `vault current` | `v31/vault_current.rs` | onebrain-core (`load_vault_config`) + vault_ctx |
@@ -240,7 +225,7 @@ Turns the forward-declared command surface into clean exits.
 | `doctor` | `commands/doctor.rs` | onebrain-fs (`doctor::run_all_checks`) · onebrain-core (config) |
 | all other `<noun> <verb>` | `v31/stubs.rs` | none (exit 72, or 64 outside a vault) |
 
-Hidden v3.0 aliases route through the same handlers after a one-time migration notice: `session-init`→`session_init`, `orphan-scan`→`orphan_scan`, `qmd-reindex`→`qmd_reindex`, `register-hooks`→`register_hooks`, `register-schedule`→`register_schedule`, `migrate`→`migrate`, `vault-sync`→`vault_sync`, `run-skill`→`run_skill`.
+Hidden v3.0 aliases route through the same handlers after a one-time migration notice: `session-init`→`session_init`, `orphan-scan`→`orphan_scan`, `qmd-reindex`→`search_reindex` (dispatches to the native `search reindex` handler, kept for un-migrated hooks), `register-hooks`→`register_hooks`, `register-schedule`→`register_schedule`, `migrate`→`migrate`, `vault-sync`→`vault_sync`, `run-skill`→`run_skill`.
 
 ## Entry points
 - `fn main()` (`src/main.rs`) — process entry; help pre-pass → `Cli::parse()` → dispatch → `process::exit`.

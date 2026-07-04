@@ -76,7 +76,6 @@ pub enum Cmd {
     //   10-13 · vault & session ops (vault, session, checkpoint, harness)
     //   14-18 · content & serving (serve, note, task, search, mcp)
     //   20-23 · config & maintenance (plugin, schedule, config, skill)
-    //   30   · search/index (qmd)
     //   99   · clap-managed `help` meta
     //
     /// Initialize a new vault (interactive setup).
@@ -136,8 +135,6 @@ pub enum Cmd {
     Pause(PauseCmd),
     #[command(display_order = 20)]
     Plugin(PluginCmd),
-    #[command(display_order = 30)]
-    Qmd(QmdCmd),
     #[command(display_order = 21)]
     Schedule(ScheduleCmd),
     #[command(display_order = 17)]
@@ -171,6 +168,15 @@ pub enum Cmd {
     VaultSyncAlias(LegacyVaultSyncArgs),
     #[command(hide = true, name = "run-skill")]
     RunSkillAlias(LegacyRunSkillArgs),
+
+    /// Removed in v3.4.5 — use `onebrain search …`. Hidden catch-all so the
+    /// removal emits a helpful migration error instead of clap's bare
+    /// "unrecognized subcommand".
+    #[command(hide = true, disable_help_flag = true)]
+    Qmd {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        rest: Vec<String>,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1139,32 +1145,6 @@ pub enum PluginVerb {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// qmd (search/setup/status visible · embed/reindex hidden)
-// ─────────────────────────────────────────────────────────────────────────
-
-#[derive(Args, Debug)]
-#[command(about = "Vault search index", disable_help_subcommand = true)]
-pub struct QmdCmd {
-    #[command(subcommand)]
-    pub verb: QmdVerb,
-}
-#[derive(Subcommand, Debug)]
-pub enum QmdVerb {
-    /// Initial qmd setup wizard (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Setup,
-    /// Re-embed documents (called by indexer hook · users can invoke manually).
-    Embed,
-    /// Report qmd index + embedding health (collection · indexed · embedded · pending).
-    Status,
-    /// Rebuild the qmd search index · called by PostToolUse hook on vault writes (replaces v3.0 `qmd-reindex`).
-    Reindex,
-    /// Search the qmd index from CLI (not yet implemented · v3.x roadmap · use the MCP `query` tool meanwhile).
-    #[command(hide = true)]
-    Search { query: String },
-}
-
-// ─────────────────────────────────────────────────────────────────────────
 // schedule (register hidden · others visible)
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -1543,7 +1523,6 @@ mod tests {
             "harness",
             "note",
             "plugin",
-            "qmd",
             "schedule",
             "session",
             "skill",

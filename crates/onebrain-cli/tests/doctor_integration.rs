@@ -464,9 +464,8 @@ fn doctor_fix_migrates_vault_yml_with_vault_flag() {
     Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(elsewhere.path())
-        // Scrub PATH so `which::which("qmd")` returns NotFound — the
-        // minimal fixture omits qmd_collection so the recipe must NOT
-        // spawn real qmd on the developer's machine.
+        // Minimal, deterministic PATH so `doctor --fix` runs against a
+        // predictable environment (no developer-specific binaries leak in).
         .env("PATH", "/usr/bin:/bin")
         .args(["doctor", "--fix", "--vault"])
         .arg(vault.path())

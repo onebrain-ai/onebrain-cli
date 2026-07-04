@@ -84,7 +84,7 @@ fn completions_exclude_hidden_top_level_commands() {
 #[test]
 fn completions_keep_visible_commands() {
     let out = completions_for("zsh");
-    for visible in ["init", "update", "doctor", "qmd", "schedule"] {
+    for visible in ["init", "update", "doctor", "schedule"] {
         assert!(
             out.contains(visible),
             "visible command `{visible}` missing from zsh completions"
@@ -134,6 +134,7 @@ fn completions_hidden_aliases_absent_from_top_level() {
         "register-hooks",
         "register-schedule",
         "qmd-reindex",
+        "qmd",
     ] {
         // Match as a whole word in the space-separated candidate list.
         let leaked = opts_line
@@ -148,7 +149,7 @@ fn completions_hidden_aliases_absent_from_top_level() {
     // Sanity: the visible top-level commands ARE candidates. `serve` joined
     // the visible set in v3.3 (was a hidden stub group pre-v3.3 step 2).
     for visible in [
-        "init", "update", "doctor", "qmd", "schedule", "vault", "session", "serve",
+        "init", "update", "doctor", "schedule", "vault", "session", "serve",
     ] {
         let present = opts_line
             .split_whitespace()
@@ -160,39 +161,10 @@ fn completions_hidden_aliases_absent_from_top_level() {
     }
 }
 
-/// Real-tree proof that hidden NESTED verbs are filtered. The unit tests cover
-/// this on a synthetic tree; this asserts it against the actual `qmd` group in
-/// the generated bash script: `embed`/`status`/`reindex` are visible verbs while
-/// `setup`/`search` are `#[command(hide = true)]` (and `help` is suppressed via
-/// the group's `disable_help_subcommand`).
-#[test]
-fn completions_exclude_hidden_nested_verbs() {
-    let out = completions_for("bash");
-    // The qmd group's candidate list is the `opts="..."` line holding its visible
-    // verbs (and not the top-level list, which carries `init`/`doctor`).
-    let qmd_opts = out
-        .lines()
-        .map(str::trim_start)
-        .filter(|l| l.starts_with("opts=\""))
-        .find(|l| l.contains(" embed ") || l.ends_with(" embed\"") || l.contains(" embed reindex"))
-        .filter(|l| !(l.contains(" init ") && l.contains(" doctor ")))
-        .expect("bash script must contain a qmd group opts= candidate list");
-
-    let candidates: Vec<&str> = qmd_opts
-        .split_whitespace()
-        .map(|tok| tok.trim_start_matches("opts=\"").trim_matches('"'))
-        .collect();
-
-    for visible in ["embed", "status", "reindex"] {
-        assert!(
-            candidates.contains(&visible),
-            "visible qmd verb `{visible}` missing from candidate list: {qmd_opts}"
-        );
-    }
-    for hidden in ["setup", "search", "help"] {
-        assert!(
-            !candidates.contains(&hidden),
-            "hidden qmd verb `{hidden}` leaked into candidate list: {qmd_opts}"
-        );
-    }
-}
+// `completions_exclude_hidden_nested_verbs` (real-tree proof that hidden
+// NESTED verbs are filtered, exercised against the `qmd` group) was removed
+// in v3.4.5: `qmd` is no longer a subcommand group with visible/hidden verb
+// children — it's now a fully hidden catch-all (`Cmd::Qmd { rest }`) that
+// only emits a migration error. The hide-nested-verbs behavior itself is
+// still covered by the synthetic-tree unit tests referenced in the removed
+// test's doc comment.

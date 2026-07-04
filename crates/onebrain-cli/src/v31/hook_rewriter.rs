@@ -8,10 +8,11 @@
 //! Mapping (skill-alignment §4.7 + design §7):
 //!   - `["session-init"]`   → `["session", "init", "--json"]`
 //!   - `["orphan-scan", L, T]` → `["checkpoint", "orphans", L, T, "--json"]`
-//!   - `["qmd-reindex"]`    → `["qmd", "reindex", "--json"]`
+//!   - `["qmd-reindex"]`    → `["search", "reindex", "--json"]`
+//!   - `["qmd", "reindex"]` → `["search", "reindex", "--json"]`
 //!   - `["session", "init"]`        → ensure trailing `--json`
 //!   - `["checkpoint", "orphans", …]` → ensure trailing `--json`
-//!   - `["qmd", "reindex"]`         → ensure trailing `--json`
+//!   - `["search", "reindex"]`      → ensure trailing `--json`
 //!   - `["checkpoint", "stop"]`     → ensure trailing `--json`
 //!
 //! v3.1 contract: hook-protocol commands default to TEXT output for
@@ -47,7 +48,11 @@ const REWRITES: &[ArgsRewrite] = &[
     },
     ArgsRewrite {
         from: &["qmd-reindex"],
-        to: &["qmd", "reindex"],
+        to: &["search", "reindex"],
+    },
+    ArgsRewrite {
+        from: &["qmd", "reindex"],
+        to: &["search", "reindex"],
     },
 ];
 
@@ -59,7 +64,7 @@ const JSON_REQUIRED_PREFIXES: &[&[&str]] = &[
     &["session", "init"],
     &["checkpoint", "orphans"],
     &["checkpoint", "stop"],
-    &["qmd", "reindex"],
+    &["search", "reindex"],
 ];
 
 /// Result of a rewrite pass over a settings.json document.
@@ -363,11 +368,11 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_qmd_reindex() {
+    fn rewrites_qmd_reindex_to_search_reindex() {
         let mut s = settings_with_v30_hooks();
         rewrite_hooks(&mut s);
         let entry = &s["hooks"]["PostToolUse"][0]["hooks"][0];
-        assert_eq!(entry["args"], json!(["qmd", "reindex", "--json"]));
+        assert_eq!(entry["args"], json!(["search", "reindex", "--json"]));
     }
 
     #[test]
@@ -618,7 +623,7 @@ mod tests {
         );
         assert_eq!(
             after["hooks"]["PostToolUse"][0]["hooks"][0]["args"],
-            json!(["qmd", "reindex", "--json"])
+            json!(["search", "reindex", "--json"])
         );
     }
 

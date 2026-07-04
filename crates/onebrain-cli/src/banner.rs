@@ -15,8 +15,8 @@
 //!    `--json`, `--yaml`, and `NO_COLOR`/`TERM=dumb`/`CI=true`/`--no-color`
 //!    all drop colour and therefore drop the banner.
 //! 3. Hook-protocol commands (`session init`, `checkpoint stop/reset/orphans`,
-//!    `qmd reindex`, and their hidden v3.0 aliases `session-init`/
-//!    `orphan-scan`/`qmd-reindex`) need deterministic stderr because Claude
+//!    and their hidden v3.0 aliases `session-init`/`orphan-scan`/
+//!    `qmd-reindex`) need deterministic stderr because Claude
 //!    Code's Stop hook surfaces stderr to the user. Banner output would
 //!    pollute the error UI, so the cleanest contract is "no banner at all
 //!    for hook commands".
@@ -37,9 +37,7 @@
 //! static strings + `env!("CARGO_PKG_VERSION")` (a compile-time constant), no
 //! allocations beyond the format buffer, no I/O beyond a single stderr flush.
 
-use crate::cli::{
-    CheckpointCmd, CheckpointVerb, Cli, Cmd, QmdCmd, QmdVerb, SessionCmd, SessionVerb,
-};
+use crate::cli::{CheckpointCmd, CheckpointVerb, Cli, Cmd, SessionCmd, SessionVerb};
 use crate::output::OutputMode;
 use std::io::Write;
 
@@ -156,9 +154,11 @@ pub fn should_show_banner(cli: &Cli, mode: &OutputMode) -> bool {
 }
 
 /// True for commands that participate in Claude Code's hook protocol —
-/// session init, all checkpoint verbs, qmd reindex, plus their hidden v3.0
-/// aliases. These commands MUST have a clean stdout (and effectively a clean
-/// stderr too — banners on stderr can confuse log scrapers).
+/// session init, all checkpoint verbs, plus their hidden v3.0 aliases (the
+/// legacy `qmd-reindex` alias now dispatches to native `search reindex`, but
+/// stays banner-suppressed here so un-migrated hooks keep clean stdio). These
+/// commands MUST have a clean stdout (and effectively a clean stderr too —
+/// banners on stderr can confuse log scrapers).
 fn is_hook_protocol(cmd: &Cmd) -> bool {
     match cmd {
         Cmd::Session(SessionCmd {
@@ -170,9 +170,6 @@ fn is_hook_protocol(cmd: &Cmd) -> bool {
                 | CheckpointVerb::Reset { .. }
                 | CheckpointVerb::Orphans { .. }
         ),
-        Cmd::Qmd(QmdCmd {
-            verb: QmdVerb::Reindex,
-        }) => true,
         // Hidden v3.0 aliases that dispatch to the hook handlers.
         Cmd::SessionInitAlias(_) | Cmd::OrphanScanAlias(_) | Cmd::QmdReindexAlias => true,
         _ => false,
@@ -603,11 +600,10 @@ mod tests {
         assert!(!should_show_banner(&cli, &color_text_mode()));
     }
 
-    #[test]
-    fn qmd_reindex_suppresses_banner() {
-        let cli = parse(&["onebrain", "qmd", "reindex"]);
-        assert!(!should_show_banner(&cli, &color_text_mode()));
-    }
+    // `onebrain qmd reindex` was removed in v3.4.5 — `qmd` is now a hidden
+    // catch-all that errors out (see `tests/qmd_removed.rs`), no longer a
+    // real hook-protocol dispatch arm. `legacy_qmd_reindex_alias_suppresses_banner`
+    // below still covers the surviving `qmd-reindex` alias.
 
     #[test]
     fn legacy_session_init_alias_suppresses_banner() {

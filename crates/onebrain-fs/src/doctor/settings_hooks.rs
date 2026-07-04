@@ -5,8 +5,8 @@
 //! Validates that:
 //! - The Stop hook is registered in canonical exec form
 //!   (`command: "onebrain", args: ["checkpoint", "stop"]`).
-//! - If `qmd_collection` is set in vault.yml, the PostToolUse qmd hook is
-//!   also registered.
+//! - If `qmd_collection` is set in vault.yml, the PostToolUse reindex hook
+//!   (canonical `search reindex`) is also registered.
 //! - No onebrain-* commands are registered under hook events other than
 //!   `Stop` / `PostToolUse` (stale events from previous CLI versions).
 //! - No stale bash-wrapper scripts (`checkpoint-hook.sh`, `session-init.sh`)
@@ -29,8 +29,12 @@ const REQUIRED_HOOKS: &[(&str, &str)] = &[("Stop", "onebrain checkpoint stop")];
 /// SessionStart, etc.) is stale and must be removed.
 const ALLOWED_HOOK_EVENTS: &[&str] = &["Stop", "PostToolUse"];
 
-/// Canonical NEW qmd hook form (v3.2+): the real subcommand `qmd reindex`.
-const QMD_HOOK_SUBSTRING_NEW: &str = "onebrain qmd reindex";
+/// Canonical NEW reindex hook form (v3.4.5+): the native `search reindex`
+/// subcommand.
+const QMD_HOOK_SUBSTRING_NEW: &str = "onebrain search reindex";
+/// Legacy v3.2–v3.4 form: `qmd reindex` (space). doctor must still recognize
+/// this so it can advise migrating to the new form via `--fix`.
+const QMD_HOOK_SUBSTRING_LEGACY_QMD_REINDEX: &str = "onebrain qmd reindex";
 /// Legacy v3.0/v3.1 hidden alias `qmd-reindex` (hyphen). doctor must still
 /// recognize this so it can advise migrating to the new form via `--fix`.
 const QMD_HOOK_SUBSTRING_LEGACY: &str = "onebrain qmd-reindex";
@@ -43,9 +47,9 @@ const CANONICAL_HOOK_COMMAND: &str = "onebrain";
 /// - `Exec`        — canonical exec form: `{ command: "onebrain", args: [...] }`
 /// - `LegacyShell` — exactly one matching entry, not in canonical exec form
 ///   (shell-form, wrapper like `bash -c …`, missing args[], etc.).
-/// - `LegacyAlias` — exactly one matching entry in exec form but using the
-///   v3.0/v3.1 hidden alias (`qmd-reindex` hyphen) instead of the canonical
-///   subcommand (`qmd reindex` space). qmd-specific.
+/// - `LegacyAlias` — exactly one matching entry in exec form but using a
+///   legacy reindex subcommand (`qmd reindex` space or `qmd-reindex` hyphen)
+///   instead of the canonical `search reindex`. qmd-specific.
 /// - `Duplicate(n)` — `n >= 2` matching entries (any mix of forms).
 /// - `Absent`      — no entry matches.
 #[derive(Debug, PartialEq, Eq)]
@@ -132,17 +136,19 @@ fn detect_hook_form(settings: &Value, event: &str, substring: &str) -> HookForm 
     }
 }
 
-/// Classify the PostToolUse qmd hook by counting EVERY entry whose effective
-/// command matches the new (`onebrain qmd reindex`) OR the legacy alias
-/// (`onebrain qmd-reindex`) form. Unlike `detect_hook_form` (which short-
-/// circuits on the first canonical match), this counts all matches so a
-/// duplicated hook is reported as such rather than silently passing.
+/// Classify the PostToolUse reindex hook by counting EVERY entry whose
+/// effective command matches the new canonical (`onebrain search reindex`)
+/// OR either legacy form (`onebrain qmd reindex` space, `onebrain
+/// qmd-reindex` hyphen). Unlike `detect_hook_form` (which short-circuits on
+/// the first canonical match), this counts all matches so a duplicated hook
+/// is reported as such rather than silently passing.
 ///
 /// Returns:
 /// - `Absent`        — 0 matches
 /// - `Duplicate(n)`  — n >= 2 matches (any mix of forms)
-/// - `Exec`          — exactly 1, new canonical exec form (`qmd reindex`)
-/// - `LegacyAlias`   — exactly 1, exec form using the hyphen alias
+/// - `Exec`          — exactly 1, new canonical exec form (`search reindex`)
+/// - `LegacyAlias`   — exactly 1, exec form using a legacy subcommand
+///   (`qmd reindex` or `qmd-reindex`)
 /// - `LegacyShell`   — exactly 1, shell form (command string, no args[])
 fn detect_qmd_hook_form(settings: &Value) -> HookForm {
     // (is_exec, is_new_form) for each matching entry.
@@ -158,13 +164,14 @@ fn detect_qmd_hook_form(settings: &Value) -> HookForm {
             for h in hooks {
                 let cmd = effective_command(h);
                 let is_new = cmd.contains(QMD_HOOK_SUBSTRING_NEW);
-                let is_legacy = cmd.contains(QMD_HOOK_SUBSTRING_LEGACY);
+                let is_legacy = cmd.contains(QMD_HOOK_SUBSTRING_LEGACY_QMD_REINDEX)
+                    || cmd.contains(QMD_HOOK_SUBSTRING_LEGACY);
                 if !is_new && !is_legacy {
                     continue;
                 }
                 // `is_canonical` only checks command=="onebrain" + non-empty
                 // args[]; pair it with the form flag so we can tell the new
-                // exec form apart from the hyphen-alias exec form.
+                // exec form apart from a legacy-subcommand exec form.
                 matches.push((is_canonical(h), is_new));
             }
         }
@@ -231,13 +238,14 @@ impl Check for SettingsHooksCheck {
             }
         }
 
-        // PostToolUse (qmd) — conditional on qmd_collection. Recognizes BOTH
-        // the new `qmd reindex` form and the legacy `qmd-reindex` alias.
+        // PostToolUse (qmd) — conditional on qmd_collection. Recognizes the
+        // new canonical `search reindex` form as well as either legacy form
+        // (`qmd reindex` space, `qmd-reindex` hyphen).
         if config.qmd_collection.is_some() {
             match detect_qmd_hook_form(&settings) {
                 HookForm::Exec => confirmed_hooks.push("PostToolUse ✓".to_string()),
                 HookForm::LegacyAlias => warnings.push(
-                    "PostToolUse (qmd) hook uses legacy form (qmd-reindex) — run onebrain doctor --fix to migrate"
+                    "PostToolUse (qmd) hook uses legacy form (qmd reindex) — run onebrain doctor --fix to migrate"
                         .to_string(),
                 ),
                 HookForm::LegacyShell => warnings.push(
@@ -587,9 +595,9 @@ mod tests {
                     {
                         "matcher": "Write|Edit",
                         "hooks": [
-                            // Canonical NEW form: `qmd reindex` (space), not the
-                            // legacy `qmd-reindex` alias.
-                            { "command": "onebrain", "args": ["qmd", "reindex", "--json"] }
+                            // Canonical NEW form: `search reindex`, not a
+                            // legacy `qmd reindex` / `qmd-reindex` form.
+                            { "command": "onebrain", "args": ["search", "reindex", "--json"] }
                         ]
                     }
                 ]
@@ -613,10 +621,63 @@ mod tests {
             .any(|s| s.contains("permissions: Bash(onebrain *) ✓")));
     }
 
-    /// New canonical exec form `qmd reindex` → ✓ ok (regression for the
-    /// v3.1 false-positive: doctor used to only match the hyphen form).
+    /// New canonical exec form `search reindex` → ✓ ok. This is exactly the
+    /// shape `apply_qmd_hook` (register_hooks/hooks.rs) now emits — this
+    /// test is the cross-check that prevents the two modules from drifting.
     #[test]
     fn qmd_new_exec_form_reports_ok() {
+        let d = tempdir().unwrap();
+        let s = json!({
+            "hooks": {
+                "Stop": [
+                    { "matcher": "", "hooks": [
+                        { "command": "onebrain", "args": ["checkpoint", "stop"] }
+                    ] }
+                ],
+                "PostToolUse": [
+                    { "matcher": "Write|Edit", "hooks": [
+                        { "command": "onebrain", "args": ["search", "reindex", "--json"] }
+                    ] }
+                ]
+            },
+            "permissions": { "allow": ["Bash(onebrain *)"] }
+        });
+        write_settings(d.path(), &s);
+        let r = SettingsHooksCheck.run(d.path(), &cfg(Some("ob-1")));
+        assert_eq!(r.status, DoctorStatus::Ok, "details: {:?}", r.details);
+        let hooks_detail = r
+            .details
+            .iter()
+            .find(|s| s.starts_with("hooks:"))
+            .expect("hooks detail present");
+        assert!(hooks_detail.contains("PostToolUse ✓"));
+    }
+
+    /// `detect_qmd_hook_form` directly on the exact entry shape emitted by
+    /// `apply_qmd_hook`'s `HookSpec::QMD` (`{"type":"command","command":
+    /// "onebrain","args":["search","reindex","--json"]}`) — classifies as
+    /// the present canonical form.
+    #[test]
+    fn apply_qmd_hook_emitted_entry_is_recognized_as_canonical() {
+        let settings = json!({
+            "hooks": {
+                "PostToolUse": [
+                    { "matcher": "Write|Edit", "hooks": [
+                        {
+                            "type": "command",
+                            "command": "onebrain",
+                            "args": ["search", "reindex", "--json"]
+                        }
+                    ] }
+                ]
+            }
+        });
+        assert_eq!(detect_qmd_hook_form(&settings), HookForm::Exec);
+    }
+
+    /// Single legacy exec form `qmd reindex` (space) → advisory to migrate.
+    #[test]
+    fn qmd_legacy_space_form_is_advisory() {
         let d = tempdir().unwrap();
         let s = json!({
             "hooks": {
@@ -635,16 +696,13 @@ mod tests {
         });
         write_settings(d.path(), &s);
         let r = SettingsHooksCheck.run(d.path(), &cfg(Some("ob-1")));
-        assert_eq!(r.status, DoctorStatus::Ok, "details: {:?}", r.details);
-        let hooks_detail = r
-            .details
-            .iter()
-            .find(|s| s.starts_with("hooks:"))
-            .expect("hooks detail present");
-        assert!(hooks_detail.contains("PostToolUse ✓"));
+        assert_eq!(r.status, DoctorStatus::Warn, "details: {:?}", r.details);
+        assert!(r.details.iter().any(|s| s.contains(
+            "PostToolUse (qmd) hook uses legacy form (qmd reindex) — run onebrain doctor --fix to migrate"
+        )), "details: {:?}", r.details);
     }
 
-    /// Single legacy-alias exec form `qmd-reindex` → advisory to migrate.
+    /// Single legacy-alias exec form `qmd-reindex` (hyphen) → advisory to migrate.
     #[test]
     fn qmd_legacy_alias_exec_form_is_advisory() {
         let d = tempdir().unwrap();
@@ -667,7 +725,7 @@ mod tests {
         let r = SettingsHooksCheck.run(d.path(), &cfg(Some("ob-1")));
         assert_eq!(r.status, DoctorStatus::Warn, "details: {:?}", r.details);
         assert!(r.details.iter().any(|s| s.contains(
-            "PostToolUse (qmd) hook uses legacy form (qmd-reindex) — run onebrain doctor --fix to migrate"
+            "PostToolUse (qmd) hook uses legacy form (qmd reindex) — run onebrain doctor --fix to migrate"
         )), "details: {:?}", r.details);
     }
 
@@ -684,10 +742,10 @@ mod tests {
                 ],
                 "PostToolUse": [
                     { "matcher": "Write|Edit", "hooks": [
-                        { "command": "onebrain", "args": ["qmd", "reindex", "--json"] }
+                        { "command": "onebrain", "args": ["search", "reindex", "--json"] }
                     ] },
                     { "matcher": "Write|Edit", "hooks": [
-                        { "command": "onebrain", "args": ["qmd", "reindex", "--json"] }
+                        { "command": "onebrain", "args": ["search", "reindex", "--json"] }
                     ] }
                 ]
             },
@@ -719,7 +777,7 @@ mod tests {
                 "PostToolUse": [
                     { "matcher": "Write|Edit", "hooks": [
                         { "command": "onebrain", "args": ["qmd-reindex", "--json"] },
-                        { "command": "onebrain", "args": ["qmd", "reindex", "--json"] }
+                        { "command": "onebrain", "args": ["search", "reindex", "--json"] }
                     ] }
                 ]
             },
@@ -749,7 +807,7 @@ mod tests {
                 ],
                 "PostToolUse": [
                     { "matcher": "Write|Edit", "hooks": [
-                        { "command": "onebrain qmd reindex" }
+                        { "command": "onebrain search reindex" }
                     ] }
                 ]
             },

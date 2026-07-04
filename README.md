@@ -178,8 +178,8 @@ onebrain
 | Group | Verbs | Purpose |
 |---|---|---|
 | **Setup** | `init`, `plugin install`, `vault sync` | Scaffold `onebrain.yml` + PARA folders, register the plugin with the harness, overlay the latest plugin tarball. |
-| **Runtime** (hook protocol) | `session init`, `checkpoint stop · reset · orphans`, `qmd reindex` | Called by the harness `SessionStart` / `Stop` / `PostToolUse` hooks. Emit hard-wired JSON; banner suppressed for clean machine stdio. |
-| **Search** | `search query · search · vsearch · get · status · reindex · model` | Native hybrid search (tantivy BM25 + fastembed embeddings, RRF-fused) over the vault's `*.md` notes, plus embedding-model management with an interactive TUI. The legacy `qmd reindex · embed · status` verbs remain until the v3.4.4 cutover. |
+| **Runtime** (hook protocol) | `session init`, `checkpoint stop · reset · orphans`, `search reindex` | Called by the harness `SessionStart` / `Stop` / `PostToolUse` hooks. Emit hard-wired JSON; banner suppressed for clean machine stdio. |
+| **Search** | `search query · search · vsearch · get · status · reindex · model` | Native hybrid search (tantivy BM25 + fastembed embeddings, RRF-fused) over the vault's `*.md` notes, plus embedding-model management with an interactive TUI. The native `search` verbs fully replace the old `qmd reindex · embed · status` commands as of v3.4.5 — the legacy verbs are removed, not deprecated. |
 | **MCP** | `mcp` | Stdio [Model Context Protocol](docs/reference/mcp.md) server exposing `query`/`get`/`multi_get`/`status` over the native search engine — for Claude Code, Cursor, or any MCP client. See [`docs/reference/mcp.md`](docs/reference/mcp.md) for the full tool reference. |
 | **Notes** | `note read · list · find · search · stat · new · append · edit · move · mkdir · archive · delete · orphans · backlinks` | Structured vault-note operations — wikilink-aware moves, dated archiving, orphan/backlink graph queries. |
 | **Tasks** | `task list` | List dated vault tasks (fence-aware), filterable by due date and folder. |
@@ -209,7 +209,7 @@ On a keyword-only (lex-only) binary: `search search`, `get`, `status`, and `rein
 
 ## Local web UI
 
-`onebrain serve` starts a local, token-gated HTTP server that hosts the **OneBrain web UI** — a file explorer, a reading view (markdown, code, PDF, Office docs, images, audio/video, Jupyter notebooks), a qmd-backed search panel, and an agent chat — over a small vault JSON API.
+`onebrain serve` starts a local, token-gated HTTP server that hosts the **OneBrain web UI** — a file explorer, a reading view (markdown, code, PDF, Office docs, images, audio/video, Jupyter notebooks), a native-search-backed search panel, and an agent chat — over a small vault JSON API.
 
 ```bash
 onebrain serve          # → http://127.0.0.1:6789/?token=<TOKEN>   (Ctrl-C to stop)
@@ -256,12 +256,12 @@ Interactive commands default to human-readable `text`; pass a flag for structure
 onebrain doctor                 # TTY: animated per-check report, colorized
 onebrain doctor --json          # { version, command, ok, vault, data, warnings, error }
 onebrain vault current --yaml   # same envelope, YAML
-onebrain qmd status --json | jq .data
+onebrain search status --json | jq .data
 ```
 
 - `--output {text,json,yaml,table,tsv}` — full matrix on every command; `--json` / `--yaml` are shorthands.
 - `--pretty` forces indented JSON even when stdout is piped; `--no-color` (or `NO_COLOR`) forces monochrome; `-q` drops info logs (errors still hit stderr).
-- Output auto-adapts: piped/CI invocations drop color and the startup banner, so machine consumers get clean bytes with no flags. Closed-pipe writes (`onebrain qmd reindex | head`) exit `0`, not a panic.
+- Output auto-adapts: piped/CI invocations drop color and the startup banner, so machine consumers get clean bytes with no flags. Closed-pipe writes (`onebrain search reindex | head`) exit `0`, not a panic.
 
 ## Security & trust model
 
@@ -301,7 +301,7 @@ onebrain-cli          Binary crate — clap dispatch over the v3.1 command tree
   │                   · init bootstrap · doctor checks · update install path · backups
   │
   ├─ onebrain-cache   Session token resolution · launchd plist generation
-  │                   · qmd status detection
+  │                   · search status detection
   │
   └─ onebrain-core    Types · config parsing · path resolution (zero filesystem deps)
 ```
@@ -335,8 +335,8 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
   - [x] **v3.4.4** — scheduler runs actually fire: `onebrain` is now put on the headless-`claude` child's PATH so cron skills no longer exit 78 (#124) · generated plists emit `skill run`, not the deprecated `run-skill` (#125). *(Interleaved scheduler-fix patch, ahead of the qmd epic.)*
   - [ ] **v3.4.5** — **native search · no dependency · auto reindex/embed · model reindex ux/ui** (the qmd epic — [milestone 1](https://github.com/onebrain-ai/onebrain-cli/milestone/1); accumulates several PRs, tagged once all tracks land):
     - [x] relocate the search cache off OS-purgeable `~/Library/Caches` → persistent data dir (#114 → #129)
-    - [ ] no-model reindex UX — active only when downloaded, e5-small default, MCP no-index fallback signal (#130)
-    - [ ] remove **`@tobilu/qmd`** — 0 node/python deps: serve/WebUI search → native, drop `qmd embed`/probe (#131)
+    - [x] no-model reindex UX — active only when downloaded, e5-small default, MCP no-index fallback signal (#130 → #134)
+    - [x] remove **`@tobilu/qmd`** — 0 node/python deps: serve/WebUI search → native, drop `qmd embed`/probe (#131)
     - [ ] plugin cutover — `.mcp.json` key + `/qmd` → `/search` skill (onebrain-ai/onebrain#206, ADR 0019)
     - [ ] auto reindex/embed hook (#133)
   - [ ] **v3.4.6** — relevance polish: rerank (bge-reranker-v2-m3) · query expansion · nlpo3 Thai word-seg · custom ONNX models.
