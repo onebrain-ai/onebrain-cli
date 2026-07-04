@@ -7,6 +7,9 @@
 //! ```text
 //!   mode=lex     → LexIndex (BM25 keyword, no model, fast as-you-type)
 //!   mode=hybrid  → Engine::query (lex + vector, one query embedding)
+//!                  (lex-only / --no-default-features builds have no
+//!                  embedder, so hybrid degrades to the same LexIndex path
+//!                  as mode=lex — see `run_hybrid` below)
 //! ```
 //!
 //! Read-only translator: it returns vault-relative paths the existing
@@ -29,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use super::api::{require_vault_root, ApiError};
 use super::AppState;
 use crate::commands::search_common::{collection_cache_dir, collection_name_readonly};
+#[cfg(feature = "semantic")]
 use onebrain_search::engine::Engine;
 use onebrain_search::lex::LexIndex;
 
@@ -159,10 +163,12 @@ fn run_lex(cache_dir: &Path, query: &str) -> anyhow::Result<Vec<SearchHit>> {
 /// empty index never triggers a query embedding (and thus never a model
 /// download) — it returns empty hits instead.
 ///
-/// `Engine::open`/`query`/`status` exist in both the default and
-/// `--no-default-features` (lex-only) builds — without the `semantic`
-/// feature the vector store degrades to lex-quality ranking internally, so
-/// this compiles and behaves sanely either way; no cfg-gating needed here.
+/// Semantic build only: in a `--no-default-features` (lex-only) build there
+/// is no embedder, so `Engine::query` would `bail!` on a non-empty index
+/// (see `onebrain_search::engine::Engine::embedder`) — see the
+/// `#[cfg(not(feature = "semantic"))]` variant below, which degrades to
+/// [`run_lex`] instead, mirroring `commands::search_query::run_query`.
+#[cfg(feature = "semantic")]
 fn run_hybrid(cache_dir: &Path, root: &Path, query: &str) -> anyhow::Result<Vec<SearchHit>> {
     let config = onebrain_core::load_vault_config_at(root)?;
     let engine = Engine::open(cache_dir, &config.search.embed_model)?;
@@ -184,6 +190,15 @@ fn run_hybrid(cache_dir: &Path, root: &Path, query: &str) -> anyhow::Result<Vec<
             snippet: h.snippet,
         })
         .collect())
+}
+
+/// Lex-only build: hybrid degrades to keyword (BM25) ranking via [`run_lex`]
+/// rather than calling `Engine::query`, which has no embedder to fall back
+/// on in this build and would error instead of degrading. `root` is unused
+/// here (only needed to load `search.embed_model` for the real engine).
+#[cfg(not(feature = "semantic"))]
+fn run_hybrid(cache_dir: &Path, _root: &Path, query: &str) -> anyhow::Result<Vec<SearchHit>> {
+    run_lex(cache_dir, query)
 }
 
 /// File stem of a slash-separated vault path (`a/b/note.md` → `note`), used
@@ -256,5 +271,48 @@ mod tests {
         assert_eq!(hits[0].path, "notes/alpha.md");
         assert_eq!(hits[0].title, "alpha");
         assert!(hits[0].snippet.is_empty());
+    }
+
+    /// Lex-only builds have no embedder — `Engine::query` would `bail!` on a
+    /// non-empty index (see `onebrain_search::engine::Engine::embedder`).
+    /// `run_native` must route `mode=hybrid` to the lex path instead of
+    /// calling the engine, so this never errors even against real hits.
+    /// Gated to lex-only: under the `semantic` feature, hitting the hybrid
+    /// path here would construct a real embedder / attempt a model download.
+    #[cfg(not(feature = "semantic"))]
+    #[test]
+    fn run_native_hybrid_degrades_to_lex_in_lex_only_build() {
+        use onebrain_search::chunk::Chunk;
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "search:\n  collection: hybrid-degrade-test\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+
+        let collection = collection_name_readonly(dir.path()).unwrap();
+        let cache_dir = collection_cache_dir(&collection);
+        {
+            let mut lex = LexIndex::open(&cache_dir.join("tantivy")).unwrap();
+            lex.add(&Chunk {
+                chunk_id: "notes/alpha.md#0".to_string(),
+                doc_path: "notes/alpha.md".to_string(),
+                heading_path: String::new(),
+                text: "the quick brown fox jumps".to_string(),
+                chunk_index: 0,
+            })
+            .unwrap();
+            lex.commit().unwrap();
+        }
+
+        let result = run_native(dir.path(), "quick fox", "hybrid");
+        std::env::remove_var("ONEBRAIN_CACHE_DIR");
+
+        let hits = result.expect("hybrid must degrade to lex, not error, in a lex-only build");
+        assert_eq!(hits.len(), 1, "hits: {hits:?}");
+        assert_eq!(hits[0].path, "notes/alpha.md");
     }
 }
