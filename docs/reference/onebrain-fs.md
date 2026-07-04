@@ -296,7 +296,7 @@ Direct GitHub-Release fetch + atomic binary swap (replaces the broken npm/bun pa
 **Key functions**
 - `fetch_and_swap_binary(version, current_exe) -> Result<(), UpdateError>` — resolve asset → build `{base}/v{version}/onebrain-{triple}.{ext}` → download → extract → swap.
 - `AssetInfo::for_running_target()` — resolves the running target triple via `cfg!(all(target_arch, target_os, target_env))` (8 triples incl. linux musl vs gnu; macOS/linux→`tar.gz`, windows→`zip`); unsupported triple → `UpdateError::Install` with arch/os/env hint.
-- `AssetInfo::extract_binary` — delegates to `extract_tar_gz` (Windows zip path intentionally unwired for v3.0.0 GA → error).
+- `AssetInfo::extract_binary` — delegates to `extract_tar_gz`; Windows zip extraction is unimplemented in this path and returns an error (Windows is excluded from `binary_targets`; Windows self-update rides the npm path).
 - `download_archive(url)` — blocking ureq GET (90 s `timeout_global`); non-2xx → `GithubStatus`.
 - `extract_tar_gz(bytes, target_name)` — gzip+tar; skips non-regular-file entries (symlink/dir guard); matches the binary by file_name at root or one-level prefix.
 - `swap_binary(current_exe, new_bytes)` — writes `<exe>.new` + `set_executable` (chmod 0755 Unix; no-op Windows), then atomic `rename` over the live binary on Unix; on Windows renames live exe → `.old` first, moves new into place, and **rolls back** `.old`→live if the second rename fails (surfacing rollback outcome to stderr).
@@ -314,12 +314,12 @@ Module root — declares step submodules and re-exports `run_vault_sync`, `resol
 **Connections** — consumed by every vault_sync submodule + `init::default_vault_sync` + `onebrain-cli`.
 
 ### `src/vault_sync/orchestrate.rs`
-**Key functions** — `run_vault_sync(vault_root, opts) -> VaultSyncResult` — resolves options/branch/harness, builds progress, downloads+extracts into a tempdir, reads version from extracted plugin.json, runs plugin/.gemini sync (critical), optional .obsidian, root docs (non-fatal), harness merge (critical), `update_vault_yml` (critical), then Claude-only pin + cache-clean (non-fatal). Always returns a result; `!ok` carries `error`. Private helpers `read_update_channel`/`read_plugin_version`/`download_and_extract` + env overrides for installed-plugins path/cache.
+**Key functions** — `run_vault_sync(vault_root, opts) -> VaultSyncResult` — resolves options/branch/harness, builds progress, downloads+extracts into a tempdir, reads version from extracted plugin.json, runs plugin/.gemini sync (critical), root docs (non-fatal), harness merge (critical), `update_vault_yml` (critical), then Claude-only pin + cache-clean (non-fatal). Always returns a result; `!ok` carries `error`. Private helpers `read_update_channel`/`read_plugin_version`/`download_and_extract` + env overrides for installed-plugins path/cache.
 **Connections** — calls: every vault_sync submodule, `harness::detect_harness`, `onebrain_core::find_config_file`, `tempfile`; called by: `init::default_vault_sync` + `onebrain-cli` `vault-sync`.
 **Tests** — fresh sync, stale removal, download/tarball/HTTP-error paths, update_channel preservation, harness-merge injection.
 
 ### `src/vault_sync/branch.rs`
-**Key functions** — `resolve_branch(update_channel: Option<&str>) -> &'static str` — `Some("stable")`→`"main"`, anything else/None→`"next"`.
+**Key functions** — `resolve_branch(update_channel: Option<&str>) -> &'static str` — `Some("next")`→`"next"`, anything else/None (incl. `Some("stable")`)→`"main"`. Defaults to `main` because the plugin repo ships only `main` today — a missing/unknown channel must not resolve to a non-existent `next` branch (would 404 the tarball fetch).
 **Connections** — called by: `orchestrate::run_vault_sync`.
 
 ### `src/vault_sync/download.rs`
