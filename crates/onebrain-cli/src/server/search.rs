@@ -220,11 +220,12 @@ mod tests {
     }
 
     // `ONEBRAIN_CACHE_DIR` is a process-global env override (see
-    // `search_common::search_cache_root`); other modules (`session_init.rs`,
-    // `banner.rs`) that mutate it in tests each hold a private `ENV_LOCK`
-    // mutex for the mutation window — same pattern here, so this can't race
-    // those (or a future sibling test in this module) under `cargo test`'s
-    // default parallel-thread execution.
+    // `search_common::search_cache_root`). This module-private `ENV_LOCK`
+    // serializes the mutation window against other tests *in this crate's
+    // test binary* (mirroring the private `ENV_LOCK` in `session_init.rs` /
+    // `banner.rs`). It does not coordinate across crates, but each crate's
+    // tests run in a separate binary, so within-binary serialization is what
+    // matters under `cargo test`'s default parallel-thread execution.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]

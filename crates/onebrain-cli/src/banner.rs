@@ -155,7 +155,8 @@ pub fn should_show_banner(cli: &Cli, mode: &OutputMode) -> bool {
 
 /// True for commands that participate in Claude Code's hook protocol —
 /// session init, all checkpoint verbs, plus their hidden v3.0 aliases (the
-/// legacy `qmd-reindex` alias also dispatches to a hook handler). These
+/// legacy `qmd-reindex` alias now dispatches to native `search reindex`, but
+/// stays banner-suppressed here so un-migrated hooks keep clean stdio). These
 /// commands MUST have a clean stdout (and effectively a clean stderr too —
 /// banners on stderr can confuse log scrapers).
 fn is_hook_protocol(cmd: &Cmd) -> bool {
