@@ -311,7 +311,7 @@ Workspace inheritance keeps `[workspace.package]` fields (`version`, `edition`, 
 
 Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `insta` snapshots, 900+ tests passing. CI gates on `fmt` + `clippy -D warnings` + a 3-platform matrix (Ubuntu, macOS, Windows). The v2.x Bun golden-master parity layer was retired in v3.1.0; the v3.1 `Envelope` shape and the output-format matrix now own the canonical-contract role.
 
-> **Design notes & Rust patterns** → [`docs/`](docs/): an architecture deep-dive, decision records (ADRs), and a guided tour of the idiomatic Rust this codebase uses — written for contributors, people studying the source, and Rust learners.
+> **Design notes & Rust patterns** → [`docs/`](docs/): an architecture deep-dive, the [search architecture reference](docs/architecture/search.md) (index storage, reindex/embed pipeline, every search mode end-to-end), decision records (ADRs), and a guided tour of the idiomatic Rust this codebase uses — written for contributors, people studying the source, and Rust learners.
 
 ## Roadmap
 
@@ -323,7 +323,7 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
 - [x] **v3.0** — Rust rewrite GA · 9-platform release pipeline · stable JSON contracts.
 - [x] **v3.1** — Consistency standard: locked `<noun> <verb>` command tree · canonical `Envelope` output · branded banner · `vault.yml → onebrain.yml` · `qmd embed` · `schedule register` `onebrain.yml` support · self-update hardening (SHA-256 verify + Homebrew-aware).
 
-### 🚧 Phase 1 · perceptual speed + skill alignment (v3.2–v3.7)
+### 🚧 Phase 1 · perceptual speed + skill alignment (v3.2–v3.8)
 - [x] **v3.2** — `note` resource group (11 verbs) · grouped `doctor` UX with braille spinner + one-pass `--fix` · animated `onebrain update` · `skill run --harness {claude,gemini}` + `--model <m>` + headless startup-skip handshake + in-place spinner · `harness run [PROMPT] --mode {with-context,ad-hoc}` for ad-hoc prompts through claude / gemini (reads stdin when omitted) · auto-checkpoint hook fix (`CLAUDE_CODE_SESSION_ID` top-priority token + anchored `last_ts` so the time threshold actually fires) · `--vault` accepted everywhere.
 - [x] **v3.3** — Daemon foundation: `onebrain serve` — a local **web UI embedded in the binary** over a token-gated vault JSON API (file explorer · reading view · search panel · agent chat), on a security-hardened surface (whole-surface token gate · vault path confinement · CSP + forced-attachment · agent env isolation).
 - [ ] **v3.4** — **Native Rust search — replaces qmd** (mini-epic across v3.4.x; exit: **0 node/python deps**):
@@ -337,13 +337,14 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
     - [x] no-model reindex UX — active only when downloaded, e5-small default, MCP no-index fallback signal (#130 → #134)
     - [x] remove **`@tobilu/qmd`** — 0 node/python deps: serve/WebUI search → native, drop `qmd embed`/probe (#131)
     - [ ] plugin cutover — `.mcp.json` key + `/qmd` → `/search` skill (onebrain-ai/onebrain#206, ADR 0019)
-    - [ ] auto reindex/embed hook (#133)
+    - [x] auto reindex/embed hook — PostToolUse lex-now + Stop embed-deferred (#133 → #141)
   - [ ] **v3.4.6** — relevance polish: rerank (bge-reranker-v2-m3) · query expansion · nlpo3 Thai word-seg · custom ONNX models.
-- [ ] **v3.5** — Bootstrap + native verbs: startup / wrapup / daily / tasks → 1 call per ceremony (import content-verbs anchored ~v3.5.x).
-- [ ] **v3.6** — Warm daemon + RPC: kill cold process-start; keeps the native index + embed model hot (absorbs the old RPC-layer milestone).
-- [ ] ~~**v3.7** — qmd native search~~ → absorbed into v3.4.
+- [ ] **v3.5.x** — **"Desktop + Deeplinks"** (mini-epic): `onebrain desktop` native app + deeplinks + standalone webui file access (`link`/`token`/`desktop` verbs, vault_id, tickets) — the agent hands you a clickable, section-precise webui URL for any vault file; completely replaces Obsidian.
+- [ ] **v3.6** — **WebUI Terminal sessions** (mini-epic): run `onebrain`/`claude`/`codex` in the WebUI from anywhere (Tailscale); persistent term-server survives daemon restart.
+- [ ] **v3.7** — Bootstrap + native verbs *(was v3.5)*: startup / wrapup / daily / tasks → 1 call per ceremony (import content-verbs anchored ~v3.7.x).
+- [ ] **v3.8** — Warm daemon + RPC *(was v3.6)*: kill cold process-start; keeps the native index + embed model hot (absorbs the old RPC-layer milestone).
 
-### 📦 Phase 2 · bundles (v3.8–v3.11)
+### 📦 Phase 2 · bundles (v3.9–v3.12)
 - [ ] Bundle CLI (`onebrain bundle install/list/info/lint/…`) · four first-party bundles (`dashboard` · `synthesis` · `research` · `scheduler`) · core skills slimmed 32 → 18 · `onebrain.run/bundles` portal.
 
 ### 🔭 Signal-driven (Tier 2/3)
