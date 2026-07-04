@@ -400,13 +400,7 @@ fn run_lex_only(
     // same live-progress marker as the normal path so `search status` from
     // another process can see this run too.
     let mut reporter = ProgressReporter::new(mode, String::new());
-    let live = match LiveProgressFile::new(resolved) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("onebrain search reindex --lex-only: {e:#}");
-            return emit_skip(mode, Some(vault_info), "error");
-        }
-    };
+    let live = LiveProgressFile::in_cache_dir(cache_dir);
     let mut on_progress = |p: ReindexProgress| {
         match &p {
             ReindexProgress::Walked { total } => live.record(0, *total),
@@ -501,13 +495,7 @@ fn run_pending_only(
 
     let size_before = index_size_bytes(cache_dir);
     let mut reporter = ProgressReporter::new(mode, model_load_notice_for(resolved));
-    let live = match LiveProgressFile::new(resolved) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("onebrain search reindex --pending-only: {e:#}");
-            return emit_skip(mode, Some(vault_info), "error");
-        }
-    };
+    let live = LiveProgressFile::in_cache_dir(cache_dir);
     let mut on_progress = |p: ReindexProgress| {
         match &p {
             ReindexProgress::Walked { total } => live.record(0, *total),
@@ -545,11 +533,21 @@ struct LiveProgressFile {
 }
 
 impl LiveProgressFile {
+    /// Normal reindex path: resolves the collection via the persisting
+    /// `collection_for` (may auto-generate + write `search.collection`).
     fn new(resolved: &onebrain_core::ResolvedVault) -> Result<Self> {
         let collection = collection_for(resolved)?;
-        Ok(Self {
-            path: reindex_progress_path(&collection_cache_dir(&collection)),
-        })
+        Ok(Self::in_cache_dir(&collection_cache_dir(&collection)))
+    }
+
+    /// Hook paths (`--lex-only` / `--pending-only`): build from the gate's
+    /// already-resolved cache dir. Re-resolving via `collection_for` here
+    /// would persist an auto-generated `search.collection` when unset,
+    /// breaking `run_hook_path`'s "never mutates config" contract.
+    fn in_cache_dir(cache_dir: &std::path::Path) -> Self {
+        Self {
+            path: reindex_progress_path(cache_dir),
+        }
     }
 
     fn record(&self, done: usize, total: usize) {
@@ -901,9 +899,11 @@ mod tests {
     #[test]
     fn live_progress_file_records_json_and_removes_on_drop() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("reindex-progress.json");
+        // The hook-path constructor: pure path construction from the cache
+        // dir — no vault, no config, so it can never persist anything.
+        let path = reindex_progress_path(dir.path());
         {
-            let live = LiveProgressFile { path: path.clone() };
+            let live = LiveProgressFile::in_cache_dir(dir.path());
             live.record(457, 761);
             let body = std::fs::read_to_string(&path).unwrap();
             assert!(body.contains("\"done\":457"), "{body}");
