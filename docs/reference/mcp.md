@@ -42,6 +42,32 @@ onebrain mcp --vault /path/to/vault
 }
 ```
 
+## Use as a standalone vault-search MCP
+
+`onebrain mcp` also works as a generic local Markdown search engine for **any** folder that has an `onebrain.yml`, not just a full OneBrain vault. Hybrid lex + semantic search, multilingual, single binary, no Node/Python.
+
+Minimal `onebrain.yml` (folder defaults + a search collection name are all it needs):
+
+```yaml
+folders:
+  inbox: 00-inbox
+  projects: 01-projects
+search:
+  collection: my-notes
+```
+
+Then index and register it in any MCP client:
+
+```bash
+onebrain search reindex --vault /path/to/notes
+```
+
+```json
+{ "vault-search": { "command": "onebrain", "args": ["mcp", "--vault", "/path/to/notes"] } }
+```
+
+A zero-config `--dir`-only mode (no `onebrain.yml` required) is on the backlog for v3.4.3+ — not yet available.
+
 ## Tools
 
 ### `query`

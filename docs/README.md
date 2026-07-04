@@ -1,8 +1,19 @@
-# OneBrain CLI — Design & Internals
+# OneBrain CLI — Docs
 
-Reference docs for people reading the source: why the code is shaped the way it is, and the Rust patterns it leans on. This complements the top-level [`README.md`](../README.md) (what the tool does) and [`CONTRIBUTING.md`](../CONTRIBUTING.md) (how to build + submit).
+User guides for the tool, plus design & internals docs for people reading the source. This complements the top-level [`README.md`](../README.md) (the quick overview) and [`CONTRIBUTING.md`](../CONTRIBUTING.md) (how to build + submit).
 
-## What's here
+## User guides
+
+| Doc | Read it when you want to… |
+|---|---|
+| [`install.md`](install.md) | Install or update the binary — Homebrew / npm / direct download, the per-platform binary table, self-update behavior, build from source, and the security & trust model. |
+| [`commands.md`](commands.md) | See the full `onebrain <noun> <verb>` command tree, what each verb group does, and the output modes (`--json` / `--yaml` / envelope contract). |
+| [`platform-support.md`](platform-support.md) | Check which release targets ship full semantic search vs keyword-only. |
+| [`serve.md`](serve.md) | Run the embedded local web UI (`onebrain serve`) — file explorer, reading view, search, agent chat — and understand its security posture. |
+| [`reference/mcp.md`](reference/mcp.md) | Plug OneBrain into Claude Code / Cursor / any MCP client (`onebrain mcp`) — including standalone vault-search use on any Markdown folder. |
+| [`why.md`](why.md) | The case for a deterministic vault binary instead of ad-hoc agent shell improvisation. |
+
+## Design & internals
 
 | Doc | Read it when you want to… |
 |---|---|

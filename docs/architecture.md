@@ -14,7 +14,8 @@ onebrain-cli          Binary crate — clap dispatch over the v3.1 command tree,
   │                   Knows about the filesystem.
   │
   ├─ onebrain-cache   Session token resolution · launchd plist generation
-  │                   · checkpoint cadence state. Host/runtime state.
+  │                   · checkpoint cadence state · search status detection.
+  │                   Host/runtime state.
   │
   └─ onebrain-core    Types · config parsing · path resolution. Zero filesystem deps —
                       pure logic, the easiest crate to unit-test.
@@ -52,7 +53,25 @@ The same shape holds for every command: **parse → resolve → do work in a lib
 
 ## Why `publish = false`
 
-The workspace root sets `publish = false` and every crate inherits it via `publish.workspace = true`. The library crates are implementation detail, not a public Rust API — only the compiled `onebrain` binary is a product. This keeps us free to refactor crate boundaries without semver obligations to crates.io consumers, and it reflects the Path-B product boundary (Studio spawns the binary as a sidecar rather than importing these crates). With the workspace now permissively licensed (`MIT OR Apache-2.0`), that boundary is a product/architecture choice — no longer forced by copyleft as it was under AGPL.
+Workspace inheritance keeps `[workspace.package]` fields (`version`, `edition`, `license`, `repository`) in one place. The workspace root sets `publish = false` and every crate inherits it via `publish.workspace = true`. The library crates are implementation detail, not a public Rust API — only the compiled `onebrain` binary is a product. This keeps us free to refactor crate boundaries without semver obligations to crates.io consumers, and it reflects the Path-B product boundary (Studio spawns the binary as a sidecar rather than importing these crates). With the workspace now permissively licensed (`MIT OR Apache-2.0`), that boundary is a product/architecture choice — no longer forced by copyleft as it was under AGPL.
+
+## Testing & CI
+
+Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `insta` snapshots, 900+ tests passing. CI gates on `fmt` + `clippy -D warnings` + a 3-platform matrix (Ubuntu, macOS, Windows). The v2.x Bun golden-master parity layer was retired in v3.1.0; the v3.1 `Envelope` shape and the output-format matrix now own the canonical-contract role. The tests that pin the output contract are listed in [`CONTRIBUTING.md`](../CONTRIBUTING.md#build--test).
+
+## Performance
+
+The Rust rewrite milestone, measured against the v2.3.3 TypeScript/Bun CLI on the same hardware (Apple M1, macOS) running `onebrain doctor` warm:
+
+| Metric | v2.3.3 (Bun) | v3.0.0 (Rust) | Δ |
+|---|---|---|---|
+| Stripped binary size | 57.8 MB | 4.6 MB | **−92%** |
+| Private memory per invocation (peak) | ~21 MB | ~2 MB | **~10× less** |
+| Cold start | ~120 ms | < 50 ms | **~2.5× faster** |
+| Warm `doctor` wall time | ~980 ms | ~890 ms | ~9% faster |
+| `update --check` (warm cache) | ~480 ms | ~10 ms | **~48× faster** |
+
+Figures are the v3.0.0 rewrite-milestone dogfood (against the v2.3.3 Bun CLI). The binary has since grown well past 4.6 MB — v3.4 embedded the native search engine (tantivy + fastembed + ONNX Runtime), so a full semantic-search build is ~27 MB while keyword-only targets stay smaller (see the [platform table](platform-support.md)). The memory / cold-start / update-check wins above still hold. Reproduce with the release profile (`lto = "thin"`, `strip = "symbols"`, `codegen-units = 1`, `panic = "abort"`).
 
 ## Where to go next
 
