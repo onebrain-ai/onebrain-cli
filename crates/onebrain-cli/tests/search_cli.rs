@@ -911,6 +911,373 @@ fn search_reindex_force_on_empty_vault_rebuilds_and_status_reports_index_size() 
     assert!(size > 0, "tantivy/redb files have real bytes: {size}");
 }
 
+// ── `--lex-only` / `--pending-only` (hook safety gate) ─────────────────────
+//
+// Both flags are "hook paths": every error/skip case must exit 0 with a skip
+// envelope on stdout (`{"skipped":true,"reason":"..."}`) — never a nonzero
+// exit, never a `decision` key (that field belongs to a completely different
+// hook-output contract this envelope must stay inert against).
+
+/// The on-disk dir name of the first registry model — used to fake a
+/// "downloaded" model without a real network fetch, exactly like
+/// `seed_fake_model` above but reusable across the gate tests below.
+fn first_model_dir_name() -> String {
+    onebrain_search::embed::model_registry()[0].cache_dir_name()
+}
+
+#[test]
+fn lex_only_gate_no_index_skips_cleanly_without_touching_config_or_models() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+    let config_before = std::fs::read(vault.path().join("onebrain.yml")).unwrap();
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "--lex-only"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "hook path must exit 0: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["data"]["skipped"], true);
+    assert_eq!(v["data"]["reason"], "no-index");
+    assert!(v["data"].get("decision").is_none(), "no decision key: {v}");
+
+    // Vault config byte-unchanged: the readonly collection resolver must
+    // never persist `search.collection`.
+    let config_after = std::fs::read(vault.path().join("onebrain.yml")).unwrap();
+    assert_eq!(config_before, config_after, "config must be untouched");
+
+    // No model download dir anywhere under the cache root.
+    assert!(
+        !walkdir_has_dir_prefix(cache.path(), "models--"),
+        "gate must never construct the embedder"
+    );
+}
+
+#[test]
+fn lex_only_gate_index_present_but_model_missing_skips_model_not_downloaded() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+    // Mirror a real installed vault: tantivy dir exists, but no model.
+    std::fs::create_dir_all(cache.path().join("search/t-vault/tantivy")).unwrap();
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "--lex-only"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["data"]["skipped"], true);
+    assert_eq!(v["data"]["reason"], "model-not-downloaded");
+}
+
+#[test]
+fn lex_only_gate_reindex_in_flight_skips() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+    let collection_dir = cache.path().join("search/t-vault");
+    std::fs::create_dir_all(collection_dir.join("tantivy")).unwrap();
+    seed_fake_model(cache.path(), "t-vault", &first_model_dir_name(), 16);
+    // Fresh live-progress marker (read_reindex_progress treats <30min as live).
+    std::fs::write(
+        collection_dir.join("reindex-progress.json"),
+        r#"{"done":1,"total":2}"#,
+    )
+    .unwrap();
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "--lex-only"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["data"]["skipped"], true);
+    assert_eq!(v["data"]["reason"], "reindex-in-flight");
+}
+
+#[test]
+fn lex_only_end_to_end_indexes_lex_only_and_leaves_vectors_pending() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+    write(vault.path(), "note.md", "# Note\nalpha bravo charlie.\n");
+    // Mirror an installed vault: tantivy dir + downloaded model pre-exist so
+    // the safety gate passes.
+    std::fs::create_dir_all(cache.path().join("search/t-vault/tantivy")).unwrap();
+    seed_fake_model(cache.path(), "t-vault", &first_model_dir_name(), 16);
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "--lex-only"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["data"].get("skipped").is_none(), "gate passed: {v}");
+    assert_eq!(v["command"], "search.reindex");
+    assert_eq!(v["data"]["added"], 1);
+
+    // No SECOND model dir appeared — only the one fake dir seeded above by
+    // the test itself, proving the run never constructed a real embedder
+    // (which would create/touch its own `models--*` dir).
+    let model_dirs: Vec<_> = std::fs::read_dir(cache.path().join("search/t-vault"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("models--"))
+        })
+        .collect();
+    assert_eq!(
+        model_dirs.len(),
+        1,
+        "lex-only run must never construct the embedder"
+    );
+
+    // `search status` proves DOC_HASHES is untouched: the doc stays pending.
+    let status_out = onebrain(vault.path(), cache.path())
+        .args(["search", "status"])
+        .output()
+        .unwrap();
+    assert!(status_out.status.success());
+    let sv: serde_json::Value = serde_json::from_slice(&status_out.stdout).unwrap();
+    assert_eq!(sv["data"]["doc_count"], 0, "DOC_HASHES untouched: {sv}");
+    assert_eq!(sv["data"]["pending_new"], 1, "{sv}");
+}
+
+#[cfg(feature = "semantic")]
+#[test]
+fn pending_only_with_nothing_pending_skips_fast() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+    std::fs::create_dir_all(cache.path().join("search/t-vault/tantivy")).unwrap();
+    seed_fake_model(cache.path(), "t-vault", &first_model_dir_name(), 16);
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "--pending-only"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["data"]["skipped"], true);
+    assert_eq!(v["data"]["reason"], "no-pending");
+}
+
+#[cfg(not(feature = "semantic"))]
+#[test]
+fn pending_only_lex_only_build_skips_semantic_unavailable() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+    std::fs::create_dir_all(cache.path().join("search/t-vault/tantivy")).unwrap();
+    seed_fake_model(cache.path(), "t-vault", &first_model_dir_name(), 16);
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "--pending-only"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["data"]["skipped"], true);
+    assert_eq!(v["data"]["reason"], "semantic-unavailable");
+}
+
+#[test]
+fn pending_only_embeds_exactly_what_lex_only_left_pending() {
+    if std::env::var("ONEBRAIN_TEST_EMBED").is_err() {
+        return; // gated: downloads a real model
+    }
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n  embed_model: multilingual-e5-small\n",
+    );
+    write(vault.path(), "a.md", "# A\nalpha bravo charlie.\n");
+    write(vault.path(), "b.md", "# B\ndelta echo foxtrot.\n");
+    std::fs::create_dir_all(cache.path().join("search/t-vault/tantivy")).unwrap();
+
+    // First reindex downloads the real model (gated) so the gate's
+    // model-downloaded check passes for the subsequent --lex-only /
+    // --pending-only calls without re-downloading.
+    let seed = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "--force"])
+        .output()
+        .unwrap();
+    assert!(seed.status.success());
+
+    // Touch the docs again so they're pending, then lex-only index them
+    // (recording LEX_HASHES, leaving DOC_HASHES stale) before pending-only
+    // picks them back up.
+    write(vault.path(), "a.md", "# A\nalpha bravo charlie updated.\n");
+    write(vault.path(), "c.md", "# C\ngolf hotel india.\n");
+
+    let lex_out = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "--lex-only"])
+        .output()
+        .unwrap();
+    assert!(
+        lex_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&lex_out.stderr)
+    );
+
+    let mut pending_cmd = onebrain(vault.path(), cache.path());
+    pending_cmd
+        .env("ONEBRAIN_EMBED_FOREGROUND", "1")
+        .args(["search", "reindex", "--pending-only"]);
+    let pending_out = pending_cmd.output().unwrap();
+    assert!(
+        pending_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&pending_out.stderr)
+    );
+    let pv: serde_json::Value = serde_json::from_slice(&pending_out.stdout).unwrap();
+    assert!(pv["data"].get("skipped").is_none(), "gate passed: {pv}");
+    let added = pv["data"]["added"].as_u64().unwrap_or(0);
+    let updated = pv["data"]["updated"].as_u64().unwrap_or(0);
+    assert_eq!(added + updated, 2, "exactly a.md + c.md embedded: {pv}");
+
+    let status_out = onebrain(vault.path(), cache.path())
+        .args(["search", "status"])
+        .output()
+        .unwrap();
+    let sv: serde_json::Value = serde_json::from_slice(&status_out.stdout).unwrap();
+    let pending = sv["data"]["pending_new"].as_u64().unwrap()
+        + sv["data"]["pending_changed"].as_u64().unwrap()
+        + sv["data"]["pending_removed"].as_u64().unwrap();
+    assert_eq!(pending, 0, "pending must be 0 after pending-only: {sv}");
+}
+
+#[test]
+fn lex_only_and_pending_only_are_clap_conflicts() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "--lex-only", "--pending-only"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "conflicting flags must error");
+}
+
+#[test]
+fn lex_only_and_force_are_clap_conflicts() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "--lex-only", "--force"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "conflicting flags must error");
+}
+
+#[test]
+fn pending_only_and_paths_are_clap_conflicts() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "somepath.md", "--pending-only"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "conflicting flags must error");
+}
+
+/// `true` if any dir under `root` (recursively) has a name starting with
+/// `prefix`. Used to prove the safety gate never constructs an embedder
+/// (which would create a `models--*` dir).
+fn walkdir_has_dir_prefix(root: &Path, prefix: &str) -> bool {
+    fn walk(dir: &Path, prefix: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name_matches = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(prefix));
+                if name_matches || walk(&path, prefix) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    walk(root, prefix)
+}
+
 #[test]
 fn search_get_rejects_absolute_path_outside_vault() {
     let vault = tempdir().unwrap();

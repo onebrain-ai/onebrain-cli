@@ -12,8 +12,9 @@ use serde::Serialize;
 
 use crate::cli::SearchReindexArgs;
 use crate::commands::search_common::{
-    collection_cache_dir, collection_for, index_size_bytes, model_not_chosen, open_engine,
-    reconcile_missing_model, reindex_progress_path,
+    collection_cache_dir, collection_for, collection_name_readonly, index_size_bytes,
+    model_not_chosen, open_engine, read_reindex_progress, reconcile_missing_model,
+    reindex_progress_path,
 };
 use crate::output::{emit, item, section, Envelope, OutputMode};
 use onebrain_search::engine::{ReindexProgress, ReindexStats};
@@ -66,6 +67,16 @@ impl ReindexData {
 }
 
 pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchReindexArgs) -> Result<()> {
+    // `--lex-only` / `--pending-only` are hook paths: dispatch to their own
+    // entry point BEFORE any of the normal reindex machinery below (the
+    // first-model-choice prompt, `reconcile_missing_model`, `--force` wipe)
+    // — hook paths must never prompt, never mutate config, and never fail
+    // the calling turn. See `run_hook_path`'s doc comment for the full
+    // safety-gate contract.
+    if args.lex_only || args.pending_only {
+        return run_hook_path(vault_flag, mode, args);
+    }
+
     // A purged model download should re-open the first-run pick: clear the
     // stale key so `model_not_chosen` becomes true and the TTY-prompt /
     // headless-default split below fires correctly. Runs unconditionally
@@ -157,6 +168,290 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchReindexA
         .unwrap_or_default();
     let data = ReindexData::from_stats(stats, embed_model, size_before, size_after);
 
+    let envelope = Envelope::ok("search.reindex", Some(vault_info), data);
+    emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `--lex-only` / `--pending-only` — hook paths
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Both flags exist so an automation hook (a Claude Code `PostToolUse`/`Stop`
+// hook, a cron job, etc.) can keep the index warm without ever risking the
+// calling turn: every failure mode here — an unresolved vault, a missing
+// index, an undownloaded model, a reindex already running, or any error
+// during the actual reindex — degrades to a "skip" envelope on stdout and
+// exit code 0. Nothing in this path prompts (no TTY interaction), persists
+// `search.collection` (uses the READONLY resolver), or calls
+// `reconcile_missing_model` (that mutates `onebrain.yml`).
+
+/// Payload for a skipped hook-path run: `{"skipped":true,"reason":"..."}`.
+/// Deliberately has NO `decision` field — a completely different hook
+/// contract (the plugin's Stop checkpoint flow) parses `decision:block` out
+/// of another hook's JSON output, and this envelope must stay inert against
+/// that parser.
+#[derive(Debug, Serialize)]
+struct ReindexSkipData {
+    skipped: bool,
+    reason: String,
+}
+
+fn render_skip_text(env: &Envelope<ReindexSkipData>) -> String {
+    let d = env.data.as_ref().expect("ok envelope always has data");
+    format!("⏭  Skipped — {}", d.reason)
+}
+
+/// Emit the skip envelope for `reason` and return `Ok(())` — the hook-path
+/// contract's single exit point for every gate failure / run error.
+/// `vault_info` is `None` when the vault itself couldn't be resolved (gate
+/// reason 1); present otherwise.
+fn emit_skip(
+    mode: &OutputMode,
+    vault_info: Option<crate::output::VaultInfo>,
+    reason: &str,
+) -> Result<()> {
+    let data = ReindexSkipData {
+        skipped: true,
+        reason: reason.to_string(),
+    };
+    let envelope = Envelope::ok("search.reindex", vault_info, data);
+    emit(&envelope, mode, std::io::stdout().lock(), render_skip_text)?;
+    Ok(())
+}
+
+/// Entry point for `--lex-only` / `--pending-only`. Runs the shared safety
+/// gate first (pure fs probes, no engine, no prompt); on any gate failure
+/// (or any error during the run itself) emits a skip envelope and returns
+/// `Ok(())` — this function's return type promises the caller (main.rs) that
+/// a hook invocation NEVER fails the process.
+fn run_hook_path(
+    vault_flag: Option<PathBuf>,
+    mode: &OutputMode,
+    args: &SearchReindexArgs,
+) -> Result<()> {
+    // Gate reason 1: vault / collection unresolvable. Uses the READONLY
+    // collection resolver (`collection_name_readonly`) — a hook must never
+    // persist an auto-generated `search.collection` into `onebrain.yml`.
+    let resolved = match crate::vault_ctx::require(vault_flag.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("onebrain search reindex (hook path): {e:#}");
+            return emit_skip(mode, None, "no-collection");
+        }
+    };
+    let vault_info = crate::vault_ctx::info_from(&resolved);
+    let collection = match collection_name_readonly(resolved.root.as_path()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("onebrain search reindex (hook path): {e:#}");
+            return emit_skip(mode, Some(vault_info), "no-collection");
+        }
+    };
+    let cache_dir = collection_cache_dir(&collection);
+
+    // Gate reason 2: no index yet.
+    if !cache_dir.join("tantivy").is_dir() {
+        return emit_skip(mode, Some(vault_info), "no-index");
+    }
+
+    // Gate reason 3: the configured model isn't downloaded. Never
+    // auto-downloads from a hook — applies to BOTH flags by design (even
+    // `--lex-only`, which itself never touches the embedder) so a hook never
+    // races a foreground first-run download.
+    let embed_model = onebrain_core::load_vault_config(&resolved.root)
+        .map(|c| c.search.embed_model)
+        .unwrap_or_default();
+    let model_downloaded = {
+        use onebrain_search::embed::{model_download_status, model_registry};
+        model_registry()
+            .iter()
+            .find(|m| m.name == embed_model)
+            .is_some_and(|info| model_download_status(info, &cache_dir).downloaded)
+    };
+    if !model_downloaded {
+        return emit_skip(mode, Some(vault_info), "model-not-downloaded");
+    }
+
+    // Gate reason 4: a reindex is already running (live marker).
+    if read_reindex_progress(&cache_dir).is_some() {
+        return emit_skip(mode, Some(vault_info), "reindex-in-flight");
+    }
+
+    if args.lex_only {
+        return run_lex_only(mode, &resolved, vault_info, &cache_dir, args);
+    }
+    debug_assert!(args.pending_only);
+    run_pending_only(mode, &resolved, vault_info, &cache_dir)
+}
+
+/// `--lex-only`, gate already passed: lex/tantivy pass over the whole vault
+/// (or `args.paths`, though clap's `conflicts_with_all` makes that
+/// combination unreachable today). Any error degrades to a skip envelope
+/// rather than failing the hook's calling turn. `cache_dir` is the
+/// already-resolved collection cache dir from the gate — re-derived here
+/// would just repeat `run_hook_path`'s `collection_name_readonly` call.
+fn run_lex_only(
+    mode: &OutputMode,
+    resolved: &onebrain_core::ResolvedVault,
+    vault_info: crate::output::VaultInfo,
+    cache_dir: &std::path::Path,
+    args: &SearchReindexArgs,
+) -> Result<()> {
+    let config = match onebrain_core::load_vault_config(&resolved.root) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("onebrain search reindex --lex-only: {e:#}");
+            return emit_skip(mode, Some(vault_info), "no-collection");
+        }
+    };
+    let mut engine =
+        match onebrain_search::engine::Engine::open(cache_dir, &config.search.embed_model) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("onebrain search reindex --lex-only: {e:#}");
+                return emit_skip(mode, Some(vault_info), "error");
+            }
+        };
+    engine.set_exclude_patterns(config.search.exclude.clone());
+
+    let size_before = index_size_bytes(cache_dir);
+    // Structured mode (hooks always pass --json) keeps the reporter Silent;
+    // same live-progress marker as the normal path so `search status` from
+    // another process can see this run too.
+    let mut reporter = ProgressReporter::new(mode, String::new());
+    let live = match LiveProgressFile::new(resolved) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("onebrain search reindex --lex-only: {e:#}");
+            return emit_skip(mode, Some(vault_info), "error");
+        }
+    };
+    let mut on_progress = |p: ReindexProgress| {
+        match &p {
+            ReindexProgress::Walked { total } => live.record(0, *total),
+            ReindexProgress::Indexing { done, total, .. } => live.record(*done, *total),
+            ReindexProgress::LoadingModel => {}
+        }
+        reporter.handle(p);
+    };
+
+    let result = if args.paths.is_empty() {
+        engine.reindex_all_lex_only_with_progress(resolved.root.as_path(), &mut on_progress)
+    } else {
+        engine.reindex_paths_lex_only_with_progress(
+            resolved.root.as_path(),
+            &args.paths,
+            &mut on_progress,
+        )
+    };
+    reporter.finish();
+    drop(live);
+
+    let stats = match result {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("onebrain search reindex --lex-only: {e:#}");
+            return emit_skip(mode, Some(vault_info), "error");
+        }
+    };
+
+    let size_after = index_size_bytes(cache_dir);
+    let data = ReindexData::from_stats(stats, config.search.embed_model, size_before, size_after);
+    let envelope = Envelope::ok("search.reindex", Some(vault_info), data);
+    emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
+    Ok(())
+}
+
+/// `--pending-only`, gate already passed: embed exactly the docs
+/// `Engine::pending_vector_paths` reports as drifted. Foreground only — the
+/// background-detach wrapper is a separate follow-up (not built here).
+///
+/// In a `--no-default-features` (lex-only) build there is no embedder at
+/// all, so this always skips `semantic-unavailable` without even resolving
+/// the collection further.
+#[cfg(not(feature = "semantic"))]
+fn run_pending_only(
+    mode: &OutputMode,
+    _resolved: &onebrain_core::ResolvedVault,
+    vault_info: crate::output::VaultInfo,
+    _cache_dir: &std::path::Path,
+) -> Result<()> {
+    emit_skip(mode, Some(vault_info), "semantic-unavailable")
+}
+
+/// `cache_dir` is the already-resolved collection cache dir from the gate —
+/// see `run_lex_only`'s doc comment for why this isn't re-derived here.
+#[cfg(feature = "semantic")]
+fn run_pending_only(
+    mode: &OutputMode,
+    resolved: &onebrain_core::ResolvedVault,
+    vault_info: crate::output::VaultInfo,
+    cache_dir: &std::path::Path,
+) -> Result<()> {
+    let config = match onebrain_core::load_vault_config(&resolved.root) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("onebrain search reindex --pending-only: {e:#}");
+            return emit_skip(mode, Some(vault_info), "no-collection");
+        }
+    };
+    let mut engine =
+        match onebrain_search::engine::Engine::open(cache_dir, &config.search.embed_model) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("onebrain search reindex --pending-only: {e:#}");
+                return emit_skip(mode, Some(vault_info), "error");
+            }
+        };
+    engine.set_exclude_patterns(config.search.exclude.clone());
+
+    // Fast path: `pending_vector_paths` never constructs the embedder, so an
+    // empty worklist skips before anything expensive happens.
+    let pending = match engine.pending_vector_paths(resolved.root.as_path()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("onebrain search reindex --pending-only: {e:#}");
+            return emit_skip(mode, Some(vault_info), "error");
+        }
+    };
+    if pending.is_empty() {
+        return emit_skip(mode, Some(vault_info), "no-pending");
+    }
+
+    let size_before = index_size_bytes(cache_dir);
+    let mut reporter = ProgressReporter::new(mode, model_load_notice_for(resolved));
+    let live = match LiveProgressFile::new(resolved) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("onebrain search reindex --pending-only: {e:#}");
+            return emit_skip(mode, Some(vault_info), "error");
+        }
+    };
+    let mut on_progress = |p: ReindexProgress| {
+        match &p {
+            ReindexProgress::Walked { total } => live.record(0, *total),
+            ReindexProgress::Indexing { done, total, .. } => live.record(*done, *total),
+            ReindexProgress::LoadingModel => {}
+        }
+        reporter.handle(p);
+    };
+
+    let result =
+        engine.reindex_paths_with_progress(resolved.root.as_path(), &pending, &mut on_progress);
+    reporter.finish();
+    drop(live);
+
+    let stats = match result {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("onebrain search reindex --pending-only: {e:#}");
+            return emit_skip(mode, Some(vault_info), "error");
+        }
+    };
+
+    let size_after = index_size_bytes(cache_dir);
+    let data = ReindexData::from_stats(stats, config.search.embed_model, size_before, size_after);
     let envelope = Envelope::ok("search.reindex", Some(vault_info), data);
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())

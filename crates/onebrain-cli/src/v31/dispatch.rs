@@ -547,6 +547,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 &crate::cli::SearchReindexArgs {
                     paths: Vec::new(),
                     force: false,
+                    lex_only: false,
+                    pending_only: false,
                 },
             )
         }
