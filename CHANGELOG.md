@@ -36,6 +36,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - See [ADR 0021](docs/decisions/0021-search-state-persistent-data-dir.md).
 
 - **Auto reindex/embed hook** — `search reindex --lex-only` runs on PostToolUse (incremental keyword-index pass, no model load), and `search reindex --pending-only` runs on Stop hook (background embed of pending docs). Both are safety-gated to skip silently when search isn't set up (no collection, no index, model not downloaded, reindex running). Existing hook entries auto-migrate on the next `onebrain plugin update` / `onebrain register hooks` (#133).
+- **Hook paths never write config** — the hook paths' live-progress marker is now built from the already-resolved (read-only) collection cache dir; previously it re-resolved through the persisting resolver, which could auto-write `search.collection` into `onebrain.yml` in a near-unreachable edge case. Closes the last gap in the hooks' "never mutates config" contract.
 
 ## [3.4.4] — 2026-07-03 — scheduler runs actually fire
 
