@@ -43,7 +43,7 @@ pub const CATEGORIES: &[Category] = &[
     Category {
         emoji: "⚙️",
         name: "System Management",
-        commands: &["init", "update", "doctor", "plugin", "qmd", "schedule"],
+        commands: &["init", "update", "doctor", "plugin", "schedule"],
     },
     Category {
         emoji: "🧠",
@@ -356,18 +356,18 @@ mod tests {
         let root = Cli::command();
         let block = build_categorized_commands_block(&root, false);
 
-        // qmd must appear under "System Management".
+        // plugin must appear under "System Management".
         let system_pos = block
             .find("System Management")
             .expect("System Management heading present");
         let vault_pos = block
             .find("Vault Management")
             .expect("Vault Management heading present");
-        let qmd_pos = block.find("\n  qmd").expect("`qmd` entry present");
+        let plugin_pos = block.find("\n  plugin").expect("`plugin` entry present");
         assert!(
-            qmd_pos > system_pos && qmd_pos < vault_pos,
-            "`qmd` must appear between `System Management` and `Vault Management`; \
-             positions: system={system_pos} qmd={qmd_pos} vault={vault_pos}"
+            plugin_pos > system_pos && plugin_pos < vault_pos,
+            "`plugin` must appear between `System Management` and `Vault Management`; \
+             positions: system={system_pos} plugin={plugin_pos} vault={vault_pos}"
         );
 
         // task must appear under "Vault Management".
@@ -400,17 +400,17 @@ mod tests {
         let root = Cli::command();
         let block = build_categorized_commands_block(&root, false);
 
-        // Pull the real `qmd` about from clap.
-        let qmd_about = root
+        // Pull the real `plugin` about from clap.
+        let plugin_about = root
             .get_subcommands()
-            .find(|c| c.get_name() == "qmd")
+            .find(|c| c.get_name() == "plugin")
             .and_then(|c| c.get_about())
             .map(|s| s.to_string())
-            .expect("qmd subcommand with about exists");
+            .expect("plugin subcommand with about exists");
 
         assert!(
-            block.contains(&qmd_about),
-            "qmd about text `{qmd_about}` not found in block; \
+            block.contains(&plugin_about),
+            "plugin about text `{plugin_about}` not found in block; \
              about must be pulled from clap, not hardcoded"
         );
     }

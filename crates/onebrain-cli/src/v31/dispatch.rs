@@ -2,9 +2,10 @@
 //!
 //! Layout:
 //! - Root verbs (`init` / `update` / `doctor`) → existing v3.0 handlers.
-//! - Hook-protocol verbs (`session init`, `checkpoint *`, `qmd reindex`) →
-//!   existing v3.0 handlers (their JSON shape is already the canonical
-//!   `{"decision":"block",...}` for the hook contract).
+//! - Hook-protocol verbs (`session init`, `checkpoint *`) → existing v3.0
+//!   handlers (their JSON shape is already the canonical
+//!   `{"decision":"block",...}` for the hook contract). The legacy
+//!   `qmd-reindex` alias now repoints to the native `search reindex` handler.
 //! - New v3.1 verbs (`vault current`, `plugin update`) → handlers in this
 //!   module's siblings.
 //! - Hidden v3.0 aliases → call the corresponding new-path handler AFTER
@@ -110,21 +111,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             } => commands::orphan_scan::run(&logs_folder, &session_token, &mode),
         },
 
-        // ───── Qmd ──────────────────────────────────────────────────
-        // Reindex is a hook-protocol command (handles vault check itself);
-        // the other verbs are vault-required and must exit 64 outside a
-        // vault before reporting E_NOT_IMPLEMENTED (R1 C3).
-        Cmd::Qmd(QmdCmd { verb }) => match verb {
-            QmdVerb::Reindex => commands::qmd_reindex::run(),
-            QmdVerb::Setup => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "qmd setup")
-            }
-            QmdVerb::Embed => commands::qmd_embed::run(vault_flag.clone()),
-            QmdVerb::Status => commands::qmd_status::run(vault_flag.clone(), &mode),
-            QmdVerb::Search { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "qmd search")
-            }
-        },
+        // ───── Qmd — removed v3.4.5 (native search replaces it) ──────
+        Cmd::Qmd { .. } => Err(anyhow::anyhow!(
+            "`onebrain qmd` was removed in v3.4.5 — use `onebrain search …` \
+             (reindex · status · query · search · vsearch)"
+        )),
 
         // ───── Schedule ─────────────────────────────────────────────
         Cmd::Schedule(ScheduleCmd { verb }) => match verb {
@@ -549,8 +540,15 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             commands::orphan_scan::run(&a.logs_folder, &a.session_token, &mode)
         }
         Cmd::QmdReindexAlias => {
-            migration::print_once("qmd-reindex", "qmd reindex");
-            commands::qmd_reindex::run()
+            migration::print_once("qmd-reindex", "search reindex");
+            commands::search_reindex::run(
+                vault_flag.clone(),
+                &mode,
+                &crate::cli::SearchReindexArgs {
+                    paths: Vec::new(),
+                    force: false,
+                },
+            )
         }
         Cmd::RegisterHooksAlias(a) => {
             migration::print_once("register-hooks", "plugin update");

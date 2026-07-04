@@ -6,7 +6,8 @@
 //! - `--help` shows the clean tree (3 root verbs + 24 groups · no hidden
 //!   aliases · no `--vault-dir` legacy in the top-level help)
 //! - `session-init` alias dispatches to `session init` with parity output
-//! - `qmd-reindex` alias dispatches to `qmd reindex`
+//! - `qmd-reindex` alias dispatches to `search reindex` (native search,
+//!   post-v3.4.5; `onebrain qmd` itself was removed)
 //! - `vault current` reports detected source correctly
 //! - Vault-required commands exit 64 outside a vault with the canonical
 //!   error envelope (text mode shows the quick-fix block; JSON mode emits
@@ -51,7 +52,6 @@ fn root_help_shows_3_root_verbs_and_visible_groups() {
         "checkpoint",
         "harness",
         "plugin",
-        "qmd",
         "schedule",
         "session",
         "skill",
@@ -151,6 +151,9 @@ fn top_level_help_hides_stub_groups() {
     // `serve` became VISIBLE in v3.3 step 2 (foreground HTTP surface).
     // `note` and `task` became VISIBLE in v3.3.14 (all 14 note verbs + task
     // list are implemented; task add/done stub verbs stay hidden).
+    // `qmd` was REMOVED in v3.4.5 (native search replaces it) — it's now a
+    // hidden catch-all that only emits a migration error, so it moved from
+    // the visible list to the hidden/stub list below.
     let out = Command::cargo_bin("onebrain")
         .unwrap()
         .arg("--help")
@@ -171,7 +174,6 @@ fn top_level_help_hides_stub_groups() {
         "schedule",
         "skill",
         "task",
-        "qmd",
         "serve",
     ] {
         // v3.3.17 categorized-help format: commands appear as `  {name}  `
@@ -196,6 +198,7 @@ fn top_level_help_hides_stub_groups() {
         "log",
         "memory",
         "pause",
+        "qmd",
     ] {
         assert!(
             // 2-space indent is the categorized-block command row form
@@ -273,7 +276,6 @@ fn top_level_help_is_production_grade() {
         "Plugin lifecycle + hook rewriter",
         "launchd schedule management",
         "Skill invocation",
-        "Vault search index",
     ] {
         assert!(
             stdout.contains(desc),
@@ -297,12 +299,11 @@ fn top_level_help_is_production_grade() {
             .or_else(|| haystack.find(&format!("  {needle}\n")))
             .unwrap_or_else(|| panic!("expected `{needle}` in --help"))
     }
-    // System Management (init, update, doctor, plugin, qmd, schedule).
+    // System Management (init, update, doctor, plugin, schedule).
     let init = offset_of(&stdout, "init");
     let update = offset_of(&stdout, "update");
     let doctor = offset_of(&stdout, "doctor");
     let plugin = offset_of(&stdout, "plugin");
-    let qmd = offset_of(&stdout, "qmd");
     let schedule = offset_of(&stdout, "schedule");
     // Vault Management (vault, note, task).
     let vault = offset_of(&stdout, "vault");
@@ -316,9 +317,9 @@ fn top_level_help_is_production_grade() {
     let serve = offset_of(&stdout, "serve");
     let skill = offset_of(&stdout, "skill");
 
-    // System Management: init → update → doctor → plugin → qmd → schedule.
+    // System Management: init → update → doctor → plugin → schedule.
     assert!(
-        init < update && update < doctor && doctor < plugin && plugin < qmd && qmd < schedule,
+        init < update && update < doctor && doctor < plugin && plugin < schedule,
         "System Management section mis-ordered"
     );
     // System precedes Vault: vault → note → task.
@@ -1725,89 +1726,7 @@ fn legacy_help_keyword_emits_no_banner() {
 // on pipes. The bare-`harness` integration test above covers the
 // pre-parse-banner-on-DisplayHelp* path that fixes issue #2.
 
-/// `qmd status` is vault-required: exit 64 outside a vault, and a clean exit 0
-/// report inside one (degrading gracefully to `qmd_available:false` when the
-/// qmd binary is absent). Regression guard for the verb graduating from a
-/// `not_implemented_vault_required` stub to a real handler in v3.1.1.
-#[test]
-fn qmd_status_requires_vault_and_reports_inside() {
-    // Outside any vault → exit 64 (E_VAULT_NOT_FOUND).
-    let no_vault = tempdir().unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
-        .current_dir(no_vault.path())
-        .env_remove("ONEBRAIN_VAULT")
-        .args(["qmd", "status"])
-        .assert()
-        .failure()
-        .code(64);
-
-    // Inside a vault → exit 0 with the status report. PATH is scrubbed so the
-    // qmd probe finds nothing and the command degrades instead of hanging.
-    let dir = tempdir().unwrap();
-    make_vault(dir.path());
-    Command::cargo_bin("onebrain")
-        .unwrap()
-        .current_dir(dir.path())
-        .env_remove("ONEBRAIN_VAULT")
-        .env("PATH", "/usr/bin:/bin")
-        .args(["qmd", "status"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Qmd index"));
-}
-
-/// `qmd status --json` inside a vault emits a parseable object carrying the
-/// stable `qmd_available` flag — the machine-consumer contract.
-#[test]
-fn qmd_status_json_is_parseable_with_availability_flag() {
-    let dir = tempdir().unwrap();
-    make_vault(dir.path());
-    let out = Command::cargo_bin("onebrain")
-        .unwrap()
-        .current_dir(dir.path())
-        .env_remove("ONEBRAIN_VAULT")
-        .env("PATH", "/usr/bin:/bin")
-        .args(["qmd", "status", "--json"])
-        .assert()
-        .success();
-    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
-    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    assert!(
-        v.get("qmd_available").is_some(),
-        "missing qmd_available: {v}"
-    );
-}
-
-/// `qmd embed` is vault-required (exit 64 outside a vault) and, inside one,
-/// runs the foreground `qmd embed`. PATH is scrubbed so the probe fails fast
-/// with the install hint — proving the verb reaches the spawn (no longer the
-/// `not_implemented` stub) WITHOUT actually generating embeddings in the test.
-#[test]
-fn qmd_embed_requires_vault_then_invokes_qmd() {
-    // Outside any vault → exit 64.
-    let no_vault = tempdir().unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
-        .current_dir(no_vault.path())
-        .env_remove("ONEBRAIN_VAULT")
-        .args(["qmd", "embed"])
-        .assert()
-        .failure()
-        .code(64);
-
-    // Inside a vault, qmd scrubbed from PATH → reaches the spawn and fails with
-    // the install hint (NOT exit 64, NOT the not-implemented stub).
-    let dir = tempdir().unwrap();
-    make_vault(dir.path());
-    Command::cargo_bin("onebrain")
-        .unwrap()
-        .current_dir(dir.path())
-        .env_remove("ONEBRAIN_VAULT")
-        .env("PATH", "/usr/bin:/bin")
-        .args(["qmd", "embed"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("qmd embed"))
-        .stderr(predicate::str::contains("installed").or(predicate::str::contains("PATH")));
-}
+// `qmd status` / `qmd embed` (and the rest of the `onebrain qmd` group) were
+// removed in v3.4.5 — native search replaces them. `qmd` is now a hidden
+// catch-all that always bails with a helpful migration error; see
+// `tests/qmd_removed.rs` for the removed-command coverage.
