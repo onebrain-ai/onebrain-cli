@@ -35,6 +35,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **MCP `query` degrades cleanly with no index.** When a vault has no search index yet, the `query` tool returns empty results plus a `note` ("run `onebrain search reindex`, or fall back to filesystem search") instead of a cryptic index-open error — so a calling agent can fall back to grep/read rather than failing.
 - See [ADR 0021](docs/decisions/0021-search-state-persistent-data-dir.md).
 
+- **Auto reindex/embed hook** — `search reindex --lex-only` runs on PostToolUse (incremental keyword-index pass, no model load), and `search reindex --pending-only` runs on Stop hook (background embed of pending docs). Both are safety-gated to skip silently when search isn't set up (no collection, no index, model not downloaded, reindex running). Existing hook entries auto-migrate on the next `onebrain plugin update` / `onebrain register hooks` (#133).
+
 ## [3.4.4] — 2026-07-03 — scheduler runs actually fire
 
 - **Scheduled cron skills now run successfully** instead of exiting 78 (EX_CONFIG). `onebrain skill run` (which the scheduler invokes) now prepends its own binary directory to the headless `claude` child's `PATH`, so skill hooks that call bare `onebrain` (e.g. `onebrain session init`) resolve even under launchd's minimal PATH (#124).
