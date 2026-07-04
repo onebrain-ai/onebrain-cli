@@ -1,19 +1,12 @@
-//! Session token resolution · launchd plist generation · qmd index query / reindex · checkpoint state.
+//! Session token resolution · launchd plist generation · checkpoint state.
 
 pub mod checkpoint;
 pub mod error;
-pub mod qmd;
-pub mod qmd_reindex;
 pub mod session_token;
 pub mod state;
 
 pub use checkpoint::{handle_reset, handle_stop};
 pub use error::{CacheError, Result};
-pub use qmd::{
-    probe_qmd_status, query_status, query_unembedded_count, QmdProbe, QmdStatus,
-    QMD_STARTUP_TIMEOUT_SECS, QMD_STATUS_TIMEOUT_SECS,
-};
-pub use qmd_reindex::{build_qmd_spawn_args, qmd_reindex, SpawnOs};
 pub use session_token::{
     clean_stale_state_file, find_claude_ancestor_pid, resolve_session_token, ProcInfo, ProcLookup,
     ResolveInputs,
