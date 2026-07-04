@@ -1062,6 +1062,28 @@ pub struct SearchReindexArgs {
     /// that invalidate stored vectors. Whole-vault only.
     #[arg(long, default_value_t = false)]
     pub force: bool,
+    /// Incremental lex/keyword pass only: never loads or downloads the
+    /// embedding model. Changed docs' vectors stay pending until the next
+    /// embed pass (`--pending-only`). Safe to call from a hook — it never
+    /// prompts and never fails the calling turn (errors degrade to a skip
+    /// envelope, exit 0).
+    #[arg(
+        long = "lex-only",
+        default_value_t = false,
+        conflicts_with_all = ["pending_only", "force", "paths"]
+    )]
+    pub lex_only: bool,
+    /// Embed only docs whose vectors are pending (from a previous
+    /// `--lex-only` pass, or external edits). Loads the model only when
+    /// there is pending work. Safe to call from a hook — it never prompts
+    /// and never fails the calling turn (errors degrade to a skip envelope,
+    /// exit 0).
+    #[arg(
+        long = "pending-only",
+        default_value_t = false,
+        conflicts_with_all = ["force", "paths"]
+    )]
+    pub pending_only: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────

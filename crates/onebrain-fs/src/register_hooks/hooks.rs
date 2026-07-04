@@ -23,13 +23,29 @@ impl HookSpec {
         args: &["checkpoint", "stop", "--json"],
     };
 
-    // v3.4.5: the canonical reindex hook is the native `search reindex`
-    // subcommand. The v3.0/v3.1 `qmd-reindex` alias AND the v3.2–v3.4 `qmd
-    // reindex` form are recognized as legacy and migrated to this by
+    // v3.4.5 Track 2: the canonical reindex hook is the native `search
+    // reindex` subcommand. The v3.0/v3.1 `qmd-reindex` alias, the v3.2–v3.4
+    // `qmd reindex` form, AND the Track-2 `search reindex --json` form (no
+    // `--lex-only`) are recognized as legacy and migrated to this by
     // `migrate_legacy_qmd_entries`.
+    //
+    // v3.4.5 Track 4: `--lex-only` scopes the PostToolUse hook to a
+    // lexical-only reindex (fast, no embedding) since it runs synchronously
+    // after every Write/Edit. Full embedding is deferred to the Stop hook
+    // (see `EMBED` below).
     pub(crate) const QMD: HookSpec = HookSpec {
         command: "onebrain",
-        args: &["search", "reindex", "--json"],
+        args: &["search", "reindex", "--lex-only", "--json"],
+    };
+
+    // v3.4.5 Track 4: Stop-event companion to `QMD` above. Runs a
+    // pending-only embed pass at session end; the CLI detaches itself in
+    // structured (--json) mode so this is non-blocking. Registered as a
+    // SEPARATE Stop entry alongside `STOP` (the checkpoint hook) — it must
+    // never replace, merge with, or dedupe against the checkpoint entry.
+    pub(crate) const EMBED: HookSpec = HookSpec {
+        command: "onebrain",
+        args: &["search", "reindex", "--pending-only", "--json"],
     };
 
     /// Shell-form representation: e.g. `"onebrain checkpoint stop"`.
@@ -890,5 +906,47 @@ mod tests {
     #[test]
     fn check_hook_presence_empty_groups_is_missing() {
         assert_eq!(check_hook_presence(&[], &HookSpec::STOP), Presence::Missing);
+    }
+
+    // ── HookSpec::EMBED (v3.4.5 Track 4) ─────────────────────────────────────
+
+    #[test]
+    fn embed_spec_has_pending_only_json_args() {
+        assert_eq!(HookSpec::EMBED.command, "onebrain");
+        assert_eq!(
+            HookSpec::EMBED.args,
+            &["search", "reindex", "--pending-only", "--json"]
+        );
+    }
+
+    #[test]
+    fn qmd_spec_has_lex_only_json_args() {
+        assert_eq!(HookSpec::QMD.command, "onebrain");
+        assert_eq!(
+            HookSpec::QMD.args,
+            &["search", "reindex", "--lex-only", "--json"]
+        );
+    }
+
+    #[test]
+    fn matches_spec_embed_does_not_match_qmd_entry() {
+        // `--lex-only` and `--pending-only` entries must never cross-match —
+        // they share the `search reindex` prefix but are distinct hooks.
+        let qmd_entry = json!({
+            "command": "onebrain",
+            "args": ["search", "reindex", "--lex-only", "--json"]
+        });
+        assert!(!matches_spec(&qmd_entry, &HookSpec::EMBED));
+        let embed_entry = json!({
+            "command": "onebrain",
+            "args": ["search", "reindex", "--pending-only", "--json"]
+        });
+        assert!(!matches_spec(&embed_entry, &HookSpec::QMD));
+    }
+
+    #[test]
+    fn matches_spec_embed_does_not_match_checkpoint_stop_entry() {
+        let checkpoint = json!({"command": "onebrain", "args": ["checkpoint", "stop", "--json"]});
+        assert!(!matches_spec(&checkpoint, &HookSpec::EMBED));
     }
 }

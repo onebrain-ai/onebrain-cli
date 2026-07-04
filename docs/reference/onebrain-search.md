@@ -207,3 +207,20 @@ In practice: Apple Silicon's CPU inference is well-optimized (NEON), and query-t
 1. **CoreML execution provider** on macOS via an `ort` feature flag — no extra user-facing dependency.
 2. **CUDA / DirectML builds** as separate release artifacts, produced only on demand.
 3. **External embedding endpoints** (e.g. MLX, Ollama) via the engine's existing `Embed` trait seam (`crates/onebrain-search/src/embed.rs`) — an additive integration point, not a rearchitecture.
+
+## CLI commands
+
+The CLI surface in `onebrain-cli` (`commands/search_reindex.rs`, `commands/search_query.rs`, `commands/search_status.rs`, `commands/search_get.rs`, `commands/search_model.rs`) exposes the engine via `onebrain search <verb>`:
+
+- `onebrain search reindex [PATHS]` — reindex the vault or specific paths. Flags:
+  - `--lex-only` — incremental keyword-index pass; never loads or downloads the embedding model. Changed docs' vectors stay pending until the next embed pass (`--pending-only`). Safe to call from a hook — it never prompts and never fails the calling turn (errors degrade to a skip envelope, exit 0).
+  - `--pending-only` — embed only docs whose vectors are pending (from a previous `--lex-only` pass, or external edits). Loads the model only when there is pending work. Safe to call from a hook — it never prompts and never fails the calling turn (errors degrade to a skip envelope, exit 0).
+  - Both flags silently skip (exit 0, `skipped`/`reason` JSON envelope) when: no collection configured · no index exists · model not downloaded · a reindex is already running.
+- `onebrain search query <TEXT>` — hybrid keyword + semantic search (Reciprocal Rank Fusion).
+- `onebrain search search <TEXT>` — keyword-only search (tantivy BM25).
+- `onebrain search vsearch <TEXT>` — semantic-only search (vector similarity); unavailable on lex-only binaries.
+- `onebrain search get <DOC_PATH>` — fetch a document's stored text + metadata.
+- `onebrain search status` — report index state (doc count, last reindex timestamp, pending drift).
+- `onebrain search model [list|set]` — list available embedding models or switch the active model (rebuilds the vector store).
+
+All search commands support `--json` / `--yaml` structured output modes.

@@ -36,6 +36,13 @@ use crate::vector::VectorStore;
 const CHUNK_META: TableDefinition<&str, &str> = TableDefinition::new("chunk_meta");
 const DOC_CHUNKS: TableDefinition<&str, &str> = TableDefinition::new("doc_chunks");
 const DOC_HASHES: TableDefinition<&str, &str> = TableDefinition::new("doc_hashes");
+/// Content hash stored by a **lex-only** reindex ([`IndexMode::LexOnly`]).
+/// Deliberately a separate table from `DOC_HASHES`, which means "vectors are
+/// current as of this hash": a doc lex-indexed but never embedded must keep
+/// reporting as pending in [`Engine::status`] so a later full/pending embed
+/// pass finds it. See [`Engine::effective_lex_hash`] for how the two tables
+/// combine on read.
+const LEX_HASHES: TableDefinition<&str, &str> = TableDefinition::new("lex_hashes");
 const ENGINE_HEADER: TableDefinition<&str, &str> = TableDefinition::new("engine_header");
 
 const ACTIVE_MODEL_KEY: &str = "active_model";
@@ -142,6 +149,18 @@ enum HashDiff {
     Updated,
     /// The stored hash matches the current content.
     Unchanged,
+}
+
+/// Which side-effects [`Engine::index_doc_mode`] / [`Engine::reindex_existing_doc`]
+/// perform for a doc. `Full` is the long-standing behavior (lex + vector +
+/// `DOC_HASHES`). `LexOnly` updates lex + chunk meta only, records into
+/// `LEX_HASHES` instead of `DOC_HASHES`, and never touches the embedder —
+/// see the module-level lex-only-reindex doc comment on
+/// [`Engine::reindex_all_lex_only_with_progress`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum IndexMode {
+    Full,
+    LexOnly,
 }
 
 /// Compare a stored hash (if any) against the freshly computed `current`
@@ -392,6 +411,7 @@ impl Engine {
             write_txn.open_table(CHUNK_META)?;
             write_txn.open_table(DOC_CHUNKS)?;
             write_txn.open_table(DOC_HASHES)?;
+            write_txn.open_table(LEX_HASHES)?;
             {
                 let mut header = write_txn.open_table(ENGINE_HEADER)?;
                 if header.get(ACTIVE_MODEL_KEY)?.is_none() {
@@ -652,6 +672,17 @@ impl Engine {
     /// Chunk `content`, index into lex + embed + vector, and record chunk
     /// meta. Returns the number of chunks indexed.
     pub fn index_doc(&mut self, doc_path: &str, content: &str) -> Result<usize> {
+        self.index_doc_mode(doc_path, content, IndexMode::Full)
+    }
+
+    /// Shared body of [`Engine::index_doc`]: chunk `content` and index into
+    /// lex + chunk meta always; embed + vector store ONLY in
+    /// [`IndexMode::Full`]. `LexOnly` never calls
+    /// [`Engine::embed_passages_if_available`] — not even to get `None` back
+    /// — so it never constructs the embedder, lazy or otherwise (see the
+    /// `PanicEmbed` test double in `mod tests`, which panics on ANY embedder
+    /// method).
+    fn index_doc_mode(&mut self, doc_path: &str, content: &str, mode: IndexMode) -> Result<usize> {
         let chunks = chunk_markdown(doc_path, content, CHUNK_MAX_TOKENS, CHUNK_OVERLAP_TOKENS);
 
         // Batch-embed ALL chunk texts in one call — `Embedder::embed` takes a
@@ -665,8 +696,17 @@ impl Engine {
         // is left unpopulated, so keyword search + the whole index lifecycle
         // work unchanged. Tests inject a fake embedder, so they still get
         // vectors regardless of the `semantic` feature.
-        let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-        let vectors = self.embed_passages_if_available(&texts)?;
+        //
+        // `IndexMode::LexOnly` skips this call entirely (rather than calling
+        // it and discarding `Some(vectors)`): the whole point of a lex-only
+        // reindex is to guarantee zero embedder interaction.
+        let vectors = match mode {
+            IndexMode::Full => {
+                let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+                self.embed_passages_if_available(&texts)?
+            }
+            IndexMode::LexOnly => None,
+        };
 
         let mut chunk_ids: Vec<String> = Vec::with_capacity(chunks.len());
         let write_txn = self.meta.begin_write()?;
@@ -831,6 +871,52 @@ impl Engine {
         Ok(())
     }
 
+    /// Stored `LEX_HASHES` entry for `doc_path`, if any (no `DOC_HASHES`
+    /// fallback — see [`Engine::effective_lex_hash`] for the combined read).
+    fn stored_lex_hash(&self, doc_path: &str) -> Result<Option<String>> {
+        let read_txn = self.meta.begin_read()?;
+        let lex_hashes = read_txn.open_table(LEX_HASHES)?;
+        Ok(lex_hashes.get(doc_path)?.map(|v| v.value().to_string()))
+    }
+
+    /// The hash a lex-only reindex should diff against: `LEX_HASHES` if
+    /// present, else `DOC_HASHES`. A fully-indexed (`Full`-mode) doc is by
+    /// definition lex-indexed too, so falling back to `DOC_HASHES` makes
+    /// existing indexes (built before `LEX_HASHES` existed) work correctly
+    /// with zero migration — they simply read as already lex-current.
+    fn effective_lex_hash(&self, doc_path: &str) -> Result<Option<String>> {
+        if let Some(h) = self.stored_lex_hash(doc_path)? {
+            return Ok(Some(h));
+        }
+        self.stored_hash(doc_path)
+    }
+
+    /// Store `hash` as `doc_path`'s `LEX_HASHES` entry (lex-only reindex —
+    /// never touches `DOC_HASHES`).
+    fn store_lex_hash(&mut self, doc_path: &str, hash: &str) -> Result<()> {
+        let write_txn = self.meta.begin_write()?;
+        {
+            let mut lex_hashes = write_txn.open_table(LEX_HASHES)?;
+            lex_hashes.insert(doc_path, hash)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Drop `doc_path`'s `LEX_HASHES` entry, if any. Used by a `Full`-mode
+    /// reindex once it has re-indexed a doc: after that, `DOC_HASHES` alone
+    /// is authoritative again (see [`Engine::effective_lex_hash`]), and a
+    /// stale `LEX_HASHES` entry left behind could otherwise diverge from it.
+    fn drop_lex_hash(&mut self, doc_path: &str) -> Result<()> {
+        let write_txn = self.meta.begin_write()?;
+        {
+            let mut lex_hashes = write_txn.open_table(LEX_HASHES)?;
+            lex_hashes.remove(doc_path)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     /// Record `epoch_secs` as the index's `last_indexed_at` in the engine
     /// header. Called by the reindex paths at the end of a successful run.
     fn record_last_indexed(&mut self, epoch_secs: u64) -> Result<()> {
@@ -854,12 +940,20 @@ impl Engine {
             .and_then(|v| v.value().parse::<u64>().ok()))
     }
 
-    /// Drop `doc_path`'s stored content hash, if any.
+    /// Drop `doc_path`'s stored content hash from BOTH `DOC_HASHES` and
+    /// `LEX_HASHES`. Used when a doc is swept as removed (file gone from
+    /// disk) — in both `Full` and `LexOnly` reindex modes a removed doc must
+    /// stop being reported as drift entirely, not merely fall back from one
+    /// table to the other.
     fn drop_hash(&mut self, doc_path: &str) -> Result<()> {
         let write_txn = self.meta.begin_write()?;
         {
             let mut doc_hashes = write_txn.open_table(DOC_HASHES)?;
             doc_hashes.remove(doc_path)?;
+        }
+        {
+            let mut lex_hashes = write_txn.open_table(LEX_HASHES)?;
+            lex_hashes.remove(doc_path)?;
         }
         write_txn.commit()?;
         Ok(())
@@ -872,18 +966,41 @@ impl Engine {
     /// before the first embed call (the first Added / Updated doc). Callers
     /// pass a closure that emits [`ReindexProgress::LoadingModel`] and flips a
     /// shared "already announced" flag so it fires at most once. Unchanged docs
-    /// don't embed, so they never trigger it.
+    /// don't embed, so they never trigger it. In [`IndexMode::LexOnly`],
+    /// `on_first_embed` is never called at all — nothing is ever embedded.
+    ///
+    /// Mode behavior:
+    /// - [`IndexMode::Full`]: diff against `DOC_HASHES`; on Added/Updated,
+    ///   `remove_doc` (unconditionally — a no-op for a brand-new doc, but
+    ///   required on Added too since a prior lex-only pass may have already
+    ///   lex-indexed this doc under LEX_HASHES without a DOC_HASHES entry;
+    ///   "no DOC_HASHES ⟹ no lex entries" stopped holding once lex-only mode
+    ///   was introduced), `index_doc` (full), store into `DOC_HASHES`, and
+    ///   drop any `LEX_HASHES` entry (keeps [`Engine::effective_lex_hash`]'s
+    ///   fallback correct — see that function's doc comment).
+    /// - [`IndexMode::LexOnly`]: diff against the *effective* lex hash
+    ///   ([`Engine::effective_lex_hash`]); on Added/Updated, `remove_doc`
+    ///   first (drops any stale lex+vec+meta; a no-op for brand-new docs),
+    ///   then `index_doc_mode(LexOnly)`, and store into `LEX_HASHES` ONLY —
+    ///   `DOC_HASHES` and `on_first_embed` are never touched, so
+    ///   [`Engine::status`] keeps reporting the doc as pending until a real
+    ///   (Full) embed pass runs.
     fn reindex_existing_doc(
         &mut self,
         doc_path: &str,
         abs_path: &Path,
+        mode: IndexMode,
         stats: &mut ReindexStats,
         on_first_embed: &mut dyn FnMut(),
     ) -> Result<()> {
         let bytes =
             std::fs::read(abs_path).with_context(|| format!("reading {}", abs_path.display()))?;
         let current_hash = hash_bytes(&bytes);
-        let stored = self.stored_hash(doc_path)?;
+
+        let stored = match mode {
+            IndexMode::Full => self.stored_hash(doc_path)?,
+            IndexMode::LexOnly => self.effective_lex_hash(doc_path)?,
+        };
 
         match diff_hash(stored.as_deref(), &current_hash) {
             HashDiff::Unchanged => {
@@ -891,17 +1008,50 @@ impl Engine {
             }
             HashDiff::Added => {
                 let content = String::from_utf8_lossy(&bytes).into_owned();
-                on_first_embed();
-                self.index_doc(doc_path, &content)?;
-                self.store_hash(doc_path, &current_hash)?;
+                match mode {
+                    IndexMode::Full => {
+                        on_first_embed();
+                        // `remove_doc` here even though this is the `Added`
+                        // branch: a prior lex-only pass may have already
+                        // lex-indexed this doc (LEX_HASHES set, DOC_HASHES
+                        // never touched), so "no DOC_HASHES ⟹ no lex
+                        // entries" no longer holds now that lex-only mode
+                        // exists. Without this, `index_doc`'s deterministic
+                        // chunk_ids would collide with the still-present
+                        // lex-only tantivy docs (`LexIndex::add` never
+                        // deletes-first), duplicating lex hits. `remove_doc`
+                        // is keyed off `DOC_CHUNKS`, which lex-only indexing
+                        // also populates, so it finds and clears those
+                        // chunks; for a truly brand-new doc it's a no-op.
+                        self.remove_doc(doc_path)?;
+                        self.index_doc(doc_path, &content)?;
+                        self.store_hash(doc_path, &current_hash)?;
+                        self.drop_lex_hash(doc_path)?;
+                    }
+                    IndexMode::LexOnly => {
+                        self.remove_doc(doc_path)?;
+                        self.index_doc_mode(doc_path, &content, IndexMode::LexOnly)?;
+                        self.store_lex_hash(doc_path, &current_hash)?;
+                    }
+                }
                 stats.added += 1;
             }
             HashDiff::Updated => {
                 let content = String::from_utf8_lossy(&bytes).into_owned();
-                on_first_embed();
-                self.remove_doc(doc_path)?;
-                self.index_doc(doc_path, &content)?;
-                self.store_hash(doc_path, &current_hash)?;
+                match mode {
+                    IndexMode::Full => {
+                        on_first_embed();
+                        self.remove_doc(doc_path)?;
+                        self.index_doc(doc_path, &content)?;
+                        self.store_hash(doc_path, &current_hash)?;
+                        self.drop_lex_hash(doc_path)?;
+                    }
+                    IndexMode::LexOnly => {
+                        self.remove_doc(doc_path)?;
+                        self.index_doc_mode(doc_path, &content, IndexMode::LexOnly)?;
+                        self.store_lex_hash(doc_path, &current_hash)?;
+                    }
+                }
                 stats.updated += 1;
             }
         }
@@ -930,6 +1080,38 @@ impl Engine {
         doc_paths: &[String],
         progress: &mut dyn FnMut(ReindexProgress),
     ) -> Result<ReindexStats> {
+        self.reindex_paths_with_progress_inner(vault_root, doc_paths, IndexMode::Full, progress)
+    }
+
+    /// Lex-only counterpart to [`Engine::reindex_paths_with_progress`]: for
+    /// each targeted doc, updates lex + chunk meta and `LEX_HASHES` only —
+    /// the embedder is never touched, and `DOC_HASHES` is left exactly as it
+    /// was, so [`Engine::status`] keeps reporting these docs as pending until
+    /// a later full/pending embed pass runs. See the module-level doc comment
+    /// on [`Engine::reindex_all_lex_only_with_progress`] for the full
+    /// rationale (this function shares its mode plumbing).
+    pub fn reindex_paths_lex_only_with_progress(
+        &mut self,
+        vault_root: &Path,
+        doc_paths: &[String],
+        progress: &mut dyn FnMut(ReindexProgress),
+    ) -> Result<ReindexStats> {
+        self.reindex_paths_with_progress_inner(vault_root, doc_paths, IndexMode::LexOnly, progress)
+    }
+
+    /// Shared body of [`Engine::reindex_paths_with_progress`] /
+    /// [`Engine::reindex_paths_lex_only_with_progress`]: only `mode` differs.
+    /// NOTE: unlike [`Engine::reindex_all_with_progress_inner`]'s sweep, a
+    /// targeted removal here is scoped to `doc_paths` (a doc not passed in is
+    /// simply not considered), so `drop_hash` (both tables) applies per-path
+    /// exactly as before lex-only existed.
+    fn reindex_paths_with_progress_inner(
+        &mut self,
+        vault_root: &Path,
+        doc_paths: &[String],
+        mode: IndexMode,
+        progress: &mut dyn FnMut(ReindexProgress),
+    ) -> Result<ReindexStats> {
         let total = doc_paths.len();
         progress(ReindexProgress::Walked { total });
         let mut model_announced = false;
@@ -943,8 +1125,16 @@ impl Engine {
                         progress(ReindexProgress::LoadingModel);
                     }
                 };
-                self.reindex_existing_doc(doc_path, &abs_path, &mut stats, &mut on_first_embed)?;
-            } else if self.stored_hash(doc_path)?.is_some() {
+                self.reindex_existing_doc(
+                    doc_path,
+                    &abs_path,
+                    mode,
+                    &mut stats,
+                    &mut on_first_embed,
+                )?;
+            } else if self.stored_hash(doc_path)?.is_some()
+                || self.stored_lex_hash(doc_path)?.is_some()
+            {
                 self.remove_doc(doc_path)?;
                 self.drop_hash(doc_path)?;
                 stats.removed += 1;
@@ -956,7 +1146,12 @@ impl Engine {
                 doc_path: doc_path.clone(),
             });
         }
-        self.record_last_indexed(now_epoch_secs())?;
+        // Lex-only runs never touch `last_indexed_at`: that field means
+        // "vectors are current as of", and a lex-only run never embeds, so
+        // recording it here would make `status` under-report drift.
+        if mode == IndexMode::Full {
+            self.record_last_indexed(now_epoch_secs())?;
+        }
         Ok(stats)
     }
 
@@ -986,6 +1181,45 @@ impl Engine {
         vault_root: &Path,
         progress: &mut dyn FnMut(ReindexProgress),
     ) -> Result<ReindexStats> {
+        self.reindex_all_with_progress_inner(vault_root, IndexMode::Full, progress)
+    }
+
+    /// Lex-only counterpart to [`Engine::reindex_all_with_progress`]: walks
+    /// the whole vault and updates the lex/BM25 index + chunk meta for every
+    /// added/updated doc, but the embedder is NEVER constructed or called —
+    /// not even the lazy production embedder in a `semantic` build. Changed
+    /// docs are recorded into `LEX_HASHES`, NOT `DOC_HASHES`, so
+    /// [`Engine::status`] keeps reporting them as pending: a lex-indexed doc
+    /// is deliberately indistinguishable from an un-embedded one until a real
+    /// (Full) reindex/embed pass runs. [`ReindexProgress::LoadingModel`] is
+    /// therefore never emitted by a lex-only run — there is nothing to load.
+    ///
+    /// The trailing stale-doc sweep (file gone from disk) behaves exactly as
+    /// in [`Engine::reindex_all_with_progress`]: `remove_doc` plus dropping
+    /// BOTH hash-table entries via [`Engine::drop_hash`], since a gone file
+    /// should stop counting as drift under either hash source.
+    ///
+    /// `last_indexed_at` is NOT updated by a lex-only run: that field means
+    /// "vectors are current as of this time", which is exactly what did NOT
+    /// just happen.
+    pub fn reindex_all_lex_only_with_progress(
+        &mut self,
+        vault_root: &Path,
+        progress: &mut dyn FnMut(ReindexProgress),
+    ) -> Result<ReindexStats> {
+        self.reindex_all_with_progress_inner(vault_root, IndexMode::LexOnly, progress)
+    }
+
+    /// Shared body of [`Engine::reindex_all_with_progress`] /
+    /// [`Engine::reindex_all_lex_only_with_progress`]: only `mode` differs
+    /// (which hash table is diffed/written, and whether the embedder is ever
+    /// touched — see [`Engine::reindex_existing_doc`]).
+    fn reindex_all_with_progress_inner(
+        &mut self,
+        vault_root: &Path,
+        mode: IndexMode,
+        progress: &mut dyn FnMut(ReindexProgress),
+    ) -> Result<ReindexStats> {
         let files = walk_markdown_files(vault_root, &self.exclude_patterns)?;
         let doc_paths: Vec<String> = files
             .iter()
@@ -1007,7 +1241,7 @@ impl Engine {
                 }
             };
             if let Err(e) =
-                self.reindex_existing_doc(doc_path, abs_path, &mut stats, &mut on_first_embed)
+                self.reindex_existing_doc(doc_path, abs_path, mode, &mut stats, &mut on_first_embed)
             {
                 stats.failed += 1;
                 eprintln!("onebrain-search: skipping {doc_path}: {e:#}");
@@ -1022,16 +1256,24 @@ impl Engine {
         // Sweep: any stored hash whose doc_path wasn't just seen on disk
         // means the file is gone. Membership is tested against a HashSet built
         // once (O(N) total) rather than `Vec::contains` per entry (O(N²)).
+        // Same in both modes: check BOTH hash tables and drop BOTH on removal
+        // (drop_hash clears both), so a doc lex-indexed-only is swept just
+        // like a fully-indexed one.
         let seen: std::collections::HashSet<&String> = doc_paths.iter().collect();
         let stale: Vec<String> = {
             let read_txn = self.meta.begin_read()?;
             let doc_hashes = read_txn.open_table(DOC_HASHES)?;
-            doc_hashes
-                .iter()?
-                .filter_map(|entry| entry.ok())
-                .map(|(k, _)| k.value().to_string())
-                .filter(|k| !seen.contains(k))
-                .collect()
+            let lex_hashes = read_txn.open_table(LEX_HASHES)?;
+            let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for entry in doc_hashes.iter()? {
+                let (k, _) = entry?;
+                out.insert(k.value().to_string());
+            }
+            for entry in lex_hashes.iter()? {
+                let (k, _) = entry?;
+                out.insert(k.value().to_string());
+            }
+            out.into_iter().filter(|k| !seen.contains(k)).collect()
         };
         for doc_path in stale {
             self.remove_doc(&doc_path)?;
@@ -1039,7 +1281,12 @@ impl Engine {
             stats.removed += 1;
         }
 
-        self.record_last_indexed(now_epoch_secs())?;
+        // Lex-only runs never touch `last_indexed_at`: see this function's
+        // doc comment (and `reindex_all_lex_only_with_progress`'s) — it means
+        // "vectors are current as of", which a lex-only run never makes true.
+        if mode == IndexMode::Full {
+            self.record_last_indexed(now_epoch_secs())?;
+        }
         Ok(stats)
     }
 
@@ -1052,6 +1299,48 @@ impl Engine {
     /// add/update/unchanged/remove classification a reindex does, MINUS the
     /// indexing side-effects.
     pub fn status(&self, vault_root: &Path) -> Result<IndexStatus> {
+        let drift = self.classify_doc_hashes_drift(vault_root)?;
+        Ok(IndexStatus {
+            doc_count: drift.doc_count,
+            last_indexed_at: self.stored_last_indexed()?,
+            pending_new: drift.added.len(),
+            pending_changed: drift.changed.len(),
+            pending_removed: drift.removed.len(),
+        })
+    }
+
+    /// The exact doc-path worklist a deferred embed pass must process: docs
+    /// on disk with no `DOC_HASHES` entry (new), docs whose stored
+    /// `DOC_HASHES` hash differs from disk (changed), and docs with a
+    /// `DOC_HASHES` entry whose file is gone (removed — included because
+    /// `reindex_paths` handles removal for missing files too).
+    ///
+    /// `LEX_HASHES` plays no role here: pending is defined purely by
+    /// `DOC_HASHES` drift, so a lex-only-indexed doc (see
+    /// [`Engine::reindex_all_lex_only_with_progress`]) is still reported as
+    /// pending until a real (Full) reindex/embed pass runs — same rule
+    /// [`Engine::status`] uses.
+    ///
+    /// Never constructs the embedder. Order: added/changed docs in
+    /// `walk_markdown_files` order, then removed docs sorted for stability.
+    pub fn pending_vector_paths(&self, vault_root: &Path) -> Result<Vec<String>> {
+        let drift = self.classify_doc_hashes_drift(vault_root)?;
+        let mut out = drift.added;
+        out.extend(drift.changed);
+        let mut removed = drift.removed;
+        removed.sort();
+        out.extend(removed);
+        Ok(out)
+    }
+
+    /// Shared walk-classify core of [`Engine::status`] and
+    /// [`Engine::pending_vector_paths`]: walks `*.md` files under
+    /// `vault_root` (honoring `exclude_patterns`), hashes each one, and
+    /// classifies it against the stored `DOC_HASHES` table. Unreadable files
+    /// are skipped (a reindex would count them as `failed`, not drift) to
+    /// keep this read-only and resilient. `added`/`changed` are in walk
+    /// order; `removed` is unordered (callers sort if they need stability).
+    fn classify_doc_hashes_drift(&self, vault_root: &Path) -> Result<DocHashesDrift> {
         // Snapshot every stored (doc_path -> hash) once. Doc count is the
         // number of distinct stored hashes.
         let stored: std::collections::HashMap<String, String> = {
@@ -1064,10 +1353,11 @@ impl Engine {
             }
             out
         };
+        let doc_count = stored.len();
 
         let files = walk_markdown_files(vault_root, &self.exclude_patterns)?;
-        let mut pending_new = 0usize;
-        let mut pending_changed = 0usize;
+        let mut added = Vec::new();
+        let mut changed = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for abs_path in &files {
             let Some(doc_path) = vault_relative_path(vault_root, abs_path) else {
@@ -1075,30 +1365,42 @@ impl Engine {
             };
             let bytes = match std::fs::read(abs_path) {
                 Ok(b) => b,
-                // Unreadable file: skip it (a reindex would count it as
-                // `failed`, not as drift). Keep status read-only + resilient.
                 Err(_) => continue,
             };
             let current_hash = hash_bytes(&bytes);
             match diff_hash(stored.get(&doc_path).map(String::as_str), &current_hash) {
-                HashDiff::Added => pending_new += 1,
-                HashDiff::Updated => pending_changed += 1,
+                HashDiff::Added => added.push(doc_path.clone()),
+                HashDiff::Updated => changed.push(doc_path.clone()),
                 HashDiff::Unchanged => {}
             }
             seen.insert(doc_path);
         }
 
         // Indexed docs whose file is gone from disk (would be removed).
-        let pending_removed = stored.keys().filter(|k| !seen.contains(*k)).count();
+        let removed: Vec<String> = stored
+            .keys()
+            .filter(|k| !seen.contains(*k))
+            .cloned()
+            .collect();
 
-        Ok(IndexStatus {
-            doc_count: stored.len(),
-            last_indexed_at: self.stored_last_indexed()?,
-            pending_new,
-            pending_changed,
-            pending_removed,
+        Ok(DocHashesDrift {
+            doc_count,
+            added,
+            changed,
+            removed,
         })
     }
+}
+
+/// Result of [`Engine::classify_doc_hashes_drift`]: the same
+/// add/update/unchanged/remove classification a reindex does against
+/// `DOC_HASHES`, minus the indexing side-effects. `doc_count` is the number
+/// of distinct stored `DOC_HASHES` keys (matches [`IndexStatus::doc_count`]).
+struct DocHashesDrift {
+    doc_count: usize,
+    added: Vec<String>,
+    changed: Vec<String>,
+    removed: Vec<String>,
 }
 
 /// Current wall-clock time as whole epoch seconds. Clamps a
@@ -1168,6 +1470,42 @@ mod tests {
 
     fn fake_engine(dir: &Path) -> Engine {
         Engine::open_with_embedder(dir, "fake-model", Box::new(FakeEmbedder { dims: 16 })).unwrap()
+    }
+
+    /// An embedder whose every method panics. Used to prove a lex-only
+    /// reindex never constructs/calls the embedder at all — if it did, the
+    /// test process would abort on the panic rather than merely fail an
+    /// assertion.
+    struct PanicEmbed;
+
+    impl Embed for PanicEmbed {
+        fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            panic!("PanicEmbed::embed called — lex-only reindex must never embed");
+        }
+        fn dims(&self) -> usize {
+            panic!("PanicEmbed::dims called — lex-only reindex must never construct/query the embedder");
+        }
+        fn embed_passages(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            panic!("PanicEmbed::embed_passages called — lex-only reindex must never embed");
+        }
+        fn embed_query(&self, _text: &str) -> Result<Vec<f32>> {
+            panic!("PanicEmbed::embed_query called — lex-only reindex must never embed");
+        }
+    }
+
+    /// Open an engine with [`PanicEmbed`] injected, at a fixed 16-dim vector
+    /// store (matching `fake_engine`'s dims so the two are interchangeable in
+    /// tests that switch embedders mid-test). `dims()` itself panics, so the
+    /// vector store must be opened directly rather than via
+    /// `Engine::open_with_embedder`, which calls `embedder.dims()`.
+    fn panic_engine(dir: &Path) -> Engine {
+        Engine::open_inner(
+            dir,
+            "panic-model",
+            16,
+            EmbedSource::Injected(Box::new(PanicEmbed)),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1964,5 +2302,344 @@ mod tests {
         let truncated_thai = truncate_snippet(&thai, 200);
         assert_eq!(truncated_thai.chars().count(), 201);
         assert!(truncated_thai.ends_with('…'));
+    }
+
+    // -- Lex-only reindex (v3.4.5 Track 4) --------------------------------
+
+    #[test]
+    fn lex_only_reindex_never_embeds() {
+        // A PanicEmbed engine: if `reindex_all_lex_only_with_progress` ever
+        // touched the embedder (construct, embed, or dims), the test process
+        // would panic instead of merely failing an assertion.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = panic_engine(cache_dir.path());
+
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
+        std::fs::write(vault_dir.path().join("b.md"), "# B\nbeta content").unwrap();
+
+        let mut events = Vec::new();
+        let stats = e
+            .reindex_all_lex_only_with_progress(vault_dir.path(), &mut |p| events.push(p))
+            .unwrap();
+        assert_eq!(stats.added, 2);
+
+        // A lex-only run never announces a model load — nothing is ever
+        // embedded, so there's nothing to stall on.
+        assert!(
+            !events
+                .iter()
+                .any(|p| matches!(p, ReindexProgress::LoadingModel)),
+            "lex-only run must never emit LoadingModel: {events:?}"
+        );
+    }
+
+    #[test]
+    fn lex_only_doc_is_lex_searchable_and_stays_pending() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
+        std::fs::write(vault_dir.path().join("b.md"), "# B\nbeta content").unwrap();
+
+        let stats = e
+            .reindex_all_lex_only_with_progress(vault_dir.path(), &mut |_| {})
+            .unwrap();
+        assert_eq!(stats.added, 2);
+
+        // Chunk meta is present (lex-indexed) though never embedded/vector-current.
+        assert!(e.get("a.md").unwrap().contains("alpha content"));
+        assert!(e.get("b.md").unwrap().contains("beta content"));
+
+        // DOC_HASHES was never written for either doc, so status still
+        // reports both as pending-new, and doc_count (distinct DOC_HASHES
+        // keys) is 0 — this is the crux of the whole feature.
+        let status = e.status(vault_dir.path()).unwrap();
+        assert_eq!(status.doc_count, 0);
+        assert_eq!(status.pending_new, 2);
+        assert_eq!(status.pending_total(), 2);
+    }
+
+    #[test]
+    fn lex_only_second_run_is_unchanged() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
+        std::fs::write(vault_dir.path().join("b.md"), "# B\nbeta content").unwrap();
+
+        let stats = e
+            .reindex_all_lex_only_with_progress(vault_dir.path(), &mut |_| {})
+            .unwrap();
+        assert_eq!(stats.added, 2);
+
+        // Second lex-only run: LEX_HASHES already holds both docs' current
+        // hashes, so nothing is re-lexed.
+        let stats2 = e
+            .reindex_all_lex_only_with_progress(vault_dir.path(), &mut |_| {})
+            .unwrap();
+        assert_eq!(
+            stats2,
+            ReindexStats {
+                added: 0,
+                updated: 0,
+                removed: 0,
+                unchanged: 2,
+                failed: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn full_reindex_after_lex_only_embeds_and_clears_pending() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
+        std::fs::write(vault_dir.path().join("b.md"), "# B\nbeta content").unwrap();
+
+        e.reindex_all_lex_only_with_progress(vault_dir.path(), &mut |_| {})
+            .unwrap();
+        assert_eq!(e.status(vault_dir.path()).unwrap().pending_total(), 2);
+
+        // A normal (full) reindex now embeds both docs and clears drift.
+        let stats = e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(stats.added, 2);
+        assert_eq!(e.status(vault_dir.path()).unwrap().pending_total(), 0);
+        assert_eq!(e.status(vault_dir.path()).unwrap().doc_count, 2);
+
+        // LEX_HASHES entries for both docs must be gone (Full mode drops
+        // them so the effective-lex-hash fallback reads from DOC_HASHES): a
+        // subsequent lex-only run reports them unchanged via the fallback,
+        // not because a stale LEX_HASHES entry happens to still match.
+        let stats2 = e
+            .reindex_all_lex_only_with_progress(vault_dir.path(), &mut |_| {})
+            .unwrap();
+        assert_eq!(
+            stats2,
+            ReindexStats {
+                added: 0,
+                updated: 0,
+                removed: 0,
+                unchanged: 2,
+                failed: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn lex_only_update_replaces_old_chunks() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        let doc_path = vault_dir.path().join("a.md");
+        std::fs::write(&doc_path, "# A\noriginal content").unwrap();
+
+        // Full-index first (as if the doc was already fully embedded).
+        let stats = e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(stats.added, 1);
+        assert_eq!(e.status(vault_dir.path()).unwrap().pending_total(), 0);
+
+        // Edit the file, then lex-only reindex.
+        std::fs::write(&doc_path, "# A\nedited content, different bytes").unwrap();
+        let stats2 = e
+            .reindex_all_lex_only_with_progress(vault_dir.path(), &mut |_| {})
+            .unwrap();
+        assert_eq!(stats2.updated, 1);
+
+        assert!(e.get("a.md").unwrap().contains("edited content"));
+        // DOC_HASHES still holds the OLD (pre-edit) hash — Full mode never
+        // ran again — so status reports the doc as pending_changed, proving
+        // the hash-drift machinery still sees it as needing a real embed.
+        let status = e.status(vault_dir.path()).unwrap();
+        assert_eq!(status.pending_changed, 1);
+        assert_eq!(status.pending_total(), 1);
+    }
+
+    #[test]
+    fn full_reindex_after_lex_only_does_not_duplicate_lex_entries_for_new_doc() {
+        // Regression for the lex-only -> pending-only handoff on a NEW doc:
+        // (1) a lex-only pass indexes "a.md" and writes tantivy docs for
+        // `a.md#0`, `a.md#1`, ... (LEX_HASHES only, no DOC_HASHES entry);
+        // (2) a later Full reindex sees no DOC_HASHES entry, so it takes the
+        // `Added` branch. `chunk_id` is deterministic (`{doc_path}#{idx}`)
+        // and `LexIndex::add` never deletes-first, so without a `remove_doc`
+        // first, Full's `index_doc` call would add a SECOND tantivy doc per
+        // chunk_id on top of the lex-only one — corrupting the lex index
+        // with duplicates that would double-count in `rrf_fuse`.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        let doc_path = vault_dir.path().join("a.md");
+        std::fs::write(&doc_path, "# A\nalpha content unique_needle").unwrap();
+
+        // Step 1: lex-only index the new doc.
+        let stats = e
+            .reindex_all_lex_only_with_progress(vault_dir.path(), &mut |_| {})
+            .unwrap();
+        assert_eq!(stats.added, 1);
+        assert_eq!(e.status(vault_dir.path()).unwrap().pending_total(), 1);
+
+        // Step 2: Full reindex (the "pending-only" embed pass).
+        let stats2 = e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(stats2.added, 1);
+        assert_eq!(e.status(vault_dir.path()).unwrap().pending_total(), 0);
+
+        // Every chunk of a.md must appear exactly once in the lex index —
+        // not duplicated by the lex-only add followed by an un-deduped
+        // Full-mode add.
+        let lex_hits = e.lex.search("unique_needle", 50).unwrap();
+        let a_hits: Vec<&String> = lex_hits
+            .iter()
+            .map(|(chunk_id, _)| chunk_id)
+            .filter(|id| id.starts_with("a.md#"))
+            .collect();
+        assert_eq!(
+            a_hits.len(),
+            1,
+            "expected exactly one lex hit for a.md's single chunk, got {a_hits:?}"
+        );
+
+        let mut unique_ids: Vec<&&String> = a_hits.iter().collect();
+        unique_ids.sort();
+        unique_ids.dedup();
+        assert_eq!(
+            unique_ids.len(),
+            a_hits.len(),
+            "lex hits for a.md must not contain duplicate chunk_ids"
+        );
+    }
+
+    #[test]
+    fn lex_only_removal_sweeps_gone_docs() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        let a = vault_dir.path().join("a.md");
+        let b = vault_dir.path().join("b.md");
+        std::fs::write(&a, "# A\nalpha content").unwrap();
+        std::fs::write(&b, "# B\nbeta content").unwrap();
+
+        // Full-index both.
+        let stats = e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(stats.added, 2);
+        assert_eq!(e.status(vault_dir.path()).unwrap().pending_total(), 0);
+
+        // Delete one file, lex-only reindex_all: it must be swept (both hash
+        // tables dropped) just like a full reindex would.
+        std::fs::remove_file(&a).unwrap();
+        let stats2 = e
+            .reindex_all_lex_only_with_progress(vault_dir.path(), &mut |_| {})
+            .unwrap();
+        assert_eq!(stats2.removed, 1);
+
+        assert!(e.get("a.md").is_err());
+        let status = e.status(vault_dir.path()).unwrap();
+        assert_eq!(
+            status.pending_total(),
+            0,
+            "both hash entries must be dropped for a.md"
+        );
+        assert_eq!(status.doc_count, 1, "only b.md remains indexed");
+    }
+
+    #[test]
+    fn lex_only_reindex_paths_targets_specific_docs() {
+        // Same coverage as `lex_only_reindex_never_embeds` but through the
+        // targeted-paths entry point, proving both public APIs share the
+        // mode plumbing.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = panic_engine(cache_dir.path());
+
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
+
+        let stats = e
+            .reindex_paths_lex_only_with_progress(
+                vault_dir.path(),
+                &["a.md".to_string()],
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(stats.added, 1);
+        assert!(e.get("a.md").unwrap().contains("alpha content"));
+    }
+
+    #[test]
+    fn pending_vector_paths_lists_lex_only_docs() {
+        // A lex-only reindex deliberately leaves DOC_HASHES untouched, so
+        // both docs must show up in the deferred-embed worklist even though
+        // they're fully lex-searchable.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
+        std::fs::write(vault_dir.path().join("b.md"), "# B\nbeta content").unwrap();
+
+        let stats = e
+            .reindex_all_lex_only_with_progress(vault_dir.path(), &mut |_| {})
+            .unwrap();
+        assert_eq!(stats.added, 2);
+
+        let mut pending = e.pending_vector_paths(vault_dir.path()).unwrap();
+        pending.sort();
+        assert_eq!(pending, vec!["a.md".to_string(), "b.md".to_string()]);
+
+        // A real (full) reindex embeds both docs and clears the worklist.
+        e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(
+            e.pending_vector_paths(vault_dir.path()).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn pending_vector_paths_includes_changed_and_removed() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        let a = vault_dir.path().join("a.md");
+        let b = vault_dir.path().join("b.md");
+        let c = vault_dir.path().join("c.md");
+        std::fs::write(&a, "# A\nalpha content").unwrap();
+        std::fs::write(&b, "# B\nbeta content").unwrap();
+        std::fs::write(&c, "# C\ngamma content").unwrap();
+        e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(
+            e.pending_vector_paths(vault_dir.path()).unwrap(),
+            Vec::<String>::new()
+        );
+
+        // Modify a, delete b, leave c untouched.
+        std::fs::write(&a, "# A\nalpha content EDITED").unwrap();
+        std::fs::remove_file(&b).unwrap();
+
+        let mut pending = e.pending_vector_paths(vault_dir.path()).unwrap();
+        pending.sort();
+        assert_eq!(pending, vec!["a.md".to_string(), "b.md".to_string()]);
+    }
+
+    #[test]
+    fn pending_vector_paths_empty_on_fresh_index_current_vault() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
+        std::fs::write(vault_dir.path().join("b.md"), "# B\nbeta content").unwrap();
+        e.reindex_all(vault_dir.path()).unwrap();
+
+        assert_eq!(
+            e.pending_vector_paths(vault_dir.path()).unwrap(),
+            Vec::<String>::new()
+        );
     }
 }

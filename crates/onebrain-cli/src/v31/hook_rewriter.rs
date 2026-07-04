@@ -29,6 +29,19 @@ use serde_json::{Map, Value};
 /// The flag that switches hook-protocol commands from default-text to JSON.
 const JSON_FLAG: &str = "--json";
 
+/// v3.4.5 Track 4: flag that scopes a PostToolUse `search reindex` hook to a
+/// lexical-only pass (fast, no embedding) — full embedding is deferred to the
+/// Stop hook. Only ever added by the migration below under `PostToolUse`.
+const LEX_ONLY_FLAG: &str = "--lex-only";
+
+/// v3.4.5 Track 4: flag on the Stop-event companion hook that runs a
+/// pending-only embed pass at session end.
+const PENDING_ONLY_FLAG: &str = "--pending-only";
+
+/// The event name the lex-only migration and Stop-embed addition key off.
+const POST_TOOL_USE: &str = "PostToolUse";
+const STOP: &str = "Stop";
+
 /// One arg-shape mapping. `from` is matched as an exact prefix of the
 /// entry's `args[]`; the prefix is replaced by `to` and any remaining args
 /// are kept (so `orphan-scan logs token` → `checkpoint orphans logs token`).
@@ -79,6 +92,12 @@ pub struct RewriteReport {
     /// v3.1 hook-protocol commands need `--json` because the default is
     /// now text; this counter records each entry the rewriter promoted.
     pub json_flag_added: u32,
+    /// v3.4.5 Track 4: true when a new Stop `search reindex --pending-only
+    /// --json` entry was appended this run (the `plugin update` upgrade path
+    /// for the same hook `onebrain-fs::register_hooks` adds on fresh
+    /// installs). Counted into `total` so `rewrite_settings_file` writes the
+    /// file when this is the only change.
+    pub stop_embed_added: bool,
     /// Soft warnings for malformed hook entries (non-string `command` /
     /// non-array `args` / etc.). Each entry is preserved as-is; the
     /// rewriter just skips it AND tells the caller. Empty when the
@@ -128,7 +147,7 @@ pub fn rewrite_hooks(settings: &mut Value) -> RewriteReport {
     let Some(hooks_obj) = settings.get_mut("hooks").and_then(|v| v.as_object_mut()) else {
         return report;
     };
-    for (_event, event_val) in hooks_obj.iter_mut() {
+    for (event, event_val) in hooks_obj.iter_mut() {
         let Some(group_arr) = event_val.as_array_mut() else {
             continue;
         };
@@ -140,14 +159,120 @@ pub fn rewrite_hooks(settings: &mut Value) -> RewriteReport {
                 continue;
             };
             for entry in entries.iter_mut() {
-                rewrite_entry(entry, &mut report);
+                rewrite_entry(entry, event.as_str(), &mut report);
             }
         }
     }
+
+    // v3.4.5 Track 4: after all per-entry rewrites, add the Stop-embed
+    // companion entry when a canonical PostToolUse reindex hook exists and
+    // no Stop `--pending-only` entry is present yet. This is the
+    // `plugin update` upgrade path's counterpart to
+    // `onebrain-fs::register_hooks::qmd::apply_embed_hook` (fresh installs).
+    add_stop_embed_entry_if_needed(hooks_obj, &mut report);
+
     report
 }
 
-fn rewrite_entry(entry: &mut Value, report: &mut RewriteReport) {
+/// True if `hooks_obj["PostToolUse"]` contains a canonical OneBrain reindex
+/// entry, i.e. `command == "onebrain"` and args starting with
+/// `["search", "reindex"]` (post-migration; covers `--lex-only`, `--json`,
+/// or both).
+fn has_post_tool_use_reindex_entry(hooks_obj: &Map<String, Value>) -> bool {
+    let Some(groups) = hooks_obj.get(POST_TOOL_USE).and_then(|v| v.as_array()) else {
+        return false;
+    };
+    groups.iter().any(|group| {
+        group
+            .get("hooks")
+            .and_then(|v| v.as_array())
+            .map(|entries| entries.iter().any(is_search_reindex_entry))
+            .unwrap_or(false)
+    })
+}
+
+/// True if `hooks_obj["Stop"]` already contains an entry with args exactly
+/// `["search", "reindex", "--pending-only", "--json"]` and command
+/// `"onebrain"`.
+fn has_stop_embed_entry(hooks_obj: &Map<String, Value>) -> bool {
+    let Some(groups) = hooks_obj.get(STOP).and_then(|v| v.as_array()) else {
+        return false;
+    };
+    groups.iter().any(|group| {
+        group
+            .get("hooks")
+            .and_then(|v| v.as_array())
+            .map(|entries| entries.iter().any(is_stop_embed_entry))
+            .unwrap_or(false)
+    })
+}
+
+fn is_search_reindex_entry(entry: &Value) -> bool {
+    let cmd = entry.get("command").and_then(|v| v.as_str());
+    if cmd != Some("onebrain") {
+        return false;
+    }
+    let Some(args) = entry.get("args").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    let args_str: Vec<&str> = args.iter().filter_map(|v| v.as_str()).collect();
+    args_starts_with_str(&args_str, &["search", "reindex"])
+}
+
+fn is_stop_embed_entry(entry: &Value) -> bool {
+    let cmd = entry.get("command").and_then(|v| v.as_str());
+    if cmd != Some("onebrain") {
+        return false;
+    }
+    entry
+        .get("args")
+        .and_then(|v| v.as_array())
+        .is_some_and(|args| {
+            args.as_slice()
+                == [
+                    Value::String("search".to_string()),
+                    Value::String("reindex".to_string()),
+                    Value::String(PENDING_ONLY_FLAG.to_string()),
+                    Value::String(JSON_FLAG.to_string()),
+                ]
+        })
+}
+
+/// Append the Stop `search reindex --pending-only --json` embed entry as a
+/// new group when a PostToolUse reindex hook exists and no Stop embed entry
+/// is present yet. Never touches existing Stop groups (the checkpoint `stop`
+/// entry stays byte-identical) — pushes a brand-new group onto `hooks.Stop`,
+/// creating the array if absent.
+fn add_stop_embed_entry_if_needed(hooks_obj: &mut Map<String, Value>, report: &mut RewriteReport) {
+    if !has_post_tool_use_reindex_entry(hooks_obj) {
+        return;
+    }
+    if has_stop_embed_entry(hooks_obj) {
+        return;
+    }
+
+    let stop_val = hooks_obj
+        .entry(STOP.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !stop_val.is_array() {
+        // Malformed `Stop` shape — don't clobber whatever is there; skip.
+        return;
+    }
+    let stop_arr = stop_val.as_array_mut().unwrap();
+    stop_arr.push(serde_json::json!({
+        "hooks": [
+            {
+                "type": "command",
+                "command": "onebrain",
+                "args": ["search", "reindex", PENDING_ONLY_FLAG, JSON_FLAG]
+            }
+        ]
+    }));
+    report.stop_embed_added = true;
+    report.total += 1;
+}
+
+fn rewrite_entry(entry: &mut Value, event: &str, report: &mut RewriteReport) {
     let Some(obj) = entry.as_object_mut() else {
         return;
     };
@@ -212,10 +337,58 @@ fn rewrite_entry(entry: &mut Value, report: &mut RewriteReport) {
         }
     }
 
-    // Pass 2 — v3.1 hook-protocol commands need `--json` so the SessionStart
+    // Pass 2 — v3.4.5 Track 4: PostToolUse-only lex-only migration. An
+    // onebrain reindex entry whose args are EXACTLY `["search", "reindex"]`
+    // or `["search", "reindex", "--json"]` (either the pre-existing form or
+    // the result of Pass 1's `qmd-reindex`/`qmd reindex` rewrite above) gets
+    // `--lex-only` inserted right after `search reindex`. Scoped to
+    // PostToolUse only — a user's custom `search reindex` entry under any
+    // other event (e.g. their own Stop hook) is theirs and stays untouched.
+    // Entries that already carry `--lex-only` or `--pending-only` anywhere
+    // don't match this exact-shape check, so they're left alone too.
+    if event == POST_TOOL_USE {
+        ensure_lex_only_flag(args_arr, report);
+    }
+
+    // Pass 3 — v3.1 hook-protocol commands need `--json` so the SessionStart
     // / Stop / PostToolUse hook consumers still get the structured envelope
     // they parse. Idempotent: skip if `--json` is anywhere in `args`.
     ensure_json_flag(args_arr, report);
+}
+
+/// Insert `--lex-only` into a PostToolUse `search reindex` entry when its
+/// args are exactly `["search", "reindex"]`, optionally followed by a single
+/// explicit format-flag suffix (`--json`, `--yaml`, `--output <fmt>`, or
+/// `--output=<fmt>`) and NOTHING else. The flag is inserted right after
+/// `reindex`, i.e. BEFORE any format flag, so `--json` (or `--yaml`) ends up
+/// after `--lex-only` — matching the canonical `["search", "reindex",
+/// "--lex-only", "--json"]` shape.
+///
+/// Entries that already carry `--lex-only`/`--pending-only`, or that have
+/// any other trailing args (e.g. a user's custom positional args), don't
+/// match this exact-shape check and are left untouched. Returns true if
+/// mutated.
+fn ensure_lex_only_flag(args_arr: &mut Vec<Value>, report: &mut RewriteReport) -> bool {
+    let args_str: Vec<&str> = args_arr.iter().filter_map(|v| v.as_str()).collect();
+    if args_str.len() < 2 || args_str[0] != "search" || args_str[1] != "reindex" {
+        return false;
+    }
+    let suffix = &args_str[2..];
+    let suffix_is_bare_or_format_flag = match suffix {
+        [] => true,
+        ["--json"] | ["--yaml"] => true,
+        ["--output", _fmt] => true,
+        [s] if s.starts_with("--output=") => true,
+        _ => false,
+    };
+    if !suffix_is_bare_or_format_flag {
+        return false;
+    }
+
+    // Insert --lex-only at index 2 (right after "reindex", before any format flag).
+    args_arr.insert(2, Value::String(LEX_ONLY_FLAG.to_string()));
+    report.record(&["search", "reindex"], &["search", "reindex", "--lex-only"]);
+    true
 }
 
 /// Append `--json` to `args_arr` when the prefix names a hook-protocol
@@ -357,10 +530,14 @@ mod tests {
         // continues to see the structured envelope (text is the new default
         // for human invocations).
         assert_eq!(entry["args"], json!(["session", "init", "--json"]));
-        // 2 path rewrites (session-init, qmd-reindex) + 3 flag injections
-        // (session init, checkpoint stop, qmd reindex).
-        assert_eq!(report.total, 5);
+        // 2 path rewrites (session-init, qmd-reindex) + 1 lex-only migration
+        // (search reindex -> search reindex --lex-only, PostToolUse only) +
+        // 3 flag injections (session init, checkpoint stop, search reindex
+        // --lex-only) + 1 Stop-embed addition (PostToolUse reindex now
+        // exists, no Stop --pending-only entry yet) = 7.
+        assert_eq!(report.total, 7);
         assert_eq!(report.json_flag_added, 3);
+        assert!(report.stop_embed_added);
         assert!(report
             .rewrites
             .iter()
@@ -372,13 +549,22 @@ mod tests {
         let mut s = settings_with_v30_hooks();
         rewrite_hooks(&mut s);
         let entry = &s["hooks"]["PostToolUse"][0]["hooks"][0];
-        assert_eq!(entry["args"], json!(["search", "reindex", "--json"]));
+        // v3.4.5 Track 4: PostToolUse reindex entries land on the lex-only
+        // canonical shape, not the bare `search reindex --json`.
+        assert_eq!(
+            entry["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
     }
 
     #[test]
     fn checkpoint_stop_path_unchanged_but_gets_json_flag() {
         // v3.0 already used `["checkpoint", "stop"]` so no path rewrite,
         // but the v3.1 default-text contract means it still needs `--json`.
+        // This is the FIRST Stop group entry (checkpoint) — it must stay
+        // exactly as before; the new embed entry is a separate, second Stop
+        // group appended after it (see `track2_state_migrates_to_lex_only_and_adds_stop_embed`
+        // below for the full Stop-array shape assertion).
         let mut s = settings_with_v30_hooks();
         let _ = rewrite_hooks(&mut s);
         let entry = &s["hooks"]["Stop"][0]["hooks"][0];
@@ -392,6 +578,7 @@ mod tests {
         let second = rewrite_hooks(&mut s);
         assert_eq!(second.total, 0, "expected zero rewrites on second pass");
         assert_eq!(second.json_flag_added, 0);
+        assert!(!second.stop_embed_added);
         assert!(second.rewrites.is_empty());
     }
 
@@ -608,10 +795,12 @@ mod tests {
         let body = serde_json::to_string_pretty(&settings_with_v30_hooks()).unwrap();
         std::fs::write(&path, body).unwrap();
         let report = rewrite_settings_file(&path, false).unwrap();
-        // v3.1: 2 path rewrites (session-init, qmd-reindex) + 3 flag
-        // injections (session init, checkpoint stop, qmd reindex).
-        assert_eq!(report.total, 5);
+        // v3.1: 2 path rewrites (session-init, qmd-reindex) + 1 lex-only
+        // migration + 3 flag injections (session init, checkpoint stop,
+        // search reindex --lex-only) + 1 Stop-embed addition = 7.
+        assert_eq!(report.total, 7);
         assert_eq!(report.json_flag_added, 3);
+        assert!(report.stop_embed_added);
         let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
             after["hooks"]["SessionStart"][0]["hooks"][0]["args"],
@@ -623,7 +812,11 @@ mod tests {
         );
         assert_eq!(
             after["hooks"]["PostToolUse"][0]["hooks"][0]["args"],
-            json!(["search", "reindex", "--json"])
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
+        assert_eq!(
+            after["hooks"]["Stop"][1]["hooks"][0]["args"],
+            json!(["search", "reindex", "--pending-only", "--json"])
         );
     }
 
@@ -687,8 +880,9 @@ mod tests {
         let original = serde_json::to_string_pretty(&settings_with_v30_hooks()).unwrap();
         std::fs::write(&path, &original).unwrap();
         let report = rewrite_settings_file(&path, true).unwrap();
-        // v3.1: 2 path rewrites + 3 flag injections.
-        assert_eq!(report.total, 5);
+        // v3.1: 2 path rewrites + 1 lex-only migration + 3 flag injections +
+        // 1 Stop-embed addition = 7.
+        assert_eq!(report.total, 7);
         // File contents unchanged.
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(after, original);
@@ -899,5 +1093,244 @@ mod tests {
         assert_eq!(report.total, 0);
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(after, original, "file must not be rewritten when total = 0");
+    }
+
+    // ── v3.4.5 Track 4: lex-only migration + Stop-embed addition ───────
+
+    fn settings_with_track2_hooks() -> Value {
+        // Track-2 state: PostToolUse `search reindex --json` (no
+        // `--lex-only` yet), Stop `checkpoint stop --json` only.
+        json!({
+            "hooks": {
+                "PostToolUse": [
+                    {
+                        "hooks": [
+                            { "type": "command", "command": "onebrain",
+                              "args": ["search", "reindex", "--json"] }
+                        ]
+                    }
+                ],
+                "Stop": [
+                    {
+                        "hooks": [
+                            { "type": "command", "command": "onebrain",
+                              "args": ["checkpoint", "stop", "--json"] }
+                        ]
+                    }
+                ]
+            }
+        })
+    }
+
+    /// Brief test 1: Track-2 state -> PostToolUse gains `--lex-only`; Stop
+    /// keeps the checkpoint entry byte-identical AND gains a new embed
+    /// entry; report.total counts both changes.
+    #[test]
+    fn track2_state_migrates_to_lex_only_and_adds_stop_embed() {
+        let mut s = settings_with_track2_hooks();
+        let report = rewrite_hooks(&mut s);
+
+        let post_tool_use = &s["hooks"]["PostToolUse"][0]["hooks"][0];
+        assert_eq!(
+            post_tool_use["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
+
+        let stop_groups = s["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop_groups.len(), 2, "expected a new, separate Stop group");
+        assert_eq!(
+            stop_groups[0]["hooks"][0]["args"],
+            json!(["checkpoint", "stop", "--json"]),
+            "existing checkpoint entry must stay byte-identical"
+        );
+        assert_eq!(
+            stop_groups[1]["hooks"][0]["args"],
+            json!(["search", "reindex", "--pending-only", "--json"])
+        );
+        assert_eq!(stop_groups[1]["hooks"][0]["command"], "onebrain");
+        assert_eq!(stop_groups[1]["hooks"][0]["type"], "command");
+
+        // 1 lex-only rewrite + 1 Stop-embed addition = 2 (no --json flag
+        // injection needed; both entries already had --json).
+        assert_eq!(report.total, 2);
+        assert_eq!(report.json_flag_added, 0);
+        assert!(report.stop_embed_added);
+    }
+
+    /// Brief test 2: v3.0 state (`["qmd-reindex"]` on PostToolUse) -> single
+    /// pass lands on the lex-only canonical form + Stop embed added.
+    #[test]
+    fn v30_qmd_reindex_single_pass_lands_on_lex_only_plus_stop_embed() {
+        let mut s = json!({
+            "hooks": {
+                "PostToolUse": [
+                    { "hooks": [
+                        { "type": "command", "command": "onebrain",
+                          "args": ["qmd-reindex"] }
+                    ] }
+                ],
+                "Stop": [
+                    { "hooks": [
+                        { "type": "command", "command": "onebrain",
+                          "args": ["checkpoint", "stop", "--json"] }
+                    ] }
+                ]
+            }
+        });
+        let report = rewrite_hooks(&mut s);
+
+        assert_eq!(
+            s["hooks"]["PostToolUse"][0]["hooks"][0]["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
+        let stop_groups = s["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop_groups.len(), 2);
+        assert_eq!(
+            stop_groups[1]["hooks"][0]["args"],
+            json!(["search", "reindex", "--pending-only", "--json"])
+        );
+        assert!(report.stop_embed_added);
+        // 1 path rewrite (qmd-reindex -> search reindex) + 1 lex-only
+        // rewrite + 1 json flag injection + 1 Stop-embed addition = 4.
+        assert_eq!(report.total, 4);
+        assert_eq!(report.json_flag_added, 1);
+    }
+
+    /// Brief test 3: idempotent — running twice yields zero changes the
+    /// second time and leaves the document unchanged.
+    #[test]
+    fn lex_only_and_stop_embed_are_idempotent_on_second_pass() {
+        let mut s = settings_with_track2_hooks();
+        let _first = rewrite_hooks(&mut s);
+        let before = s.clone();
+        let second = rewrite_hooks(&mut s);
+        assert_eq!(second.total, 0);
+        assert!(!second.stop_embed_added);
+        assert_eq!(second.json_flag_added, 0);
+        assert!(second.rewrites.is_empty());
+        assert_eq!(s, before, "document must be unchanged on the second pass");
+    }
+
+    /// Brief test 4: Stop embed NOT added when there is no OneBrain
+    /// PostToolUse reindex entry at all (e.g. a vault without search hooks).
+    #[test]
+    fn stop_embed_not_added_without_post_tool_use_reindex_entry() {
+        let mut s = json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [
+                        { "type": "command", "command": "onebrain",
+                          "args": ["checkpoint", "stop", "--json"] }
+                    ] }
+                ]
+            }
+        });
+        let before = s.clone();
+        let report = rewrite_hooks(&mut s);
+        assert_eq!(report.total, 0);
+        assert!(!report.stop_embed_added);
+        assert_eq!(s, before, "no PostToolUse reindex entry -> no Stop embed");
+        assert_eq!(s["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    }
+
+    /// Brief test 5: an existing Stop `--pending-only --json` entry is not
+    /// duplicated and not rewritten — in particular it must NOT gain
+    /// `--lex-only` (that flag is PostToolUse-only).
+    #[test]
+    fn existing_stop_pending_only_entry_not_duplicated_or_rewritten() {
+        let mut s = json!({
+            "hooks": {
+                "PostToolUse": [
+                    { "hooks": [
+                        { "type": "command", "command": "onebrain",
+                          "args": ["search", "reindex", "--lex-only", "--json"] }
+                    ] }
+                ],
+                "Stop": [
+                    { "hooks": [
+                        { "type": "command", "command": "onebrain",
+                          "args": ["checkpoint", "stop", "--json"] }
+                    ] },
+                    { "hooks": [
+                        { "type": "command", "command": "onebrain",
+                          "args": ["search", "reindex", "--pending-only", "--json"] }
+                    ] }
+                ]
+            }
+        });
+        let before = s.clone();
+        let report = rewrite_hooks(&mut s);
+        assert_eq!(report.total, 0);
+        assert!(!report.stop_embed_added);
+        assert_eq!(s, before, "already-canonical document must be untouched");
+        let stop_groups = s["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop_groups.len(), 2, "must not duplicate the embed entry");
+        assert_eq!(
+            stop_groups[1]["hooks"][0]["args"],
+            json!(["search", "reindex", "--pending-only", "--json"]),
+            "must not gain --lex-only"
+        );
+    }
+
+    /// Brief test 6: `search reindex --json` under an event OTHER than
+    /// PostToolUse (a user's custom Stop entry) is untouched by the
+    /// lex-only rule.
+    #[test]
+    fn search_reindex_under_non_post_tool_use_event_untouched_by_lex_only() {
+        let mut s = json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [
+                        { "type": "command", "command": "onebrain",
+                          "args": ["search", "reindex", "--json"] }
+                    ] }
+                ]
+            }
+        });
+        let report = rewrite_hooks(&mut s);
+        // No PostToolUse reindex entry exists, so no Stop embed is added
+        // either — this custom Stop entry is the user's own, not the
+        // canonical embed hook.
+        let entry = &s["hooks"]["Stop"][0]["hooks"][0];
+        assert_eq!(
+            entry["args"],
+            json!(["search", "reindex", "--json"]),
+            "lex-only rule must not apply outside PostToolUse"
+        );
+        assert_eq!(report.total, 0);
+        assert!(!report.stop_embed_added);
+        assert_eq!(s["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    }
+
+    /// Brief test 7: `--yaml` PostToolUse entry gains `--lex-only` (inserted
+    /// before `--yaml`), and does NOT gain `--json` on top of the explicit
+    /// YAML choice.
+    #[test]
+    fn yaml_post_tool_use_entry_gains_lex_only_no_json_added() {
+        let mut s = json!({
+            "hooks": {
+                "PostToolUse": [
+                    { "hooks": [
+                        { "type": "command", "command": "onebrain",
+                          "args": ["search", "reindex", "--yaml"] }
+                    ] }
+                ]
+            }
+        });
+        let report = rewrite_hooks(&mut s);
+        let entry = &s["hooks"]["PostToolUse"][0]["hooks"][0];
+        assert_eq!(
+            entry["args"],
+            json!(["search", "reindex", "--lex-only", "--yaml"])
+        );
+        // 1 lex-only rewrite + 1 Stop-embed addition (PostToolUse reindex
+        // now exists). No json_flag_added since --yaml is explicit.
+        assert_eq!(report.json_flag_added, 0);
+        assert!(report.stop_embed_added);
+        let stop_groups = s["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(
+            stop_groups[0]["hooks"][0]["args"],
+            json!(["search", "reindex", "--pending-only", "--json"])
+        );
     }
 }
