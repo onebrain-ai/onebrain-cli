@@ -7,6 +7,7 @@ Reference docs for people reading the source: why the code is shaped the way it 
 | Doc | Read it when you want to… |
 |---|---|
 | [`architecture.md`](architecture.md) | Understand the 4-crate workspace, how a command flows from `main` to the filesystem, and why the crate boundaries fall where they do. |
+| [`architecture/search.md`](architecture/search.md) | Follow the whole native-search system end-to-end: what's stored on disk per collection, the reindex/embed pipeline (incl. the auto-hook split), and what every search surface — CLI verbs, MCP tools, WebUI, `status` — actually touches, with degradation behavior. |
 | [`reference/`](reference/) | Navigate the source file-by-file: every module's purpose, its key types/functions, and how it connects to the rest. A code/API reference — start here when you want to follow the calls. |
 | [`decisions/`](decisions/) | Understand *why* a choice was made (Rust over Bun, direct-GitHub self-update, the canonical `Envelope`, …). One Architecture Decision Record (ADR) per choice. |
 | [`rust-patterns.md`](rust-patterns.md) | Learn the idiomatic Rust this codebase uses — trait objects, compile-time target detection, error enums, atomic file swaps — each anchored to a real file. |
