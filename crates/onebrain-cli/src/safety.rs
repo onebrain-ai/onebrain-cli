@@ -69,9 +69,13 @@ mod tests {
 
     #[test]
     fn refuses_home_directory() {
+        // `HOME` steers `dirs::*` lookups crate-wide; mutate it only under
+        // the shared `test_env` lock, which also restores it afterwards.
         let d = tempdir().unwrap();
-        std::env::set_var("HOME", d.path());
-        std::env::set_var("USERPROFILE", d.path());
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", d.path().as_os_str()),
+            ("USERPROFILE", d.path().as_os_str()),
+        ]);
         let err = refuse_dangerous_vault_path(d.path()).unwrap_err();
         assert!(
             err.to_string().contains("home directory"),
