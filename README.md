@@ -321,24 +321,15 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
 
 ### ✅ Shipped
 - [x] **v3.0** — Rust rewrite GA · 9-platform release pipeline · stable JSON contracts.
-- [x] **v3.1** — Consistency standard: locked `<noun> <verb>` command tree · canonical `Envelope` output · branded banner · `vault.yml → onebrain.yml` · `qmd embed` · `schedule register` `onebrain.yml` support · self-update hardening (SHA-256 verify + Homebrew-aware).
+- [x] **v3.1** — Consistency standard: locked `<noun> <verb>` command tree · canonical `Envelope` output · `vault.yml → onebrain.yml`.
 
 ### 🚧 Phase 1 · perceptual speed + skill alignment (v3.2–v3.8)
-- [x] **v3.2** — `note` resource group (11 verbs) · grouped `doctor` UX with braille spinner + one-pass `--fix` · animated `onebrain update` · `skill run --harness {claude,gemini}` + `--model <m>` + headless startup-skip handshake + in-place spinner · `harness run [PROMPT] --mode {with-context,ad-hoc}` for ad-hoc prompts through claude / gemini (reads stdin when omitted) · auto-checkpoint hook fix (`CLAUDE_CODE_SESSION_ID` top-priority token + anchored `last_ts` so the time threshold actually fires) · `--vault` accepted everywhere.
-- [x] **v3.3** — Daemon foundation: `onebrain serve` — a local **web UI embedded in the binary** over a token-gated vault JSON API (file explorer · reading view · search panel · agent chat), on a security-hardened surface (whole-surface token gate · vault path confinement · CSP + forced-attachment · agent env isolation).
+- [x] **v3.2** — `note` resource group · grouped `doctor` UX · `skill run`/`harness run` for headless skills.
+- [x] **v3.3** — Daemon foundation: `onebrain serve` — embedded web UI over a token-gated vault JSON API.
 - [ ] **v3.4** — **Native Rust search — replaces qmd** (mini-epic across v3.4.x; exit: **0 node/python deps**):
-  - [x] **v3.4.0** — `onebrain-search` engine (tantivy BM25 + fastembed embeddings + RRF hybrid, ~100-language semantic + Thai/CJK keyword) · `onebrain search` verbs (`query/search/vsearch/get/status/reindex/model` + interactive model TUI) · doctor native-search checks · `qmd_collection` → `search.collection` migration.
-  - [x] **v3.4.1** — native MCP server (`onebrain mcp`, rmcp): qmd-compatible `query/get/multi_get/status` tools, client-side RRF fusion, native `session init` probe (drops the qmd subprocess). Plugin `.mcp.json` server-key rename (`qmd` → `search`) is staged for the v3.4.5 cutover — see [ADR 0019](docs/decisions/0019-native-mcp-server-staged-qmd-cutover.md).
-  - [x] **v3.4.2** — **security fix**: the `serve`/daemon session auth token now comes from the OS CSPRNG on every platform (`getrandom`), removing the time-seeded, guessable Windows fallback. *(Interleaved ahead of the qmd epic — see below.)*
-  - [x] **v3.4.3** — housekeeping bundle: scheduler polish (cron steps/lists · plist collision · `schedule list`) · CI `lex-only` test job · minor fixes.
-  - [x] **v3.4.4** — scheduler runs actually fire: `onebrain` is now put on the headless-`claude` child's PATH so cron skills no longer exit 78 (#124) · generated plists emit `skill run`, not the deprecated `run-skill` (#125). *(Interleaved scheduler-fix patch, ahead of the qmd epic.)*
-  - [ ] **v3.4.5** — **native search · no dependency · auto reindex/embed · model reindex ux/ui** (the qmd epic — [milestone 1](https://github.com/onebrain-ai/onebrain-cli/milestone/1); accumulates several PRs, tagged once all tracks land):
-    - [x] relocate the search cache off OS-purgeable `~/Library/Caches` → persistent data dir (#114 → #129)
-    - [x] no-model reindex UX — active only when downloaded, e5-small default, MCP no-index fallback signal (#130 → #134)
-    - [x] remove **`@tobilu/qmd`** — 0 node/python deps: serve/WebUI search → native, drop `qmd embed`/probe (#131)
-    - [ ] plugin cutover — `.mcp.json` key + `/qmd` → `/search` skill (onebrain-ai/onebrain#206, ADR 0019)
-    - [x] auto reindex/embed hook — PostToolUse lex-now + Stop embed-deferred (#133 → #141)
-  - [ ] **v3.4.6** — relevance polish: rerank (bge-reranker-v2-m3) · query expansion · nlpo3 Thai word-seg · custom ONNX models.
+  - [x] **v3.4.0–v3.4.4** — native search engine + `onebrain search` verbs · native MCP server (`onebrain mcp`) · CSPRNG token security fix · scheduler fixes + housekeeping.
+  - [ ] **v3.4.5** — **the qmd epic**: native search everywhere · 0 node/python deps · auto reindex/embed hooks · model reindex UX · plugin cutover ([milestone 1](https://github.com/onebrain-ai/onebrain-cli/milestone/1) — tagged once all tracks land).
+  - [ ] **v3.4.6** — relevance polish: rerank · query expansion · Thai word-seg · custom ONNX models.
 - [ ] **v3.5.x** — **"Desktop + Deeplinks"** (mini-epic): `onebrain desktop` native app + deeplinks + standalone webui file access (`link`/`token`/`desktop` verbs, vault_id, tickets) — the agent hands you a clickable, section-precise webui URL for any vault file; completely replaces Obsidian.
 - [ ] **v3.6** — **WebUI Terminal sessions** (mini-epic): run `onebrain`/`claude`/`codex` in the WebUI from anywhere (Tailscale); persistent term-server survives daemon restart.
 - [ ] **v3.7** — Bootstrap + native verbs *(was v3.5)*: startup / wrapup / daily / tasks → 1 call per ceremony (import content-verbs anchored ~v3.7.x).
