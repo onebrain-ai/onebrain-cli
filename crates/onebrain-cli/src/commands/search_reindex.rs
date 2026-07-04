@@ -220,7 +220,7 @@ struct ReindexDetachData {
 #[cfg(feature = "semantic")]
 fn render_detach_text(env: &Envelope<ReindexDetachData>) -> String {
     let _ = env.data.as_ref().expect("ok envelope always has data");
-    "🚀  Embedding pending docs in background".to_string()
+    "🚀  Embedding pending docs in the background".to_string()
 }
 
 /// Emit the "detached" envelope and return `Ok(())`.
