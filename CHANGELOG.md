@@ -12,6 +12,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [3.4.5] — native search · no dependency · auto reindex/embed · model reindex ux/ui (the qmd epic)
 
+### Breaking
+- Removed the `onebrain qmd …` command group and the runtime dependency on the
+  external `@tobilu/qmd` Node binary. Native `onebrain-search` now powers webui
+  search and the reindex-on-write hook. Migration: use `onebrain search …`
+  (`reindex` · `status` · `query` · `search` · `vsearch`). Existing
+  `.claude/settings.json` PostToolUse hooks and launchd schedules referencing
+  `qmd reindex` / `qmd-reindex` are auto-rewritten to `search reindex` on the
+  next `onebrain plugin update` / `onebrain schedule register`.
+
 - **Native-search state (embedding model + tantivy/vector index + `engine.redb`) now lives in the OS data dir** — `~/Library/Application Support/onebrain/search/` (macOS) · `$XDG_DATA_HOME/onebrain/search/` (Linux) · `%APPDATA%\onebrain\search\` (Windows) — instead of the OS-**purgeable** cache dir. macOS storage cleanup silently wiped a ~536 MB model + index from `~/Library/Caches` (#114); expensive-to-recreate data must not live somewhere the OS may evict.
 - **Existing state migrates automatically and transparently** on the next command: a one-time same-volume rename of `<cache>/onebrain/search` → `<data>/onebrain/search` (atomic, instant, no re-download / re-embed). Best-effort — a failure warns on stderr but never aborts, leaving the old data for manual recovery.
 - **Only the `search/` subtree moves**; the disposable `latest-release.json` update-check cache stays in the cache dir by design.
