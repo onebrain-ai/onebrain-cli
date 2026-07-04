@@ -551,10 +551,9 @@ mod tests {
     //
     // These exercise the production `native_pending` function directly
     // (not the injected-closure seam above), isolating the process-global
-    // `ONEBRAIN_CACHE_DIR` override behind a mutex so parallel test threads
-    // can't race each other (same pattern as `banner.rs`'s `ENV_LOCK`).
-
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // `ONEBRAIN_CACHE_DIR` override behind the crate-wide `test_env` lock so
+    // parallel test threads — including `server::search`'s tests, which
+    // mutate the same variable — can't race each other.
 
     #[test]
     fn session_init_reports_null_when_collection_configured_but_never_indexed() {
@@ -564,9 +563,8 @@ mod tests {
         // the cache dir skeleton. `search_common::status_data` avoids this by
         // checking the cache dir's existence before opening the engine;
         // `native_pending` mirrors that ordering.
-        let _guard = ENV_LOCK.lock().unwrap();
         let cache = tempdir().unwrap();
-        std::env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
 
         let vault = tempdir().unwrap();
         std::fs::write(
@@ -577,8 +575,6 @@ mod tests {
         let vault_root = onebrain_core::VaultRoot::from_path(vault.path()).unwrap();
 
         let result = native_pending(&vault_root, "never-indexed-collection");
-
-        std::env::remove_var("ONEBRAIN_CACHE_DIR");
 
         assert_eq!(
             result, None,
@@ -602,9 +598,8 @@ mod tests {
         // opens the engine and reports the real pending count via
         // `Engine::status(..).pending_total()` — 0 here since the vault has
         // no markdown files and the (empty) index was never touched.
-        let _guard = ENV_LOCK.lock().unwrap();
         let cache = tempdir().unwrap();
-        std::env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
 
         let vault = tempdir().unwrap();
         std::fs::write(
@@ -624,8 +619,6 @@ mod tests {
         .unwrap();
 
         let result = native_pending(&vault_root, "already-indexed-collection");
-
-        std::env::remove_var("ONEBRAIN_CACHE_DIR");
 
         assert_eq!(
             result,

@@ -13,6 +13,8 @@ mod migration;
 mod output;
 mod safety;
 mod server;
+#[cfg(test)]
+mod test_env;
 mod v31;
 mod vault_ctx;
 

@@ -219,22 +219,14 @@ mod tests {
         assert_eq!(title_from_path("no-extension"), "no-extension");
     }
 
-    // `ONEBRAIN_CACHE_DIR` is a process-global env override (see
-    // `search_common::search_cache_root`). This module-private `ENV_LOCK`
-    // serializes the mutation window against other tests *in this crate's
-    // test binary* (mirroring the private `ENV_LOCK` in `session_init.rs` /
-    // `banner.rs`). It does not coordinate across crates, but each crate's
-    // tests run in a separate binary, so within-binary serialization is what
-    // matters under `cargo test`'s default parallel-thread execution.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn run_native_no_index_returns_empty() {
         // A vault dir with a config but no built index → empty hits, no error,
         // for both modes. Pointing `ONEBRAIN_CACHE_DIR` at a fresh, empty
         // tempdir guarantees `<cache>/search/never-indexed/tantivy` genuinely
-        // doesn't exist.
-        let _guard = ENV_LOCK.lock().unwrap();
+        // doesn't exist. `test_env` holds the crate-wide env lock for the
+        // guard's lifetime (see its module doc — a module-private lock here
+        // still raced `session_init.rs`'s tests on the same variable).
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("onebrain.yml"),
@@ -242,10 +234,9 @@ mod tests {
         )
         .unwrap();
         let cache = tempfile::tempdir().unwrap();
-        std::env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         let result_lex = run_native(dir.path(), "anything", "lex");
         let result_hybrid = run_native(dir.path(), "anything", "hybrid");
-        std::env::remove_var("ONEBRAIN_CACHE_DIR");
         assert!(result_lex.unwrap().is_empty());
         assert!(result_hybrid.unwrap().is_empty());
     }
@@ -284,7 +275,6 @@ mod tests {
     #[test]
     fn run_native_hybrid_degrades_to_lex_in_lex_only_build() {
         use onebrain_search::chunk::Chunk;
-        let _guard = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("onebrain.yml"),
@@ -292,7 +282,7 @@ mod tests {
         )
         .unwrap();
         let cache = tempfile::tempdir().unwrap();
-        std::env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
 
         let collection = collection_name_readonly(dir.path()).unwrap();
         let cache_dir = collection_cache_dir(&collection);
@@ -310,7 +300,6 @@ mod tests {
         }
 
         let result = run_native(dir.path(), "quick fox", "hybrid");
-        std::env::remove_var("ONEBRAIN_CACHE_DIR");
 
         let hits = result.expect("hybrid must degrade to lex, not error, in a lex-only build");
         assert_eq!(hits.len(), 1, "hits: {hits:?}");

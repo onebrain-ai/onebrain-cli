@@ -509,10 +509,6 @@ mod tests {
     use crate::cli::*;
     use clap::Parser;
 
-    /// Serialises tests that mutate the process-global `ONEBRAIN_FORCE_BANNER`
-    /// env var, which would otherwise race under parallel test threads.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).unwrap()
     }
@@ -1075,11 +1071,9 @@ mod tests {
     #[test]
     fn emit_help_banner_writes_to_buffer_when_gated_on() {
         // `cargo test`'s harness pipes stderr, so the stderr-tty gate would
-        // suppress emission. Lift it the same way integration tests do.
-        // Hold ENV_LOCK for the whole env-mutation window so this can't race
-        // the sibling test that toggles the same var under parallel threads.
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("ONEBRAIN_FORCE_BANNER", "1");
+        // suppress emission. Lift it the same way integration tests do,
+        // holding the crate-wide `test_env` lock for the mutation window.
+        let _env = crate::test_env::set_var("ONEBRAIN_FORCE_BANNER", "1");
         let args = s(&["onebrain", "--help"]);
         let mut buf: Vec<u8> = Vec::new();
         emit_help_banner(
@@ -1088,7 +1082,6 @@ mod tests {
             &args,
             &HelpBannerEnv::default(),
         );
-        std::env::remove_var("ONEBRAIN_FORCE_BANNER");
         assert!(!buf.is_empty(), "expected banner emission");
         let out = String::from_utf8(buf).unwrap();
         // The ASCII art's chunky-font `_______` top-line motif is the
@@ -1104,10 +1097,9 @@ mod tests {
     #[test]
     fn emit_help_banner_writes_nothing_when_version_present() {
         // Force the stderr-tty gate ON so the suppression we observe can
-        // only come from the `--version` short-circuit. Hold ENV_LOCK for the
-        // whole env-mutation window (see the sibling test) to avoid a race.
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("ONEBRAIN_FORCE_BANNER", "1");
+        // only come from the `--version` short-circuit, holding the
+        // crate-wide `test_env` lock for the mutation window.
+        let _env = crate::test_env::set_var("ONEBRAIN_FORCE_BANNER", "1");
         let args = s(&["onebrain", "--version"]);
         let mut buf: Vec<u8> = Vec::new();
         emit_help_banner(
@@ -1116,7 +1108,6 @@ mod tests {
             &args,
             &HelpBannerEnv::default(),
         );
-        std::env::remove_var("ONEBRAIN_FORCE_BANNER");
         assert!(buf.is_empty(), "expected no banner for --version path");
     }
 
