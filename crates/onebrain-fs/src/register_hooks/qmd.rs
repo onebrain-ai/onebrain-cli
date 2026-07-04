@@ -87,6 +87,28 @@ fn is_legacy_qmd_reindex_entry(entry: &Value) -> bool {
     }
 }
 
+/// True when `entry` is the v3.4.5 Track-2 canonical form (exec: command
+/// "onebrain", args EXACTLY `["search","reindex","--json"]`; or shell form
+/// `"onebrain search reindex --json"` / `"onebrain search reindex"`, and the
+/// pre-json exec form `["search","reindex"]`). This WAS canonical before
+/// Track 4 introduced `--lex-only`; it is now legacy and migrates to the new
+/// canonical `HookSpec::QMD` (`--lex-only --json`).
+///
+/// Matches the EXACT arg list only (not a prefix) so this never matches the
+/// Stop `EMBED` entry (`--pending-only`), which also starts with
+/// `search reindex`.
+fn is_legacy_track2_reindex_entry(entry: &Value) -> bool {
+    let cmd = entry.get("command").and_then(|v| v.as_str()).unwrap_or("");
+    match entry.get("args").and_then(|v| v.as_array()) {
+        Some(args) => {
+            cmd == "onebrain"
+                && (args.as_slice() == [json!("search"), json!("reindex"), json!("--json")]
+                    || args.as_slice() == [json!("search"), json!("reindex")])
+        }
+        None => cmd == "onebrain search reindex --json" || cmd == "onebrain search reindex",
+    }
+}
+
 /// Rewrite a legacy-alias qmd entry in place to the canonical new form
 /// (`command: "onebrain", args: ["qmd", "reindex", "--json"]`). Returns true
 /// if the entry was a legacy alias and was rewritten.
@@ -147,7 +169,9 @@ pub(crate) fn migrate_legacy_qmd_entries(groups: &mut Vec<Value>, keep_canonical
                     group_touched = true;
                 } else if rewrite_legacy_alias_to_canonical(entry) {
                     group_touched = true;
-                } else if is_legacy_qmd_reindex_entry(entry) {
+                } else if is_legacy_qmd_reindex_entry(entry)
+                    || is_legacy_track2_reindex_entry(entry)
+                {
                     let obj = entry.as_object_mut().unwrap();
                     obj.insert("command".into(), Value::String(qmd.command.into()));
                     let args: Vec<Value> = qmd
@@ -174,6 +198,7 @@ pub(crate) fn migrate_legacy_qmd_entries(groups: &mut Vec<Value>, keep_canonical
                 !is_legacy_qmd_cmd(cmd)
                     && !is_legacy_alias_qmd_entry(h)
                     && !is_legacy_qmd_reindex_entry(h)
+                    && !is_legacy_track2_reindex_entry(h)
                     && !is_canonical_qmd_entry(h)
                     && !is_pre_json_qmd_entry(h)
             });
@@ -286,6 +311,148 @@ pub(crate) fn apply_qmd_hook(settings: &mut Value) -> HookStatus {
     HookStatus::Added
 }
 
+fn is_embed_entry(entry: &Value) -> bool {
+    matches_spec(entry, &HookSpec::EMBED)
+}
+
+/// Apply the Stop `search reindex --pending-only --json` embed hook for
+/// vaults where `qmd_collection` is set — same condition as
+/// `apply_qmd_hook`. Adds it as a SEPARATE group under the Stop event.
+///
+/// CRITICAL: only ever inspects/mutates entries matching `HookSpec::EMBED`.
+/// It never touches, dedupes, or reorders the `checkpoint stop` (`STOP`)
+/// entry registered by `hooks::apply_hooks` — those live in a different
+/// group (or, if the caller merged them, are skipped by the `is_embed_entry`
+/// filter below) and are left byte-for-byte untouched.
+pub(crate) fn apply_embed_hook(settings: &mut Value) -> HookStatus {
+    let root = settings.as_object_mut().expect("settings is JSON object");
+    let hooks_val = root
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !hooks_val.is_object() {
+        *hooks_val = Value::Object(Map::new());
+    }
+    let entry_val = hooks_val
+        .as_object_mut()
+        .unwrap()
+        .entry("Stop".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !entry_val.is_array() {
+        *entry_val = Value::Array(Vec::new());
+    }
+    let groups = entry_val.as_array_mut().unwrap();
+
+    // Pass 1: rewrite shell-form / pre-json embed entries in place (parity
+    // with the qmd hook's own migration passes). These helpers key off
+    // `matches_spec`/`matches_spec_pre_json` against `HookSpec::EMBED`
+    // specifically, so they cannot touch a `STOP` (checkpoint) entry.
+    let mut migrated = false;
+    for g in groups.iter_mut() {
+        if let Some(hooks_arr) = g.get_mut("hooks").and_then(|v| v.as_array_mut()) {
+            for entry in hooks_arr.iter_mut() {
+                if rewrite_if_shell_form(entry, &HookSpec::EMBED) {
+                    migrated = true;
+                }
+                if append_json_if_needed(entry, &HookSpec::EMBED) {
+                    migrated = true;
+                }
+            }
+        }
+    }
+
+    // Pass 2: dedupe — keep first embed entry, drop the rest. Non-embed
+    // entries (including checkpoint stop) are never inspected by
+    // `is_embed_entry` and pass through `retain` untouched.
+    let mut seen = false;
+    for g in groups.iter_mut() {
+        if let Some(hooks_arr) = g.get_mut("hooks").and_then(|v| v.as_array_mut()) {
+            let before = hooks_arr.len();
+            hooks_arr.retain(|h| {
+                if !is_embed_entry(h) {
+                    return true;
+                }
+                if seen {
+                    return false;
+                }
+                seen = true;
+                true
+            });
+            if hooks_arr.len() != before {
+                migrated = true;
+            }
+        }
+    }
+    // Splice out groups left empty by the dedupe pass.
+    groups.retain(|g| {
+        g.get("hooks")
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+    });
+
+    let already = groups.iter().any(|g| {
+        g.get("hooks")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().any(is_embed_entry))
+            .unwrap_or(false)
+    });
+    if already {
+        return if migrated {
+            HookStatus::Migrated
+        } else {
+            HookStatus::Ok
+        };
+    }
+
+    // Not present — add as a new, separate group. Never appended into the
+    // checkpoint's existing group, so the checkpoint entry's group/array is
+    // untouched.
+    groups.push(json!({
+        "matcher": "",
+        "hooks": [HookSpec::EMBED.to_canonical_entry()],
+    }));
+    HookStatus::Added
+}
+
+/// `qmd_collection` is absent — strip the Stop embed entry (and any legacy
+/// shell/pre-json shape of it). Never touches the checkpoint `STOP` entry.
+/// Returns true if anything was removed.
+pub(crate) fn strip_embed_hook(settings: &mut Value) -> bool {
+    let Some(root) = settings.as_object_mut() else {
+        return false;
+    };
+    let Some(hooks_val) = root.get_mut("hooks") else {
+        return false;
+    };
+    let Some(hooks_obj) = hooks_val.as_object_mut() else {
+        return false;
+    };
+    let Some(groups) = hooks_obj.get_mut("Stop").and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+
+    let mut changed = false;
+    for g in groups.iter_mut() {
+        if let Some(hooks_arr) = g.get_mut("hooks").and_then(|v| v.as_array_mut()) {
+            let before = hooks_arr.len();
+            hooks_arr.retain(|h| !is_embed_entry(h) && !matches_spec_pre_json(h, &HookSpec::EMBED));
+            if hooks_arr.len() != before {
+                changed = true;
+            }
+        }
+    }
+    groups.retain(|g| {
+        g.get("hooks")
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+    });
+    if groups.is_empty() {
+        hooks_obj.remove("Stop");
+    }
+    changed
+}
+
 /// `qmd_collection` is absent — strip every legacy + canonical qmd entry. If
 /// PostToolUse ends up empty, delete the key. Returns true if any entry was
 /// removed.
@@ -355,7 +522,10 @@ mod tests {
         assert_eq!(entry["command"], "onebrain");
         // v3.4.5: canonical NEW form `search reindex`, not the legacy
         // `qmd reindex` / `qmd-reindex` forms.
-        assert_eq!(entry["args"], json!(["search", "reindex", "--json"]));
+        assert_eq!(
+            entry["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
         assert_eq!(entry["type"], "command");
     }
 
@@ -379,7 +549,10 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
+        assert_eq!(
+            entries[0]["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
     }
 
     /// v3.1 legacy ALIAS exec form (`qmd-reindex` hyphen) migrates to the
@@ -407,7 +580,10 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
+        assert_eq!(
+            entries[0]["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
     }
 
     /// v3.0 legacy ALIAS exec form (`qmd-reindex`, no `--json`) migrates to
@@ -433,7 +609,10 @@ mod tests {
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
+        assert_eq!(
+            entries[0]["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
     }
 
     /// Legacy alias shell form (`onebrain qmd-reindex`) migrates to new exec.
@@ -457,7 +636,10 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
+        assert_eq!(
+            entries[0]["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
     }
 
     /// Mixed legacy alias + new-form duplicate collapse to ONE canonical
@@ -485,12 +667,16 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1, "entries: {entries:?}");
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
+        assert_eq!(
+            entries[0]["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
     }
 
-    /// Two NEW-form duplicates collapse to ONE.
+    /// Two Track-2 (`search reindex --json`, pre-Track-4) duplicates both
+    /// migrate to the new `--lex-only` canonical and collapse to ONE.
     #[test]
-    fn apply_qmd_hook_two_new_form_dedupes_to_single() {
+    fn apply_qmd_hook_two_track2_legacy_dedupes_to_single() {
         let mut s = json!({
             "hooks": {
                 "PostToolUse": [
@@ -511,7 +697,39 @@ mod tests {
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
+        assert_eq!(
+            entries[0]["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
+    }
+
+    /// Two NEW (`--lex-only`) canonical duplicates collapse to ONE.
+    #[test]
+    fn apply_qmd_hook_two_new_form_dedupes_to_single() {
+        let mut s = json!({
+            "hooks": {
+                "PostToolUse": [
+                    {"matcher": "Write|Edit", "hooks": [{
+                        "type": "command", "command": "onebrain", "args": ["search", "reindex", "--lex-only", "--json"]
+                    }]},
+                    {"matcher": "Write|Edit", "hooks": [{
+                        "type": "command", "command": "onebrain", "args": ["search", "reindex", "--lex-only", "--json"]
+                    }]},
+                ]
+            }
+        });
+        apply_qmd_hook(&mut s);
+        let entries: Vec<_> = s["hooks"]["PostToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0]["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
     }
 
     #[test]
@@ -536,6 +754,38 @@ mod tests {
         assert_eq!(entries.len(), 1);
     }
 
+    /// Track-2 canonical (`search reindex --json`, no `--lex-only`) is now
+    /// LEGACY — v3.4.5 Track 4 migrates it in place to the new canonical.
+    #[test]
+    fn apply_qmd_hook_track2_canonical_migrates_to_lex_only() {
+        let mut s = json!({
+            "hooks": {
+                "PostToolUse": [{
+                    "matcher": "Write|Edit",
+                    "hooks": [{
+                        "type": "command", "command": "onebrain",
+                        "args": ["search", "reindex", "--json"]
+                    }],
+                }]
+            }
+        });
+        let st = apply_qmd_hook(&mut s);
+        assert_eq!(st, HookStatus::Migrated);
+        let entries: Vec<_> = s["hooks"]["PostToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0]["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
+    }
+
+    /// The TRUE new canonical (`--lex-only --json`) already present is a
+    /// genuine no-op.
     #[test]
     fn apply_qmd_hook_canonical_already_present_no_op() {
         let mut s = json!({
@@ -544,7 +794,7 @@ mod tests {
                     "matcher": "Write|Edit",
                     "hooks": [{
                         "type": "command", "command": "onebrain",
-                        "args": ["search", "reindex", "--json"]
+                        "args": ["search", "reindex", "--lex-only", "--json"]
                     }],
                 }]
             }
@@ -562,7 +812,9 @@ mod tests {
 
     #[test]
     fn apply_qmd_hook_v31_canonical_args_migrate_with_json_flag() {
-        // v3.4.5 NEW-form entry (no --json) gets the flag appended in place.
+        // Pre-json Track-2 canonical (no --json, no --lex-only) is a legacy
+        // shape (`is_legacy_track2_reindex_entry`) that migrates straight to
+        // the new `--lex-only --json` canonical via Pass 1.
         let mut s = json!({
             "hooks": {
                 "PostToolUse": [{
@@ -578,7 +830,10 @@ mod tests {
         // Migrated because the args[] changed.
         assert_eq!(st, HookStatus::Migrated);
         let entry = &s["hooks"]["PostToolUse"][0]["hooks"][0];
-        assert_eq!(entry["args"], json!(["search", "reindex", "--json"]));
+        assert_eq!(
+            entry["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
     }
 
     /// v3.2–v3.4 `qmd reindex` exec form (no `--json`) migrates directly to
@@ -599,7 +854,10 @@ mod tests {
         let st = apply_qmd_hook(&mut s);
         assert_eq!(st, HookStatus::Migrated);
         let entry = &s["hooks"]["PostToolUse"][0]["hooks"][0];
-        assert_eq!(entry["args"], json!(["search", "reindex", "--json"]));
+        assert_eq!(
+            entry["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
     }
 
     #[test]
@@ -616,7 +874,10 @@ mod tests {
         assert_eq!(st, HookStatus::Migrated);
         let entry = &s["hooks"]["PostToolUse"][0]["hooks"][0];
         assert_eq!(entry["command"], "onebrain");
-        assert_eq!(entry["args"], json!(["search", "reindex", "--json"]));
+        assert_eq!(
+            entry["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
     }
 
     #[test]
@@ -641,7 +902,10 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
+        assert_eq!(
+            entries[0]["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
     }
 
     #[test]
@@ -664,6 +928,7 @@ mod tests {
         let want_args = vec![
             Value::String("search".into()),
             Value::String("reindex".into()),
+            Value::String("--lex-only".into()),
             Value::String("--json".into()),
         ];
         let canonical_count = entries
@@ -733,10 +998,8 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| e["command"] == "echo user-custom-hook"));
-        assert!(entries
-            .iter()
-            .any(|e| e["command"] == "onebrain"
-                && e["args"] == json!(["search", "reindex", "--json"])));
+        assert!(entries.iter().any(|e| e["command"] == "onebrain"
+            && e["args"] == json!(["search", "reindex", "--lex-only", "--json"])));
     }
 
     #[test]
@@ -865,7 +1128,10 @@ mod tests {
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
+        assert_eq!(
+            entries[0]["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
     }
 
     /// When `"PostToolUse"` exists but holds a non-array value, `apply_qmd_hook`
@@ -884,7 +1150,10 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["command"], "onebrain");
-        assert_eq!(entries[0]["args"], json!(["search", "reindex", "--json"]));
+        assert_eq!(
+            entries[0]["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
     }
 
     /// A group that has no `"hooks"` key is silently skipped in
@@ -910,7 +1179,7 @@ mod tests {
         assert_eq!(all_entries[0]["command"], "onebrain");
         assert_eq!(
             all_entries[0]["args"],
-            json!(["search", "reindex", "--json"])
+            json!(["search", "reindex", "--lex-only", "--json"])
         );
     }
 
@@ -972,7 +1241,10 @@ mod tests {
         let st = apply_qmd_hook(&mut s);
         assert_eq!(st, HookStatus::Migrated);
         let e = &s["hooks"]["PostToolUse"][0]["hooks"][0];
-        assert_eq!(e["args"], json!(["search", "reindex", "--json"]));
+        assert_eq!(
+            e["args"],
+            json!(["search", "reindex", "--lex-only", "--json"])
+        );
     }
 
     /// Disabled qmd strips the old `qmd reindex` form too.
@@ -986,5 +1258,178 @@ mod tests {
         });
         strip_qmd_hook(&mut s);
         assert!(s["hooks"].get("PostToolUse").is_none());
+    }
+
+    // ── v3.4.5 Track 4: apply_embed_hook / strip_embed_hook ──────────────────
+
+    #[test]
+    fn apply_embed_hook_fresh_adds_pending_only_entry() {
+        let mut s = json!({});
+        let st = apply_embed_hook(&mut s);
+        assert_eq!(st, HookStatus::Added);
+        let entries: Vec<_> = s["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["command"], "onebrain");
+        assert_eq!(
+            entries[0]["args"],
+            json!(["search", "reindex", "--pending-only", "--json"])
+        );
+    }
+
+    #[test]
+    fn apply_embed_hook_never_touches_existing_checkpoint_entry() {
+        let mut s = json!({
+            "hooks": {
+                "Stop": [{"matcher": "", "hooks": [
+                    {"command": "onebrain", "args": ["checkpoint", "stop", "--json"]}
+                ]}],
+            }
+        });
+        apply_embed_hook(&mut s);
+        let stop = s["hooks"]["Stop"].as_array().unwrap();
+        // Checkpoint's original group is untouched; embed lands in a new group.
+        assert_eq!(
+            stop[0]["hooks"][0],
+            json!({"command": "onebrain", "args": ["checkpoint", "stop", "--json"]})
+        );
+        let entries: Vec<_> = stop
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+            .collect();
+        assert_eq!(entries.len(), 2, "entries: {entries:?}");
+        assert!(entries
+            .iter()
+            .any(|e| e["args"] == json!(["search", "reindex", "--pending-only", "--json"])));
+    }
+
+    #[test]
+    fn apply_embed_hook_idempotent_second_run_is_ok() {
+        let mut s = json!({});
+        apply_embed_hook(&mut s);
+        let st = apply_embed_hook(&mut s);
+        assert_eq!(st, HookStatus::Ok);
+        let entries: Vec<_> = s["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+            .collect();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn apply_embed_hook_dedupes_existing_duplicates() {
+        let mut s = json!({
+            "hooks": {
+                "Stop": [
+                    {"matcher": "", "hooks": [
+                        {"command": "onebrain", "args": ["search", "reindex", "--pending-only", "--json"]}
+                    ]},
+                    {"matcher": "", "hooks": [
+                        {"command": "onebrain", "args": ["search", "reindex", "--pending-only", "--json"]}
+                    ]},
+                ],
+            }
+        });
+        let st = apply_embed_hook(&mut s);
+        assert_eq!(st, HookStatus::Migrated);
+        let entries: Vec<_> = s["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+            .collect();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn apply_embed_hook_does_not_match_qmd_lex_only_entry() {
+        // Sanity: the PostToolUse `--lex-only` entry living under Stop
+        // (shouldn't happen, but prove the matcher is exact-args) must not
+        // be treated as "already present" for the embed hook.
+        let mut s = json!({
+            "hooks": {
+                "Stop": [{"matcher": "", "hooks": [
+                    {"command": "onebrain", "args": ["search", "reindex", "--lex-only", "--json"]}
+                ]}],
+            }
+        });
+        let st = apply_embed_hook(&mut s);
+        assert_eq!(st, HookStatus::Added);
+        let entries: Vec<_> = s["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+            .collect();
+        assert_eq!(entries.len(), 2, "entries: {entries:?}");
+    }
+
+    #[test]
+    fn strip_embed_hook_removes_entry_keeps_checkpoint() {
+        let mut s = json!({
+            "hooks": {
+                "Stop": [
+                    {"matcher": "", "hooks": [
+                        {"command": "onebrain", "args": ["checkpoint", "stop", "--json"]}
+                    ]},
+                    {"matcher": "", "hooks": [
+                        {"command": "onebrain", "args": ["search", "reindex", "--pending-only", "--json"]}
+                    ]},
+                ],
+            }
+        });
+        let changed = strip_embed_hook(&mut s);
+        assert!(changed);
+        let entries: Vec<_> = s["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["args"], json!(["checkpoint", "stop", "--json"]));
+    }
+
+    #[test]
+    fn strip_embed_hook_removes_stop_key_when_only_embed_present() {
+        let mut s = json!({
+            "hooks": {
+                "Stop": [{"matcher": "", "hooks": [
+                    {"command": "onebrain", "args": ["search", "reindex", "--pending-only", "--json"]}
+                ]}],
+            }
+        });
+        strip_embed_hook(&mut s);
+        assert!(s["hooks"].get("Stop").is_none());
+    }
+
+    #[test]
+    fn strip_embed_hook_returns_false_when_no_stop_event() {
+        let mut s = json!({"hooks": {"PostToolUse": []}});
+        assert!(!strip_embed_hook(&mut s));
+    }
+
+    #[test]
+    fn strip_embed_hook_returns_false_for_non_object_settings() {
+        let mut s = json!([]);
+        assert!(!strip_embed_hook(&mut s));
+    }
+
+    #[test]
+    fn strip_embed_hook_returns_false_when_hooks_value_is_not_object() {
+        let mut s = json!({"hooks": "not-an-object"});
+        assert!(!strip_embed_hook(&mut s));
+    }
+
+    #[test]
+    fn strip_embed_hook_returns_false_when_no_hooks_key() {
+        let mut s = json!({"theme": "dark"});
+        assert!(!strip_embed_hook(&mut s));
     }
 }

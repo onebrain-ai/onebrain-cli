@@ -19,6 +19,21 @@ expression: text
                         "type": "command"
                     }
                 ]
+            },
+            {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "onebrain",
+                        "args": [
+                            "search",
+                            "reindex",
+                            "--pending-only",
+                            "--json"
+                        ]
+                    }
+                ]
             }
         ],
         "PostToolUse": [
@@ -31,6 +46,7 @@ expression: text
                         "args": [
                             "search",
                             "reindex",
+                            "--lex-only",
                             "--json"
                         ]
                     }

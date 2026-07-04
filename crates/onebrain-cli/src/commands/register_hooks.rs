@@ -57,6 +57,9 @@ fn print_summary<W: Write>(result: &RegisterHooksResult, mut w: W) -> Result<()>
     if let Some(s) = result.qmd {
         writeln!(w, "{prefix} PostToolUse {}", s.as_str())?;
     }
+    if let Some(s) = result.embed {
+        writeln!(w, "{prefix} Stop (embed) {}", s.as_str())?;
+    }
     writeln!(
         w,
         "{prefix} permissions added = {}",
@@ -158,5 +161,15 @@ mod tests {
         print_summary(&r, &mut buf).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("PostToolUse added"));
+    }
+
+    #[test]
+    fn print_summary_with_embed_status() {
+        let mut r = fake_result();
+        r.embed = Some(HookStatus::Added);
+        let mut buf = Vec::new();
+        print_summary(&r, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("Stop (embed) added"));
     }
 }
