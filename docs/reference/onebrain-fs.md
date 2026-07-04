@@ -65,7 +65,7 @@ src/
     ├── branch.rs         resolve_branch — update_channel → main/next
     ├── download.rs       download_tarball + extract_tarball + build_tar_spawn_overrides
     ├── walker.rs         list_files_recursive — best-effort recursive file listing
-    ├── sync.rs           sync_plugin_files / sync_gemini_config / sync_obsidian (overlay + stale removal)
+    ├── sync.rs           sync_plugin_files / sync_gemini_config (overlay + stale removal)
     ├── docs.rs           copy_root_docs — CONTRIBUTING/CHANGELOG/PLUGIN-CHANGELOG
     ├── harness_merge.rs  merge_harness_files — merge @-import lines into CLAUDE/GEMINI/AGENTS.md
     ├── vault_yml.rs      update_vault_yml — write update_channel back (atomic, backup-first)
@@ -310,7 +310,7 @@ Direct GitHub-Release fetch + atomic binary swap (replaces the broken npm/bun pa
 Module root — declares step submodules and re-exports `run_vault_sync`, `resolve_branch`, `build_tar_spawn_overrides`, `normalize_path`, `VaultSyncOptions`, `VaultSyncResult`.
 
 ### `src/vault_sync/types.rs`
-**Key types** — `VaultSyncOptions` (`branch`, `fetch_fn`, `installed_plugins_path`/`_cache_dir`, `is_tty`, `unlink_fn`, `include_obsidian`, `embedded`, `now_fn`, `progress_writer`); `VaultSyncResult` (Serialize with Bun camelCase rename: `ok`, `version`, `branch`, `filesAdded`, `filesRemoved`, `importsAdded`, `pinSkipped`, `cacheRemoved`, `error`); closure aliases `FetchFn`/`UnlinkFn`/`NowFn`. `VaultSyncResult::pending(branch)` (crate-private initial state).
+**Key types** — `VaultSyncOptions` (`branch`, `fetch_fn`, `installed_plugins_path`/`_cache_dir`, `is_tty`, `unlink_fn`, `embedded`, `now_fn`, `progress_writer`); `VaultSyncResult` (Serialize with Bun camelCase rename: `ok`, `version`, `branch`, `filesAdded`, `filesRemoved`, `importsAdded`, `pinSkipped`, `cacheRemoved`, `error`); closure aliases `FetchFn`/`UnlinkFn`/`NowFn`. `VaultSyncResult::pending(branch)` (crate-private initial state).
 **Connections** — consumed by every vault_sync submodule + `init::default_vault_sync` + `onebrain-cli`.
 
 ### `src/vault_sync/orchestrate.rs`
@@ -333,7 +333,7 @@ Step 1 — tarball download + extract (pure-Rust `tar`+`flate2`, no system `tar`
 
 ### `src/vault_sync/sync.rs`
 Steps 2–4 — overlay directories.
-**Key functions** — `sync_plugin_files` (`.claude/plugins/onebrain/`, copies + removes stale), `sync_gemini_config` (`.gemini/`, source-absent no-op), `sync_obsidian` (init-only, no stale removal), `default_unlink_fn`; private `overlay_directory(source, dest, unlink_fn, _strict) -> io::Result<(u64,u64)>` (returns `(files_added, files_removed)`; counts only successful unlinks).
+**Key functions** — `sync_plugin_files` (`.claude/plugins/onebrain/`, copies + removes stale), `sync_gemini_config` (`.gemini/`, source-absent no-op), `default_unlink_fn`; private `overlay_directory(source, dest, unlink_fn, _strict) -> io::Result<(u64,u64)>` (returns `(files_added, files_removed)`; counts only successful unlinks).
 **Connections** — calls: `walker::list_files_recursive`; called by: `orchestrate`.
 
 ### `src/vault_sync/docs.rs`
