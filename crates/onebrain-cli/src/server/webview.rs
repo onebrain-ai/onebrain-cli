@@ -130,7 +130,11 @@ fn resolve_redirect(base: &str, location: &str) -> Option<String> {
         let origin_end = base[scheme_end..]
             .find('/')
             .map_or(base.len(), |i| scheme_end + i);
-        return Some(format!("{}{}", &base[..origin_end], location));
+        // The base's http(s) invariant makes this guard unreachable-false by
+        // construction, but keep the same `.then_some` belt-and-braces as the
+        // scheme-relative branch above so every exit revalidates.
+        let resolved = format!("{}{}", &base[..origin_end], location);
+        return is_http_url(&resolved).then_some(resolved);
     }
     None
 }
