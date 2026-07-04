@@ -8,11 +8,11 @@
 //! Mapping (skill-alignment §4.7 + design §7):
 //!   - `["session-init"]`   → `["session", "init", "--json"]`
 //!   - `["orphan-scan", L, T]` → `["checkpoint", "orphans", L, T, "--json"]`
-//!   - `["qmd-reindex"]`    → `["search", "reindex", "--json"]`
-//!   - `["qmd", "reindex"]` → `["search", "reindex", "--json"]`
+//!   - `["qmd-reindex"]`    → `["search", "reindex", "--lex-only", "--json"]` (PostToolUse)
+//!   - `["qmd", "reindex"]` → `["search", "reindex", "--lex-only", "--json"]` (PostToolUse)
 //!   - `["session", "init"]`        → ensure trailing `--json`
 //!   - `["checkpoint", "orphans", …]` → ensure trailing `--json`
-//!   - `["search", "reindex"]`      → ensure trailing `--json`
+//!   - `["search", "reindex"]`      → ensure `--lex-only` (PostToolUse) and trailing `--json`
 //!   - `["checkpoint", "stop"]`     → ensure trailing `--json`
 //!
 //! v3.1 contract: hook-protocol commands default to TEXT output for
@@ -259,7 +259,12 @@ fn add_stop_embed_entry_if_needed(hooks_obj: &mut Map<String, Value>, report: &m
         return;
     }
     let stop_arr = stop_val.as_array_mut().unwrap();
+    // "matcher": "" matches the canonical group shape `register hooks` emits
+    // (see `register_hooks/qmd.rs::apply_embed_hook`) — omitting it made a
+    // plugin-update-added Stop group structurally different from a
+    // register-hooks one.
     stop_arr.push(serde_json::json!({
+        "matcher": "",
         "hooks": [
             {
                 "type": "command",
@@ -1147,6 +1152,8 @@ mod tests {
             stop_groups[1]["hooks"][0]["args"],
             json!(["search", "reindex", "--pending-only", "--json"])
         );
+        // Group shape must match what `register hooks` emits (matcher present).
+        assert_eq!(stop_groups[1]["matcher"], "");
         assert_eq!(stop_groups[1]["hooks"][0]["command"], "onebrain");
         assert_eq!(stop_groups[1]["hooks"][0]["type"], "command");
 
