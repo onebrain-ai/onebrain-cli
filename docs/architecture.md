@@ -14,7 +14,7 @@ onebrain-cli          Binary crate — clap dispatch over the v3.1 command tree,
   │                   Knows about the filesystem.
   │
   ├─ onebrain-cache   Session token resolution · launchd plist generation
-  │                   · qmd status detection. Host/runtime state.
+  │                   · checkpoint cadence state. Host/runtime state.
   │
   └─ onebrain-core    Types · config parsing · path resolution. Zero filesystem deps —
                       pure logic, the easiest crate to unit-test.

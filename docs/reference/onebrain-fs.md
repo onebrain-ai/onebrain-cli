@@ -259,7 +259,7 @@ Entry point + result types.
 
 ### `src/register_hooks/hooks.rs`
 Stop-hook primitives (port of Bun `register-hooks.ts`).
-**Key types** — `HookSpec { command, args }` with `STOP = ["checkpoint","stop","--json"]` and `QMD = ["qmd-reindex","--json"]`; `Presence { Found, Migrate, Missing }`; `HookStatus { Added, Migrated, Ok }`.
+**Key types** — `HookSpec { command, args }` with `STOP = ["checkpoint","stop","--json"]` and `QMD = ["search","reindex","--json"]` (the reindex-on-write hook — const name retained, registers the native `search reindex`); `Presence { Found, Migrate, Missing }`; `HookStatus { Added, Migrated, Ok }`.
 **Key functions** — `matches_spec` (v3.1 canonical + v3.0 pre-json + both shell forms), `matches_spec_pre_json`, `append_json_if_needed` (v3.0→v3.1 flag append), `rewrite_if_shell_form` (shell→exec), `check_hook_presence`, `apply_hooks` (stale-event sweep + Stop register/migrate), `strip_onebrain_hooks`.
 **Connections** — calls: `serde_json`; called by: `register_hooks::mod`, `register_hooks::qmd` (shared `HookSpec`/`rewrite`).
 **Tests** — exhaustive match/rewrite/migrate/strip + stale-event sweep.

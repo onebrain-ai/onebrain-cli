@@ -42,13 +42,12 @@ the exclusion is an explicit decision, not a silent skip.
 | `crates/onebrain-cli/src/commands/serve.rs` | Foreground blocking HTTP listener — never returns in a test |
 | `crates/onebrain-cli/src/commands/daemon.rs` | Process fork/detach + PID files |
 | `crates/onebrain-cli/src/commands/update.rs` | GitHub releases API + binary self-replace (network) |
-| `crates/onebrain-cli/src/commands/qmd_reindex.rs` | Shells out to the `qmd` binary |
 | `crates/onebrain-cli/src/commands/harness_run.rs` | Spawns `claude` / `gemini` |
 | `crates/onebrain-cli/src/commands/search_query.rs` | Embedding-backed query verb — opens the real engine (model download); non-embedding paths tested, embed path validated by gated tests |
 | `crates/onebrain-cli/src/commands/search_reindex.rs` | Embedding-backed reindex verb — model download in the CLI binary path |
 | `crates/onebrain-cli/src/commands/search_model_tui.rs` | Raw-mode ratatui event loop (`run`/`event_loop`/`render`/`perform_switch`) — needs a live TTY. The pure pieces it drives (`build_rows`, `sort_rows`, `next_sort`, `footer_text`, and every `AppState` transition incl. `perform_delete`) ARE unit-tested in-file; only the terminal-coupled shell is untestable, so the whole file is excluded per the "most of it is untestable" rule |
 | `crates/onebrain-cli/src/server/chat.rs` | SSE streaming proxy to a live AI subprocess |
-| `crates/onebrain-cli/src/server/search.rs` | Live qmd-backed search path |
+| `crates/onebrain-cli/src/server/search.rs` | Live native search path (opens the real engine) |
 | `crates/onebrain-search/src/embed.rs` | fastembed model download + ONNX inference (multi-GB model, network) — logic exercised via the `Embed` trait + `FakeEmbedder`; real path validated by embed-gated tests |
 | `crates/onebrain-fs/src/update/install.rs` | npm/bun/brew install subprocess + network |
 | `crates/onebrain-fs/src/init/wizard.rs` | Interactive TTY prompts |

@@ -47,7 +47,7 @@ Point an AI agent at a vault and it improvises — a different pile of `grep` / 
 
 ## Features
 
-- **🔍 Built-in native search** — hybrid keyword + semantic search over your vault's Markdown, multilingual (Thai/CJK-aware keyword bigrams + ~100-language embeddings), zero external dependencies: no Node, no Python, no separate `qmd` install.
+- **🔍 Built-in native search** — hybrid keyword + semantic search over your vault's Markdown, multilingual (Thai/CJK-aware keyword bigrams + ~100-language embeddings), zero external dependencies: no Node, no Python, no separate search binary to install.
 - **🔌 Built-in MCP server** — `onebrain mcp` plugs OneBrain into Claude Code, Cursor, or any MCP client as a vault search engine; see [Use as a standalone vault-search MCP](#use-as-a-standalone-vault-search-mcp).
 - **Single static binary** — one self-contained file, no runtime to install, cross-platform down to a Raspberry Pi Zero.
 - **Embedded web UI** — `onebrain serve` hosts a local, token-gated file explorer + reading view + search panel + agent chat, with nothing extra to install.
@@ -57,7 +57,7 @@ Point an AI agent at a vault and it improvises — a different pile of `grep` / 
 
 ## Status
 
-**v3.4.x — stable & production-ready, in active maintenance.** GA since v3.0.0 (2026-05-22), shipping ~weekly themed minors. The v3.3 line landed the daemon foundation — `onebrain serve` hosts a local web UI (embedded in the binary) over a token-gated vault JSON API. The v3.4 line introduces the native Rust search engine (the `onebrain-search` crate + `onebrain search` verbs) and a native MCP server (`onebrain mcp`, v3.4.1), replacing the external qmd Node dependency across v3.4.x with full cutover — **0 node/python deps** — at v3.4.5. Version history + direction in the [Roadmap](#roadmap); full detail in [CHANGELOG.md](CHANGELOG.md).
+**v3.4.x — stable & production-ready, in active maintenance.** GA since v3.0.0 (2026-05-22), shipping ~weekly themed minors. The v3.3 line landed the daemon foundation — `onebrain serve` hosts a local web UI (embedded in the binary) over a token-gated vault JSON API. The v3.4 line introduces the native Rust search engine (the `onebrain-search` crate + `onebrain search` verbs) and a native MCP server (`onebrain mcp`, v3.4.1), replacing the external Node search dependency across v3.4.x with full cutover — **0 node/python deps** — at v3.4.5. Version history + direction in the [Roadmap](#roadmap); full detail in [CHANGELOG.md](CHANGELOG.md).
 
 ## Quickstart
 
@@ -168,7 +168,6 @@ onebrain
 ├── note        read · list · find · search · stat · new · append · edit
 │               · move · mkdir · archive · delete · orphans · backlinks
 ├── task        list
-├── qmd         reindex · embed · status        (legacy — removed in v3.4.5)
 ├── plugin      install · update · migrate
 ├── schedule    register · list
 ├── skill       run
@@ -179,7 +178,7 @@ onebrain
 |---|---|---|
 | **Setup** | `init`, `plugin install`, `vault sync` | Scaffold `onebrain.yml` + PARA folders, register the plugin with the harness, overlay the latest plugin tarball. |
 | **Runtime** (hook protocol) | `session init`, `checkpoint stop · reset · orphans`, `search reindex` | Called by the harness `SessionStart` / `Stop` / `PostToolUse` hooks. Emit hard-wired JSON; banner suppressed for clean machine stdio. |
-| **Search** | `search query · search · vsearch · get · status · reindex · model` | Native hybrid search (tantivy BM25 + fastembed embeddings, RRF-fused) over the vault's `*.md` notes, plus embedding-model management with an interactive TUI. The native `search` verbs fully replace the old `qmd reindex · embed · status` commands as of v3.4.5 — the legacy verbs are removed, not deprecated. |
+| **Search** | `search query · search · vsearch · get · status · reindex · model` | Native hybrid search (tantivy BM25 + fastembed embeddings, RRF-fused) over the vault's `*.md` notes, plus embedding-model management with an interactive TUI. The native `search` verbs are the sole search surface as of v3.4.5, completing the v3.4 native-search cutover (the previous external search commands were removed, not deprecated). |
 | **MCP** | `mcp` | Stdio [Model Context Protocol](docs/reference/mcp.md) server exposing `query`/`get`/`multi_get`/`status` over the native search engine — for Claude Code, Cursor, or any MCP client. See [`docs/reference/mcp.md`](docs/reference/mcp.md) for the full tool reference. |
 | **Notes** | `note read · list · find · search · stat · new · append · edit · move · mkdir · archive · delete · orphans · backlinks` | Structured vault-note operations — wikilink-aware moves, dated archiving, orphan/backlink graph queries. |
 | **Tasks** | `task list` | List dated vault tasks (fence-aware), filterable by due date and folder. |
@@ -224,7 +223,7 @@ The web UI is **embedded in the binary** — a release `onebrain` ships the late
 
 ## Use as a standalone vault-search MCP
 
-`onebrain mcp` also works as a generic local Markdown search engine — a `qmd` replacement — for **any** folder that has an `onebrain.yml`, not just a full OneBrain vault. Hybrid lex + semantic search, multilingual, single binary, no Node/Python.
+`onebrain mcp` also works as a generic local Markdown search engine for **any** folder that has an `onebrain.yml`, not just a full OneBrain vault. Hybrid lex + semantic search, multilingual, single binary, no Node/Python.
 
 Minimal `onebrain.yml` (folder defaults + a search collection name are all it needs):
 
@@ -326,7 +325,7 @@ Test pyramid (3 layers since v3.1.0): inline unit + `assert_cmd` integration + `
 
 ### 🚧 Phase 1 · perceptual speed + skill alignment (v3.2–v3.7)
 - [x] **v3.2** — `note` resource group (11 verbs) · grouped `doctor` UX with braille spinner + one-pass `--fix` · animated `onebrain update` · `skill run --harness {claude,gemini}` + `--model <m>` + headless startup-skip handshake + in-place spinner · `harness run [PROMPT] --mode {with-context,ad-hoc}` for ad-hoc prompts through claude / gemini (reads stdin when omitted) · auto-checkpoint hook fix (`CLAUDE_CODE_SESSION_ID` top-priority token + anchored `last_ts` so the time threshold actually fires) · `--vault` accepted everywhere.
-- [x] **v3.3** — Daemon foundation: `onebrain serve` — a local **web UI embedded in the binary** over a token-gated vault JSON API (file explorer · reading view · qmd-backed search · agent chat), on a security-hardened surface (whole-surface token gate · vault path confinement · CSP + forced-attachment · agent env isolation).
+- [x] **v3.3** — Daemon foundation: `onebrain serve` — a local **web UI embedded in the binary** over a token-gated vault JSON API (file explorer · reading view · search panel · agent chat), on a security-hardened surface (whole-surface token gate · vault path confinement · CSP + forced-attachment · agent env isolation).
 - [ ] **v3.4** — **Native Rust search — replaces qmd** (mini-epic across v3.4.x; exit: **0 node/python deps**):
   - [x] **v3.4.0** — `onebrain-search` engine (tantivy BM25 + fastembed embeddings + RRF hybrid, ~100-language semantic + Thai/CJK keyword) · `onebrain search` verbs (`query/search/vsearch/get/status/reindex/model` + interactive model TUI) · doctor native-search checks · `qmd_collection` → `search.collection` migration.
   - [x] **v3.4.1** — native MCP server (`onebrain mcp`, rmcp): qmd-compatible `query/get/multi_get/status` tools, client-side RRF fusion, native `session init` probe (drops the qmd subprocess). Plugin `.mcp.json` server-key rename (`qmd` → `search`) is staged for the v3.4.5 cutover — see [ADR 0019](docs/decisions/0019-native-mcp-server-staged-qmd-cutover.md).
