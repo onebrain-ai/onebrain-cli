@@ -19,7 +19,9 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
 use crate::cli::{ModelSortCol, SearchModelListArgs, SearchModelRemoveArgs, SearchModelSetArgs};
-use crate::commands::search_common::{collection_cache_dir, collection_for, open_engine};
+use crate::commands::search_common::{
+    collection_cache_dir, collection_for, format_size, open_engine,
+};
 use crate::output::{emit, Envelope, OutputMode};
 use onebrain_core::load_vault_config;
 use onebrain_search::embed::{
@@ -194,24 +196,6 @@ pub(crate) fn parse_approx_size(s: &str) -> u64 {
         _ => 1.0,
     };
     (num * mult) as u64
-}
-
-/// Human-readable byte size (`471 MB`, `1.2 GB`, `840 KB`, `12 B`). Mirrors
-/// `search_status::format_size`.
-pub(crate) fn format_size(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = 1024.0 * 1024.0;
-    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
-    let b = bytes as f64;
-    if b >= GB {
-        format!("{:.1} GB", b / GB)
-    } else if b >= MB {
-        format!("{:.0} MB", b / MB)
-    } else if b >= KB {
-        format!("{:.0} KB", b / KB)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 /// Pad `s` with trailing spaces to `w` DISPLAY columns (not chars/bytes) —

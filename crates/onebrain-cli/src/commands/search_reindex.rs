@@ -618,7 +618,7 @@ fn maybe_prompt_first_model(vault_flag: Option<PathBuf>, mode: &OutputMode) -> R
     let current = config.search.embed_model.clone();
     if let Some(chosen) = crate::commands::search_model::prompt_pick_model(&current) {
         onebrain_fs::persist_search_key(resolved.root.as_path(), "embed_model", chosen)?;
-        println!("✅  Using {chosen} — indexing now…");
+        eprintln!("✅  Using {chosen} — indexing now…");
     }
     Ok(())
 }
@@ -811,8 +811,9 @@ fn model_load_notice_for(resolved: &onebrain_core::ResolvedVault) -> String {
     }
 }
 
-/// Human-readable byte size (`471 MB`, `1.2 GB`, `840 KB`, `12 B`). Matches
-/// `search_status::format_size`.
+/// Human-readable byte size with ONE-DECIMAL MB (`16.2 MB`) — deliberately
+/// different from `search_common::format_size` (whole-number MB): this file's
+/// size DELTAS (`+1.2 MB`) need the precision.
 fn format_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = 1024.0 * 1024.0;

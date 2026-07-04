@@ -236,9 +236,40 @@ pub(crate) fn reconcile_missing_model(vault_root: &Path, cache_dir: &Path, embed
     }
 }
 
+/// Human-readable byte size (`471 MB`, `2.2 GB`, `12 B`) — whole-number MB/KB,
+/// one decimal for GB. Shared by `search status` and `search model`
+/// (`search reindex` keeps a local one-decimal-MB variant: its size DELTAS
+/// like `+1.2 MB` need the precision).
+pub(crate) fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.0} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_size_renders_units() {
+        assert_eq!(format_size(12), "12 B");
+        assert_eq!(format_size(2048), "2 KB");
+        assert_eq!(format_size(471 * 1024 * 1024), "471 MB");
+        assert_eq!(
+            format_size(2 * 1024 * 1024 * 1024 + 200 * 1024 * 1024),
+            "2.2 GB"
+        );
+    }
     use onebrain_core::{ResolvedVault, VaultRoot, VaultSource};
     use tempfile::tempdir;
 

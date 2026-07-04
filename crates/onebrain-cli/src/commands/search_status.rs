@@ -17,7 +17,7 @@ use onebrain_core::path::ResolvedVault;
 use serde::Serialize;
 
 use crate::commands::search_common::{
-    collection_cache_dir, collection_for, index_size_bytes, read_reindex_progress,
+    collection_cache_dir, collection_for, format_size, index_size_bytes, read_reindex_progress,
     resolve_collection, ReindexLiveProgress,
 };
 use crate::output::{emit, item, section, Envelope, OutputMode};
@@ -262,23 +262,6 @@ fn dir_mtime_secs(root: &Path) -> Option<u64> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs())
-}
-
-/// Human-readable byte size (`471 MB`, `1.2 GB`, `840 KB`, `12 B`).
-fn format_size(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = 1024.0 * 1024.0;
-    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
-    let b = bytes as f64;
-    if b >= GB {
-        format!("{:.1} GB", b / GB)
-    } else if b >= MB {
-        format!("{:.0} MB", b / MB)
-    } else if b >= KB {
-        format!("{:.0} KB", b / KB)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 /// Format epoch seconds as local `YYYY-MM-DD HH:MM`, or `None` on an
@@ -652,17 +635,6 @@ mod tests {
     fn json_omits_reindexing_when_absent() {
         let v = serde_json::to_value(env(Some("ob-1"), true).data.as_ref().unwrap()).unwrap();
         assert!(v.get("reindexing").is_none());
-    }
-
-    #[test]
-    fn format_size_renders_units() {
-        assert_eq!(format_size(12), "12 B");
-        assert_eq!(format_size(2048), "2 KB");
-        assert_eq!(format_size(471 * 1024 * 1024), "471 MB");
-        assert_eq!(
-            format_size(2 * 1024 * 1024 * 1024 + 200 * 1024 * 1024),
-            "2.2 GB"
-        );
     }
 
     #[test]

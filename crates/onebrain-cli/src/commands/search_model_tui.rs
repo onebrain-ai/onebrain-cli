@@ -39,12 +39,13 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use crate::cli::ModelSortCol;
+use crate::commands::search_common::format_size;
 use crate::commands::search_common::{
     collection_cache_dir, collection_for, reconcile_missing_model,
 };
 #[cfg(feature = "semantic")]
 use crate::commands::search_model::apply_model_change;
-use crate::commands::search_model::{cmp_option_last, disk_cell, format_size};
+use crate::commands::search_model::{cmp_option_last, disk_cell};
 use onebrain_core::load_vault_config;
 use onebrain_search::embed::{dir_size_bytes, model_download_status, model_registry};
 
