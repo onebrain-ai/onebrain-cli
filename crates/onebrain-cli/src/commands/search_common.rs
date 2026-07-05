@@ -360,6 +360,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn map_daemon_error_engine_busy_becomes_core_engine_busy() {
+        // A daemon 503 arrives as `onebrain_search::EngineBusy` in the chain
+        // (via `daemon_client::daemon_engine_busy`); `map_daemon_error` must turn
+        // it into `CoreError::EngineBusy` so the verb exits 77 / E_ENGINE_BUSY —
+        // exactly like the direct path's `map_engine_open_error`.
+        let busy = anyhow::Error::new(onebrain_search::error::EngineBusy).context("via daemon");
+        let mapped = map_daemon_error(busy, "route search through warm daemon");
+        assert!(
+            matches!(
+                mapped.downcast_ref::<onebrain_core::CoreError>(),
+                Some(onebrain_core::CoreError::EngineBusy(_))
+            ),
+            "an engine-busy daemon error must become CoreError::EngineBusy, got: {mapped:#}"
+        );
+    }
+
+    #[test]
+    fn map_daemon_error_other_keeps_verb_context() {
+        // A non-busy daemon error keeps its opaque verb context (an E_INTERNAL),
+        // and must NOT be classified as engine-busy.
+        let other = anyhow::anyhow!("some genuine daemon failure");
+        let mapped = map_daemon_error(other, "route `search get` through warm daemon");
+        assert!(
+            !onebrain_search::error::is_engine_busy(&mapped),
+            "a non-busy error must not be classified as EngineBusy"
+        );
+        assert!(
+            format!("{mapped:#}").contains("route `search get` through warm daemon"),
+            "the verb context must be preserved, got: {mapped:#}"
+        );
+    }
+
+    #[test]
     fn format_size_renders_units() {
         assert_eq!(format_size(12), "12 B");
         assert_eq!(format_size(2048), "2 KB");

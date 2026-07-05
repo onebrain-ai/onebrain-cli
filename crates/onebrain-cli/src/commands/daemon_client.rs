@@ -583,6 +583,16 @@ fn with_retry(
 /// [`onebrain_search::error::EngineBusy`] in the error chain; the search-verb
 /// callers (`map_daemon_error`) and the status probe then map it identically to
 /// the direct `Engine::open` lock case. Any other status keeps an opaque wrap.
+///
+/// **Why every routed 503 means engine-busy (not "no vault bound").** The daemon
+/// also 503s from `require_vault_root` when it is running vault-less. But this
+/// client is only reached via [`route_to_daemon`](super::search_common::route_to_daemon)
+/// → [`discover_matching`], which returns a handle ONLY for a daemon whose
+/// `daemon.json.vault` matches the caller's vault; a vault-less daemon fails
+/// `vault_decision` (`Restart`) and is never routed to (the CLI opens the engine
+/// directly instead). So a 503 on a routed request can only come from the
+/// engine-contention paths — `require_engine` on `/api/internal/*` or
+/// `map_search_failure` on `/api/vault/search` — never the no-vault guard.
 fn classify_daemon_ureq(e: ureq::Error) -> anyhow::Error {
     if matches!(e, ureq::Error::StatusCode(503)) {
         return daemon_engine_busy();
