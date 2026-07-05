@@ -117,11 +117,11 @@ Interactive commands print human-readable text; every command also speaks struct
 ### 🚧 Phase 1 · perceptual speed + skill alignment (v3.2–v3.8)
 - [x] **v3.2** — `note` resource group · grouped `doctor` UX · `skill run`/`harness run` for headless skills.
 - [x] **v3.3** — Daemon foundation: `onebrain serve` — embedded web UI over a token-gated vault JSON API.
-- [ ] **v3.4** — **Native Rust search — replaces qmd**: native engine + `onebrain search` verbs · native MCP server · auto reindex/embed hooks · model reindex UX · 0 node/python deps ([milestone 1](https://github.com/onebrain-ai/onebrain-cli/milestone/1)).
+- [ ] **v3.4** — **Native Search + Warm Daemon** *(backend epic — finishes here)*: native Rust search replaces qmd (native engine + `onebrain search` verbs · native MCP server · 0 node/python deps, v3.4.5), plus a minimal **warm daemon** that owns the engine for mcp + search so the CLI works during a live session and multiple sessions coexist (v3.4.6) ([milestone](https://github.com/onebrain-ai/onebrain-cli/milestone/4)).
 - [ ] **v3.5** — **"Desktop + Deeplinks"**: `onebrain desktop` native app + deeplinks + standalone webui file access (`link`/`token`/`desktop` verbs, vault_id, tickets) — the agent hands you a clickable, section-precise webui URL for any vault file; completely replaces Obsidian.
-- [ ] **v3.6** — **WebUI Terminal sessions** (mini-epic): run `onebrain`/`claude`/`codex` in the WebUI from anywhere (Tailscale); persistent term-server survives daemon restart.
-- [ ] **v3.7** — Bootstrap + native verbs *(was v3.5)*: startup / wrapup / daily / tasks → 1 call per ceremony (import content-verbs anchored ~v3.7.x).
-- [ ] **v3.8** — Warm daemon + RPC *(was v3.6)*: kill cold process-start; keeps the native index + embed model hot (absorbs the old RPC-layer milestone).
+- [ ] **v3.6** — **Terminal sessions** (mini-epic): run `onebrain`/`claude`/`codex` in the WebUI from anywhere (Tailscale); persistent term-server survives daemon restart.
+- [ ] **v3.7** — **Bootstrap + native verbs + skill optimization**: startup / wrapup / daily / tasks → 1 call per ceremony; native settings-merge + vault migrations in `plugin update`; skill-body optimization pass (import content-verbs anchored ~v3.7.x).
+- [ ] **v3.8** *(may not ship)* — **เก็บตก / remaining backend cleanup**: full daemon refactor of surfaces beyond mcp + search + daily-brief precompute — only if not already absorbed by v3.4 + v3.7.
 
 ### 📦 Phase 2 · bundles (v3.9–v3.12)
 - [ ] Bundle CLI (`onebrain bundle install/list/info/lint/…`) · four first-party bundles (`dashboard` · `synthesis` · `research` · `scheduler`) · core skills slimmed 32 → 18 · `onebrain.run/bundles` portal.
