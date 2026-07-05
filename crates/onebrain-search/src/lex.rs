@@ -413,6 +413,62 @@ impl LexIndex {
         }
         Ok(results)
     }
+
+    /// Like [`Self::search`], but also returns each hit's `heading_path`, which
+    /// is a STORED tantivy field — so the lex-only verb can show the heading
+    /// WITHOUT opening the engine's redb metadata (v3.4.6, bug E). The chunk
+    /// text/snippet is deliberately NOT returned: the `body` field is indexed
+    /// but NOT `STORED`, so retrieving a snippet would require a schema change
+    /// plus a full reindex migration (deferred). Returns triples of
+    /// `chunk_id`, `heading_path`, and `score`, highest score first.
+    pub fn search_with_heading(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<(String, String, f32)>> {
+        let raw = self.search(query, top_k)?;
+        if raw.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Re-run the search to recover stored fields alongside the chunk_id.
+        // Cheap relative to the query itself (same reader, same top_docs), and
+        // keeps `search`'s hot-path signature `(chunk_id, score)` untouched for
+        // its many callers (hybrid fuse, mcp, webui).
+        //
+        // TODO(v3.4.x): this issues a redundant per-hit `TermQuery` +
+        // `order_by_score` to re-fetch each doc, even though `search()` already
+        // retrieved the doc address whose STORED `heading_path` we want. Fold
+        // heading (and eventually a STORED-body snippet) into a single pass by
+        // having `search()` return the doc addresses — folded into the
+        // deferred-snippet follow-up (body-STORED schema change + reindex
+        // migration), so it lands with that work rather than as a separate
+        // refactor now.
+        let reader = self.index.reader()?;
+        let searcher = reader.searcher();
+        let mut by_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for (chunk_id, _) in &raw {
+            // Look up the doc for this chunk_id to fetch its heading_path.
+            let term = Term::from_field_text(self.chunk_id, chunk_id);
+            let tq = TermQuery::new(term, IndexRecordOption::Basic);
+            let hits = searcher.search(&tq, &TopDocs::with_limit(1).order_by_score())?;
+            if let Some((_, addr)) = hits.first() {
+                let doc: tantivy::TantivyDocument = searcher.doc(*addr)?;
+                let heading = doc
+                    .get_first(self.heading_path)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                by_id.insert(chunk_id.clone(), heading);
+            }
+        }
+        Ok(raw
+            .into_iter()
+            .map(|(id, score)| {
+                let heading = by_id.get(&id).cloned().unwrap_or_default();
+                (id, heading, score)
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -436,6 +492,33 @@ mod tests {
         ix.add(&chunk("d2#0", "cooking pasta recipe")).unwrap();
         ix.commit().unwrap();
         assert_eq!(ix.search("error", 1).unwrap()[0].0, "d1#0");
+    }
+
+    #[test]
+    fn search_with_heading_returns_stored_heading_path() {
+        // Bug E (v3.4.6): heading_path is a STORED tantivy field, so the
+        // lex-only verb can recover it without opening redb.
+        let dir = tempfile::tempdir().unwrap();
+        let mut ix = LexIndex::open(dir.path()).unwrap();
+        let mut c = chunk("d1#0", "error handling in rust");
+        c.heading_path = "Errors › Handling".into();
+        ix.add(&c).unwrap();
+        ix.commit().unwrap();
+
+        let hits = ix.search_with_heading("error", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        let (id, heading, _score) = &hits[0];
+        assert_eq!(id, "d1#0");
+        assert_eq!(heading, "Errors › Handling");
+    }
+
+    #[test]
+    fn search_with_heading_empty_when_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ix = LexIndex::open(dir.path()).unwrap();
+        ix.add(&chunk("d1#0", "error handling")).unwrap();
+        ix.commit().unwrap();
+        assert!(ix.search_with_heading("zorp", 5).unwrap().is_empty());
     }
     #[test]
     fn thai_segmented_match() {

@@ -1080,6 +1080,70 @@ fn lex_only_end_to_end_indexes_lex_only_and_leaves_vectors_pending() {
     assert_eq!(sv["data"]["pending_new"], 1, "{sv}");
 }
 
+/// Bug E (v3.4.6) at the CLI layer: the lex `search` verb populates each hit's
+/// `heading_path` from the STORED tantivy field (no redb open), while `snippet`
+/// stays empty (the `body` field is indexed but NOT STORED — a snippet needs a
+/// schema change + reindex migration, deferred). This proves the wiring
+/// end-to-end through the compiled binary: index a doc under a known heading
+/// with `--lex-only` (which populates tantivy without embedding, so it's
+/// ungated), then assert `search search --json` echoes that exact heading and
+/// an empty snippet.
+#[test]
+fn lex_search_verb_populates_heading_path_and_empty_snippet() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+    // A single heading so the chunk's heading_path is deterministic.
+    write(
+        vault.path(),
+        "note.md",
+        "# Errors Handling\nzebra quokka narwhal.\n",
+    );
+    // Mirror an installed vault so the `--lex-only` safety gate passes.
+    std::fs::create_dir_all(cache.path().join("search/t-vault/tantivy")).unwrap();
+    seed_fake_model(cache.path(), "t-vault", &first_model_dir_name(), 16);
+
+    // Populate tantivy (heading_path is STORED) without embedding.
+    let lex_out = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "--lex-only"])
+        .output()
+        .unwrap();
+    assert!(
+        lex_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&lex_out.stderr)
+    );
+    let lv: serde_json::Value = serde_json::from_slice(&lex_out.stdout).unwrap();
+    assert!(lv["data"].get("skipped").is_none(), "gate passed: {lv}");
+
+    // Now the lex `search` verb must echo the STORED heading + empty snippet.
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "search", "quokka"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "search.lex", "{v}");
+    let hits = v["data"]["hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "expected a lex hit for `quokka`: {v}");
+    assert_eq!(
+        hits[0]["heading_path"], "Errors Handling",
+        "heading_path must come from the STORED tantivy field: {v}"
+    );
+    assert_eq!(
+        hits[0]["snippet"], "",
+        "snippet is deferred (body not STORED) — must be empty, NOT 'no match': {v}"
+    );
+}
+
 /// Regression: past the safety gates, the hook path's live-progress marker
 /// used to re-resolve the collection via the persisting `collection_for`,
 /// which auto-generates AND writes `search.collection` into `onebrain.yml`

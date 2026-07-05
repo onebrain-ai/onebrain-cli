@@ -121,9 +121,27 @@ pub fn open_engine(vault_flag: Option<PathBuf>) -> Result<(Engine, ResolvedVault
 
     let cache_dir = collection_cache_dir(&collection);
     let mut engine = Engine::open(&cache_dir, &config.search.embed_model)
-        .with_context(|| format!("opening search engine at {}", cache_dir.display()))?;
+        .map_err(|e| map_engine_open_error(e, &cache_dir))?;
     engine.set_exclude_patterns(config.search.exclude.clone());
     Ok((engine, resolved))
+}
+
+/// Turn an `Engine::open` failure into the right typed CLI error. The redb
+/// single-process lock case (already classified as `onebrain_search`'s
+/// `EngineBusy`) becomes `CoreError::EngineBusy`, which the envelope + exit
+/// mapping render as `E_ENGINE_BUSY` / exit 77. Every other failure keeps the
+/// prior behaviour: a plain `.context(...)`-wrapped opaque error. This is the
+/// single choke point so `query`, `vsearch`, `get`, and a full `reindex` all
+/// report lock contention uniformly (v3.4.6).
+pub(crate) fn map_engine_open_error(err: anyhow::Error, cache_dir: &Path) -> anyhow::Error {
+    if onebrain_search::error::is_engine_busy(&err) {
+        return anyhow::Error::new(onebrain_core::CoreError::EngineBusy(format!(
+            "index at {} is locked by another process (e.g. the `onebrain mcp` server) — \
+             retry once it releases the lock",
+            cache_dir.display()
+        )));
+    }
+    err.context(format!("opening search engine at {}", cache_dir.display()))
 }
 
 /// Persist `search.collection = collection` into the vault's config file

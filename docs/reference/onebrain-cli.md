@@ -74,7 +74,7 @@ TTY-only branded `OneBrain` block-art wordmark + dim `Your AI Thinking Partner �
 ### `src/exit.rs`
 Single source of truth for `CoreError → i32` exit codes (skill-alignment §4.8). Stable for v3.x.
 **Key items**
-- Named constants: `EXIT_OK=0`, `EXIT_GENERIC=1`, `EXIT_INVALID_ARGS=2`, `EXIT_VAULT_NOT_FOUND=64`, `EXIT_INVALID_YAML=65`, `EXIT_FS_ERROR=66`, `EXIT_CACHE_ERROR=67`, `EXIT_NETWORK=68`, `EXIT_INVALID_DATE=70`, `EXIT_INVALID_TARGET=71`, `EXIT_NOT_IMPLEMENTED=72`, `EXIT_RPC_HANDSHAKE=73`, `EXIT_AUTH_FAILED=74`, `EXIT_INIT_TARGET_NOT_EMPTY=75`.
+- Named constants: `EXIT_OK=0`, `EXIT_GENERIC=1`, `EXIT_INVALID_ARGS=2`, `EXIT_VAULT_NOT_FOUND=64`, `EXIT_INVALID_YAML=65`, `EXIT_FS_ERROR=66`, `EXIT_CACHE_ERROR=67`, `EXIT_NETWORK=68`, `EXIT_INVALID_DATE=70`, `EXIT_INVALID_TARGET=71`, `EXIT_NOT_IMPLEMENTED=72`, `EXIT_RPC_HANDSHAKE=73`, `EXIT_AUTH_FAILED=74`, `EXIT_INIT_TARGET_NOT_EMPTY=75`, `EXIT_ROLLBACK_INCOMPLETE=76`, `EXIT_ENGINE_BUSY=77` (native-search engine locked by another process — `E_ENGINE_BUSY`; a dedicated transient-failure code, semantically `EX_TEMPFAIL`, but 75 was already taken; see [ADR 0022](../decisions/0022-honest-search-lock-errors.md)).
 - `exit_code_for_core(&CoreError) -> i32` — direct variant→code map.
 - `exit_code_for(&anyhow::Error) -> i32` — walks the chain for `CoreError` (and the `FsError::Core(_)` passthrough that thiserror's `transparent` hides from `chain()`); then `FsError`/`CacheError` wrappers; then bare/`serde_json`-wrapped `io::Error` (BrokenPipe→0, PermissionDenied→66); else `EXIT_GENERIC`.
 **Connections** — called by: `main` (drives `process::exit`) and `v31::dispatch` tests. Tests lock every variant→code mapping plus the broken-pipe/wrapped-error edge cases.

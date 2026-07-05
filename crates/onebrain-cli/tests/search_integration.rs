@@ -101,6 +101,235 @@ fn search_model_set_empty_index_dims_change_succeeds() {
     );
 }
 
+/// Bug B/C/D (v3.4.6): while another process holds the engine's single-process
+/// redb lock, the CLI must report contention HONESTLY and UNIFORMLY:
+/// - `search status` → exit 0, `busy: true`, `doc_count: null`, a
+///   `W_ENGINE_BUSY` warning — NEVER "up to date".
+/// - `search query` → non-zero exit (77) + an `E_ENGINE_BUSY` error envelope.
+/// - `search reindex --lex-only` (hook path) → exit 0 + `skipped`, reason
+///   `engine-busy` (must not break the hook chain).
+///
+/// The lock is held in-process by opening `Engine` at the exact collection
+/// cache dir the CLI will resolve (`<ONEBRAIN_CACHE_DIR>/search/<collection>`),
+/// then keeping the handle alive across the subprocess invocations.
+// `query` opens redb (semantic path) — in a lex-only build it degrades to
+// keyword results and never trips the single-process lock, so this end-to-end
+// busy test is semantic-only. (status busy/unreadable is also unit-tested.)
+#[cfg(feature = "semantic")]
+#[test]
+fn engine_busy_is_honest_across_status_query_and_hook() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let collection = "t-busy";
+    write(
+        vault.path(),
+        "onebrain.yml",
+        &format!("search:\n  collection: {collection}\n  embed_model: multilingual-e5-small\n"),
+    );
+    write(vault.path(), "a.md", "# Title\nsome content here");
+
+    // Hold the single-process lock at the exact cache dir the CLI resolves.
+    let collection_dir = cache.path().join("search").join(collection);
+    let _held = onebrain_search::engine::Engine::open(&collection_dir, "multilingual-e5-small")
+        .expect("first open should take the lock");
+
+    // Seed a fake "downloaded" model dir so the `--lex-only` hook's
+    // model-not-downloaded gate passes and it actually reaches the engine open
+    // (where the lock trips). Mirrors the real MCP scenario: the server that
+    // holds the lock already downloaded the model. `model_download_status`
+    // treats the mere presence of the `models--*` dir as downloaded.
+    let model_dir = collection_dir.join("models--intfloat--multilingual-e5-small");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(model_dir.join("model.onnx"), b"stub").unwrap();
+
+    // --- status: honest busy report, still exit 0 ---
+    let status = onebrain(vault.path(), cache.path())
+        .args(["search", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "status under a held lock is a valid report → exit 0; stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let sv: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(sv["ok"], true);
+    assert_eq!(sv["data"]["busy"], true, "status must flag busy: {sv}");
+    assert!(
+        sv["data"]["doc_count"].is_null(),
+        "doc_count must be null (unknown), not a healthy zero: {sv}"
+    );
+    let warnings = sv["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w["code"] == "W_ENGINE_BUSY"),
+        "status must carry a W_ENGINE_BUSY warning: {sv}"
+    );
+
+    // --- query: E_ENGINE_BUSY envelope + non-zero exit (77) ---
+    let query = onebrain(vault.path(), cache.path())
+        .args(["search", "query", "content"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        query.status.code(),
+        Some(77),
+        "query under a held lock must exit 77; stderr: {}",
+        String::from_utf8_lossy(&query.stderr)
+    );
+    let qv: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
+    assert_eq!(qv["ok"], false, "{qv}");
+    assert_eq!(qv["error"]["code"], "E_ENGINE_BUSY", "{qv}");
+
+    // --- hook path: exit 0 + skipped reason engine-busy ---
+    let hook = onebrain(vault.path(), cache.path())
+        .args(["search", "reindex", "--lex-only"])
+        .output()
+        .unwrap();
+    assert!(
+        hook.status.success(),
+        "a hook path must NEVER fail the calling turn (exit 0); stderr: {}",
+        String::from_utf8_lossy(&hook.stderr)
+    );
+    let hv: serde_json::Value = serde_json::from_slice(&hook.stdout).unwrap();
+    assert_eq!(hv["ok"], true, "{hv}");
+    assert_eq!(hv["data"]["skipped"], true, "{hv}");
+    assert_eq!(hv["data"]["reason"], "engine-busy", "{hv}");
+}
+
+/// Bug C (v3.4.6), `--pending-only` variant: the OTHER hook path must ALSO
+/// skip honestly (exit 0 + `reason: "engine-busy"`) when the engine is locked
+/// by a live process. Companion to
+/// `engine_busy_is_honest_across_status_query_and_hook`, which covers
+/// `--lex-only`. Runs the pending-only path in the foreground
+/// (`ONEBRAIN_EMBED_FOREGROUND=1`) so it reaches `Engine::open` (where the lock
+/// trips) synchronously instead of detaching. Semantic-gated: a lex-only build
+/// returns `reason:"semantic-unavailable"` before ever reaching `Engine::open`,
+/// so the engine-busy path only exists in semantic builds.
+#[cfg(feature = "semantic")]
+#[test]
+fn pending_only_hook_is_honest_when_engine_busy() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let collection = "t-busy-pending";
+    write(
+        vault.path(),
+        "onebrain.yml",
+        &format!("search:\n  collection: {collection}\n  embed_model: multilingual-e5-small\n"),
+    );
+    write(vault.path(), "a.md", "# Title\nsome content here");
+
+    // Hold the single-process lock at the exact cache dir the CLI resolves.
+    let collection_dir = cache.path().join("search").join(collection);
+    let _held = onebrain_search::engine::Engine::open(&collection_dir, "multilingual-e5-small")
+        .expect("first open should take the lock");
+
+    // Seed a fake "downloaded" model dir so the gate's model-not-downloaded
+    // check passes and the hook actually reaches the engine open (where the
+    // lock trips). Mirrors the real MCP scenario.
+    let model_dir = collection_dir.join("models--intfloat--multilingual-e5-small");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(model_dir.join("model.onnx"), b"stub").unwrap();
+
+    let hook = onebrain(vault.path(), cache.path())
+        .env("ONEBRAIN_EMBED_FOREGROUND", "1")
+        .args(["search", "reindex", "--pending-only"])
+        .output()
+        .unwrap();
+    assert!(
+        hook.status.success(),
+        "a --pending-only hook must NEVER fail the calling turn (exit 0); stderr: {}",
+        String::from_utf8_lossy(&hook.stderr)
+    );
+    let hv: serde_json::Value = serde_json::from_slice(&hook.stdout).unwrap();
+    assert_eq!(hv["ok"], true, "{hv}");
+    assert_eq!(hv["data"]["skipped"], true, "{hv}");
+    assert_eq!(hv["data"]["reason"], "engine-busy", "{hv}");
+}
+
+/// Round-2 fix (v3.4.6): a NON-lock open failure — here a corrupt `engine.redb`
+/// — must NOT be reported as `busy`, must NOT render "✅ up to date", and MUST
+/// surface the failure (a `W_STATUS_UNREADABLE` warning + null counts). This is
+/// the CLI-level guard against the resurrected bug B where a broken index used
+/// to fall through to the healthy "up to date" branch.
+///
+/// The failure is deterministic and lock-free: writing garbage to
+/// `engine.redb` makes `Engine::open` -> `Database::create` fail on an invalid
+/// redb header (not the single-process lock), so no live handle is held.
+/// NON-gated: no model download — the open fails before any embed.
+#[test]
+fn status_over_broken_index_is_not_busy_and_never_up_to_date() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let collection = "t-broken";
+    write(
+        vault.path(),
+        "onebrain.yml",
+        &format!("search:\n  collection: {collection}\n  embed_model: multilingual-e5-small\n"),
+    );
+    write(vault.path(), "a.md", "# Title\nsome content here");
+
+    // Corrupt the redb metadata db at the exact cache dir the CLI resolves, so
+    // `Engine::open` fails on an invalid header — a non-lock open error.
+    let collection_dir = cache.path().join("search").join(collection);
+    std::fs::create_dir_all(&collection_dir).unwrap();
+    std::fs::write(
+        collection_dir.join("engine.redb"),
+        b"not a redb database \x00\x01\x02 garbage header bytes",
+    )
+    .unwrap();
+
+    let status = onebrain(vault.path(), cache.path())
+        .args(["search", "status"])
+        .output()
+        .unwrap();
+    // A status read is a report, not a failure → exit 0 even when unreadable.
+    assert!(
+        status.status.success(),
+        "status over a broken index is still a report → exit 0; stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let sv: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(sv["ok"], true);
+    assert_eq!(
+        sv["data"]["busy"], false,
+        "a broken index is unreadable, NOT busy (no live lock): {sv}"
+    );
+    assert!(
+        sv["data"]["doc_count"].is_null(),
+        "doc_count must be null (unknown), not a healthy zero: {sv}"
+    );
+    assert_eq!(sv["data"]["indexed"], false, "{sv}");
+    assert!(
+        sv["data"]["status_error"].is_string(),
+        "the failure message must be surfaced: {sv}"
+    );
+    let warnings = sv["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w["code"] == "W_STATUS_UNREADABLE"),
+        "status must carry a W_STATUS_UNREADABLE warning: {sv}"
+    );
+
+    // Text output must never claim "up to date" over a broken index. Build a
+    // raw command (the `onebrain` helper forces `--json`, which conflicts with
+    // text mode); default output is already `text`.
+    let mut text_cmd = Command::new(env!("CARGO_BIN_EXE_onebrain"));
+    text_cmd
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .arg("--vault")
+        .arg(vault.path())
+        .args(["search", "status"]);
+    let status_text = text_cmd.output().unwrap();
+    let text = String::from_utf8_lossy(&status_text.stdout);
+    assert!(
+        !text.contains("up to date"),
+        "broken-index status must never read up to date: {text}"
+    );
+    assert!(
+        text.contains("status read failed"),
+        "broken-index status text must surface the failure: {text}"
+    );
+}
+
 #[test]
 fn search_reindex_and_query_multilingual_end_to_end() {
     if std::env::var("ONEBRAIN_TEST_EMBED").is_err() {

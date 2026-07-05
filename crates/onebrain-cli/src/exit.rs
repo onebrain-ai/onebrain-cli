@@ -31,6 +31,10 @@ pub const EXIT_RPC_HANDSHAKE: i32 = 73;
 pub const EXIT_AUTH_FAILED: i32 = 74;
 pub const EXIT_INIT_TARGET_NOT_EMPTY: i32 = 75;
 pub const EXIT_ROLLBACK_INCOMPLETE: i32 = 76;
+/// Native-search engine locked by another process (redb single-process lock).
+/// A dedicated transient-failure code — semantically EX_TEMPFAIL, but 75 is
+/// already taken by `E_INIT_TARGET_NOT_EMPTY`, so OneBrain uses 77.
+pub const EXIT_ENGINE_BUSY: i32 = 77;
 
 /// Map a `CoreError` directly to its stable exit code.
 pub fn exit_code_for_core(err: &CoreError) -> i32 {
@@ -49,6 +53,7 @@ pub fn exit_code_for_core(err: &CoreError) -> i32 {
         CoreError::AuthFailed(_) => EXIT_AUTH_FAILED,
         CoreError::InitTargetNotEmpty(_) => EXIT_INIT_TARGET_NOT_EMPTY,
         CoreError::RollbackIncomplete(_) => EXIT_ROLLBACK_INCOMPLETE,
+        CoreError::EngineBusy(_) => EXIT_ENGINE_BUSY,
     }
 }
 
@@ -199,6 +204,24 @@ mod tests {
             exit_code_for_core(&CoreError::InitTargetNotEmpty("contents".into())),
             75
         );
+    }
+
+    #[test]
+    fn engine_busy_maps_to_77() {
+        assert_eq!(
+            exit_code_for_core(&CoreError::EngineBusy("index locked by mcp".into())),
+            77
+        );
+    }
+
+    #[test]
+    fn engine_busy_wrapped_in_anyhow_context_still_maps_to_77() {
+        // The real path: `open_engine` returns a `CoreError::EngineBusy`
+        // wrapped in `anyhow::Error` (possibly with `.context(...)`). The
+        // walker must reach it and emit 77, not the generic 1.
+        let e: anyhow::Error = anyhow::Error::new(CoreError::EngineBusy("locked".into()))
+            .context("opening search engine");
+        assert_eq!(exit_code_for(&e), EXIT_ENGINE_BUSY);
     }
 
     #[test]
