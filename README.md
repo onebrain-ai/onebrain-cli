@@ -110,20 +110,22 @@ Interactive commands print human-readable text; every command also speaks struct
 
 > Major/minor only — see [CHANGELOG](CHANGELOG.md) for per-patch detail.
 
-### ✅ Shipped
+### ✅ Foundation (v3.0–v3.4) · the system base everything else builds on
 - [x] **v3.0** — Rust rewrite GA · 9-platform release pipeline · stable JSON contracts.
 - [x] **v3.1** — Consistency standard: locked `<noun> <verb>` command tree · canonical `Envelope` output · `vault.yml → onebrain.yml`.
-
-### 🚧 Phase 1 · perceptual speed + skill alignment (v3.2–v3.8)
 - [x] **v3.2** — `note` resource group · grouped `doctor` UX · `skill run`/`harness run` for headless skills.
 - [x] **v3.3** — Daemon foundation: `onebrain serve` — embedded web UI over a token-gated vault JSON API.
-- [ ] **v3.4** — **Native Rust search — replaces qmd**: native engine + `onebrain search` verbs · native MCP server · auto reindex/embed hooks · model reindex UX · 0 node/python deps ([milestone 1](https://github.com/onebrain-ai/onebrain-cli/milestone/1)).
-- [ ] **v3.5** — **"Desktop + Deeplinks"**: `onebrain desktop` native app + deeplinks + standalone webui file access (`link`/`token`/`desktop` verbs, vault_id, tickets) — the agent hands you a clickable, section-precise webui URL for any vault file; completely replaces Obsidian.
-- [ ] **v3.6** — **WebUI Terminal sessions** (mini-epic): run `onebrain`/`claude`/`codex` in the WebUI from anywhere (Tailscale); persistent term-server survives daemon restart.
-- [ ] **v3.7** — Bootstrap + native verbs *(was v3.5)*: startup / wrapup / daily / tasks → 1 call per ceremony (import content-verbs anchored ~v3.7.x).
-- [ ] **v3.8** — Warm daemon + RPC *(was v3.6)*: kill cold process-start; keeps the native index + embed model hot (absorbs the old RPC-layer milestone).
+- [ ] **v3.4** — **Native Search + Warm Daemon** *(in progress — completes the foundation)*: native Rust search replaces qmd (native engine + `onebrain search` verbs · native MCP server · 0 node/python deps, v3.4.5), plus a minimal **warm daemon** that owns the engine for mcp + search so the CLI works during a live session and multiple sessions coexist (v3.4.6) ([milestone](https://github.com/onebrain-ai/onebrain-cli/milestone/4)).
 
-### 📦 Phase 2 · bundles (v3.9–v3.12)
+### 🖥️ Phase 1 · Product surfaces — replace Obsidian (v3.5–v3.6)
+- [ ] **v3.5** — **"Desktop + Deeplinks"**: `onebrain desktop` native app + deeplinks + standalone webui file access (`link`/`token`/`desktop` verbs, vault_id, tickets) — the agent hands you a clickable, section-precise webui URL for any vault file; completely replaces Obsidian.
+- [ ] **v3.6** — **Terminal sessions** (mini-epic): run `onebrain`/`claude`/`codex` from a persistent term-server (survives daemon restart · reachable over Tailscale) — in **both** the WebUI and the v3.5 desktop shell. *Builds on v3.5 desktop.*
+
+### ⚡ Phase 2 · Speed & skills (v3.7–v3.8)
+- [ ] **v3.7** — **Bootstrap + native verbs + skill optimization**: startup / wrapup / daily / tasks → 1 call per ceremony; native settings-merge + vault migrations in `plugin update`; skill-body optimization pass (import content-verbs anchored ~v3.7.x).
+- [ ] **v3.8** *(may not ship)* — **remaining cleanup**: full daemon refactor of surfaces beyond mcp + search + daily-brief precompute — only if not already absorbed by v3.4 + v3.7.
+
+### 📦 Phase 3 · bundles (v3.9–v3.12)
 - [ ] Bundle CLI (`onebrain bundle install/list/info/lint/…`) · four first-party bundles (`dashboard` · `synthesis` · `research` · `scheduler`) · core skills slimmed 32 → 18 · `onebrain.run/bundles` portal.
 
 ### 🔭 Signal-driven (Tier 2/3)
