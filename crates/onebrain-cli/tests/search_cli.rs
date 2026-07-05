@@ -872,6 +872,66 @@ fn search_reindex_force_rejects_specific_paths() {
     assert!(text.contains("--force"), "mentions the flag: {text}");
 }
 
+/// #175 — the DIRECT reindex path (`ONEBRAIN_NO_DAEMON=1`) must confine
+/// caller-supplied paths inside the vault: a `../…` escape and an absolute
+/// path are each rejected (counted `failed`, nothing added), the rejection is
+/// surfaced as "outside the vault" on stderr, and — non-vacuously — the real
+/// out-of-vault file never lands in the index (`doc_count` stays 0). Uses only
+/// escaping paths, so the rejection happens before any read/embed and NO model
+/// is downloaded (keeps this test ungated).
+#[test]
+fn search_reindex_direct_confines_out_of_vault_paths() {
+    // Nest the vault so `../secret.md` resolves to a REAL file outside it.
+    let parent = tempdir().unwrap();
+    let vault_root = parent.path().join("vault");
+    std::fs::create_dir_all(&vault_root).unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        &vault_root,
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+    // A real secret file that lives OUTSIDE the vault.
+    std::fs::write(
+        parent.path().join("secret.md"),
+        "# TOPSECRET_MARKER out-of-vault payload",
+    )
+    .unwrap();
+
+    let out = onebrain(&vault_root, cache.path())
+        .env("ONEBRAIN_NO_DAEMON", "1")
+        .args(["search", "reindex", "../secret.md", "/etc/hosts"])
+        .output()
+        .unwrap();
+
+    // Exit 0 with a per-path skip (matches how the engine reports `failed`).
+    assert!(
+        out.status.success(),
+        "confined reindex should exit 0 (per-path skip): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["command"], "search.reindex");
+    assert_eq!(v["data"]["failed"], 2, "both escapes must be rejected");
+    assert_eq!(v["data"]["added"], 0, "nothing out-of-vault indexed");
+    assert_eq!(v["data"]["updated"], 0);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("outside the vault"),
+        "rejection must name 'outside the vault': {stderr}"
+    );
+
+    // Non-vacuous: the index has zero docs — the out-of-vault file never got in.
+    let status = onebrain(&vault_root, cache.path())
+        .env("ONEBRAIN_NO_DAEMON", "1")
+        .args(["search", "status"])
+        .output()
+        .unwrap();
+    let sv: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(sv["data"]["doc_count"], 0);
+    assert_eq!(sv["data"]["indexed"], false);
+}
+
 #[test]
 fn search_reindex_force_on_empty_vault_rebuilds_and_status_reports_index_size() {
     // An empty vault embeds nothing, so --force runs the full wipe+rebuild
