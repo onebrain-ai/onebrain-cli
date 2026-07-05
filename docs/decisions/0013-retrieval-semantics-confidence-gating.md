@@ -1,6 +1,6 @@
 # 0013 — Retrieval semantics: instruction prefixes, confidence floor, exact-word lex
 
-- **Status:** accepted
+- **Status:** accepted; the **confidence-floor** decision is **superseded by [ADR 0024](0024-vector-confidence-recall-first.md)** (v3.4.6 — the absolute per-model `vec_floor` mis-calibrated for e5 and silently dropped real matches; replaced by a recall-first relative cutoff + honest confidence). Instruction prefixes and exact-word lex still stand.
 - **Date:** 2026-07-02
 
 ## Context

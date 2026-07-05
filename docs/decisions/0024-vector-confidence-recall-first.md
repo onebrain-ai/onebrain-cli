@@ -10,9 +10,9 @@ was to suppress noise: a query about something the vault doesn't contain would
 otherwise surface its nearest neighbours as authoritative-looking results.
 
 Pre-tag testing on the real ob-1 vault (759 docs) showed the floor was
-**mis-calibrated and failing silently** ([finding
-2026-07-06](../../01-projects/onebrain/cli/2026-07-06-vsearch-floor-calibration-finding.md)
-in the project vault): `vsearch` returned **0 hits** for genuine queries, and
+**mis-calibrated and failing silently** (recorded in the project vault's
+`2026-07-06-vsearch-floor-calibration-finding` note): `vsearch` returned
+**0 hits** for genuine queries, and
 `query` (hybrid) silently degraded to lex-only, because e5 genuine matches
 cluster at ~0.83–0.87 — *straddling* the 0.85 floor and overlapping the e5
 unrelated-baseline (~0.84).
@@ -39,10 +39,18 @@ not a hand-tuned per-model constant):
    score). **Never empties a non-empty set.** Used by both `query` (so vec
    contributes to RRF again — lex + fusion provide precision) and `vector_search`.
 2. **`vec_confidence_hint(top_score)`** (`search_query.rs`) — an advisory,
-   **never-silent** label from the best score: ≥0.86 confident (no hint);
+   **never-silent** label from the best raw cosine: ≥0.86 confident (no hint);
    0.80–0.86 low-confidence; <0.80 "no strong match". The renderer now surfaces
    this hint on **non-empty** results too — a weak `vsearch` reads as honest
-   rather than authoritative.
+   rather than authoritative. **Scope: `vsearch` (vector-only) only.** `query`
+   (hybrid) returns a fused RRF score, not a raw cosine, so there is no
+   comparable per-result confidence to label in Tier 1; hybrid leans on its lex
+   half for precision. A narrow consequence: a query with *no* lex match and
+   only weak vec neighbours now returns those neighbours (recall-first) where the
+   old floor would have returned empty — best-effort, but unlabelled on the
+   hybrid path. Per-result confidence for **all** verbs/surfaces (CLI, MCP,
+   daemon, webui) arrives with the Tier-2 cross-encoder reranker, whose
+   calibrated 0–1 score is a real gate (below).
 3. **Deleted `ModelInfo::vec_floor`** (field + registry values + `Engine::vec_floor`).
 
 ## Consequences
@@ -64,5 +72,5 @@ is a **cross-encoder reranker** (`bge-reranker-v2-m3`, already supported by our
 `fastembed-rs`, ONNX, no new dependency): retrieve recall-first, then rerank the
 top-K. The reranker's calibrated 0–1 score **replaces this confidence heuristic**
 as a reliable gate. Tracked as a dedicated v3.4.x epic (search is finished within
-v3.4.x before v3.5). See
-[search-quality research](../../01-projects/onebrain/cli/2026-07-06-search-quality-reranker-research.md).
+v3.4.x before v3.5). Details in the project vault's
+`2026-07-06-search-quality-reranker-research` note.
