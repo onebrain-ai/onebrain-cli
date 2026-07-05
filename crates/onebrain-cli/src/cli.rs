@@ -419,15 +419,27 @@ pub struct DaemonCmd {
 #[derive(Subcommand, Debug)]
 pub enum DaemonVerb {
     /// Start the OneBrain daemon as a detached background process.
-    Start,
+    Start {
+        /// Vault the daemon should bind. Takes precedence over `$ONEBRAIN_VAULT`
+        /// (which stays a back-compat fallback). Threaded to the detached
+        /// `__run` child so callers convey the vault explicitly instead of
+        /// mutating the process environment.
+        #[arg(long)]
+        vault: Option<PathBuf>,
+    },
     /// Stop the running daemon (SIGTERM + PID-file cleanup).
     Stop,
     /// Report whether the daemon is running, and its PID.
     Status,
     /// Internal: the detached daemon body. Spawned by `daemon start`; not for
-    /// direct use. Parks until SIGTERM (no server yet — arrives in v3.3 step 2).
+    /// direct use. Runs the HTTP surface until SIGTERM.
     #[command(name = "__run", hide = true)]
-    Run,
+    Run {
+        /// Vault to bind (passed by `daemon start`). Precedence over
+        /// `$ONEBRAIN_VAULT`.
+        #[arg(long)]
+        vault: Option<PathBuf>,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────
