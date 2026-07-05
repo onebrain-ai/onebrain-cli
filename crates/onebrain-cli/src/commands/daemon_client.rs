@@ -1,0 +1,1034 @@
+//! Warm-daemon discovery + client library.
+//!
+//! redb is single-process, so exactly ONE process (the daemon) opens the
+//! search engine; the CLI `onebrain search …` verbs and the native MCP server
+//! become *clients* that talk to it over the existing localhost HTTP surface
+//! (`/api/vault/search`, `/api/internal/*`) with the daemon's token. This
+//! module is that reusable client — the mcp + CLI tracks call it; nothing here
+//! opens an engine itself.
+//!
+//! ## Discovery file — `~/.onebrain/run/daemon.json`
+//! The daemon writes `{ port, token, pid, version }` after it binds (see
+//! [`DaemonInfo::write`]); a clean shutdown removes it. Clients read it,
+//! liveness-probe the daemon, and connect. A stale file (daemon dead, or a
+//! version mismatch) is cleaned up / triggers a restart rather than trusted.
+//!
+//! ## Entry points
+//! - [`discover`] — read + liveness-probe an already-running daemon, else
+//!   `None` (and clean up a stale discovery file).
+//! - [`ensure_running`] — [`discover`], else spawn `daemon __run` detached and
+//!   poll until it's live; handles the start race (someone else won → connect).
+//! - [`DaemonHandle::search`] / [`reindex`](DaemonHandle::reindex) /
+//!   [`status`](DaemonHandle::status) — typed HTTP calls carrying the token.
+//!
+//! ## Version skew
+//! A daemon from an older/newer CLI may speak a different wire shape, so
+//! [`discover`] treats a `version` mismatch as "must restart": it stops the old
+//! daemon and (via [`ensure_running`]) starts one at our version before use.
+//!
+//! ## Dead-code allow
+//! This is a REUSABLE client library: the daemon side (this PR) only calls
+//! [`DaemonInfo::write`]/[`remove`](DaemonInfo::remove); the *consumers* of
+//! `discover`/`ensure_running`/[`DaemonHandle`] are the mcp + CLI-search tracks
+//! that land separately. Until they wire in, most of this module reads as dead
+//! code, so we allow it here rather than sprinkle per-item `#[allow]`s or gate
+//! the API behind a feature — the unit tests below exercise the core paths so
+//! it isn't untested dead code.
+#![allow(dead_code)]
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+/// The CLI's own version — the daemon stamps it into `daemon.json`, and a
+/// client compares against it to detect version skew.
+fn own_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Directory holding the daemon's runtime files: `~/.onebrain/run/`.
+///
+/// Kept in lockstep with `commands::daemon`'s private `run_dir()` (both key off
+/// `dirs::home_dir`), so the client reads the same `daemon.json` the daemon
+/// writes. Honours `$HOME` on Unix / `%USERPROFILE%` on Windows.
+fn run_dir() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("resolve home directory for daemon run dir")?;
+    Ok(home.join(".onebrain").join("run"))
+}
+
+/// Path to the discovery file: `~/.onebrain/run/daemon.json`.
+pub fn discovery_path() -> Result<PathBuf> {
+    Ok(run_dir()?.join("daemon.json"))
+}
+
+/// Path to the daemon log — surfaced in the `ensure_running` timeout error so
+/// the operator knows where to look.
+fn log_path() -> Result<PathBuf> {
+    Ok(run_dir()?.join("daemon.log"))
+}
+
+/// The daemon's discovery record, published to `daemon.json` after it binds.
+/// `port` is the ACTUAL bound port (may differ from the requested one when
+/// binding `0`); `version` is the daemon CLI's own version, used for skew
+/// detection.
+///
+/// CLEANUP: removed on a clean shutdown (SIGTERM handler + `daemon stop`). A
+/// HARD kill (SIGKILL / crash) leaves the record on disk — there is no
+/// crash-time cleanup hook — so [`discover`] treats it as UNTRUSTED: it
+/// liveness-probes and removes any stale record whose daemon no longer answers.
+/// So a stale `daemon.json` is reclaimed LAZILY on the next `discover`, not
+/// eagerly on death.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonInfo {
+    pub port: u16,
+    pub token: String,
+    pub pid: u32,
+    pub version: String,
+}
+
+impl DaemonInfo {
+    /// Serialize + atomically write `daemon.json` (write to a temp sibling then
+    /// rename) with owner-only (0600) perms on Unix — the token is a
+    /// credential, so the file must not be world-readable. Creates the run dir
+    /// (0700) first. Called by the daemon right after it binds.
+    pub fn write(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            ensure_private_run_dir(parent)?;
+        }
+        let json = serde_json::to_vec_pretty(self).context("serialize daemon.json")?;
+        // Temp sibling + rename → readers never observe a half-written file.
+        let tmp = path.with_extension("json.tmp");
+        {
+            use std::fs::OpenOptions;
+            let mut opts = OpenOptions::new();
+            opts.create(true).write(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts
+                .open(&tmp)
+                .with_context(|| format!("create {}", tmp.display()))?;
+            use std::io::Write;
+            f.write_all(&json)
+                .with_context(|| format!("write {}", tmp.display()))?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Re-assert 0600 (the `.mode` above only applies when this call
+            // CREATES the temp file; an existing one keeps its old bits). This
+            // is a CREDENTIAL file — a failed chmod means it could be left
+            // group/world-readable, so warn loudly rather than swallow with
+            // `.ok()`; the write still succeeds (the create-time mode usually
+            // held), but the operator gets a signal to investigate.
+            if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+                tracing::warn!(error = %e, path = %tmp.display(),
+                    "could not re-assert 0600 on daemon.json (token file may be readable)");
+            }
+        }
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+        Ok(())
+    }
+
+    /// Read + parse `daemon.json`. Returns `Ok(None)` for a missing file (no
+    /// daemon has run) and an `Err` for a present-but-corrupt file so callers
+    /// can distinguish "nothing there" from "there's junk to clean up".
+    pub fn read(path: &Path) -> Result<Option<Self>> {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let info: DaemonInfo =
+                    serde_json::from_slice(&bytes).context("parse daemon.json")?;
+                Ok(Some(info))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).context("read daemon.json"),
+        }
+    }
+
+    /// Remove `daemon.json` if present (idempotent — a missing file is success).
+    /// The daemon calls this on clean shutdown; clients call it to clear a
+    /// stale record.
+    pub fn remove(path: &Path) -> Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).context("remove daemon.json"),
+        }
+    }
+
+    /// The base URL a client hits: `http://127.0.0.1:<port>`.
+    fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+/// Create the daemon run dir with private (0700) perms on Unix — same policy as
+/// `commands::daemon`'s `ensure_private_run_dir`, duplicated here so the client
+/// doesn't reach into that module's private fns. On non-Unix, a plain mkdir.
+fn ensure_private_run_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("create daemon run dir {}", dir.display()))?;
+        // Re-assert 0700 on a pre-existing (possibly looser) dir. It guards a
+        // credential file, so warn rather than silently `.ok()` on failure.
+        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+            tracing::warn!(error = %e, path = %dir.display(),
+                "could not re-assert 0700 on daemon run dir");
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create daemon run dir {}", dir.display()))
+    }
+}
+
+/// Decide what a client should do given a discovered record's version vs ours.
+/// Pure (no I/O) so the skew policy is unit-testable in isolation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VersionDecision {
+    /// Versions match — use the running daemon as-is.
+    Use,
+    /// Versions differ — stop the old daemon and start one at our version.
+    Restart,
+}
+
+/// Compare a discovered daemon's `version` against ours.
+pub fn version_decision(daemon_version: &str, own: &str) -> VersionDecision {
+    if daemon_version == own {
+        VersionDecision::Use
+    } else {
+        VersionDecision::Restart
+    }
+}
+
+/// Why the client is still waiting for a daemon — used to turn `ensure_running`'s
+/// opaque timeout into an actionable message. Pure classification (no I/O) so it
+/// is unit-testable: [`classify_last_state`] maps the last-observed
+/// `daemon.json` state to one of these.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LastState {
+    /// No `daemon.json` ever appeared — the spawned `daemon start` never
+    /// published discovery (likely failed at bind / vault resolution).
+    NotFound,
+    /// A `daemon.json` at a DIFFERENT version — a stale daemon we couldn't
+    /// supersede in time.
+    VersionSkew { found: String, own: String },
+    /// A `daemon.json` at OUR version exists, but the daemon didn't answer the
+    /// liveness probe (still coming up, or bound-but-wedged).
+    AliveNoResponse,
+}
+
+impl LastState {
+    /// One-line, human-readable summary for the timeout error message.
+    pub fn describe(&self) -> String {
+        match self {
+            LastState::NotFound => "no daemon.json ever appeared (start likely failed)".to_string(),
+            LastState::VersionSkew { found, own } => {
+                format!(
+                    "found a daemon at version {found} (we are {own}) that didn't yield in time"
+                )
+            }
+            LastState::AliveNoResponse => {
+                "daemon.json at our version present but the daemon didn't answer the health probe"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// Classify the last-observed discovery state for the timeout message. Pure:
+/// takes the read result + our version, returns a [`LastState`]. `read` is
+/// `Ok(None)` for a missing file, `Ok(Some(info))` for a present record.
+pub fn classify_last_state(read: &Option<DaemonInfo>, own: &str) -> LastState {
+    match read {
+        None => LastState::NotFound,
+        Some(info) if version_decision(&info.version, own) == VersionDecision::Restart => {
+            LastState::VersionSkew {
+                found: info.version.clone(),
+                own: own.to_string(),
+            }
+        }
+        // Present + our version, yet we still timed out → it never answered.
+        Some(_) => LastState::AliveNoResponse,
+    }
+}
+
+/// A live, verified connection to the daemon: the discovery record plus a
+/// pre-built HTTP agent. All calls carry the token and target `127.0.0.1`.
+#[derive(Debug, Clone)]
+pub struct DaemonHandle {
+    info: DaemonInfo,
+    agent: ureq::Agent,
+}
+
+/// How long a client waits on any single daemon HTTP call before giving up.
+/// Generous: a cold hybrid embed on the daemon side can take seconds.
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long [`ensure_running`] polls for a freshly-spawned daemon to publish
+/// `daemon.json` + answer a liveness probe before failing.
+const START_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Liveness-probe timeout — a health check must be quick or the daemon is
+/// wedged and should be treated as dead.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+impl DaemonHandle {
+    fn new(info: DaemonInfo) -> Self {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(CLIENT_TIMEOUT))
+            .build()
+            .into();
+        Self { info, agent }
+    }
+
+    /// The discovery record this handle wraps.
+    pub fn info(&self) -> &DaemonInfo {
+        &self.info
+    }
+
+    /// Liveness check with a SHORT probe timeout. Probes the ENGINE-INDEPENDENT
+    /// `GET /api/health` (200 whenever the process is up) — NOT
+    /// `/api/internal/status`, which 503s when the daemon holds no engine. Using
+    /// the status route here would make a live-but-engine-less daemon read as
+    /// dead, so `discover()` would delete its `daemon.json` and respawn it in a
+    /// loop. `true` iff `/api/health` answered 2xx.
+    fn is_live(&self) -> bool {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(PROBE_TIMEOUT))
+            .build()
+            .into();
+        let url = format!("{}/api/health", self.info.base_url());
+        agent
+            .get(&url)
+            .header("x-onebrain-token", &self.info.token)
+            .call()
+            .is_ok()
+    }
+
+    /// `GET /api/internal/status` → parsed JSON value. The daemon returns the
+    /// `search status` shape (`doc_count`, `pending_*`, `last_indexed`,
+    /// `indexed`). Retries ONCE via [`ensure_running`] if the daemon vanished
+    /// between discovery and the call (see [`with_retry`]).
+    pub fn status(&self) -> Result<serde_json::Value> {
+        with_retry(self, |h| {
+            let url = format!("{}/api/internal/status", h.info.base_url());
+            h.agent
+                .get(&url)
+                .header("x-onebrain-token", &h.info.token)
+                .call()
+        })
+    }
+
+    /// `POST /api/internal/reindex` with `{ mode, paths? }`. `paths` is required
+    /// for `mode = "paths"`. Returns the daemon's reindex-result JSON. Retries
+    /// ONCE via [`ensure_running`] on a transport failure.
+    pub fn reindex(&self, mode: &str, paths: &[String]) -> Result<serde_json::Value> {
+        let body = serde_json::json!({ "mode": mode, "paths": paths });
+        let payload = serde_json::to_string(&body).context("serialize reindex body")?;
+        with_retry(self, |h| {
+            let url = format!("{}/api/internal/reindex", h.info.base_url());
+            h.agent
+                .post(&url)
+                .header("x-onebrain-token", &h.info.token)
+                .header("content-type", "application/json")
+                .send(payload.as_str())
+        })
+    }
+
+    /// `GET /api/vault/search?q=&mode=` → the webui search response JSON.
+    /// Retries ONCE via [`ensure_running`] on a transport failure.
+    pub fn search(&self, query: &str, mode: &str) -> Result<serde_json::Value> {
+        let q = urlencode(query);
+        let m = urlencode(mode);
+        with_retry(self, |h| {
+            let url = format!("{}/api/vault/search?q={}&mode={}", h.info.base_url(), q, m);
+            h.agent
+                .get(&url)
+                .header("x-onebrain-token", &h.info.token)
+                .call()
+        })
+    }
+}
+
+/// True when a ureq error means the daemon is UNREACHABLE (transport-level) —
+/// as opposed to reachable-but-returned-an-error-status. Only a transport
+/// failure justifies a respawn-and-retry; an HTTP status error is a real answer
+/// from a live daemon and must propagate unchanged.
+fn is_transport_error(e: &ureq::Error) -> bool {
+    matches!(
+        e,
+        ureq::Error::ConnectionFailed
+            | ureq::Error::HostNotFound
+            | ureq::Error::Io(_)
+            | ureq::Error::Timeout(_)
+    )
+}
+
+/// Run a daemon request `op` against `handle`; if it fails with a TRANSPORT
+/// error (daemon gone between discovery and the call), respawn via
+/// [`ensure_running`] and retry the op ONCE against the fresh handle. Any other
+/// error (HTTP status, body-read/parse) propagates immediately — the warm-client
+/// contract is "reconnect to a vanished daemon", not "retry a real error".
+///
+/// The retry POLICY is factored into the generic, network-free [`retry_once`]
+/// so it is unit-testable without a live daemon; this wrapper just supplies the
+/// real `is_transport_error` predicate + `ensure_running` reconnect and parses
+/// the JSON body.
+fn with_retry(
+    handle: &DaemonHandle,
+    op: impl Fn(&DaemonHandle) -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<serde_json::Value> {
+    let mut resp = retry_once(handle, &op, is_transport_error, || {
+        ensure_running().context("respawn daemon after transport failure")
+    })?;
+    read_json(&mut resp)
+}
+
+/// Generic "try, and on a retryable error reconnect + try ONCE more" core.
+///
+/// Pure of any network/daemon knowledge — it takes the operation, a predicate
+/// deciding whether an error is retryable, and a reconnect action producing a
+/// fresh handle. Returns the first success, the reconnect error if reconnect
+/// fails, or the SECOND attempt's result. A non-retryable error propagates
+/// immediately (no reconnect). This is the seam the unit tests drive with fake
+/// ops + a fake reconnect, so the branch logic is covered without a daemon.
+fn retry_once<H, T, E>(
+    handle: &H,
+    op: &impl Fn(&H) -> std::result::Result<T, E>,
+    is_retryable: impl Fn(&E) -> bool,
+    reconnect: impl FnOnce() -> Result<H>,
+) -> Result<T>
+where
+    E: std::fmt::Display,
+{
+    match op(handle) {
+        Ok(v) => Ok(v),
+        Err(e) if is_retryable(&e) => {
+            tracing::warn!(error = %e, "daemon unreachable; reconnecting and retrying once");
+            let fresh = reconnect()?;
+            op(&fresh).map_err(|e| anyhow::anyhow!("daemon request (after reconnect): {e}"))
+        }
+        Err(e) => Err(anyhow::anyhow!("daemon request: {e}")),
+    }
+}
+
+/// Read a ureq response body as JSON. ureq's `json` feature is off (the crate
+/// parses via serde_json directly), so read the body to a string and parse it.
+fn read_json(resp: &mut ureq::http::Response<ureq::Body>) -> Result<serde_json::Value> {
+    let body = resp
+        .body_mut()
+        .read_to_string()
+        .context("read daemon response body")?;
+    serde_json::from_str(&body).context("parse daemon response JSON")
+}
+
+/// Minimal percent-encoding for a query-string value: encodes everything that
+/// isn't an unreserved char. Kept local so the client pulls in no url crate.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Discover an already-running daemon, or `None`.
+///
+/// Reads `daemon.json`; if present and live AND at our version, returns a
+/// handle. A stale record (parse error, dead daemon) is cleaned up and yields
+/// `None`. A version mismatch stops the old daemon, cleans the record, and
+/// yields `None` so a caller's [`ensure_running`] starts a fresh one at our
+/// version (see [`version_decision`]).
+pub fn discover() -> Result<Option<DaemonHandle>> {
+    let path = discovery_path()?;
+    let info = match DaemonInfo::read(&path) {
+        Ok(Some(info)) => info,
+        // No file → no daemon. A corrupt file → clean it and treat as none.
+        Ok(None) => return Ok(None),
+        Err(_) => {
+            let _ = DaemonInfo::remove(&path);
+            return Ok(None);
+        }
+    };
+
+    if version_decision(&info.version, own_version()) == VersionDecision::Restart {
+        tracing::info!(
+            daemon_version = %info.version,
+            own_version = own_version(),
+            "daemon version skew; restarting daemon"
+        );
+        // Stop the mismatched daemon, then clear its record. A stop FAILURE is
+        // material — the old daemon may still hold the redb lock, so the
+        // subsequent start would fail. Capture it: warn now, and (via the
+        // caller's `ensure_running`) it surfaces as an "engine still locked"
+        // start failure rather than being silently dropped.
+        if let Err(e) = stop_daemon() {
+            tracing::warn!(error = %e, "failed to stop version-skewed daemon; \
+                a fresh start may fail while it still holds the engine lock");
+        }
+        let _ = DaemonInfo::remove(&path);
+        return Ok(None);
+    }
+
+    let handle = DaemonHandle::new(info);
+    if handle.is_live() {
+        Ok(Some(handle))
+    } else {
+        // Stale record: daemon named in the file is gone. Clean up.
+        let _ = DaemonInfo::remove(&path);
+        Ok(None)
+    }
+}
+
+/// Ensure a daemon is running at our version and return a connected handle.
+///
+/// Fast path: [`discover`] returns an existing live daemon. Otherwise spawn
+/// `onebrain daemon start` (detached; the existing self-respawn path) and poll
+/// for `daemon.json` + liveness up to [`START_TIMEOUT`]. The start race is
+/// handled implicitly: if a concurrent starter won, its `daemon.json` appears
+/// and we connect to it — we don't require that *we* spawned the winner.
+pub fn ensure_running() -> Result<DaemonHandle> {
+    if let Some(handle) = discover()? {
+        return Ok(handle);
+    }
+
+    spawn_daemon_start().context("spawn daemon start")?;
+
+    let path = discovery_path()?;
+    let deadline = Instant::now() + START_TIMEOUT;
+    // Remember the last-observed discovery record so a timeout can say WHY.
+    let mut last_read: Option<DaemonInfo> = None;
+    loop {
+        // A daemon.json at our version + live probe → connected.
+        if let Ok(read) = DaemonInfo::read(&path) {
+            last_read = read.clone();
+            if let Some(info) = read {
+                if version_decision(&info.version, own_version()) == VersionDecision::Use {
+                    let handle = DaemonHandle::new(info);
+                    if handle.is_live() {
+                        return Ok(handle);
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            // Classify the last state + point at the log, instead of one opaque
+            // "did not become ready" line.
+            let state = classify_last_state(&last_read, own_version());
+            let log = log_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "~/.onebrain/run/daemon.log".to_string());
+            anyhow::bail!(
+                "daemon did not become ready within {}s; last state: {}. See {log}",
+                START_TIMEOUT.as_secs(),
+                state.describe(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Spawn `onebrain daemon start` (which self-respawns the detached `__run`
+/// child + writes the PID file). Runs the CURRENT executable so a client always
+/// starts a daemon at its own version. Inherits no stdio (the child redirects
+/// its own to the daemon log).
+fn spawn_daemon_start() -> Result<()> {
+    let exe = std::env::current_exe().context("resolve current executable")?;
+    let status = std::process::Command::new(exe)
+        .args(["daemon", "start"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("run `onebrain daemon start`")?;
+    if !status.success() {
+        anyhow::bail!("`onebrain daemon start` exited with {status}");
+    }
+    Ok(())
+}
+
+/// Stop a running daemon via `onebrain daemon stop` (SIGTERM + PID cleanup).
+/// Used by the version-skew restart path. Returns an error on a non-zero exit
+/// so the caller can react (the old daemon may still hold the engine lock).
+fn stop_daemon() -> Result<()> {
+    let exe = std::env::current_exe().context("resolve current executable")?;
+    let status = std::process::Command::new(exe)
+        .args(["daemon", "stop"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("run `onebrain daemon stop`")?;
+    if !status.success() {
+        anyhow::bail!("`onebrain daemon stop` exited with {status}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn sample(version: &str) -> DaemonInfo {
+        DaemonInfo {
+            port: 6789,
+            token: "tok-abcdefghijklmnop".to_string(),
+            pid: 4242,
+            version: version.to_string(),
+        }
+    }
+
+    #[test]
+    fn write_then_read_roundtrips() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("daemon.json");
+        let info = sample("3.4.6");
+        info.write(&path).unwrap();
+        let back = DaemonInfo::read(&path).unwrap().unwrap();
+        assert_eq!(info, back);
+    }
+
+    #[test]
+    fn read_missing_file_is_none() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("daemon.json");
+        assert!(DaemonInfo::read(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_corrupt_file_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("daemon.json");
+        std::fs::write(&path, "not json {{{").unwrap();
+        assert!(DaemonInfo::read(&path).is_err());
+    }
+
+    #[test]
+    fn remove_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("daemon.json");
+        DaemonInfo::remove(&path).unwrap(); // missing → ok
+        sample("3.4.6").write(&path).unwrap();
+        DaemonInfo::remove(&path).unwrap();
+        assert!(DaemonInfo::read(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn write_is_atomic_no_tmp_left_behind() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("daemon.json");
+        sample("3.4.6").write(&path).unwrap();
+        // The temp sibling must be gone after a successful write.
+        assert!(!dir.path().join("daemon.json.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("daemon.json");
+        sample("3.4.6").write(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "daemon.json must be 0600 (holds the token)");
+    }
+
+    #[test]
+    fn version_match_uses_running_daemon() {
+        assert_eq!(version_decision("3.4.6", "3.4.6"), VersionDecision::Use);
+    }
+
+    #[test]
+    fn version_mismatch_requests_restart() {
+        assert_eq!(version_decision("3.4.5", "3.4.6"), VersionDecision::Restart);
+        assert_eq!(version_decision("3.5.0", "3.4.6"), VersionDecision::Restart);
+    }
+
+    #[test]
+    fn urlencode_escapes_reserved_and_spaces() {
+        assert_eq!(urlencode("a b&c"), "a%20b%26c");
+        assert_eq!(urlencode("plain-Text_1.0~"), "plain-Text_1.0~");
+        assert_eq!(urlencode("คำ"), "%E0%B8%84%E0%B8%B3");
+    }
+
+    // Client fallback: with no daemon.json present, discover() returns None
+    // (no daemon), so a caller falls back to opening the engine directly. We
+    // point HOME at an empty tempdir so `discovery_path()` resolves under it and
+    // finds nothing — never touching the real ~/.onebrain.
+    #[cfg(unix)]
+    #[test]
+    fn discover_returns_none_when_no_daemon() {
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_var("HOME", home.path());
+        assert!(discover().unwrap().is_none());
+    }
+
+    #[test]
+    fn base_url_targets_localhost_and_port() {
+        assert_eq!(sample("3.4.6").base_url(), "http://127.0.0.1:6789");
+    }
+
+    // ── is_transport_error: only unreachable errors are retryable ──────────
+    #[test]
+    fn transport_errors_are_retryable_status_errors_are_not() {
+        assert!(is_transport_error(&ureq::Error::ConnectionFailed));
+        assert!(is_transport_error(&ureq::Error::HostNotFound));
+        assert!(is_transport_error(&ureq::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        ))));
+        // An HTTP status is a real answer from a live daemon — NOT retryable.
+        assert!(!is_transport_error(&ureq::Error::StatusCode(503)));
+        assert!(!is_transport_error(&ureq::Error::StatusCode(400)));
+    }
+
+    // ── retry_once: the reconnect-and-retry policy, network-free ───────────
+    #[test]
+    fn retry_once_returns_first_success_without_reconnect() {
+        let reconnected = std::cell::Cell::new(false);
+        let out: Result<u32> = retry_once(
+            &(),
+            &|_| Ok::<u32, String>(7),
+            |_| true,
+            || {
+                reconnected.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(out.unwrap(), 7);
+        assert!(!reconnected.get(), "no reconnect on first-try success");
+    }
+
+    #[test]
+    fn retry_once_reconnects_and_retries_on_retryable_error() {
+        // First op call fails retryably; after reconnect the second call wins.
+        let calls = std::cell::Cell::new(0u32);
+        let reconnected = std::cell::Cell::new(false);
+        let out: Result<u32> = retry_once(
+            &(),
+            &|_| {
+                let n = calls.get();
+                calls.set(n + 1);
+                if n == 0 {
+                    Err("gone".to_string())
+                } else {
+                    Ok(42)
+                }
+            },
+            |_| true, // retryable
+            || {
+                reconnected.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(out.unwrap(), 42);
+        assert_eq!(calls.get(), 2, "op runs exactly twice (retry ONCE)");
+        assert!(reconnected.get(), "reconnect happened");
+    }
+
+    #[test]
+    fn retry_once_does_not_reconnect_on_nonretryable_error() {
+        let reconnected = std::cell::Cell::new(false);
+        let out: Result<u32> = retry_once(
+            &(),
+            &|_| Err::<u32, String>("HTTP 400".to_string()),
+            |_| false, // NOT retryable (e.g. a status error)
+            || {
+                reconnected.set(true);
+                Ok(())
+            },
+        );
+        assert!(out.is_err());
+        assert!(
+            !reconnected.get(),
+            "a non-retryable error must not reconnect"
+        );
+    }
+
+    #[test]
+    fn retry_once_propagates_reconnect_failure() {
+        let out: Result<u32> = retry_once(
+            &(),
+            &|_| Err::<u32, String>("gone".to_string()),
+            |_| true,
+            || anyhow::bail!("reconnect failed"),
+        );
+        let msg = format!("{:#}", out.unwrap_err());
+        assert!(msg.contains("reconnect failed"), "got: {msg}");
+    }
+
+    // ── classify_last_state + LastState::describe (timeout diagnostics) ────
+    #[test]
+    fn classify_last_state_maps_each_case() {
+        assert_eq!(classify_last_state(&None, "3.4.6"), LastState::NotFound);
+
+        let skew = classify_last_state(&Some(sample("3.4.5")), "3.4.6");
+        assert_eq!(
+            skew,
+            LastState::VersionSkew {
+                found: "3.4.5".to_string(),
+                own: "3.4.6".to_string(),
+            }
+        );
+
+        let alive = classify_last_state(&Some(sample("3.4.6")), "3.4.6");
+        assert_eq!(alive, LastState::AliveNoResponse);
+    }
+
+    #[test]
+    fn last_state_describe_is_actionable() {
+        assert!(LastState::NotFound.describe().contains("no daemon.json"));
+        assert!(LastState::AliveNoResponse
+            .describe()
+            .contains("didn't answer"));
+        let msg = LastState::VersionSkew {
+            found: "3.4.5".to_string(),
+            own: "3.4.6".to_string(),
+        }
+        .describe();
+        assert!(msg.contains("3.4.5") && msg.contains("3.4.6"), "got: {msg}");
+    }
+
+    // ── wire-contract: a real internal.rs status body parses cleanly ───────
+    // Feeds the EXACT JSON shape `GET /api/internal/status` emits through the
+    // same `serde_json` parse `read_json` uses, so the client + server agree on
+    // the wire format without a live socket.
+    #[test]
+    fn status_wire_shape_parses() {
+        let body = r#"{"doc_count":3,"pending_new":1,"pending_changed":0,
+            "pending_removed":2,"pending_total":3,"last_indexed":42,"indexed":true}"#;
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v["doc_count"], 3);
+        assert_eq!(v["pending_total"], 3);
+        assert_eq!(v["indexed"], true);
+    }
+
+    // Reindex non-2xx mapping: a ureq StatusCode error is classified
+    // non-retryable, so `with_retry` would propagate it (see the retry_once
+    // non-retryable test). This locks that a 500-class reindex response is NOT
+    // treated as "daemon gone".
+    #[test]
+    fn reindex_error_status_is_not_transport_error() {
+        assert!(!is_transport_error(&ureq::Error::StatusCode(500)));
+    }
+
+    // ── Live-server tests: exercise the HTTP client methods (is_live, status,
+    // search, discover) against a REAL ephemeral server holding an engine over a
+    // lex-seeded vault. Download-free (lex / empty engine). This covers the
+    // ureq client paths without spawning a full daemon process. ───────────────
+
+    /// Stand up a real server on an ephemeral port, holding an engine over a
+    /// lex-seeded vault, and return a LiveServer with a matching DaemonInfo.
+    ///
+    /// The CALLER must already hold the `ONEBRAIN_CACHE_DIR` (+ `HOME`) env
+    /// under `test_env`'s lock — the server thread must NOT call
+    /// `test_env::set_var` (the lock is non-reentrant → it would deadlock
+    /// against the caller's guard). The server thread only reads the process env
+    /// the caller set. Lex is seeded here (under the held env) so the held
+    /// engine has data; the seed path is derived from `collection_cache_dir`, so
+    /// it honours the caller's `ONEBRAIN_CACHE_DIR`.
+    fn start_live_server(vault: &Path, token: &str) -> LiveServerHandle {
+        use onebrain_search::chunk::Chunk;
+        use onebrain_search::lex::LexIndex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        std::fs::write(
+            vault.join("onebrain.yml"),
+            "search:\n  collection: dc-live\n",
+        )
+        .unwrap();
+        {
+            let cache_dir = crate::commands::search_common::collection_cache_dir("dc-live");
+            let tantivy = cache_dir.join("tantivy");
+            let mut lex = LexIndex::open(&tantivy).unwrap();
+            lex.add(&Chunk {
+                chunk_id: "alpha.md#0".to_string(),
+                doc_path: "alpha.md".to_string(),
+                heading_path: String::new(),
+                text: "the quick brown fox".to_string(),
+                chunk_index: 0,
+            })
+            .unwrap();
+            lex.commit().unwrap();
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let port = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let vault_path = vault.to_path_buf();
+        let token_thread = token.to_string();
+        let stop_thread = stop.clone();
+        let port_thread = port.clone();
+
+        let join = std::thread::spawn(move || {
+            let mut cfg =
+                crate::server::ServeConfig::localhost(Some(vault_path), 0, token_thread, None);
+            cfg.hold_engine = true;
+            let (router, _state) = crate::server::build_router_with_state(cfg);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+                let on_bind =
+                    |a: std::net::SocketAddr| port_thread.store(a.port(), Ordering::SeqCst);
+                let shutdown = async move {
+                    while !stop_thread.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                };
+                let _ =
+                    crate::server::run_server_from_router(router, addr, on_bind, shutdown).await;
+            });
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let bound = loop {
+            let p = port.load(Ordering::SeqCst);
+            if p != 0 {
+                break p;
+            }
+            assert!(Instant::now() < deadline, "server never bound");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        LiveServerHandle {
+            info: DaemonInfo {
+                port: bound,
+                token: token.to_string(),
+                pid: std::process::id(),
+                version: own_version().to_string(),
+            },
+            stop,
+            join: Some(join),
+        }
+    }
+
+    /// The running server's info + shutdown handle (no temp dirs — the caller
+    /// owns those + the env guard, keeping the non-reentrant lock uncontended).
+    struct LiveServerHandle {
+        info: DaemonInfo,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for LiveServerHandle {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(j) = self.join.take() {
+                let _ = j.join();
+            }
+        }
+    }
+
+    #[test]
+    fn handle_is_live_and_status_search_reindex_round_trip() {
+        // One test drives all four HTTP client methods against one live server,
+        // holding the env lock for the whole test (so the server thread — which
+        // must NOT take the lock — reads a stable ONEBRAIN_CACHE_DIR).
+        let vault = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let srv = start_live_server(vault.path(), "dc-live-token-1234567890");
+        let handle = DaemonHandle::new(srv.info.clone());
+
+        assert!(handle.is_live(), "health probe should see the live server");
+
+        let status = handle.status().unwrap();
+        assert!(status["doc_count"].is_number(), "status: {status}");
+
+        let search = handle.search("quick", "lex").unwrap();
+        let hits = search["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "search: {search}");
+        assert_eq!(hits[0]["path"], "alpha.md");
+
+        // pending reindex: no on-disk md → empty worklist → accepted, no embed.
+        let reindex = handle.reindex("pending", &[]).unwrap();
+        assert!(reindex["doc_count"].is_number(), "reindex: {reindex}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_finds_a_live_server_via_daemon_json() {
+        // HOME + ONEBRAIN_CACHE_DIR under ONE guard (set_vars is atomic; two
+        // set_var calls would deadlock on the non-reentrant lock).
+        let vault = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("HOME", home.path().as_os_str()),
+        ]);
+        let srv = start_live_server(vault.path(), "dc-live-token-1234567890");
+
+        let path = discovery_path().unwrap();
+        srv.info.write(&path).unwrap();
+
+        let found = discover().unwrap();
+        assert!(found.is_some(), "discover should find the live server");
+        let v = found.unwrap().status().unwrap();
+        assert!(v["doc_count"].is_number());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_running_fast_path_returns_discovered_daemon() {
+        // With a live server + a matching daemon.json, ensure_running must take
+        // the fast path (discover succeeds) and NOT spawn anything.
+        let vault = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("HOME", home.path().as_os_str()),
+        ]);
+        let srv = start_live_server(vault.path(), "dc-live-token-1234567890");
+        srv.info.write(&discovery_path().unwrap()).unwrap();
+
+        let handle = ensure_running().expect("fast path should connect");
+        assert_eq!(handle.info().port, srv.info.port);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_removes_stale_record_for_dead_server() {
+        // A daemon.json pointing at a port nothing listens on → discover cleans
+        // it up and returns None (stale record, no live daemon).
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_var("HOME", home.path());
+        let path = discovery_path().unwrap();
+        DaemonInfo {
+            port: 1, // unused — connection refused
+            token: "x".repeat(20),
+            pid: std::process::id(),
+            version: own_version().to_string(),
+        }
+        .write(&path)
+        .unwrap();
+
+        assert!(discover().unwrap().is_none(), "dead server → None");
+        assert!(
+            DaemonInfo::read(&path).unwrap().is_none(),
+            "stale daemon.json should be removed"
+        );
+    }
+}

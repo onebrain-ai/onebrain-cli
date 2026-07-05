@@ -1,6 +1,7 @@
 pub mod checkpoint;
 pub mod completions;
 pub mod daemon;
+pub mod daemon_client;
 pub mod doctor;
 pub mod harness;
 pub mod harness_run;

@@ -964,6 +964,72 @@ async fn run_server_binds_serves_and_shuts_down_cleanly() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Daemon entry point: `build_router_with_state` + `run_server_from_router` +
+// the `on_bind` callback (the seam the warm daemon uses). Exercises the shared
+// state hand-back + the real-bound-address callback without spawning a daemon.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+async fn run_server_from_router_fires_on_bind_and_shuts_down() {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::net::TcpStream;
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("onebrain.yml"), "qmd_collection: v\n").unwrap();
+
+    // `hold_engine` is false here (no ONEBRAIN_CACHE_DIR set), so no engine is
+    // opened — we're covering the router/state/bind plumbing, not the engine.
+    let cfg = ServeConfig::localhost(Some(dir.path().to_path_buf()), 0, TOKEN.to_string(), None);
+    let (router, state) = build_router_with_state(cfg);
+    // The returned state is the same one the router holds — sanity-check a field.
+    assert!(state.search_engine.is_none());
+
+    // Capture the real bound port from the on_bind callback.
+    let bound_port = Arc::new(AtomicU16::new(0));
+    let bp = bound_port.clone();
+    let on_bind = move |addr: SocketAddr| bp.store(addr.port(), Ordering::SeqCst);
+
+    let flag = Arc::new(AtomicBool::new(false));
+    let flag_for_future = flag.clone();
+    let shutdown = async move {
+        while !flag_for_future.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let server =
+        tokio::spawn(async move { run_server_from_router(router, addr, on_bind, shutdown).await });
+
+    // Poll until on_bind fired (server is up).
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let port = loop {
+        let p = bound_port.load(Ordering::SeqCst);
+        if p != 0 {
+            break p;
+        }
+        assert!(std::time::Instant::now() < deadline, "on_bind never fired");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    // The bound port is real: a client can connect to it.
+    assert!(
+        TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .is_ok(),
+        "on_bind reported a port nothing is listening on"
+    );
+
+    flag.store(true, Ordering::SeqCst);
+    let joined = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server did not shut down in time")
+        .expect("server task panicked");
+    assert!(joined.is_ok(), "graceful shutdown should be Ok: {joined:?}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // FIX 1: large note round-trip (body limit matches the 10MB read cap)
 // ─────────────────────────────────────────────────────────────────────────
 

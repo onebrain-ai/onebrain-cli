@@ -40,14 +40,12 @@ the exclusion is an explicit decision, not a silent skip.
 |---|---|
 | `crates/onebrain-cli/src/main.rs` | Process bootstrap, panic-hook install, `std::process::exit` |
 | `crates/onebrain-cli/src/commands/serve.rs` | Foreground blocking HTTP listener — never returns in a test |
-| `crates/onebrain-cli/src/commands/daemon.rs` | Process fork/detach + PID files |
 | `crates/onebrain-cli/src/commands/update.rs` | GitHub releases API + binary self-replace (network) |
 | `crates/onebrain-cli/src/commands/harness_run.rs` | Spawns `claude` / `gemini` |
 | `crates/onebrain-cli/src/commands/search_query.rs` | Embedding-backed query verb — opens the real engine (model download); non-embedding paths tested, embed path validated by gated tests |
 | `crates/onebrain-cli/src/commands/search_reindex.rs` | Embedding-backed reindex verb — model download in the CLI binary path |
 | `crates/onebrain-cli/src/commands/search_model_tui.rs` | Raw-mode ratatui event loop (`run`/`event_loop`/`render`/`perform_switch`) — needs a live TTY. The pure pieces it drives (`build_rows`, `sort_rows`, `next_sort`, `footer_text`, and every `AppState` transition incl. `perform_delete`) ARE unit-tested in-file; only the terminal-coupled shell is untestable, so the whole file is excluded per the "most of it is untestable" rule |
 | `crates/onebrain-cli/src/server/chat.rs` | SSE streaming proxy to a live AI subprocess |
-| `crates/onebrain-cli/src/server/search.rs` | Live native search path (opens the real engine) |
 | `crates/onebrain-search/src/embed.rs` | fastembed model download + ONNX inference (multi-GB model, network) — logic exercised via the `Embed` trait + `FakeEmbedder`; real path validated by embed-gated tests |
 | `crates/onebrain-fs/src/update/install.rs` | npm/bun/brew install subprocess + network |
 | `crates/onebrain-fs/src/init/wizard.rs` | Interactive TTY prompts |
@@ -72,6 +70,27 @@ it is untestable.
 - Canonicalize / server-fault arms (vault root canonicalize fails though root existed at bind).
 - Platform-defensive `RootDir`/`Prefix` path-component arms (unreachable on unix — caught by `is_absolute()`; platform-defensive on Windows, where a drive-relative `C:foo` carries a `Prefix` component yet `is_absolute()` is false).
 - Defensive "can't happen" arms (WalkDir entry `Err`/`strip_prefix`, `HeaderValue::from_str` on a sanitized filename, ancestor-loop past canonical root) + llvm-cov closing-brace region artifacts.
+
+#### Warm daemon (high-assurance policy — NOT whole-file-excluded)
+
+**Policy (2026-07-05):** security/filesystem-touching daemon code is held to the coverage target; only the irreducible OS/network/embed shell is residual. The extracted LOGIC — concurrent-start orchestration + lock reclaim (`acquire_start_lock`/`lock_owner_state`/`read_lock_pid`), path confinement (`confine_reindex_path`), `is_live`/health decision, discovery + version-skew (`version_decision`/`classify_last_state`), the retry policy (`retry_once`/`is_transport_error`), and the idle-shutdown predicate (`should_idle_shutdown`) — is unit-tested, plus live-server HTTP round-trips (`DaemonHandle` status/search/reindex/`is_live`, `discover`) and a real-binary concurrent-start orchestration test. Residual lines:
+
+`crates/onebrain-cli/src/commands/daemon.rs`:
+- `run_internal` (the detached daemon body: tokio runtime + blocking server + `$ONEBRAIN_*` env parsing + on-exit cleanup) — never returns in a test.
+- `spawn_detached_run` (fork/exec + `setsid` `pre_exec`), `terminate` (SIGTERM + poll), `init_tracing` (global subscriber), `sigterm_future` (async signal handler) — OS-shell.
+- Error-context arms in `write_pid`/`remove_pid`/`ensure_private_run_dir` (EACCES etc. on an already-created private dir) and llvm-cov closing-brace artifacts.
+
+`crates/onebrain-cli/src/commands/daemon_client.rs`:
+- `ensure_running` poll-after-spawn loop, `spawn_daemon_start`, `stop_daemon` — spawn the real `onebrain` binary; the FAST path (`discover` succeeds) IS tested against a live server.
+- `discover` version-skew branch's `stop_daemon` call (spawns the binary) and `with_retry`'s live `ensure_running` reconnect closure (a real transport failure mid-call) — the `retry_once` policy itself is unit-tested with fakes.
+- Error-context arms (`.context(...)` on `read`/`write`/`remove` I/O failures) + the test-only live-server helper's own error paths.
+
+`crates/onebrain-cli/src/server/search.rs`:
+- `get_vault_search` async error/timeout arms (`spawn_blocking` `JoinError`, `run_search` `Err`, 30s timeout) — fire only on a panic/hang.
+- Semantic `run_hybrid` / `run_hybrid_held` hit-mapping AFTER a non-empty index — requires a real embedding model (`Engine::query`); forbidden by the no-download test rule. The empty-index early-returns + the lex-only degrade paths ARE tested; engine query correctness is covered by `onebrain-search`'s `FakeEmbedder` tests.
+
+`crates/onebrain-cli/src/server/internal.rs`:
+- A few `spawn_blocking` panic-mapper arms + the reindex/status engine-error `.map_err` arms (fire only on an engine fault).
 
 ## Status (2026-06-30)
 

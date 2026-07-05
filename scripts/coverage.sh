@@ -16,13 +16,29 @@ set -euo pipefail
 # Files excluded from the coverage target — keep in sync with docs/coverage.md.
 # Each entry is unreachable in tests without mocking the network, spawning a real
 # subprocess, running a blocking server, or driving a TTY.
-IGNORE_REGEX='(src/main\.rs|commands/(serve|daemon|update|qmd_reindex|harness_run|search_query|search_reindex|search_model_tui)\.rs|server/(chat|search)\.rs|update/install\.rs|init/wizard\.rs|(vault_sync|output)/progress\.rs|cache/src/session_token\.rs|onebrain-search/src/embed\.rs)'
+#
+# HIGH-ASSURANCE POLICY (repo owner): security/filesystem-touching code is NOT
+# whole-file-excluded. `daemon.rs`, `daemon_client.rs`, and `server/search.rs`
+# are DELIBERATELY absent from this list — their LOGIC (concurrent-start
+# orchestration, path confinement, is_live/discovery/version-skew decisions,
+# idle-shutdown predicate) is unit-tested; only the irreducible OS shell
+# (fork/detach, bind, signal-wait) remains, documented per-line in
+# docs/coverage.md "Residual unreachable lines".
+IGNORE_REGEX='(src/main\.rs|commands/(serve|update|qmd_reindex|harness_run|search_query|search_reindex|search_model_tui)\.rs|server/chat\.rs|update/install\.rs|init/wizard\.rs|(vault_sync|output)/progress\.rs|cache/src/session_token\.rs|onebrain-search/src/embed\.rs)'
 
 # Ratchet gate: CI fails if core line coverage drops below this. Set conservatively
-# below the achieved % (≈95.6% macOS / ≈95.5% Linux after the long-tail mop-up) to
-# absorb platform/measurement jitter; RAISE this number as coverage climbs — never
-# lower it. Raised 94 → 95 once the mop-up gave ~0.5% headroom. See docs/coverage.md.
-CORE_LINE_THRESHOLD="${CORE_LINE_THRESHOLD:-95}"
+# below the achieved % to absorb platform/measurement jitter; RAISE as coverage
+# climbs — never lower it EXCEPT when the measured surface deliberately widens.
+#
+# History: 94 → 95 once the long-tail mop-up gave headroom (achieved ≈95.6% macOS /
+# ≈95.5% Linux). 95 → 94 (2026-07-05) is a DELIBERATE ratchet RESET, not a
+# regression: the high-assurance policy un-excluded `daemon.rs`, `daemon_client.rs`,
+# and `server/search.rs` (previously whole-file-excluded), pulling their irreducible
+# OS/network/embed shell into the measured surface (documented per-line under
+# "Residual unreachable lines" in docs/coverage.md). Achieved after un-exclude +
+# the new daemon logic tests: ≈94.99% line. 94 sits just under that. Ratchet UP from
+# here as the remaining reachable gaps close.
+CORE_LINE_THRESHOLD="${CORE_LINE_THRESHOLD:-94}"
 
 mode="${1:---summary-only}"
 case "$mode" in

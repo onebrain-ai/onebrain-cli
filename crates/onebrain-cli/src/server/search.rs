@@ -30,7 +30,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use super::api::{require_vault_root, ApiError};
-use super::AppState;
+use super::{AppState, SharedEngine};
 use crate::commands::search_common::{collection_cache_dir, collection_name_readonly};
 #[cfg(feature = "semantic")]
 use onebrain_search::engine::Engine;
@@ -89,9 +89,18 @@ pub(crate) async fn get_vault_search(
         return Ok(Json(SearchResponse { hits: vec![], mode }).into_response());
     }
 
+    // Warm-daemon path: when the process holds a persistent engine, route
+    // through it instead of opening a fresh one per request. redb is
+    // single-writer, so a per-request `Engine::open` in the daemon process
+    // would clash with the held engine ("Database already open"); reusing the
+    // held handle both avoids that and keeps the boot-time index warm. `serve`
+    // / the unit-test router hold no engine and fall through to `run_native`.
+    let held = state.search_engine.clone();
+
     // Native search is synchronous (tantivy / embedding). Run it off the async
     // runtime and bound it so a slow hybrid embed can't wedge a worker.
-    let search = tokio::task::spawn_blocking(move || run_native(&root, &query, mode));
+    let search =
+        tokio::task::spawn_blocking(move || run_search(held.as_ref(), &root, &query, mode));
     let hits = match tokio::time::timeout(SEARCH_TIMEOUT, search).await {
         Ok(Ok(Ok(hits))) => hits,
         Ok(Ok(Err(e))) => {
@@ -111,6 +120,94 @@ pub(crate) async fn get_vault_search(
         }
     };
     Ok(Json(SearchResponse { hits, mode }).into_response())
+}
+
+/// Synchronous search dispatcher, aware of an optionally-held persistent
+/// engine (the warm-daemon path). Runs entirely inside `spawn_blocking`.
+///
+/// - **lex** always uses the standalone [`LexIndex`] (tantivy only — it never
+///   opens redb, so it can't clash with a held engine, and needs no lock).
+/// - **hybrid** with a held engine reuses that engine under its mutex (the
+///   ONLY redb opener in the daemon); without one it falls back to
+///   [`run_native`]'s per-request `Engine::open` (the `serve` / CLI path).
+fn run_search(
+    held: Option<&SharedEngine>,
+    root: &Path,
+    query: &str,
+    mode: &str,
+) -> anyhow::Result<Vec<SearchHit>> {
+    // No held engine → the per-request path, unchanged (`serve` / CLI).
+    let Some(engine) = held else {
+        return run_native(root, query, mode);
+    };
+
+    let collection = collection_name_readonly(root)?;
+    let cache_dir = collection_cache_dir(&collection);
+
+    // Never-indexed vault → empty hits (200), not an error — mirrors
+    // `run_native`'s short-circuit so a held engine on an empty index behaves
+    // identically to the per-request path.
+    if !cache_dir.join("tantivy").exists() {
+        return Ok(vec![]);
+    }
+
+    // lex never opens redb (tantivy only), so it stays on the standalone index
+    // even with a held engine — no lock, no contention. Only hybrid reuses the
+    // held (sole redb-owning) engine.
+    if mode == "hybrid" {
+        run_hybrid_held(engine, &cache_dir, root, query)
+    } else {
+        run_lex(&cache_dir, query)
+    }
+}
+
+/// Hybrid search against the daemon's held engine (the sole redb owner). Locks
+/// the engine for the query, mirroring [`run_hybrid`]'s empty-index guard +
+/// hit-mapping so results are identical to the per-request path.
+///
+/// Semantic build only: a lex-only build has no embedder and degrades hybrid to
+/// lex (there is no held engine to query differently), so the held path is
+/// gated to `semantic` and the lex-only variant below routes to [`run_lex`].
+#[cfg(feature = "semantic")]
+fn run_hybrid_held(
+    engine: &SharedEngine,
+    _cache_dir: &Path,
+    root: &Path,
+    query: &str,
+) -> anyhow::Result<Vec<SearchHit>> {
+    let engine = engine.lock().unwrap_or_else(|p| p.into_inner());
+    if engine.status(root)?.doc_count == 0 {
+        return Ok(vec![]);
+    }
+    Ok(engine
+        .query(query, TOP_K)?
+        .into_iter()
+        .filter(|h| !h.doc_path.is_empty())
+        .map(|h| SearchHit {
+            title: if h.heading_path.is_empty() {
+                title_from_path(&h.doc_path)
+            } else {
+                h.heading_path.clone()
+            },
+            path: h.doc_path,
+            score: h.score,
+            snippet: h.snippet,
+        })
+        .collect())
+}
+
+/// Lex-only build: a held engine can't do vector search (no embedder), so
+/// hybrid degrades to keyword ranking. `cache_dir` is re-derived by the caller;
+/// route straight to [`run_lex`] via the standalone index. `root`/`engine` are
+/// unused here — the held engine offers nothing a lex-only build can use.
+#[cfg(not(feature = "semantic"))]
+fn run_hybrid_held(
+    _engine: &SharedEngine,
+    cache_dir: &Path,
+    _root: &Path,
+    query: &str,
+) -> anyhow::Result<Vec<SearchHit>> {
+    run_lex(cache_dir, query)
 }
 
 /// Synchronous native search. `mode` is `"hybrid"` or `"lex"`.
@@ -304,5 +401,152 @@ mod tests {
         let hits = result.expect("hybrid must degrade to lex, not error, in a lex-only build");
         assert_eq!(hits.len(), 1, "hits: {hits:?}");
         assert_eq!(hits[0].path, "notes/alpha.md");
+    }
+
+    // ── run_search dispatcher (the warm-daemon seam) ───────────────────────
+
+    /// Build a vault + a held engine over a lex-seeded collection, returning
+    /// (vault_dir, cache_dir, held engine). The env guard must outlive the
+    /// caller, so it's returned too.
+    fn held_engine_over_lex_seeded_vault(
+        collection: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        SharedEngine,
+        crate::test_env::EnvVarGuard,
+    ) {
+        use onebrain_search::chunk::Chunk;
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            format!("search:\n  collection: {collection}\n"),
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let cache_dir = collection_cache_dir(collection);
+        {
+            let mut lex = LexIndex::open(&cache_dir.join("tantivy")).unwrap();
+            lex.add(&Chunk {
+                chunk_id: "notes/alpha.md#0".to_string(),
+                doc_path: "notes/alpha.md".to_string(),
+                heading_path: String::new(),
+                text: "the quick brown fox jumps".to_string(),
+                chunk_index: 0,
+            })
+            .unwrap();
+            lex.commit().unwrap();
+        }
+        let engine =
+            crate::server::internal::open_held_engine(vault.path()).expect("held engine opens");
+        (vault, cache, engine, env)
+    }
+
+    #[test]
+    fn run_search_none_delegates_to_native() {
+        // No held engine → run_search must behave exactly like run_native.
+        let (vault, _cache, _engine, _env) = held_engine_over_lex_seeded_vault("rs-none");
+        let hits = run_search(None, vault.path(), "quick fox", "lex").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "notes/alpha.md");
+    }
+
+    #[test]
+    fn run_search_lex_with_held_engine_returns_hits() {
+        // A held engine + lex mode → lex path (standalone tantivy, no redb lock).
+        let (vault, _cache, engine, _env) = held_engine_over_lex_seeded_vault("rs-lex");
+        let hits = run_search(Some(&engine), vault.path(), "quick fox", "lex").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "notes/alpha.md");
+    }
+
+    #[test]
+    fn run_search_held_no_index_returns_empty() {
+        // A held engine but a vault whose collection has no tantivy dir → empty.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: rs-empty\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let engine = crate::server::internal::open_held_engine(vault.path()).unwrap();
+        assert!(run_search(Some(&engine), vault.path(), "anything", "lex")
+            .unwrap()
+            .is_empty());
+        assert!(
+            run_search(Some(&engine), vault.path(), "anything", "hybrid")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Lex-only build: hybrid through the HELD engine degrades to lex (no
+    /// embedder to query), so it returns hits without erroring / downloading.
+    /// Gated to lex-only so `run_hybrid_held`'s semantic path never embeds here.
+    #[cfg(not(feature = "semantic"))]
+    #[test]
+    fn run_search_hybrid_held_degrades_to_lex_in_lex_only_build() {
+        let (vault, _cache, engine, _env) = held_engine_over_lex_seeded_vault("rs-hybrid-degrade");
+        let hits = run_search(Some(&engine), vault.path(), "quick fox", "hybrid").unwrap();
+        assert_eq!(hits.len(), 1, "hits: {hits:?}");
+        assert_eq!(hits[0].path, "notes/alpha.md");
+    }
+
+    /// Semantic build: the PER-REQUEST `run_hybrid` (via `run_native`) on an
+    /// EMPTY index also short-circuits at `doc_count == 0` before embedding —
+    /// covering the non-held hybrid path's open+status+early-return with NO
+    /// download.
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn run_native_hybrid_empty_index_is_download_free_empty() {
+        use onebrain_search::lex::LexIndex;
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: rn-hybrid-empty\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let cache_dir = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap());
+        {
+            let mut lex = LexIndex::open(&cache_dir.join("tantivy")).unwrap();
+            lex.commit().unwrap();
+        }
+        let hits = run_native(vault.path(), "anything", "hybrid").unwrap();
+        assert!(hits.is_empty());
+    }
+
+    /// Semantic build: `run_hybrid_held` on an EMPTY index short-circuits at the
+    /// `doc_count == 0` guard BEFORE constructing any embedder — so it returns
+    /// empty hits with NO model download. Covers the held-engine hybrid path's
+    /// early-return in a semantic build without any network.
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn run_search_hybrid_held_empty_index_is_download_free_empty() {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: rs-hybrid-empty\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        // Empty tantivy index (commit with no docs): the never-indexed guard
+        // passes, but the engine's doc_count is 0.
+        let cache_dir = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap());
+        {
+            let mut lex = LexIndex::open(&cache_dir.join("tantivy")).unwrap();
+            lex.commit().unwrap();
+        }
+        let engine = crate::server::internal::open_held_engine(vault.path()).unwrap();
+        let hits = run_search(Some(&engine), vault.path(), "anything", "hybrid").unwrap();
+        assert!(
+            hits.is_empty(),
+            "empty index must yield no hits, no download"
+        );
     }
 }
