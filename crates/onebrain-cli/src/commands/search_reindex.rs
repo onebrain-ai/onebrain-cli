@@ -7,14 +7,15 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::cli::SearchReindexArgs;
+use crate::commands::daemon_client::DaemonHandle;
 use crate::commands::search_common::{
     collection_cache_dir, collection_for, collection_name_readonly, index_size_bytes,
     model_not_chosen, open_engine, read_reindex_progress, reconcile_missing_model,
-    reindex_progress_path,
+    reindex_progress_path, route_to_daemon,
 };
 use crate::output::{emit, item, section, Envelope, OutputMode};
 use onebrain_search::engine::{ReindexProgress, ReindexStats};
@@ -75,6 +76,22 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchReindexA
     // safety-gate contract.
     if args.lex_only || args.pending_only {
         return run_hook_path(vault_flag, mode, args);
+    }
+
+    // Warm-daemon path (v3.4.6 Track 2c): a manual `search reindex` (full, or
+    // over explicit paths) while a daemon holds the engine would otherwise hit
+    // the redb lock. Route it to the daemon (the sole owner) so it runs
+    // in-session: full → daemon `all`, explicit paths → daemon `paths`. NOT for
+    // `--force` — that wipes the index files the daemon has open, so it needs a
+    // daemon-free direct rebuild (falls through to the local path, honest
+    // `EngineBusy` if a lock is genuinely held). Only when the daemon serves
+    // THIS vault; else the local path below.
+    if !args.force {
+        if let Ok(resolved) = crate::vault_ctx::require(vault_flag.clone()) {
+            if let Some(handle) = route_to_daemon(&resolved) {
+                return run_reindex_via_daemon(&handle, &resolved, mode, args);
+            }
+        }
     }
 
     // A purged model download should re-open the first-run pick: clear the
@@ -322,6 +339,18 @@ fn run_hook_path(
     };
     let cache_dir = collection_cache_dir(&collection);
 
+    // Warm-daemon path (v3.4.6 Track 2c) — THE headline fix. When a daemon
+    // holds the engine (an active `onebrain mcp` session), the auto-reindex
+    // hooks previously skipped with `engine-busy` and the write never got
+    // indexed in-session. Route the reindex to the daemon instead so it lands
+    // NOW: `--lex-only` → daemon `lex` (keyword-only, no embed), `--pending-only`
+    // → daemon `pending` (embed the drifted docs). Only when the daemon serves
+    // THIS vault; any daemon-side failure degrades to a skip (still exit 0), and
+    // no daemon → the local direct-open gates below (unchanged, honest skip).
+    if let Some(handle) = route_to_daemon(&resolved) {
+        return run_hook_via_daemon(&handle, mode, vault_info, args);
+    }
+
     // Gate reason 2: no index yet.
     if !cache_dir.join("tantivy").is_dir() {
         return emit_skip(mode, Some(vault_info), "no-index");
@@ -375,6 +404,96 @@ fn run_hook_path(
         };
     }
     run_pending_only(mode, &resolved, vault_info, &cache_dir)
+}
+
+/// Route a manual `search reindex` (full, or over explicit paths) to the warm
+/// daemon so it runs while the daemon holds the engine. Unlike the hook path,
+/// this is a foreground command: a daemon error PROPAGATES (the user asked for a
+/// reindex and should hear if it failed), not degrade to a silent skip. Full →
+/// daemon `all`; explicit paths → daemon `paths`. The daemon reports counts +
+/// its active model; on-disk size deltas aren't available over the wire, so the
+/// summary omits the 📊  Index section (the counts are what a reindex reports).
+fn run_reindex_via_daemon(
+    handle: &DaemonHandle,
+    resolved: &onebrain_core::ResolvedVault,
+    mode: &OutputMode,
+    args: &SearchReindexArgs,
+) -> Result<()> {
+    let vault_info = crate::vault_ctx::info_from(resolved);
+    let (daemon_mode, paths) = if args.paths.is_empty() {
+        ("all", Vec::new())
+    } else {
+        ("paths", args.paths.clone())
+    };
+    let resp = handle
+        .reindex(daemon_mode, &paths)
+        .context("route `search reindex` through warm daemon")?;
+
+    let embed_model = resp
+        .get("embed_model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+    let field = |k: &str| resp.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+    let stats = ReindexStats {
+        added: field("added"),
+        updated: field("updated"),
+        removed: field("removed"),
+        unchanged: field("unchanged"),
+        failed: field("failed"),
+    };
+    let data = ReindexData::from_stats(stats, embed_model, None, None);
+    let envelope = Envelope::ok("search.reindex", Some(vault_info), data);
+    emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
+    Ok(())
+}
+
+/// Route a hook-path reindex (`--lex-only` / `--pending-only`) to the warm
+/// daemon (the sole redb owner), so the write is indexed IN-SESSION instead of
+/// skipping on the lock. `--lex-only` → daemon `lex` (keyword-only, no embed);
+/// `--pending-only` → daemon `pending` (embed the drifted docs).
+///
+/// Honesty + exit-0 contract preserved: any daemon-side failure degrades to a
+/// skip envelope (`daemon-error`) and returns `Ok(())`, exactly like the local
+/// gate failures — a hook invocation NEVER fails the calling turn. On success it
+/// emits the normal reindex summary so the hook's output shape is unchanged from
+/// the direct path. The daemon caps this at the vault's collection; the size
+/// fields stay `None` (the daemon doesn't report on-disk sizes — the counts are
+/// what matter to a hook).
+fn run_hook_via_daemon(
+    handle: &DaemonHandle,
+    mode: &OutputMode,
+    vault_info: crate::output::VaultInfo,
+    args: &SearchReindexArgs,
+) -> Result<()> {
+    let daemon_mode = if args.lex_only { "lex" } else { "pending" };
+    let resp = match handle.reindex(daemon_mode, &[]) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("onebrain search reindex (hook path, daemon): {e:#}");
+            return emit_skip(mode, Some(vault_info), "daemon-error");
+        }
+    };
+
+    let embed_model = resp
+        .get("embed_model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+    let field = |k: &str| resp.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+    let stats = ReindexStats {
+        added: field("added"),
+        updated: field("updated"),
+        removed: field("removed"),
+        unchanged: field("unchanged"),
+        failed: field("failed"),
+    };
+    // The daemon doesn't report on-disk index sizes (`None` → the summary omits
+    // the 📊  Index section), which is fine for a hook.
+    let data = ReindexData::from_stats(stats, embed_model, None, None);
+    let envelope = Envelope::ok("search.reindex", Some(vault_info), data);
+    emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
+    Ok(())
 }
 
 /// `--lex-only`, gate already passed: lex/tantivy pass over the whole vault

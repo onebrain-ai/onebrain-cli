@@ -278,6 +278,64 @@ pub(crate) fn format_size(bytes: u64) -> String {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Warm-daemon routing (v3.4.6 Track 2c)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// redb is single-process: exactly ONE process (the warm daemon) may open a
+// collection's engine at a time (ADR 0023). So when a daemon is already
+// running — typically because an `onebrain mcp` session holds the engine — the
+// CLI search verbs route their request through it (over the existing localhost
+// HTTP surface) instead of opening a second engine and hitting the redb lock
+// (`E_ENGINE_BUSY`). When no daemon is running there's no contention, so the
+// verbs open the engine directly (today's path), and T1's honest `EngineBusy`
+// still applies if the lock is genuinely held by something else.
+
+use crate::commands::daemon_client::{self, DaemonHandle};
+
+/// `true` when daemon routing is turned OFF via `ONEBRAIN_NO_DAEMON` (any
+/// non-empty value). The escape hatch: with it set, every search verb / hook
+/// opens the engine directly and never discovers or starts a daemon — the
+/// pre-daemon behaviour. Used by tests that must exercise the direct-open /
+/// honest-`EngineBusy` path deterministically, and as an operator kill-switch.
+pub(crate) fn daemon_routing_disabled() -> bool {
+    std::env::var_os("ONEBRAIN_NO_DAEMON").is_some_and(|v| !v.is_empty())
+}
+
+/// Discover an already-running daemon and return a handle ONLY when it is
+/// **live, at our version, AND bound to the vault the CLI is targeting**;
+/// otherwise `None` (the caller opens the engine directly).
+///
+/// This is the CLI's **PASSIVE** routing check — it uses
+/// [`daemon_client::discover_matching`], NOT #170's active
+/// [`daemon_client::discover`]/[`ensure_running`]. The distinction is
+/// load-bearing:
+/// - `discover`/`ensure_running` are the MCP path's ACTIVE lifecycle owner:
+///   on a version- or vault-mismatch they STOP + restart the daemon for the
+///   caller's vault (one daemon per machine; switching vaults restarts it).
+/// - `onebrain search …` must NEVER kill a daemon serving another vault — that
+///   would disrupt a live MCP session. So the CLI reads `daemon.json`'s stored
+///   canonical `vault` and, on ANY mismatch (wrong vault, wrong version, dead,
+///   or a pre-vault-field record), simply routes to DIRECT open — it never
+///   restarts and never spawns.
+///
+/// The result: a plain `onebrain search …` routes to the warm daemon only when
+/// it already serves this exact vault (the contention case an MCP session
+/// creates), and otherwise opens the engine directly so T1's honest
+/// `E_ENGINE_BUSY` still applies if the lock is genuinely held.
+pub(crate) fn route_to_daemon(resolved: &ResolvedVault) -> Option<DaemonHandle> {
+    if daemon_routing_disabled() {
+        return None;
+    }
+    match daemon_client::discover_matching(Some(resolved.root.as_path())) {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::debug!(error = %e, "daemon discover_matching failed; opening engine directly");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +633,114 @@ mod tests {
         reconcile_missing_model(vault.path(), cache.path(), "multilingual-e5-small");
         let yaml = std::fs::read_to_string(vault.path().join("onebrain.yml")).unwrap();
         assert!(yaml.contains("collection: c"), "{yaml}");
+    }
+
+    // ── Warm-daemon routing (Track 2c) ─────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_routing_disabled_honours_env() {
+        // Empty value → routing enabled; any non-empty value → disabled. Each
+        // guard is scoped so only one holds the (non-reentrant) env lock at a
+        // time.
+        {
+            let _enabled = crate::test_env::set_var("ONEBRAIN_NO_DAEMON", "");
+            assert!(!daemon_routing_disabled(), "empty value → enabled");
+        }
+        {
+            let _disabled = crate::test_env::set_var("ONEBRAIN_NO_DAEMON", "1");
+            assert!(daemon_routing_disabled(), "non-empty value → disabled");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn route_to_daemon_none_when_disabled() {
+        // With routing disabled, `route_to_daemon` short-circuits to None even
+        // before any discovery — the direct-open / honest-EngineBusy path.
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "search:\n  collection: rd-disabled\n",
+        )
+        .unwrap();
+        let _set = crate::test_env::set_var("ONEBRAIN_NO_DAEMON", "1");
+        let resolved = resolved_at(dir.path());
+        assert!(route_to_daemon(&resolved).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn route_to_daemon_none_when_no_daemon_running() {
+        // Routing enabled but no daemon.json under HOME → discover() is None →
+        // route_to_daemon is None (fall back to direct open). HOME is redirected
+        // to an empty tempdir so we never touch the real ~/.onebrain.
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "search:\n  collection: rd-nodaemon\n",
+        )
+        .unwrap();
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", home.path().as_os_str()),
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("")),
+        ]);
+        let resolved = resolved_at(dir.path());
+        assert!(route_to_daemon(&resolved).is_none());
+    }
+
+    /// PASSIVE, no-restart guard (Track 2c): a `daemon.json` bound to vault A,
+    /// while the CLI resolves vault B, routes to DIRECT open (None) AND leaves
+    /// the vault-A record untouched — the CLI must never stop/restart a daemon
+    /// serving another vault (that would disrupt a live MCP session). Decision-
+    /// level: no live server needed, since `discover_matching` rejects on the
+    /// vault mismatch BEFORE any liveness probe or restart.
+    #[cfg(unix)]
+    #[test]
+    fn route_to_daemon_wrong_vault_goes_direct_and_leaves_daemon_untouched() {
+        use crate::commands::daemon_client::{canonical_vault_id, DaemonInfo};
+
+        // Two distinct real vault dirs: A (the daemon's) and B (the CLI's).
+        let vault_a = tempdir().unwrap();
+        let vault_b = tempdir().unwrap();
+        std::fs::write(
+            vault_b.path().join("onebrain.yml"),
+            "search:\n  collection: rd-vault-b\n",
+        )
+        .unwrap();
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", home.path().as_os_str()),
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("")),
+        ]);
+
+        // A daemon.json bound to vault A (port 1 = connection refused; never
+        // probed here — the vault check short-circuits first).
+        let path = crate::commands::daemon_client::discovery_path().unwrap();
+        DaemonInfo {
+            port: 1,
+            token: "x".repeat(20),
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            vault: canonical_vault_id(vault_a.path()),
+        }
+        .write(&path)
+        .unwrap();
+
+        // CLI resolves vault B → routes DIRECT (None), no restart.
+        let resolved = resolved_at(vault_b.path());
+        assert!(
+            route_to_daemon(&resolved).is_none(),
+            "wrong-vault daemon → direct open"
+        );
+        // The vault-A record is UNTOUCHED (passive path never removes/stops it).
+        let still = DaemonInfo::read(&path).unwrap().expect("record preserved");
+        assert_eq!(
+            still.vault,
+            canonical_vault_id(vault_a.path()),
+            "CLI must not disturb a daemon serving another vault"
+        );
     }
 }
 

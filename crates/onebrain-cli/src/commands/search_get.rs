@@ -10,7 +10,8 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::cli::SearchGetArgs;
-use crate::commands::search_common::open_engine;
+use crate::commands::daemon_client::DaemonHandle;
+use crate::commands::search_common::{open_engine, route_to_daemon};
 use crate::output::{emit, Envelope, OutputMode};
 
 #[derive(Debug, Serialize)]
@@ -19,8 +20,13 @@ struct SearchGetData {
     content: String,
 }
 
+/// The hint appended when a doc isn't found in the index — shared by the direct
+/// and daemon-routed paths so the message never drifts.
+const NOT_INDEXED_HINT: &str = "💡  paths are vault-relative (e.g. `00-inbox/note.md`); \
+     if the doc is new, `onebrain search reindex` may not have indexed it yet";
+
 pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchGetArgs) -> Result<()> {
-    let (engine, resolved) = open_engine(vault_flag)?;
+    let resolved = crate::vault_ctx::require(vault_flag.clone())?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
 
     // An absolute path that isn't under the vault root can never be an index
@@ -38,17 +44,34 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchGetArgs)
     // absolute path under the vault root and normalize it so
     // `search get /abs/vault/00-inbox/x.md` just works.
     let doc_path = normalize_doc_path(&args.doc_path, resolved.root.as_path());
-    let content = engine.get(&doc_path).map_err(|e| {
-        anyhow::anyhow!(
-            "{e}\n💡  paths are vault-relative (e.g. `00-inbox/note.md`); \
-             if the doc is new, `onebrain search reindex` may not have indexed it yet"
-        )
-    })?;
+
+    // Warm-daemon path: when a daemon already holds the engine, `Engine::get`
+    // (a redb read) would clash with it → route the lookup through the daemon.
+    // Only when it serves this exact vault; else fall through to a direct open.
+    let content = if let Some(handle) = route_to_daemon(&resolved) {
+        get_via_daemon(&handle, &doc_path)?
+    } else {
+        let (engine, _resolved) = open_engine(vault_flag)?;
+        engine
+            .get(&doc_path)
+            .map_err(|e| anyhow::anyhow!("{e}\n{NOT_INDEXED_HINT}"))?
+    };
     let data = SearchGetData { doc_path, content };
 
     let envelope = Envelope::ok("search.get", Some(vault_info), data);
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
+}
+
+/// Fetch a doc's indexed text through the warm daemon's `/api/internal/get`. A
+/// daemon 404 (doc not indexed) maps to the SAME "not indexed yet" error the
+/// direct path emits, so the two surfaces are indistinguishable to the user.
+fn get_via_daemon(handle: &DaemonHandle, doc_path: &str) -> Result<String> {
+    match handle.get(doc_path) {
+        Ok(Some(content)) => Ok(content),
+        Ok(None) => anyhow::bail!("doc not found: {doc_path}\n{NOT_INDEXED_HINT}"),
+        Err(e) => Err(e.context("route `search get` through warm daemon")),
+    }
 }
 
 /// `true` when `input` is an absolute path that is NOT under `vault_root`.
