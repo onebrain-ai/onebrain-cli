@@ -53,14 +53,19 @@ pub(crate) struct SearchStatusData {
     /// when no index exists yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     index_size_bytes: Option<u64>,
-    /// Number of docs currently indexed.
-    doc_count: usize,
-    /// Pending drift: docs on disk with no stored hash.
-    pending_new: usize,
-    /// Pending drift: docs whose content changed since last index.
-    pending_changed: usize,
-    /// Pending drift: indexed docs whose file is gone.
-    pending_removed: usize,
+    /// Number of docs currently indexed. `null` when the count is UNKNOWN
+    /// because the engine couldn't be opened (see `busy`) — distinct from a
+    /// genuine `0` (a real, empty index).
+    doc_count: Option<usize>,
+    /// Pending drift: docs on disk with no stored hash. `null` when unknown
+    /// (engine busy).
+    pending_new: Option<usize>,
+    /// Pending drift: docs whose content changed since last index. `null` when
+    /// unknown (engine busy).
+    pending_changed: Option<usize>,
+    /// Pending drift: indexed docs whose file is gone. `null` when unknown
+    /// (engine busy).
+    pending_removed: Option<usize>,
     /// Total byte size of the whole collection cache dir (models + index +
     /// live markers). `None` when no collection is configured.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -70,6 +75,13 @@ pub(crate) struct SearchStatusData {
     /// While set, `doc_count`/pending below may lag the in-flight run.
     #[serde(skip_serializing_if = "Option::is_none")]
     reindexing: Option<ReindexLiveProgress>,
+    /// `true` when the engine could NOT be opened because its index is locked
+    /// by another process (redb single-process lock — typically the long-lived
+    /// `onebrain mcp` server). When set, `doc_count` and the `pending_*` counts
+    /// are `null`/unknown (NOT a healthy zero) and a `W_ENGINE_BUSY` warning
+    /// rides the envelope. See v3.4.6 (bug B): never report "up to date" while
+    /// busy.
+    busy: bool,
     /// `false` in a lex-only build (no `semantic` feature): no ONNX runtime,
     /// so embedding-backed verbs (`vsearch`, hybrid `query`, `model set`) are
     /// unavailable and `reindex` indexes keyword-only. See ADR 0017.
@@ -82,7 +94,18 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
 
     let data = status_data(&resolved, collection)?;
 
-    let envelope = Envelope::ok("search.status", Some(vault_info), data);
+    // Bug B (v3.4.6): a busy index is a valid report (exit 0), but must ride a
+    // warning so machine consumers see the contention explicitly rather than
+    // inferring it from the null counts.
+    let busy = data.busy;
+    let mut envelope = Envelope::ok("search.status", Some(vault_info), data);
+    if busy {
+        envelope = envelope.with_warning(
+            "W_ENGINE_BUSY",
+            "search index is locked by another process (e.g. the `onebrain mcp` server) — \
+             doc/pending counts are unknown until it releases the lock",
+        );
+    }
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
 }
@@ -136,27 +159,40 @@ pub(crate) fn status_data(
     // `open_engine`, which would redundantly re-resolve the vault + collection
     // we already have. `set_exclude_patterns` still mirrors `open_engine` so
     // `status`'s drift walk honours `search.exclude` (else excluded files would
-    // inflate `pending_new`). Best-effort: fall back to zeros on any failure
-    // rather than failing status.
-    let (last_indexed_at, doc_count, pending_new, pending_changed, pending_removed) =
-        match cache_dir.as_deref() {
-            Some(dir) => match Engine::open(dir, &config.search.embed_model) {
-                Ok(mut engine) => {
-                    engine.set_exclude_patterns(config.search.exclude.clone());
-                    match engine.status(resolved.root.as_path()) {
-                        Ok(s) => (
-                            s.last_indexed_at,
-                            s.doc_count,
-                            s.pending_new,
-                            s.pending_changed,
-                            s.pending_removed,
-                        ),
-                        Err(_) => (None, 0, 0, 0, 0),
-                    }
+    // inflate `pending_new`).
+    //
+    // Honesty contract (v3.4.6, bug B): when the engine is LOCKED by another
+    // process (redb single-process lock — the `onebrain mcp` server), report
+    // the counts as UNKNOWN (`None`) + `busy: true`, NOT as a healthy `0` that
+    // would render "✅ up to date". Any other open/status failure also degrades
+    // to unknown counts (`None`), but without the busy flag.
+    let probe = match cache_dir.as_deref() {
+        Some(dir) => match Engine::open(dir, &config.search.embed_model) {
+            Ok(mut engine) => {
+                engine.set_exclude_patterns(config.search.exclude.clone());
+                match engine.status(resolved.root.as_path()) {
+                    Ok(s) => StatusProbe::Ok(s),
+                    Err(_) => StatusProbe::Unknown { busy: false },
                 }
-                Err(_) => (None, 0, 0, 0, 0),
+            }
+            Err(e) => StatusProbe::Unknown {
+                busy: onebrain_search::error::is_engine_busy(&e),
             },
-            None => (None, 0, 0, 0, 0),
+        },
+        None => StatusProbe::Unknown { busy: false },
+    };
+
+    let (last_indexed_at, doc_count, pending_new, pending_changed, pending_removed, busy) =
+        match probe {
+            StatusProbe::Ok(s) => (
+                s.last_indexed_at,
+                Some(s.doc_count),
+                Some(s.pending_new),
+                Some(s.pending_changed),
+                Some(s.pending_removed),
+                false,
+            ),
+            StatusProbe::Unknown { busy } => (None, None, None, None, None, busy),
         };
 
     let current_model_missing =
@@ -166,7 +202,8 @@ pub(crate) fn status_data(
         collection,
         embed_model: config.search.embed_model,
         cache_dir,
-        indexed: doc_count > 0,
+        // Unknown doc_count (engine busy / open failed) is NOT "indexed".
+        indexed: doc_count.is_some_and(|c| c > 0),
         current_model_missing,
         model_size_bytes,
         model_downloaded_at,
@@ -178,8 +215,17 @@ pub(crate) fn status_data(
         pending_removed,
         cache_size_bytes,
         reindexing,
+        busy,
         semantic_available: cfg!(feature = "semantic"),
     })
+}
+
+/// Outcome of the read-only index-status probe in [`status_data`]. Separates
+/// a real status read from an "unknown" outcome (engine open/status failed),
+/// carrying whether the failure was specifically redb lock contention.
+enum StatusProbe {
+    Ok(onebrain_search::engine::IndexStatus),
+    Unknown { busy: bool },
 }
 
 /// Build status data for an already-open engine (used by the MCP `status`
@@ -227,12 +273,15 @@ pub(crate) fn status_data_for(
         model_downloaded_at,
         last_indexed_at: status.last_indexed_at,
         index_size_bytes,
-        doc_count: status.doc_count,
-        pending_new: status.pending_new,
-        pending_changed: status.pending_changed,
-        pending_removed: status.pending_removed,
+        doc_count: Some(status.doc_count),
+        pending_new: Some(status.pending_new),
+        pending_changed: Some(status.pending_changed),
+        pending_removed: Some(status.pending_removed),
         cache_size_bytes,
         reindexing,
+        // The caller already holds a live engine handle, so by construction
+        // the index is NOT locked out — this path is never "busy".
+        busy: false,
         semantic_available: cfg!(feature = "semantic"),
     })
 }
@@ -308,7 +357,10 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
             "not set — set `search.collection` in onebrain.yml",
         )),
     }
-    lines.push(item("Docs", &d.doc_count.to_string()));
+    match d.doc_count {
+        Some(n) => lines.push(item("Docs", &n.to_string())),
+        None => lines.push(item("Docs", "unknown")),
+    }
     if let Some(size) = d.index_size_bytes {
         lines.push(item("Size", &format_size(size)));
     }
@@ -326,17 +378,33 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
             ),
         ));
     }
-    let pending = d.pending_new + d.pending_changed + d.pending_removed;
-    if pending > 0 {
+    // Bug B (v3.4.6): a locked index NEVER reports "✅ up to date" — the counts
+    // are unknown, so say so. This branch wins over the pending/up-to-date
+    // rendering below.
+    if d.busy {
         lines.push(item(
             "Status",
-            &format!(
-                "⚠️  {pending} pending ({} new · {} changed · {} removed)",
-                d.pending_new, d.pending_changed, d.pending_removed
-            ),
+            "⚠️  engine busy (indexed by another process)",
         ));
     } else {
-        lines.push(item("Status", "✅  up to date"));
+        // Pending counts are `Some` on the healthy path; treat an unknown
+        // (non-busy open/status failure) as zero pending for this rollup.
+        let pending = d.pending_new.unwrap_or(0)
+            + d.pending_changed.unwrap_or(0)
+            + d.pending_removed.unwrap_or(0);
+        if pending > 0 {
+            lines.push(item(
+                "Status",
+                &format!(
+                    "⚠️  {pending} pending ({} new · {} changed · {} removed)",
+                    d.pending_new.unwrap_or(0),
+                    d.pending_changed.unwrap_or(0),
+                    d.pending_removed.unwrap_or(0)
+                ),
+            ));
+        } else {
+            lines.push(item("Status", "✅  up to date"));
+        }
     }
 
     if let Some(dir) = &d.cache_dir {
@@ -348,10 +416,24 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
         }
     }
 
+    // Pending rollup for the hint block below. Unknown/busy counts contribute
+    // zero — a busy engine gets no reindex hint (retry, don't reindex).
+    let pending = d.pending_new.unwrap_or(0)
+        + d.pending_changed.unwrap_or(0)
+        + d.pending_removed.unwrap_or(0);
+
     // A missing model blocks all search — surface it ahead of pending drift (a
     // reindex selects/downloads the model AND indexes). Suppressed while a
-    // reindex is already running (the model is being fetched right now).
-    if d.current_model_missing && d.reindexing.is_none() {
+    // reindex is already running (the model is being fetched right now), and
+    // while the engine is busy (the count is unknown, so don't guess).
+    if d.busy {
+        lines.push(String::new());
+        lines.push(
+            "💡  Index is locked by another process (e.g. the `onebrain mcp` server) — \
+             retry `onebrain search status` once it exits"
+                .to_string(),
+        );
+    } else if d.current_model_missing && d.reindexing.is_none() {
         lines.push(String::new());
         lines.push(
             "💡  No embedding model downloaded — run `onebrain search reindex` to select, download + index"
@@ -385,11 +467,12 @@ mod tests {
                 last_indexed_at: None,
                 index_size_bytes: None,
                 cache_size_bytes: None,
-                doc_count: 0,
-                pending_new: 0,
-                pending_changed: 0,
-                pending_removed: 0,
+                doc_count: Some(0),
+                pending_new: Some(0),
+                pending_changed: Some(0),
+                pending_removed: Some(0),
                 reindexing: None,
+                busy: false,
                 semantic_available: true,
             },
         )
@@ -473,7 +556,7 @@ mod tests {
         {
             let d = e.data.as_mut().unwrap();
             d.current_model_missing = true;
-            d.pending_new = 2; // drift present too
+            d.pending_new = Some(2); // drift present too
         }
         let s = render_text(&e);
         assert!(
@@ -509,6 +592,63 @@ mod tests {
     }
 
     #[test]
+    fn text_shows_engine_busy_never_up_to_date() {
+        // Bug B (v3.4.6): a locked index reports the busy status + unknown
+        // docs, and NEVER "✅ up to date".
+        let mut e = env(Some("ob-1"), false);
+        {
+            let d = e.data.as_mut().unwrap();
+            d.busy = true;
+            d.doc_count = None;
+            d.pending_new = None;
+            d.pending_changed = None;
+            d.pending_removed = None;
+        }
+        let s = render_text(&e);
+        assert!(
+            s.contains("⚠️  engine busy (indexed by another process)"),
+            "{s}"
+        );
+        assert!(
+            !s.contains("up to date"),
+            "busy must never read up to date: {s}"
+        );
+        assert!(s.contains("    Docs          unknown"), "{s}");
+        // The hint points at retry, not reindex.
+        assert!(
+            s.contains("💡") && s.contains("locked by another process"),
+            "{s}"
+        );
+        assert!(
+            !s.contains("index pending changes"),
+            "busy suppresses the reindex hint: {s}"
+        );
+    }
+
+    #[test]
+    fn json_busy_reports_null_counts_and_flag() {
+        // Bug B: machine consumers must see `busy: true` and null (not zero)
+        // counts, so they can't mistake a locked index for a healthy empty one.
+        let mut e = env(Some("ob-1"), false);
+        {
+            let d = e.data.as_mut().unwrap();
+            d.busy = true;
+            d.doc_count = None;
+            d.pending_new = None;
+            d.pending_changed = None;
+            d.pending_removed = None;
+        }
+        let v = serde_json::to_value(e.data.as_ref().unwrap()).unwrap();
+        assert_eq!(v["busy"], true);
+        assert!(
+            v["doc_count"].is_null(),
+            "doc_count must be null when busy: {v}"
+        );
+        assert!(v["pending_new"].is_null(), "{v}");
+        assert_eq!(v["indexed"], false);
+    }
+
+    #[test]
     fn text_shows_pending_drift_when_present() {
         let mut e = env(Some("ob-1"), true);
         {
@@ -516,10 +656,10 @@ mod tests {
             // 5 docs indexed ⇒ the model was downloaded to embed them; set it so
             // the pending-drift hint (not the model-missing hint) is exercised.
             d.model_size_bytes = Some(493_921_024);
-            d.doc_count = 5;
-            d.pending_new = 2;
-            d.pending_changed = 1;
-            d.pending_removed = 3;
+            d.doc_count = Some(5);
+            d.pending_new = Some(2);
+            d.pending_changed = Some(1);
+            d.pending_removed = Some(3);
         }
         let s = render_text(&e);
         assert!(s.contains("    Docs          5"), "{s}");
@@ -579,8 +719,8 @@ mod tests {
         let mut e = env(Some("ob-1"), true);
         {
             let d = e.data.as_mut().unwrap();
-            d.doc_count = 7;
-            d.pending_new = 1;
+            d.doc_count = Some(7);
+            d.pending_new = Some(1);
             d.last_indexed_at = Some(1_700_000_000);
             d.model_size_bytes = Some(1234);
             d.index_size_bytes = Some(5678);
@@ -729,11 +869,12 @@ mod tests {
         let data = status_data_for(&engine, &resolved).unwrap();
 
         assert_eq!(data.collection, Some("t-status-data-for".to_string()));
-        assert_eq!(data.doc_count, 0);
+        assert_eq!(data.doc_count, Some(0));
         assert!(
             !data.indexed,
             "never-indexed vault (doc_count == 0) must report indexed: false"
         );
+        assert!(!data.busy, "a live-engine status path is never busy");
         assert_eq!(data.semantic_available, cfg!(feature = "semantic"));
     }
 
@@ -762,16 +903,17 @@ mod tests {
             model_downloaded_at: None,
             last_indexed_at: Some(1_700_000_000),
             index_size_bytes: None,
-            doc_count,
-            pending_new: 0,
-            pending_changed: 0,
-            pending_removed: 0,
+            doc_count: Some(doc_count),
+            pending_new: Some(0),
+            pending_changed: Some(0),
+            pending_removed: Some(0),
             cache_size_bytes: None,
             reindexing: None,
+            busy: false,
             semantic_available: cfg!(feature = "semantic"),
         };
 
-        assert_eq!(data.doc_count, 3);
+        assert_eq!(data.doc_count, Some(3));
         assert!(
             data.indexed,
             "indexed vault (doc_count > 0) must report indexed: true"

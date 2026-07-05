@@ -84,6 +84,14 @@ pub enum CoreError {
     /// broken.
     #[error("rollback incomplete — vault may be inconsistent: {0}")]
     RollbackIncomplete(String),
+
+    /// The native-search engine could not be opened because its on-disk index
+    /// is locked by another process (redb is single-process by design — the
+    /// long-lived `onebrain mcp` server holds the lock for a whole session).
+    /// Exit 77. Transient contention, not corruption: retry once the holder
+    /// releases the lock. The wrapped string carries a user-facing hint.
+    #[error("search engine busy: {0}")]
+    EngineBusy(String),
 }
 
 impl CoreError {
@@ -105,6 +113,7 @@ impl CoreError {
             Self::AuthFailed(_) => "E_AUTH_FAILED",
             Self::InitTargetNotEmpty(_) => "E_INIT_TARGET_NOT_EMPTY",
             Self::RollbackIncomplete(_) => "E_ROLLBACK_INCOMPLETE",
+            Self::EngineBusy(_) => "E_ENGINE_BUSY",
         }
     }
 }
@@ -167,6 +176,10 @@ mod tests {
         assert_eq!(
             CoreError::RollbackIncomplete("could not restore a.md".into()).error_code(),
             "E_ROLLBACK_INCOMPLETE"
+        );
+        assert_eq!(
+            CoreError::EngineBusy("index locked by mcp".into()).error_code(),
+            "E_ENGINE_BUSY"
         );
     }
 }

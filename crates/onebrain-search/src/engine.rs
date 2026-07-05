@@ -359,6 +359,12 @@ impl Engine {
             dims,
             EmbedSource::Lazy(OnceCell::new()),
         )
+        // Classify redb's single-process lock ("database already open") into
+        // the typed `EngineBusy` error so every CLI surface can report honest
+        // contention instead of a generic failure (v3.4.6). The lock can be
+        // tripped by either the vector-meta db or `engine.redb`, so classify
+        // once here at the shared open boundary.
+        .map_err(crate::error::classify_open_error)
     }
 
     /// Open/create an engine rooted at `cache_dir` with a caller-supplied
@@ -383,6 +389,7 @@ impl Engine {
             dims,
             EmbedSource::Injected(embedder),
         )
+        .map_err(crate::error::classify_open_error)
     }
 
     /// Shared open/create path for both [`Engine::open`] and
@@ -1470,6 +1477,27 @@ mod tests {
 
     fn fake_engine(dir: &Path) -> Engine {
         Engine::open_with_embedder(dir, "fake-model", Box::new(FakeEmbedder { dims: 16 })).unwrap()
+    }
+
+    #[test]
+    fn second_open_while_first_held_is_engine_busy() {
+        use crate::error::{is_engine_busy, EngineBusy};
+        let dir = tempfile::tempdir().unwrap();
+        // First handle takes redb's single-process lock and keeps it.
+        let _held = fake_engine(dir.path());
+        // A second open of the SAME cache dir must classify as EngineBusy,
+        // not a generic error (redb is single-process by design). `Engine`
+        // isn't `Debug`, so unwrap the error via `match` rather than
+        // `expect_err`.
+        let err = match Engine::open(dir.path(), "multilingual-e5-small") {
+            Ok(_) => panic!("second open must fail while the first handle holds the lock"),
+            Err(e) => e,
+        };
+        assert!(
+            is_engine_busy(&err),
+            "second open should be EngineBusy, got: {err:#}"
+        );
+        assert!(err.downcast_ref::<EngineBusy>().is_some());
     }
 
     /// An embedder whose every method panics. Used to prove a lex-only

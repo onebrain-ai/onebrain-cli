@@ -10,6 +10,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
+## [3.4.6] — honest search-engine lock contention
+
+### Fixed
+- redb is single-process: while the long-lived `onebrain mcp` server holds the search index open, other commands that opened the engine misreported instead of surfacing the busy state. Lock contention is now honest and uniform.
+- `search status` under a held lock reports `busy: true`, `doc_count: null` (unknown, not a healthy `0`) + a `W_ENGINE_BUSY` warning and text "⚠️ engine busy (indexed by another process)" — never "✅ up to date"; still exit 0 (a valid report).
+- User-facing verbs (`query` / `vsearch` / `get` / full `reindex`) now emit an `E_ENGINE_BUSY` error envelope and exit **77** (dedicated transient-failure code) instead of a generic `E_INTERNAL` / exit 1.
+- Hook paths (`search reindex --lex-only` / `--pending-only`) skip with `reason: "engine-busy"` and stay exit 0, so a locked index never breaks the Claude Code hook chain.
+- The lock is classified from redb's typed `DatabaseAlreadyOpen` kind (with a defensive string fallback), surfaced as `onebrain_search::error::EngineBusy` + `CoreError::EngineBusy`.
+- `search search` (lex-only verb) now populates each hit's `heading_path` from the STORED tantivy field — no redb open. Snippet stays empty pending a `body`-STORED schema change + reindex migration (deferred follow-up).
+
 ## [3.4.5] — native search · no dependency · auto reindex/embed · model reindex ux/ui (the qmd epic)
 
 ### Breaking

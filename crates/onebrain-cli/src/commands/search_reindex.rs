@@ -280,6 +280,18 @@ fn emit_skip(
     Ok(())
 }
 
+/// Skip `reason` for a hook-path `Engine::open` failure: `"engine-busy"` when
+/// the index is locked by another process (redb single-process lock — bug C,
+/// v3.4.6), else the generic `"error"`. Keeps the hook path honest without
+/// ever failing the calling turn (still exit 0 via `emit_skip`).
+fn engine_open_skip_reason(err: &anyhow::Error) -> &'static str {
+    if onebrain_search::error::is_engine_busy(err) {
+        "engine-busy"
+    } else {
+        "error"
+    }
+}
+
 /// Entry point for `--lex-only` / `--pending-only`. Runs the shared safety
 /// gate first (pure fs probes, no engine, no prompt); on any gate failure
 /// (or any error during the run itself) emits a skip envelope and returns
@@ -390,7 +402,7 @@ fn run_lex_only(
             Ok(e) => e,
             Err(e) => {
                 eprintln!("onebrain search reindex --lex-only: {e:#}");
-                return emit_skip(mode, Some(vault_info), "error");
+                return emit_skip(mode, Some(vault_info), engine_open_skip_reason(&e));
             }
         };
     engine.set_exclude_patterns(config.search.exclude.clone());
@@ -475,7 +487,7 @@ fn run_pending_only(
             Ok(e) => e,
             Err(e) => {
                 eprintln!("onebrain search reindex --pending-only: {e:#}");
-                return emit_skip(mode, Some(vault_info), "error");
+                return emit_skip(mode, Some(vault_info), engine_open_skip_reason(&e));
             }
         };
     engine.set_exclude_patterns(config.search.exclude.clone());

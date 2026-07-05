@@ -150,19 +150,21 @@ pub fn run_lex(
     let lex = LexIndex::open(&cache_dir.join("tantivy"))
         .with_context(|| format!("opening lex index at {}", cache_dir.display()))?;
 
-    let mut raw_hits = lex.search(&args.text, args.top_k)?;
+    let mut raw_hits = lex.search_with_heading(&args.text, args.top_k)?;
     if let Some(min) = args.min_score {
-        raw_hits.retain(|(_, score)| f64::from(*score) >= min);
+        raw_hits.retain(|(_, _, score)| f64::from(*score) >= min);
     }
-    // LexIndex::search returns bare (chunk_id, score) pairs — no doc_path,
-    // heading_path, or snippet (those live in the engine's redb metadata,
-    // which this verb deliberately never opens). chunk_id already encodes
-    // the doc path as its prefix (see `chunk::Chunk::chunk_id`, `<doc_path>#N`),
-    // so surface that much; heading_path/snippet are left empty rather than
-    // guessed.
+    // `search_with_heading` returns (chunk_id, heading_path, score). The
+    // heading_path IS a STORED tantivy field, so we populate it here WITHOUT
+    // opening the engine's redb metadata (v3.4.6, bug E). chunk_id encodes the
+    // doc path as its prefix (see `chunk::Chunk::chunk_id`, `<doc_path>#N`), so
+    // derive doc_path from it. The `snippet` stays empty: the chunk text lives
+    // in the `body` field, which is indexed but NOT `STORED` in tantivy — a
+    // snippet would need a schema change + full reindex migration, deferred to
+    // a follow-up (bug E is cosmetic/low-priority).
     let hits: Vec<HitData> = raw_hits
         .into_iter()
-        .map(|(chunk_id, score)| {
+        .map(|(chunk_id, heading_path, score)| {
             let doc_path = chunk_id
                 .rsplit_once('#')
                 .map(|(path, _)| path.to_string())
@@ -170,7 +172,7 @@ pub fn run_lex(
             HitData {
                 doc_path,
                 chunk_id,
-                heading_path: String::new(),
+                heading_path,
                 score: score as f64,
                 snippet: String::new(),
             }
