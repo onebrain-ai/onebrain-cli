@@ -98,11 +98,16 @@ it is untestable.
 `crates/onebrain-cli/src/server/internal.rs`:
 - A few `spawn_blocking` panic-mapper arms + the reindex/status engine-error `.map_err` arms (fire only on an engine fault).
 
-## Status (2026-06-30)
+## Status (2026-07-05 · v3.4.6)
 
-- Whole-workspace baseline (no exclusions): **89.58% line** (`cargo llvm-cov --workspace`).
-- **Core (this initiative's target surface, exclusions applied): 95.59% line** (macOS; ~95.5% Linux CI) —
-  `scripts/coverage.sh`. ~1,166 missed lines remain on core code (down from 1,711 baseline).
+- **Core (this initiative's target surface, exclusions applied): ~94.99% line** (`scripts/coverage.sh`,
+  gate `CORE_LINE_THRESHOLD=94`). The v3.4.6 warm-daemon epic **un-excluded** `daemon.rs`,
+  `daemon_client.rs`, and `server/search.rs` from the measured surface (high-assurance policy — see
+  ADR 0023: security/filesystem-touching code must be covered, not whole-file-excluded). Including that
+  harder-to-cover daemon code pulled the aggregate down from the prior ~95.5% (that number **excluded**
+  the daemon code) while genuinely **raising** assurance; the ratchet was reset 95 → 94 to lock in the
+  new, broader measured floor (see ratchet history below).
+- Prior (2026-06-30, pre-daemon-un-exclusion): 95.59% macOS / ~95.5% Linux with the daemon files excluded.
 
 Closed so far:
 - Phase 1 — `v31/dispatch.rs` 76.94% → 86.70% (stub/verb exit-code tests).
@@ -150,7 +155,12 @@ Closed so far:
 core line coverage drops below `CORE_LINE_THRESHOLD` (in `scripts/coverage.sh`). It is
 **ratcheted UP, never down**, as coverage climbs (raise the threshold in a follow-up PR whenever a
 new floor is comfortably held): started at **94** (v3.3.21), raised to **95** after the long-tail
-mop-up gave ~0.5% Linux headroom (achieved ~95.5% Linux / 95.59% macOS). Literal 100% is not the
+mop-up gave ~0.5% Linux headroom (achieved ~95.5% Linux / 95.59% macOS), then **reset 95 → 94
+(v3.4.6, 2026-07-05)** when the warm-daemon epic **un-excluded** `daemon.rs` / `daemon_client.rs` /
+`server/search.rs` per the ADR 0023 high-assurance policy — including that harder-to-cover code
+lowered the aggregate to ~94.99%, so the floor was reset to 94 to lock in the new (broader, more
+honest) measured set. This is the one intentional exception to "ratchet up, never down": the drop
+reflects *more* code being measured, not a coverage regression. Literal 100% is not the
 bar (see the ceiling note up top); the gate locks in whatever % the documented-residual set leaves.
 
 **No dead code inflates the residuals.** An audit traced every logically-unreachable "residual"

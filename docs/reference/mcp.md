@@ -21,7 +21,7 @@ onebrain mcp --vault /path/to/vault
 ```json
 {
   "mcpServers": {
-    "qmd": {
+    "search": {
       "command": "onebrain",
       "args": ["mcp", "--vault", "/path/to/vault"]
     }
@@ -29,7 +29,7 @@ onebrain mcp --vault /path/to/vault
 }
 ```
 
-> The server key is `qmd` in v3.4.1 — see [Versioning & compatibility](#versioning--compatibility) below for why, and when that changes.
+> The OneBrain plugin's `.mcp.json` server key was renamed from `qmd` to **`search`** in v3.4.5 (when `onebrain qmd` was removed in favour of native `onebrain search`). Standalone/generic clients can use any key.
 
 **Generic MCP client** (any client that spawns a stdio server):
 
@@ -66,9 +66,11 @@ onebrain search reindex --vault /path/to/notes
 { "vault-search": { "command": "onebrain", "args": ["mcp", "--vault", "/path/to/notes"] } }
 ```
 
-A zero-config `--dir`-only mode (no `onebrain.yml` required) is on the backlog for v3.4.3+ — not yet available.
+A zero-config `--dir`-only mode (no `onebrain.yml` required) is on the backlog — not yet available.
 
 ## Tools
+
+> **Warm daemon routing (v3.4.6+).** When a warm daemon is running for this vault (`onebrain daemon` — the MCP server auto-starts one), `query` and `status` are served by the daemon over its local HTTP API instead of this process opening its own search engine, so **multiple concurrent MCP sessions coexist** without racing redb's single-writer lock. Daemon-routed `query` has documented deltas vs a direct open: results are **doc-level** (deduped by `path` → at most one hit per document), `vec`/`hyde` sub-queries are served as `hybrid` on the wire, and candidates are capped at `TOP_K`=20 per sub-query (`status`'s shape is identical either way). `get`/`multi_get` are always direct filesystem reads. If the daemon can't start, the tools fall back to a direct engine open. See [docs/daemon.md](../daemon.md).
 
 ### `query`
 
@@ -83,8 +85,8 @@ Search the vault with typed sub-queries (`lex` = BM25 keywords, `vec` = semantic
 | `minScore` | number | no | `0` | Minimum normalized relevance, 0–1. The top fused hit always scores exactly `1.0`, so `minScore` is a fraction of the best hit's fused rank score, not an absolute similarity. |
 | `candidateLimit` | number | no | — | **Compatibility only, not used by the native engine.** Accepted for qmd schema compatibility; deserializes without error, has no effect. |
 | `collections` | array of string | no | — | **Compatibility only, not used by the native engine.** The native index is single-collection per vault, so there's nothing to select between. |
-| `intent` | string | no | — | **Compatibility only, not used by the native engine yet.** Background context for disambiguation; native intent-aware ranking is relevance-phase work (v3.4.5). |
-| `rerank` | boolean | no | — | **Compatibility only, not used by the native engine.** Native rerank (bge-reranker-v2-m3) lands in v3.4.5. |
+| `intent` | string | no | — | **Compatibility only, not used by the native engine yet.** Background context for disambiguation; native intent-aware ranking is not yet implemented. |
+| `rerank` | boolean | no | — | **Compatibility only, not used by the native engine.** Native rerank (bge-reranker-v2-m3) is not yet implemented. |
 
 **Result shape**
 
@@ -218,7 +220,7 @@ A common question for tools like a future `reindex`: can an agent kick off long 
 
 **Today, all four shipped tools are fast and effectively synchronous** — none starts background work. There is no `reindex` MCP tool yet; reindexing is a CLI/cron operation. However, the engine already provides the primitive for the *return-immediately + poll* pattern: `onebrain search reindex` writes an on-disk progress marker, and the `status` tool reports `reindexing: { done, total }` live — even when the reindex is running in a **separate** process. So a client can already observe reindex progress through `status` while a CLI/cron reindex runs.
 
-**Forward design (roadmap, not a commitment):** when a `reindex` MCP tool lands (v3.4.4, alongside the auto-reindex work), the natural shape is the return-immediately + poll pattern above: `reindex` spawns the work and returns a "started" acknowledgement, and the agent polls `status` for `reindexing: { done, total }`. Two design constraints apply and are tracked for that milestone:
+**Forward design (roadmap, not a commitment):** if a `reindex` MCP tool lands, the natural shape is the return-immediately + poll pattern above: `reindex` spawns the work and returns a "started" acknowledgement, and the agent polls `status` for `reindexing: { done, total }`. (In-session auto-reindex already ships via the CLI/daemon path — the PostToolUse/Stop hooks route `search reindex` to the warm daemon; a dedicated MCP `reindex` tool is a separate, unshipped idea.) Two design constraints would apply:
 
 - The server holds the engine behind a single `Arc<Mutex<Engine>>`, so a `reindex` that held the lock for its whole duration would serialize (block) concurrent `query`/`status` calls. A long-running tool must run its work off the shared lock, not inside a single `with_engine` critical section.
 - A long-lived server's in-memory readers (tantivy `IndexReader`, the vector mmap) must be reloaded after an external reindex commits, or the server would keep answering from the pre-reindex index until restart.
@@ -226,7 +228,7 @@ A common question for tools like a future `reindex`: can an agent kick off long 
 ## Versioning & compatibility
 
 - **qmd-compat contract**: the tool names (`query`/`get`/`multi_get`/`status`) and most parameter names deliberately match the external `qmd` MCP server this replaces, so agent instructions written against qmd need no rewrite to call this server instead. Params the native engine doesn't yet use are still accepted (see each tool's table above) rather than rejected — a client sending them gets normal behavior, not a schema error.
-- **Plugin config staging**: the OneBrain plugin's `.mcp.json` registered this server under the config key `qmd` from the **v3.4.1** native-backend swap onward — this is why the example above uses `"qmd":` as the server key even though the binary command is `onebrain mcp`. The key was renamed to `search` (with a matching agent-instruction update) in the **v3.4.5** epic — plugin PR onebrain-ai/onebrain#208 — after which the tool namespace is `mcp__plugin_onebrain_search__*`.
+- **Plugin config staging**: the OneBrain plugin's `.mcp.json` registered this server under the config key `qmd` from the **v3.4.1** native-backend swap onward, then renamed it to **`search`** (with a matching agent-instruction update) in the **v3.4.5** epic — plugin PR onebrain-ai/onebrain#208. The example above uses the current `search` key; after the rename the tool namespace is `mcp__plugin_onebrain_search__*`.
 - **Server version = CLI version**: the MCP `initialize` handshake's `serverInfo` reports `{ "name": "onebrain", "version": "<CLI version>" }` — there is no separate MCP-protocol version to track; it always matches `onebrain --version`.
 
 ## Roadmap

@@ -1,4 +1,4 @@
-# 0023 — Warm daemon owns the search engine for mcp + CLI search
+# 0023 — Warm daemon owns the search engine for MCP + CLI search
 
 - **Status:** accepted
 - **Date:** 2026-07-05
@@ -19,9 +19,9 @@ An existing HTTP surface already runs in-process: `onebrain serve` / `daemon __r
 
 ## Decision
 
-**The warm daemon becomes the sole redb owner; mcp + CLI search become HTTP clients of it.** Transport is the **existing localhost Axum HTTP surface + the existing token auth** — no new IPC mechanism.
+**The warm daemon becomes the sole redb owner; MCP + CLI search become HTTP clients of it.** Transport is the **existing localhost Axum HTTP surface + the existing token auth** — no new IPC mechanism.
 
-Concretely, Track 2a built the **daemon side + the reusable client library**; the mcp + CLI client wirings are separate tracks. **Track 2b (this update) wired the MCP server in:** `commands/mcp.rs` now obtains a daemon via `ensure_running()` and routes its `status`/`query` tools through `DaemonHandle` (`/api/internal/status` + `/api/vault/search`) instead of opening its own engine — `get`/`multi_get` stay filesystem reads, and a direct single-process engine open is kept as the daemon-unavailable fallback. **Daemon-routed `query` deltas** (on record, not overclaimed as parity): results are DOC-level (dedup/fusion keys on `path`, ≤1 hit per document, vs multiple chunks per doc directly), a `vec` sub-query is served as `hybrid` (lex mixed in) on the wire, and the daemon caps candidates at `TOP_K`=20 per sub-query (direct over-fetches ≥30); `hyde`≡`vec` on BOTH paths already, so no NEW hyde loss. `status`'s response shape is identical on both paths. The CLI `search` verb wiring remains a follow-up track.
+Concretely, Track 2a built the **daemon side + the reusable client library**; the MCP + CLI client wirings are separate tracks. **Track 2b (this update) wired the MCP server in:** `commands/mcp.rs` now obtains a daemon via `ensure_running()` and routes its `status`/`query` tools through `DaemonHandle` (`/api/internal/status` + `/api/vault/search`) instead of opening its own engine — `get`/`multi_get` stay filesystem reads, and a direct single-process engine open is kept as the daemon-unavailable fallback. **Daemon-routed `query` deltas** (on record, not overclaimed as parity): results are DOC-level (dedup/fusion keys on `path`, ≤1 hit per document, vs multiple chunks per doc directly), a `vec` sub-query is served as `hybrid` (lex mixed in) on the wire, and the daemon caps candidates at `TOP_K`=20 per sub-query (direct over-fetches ≥30); `hyde`≡`vec` on BOTH paths already, so no NEW hyde loss. `status`'s response shape is identical on both paths. The CLI `search` verb wiring remains a follow-up track.
 
 1. **Persistent engine.** `daemon __run` opens the engine ONCE at boot and holds it in `Arc<Mutex<Engine>>` (`server::SharedEngine`) on `AppState.search_engine` for the process lifetime. `GET /api/vault/search` uses the held engine (hybrid) instead of opening per-request; lex stays on the standalone `LexIndex` (tantivy only — it never touches redb, so it can't clash). `serve` and the unit-test router leave the engine unheld (`hold_engine: false`) and keep the per-request behaviour, since a foreground `serve` is short-lived and not the canonical owner.
 
@@ -48,16 +48,16 @@ Security/filesystem-touching daemon code is **NOT whole-file-excluded** from cov
 ### Rejected / deferred
 
 - **Bespoke unix-domain socket — REJECTED (deferred to the v3.8 full daemon refactor).** A unix socket is arguably a tighter fit for a local-only IPC, but it isn't cross-platform (Windows named pipes would need a parallel path) and would mean a *second* server stack alongside the Axum one we already run for the webui. Reusing the existing HTTP surface + token auth gives cross-platform behaviour and maximum code reuse now; a socket can be revisited when the full daemon refactor consolidates all surfaces (v3.8).
-- **Daemon owning ALL surfaces (config/tree/file/chat routed through it) — OUT OF SCOPE.** This PR scopes the daemon to the **search** engine ownership problem (mcp + search). The remaining surfaces still work per-request; consolidating them is the later full-refactor cleanup.
+- **Daemon owning ALL surfaces (config/tree/file/chat routed through it) — OUT OF SCOPE.** This PR scopes the daemon to the **search** engine ownership problem (MCP + search). The remaining surfaces still work per-request; consolidating them is the later full-refactor cleanup.
 - **HTTP-layer doc-count-rise test — done download-free in a lex-only build.** A lex-only build lex-indexes a doc and records its `DOC_HASHES` hash WITHOUT embedding (`Engine::embed_passages_if_available` returns `None`), so `reindex {mode:"paths"}` over a real on-disk `.md` genuinely returns non-zero `added` and raises `doc_count` with NO model download — the HTTP end-to-end reindex-mutation test runs in the lex-only tier and checks each stat maps to the right response field. Under the `semantic` feature the same path would embed (model download), which the no-download rule forbids, so that tier asserts only the download-free arms (empty-pending no-op, confinement rejects, concurrent search+status, auth, 503). The stats→`ReindexResponse` field mapping is ALSO covered by a build-agnostic direct unit test, and engine reindex correctness by `onebrain-search`'s `FakeEmbedder` tests.
 
 ## Consequences
 
-- With the client tracks wired in, mcp + CLI search route through the one daemon engine, so multiple concurrent sessions no longer race redb's single-writer lock.
+- With the client tracks wired in, MCP + CLI search route through the one daemon engine, so multiple concurrent sessions no longer race redb's single-writer lock.
 - `serve` behaviour is unchanged (still opens per-request) — no regression for the foreground command, and every existing server test passes untouched (they build the router with `hold_engine: false`).
 - The daemon now cleans up after itself: idle-shutdown releases the redb lock when unused, and `daemon.json` is removed on clean exit so a client never connects to a dead daemon.
 - Version skew is handled explicitly: a client that finds a daemon at a different version restarts it before use, so a stale daemon from an older install can't serve an incompatible wire shape.
-- The client library (`daemon_client.rs`) currently reads as mostly dead code (allowed at the module level) until the mcp + CLI tracks call it; its core paths are unit-tested so it isn't untested dead code.
+- The client library (`daemon_client.rs`) currently reads as mostly dead code (allowed at the module level) until the MCP + CLI tracks call it; its core paths are unit-tested so it isn't untested dead code.
 - Windows: TCP + `O_EXCL` work everywhere, so the concurrent-start guard and discovery are cross-platform; the detached-spawn / SIGTERM parts of the daemon remain Unix-first as before (unchanged by this PR).
 
 ## Update — Track 2c: CLI search verbs wired to the daemon (v3.4.6)

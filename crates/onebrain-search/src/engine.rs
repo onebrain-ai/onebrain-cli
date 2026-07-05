@@ -975,6 +975,20 @@ impl Engine {
         Ok(lex_hashes.get(doc_path)?.map(|v| v.value().to_string()))
     }
 
+    /// True if `doc_path` is recorded in EITHER `DOC_HASHES` or `LEX_HASHES`,
+    /// read in a SINGLE transaction (vs `stored_hash` + `stored_lex_hash` =
+    /// two `begin_read`s). Used on the removal path, where presence in either
+    /// table means the doc was indexed and must be removed.
+    fn is_indexed_in_either(&self, doc_path: &str) -> Result<bool> {
+        let read_txn = self.meta.begin_read()?;
+        let doc_hashes = read_txn.open_table(DOC_HASHES)?;
+        if doc_hashes.get(doc_path)?.is_some() {
+            return Ok(true);
+        }
+        let lex_hashes = read_txn.open_table(LEX_HASHES)?;
+        Ok(lex_hashes.get(doc_path)?.is_some())
+    }
+
     /// The hash a lex-only reindex should diff against: `LEX_HASHES` if
     /// present, else `DOC_HASHES`. A fully-indexed (`Full`-mode) doc is by
     /// definition lex-indexed too, so falling back to `DOC_HASHES` makes
@@ -1243,9 +1257,7 @@ impl Engine {
                     &mut stats,
                     &mut on_first_embed,
                 )?;
-            } else if self.stored_hash(doc_path)?.is_some()
-                || self.stored_lex_hash(doc_path)?.is_some()
-            {
+            } else if self.is_indexed_in_either(doc_path)? {
                 self.remove_doc(doc_path)?;
                 self.drop_hash(doc_path)?;
                 stats.removed += 1;

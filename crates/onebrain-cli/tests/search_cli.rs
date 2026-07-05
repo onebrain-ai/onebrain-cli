@@ -22,6 +22,11 @@ fn write(root: &Path, rel: &str, body: &str) {
 fn onebrain(vault_root: &Path, cache_dir: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_onebrain"));
     cmd.env("ONEBRAIN_CACHE_DIR", cache_dir)
+        // Hermetic: force the direct engine path so a live machine daemon
+        // (`~/.onebrain/run/daemon.json` from a real MCP session) never routes
+        // these direct-path CLI tests — keeps the suite deterministic regardless
+        // of a developer's live session (CI runners are clean; dev machines aren't).
+        .env("ONEBRAIN_NO_DAEMON", "1")
         .arg("--vault")
         .arg(vault_root)
         .arg("--json");
