@@ -506,6 +506,10 @@ impl DaemonHandle {
             // A 404 is the daemon's "doc not indexed" — surface it as `None` so
             // the caller renders its hint rather than an error.
             Err(ureq::Error::StatusCode(404)) => Ok(None),
+            // A 503 is the daemon holding no engine (another process owns the
+            // redb lock) — classify as EngineBusy so the caller reports honest
+            // E_ENGINE_BUSY, not an opaque E_INTERNAL. See `classify_daemon_ureq`.
+            Err(ureq::Error::StatusCode(503)) => Err(daemon_engine_busy()),
             Err(e) => Err(anyhow::anyhow!("daemon get: {e}")),
         }
     }
@@ -557,11 +561,41 @@ fn with_retry(
     // as the expected vault so a respawn (after the daemon vanished) can't be
     // satisfied by a wrong-vault daemon that started meanwhile.
     let expected = handle.info.vault.clone();
-    let mut resp = retry_once(handle, &op, is_transport_error, || {
-        ensure_running(expected.as_deref().map(Path::new))
-            .context("respawn daemon after transport failure")
-    })?;
+    let mut resp = retry_once(
+        handle,
+        &op,
+        is_transport_error,
+        || {
+            ensure_running(expected.as_deref().map(Path::new))
+                .context("respawn daemon after transport failure")
+        },
+        classify_daemon_ureq,
+    )?;
     read_json(&mut resp)
+}
+
+/// Turn a non-transport ureq error from a daemon request into an `anyhow` error.
+///
+/// A vault-bound daemon returns **503** when it holds no engine — another
+/// process owns redb's single-writer lock (e.g. an `onebrain mcp` server from
+/// before an upgrade, still alive while the new warm daemon runs). That is the
+/// SAME contention the direct path reports as `E_ENGINE_BUSY`, so put the typed
+/// [`onebrain_search::error::EngineBusy`] in the error chain; the search-verb
+/// callers (`map_daemon_error`) and the status probe then map it identically to
+/// the direct `Engine::open` lock case. Any other status keeps an opaque wrap.
+fn classify_daemon_ureq(e: ureq::Error) -> anyhow::Error {
+    if matches!(e, ureq::Error::StatusCode(503)) {
+        return daemon_engine_busy();
+    }
+    anyhow::anyhow!("daemon request: {e}")
+}
+
+/// The typed engine-busy error for a daemon that holds no engine (503). Mirrors
+/// the direct path's `onebrain_search` classification so `is_engine_busy` on the
+/// chain is `true` for both the direct lock and the routed-503 case.
+fn daemon_engine_busy() -> anyhow::Error {
+    anyhow::Error::new(onebrain_search::error::EngineBusy)
+        .context("daemon holds no engine — the search index is locked by another process")
 }
 
 /// Generic "try, and on a retryable error reconnect + try ONCE more" core.
@@ -577,6 +611,7 @@ fn retry_once<H, T, E>(
     op: &impl Fn(&H) -> std::result::Result<T, E>,
     is_retryable: impl Fn(&E) -> bool,
     reconnect: impl FnOnce() -> Result<H>,
+    classify: impl Fn(E) -> anyhow::Error,
 ) -> Result<T>
 where
     E: std::fmt::Display,
@@ -586,9 +621,12 @@ where
         Err(e) if is_retryable(&e) => {
             tracing::warn!(error = %e, "daemon unreachable; reconnecting and retrying once");
             let fresh = reconnect()?;
-            op(&fresh).map_err(|e| anyhow::anyhow!("daemon request (after reconnect): {e}"))
+            op(&fresh).map_err(classify)
         }
-        Err(e) => Err(anyhow::anyhow!("daemon request: {e}")),
+        // A non-retryable error is a real answer from a live daemon; `classify`
+        // turns a 503 (daemon holds no engine) into the typed EngineBusy, leaving
+        // any other status as an opaque wrap.
+        Err(e) => Err(classify(e)),
     }
 }
 
@@ -1106,6 +1144,7 @@ mod tests {
                 reconnected.set(true);
                 Ok(())
             },
+            |e| anyhow::anyhow!("{e}"),
         );
         assert_eq!(out.unwrap(), 7);
         assert!(!reconnected.get(), "no reconnect on first-try success");
@@ -1132,6 +1171,7 @@ mod tests {
                 reconnected.set(true);
                 Ok(())
             },
+            |e| anyhow::anyhow!("{e}"),
         );
         assert_eq!(out.unwrap(), 42);
         assert_eq!(calls.get(), 2, "op runs exactly twice (retry ONCE)");
@@ -1149,6 +1189,7 @@ mod tests {
                 reconnected.set(true);
                 Ok(())
             },
+            |e| anyhow::anyhow!("{e}"),
         );
         assert!(out.is_err());
         assert!(
@@ -1164,9 +1205,29 @@ mod tests {
             &|_| Err::<u32, String>("gone".to_string()),
             |_| true,
             || anyhow::bail!("reconnect failed"),
+            |e| anyhow::anyhow!("{e}"),
         );
         let msg = format!("{:#}", out.unwrap_err());
         assert!(msg.contains("reconnect failed"), "got: {msg}");
+    }
+
+    // ── classify_daemon_ureq: 503 → typed EngineBusy, else opaque ──────────
+    #[test]
+    fn classify_daemon_ureq_maps_503_to_engine_busy() {
+        let err = classify_daemon_ureq(ureq::Error::StatusCode(503));
+        assert!(
+            onebrain_search::error::is_engine_busy(&err),
+            "a daemon 503 (engine-less) must classify as EngineBusy, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn classify_daemon_ureq_leaves_other_status_opaque() {
+        let err = classify_daemon_ureq(ureq::Error::StatusCode(500));
+        assert!(
+            !onebrain_search::error::is_engine_busy(&err),
+            "a non-503 status must NOT be EngineBusy, got: {err:#}"
+        );
     }
 
     // ── classify_last_state + LastState::describe (timeout diagnostics) ────

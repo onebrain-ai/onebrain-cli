@@ -7,15 +7,15 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::Serialize;
 
 use crate::cli::SearchReindexArgs;
 use crate::commands::daemon_client::DaemonHandle;
 use crate::commands::search_common::{
     collection_cache_dir, collection_for, collection_name_readonly, index_size_bytes,
-    model_not_chosen, open_engine, read_reindex_progress, reconcile_missing_model,
-    reindex_progress_path, route_to_daemon,
+    map_daemon_error, model_not_chosen, open_engine, read_reindex_progress,
+    reconcile_missing_model, reindex_progress_path, route_to_daemon,
 };
 use crate::output::{emit, item, section, Envelope, OutputMode};
 use onebrain_search::engine::{ReindexProgress, ReindexStats};
@@ -427,7 +427,7 @@ fn run_reindex_via_daemon(
     };
     let resp = handle
         .reindex(daemon_mode, &paths)
-        .context("route `search reindex` through warm daemon")?;
+        .map_err(|e| map_daemon_error(e, "route `search reindex` through warm daemon"))?;
 
     let embed_model = resp
         .get("embed_model")

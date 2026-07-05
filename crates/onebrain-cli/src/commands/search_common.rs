@@ -144,6 +144,25 @@ pub(crate) fn map_engine_open_error(err: anyhow::Error, cache_dir: &Path) -> any
     err.context(format!("opening search engine at {}", cache_dir.display()))
 }
 
+/// Turn a warm-daemon request failure into the right typed CLI error — the
+/// daemon-path analogue of [`map_engine_open_error`]. When the daemon 503s
+/// because it holds no engine (another process owns the redb lock), the client
+/// classifies the error as `onebrain_search`'s `EngineBusy`; convert it to the
+/// same `CoreError::EngineBusy` (E_ENGINE_BUSY / exit 77) the direct path uses,
+/// so `query` / `get` / `reindex` report contention identically whether they
+/// went direct or through the daemon. Any other daemon error keeps its verb
+/// context (an opaque `E_INTERNAL`).
+pub(crate) fn map_daemon_error(err: anyhow::Error, ctx: &'static str) -> anyhow::Error {
+    if onebrain_search::error::is_engine_busy(&err) {
+        return anyhow::Error::new(onebrain_core::CoreError::EngineBusy(
+            "the search index is held by another process (e.g. an `onebrain mcp` \
+             server, possibly from before an upgrade) — retry once it releases the engine"
+                .to_string(),
+        ));
+    }
+    err.context(ctx)
+}
+
 /// Persist `search.collection = collection` into the vault's config file
 /// (`onebrain.yml`, or legacy `vault.yml` if that's what's present),
 /// preserving every other key. Thin wrapper over the shared

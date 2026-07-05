@@ -17,9 +17,9 @@ use serde::Serialize;
 use crate::cli::SearchQueryArgs;
 #[cfg(feature = "semantic")]
 use crate::commands::daemon_client::DaemonHandle;
-#[cfg(feature = "semantic")]
-use crate::commands::search_common::route_to_daemon;
 use crate::commands::search_common::{collection_cache_dir, open_engine, resolve_collection};
+#[cfg(feature = "semantic")]
+use crate::commands::search_common::{map_daemon_error, route_to_daemon};
 use crate::output::{emit, Envelope, OutputMode};
 use onebrain_search::engine::Hit;
 use onebrain_search::lex::LexIndex;
@@ -244,7 +244,7 @@ fn run_query_via_daemon(
     let vault_info = crate::vault_ctx::info_from(resolved);
     let resp = handle
         .search(&args.text, daemon_mode)
-        .context("route search through warm daemon")?;
+        .map_err(|e| map_daemon_error(e, "route search through warm daemon"))?;
 
     let mut hits = daemon_hits(&resp);
     if let Some(min) = args.min_score {
