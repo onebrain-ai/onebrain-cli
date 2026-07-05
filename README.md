@@ -123,7 +123,7 @@ Interactive commands print human-readable text; every command also speaks struct
 
 ### ⚡ Phase 2 · Speed & skills (v3.7–v3.8)
 - [ ] **v3.7** — **Bootstrap + native verbs + skill optimization**: startup / wrapup / daily / tasks → 1 call per ceremony; native settings-merge + vault migrations in `plugin update`; skill-body optimization pass (import content-verbs anchored ~v3.7.x).
-- [ ] **v3.8** *(may not ship)* — **เก็บตก / remaining cleanup**: full daemon refactor of surfaces beyond mcp + search + daily-brief precompute — only if not already absorbed by v3.4 + v3.7.
+- [ ] **v3.8** *(may not ship)* — **remaining cleanup**: full daemon refactor of surfaces beyond mcp + search + daily-brief precompute — only if not already absorbed by v3.4 + v3.7.
 
 ### 📦 Phase 3 · bundles (v3.9–v3.12)
 - [ ] Bundle CLI (`onebrain bundle install/list/info/lint/…`) · four first-party bundles (`dashboard` · `synthesis` · `research` · `scheduler`) · core skills slimmed 32 → 18 · `onebrain.run/bundles` portal.
