@@ -96,6 +96,10 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
         host,
         port,
         token: token.clone(),
+        // Foreground `serve` is short-lived and not the canonical engine owner,
+        // so it opens the search engine per-request as before rather than
+        // holding it. Only the daemon (`daemon __run`) sets `hold_engine`.
+        hold_engine: false,
     };
 
     // Jupyter-style URL — the token rides in the query string so a copy-paste

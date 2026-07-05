@@ -10,7 +10,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
-## [3.4.6] — honest search-engine lock contention
+## [3.4.6] — warm daemon + honest search-engine lock contention
+
+### Added
+- **Warm daemon owns the native-search engine.** `daemon __run` now opens the search engine ONCE at boot and holds it for the process lifetime (the sole redb owner), so mcp + CLI search can be clients instead of each opening their own engine and racing redb's single-writer lock. New token-gated `POST /api/internal/reindex` (`pending`/`paths`) + `GET /api/internal/status` endpoints; `GET /api/vault/search` reuses the held engine. Adds a `~/.onebrain/run/daemon.json` discovery file (`port`/`token`/`pid`/`version`), a cross-platform `O_EXCL` concurrent-start guard, an idle-shutdown TTL (`$ONEBRAIN_DAEMON_IDLE_SECS`, default 30 min), and a reusable client library (`daemon_client`) with discovery, auto-start, and version-skew restart. `serve` is unchanged (still per-request). See [ADR 0023](docs/decisions/0023-warm-daemon-mcp-search.md) and [docs/daemon.md](docs/daemon.md). (#164)
 
 ### Fixed
 - redb is single-process: while the long-lived `onebrain mcp` server holds the search index open, other commands that opened the engine misreported instead of surfacing the busy state. Lock contention is now honest and uniform.

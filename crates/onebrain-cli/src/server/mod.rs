@@ -12,10 +12,19 @@
 //!    `std::fs` file read). No vault logic is re-implemented here.
 //!
 //! ## Shared by `serve` and `daemon __run`
-//! Both entry points build a [`ServeConfig`] and call [`run_server`]. The only
-//! difference is the *shutdown signal*:
-//! - `onebrain serve` (foreground) → Ctrl-C (`tokio::signal::ctrl_c`).
-//! - `daemon __run` (detached) → SIGTERM (`tokio::signal::unix`).
+//! Both entry points build a [`ServeConfig`] and serve the same router. They
+//! differ in three ways:
+//! - **Shutdown signal** — `onebrain serve` (foreground) → Ctrl-C
+//!   (`tokio::signal::ctrl_c`); `daemon __run` (detached) → SIGTERM (or the
+//!   daemon's idle-timeout).
+//! - **Engine ownership** — the daemon sets `hold_engine` so the search
+//!   [`Engine`](onebrain_search::engine::Engine) is opened ONCE and held on
+//!   [`AppState::search_engine`] for the process lifetime (the sole redb owner;
+//!   `serve` opens per-request). This also lights up the token-gated
+//!   `/api/internal/*` reindex + status routes.
+//! - **Entry point** — `serve` calls [`run_server`]; the daemon uses
+//!   [`build_router_with_state`] + [`run_server_from_router`] so it can read
+//!   `last_activity` for idle-shutdown and publish `daemon.json` on bind.
 //!
 //! Factoring the router into [`build_router`] (which never touches a socket)
 //! keeps every handler unit-testable via `tower::ServiceExt::oneshot`.
@@ -36,6 +45,7 @@ mod api;
 mod auth;
 mod chat;
 mod headers;
+mod internal;
 mod search;
 mod r#static;
 mod token;
@@ -79,6 +89,14 @@ pub struct ServeConfig {
     pub port: u16,
     /// Per-session random auth token, required on every `/api/*` call.
     pub token: String,
+    /// When `true`, open the search [`Engine`] ONCE at router-build time and
+    /// hold it for the process lifetime (the warm-daemon model — see
+    /// [`SharedEngine`]). The daemon sets this so it is the sole redb owner and
+    /// mcp/CLI clients route search + reindex through `/api/vault/search` /
+    /// `/api/internal/*`. `serve` leaves it `false` (opens per-request as
+    /// before), since a foreground `serve` is short-lived and not the canonical
+    /// engine owner.
+    pub hold_engine: bool,
 }
 
 impl ServeConfig {
@@ -97,6 +115,7 @@ impl ServeConfig {
             host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port,
             token,
+            hold_engine: false,
         }
     }
 
@@ -106,10 +125,27 @@ impl ServeConfig {
     }
 }
 
+/// The one search [`Engine`] a warm daemon opens at boot and holds for its
+/// whole lifetime. redb (the engine's KV store) is single-process /
+/// single-writer, so exactly ONE process may open a given collection's engine
+/// at a time — the daemon is that process, and mcp + CLI search become HTTP
+/// clients of it (`/api/vault/search`, `/api/internal/*`).
+///
+/// A blocking [`std::sync::Mutex`] (not tokio's) because every use is inside a
+/// `spawn_blocking` closure: the engine's search/reindex calls are synchronous
+/// (tantivy + redb + embedding), so they must never run on an async worker.
+/// Reads and reindex writes all serialise on this one lock; a reindex holds it
+/// only for its (small-batch) duration so interleaved searches make progress
+/// between batches.
+pub type SharedEngine = Arc<std::sync::Mutex<onebrain_search::engine::Engine>>;
+
 /// Shared, immutable state handed to every handler via axum's `State`
 /// extractor. Wrapped in an `Arc` by the router so cloning per-request is a
 /// refcount bump, not a deep copy of the (potentially long) vault path.
-#[derive(Debug)]
+///
+/// `Debug` is hand-written (not derived) because [`SharedEngine`]'s `Engine`
+/// isn't `Debug` — and its contents (an index handle, a lazy embedder) aren't
+/// meaningfully printable anyway; the field renders as a presence flag.
 pub struct AppState {
     /// The vault the JSON API reads from, or `None` when no real vault is bound.
     ///
@@ -122,6 +158,21 @@ pub struct AppState {
     pub vault_root: Option<PathBuf>,
     pub token: String,
     pub dist_dir: Option<PathBuf>,
+    /// The persistent search engine, opened ONCE at daemon boot and held for
+    /// the process lifetime (see [`SharedEngine`]). `None` when no engine is
+    /// held — the foreground `serve` command and the unit-test router leave
+    /// this `None`, so `/api/vault/search` opens the engine per-request as
+    /// before, and `/api/internal/*` report 503. The daemon (`daemon __run`)
+    /// supplies `Some` so it is the sole redb owner and mcp/CLI clients route
+    /// through it.
+    pub search_engine: Option<SharedEngine>,
+    /// Monotonic-ish "last request seen" marker: epoch-seconds of the most
+    /// recent authenticated request, bumped by the auth middleware on every
+    /// request that reaches the surface. The daemon's idle-shutdown loop reads
+    /// it to decide when the process has been idle long enough to exit and
+    /// release the redb lock. `serve` and the tests ignore it (they never poll
+    /// for idle-shutdown), so it's harmless overhead there.
+    pub last_activity: Arc<std::sync::atomic::AtomicU64>,
     /// Caps how many `POST /api/chat` agent turns may run at once. Each chat
     /// turn spawns a full `claude` agent (loads MEMORY/plugins, burns API
     /// tokens), so an unbounded fan-out is a denial-of-wallet vector even behind
@@ -130,10 +181,30 @@ pub struct AppState {
     pub chat_limit: Arc<tokio::sync::Semaphore>,
 }
 
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("vault_root", &self.vault_root)
+            // Token elided — never print the auth credential, even in Debug.
+            .field("dist_dir", &self.dist_dir)
+            .field("search_engine_held", &self.search_engine.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Max concurrent `POST /api/chat` agent turns. Small: this is a single-tenant
 /// local assistant, not a fleet — a couple in flight is plenty and bounds the
 /// parallel API-token burn.
 pub const MAX_CONCURRENT_CHATS: usize = 2;
+
+/// Current wall-clock time as epoch seconds (0 before the epoch — never in
+/// practice). Used to seed + bump [`AppState::last_activity`] for idle-shutdown.
+pub(crate) fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Build the axum [`Router`] for a given config WITHOUT binding a socket.
 ///
@@ -152,24 +223,47 @@ pub const MAX_CONCURRENT_CHATS: usize = 2;
 ///          (401 without a header / ?token= / onebrain_token cookie)
 /// ```
 pub fn build_router(cfg: ServeConfig) -> Router {
+    build_router_with_state(cfg).0
+}
+
+/// [`build_router`] but also returns the shared [`AppState`], so the daemon can
+/// read `last_activity` for its idle-shutdown loop. The router already holds an
+/// `Arc` clone of the same state, so the two stay in sync.
+pub fn build_router_with_state(cfg: ServeConfig) -> (Router, Arc<AppState>) {
+    // Warm-daemon path: open the engine ONCE now and hold it for the process
+    // lifetime. Only when `hold_engine` is set AND a vault is bound — a failure
+    // to open (never-indexed vault, model resolution error) leaves the held
+    // engine `None`, so search transparently falls back to the per-request open
+    // and `/api/internal/*` report 503 until the index exists. `serve` and the
+    // unit-test router leave `hold_engine` false, so this is skipped entirely.
+    let search_engine = if cfg.hold_engine {
+        cfg.vault_root
+            .as_deref()
+            .and_then(internal::open_held_engine)
+    } else {
+        None
+    };
+
     let state = Arc::new(AppState {
         vault_root: cfg.vault_root,
         token: cfg.token,
         dist_dir: cfg.dist_dir,
+        search_engine,
+        last_activity: Arc::new(std::sync::atomic::AtomicU64::new(now_epoch_secs())),
         chat_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CHATS)),
     });
 
     // The API sub-router stays a `Router<Arc<AppState>>` (no own `.with_state`);
     // the single `.with_state(state)` at the bottom supplies state to the whole
     // tree — nested API routes AND the static fallback — exactly once.
-    let api = api::router();
+    let api = api::router().merge(internal::router());
 
     // DoS hardening note (fix L, deferred): a `tower_http::timeout::TimeoutLayer`
     // here would cap slow/stuck requests cheaply. It needs tower-http's `timeout`
     // feature, which this crate does NOT enable (only `fs` is on), and turning it
     // on is a Cargo.toml change out of scope for this src-only pass. Add the
     // feature + the 30s `TimeoutLayer` in a follow-up.
-    Router::new()
+    let router = Router::new()
         .nest("/api", api)
         // Static + SPA fallback handles every non-`/api` path. `fallback`
         // (not a route) so it only fires when no API route matched.
@@ -186,7 +280,8 @@ pub fn build_router(cfg: ServeConfig) -> Router {
         // Outermost: stamp security headers on EVERY response, including the auth
         // layer's 401s. (Applied after auth so it wraps it.)
         .layer(axum::middleware::from_fn(headers::security_headers))
-        .with_state(state)
+        .with_state(state.clone());
+    (router, state)
 }
 
 /// Bind `cfg.host:cfg.port` and serve until `shutdown` resolves.
@@ -206,11 +301,36 @@ pub async fn run_server(
     cfg: ServeConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    run_server_with(cfg, shutdown, |_| {}).await
+}
+
+/// [`run_server`] plus an `on_bind` callback fired with the ACTUAL bound
+/// [`SocketAddr`] once the listener is up (before serving). The daemon uses it
+/// to publish its discovery file (`~/.onebrain/run/daemon.json`) with the real
+/// port — which matters when it binds port `0` (OS-assigned) so a client can
+/// still find it. `serve` and the tests use the no-op [`run_server`].
+pub async fn run_server_with(
+    cfg: ServeConfig,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    on_bind: impl FnOnce(SocketAddr),
+) -> anyhow::Result<()> {
     let addr = cfg.socket_addr();
-    let dist = cfg.dist_dir.clone();
-
     let router = build_router(cfg);
+    run_server_from_router(router, addr, on_bind, shutdown).await
+}
 
+/// Bind `addr`, serve `router` until `shutdown` resolves, and fire `on_bind`
+/// with the real bound address in between. The lowest-level entry point: the
+/// daemon uses it directly so it can pre-build the router (via
+/// [`build_router_with_state`]) and keep a handle on the shared state for its
+/// idle-shutdown loop. [`run_server`] / [`run_server_with`] are thin wrappers
+/// that build the router from a [`ServeConfig`] first.
+pub async fn run_server_from_router(
+    router: Router,
+    addr: SocketAddr,
+    on_bind: impl FnOnce(SocketAddr),
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     // Bind first so a port-in-use error surfaces here (with context) rather
     // than deep inside `axum::serve`.
     let listener = tokio::net::TcpListener::bind(addr)
@@ -221,11 +341,10 @@ pub async fn run_server(
     // Log the bound address WITHOUT the token (see the doc comment above): the
     // address tells an operator where to point a browser; the token must not
     // land in the persistent log.
-    tracing::info!(
-        addr = %bound,
-        dist = ?dist,
-        "OneBrain HTTP surface listening"
-    );
+    tracing::info!(addr = %bound, "OneBrain HTTP surface listening");
+
+    // Publish discovery (real bound port) now that we know the actual address.
+    on_bind(bound);
 
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown)

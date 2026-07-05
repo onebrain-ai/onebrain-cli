@@ -41,6 +41,7 @@ the exclusion is an explicit decision, not a silent skip.
 | `crates/onebrain-cli/src/main.rs` | Process bootstrap, panic-hook install, `std::process::exit` |
 | `crates/onebrain-cli/src/commands/serve.rs` | Foreground blocking HTTP listener — never returns in a test |
 | `crates/onebrain-cli/src/commands/daemon.rs` | Process fork/detach + PID files |
+| `crates/onebrain-cli/src/commands/daemon_client.rs` | Daemon HTTP client — spawns `daemon start`, network calls to a live daemon. Pure logic (`DaemonInfo` read/write/remove, `version_decision`, `urlencode`) IS unit-tested in-file; the spawn/network shell is untestable without a real daemon, so the whole file is excluded per the "most of it is untestable" rule |
 | `crates/onebrain-cli/src/commands/update.rs` | GitHub releases API + binary self-replace (network) |
 | `crates/onebrain-cli/src/commands/harness_run.rs` | Spawns `claude` / `gemini` |
 | `crates/onebrain-cli/src/commands/search_query.rs` | Embedding-backed query verb — opens the real engine (model download); non-embedding paths tested, embed path validated by gated tests |

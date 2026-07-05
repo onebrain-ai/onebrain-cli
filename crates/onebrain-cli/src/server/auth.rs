@@ -78,6 +78,13 @@ pub async fn require_token(
     let secure = forwarded_https(&request);
     match outcome {
         AuthOutcome::Ok { set_cookie } => {
+            // Record activity for the daemon's idle-shutdown loop: any
+            // authenticated request keeps the daemon alive. `Relaxed` is fine —
+            // the loop only needs an approximate "seconds since last request".
+            state.last_activity.store(
+                super::now_epoch_secs(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let mut resp = next.run(request).await;
             if set_cookie {
                 // HttpOnly: JS never needs to read it (the SPA reads the token
