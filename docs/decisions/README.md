@@ -48,5 +48,7 @@ ADRs are immutable once accepted — if a decision changes, write a new ADR that
 | [0018](0018-release-build-strategy-lessons.md) | Release build strategy: win-arm64 cross-compile + pre-tag matrix rule | accepted |
 | [0019](0019-native-mcp-server-staged-qmd-cutover.md) | Native MCP server (`onebrain mcp`) + staged qmd cutover | accepted |
 | [0020](0020-cpu-only-embedding-runtime.md) | CPU-only embedding runtime, by packaging choice | accepted |
+| [0021](0021-search-state-persistent-data-dir.md) | Native-search state moves to the persistent data dir | accepted |
+| [0022](0022-honest-search-lock-errors.md) | Honest search lock & status errors (`E_ENGINE_BUSY`, exit 77) | accepted |
 
 > These ADRs distill the public-facing rationale; the full design notes live in the project tracker. Numbers are stable IDs assigned at authoring time — see each ADR's **Date** for chronology.

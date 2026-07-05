@@ -434,6 +434,15 @@ impl LexIndex {
         // Cheap relative to the query itself (same reader, same top_docs), and
         // keeps `search`'s hot-path signature `(chunk_id, score)` untouched for
         // its many callers (hybrid fuse, mcp, webui).
+        //
+        // TODO(v3.4.x): this issues a redundant per-hit `TermQuery` +
+        // `order_by_score` to re-fetch each doc, even though `search()` already
+        // retrieved the doc address whose STORED `heading_path` we want. Fold
+        // heading (and eventually a STORED-body snippet) into a single pass by
+        // having `search()` return the doc addresses — folded into the
+        // deferred-snippet follow-up (body-STORED schema change + reindex
+        // migration), so it lands with that work rather than as a separate
+        // refactor now.
         let reader = self.index.reader()?;
         let searcher = reader.searcher();
         let mut by_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();

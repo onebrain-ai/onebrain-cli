@@ -14,7 +14,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 - redb is single-process: while the long-lived `onebrain mcp` server holds the search index open, other commands that opened the engine misreported instead of surfacing the busy state. Lock contention is now honest and uniform.
-- `search status` under a held lock reports `busy: true`, `doc_count: null` (unknown, not a healthy `0`) + a `W_ENGINE_BUSY` warning and text "⚠️ engine busy (indexed by another process)" — never "✅ up to date"; still exit 0 (a valid report).
+- `search status` never shows "✅ up to date" over an unknown index: a held lock reports `busy: true` + `W_ENGINE_BUSY`, and a broken/unreadable index (status-read failure or a non-lock open failure) reports `status_error` + `W_STATUS_UNREADABLE` — both with `doc_count: null` (unknown, not a healthy `0`) and exit 0 (a valid report). The underlying error is logged to stderr, never swallowed.
 - User-facing verbs (`query` / `vsearch` / `get` / full `reindex`) now emit an `E_ENGINE_BUSY` error envelope and exit **77** (dedicated transient-failure code) instead of a generic `E_INTERNAL` / exit 1.
 - Hook paths (`search reindex --lex-only` / `--pending-only`) skip with `reason: "engine-busy"` and stay exit 0, so a locked index never breaks the Claude Code hook chain.
 - The lock is classified from redb's typed `DatabaseAlreadyOpen` kind (with a defensive string fallback), surfaced as `onebrain_search::error::EngineBusy` + `CoreError::EngineBusy`.

@@ -82,6 +82,15 @@ pub(crate) struct SearchStatusData {
     /// rides the envelope. See v3.4.6 (bug B): never report "up to date" while
     /// busy.
     busy: bool,
+    /// Present when the engine opened but its status could NOT be read, or the
+    /// engine failed to open for a NON-lock reason (corrupt redb, IO error,
+    /// permission denied, missing model dir). Distinct from `busy` (a lock held
+    /// by a live process): here the index is broken/unreadable, so counts are
+    /// `null`/unknown and status text shows "⚠️ status read failed" — NEVER
+    /// "✅ up to date" (v3.4.6 round-2: don't resurrect bug B over a broken
+    /// index). Rides a `W_STATUS_UNREADABLE` warning on the envelope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status_error: Option<String>,
     /// `false` in a lex-only build (no `semantic` feature): no ONNX runtime,
     /// so embedding-backed verbs (`vsearch`, hybrid `query`, `model set`) are
     /// unavailable and `reindex` indexes keyword-only. See ADR 0017.
@@ -96,14 +105,26 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
 
     // Bug B (v3.4.6): a busy index is a valid report (exit 0), but must ride a
     // warning so machine consumers see the contention explicitly rather than
-    // inferring it from the null counts.
+    // inferring it from the null counts. Round-2: an unreadable/broken index
+    // (open/status failure that ISN'T a live lock) rides its own
+    // `W_STATUS_UNREADABLE` warning so it, too, can't be mistaken for a healthy
+    // empty index. Both keep exit 0 — `status` is a report, not a failure.
     let busy = data.busy;
+    let status_error = data.status_error.clone();
     let mut envelope = Envelope::ok("search.status", Some(vault_info), data);
     if busy {
         envelope = envelope.with_warning(
             "W_ENGINE_BUSY",
             "search index is locked by another process (e.g. the `onebrain mcp` server) — \
              doc/pending counts are unknown until it releases the lock",
+        );
+    } else if let Some(msg) = status_error {
+        envelope = envelope.with_warning(
+            "W_STATUS_UNREADABLE",
+            format!(
+                "search index status could not be read (index broken/unreadable) — \
+                 doc/pending counts are unknown: {msg}"
+            ),
         );
     }
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
@@ -164,24 +185,44 @@ pub(crate) fn status_data(
     // Honesty contract (v3.4.6, bug B): when the engine is LOCKED by another
     // process (redb single-process lock — the `onebrain mcp` server), report
     // the counts as UNKNOWN (`None`) + `busy: true`, NOT as a healthy `0` that
-    // would render "✅ up to date". Any other open/status failure also degrades
-    // to unknown counts (`None`), but without the busy flag.
+    // would render "✅ up to date".
+    //
+    // Round-2 fix: a NON-lock open failure (permission denied, corrupt redb
+    // header, missing model dir) OR a `status()` read failure (corrupt redb /
+    // IO / partial write) must ALSO refuse the up-to-date branch. Both degrade
+    // to a distinct `Error` outcome (unknown counts + a `W_STATUS_UNREADABLE`
+    // warning), NOT the silent `busy:false` path that used to resurrect bug B
+    // by rendering "✅ up to date" over a broken index. The underlying error is
+    // logged to stderr (mirrors the hook path in search_reindex.rs) so it's
+    // never swallowed.
     let probe = match cache_dir.as_deref() {
         Some(dir) => match Engine::open(dir, &config.search.embed_model) {
             Ok(mut engine) => {
                 engine.set_exclude_patterns(config.search.exclude.clone());
                 match engine.status(resolved.root.as_path()) {
                     Ok(s) => StatusProbe::Ok(s),
-                    Err(_) => StatusProbe::Unknown { busy: false },
+                    Err(e) => {
+                        eprintln!("search status: {e:#}");
+                        StatusProbe::Error {
+                            message: short_error(&e),
+                        }
+                    }
                 }
             }
-            Err(e) => StatusProbe::Unknown {
-                busy: onebrain_search::error::is_engine_busy(&e),
-            },
+            Err(e) if onebrain_search::error::is_engine_busy(&e) => {
+                StatusProbe::Unknown { busy: true }
+            }
+            Err(e) => {
+                eprintln!("search status: {e:#}");
+                StatusProbe::Error {
+                    message: short_error(&e),
+                }
+            }
         },
         None => StatusProbe::Unknown { busy: false },
     };
 
+    let mut status_error: Option<String> = None;
     let (last_indexed_at, doc_count, pending_new, pending_changed, pending_removed, busy) =
         match probe {
             StatusProbe::Ok(s) => (
@@ -193,6 +234,10 @@ pub(crate) fn status_data(
                 false,
             ),
             StatusProbe::Unknown { busy } => (None, None, None, None, None, busy),
+            StatusProbe::Error { message } => {
+                status_error = Some(message);
+                (None, None, None, None, None, false)
+            }
         };
 
     let current_model_missing =
@@ -216,16 +261,35 @@ pub(crate) fn status_data(
         cache_size_bytes,
         reindexing,
         busy,
+        status_error,
         semantic_available: cfg!(feature = "semantic"),
     })
 }
 
-/// Outcome of the read-only index-status probe in [`status_data`]. Separates
-/// a real status read from an "unknown" outcome (engine open/status failed),
-/// carrying whether the failure was specifically redb lock contention.
+/// Outcome of the read-only index-status probe in [`status_data`]. Separates a
+/// real status read from the two failure shapes: `Unknown { busy }` is the
+/// honest lock-contention case (the index is fine, just held by a live
+/// process), while `Error` is a broken/unreadable index — a `status()` read
+/// failure or a NON-lock open failure. Both suppress the "up to date" branch,
+/// but only `Error` carries a message + `W_STATUS_UNREADABLE` warning.
 enum StatusProbe {
     Ok(onebrain_search::engine::IndexStatus),
     Unknown { busy: bool },
+    Error { message: String },
+}
+
+/// One-line, size-bounded rendering of an error's full `anyhow` chain, for the
+/// status text line and the `W_STATUS_UNREADABLE` warning. The complete chain
+/// still goes to stderr via `eprintln!("search status: {e:#}")`.
+fn short_error(err: &anyhow::Error) -> String {
+    const MAX: usize = 160;
+    let full = format!("{err:#}").replace('\n', " ");
+    if full.chars().count() > MAX {
+        let truncated: String = full.chars().take(MAX).collect();
+        format!("{truncated}…")
+    } else {
+        full
+    }
 }
 
 /// Build status data for an already-open engine (used by the MCP `status`
@@ -282,6 +346,9 @@ pub(crate) fn status_data_for(
         // The caller already holds a live engine handle, so by construction
         // the index is NOT locked out — this path is never "busy".
         busy: false,
+        // A live engine that already answered `status()` above is readable by
+        // construction — never the unreadable-index case.
+        status_error: None,
         semantic_available: cfg!(feature = "semantic"),
     })
 }
@@ -379,9 +446,14 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
         ));
     }
     // Bug B (v3.4.6): a locked index NEVER reports "✅ up to date" — the counts
-    // are unknown, so say so. This branch wins over the pending/up-to-date
-    // rendering below.
-    if d.busy {
+    // are unknown, so say so. These failure branches win over the
+    // pending/up-to-date rendering below. Round-2: a broken/unreadable index
+    // (status read failed, or a non-lock open failure) gets the same honest
+    // treatment via `status_error`, so it can't slip into the up-to-date branch
+    // either.
+    if let Some(msg) = &d.status_error {
+        lines.push(item("Status", &format!("⚠️  status read failed ({msg})")));
+    } else if d.busy {
         lines.push(item(
             "Status",
             "⚠️  engine busy (indexed by another process)",
@@ -426,7 +498,16 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
     // reindex selects/downloads the model AND indexes). Suppressed while a
     // reindex is already running (the model is being fetched right now), and
     // while the engine is busy (the count is unknown, so don't guess).
-    if d.busy {
+    if d.status_error.is_some() {
+        // Broken/unreadable index: the honest recovery is a rebuild, not a
+        // retry (unlike the busy case, nothing will free up on its own).
+        lines.push(String::new());
+        lines.push(
+            "💡  Index status could not be read (index may be corrupt) — \
+             run `onebrain search reindex --force` to rebuild"
+                .to_string(),
+        );
+    } else if d.busy {
         lines.push(String::new());
         lines.push(
             "💡  Index is locked by another process (e.g. the `onebrain mcp` server) — \
@@ -473,6 +554,7 @@ mod tests {
                 pending_removed: Some(0),
                 reindexing: None,
                 busy: false,
+                status_error: None,
                 semantic_available: true,
             },
         )
@@ -646,6 +728,86 @@ mod tests {
         );
         assert!(v["pending_new"].is_null(), "{v}");
         assert_eq!(v["indexed"], false);
+    }
+
+    #[test]
+    fn text_status_error_never_up_to_date_and_surfaces_failure() {
+        // Round-2 (v3.4.6): a broken/unreadable index (open or status-read
+        // failure that ISN'T a live lock) must NEVER render "✅ up to date".
+        // With counts all `None` (unknown) and `busy: false`, the pre-fix code
+        // fell into the else-branch and printed "up to date" — the exact bug B
+        // regression. `status_error` now wins.
+        let mut e = env(Some("ob-1"), false);
+        {
+            let d = e.data.as_mut().unwrap();
+            d.busy = false;
+            d.doc_count = None;
+            d.pending_new = None;
+            d.pending_changed = None;
+            d.pending_removed = None;
+            d.status_error = Some("redb: invalid database header".to_string());
+        }
+        let s = render_text(&e);
+        assert!(
+            s.contains("⚠️  status read failed (redb: invalid database header)"),
+            "{s}"
+        );
+        assert!(
+            !s.contains("up to date"),
+            "an unreadable index must never read up to date: {s}"
+        );
+        assert!(s.contains("    Docs          unknown"), "{s}");
+        // The hint points at a rebuild, not the plain pending-changes reindex.
+        assert!(
+            s.contains("💡") && s.contains("index may be corrupt") && s.contains("--force"),
+            "{s}"
+        );
+        assert!(
+            !s.contains("index pending changes"),
+            "a status-read failure suppresses the plain pending hint: {s}"
+        );
+    }
+
+    #[test]
+    fn json_status_error_reports_null_counts_and_message() {
+        // Machine consumers must see null (not zero) counts + the error string,
+        // so a broken index can't be mistaken for a healthy empty one.
+        let mut e = env(Some("ob-1"), false);
+        {
+            let d = e.data.as_mut().unwrap();
+            d.doc_count = None;
+            d.pending_new = None;
+            d.pending_changed = None;
+            d.pending_removed = None;
+            d.status_error = Some("permission denied".to_string());
+        }
+        let v = serde_json::to_value(e.data.as_ref().unwrap()).unwrap();
+        assert_eq!(v["status_error"], "permission denied");
+        assert_eq!(v["busy"], false, "unreadable is not the same as busy: {v}");
+        assert!(v["doc_count"].is_null(), "{v}");
+        assert!(v["pending_new"].is_null(), "{v}");
+        assert_eq!(v["indexed"], false);
+    }
+
+    #[test]
+    fn json_omits_status_error_when_none() {
+        let v = serde_json::to_value(env(Some("ob-1"), true).data.as_ref().unwrap()).unwrap();
+        assert!(v.get("status_error").is_none());
+    }
+
+    #[test]
+    fn short_error_truncates_long_chains() {
+        let long = "x".repeat(500);
+        let s = short_error(&anyhow::anyhow!(long));
+        assert!(s.chars().count() <= 161, "len {}", s.chars().count());
+        assert!(s.ends_with('…'), "{s}");
+    }
+
+    #[test]
+    fn short_error_collapses_newlines() {
+        let s = short_error(&anyhow::anyhow!("line one\nline two"));
+        assert!(!s.contains('\n'), "{s}");
+        assert!(s.contains("line one line two"), "{s}");
     }
 
     #[test]
@@ -910,6 +1072,7 @@ mod tests {
             cache_size_bytes: None,
             reindexing: None,
             busy: false,
+            status_error: None,
             semantic_available: cfg!(feature = "semantic"),
         };
 

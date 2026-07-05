@@ -26,6 +26,12 @@ struct HitData {
     doc_path: String,
     heading_path: String,
     score: f64,
+    /// On the lex `search` verb an empty `snippet` means "not supported on this
+    /// verb yet" (deferred — the tantivy `body` field is indexed but NOT
+    /// STORED, so there's no text to slice a snippet from without a schema
+    /// change + reindex migration). It does NOT mean "no matching text". The
+    /// hybrid `query`/`vsearch` verbs DO populate it from redb-stored chunk
+    /// text. See v3.4.6 bug E.
     snippet: String,
 }
 
