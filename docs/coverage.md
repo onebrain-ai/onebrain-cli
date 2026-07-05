@@ -82,8 +82,11 @@ it is untestable.
 
 `crates/onebrain-cli/src/commands/daemon_client.rs`:
 - `ensure_running` poll-after-spawn loop, `spawn_daemon_start`, `stop_daemon` — spawn the real `onebrain` binary; the FAST path (`discover` succeeds) IS tested against a live server.
-- `discover` version-skew branch's `stop_daemon` call (spawns the binary) and `with_retry`'s live `ensure_running` reconnect closure (a real transport failure mid-call) — the `retry_once` policy itself is unit-tested with fakes.
+- `discover` version-skew AND vault-skew branches' `stop_daemon` call (spawns the binary) and `with_retry`'s live `ensure_running` reconnect closure (a real transport failure mid-call) — the `retry_once` policy, `version_decision`, and `vault_decision` are all unit-tested with fakes, and the vault-skew restart SIGNAL (wrong-vault record removed + `None`) is tested against a live server.
 - Error-context arms (`.context(...)` on `read`/`write`/`remove` I/O failures) + the test-only live-server helper's own error paths.
+
+`crates/onebrain-cli/src/commands/mcp.rs`:
+- `run()`'s backend-SELECTION arm on daemon-spawn failure (the `Err(daemon_err) => open_engine(...)` branch that constructs a `Direct` backend) — reaching it requires `ensure_running` to actually fail to spawn a real daemon in-process, which the test harness can't do without the binary. The fallback backend's BEHAVIOUR is fully tested (`direct_engine_fallback_answers_query_and_status`, `with_engine` on both backends); only the in-process selection-on-spawn-failure is residual OS shell.
 
 `crates/onebrain-cli/src/server/search.rs`:
 - `get_vault_search` async error/timeout arms (`spawn_blocking` `JoinError`, `run_search` `Err`, 30s timeout) — fire only on a panic/hang.

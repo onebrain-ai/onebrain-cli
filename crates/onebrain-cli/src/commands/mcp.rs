@@ -592,7 +592,6 @@ impl McpServer {
 
         let limit = params.limit.unwrap_or(10);
         let min_score = params.min_score.unwrap_or(0.0);
-        let fetch_k = limit.max(10) * 3;
         let has_lex = params
             .searches
             .iter()
@@ -612,6 +611,13 @@ impl McpServer {
             // over HTTP (`GET /api/vault/search`) — lex → `lex`, vec/hyde →
             // `hybrid`. The MCP server opens no engine, so N concurrent MCP
             // sessions all fan out to the one daemon with no redb contention.
+            //
+            // Behavioral deltas vs the Direct path (documented in docs/daemon.md
+            // + ADR 0023): the daemon returns DOC-LEVEL hits (dedup/fusion keys
+            // on `path`, so at most one hit per document), a `vec` sub-query is
+            // served as `hybrid` (lex mixed in) on the wire, and the daemon caps
+            // candidates at its own `TOP_K` (20) per sub-query — so `fetch_k`'s
+            // over-fetch (used by the Direct arm below) doesn't apply here.
             Backend::Daemon(handle) => {
                 let handle = handle.clone();
                 tokio::task::spawn_blocking(move || {
@@ -638,7 +644,11 @@ impl McpServer {
             }
             // Fallback path: run sub-queries against the locally-owned engine
             // (lex bypasses redb via a standalone LexIndex; vec/hyde use it).
+            // Over-fetches `fetch_k` (≥30) chunk-level candidates per sub-query
+            // so RRF has depth to fuse; this path can return multiple chunks of
+            // one doc, unlike the doc-level daemon path.
             Backend::Direct(_) => {
+                let fetch_k = limit.max(10) * 3;
                 let resolved = self.resolved.clone();
                 self.with_engine(move |eng| {
                     let mut ranked = Vec::with_capacity(params.searches.len());
@@ -806,26 +816,28 @@ pub fn run(vault_flag: Option<PathBuf>) -> Result<()> {
     // for `get`/`multi_get` filesystem reads.
     let resolved = crate::vault_ctx::require(vault_flag.clone())?;
 
-    // The daemon `ensure_running` may spawn resolves ITS vault from
-    // `$ONEBRAIN_VAULT` (its detached child chdir's to `/`, so walk-up is
-    // useless — see `daemon::resolve_daemon_vault`). Export the vault we just
-    // resolved so a daemon we auto-start holds the engine for the SAME vault —
-    // otherwise it would bind vault-less and `/api/internal/status` /
-    // `/api/vault/search` would 503/empty. In production the launcher already
-    // sets this; bridging it here makes `onebrain --vault <path> mcp` work too.
-    // Only set it when unset, so an explicit `$ONEBRAIN_VAULT` still wins.
-    if std::env::var_os("ONEBRAIN_VAULT").is_none() {
-        std::env::set_var("ONEBRAIN_VAULT", resolved.root.as_path());
-    }
+    // A daemon `ensure_running` spawns resolves ITS vault from `$ONEBRAIN_VAULT`
+    // (its detached child chdir's to `/`, so walk-up is useless — see
+    // `daemon::resolve_daemon_vault`). Export the vault we JUST resolved so a
+    // daemon we auto-start binds the SAME vault; otherwise it would bind
+    // vault-less (503/empty) or, worse, bind a stale `$ONEBRAIN_VAULT` that
+    // differs from our `--vault` and trigger an endless restart loop against the
+    // vault check below. `resolved` already honoured the canonical precedence
+    // (flag > env > cwd), so it is authoritative for THIS process — set it
+    // unconditionally so the spawned daemon can't disagree with what we resolved.
+    std::env::set_var("ONEBRAIN_VAULT", resolved.root.as_path());
 
     // Primary path: route through the warm daemon so the MCP server holds NO
     // redb lock and multiple concurrent MCP sessions coexist. `ensure_running`
-    // auto-starts the daemon (the sole engine owner) if it isn't up yet.
+    // auto-starts the daemon (the sole engine owner) if it isn't up yet, and —
+    // passed our resolved vault — RESTARTS a daemon bound to a DIFFERENT vault so
+    // `query`/`status` never silently route through the wrong vault's engine
+    // (one vault at a time per machine; switching vaults restarts the daemon).
     //
     // Fallback: if the daemon genuinely can't start (e.g. spawn failed), open
     // the engine directly so a lone session still works — today's behaviour.
     // This is the ONLY safe direct-open: as the sole owner there's no lock race.
-    let server = match daemon_client::ensure_running() {
+    let server = match daemon_client::ensure_running(Some(resolved.root.as_path())) {
         Ok(handle) => McpServer::with_daemon(handle, resolved),
         Err(daemon_err) => {
             tracing::warn!(
@@ -1250,7 +1262,7 @@ mod tests {
     #[cfg(test)]
     mod daemon_backed {
         use super::*;
-        use crate::commands::daemon_client::{DaemonHandle, DaemonInfo};
+        use crate::commands::daemon_client::{canonical_vault_id, DaemonHandle, DaemonInfo};
         use crate::commands::search_common::collection_cache_dir;
         use onebrain_search::chunk::Chunk;
         use onebrain_search::lex::LexIndex;
@@ -1353,6 +1365,10 @@ mod tests {
                     token: TOKEN.to_string(),
                     pid: std::process::id(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
+                    // Stamp the bound vault so a daemon-backed McpServer built
+                    // from this info reconnects to (and status/search-matches)
+                    // the SAME vault.
+                    vault: canonical_vault_id(vault),
                 },
                 stop,
                 join: Some(join),
@@ -1458,6 +1474,33 @@ mod tests {
             );
         }
 
+        // crit-6: a NON-2xx from the daemon on a lex sub-query must surface as
+        // an MCP ERROR from the `query` tool — NEVER a silent empty result set.
+        // We point the handle at the live server but with a WRONG token, so
+        // `/api/vault/search` returns 401 (a real answer from a live daemon,
+        // classified non-retryable → propagates through `with_retry`). The lex
+        // sub-query error is NOT degraded (no other lex to fall back to), so the
+        // tool errors. This pins the silent-failure guarantee end-to-end.
+        #[test]
+        fn query_errors_not_empty_on_daemon_non_2xx() {
+            let vault = tempdir().unwrap();
+            let cache = tempdir().unwrap();
+            let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+            seed_vault(vault.path());
+            let srv = start_live_server(vault.path());
+
+            // Same port/vault, but a token the server will reject → 401 on search.
+            let mut bad = srv.info.clone();
+            bad.token = "wrong-token-000000000000".to_string();
+            let server = McpServer::with_daemon(DaemonHandle::new(bad), resolved_for(vault.path()));
+
+            let res = block_on(server.query(lex_query()));
+            assert!(
+                res.is_err(),
+                "a daemon non-2xx on a lex sub-query must ERROR, not return an empty result set"
+            );
+        }
+
         // Guard: `with_engine` on a daemon-backed server must error, not panic
         // or silently succeed — the daemon path owns no local engine.
         #[test]
@@ -1472,6 +1515,7 @@ mod tests {
                 token: TOKEN.to_string(),
                 pid: std::process::id(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                vault: canonical_vault_id(vault.path()),
             });
             let server = McpServer::with_daemon(handle, resolved_for(vault.path()));
             let res = block_on(server.with_engine(|_eng| Ok(())));
