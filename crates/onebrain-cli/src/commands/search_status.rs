@@ -131,6 +131,16 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
     Ok(())
 }
 
+impl SearchStatusData {
+    /// Indexed doc count (`None` when unknown — engine busy/unreadable). Exposed
+    /// `pub(crate)` for the MCP track's tests, which assert the daemon-routed
+    /// `status` tool reports the same count as the direct-engine path.
+    #[cfg(test)]
+    pub(crate) fn doc_count(&self) -> Option<usize> {
+        self.doc_count
+    }
+}
+
 /// Build the `search status` payload for an already-resolved vault.
 ///
 /// `collection` is the effective collection name (already resolved by the
@@ -348,6 +358,74 @@ pub(crate) fn status_data_for(
         busy: false,
         // A live engine that already answered `status()` above is readable by
         // construction — never the unreadable-index case.
+        status_error: None,
+        semantic_available: cfg!(feature = "semantic"),
+    })
+}
+
+/// Counts a daemon's `GET /api/internal/status` reports about the held engine —
+/// the subset of [`SearchStatusData`] the daemon actually knows. The MCP
+/// `status` tool (when routed through the daemon) pairs these with the
+/// filesystem-derived fields (model/index sizes, cache dir, reindex progress)
+/// that the client reads locally, so the tool's response shape is identical to
+/// the direct-engine path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DaemonStatusCounts {
+    pub doc_count: usize,
+    pub pending_new: usize,
+    pub pending_changed: usize,
+    pub pending_removed: usize,
+    pub last_indexed: Option<u64>,
+}
+
+/// Build the `status` payload from daemon-reported engine counts plus local
+/// filesystem reads — the MCP `status` tool's DAEMON path.
+///
+/// Unlike [`status_data_for`] (which reads counts off a locally-held `Engine`),
+/// this never opens an engine: the daemon is the sole engine owner and already
+/// returned the counts over HTTP. The model/index/cache sizes are pure fs reads
+/// keyed off the same `collection_cache_dir`, so the response shape matches the
+/// direct-engine path byte-for-byte. `busy`/`status_error` are always
+/// `false`/`None`: a successful daemon status call means the engine was
+/// readable by construction (contention is resolved inside the daemon).
+pub(crate) fn status_data_from_daemon(
+    resolved: &ResolvedVault,
+    counts: DaemonStatusCounts,
+) -> Result<SearchStatusData> {
+    let collection = collection_for(resolved)?;
+    let config = load_vault_config(&resolved.root)?;
+
+    let dir = collection_cache_dir(&collection);
+    let (model_size_bytes, model_downloaded_at) =
+        match active_model_dir_stats(&dir, &config.search.embed_model) {
+            Some((size, mtime)) => (Some(size), mtime),
+            None => (None, None),
+        };
+    let index_size_bytes = index_size_bytes(&dir);
+    let reindexing = read_reindex_progress(&dir);
+    let cache_size_bytes = dir
+        .is_dir()
+        .then(|| onebrain_search::embed::dir_size_bytes(&dir));
+
+    let current_model_missing = cfg!(feature = "semantic") && model_size_bytes.is_none();
+
+    Ok(SearchStatusData {
+        collection: Some(collection),
+        embed_model: config.search.embed_model,
+        cache_dir: Some(dir),
+        indexed: counts.doc_count > 0,
+        current_model_missing,
+        model_size_bytes,
+        model_downloaded_at,
+        last_indexed_at: counts.last_indexed,
+        index_size_bytes,
+        doc_count: Some(counts.doc_count),
+        pending_new: Some(counts.pending_new),
+        pending_changed: Some(counts.pending_changed),
+        pending_removed: Some(counts.pending_removed),
+        cache_size_bytes,
+        reindexing,
+        busy: false,
         status_error: None,
         semantic_available: cfg!(feature = "semantic"),
     })

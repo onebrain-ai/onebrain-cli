@@ -12,7 +12,7 @@ onebrain daemon stop     # SIGTERM it, clean up its runtime files
 
 The search engine's metadata store (`engine.redb`) is **single-process**: only one process may open a collection's engine at a time. With multiple concurrent sessions (webui, CLI, agent-teams) each opening their own engine, they collide with redb's single-writer limit. The daemon opens the engine **once at boot** and holds it, so the other surfaces talk to it over HTTP instead of each opening their own. See [ADR 0023](decisions/0023-warm-daemon-mcp-search.md).
 
-> **Scope (v3.4.6):** the daemon owns the **search** engine and exposes reindex + status endpoints; the reusable client library ships alongside it. Wiring the CLI `search` verbs and the MCP server to *use* the daemon lands in follow-up tracks — until then those surfaces still open the engine directly. Consolidating the remaining surfaces (config/tree/file/chat) behind the daemon is later cleanup.
+> **Scope (v3.4.6):** the daemon owns the **search** engine and exposes reindex + status endpoints; the reusable client library ships alongside it. The **MCP server** (`onebrain mcp`) now *uses* the daemon: its `status`/`query` tools route through `daemon_client` (`GET /api/internal/status` + `GET /api/vault/search`) instead of opening their own engine, so multiple concurrent MCP sessions coexist without racing redb's lock — it falls back to a direct single-process engine open only when the daemon can't start. Wiring the CLI `search` verbs to the daemon lands in a follow-up track — until then those verbs still open the engine directly. Consolidating the remaining surfaces (config/tree/file/chat) behind the daemon is later cleanup.
 
 ## Persistent engine + internal endpoints
 

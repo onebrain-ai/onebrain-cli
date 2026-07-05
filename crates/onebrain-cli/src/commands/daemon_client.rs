@@ -286,7 +286,10 @@ const START_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl DaemonHandle {
-    fn new(info: DaemonInfo) -> Self {
+    /// Build a handle around a discovery record. `pub(crate)` so the mcp track's
+    /// tests can construct one pointing at a test-owned live server (the normal
+    /// callers go through `discover`/`ensure_running`).
+    pub(crate) fn new(info: DaemonInfo) -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(CLIENT_TIMEOUT))
             .build()

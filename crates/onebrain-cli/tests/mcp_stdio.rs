@@ -41,9 +41,18 @@ fn write(root: &Path, rel: &str, body: &str) {
 /// other integration tests' `onebrain()` helper, this one deliberately omits
 /// `--json` (irrelevant to `mcp`, which speaks JSON-RPC over stdio
 /// regardless) and pipes all three stdio streams for the caller to drive.
-fn onebrain_mcp(vault_root: &Path, cache_dir: &Path) -> Command {
+///
+/// `home` redirects `$HOME` / `%USERPROFILE%` to a tempdir so the warm-daemon
+/// discovery + run dir (`~/.onebrain/run/`) is fully isolated: the `mcp`
+/// server's `ensure_running()` spawns ITS OWN daemon over `vault_root` in the
+/// sandbox instead of discovering (and colliding with) a real daemon on the
+/// developer's machine. The spawned daemon inherits this env, so it publishes
+/// `daemon.json` under the sandbox HOME and holds the fixture vault's engine.
+fn onebrain_mcp(vault_root: &Path, cache_dir: &Path, home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_onebrain"));
     cmd.env("ONEBRAIN_CACHE_DIR", cache_dir)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
         .arg("--vault")
         .arg(vault_root)
         .arg("mcp")
@@ -51,6 +60,21 @@ fn onebrain_mcp(vault_root: &Path, cache_dir: &Path) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd
+}
+
+/// Best-effort `onebrain daemon stop` in the sandbox HOME, so a daemon the
+/// `mcp` server auto-started doesn't linger past the test (it would idle-exit
+/// on its own TTL, but stopping is tidy and frees the port immediately).
+fn stop_daemon(cache_dir: &Path, home: &Path) {
+    let _ = Command::new(env!("CARGO_BIN_EXE_onebrain"))
+        .env("ONEBRAIN_CACHE_DIR", cache_dir)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .args(["daemon", "stop"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Sends one JSON-RPC line (`value` + trailing `\n`) to the child's stdin.
@@ -138,9 +162,10 @@ fn recv_response(
 fn mcp_without_vault_exits_64_before_any_handshake() {
     let neutral = tempdir().unwrap(); // no onebrain.yml anywhere above
     let cache = tempdir().unwrap();
+    let home = tempdir().unwrap(); // isolate the daemon run dir
 
     let mut child = KillOnDrop(
-        onebrain_mcp(neutral.path(), cache.path())
+        onebrain_mcp(neutral.path(), cache.path(), home.path())
             .spawn()
             .expect("spawn onebrain mcp"),
     );
@@ -192,6 +217,7 @@ fn mcp_without_vault_exits_64_before_any_handshake() {
 fn stdio_jsonrpc_handshake_tools_list_and_status_then_clean_exit() {
     let vault = tempdir().unwrap();
     let cache = tempdir().unwrap();
+    let home = tempdir().unwrap(); // isolate the daemon run dir (~/.onebrain/run/)
     write(
         vault.path(),
         "onebrain.yml",
@@ -200,7 +226,7 @@ fn stdio_jsonrpc_handshake_tools_list_and_status_then_clean_exit() {
     write(vault.path(), "note.md", "# Hello\nsome vault content\n");
 
     let mut child = KillOnDrop(
-        onebrain_mcp(vault.path(), cache.path())
+        onebrain_mcp(vault.path(), cache.path(), home.path())
             .spawn()
             .expect("spawn onebrain mcp"),
     );
@@ -361,8 +387,13 @@ fn stdio_jsonrpc_handshake_tools_list_and_status_then_clean_exit() {
         if start.elapsed() > Duration::from_secs(30) {
             let _ = child.0.kill();
             let _ = child.0.wait();
+            stop_daemon(cache.path(), home.path());
             panic!("onebrain mcp did not exit within 30s of stdin close");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+
+    // The `mcp` server auto-started a daemon in the sandbox HOME; stop it so it
+    // doesn't linger past the test (it would idle-exit anyway, but this is tidy).
+    stop_daemon(cache.path(), home.path());
 }

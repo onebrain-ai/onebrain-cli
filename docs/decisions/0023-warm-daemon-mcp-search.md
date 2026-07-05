@@ -21,7 +21,7 @@ An existing HTTP surface already runs in-process: `onebrain serve` / `daemon __r
 
 **The warm daemon becomes the sole redb owner; mcp + CLI search become HTTP clients of it.** Transport is the **existing localhost Axum HTTP surface + the existing token auth** — no new IPC mechanism.
 
-Concretely, this PR (v3.4.6 Track 2a) builds the **daemon side + the reusable client library**; the mcp + CLI client wirings are separate tracks.
+Concretely, Track 2a built the **daemon side + the reusable client library**; the mcp + CLI client wirings are separate tracks. **Track 2b (this update) wired the MCP server in:** `commands/mcp.rs` now obtains a daemon via `ensure_running()` and routes its `status`/`query` tools through `DaemonHandle` (`/api/internal/status` + `/api/vault/search`) instead of opening its own engine — `get`/`multi_get` stay filesystem reads, and a direct single-process engine open is kept as the daemon-unavailable fallback. The CLI `search` verb wiring remains a follow-up track.
 
 1. **Persistent engine.** `daemon __run` opens the engine ONCE at boot and holds it in `Arc<Mutex<Engine>>` (`server::SharedEngine`) on `AppState.search_engine` for the process lifetime. `GET /api/vault/search` uses the held engine (hybrid) instead of opening per-request; lex stays on the standalone `LexIndex` (tantivy only — it never touches redb, so it can't clash). `serve` and the unit-test router leave the engine unheld (`hold_engine: false`) and keep the per-request behaviour, since a foreground `serve` is short-lived and not the canonical owner.
 

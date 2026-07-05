@@ -20,12 +20,34 @@ use onebrain_core::path::ResolvedVault;
 use onebrain_search::engine::{Engine, Hit};
 use onebrain_search::lex::LexIndex;
 
+use super::daemon_client::{self, DaemonHandle};
 use super::search_common::{collection_cache_dir, collection_for, open_engine};
-use super::search_status::{status_data_for, SearchStatusData};
+use super::search_status::{
+    status_data_for, status_data_from_daemon, DaemonStatusCounts, SearchStatusData,
+};
+
+/// How the MCP server reaches the search engine.
+///
+/// redb is single-process, so the engine must have exactly ONE owner. The
+/// primary path is [`Backend::Daemon`]: the warm daemon owns the engine and the
+/// MCP server routes `status`/`query` through it over HTTP, holding no engine
+/// itself — this is what lets multiple concurrent MCP sessions coexist without
+/// racing redb's single-writer lock. [`Backend::Direct`] is the fallback for a
+/// lone session where the daemon couldn't be started: the server opens the
+/// engine itself (today's behaviour), which still works precisely because it's
+/// the only owner in that case.
+#[derive(Clone)]
+enum Backend {
+    /// The daemon owns the engine; we talk to it over HTTP. No redb lock held.
+    Daemon(DaemonHandle),
+    /// No daemon available — this process opened the engine directly (the sole
+    /// owner). Holds the redb lock for its lifetime, so only viable solo.
+    Direct(Arc<Mutex<Engine>>),
+}
 
 #[derive(Clone)]
 pub struct McpServer {
-    engine: Arc<Mutex<Engine>>,
+    backend: Backend,
     resolved: ResolvedVault,
     tool_router: ToolRouter<Self>,
 }
@@ -239,7 +261,7 @@ pub struct QueryOut {
     pub note: Option<String>,
 }
 
-#[derive(serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
 pub struct QueryHit {
     pub docid: String, // chunk id
     pub file: String,  // vault-relative doc path
@@ -358,6 +380,100 @@ fn degrade_vec_error(has_lex: bool, result: anyhow::Result<Vec<Hit>>) -> anyhow:
     }
 }
 
+/// The daemon `mode` string for a typed sub-query. The daemon's
+/// `GET /api/vault/search` speaks only `lex` (BM25) or `hybrid` (lex + vector),
+/// so a `vec`/`hyde` sub-query maps to `hybrid` (which embeds the query and
+/// fuses with lex inside the daemon), and `lex` maps to `lex`.
+fn daemon_mode_for(t: &SubQueryType) -> &'static str {
+    match t {
+        SubQueryType::Lex => "lex",
+        SubQueryType::Vec | SubQueryType::Hyde => "hybrid",
+    }
+}
+
+/// Parse the daemon's `GET /api/vault/search` response body into `Hit`s — the
+/// WIRE CONTRACT between `server::search::SearchResponse`/`SearchHit` (producer)
+/// and this consumer. The daemon emits
+/// `{ "hits": [ { "path", "score", "title", "snippet" }, .. ], "mode": ".." }`.
+///
+/// The daemon's hits are DOC-level (no chunk id — that lives in the engine's
+/// redb, which the daemon owns and doesn't expose), so `chunk_id` is set to the
+/// `path`: client-side RRF fusion then dedupes by document path across
+/// sub-queries. `heading_path` carries the daemon's `title` when it's a real
+/// heading path; the file stem (`title == stem`) is dropped so `QueryHit::from`
+/// re-derives the stem itself and `context` stays `None` for stem-only titles,
+/// matching the direct-engine path where lex hits carry an empty heading.
+fn parse_daemon_search_hits(body: &serde_json::Value) -> anyhow::Result<Vec<Hit>> {
+    let hits = body
+        .get("hits")
+        .and_then(|h| h.as_array())
+        .ok_or_else(|| anyhow::anyhow!("daemon search response missing `hits` array"))?;
+    let mut out = Vec::with_capacity(hits.len());
+    for h in hits {
+        let path = h
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("daemon search hit missing `path`"))?
+            .to_string();
+        let score = h.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let title = h.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let snippet = h
+            .get("snippet")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        // The daemon sets `title` to the heading path when present, else the
+        // file stem. Only keep it as `heading_path` when it's NOT just the
+        // stem, so stem-only hits round-trip to an empty heading (context=None)
+        // exactly like the direct lex path.
+        let heading_path = if title.is_empty() || title == title_from_doc_path(&path) {
+            String::new()
+        } else {
+            title.to_string()
+        };
+        out.push(Hit {
+            chunk_id: path.clone(),
+            doc_path: path,
+            heading_path,
+            score,
+            snippet,
+        });
+    }
+    Ok(out)
+}
+
+/// Parse the daemon's `GET /api/internal/status` response body into
+/// [`DaemonStatusCounts`] — the WIRE CONTRACT between
+/// `server::internal::InternalStatusResponse` (producer) and this consumer. The
+/// daemon emits `{ "doc_count", "pending_new", "pending_changed",
+/// "pending_removed", "pending_total", "last_indexed", "indexed" }`. Only the
+/// engine-truth counts are consumed here; the client re-derives `indexed` /
+/// `pending_total` itself, and pairs these with local filesystem reads to build
+/// the full `SearchStatusData`.
+fn parse_daemon_status(body: &serde_json::Value) -> anyhow::Result<DaemonStatusCounts> {
+    let u = |key: &str| -> anyhow::Result<usize> {
+        body.get(key)
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .ok_or_else(|| anyhow::anyhow!("daemon status missing numeric `{key}`"))
+    };
+    Ok(DaemonStatusCounts {
+        doc_count: u("doc_count")?,
+        pending_new: u("pending_new")?,
+        pending_changed: u("pending_changed")?,
+        pending_removed: u("pending_removed")?,
+        // `last_indexed` is `null` when never indexed — absent/null → None,
+        // a number → Some. A non-numeric non-null value is a contract break.
+        last_indexed: match body.get("last_indexed") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(
+                v.as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("daemon status `last_indexed` not a number"))?,
+            ),
+        },
+    })
+}
+
 /// File stem of a vault-relative doc path, for `QueryHit::title`.
 fn title_from_doc_path(doc_path: &str) -> String {
     std::path::Path::new(doc_path)
@@ -381,21 +497,40 @@ impl From<Hit> for QueryHit {
 
 #[tool_router]
 impl McpServer {
-    pub fn new(engine: Engine, resolved: ResolvedVault) -> Self {
+    /// Construct a daemon-backed server: the daemon owns the engine, so this
+    /// process holds none and can coexist with other MCP/CLI clients.
+    fn with_daemon(handle: DaemonHandle, resolved: ResolvedVault) -> Self {
         Self {
-            engine: Arc::new(Mutex::new(engine)),
+            backend: Backend::Daemon(handle),
             resolved,
             tool_router: Self::tool_router(),
         }
     }
 
-    /// Runs a closure against the engine on a blocking thread.
+    /// Construct a direct-engine server (fallback): this process owns the engine
+    /// and holds the redb lock for its lifetime. Only safe as a lone owner.
+    fn with_direct_engine(engine: Engine, resolved: ResolvedVault) -> Self {
+        Self {
+            backend: Backend::Direct(Arc::new(Mutex::new(engine))),
+            resolved,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Runs a closure against the directly-owned engine on a blocking thread.
+    /// Only valid on the [`Backend::Direct`] fallback path — the daemon path
+    /// owns no engine and routes over HTTP instead.
     async fn with_engine<T, F>(&self, f: F) -> Result<T, ErrorData>
     where
         T: Send + 'static,
         F: FnOnce(&mut Engine) -> anyhow::Result<T> + Send + 'static,
     {
-        let engine = self.engine.clone();
+        let Backend::Direct(engine) = &self.backend else {
+            return Err(internal(
+                "with_engine called on a daemon-backed server (no local engine)",
+            ));
+        };
+        let engine = engine.clone();
         tokio::task::spawn_blocking(move || {
             // Recover the guard on poison (a prior closure panicked) instead of
             // erroring forever — matches the rest of the codebase
@@ -416,9 +551,28 @@ impl McpServer {
     )]
     async fn status(&self) -> Result<Json<SearchStatusData>, ErrorData> {
         let resolved = self.resolved.clone();
-        self.with_engine(move |eng| status_data_for(eng, &resolved))
-            .await
-            .map(Json)
+        match &self.backend {
+            // Daemon path: the daemon owns the engine and returns the live
+            // counts over HTTP; we pair them with local filesystem reads to
+            // build the identical `SearchStatusData` shape.
+            Backend::Daemon(handle) => {
+                let handle = handle.clone();
+                let data = tokio::task::spawn_blocking(move || {
+                    let body = handle.status()?;
+                    let counts = parse_daemon_status(&body)?;
+                    status_data_from_daemon(&resolved, counts)
+                })
+                .await
+                .map_err(internal)?
+                .map_err(internal)?;
+                Ok(Json(data))
+            }
+            // Fallback path: read status off the locally-owned engine.
+            Backend::Direct(_) => self
+                .with_engine(move |eng| status_data_for(eng, &resolved))
+                .await
+                .map(Json),
+        }
     }
 
     #[tool(
@@ -453,23 +607,56 @@ impl McpServer {
             }));
         }
 
-        let resolved = self.resolved.clone();
-        let ranked: Vec<(f64, Vec<Hit>)> = self
-            .with_engine(move |eng| {
-                let mut ranked = Vec::with_capacity(params.searches.len());
-                for (i, sub) in params.searches.into_iter().enumerate() {
-                    let weight = if i == 0 { 2.0 } else { 1.0 };
-                    let hits = match sub.r#type {
-                        SubQueryType::Lex => lex_subquery(&resolved, &sub.query, fetch_k)?,
-                        SubQueryType::Vec | SubQueryType::Hyde => {
-                            degrade_vec_error(has_lex, eng.vector_search(&sub.query, fetch_k))?
-                        }
-                    };
-                    ranked.push((weight, hits));
-                }
-                Ok(ranked)
-            })
-            .await?;
+        let ranked: Vec<(f64, Vec<Hit>)> = match &self.backend {
+            // Daemon path: route EACH sub-query through the daemon's held engine
+            // over HTTP (`GET /api/vault/search`) — lex → `lex`, vec/hyde →
+            // `hybrid`. The MCP server opens no engine, so N concurrent MCP
+            // sessions all fan out to the one daemon with no redb contention.
+            Backend::Daemon(handle) => {
+                let handle = handle.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut ranked = Vec::with_capacity(params.searches.len());
+                    for (i, sub) in params.searches.into_iter().enumerate() {
+                        let weight = if i == 0 { 2.0 } else { 1.0 };
+                        let mode = daemon_mode_for(&sub.r#type);
+                        // Mirror the direct path's degradation: a vec/hyde
+                        // sub-query error degrades to empty when a lex sub-query
+                        // can still answer; a lone vec/hyde error propagates.
+                        let hits = degrade_vec_error(
+                            has_lex && !matches!(sub.r#type, SubQueryType::Lex),
+                            handle
+                                .search(&sub.query, mode)
+                                .and_then(|body| parse_daemon_search_hits(&body)),
+                        )?;
+                        ranked.push((weight, hits));
+                    }
+                    Ok::<_, anyhow::Error>(ranked)
+                })
+                .await
+                .map_err(internal)?
+                .map_err(internal)?
+            }
+            // Fallback path: run sub-queries against the locally-owned engine
+            // (lex bypasses redb via a standalone LexIndex; vec/hyde use it).
+            Backend::Direct(_) => {
+                let resolved = self.resolved.clone();
+                self.with_engine(move |eng| {
+                    let mut ranked = Vec::with_capacity(params.searches.len());
+                    for (i, sub) in params.searches.into_iter().enumerate() {
+                        let weight = if i == 0 { 2.0 } else { 1.0 };
+                        let hits = match sub.r#type {
+                            SubQueryType::Lex => lex_subquery(&resolved, &sub.query, fetch_k)?,
+                            SubQueryType::Vec | SubQueryType::Hyde => {
+                                degrade_vec_error(has_lex, eng.vector_search(&sub.query, fetch_k))?
+                            }
+                        };
+                        ranked.push((weight, hits));
+                    }
+                    Ok(ranked)
+                })
+                .await?
+            }
+        };
 
         let fused = rrf_fuse(ranked);
         let results: Vec<QueryHit> = fused
@@ -612,13 +799,52 @@ impl ServerHandler for McpServer {
 }
 
 pub fn run(vault_flag: Option<PathBuf>) -> Result<()> {
-    let (engine, resolved) = open_engine(vault_flag)?;
+    // Resolve the vault FIRST — fail fast with the vault-not-found guard (exit
+    // 64) before touching the daemon, exactly as the pre-daemon `open_engine`
+    // first-statement did. This keeps `onebrain mcp` outside a vault a clean
+    // early exit (no daemon spawned) and gives both backends a resolved vault
+    // for `get`/`multi_get` filesystem reads.
+    let resolved = crate::vault_ctx::require(vault_flag.clone())?;
+
+    // The daemon `ensure_running` may spawn resolves ITS vault from
+    // `$ONEBRAIN_VAULT` (its detached child chdir's to `/`, so walk-up is
+    // useless — see `daemon::resolve_daemon_vault`). Export the vault we just
+    // resolved so a daemon we auto-start holds the engine for the SAME vault —
+    // otherwise it would bind vault-less and `/api/internal/status` /
+    // `/api/vault/search` would 503/empty. In production the launcher already
+    // sets this; bridging it here makes `onebrain --vault <path> mcp` work too.
+    // Only set it when unset, so an explicit `$ONEBRAIN_VAULT` still wins.
+    if std::env::var_os("ONEBRAIN_VAULT").is_none() {
+        std::env::set_var("ONEBRAIN_VAULT", resolved.root.as_path());
+    }
+
+    // Primary path: route through the warm daemon so the MCP server holds NO
+    // redb lock and multiple concurrent MCP sessions coexist. `ensure_running`
+    // auto-starts the daemon (the sole engine owner) if it isn't up yet.
+    //
+    // Fallback: if the daemon genuinely can't start (e.g. spawn failed), open
+    // the engine directly so a lone session still works — today's behaviour.
+    // This is the ONLY safe direct-open: as the sole owner there's no lock race.
+    let server = match daemon_client::ensure_running() {
+        Ok(handle) => McpServer::with_daemon(handle, resolved),
+        Err(daemon_err) => {
+            tracing::warn!(
+                error = %daemon_err,
+                "warm daemon unavailable; falling back to a direct single-process engine open"
+            );
+            let (engine, resolved) = open_engine(vault_flag).with_context(|| {
+                format!("daemon unavailable ({daemon_err:#}) and direct engine open also failed")
+            })?;
+            McpServer::with_direct_engine(engine, resolved)
+        }
+    };
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("build tokio runtime for onebrain mcp")?;
     runtime.block_on(async move {
-        let service = McpServer::new(engine, resolved)
+        let service = server
             .serve(stdio())
             .await
             .context("initialize MCP stdio server")?;
@@ -916,5 +1142,340 @@ mod tests {
         assert!(!tantivy_index_present(dir.path()));
         std::fs::create_dir_all(dir.path().join("tantivy")).unwrap();
         assert!(tantivy_index_present(dir.path()));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Wire-contract: the EXACT JSON bodies the daemon's `server::search` /
+    // `server::internal` routes emit must parse cleanly into what the MCP
+    // client consumes. Nothing pinned this until a consumer wired in (round-3
+    // review) — these are that pin. A field/shape drift on either side
+    // (rename, type change, dropped key) breaks these instead of silently
+    // returning empty results to a live client.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn daemon_mode_maps_subquery_types() {
+        assert_eq!(daemon_mode_for(&SubQueryType::Lex), "lex");
+        assert_eq!(daemon_mode_for(&SubQueryType::Vec), "hybrid");
+        assert_eq!(daemon_mode_for(&SubQueryType::Hyde), "hybrid");
+    }
+
+    #[test]
+    fn parse_daemon_search_hits_matches_server_wire_shape() {
+        // The exact shape `server::search::SearchResponse` serializes:
+        // { "hits": [ { path, score, title, snippet } ], "mode" }.
+        // The daemon sets `title` to the file STEM when there's no heading
+        // (`server::search::title_from_path`) — for `notes/a.md` that's `"a"`.
+        let body = serde_json::json!({
+            "hits": [
+                {"path": "notes/a.md", "score": 3.5, "title": "a", "snippet": ""},
+                {"path": "notes/b.md", "score": 1.2, "title": "A Heading > Sub", "snippet": "…text…"}
+            ],
+            "mode": "lex"
+        });
+        let hits = parse_daemon_search_hits(&body).unwrap();
+        assert_eq!(hits.len(), 2);
+        // Stem-equal title → empty heading (context stays None, like direct lex).
+        assert_eq!(hits[0].doc_path, "notes/a.md");
+        assert_eq!(hits[0].chunk_id, "notes/a.md", "chunk_id defaults to path");
+        assert_eq!(hits[0].score, 3.5);
+        assert!(hits[0].heading_path.is_empty());
+        // A real heading path (not the stem) is preserved as heading_path.
+        assert_eq!(hits[1].heading_path, "A Heading > Sub");
+        assert_eq!(hits[1].snippet, "…text…");
+
+        // Round-trip into a QueryHit: stem-only → context None; heading → Some.
+        // (Hit isn't Clone; consume the vec in order.)
+        let mut it = hits.into_iter();
+        let qh0 = QueryHit::from(it.next().unwrap());
+        let qh1 = QueryHit::from(it.next().unwrap());
+        assert!(qh0.context.is_none());
+        assert_eq!(qh1.context.as_deref(), Some("A Heading > Sub"));
+    }
+
+    #[test]
+    fn parse_daemon_search_hits_rejects_missing_hits_array() {
+        // A body without `hits` is a contract break, NOT an empty result — the
+        // client must error rather than silently degrade to "no matches".
+        let body = serde_json::json!({ "mode": "lex" });
+        assert!(parse_daemon_search_hits(&body).is_err());
+    }
+
+    #[test]
+    fn parse_daemon_status_matches_internal_wire_shape() {
+        // The exact shape `server::internal::InternalStatusResponse` emits.
+        let body = serde_json::json!({
+            "doc_count": 7,
+            "pending_new": 1,
+            "pending_changed": 2,
+            "pending_removed": 3,
+            "pending_total": 6,
+            "last_indexed": 1_720_000_000_u64,
+            "indexed": true
+        });
+        let c = parse_daemon_status(&body).unwrap();
+        assert_eq!(c.doc_count, 7);
+        assert_eq!(c.pending_new, 1);
+        assert_eq!(c.pending_changed, 2);
+        assert_eq!(c.pending_removed, 3);
+        assert_eq!(c.last_indexed, Some(1_720_000_000));
+    }
+
+    #[test]
+    fn parse_daemon_status_null_last_indexed_is_none() {
+        // A never-indexed daemon reports `last_indexed: null` → None (distinct
+        // from a real epoch), and a missing key is likewise None.
+        let with_null = serde_json::json!({
+            "doc_count": 0, "pending_new": 0, "pending_changed": 0,
+            "pending_removed": 0, "pending_total": 0, "last_indexed": null, "indexed": false
+        });
+        assert_eq!(parse_daemon_status(&with_null).unwrap().last_indexed, None);
+    }
+
+    #[test]
+    fn parse_daemon_status_rejects_missing_count() {
+        // A dropped count key breaks the contract — must error, not default to 0.
+        let body = serde_json::json!({ "pending_new": 0 });
+        assert!(parse_daemon_status(&body).is_err());
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Multi-session coexistence + fallback: end-to-end against a REAL
+    // ephemeral daemon-style server holding ONE engine over a lex-seeded
+    // vault. Download-free (lex). This proves the core win — N MCP clients
+    // fan out to ONE engine owner with no redb "Database already open" — and
+    // exercises the direct-open fallback path with no daemon at all.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[cfg(test)]
+    mod daemon_backed {
+        use super::*;
+        use crate::commands::daemon_client::{DaemonHandle, DaemonInfo};
+        use crate::commands::search_common::collection_cache_dir;
+        use onebrain_search::chunk::Chunk;
+        use onebrain_search::lex::LexIndex;
+        use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        use tempfile::{tempdir, TempDir};
+
+        const COLLECTION: &str = "mcp-live";
+        const TOKEN: &str = "mcp-live-token-1234567890";
+
+        /// Seed a one-doc lex index for `COLLECTION` under the caller's held
+        /// `ONEBRAIN_CACHE_DIR`, and write the vault's `onebrain.yml`.
+        fn seed_vault(vault: &Path) {
+            std::fs::write(
+                vault.join("onebrain.yml"),
+                format!("search:\n  collection: {COLLECTION}\n"),
+            )
+            .unwrap();
+            let cache_dir = collection_cache_dir(COLLECTION);
+            let mut lex = LexIndex::open(&cache_dir.join("tantivy")).unwrap();
+            lex.add(&Chunk {
+                chunk_id: "alpha.md#0".to_string(),
+                doc_path: "alpha.md".to_string(),
+                heading_path: String::new(),
+                text: "the quick brown fox jumps".to_string(),
+                chunk_index: 0,
+            })
+            .unwrap();
+            lex.commit().unwrap();
+            // A readable doc on disk so `get`/status fs reads have something.
+            std::fs::write(vault.join("alpha.md"), "the quick brown fox jumps").unwrap();
+        }
+
+        /// A live daemon-style server holding ONE engine, on an ephemeral port.
+        struct LiveServer {
+            info: DaemonInfo,
+            stop: Arc<AtomicBool>,
+            join: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for LiveServer {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::SeqCst);
+                if let Some(j) = self.join.take() {
+                    let _ = j.join();
+                }
+            }
+        }
+
+        /// Stand up the server (engine held) and return its handle. The CALLER
+        /// must hold the `ONEBRAIN_CACHE_DIR` env guard for the test's lifetime
+        /// — the server thread only reads the process env, never locks it.
+        fn start_live_server(vault: &Path) -> LiveServer {
+            let stop = Arc::new(AtomicBool::new(false));
+            let port = Arc::new(AtomicU16::new(0));
+            let vault_path = vault.to_path_buf();
+            let stop_t = stop.clone();
+            let port_t = port.clone();
+
+            let join = std::thread::spawn(move || {
+                let mut cfg = crate::server::ServeConfig::localhost(
+                    Some(vault_path),
+                    0,
+                    TOKEN.to_string(),
+                    None,
+                );
+                cfg.hold_engine = true;
+                let (router, _state) = crate::server::build_router_with_state(cfg);
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+                    let on_bind =
+                        |a: std::net::SocketAddr| port_t.store(a.port(), Ordering::SeqCst);
+                    let shutdown = async move {
+                        while !stop_t.load(Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    };
+                    let _ = crate::server::run_server_from_router(router, addr, on_bind, shutdown)
+                        .await;
+                });
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let bound = loop {
+                let p = port.load(Ordering::SeqCst);
+                if p != 0 {
+                    break p;
+                }
+                assert!(Instant::now() < deadline, "server never bound");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+
+            LiveServer {
+                info: DaemonInfo {
+                    port: bound,
+                    token: TOKEN.to_string(),
+                    pid: std::process::id(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                },
+                stop,
+                join: Some(join),
+            }
+        }
+
+        fn resolved_for(vault: &Path) -> ResolvedVault {
+            crate::vault_ctx::require(Some(vault.to_path_buf())).unwrap()
+        }
+
+        fn lex_query() -> Parameters<QueryParams> {
+            Parameters(QueryParams {
+                searches: vec![SubQuery {
+                    r#type: SubQueryType::Lex,
+                    query: "quick".to_string(),
+                }],
+                limit: Some(5),
+                min_score: None,
+                candidate_limit: None,
+                collections: None,
+                intent: None,
+                rerank: None,
+            })
+        }
+
+        fn block_on<F: std::future::Future>(f: F) -> F::Output {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(f)
+        }
+
+        // THE CORE WIN: two MCP servers, each daemon-backed, both query the
+        // SAME single-engine server concurrently. If either had opened its own
+        // engine, redb would refuse with "Database already open" — that this
+        // succeeds proves the MCP server holds NO engine and N sessions coexist.
+        #[cfg(unix)]
+        #[test]
+        fn two_daemon_backed_mcp_sessions_query_one_engine() {
+            let vault = tempdir().unwrap();
+            let cache = tempdir().unwrap();
+            let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+            seed_vault(vault.path());
+            let srv = start_live_server(vault.path());
+
+            let mk = || {
+                McpServer::with_daemon(
+                    DaemonHandle::new(srv.info.clone()),
+                    resolved_for(vault.path()),
+                )
+            };
+            let (a, b) = (mk(), mk());
+
+            let out_a = block_on(a.query(lex_query())).expect("session A query");
+            let out_b = block_on(b.query(lex_query())).expect("session B query");
+            assert_eq!(out_a.0.results.len(), 1, "A: {:?}", out_a.0.results);
+            assert_eq!(out_b.0.results.len(), 1, "B: {:?}", out_b.0.results);
+            assert_eq!(out_a.0.results[0].file, "alpha.md");
+            assert_eq!(out_b.0.results[0].file, "alpha.md");
+            // Neither returned the no-index note — both actually hit the engine.
+            assert!(out_a.0.note.is_none() && out_b.0.note.is_none());
+
+            // status also routes over HTTP on both, no second engine opened.
+            let st_a = block_on(a.status()).expect("session A status");
+            let st_b = block_on(b.status()).expect("session B status");
+            assert_eq!(st_a.0.doc_count(), st_b.0.doc_count());
+            assert!(
+                st_a.0.doc_count().is_some(),
+                "daemon status has a doc_count"
+            );
+        }
+
+        // Fallback: with NO daemon, a lone MCP server opens the engine directly
+        // (sole owner → no lock race) and answers query + status. This is the
+        // `Backend::Direct` path `run()` falls back to when `ensure_running`
+        // fails — exercised here without spawning a process.
+        #[test]
+        fn direct_engine_fallback_answers_query_and_status() {
+            let vault = tempdir().unwrap();
+            let cache = tempdir().unwrap();
+            let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+            seed_vault(vault.path());
+
+            // Exactly the fallback path `run()` takes: open_engine, then
+            // with_direct_engine (sole owner → no lock race).
+            let (engine, resolved) =
+                crate::commands::search_common::open_engine(Some(vault.path().to_path_buf()))
+                    .expect("direct engine open");
+            let server = McpServer::with_direct_engine(engine, resolved);
+
+            let out = block_on(server.query(lex_query())).expect("direct query");
+            assert_eq!(out.0.results.len(), 1, "direct: {:?}", out.0.results);
+            assert_eq!(out.0.results[0].file, "alpha.md");
+
+            let st = block_on(server.status()).expect("direct status");
+            // The lex-only seed doesn't populate the engine's redb, so the
+            // engine reports 0 docs — the point is that status READS a real
+            // count (Some, not None/busy) off the directly-owned engine.
+            assert!(
+                st.0.doc_count().is_some(),
+                "direct status must read a doc_count off the owned engine, got None (busy?)"
+            );
+        }
+
+        // Guard: `with_engine` on a daemon-backed server must error, not panic
+        // or silently succeed — the daemon path owns no local engine.
+        #[test]
+        fn with_engine_errors_on_daemon_backend() {
+            let vault = tempdir().unwrap();
+            let cache = TempDir::new().unwrap();
+            let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+            seed_vault(vault.path());
+            // A DaemonHandle pointing nowhere is fine — with_engine never calls it.
+            let handle = DaemonHandle::new(DaemonInfo {
+                port: 1,
+                token: TOKEN.to_string(),
+                pid: std::process::id(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            });
+            let server = McpServer::with_daemon(handle, resolved_for(vault.path()));
+            let res = block_on(server.with_engine(|_eng| Ok(())));
+            assert!(res.is_err(), "with_engine must error on daemon backend");
+        }
     }
 }
