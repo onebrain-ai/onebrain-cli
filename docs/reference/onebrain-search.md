@@ -51,21 +51,21 @@ Wraps `fastembed` to turn chunk texts into **L2-normalized** embedding vectors, 
 **Key types**
 - `trait Embed` — the embedding seam: `embed(texts)`, `dims()`, plus `embed_passages` / `embed_query` with pass-through defaults. `Embedder` is the real implementation; engine tests inject a deterministic in-memory fake (`FakeEmbedder`, defined in `src/engine.rs`'s `#[cfg(test)]` module) via `Engine::open_with_embedder` so index/query/rebuild logic runs without a multi-GB download.
 - `Embedder` — `Mutex<TextEmbedding>` + `dims`, `model_name`, and the model's `query_prefix`/`passage_prefix`. `embed_passages` prepends the passage prefix, `embed_query` the query prefix (stored chunk text stays raw — prefixes apply at embed time only).
-- `ModelInfo` — one registry entry: `name` (config-facing `search.embed_model` value), `dims`, `approx_size`/`approx_bytes` (the denominator for download-progress %), `context` (max input tokens), `thai_miracl` (`Option` — `None` = unverified for Thai), `note`, `vec_floor` (minimum cosine for a vector hit to count as a real match; `None` = no floor), `query_prefix`/`passage_prefix`, `hf_repo`.
+- `ModelInfo` — one registry entry: `name` (config-facing `search.embed_model` value), `dims`, `approx_size`/`approx_bytes` (the denominator for download-progress %), `context` (max input tokens), `thai_miracl` (`Option` — `None` = unverified for Thai), `note`, `query_prefix`/`passage_prefix`, `hf_repo`.
 - `ModelDownloadStatus` — `{ downloaded, disk_size: Option<u64>, path }`, computed per model from a collection cache dir.
 
 **The registry** (`model_registry()` — display order, smallest/default first; the single source of truth for model names):
 
-| name | dims | context | approx size | note | prefixes (query · passage) | vec_floor |
-|---|---|---|---|---|---|---|
-| `multilingual-e5-small` | 384 | 512 | ~470 MB | default · small + fast | `query: ` · `passage: ` | 0.85 |
-| `multilingual-e5-base` | 768 | 512 | ~1.1 GB | larger · better recall | `query: ` · `passage: ` | 0.85 |
-| `multilingual-e5-large` | 1024 | 512 | ~2.1 GB | high accuracy | `query: ` · `passage: ` | 0.85 |
-| `bge-m3` | 1024 | 8192 | ~2.2 GB | best Thai/accuracy · fp32 | (none) | — |
-| `embeddinggemma-300m-q` | 768 | 2048 | ~310 MB | small · int8 · Thai unverified | `task: search result \| query: ` · `title: none \| text: ` | — |
-| `embeddinggemma-300m-q4` | 768 | 2048 | ~200 MB | smallest · 4-bit · Thai unverified | `task: search result \| query: ` · `title: none \| text: ` | — |
+| name | dims | context | approx size | note | prefixes (query · passage) |
+|---|---|---|---|---|---|
+| `multilingual-e5-small` | 384 | 512 | ~470 MB | default · small + fast | `query: ` · `passage: ` |
+| `multilingual-e5-base` | 768 | 512 | ~1.1 GB | larger · better recall | `query: ` · `passage: ` |
+| `multilingual-e5-large` | 1024 | 512 | ~2.1 GB | high accuracy | `query: ` · `passage: ` |
+| `bge-m3` | 1024 | 8192 | ~2.2 GB | best Thai/accuracy · fp32 | (none) |
+| `embeddinggemma-300m-q` | 768 | 2048 | ~310 MB | small · int8 · Thai unverified | `task: search result \| query: ` · `title: none \| text: ` |
+| `embeddinggemma-300m-q4` | 768 | 2048 | ~200 MB | smallest · 4-bit · Thai unverified | `task: search result \| query: ` · `title: none \| text: ` |
 
-The e5 family was trained with instruction prefixes (omitting them measurably degrades retrieval); its 0.85 floor splits unrelated (≈0.84) from related (≥0.87) clusters with margin. The two embeddinggemma variants **share one HF repo** (`onnx-community/embeddinggemma-300m-ONNX`) and therefore one `models--onnx-community--embeddinggemma-300m-ONNX` cache dir — `model_download_status` can't tell them apart, so downloading either marks both as downloaded and the reported disk size is the dir total.
+The e5 family was trained with instruction prefixes (omitting them measurably degrades retrieval). Vector-hit trimming is a recall-first relative cutoff (`keep_top_cluster`), not a per-model absolute floor — see [ADR 0024](../decisions/0024-vector-confidence-recall-first.md). The two embeddinggemma variants **share one HF repo** (`onnx-community/embeddinggemma-300m-ONNX`) and therefore one `models--onnx-community--embeddinggemma-300m-ONNX` cache dir — `model_download_status` can't tell them apart, so downloading either marks both as downloaded and the reported disk size is the dir total.
 
 **Key functions**
 - `new(model_name, cache_dir) -> Result<Embedder>` / `new_quiet(..)` — load the fastembed model, caching downloads under `cache_dir` (`InitOptions::with_cache_dir` + `with_show_download_progress`). `new` prints fastembed's stdout download bar on a first-time download; `new_quiet` disables it (the interactive model TUI runs the terminal in raw mode and draws its own in-table progress — a stray stdout print would corrupt it).
@@ -138,7 +138,7 @@ Ties `chunk` + `embed` + `vector` + `lex` + `hybrid` into one synchronous engine
 - `set_exclude_patterns(&mut self, patterns)` — install the vault's `search.exclude` patterns, applied by every vault walk on top of the built-in skips.
 - `index_doc(&mut self, doc_path, content) -> Result<usize>` — chunk (512/64), batch-embed all chunk texts in **one** `embed_passages` call, add each chunk to lex + vector, record `ChunkMeta` + the doc's chunk-id list, commit lex; returns the chunk count.
 - `remove_doc(&mut self, doc_path)` — look up the doc's chunk ids, delete each from lex + vector + `chunk_meta`, drop the `doc_chunks` entry.
-- `query(&self, text, top_k) -> Result<Vec<Hit>>` — hybrid search: `embed_query` → vector top-50 filtered by the model's `vec_floor` (`drop_below_floor` — without it, a query about something the vault doesn't contain still surfaces authoritative-looking nearest neighbors) + lex top-50 → `rrf_fuse(.., RRF_K, top_k)` → `resolve_hits`.
+- `query(&self, text, top_k) -> Result<Vec<Hit>>` — hybrid search: `embed_query` → vector top-50 trimmed to the top cluster (`keep_top_cluster`, within `VEC_CLUSTER_WINDOW` of the best score — recall-first, relative) + lex top-50 → `rrf_fuse(.., RRF_K, top_k)` → `resolve_hits`.
 - `vector_search(&self, text, top_k)` — vector-only semantic search (no fusion); the CLI's `search vsearch` verb.
 - `get(&self, doc_path) -> Result<String>` — full stored text: the doc's chunks concatenated in `chunk_index` order; error if absent.
 - `status(&self, vault_root) -> Result<IndexStatus>` — read-only drift report: snapshot stored hashes, walk + re-hash the vault's `*.md` files, classify each via `diff_hash`, count indexed docs whose file is gone. Never constructs the embedder.
@@ -147,10 +147,10 @@ Ties `chunk` + `embed` + `vector` + `lex` + `hybrid` into one synchronous engine
 - `rebuild(&mut self, new_model)` / `rebuild_with_progress(..)` — model switch: collect the re-embed worklist from `chunk_meta`, delete + recreate **only** the vector store at the new model's dims, reset to a fresh lazy embedder, re-embed in batches of 64 (progress `(0, total)` fires before the first embed — the download/load stall), record the new active model. The lex index and `chunk_meta`/`doc_chunks` are model-independent and untouched; an empty index never constructs the embedder.
 - `active_model_matches(&self, cfg_model) -> Result<bool>` — compares the `engine_header` active model against config (the CLI's rebuild-needed probe).
 - `short_path_hash(path) -> String` — first 6 hex chars of sha256(path); public so the CLI derives the default collection name (`<dir>-<hash>`) without duplicating the hashing.
-- (private helpers: `hash_bytes` (sha256 hex), `diff_hash`, `vault_relative_path` (forward slashes on every platform — the stable `doc_path` key), `is_skipped_dir`, `is_excluded`, `walk_markdown_files`, `drop_below_floor`, `truncate_snippet`, `now_epoch_secs`.)
+- (private helpers: `hash_bytes` (sha256 hex), `diff_hash`, `vault_relative_path` (forward slashes on every platform — the stable `doc_path` key), `is_skipped_dir`, `is_excluded`, `walk_markdown_files`, `keep_top_cluster`, `truncate_snippet`, `now_epoch_secs`.)
 
 **Connections** — calls: every sibling module + `redb`, `sha2`, `serde_json`; called by: onebrain-cli's `search` verb group via `search_common.rs` (`Engine::open(collection_cache_dir(..), config.search.embed_model)`) and `doctor`'s `native_search_check`.
-**Tests** — 28 tests, almost all against `FakeEmbedder` (no network): index→query→get→remove roundtrips, add/update/unchanged/remove drift detection for both reindex paths, `status` doc-count/last-indexed/drift, `ReindexProgress` event contracts (increasing `done`, `LoadingModel` before the first embed), rebuild (re-embeds all, dims change, empty index embeds nothing, batched progress), failed-file counting (root-guarded chmod test), `vec_floor` filtering + registry floor expectations, exclude-pattern and hidden-dir/`node_modules` walk behavior, and the pure helpers (`vault_relative_path`, `short_path_hash`, `diff_hash`, snippet truncation on a char boundary).
+**Tests** — ~50 tests, almost all against `FakeEmbedder` (no network): index→query→get→remove roundtrips, add/update/unchanged/remove drift detection for both reindex paths, `status` doc-count/last-indexed/drift, `ReindexProgress` event contracts (increasing `done`, `LoadingModel` before the first embed), rebuild (re-embeds all, dims change, empty index embeds nothing, batched progress), failed-file counting (root-guarded chmod test), `keep_top_cluster` recall-first cutoff (within-window / never-empties / empty), exclude-pattern and hidden-dir/`node_modules` walk behavior, and the pure helpers (`vault_relative_path`, `short_path_hash`, `diff_hash`, snippet truncation on a char boundary).
 
 ## Entry points
 The public surface other crates (chiefly `onebrain-cli`) reach for first:

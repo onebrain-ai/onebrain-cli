@@ -126,6 +126,33 @@ pub fn run_query(
     run_lex(vault_flag, mode, args)
 }
 
+/// Top score ≥ this → a confident vector match (above the e5 no-match ceiling
+/// ~0.85, measured 2026-07-06). Below → advisory hint, never a silent drop.
+const VEC_CONFIDENT: f64 = 0.86;
+/// Top score in `[VEC_AMBIGUOUS, VEC_CONFIDENT)` → low-confidence band; below
+/// `VEC_AMBIGUOUS` → likely noise. (Bi-encoder cosine can't cleanly gate e5
+/// noise — see the search-quality research; superseded by the reranker.)
+const VEC_AMBIGUOUS: f64 = 0.80;
+
+/// Advisory, never-silent confidence label for a vsearch result set, from its
+/// best cosine score. Returns `None` when confident (no hint needed); otherwise
+/// a hint that the results may be weak — so a low-confidence result reads as
+/// honest rather than authoritative. We NEVER drop results here (recall-first);
+/// this only annotates them.
+fn vec_confidence_hint(top_score: f64) -> Option<String> {
+    if top_score >= VEC_CONFIDENT {
+        None
+    } else if top_score >= VEC_AMBIGUOUS {
+        Some(
+            "low-confidence semantic match — results may not be relevant; \
+             verify or try `search search` (keyword)"
+                .to_string(),
+        )
+    } else {
+        Some("no strong semantic match — showing nearest results, likely not relevant".to_string())
+    }
+}
+
 /// `onebrain search vsearch` — vector-only semantic search. Also embeds the
 /// query text (model-download point on first use).
 ///
@@ -147,10 +174,13 @@ pub fn run_vsearch(
         engine.vector_search(&args.text, args.top_k)?,
         args.min_score,
     );
-    let hint = hits
-        .is_empty()
-        .then(|| index_hint_for(&engine, &resolved))
-        .flatten();
+    // Never-silent: an empty result explains itself (empty/stale index); a
+    // non-empty one carries a confidence label so a weak vsearch reads as
+    // honest rather than authoritative (bi-encoder cosine can't gate e5 noise).
+    let hint = match hits.first() {
+        None => index_hint_for(&engine, &resolved),
+        Some(top) => vec_confidence_hint(top.score),
+    };
     emit_hits("search.vec", vault_info, hits, hint, mode)
 }
 
@@ -394,12 +424,36 @@ fn render_text(env: &Envelope<SearchHitsData>) -> String {
         blocks.push(block);
     }
     // Blank line between hits so each result reads as its own block.
-    blocks.join("\n\n")
+    let mut out = blocks.join("\n\n");
+    // Never-silent: surface a confidence/index hint even when we DID return
+    // hits (e.g. a low-confidence vsearch), so weak results read as honest.
+    if let Some(h) = &d.index_hint {
+        out.push_str(&format!("\n\nℹ️  {h}"));
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vec_confidence_hint_labels_weak_results_but_not_strong() {
+        assert_eq!(
+            vec_confidence_hint(0.90),
+            None,
+            "a clear match (≥0.86) needs no hint"
+        );
+        assert!(
+            vec_confidence_hint(0.83).is_some(),
+            "the ambiguous band (0.80–0.86) gets a low-confidence hint"
+        );
+        let weak = vec_confidence_hint(0.75).expect("below 0.80 must still return a hint");
+        assert!(
+            weak.contains("no strong"),
+            "below-band hint names it plainly: {weak}"
+        );
+    }
 
     fn env(hits: Vec<HitData>) -> Envelope<SearchHitsData> {
         Envelope::ok(
@@ -444,6 +498,32 @@ mod tests {
         }]));
         assert!(s.contains("📄  1. a.md › Intro  (0.500)"));
         assert!(s.contains("hello world"));
+    }
+
+    #[test]
+    fn text_surfaces_hint_on_weak_but_present_hits() {
+        // Never-silent: a low-confidence vsearch still shows its hits AND the
+        // confidence hint (the old renderer showed hints only on empty results).
+        let e = Envelope::ok(
+            "search.vec",
+            None,
+            SearchHitsData {
+                hits: vec![HitData {
+                    chunk_id: "a.md#0".into(),
+                    doc_path: "a.md".into(),
+                    heading_path: String::new(),
+                    score: 0.83,
+                    snippet: String::new(),
+                }],
+                index_hint: Some("⚠️  low-confidence semantic match".into()),
+            },
+        );
+        let s = render_text(&e);
+        assert!(s.contains("a.md"), "shows the hit: {s}");
+        assert!(
+            s.contains("low-confidence"),
+            "surfaces the hint on non-empty results: {s}"
+        );
     }
 
     #[test]

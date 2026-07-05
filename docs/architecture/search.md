@@ -65,17 +65,22 @@ Default `multilingual-e5-small`.
 
 | Name | Dims | Size | Context | Notes |
 |---|---|---|---|---|
-| `multilingual-e5-small` | 384 | ~470 MB | 512 | **default** · `query: `/`passage: ` prefixes · vec floor 0.85 |
-| `multilingual-e5-base` | 768 | ~1.1 GB | 512 | e5 prefixes · vec floor 0.85 |
-| `multilingual-e5-large` | 1024 | ~2.1 GB | 512 | e5 prefixes · vec floor 0.85 |
-| `bge-m3` | 1024 | ~2.2 GB | 8192 | best Thai accuracy · fp32 · no prefixes, no floor |
+| `multilingual-e5-small` | 384 | ~470 MB | 512 | **default** · `query: `/`passage: ` prefixes |
+| `multilingual-e5-base` | 768 | ~1.1 GB | 512 | e5 prefixes |
+| `multilingual-e5-large` | 1024 | ~2.1 GB | 512 | e5 prefixes |
+| `bge-m3` | 1024 | ~2.2 GB | 8192 | best Thai accuracy · fp32 · no prefixes |
 | `embeddinggemma-300m-q` | 768 | ~310 MB | 2048 | int8 · gemma prompt prefixes |
 | `embeddinggemma-300m-q4` | 768 | ~200 MB | 2048 | 4-bit · shares one HF repo/cache dir with `-q` |
 
-The `vec_floor` is a per-model confidence floor: vector hits below it are dropped
-(`engine.rs::drop_below_floor`) so a query about something the vault doesn't contain returns
-nothing instead of its nearest-neighbor noise
-([ADR 0013](../decisions/0013-retrieval-semantics-confidence-gating.md)).
+Vector hits are trimmed to the **top cluster** — those within `VEC_CLUSTER_WINDOW`
+(0.02 cosine) of a query's best score (`engine.rs::keep_top_cluster`), relative to
+each query rather than an absolute per-model threshold. This is recall-first: it
+never empties a non-empty result set. It **replaced** an absolute per-model
+`vec_floor` (0.85 for e5), which straddled genuine e5 match scores (~0.83–0.87)
+and silently dropped real matches
+([ADR 0024](../decisions/0024-vector-confidence-recall-first.md), superseding the
+confidence-floor part of [ADR 0013](../decisions/0013-retrieval-semantics-confidence-gating.md)).
+A calibrated cross-encoder reranker is the follow-up precision gate.
 
 ### Config keys (`onebrain.yml`)
 
@@ -346,14 +351,15 @@ flowchart LR
 | `tantivy/` | ❌ |
 
 Flow: open engine → embed the query (`embed_query`, model's query prefix) → vector store scan →
-drop hits below the model's `vec_floor` → resolve chunk ids to `Hit`s (doc path, heading path,
-200-char snippet) from `chunk_meta`. Empty results attach an `index_hint` ("index is empty…" /
-"index is behind — N doc(s) not yet indexed") from a best-effort status probe. In a **lex-only
-build** this verb errors with `SEMANTIC_UNAVAILABLE` (no lex analogue to degrade to).
+keep the top cluster (`keep_top_cluster`, within 0.02 of the best score) → resolve chunk ids to
+`Hit`s (doc path, heading path, 200-char snippet) from `chunk_meta`. A non-empty but low-confidence
+result attaches an advisory hint (`vec_confidence_hint`); an empty result attaches an `index_hint`
+("index is empty…" / "index is behind — N doc(s) not yet indexed") from a best-effort status probe.
+In a **lex-only build** this verb errors with `SEMANTIC_UNAVAILABLE` (no lex analogue to degrade to).
 
 ```mermaid
 flowchart LR
-    Q["query text"] --> E["embed_query<br/>(model, query prefix)"] --> V["VectorStore top-k<br/>cosine ≥ vec_floor"] --> M["resolve via engine.redb<br/>chunk_meta"] --> H["Hits (path · heading · snippet)"]
+    Q["query text"] --> E["embed_query<br/>(model, query prefix)"] --> V["VectorStore top-k<br/>keep top cluster"] --> M["resolve via engine.redb<br/>chunk_meta"] --> H["Hits (path · heading · snippet)"]
 ```
 
 ### `onebrain search query` — hybrid (RRF)
