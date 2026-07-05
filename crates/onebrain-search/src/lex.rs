@@ -389,10 +389,9 @@ impl LexIndex {
                         (Occur::Should, tq)
                     })
                     .collect();
-                let min = n;
                 units.push((
                     Occur::Should,
-                    Box::new(BooleanQuery::with_minimum_required_clauses(subs, min)),
+                    Box::new(BooleanQuery::with_minimum_required_clauses(subs, n)),
                 ));
             } else {
                 for (text, _, _) in other_tokens(run, start) {

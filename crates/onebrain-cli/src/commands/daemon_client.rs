@@ -269,21 +269,62 @@ pub enum VaultDecision {
     Restart,
 }
 
+/// What vault a caller expects a daemon to be serving — the input to
+/// [`vault_decision`]. Distinguishing the three cases is a safety property: an
+/// [`Unresolvable`](VaultExpectation::Unresolvable) expected vault (the caller
+/// HAS a vault, but it wouldn't canonicalize — e.g. the directory vanished
+/// mid-operation) must NOT collapse into [`Any`](VaultExpectation::Any), or the
+/// caller would silently REUSE/route to a possibly-wrong-vault daemon it can't
+/// verify (a narrow wrong-vault TOCTOU). It is instead treated conservatively
+/// as a mismatch.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VaultExpectation {
+    /// The caller expressed NO vault expectation (`expected_vault == None`) — it
+    /// doesn't care which vault the daemon serves. Never a mismatch.
+    Any,
+    /// The caller HAS a vault that canonicalized to this id — match against it.
+    Vault(String),
+    /// The caller HAS a vault, but it wouldn't canonicalize (canonicalize failed
+    /// — the dir vanished / a transient stat error). Conservatively a mismatch:
+    /// the caller can't verify a daemon serves the right vault, so it must not
+    /// adopt one.
+    Unresolvable,
+}
+
+/// Turn a caller's expected vault path into a [`VaultExpectation`], preserving
+/// the "has a vault but it wouldn't canonicalize" case rather than flattening it
+/// to "no expectation". This is the seam that closes the wrong-vault TOCTOU:
+/// callers previously did `expected_vault.and_then(canonical_vault_id)`, which
+/// mapped BOTH `None` (no vault) AND `Some(uncanonicalizable)` to `None`, and
+/// `vault_decision(_, None)` said `Use` — so a caller whose vault vanished
+/// mid-op would reuse whatever daemon was up.
+pub fn vault_expectation(expected_vault: Option<&Path>) -> VaultExpectation {
+    match expected_vault {
+        None => VaultExpectation::Any,
+        Some(p) => match canonical_vault_id(p) {
+            Some(id) => VaultExpectation::Vault(id),
+            None => VaultExpectation::Unresolvable,
+        },
+    }
+}
+
 /// Compare a discovered daemon's bound vault (`daemon.json.vault`, already
-/// canonicalized at write time) against the caller's expected vault
-/// (canonicalized via [`canonical_vault_id`]).
+/// canonicalized at write time) against the caller's [`VaultExpectation`].
 ///
-/// - `expected == None` → the caller doesn't care which vault (never restarts).
-/// - `expected == Some(v)` and the daemon's `vault == Some(v)` → `Use`.
-/// - Any other `Some` case — daemon on a different vault, daemon bound
+/// - `Any` → the caller doesn't care which vault (never restarts).
+/// - `Vault(v)` and the daemon's `vault == Some(v)` → `Use`.
+/// - `Vault(_)` with any other daemon vault — different vault, daemon bound
 ///   vault-less, or an old record with no vault field (`daemon_vault == None`) —
 ///   → `Restart`. An old daemon is thus never trusted to be serving the right
 ///   vault.
-pub fn vault_decision(daemon_vault: Option<&str>, expected: Option<&str>) -> VaultDecision {
+/// - `Unresolvable` → `Restart`. The caller HAS a vault it can't canonicalize,
+///   so it can't confirm any daemon serves the right one — treat conservatively
+///   as a mismatch rather than adopt a possibly-wrong-vault daemon.
+pub fn vault_decision(daemon_vault: Option<&str>, expected: &VaultExpectation) -> VaultDecision {
     match expected {
-        None => VaultDecision::Use,
-        Some(want) if daemon_vault == Some(want) => VaultDecision::Use,
-        Some(_) => VaultDecision::Restart,
+        VaultExpectation::Any => VaultDecision::Use,
+        VaultExpectation::Vault(want) if daemon_vault == Some(want.as_str()) => VaultDecision::Use,
+        VaultExpectation::Vault(_) | VaultExpectation::Unresolvable => VaultDecision::Restart,
     }
 }
 
@@ -602,18 +643,18 @@ pub fn discover(expected_vault: Option<&Path>) -> Result<Option<DaemonHandle>> {
     };
 
     // A version OR vault mismatch both mean "this running daemon can't serve
-    // us": restart it. Compute the vault decision from the caller's canonical
-    // expected vault vs the daemon's stored canonical vault.
-    let expected_id = expected_vault.and_then(canonical_vault_id);
+    // us": restart it. Compute the vault decision from the caller's expectation
+    // (which preserves the "has a vault but it wouldn't canonicalize" case as a
+    // conservative mismatch) vs the daemon's stored canonical vault.
+    let expected = vault_expectation(expected_vault);
     let version_mismatch =
         version_decision(&info.version, own_version()) == VersionDecision::Restart;
-    let vault_mismatch =
-        vault_decision(info.vault.as_deref(), expected_id.as_deref()) == VaultDecision::Restart;
+    let vault_mismatch = vault_decision(info.vault.as_deref(), &expected) == VaultDecision::Restart;
     if version_mismatch || vault_mismatch {
         if vault_mismatch && !version_mismatch {
             tracing::info!(
                 daemon_vault = ?info.vault,
-                expected_vault = ?expected_id,
+                expected_vault = ?expected,
                 "daemon bound to a different vault; restarting daemon for the caller's vault"
             );
         } else {
@@ -689,8 +730,11 @@ pub fn discover_matching(expected_vault: Option<&Path>) -> Result<Option<DaemonH
 
     // Version or vault mismatch → decline to route, WITHOUT touching the record.
     // A mismatched daemon may be a live MCP session on another vault; the CLI
-    // must never stop/restart/remove it.
-    let expected_id = expected_vault.and_then(canonical_vault_id);
+    // must never stop/restart/remove it. An expected vault that won't
+    // canonicalize is treated as a mismatch here too (via `vault_expectation`):
+    // the CLI can't verify the daemon serves the right vault, so it routes
+    // direct rather than adopt a possibly-wrong-vault daemon.
+    let expected = vault_expectation(expected_vault);
     if version_decision(&info.version, own_version()) == VersionDecision::Restart {
         tracing::debug!(
             daemon_version = %info.version, own_version = own_version(),
@@ -698,9 +742,9 @@ pub fn discover_matching(expected_vault: Option<&Path>) -> Result<Option<DaemonH
         );
         return Ok(None);
     }
-    if vault_decision(info.vault.as_deref(), expected_id.as_deref()) == VaultDecision::Restart {
+    if vault_decision(info.vault.as_deref(), &expected) == VaultDecision::Restart {
         tracing::debug!(
-            daemon_vault = ?info.vault, expected_vault = ?expected_id,
+            daemon_vault = ?info.vault, expected_vault = ?expected,
             "daemon bound to a different vault; CLI routes direct (no restart)"
         );
         return Ok(None);
@@ -730,10 +774,24 @@ pub fn ensure_running(expected_vault: Option<&Path>) -> Result<DaemonHandle> {
         return Ok(handle);
     }
 
-    spawn_daemon_start().context("spawn daemon start")?;
+    // If the caller HAS a vault but it won't canonicalize (dir vanished
+    // mid-op), refuse rather than spawn a daemon we couldn't verify — a
+    // `--vault <vanished-path>` daemon would bind vault-less and we'd never
+    // adopt it anyway (the poll below requires a vault MATCH). Bail early with a
+    // clear message instead of spinning to the start timeout.
+    let expected = vault_expectation(expected_vault);
+    if expected == VaultExpectation::Unresolvable {
+        anyhow::bail!(
+            "cannot start a daemon: the expected vault could not be resolved \
+             (canonicalize failed — did the directory move or get removed?)"
+        );
+    }
+
+    // Pass the resolved vault through `daemon start --vault` so the spawned
+    // daemon binds it EXPLICITLY (no `$ONEBRAIN_VAULT` mutation).
+    spawn_daemon_start(expected_vault).context("spawn daemon start")?;
 
     let path = discovery_path()?;
-    let expected_id = expected_vault.and_then(canonical_vault_id);
     let deadline = Instant::now() + START_TIMEOUT;
     // Remember the last-observed discovery record so a timeout can say WHY.
     let mut last_read: Option<DaemonInfo> = None;
@@ -741,17 +799,17 @@ pub fn ensure_running(expected_vault: Option<&Path>) -> Result<DaemonHandle> {
         // A daemon.json at our version + our vault + live probe → connected.
         // The vault check matters even here: a concurrent starter for a
         // DIFFERENT vault could win the race and publish first, and connecting
-        // to it would silently serve the wrong vault. `spawn_daemon_start`
-        // inherits our `$ONEBRAIN_VAULT`, so the daemon WE spawn binds our
-        // vault; requiring the match just refuses to adopt a wrong-vault winner
-        // (we keep polling until the deadline instead).
+        // to it would silently serve the wrong vault. `spawn_daemon_start` now
+        // passes `--vault`, so the daemon WE spawn binds our vault; requiring
+        // the match just refuses to adopt a wrong-vault winner (we keep polling
+        // until the deadline instead).
         if let Ok(read) = DaemonInfo::read(&path) {
             last_read = read.clone();
             if let Some(info) = read {
                 let version_ok =
                     version_decision(&info.version, own_version()) == VersionDecision::Use;
-                let vault_ok = vault_decision(info.vault.as_deref(), expected_id.as_deref())
-                    == VaultDecision::Use;
+                let vault_ok =
+                    vault_decision(info.vault.as_deref(), &expected) == VaultDecision::Use;
                 if version_ok && vault_ok {
                     let handle = DaemonHandle::new(info);
                     if handle.is_live() {
@@ -781,15 +839,23 @@ pub fn ensure_running(expected_vault: Option<&Path>) -> Result<DaemonHandle> {
 /// child + writes the PID file). Runs the CURRENT executable so a client always
 /// starts a daemon at its own version. Inherits no stdio (the child redirects
 /// its own to the daemon log).
-fn spawn_daemon_start() -> Result<()> {
+///
+/// `expected_vault` is passed through as `daemon start --vault <path>` so the
+/// spawned daemon binds the SAME vault the caller resolved, WITHOUT the caller
+/// having to export `$ONEBRAIN_VAULT` (a process-env mutation that is unsound
+/// under concurrent reads and deprecated since Rust 1.81). When `None`, no
+/// `--vault` is passed and the daemon falls back to `$ONEBRAIN_VAULT`.
+fn spawn_daemon_start(expected_vault: Option<&Path>) -> Result<()> {
     let exe = std::env::current_exe().context("resolve current executable")?;
-    let status = std::process::Command::new(exe)
-        .args(["daemon", "start"])
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["daemon", "start"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .context("run `onebrain daemon start`")?;
+        .stderr(std::process::Stdio::null());
+    if let Some(v) = expected_vault {
+        cmd.arg("--vault").arg(v);
+    }
+    let status = cmd.status().context("run `onebrain daemon start`")?;
     if !status.success() {
         anyhow::bail!("`onebrain daemon start` exited with {status}");
     }
@@ -899,14 +965,23 @@ mod tests {
     #[test]
     fn vault_decision_no_expectation_always_uses() {
         // A caller with no vault expectation never forces a restart.
-        assert_eq!(vault_decision(Some("/vaults/a"), None), VaultDecision::Use);
-        assert_eq!(vault_decision(None, None), VaultDecision::Use);
+        assert_eq!(
+            vault_decision(Some("/vaults/a"), &VaultExpectation::Any),
+            VaultDecision::Use
+        );
+        assert_eq!(
+            vault_decision(None, &VaultExpectation::Any),
+            VaultDecision::Use
+        );
     }
 
     #[test]
     fn vault_decision_same_vault_uses() {
         assert_eq!(
-            vault_decision(Some("/vaults/a"), Some("/vaults/a")),
+            vault_decision(
+                Some("/vaults/a"),
+                &VaultExpectation::Vault("/vaults/a".into())
+            ),
             VaultDecision::Use
         );
     }
@@ -915,7 +990,10 @@ mod tests {
     fn vault_decision_different_vault_restarts() {
         // Daemon on A, caller wants B → restart (the core wrong-vault guard).
         assert_eq!(
-            vault_decision(Some("/vaults/a"), Some("/vaults/b")),
+            vault_decision(
+                Some("/vaults/a"),
+                &VaultExpectation::Vault("/vaults/b".into())
+            ),
             VaultDecision::Restart
         );
     }
@@ -926,8 +1004,55 @@ mod tests {
         // (deserializes to None) → restart when a caller expects a vault. An
         // old daemon is never trusted to be serving the right vault.
         assert_eq!(
-            vault_decision(None, Some("/vaults/b")),
+            vault_decision(None, &VaultExpectation::Vault("/vaults/b".into())),
             VaultDecision::Restart
+        );
+    }
+
+    // ── vault_decision + vault_expectation: the uncanonicalizable-expected-vault
+    // hardening (the narrow wrong-vault TOCTOU). A caller that HAS a vault which
+    // won't canonicalize must be a MISMATCH, not silently "no expectation".
+    #[test]
+    fn vault_decision_unresolvable_expected_restarts_even_against_matching_daemon() {
+        // Even if a daemon is up on `/vaults/a`, an Unresolvable expectation
+        // can't confirm it — treat as a mismatch (don't adopt it).
+        assert_eq!(
+            vault_decision(Some("/vaults/a"), &VaultExpectation::Unresolvable),
+            VaultDecision::Restart
+        );
+        assert_eq!(
+            vault_decision(None, &VaultExpectation::Unresolvable),
+            VaultDecision::Restart
+        );
+    }
+
+    #[test]
+    fn vault_expectation_none_is_any() {
+        assert_eq!(vault_expectation(None), VaultExpectation::Any);
+    }
+
+    #[test]
+    fn vault_expectation_real_dir_canonicalizes_to_vault() {
+        // An existing directory canonicalizes → `Vault(id)` matching the daemon
+        // record a co-located daemon would write for the same path.
+        let dir = tempdir().unwrap();
+        match vault_expectation(Some(dir.path())) {
+            VaultExpectation::Vault(id) => {
+                assert_eq!(Some(id), canonical_vault_id(dir.path()));
+            }
+            other => panic!("expected Vault(_), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_expectation_missing_dir_is_unresolvable() {
+        // A path that can't be canonicalized (never existed / vanished mid-op)
+        // → `Unresolvable`, NOT `Any` — this is the TOCTOU the hardening closes.
+        let dir = tempdir().unwrap();
+        let gone = dir.path().join("does-not-exist");
+        assert_eq!(
+            vault_expectation(Some(&gone)),
+            VaultExpectation::Unresolvable
         );
     }
 
@@ -1394,7 +1519,7 @@ mod tests {
         assert_eq!(
             vault_decision(
                 srv.info.vault.as_deref(),
-                canonical_vault_id(vault_b.path()).as_deref()
+                &vault_expectation(Some(vault_b.path()))
             ),
             VaultDecision::Restart,
             "a daemon bound to A must be refused (restarted) for vault B"
@@ -1410,7 +1535,10 @@ mod tests {
         let info: DaemonInfo = serde_json::from_str(body).unwrap();
         assert_eq!(info.vault, None);
         assert_eq!(
-            vault_decision(info.vault.as_deref(), Some("/vaults/b")),
+            vault_decision(
+                info.vault.as_deref(),
+                &VaultExpectation::Vault("/vaults/b".into())
+            ),
             VaultDecision::Restart
         );
     }

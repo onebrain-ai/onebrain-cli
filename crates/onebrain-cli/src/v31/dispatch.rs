@@ -364,11 +364,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             ConfigVerb::Init => stubs::not_implemented("config init"),
         },
         Cmd::Daemon(DaemonCmd { verb }) => match verb {
-            DaemonVerb::Start => commands::daemon::run_start(&mode),
+            DaemonVerb::Start { vault } => commands::daemon::run_start(&mode, vault.as_deref()),
             DaemonVerb::Stop => commands::daemon::run_stop(&mode),
             DaemonVerb::Status => commands::daemon::run_status(&mode),
             // Hidden internal verb — the detached child's body.
-            DaemonVerb::Run => commands::daemon::run_internal(),
+            DaemonVerb::Run { vault } => commands::daemon::run_internal(vault.as_deref()),
         },
         Cmd::Date(DateCmd { verb }) => match verb {
             DateVerb::Today => stubs::not_implemented("date today"),

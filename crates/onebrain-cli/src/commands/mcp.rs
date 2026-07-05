@@ -816,16 +816,15 @@ pub fn run(vault_flag: Option<PathBuf>) -> Result<()> {
     // for `get`/`multi_get` filesystem reads.
     let resolved = crate::vault_ctx::require(vault_flag.clone())?;
 
-    // A daemon `ensure_running` spawns resolves ITS vault from `$ONEBRAIN_VAULT`
-    // (its detached child chdir's to `/`, so walk-up is useless — see
-    // `daemon::resolve_daemon_vault`). Export the vault we JUST resolved so a
-    // daemon we auto-start binds the SAME vault; otherwise it would bind
-    // vault-less (503/empty) or, worse, bind a stale `$ONEBRAIN_VAULT` that
-    // differs from our `--vault` and trigger an endless restart loop against the
-    // vault check below. `resolved` already honoured the canonical precedence
-    // (flag > env > cwd), so it is authoritative for THIS process — set it
-    // unconditionally so the spawned daemon can't disagree with what we resolved.
-    std::env::set_var("ONEBRAIN_VAULT", resolved.root.as_path());
+    // A daemon `ensure_running` spawns resolves ITS vault from the `--vault` arg
+    // we pass it (its detached child chdir's to `/`, so walk-up is useless — see
+    // `daemon::resolve_daemon_vault`). We thread `resolved.root` through
+    // `ensure_running` → `spawn_daemon_start` → `daemon start --vault <path>`,
+    // so the daemon we auto-start binds the SAME vault we resolved WITHOUT
+    // mutating this process's `$ONEBRAIN_VAULT` (a `std::env::set_var`, which is
+    // unsound under concurrent reads and deprecated since Rust 1.81). `resolved`
+    // already honoured the canonical precedence (flag > env > cwd), so it is
+    // authoritative for THIS process and the daemon can't disagree.
 
     // Primary path: route through the warm daemon so the MCP server holds NO
     // redb lock and multiple concurrent MCP sessions coexist. `ensure_running`

@@ -467,7 +467,13 @@ fn render_status_text(env: &Envelope<DaemonStatusData>) -> String {
 
 /// `onebrain daemon start` — spawn a detached `__run` child if not already
 /// running, record its PID, report.
-pub fn run_start(mode: &OutputMode) -> Result<()> {
+///
+/// `vault` (from `--vault`) is threaded to the detached `__run` child so a
+/// caller conveys the vault the daemon should bind EXPLICITLY, rather than
+/// mutating `$ONEBRAIN_VAULT` in the parent process (which is unsound under
+/// concurrent reads and deprecated since Rust 1.81). When `None`, the child
+/// falls back to `$ONEBRAIN_VAULT` — the pre-`--vault` behaviour.
+pub fn run_start(mode: &OutputMode, vault: Option<&Path>) -> Result<()> {
     let pid_path = pid_path()?;
 
     // Already-running guard: a live PID file means a no-op start.
@@ -506,7 +512,7 @@ pub fn run_start(mode: &OutputMode) -> Result<()> {
     }
 
     // Spawn the detached child and record its PID.
-    let pid = spawn_detached_run(&log_path()?).context("spawn detached daemon process")?;
+    let pid = spawn_detached_run(&log_path()?, vault).context("spawn detached daemon process")?;
     write_pid(&pid_path, pid)?;
 
     // Wait — STILL HOLDING THE LOCK — until the daemon is fully up (it has
@@ -660,7 +666,7 @@ fn render_stop_text(env: &Envelope<DaemonStopData>) -> String {
 /// No `unsafe fork`, no libc double-fork — `std::process::Command` does the
 /// `fork`+`exec` for us; we only add `setsid` + the stdio redirection.
 #[cfg(unix)]
-fn spawn_detached_run(log_path: &Path) -> Result<u32> {
+fn spawn_detached_run(log_path: &Path, vault: Option<&Path>) -> Result<u32> {
     use std::fs::OpenOptions;
     use std::os::unix::fs::OpenOptionsExt; // for `.mode(...)`
     use std::os::unix::process::CommandExt; // for `pre_exec`
@@ -706,6 +712,12 @@ fn spawn_detached_run(log_path: &Path) -> Result<u32> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
+    // Convey the vault to the child EXPLICITLY via `--vault` rather than
+    // mutating `$ONEBRAIN_VAULT` in the parent (unsound/deprecated). The child
+    // still honours `$ONEBRAIN_VAULT` as a fallback when no `--vault` is passed.
+    if let Some(v) = vault {
+        cmd.arg("--vault").arg(v);
+    }
 
     // SAFETY: `pre_exec` runs in the forked child *before* exec. Both setsid()
     // and chdir() are async-signal-safe and we touch no shared state (no
@@ -736,7 +748,7 @@ fn spawn_detached_run(log_path: &Path) -> Result<u32> {
 
 /// Non-Unix stub — the detached-spawn path is Unix-only for now.
 #[cfg(not(unix))]
-fn spawn_detached_run(_log_path: &Path) -> Result<u32> {
+fn spawn_detached_run(_log_path: &Path, _vault: Option<&Path>) -> Result<u32> {
     anyhow::bail!("daemon is not yet supported on this platform")
 }
 
@@ -790,8 +802,9 @@ fn terminate(_pid: u32) -> Result<()> {
 /// The server is the SAME one `onebrain serve` runs — only the shutdown trigger
 /// differs (SIGTERM here vs Ctrl-C there). The daemon resolves its
 /// [`crate::server::ServeConfig`] from:
-/// - **vault_root** — `$ONEBRAIN_VAULT`, but ONLY if it names a real vault (see
-///   [`resolve_daemon_vault`]). Otherwise `None`.
+/// - **vault_root** — the `--vault` arg passed by `daemon start` if present,
+///   else `$ONEBRAIN_VAULT` — but ONLY if the chosen candidate names a real
+///   vault (see [`resolve_daemon_vault`]). Otherwise `None`.
 /// - **port** — the shared default ([`crate::commands::serve::DEFAULT_PORT`]).
 /// - **token** — freshly generated per process.
 /// - **dist_dir** — `$ONEBRAIN_DIST` if set, else `None` (API-only). The plugin
@@ -810,7 +823,10 @@ fn terminate(_pid: u32) -> Result<()> {
 /// daemon is already running still overwrites `daemon.pid`/`daemon.json` with
 /// this process's values, orphaning the existing daemon. `__run` is a hidden,
 /// internal verb only `daemon start` (which holds the lock) is meant to spawn.
-pub fn run_internal() -> Result<()> {
+///
+/// `vault` is the `--vault` arg `daemon start` threaded through; it takes
+/// precedence over `$ONEBRAIN_VAULT` (see [`resolve_daemon_vault`]).
+pub fn run_internal(vault: Option<&Path>) -> Result<()> {
     use crate::commands::serve::DEFAULT_PORT;
     use crate::server::{self, resolve_token, ServeConfig};
 
@@ -834,7 +850,7 @@ pub fn run_internal() -> Result<()> {
     // `None`, and the vault handlers return 503 (the static surface + token
     // still work, so the daemon runs and reports cleanly; it just exposes no
     // filesystem).
-    let vault_root = resolve_daemon_vault();
+    let vault_root = resolve_daemon_vault(vault);
     // Canonical identity of the bound vault, stamped into `daemon.json` so a
     // client that resolved a DIFFERENT vault detects the mismatch and restarts
     // the daemon instead of silently routing through the wrong-vault engine
@@ -980,15 +996,23 @@ fn should_idle_shutdown(last_activity: u64, now: u64, idle_secs: u64) -> bool {
 
 /// Resolve the vault the daemon should serve, or `None` when none is bound.
 ///
-/// Reads the `$ONEBRAIN_VAULT` candidate and verifies it is a REAL vault before
-/// trusting it (fix A): a directory only counts if it contains a config file
+/// Candidate precedence: the `--vault` arg (`arg`, threaded from `daemon start`)
+/// if present, else the `$ONEBRAIN_VAULT` env var (the back-compat fallback).
+/// Passing the vault as an explicit argument avoids the parent having to mutate
+/// its own process environment (`std::env::set_var`, unsound/deprecated).
+///
+/// Whichever candidate is chosen is then VALIDATED to be a REAL vault before it
+/// is trusted (fix A): a directory only counts if it contains a config file
 /// (`onebrain.yml`, or legacy `vault.yml`) at its root, exactly the check
 /// `onebrain_core::find_vault_root` / `load_vault_config` rely on. We use
-/// `find_config_file` (not a walk-up) because `$ONEBRAIN_VAULT` is meant to name
-/// the vault root directly. An unset env var, or a path that isn't a vault,
-/// yields `None` — never a fallback like `/`.
-fn resolve_daemon_vault() -> Option<PathBuf> {
-    let candidate = PathBuf::from(std::env::var_os("ONEBRAIN_VAULT")?);
+/// `find_config_file` (not a walk-up) because the candidate is meant to name the
+/// vault root directly. No candidate, or a path that isn't a vault, yields
+/// `None` — never a fallback like `/`.
+fn resolve_daemon_vault(arg: Option<&Path>) -> Option<PathBuf> {
+    let candidate = match arg {
+        Some(p) => p.to_path_buf(),
+        None => PathBuf::from(std::env::var_os("ONEBRAIN_VAULT")?),
+    };
     // `find_config_file` returns `Some(path-to-config)` only when the dir really
     // holds a vault config. Map that to the vault ROOT (the candidate dir).
     if onebrain_core::find_config_file(&candidate).is_some() {
@@ -996,7 +1020,7 @@ fn resolve_daemon_vault() -> Option<PathBuf> {
     } else {
         tracing::warn!(
             vault = %candidate.display(),
-            "ONEBRAIN_VAULT is not a OneBrain vault (no onebrain.yml/vault.yml); \
+            "daemon vault candidate is not a OneBrain vault (no onebrain.yml/vault.yml); \
              serving with no vault bound (vault endpoints return 503)"
         );
         None
@@ -1376,16 +1400,41 @@ mod tests {
         {
             let _e = crate::test_env::set_var("ONEBRAIN_VAULT", notvault.path());
             // A dir that isn't a vault → None (never a fallback like `/`).
-            assert!(resolve_daemon_vault().is_none());
+            assert!(resolve_daemon_vault(None).is_none());
         }
 
         let vault = tempdir().unwrap();
         std::fs::write(vault.path().join("onebrain.yml"), "search: {}\n").unwrap();
         {
             let _e = crate::test_env::set_var("ONEBRAIN_VAULT", vault.path());
-            // Valid vault (has onebrain.yml) → Some(that dir).
-            assert_eq!(resolve_daemon_vault().as_deref(), Some(vault.path()));
+            // Valid vault (has onebrain.yml) via the env FALLBACK → Some(that dir).
+            assert_eq!(resolve_daemon_vault(None).as_deref(), Some(vault.path()));
         }
+    }
+
+    #[test]
+    fn resolve_daemon_vault_arg_takes_precedence_over_env() {
+        // The `--vault` arg wins over `$ONEBRAIN_VAULT`, and a non-vault arg
+        // yields None even when the env names a real vault (no silent fallback).
+        let arg_vault = tempdir().unwrap();
+        std::fs::write(arg_vault.path().join("onebrain.yml"), "search: {}\n").unwrap();
+        let env_vault = tempdir().unwrap();
+        std::fs::write(env_vault.path().join("onebrain.yml"), "search: {}\n").unwrap();
+
+        let _e = crate::test_env::set_var("ONEBRAIN_VAULT", env_vault.path());
+        // Arg present + a real vault → arg wins over env.
+        assert_eq!(
+            resolve_daemon_vault(Some(arg_vault.path())).as_deref(),
+            Some(arg_vault.path()),
+            "--vault must take precedence over $ONEBRAIN_VAULT"
+        );
+
+        // Arg present but NOT a vault → None, without falling back to the env.
+        let notvault = tempdir().unwrap();
+        assert!(
+            resolve_daemon_vault(Some(notvault.path())).is_none(),
+            "a non-vault --vault must not silently fall back to the env"
+        );
     }
 
     #[test]
@@ -1657,8 +1706,13 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(8);
         let info: crate::commands::daemon_client::DaemonInfo = loop {
             if let Ok(Some(info)) = crate::commands::daemon_client::DaemonInfo::read(&discovery) {
-                // Also wait until it answers a liveness probe.
-                let url = format!("http://127.0.0.1:{}/api/internal/status", info.port);
+                // Also wait until it answers a liveness probe. Use the
+                // engine-INDEPENDENT `/api/health` route (matching
+                // `daemon_client::is_live`): `/api/internal/status` 503s while
+                // the daemon holds no engine (the startup window), so probing it
+                // here could spin the readiness loop against a live-but-warming
+                // daemon until the deadline.
+                let url = format!("http://127.0.0.1:{}/api/health", info.port);
                 let ok = ureq::get(&url)
                     .header("x-onebrain-token", &info.token)
                     .call()
@@ -1910,5 +1964,80 @@ mod tests {
             "recovered daemon never published daemon.json"
         );
         let _ = daemon("stop");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // `daemon start --vault <path>` binds the PASSED vault — the explicit
+    // mechanism that replaced `mcp.rs`'s `std::env::set_var("ONEBRAIN_VAULT")`.
+    // `$ONEBRAIN_VAULT` is deliberately UNSET here, so a daemon that binds the
+    // vault proves the ARGUMENT carried it (threaded start → __run → bind),
+    // not the environment. Asserted via `daemon.json.vault`, the canonical
+    // bound-vault identity. Unix-only (daemon is).
+    // ─────────────────────────────────────────────────────────────────────
+    #[cfg(unix)]
+    #[test]
+    fn daemon_start_vault_arg_binds_that_vault_without_env() {
+        use assert_cmd::cargo::cargo_bin;
+        use std::process::Command as StdCommand;
+        use std::time::{Duration, Instant};
+
+        let home = tempdir().unwrap();
+        let vault = tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: vault-arg-it\n",
+        )
+        .unwrap();
+        let bin = cargo_bin("onebrain");
+
+        // Start WITH --vault and WITHOUT $ONEBRAIN_VAULT (env_remove makes the
+        // arg the only possible source of the bound vault).
+        let start = StdCommand::new(&bin)
+            .env("HOME", home.path())
+            .env_remove("ONEBRAIN_VAULT")
+            .env("ONEBRAIN_DAEMON_PORT", "0")
+            .env("ONEBRAIN_DAEMON_IDLE_SECS", "0")
+            .args(["daemon", "start", "--vault"])
+            .arg(vault.path())
+            .output()
+            .expect("spawn onebrain daemon start --vault");
+        assert!(
+            start.status.success(),
+            "daemon start --vault exited non-zero: {start:?}"
+        );
+
+        let discovery = home
+            .path()
+            .join(".onebrain")
+            .join("run")
+            .join("daemon.json");
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let info = loop {
+            if let Ok(Some(info)) = crate::commands::daemon_client::DaemonInfo::read(&discovery) {
+                break info;
+            }
+            if Instant::now() >= deadline {
+                let _ = StdCommand::new(&bin)
+                    .env("HOME", home.path())
+                    .args(["daemon", "stop"])
+                    .output();
+                panic!("daemon never published daemon.json");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        // The daemon bound the vault from --vault: daemon.json records its
+        // canonical identity (NOT null / vault-less).
+        let expected = crate::commands::daemon_client::canonical_vault_id(vault.path());
+        assert!(expected.is_some(), "test vault must canonicalize");
+        assert_eq!(
+            info.vault, expected,
+            "daemon.json.vault must be the --vault path (arg carried the vault, not env)"
+        );
+
+        let _ = StdCommand::new(&bin)
+            .env("HOME", home.path())
+            .args(["daemon", "stop"])
+            .output();
     }
 }
