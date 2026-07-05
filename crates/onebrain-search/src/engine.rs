@@ -53,6 +53,12 @@ const CHUNK_OVERLAP_TOKENS: usize = 64;
 const LEX_TOP_K: usize = 50;
 const VEC_TOP_K: usize = 50;
 const RRF_K: f64 = 60.0;
+/// Cosine window for the recall-first vector cutoff ([`keep_top_cluster`]):
+/// keep hits within this much of a query's best score. Measured on real e5
+/// content (2026-07-06) — genuine matches cluster ~0.012–0.019 below the top,
+/// so 0.02 keeps the coherent cluster while shedding the flat tail. Model-
+/// agnostic (relative), replacing the old per-model absolute `vec_floor`.
+const VEC_CLUSTER_WINDOW: f32 = 0.02;
 const SNIPPET_MAX_CHARS: usize = 200;
 
 /// Error message returned by embedder-backed operations (`query`,
@@ -352,15 +358,25 @@ fn walk_markdown_files(root: &Path, exclude: &[String]) -> Result<Vec<PathBuf>> 
     Ok(out)
 }
 
-/// Drop vector hits whose cosine similarity is below the model's measured
-/// confidence floor (see `ModelInfo::vec_floor`). Without this, a query
-/// about something the vault doesn't contain still surfaces its top-k
-/// nearest neighbors — pure noise with authoritative-looking ranks.
-fn drop_below_floor(hits: Vec<(String, f32)>, floor: Option<f32>) -> Vec<(String, f32)> {
-    match floor {
-        Some(f) => hits.into_iter().filter(|(_, s)| *s >= f).collect(),
-        None => hits,
-    }
+/// Keep only the coherent TOP CLUSTER of vector hits: those within `window`
+/// cosine of the best score. Recall-first replacement for the absolute
+/// `drop_below_floor` — it NEVER empties a non-empty result set (the old
+/// per-model floor silently zeroed genuine e5 matches that cluster at
+/// ~0.83–0.87, just under a 0.85 floor). Relative to each query's own top, so
+/// it is model-agnostic. Input is assumed sorted by score descending (as
+/// `VectorStore::search` returns); the max is taken defensively regardless.
+fn keep_top_cluster(hits: Vec<(String, f32)>, window: f32) -> Vec<(String, f32)> {
+    let Some(top) = hits
+        .iter()
+        .map(|(_, s)| *s)
+        .fold(None, |acc: Option<f32>, s| {
+            Some(acc.map_or(s, |a| a.max(s)))
+        })
+    else {
+        return hits; // empty in → empty out
+    };
+    let cutoff = top - window;
+    hits.into_iter().filter(|(_, s)| *s >= cutoff).collect()
 }
 
 /// A single fused, resolved search hit.
@@ -686,15 +702,6 @@ impl Engine {
         Ok(chunks.len())
     }
 
-    /// The active model's vector-confidence floor from the registry
-    /// (`None` for unknown/test models and models without a measured floor).
-    fn vec_floor(&self) -> Option<f32> {
-        embed::model_registry()
-            .iter()
-            .find(|m| m.name == self.model_name)
-            .and_then(|m| m.vec_floor)
-    }
-
     /// Install the vault's `search.exclude` patterns — applied by every
     /// vault walk on top of the built-in skips (hidden dirs, node_modules).
     pub fn set_exclude_patterns(&mut self, patterns: Vec<String>) {
@@ -901,7 +908,10 @@ impl Engine {
     /// `top_k` [`Hit`]s. Fused ids whose meta is missing are skipped.
     pub fn query(&self, text: &str, top_k: usize) -> Result<Vec<Hit>> {
         let query_vec = self.embedder()?.embed_query(text)?;
-        let vec_hits = drop_below_floor(self.vec.search(&query_vec, VEC_TOP_K), self.vec_floor());
+        // Recall-first: keep the vec top cluster (relative) and let RRF + lex
+        // provide precision. The old absolute floor silently dropped ALL vec
+        // hits for e5 (scores ~0.83–0.87 < 0.85), degrading hybrid to lex-only.
+        let vec_hits = keep_top_cluster(self.vec.search(&query_vec, VEC_TOP_K), VEC_CLUSTER_WINDOW);
         let lex_hits = self.lex.search(text, LEX_TOP_K)?;
 
         let fused = rrf_fuse(&lex_hits, &vec_hits, RRF_K, top_k);
@@ -913,7 +923,7 @@ impl Engine {
     /// full [`Hit`]s. Used by the CLI's `search vsearch` verb.
     pub fn vector_search(&self, text: &str, top_k: usize) -> Result<Vec<Hit>> {
         let query_vec = self.embedder()?.embed_query(text)?;
-        let vec_hits = drop_below_floor(self.vec.search(&query_vec, top_k), self.vec_floor());
+        let vec_hits = keep_top_cluster(self.vec.search(&query_vec, top_k), VEC_CLUSTER_WINDOW);
         let ranked: Vec<(String, f64)> = vec_hits
             .into_iter()
             .map(|(id, score)| (id, score as f64))
@@ -2422,30 +2432,37 @@ mod tests {
     }
 
     #[test]
-    fn drop_below_floor_filters_only_with_floor() {
-        let hits = vec![("a".to_string(), 0.88f32), ("b".to_string(), 0.84)];
-        let kept = drop_below_floor(hits.clone(), Some(0.85));
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].0, "a");
+    fn keep_top_cluster_keeps_within_window_drops_beyond() {
+        // window 0.02 → keep scores >= top(0.839) - 0.02 = 0.819.
+        let hits = vec![
+            ("a".to_string(), 0.839f32),
+            ("b".to_string(), 0.830),
+            ("c".to_string(), 0.811),
+        ];
+        let kept = keep_top_cluster(hits, 0.02);
         assert_eq!(
-            drop_below_floor(hits, None).len(),
-            2,
-            "no floor → untouched"
+            kept.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "keeps the top cluster (within 0.02 of top); drops c at 0.811"
         );
     }
 
     #[test]
-    fn e5_family_has_vec_floor_bge_does_not() {
-        for m in embed::model_registry() {
-            if m.name.starts_with("multilingual-e5") {
-                assert_eq!(m.vec_floor, Some(0.85), "{}", m.name);
-            }
-        }
-        let bge = embed::model_registry()
-            .iter()
-            .find(|m| m.name == "bge-m3")
-            .unwrap();
-        assert!(bge.vec_floor.is_none());
+    fn keep_top_cluster_never_empties_a_real_match() {
+        // The exact e5 regression: a genuine top match scores 0.839 — BELOW the
+        // old 0.85 floor, which silently returned zero hits. Relative keep must
+        // RETURN it (recall-first).
+        let hits = vec![("warm-daemon-doc".to_string(), 0.839f32)];
+        assert_eq!(
+            keep_top_cluster(hits, 0.02).len(),
+            1,
+            "a 0.839 real match must survive (old absolute floor dropped it)"
+        );
+    }
+
+    #[test]
+    fn keep_top_cluster_empty_stays_empty() {
+        assert!(keep_top_cluster(Vec::<(String, f32)>::new(), 0.02).is_empty());
     }
 
     #[test]
