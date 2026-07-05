@@ -12,7 +12,9 @@ onebrain daemon stop     # SIGTERM it, clean up its runtime files
 
 The search engine's metadata store (`engine.redb`) is **single-process**: only one process may open a collection's engine at a time. With multiple concurrent sessions (webui, CLI, agent-teams) each opening their own engine, they collide with redb's single-writer limit. The daemon opens the engine **once at boot** and holds it, so the other surfaces talk to it over HTTP instead of each opening their own. See [ADR 0023](decisions/0023-warm-daemon-mcp-search.md).
 
-> **Scope (v3.4.6):** the daemon owns the **search** engine and exposes reindex + status endpoints; the reusable client library ships alongside it. Wiring the CLI `search` verbs and the MCP server to *use* the daemon lands in follow-up tracks — until then those surfaces still open the engine directly. Consolidating the remaining surfaces (config/tree/file/chat) behind the daemon is later cleanup.
+> **Scope (v3.4.6):** the daemon owns the **search** engine and exposes reindex + status endpoints; the reusable client library ships alongside it. The **MCP server** (`onebrain mcp`) now *uses* the daemon: its `status`/`query` tools route through `daemon_client` (`GET /api/internal/status` + `GET /api/vault/search`) instead of opening their own engine, so multiple concurrent MCP sessions coexist without racing redb's lock — it falls back to a direct single-process engine open only when the daemon can't start. Wiring the CLI `search` verbs to the daemon lands in a follow-up track — until then those verbs still open the engine directly. Consolidating the remaining surfaces (config/tree/file/chat) behind the daemon is later cleanup.
+>
+> **Daemon-routed `query` deltas (MCP tool):** the daemon-backed `query` path differs slightly from the direct-engine path — results are **doc-level** (dedup/fusion keys on `path`, so at most one hit per document, vs multiple chunks of one doc directly); a `vec` sub-query is served as **`hybrid`** (lex mixed in) on the wire; and the daemon caps candidates at **`TOP_K` = 20** per sub-query (the direct path over-fetches ≥30). `hyde` ≡ `vec` on **both** paths already (both embed the passage text), so daemon routing adds no new hyde loss. `status` is unaffected — its response shape is identical on both paths.
 
 ## Persistent engine + internal endpoints
 
@@ -36,10 +38,11 @@ Every route — including `/api/health` — is behind the **same token auth** as
 After it binds, the daemon writes a discovery file so clients can find it:
 
 ```json
-{ "port": 6789, "token": "…", "pid": 12345, "version": "3.4.6" }
+{ "port": 6789, "token": "…", "pid": 12345, "version": "3.4.6", "vault": "/abs/canonical/vault" }
 ```
 
 - `port` is the **actual** bound port (relevant when the daemon binds `0` for an OS-assigned port).
+- `vault` is the **canonical path** of the vault the daemon bound at boot (`null` if it bound vault-less). The daemon is a **machine singleton**, so a client that resolved a **different** vault must not silently reuse this engine — `discover()`/`ensure_running()` compare `vault` to the caller's resolved vault and, on mismatch, **restart the daemon for the caller's vault** (same handling as a version skew). This makes the v3.4.6 model explicit: **one vault at a time per machine; switching vaults restarts the daemon** (concurrent per-vault daemons are deferred to v3.8). An old `daemon.json` without the `vault` key deserializes to `null`, so a pre-vault-field daemon is never trusted to be serving the right vault.
 - The file is `0600` (it holds the token) and written atomically (temp-then-rename).
 - It is **removed on clean shutdown** (SIGTERM / `daemon stop`). A **hard kill** (SIGKILL/crash) leaves it behind — there's no crash-time cleanup — so `discover()` treats every record as untrusted: it liveness-probes and **reclaims a stale record lazily** on the next lookup, so a client never connects to a dead daemon.
 

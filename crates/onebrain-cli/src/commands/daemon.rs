@@ -835,6 +835,13 @@ pub fn run_internal() -> Result<()> {
     // still work, so the daemon runs and reports cleanly; it just exposes no
     // filesystem).
     let vault_root = resolve_daemon_vault();
+    // Canonical identity of the bound vault, stamped into `daemon.json` so a
+    // client that resolved a DIFFERENT vault detects the mismatch and restarts
+    // the daemon instead of silently routing through the wrong-vault engine
+    // (see `daemon_client::vault_decision`). `None` when bound vault-less.
+    let vault_id = vault_root
+        .as_deref()
+        .and_then(crate::commands::daemon_client::canonical_vault_id);
     // Optional pre-built webui dist, passed by the plugin launcher.
     let dist_dir = std::env::var_os("ONEBRAIN_DIST").map(PathBuf::from);
     // Honours $ONEBRAIN_TOKEN (≥16 chars) for a stable token across restarts.
@@ -906,6 +913,7 @@ pub fn run_internal() -> Result<()> {
                 token,
                 pid,
                 version: env!("CARGO_PKG_VERSION").to_string(),
+                vault: vault_id,
             };
             if let Err(e) = info.write(&discovery_for_bind) {
                 tracing::warn!(error = %e, "failed to write daemon.json discovery file");

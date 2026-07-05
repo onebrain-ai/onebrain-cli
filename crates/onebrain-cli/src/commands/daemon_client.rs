@@ -86,6 +86,32 @@ pub struct DaemonInfo {
     pub token: String,
     pub pid: u32,
     pub version: String,
+    /// The CANONICAL path of the vault this daemon bound at boot, or `None` if
+    /// it bound vault-less (`$ONEBRAIN_VAULT` unset/invalid — see
+    /// `daemon::resolve_daemon_vault`). The daemon is a MACHINE SINGLETON keyed
+    /// on `daemon.json`, so a client that resolved a DIFFERENT vault must not
+    /// silently reuse this daemon's engine — [`vault_decision`] compares this to
+    /// the caller's vault and triggers a restart on mismatch, exactly like a
+    /// version skew. Absent in `daemon.json` written by a pre-vault-field CLI →
+    /// deserializes to `None` (treated as "unknown vault" → restart when a
+    /// caller expects a specific one), so an old daemon is never trusted to be
+    /// serving the right vault.
+    #[serde(default)]
+    pub vault: Option<String>,
+}
+
+/// Canonical identity string for a vault path — the value stored in
+/// `daemon.json.vault` and compared by [`vault_decision`]. Canonicalizing both
+/// the daemon's bound vault and the caller's resolved vault means a symlinked,
+/// `..`-laden, or trailing-slash path variant of the SAME vault compares equal
+/// (no spurious restart), while genuinely different vaults compare unequal.
+/// Returns `None` when the path can't be canonicalized (e.g. it no longer
+/// exists) — callers treat an uncanonicalizable expected vault as "unknown", so
+/// they don't force a restart on a transient stat failure.
+pub fn canonical_vault_id(path: &Path) -> Option<String> {
+    path.canonicalize()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 impl DaemonInfo {
@@ -213,6 +239,45 @@ pub fn version_decision(daemon_version: &str, own: &str) -> VersionDecision {
     }
 }
 
+/// Decide what a client should do given a discovered daemon's bound vault vs the
+/// vault the caller resolved. Pure (no I/O) so the policy is unit-testable.
+///
+/// The daemon is a machine singleton keyed on `daemon.json`, so if it's serving
+/// vault A and the caller resolved vault B, routing B's `query`/`status` through
+/// A's engine would return WRONG-VAULT results with no error. This maps that to
+/// a restart, exactly like a version skew — making the v3.4.6 model explicit:
+/// **one vault at a time per machine; switching vaults restarts the daemon.**
+/// (Multiple concurrent per-vault daemons are deferred to the v3.8 daemon
+/// refactor.)
+#[derive(Debug, PartialEq, Eq)]
+pub enum VaultDecision {
+    /// The daemon's bound vault matches the caller's (or the caller expressed no
+    /// vault expectation) — use the running daemon as-is.
+    Use,
+    /// The daemon is bound to a DIFFERENT vault (or bound vault-less while the
+    /// caller expects one, or its record predates the vault field) — restart it
+    /// for the caller's vault.
+    Restart,
+}
+
+/// Compare a discovered daemon's bound vault (`daemon.json.vault`, already
+/// canonicalized at write time) against the caller's expected vault
+/// (canonicalized via [`canonical_vault_id`]).
+///
+/// - `expected == None` → the caller doesn't care which vault (never restarts).
+/// - `expected == Some(v)` and the daemon's `vault == Some(v)` → `Use`.
+/// - Any other `Some` case — daemon on a different vault, daemon bound
+///   vault-less, or an old record with no vault field (`daemon_vault == None`) —
+///   → `Restart`. An old daemon is thus never trusted to be serving the right
+///   vault.
+pub fn vault_decision(daemon_vault: Option<&str>, expected: Option<&str>) -> VaultDecision {
+    match expected {
+        None => VaultDecision::Use,
+        Some(want) if daemon_vault == Some(want) => VaultDecision::Use,
+        Some(_) => VaultDecision::Restart,
+    }
+}
+
 /// Why the client is still waiting for a daemon — used to turn `ensure_running`'s
 /// opaque timeout into an actionable message. Pure classification (no I/O) so it
 /// is unit-testable: [`classify_last_state`] maps the last-observed
@@ -286,7 +351,10 @@ const START_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl DaemonHandle {
-    fn new(info: DaemonInfo) -> Self {
+    /// Build a handle around a discovery record. `pub(crate)` so the mcp track's
+    /// tests can construct one pointing at a test-owned live server (the normal
+    /// callers go through `discover`/`ensure_running`).
+    pub(crate) fn new(info: DaemonInfo) -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(CLIENT_TIMEOUT))
             .build()
@@ -391,8 +459,13 @@ fn with_retry(
     handle: &DaemonHandle,
     op: impl Fn(&DaemonHandle) -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
 ) -> Result<serde_json::Value> {
+    // Reconnect to the SAME vault this handle was serving — pass its bound vault
+    // as the expected vault so a respawn (after the daemon vanished) can't be
+    // satisfied by a wrong-vault daemon that started meanwhile.
+    let expected = handle.info.vault.clone();
     let mut resp = retry_once(handle, &op, is_transport_error, || {
-        ensure_running().context("respawn daemon after transport failure")
+        ensure_running(expected.as_deref().map(Path::new))
+            .context("respawn daemon after transport failure")
     })?;
     read_json(&mut resp)
 }
@@ -450,14 +523,20 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-/// Discover an already-running daemon, or `None`.
+/// Discover an already-running daemon serving `expected_vault`, or `None`.
 ///
-/// Reads `daemon.json`; if present and live AND at our version, returns a
-/// handle. A stale record (parse error, dead daemon) is cleaned up and yields
-/// `None`. A version mismatch stops the old daemon, cleans the record, and
-/// yields `None` so a caller's [`ensure_running`] starts a fresh one at our
-/// version (see [`version_decision`]).
-pub fn discover() -> Result<Option<DaemonHandle>> {
+/// Reads `daemon.json`; if present and live AND at our version AND bound to the
+/// caller's `expected_vault`, returns a handle. A stale record (parse error,
+/// dead daemon) is cleaned up and yields `None`. A version OR vault mismatch
+/// stops the old daemon, cleans the record, and yields `None` so a caller's
+/// [`ensure_running`] starts a fresh one (see [`version_decision`] /
+/// [`vault_decision`]).
+///
+/// `expected_vault` is the caller's resolved vault path (`None` = "any vault,
+/// don't check" — e.g. a diagnostic that just wants to reach whatever daemon is
+/// up). It is canonicalized here and compared against the daemon's stored
+/// canonical vault.
+pub fn discover(expected_vault: Option<&Path>) -> Result<Option<DaemonHandle>> {
     let path = discovery_path()?;
     let info = match DaemonInfo::read(&path) {
         Ok(Some(info)) => info,
@@ -469,19 +548,35 @@ pub fn discover() -> Result<Option<DaemonHandle>> {
         }
     };
 
-    if version_decision(&info.version, own_version()) == VersionDecision::Restart {
-        tracing::info!(
-            daemon_version = %info.version,
-            own_version = own_version(),
-            "daemon version skew; restarting daemon"
-        );
+    // A version OR vault mismatch both mean "this running daemon can't serve
+    // us": restart it. Compute the vault decision from the caller's canonical
+    // expected vault vs the daemon's stored canonical vault.
+    let expected_id = expected_vault.and_then(canonical_vault_id);
+    let version_mismatch =
+        version_decision(&info.version, own_version()) == VersionDecision::Restart;
+    let vault_mismatch =
+        vault_decision(info.vault.as_deref(), expected_id.as_deref()) == VaultDecision::Restart;
+    if version_mismatch || vault_mismatch {
+        if vault_mismatch && !version_mismatch {
+            tracing::info!(
+                daemon_vault = ?info.vault,
+                expected_vault = ?expected_id,
+                "daemon bound to a different vault; restarting daemon for the caller's vault"
+            );
+        } else {
+            tracing::info!(
+                daemon_version = %info.version,
+                own_version = own_version(),
+                "daemon version skew; restarting daemon"
+            );
+        }
         // Stop the mismatched daemon, then clear its record. A stop FAILURE is
         // material — the old daemon may still hold the redb lock, so the
         // subsequent start would fail. Capture it: warn now, and (via the
         // caller's `ensure_running`) it surfaces as an "engine still locked"
         // start failure rather than being silently dropped.
         if let Err(e) = stop_daemon() {
-            tracing::warn!(error = %e, "failed to stop version-skewed daemon; \
+            tracing::warn!(error = %e, "failed to stop mismatched daemon; \
                 a fresh start may fail while it still holds the engine lock");
         }
         let _ = DaemonInfo::remove(&path);
@@ -505,23 +600,34 @@ pub fn discover() -> Result<Option<DaemonHandle>> {
 /// for `daemon.json` + liveness up to [`START_TIMEOUT`]. The start race is
 /// handled implicitly: if a concurrent starter won, its `daemon.json` appears
 /// and we connect to it — we don't require that *we* spawned the winner.
-pub fn ensure_running() -> Result<DaemonHandle> {
-    if let Some(handle) = discover()? {
+pub fn ensure_running(expected_vault: Option<&Path>) -> Result<DaemonHandle> {
+    if let Some(handle) = discover(expected_vault)? {
         return Ok(handle);
     }
 
     spawn_daemon_start().context("spawn daemon start")?;
 
     let path = discovery_path()?;
+    let expected_id = expected_vault.and_then(canonical_vault_id);
     let deadline = Instant::now() + START_TIMEOUT;
     // Remember the last-observed discovery record so a timeout can say WHY.
     let mut last_read: Option<DaemonInfo> = None;
     loop {
-        // A daemon.json at our version + live probe → connected.
+        // A daemon.json at our version + our vault + live probe → connected.
+        // The vault check matters even here: a concurrent starter for a
+        // DIFFERENT vault could win the race and publish first, and connecting
+        // to it would silently serve the wrong vault. `spawn_daemon_start`
+        // inherits our `$ONEBRAIN_VAULT`, so the daemon WE spawn binds our
+        // vault; requiring the match just refuses to adopt a wrong-vault winner
+        // (we keep polling until the deadline instead).
         if let Ok(read) = DaemonInfo::read(&path) {
             last_read = read.clone();
             if let Some(info) = read {
-                if version_decision(&info.version, own_version()) == VersionDecision::Use {
+                let version_ok =
+                    version_decision(&info.version, own_version()) == VersionDecision::Use;
+                let vault_ok = vault_decision(info.vault.as_deref(), expected_id.as_deref())
+                    == VaultDecision::Use;
+                if version_ok && vault_ok {
                     let handle = DaemonHandle::new(info);
                     if handle.is_live() {
                         return Ok(handle);
@@ -594,6 +700,7 @@ mod tests {
             token: "tok-abcdefghijklmnop".to_string(),
             pid: 4242,
             version: version.to_string(),
+            vault: None,
         }
     }
 
@@ -663,6 +770,42 @@ mod tests {
         assert_eq!(version_decision("3.5.0", "3.4.6"), VersionDecision::Restart);
     }
 
+    // ── vault_decision: the wrong-vault-daemon restart policy (C1) ─────────
+    #[test]
+    fn vault_decision_no_expectation_always_uses() {
+        // A caller with no vault expectation never forces a restart.
+        assert_eq!(vault_decision(Some("/vaults/a"), None), VaultDecision::Use);
+        assert_eq!(vault_decision(None, None), VaultDecision::Use);
+    }
+
+    #[test]
+    fn vault_decision_same_vault_uses() {
+        assert_eq!(
+            vault_decision(Some("/vaults/a"), Some("/vaults/a")),
+            VaultDecision::Use
+        );
+    }
+
+    #[test]
+    fn vault_decision_different_vault_restarts() {
+        // Daemon on A, caller wants B → restart (the core wrong-vault guard).
+        assert_eq!(
+            vault_decision(Some("/vaults/a"), Some("/vaults/b")),
+            VaultDecision::Restart
+        );
+    }
+
+    #[test]
+    fn vault_decision_vaultless_or_old_record_restarts_when_vault_expected() {
+        // Daemon bound vault-less, OR an old daemon.json with no vault field
+        // (deserializes to None) → restart when a caller expects a vault. An
+        // old daemon is never trusted to be serving the right vault.
+        assert_eq!(
+            vault_decision(None, Some("/vaults/b")),
+            VaultDecision::Restart
+        );
+    }
+
     #[test]
     fn urlencode_escapes_reserved_and_spaces() {
         assert_eq!(urlencode("a b&c"), "a%20b%26c");
@@ -679,7 +822,7 @@ mod tests {
     fn discover_returns_none_when_no_daemon() {
         let home = tempdir().unwrap();
         let _env = crate::test_env::set_var("HOME", home.path());
-        assert!(discover().unwrap().is_none());
+        assert!(discover(None).unwrap().is_none());
     }
 
     #[test]
@@ -918,6 +1061,9 @@ mod tests {
                 token: token.to_string(),
                 pid: std::process::id(),
                 version: own_version().to_string(),
+                // Stamp the canonical vault so discover/ensure_running vault
+                // checks match a caller resolving this same vault.
+                vault: canonical_vault_id(vault),
             },
             stop,
             join: Some(join),
@@ -983,10 +1129,73 @@ mod tests {
         let path = discovery_path().unwrap();
         srv.info.write(&path).unwrap();
 
-        let found = discover().unwrap();
+        // Discover with the SAME vault the server bound → vault check passes.
+        let found = discover(Some(vault.path())).unwrap();
         assert!(found.is_some(), "discover should find the live server");
         let v = found.unwrap().status().unwrap();
         assert!(v["doc_count"].is_number());
+    }
+
+    // C1: a daemon bound to vault A must NOT be adopted by a client resolving a
+    // DIFFERENT vault B — `discover(Some(B))` refuses it (restarts instead), so
+    // B's queries never silently route through A's engine.
+    //
+    // We assert the REFUSAL at the fast-path level with a live server bound to A
+    // and `daemon.json` stamped with A. To avoid the `stop_daemon` subprocess
+    // spawn on the mismatch path (which, under `cargo test`, would re-exec the
+    // test binary — the same reason `ensure_running`'s spawn is a documented
+    // coverage residual), we test the REUSE side directly: a same-vault client
+    // (A) adopts it, and a cross-vault client's decision is `Restart`. The
+    // actual respawn is the version-skew-equivalent OS shell (see
+    // docs/coverage.md). The pure `vault_decision`/`version_decision` policy and
+    // the wire round-trips below pin the logic without a spawn.
+    #[cfg(unix)]
+    #[test]
+    fn discover_reuses_only_when_vault_matches() {
+        let vault_a = tempdir().unwrap();
+        let vault_b = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("HOME", home.path().as_os_str()),
+        ]);
+        // Live server bound to vault A, and a daemon.json stamped with A.
+        let srv = start_live_server(vault_a.path(), "dc-live-token-1234567890");
+        srv.info.write(&discovery_path().unwrap()).unwrap();
+        let a_id = canonical_vault_id(vault_a.path());
+        assert_eq!(srv.info.vault, a_id, "daemon.json must record vault A");
+
+        // Same-vault client (A) → the daemon is REUSED (fast path, no restart).
+        let found = discover(Some(vault_a.path())).unwrap();
+        assert!(found.is_some(), "a same-vault client must reuse the daemon");
+        assert_eq!(found.unwrap().info().vault, a_id);
+
+        // Cross-vault client (B) → the DECISION is Restart (the refusal), which
+        // is what triggers `discover` to stop + respawn for B. Asserting the
+        // pure decision keeps this spawn-free; the live restart is OS shell.
+        assert_eq!(
+            vault_decision(
+                srv.info.vault.as_deref(),
+                canonical_vault_id(vault_b.path()).as_deref()
+            ),
+            VaultDecision::Restart,
+            "a daemon bound to A must be refused (restarted) for vault B"
+        );
+    }
+
+    // Back-compat: a daemon.json written by a pre-vault-field CLI has no `vault`
+    // key; it must deserialize with `vault: None` (serde default), so an old
+    // daemon reads as "unknown vault" and a vault-expecting caller restarts it.
+    #[test]
+    fn old_daemon_json_without_vault_field_deserializes_to_none() {
+        let body = r#"{"port":6789,"token":"tok-abcdefghijklmnop","pid":42,"version":"3.4.5"}"#;
+        let info: DaemonInfo = serde_json::from_str(body).unwrap();
+        assert_eq!(info.vault, None);
+        assert_eq!(
+            vault_decision(info.vault.as_deref(), Some("/vaults/b")),
+            VaultDecision::Restart
+        );
     }
 
     #[cfg(unix)]
@@ -1004,7 +1213,7 @@ mod tests {
         let srv = start_live_server(vault.path(), "dc-live-token-1234567890");
         srv.info.write(&discovery_path().unwrap()).unwrap();
 
-        let handle = ensure_running().expect("fast path should connect");
+        let handle = ensure_running(Some(vault.path())).expect("fast path should connect");
         assert_eq!(handle.info().port, srv.info.port);
     }
 
@@ -1021,11 +1230,14 @@ mod tests {
             token: "x".repeat(20),
             pid: std::process::id(),
             version: own_version().to_string(),
+            vault: None,
         }
         .write(&path)
         .unwrap();
 
-        assert!(discover().unwrap().is_none(), "dead server → None");
+        // Vault-agnostic (None) so this exercises ONLY the dead-server cleanup,
+        // not the vault check — a dead daemon is cleaned up regardless of vault.
+        assert!(discover(None).unwrap().is_none(), "dead server → None");
         assert!(
             DaemonInfo::read(&path).unwrap().is_none(),
             "stale daemon.json should be removed"
