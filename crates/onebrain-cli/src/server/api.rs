@@ -109,6 +109,9 @@ pub(crate) enum ApiError {
     /// 422 — the resource exists and the request is well-formed, but the content
     /// can't be processed as requested (e.g. a file that isn't valid UTF-8 text).
     Unprocessable(String),
+    /// 428 — the request must carry a precondition header (`If-Match`) and
+    /// didn't. Distinct from 400 so clients learn the revision contract.
+    PreconditionRequired(String),
     /// 503 — no vault is bound, so the vault endpoints have nothing to serve.
     /// Distinct from 404/500 so a client can tell "this daemon has no vault"
     /// apart from "this file is missing" / "the server broke".
@@ -126,6 +129,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::PayloadTooLarge(m) => (StatusCode::PAYLOAD_TOO_LARGE, m),
             ApiError::Unprocessable(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
+            ApiError::PreconditionRequired(m) => (StatusCode::PRECONDITION_REQUIRED, m),
             ApiError::ServiceUnavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
         };
@@ -867,22 +871,26 @@ async fn put_vault_file(
         .map(|n| n.to_string())
         .unwrap_or_else(|| "0".into());
 
+    // The revision contract is mandatory: a PUT without `If-Match` used to
+    // skip the conflict check entirely (silent unconditional overwrite) —
+    // callers that really mean "overwrite whatever is there" say so
+    // explicitly with `If-Match: *`. The bundled webui always sends the header
+    // (daemon.ts saveFile), so only out-of-contract callers see the 428.
     let if_match = headers
         .get("If-Match")
         .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+        .map(str::to_string)
+        .ok_or_else(|| ApiError::PreconditionRequired("missing required If-Match header".into()))?;
 
-    if let Some(expected) = &if_match {
-        if expected != "*" && expected != &current {
-            // This 409 deliberately carries a `rev` field beyond the standard
-            // `{ error }` envelope — the client (webui autosaver) needs the
-            // server's CURRENT rev to offer reload/overwrite and retry the save.
-            return Ok((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({ "error": "rev mismatch", "rev": current })),
-            )
-                .into_response());
-        }
+    if if_match != "*" && if_match != current {
+        // This 409 deliberately carries a `rev` field beyond the standard
+        // `{ error }` envelope — the client (webui autosaver) needs the
+        // server's CURRENT rev to offer reload/overwrite and retry the save.
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "rev mismatch", "rev": current })),
+        )
+            .into_response());
     }
 
     let rel = safe
@@ -1090,6 +1098,13 @@ async fn delete_vault_folder(
 /// to a 404 here (not a 400) so a legitimate-but-absent path reads as "missing"
 /// rather than "malformed".
 fn resolve_in_vault(vault_root: &Path, rel: &str) -> Result<PathBuf, ApiError> {
+    // Empty paths are invalid for resolver callers; otherwise "" joins onto
+    // the root and canonicalizes to the VAULT ROOT ITSELF — which, e.g., the
+    // folder-delete endpoint would then happily trash. Mirrors the guard in
+    // `resolve_in_vault_create`.
+    if rel.is_empty() {
+        return Err(ApiError::BadRequest("empty path".into()));
+    }
     // (0) An interior NUL byte can never appear in a real filesystem path; a
     //     request carrying one is malformed/hostile. Reject it lexically (fix D)
     //     so it never reaches `canonicalize` (which would error with a confusing

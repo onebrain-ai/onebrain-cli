@@ -1581,9 +1581,11 @@ async fn put_with_star_if_match_overwrites_unconditionally() {
 }
 
 #[tokio::test]
-async fn put_without_if_match_overwrites_unconditionally() {
+async fn put_without_if_match_is_precondition_required() {
     let (dir, router) = vault_router(None);
-    // No If-Match header at all → no conflict check, plain overwrite.
+    // The revision contract is mandatory: omitting If-Match is a 428, never a
+    // silent overwrite (explicit force = `If-Match: *`).
+    let before = std::fs::read_to_string(dir.path().join("01-projects/alpha.md")).unwrap();
     let req = Request::builder()
         .method("PUT")
         .uri("/api/vault/file?path=01-projects/alpha.md")
@@ -1591,10 +1593,30 @@ async fn put_without_if_match_overwrites_unconditionally() {
         .header("content-type", "text/markdown")
         .body(Body::from("# Headerless overwrite\n"))
         .unwrap();
-    let (status, body) = send(&router, req).await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    let on_disk = fs::read_to_string(dir.path().join("01-projects/alpha.md")).unwrap();
-    assert!(on_disk.contains("Headerless overwrite"), "disk: {on_disk}");
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PRECONDITION_REQUIRED);
+    // And the file is untouched.
+    let after = std::fs::read_to_string(dir.path().join("01-projects/alpha.md")).unwrap();
+    assert_eq!(before, after, "missing If-Match must not write");
+}
+
+#[tokio::test]
+async fn delete_folder_empty_path_is_bad_request_not_vault_root_trash() {
+    let (dir, router) = vault_router(None);
+    // "" used to resolve to the vault root itself — the folder-delete endpoint
+    // would then trash the whole vault. Now a 400 from resolve_in_vault.
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/api/vault/folder?path=")
+        .header("X-OneBrain-Token", TOKEN)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        dir.path().join("01-projects").exists(),
+        "vault must be untouched"
+    );
 }
 
 #[tokio::test]
