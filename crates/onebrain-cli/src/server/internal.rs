@@ -405,13 +405,33 @@ mod tests {
     // form must be rejected with 400, and the target file must NOT be indexed.
     #[tokio::test]
     async fn reindex_paths_rejects_traversal_absolute_and_symlink_escape() {
+        use onebrain_search::chunk::Chunk;
+        use onebrain_search::lex::LexIndex;
         let (vault, cache) = vault_with_empty_index();
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+
+        // Seed a WORKING index with a LEGIT in-vault doc, so the "secret absent"
+        // assertion below is proven against a real, searchable index — not a
+        // vacuously-empty one (where every query returns 0 regardless).
+        {
+            let tantivy = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap())
+                .join("tantivy");
+            let mut lex = LexIndex::open(&tantivy).unwrap();
+            lex.add(&Chunk {
+                chunk_id: "legit.md#0".to_string(),
+                doc_path: "legit.md".to_string(),
+                heading_path: String::new(),
+                text: "legitimate PUBLIC vault marker".to_string(),
+                chunk_index: 0,
+            })
+            .unwrap();
+            lex.commit().unwrap();
+        }
 
         // A secret OUTSIDE the vault that a traversal would try to read + index.
         let outside = tempfile::tempdir().unwrap();
         let secret = outside.path().join("secret.md");
-        std::fs::write(&secret, "TOP SECRET vault-escape marker\n").unwrap();
+        std::fs::write(&secret, "TOPSECRET vault-escape marker\n").unwrap();
 
         // A symlink INSIDE the vault pointing at the outside secret (symlink
         // escape — the lexical `..` check can't see through it).
@@ -419,6 +439,24 @@ mod tests {
         std::os::unix::fs::symlink(&secret, vault.path().join("link.md")).unwrap();
 
         let router = router_holding_engine(vault.path());
+
+        // Sanity: the index WORKS — searching the legit marker returns the doc.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::get("/api/vault/search?q=legitimate&mode=lex")
+                    .header("x-onebrain-token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["hits"][0]["path"], "legit.md",
+            "the seeded index must be searchable (else the secret-absent check is vacuous): {v}"
+        );
 
         // Each hostile entry, tried on its own → must be 400 (rejected).
         let mut hostile: Vec<String> = vec![
@@ -449,11 +487,12 @@ mod tests {
             );
         }
 
-        // And the secret was never indexed — a lex search for its marker returns
-        // nothing (the reindex never ran, so no index exists → empty hits).
+        // Now — against a KNOWN-WORKING index — the escaped secret is absent: a
+        // search for its unique marker returns nothing, proving confinement
+        // stopped it from being read + indexed (not that the index was empty).
         let resp = router
             .oneshot(
-                Request::get("/api/vault/search?q=SECRET&mode=lex")
+                Request::get("/api/vault/search?q=TOPSECRET&mode=lex")
                     .header("x-onebrain-token", TOKEN)
                     .body(Body::empty())
                     .unwrap(),
@@ -466,38 +505,98 @@ mod tests {
         assert_eq!(
             v["hits"].as_array().map(|a| a.len()),
             Some(0),
-            "escaped secret must NOT be indexed: {v}"
+            "escaped secret must NOT be indexed even against a working index: {v}"
         );
     }
 
+    /// End-to-end `reindex {mode:"paths"}` with a REAL on-disk doc: it must
+    /// index the doc and return NON-ZERO `added` + `doc_count`, with each stat
+    /// mapped to the right response field. Lex-only build — in a lex-only build
+    /// `index_doc` records the doc's lex chunks + `DOC_HASHES` hash WITHOUT
+    /// embedding (`embed_passages_if_available` returns `None`), so `added`/
+    /// `doc_count` genuinely rise with NO model download. This is what catches a
+    /// field-swap like `removed: stats.updated` in `ReindexResponse`; the other
+    /// reindex tests only assert the all-zero no-op.
+    #[cfg(not(feature = "semantic"))]
     #[tokio::test]
-    async fn reindex_paths_accepts_a_normal_in_vault_path() {
-        // A legitimate in-vault relative path passes confinement (reaches the
-        // engine). In a lex-only build the reindex succeeds; in a semantic build
-        // it would embed, so we only assert confinement did NOT reject it (not
-        // 400). Gated to lex-only to stay download-free.
-        #[cfg(not(feature = "semantic"))]
-        {
-            let (vault, cache) = vault_with_empty_index();
-            std::fs::write(vault.path().join("note.md"), "hello world\n").unwrap();
-            let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
-            let router = router_holding_engine(vault.path());
-            let resp = router
-                .oneshot(
-                    Request::post("/api/internal/reindex")
-                        .header("x-onebrain-token", TOKEN)
-                        .header("content-type", "application/json")
-                        .body(Body::from(r#"{"mode":"paths","paths":["note.md"]}"#))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_ne!(
-                resp.status(),
-                StatusCode::BAD_REQUEST,
-                "a normal in-vault path must not be rejected as traversal"
-            );
-        }
+    async fn reindex_paths_adds_a_new_doc_and_maps_fields() {
+        let (vault, cache) = vault_with_empty_index();
+        std::fs::write(vault.path().join("note.md"), "hello indexed world\n").unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let router = router_holding_engine(vault.path());
+
+        // First reindex: the doc is NEW → added=1, updated=0, removed=0,
+        // unchanged=0, doc_count=1.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::post("/api/internal/reindex")
+                    .header("x-onebrain-token", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"paths","paths":["note.md"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "reindex should succeed");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["added"], 1, "new doc → added=1: {v}");
+        assert_eq!(v["updated"], 0, "field mapping: updated must be 0: {v}");
+        assert_eq!(v["removed"], 0, "field mapping: removed must be 0: {v}");
+        assert_eq!(v["unchanged"], 0, "field mapping: unchanged must be 0: {v}");
+        assert_eq!(v["failed"], 0, "no failures: {v}");
+        assert_eq!(v["doc_count"], 1, "doc_count rose to 1: {v}");
+
+        // Second reindex of the SAME unchanged file: added=0, unchanged=1 — a
+        // different field lights up, so a swap of added↔unchanged would be caught.
+        let resp = router
+            .oneshot(
+                Request::post("/api/internal/reindex")
+                    .header("x-onebrain-token", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"paths","paths":["note.md"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["added"], 0, "unchanged doc → added=0: {v}");
+        assert_eq!(v["unchanged"], 1, "unchanged doc → unchanged=1: {v}");
+        assert_eq!(v["doc_count"], 1, "still exactly 1 doc: {v}");
+    }
+
+    /// Direct unit test of the stats→response field mapping, independent of the
+    /// engine — a belt-and-braces guard against a field swap in
+    /// `ReindexResponse` construction that runs in BOTH build tiers (the
+    /// end-to-end test above is lex-only). Uses distinct values per field so any
+    /// transposition is caught.
+    #[test]
+    fn reindex_response_maps_each_stat_field() {
+        let stats = onebrain_search::engine::ReindexStats {
+            added: 1,
+            updated: 2,
+            removed: 3,
+            unchanged: 4,
+            failed: 5,
+        };
+        let resp = ReindexResponse {
+            added: stats.added,
+            updated: stats.updated,
+            removed: stats.removed,
+            unchanged: stats.unchanged,
+            failed: stats.failed,
+            doc_count: 6,
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["added"], 1);
+        assert_eq!(v["updated"], 2);
+        assert_eq!(v["removed"], 3);
+        assert_eq!(v["unchanged"], 4);
+        assert_eq!(v["failed"], 5);
+        assert_eq!(v["doc_count"], 6);
     }
 
     #[tokio::test]

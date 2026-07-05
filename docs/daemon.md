@@ -49,6 +49,8 @@ Runtime files live under `~/.onebrain/run/`: `daemon.pid`, `daemon.log`, `daemon
 
 Two `daemon start` calls racing in parallel used to be able to both spawn (a TOCTOU race). `daemon start` now takes an **exclusive `O_EXCL`-create lock** (`daemon.lock`) around the check-then-spawn window: exactly one wins and binds; the others report "already running". The lock is **self-describing** — it records the creating `daemon start` PID, and a contender reclaims it only if that PID is provably dead (a crashed starter); a live creator (or an unreadable PID) is respected. The winner **holds the lock until the daemon has published `daemon.json`** (fully bound), so serialized racers always observe a running daemon and back off. Result: N simultaneous starts → exactly one daemon. Cross-platform (`create_new` = `O_EXCL` / `CREATE_NEW`), no `flock` dependency.
 
+**Wedged-lock recovery.** A `daemon start` that is SIGKILL'd inside the check-then-spawn window can leave `daemon.lock` behind; if the OS later recycles that PID onto an unrelated live process, the lock never looks stale and `daemon start` would report "already running" forever. **`onebrain daemon stop` unlinks `daemon.lock`** (along with `daemon.pid`/`daemon.json`), so `stop` is the CLI recovery — no manual `rm` needed.
+
 ## Auto-start + client library
 
 The client library (`commands/daemon_client.rs`) is what the CLI/MCP tracks call to reach the daemon:
@@ -61,7 +63,7 @@ The client library (`commands/daemon_client.rs`) is what the CLI/MCP tracks call
 ## Lifecycle
 
 - **Idle-shutdown TTL** — after `$ONEBRAIN_DAEMON_IDLE_SECS` (default **30 min**) with no authenticated request, the daemon exits, dropping the engine and releasing the redb lock. Set `0` to disable (run forever — e.g. a pinned always-on daemon).
-- **Clean SIGTERM** — `daemon stop` (or any SIGTERM) drains in-flight requests, drops the engine, and removes `daemon.pid` + `daemon.json`.
+- **Clean SIGTERM** — `daemon stop` (or any SIGTERM) drains in-flight requests, drops the engine, and clears the runtime files (`daemon.pid`, `daemon.json`, and `daemon.lock`).
 - **Port** — the daemon binds `127.0.0.1` on the shared default `6789`; `$ONEBRAIN_DAEMON_PORT` overrides it (`0` = OS-assigned ephemeral, published via `daemon.json`).
 
 ## Differences from `serve`

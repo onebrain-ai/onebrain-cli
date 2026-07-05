@@ -581,8 +581,25 @@ fn render_start_text(env: &Envelope<DaemonStartData>) -> String {
     }
 }
 
+/// Remove ALL of the daemon's runtime files: the PID file, the `daemon.json`
+/// discovery record, and the `daemon.lock` start lock. Called by `run_stop` in
+/// both branches so `onebrain daemon stop` fully resets the runtime state.
+///
+/// Clearing `daemon.lock` here is the CLI recovery for a WEDGED start lock: if a
+/// `daemon start` is SIGKILL'd inside the check-then-spawn window it leaves the
+/// lock behind, and if the OS later recycles that PID onto an unrelated live
+/// process, `pid_exists` stays true so `acquire_start_lock` would report
+/// "already running" forever with no way out but a manual `rm`. `daemon stop`
+/// now unwedges it. Each removal is best-effort (a missing file is fine).
+fn clear_runtime_files() -> Result<()> {
+    remove_pid(&pid_path()?)?;
+    let _ = crate::commands::daemon_client::DaemonInfo::remove(&discovery_path()?);
+    let _ = remove_pid_lock_stale(&start_lock_path()?);
+    Ok(())
+}
+
 /// `onebrain daemon stop` — SIGTERM the recorded PID, wait briefly for it to
-/// exit, remove the PID file, report.
+/// exit, then clear the PID / discovery / lock files, report.
 pub fn run_stop(mode: &OutputMode) -> Result<()> {
     let pid_path = pid_path()?;
 
@@ -595,20 +612,20 @@ pub fn run_stop(mode: &OutputMode) -> Result<()> {
             // Best-effort: the daemon's SIGTERM handler removes the PID +
             // discovery files on its way out, but if it died uncleanly (or isn't
             // ours — a recycled session leader could slip through) we still clear
-            // BOTH here so a later `start` isn't blocked by a stale PID and no
-            // client connects to a dead daemon via a stale `daemon.json`.
-            remove_pid(&pid_path)?;
-            let _ = crate::commands::daemon_client::DaemonInfo::remove(&discovery_path()?);
+            // the PID, discovery, AND start-lock files so a later `start` isn't
+            // blocked by a stale PID / wedged lock and no client connects to a
+            // dead daemon via a stale `daemon.json`.
+            clear_runtime_files()?;
             DaemonStopData {
                 stopped: true,
                 pid: Some(pid),
             }
         }
-        // Nothing live to stop. Clear any stale PID + discovery files so the
-        // slate is clean (a hard-killed daemon leaves both behind).
+        // Nothing live to stop. Clear any stale PID / discovery / lock files so
+        // the slate is clean (a hard-killed daemon, or a SIGKILL'd `start`,
+        // leaves these behind — this is the CLI recovery for a wedged lock).
         _ => {
-            remove_pid(&pid_path)?;
-            let _ = crate::commands::daemon_client::DaemonInfo::remove(&discovery_path()?);
+            clear_runtime_files()?;
             DaemonStopData {
                 stopped: false,
                 pid: None,
@@ -1813,5 +1830,77 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(!discovery.exists(), "daemon.json should be gone after stop");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Wedged-lock recovery: a SIGKILL'd `daemon start` can leave `daemon.lock`
+    // behind, and if the OS recycles that PID onto an unrelated LIVE process the
+    // lock never looks stale → every `daemon start` reports "already running"
+    // forever. `onebrain daemon stop` must clear the lock so `start` recovers.
+    // We simulate the recycled-PID case by planting a lock whose PID is a
+    // live-but-unrelated process (this test process), then assert stop unwedges
+    // it and a subsequent start succeeds. Unix-only (daemon is).
+    // ─────────────────────────────────────────────────────────────────────
+    #[cfg(unix)]
+    #[test]
+    fn daemon_stop_clears_a_wedged_lock() {
+        use assert_cmd::cargo::cargo_bin;
+        use std::process::Command as StdCommand;
+        use std::time::{Duration, Instant};
+
+        let home = tempdir().unwrap();
+        let bin = cargo_bin("onebrain");
+        let run_dir = home.path().join(".onebrain").join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let lock = run_dir.join("daemon.lock");
+
+        // Plant a wedged lock: its recorded PID is THIS test process — live, but
+        // not our daemon. `pid_exists` sees it alive, so without the stop-unlink
+        // fix `acquire_start_lock` would treat it as a held lock forever.
+        std::fs::write(&lock, std::process::id().to_string()).unwrap();
+        assert_eq!(
+            read_lock_pid(&lock),
+            Some(std::process::id()),
+            "planted lock records a live PID"
+        );
+
+        let daemon = |verb: &str| -> std::process::Output {
+            StdCommand::new(&bin)
+                .env("HOME", home.path())
+                .env("ONEBRAIN_DAEMON_PORT", "0")
+                .env("ONEBRAIN_DAEMON_IDLE_SECS", "0")
+                .args(["daemon", verb])
+                .output()
+                .expect("spawn onebrain daemon")
+        };
+
+        // `daemon stop` must clear the wedged lock (nothing live to signal, but
+        // it still resets the runtime files).
+        assert!(daemon("stop").status.success(), "daemon stop failed");
+        assert!(
+            !lock.exists(),
+            "daemon stop must clear the wedged daemon.lock"
+        );
+
+        // And now `daemon start` succeeds (no longer wedged) and comes up.
+        let start = daemon("start");
+        assert!(start.status.success(), "daemon start after unwedge failed");
+        let out = String::from_utf8_lossy(&start.stdout);
+        assert!(
+            out.contains("started") && !out.contains("already running"),
+            "start after unwedge should be a FRESH start, got: {out}"
+        );
+
+        // Confirm it really bound, then clean up.
+        let discovery = run_dir.join("daemon.json");
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !discovery.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            discovery.exists(),
+            "recovered daemon never published daemon.json"
+        );
+        let _ = daemon("stop");
     }
 }
