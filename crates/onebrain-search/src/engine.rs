@@ -206,6 +206,95 @@ fn vault_relative_path(vault_root: &Path, file_path: &Path) -> Option<String> {
     Some(components.join("/"))
 }
 
+/// Confine ONE caller-supplied reindex `doc_path` to `vault_root` — the
+/// **engine-level** defense-in-depth that guards the DIRECT reindex path
+/// (`ONEBRAIN_NO_DAEMON=1`, daemon-unavailable fallback, plain
+/// `onebrain search reindex <paths>`), which reaches
+/// [`Engine::reindex_paths_with_progress`] without ever passing through the
+/// HTTP-layer `confine_reindex_path` in `onebrain-cli`'s `server`.
+///
+/// SECURITY (#175): without this, [`reindex_paths_with_progress_inner`] does
+/// `vault_root.join(doc_path)` + `std::fs::read` on the raw caller string, so
+/// `"../../../../etc/passwd"` or an absolute path escapes the vault and indexes
+/// an arbitrary file. Mirrors the CLI HTTP guard's checks so every reindex
+/// caller — HTTP or direct — is confined:
+///
+/// 1. reject absolute paths (and, on Windows, a drive/root prefix),
+/// 2. reject any `..` / root component lexically (fail before any syscall),
+/// 3. reject an interior NUL byte (can't name a real path; malformed/hostile),
+/// 4. canonical-prefix check: the deepest EXISTING ancestor of the joined path
+///    must canonicalize to somewhere under the canonicalized vault root — this
+///    catches a symlink component escaping the vault. A reindex target MAY be
+///    absent (that's how a removed doc is expressed), so a non-existent tail is
+///    fine: its `..`-free components (guard 2) are read/removed in place and
+///    cannot climb out.
+///
+/// `Ok(())` = safe to index. `Err(reason)` names why it was rejected; the caller
+/// surfaces "…: {reason}" and skips the path (never reads it).
+fn confine_reindex_doc_path(vault_root: &Path, doc_path: &str) -> std::result::Result<(), String> {
+    use std::path::Component;
+
+    if doc_path.is_empty() {
+        return Err("path is empty".to_string());
+    }
+    if doc_path.contains('\0') {
+        return Err("path contains an interior NUL byte".to_string());
+    }
+
+    let rel_path = Path::new(doc_path);
+    if rel_path.is_absolute() {
+        return Err(format!(
+            "path is outside the vault (must be relative to the vault root): {doc_path}"
+        ));
+    }
+    for comp in rel_path.components() {
+        match comp {
+            Component::ParentDir => {
+                return Err(format!(
+                    "path is outside the vault (`..` not allowed): {doc_path}"
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "path is outside the vault (must be relative to the vault root): {doc_path}"
+                ));
+            }
+            // Normal / CurDir are fine.
+            _ => {}
+        }
+    }
+
+    // Canonical-prefix check — catches a symlink component escaping the vault.
+    // The vault root existed when the engine opened it; a canonicalize failure
+    // here is a real environment fault, surfaced as a rejection (fail closed).
+    let canonical_root = vault_root
+        .canonicalize()
+        .map_err(|e| format!("could not resolve vault root: {e}"))?;
+    let joined = canonical_root.join(rel_path);
+
+    // The target may not exist yet (a removed doc), so we can't canonicalize it
+    // directly. Canonicalize the DEEPEST EXISTING ANCESTOR and verify it stays
+    // under the canonical root — a symlinked parent that escapes is caught here.
+    let mut ancestor = joined.as_path();
+    let canonical_existing = loop {
+        match ancestor.canonicalize() {
+            Ok(p) => break p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match ancestor.parent() {
+                Some(parent) => ancestor = parent,
+                // We always reach `canonical_root` (it canonicalized above), so
+                // a None here means we climbed past it — treat as outside.
+                None => return Err(format!("path is outside the vault: {doc_path}")),
+            },
+            Err(e) => return Err(format!("could not resolve path: {e}")),
+        }
+    };
+    if !canonical_existing.starts_with(&canonical_root) {
+        return Err(format!("path is outside the vault: {doc_path}"));
+    }
+
+    Ok(())
+}
+
 /// `true` for directory names the vault walk must never descend into:
 /// hidden dirs (`.obsidian`, `.git`, `.claude`, …) and vendored
 /// `node_modules` trees (an attachment carrying a JS project would
@@ -1124,6 +1213,21 @@ impl Engine {
         let mut model_announced = false;
         let mut stats = ReindexStats::default();
         for (i, doc_path) in doc_paths.iter().enumerate() {
+            // Defense-in-depth (#175): confine each caller-supplied path to the
+            // vault BEFORE `join`/`read`. The HTTP layer already confines, but
+            // the DIRECT path (`ONEBRAIN_NO_DAEMON=1`, daemon fallback, plain
+            // `search reindex <paths>`) reaches here unchecked. A path that
+            // escapes is skipped (counted as `failed`), never read/indexed.
+            if let Err(reason) = confine_reindex_doc_path(vault_root, doc_path) {
+                stats.failed += 1;
+                eprintln!("onebrain-search: skipping {doc_path}: {reason}");
+                progress(ReindexProgress::Indexing {
+                    done: i + 1,
+                    total,
+                    doc_path: doc_path.clone(),
+                });
+                continue;
+            }
             let abs_path = vault_root.join(doc_path);
             if abs_path.is_file() {
                 let mut on_first_embed = || {
@@ -2179,6 +2283,130 @@ mod tests {
 
         assert_eq!(stats.failed, 1, "unreadable file should count as failed");
         assert_eq!(stats.added, 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #175 — engine-level reindex path confinement (direct path, not just HTTP)
+    // ─────────────────────────────────────────────────────────────────────
+
+    // `confine_reindex_doc_path` rejects the lexical escapes without touching
+    // the filesystem beyond canonicalizing the (real) vault root.
+    #[test]
+    fn confine_rejects_parent_traversal() {
+        let vault = tempfile::tempdir().unwrap();
+        let err = confine_reindex_doc_path(vault.path(), "../../../etc/passwd").unwrap_err();
+        assert!(err.contains("outside the vault"), "got {err:?}");
+    }
+
+    #[test]
+    fn confine_rejects_absolute_path() {
+        let vault = tempfile::tempdir().unwrap();
+        let err = confine_reindex_doc_path(vault.path(), "/etc/passwd").unwrap_err();
+        assert!(err.contains("outside the vault"), "got {err:?}");
+    }
+
+    #[test]
+    fn confine_accepts_a_normal_nested_path() {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(vault.path().join("01-projects")).unwrap();
+        std::fs::write(vault.path().join("01-projects/a.md"), "x").unwrap();
+        assert!(confine_reindex_doc_path(vault.path(), "01-projects/a.md").is_ok());
+        // A not-yet-existing (removed) doc with a clean relative path is fine —
+        // that's how a removal is expressed.
+        assert!(confine_reindex_doc_path(vault.path(), "01-projects/gone.md").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confine_rejects_symlink_escaping_the_vault() {
+        // A symlink INSIDE the vault pointing OUTSIDE must be rejected by the
+        // canonical-prefix check — the lexical `..` guard can't see through it.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "top secret").unwrap();
+        let vault = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            vault.path().join("leak.md"),
+        )
+        .unwrap();
+        let err = confine_reindex_doc_path(vault.path(), "leak.md").unwrap_err();
+        assert!(err.contains("outside the vault"), "got {err:?}");
+    }
+
+    // End-to-end via `reindex_paths`: a `..` escape and an absolute path are
+    // each REJECTED (counted `failed`, `added == 0`), and — non-vacuously — the
+    // real out-of-vault target is NEVER indexed/searchable. The rejection
+    // happens before any read/embed, so no model download is triggered.
+    #[test]
+    fn reindex_paths_confines_escapes_and_indexes_nothing_out_of_vault() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        // Nest the vault so `../secret.md` lands on a REAL seeded file that is
+        // genuinely outside the vault root.
+        let parent = tempfile::tempdir().unwrap();
+        let vault_dir = parent.path().join("vault");
+        std::fs::create_dir_all(&vault_dir).unwrap();
+        let secret = parent.path().join("secret.md");
+        std::fs::write(&secret, "# TOPSECRET_MARKER unique payload").unwrap();
+
+        // Deterministic in-memory embedder — no model download, so `query`
+        // works offline in CI (rejection happens before any embed anyway).
+        let mut e = fake_engine(cache_dir.path());
+
+        let escapes = vec![
+            "../secret.md".to_string(),
+            secret.to_string_lossy().into_owned(), // absolute path to the same file
+            "../../etc/passwd".to_string(),
+        ];
+        let n = escapes.len();
+        let stats = e.reindex_paths(&vault_dir, &escapes).unwrap();
+
+        assert_eq!(stats.failed, n, "every escaping path must be rejected");
+        assert_eq!(stats.added, 0, "nothing out-of-vault should be indexed");
+        assert_eq!(stats.updated, 0);
+
+        // Non-vacuous: the out-of-vault file must not be retrievable under ANY
+        // of the keys used to smuggle it in, nor appear in a content search.
+        for key in &escapes {
+            assert!(e.stored_hash(key).unwrap().is_none(), "indexed: {key}");
+            assert!(e.get(key).is_err(), "retrievable: {key}");
+        }
+        let hits = e.query("TOPSECRET_MARKER", 5).unwrap();
+        assert!(
+            hits.is_empty(),
+            "out-of-vault content leaked into search: {} hits",
+            hits.len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reindex_paths_confines_symlink_escape() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("secret.txt"),
+            "# LEAK_MARKER via symlink",
+        )
+        .unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            vault_dir.path().join("leak.md"),
+        )
+        .unwrap();
+
+        let mut e = fake_engine(cache_dir.path());
+        let paths = vec!["leak.md".to_string()];
+        let stats = e.reindex_paths(vault_dir.path(), &paths).unwrap();
+
+        assert_eq!(stats.failed, 1, "symlink escape must be rejected");
+        assert_eq!(stats.added, 0);
+        assert!(e.stored_hash("leak.md").unwrap().is_none());
+        assert!(e.get("leak.md").is_err(), "symlinked file was retrievable");
+        assert!(
+            e.query("LEAK_MARKER", 5).unwrap().is_empty(),
+            "symlinked out-of-vault content leaked into search"
+        );
     }
 
     #[test]
