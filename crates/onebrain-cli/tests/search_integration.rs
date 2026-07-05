@@ -112,6 +112,10 @@ fn search_model_set_empty_index_dims_change_succeeds() {
 /// The lock is held in-process by opening `Engine` at the exact collection
 /// cache dir the CLI will resolve (`<ONEBRAIN_CACHE_DIR>/search/<collection>`),
 /// then keeping the handle alive across the subprocess invocations.
+// `query` opens redb (semantic path) — in a lex-only build it degrades to
+// keyword results and never trips the single-process lock, so this end-to-end
+// busy test is semantic-only. (status busy/unreadable is also unit-tested.)
+#[cfg(feature = "semantic")]
 #[test]
 fn engine_busy_is_honest_across_status_query_and_hook() {
     let vault = tempdir().unwrap();
@@ -198,8 +202,10 @@ fn engine_busy_is_honest_across_status_query_and_hook() {
 /// `engine_busy_is_honest_across_status_query_and_hook`, which covers
 /// `--lex-only`. Runs the pending-only path in the foreground
 /// (`ONEBRAIN_EMBED_FOREGROUND=1`) so it reaches `Engine::open` (where the lock
-/// trips) synchronously instead of detaching. NON-gated: the lock trips before
-/// any embed, so no real model download is needed.
+/// trips) synchronously instead of detaching. Semantic-gated: a lex-only build
+/// returns `reason:"semantic-unavailable"` before ever reaching `Engine::open`,
+/// so the engine-busy path only exists in semantic builds.
+#[cfg(feature = "semantic")]
 #[test]
 fn pending_only_hook_is_honest_when_engine_busy() {
     let vault = tempdir().unwrap();
