@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::cli::SearchGetArgs;
 use crate::commands::daemon_client::DaemonHandle;
-use crate::commands::search_common::{open_engine, route_to_daemon};
+use crate::commands::search_common::{map_daemon_error, open_engine, route_to_daemon};
 use crate::output::{emit, Envelope, OutputMode};
 
 #[derive(Debug, Serialize)]
@@ -70,7 +70,10 @@ fn get_via_daemon(handle: &DaemonHandle, doc_path: &str) -> Result<String> {
     match handle.get(doc_path) {
         Ok(Some(content)) => Ok(content),
         Ok(None) => anyhow::bail!("doc not found: {doc_path}\n{NOT_INDEXED_HINT}"),
-        Err(e) => Err(e.context("route `search get` through warm daemon")),
+        Err(e) => Err(map_daemon_error(
+            e,
+            "route `search get` through warm daemon",
+        )),
     }
 }
 

@@ -311,9 +311,16 @@ enum StatusProbe {
 /// / parse failure degrades to `Error` (unknown counts + `W_STATUS_UNREADABLE`),
 /// mirroring the direct path's broken-index handling so it can't render a false
 /// "up to date".
+///
+/// One exception: a daemon that holds NO engine (it 503s because another process
+/// owns the redb lock — e.g. an `onebrain mcp` from before an upgrade) is
+/// contention, not a broken read. The client classifies that as `EngineBusy`, so
+/// report `Unknown { busy: true }` — the SAME honest signal the direct path emits
+/// when `Engine::open` hits the lock — instead of leaking the raw 503 string.
 fn probe_via_daemon(handle: &crate::commands::daemon_client::DaemonHandle) -> StatusProbe {
     match handle.status() {
         Ok(v) => probe_from_daemon_status(&v),
+        Err(e) if onebrain_search::error::is_engine_busy(&e) => StatusProbe::Unknown { busy: true },
         Err(e) => {
             eprintln!("search status (daemon): {e:#}");
             StatusProbe::Error {

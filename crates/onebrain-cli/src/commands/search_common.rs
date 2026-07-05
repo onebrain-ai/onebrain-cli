@@ -144,6 +144,25 @@ pub(crate) fn map_engine_open_error(err: anyhow::Error, cache_dir: &Path) -> any
     err.context(format!("opening search engine at {}", cache_dir.display()))
 }
 
+/// Turn a warm-daemon request failure into the right typed CLI error — the
+/// daemon-path analogue of [`map_engine_open_error`]. When the daemon 503s
+/// because it holds no engine (another process owns the redb lock), the client
+/// classifies the error as `onebrain_search`'s `EngineBusy`; convert it to the
+/// same `CoreError::EngineBusy` (E_ENGINE_BUSY / exit 77) the direct path uses,
+/// so `query` / `get` / `reindex` report contention identically whether they
+/// went direct or through the daemon. Any other daemon error keeps its verb
+/// context (an opaque `E_INTERNAL`).
+pub(crate) fn map_daemon_error(err: anyhow::Error, ctx: &'static str) -> anyhow::Error {
+    if onebrain_search::error::is_engine_busy(&err) {
+        return anyhow::Error::new(onebrain_core::CoreError::EngineBusy(
+            "the search index is held by another process (e.g. an `onebrain mcp` \
+             server, possibly from before an upgrade) — retry once it releases the engine"
+                .to_string(),
+        ));
+    }
+    err.context(ctx)
+}
+
 /// Persist `search.collection = collection` into the vault's config file
 /// (`onebrain.yml`, or legacy `vault.yml` if that's what's present),
 /// preserving every other key. Thin wrapper over the shared
@@ -339,6 +358,39 @@ pub(crate) fn route_to_daemon(resolved: &ResolvedVault) -> Option<DaemonHandle> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_daemon_error_engine_busy_becomes_core_engine_busy() {
+        // A daemon 503 arrives as `onebrain_search::EngineBusy` in the chain
+        // (via `daemon_client::daemon_engine_busy`); `map_daemon_error` must turn
+        // it into `CoreError::EngineBusy` so the verb exits 77 / E_ENGINE_BUSY —
+        // exactly like the direct path's `map_engine_open_error`.
+        let busy = anyhow::Error::new(onebrain_search::error::EngineBusy).context("via daemon");
+        let mapped = map_daemon_error(busy, "route search through warm daemon");
+        assert!(
+            matches!(
+                mapped.downcast_ref::<onebrain_core::CoreError>(),
+                Some(onebrain_core::CoreError::EngineBusy(_))
+            ),
+            "an engine-busy daemon error must become CoreError::EngineBusy, got: {mapped:#}"
+        );
+    }
+
+    #[test]
+    fn map_daemon_error_other_keeps_verb_context() {
+        // A non-busy daemon error keeps its opaque verb context (an E_INTERNAL),
+        // and must NOT be classified as engine-busy.
+        let other = anyhow::anyhow!("some genuine daemon failure");
+        let mapped = map_daemon_error(other, "route `search get` through warm daemon");
+        assert!(
+            !onebrain_search::error::is_engine_busy(&mapped),
+            "a non-busy error must not be classified as EngineBusy"
+        );
+        assert!(
+            format!("{mapped:#}").contains("route `search get` through warm daemon"),
+            "the verb context must be preserved, got: {mapped:#}"
+        );
+    }
 
     #[test]
     fn format_size_renders_units() {

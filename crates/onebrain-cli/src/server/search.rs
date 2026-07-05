@@ -103,10 +103,7 @@ pub(crate) async fn get_vault_search(
         tokio::task::spawn_blocking(move || run_search(held.as_ref(), &root, &query, mode));
     let hits = match tokio::time::timeout(SEARCH_TIMEOUT, search).await {
         Ok(Ok(Ok(hits))) => hits,
-        Ok(Ok(Err(e))) => {
-            tracing::warn!(error = %e, "native search failed");
-            return Err(ApiError::Internal("search failed".to_string()));
-        }
+        Ok(Ok(Err(e))) => return Err(map_search_failure(e)),
         Ok(Err(join_err)) => {
             tracing::warn!(error = %join_err, "native search task panicked");
             return Err(ApiError::Internal("search failed".to_string()));
@@ -120,6 +117,22 @@ pub(crate) async fn get_vault_search(
         }
     };
     Ok(Json(SearchResponse { hits, mode }).into_response())
+}
+
+/// Map a native-search failure to the right HTTP error. A held-engine-less
+/// hybrid search opens the engine per-request; if another process owns redb's
+/// single-writer lock that surfaces as the typed `EngineBusy` — signal it as
+/// **503** (like `/api/internal/*`) so the CLI classifies it as honest
+/// `E_ENGINE_BUSY` rather than an opaque **500** / `E_INTERNAL`. Any other
+/// failure stays a genuine 500.
+fn map_search_failure(e: anyhow::Error) -> ApiError {
+    if onebrain_search::error::is_engine_busy(&e) {
+        tracing::warn!(error = %e, "native search: engine busy (index locked by another process)");
+        ApiError::ServiceUnavailable("search index locked by another process".to_string())
+    } else {
+        tracing::warn!(error = %e, "native search failed");
+        ApiError::Internal("search failed".to_string())
+    }
 }
 
 /// Synchronous search dispatcher, aware of an optionally-held persistent
@@ -547,6 +560,27 @@ mod tests {
         assert!(
             hits.is_empty(),
             "empty index must yield no hits, no download"
+        );
+    }
+
+    #[test]
+    fn map_search_failure_engine_busy_is_503() {
+        // A per-request `Engine::open` that hits the redb lock surfaces as the
+        // typed EngineBusy → 503 (ServiceUnavailable), so the CLI reports honest
+        // E_ENGINE_BUSY instead of an opaque 500.
+        let busy = anyhow::Error::new(onebrain_search::error::EngineBusy);
+        assert!(
+            matches!(map_search_failure(busy), ApiError::ServiceUnavailable(_)),
+            "engine-busy must map to 503"
+        );
+    }
+
+    #[test]
+    fn map_search_failure_other_error_is_500() {
+        let other = anyhow::anyhow!("some genuine internal failure");
+        assert!(
+            matches!(map_search_failure(other), ApiError::Internal(_)),
+            "a non-busy failure must stay a 500"
         );
     }
 }
