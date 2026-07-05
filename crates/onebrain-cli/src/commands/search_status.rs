@@ -101,7 +101,11 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
     let (resolved, collection) = resolve_collection(vault_flag)?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
 
-    let data = status_data(&resolved, collection)?;
+    // Warm-daemon path: when a daemon holds the engine, source the doc/pending
+    // counts from it instead of opening a second engine (which would report
+    // `busy`). Only when it serves this exact vault; else `None` → direct probe.
+    let daemon = crate::commands::search_common::route_to_daemon(&resolved);
+    let data = status_data(&resolved, collection, daemon.as_ref())?;
 
     // Bug B (v3.4.6): a busy index is a valid report (exit 0), but must ride a
     // warning so machine consumers see the contention explicitly rather than
@@ -157,9 +161,18 @@ impl SearchStatusData {
 /// cache dir's existence: an existing-but-empty dir — one left behind by a
 /// prior status probe's `Engine::open`, or a cache purged and recreated empty
 /// — must still report `indexed: false`.
+/// `daemon`: an optional warm-daemon handle. When `Some`, the doc/pending
+/// counts come from the daemon's `/api/internal/status` (the sole redb owner)
+/// instead of opening a second engine — so `search status` succeeds with real
+/// counts while an MCP session holds the engine, rather than degrading to
+/// `busy`. All the fs-derived fields (model/index/cache sizes) are read
+/// identically either way. A daemon status-probe failure degrades to the same
+/// `Error` outcome the direct broken-index path uses (unknown counts +
+/// `W_STATUS_UNREADABLE`), never a false "up to date".
 pub(crate) fn status_data(
     resolved: &ResolvedVault,
     collection: Option<String>,
+    daemon: Option<&crate::commands::daemon_client::DaemonHandle>,
 ) -> Result<SearchStatusData> {
     let config = load_vault_config(&resolved.root)?;
 
@@ -205,8 +218,11 @@ pub(crate) fn status_data(
     // by rendering "✅ up to date" over a broken index. The underlying error is
     // logged to stderr (mirrors the hook path in search_reindex.rs) so it's
     // never swallowed.
-    let probe = match cache_dir.as_deref() {
-        Some(dir) => match Engine::open(dir, &config.search.embed_model) {
+    let probe = match (daemon, cache_dir.as_deref()) {
+        // Warm-daemon path: counts come from the held engine over HTTP, so a
+        // live MCP session no longer forces a `busy` report.
+        (Some(handle), _) => probe_via_daemon(handle),
+        (None, Some(dir)) => match Engine::open(dir, &config.search.embed_model) {
             Ok(mut engine) => {
                 engine.set_exclude_patterns(config.search.exclude.clone());
                 match engine.status(resolved.root.as_path()) {
@@ -229,7 +245,7 @@ pub(crate) fn status_data(
                 }
             }
         },
-        None => StatusProbe::Unknown { busy: false },
+        (None, None) => StatusProbe::Unknown { busy: false },
     };
 
     let mut status_error: Option<String> = None;
@@ -282,10 +298,50 @@ pub(crate) fn status_data(
 /// process), while `Error` is a broken/unreadable index — a `status()` read
 /// failure or a NON-lock open failure. Both suppress the "up to date" branch,
 /// but only `Error` carries a message + `W_STATUS_UNREADABLE` warning.
+#[derive(Debug)]
 enum StatusProbe {
     Ok(onebrain_search::engine::IndexStatus),
     Unknown { busy: bool },
     Error { message: String },
+}
+
+/// Probe the daemon's `/api/internal/status` and map it into a [`StatusProbe`].
+/// The daemon is the sole redb owner, so this is the contention-free path used
+/// while an MCP session is live — a live index here is NEVER `busy`. A transport
+/// / parse failure degrades to `Error` (unknown counts + `W_STATUS_UNREADABLE`),
+/// mirroring the direct path's broken-index handling so it can't render a false
+/// "up to date".
+fn probe_via_daemon(handle: &crate::commands::daemon_client::DaemonHandle) -> StatusProbe {
+    match handle.status() {
+        Ok(v) => probe_from_daemon_status(&v),
+        Err(e) => {
+            eprintln!("search status (daemon): {e:#}");
+            StatusProbe::Error {
+                message: short_error(&e),
+            }
+        }
+    }
+}
+
+/// Map a `/api/internal/status` JSON body into a [`StatusProbe`]. Pure (no
+/// I/O) so the mapping — including the "missing doc_count → broken read"
+/// refusal — is unit-testable without a live daemon.
+fn probe_from_daemon_status(v: &serde_json::Value) -> StatusProbe {
+    let field = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
+    match field("doc_count") {
+        Some(doc_count) => StatusProbe::Ok(onebrain_search::engine::IndexStatus {
+            doc_count: doc_count as usize,
+            last_indexed_at: field("last_indexed"),
+            pending_new: field("pending_new").unwrap_or(0) as usize,
+            pending_changed: field("pending_changed").unwrap_or(0) as usize,
+            pending_removed: field("pending_removed").unwrap_or(0) as usize,
+        }),
+        // A malformed body (no numeric doc_count) is a broken read, not a
+        // healthy zero — refuse the up-to-date branch.
+        None => StatusProbe::Error {
+            message: format!("daemon status missing doc_count: {v}"),
+        },
+    }
 }
 
 /// One-line, size-bounded rendering of an error's full `anyhow` chain, for the
@@ -610,6 +666,47 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn probe_from_daemon_status_maps_counts() {
+        let body = serde_json::json!({
+            "doc_count": 12, "pending_new": 1, "pending_changed": 2,
+            "pending_removed": 3, "pending_total": 6, "last_indexed": 99, "indexed": true
+        });
+        match probe_from_daemon_status(&body) {
+            StatusProbe::Ok(s) => {
+                assert_eq!(s.doc_count, 12);
+                assert_eq!(s.pending_new, 1);
+                assert_eq!(s.pending_changed, 2);
+                assert_eq!(s.pending_removed, 3);
+                assert_eq!(s.last_indexed_at, Some(99));
+                assert_eq!(s.pending_total(), 6);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_from_daemon_status_healthy_zero_is_ok_not_error() {
+        // A real empty index (doc_count present, = 0) is Ok(0) — NOT the broken
+        // read that a MISSING doc_count triggers.
+        let body = serde_json::json!({"doc_count": 0, "pending_new": 0});
+        assert!(matches!(
+            probe_from_daemon_status(&body),
+            StatusProbe::Ok(s) if s.doc_count == 0
+        ));
+    }
+
+    #[test]
+    fn probe_from_daemon_status_missing_doc_count_is_error() {
+        // No doc_count → a broken/unreadable read, refusing the up-to-date
+        // branch (never a false healthy zero).
+        let body = serde_json::json!({"pending_new": 0});
+        assert!(matches!(
+            probe_from_daemon_status(&body),
+            StatusProbe::Error { .. }
+        ));
+    }
 
     fn env(collection: Option<&str>, indexed: bool) -> Envelope<SearchStatusData> {
         Envelope::ok(

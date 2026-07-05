@@ -33,7 +33,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -56,6 +56,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         // `daemon.json` deleted + respawned in a loop.
         .route("/health", get(get_health))
         .route("/internal/status", get(get_internal_status))
+        .route("/internal/get", get(get_internal_get))
         .route("/internal/reindex", post(post_internal_reindex))
 }
 
@@ -64,6 +65,12 @@ pub(super) fn router() -> Router<Arc<AppState>> {
 /// the token-auth middleware (the whole surface is), so it leaks nothing to an
 /// unauthenticated caller; it just doesn't depend on the search engine being
 /// held, which is exactly what a liveness check must not do.
+///
+/// The vault identity a CLI client vault-matches against is NOT surfaced here —
+/// it reads the daemon's canonical bound vault from `daemon.json` (`DaemonInfo.
+/// vault`, written at bind time and rung true by the liveness probe), so there
+/// is no second served-vault source to keep in sync. See #170's `vault_decision`
+/// + the passive `daemon_client::discover_matching`.
 async fn get_health(State(state): State<Arc<AppState>>) -> Response {
     Json(serde_json::json!({
         "ok": true,
@@ -182,6 +189,66 @@ async fn get_internal_status(State(state): State<Arc<AppState>>) -> Result<Respo
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// GET /api/internal/get
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Query string for `GET /api/internal/get`.
+#[derive(Debug, Deserialize)]
+struct InternalGetQuery {
+    /// Vault-relative, forward-slash doc path (an index key), e.g.
+    /// `00-inbox/note.md`.
+    path: String,
+}
+
+/// A doc's full indexed text (the `search get` shape). Mirrors the CLI's
+/// `SearchGetData` so a client can forward it verbatim.
+#[derive(Debug, Serialize, PartialEq)]
+struct InternalGetResponse {
+    doc_path: String,
+    content: String,
+}
+
+/// `GET /api/internal/get?path=<doc>` — the held engine's `Engine::get` (a redb
+/// read). The daemon is the sole redb owner, so the CLI `search get` verb
+/// routes here while a session is live instead of opening a second engine and
+/// hitting the single-writer lock. A doc that isn't indexed is a 404 so the
+/// client can render the same "not indexed yet" hint as the direct path.
+async fn get_internal_get(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<InternalGetQuery>,
+) -> Result<Response, ApiError> {
+    // A vault must be bound even though `Engine::get` keys off vault-relative
+    // paths only — keeps the internal surface uniformly 503 with no vault.
+    let _ = require_vault_root(&state)?;
+    let engine = require_engine(&state)?.clone();
+    let doc_path = q.path.clone();
+
+    // `Engine::get` is a synchronous redb read — run it off the async runtime
+    // under the blocking mutex, same as status/reindex.
+    let content = tokio::task::spawn_blocking(move || {
+        let engine = engine.lock().unwrap_or_else(|p| p.into_inner());
+        engine.get(&doc_path)
+    })
+    .await
+    .map_err(|e| {
+        tracing::warn!(error = %e, "internal get task panicked");
+        ApiError::Internal("get failed".to_string())
+    })?;
+
+    match content {
+        Ok(content) => Ok(Json(InternalGetResponse {
+            doc_path: q.path,
+            content,
+        })
+        .into_response()),
+        // A miss is a client-facing 404 (not a 500) — `Engine::get` returns a
+        // "doc not found" error for an unindexed path; the CLI maps this back to
+        // its "paths are vault-relative / reindex may not have run" hint.
+        Err(_) => Err(ApiError::NotFound(format!("doc not indexed: {}", q.path))),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // POST /api/internal/reindex
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -201,6 +268,15 @@ enum ReindexMode {
     Pending,
     /// Reindex the caller-supplied vault-relative doc paths.
     Paths,
+    /// Keyword-only (tantivy) reindex over the whole vault, NO embedding —
+    /// mirrors `--lex-only`. Cheap: it never loads the model, so the PostToolUse
+    /// auto-reindex hook can route here in-session without a per-write embed.
+    Lex,
+    /// Full reindex + embed of the whole vault — mirrors a bare `search
+    /// reindex`. Lets a manual full reindex run WHILE the daemon holds the
+    /// engine (it would otherwise hit the redb lock). Embeds, so it can load the
+    /// model; only reached from an explicit CLI reindex, never a hook.
+    All,
 }
 
 /// Reindex result — the batch stats plus the post-reindex doc count, so a
@@ -215,6 +291,10 @@ struct ReindexResponse {
     /// Docs indexed after this reindex (so a caller can confirm `doc_count`
     /// rose without a second request).
     doc_count: usize,
+    /// The active embedding model, so the CLI can name it in the reindex summary
+    /// exactly as the direct path does (mirrors `search reindex`'s
+    /// `embed_model`). Read from vault config, defaulting when the key is absent.
+    embed_model: String,
 }
 
 async fn post_internal_reindex(
@@ -246,7 +326,9 @@ async fn post_internal_reindex(
     // Reindex is synchronous (tantivy + redb + embedding). Run it off the async
     // runtime, holding the engine mutex for the batch's duration so a concurrent
     // search serialises behind it rather than racing the redb writer.
+    let root_for_task = root.clone();
     let result = tokio::task::spawn_blocking(move || {
+        let root = root_for_task;
         let mut engine = engine.lock().unwrap_or_else(|p| p.into_inner());
         let stats = match req.mode {
             ReindexMode::Pending => {
@@ -258,6 +340,10 @@ async fn post_internal_reindex(
                 }
             }
             ReindexMode::Paths => engine.reindex_paths(&root, &confined_paths)?,
+            // Keyword-only whole-vault pass — no embed, no model load.
+            ReindexMode::Lex => engine.reindex_all_lex_only_with_progress(&root, &mut |_| {})?,
+            // Full whole-vault reindex + embed.
+            ReindexMode::All => engine.reindex_all(&root)?,
         };
         let doc_count = engine.status(&root)?.doc_count;
         Ok::<_, anyhow::Error>((stats, doc_count))
@@ -273,6 +359,11 @@ async fn post_internal_reindex(
     })?;
 
     let (stats, doc_count) = result;
+    // Name the active model so the CLI hook path renders the same summary the
+    // direct path does. Read-only; defaults when the vault config lacks the key.
+    let embed_model = onebrain_core::load_vault_config_at(&root)
+        .map(|c| c.search.embed_model)
+        .unwrap_or_default();
     let resp = ReindexResponse {
         added: stats.added,
         updated: stats.updated,
@@ -280,6 +371,7 @@ async fn post_internal_reindex(
         unchanged: stats.unchanged,
         failed: stats.failed,
         doc_count,
+        embed_model,
     };
     Ok(Json(resp).into_response())
 }
@@ -568,6 +660,152 @@ mod tests {
         assert_eq!(v["doc_count"], 1, "still exactly 1 doc: {v}");
     }
 
+    /// `mode:"lex"` (Track 2c) — a keyword-only whole-vault reindex. In a
+    /// lex-only build it indexes the on-disk doc WITHOUT embedding, so `added`
+    /// and `doc_count` rise with no model download; the response also names the
+    /// active `embed_model` so the CLI hook path can render the same summary.
+    #[cfg(not(feature = "semantic"))]
+    #[tokio::test]
+    async fn reindex_lex_mode_indexes_whole_vault() {
+        let (vault, cache) = vault_with_empty_index();
+        std::fs::write(vault.path().join("note.md"), "warm daemon lex pass\n").unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let router = router_holding_engine(vault.path());
+
+        let resp = router
+            .oneshot(
+                Request::post("/api/internal/reindex")
+                    .header("x-onebrain-token", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"lex"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "lex reindex should succeed");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["added"], 1, "new doc lex-indexed → added=1: {v}");
+        // `doc_count` (DOC_HASHES keys) reflects EMBEDDED docs; a keyword-only
+        // lex pass records lex chunks but no content hash, so it stays 0 here.
+        // The point of `lex` mode is exactly this: index for keyword search
+        // WITHOUT the embed that would bump doc_count.
+        assert_eq!(
+            v["doc_count"], 0,
+            "lex-only records no hash → doc_count 0: {v}"
+        );
+        // The active model is named so the CLI hook renders the same summary.
+        assert_eq!(v["embed_model"], "multilingual-e5-small", "{v}");
+    }
+
+    /// `mode:"all"` (Track 2c) — a full whole-vault reindex. Lex-only build →
+    /// no embed, so `added`/`doc_count` rise download-free, same as `lex`/
+    /// `paths`. (Under `semantic` this would embed → model download, which the
+    /// no-download test rule forbids, so it's asserted only in the lex-only tier.)
+    #[cfg(not(feature = "semantic"))]
+    #[tokio::test]
+    async fn reindex_all_mode_indexes_whole_vault() {
+        let (vault, cache) = vault_with_empty_index();
+        std::fs::write(vault.path().join("note.md"), "full daemon reindex\n").unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let router = router_holding_engine(vault.path());
+
+        let resp = router
+            .oneshot(
+                Request::post("/api/internal/reindex")
+                    .header("x-onebrain-token", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"all"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "full reindex should succeed");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["added"], 1, "new doc → added=1: {v}");
+        assert_eq!(v["doc_count"], 1, "doc_count rose to 1: {v}");
+    }
+
+    /// `GET /api/internal/get` (Track 2c) — returns a doc's indexed text after
+    /// it's indexed, and 404s for an unindexed path (so the CLI can render its
+    /// "not indexed yet" hint). Lex-only build: indexing is download-free.
+    #[cfg(not(feature = "semantic"))]
+    #[tokio::test]
+    async fn internal_get_returns_indexed_text_and_404s_when_missing() {
+        let (vault, cache) = vault_with_empty_index();
+        std::fs::write(vault.path().join("note.md"), "indexed body text\n").unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let router = router_holding_engine(vault.path());
+
+        // Not indexed yet → 404.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::get("/api/internal/get?path=note.md")
+                    .header("x-onebrain-token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "unindexed → 404");
+
+        // Index it, then GET returns its text.
+        router
+            .clone()
+            .oneshot(
+                Request::post("/api/internal/reindex")
+                    .header("x-onebrain-token", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"paths","paths":["note.md"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let resp = router
+            .oneshot(
+                Request::get("/api/internal/get?path=note.md")
+                    .header("x-onebrain-token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "indexed doc → 200");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["doc_path"], "note.md", "{v}");
+        assert!(
+            v["content"].as_str().unwrap().contains("indexed body text"),
+            "get returns the indexed text: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_get_503_when_no_engine_held() {
+        // Like status/reindex, get 503s (never per-request opens) with no engine.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: get-no-engine\n",
+        )
+        .unwrap();
+        let cfg =
+            ServeConfig::localhost(Some(vault.path().to_path_buf()), 0, TOKEN.to_string(), None);
+        let router = build_router(cfg);
+        let resp = router
+            .oneshot(
+                Request::get("/api/internal/get?path=x.md")
+                    .header("x-onebrain-token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     /// Direct unit test of the stats→response field mapping, independent of the
     /// engine — a belt-and-braces guard against a field swap in
     /// `ReindexResponse` construction that runs in BOTH build tiers (the
@@ -589,6 +827,7 @@ mod tests {
             unchanged: stats.unchanged,
             failed: stats.failed,
             doc_count: 6,
+            embed_model: "multilingual-e5-small".to_string(),
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert_eq!(v["added"], 1);
@@ -597,6 +836,7 @@ mod tests {
         assert_eq!(v["unchanged"], 4);
         assert_eq!(v["failed"], 5);
         assert_eq!(v["doc_count"], 6);
+        assert_eq!(v["embed_model"], "multilingual-e5-small");
     }
 
     #[tokio::test]

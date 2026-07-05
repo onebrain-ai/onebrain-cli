@@ -8,18 +8,27 @@
 //! opens an engine itself.
 //!
 //! ## Discovery file — `~/.onebrain/run/daemon.json`
-//! The daemon writes `{ port, token, pid, version }` after it binds (see
+//! The daemon writes `{ port, token, pid, version, vault }` after it binds (see
 //! [`DaemonInfo::write`]); a clean shutdown removes it. Clients read it,
 //! liveness-probe the daemon, and connect. A stale file (daemon dead, or a
-//! version mismatch) is cleaned up / triggers a restart rather than trusted.
+//! version/vault mismatch) is cleaned up / triggers a restart rather than
+//! trusted — except the PASSIVE CLI path ([`discover_matching`]), which on a
+//! mismatch routes direct and LEAVES the record intact (never restarts a daemon
+//! serving another vault).
 //!
 //! ## Entry points
-//! - [`discover`] — read + liveness-probe an already-running daemon, else
-//!   `None` (and clean up a stale discovery file).
+//! - [`discover`] — ACTIVE: read + liveness-probe an already-running daemon,
+//!   RESTARTING it on a version/vault mismatch (the MCP path owns the daemon's
+//!   lifecycle); else `None` (and clean up a stale discovery file).
+//! - [`discover_matching`] — PASSIVE (the CLI-search path): return a handle only
+//!   for a live daemon matching BOTH version and the caller's vault; on ANY
+//!   mismatch route direct (`None`) WITHOUT stopping/restarting — never disrupt
+//!   a daemon serving another vault.
 //! - [`ensure_running`] — [`discover`], else spawn `daemon __run` detached and
 //!   poll until it's live; handles the start race (someone else won → connect).
 //! - [`DaemonHandle::search`] / [`reindex`](DaemonHandle::reindex) /
-//!   [`status`](DaemonHandle::status) — typed HTTP calls carrying the token.
+//!   [`status`](DaemonHandle::status) / [`get`](DaemonHandle::get) — typed HTTP
+//!   calls carrying the token.
 //!
 //! ## Version skew
 //! A daemon from an older/newer CLI may speak a different wire shape, so
@@ -416,6 +425,50 @@ impl DaemonHandle {
         })
     }
 
+    /// `GET /api/internal/get?path=` → the doc's full indexed text, or
+    /// `Ok(None)` when the daemon answers 404 (doc not indexed) so the CLI can
+    /// render the same "not indexed yet" hint the direct path does.
+    ///
+    /// Uses [`retry_once`] with a status-preserving reconnect (a vanished daemon
+    /// respawns + retries; any HTTP status is a real answer) but keeps the
+    /// structured `ureq::Error` on the failure arm so a 404 can be told apart
+    /// from a genuine error — [`with_retry`] can't, since it stringifies the
+    /// status into an opaque anyhow before returning.
+    pub fn get(&self, doc_path: &str) -> Result<Option<String>> {
+        let p = urlencode(doc_path);
+        let op = |h: &DaemonHandle| {
+            let url = format!("{}/api/internal/get?path={}", h.info.base_url(), p);
+            h.agent
+                .get(&url)
+                .header("x-onebrain-token", &h.info.token)
+                .call()
+        };
+        let outcome = match op(self) {
+            Ok(resp) => Ok(resp),
+            Err(e) if is_transport_error(&e) => {
+                tracing::warn!(error = %e, "daemon unreachable (get); reconnecting and retrying once");
+                // Reconnect to the SAME vault this handle was serving (mirrors
+                // `with_retry`), so a respawn after the daemon vanished can't be
+                // satisfied by a wrong-vault daemon that started meanwhile.
+                let expected = self.info.vault.clone();
+                let fresh = ensure_running(expected.as_deref().map(Path::new))
+                    .context("respawn daemon after transport failure (get)")?;
+                op(&fresh)
+            }
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok(mut resp) => {
+                let v = read_json(&mut resp)?;
+                Ok(v.get("content").and_then(|c| c.as_str()).map(String::from))
+            }
+            // A 404 is the daemon's "doc not indexed" — surface it as `None` so
+            // the caller renders its hint rather than an error.
+            Err(ureq::Error::StatusCode(404)) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("daemon get: {e}")),
+        }
+    }
+
     /// `GET /api/vault/search?q=&mode=` → the webui search response JSON.
     /// Retries ONCE via [`ensure_running`] on a transport failure.
     pub fn search(&self, query: &str, mode: &str) -> Result<serde_json::Value> {
@@ -588,6 +641,78 @@ pub fn discover(expected_vault: Option<&Path>) -> Result<Option<DaemonHandle>> {
         Ok(Some(handle))
     } else {
         // Stale record: daemon named in the file is gone. Clean up.
+        let _ = DaemonInfo::remove(&path);
+        Ok(None)
+    }
+}
+
+/// PASSIVE discovery for the CLI search verbs — return a handle ONLY when a
+/// daemon is live, at our version, AND bound to `expected_vault`; otherwise
+/// `Ok(None)`. **Never stops, restarts, or spawns a daemon.**
+///
+/// This is the deliberate counterpart to [`discover`]: `discover` is the MCP
+/// path's ACTIVE lifecycle owner and, on a version- OR vault-mismatch, STOPS +
+/// restarts the daemon for the caller's vault (one daemon per machine; the MCP
+/// session owns switching it). The CLI, by contrast, is a PASSIVE reader —
+/// `onebrain search …` must NEVER kill a daemon that is serving another vault
+/// (a live MCP session), so on ANY mismatch it simply declines to route
+/// (`Ok(None)`) and the caller opens the engine directly.
+///
+/// Decisions (all from `daemon.json`, no HTTP until the vault/version check
+/// passes):
+/// - version mismatch (`version_decision == Restart`) → `Ok(None)`, record
+///   LEFT INTACT (a foreign daemon; not ours to reclaim).
+/// - vault mismatch (`vault_decision == Restart` — wrong vault, vault-less
+///   daemon while we expect one, or a pre-vault-field record) → `Ok(None)`,
+///   record LEFT INTACT.
+/// - match, but the daemon fails the `/api/health` liveness probe (via
+///   [`DaemonHandle::is_live`] — the engine-INDEPENDENT route, so a
+///   startup-window engine-less daemon still reads live) → a genuinely-dead
+///   SAME-vault record is stale, so it is reclaimed (`remove`) and `Ok(None)`
+///   returned.
+/// - match + live → `Ok(Some(handle))`.
+///
+/// `expected_vault = None` means "any vault" and skips the vault check (kept for
+/// signature symmetry; the CLI always passes `Some`).
+pub fn discover_matching(expected_vault: Option<&Path>) -> Result<Option<DaemonHandle>> {
+    let path = discovery_path()?;
+    let info = match DaemonInfo::read(&path) {
+        Ok(Some(info)) => info,
+        Ok(None) => return Ok(None),
+        // A corrupt record isn't tied to any specific vault, so cleaning it is
+        // safe and matches `discover`'s handling.
+        Err(_) => {
+            let _ = DaemonInfo::remove(&path);
+            return Ok(None);
+        }
+    };
+
+    // Version or vault mismatch → decline to route, WITHOUT touching the record.
+    // A mismatched daemon may be a live MCP session on another vault; the CLI
+    // must never stop/restart/remove it.
+    let expected_id = expected_vault.and_then(canonical_vault_id);
+    if version_decision(&info.version, own_version()) == VersionDecision::Restart {
+        tracing::debug!(
+            daemon_version = %info.version, own_version = own_version(),
+            "daemon at a different version; CLI routes direct (no restart)"
+        );
+        return Ok(None);
+    }
+    if vault_decision(info.vault.as_deref(), expected_id.as_deref()) == VaultDecision::Restart {
+        tracing::debug!(
+            daemon_vault = ?info.vault, expected_vault = ?expected_id,
+            "daemon bound to a different vault; CLI routes direct (no restart)"
+        );
+        return Ok(None);
+    }
+
+    // Same vault + our version. Probe liveness (engine-independent /api/health).
+    let handle = DaemonHandle::new(info);
+    if handle.is_live() {
+        Ok(Some(handle))
+    } else {
+        // A dead SAME-vault record is genuinely stale (it's ours to reclaim);
+        // clean it so the next lookup doesn't re-probe a corpse.
         let _ = DaemonInfo::remove(&path);
         Ok(None)
     }
@@ -1110,6 +1235,98 @@ mod tests {
         // pending reindex: no on-disk md → empty worklist → accepted, no embed.
         let reindex = handle.reindex("pending", &[]).unwrap();
         assert!(reindex["doc_count"].is_number(), "reindex: {reindex}");
+
+        // get: nothing embedded (only lex was seeded), so the meta table has no
+        // record → the daemon 404s → the client maps that to Ok(None) (Track 2c).
+        let got = handle.get("alpha.md").unwrap();
+        assert!(got.is_none(), "unindexed doc → Ok(None): {got:?}");
+    }
+
+    /// PASSIVE vault-match (Track 2c): `discover_matching` routes to a live
+    /// daemon that serves the caller's vault, but returns `None` (→ direct open)
+    /// for a DIFFERENT vault — WITHOUT stopping/removing the daemon.json record
+    /// (the CLI never disturbs a daemon serving another vault). Live server so
+    /// the same-vault arm exercises the real `/api/health` liveness probe.
+    #[cfg(unix)]
+    #[test]
+    fn discover_matching_routes_same_vault_and_declines_other_untouched() {
+        let vault = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("HOME", home.path().as_os_str()),
+        ]);
+        let srv = start_live_server(vault.path(), "dc-live-token-1234567890");
+        let path = discovery_path().unwrap();
+        srv.info.write(&path).unwrap();
+
+        // Same vault → routes (Some, live).
+        let matched = discover_matching(Some(vault.path())).unwrap();
+        assert!(matched.is_some(), "same-vault daemon should route");
+
+        // A DIFFERENT vault → declines (None, direct open) …
+        let other = tempdir().unwrap();
+        assert!(
+            discover_matching(Some(other.path())).unwrap().is_none(),
+            "wrong-vault daemon must NOT route"
+        );
+        // … and the daemon.json record is UNTOUCHED (no stop/remove — the CLI
+        // must never disturb a daemon serving another vault).
+        let still = DaemonInfo::read(&path).unwrap().expect("record preserved");
+        assert_eq!(still.vault, srv.info.vault, "record must be left intact");
+    }
+
+    /// HEADLINE acceptance (Track 2c): with a daemon holding the engine, a
+    /// client can write a note, reindex it THROUGH the daemon, and then `get` /
+    /// `status` see it — i.e. in-session indexing works and CLI-during-session
+    /// reads succeed without ever opening a second engine (no `E_ENGINE_BUSY`).
+    ///
+    /// Lex-only tier only: there, `mode:"paths"` records the doc's chunk
+    /// metadata + hash WITHOUT embedding (`embed_passages_if_available` returns
+    /// `None`), so `get` returns text and `doc_count` rises with NO model
+    /// download. Under `semantic` the same path would embed → a multi-GB model
+    /// download, which the no-download test rule forbids; that tier's daemon
+    /// round-trip is covered by `handle_is_live_and_status_search_reindex_round_trip`
+    /// (empty-`pending` reindex + `get`-miss, all embed-free) plus
+    /// `discover_matching_routes_same_vault_and_declines_other_untouched`.
+    #[cfg(not(feature = "semantic"))]
+    #[test]
+    fn in_session_write_reindex_get_round_trip() {
+        let vault = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let srv = start_live_server(vault.path(), "dc-live-token-1234567890");
+        let handle = DaemonHandle::new(srv.info.clone());
+
+        // A real on-disk note the daemon can index via mode:"paths".
+        std::fs::write(
+            vault.path().join("note.md"),
+            "in-session indexed body text\n",
+        )
+        .unwrap();
+
+        // Before indexing: get is a miss (Ok(None)).
+        assert!(
+            handle.get("note.md").unwrap().is_none(),
+            "unindexed note → Ok(None) before reindex"
+        );
+
+        // Reindex the note THROUGH the daemon (the sole engine owner).
+        let reindex = handle.reindex("paths", &["note.md".to_string()]).unwrap();
+        assert_eq!(reindex["added"], 1, "note newly indexed: {reindex}");
+        assert_eq!(reindex["doc_count"], 1, "doc_count rose: {reindex}");
+
+        // After: get returns the indexed text (CLI-during-session read works).
+        let content = handle.get("note.md").unwrap().expect("note now indexed");
+        assert!(
+            content.contains("in-session indexed body text"),
+            "get returns indexed text: {content}"
+        );
+
+        // And status reflects the in-session index (never busy — routed).
+        let status = handle.status().unwrap();
+        assert_eq!(status["doc_count"], 1, "status sees the doc: {status}");
     }
 
     #[cfg(unix)]

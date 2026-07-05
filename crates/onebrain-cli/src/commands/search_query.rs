@@ -15,6 +15,10 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::cli::SearchQueryArgs;
+#[cfg(feature = "semantic")]
+use crate::commands::daemon_client::DaemonHandle;
+#[cfg(feature = "semantic")]
+use crate::commands::search_common::route_to_daemon;
 use crate::commands::search_common::{collection_cache_dir, open_engine, resolve_collection};
 use crate::output::{emit, Envelope, OutputMode};
 use onebrain_search::engine::Hit;
@@ -91,6 +95,15 @@ pub fn run_query(
     mode: &OutputMode,
     args: &SearchQueryArgs,
 ) -> Result<()> {
+    // Warm-daemon path: when a daemon already holds the engine (e.g. an active
+    // `onebrain mcp` session), route the hybrid query through it so the CLI
+    // works WITHOUT hitting redb's single-writer lock. Only when the daemon
+    // serves this exact vault; otherwise fall through to the direct open below.
+    let resolved = crate::vault_ctx::require(vault_flag.clone())?;
+    if let Some(handle) = route_to_daemon(&resolved) {
+        return run_query_via_daemon(&handle, &resolved, "hybrid", args, mode);
+    }
+
     let (engine, resolved) = open_engine(vault_flag)?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
     let hits = apply_min_score(engine.query(&args.text, args.top_k)?, args.min_score);
@@ -115,6 +128,14 @@ pub fn run_query(
 
 /// `onebrain search vsearch` — vector-only semantic search. Also embeds the
 /// query text (model-download point on first use).
+///
+/// NOT daemon-routable: the warm daemon's `/api/vault/search` exposes only
+/// `lex` + `hybrid` (no vector-only mode), so vsearch always opens the engine
+/// directly. When a daemon is holding the engine (an active `onebrain mcp`
+/// session), this therefore degrades to T1's honest `E_ENGINE_BUSY` rather than
+/// silently returning hybrid results under a different ranking — use `query`
+/// (hybrid, daemon-routable) if you need results while a session is live. A
+/// dedicated vec-only daemon endpoint is a follow-up (out of scope for 2c).
 pub fn run_vsearch(
     vault_flag: Option<PathBuf>,
     mode: &OutputMode,
@@ -196,6 +217,131 @@ pub fn run_lex(
     );
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
+}
+
+/// Run a search through the warm daemon's `/api/vault/search` (mode `hybrid` /
+/// `lex`) and emit the same envelope the direct path does. The daemon is the
+/// sole redb owner, so this never hits the single-writer lock.
+///
+/// The daemon caps top-k (~20) and returns `{path, score, title, snippet}`
+/// rows; `--top-k` / `--min-score` are applied client-side over that set so
+/// the flags behave the same as the direct path (within the daemon's cap). On
+/// an empty result, the index hint is derived from the daemon's
+/// `/api/internal/status` (empty / behind), matching the direct path's
+/// `index_hint_for`.
+///
+/// Semantic-only: the lex-only build's `run_query` degrades to `run_lex`
+/// (a standalone `LexIndex`, no redb → no daemon contention), so the daemon
+/// query path is never reached there.
+#[cfg(feature = "semantic")]
+fn run_query_via_daemon(
+    handle: &DaemonHandle,
+    resolved: &onebrain_core::ResolvedVault,
+    daemon_mode: &str,
+    args: &SearchQueryArgs,
+    mode: &OutputMode,
+) -> Result<()> {
+    let vault_info = crate::vault_ctx::info_from(resolved);
+    let resp = handle
+        .search(&args.text, daemon_mode)
+        .context("route search through warm daemon")?;
+
+    let mut hits = daemon_hits(&resp);
+    if let Some(min) = args.min_score {
+        hits.retain(|h| h.score >= min);
+    }
+    hits.truncate(args.top_k);
+
+    let hint = if hits.is_empty() {
+        daemon_index_hint(handle)
+    } else {
+        None
+    };
+    let command = if daemon_mode == "hybrid" {
+        "search.query"
+    } else {
+        "search.lex"
+    };
+    let envelope = Envelope::ok(
+        command,
+        Some(vault_info),
+        SearchHitsData {
+            hits,
+            index_hint: hint,
+        },
+    );
+    emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
+    Ok(())
+}
+
+/// Map the daemon `/api/vault/search` response (`{hits:[{path,score,title,
+/// snippet}], mode}`) into the CLI's `HitData`. `chunk_id`/`doc_path` both take
+/// the doc path (the daemon collapses per-chunk hits to one row per doc);
+/// `heading_path` takes the title UNLESS it equals the file stem (which the
+/// daemon substitutes when a doc has no heading) — so the text render doesn't
+/// print `note.md › note`. A malformed / missing `hits` array maps to empty.
+#[cfg(feature = "semantic")]
+fn daemon_hits(resp: &serde_json::Value) -> Vec<HitData> {
+    let Some(arr) = resp.get("hits").and_then(|h| h.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|h| {
+            let path = h.get("path")?.as_str()?.to_string();
+            let score = h.get("score").and_then(|s| s.as_f64()).unwrap_or(0.0);
+            let title = h
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            let heading_path = if title.is_empty() || title == file_stem(&path) {
+                String::new()
+            } else {
+                title
+            };
+            let snippet = h
+                .get("snippet")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(HitData {
+                chunk_id: path.clone(),
+                doc_path: path,
+                heading_path,
+                score,
+                snippet,
+            })
+        })
+        .collect()
+}
+
+/// The `title`-vs-stem test's stem: last path segment with a trailing `.md`
+/// stripped — mirrors the daemon's `title_from_path` so a headingless hit's
+/// title (the stem) collapses to an empty `heading_path`.
+#[cfg(feature = "semantic")]
+fn file_stem(path: &str) -> String {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    file.strip_suffix(".md").unwrap_or(file).to_string()
+}
+
+/// Build the empty-result index hint from the daemon's `/api/internal/status`,
+/// mirroring the direct path's [`index_hint_for`]. Best-effort: any probe
+/// failure degrades to no hint rather than failing the search.
+#[cfg(feature = "semantic")]
+fn daemon_index_hint(handle: &DaemonHandle) -> Option<String> {
+    let st = handle.status().ok()?;
+    if st.get("doc_count").and_then(|c| c.as_u64()) == Some(0) {
+        return Some("index is empty — run `onebrain search reindex` first".to_string());
+    }
+    let pending = st
+        .get("pending_total")
+        .and_then(|p| p.as_u64())
+        .unwrap_or(0);
+    (pending > 0).then(|| {
+        format!(
+            "index is behind — {pending} doc(s) not yet indexed · run `onebrain search reindex`"
+        )
+    })
 }
 
 /// Apply the optional `--min-score` floor to engine hits.
@@ -335,5 +481,48 @@ mod tests {
         assert!(s.contains("📄  2. b.md"));
         // Blank line separates the two hit blocks.
         assert!(s.contains("first\n\n📄  2."));
+    }
+
+    // ── Daemon response mapping (Track 2c) ─────────────────────────────────
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn file_stem_strips_dirs_and_md() {
+        assert_eq!(file_stem("01-projects/oma/x.md"), "x");
+        assert_eq!(file_stem("note.md"), "note");
+        assert_eq!(file_stem("no-ext"), "no-ext");
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn daemon_hits_maps_fields_and_collapses_stem_title() {
+        let resp = serde_json::json!({
+            "mode": "hybrid",
+            "hits": [
+                // Title differs from the stem → kept as heading_path.
+                {"path": "a/b.md", "score": 0.9, "title": "Intro", "snippet": "hello"},
+                // Title equals the file stem (headingless) → heading_path empty.
+                {"path": "c.md", "score": 0.4, "title": "c", "snippet": ""},
+            ]
+        });
+        let hits = daemon_hits(&resp);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].doc_path, "a/b.md");
+        assert_eq!(hits[0].chunk_id, "a/b.md");
+        assert_eq!(hits[0].heading_path, "Intro");
+        assert_eq!(hits[0].score, 0.9);
+        assert_eq!(hits[0].snippet, "hello");
+        // Stem-equal title collapses so the render never prints `c.md › c`.
+        assert_eq!(hits[1].heading_path, "");
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn daemon_hits_empty_on_missing_or_malformed_array() {
+        assert!(daemon_hits(&serde_json::json!({})).is_empty());
+        assert!(daemon_hits(&serde_json::json!({"hits": "nope"})).is_empty());
+        // A row missing `path` is skipped (filter_map), not panicked on.
+        let resp = serde_json::json!({"hits": [{"score": 1.0}]});
+        assert!(daemon_hits(&resp).is_empty());
     }
 }

@@ -12,24 +12,49 @@ onebrain daemon stop     # SIGTERM it, clean up its runtime files
 
 The search engine's metadata store (`engine.redb`) is **single-process**: only one process may open a collection's engine at a time. With multiple concurrent sessions (webui, CLI, agent-teams) each opening their own engine, they collide with redb's single-writer limit. The daemon opens the engine **once at boot** and holds it, so the other surfaces talk to it over HTTP instead of each opening their own. See [ADR 0023](decisions/0023-warm-daemon-mcp-search.md).
 
-> **Scope (v3.4.6):** the daemon owns the **search** engine and exposes reindex + status endpoints; the reusable client library ships alongside it. The **MCP server** (`onebrain mcp`) now *uses* the daemon: its `status`/`query` tools route through `daemon_client` (`GET /api/internal/status` + `GET /api/vault/search`) instead of opening their own engine, so multiple concurrent MCP sessions coexist without racing redb's lock — it falls back to a direct single-process engine open only when the daemon can't start. Wiring the CLI `search` verbs to the daemon lands in a follow-up track — until then those verbs still open the engine directly. Consolidating the remaining surfaces (config/tree/file/chat) behind the daemon is later cleanup.
+> **Scope (v3.4.6):** the daemon owns the **search** engine and exposes reindex + status + get endpoints; the reusable client library ships alongside it. Both the **MCP server** (`onebrain mcp`) and the **CLI `search` verbs** now *use* the daemon:
+> - **MCP (Track 2b) — ACTIVE lifecycle owner.** Its `status`/`query` tools route through `daemon_client::ensure_running` (`GET /api/internal/status` + `GET /api/vault/search`), which STARTS a daemon if none is up and RESTARTS it on a version/vault mismatch (one daemon per machine — the MCP session owns switching it). Falls back to a direct single-process engine open only when the daemon can't start.
+> - **CLI (Track 2c) — PASSIVE reader.** `onebrain search …` routes through `daemon_client::discover_matching` — it uses a daemon only when one is ALREADY running and serves this exact vault, and **never starts or restarts** one (a `search` command must not disrupt a live MCP session on another vault). On any mismatch (no daemon / wrong vault / wrong version / dead) it opens the engine directly. See [CLI search verbs route through the daemon](#cli-search-verbs-route-through-the-daemon-track-2c) below.
+>
+> Consolidating the remaining surfaces (config/tree/file/chat) behind the daemon is later cleanup.
 >
 > **Daemon-routed `query` deltas (MCP tool):** the daemon-backed `query` path differs slightly from the direct-engine path — results are **doc-level** (dedup/fusion keys on `path`, so at most one hit per document, vs multiple chunks of one doc directly); a `vec` sub-query is served as **`hybrid`** (lex mixed in) on the wire; and the daemon caps candidates at **`TOP_K` = 20** per sub-query (the direct path over-fetches ≥30). `hyde` ≡ `vec` on **both** paths already (both embed the passage text), so daemon routing adds no new hyde loss. `status` is unaffected — its response shape is identical on both paths.
 
 ## Persistent engine + internal endpoints
 
-`daemon __run` (the detached body, spawned by `daemon start`) opens the engine once and holds it in-process. On top of the usual [`serve` surface](serve.md) it adds two token-gated **internal** routes:
+`daemon __run` (the detached body, spawned by `daemon start`) opens the engine once and holds it in-process. On top of the usual [`serve` surface](serve.md) it adds token-gated **internal** routes:
 
 | route | body / returns |
 |-------|----------------|
-| `POST /api/internal/reindex` | `{ "mode": "pending" \| "paths", "paths"?: [..] }` → runs the corresponding engine reindex, returns `{ added, updated, removed, unchanged, failed, doc_count }` |
+| `POST /api/internal/reindex` | `{ "mode": "pending" \| "paths" \| "lex" \| "all", "paths"?: [..] }` → runs the corresponding engine reindex, returns `{ added, updated, removed, unchanged, failed, doc_count, embed_model }` |
 | `GET  /api/internal/status`  | `{ doc_count, pending_new, pending_changed, pending_removed, pending_total, last_indexed, indexed }` — live status from the held engine |
-| `GET  /api/health`           | `{ ok, engine_held }` — **engine-independent** liveness: 200 whenever the process is up, whether or not an engine is held |
+| `GET  /api/internal/get`     | `?path=<vault-relative doc>` → `{ doc_path, content }`, or `404` when the doc isn't indexed — the held engine's `Engine::get` (a redb read) |
+| `GET  /api/health`           | `{ ok, engine_held }` — **engine-independent** liveness: 200 whenever the process is up, whether or not an engine is held (the vault a client matches against is read from `daemon.json`'s `vault`, not surfaced here) |
 
-- `mode: "pending"` embeds exactly the docs `Engine::pending_vector_paths` reports as drifted (same as `onebrain search reindex --pending-only`). `mode: "paths"` reindexes the caller-supplied vault-relative doc paths.
+- `mode: "pending"` embeds exactly the docs `Engine::pending_vector_paths` reports as drifted (same as `onebrain search reindex --pending-only`). `mode: "paths"` reindexes the caller-supplied vault-relative doc paths. `mode: "lex"` is a keyword-only whole-vault pass with **no embedding** (mirrors `--lex-only`; the PostToolUse hook uses it in-session without a per-write model load). `mode: "all"` is a full whole-vault reindex + embed (a bare `search reindex`).
 - **Path safety:** every `paths` entry is confined to the vault at the HTTP layer before it reaches the engine — absolute paths, `..` traversal, symlink-escapes, and tooling dirs (`.git`/`.claude`/…) are rejected with `400`, so a reindex can't be steered into arbitrary files (`../../etc/passwd`).
 - The `/internal/*` routes require the daemon to actually **hold** an engine; a `serve` process (which doesn't) returns `503` rather than opening one per-request. `/api/health` does NOT — it's a pure liveness check. Reindex writes serialise on the engine mutex, so a concurrent `/api/vault/search` interleaves between batches.
 - The webui `GET /api/vault/search` uses the **held** engine when the daemon is running (lex still uses the standalone tantivy index, which never touches redb).
+
+## CLI search verbs route through the daemon (Track 2c)
+
+When a daemon is **already running and serves the same vault**, the CLI search verbs route their request to it instead of opening a second engine — so the CLI keeps working while an `onebrain mcp` session holds the engine, and auto-reindex hooks land in-session:
+
+| verb | routes to | when no daemon (fallback) |
+|------|-----------|---------------------------|
+| `search query` (hybrid) | `GET /api/vault/search?mode=hybrid` | direct engine open |
+| `search status` | `GET /api/internal/status` | direct open → honest `E_ENGINE_BUSY` if the lock is genuinely held |
+| `search get` | `GET /api/internal/get` | direct open → honest `E_ENGINE_BUSY` |
+| `search reindex` (full) | `POST /api/internal/reindex {mode:"all"}` | direct open (or `--force`, which never routes — it wipes the index files the daemon has open) |
+| `search reindex <paths>` | `POST …{mode:"paths"}` | direct open |
+| `search reindex --lex-only` (hook) | `POST …{mode:"lex"}` | local gate → skip on `engine-busy` (exit 0) |
+| `search reindex --pending-only` (hook) | `POST …{mode:"pending"}` | local detach/foreground path |
+
+Notes:
+- **Passive: route-only, never start or restart.** The CLI uses `daemon_client::discover_matching`, NOT the MCP path's active `discover()`/`ensure_running()`. A plain `onebrain search …` never spawns a daemon and never stops/restarts one — it routes only to a daemon that is ALREADY up (the contention an MCP session creates). This is the load-bearing difference from the MCP path, which owns the daemon's lifecycle and restarts it on a version/vault mismatch. The CLI must never disrupt a daemon serving another vault.
+- **Vault-match guard.** The machine runs one daemon on a fixed port, so a daemon started for vault A must never answer a `--vault B` request. `discover_matching` reads the daemon's canonical bound vault from `daemon.json` (`DaemonInfo.vault`, written at bind) and routes only when `vault_decision` says it matches the caller's vault AND `version_decision` matches AND the daemon passes the engine-independent `/api/health` liveness probe. On ANY mismatch it declines (direct open) and **leaves the daemon.json record untouched** — no stop, no remove.
+- **`search search` (lex)** and **`search vsearch` (vector-only)** are NOT daemon-routed: lex uses the standalone tantivy index (no redb, no contention), and the daemon exposes no vector-only search mode, so vsearch opens directly (honest `E_ENGINE_BUSY` while a session holds the engine — use `query` for results mid-session).
+- **Kill switch.** Set `ONEBRAIN_NO_DAEMON=1` to disable all CLI daemon routing (every verb opens the engine directly, the pre-daemon behaviour).
 
 Every route — including `/api/health` — is behind the **same token auth** as the rest of the surface; no separate credential.
 
@@ -58,10 +83,11 @@ Two `daemon start` calls racing in parallel used to be able to both spawn (a TOC
 
 The client library (`commands/daemon_client.rs`) is what the CLI/MCP tracks call to reach the daemon:
 
-- `discover()` — read `daemon.json`, liveness-probe via **`GET /api/health`** (the engine-independent route — probing `/internal/status` would wrongly read a live-but-engine-less daemon as dead and delete its record), return a handle; a stale/dead record is cleaned up and yields `None`.
-- `ensure_running()` — `discover()`, else spawn `daemon start` detached and poll for readiness with a bounded timeout. The start race is handled implicitly: if another starter won, its `daemon.json` appears and the client connects to it. On timeout the error **classifies the last state** (no daemon.json / version-skew / alive-but-no-response) and points at `~/.onebrain/run/daemon.log`.
-- `DaemonHandle::search` / `reindex` / `status` — typed HTTP calls carrying the token. Each **retries once via `ensure_running()`** on a transport error (a daemon that vanished mid-call), while an HTTP status error propagates unchanged.
-- **Version skew:** when `daemon.json.version` differs from the client's own version, the client restarts the daemon (stop + start) before use, so a daemon from an older install can't serve an incompatible wire shape. A failed stop is surfaced as a warning (the old daemon may still hold the engine lock), not swallowed.
+- `discover(expected_vault)` — **ACTIVE (MCP path).** Read `daemon.json`, liveness-probe via **`GET /api/health`** (the engine-independent route — probing `/internal/status` would wrongly read a live-but-engine-less daemon as dead and delete its record), return a handle; a stale/dead record is cleaned up and yields `None`. On a version OR vault mismatch it **stops the daemon** and yields `None` so `ensure_running` starts a fresh one for `expected_vault`.
+- `ensure_running(expected_vault)` — `discover()`, else spawn `daemon start` detached and poll for readiness with a bounded timeout. The start race is handled implicitly: if another starter won, its `daemon.json` appears and the client connects to it. On timeout the error **classifies the last state** (no daemon.json / version-skew / alive-but-no-response) and points at `~/.onebrain/run/daemon.log`.
+- `discover_matching(expected_vault)` — **PASSIVE (CLI-search path).** Same read + `/api/health` liveness check, but returns a handle ONLY for a live daemon matching BOTH version and vault; on ANY mismatch it declines (`None` → direct open) **without stopping, restarting, or removing** the record (a wrong-vault daemon may be a live MCP session — the CLI must never disrupt it). A dead SAME-vault record is reclaimed like `discover`.
+- `DaemonHandle::search` / `reindex` / `status` / `get` — typed HTTP calls carrying the token. Each **retries once via `ensure_running()`** (reconnecting to the handle's OWN bound vault) on a transport error (a daemon that vanished mid-call), while an HTTP status error propagates unchanged; `get` additionally maps a `404` to `Ok(None)` (doc not indexed) so the CLI renders its "not indexed yet" hint.
+- **Version / vault skew (ACTIVE path):** when `daemon.json`'s `version` or bound `vault` differs from the caller's, `discover`/`ensure_running` restart the daemon (stop + start) for the caller's vault before use, so a daemon from an older install or a different vault can't serve the wrong engine. A failed stop is surfaced as a warning (the old daemon may still hold the engine lock), not swallowed. The PASSIVE `discover_matching` never restarts — it routes direct instead.
 
 ## Lifecycle
 
