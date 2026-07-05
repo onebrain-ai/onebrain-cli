@@ -198,6 +198,28 @@ Show the status of the search index: collection, embed model, document counts, p
 
 `index_size_bytes`, `cache_size_bytes`, and `reindexing` are omitted (not `null`) when there's nothing to report. When present, `reindexing` is an object with live progress counters — `{ "done": 10, "total": 100 }` — reported even while the reindex runs in a **separate** process (CLI/daemon), so an agent can poll `status` for progress.
 
+The same result **while a reindex is in progress** (note the added `reindexing` and non-zero `pending_changed`):
+
+```json
+{
+  "collection": "my-vault-a1b2c3",
+  "embed_model": "multilingual-e5-small",
+  "cache_dir": "/Users/you/Library/Application Support/onebrain/search/my-vault-a1b2c3",
+  "indexed": true,
+  "model_size_bytes": 493921024,
+  "model_downloaded_at": 1751500000,
+  "last_indexed_at": 1751500400,
+  "index_size_bytes": 16777216,
+  "doc_count": 412,
+  "pending_new": 0,
+  "pending_changed": 2,
+  "pending_removed": 0,
+  "cache_size_bytes": 510000000,
+  "reindexing": { "done": 10, "total": 100 },
+  "semantic_available": true
+}
+```
+
 > **Note:** the MCP `status` tool's `indexed` reflects `doc_count > 0` (the engine is already open on this path), a deliberate refinement over `onebrain search status`'s cache-dir-existence `indexed` — an empty-but-present cache dir reads as `indexed: true` there but `indexed: false` here.
 
 **Example call**
@@ -218,7 +240,7 @@ A common question for tools like a future `reindex`: can an agent kick off long 
 | **Progress notifications** | `notifications/progress` (requires the client to pass a `progressToken`) streams progress while the request stays open, so the call still resolves at the end but the agent sees intermediate percentages. | Work whose final result the agent needs, but wants visible progress meanwhile. |
 | **Concurrent transport + cancellation** | The transport is duplex: the client can issue other requests while one is in flight (each has its own `id`), and `notifications/cancelled` can cancel an in-flight request. | Keeping a slow call from blocking other tool calls. |
 
-**Today, all four shipped tools are fast and effectively synchronous** — none starts background work. There is no `reindex` MCP tool yet; reindexing is a CLI/cron operation. However, the engine already provides the primitive for the *return-immediately + poll* pattern: `onebrain search reindex` writes an on-disk progress marker, and the `status` tool reports `reindexing: { done, total }` live — even when the reindex is running in a **separate** process. So a client can already observe reindex progress through `status` while a CLI/cron reindex runs.
+**Today, the four shipped tools (`query`, `get`, `multi_get`, `status`) are fast and effectively synchronous** — none starts background work. There is no `reindex` MCP tool yet; reindexing is a CLI/cron operation. However, the engine already provides the primitive for the *return-immediately + poll* pattern: `onebrain search reindex` writes an on-disk progress marker, and the `status` tool reports `reindexing: { done, total }` live — even when the reindex is running in a **separate** process. So a client can already observe reindex progress through `status` while a CLI/cron reindex runs.
 
 **Forward design (roadmap, not a commitment):** if a `reindex` MCP tool lands, the natural shape is the return-immediately + poll pattern above: `reindex` spawns the work and returns a "started" acknowledgement, and the agent polls `status` for `reindexing: { done, total }`. (In-session auto-reindex already ships via the CLI/daemon path — the PostToolUse/Stop hooks route `search reindex` to the warm daemon; a dedicated MCP `reindex` tool is a separate, unshipped idea.) Two design constraints would apply:
 
