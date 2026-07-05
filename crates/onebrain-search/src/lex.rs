@@ -346,12 +346,20 @@ impl LexIndex {
     /// `(chunk_id, score)`
     /// pairs, highest score first.
     pub fn search(&self, query: &str, top_k: usize) -> Result<Vec<(String, f32)>> {
-        // Guard top_k == 0: tantivy's `TopDocs::with_limit` asserts limit > 0
-        // and would panic. Mirror `VectorStore::search`'s guard so a raw
-        // `--top-k 0` on the CLI returns empty rather than aborting.
-        if top_k == 0 {
-            return Ok(Vec::new());
-        }
+        self.search_docs(query, top_k, |searcher, doc_address| {
+            let retrieved: tantivy::TantivyDocument = searcher.doc(doc_address)?;
+            Ok(retrieved
+                .get_first(self.chunk_id)
+                .and_then(|v| v.as_str())
+                .map(str::to_string))
+        })
+    }
+
+    /// Build the `Should`-combined [`BooleanQuery`] for `query` using the same
+    /// script-aware segmentation as index time. Returns `None` when the query
+    /// yields no searchable units (empty / punctuation-only), so callers return
+    /// an empty result set without touching the reader.
+    fn build_query(&self, query: &str) -> Option<BooleanQuery> {
         // Build one subquery per QUERY UNIT. Each no-space-script run (a
         // pseudo-word like `สุขภาพ`) becomes a nested Boolean requiring ALL
         // of its bigrams — lex semantics for no-space scripts are exact
@@ -396,9 +404,31 @@ impl LexIndex {
             }
         }
         if units.is_empty() {
+            return None;
+        }
+        Some(BooleanQuery::new(units))
+    }
+
+    /// Shared search core: build the query, run one top-`top_k` pass, and map
+    /// each retrieved doc via `extract`, keeping only `Some` results. Both
+    /// [`Self::search`] and [`Self::search_with_heading`] go through this so a
+    /// hit's STORED fields (chunk_id, heading_path) are read from the SAME
+    /// retrieved doc — no per-hit re-query.
+    fn search_docs<T>(
+        &self,
+        query: &str,
+        top_k: usize,
+        extract: impl Fn(&tantivy::Searcher, tantivy::DocAddress) -> Result<Option<T>>,
+    ) -> Result<Vec<(T, f32)>> {
+        // Guard top_k == 0: tantivy's `TopDocs::with_limit` asserts limit > 0
+        // and would panic. Mirror `VectorStore::search`'s guard so a raw
+        // `--top-k 0` on the CLI returns empty rather than aborting.
+        if top_k == 0 {
             return Ok(Vec::new());
         }
-        let query = BooleanQuery::new(units);
+        let Some(query) = self.build_query(query) else {
+            return Ok(Vec::new());
+        };
 
         let reader = self.index.reader()?;
         let searcher = reader.searcher();
@@ -406,9 +436,8 @@ impl LexIndex {
 
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, doc_address) in top_docs {
-            let retrieved: tantivy::TantivyDocument = searcher.doc(doc_address)?;
-            if let Some(id) = retrieved.get_first(self.chunk_id).and_then(|v| v.as_str()) {
-                results.push((id.to_string(), score));
+            if let Some(value) = extract(&searcher, doc_address)? {
+                results.push((value, score));
             }
         }
         Ok(results)
@@ -421,52 +450,31 @@ impl LexIndex {
     /// but NOT `STORED`, so retrieving a snippet would require a schema change
     /// plus a full reindex migration (deferred). Returns triples of
     /// `chunk_id`, `heading_path`, and `score`, highest score first.
+    ///
+    /// Both `chunk_id` and `heading_path` are read from the SAME retrieved doc
+    /// in the single search pass — no redundant per-hit `TermQuery`.
     pub fn search_with_heading(
         &self,
         query: &str,
         top_k: usize,
     ) -> Result<Vec<(String, String, f32)>> {
-        let raw = self.search(query, top_k)?;
-        if raw.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Re-run the search to recover stored fields alongside the chunk_id.
-        // Cheap relative to the query itself (same reader, same top_docs), and
-        // keeps `search`'s hot-path signature `(chunk_id, score)` untouched for
-        // its many callers (hybrid fuse, mcp, webui).
-        //
-        // TODO(v3.4.x): this issues a redundant per-hit `TermQuery` +
-        // `order_by_score` to re-fetch each doc, even though `search()` already
-        // retrieved the doc address whose STORED `heading_path` we want. Fold
-        // heading (and eventually a STORED-body snippet) into a single pass by
-        // having `search()` return the doc addresses — folded into the
-        // deferred-snippet follow-up (body-STORED schema change + reindex
-        // migration), so it lands with that work rather than as a separate
-        // refactor now.
-        let reader = self.index.reader()?;
-        let searcher = reader.searcher();
-        let mut by_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        for (chunk_id, _) in &raw {
-            // Look up the doc for this chunk_id to fetch its heading_path.
-            let term = Term::from_field_text(self.chunk_id, chunk_id);
-            let tq = TermQuery::new(term, IndexRecordOption::Basic);
-            let hits = searcher.search(&tq, &TopDocs::with_limit(1).order_by_score())?;
-            if let Some((_, addr)) = hits.first() {
-                let doc: tantivy::TantivyDocument = searcher.doc(*addr)?;
-                let heading = doc
-                    .get_first(self.heading_path)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                by_id.insert(chunk_id.clone(), heading);
-            }
-        }
-        Ok(raw
+        let hits = self.search_docs(query, top_k, |searcher, doc_address| {
+            let retrieved: tantivy::TantivyDocument = searcher.doc(doc_address)?;
+            Ok(retrieved
+                .get_first(self.chunk_id)
+                .and_then(|v| v.as_str())
+                .map(|id| {
+                    let heading = retrieved
+                        .get_first(self.heading_path)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    (id.to_string(), heading)
+                }))
+        })?;
+        Ok(hits
             .into_iter()
-            .map(|(id, score)| {
-                let heading = by_id.get(&id).cloned().unwrap_or_default();
-                (id, heading, score)
-            })
+            .map(|((id, heading), score)| (id, heading, score))
             .collect())
     }
 }
@@ -510,6 +518,42 @@ mod tests {
         let (id, heading, _score) = &hits[0];
         assert_eq!(id, "d1#0");
         assert_eq!(heading, "Errors › Handling");
+    }
+
+    #[test]
+    fn search_with_heading_maps_each_hit_to_its_own_heading() {
+        // Multi-hit: every hit's heading_path must come from ITS OWN doc, read
+        // from the same retrieved doc in the single search pass (no per-hit
+        // re-query, no shared by_id map that could mis-associate headings).
+        let dir = tempfile::tempdir().unwrap();
+        let mut ix = LexIndex::open(dir.path()).unwrap();
+        for (id, heading) in [
+            ("d1#0", "Alpha › One"),
+            ("d2#0", "Bravo › Two"),
+            ("d3#0", "Charlie › Three"),
+        ] {
+            let mut c = chunk(id, "shared token error");
+            c.heading_path = heading.into();
+            ix.add(&c).unwrap();
+        }
+        ix.commit().unwrap();
+
+        let hits = ix.search_with_heading("error", 10).unwrap();
+        assert_eq!(hits.len(), 3, "all three docs match `error`");
+        let expected: std::collections::HashMap<&str, &str> = [
+            ("d1#0", "Alpha › One"),
+            ("d2#0", "Bravo › Two"),
+            ("d3#0", "Charlie › Three"),
+        ]
+        .into_iter()
+        .collect();
+        for (id, heading, _score) in &hits {
+            assert_eq!(
+                Some(heading.as_str()),
+                expected.get(id.as_str()).copied(),
+                "hit {id} must carry its own heading, got {heading}"
+            );
+        }
     }
 
     #[test]
@@ -614,10 +658,9 @@ mod tests {
         assert_eq!(reader_ix2.search("quux", 1).unwrap()[0].0, "d1#0");
     }
 
-    /// A read-only open + `search` must succeed even when a stale writer lock
-    /// file is present on disk (e.g. left behind by a killed `reindex`). Since
-    /// `open`/`search` never acquire the writer lock, the stale file is
-    /// irrelevant to them. Regression test for the `LockBusy` failure.
+    /// An empty query, a punctuation-only query (no searchable units), and
+    /// `top_k == 0` must each return an empty result set without panicking —
+    /// the query-build and `TopDocs::with_limit` guards short-circuit first.
     #[test]
     fn search_empty_and_punctuation_queries_return_empty() {
         let dir = tempfile::tempdir().unwrap();
@@ -649,6 +692,10 @@ mod tests {
         assert_eq!(hits.len(), 2, "{hits:?}");
     }
 
+    /// A read-only open + `search` must succeed even when a stale writer lock
+    /// file is present on disk (e.g. left behind by a killed `reindex`). Since
+    /// `open`/`search` never acquire the writer lock, the stale file is
+    /// irrelevant to them. Regression test for the `LockBusy` failure.
     #[test]
     fn search_succeeds_with_stale_writer_lock_present() {
         let dir = tempfile::tempdir().unwrap();

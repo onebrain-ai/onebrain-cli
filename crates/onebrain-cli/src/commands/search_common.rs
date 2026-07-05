@@ -154,9 +154,13 @@ fn persist_collection(vault_root: &Path, collection: &str) -> Result<()> {
     onebrain_fs::persist_search_key(vault_root, "collection", collection)
 }
 
-/// `true` when the collection's cache dir already exists on disk (used by
-/// `status`'s `indexed` field). Pure path check — never touches the engine,
-/// so it never triggers a model download.
+/// `true` when the collection's cache dir already exists on disk. Used as a
+/// read-only pre-check by `session_init::native_pending` and `doctor` to skip
+/// opening the engine (which would create the dir as a side effect) on a
+/// never-indexed vault. Note: `search status` does NOT use this — it derives
+/// its `indexed` field from `doc_count > 0`, since a cache dir can exist while
+/// holding zero docs. Pure path check — never touches the engine, so it never
+/// triggers a model download.
 pub fn is_indexed(cache_dir: &Path) -> bool {
     cache_dir.is_dir()
 }

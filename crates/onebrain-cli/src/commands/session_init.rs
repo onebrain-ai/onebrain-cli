@@ -128,9 +128,9 @@ fn compute_result(
 /// (fresh `search.collection` in `onebrain.yml`, no `onebrain search reindex`
 /// run yet), calling `Engine::open` here would silently create an empty index
 /// skeleton on every session start, just to answer "how many are pending?".
-/// So: check the cache dir's existence first (pure fs, same check
-/// `search_status::status_data` uses for its `indexed` field) and only open
-/// the engine when it already exists. A configured-but-never-indexed vault
+/// So: check the cache dir's existence first (pure fs, via the shared
+/// `is_indexed` helper) and only open the engine when it already exists. A
+/// configured-but-never-indexed vault
 /// reports `None` (unknown) without touching disk — consistent with "probe
 /// couldn't determine" rather than a misleading `Some(0)`.
 fn native_pending(vault_root: &onebrain_core::VaultRoot, collection: &str) -> Option<usize> {

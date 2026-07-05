@@ -19,6 +19,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Hook paths (`search reindex --lex-only` / `--pending-only`) skip with `reason: "engine-busy"` and stay exit 0, so a locked index never breaks the Claude Code hook chain.
 - The lock is classified from redb's typed `DatabaseAlreadyOpen` kind (with a defensive string fallback), surfaced as `onebrain_search::error::EngineBusy` + `CoreError::EngineBusy`.
 - `search search` (lex-only verb) now populates each hit's `heading_path` from the STORED tantivy field — no redb open. Snippet stays empty pending a `body`-STORED schema change + reindex migration (deferred follow-up).
+- `LexIndex::search_with_heading` reads `chunk_id` + `heading_path` from a single search pass instead of re-querying tantivy once per hit (was up to 51 queries at `LEX_TOP_K`=50); plus test-hygiene fixes (real model-cache-path assertions in `search_cli`, corrected `is_indexed` / stale-lock doc comments).
 
 ## [3.4.5] — native search · no dependency · auto reindex/embed · model reindex ux/ui (the qmd epic)
 

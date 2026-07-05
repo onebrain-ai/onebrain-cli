@@ -64,7 +64,7 @@ fn search_status_json_reports_collection_and_model_without_downloading() {
     // so the cache dir (tantivy/vectors/redb) may exist — but NO embedding
     // model must ever be downloaded. Assert the real invariant: no ONNX model
     // files and no `models--*` download dir under the collection cache.
-    let model_cache = cache.path().join("onebrain").join("search").join("t-vault");
+    let model_cache = cache.path().join("search").join("t-vault");
     if model_cache.exists() {
         assert!(
             !walkdir_has_onnx(&model_cache),
@@ -228,7 +228,7 @@ fn search_lex_only_works_without_embedding_model() {
     assert_eq!(v["data"]["hits"].as_array().unwrap().len(), 0);
 
     // Confirm no embedding model was ever fetched by this lex-only path.
-    let model_cache = cache.path().join("onebrain").join("search").join("t-vault");
+    let model_cache = cache.path().join("search").join("t-vault");
     if model_cache.exists() {
         // The tantivy dir may exist (LexIndex::open creates it), but no
         // fastembed ONNX model files should be there.
@@ -327,7 +327,7 @@ fn search_model_list_json_reports_all_models_with_current_marked() {
     assert_eq!(current, vec!["bge-m3"]);
 
     // `list` must never touch the engine's on-disk state — no download.
-    let model_cache = cache.path().join("onebrain").join("search").join("t-vault");
+    let model_cache = cache.path().join("search").join("t-vault");
     assert!(
         !model_cache.exists(),
         "model list must not touch the engine's on-disk state"
@@ -387,7 +387,7 @@ fn search_model_set_unknown_name_errors_without_downloading() {
     // Config must be left untouched, and no model cache created.
     let yaml = std::fs::read_to_string(vault.path().join("onebrain.yml")).unwrap();
     assert!(!yaml.contains("not-a-real-model"));
-    let model_cache = cache.path().join("onebrain").join("search").join("t-vault");
+    let model_cache = cache.path().join("search").join("t-vault");
     assert!(
         !model_cache.exists(),
         "an unsupported model must never trigger engine open / download"
@@ -438,7 +438,7 @@ fn search_model_bare_non_tty_falls_back_to_static_list_without_prompting() {
 
     // No engine cache dir should be created — the static list must never open
     // the engine or trigger a model download.
-    let model_cache = cache.path().join("onebrain").join("search").join("t-vault");
+    let model_cache = cache.path().join("search").join("t-vault");
     assert!(
         !model_cache.exists(),
         "bare model fallback must not touch the engine's on-disk state"
@@ -503,7 +503,7 @@ fn search_model_set_already_current_is_a_noop() {
     assert_eq!(v["data"]["chunks_reembedded"], serde_json::Value::Null);
 
     // No engine cache dir should be created for a no-op set.
-    let model_cache = cache.path().join("onebrain").join("search").join("t-vault");
+    let model_cache = cache.path().join("search").join("t-vault");
     assert!(!model_cache.exists());
 }
 
