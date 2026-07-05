@@ -49,8 +49,27 @@ use onebrain_search::engine::Engine;
 /// [`super::build_router`] for the whole tree, so this stays a pure route table.
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
+        // Engine-INDEPENDENT liveness: 200 whenever the process is up, whether
+        // or not it holds an engine. The client's `is_live()` MUST probe this
+        // (not `/internal/status`, which 503s with no engine) — otherwise a
+        // live daemon that hasn't opened an engine reads as dead and gets its
+        // `daemon.json` deleted + respawned in a loop.
+        .route("/health", get(get_health))
         .route("/internal/status", get(get_internal_status))
         .route("/internal/reindex", post(post_internal_reindex))
+}
+
+/// `GET /api/health` — the engine-independent liveness probe. Returns
+/// `{ ok: true, engine_held }` with 200 whenever the daemon is up. Still behind
+/// the token-auth middleware (the whole surface is), so it leaks nothing to an
+/// unauthenticated caller; it just doesn't depend on the search engine being
+/// held, which is exactly what a liveness check must not do.
+async fn get_health(State(state): State<Arc<AppState>>) -> Response {
+    Json(serde_json::json!({
+        "ok": true,
+        "engine_held": state.search_engine.is_some(),
+    }))
+    .into_response()
 }
 
 /// Open the one engine the daemon holds for its lifetime, rooted at the vault's
@@ -205,11 +224,24 @@ async fn post_internal_reindex(
     let root = require_vault_root(&state)?.to_path_buf();
     let engine = require_engine(&state)?.clone();
 
-    if req.mode == ReindexMode::Paths && req.paths.is_empty() {
-        return Err(ApiError::BadRequest(
-            "mode=paths requires a non-empty paths list".to_string(),
-        ));
-    }
+    // For `mode=paths`, confine EVERY caller-supplied entry to the vault BEFORE
+    // it can reach `engine.reindex_paths` → `vault_root.join(doc_path)` →
+    // `std::fs::read`. Without this an entry like `../../../../etc/passwd` or an
+    // absolute path would be read + indexed (path-traversal). `pending` mode
+    // derives its worklist from a vault walk, so it needs no confinement.
+    let confined_paths: Vec<String> = if req.mode == ReindexMode::Paths {
+        if req.paths.is_empty() {
+            return Err(ApiError::BadRequest(
+                "mode=paths requires a non-empty paths list".to_string(),
+            ));
+        }
+        req.paths
+            .iter()
+            .map(|p| super::api::confine_reindex_path(&root, p))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
 
     // Reindex is synchronous (tantivy + redb + embedding). Run it off the async
     // runtime, holding the engine mutex for the batch's duration so a concurrent
@@ -225,7 +257,7 @@ async fn post_internal_reindex(
                     engine.reindex_paths(&root, &pending)?
                 }
             }
-            ReindexMode::Paths => engine.reindex_paths(&root, &req.paths)?,
+            ReindexMode::Paths => engine.reindex_paths(&root, &confined_paths)?,
         };
         let doc_count = engine.status(&root)?.doc_count;
         Ok::<_, anyhow::Error>((stats, doc_count))
@@ -365,6 +397,264 @@ mod tests {
         // An unknown enum variant fails deserialization → 4xx (axum's Json
         // rejection), never a 5xx.
         assert!(resp.status().is_client_error(), "got {}", resp.status());
+    }
+
+    // ── SECURITY: path-traversal in `reindex {mode:"paths"}` ───────────────
+    // Every caller-supplied path must be confined to the vault BEFORE it reaches
+    // the engine's `vault_root.join(doc_path)` + `std::fs::read`. Each hostile
+    // form must be rejected with 400, and the target file must NOT be indexed.
+    #[tokio::test]
+    async fn reindex_paths_rejects_traversal_absolute_and_symlink_escape() {
+        let (vault, cache) = vault_with_empty_index();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+
+        // A secret OUTSIDE the vault that a traversal would try to read + index.
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.md");
+        std::fs::write(&secret, "TOP SECRET vault-escape marker\n").unwrap();
+
+        // A symlink INSIDE the vault pointing at the outside secret (symlink
+        // escape — the lexical `..` check can't see through it).
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&secret, vault.path().join("link.md")).unwrap();
+
+        let router = router_holding_engine(vault.path());
+
+        // Each hostile entry, tried on its own → must be 400 (rejected).
+        let mut hostile: Vec<String> = vec![
+            "../../../../etc/passwd".to_string(),
+            secret.display().to_string(), // absolute path
+            "sub/../../escape.md".to_string(),
+        ];
+        #[cfg(unix)]
+        hostile.push("link.md".to_string()); // symlink escape
+
+        for path in &hostile {
+            let body = serde_json::json!({ "mode": "paths", "paths": [path] }).to_string();
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::post("/api/internal/reindex")
+                        .header("x-onebrain-token", TOKEN)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "hostile path must be rejected: {path}"
+            );
+        }
+
+        // And the secret was never indexed — a lex search for its marker returns
+        // nothing (the reindex never ran, so no index exists → empty hits).
+        let resp = router
+            .oneshot(
+                Request::get("/api/vault/search?q=SECRET&mode=lex")
+                    .header("x-onebrain-token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["hits"].as_array().map(|a| a.len()),
+            Some(0),
+            "escaped secret must NOT be indexed: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_paths_accepts_a_normal_in_vault_path() {
+        // A legitimate in-vault relative path passes confinement (reaches the
+        // engine). In a lex-only build the reindex succeeds; in a semantic build
+        // it would embed, so we only assert confinement did NOT reject it (not
+        // 400). Gated to lex-only to stay download-free.
+        #[cfg(not(feature = "semantic"))]
+        {
+            let (vault, cache) = vault_with_empty_index();
+            std::fs::write(vault.path().join("note.md"), "hello world\n").unwrap();
+            let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+            let router = router_holding_engine(vault.path());
+            let resp = router
+                .oneshot(
+                    Request::post("/api/internal/reindex")
+                        .header("x-onebrain-token", TOKEN)
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"mode":"paths","paths":["note.md"]}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "a normal in-vault path must not be rejected as traversal"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn health_is_200_even_with_no_engine_held() {
+        // The engine-independent liveness route: 200 whether or not an engine is
+        // held. This is what the client's is_live() probes so a live-but-
+        // engine-less daemon isn't mistaken for dead.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: health-no-engine\n",
+        )
+        .unwrap();
+        // hold_engine=false → search_engine is None, yet /api/health must be 200.
+        let cfg =
+            ServeConfig::localhost(Some(vault.path().to_path_buf()), 0, TOKEN.to_string(), None);
+        let router = build_router(cfg);
+
+        let resp = router
+            .oneshot(
+                Request::get("/api/health")
+                    .header("x-onebrain-token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["engine_held"], false);
+    }
+
+    #[tokio::test]
+    async fn vault_search_via_held_engine_empty_query_and_hits() {
+        // Exercises `get_vault_search` through the held engine: an empty query
+        // short-circuits to empty hits, and a real lex query returns the seeded
+        // doc. Covers the async handler + the held-engine `run_search` lex path.
+        use onebrain_search::chunk::Chunk;
+        use onebrain_search::lex::LexIndex;
+        let (vault, cache) = vault_with_empty_index();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        {
+            let tantivy = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap())
+                .join("tantivy");
+            let mut lex = LexIndex::open(&tantivy).unwrap();
+            lex.add(&Chunk {
+                chunk_id: "beta.md#0".to_string(),
+                doc_path: "beta.md".to_string(),
+                heading_path: String::new(),
+                text: "lazy dog sleeps".to_string(),
+                chunk_index: 0,
+            })
+            .unwrap();
+            lex.commit().unwrap();
+        }
+        let router = router_holding_engine(vault.path());
+
+        // Empty query → empty hits (200), no engine work.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::get("/api/vault/search?q=&mode=lex")
+                    .header("x-onebrain-token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["hits"].as_array().unwrap().len(), 0);
+
+        // Real query → the seeded doc, through the held engine.
+        let resp = router
+            .oneshot(
+                Request::get("/api/vault/search?q=lazy&mode=lex")
+                    .header("x-onebrain-token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["hits"][0]["path"], "beta.md");
+    }
+
+    #[tokio::test]
+    async fn vault_search_without_held_engine_uses_per_request_path() {
+        // hold_engine=false → search goes through the per-request `run_native`
+        // path (the `serve`/CLI path), covering it via the async handler.
+        use onebrain_search::chunk::Chunk;
+        use onebrain_search::lex::LexIndex;
+        let (vault, cache) = vault_with_empty_index();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        {
+            let tantivy = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap())
+                .join("tantivy");
+            let mut lex = LexIndex::open(&tantivy).unwrap();
+            lex.add(&Chunk {
+                chunk_id: "gamma.md#0".to_string(),
+                doc_path: "gamma.md".to_string(),
+                heading_path: String::new(),
+                text: "per request path".to_string(),
+                chunk_index: 0,
+            })
+            .unwrap();
+            lex.commit().unwrap();
+        }
+        // No hold_engine → search_engine is None → run_native.
+        let cfg =
+            ServeConfig::localhost(Some(vault.path().to_path_buf()), 0, TOKEN.to_string(), None);
+        let router = build_router(cfg);
+        let resp = router
+            .oneshot(
+                Request::get("/api/vault/search?q=request&mode=lex")
+                    .header("x-onebrain-token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["hits"][0]["path"], "gamma.md");
+    }
+
+    #[test]
+    fn app_state_debug_elides_token_and_shows_engine_flag() {
+        // Covers AppState's hand-written Debug impl (mod.rs).
+        let (vault, cache) = vault_with_empty_index();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let mut cfg =
+            ServeConfig::localhost(Some(vault.path().to_path_buf()), 0, TOKEN.to_string(), None);
+        cfg.hold_engine = true;
+        let (_router, state) = crate::server::build_router_with_state(cfg);
+        let s = format!("{state:?}");
+        assert!(s.contains("AppState"), "{s}");
+        assert!(s.contains("search_engine_held"), "{s}");
+        assert!(!s.contains(TOKEN), "Debug must not print the token: {s}");
+    }
+
+    #[tokio::test]
+    async fn health_requires_token() {
+        let (vault, cache) = vault_with_empty_index();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let router = router_holding_engine(vault.path());
+        let resp = router
+            .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

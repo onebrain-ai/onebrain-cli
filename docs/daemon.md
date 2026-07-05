@@ -22,12 +22,14 @@ The search engine's metadata store (`engine.redb`) is **single-process**: only o
 |-------|----------------|
 | `POST /api/internal/reindex` | `{ "mode": "pending" \| "paths", "paths"?: [..] }` → runs the corresponding engine reindex, returns `{ added, updated, removed, unchanged, failed, doc_count }` |
 | `GET  /api/internal/status`  | `{ doc_count, pending_new, pending_changed, pending_removed, pending_total, last_indexed, indexed }` — live status from the held engine |
+| `GET  /api/health`           | `{ ok, engine_held }` — **engine-independent** liveness: 200 whenever the process is up, whether or not an engine is held |
 
 - `mode: "pending"` embeds exactly the docs `Engine::pending_vector_paths` reports as drifted (same as `onebrain search reindex --pending-only`). `mode: "paths"` reindexes the caller-supplied vault-relative doc paths.
-- Both routes require the daemon to actually **hold** an engine; a `serve` process (which doesn't) returns `503` rather than opening one per-request. Reindex writes serialise on the engine mutex, so a concurrent `/api/vault/search` interleaves between batches.
+- **Path safety:** every `paths` entry is confined to the vault at the HTTP layer before it reaches the engine — absolute paths, `..` traversal, symlink-escapes, and tooling dirs (`.git`/`.claude`/…) are rejected with `400`, so a reindex can't be steered into arbitrary files (`../../etc/passwd`).
+- The `/internal/*` routes require the daemon to actually **hold** an engine; a `serve` process (which doesn't) returns `503` rather than opening one per-request. `/api/health` does NOT — it's a pure liveness check. Reindex writes serialise on the engine mutex, so a concurrent `/api/vault/search` interleaves between batches.
 - The webui `GET /api/vault/search` uses the **held** engine when the daemon is running (lex still uses the standalone tantivy index, which never touches redb).
 
-Every internal route is behind the **same token auth** as the rest of the surface — no separate credential.
+Every route — including `/api/health` — is behind the **same token auth** as the rest of the surface; no separate credential.
 
 ## Discovery — `~/.onebrain/run/daemon.json`
 
@@ -39,22 +41,22 @@ After it binds, the daemon writes a discovery file so clients can find it:
 
 - `port` is the **actual** bound port (relevant when the daemon binds `0` for an OS-assigned port).
 - The file is `0600` (it holds the token) and written atomically (temp-then-rename).
-- It is **removed on clean shutdown**, so a client never connects to a dead daemon.
+- It is **removed on clean shutdown** (SIGTERM / `daemon stop`). A **hard kill** (SIGKILL/crash) leaves it behind — there's no crash-time cleanup — so `discover()` treats every record as untrusted: it liveness-probes and **reclaims a stale record lazily** on the next lookup, so a client never connects to a dead daemon.
 
 Runtime files live under `~/.onebrain/run/`: `daemon.pid`, `daemon.log`, `daemon.json`, and the transient `daemon.lock` (below).
 
 ## Concurrent-start guard
 
-Two `daemon start` calls racing in parallel used to be able to both spawn (a TOCTOU race). `daemon start` now takes an **exclusive `O_EXCL`-create lock** (`daemon.lock`) around the check-then-spawn window: exactly one wins and binds; the other reads the discovery/PID and reports "already running". A stale lock left by a crashed daemon (no live PID) is reclaimed once. This uses `create_new` (`O_EXCL` / `CREATE_NEW`), so it is **cross-platform** — no `flock` dependency.
+Two `daemon start` calls racing in parallel used to be able to both spawn (a TOCTOU race). `daemon start` now takes an **exclusive `O_EXCL`-create lock** (`daemon.lock`) around the check-then-spawn window: exactly one wins and binds; the others report "already running". The lock is **self-describing** — it records the creating `daemon start` PID, and a contender reclaims it only if that PID is provably dead (a crashed starter); a live creator (or an unreadable PID) is respected. The winner **holds the lock until the daemon has published `daemon.json`** (fully bound), so serialized racers always observe a running daemon and back off. Result: N simultaneous starts → exactly one daemon. Cross-platform (`create_new` = `O_EXCL` / `CREATE_NEW`), no `flock` dependency.
 
 ## Auto-start + client library
 
 The client library (`commands/daemon_client.rs`) is what the CLI/MCP tracks call to reach the daemon:
 
-- `discover()` — read `daemon.json`, liveness-probe the daemon, return a handle; a stale/dead record is cleaned up and yields `None`.
-- `ensure_running()` — `discover()`, else spawn `daemon start` detached and poll for readiness with a bounded timeout. The start race is handled implicitly: if another starter won, its `daemon.json` appears and the client connects to it.
-- `DaemonHandle::search` / `reindex` / `status` — typed HTTP calls carrying the token.
-- **Version skew:** when `daemon.json.version` differs from the client's own version, the client restarts the daemon (stop + start) before use, so a daemon from an older install can't serve an incompatible wire shape.
+- `discover()` — read `daemon.json`, liveness-probe via **`GET /api/health`** (the engine-independent route — probing `/internal/status` would wrongly read a live-but-engine-less daemon as dead and delete its record), return a handle; a stale/dead record is cleaned up and yields `None`.
+- `ensure_running()` — `discover()`, else spawn `daemon start` detached and poll for readiness with a bounded timeout. The start race is handled implicitly: if another starter won, its `daemon.json` appears and the client connects to it. On timeout the error **classifies the last state** (no daemon.json / version-skew / alive-but-no-response) and points at `~/.onebrain/run/daemon.log`.
+- `DaemonHandle::search` / `reindex` / `status` — typed HTTP calls carrying the token. Each **retries once via `ensure_running()`** on a transport error (a daemon that vanished mid-call), while an HTTP status error propagates unchanged.
+- **Version skew:** when `daemon.json.version` differs from the client's own version, the client restarts the daemon (stop + start) before use, so a daemon from an older install can't serve an incompatible wire shape. A failed stop is surfaced as a warning (the old daemon may still hold the engine lock), not swallowed.
 
 ## Lifecycle
 

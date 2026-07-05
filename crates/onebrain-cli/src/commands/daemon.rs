@@ -36,9 +36,11 @@
 //!
 //! ## Concurrent-start guard (v3.4.6)
 //! `daemon start` takes an exclusive `O_EXCL`-create lock around the
-//! check-then-spawn window, so two parallel starts → exactly one binds (see
-//! [`acquire_start_lock`]). A stale lock left by a crashed daemon (no live PID)
-//! is reclaimed once. Cross-platform (`create_new` = `O_EXCL`/`CREATE_NEW`).
+//! check-then-spawn window (see [`acquire_start_lock`]). The lock records the
+//! creating PID and is reclaimed only if that PID is provably dead; the winner
+//! holds it until the daemon publishes `daemon.json` (fully bound), so N
+//! parallel starts → exactly one daemon. Cross-platform (`create_new` =
+//! `O_EXCL`/`CREATE_NEW`).
 //!
 //! ## Known limitation (residual)
 //! - **Recycled session-leader false positive.** The interim liveness/identity
@@ -287,10 +289,19 @@ fn is_alive(_pid: u32) -> bool {
 // (`create_new` maps to `O_EXCL` on Unix and `CREATE_NEW` on Windows) so the
 // 3-OS CI matrix passes without nix's `fs` feature / a `flock` dep.
 //
-// Staleness: a crashed daemon can leave `daemon.lock` behind. On `AlreadyExists`
-// we consult the PID file — if NO live daemon is recorded, the lock is stale, so
-// we remove it and retry the create ONCE. A genuinely-running daemon still has a
-// live PID, so its lock is respected.
+// Staleness: a crashed `daemon start` can leave `daemon.lock` behind. The lock
+// is SELF-DESCRIBING — it records the PID of the `daemon start` process that
+// created it. On `AlreadyExists` we read that PID and probe it:
+//   - lock PID ALIVE            → a concurrent starter (or a held lock) → contended.
+//   - lock PID DEAD             → the creator crashed → stale → reclaim once.
+//   - lock PID unreadable/empty → a concurrent creator that hasn't written its
+//                                 PID yet → assume live → contended (conservative;
+//                                 never reclaim a lock we can't prove is stale).
+// This is why the guard keys off the LOCK's PID, not the daemon's PID file:
+// during a fresh concurrent start the winner hasn't written the daemon PID yet,
+// so a daemon-PID probe would wrongly read "not running" and every loser would
+// reclaim + spawn. The lock-creating process, by contrast, is demonstrably alive
+// for the whole critical section.
 // ─────────────────────────────────────────────────────────────────────────
 
 /// RAII holder of the exclusive start lock. Dropping it removes the lock file
@@ -316,10 +327,15 @@ enum StartLock {
     Contended,
 }
 
-/// Try to take the exclusive start lock, clearing a stale lock left by a crashed
-/// daemon exactly once. `is_running` reports whether a live daemon exists (used
-/// to distinguish a real holder from a stale lock).
-fn acquire_start_lock(lock_path: &Path, is_running: impl Fn() -> bool) -> Result<StartLock> {
+/// Try to take the exclusive start lock, clearing a lock left by a crashed
+/// `daemon start` exactly once. `pid_is_live(pid)` probes whether the process
+/// that created the lock is still alive — the reclaim decision keys off the
+/// LOCK's recorded PID, never the daemon PID file (see the module comment for
+/// why: during a fresh concurrent start the daemon PID isn't written yet).
+///
+/// Pure of process spawning + injected `pid_is_live` so the three outcomes
+/// (fresh acquire / live-holder contended / stale-reclaim) are unit-testable.
+fn acquire_start_lock(lock_path: &Path, pid_is_live: impl Fn(u32) -> bool) -> Result<StartLock> {
     if let Some(parent) = lock_path.parent() {
         ensure_private_run_dir(parent)?;
     }
@@ -328,20 +344,23 @@ fn acquire_start_lock(lock_path: &Path, is_running: impl Fn() -> bool) -> Result
             path: lock_path.to_path_buf(),
         })),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Lock present. If a live daemon backs it, respect it (contended);
-            // else it's stale — clear it and retry the exclusive create once.
-            if is_running() {
-                return Ok(StartLock::Contended);
-            }
-            remove_pid_lock_stale(lock_path)?;
-            match create_lock(lock_path) {
-                Ok(()) => Ok(StartLock::Acquired(StartGuard {
-                    path: lock_path.to_path_buf(),
-                })),
-                // Someone else grabbed it in the retry window → contended.
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(StartLock::Contended),
-                Err(e) => {
-                    Err(e).with_context(|| format!("create start lock {}", lock_path.display()))
+            match lock_owner_state(lock_path, &pid_is_live) {
+                // The creator is alive (or we can't prove it's dead) → respect it.
+                LockOwner::Live | LockOwner::Unknown => Ok(StartLock::Contended),
+                // The creator is provably dead → reclaim once and retry.
+                LockOwner::Dead => {
+                    remove_pid_lock_stale(lock_path)?;
+                    match create_lock(lock_path) {
+                        Ok(()) => Ok(StartLock::Acquired(StartGuard {
+                            path: lock_path.to_path_buf(),
+                        })),
+                        // Someone grabbed it in the retry window → contended.
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            Ok(StartLock::Contended)
+                        }
+                        Err(e) => Err(e)
+                            .with_context(|| format!("create start lock {}", lock_path.display())),
+                    }
                 }
             }
         }
@@ -349,15 +368,69 @@ fn acquire_start_lock(lock_path: &Path, is_running: impl Fn() -> bool) -> Result
     }
 }
 
-/// Exclusive-create the lock file (`O_EXCL` / `CREATE_NEW`). The bytes written
-/// are informational only (our PID) — the create itself is the lock.
+/// State of the process that created an existing lock file.
+#[derive(Debug, PartialEq, Eq)]
+enum LockOwner {
+    /// The recorded PID is a live process → a real concurrent holder.
+    Live,
+    /// The recorded PID is dead → the creator crashed; the lock is stale.
+    Dead,
+    /// The lock's PID couldn't be read (empty/partial write by a concurrent
+    /// creator, or unreadable) → treat as live (never reclaim on a guess).
+    Unknown,
+}
+
+/// Classify an existing lock by probing its recorded PID with `pid_is_live`.
+/// Pure (no I/O beyond reading the lock) so the reclaim decision is testable.
+fn lock_owner_state(lock_path: &Path, pid_is_live: &impl Fn(u32) -> bool) -> LockOwner {
+    match read_lock_pid(lock_path) {
+        Some(pid) if pid_is_live(pid) => LockOwner::Live,
+        Some(_) => LockOwner::Dead,
+        None => LockOwner::Unknown,
+    }
+}
+
+/// Read the PID recorded in a lock file, or `None` if missing / empty / garbage.
+fn read_lock_pid(lock_path: &Path) -> Option<u32> {
+    let raw = fs::read_to_string(lock_path).ok()?;
+    raw.trim().parse::<u32>().ok().filter(|&p| p != 0)
+}
+
+/// Raw process-existence probe: `kill(pid, 0)` with no session-leader check.
+/// Distinct from [`is_alive`] (which requires the pid to be a *daemon* session
+/// leader): the lock's PID is the `daemon start` PROCESS, not the setsid daemon,
+/// so it must not be gated on session-leadership.
+#[cfg(unix)]
+fn pid_exists(pid: u32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    match kill(Pid::from_raw(pid as i32), None) {
+        Ok(()) => true,
+        Err(Errno::EPERM) => true, // exists, owned by someone else
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn pid_exists(_pid: u32) -> bool {
+    // Non-unix: no cheap raw probe wired yet; assume live so we never reclaim a
+    // lock we can't verify is stale (conservative — matches `LockOwner::Unknown`).
+    true
+}
+
+/// Exclusive-create the lock file (`O_EXCL` / `CREATE_NEW`) and record OUR PID
+/// (the `daemon start` process) so a later contender can probe whether the
+/// creator is still alive. The create itself is the lock; the PID makes stale
+/// detection possible.
 fn create_lock(lock_path: &Path) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(lock_path)?;
-    let _ = write!(f, "{}", std::process::id());
+    write!(f, "{}", std::process::id())?;
+    f.flush()?;
     Ok(())
 }
 
@@ -408,15 +481,11 @@ pub fn run_start(mode: &OutputMode) -> Result<()> {
 
     // Take the exclusive start lock so two parallel `daemon start` calls can't
     // both spawn (see [`acquire_start_lock`]). We won it → hold the guard across
-    // the check-then-spawn window; drop clears the lock afterwards.
+    // the check-then-spawn window; drop clears the lock afterwards. The reclaim
+    // decision probes the LOCK's own creator PID (`pid_exists`), not the daemon
+    // PID file — the latter isn't written yet during a fresh concurrent start.
     let lock_path = start_lock_path()?;
-    let pid_for_probe = pid_path.clone();
-    let _guard = match acquire_start_lock(&lock_path, move || {
-        matches!(
-            compute_status(&pid_for_probe, is_alive),
-            DaemonStatusData { running: true, .. }
-        )
-    })? {
+    let _guard = match acquire_start_lock(&lock_path, pid_exists)? {
         StartLock::Acquired(g) => g,
         // A concurrent starter won. Report the daemon it started as
         // already-running (the recorded PID, or 0 if it hasn't landed yet).
@@ -440,6 +509,16 @@ pub fn run_start(mode: &OutputMode) -> Result<()> {
     let pid = spawn_detached_run(&log_path()?).context("spawn detached daemon process")?;
     write_pid(&pid_path, pid)?;
 
+    // Wait — STILL HOLDING THE LOCK — until the daemon is fully up (it has
+    // published `daemon.json` after binding). Releasing the lock the instant we
+    // spawn would let a serialized racer take it and, seeing the child not yet
+    // bound (no daemon.json, PID not yet a confirmed session leader), spawn a
+    // SECOND daemon. Holding until the daemon advertises readiness means every
+    // later racer sees a confirmed-running daemon and backs off. Bounded so a
+    // wedged child can't hang `start` forever; on timeout we proceed (the PID
+    // file is written, and `stop`/`status` handle a partially-up child).
+    wait_until_ready(pid, &discovery_path()?, std::time::Duration::from_secs(5));
+
     let data = DaemonStartData {
         started: true,
         already_running: false,
@@ -448,6 +527,37 @@ pub fn run_start(mode: &OutputMode) -> Result<()> {
     let env = Envelope::ok("daemon.start", None, data);
     emit(&env, mode, std::io::stdout().lock(), render_start_text)?;
     Ok(())
+}
+
+/// Poll until the freshly-spawned daemon is READY — it has published its
+/// `discovery` file (`daemon.json`, written after it binds) AND `pid` is a live
+/// session leader — or `timeout` elapses (best-effort). Called by `run_start`
+/// while STILL holding the start lock, so a serialized concurrent starter always
+/// observes a fully-up daemon and backs off instead of spawning a second one.
+///
+/// If the child dies early (`!is_alive`), stop waiting immediately — there's no
+/// point holding the lock for a daemon that already failed; the caller reports
+/// the (now-dead) start and a later `start` can retry cleanly.
+fn wait_until_ready(pid: u32, discovery: &Path, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if is_alive(pid) && discovery.exists() {
+            return;
+        }
+        // Child forked but exited before binding → don't spin the full timeout.
+        if !bare_pid_or_session_alive(pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// `true` while the child process still exists at all (bare `pid_exists`) — used
+/// by [`wait_until_ready`] to bail early if the child died before binding,
+/// rather than the stricter session-leader [`is_alive`] (which is only true
+/// AFTER setsid, so it can't distinguish "not yet setsid" from "dead").
+fn bare_pid_or_session_alive(pid: u32) -> bool {
+    pid_exists(pid)
 }
 
 /// Emit the `already_running` start envelope for `pid`.
@@ -482,20 +592,23 @@ pub fn run_stop(mode: &OutputMode) -> Result<()> {
             pid: Some(pid),
         } => {
             terminate(pid).with_context(|| format!("signal daemon pid {pid}"))?;
-            // Best-effort: the daemon's SIGTERM handler removes the PID file on
-            // its way out, but if it died uncleanly (or isn't ours — `is_alive`
-            // gates on the session-leader/pgid identity check, but a recycled
-            // session leader could still slip through, see fix A) we still clear
-            // the file so a later `start` isn't blocked by a stale PID.
+            // Best-effort: the daemon's SIGTERM handler removes the PID +
+            // discovery files on its way out, but if it died uncleanly (or isn't
+            // ours — a recycled session leader could slip through) we still clear
+            // BOTH here so a later `start` isn't blocked by a stale PID and no
+            // client connects to a dead daemon via a stale `daemon.json`.
             remove_pid(&pid_path)?;
+            let _ = crate::commands::daemon_client::DaemonInfo::remove(&discovery_path()?);
             DaemonStopData {
                 stopped: true,
                 pid: Some(pid),
             }
         }
-        // Nothing live to stop. Clear any stale PID file so the slate is clean.
+        // Nothing live to stop. Clear any stale PID + discovery files so the
+        // slate is clean (a hard-killed daemon leaves both behind).
         _ => {
             remove_pid(&pid_path)?;
+            let _ = crate::commands::daemon_client::DaemonInfo::remove(&discovery_path()?);
             DaemonStopData {
                 stopped: false,
                 pid: None,
@@ -823,10 +936,21 @@ async fn idle_shutdown(state: std::sync::Arc<crate::server::AppState>, idle_secs
         tokio::time::sleep(poll).await;
         let last = state.last_activity.load(Ordering::Relaxed);
         let now = crate::server::now_epoch_secs();
-        if now.saturating_sub(last) >= idle_secs {
+        if should_idle_shutdown(last, now, idle_secs) {
             return;
         }
     }
+}
+
+/// Pure idle-shutdown predicate: `true` when `now` is at least `idle_secs` past
+/// `last_activity`. `idle_secs == 0` disables (never fires). Extracted from the
+/// async poll loop so the timing decision is unit-testable without a runtime;
+/// `saturating_sub` guards a clock that stepped backwards (last > now → 0).
+fn should_idle_shutdown(last_activity: u64, now: u64, idle_secs: u64) -> bool {
+    if idle_secs == 0 {
+        return false;
+    }
+    now.saturating_sub(last_activity) >= idle_secs
 }
 
 /// Resolve the vault the daemon should serve, or `None` when none is bound.
@@ -1043,8 +1167,9 @@ mod tests {
     fn start_lock_first_caller_acquires() {
         let dir = tempdir().unwrap();
         let lock = dir.path().join("daemon.lock");
-        // No daemon running → the first caller wins the lock.
-        match acquire_start_lock(&lock, || false).unwrap() {
+        // No lock present → the first caller creates it and wins. The probe
+        // (unused on a fresh acquire) treats everything as live.
+        match acquire_start_lock(&lock, |_| true).unwrap() {
             StartLock::Acquired(_g) => {}
             StartLock::Contended => panic!("first caller must acquire the lock"),
         }
@@ -1054,30 +1179,73 @@ mod tests {
     fn start_lock_second_concurrent_caller_is_contended() {
         let dir = tempdir().unwrap();
         let lock = dir.path().join("daemon.lock");
-        // First caller holds the lock (guard kept alive) AND a live daemon is
-        // reported → the second caller must back off as contended, NOT spawn.
-        let _first = match acquire_start_lock(&lock, || false).unwrap() {
+        // First caller holds the lock (guard kept alive). The lock records the
+        // creating (test) process's PID; probing it as LIVE → the second caller
+        // must back off as contended, NOT reclaim + spawn.
+        let _first = match acquire_start_lock(&lock, |_| true).unwrap() {
             StartLock::Acquired(g) => g,
             StartLock::Contended => panic!("first caller must acquire"),
         };
-        // Second call sees the lock present + a "running" daemon → contended.
-        match acquire_start_lock(&lock, || true).unwrap() {
+        match acquire_start_lock(&lock, |_| true).unwrap() {
             StartLock::Contended => {}
             StartLock::Acquired(_) => panic!("second concurrent caller must be contended"),
         }
     }
 
     #[test]
-    fn start_lock_stale_lock_is_reclaimed_when_no_daemon() {
+    fn start_lock_stale_lock_is_reclaimed_when_creator_dead() {
         let dir = tempdir().unwrap();
         let lock = dir.path().join("daemon.lock");
-        // Simulate a crashed daemon: a lock file left behind, but no live daemon.
+        // A crashed `daemon start`: the lock records a PID whose process is gone.
         fs::write(&lock, "999999").unwrap();
-        // The guard must reclaim the stale lock (is_running → false) and win.
-        match acquire_start_lock(&lock, || false).unwrap() {
+        // Probe reports that PID as DEAD → the guard reclaims the stale lock.
+        match acquire_start_lock(&lock, |pid| pid != 999999).unwrap() {
             StartLock::Acquired(_g) => {}
-            StartLock::Contended => panic!("a stale lock with no live daemon must be reclaimed"),
+            StartLock::Contended => panic!("a lock whose creator is dead must be reclaimed"),
         }
+    }
+
+    #[test]
+    fn start_lock_live_creator_is_respected_not_reclaimed() {
+        let dir = tempdir().unwrap();
+        let lock = dir.path().join("daemon.lock");
+        // A lock whose recorded PID is a LIVE concurrent starter → contended
+        // (this is the case that regressed: it must NOT be reclaimed even though
+        // no daemon PID file exists yet).
+        fs::write(&lock, "424242").unwrap();
+        match acquire_start_lock(&lock, |pid| pid == 424242).unwrap() {
+            StartLock::Contended => {}
+            StartLock::Acquired(_) => panic!("a live creator's lock must not be reclaimed"),
+        }
+    }
+
+    #[test]
+    fn start_lock_unreadable_pid_is_treated_as_live() {
+        let dir = tempdir().unwrap();
+        let lock = dir.path().join("daemon.lock");
+        // An empty lock (a concurrent creator hasn't written its PID yet) →
+        // Unknown → contended (never reclaim on a guess).
+        fs::write(&lock, "").unwrap();
+        match acquire_start_lock(&lock, |_| false).unwrap() {
+            StartLock::Contended => {}
+            StartLock::Acquired(_) => panic!("an unreadable lock PID must not be reclaimed"),
+        }
+    }
+
+    #[test]
+    fn lock_owner_state_classifies_live_dead_unknown() {
+        let dir = tempdir().unwrap();
+        let live = dir.path().join("live.lock");
+        fs::write(&live, "100").unwrap();
+        assert_eq!(lock_owner_state(&live, &|_| true), LockOwner::Live);
+
+        let dead = dir.path().join("dead.lock");
+        fs::write(&dead, "100").unwrap();
+        assert_eq!(lock_owner_state(&dead, &|_| false), LockOwner::Dead);
+
+        let empty = dir.path().join("empty.lock");
+        fs::write(&empty, "  \n").unwrap();
+        assert_eq!(lock_owner_state(&empty, &|_| true), LockOwner::Unknown);
     }
 
     #[test]
@@ -1085,7 +1253,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let lock = dir.path().join("daemon.lock");
         {
-            let _g = match acquire_start_lock(&lock, || false).unwrap() {
+            let _g = match acquire_start_lock(&lock, |_| true).unwrap() {
                 StartLock::Acquired(g) => g,
                 StartLock::Contended => panic!("must acquire"),
             };
@@ -1093,6 +1261,106 @@ mod tests {
         }
         // Dropping the guard clears the lock so the next start isn't blocked.
         assert!(!lock.exists(), "lock file removed after guard drop");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Idle-shutdown predicate (pure).
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn idle_shutdown_fires_after_ttl_elapses() {
+        // last=now-120, idle=60 → 120 >= 60 → should exit.
+        assert!(should_idle_shutdown(1_000, 1_120, 60));
+    }
+
+    #[test]
+    fn idle_shutdown_holds_within_ttl() {
+        // A recent request (30s ago) with a 60s TTL → stay up.
+        assert!(!should_idle_shutdown(1_090, 1_120, 60));
+        // Exactly at the boundary counts as elapsed (>=).
+        assert!(should_idle_shutdown(1_060, 1_120, 60));
+    }
+
+    #[test]
+    fn idle_shutdown_zero_ttl_never_fires() {
+        // idle=0 disables idle-shutdown regardless of how long ago activity was.
+        assert!(!should_idle_shutdown(0, u64::MAX, 0));
+    }
+
+    #[test]
+    fn idle_shutdown_survives_backward_clock_step() {
+        // If the clock stepped back so last > now, saturating_sub yields 0 → no
+        // spurious shutdown.
+        assert!(!should_idle_shutdown(2_000, 1_000, 60));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Small pure/near-pure helpers.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn addr_from_is_localhost_with_port() {
+        let a = addr_from(6789);
+        assert_eq!(a.ip().to_string(), "127.0.0.1");
+        assert_eq!(a.port(), 6789);
+    }
+
+    #[test]
+    fn read_lock_pid_parses_or_rejects() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("l.lock");
+        fs::write(&p, "12345\n").unwrap();
+        assert_eq!(read_lock_pid(&p), Some(12345));
+        fs::write(&p, "0").unwrap();
+        assert_eq!(read_lock_pid(&p), None, "pid 0 is rejected");
+        fs::write(&p, "not-a-pid").unwrap();
+        assert_eq!(read_lock_pid(&p), None);
+        fs::write(&p, "").unwrap();
+        assert_eq!(read_lock_pid(&p), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_exists_true_for_self_false_for_impossible() {
+        assert!(pid_exists(std::process::id()), "our own pid must exist");
+        // A pid far above any real one → almost certainly not a live process.
+        assert!(!pid_exists(0x7FFF_FFF0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_until_ready_bails_early_when_child_is_dead() {
+        // A pid that doesn't exist → wait_until_ready returns fast (no full
+        // timeout) via the `!bare_pid_or_session_alive` early-out.
+        let dir = tempdir().unwrap();
+        let never = dir.path().join("never.json");
+        let start = std::time::Instant::now();
+        wait_until_ready(0x7FFF_FFF0, &never, std::time::Duration::from_secs(30));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "should bail early for a dead child, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn resolve_daemon_vault_valid_and_invalid() {
+        // Each `set_var` guard is scoped (dropped) before the next — the env
+        // lock is NON-REENTRANT, so holding two guards at once would deadlock.
+        let notvault = tempdir().unwrap();
+        {
+            let _e = crate::test_env::set_var("ONEBRAIN_VAULT", notvault.path());
+            // A dir that isn't a vault → None (never a fallback like `/`).
+            assert!(resolve_daemon_vault().is_none());
+        }
+
+        let vault = tempdir().unwrap();
+        std::fs::write(vault.path().join("onebrain.yml"), "search: {}\n").unwrap();
+        {
+            let _e = crate::test_env::set_var("ONEBRAIN_VAULT", vault.path());
+            // Valid vault (has onebrain.yml) → Some(that dir).
+            assert_eq!(resolve_daemon_vault().as_deref(), Some(vault.path()));
+        }
     }
 
     #[test]
@@ -1443,5 +1711,107 @@ mod tests {
         };
         let _ = run("stop"); // clean up regardless
         assert!(restarted, "daemon did not restart after stop");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Concurrent-start orchestration — N threads race the REAL `onebrain daemon
+    // start` under one shared tempdir HOME + `ONEBRAIN_DAEMON_PORT=0`. Exactly
+    // ONE must bind (one live daemon.json / one PID); the rest must report
+    // "already running" (started=false). Then a clean stop tears it down.
+    //
+    // This is the end-to-end proof of the `O_EXCL` concurrent-start guard under
+    // real process contention (the unit tests cover the lock fn in isolation).
+    // Unix-only (daemon is). Download-free: no vault bound, no engine, no index.
+    // ─────────────────────────────────────────────────────────────────────
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_starts_yield_exactly_one_daemon() {
+        use assert_cmd::cargo::cargo_bin;
+        use std::process::Command as StdCommand;
+        use std::time::{Duration, Instant};
+
+        let home = tempdir().unwrap();
+        let home_path = home.path().to_path_buf();
+        let bin = cargo_bin("onebrain");
+
+        // Spawn N threads that each run `onebrain daemon start` as close to
+        // simultaneously as possible, collecting each invocation's stdout.
+        const N: usize = 6;
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let bin = bin.clone();
+            let home_path = home_path.clone();
+            handles.push(std::thread::spawn(move || {
+                let out = StdCommand::new(&bin)
+                    .env("HOME", &home_path)
+                    .env("ONEBRAIN_DAEMON_PORT", "0")
+                    .env("ONEBRAIN_DAEMON_IDLE_SECS", "0")
+                    .args(["daemon", "start"])
+                    .output()
+                    .expect("spawn onebrain daemon start");
+                assert!(
+                    out.status.success(),
+                    "daemon start exited non-zero: {out:?}"
+                );
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            }));
+        }
+        let outputs: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Exactly one invocation reports a fresh start; the rest are no-ops.
+        // (A racing loser may briefly see "already running" before daemon.json
+        // lands, or after — either way it must NOT report a second fresh start.)
+        let fresh = outputs
+            .iter()
+            .filter(|o| o.contains("started") && !o.contains("already running"))
+            .count();
+        let already = outputs
+            .iter()
+            .filter(|o| o.contains("already running"))
+            .count();
+        assert_eq!(
+            fresh, 1,
+            "exactly one fresh start expected; outputs: {outputs:?}"
+        );
+        assert_eq!(
+            already,
+            N - 1,
+            "the other {} starts must be no-ops; outputs: {outputs:?}",
+            N - 1
+        );
+
+        // Wait for the winning daemon to publish discovery, then assert exactly
+        // one live daemon.json + one PID.
+        let discovery = home
+            .path()
+            .join(".onebrain")
+            .join("run")
+            .join("daemon.json");
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !discovery.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            discovery.exists(),
+            "the winning daemon never published daemon.json"
+        );
+        let info = crate::commands::daemon_client::DaemonInfo::read(&discovery)
+            .unwrap()
+            .expect("daemon.json present");
+        assert!(info.pid > 0, "discovery records a real PID");
+
+        // Clean teardown: stop, and confirm discovery is removed.
+        let stop = StdCommand::new(&bin)
+            .env("HOME", home.path())
+            .env("ONEBRAIN_DAEMON_PORT", "0")
+            .args(["daemon", "stop"])
+            .output()
+            .expect("spawn onebrain daemon stop");
+        assert!(stop.status.success(), "daemon stop failed: {stop:?}");
+        let gone = Instant::now() + Duration::from_secs(3);
+        while discovery.exists() && Instant::now() < gone {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!discovery.exists(), "daemon.json should be gone after stop");
     }
 }

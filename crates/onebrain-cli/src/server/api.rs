@@ -170,7 +170,7 @@ const MAX_NOTE_BYTES: u64 = 10 * 1024 * 1024;
 /// Checks every `Normal` component (so a leading `./` or nesting can't bypass)
 /// and compares case-insensitively (case-insensitive filesystems resolve
 /// `.GIT` to `.git`). `..`/absolute components are already rejected downstream.
-fn reject_tooling_path(rel: &str) -> Result<(), ApiError> {
+pub(crate) fn reject_tooling_path(rel: &str) -> Result<(), ApiError> {
     for comp in std::path::Path::new(rel).components() {
         if let std::path::Component::Normal(name) = comp {
             if let Some(s) = name.to_str() {
@@ -1238,6 +1238,34 @@ pub(crate) fn resolve_in_vault_create(vault_root: &Path, rel: &str) -> Result<Pa
         return Err(ApiError::BadRequest("path escapes the vault".into()));
     }
     Ok(joined)
+}
+
+/// Confine ONE caller-supplied reindex path to the vault and return the
+/// normalized vault-relative, slash-separated form the search engine expects
+/// (`Engine::reindex_paths` keys on it, then joins it onto the vault root).
+///
+/// A reindex target MAY be absent from disk (that's how a *removed* doc is
+/// expressed), so this reuses the create-tolerant [`resolve_in_vault_create`]
+/// for the security checks — the same NUL / absolute / `..` lexical rejection
+/// plus the deepest-existing-ancestor canonical-prefix check that catches a
+/// symlink escaping the vault — rather than [`resolve_in_vault`] (which 404s on
+/// a missing file). It ALSO rejects tooling directories (`.git`, `.claude`, …)
+/// so a reindex can't be steered into vault internals.
+///
+/// SECURITY: without this, `POST /api/internal/reindex {mode:"paths"}` passes
+/// caller strings straight to `vault_root.join(doc_path)` + `std::fs::read`, so
+/// `["../../../../etc/passwd"]` or an absolute path would be read and indexed.
+/// Every `paths` entry MUST pass through here before reaching the engine.
+///
+/// Returns the input's `to_slash` form on success (the lexical guards guarantee
+/// it carries no `..`/root component, so the relative string itself is the safe
+/// key — no need to re-derive it from the canonical join).
+pub(crate) fn confine_reindex_path(vault_root: &Path, rel: &str) -> Result<String, ApiError> {
+    reject_tooling_path(rel)?;
+    // Runs the full lexical + symlink-escape confinement; we discard the
+    // absolute path it returns and hand the engine the relative form.
+    resolve_in_vault_create(vault_root, rel)?;
+    Ok(to_slash(Path::new(rel)))
 }
 
 /// File mtime as whole nanoseconds since the Unix epoch (`None` if unavailable).
