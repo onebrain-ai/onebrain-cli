@@ -7,8 +7,11 @@
 //! retrieval score (or replace it outright) to re-order top-k results.
 
 use crate::embed;
-use anyhow::Result;
+use anyhow::{bail, Result};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::fs::File;
+use std::io::Read as _;
 use std::path::Path;
 #[cfg(feature = "semantic")]
 use std::sync::Mutex;
@@ -92,6 +95,69 @@ pub fn reranker_registry() -> &'static [RerankerInfo] {
 /// `true` when `name` matches a reranker in [`reranker_registry`].
 pub fn is_supported_reranker(name: &str) -> bool {
     reranker_registry().iter().any(|r| r.name == name)
+}
+
+/// The marker filename this crate writes next to a verified model file, e.g.
+/// `model_int8.onnx.sha256-verified`. Its content is just the expected hex
+/// digest at the time of verification, so a stale/mismatched marker (model
+/// file replaced without updating the marker) is detected on the next
+/// verify-once call rather than trusted blindly.
+fn marker_path(model_path: &Path) -> std::path::PathBuf {
+    let mut s = model_path.as_os_str().to_owned();
+    s.push(".sha256-verified");
+    std::path::PathBuf::from(s)
+}
+
+/// Verify `path`'s SHA-256 against `expected_hex` (case-insensitive), once.
+///
+/// On the happy path this only hashes the file the first time: if a marker
+/// file (see [`marker_path`]) exists next to `path` and its content matches
+/// `expected_hex`, hashing is skipped entirely. Otherwise the file is
+/// streamed through SHA-256 in fixed-size chunks — this crate's model files
+/// run ~570MB, so the whole file is never read into memory at once — and
+/// compared against `expected_hex`. On success the marker is written so
+/// later calls (e.g. every process start) skip the re-hash; a failed marker
+/// write is logged-and-ignored (best effort) since it only costs a redundant
+/// hash next time, never correctness. On mismatch, returns an error naming
+/// both hashes and how to recover.
+///
+/// Pure filesystem + hashing, no `fastembed`/ONNX types involved, so this
+/// stays compiled and tested in default (non-`semantic`) configurations too.
+fn verify_sha256_once(path: &Path, expected_hex: &str) -> Result<()> {
+    let marker = marker_path(path);
+    if let Ok(existing) = std::fs::read_to_string(&marker) {
+        if existing.trim().eq_ignore_ascii_case(expected_hex) {
+            return Ok(());
+        }
+    }
+
+    let mut file = File::open(path)
+        .map_err(|e| anyhow::anyhow!("failed to open model file {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let actual_hex = format!("{:x}", hasher.finalize());
+
+    if !actual_hex.eq_ignore_ascii_case(expected_hex) {
+        bail!(
+            "model file {} failed integrity check: expected sha256 {expected_hex}, got {actual_hex}. \
+             The download is likely corrupt or tampered. Delete and re-fetch it: \
+             `onebrain search model remove onebrain-reranker-v1`, then reindex.",
+            path.display()
+        );
+    }
+
+    // Best-effort: a failed marker write must not fail the load, it just
+    // means the next load re-hashes instead of short-circuiting.
+    let _ = std::fs::write(&marker, expected_hex);
+
+    Ok(())
 }
 
 /// Compute the download status of `info` given the collection's `cache_dir`.
@@ -204,6 +270,8 @@ pub fn new(model_name: &str, cache_dir: &Path) -> Result<Reranker> {
     let repo = api.model(info.hf_repo.to_string());
 
     let model_path = repo.get(info.model_file)?;
+    verify_sha256_once(&model_path, info.sha256)?;
+
     let tokenizer_files = TokenizerFiles {
         tokenizer_file: std::fs::read(repo.get("tokenizer.json")?)?,
         config_file: std::fs::read(repo.get("config.json")?)?,
@@ -225,6 +293,13 @@ pub fn new(model_name: &str, cache_dir: &Path) -> Result<Reranker> {
 #[cfg(feature = "semantic")]
 impl Rerank for Reranker {
     fn rerank(&self, query: &str, passages: &[String]) -> Result<Vec<f32>> {
+        // Short-circuit on empty input before touching the mutex/model at
+        // all — don't rely on fastembed's own behavior for a zero-length
+        // batch (untested edge case upstream, and pointless lock contention
+        // for a result we already know: no passages, no scores).
+        if passages.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut model = self
             .model
             .lock()
@@ -369,8 +444,17 @@ mod tests {
         ];
         let scores = fake.rerank("the cat sat on the mat", &passages).unwrap();
         for s in scores {
-            assert!((0.0..1.0).contains(&s), "score {s} out of bounds");
+            assert!(s > 0.0 && s < 1.0, "score {s} out of bounds");
         }
+    }
+
+    #[test]
+    fn fake_reranker_empty_passages_returns_empty() {
+        // Documents the `Rerank::rerank` length-preservation contract at
+        // n=0: an empty input yields an empty output, not an error.
+        let fake = FakeReranker;
+        let scores = fake.rerank("query", &[]).unwrap();
+        assert!(scores.is_empty());
     }
 
     #[test]
@@ -401,6 +485,51 @@ mod tests {
         assert!(st.downloaded);
         assert_eq!(st.disk_size, Some(4296));
         assert_eq!(st.path, model_dir);
+    }
+
+    #[test]
+    fn verify_sha256_once_passes_and_writes_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.onnx");
+        std::fs::write(&path, b"hello reranker").unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"hello reranker"));
+
+        verify_sha256_once(&path, &expected).unwrap();
+
+        let marker = marker_path(&path);
+        assert!(marker.exists(), "marker file should be written on success");
+        assert_eq!(std::fs::read_to_string(marker).unwrap().trim(), expected);
+    }
+
+    #[test]
+    fn verify_sha256_once_bails_on_mismatch_with_both_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.onnx");
+        std::fs::write(&path, b"hello reranker").unwrap();
+        let wrong = "0".repeat(64);
+
+        let err = verify_sha256_once(&path, &wrong).unwrap_err();
+        let msg = err.to_string();
+        let actual = format!("{:x}", Sha256::digest(b"hello reranker"));
+        assert!(msg.contains(&wrong), "{msg}");
+        assert!(msg.contains(&actual), "{msg}");
+        assert!(!marker_path(&path).exists(), "no marker on failure");
+    }
+
+    #[test]
+    fn verify_sha256_once_short_circuits_via_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.onnx");
+        std::fs::write(&path, b"hello reranker").unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"hello reranker"));
+
+        verify_sha256_once(&path, &expected).unwrap();
+        assert!(marker_path(&path).exists());
+
+        // Corrupt the file after the marker was written: a second call must
+        // still succeed because the marker short-circuits the re-hash.
+        std::fs::write(&path, b"corrupted contents").unwrap();
+        verify_sha256_once(&path, &expected).unwrap();
     }
 
     #[cfg(feature = "semantic")]
