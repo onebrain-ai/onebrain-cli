@@ -114,6 +114,14 @@ pub enum ReindexProgress {
         total: usize,
         doc_path: String,
     },
+    /// Emitted at most once, at the END of a full reindex, right before the
+    /// engine constructs the reranker for the first time — i.e. where the
+    /// reranker model download happens (mirrors [`ReindexProgress::LoadingModel`]
+    /// for the embedder). Only fires when reranking is enabled and the
+    /// configured reranker model is not yet downloaded; a run where it's
+    /// already present, disabled, or the model name is unknown never emits
+    /// it. See [`should_fetch_reranker`].
+    LoadingReranker,
 }
 
 /// Outcome counts of a [`Engine::reindex_paths`] / [`Engine::reindex_all`] run.
@@ -503,6 +511,15 @@ pub struct Engine {
     /// Tier-2 reranker source; see [`RerankSource`].
     reranker: RerankSource,
     meta: Database,
+}
+
+/// Pure decision for the reindex-time reranker fetch: fetch only when
+/// reranking is enabled AND the configured model isn't already downloaded.
+/// An unknown model name is treated as "downloaded" by the caller (mirrors
+/// [`Engine::build_reranker`]'s skip-on-unknown-model behavior), so this
+/// function never needs to know about the registry itself.
+fn should_fetch_reranker(enabled: bool, downloaded: bool) -> bool {
+    enabled && !downloaded
 }
 
 /// Truncate `text` to at most `max_chars` characters on a char boundary,
@@ -1660,6 +1677,28 @@ impl Engine {
         // "vectors are current as of", which a lex-only run never makes true.
         if mode == IndexMode::Full {
             self.record_last_indexed(now_epoch_secs())?;
+
+            // End-of-run reranker fetch: a lex-only pass never embeds, so it
+            // has no business fetching the (embed-adjacent) reranker model
+            // either. Downloaded-status is a plain filesystem check (never
+            // feature-gated), so this is safe to evaluate in lex-only
+            // builds too — `should_fetch_reranker` just comes back false
+            // once the model directory exists, and an unknown model name is
+            // treated as "downloaded" (nothing to fetch), mirroring
+            // `build_reranker`'s skip-on-unknown-model.
+            let downloaded = rerank::reranker_registry()
+                .iter()
+                .find(|m| m.name == self.rerank_settings.model)
+                .map(|info| rerank::reranker_download_status(info, &self.cache_dir).downloaded)
+                .unwrap_or(true);
+            if should_fetch_reranker(self.rerank_settings.enabled, downloaded) {
+                progress(ReindexProgress::LoadingReranker);
+                // Resolve the lazy reranker once so the download/construction
+                // happens now (hf-hub prints its own progress), not on the
+                // next query. `reranker()` is skip-not-fail by design — a
+                // download error never fails the reindex.
+                self.reranker();
+            }
         }
         Ok(stats)
     }
@@ -2213,6 +2252,90 @@ mod tests {
                 .filter(|p| matches!(p, ReindexProgress::Indexing { .. }))
                 .count(),
             3
+        );
+    }
+
+    #[test]
+    fn should_fetch_reranker_truth_table() {
+        assert!(
+            should_fetch_reranker(true, false),
+            "enabled + not downloaded => fetch"
+        );
+        assert!(
+            !should_fetch_reranker(true, true),
+            "enabled + already downloaded => no fetch"
+        );
+        assert!(
+            !should_fetch_reranker(false, false),
+            "disabled + not downloaded => no fetch"
+        );
+        assert!(
+            !should_fetch_reranker(false, true),
+            "disabled + already downloaded => no fetch"
+        );
+    }
+
+    #[test]
+    fn fake_reindex_all_with_progress_emits_loading_reranker_after_indexing() {
+        // Default rerank settings are enabled, and a fresh temp cache_dir has
+        // no reranker model downloaded, so `should_fetch_reranker` is true.
+        // The fake embedder engine still resolves the LAZY reranker path
+        // (cheaply, to None) — assert LoadingReranker fires exactly once,
+        // after every Indexing event.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
+        std::fs::write(vault_dir.path().join("b.md"), "# B\nbeta content").unwrap();
+
+        let mut events = Vec::new();
+        e.reindex_all_with_progress(vault_dir.path(), &mut |p| events.push(p))
+            .unwrap();
+
+        let loading_reranker_count = events
+            .iter()
+            .filter(|p| matches!(p, ReindexProgress::LoadingReranker))
+            .count();
+        assert_eq!(
+            loading_reranker_count, 1,
+            "LoadingReranker must fire exactly once: {events:?}"
+        );
+        let last_indexing = events
+            .iter()
+            .rposition(|p| matches!(p, ReindexProgress::Indexing { .. }))
+            .unwrap();
+        let loading_reranker_pos = events
+            .iter()
+            .position(|p| matches!(p, ReindexProgress::LoadingReranker))
+            .unwrap();
+        assert!(
+            loading_reranker_pos > last_indexing,
+            "LoadingReranker must come after every Indexing event: {events:?}"
+        );
+    }
+
+    #[test]
+    fn fake_reindex_all_with_progress_skips_loading_reranker_when_disabled() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+        e.set_rerank_settings(RerankSettings {
+            enabled: false,
+            ..Default::default()
+        });
+
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
+
+        let mut events = Vec::new();
+        e.reindex_all_with_progress(vault_dir.path(), &mut |p| events.push(p))
+            .unwrap();
+
+        assert!(
+            !events
+                .iter()
+                .any(|p| matches!(p, ReindexProgress::LoadingReranker)),
+            "disabled reranker must never emit LoadingReranker: {events:?}"
         );
     }
 
