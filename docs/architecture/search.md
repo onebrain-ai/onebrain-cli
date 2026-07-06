@@ -65,7 +65,7 @@ Default `multilingual-e5-small`.
 
 | Name | Dims | Size | Context | Notes |
 |---|---|---|---|---|
-| `multilingual-e5-small` | 384 | ~470 MB | 512 | **default** · `query: `/`passage: ` prefixes |
+| `multilingual-e5-small` | 384 | ~470 MB | 512 | **default** · `query: <text>` / `passage: <text>` prefixes |
 | `multilingual-e5-base` | 768 | ~1.1 GB | 512 | e5 prefixes |
 | `multilingual-e5-large` | 1024 | ~2.1 GB | 512 | e5 prefixes |
 | `bge-m3` | 1024 | ~2.2 GB | 8192 | best Thai accuracy · fp32 · no prefixes |
@@ -374,7 +374,7 @@ flowchart LR
 | `engine.redb` | ✅ resolve fused hits |
 | `models--*` | ✅ query embedding |
 
-Flow: both legs run inside `Engine::query` — lex top-50 and vector top-50 (trimmed to top cluster via `keep_top_cluster`) — then
+Flow: both legs run inside `Engine::query` — lex top-50 and vector top-50 (the vector leg trimmed as noted in the table above) — then
 `rrf_fuse` combines them by **rank only** (each list contributes `1/(60 + rank)`; scores summed,
 ties broken by chunk id for determinism), truncated to `--top-k`, resolved via `chunk_meta`.
 `--min-score` filters on the fused RRF score. In a **lex-only build**, hybrid degrades to
@@ -419,7 +419,10 @@ engine's — it fuses N weighted sub-query result lists, normalizing the top sco
 | `hyde` | `Engine::vector_search` on a client-written *hypothetical answer passage* (the server treats it identically to `vec` — the HyDE trick is the caller's prompt-side job) | same as `vec` |
 
 Rules (all in `mcp.rs`): 1–10 sub-queries; the **first sub-query gets 2× weight**; each list
-contributes `weight / (60 + rank + 1)`; internal fetch depth is `max(limit,10) × 3`;
+contributes `weight / (60 + rank + 1)` (0-based `rank`). This is a **deliberately separate**
+fusion from the engine's hybrid `rrf_fuse` in §3 (`1 / (60 + rank)`) — it adds per-sub-query
+weights and a `+1` on the rank term, and normalizes the top hit to 1.0; the two are intentionally
+NOT unified (see the note in `mcp.rs`). Internal fetch depth is `max(limit,10) × 3`;
 `minScore` filters on the normalized score. **Degradation**: if at least one `lex` sub-query is
 present, any `vec`/`hyde` error (lex-only build, model failure mid-query) degrades that
 sub-query to empty hits with a stderr log; with no lex sub-query the error propagates. **No
