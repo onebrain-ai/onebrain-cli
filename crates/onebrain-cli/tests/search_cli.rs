@@ -91,6 +91,53 @@ fn search_status_json_reports_collection_and_model_without_downloading() {
     }
 }
 
+#[test]
+fn search_status_json_reports_reranker_fields_without_downloading() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // Config default reranker.
+    assert_eq!(v["data"]["reranker_model"], "onebrain-reranker-v1");
+    // Nothing downloaded on a fresh vault → not ready, no size.
+    assert_eq!(v["data"]["reranker_ready"], false);
+    assert_eq!(v["data"]["reranker_downloaded"], false);
+    assert!(v["data"]["reranker_disk_bytes"].is_null());
+
+    // Never downloads the reranker either.
+    let model_cache = cache.path().join("search").join("t-vault");
+    if model_cache.exists() {
+        let has_reranker_dir = std::fs::read_dir(&model_cache)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok()).any(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with("models--onebrain-ai--onebrain-reranker"))
+                })
+            })
+            .unwrap_or(false);
+        assert!(
+            !has_reranker_dir,
+            "status must not download a reranker model"
+        );
+    }
+}
+
 /// Regression (v3.4.5): `indexed` must reflect whether docs are actually
 /// indexed (`doc_count > 0`), NOT merely whether the cache dir exists on disk.
 ///
@@ -612,10 +659,12 @@ fn search_model_remove_unknown_name_errors() {
     assert!(!out.status.success());
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["ok"], false);
+    // `model remove` now accepts either an embedding model or a reranker
+    // name (v3.4.7) — the unsupported-name error spans both registries.
     assert!(v["error"]["message"]
         .as_str()
         .unwrap_or_default()
-        .contains("unsupported embedding model"));
+        .contains("unsupported model"));
 }
 
 #[test]
@@ -732,6 +781,96 @@ fn search_model_remove_current_with_force_deletes() {
     assert_eq!(v["data"]["was_current"], true);
     assert_eq!(v["data"]["freed_bytes"], 2048);
     assert!(!model_dir.exists());
+}
+
+// ── Reranker section (v3.4.7 Task 6) ────────────────────────────────────────
+
+#[test]
+fn search_model_list_json_reports_reranker_section() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "model", "list"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rerankers = v["data"]["rerankers"].as_array().unwrap();
+    assert_eq!(rerankers.len(), 1);
+    assert_eq!(rerankers[0]["name"], "onebrain-reranker-v1");
+    // Default `search.reranker.model` is `onebrain-reranker-v1` (config default).
+    assert_eq!(rerankers[0]["current"], true);
+    // Nothing downloaded in a fresh cache.
+    assert_eq!(rerankers[0]["downloaded"], false);
+}
+
+#[test]
+fn search_model_remove_accepts_reranker_name() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+    let reranker_dir = seed_fake_model(
+        cache.path(),
+        "t-vault",
+        "models--onebrain-ai--onebrain-reranker-v1",
+        16384,
+    );
+    assert!(reranker_dir.exists());
+
+    let out = onebrain(vault.path(), cache.path())
+        .args([
+            "search",
+            "model",
+            "remove",
+            "onebrain-reranker-v1",
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["data"]["removed"], true);
+    assert_eq!(v["data"]["freed_bytes"], 16384);
+    // Default config's `reranker.model` IS `onebrain-reranker-v1`, so this
+    // is the active reranker — hence `--force`.
+    assert_eq!(v["data"]["was_current"], true);
+    assert!(!reranker_dir.exists(), "reranker dir should be gone");
+}
+
+#[test]
+fn search_model_remove_unknown_name_lists_both_registries() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-vault\n",
+    );
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["search", "model", "remove", "not-a-real-name"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let message = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("multilingual-e5-small"), "{message}");
+    assert!(message.contains("onebrain-reranker-v1"), "{message}");
 }
 
 // ── Gated: real embeddings (reindex + query + vsearch) ─────────────────────

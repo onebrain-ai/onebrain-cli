@@ -31,6 +31,8 @@ use serde::{Deserialize, Serialize};
 
 use super::api::{require_vault_root, ApiError};
 use super::{AppState, SharedEngine};
+#[cfg(feature = "semantic")]
+use crate::commands::search_common::rerank_settings_from_config;
 use crate::commands::search_common::{collection_cache_dir, collection_name_readonly};
 #[cfg(feature = "semantic")]
 use onebrain_search::engine::Engine;
@@ -64,6 +66,13 @@ struct SearchHit {
     title: String,
     /// Short one-line excerpt (may be empty; lex results carry none).
     snippet: String,
+    /// Calibrated 0-1 Tier-2 cross-encoder relevance, mirroring
+    /// `onebrain_search::engine::Hit::rerank_score`. `None` for lex-only hits
+    /// (the rerank stage only runs on the hybrid/vector path) and for any
+    /// hybrid hit the rerank stage skipped (disabled, model not downloaded,
+    /// load failure, or outside the fused `candidates` window).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rerank_score: Option<f32>,
 }
 
 /// Max top-k the webui asks for (native search engine caps at ~20; keep parity).
@@ -205,6 +214,7 @@ fn run_hybrid_held(
             path: h.doc_path,
             score: h.score,
             snippet: h.snippet,
+            rerank_score: h.rerank_score,
         })
         .collect())
 }
@@ -264,6 +274,10 @@ fn run_lex(cache_dir: &Path, query: &str) -> anyhow::Result<Vec<SearchHit>> {
                 path: doc_path,
                 score: f64::from(score),
                 snippet: String::new(),
+                // Lex-only path — the rerank stage never runs here (see
+                // `Hit::rerank_score`'s doc comment: only hybrid/vector
+                // queries feed the cross-encoder).
+                rerank_score: None,
             })
         })
         .collect())
@@ -273,6 +287,16 @@ fn run_lex(cache_dir: &Path, query: &str) -> anyhow::Result<Vec<SearchHit>> {
 /// empty index never triggers a query embedding (and thus never a model
 /// download) — it returns empty hits instead.
 ///
+/// Drive-by fix (Task 7): this per-request `Engine::open` path — the ONLY one
+/// that serves `mode=hybrid` when no daemon holds the engine — used to open
+/// the engine with neither `RerankSettings` NOR `search.exclude` applied,
+/// unlike every other engine-opening seam (`search_common::open_engine`,
+/// `server::internal::try_open_held_engine`). That meant a `serve`-only
+/// (no-daemon) hybrid search silently never reranked and never honoured the
+/// vault's exclude patterns. Both are now applied here exactly like those
+/// other seams, via the SAME `rerank_settings_from_config` mapping so the
+/// three call sites can't drift.
+///
 /// Semantic build only: in a `--no-default-features` (lex-only) build there
 /// is no embedder, so `Engine::query` would `bail!` on a non-empty index
 /// (see `onebrain_search::engine::Engine::embedder`) — see the
@@ -281,7 +305,9 @@ fn run_lex(cache_dir: &Path, query: &str) -> anyhow::Result<Vec<SearchHit>> {
 #[cfg(feature = "semantic")]
 fn run_hybrid(cache_dir: &Path, root: &Path, query: &str) -> anyhow::Result<Vec<SearchHit>> {
     let config = onebrain_core::load_vault_config_at(root)?;
-    let engine = Engine::open(cache_dir, &config.search.embed_model)?;
+    let mut engine = Engine::open(cache_dir, &config.search.embed_model)?;
+    engine.set_exclude_patterns(config.search.exclude.clone());
+    engine.set_rerank_settings(rerank_settings_from_config(&config.search.reranker));
     if engine.status(root)?.doc_count == 0 {
         return Ok(vec![]);
     }
@@ -298,6 +324,7 @@ fn run_hybrid(cache_dir: &Path, root: &Path, query: &str) -> anyhow::Result<Vec<
             path: h.doc_path,
             score: h.score,
             snippet: h.snippet,
+            rerank_score: h.rerank_score,
         })
         .collect())
 }
@@ -373,6 +400,49 @@ mod tests {
         assert_eq!(hits[0].path, "notes/alpha.md");
         assert_eq!(hits[0].title, "alpha");
         assert!(hits[0].snippet.is_empty());
+        // Lex never reranks — every hit's rerank_score stays None.
+        assert!(hits[0].rerank_score.is_none());
+    }
+
+    // ── SearchHit::rerank_score serialization (Task 7) ─────────────────────
+
+    #[test]
+    fn search_hit_serializes_rerank_score_when_present() {
+        let hit = SearchHit {
+            path: "a.md".to_string(),
+            score: 1.0,
+            title: "a".to_string(),
+            snippet: String::new(),
+            rerank_score: Some(0.87),
+        };
+        let v = serde_json::to_value(&hit).unwrap();
+        // `f32` → JSON number round-trips through `f64`, so compare with a
+        // tolerance rather than exact equality (0.87f32 as f64 != 0.87f64).
+        let got = v["rerank_score"]
+            .as_f64()
+            .expect("rerank_score is a number");
+        assert!((got - 0.87).abs() < 1e-6, "got {got}");
+    }
+
+    #[test]
+    fn search_hit_omits_rerank_score_when_none() {
+        // `skip_serializing_if` means an unreranked hit (lex mode, or a
+        // hybrid hit the rerank stage skipped) drops the key entirely rather
+        // than emitting `"rerank_score": null` — matching the existing
+        // optional-field style elsewhere on this struct's siblings (e.g. the
+        // MCP `QueryHit::context`).
+        let hit = SearchHit {
+            path: "a.md".to_string(),
+            score: 1.0,
+            title: "a".to_string(),
+            snippet: String::new(),
+            rerank_score: None,
+        };
+        let v = serde_json::to_value(&hit).unwrap();
+        assert!(
+            v.get("rerank_score").is_none(),
+            "rerank_score must be omitted, not null: {v}"
+        );
     }
 
     /// Lex-only builds have no embedder — `Engine::query` would `bail!` on a
@@ -529,6 +599,45 @@ mod tests {
             let mut lex = LexIndex::open(&cache_dir.join("tantivy")).unwrap();
             lex.commit().unwrap();
         }
+        let hits = run_native(vault.path(), "anything", "hybrid").unwrap();
+        assert!(hits.is_empty());
+    }
+
+    /// Drive-by fix (Task 7): the per-request `run_hybrid` must apply
+    /// `RerankSettings` + `search.exclude` from config BEFORE the
+    /// `doc_count == 0` short-circuit (both are pure in-memory struct
+    /// assignments, so this is exercisable download-free). A non-default
+    /// reranker block (`enabled: false`, a custom `min_score`, a made-up
+    /// `candidates`) plus a non-empty `exclude` list must round-trip through
+    /// `run_native`/`run_hybrid` with no error — a regression that skipped
+    /// applying settings would still pass this (settings are a silent no-op
+    /// on an empty index), but a regression that panics or errors while
+    /// APPLYING a non-default config (e.g. a bad field mapping) is caught.
+    /// The load-bearing assertion that `rerank_settings_from_config` maps
+    /// every field correctly lives in `search_common.rs`'s own unit tests;
+    /// this test only pins that `run_hybrid` actually calls it.
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn run_hybrid_applies_non_default_rerank_and_exclude_settings_download_free() {
+        use onebrain_search::lex::LexIndex;
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: rn-hybrid-settings\n  exclude:\n    - '06-archive/**'\n  reranker:\n    enabled: false\n    candidates: 7\n    min_score: 0.42\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let cache_dir = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap());
+        {
+            let mut lex = LexIndex::open(&cache_dir.join("tantivy")).unwrap();
+            lex.commit().unwrap();
+        }
+        // Empty index → the doc_count==0 guard trips AFTER settings are
+        // applied, so this never touches the embedder/model. A `run_native`
+        // that errored while applying a non-default reranker/exclude config
+        // would fail this test; today's empty-hits success means the settings
+        // application path is safe to reach with real (non-default) values.
         let hits = run_native(vault.path(), "anything", "hybrid").unwrap();
         assert!(hits.is_empty());
     }

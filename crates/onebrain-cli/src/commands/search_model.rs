@@ -27,6 +27,9 @@ use onebrain_core::load_vault_config;
 use onebrain_search::embed::{
     is_supported_model, model_download_status, model_registry, ModelInfo,
 };
+use onebrain_search::rerank::{
+    is_supported_reranker, reranker_download_status, reranker_registry, RerankerInfo,
+};
 
 #[derive(Debug, Serialize)]
 struct ModelListEntry {
@@ -60,9 +63,41 @@ impl ModelListEntry {
     }
 }
 
+/// One row of the reranker section — mirrors [`ModelListEntry`]'s shape but
+/// for [`RerankerInfo`] (name, size, downloaded), keyed off the vault's
+/// configured `search.reranker.model` for the `current` flag.
+#[derive(Debug, Serialize)]
+struct RerankerListEntry {
+    name: &'static str,
+    approx_size: &'static str,
+    note: &'static str,
+    current: bool,
+    /// Whether the reranker's `models--*` dir exists under the cache dir.
+    downloaded: bool,
+    /// On-disk byte size of the downloaded reranker, `None` if not downloaded.
+    disk_bytes: Option<u64>,
+}
+
+impl RerankerListEntry {
+    fn from_info(info: &RerankerInfo, current_reranker: &str, cache_dir: &Path) -> Self {
+        let status = reranker_download_status(info, cache_dir);
+        Self {
+            name: info.name,
+            approx_size: info.approx_size,
+            note: info.note,
+            current: info.name == current_reranker,
+            downloaded: status.downloaded,
+            disk_bytes: status.disk_size,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ModelListData {
     models: Vec<ModelListEntry>,
+    /// Reranker registry rows (Tier-2 cross-encoder), same shape idea as
+    /// `models` but keyed off `search.reranker.model` for `current`.
+    rerankers: Vec<RerankerListEntry>,
     /// Collection cache dir where downloaded models live (footer + JSON).
     cache_dir: PathBuf,
 }
@@ -92,10 +127,19 @@ pub fn run_list(
         sort_rows(&mut models, col, args.desc);
     }
 
+    let rerankers: Vec<RerankerListEntry> = reranker_registry()
+        .iter()
+        .map(|r| RerankerListEntry::from_info(r, &config.search.reranker.model, &cache_dir))
+        .collect();
+
     let envelope = Envelope::ok(
         "search.model.list",
         Some(vault_info),
-        ModelListData { models, cache_dir },
+        ModelListData {
+            models,
+            rerankers,
+            cache_dir,
+        },
     );
     // Resolve the colour bit once from the mode (single source of truth with
     // the banner/doctor gate) and capture it — `emit` only invokes the
@@ -320,6 +364,76 @@ fn render_list_text(env: &Envelope<ModelListData>, color: bool) -> String {
                 .to_string(),
         );
     }
+
+    lines.push(String::new());
+    lines.extend(
+        render_reranker_section(&d.rerankers, color)
+            .lines()
+            .map(str::to_string),
+    );
+
+    lines.join("\n")
+}
+
+/// Boxed reranker section, appended below the embedding-model table —
+/// same look (title-in-border box, bold-green active row), simpler columns
+/// (no dims/Thai score): marker · MODEL · DOWNLOADED · DISK · NOTE.
+fn render_reranker_section(rerankers: &[RerankerListEntry], color: bool) -> String {
+    use unicode_width::UnicodeWidthStr;
+
+    const MARKER: usize = 2;
+    const NAME: usize = 24;
+    const DL: usize = 12;
+    const DISK: usize = 10;
+
+    let row = |marker: &str, name: &str, dl: &str, disk: &str, note: &str| {
+        format!(
+            "{}{}{}{}{}",
+            pad_display(marker, MARKER),
+            pad_display(name, NAME),
+            pad_display(dl, DL),
+            pad_display(disk, DISK),
+            note
+        )
+    };
+
+    let mut content = vec![(row("", "MODEL", "DOWNLOADED", "DISK", "NOTE"), false)];
+    for r in rerankers {
+        let active = r.current && r.downloaded;
+        let marker = if active { "●" } else { "" };
+        let downloaded = if r.downloaded { "✓" } else { "—" };
+        let disk = disk_cell(r.downloaded, r.disk_bytes, r.approx_size);
+        content.push((row(marker, r.name, downloaded, &disk, r.note), active));
+    }
+
+    const TITLE: &str = " Rerankers ";
+    let inner = content
+        .iter()
+        .map(|(l, _)| l.width())
+        .max()
+        .unwrap_or(0)
+        .max(TITLE.width());
+    let boxed = inner + 2;
+    let mut lines = Vec::with_capacity(content.len() + 3);
+    lines.push(format!(
+        "┌{TITLE}{}┐",
+        "─".repeat(boxed.saturating_sub(TITLE.width()))
+    ));
+    for (l, active) in &content {
+        let padded = pad_display(l, inner);
+        if color && *active {
+            lines.push(format!("│ {ACTIVE_ROW_ANSI}{padded}{ANSI_RESET} │"));
+        } else {
+            lines.push(format!("│ {padded} │"));
+        }
+    }
+    lines.push(format!("└{}┘", "─".repeat(boxed)));
+    if !rerankers.iter().any(|r| r.current && r.downloaded) {
+        lines.push(
+            "⚠️  No reranker downloaded — run `onebrain search reindex` to select, download + index."
+                .to_string(),
+        );
+    }
     lines.join("\n")
 }
 
@@ -380,6 +494,17 @@ fn supported_model_names() -> String {
     model_registry()
         .iter()
         .map(|m| m.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Comma-joined list of every registry reranker name — the reranker-name
+/// analogue of [`supported_model_names`], used by `model remove`'s
+/// unsupported-name error (which now spans both registries).
+fn supported_reranker_names() -> String {
+    reranker_registry()
+        .iter()
+        .map(|r| r.name)
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -471,9 +596,13 @@ struct ModelRemoveData {
 }
 
 /// `onebrain search model remove <name>` — delete a downloaded model's cache
-/// dir (`models--*`).
+/// dir (`models--*`). Accepts either an embedding model name OR a reranker
+/// name (see [`reranker_registry`]) — the cache dir layout is identical
+/// (`models--org--repo`), so only the lookup + "is this the active one?"
+/// check needs a name-space branch; deletion itself is one shared code path.
 ///
-/// - Unknown name → error listing supported names (mirrors `set`).
+/// - Unknown name (in EITHER registry) → error listing supported names
+///   (mirrors `set`).
 /// - Not downloaded → friendly "nothing to remove", exit 0.
 /// - Active model guard: on a TTY, `inquire::Confirm` warns before deleting;
 ///   on non-TTY, refuse unless `--force`.
@@ -484,11 +613,13 @@ pub fn run_remove(
 ) -> Result<()> {
     use std::io::IsTerminal;
 
-    if !is_supported_model(&args.name) {
+    let is_reranker = is_supported_reranker(&args.name);
+    if !is_supported_model(&args.name) && !is_reranker {
         bail!(
-            "unsupported embedding model '{}': supported names are {}",
+            "unsupported model '{}': supported names are {}, {}",
             args.name,
-            supported_model_names()
+            supported_model_names(),
+            supported_reranker_names()
         );
     }
 
@@ -498,12 +629,29 @@ pub fn run_remove(
     let collection = collection_for(&resolved).context("resolve collection")?;
     let cache_dir = collection_cache_dir(&collection);
 
-    let info = model_registry()
-        .iter()
-        .find(|m| m.name == args.name)
-        .expect("name validated as supported above");
-    let status = model_download_status(info, &cache_dir);
-    let was_current = config.search.embed_model == args.name;
+    // Small branch: the two registries carry different metadata shapes
+    // (`ModelInfo` vs `RerankerInfo`), so status lookup + the "active name"
+    // comparison target differ, but everything downstream (guard, delete,
+    // response shape) is identical.
+    let (status, was_current) = if is_reranker {
+        let info = reranker_registry()
+            .iter()
+            .find(|r| r.name == args.name)
+            .expect("name validated as a supported reranker above");
+        (
+            reranker_download_status(info, &cache_dir),
+            config.search.reranker.model == args.name,
+        )
+    } else {
+        let info = model_registry()
+            .iter()
+            .find(|m| m.name == args.name)
+            .expect("name validated as a supported embedding model above");
+        (
+            model_download_status(info, &cache_dir),
+            config.search.embed_model == args.name,
+        )
+    };
 
     // Nothing on disk → friendly no-op, exit 0.
     if !status.downloaded {
@@ -552,8 +700,13 @@ pub fn run_remove(
                 return Ok(());
             }
         } else {
+            let kind = if is_reranker {
+                "reranker"
+            } else {
+                "embedding model"
+            };
             bail!(
-                "'{}' is the current embedding model — refusing to remove it non-interactively. \
+                "'{}' is the current {kind} — refusing to remove it non-interactively. \
                  Re-run with --force to override (the next search will re-download it).",
                 args.name
             );
@@ -675,6 +828,16 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Reranker rows for a given collection cache dir, current model unset
+    /// (empty string never matches a real registry name) — the default for
+    /// list-env fixtures that don't care about the reranker section.
+    fn empty_reranker_rows(cache_dir: &Path) -> Vec<RerankerListEntry> {
+        reranker_registry()
+            .iter()
+            .map(|r| RerankerListEntry::from_info(r, "", cache_dir))
+            .collect()
+    }
+
     fn list_env(current: &str) -> Envelope<ModelListData> {
         // Empty cache dir → nothing downloaded (pure-render tests), except the
         // current model, which we force-mark downloaded so the ●/color tests
@@ -691,10 +854,15 @@ mod tests {
                 e
             })
             .collect();
+        let rerankers = empty_reranker_rows(&cache_dir);
         Envelope::ok(
             "search.model.list",
             None,
-            ModelListData { models, cache_dir },
+            ModelListData {
+                models,
+                rerankers,
+                cache_dir,
+            },
         )
     }
 
@@ -707,10 +875,15 @@ mod tests {
             .iter()
             .map(|m| ModelListEntry::from_info(m, "bge-m3", &cache_dir))
             .collect();
+        let rerankers = empty_reranker_rows(&cache_dir);
         let env = Envelope::ok(
             "search.model.list",
             None,
-            ModelListData { models, cache_dir },
+            ModelListData {
+                models,
+                rerankers,
+                cache_dir,
+            },
         );
         let s = render_list_text(&env, false);
         assert!(
@@ -768,11 +941,32 @@ mod tests {
         }
     }
 
+    /// The embedding-model box's lines only — the render now appends a
+    /// second (reranker) box below it (Task 6), so tests asserting on ONE
+    /// box's structure must scope to it rather than the whole render. Ends
+    /// right after the embed-model box's own bottom border (before the
+    /// "Cache dir:" footer / no-model guidance / reranker section).
+    fn embed_box_lines(s: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        for line in s.lines() {
+            let is_border_or_row =
+                line.starts_with('┌') || line.starts_with('│') || line.starts_with('└');
+            out.push(line);
+            if line.starts_with('└') {
+                break;
+            }
+            if !is_border_or_row {
+                break;
+            }
+        }
+        out
+    }
+
     #[test]
     fn list_text_boxes_the_table_like_the_tui() {
         use unicode_width::UnicodeWidthStr;
         let s = render_list_text(&list_env("bge-m3"), false);
-        let lines: Vec<&str> = s.lines().collect();
+        let lines = embed_box_lines(&s);
         // Title embedded in the plain top border, ratatui-style.
         assert!(
             lines[0].starts_with("┌ Available Embedding Models ─"),
@@ -781,7 +975,7 @@ mod tests {
         );
         assert!(lines[0].ends_with('┐'), "top-right corner: {}", lines[0]);
         // Bottom border closes the box; the Cache dir footer stays OUTSIDE.
-        let bottom = lines[lines.len() - 2];
+        let bottom = lines[lines.len() - 1];
         assert!(
             bottom.starts_with('└') && bottom.ends_with('┘'),
             "bottom border: {bottom}"
@@ -791,19 +985,18 @@ mod tests {
             "bottom rule dashes: {bottom}"
         );
         assert!(
-            lines.last().unwrap().starts_with("📁  Cache dir:"),
-            "footer outside the box: {:?}",
-            lines.last()
+            s.lines().any(|l| l.starts_with("📁  Cache dir:")),
+            "footer present outside the box: {s:?}"
         );
         // Every box line — borders and │-wrapped rows — has the same display
         // width, so the right border stays flush despite ✓ ● — cells.
-        let widths: Vec<usize> = lines[..lines.len() - 1].iter().map(|l| l.width()).collect();
+        let widths: Vec<usize> = lines.iter().map(|l| l.width()).collect();
         assert!(
             widths.windows(2).all(|w| w[0] == w[1]),
             "box lines must share one display width: {widths:?}\n{s}"
         );
         // Content rows are │-wrapped.
-        for l in &lines[1..lines.len() - 2] {
+        for l in &lines[1..lines.len() - 1] {
             assert!(
                 l.starts_with('│') && l.ends_with('│'),
                 "row not │-wrapped: {l}"
@@ -846,9 +1039,10 @@ mod tests {
         let stripped = s.replace(ACTIVE_ROW_ANSI, "").replace(ANSI_RESET, "");
         let mono = render_list_text(&list_env("bge-m3"), false);
         assert_eq!(stripped, mono, "colour must be layout-neutral");
-        let widths: Vec<usize> = stripped
-            .lines()
-            .filter(|l| l.starts_with('│') || l.starts_with('┌') || l.starts_with('└'))
+        // Scope the flush-width check to the embed-model box (the reranker
+        // section below it is a separate, independently-sized box).
+        let widths: Vec<usize> = embed_box_lines(&stripped)
+            .iter()
             .map(|l| l.width())
             .collect();
         assert!(
@@ -872,11 +1066,13 @@ mod tests {
             .iter()
             .map(|m| ModelListEntry::from_info(m, "bge-m3", cache.path()))
             .collect();
+        let rerankers = empty_reranker_rows(cache.path());
         let env = Envelope::ok(
             "search.model.list",
             None,
             ModelListData {
                 models,
+                rerankers,
                 cache_dir: cache.path().to_path_buf(),
             },
         );

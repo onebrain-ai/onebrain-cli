@@ -273,26 +273,105 @@ fn all_checks(vault_root: &Path, config: &onebrain_core::VaultConfig) -> Vec<Doc
 ///   exit code only escalates on `error`, so this check never fails the run.
 fn native_search_check(vault_root: &Path) -> DoctorResult {
     use crate::commands::search_common::{
-        any_model_downloaded, collection_cache_dir, collection_for, is_indexed, open_engine,
+        collection_cache_dir, collection_for, is_indexed, open_engine,
     };
+    use onebrain_core::load_vault_config;
+    use onebrain_search::embed::model_download_status;
+    use onebrain_search::rerank::{reranker_download_status, reranker_registry};
 
     // Resolve the collection. `collection_for` may persist a generated name on
     // a never-configured vault — the same deterministic name every other
     // `search` command would write; harmless and one-time.
+    // On the two resolution-failure early returns the reranker state is
+    // genuinely uncomputable (no config, no cache dir) — the three fields
+    // are still reported, as `unknown`, so the payload shape is identical
+    // on EVERY return path (consumers never branch on field presence).
+    let unresolved = |msg: String| {
+        let mut r = DoctorResult::warn("search", msg);
+        r.details.extend([
+            "reranker_enabled: unknown".to_string(),
+            "reranker_model: unknown".to_string(),
+            "reranker_downloaded: unknown".to_string(),
+        ]);
+        r
+    };
     let resolved = match crate::vault_ctx::require(Some(vault_root.to_path_buf())) {
         Ok(r) => r,
         Err(e) => {
-            return DoctorResult::warn("search", format!("could not resolve vault: {e}"));
+            return unresolved(format!("could not resolve vault: {e}"));
         }
     };
     let collection = match collection_for(&resolved) {
         Ok(c) => c,
         Err(e) => {
-            return DoctorResult::warn("search", format!("could not resolve collection: {e}"));
+            return unresolved(format!("could not resolve collection: {e}"));
         }
     };
     let cache_dir = collection_cache_dir(&collection);
-    let model_downloaded = any_model_downloaded(&cache_dir);
+
+    // Read-only config load — same config the rest of the check already
+    // resolves through `collection_for`/`open_engine`. Never persisted here.
+    // A load failure degrades gracefully to reranker-disabled defaults +
+    // an unknown configured embed model name, rather than aborting the whole
+    // check — the index/model-on-disk facts below are still worth reporting.
+    let config = load_vault_config(&resolved.root).ok();
+    let reranker_cfg = config.as_ref().map(|c| c.search.reranker.clone());
+    let reranker_enabled = reranker_cfg.as_ref().is_some_and(|r| r.enabled);
+    let reranker_model = reranker_cfg
+        .as_ref()
+        .map(|r| r.model.clone())
+        .unwrap_or_default();
+    let reranker_downloaded = reranker_registry()
+        .iter()
+        .find(|r| r.name == reranker_model)
+        .is_some_and(|r| reranker_download_status(r, &cache_dir).downloaded);
+    let configured_embed_model = config
+        .as_ref()
+        .map(|c| c.search.embed_model.clone())
+        .unwrap_or_default();
+    let configured_model_downloaded = onebrain_search::embed::model_registry()
+        .iter()
+        .find(|m| m.name == configured_embed_model)
+        .is_some_and(|m| model_download_status(m, &cache_dir).downloaded);
+    // "Any model downloaded" still gates the coarser "nothing at all is
+    // downloaded" wording used below (kept byte-identical to the pre-Task-8
+    // messages so existing consumers aren't surprised); the finer-grained
+    // "wrong model downloaded" case is reported separately.
+    let any_model_downloaded = onebrain_search::embed::model_registry()
+        .iter()
+        .any(|m| model_download_status(m, &cache_dir).downloaded);
+
+    let reranker_details = vec![
+        format!("reranker_enabled: {reranker_enabled}"),
+        format!("reranker_model: {reranker_model}"),
+        format!("reranker_downloaded: {reranker_downloaded}"),
+    ];
+    // The reranker warn is additive to whatever the index-state arms below
+    // decide — surfaced via the `finish` closure on every return path so the
+    // fields (and, when applicable, the warn) are reported regardless of
+    // index state.
+    let reranker_warn_hint = "run `onebrain search reindex` to fetch the reranker model (~570 MB)";
+    let reranker_needs_warn = reranker_enabled && !reranker_downloaded;
+
+    // Finish a result by appending the reranker detail lines (always) and
+    // escalating to `warn` with the reranker hint when the reranker is
+    // enabled but its model isn't downloaded — without ever *downgrading* an
+    // existing warn/error, and without clobbering an existing hint (the
+    // reranker hint only wins when the base result carries none).
+    let finish = |mut result: DoctorResult| -> DoctorResult {
+        result.details.extend(reranker_details.clone());
+        if reranker_needs_warn {
+            if result.status == DoctorStatus::Ok {
+                result.status = DoctorStatus::Warn;
+            }
+            if result.hint.is_none() {
+                result.hint = Some(reranker_warn_hint.to_string());
+            } else {
+                result.details.push(reranker_warn_hint.to_string());
+            }
+        }
+        result
+    };
 
     // No index on disk → advisory warn. Two causes look identical from here
     // (there's no marker that survives a cache purge — `last_indexed_at` lives
@@ -303,12 +382,14 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
     // on a fresh vault. The model dirs live INSIDE the collection cache dir, so
     // "no cache dir" implies "no model" — no need to qualify that separately.
     if !is_indexed(&cache_dir) {
-        return DoctorResult::warn(
-            "search",
-            format!("no index for {collection} · model not downloaded — never reindexed, or the search cache was cleared by OS storage cleanup"),
-        )
-        .with_hint("onebrain search reindex")
-        .with_details(vec![format!("collection: {collection}")]);
+        return finish(
+            DoctorResult::warn(
+                "search",
+                format!("no index for {collection} · model not downloaded — never reindexed, or the search cache was cleared by OS storage cleanup"),
+            )
+            .with_hint("onebrain search reindex")
+            .with_details(vec![format!("collection: {collection}")]),
+        );
     }
 
     // Index exists → open the engine (lazy embedder, no download) and read
@@ -318,20 +399,28 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
             Ok((engine, r)) => match engine.status(r.root.as_path()) {
                 Ok(s) => (s.last_indexed_at, s.doc_count, s.pending_total()),
                 Err(e) => {
-                    return DoctorResult::warn("search", format!("index status unavailable: {e}"))
-                        .with_details(vec![format!("collection: {collection}")]);
+                    return finish(
+                        DoctorResult::warn("search", format!("index status unavailable: {e}"))
+                            .with_details(vec![format!("collection: {collection}")]),
+                    );
                 }
             },
             Err(e) => {
-                return DoctorResult::warn("search", format!("engine unavailable: {e}"))
-                    .with_details(vec![format!("collection: {collection}")]);
+                return finish(
+                    DoctorResult::warn("search", format!("engine unavailable: {e}"))
+                        .with_details(vec![format!("collection: {collection}")]),
+                );
             }
         };
 
     let never_indexed = last_indexed_at.is_none();
     let mut details = vec![format!("collection: {collection}")];
-    if !model_downloaded {
+    if !any_model_downloaded {
         details.push("embedding model not downloaded — onebrain search reindex".to_string());
+    } else if !configured_model_downloaded {
+        details.push(format!(
+            "configured embedding model '{configured_embed_model}' is not downloaded — run `onebrain search reindex`"
+        ));
     }
 
     if pending > 0 || never_indexed {
@@ -340,23 +429,47 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
         } else {
             format!("{doc_count} indexed · {pending} pending")
         };
-        return DoctorResult::warn("search", summary)
-            .with_hint("onebrain search reindex")
-            .with_details(details);
+        return finish(
+            DoctorResult::warn("search", summary)
+                .with_hint("onebrain search reindex")
+                .with_details(details),
+        );
     }
 
-    if !model_downloaded {
+    if !any_model_downloaded {
         // Up to date on disk, but the model isn't present — a reindex or query
         // would trigger a download. Advisory warn so the user isn't surprised.
-        return DoctorResult::warn(
-            "search",
-            format!("{doc_count} indexed · model not downloaded"),
-        )
-        .with_hint("onebrain search reindex")
-        .with_details(details);
+        return finish(
+            DoctorResult::warn(
+                "search",
+                format!("{doc_count} indexed · model not downloaded"),
+            )
+            .with_hint("onebrain search reindex")
+            .with_details(details),
+        );
     }
 
-    DoctorResult::ok("search", format!("{doc_count} indexed · up to date")).with_details(details)
+    if !configured_model_downloaded {
+        // Some model is on disk, but not the one the vault is configured to
+        // use — the next query/reindex would silently pull a fresh download
+        // of the configured model. Advisory warn, distinct wording from the
+        // "nothing downloaded" case above.
+        return finish(
+            DoctorResult::warn(
+                "search",
+                format!(
+                    "{doc_count} indexed · configured embedding model '{configured_embed_model}' is not downloaded"
+                ),
+            )
+            .with_hint("onebrain search reindex")
+            .with_details(details),
+        );
+    }
+
+    finish(
+        DoctorResult::ok("search", format!("{doc_count} indexed · up to date"))
+            .with_details(details),
+    )
 }
 
 /// Decide whether the text-mode `--fix` should apply its recipes.
@@ -2700,6 +2813,19 @@ mod tests {
         assert_eq!(r.check, "search");
         assert_eq!(r.status, DoctorStatus::Warn);
         assert!(r.message.contains("could not resolve vault"), "{r:?}");
+        // Payload shape parity: the reranker fields appear on EVERY return
+        // path — as `unknown` here, since no config/cache dir exists to
+        // compute them from.
+        for field in [
+            "reranker_enabled: unknown",
+            "reranker_model: unknown",
+            "reranker_downloaded: unknown",
+        ] {
+            assert!(
+                r.details.iter().any(|d| d == field),
+                "missing {field}: {r:?}"
+            );
+        }
     }
 
     #[test]
@@ -2735,6 +2861,161 @@ mod tests {
             r.details.iter().any(|d| d.contains(&collection)),
             "collection in details: {r:?}"
         );
+    }
+
+    #[test]
+    fn native_search_check_reports_reranker_fields() {
+        // Reranker fields (enabled/model/downloaded) are always reported in
+        // details regardless of index state — here on the "no index" arm,
+        // using the default config (reranker enabled, default model, not
+        // downloaded on a fresh cache dir).
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let d = tempdir().unwrap();
+        let collection = format!(
+            "doctor-unit-reranker-fields-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        fs::write(
+            d.path().join("onebrain.yml"),
+            format!("search:\n  collection: {collection}\n"),
+        )
+        .unwrap();
+        let r = native_search_check(d.path());
+        assert!(
+            r.details
+                .iter()
+                .any(|d| d.contains("reranker_enabled: true")),
+            "{r:?}"
+        );
+        assert!(
+            r.details
+                .iter()
+                .any(|d| d.contains("reranker_model: onebrain-reranker-v1")),
+            "{r:?}"
+        );
+        assert!(
+            r.details
+                .iter()
+                .any(|d| d.contains("reranker_downloaded: false")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn native_search_check_warns_when_reranker_enabled_but_not_downloaded() {
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let d = tempdir().unwrap();
+        let collection = format!(
+            "doctor-unit-reranker-warn-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        fs::write(
+            d.path().join("onebrain.yml"),
+            format!("search:\n  collection: {collection}\n  reranker:\n    enabled: true\n"),
+        )
+        .unwrap();
+        let r = native_search_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Warn);
+        assert!(
+            r.details.iter().any(|d| d
+                .contains("run `onebrain search reindex` to fetch the reranker model (~570 MB)"))
+                || r.hint.as_deref().unwrap_or_default().contains(
+                    "run `onebrain search reindex` to fetch the reranker model (~570 MB)"
+                ),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn native_search_check_no_reranker_warn_when_disabled_and_not_downloaded() {
+        // Disabled is an explicit user choice — never warn about the reranker
+        // model even though it isn't downloaded. Fields must still be reported.
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let d = tempdir().unwrap();
+        let collection = format!(
+            "doctor-unit-reranker-disabled-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        fs::write(
+            d.path().join("onebrain.yml"),
+            format!("search:\n  collection: {collection}\n  reranker:\n    enabled: false\n"),
+        )
+        .unwrap();
+        let r = native_search_check(d.path());
+        assert!(
+            r.details
+                .iter()
+                .any(|d| d.contains("reranker_enabled: false")),
+            "{r:?}"
+        );
+        assert!(
+            !r.details
+                .iter()
+                .any(|d| d.contains("reranker model") || d.contains("~570 MB")),
+            "unexpected reranker warn on disabled reranker: {r:?}"
+        );
+        assert!(
+            r.hint
+                .as_deref()
+                .map(|h| !h.contains("reranker"))
+                .unwrap_or(true),
+            "unexpected reranker hint on disabled reranker: {r:?}"
+        );
+    }
+
+    #[test]
+    fn native_search_check_warns_configured_embed_model_missing_but_other_downloaded() {
+        // Cache has model X downloaded but config says Y (the configured
+        // model) — the check must warn specifically about Y, not treat "some
+        // model is downloaded" as good enough.
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let d = tempdir().unwrap();
+        let collection = format!(
+            "doctor-unit-configured-model-missing-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        fs::write(
+            d.path().join("onebrain.yml"),
+            format!("search:\n  collection: {collection}\n  embed_model: multilingual-e5-base\n"),
+        )
+        .unwrap();
+
+        // Simulate an already-indexed vault with a DIFFERENT model
+        // downloaded (multilingual-e5-small, the default) than configured
+        // (multilingual-e5-base).
+        let cache_dir = crate::commands::search_common::collection_cache_dir(&collection);
+        fs::create_dir_all(cache_dir.join("models--intfloat--multilingual-e5-small")).unwrap();
+
+        let r = native_search_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Warn);
+        let all_text = format!("{} {:?} {:?}", r.message, r.details, r.hint);
+        assert!(
+            all_text.contains("multilingual-e5-base"),
+            "expected configured model name in message/details/hint: {r:?}"
+        );
+        assert!(
+            all_text.contains("configured embedding model"),
+            "expected configured-model wording: {r:?}"
+        );
+
+        // Cache lives under the guard-scoped tempdir (`cache`), which is
+        // removed on drop — no manual cleanup of the real cache root needed.
     }
 
     // ── fix_settings_hooks: success path ─────────────────────────────────────
