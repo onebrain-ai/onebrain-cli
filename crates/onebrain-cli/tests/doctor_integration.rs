@@ -579,9 +579,9 @@ fn doctor_fix_does_not_resurrect_vault_yml_after_migration() {
     );
 }
 
-/// Text-mode `--fix` with a vault that has only manual issues (qmd_collection
-/// the native `search` "no index yet" warning is the one manual-only warning
-/// the minimal canonical vault always has). Must not print "Will apply" (no
+/// Text-mode `--fix` with a vault that has only manual issues (the native
+/// `search` "no index yet" warning is the one manual-only warning the minimal
+/// canonical vault always has). Must not print "Will apply" (no
 /// auto-fixable issues) and should confirm via the "manual step" path.
 /// The `issues.is_empty()` branch requires a vault with ZERO Warn/Error
 /// results — only possible once the search index has been built, which needs a

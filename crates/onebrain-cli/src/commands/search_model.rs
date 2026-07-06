@@ -158,7 +158,6 @@ pub fn run_list(
 /// downloaded, the parsed registry approx otherwise — so the order always
 /// matches the column.
 fn sort_rows(rows: &mut [ModelListEntry], col: ModelSortCol, desc: bool) {
-    use std::cmp::Ordering;
     // Approx registry size is a human string ("~470 MB", "~1.1 GB"); parse it
     // to bytes for a meaningful numeric sort.
     rows.sort_by(|a, b| {
@@ -191,7 +190,6 @@ fn sort_rows(rows: &mut [ModelListEntry], col: ModelSortCol, desc: bool) {
             _ if desc => ord.reverse(),
             _ => ord,
         }
-        .then(Ordering::Equal)
     });
 }
 
