@@ -894,6 +894,35 @@ impl Engine {
         }
     }
 
+    /// Download the configured reranker model if it isn't on disk yet — the
+    /// reindex fetch path. This is DISTINCT from [`Engine::reranker`]: the
+    /// lazy accessor deliberately skips (returns `None`) when the model is
+    /// absent, because a query must never trigger a multi-hundred-MB
+    /// download on the request path. Reindex, by contrast, WANTS the
+    /// download, so it goes straight to [`rerank::new`] (which fetches via
+    /// hf-hub + verifies the pinned sha256). Without this split the two
+    /// contracts deadlock — reindex asks `reranker()` to download, but
+    /// `reranker()` refuses to construct until already downloaded, so the
+    /// model can never arrive (found on real ob-1, 2026-07-06).
+    ///
+    /// Skip-not-fail: an unknown model name or a download/verify error is
+    /// logged and swallowed — a failed fetch leaves search unreranked, never
+    /// fails the reindex.
+    fn fetch_reranker_model(&self) {
+        #[cfg(feature = "semantic")]
+        {
+            if !rerank::is_supported_reranker(&self.rerank_settings.model) {
+                return;
+            }
+            if let Err(e) = rerank::new(&self.rerank_settings.model, &self.cache_dir) {
+                eprintln!(
+                    "onebrain-search: reranker model '{}' failed to fetch — search stays unreranked: {e:#}",
+                    self.rerank_settings.model
+                );
+            }
+        }
+    }
+
     /// Install rerank settings (the CLI layer maps `search.reranker` here).
     /// Resets the lazy reranker source so a model change re-resolves.
     pub fn set_rerank_settings(&mut self, settings: RerankSettings) {
@@ -1765,11 +1794,14 @@ impl Engine {
                 .unwrap_or(true);
             if should_fetch_reranker(self.rerank_settings.enabled, downloaded) {
                 progress(ReindexProgress::LoadingReranker);
-                // Resolve the lazy reranker once so the download/construction
-                // happens now (hf-hub prints its own progress), not on the
-                // next query. `reranker()` is skip-not-fail by design — a
-                // download error never fails the reindex.
-                self.reranker();
+                // Download the model NOW via the dedicated fetch path (hf-hub
+                // prints its own progress). Must be `fetch_reranker_model`,
+                // NOT `reranker()`: the lazy accessor skips when the model is
+                // absent (queries must not trigger a 570MB download), so it
+                // would never actually fetch here — the model could never
+                // arrive. Skip-not-fail — a download error never fails the
+                // reindex.
+                self.fetch_reranker_model();
             }
         }
         Ok(stats)
@@ -2408,6 +2440,46 @@ mod tests {
                 .iter()
                 .any(|p| matches!(p, ReindexProgress::LoadingReranker)),
             "disabled reranker must never emit LoadingReranker: {events:?}"
+        );
+    }
+
+    // Live network test: a full reindex with the reranker enabled and its
+    // model NOT yet on disk must actually DOWNLOAD it (not just emit the
+    // event). Gated behind ONEBRAIN_TEST_RERANK because it fetches ~570MB
+    // from Hugging Face. This is the test the unit suite structurally could
+    // not have: it exercises the real hf-hub path, and it fails on the
+    // circular-skip deadlock (reindex→reranker()→build_reranker skips) that
+    // shipped in the first v3.4.7 cut and was caught only on the real vault.
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn reindex_downloads_reranker_model_when_missing() {
+        if std::env::var("ONEBRAIN_TEST_RERANK").is_err() {
+            return; // gated: multi-hundred-MB network download
+        }
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        // Fake embedder (so embedding needs no model), real reranker source
+        // (default settings: enabled + onebrain-reranker-v1). The reranker
+        // fetch path is independent of the injected embedder.
+        let mut e = fake_engine(cache_dir.path());
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
+
+        let info = rerank::reranker_registry()
+            .iter()
+            .find(|m| m.name == "onebrain-reranker-v1")
+            .unwrap();
+        assert!(
+            !rerank::reranker_download_status(info, cache_dir.path()).downloaded,
+            "precondition: model must be absent before reindex"
+        );
+
+        e.reindex_all_with_progress(vault_dir.path(), &mut |_| {})
+            .unwrap();
+
+        assert!(
+            rerank::reranker_download_status(info, cache_dir.path()).downloaded,
+            "reindex must leave the reranker model on disk — a query-path skip \
+             would silently never download it"
         );
     }
 
