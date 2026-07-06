@@ -370,11 +370,11 @@ flowchart LR
 | Artifact | Touched |
 |---|---|
 | `tantivy/` | ✅ lex leg (top 50) |
-| `vectors/*` | ✅ vector leg (top 50, floor-gated) |
+| `vectors/*` | ✅ vector leg (top 50, trimmed to top cluster via `keep_top_cluster`) |
 | `engine.redb` | ✅ resolve fused hits |
 | `models--*` | ✅ query embedding |
 
-Flow: both legs run inside `Engine::query` — lex top-50 and vector top-50 (floor-gated) — then
+Flow: both legs run inside `Engine::query` — lex top-50 and vector top-50 (trimmed to top cluster via `keep_top_cluster`) — then
 `rrf_fuse` combines them by **rank only** (each list contributes `1/(60 + rank)`; scores summed,
 ties broken by chunk id for determinism), truncated to `--top-k`, resolved via `chunk_meta`.
 `--min-score` filters on the fused RRF score. In a **lex-only build**, hybrid degrades to
@@ -383,7 +383,7 @@ ties broken by chunk id for determinism), truncated to `--top-k`, resolved via `
 ```mermaid
 flowchart LR
     Q["query text"] --> LX["lex top-50 (tantivy/)"]
-    Q --> EMB["embed_query"] --> VC["vector top-50 ≥ floor"]
+    Q --> EMB["embed_query"] --> VC["vector top-50 → keep_top_cluster"]
     LX --> F["rrf_fuse k=60<br/>rank-only, deterministic ties"]
     VC --> F
     F --> RES["resolve via chunk_meta"] --> H["top-k Hits"]
