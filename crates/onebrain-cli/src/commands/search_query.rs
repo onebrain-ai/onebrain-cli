@@ -37,6 +37,13 @@ struct HitData {
     /// hybrid `query`/`vsearch` verbs DO populate it from redb-stored chunk
     /// text. See v3.4.6 bug E.
     snippet: String,
+    /// Calibrated 0–1 cross-encoder relevance from the Tier-2 rerank stage
+    /// (see `onebrain_search::engine::Hit::rerank_score`). `None` on the
+    /// pure-lex `search` verb (never reranked), on a daemon-routed hit (the
+    /// daemon doesn't rerank yet — Task 7), or when the reranker was
+    /// skipped/unavailable for this query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rerank_score: Option<f32>,
 }
 
 impl From<Hit> for HitData {
@@ -47,6 +54,7 @@ impl From<Hit> for HitData {
             heading_path: h.heading_path,
             score: h.score,
             snippet: h.snippet,
+            rerank_score: h.rerank_score,
         }
     }
 }
@@ -107,10 +115,14 @@ pub fn run_query(
     let (engine, resolved) = open_engine(vault_flag)?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
     let hits = apply_min_score(engine.query(&args.text, args.top_k)?, args.min_score);
-    let hint = hits
-        .is_empty()
-        .then(|| index_hint_for(&engine, &resolved))
-        .flatten();
+    let hint = if hits.is_empty() {
+        index_hint_for(&engine, &resolved)
+    } else {
+        // `query`'s fused RRF score has no cosine interpretation, so the
+        // unreranked fallback gets the generic reranker-not-downloaded line
+        // only (no `vec_top_score`).
+        rerank_unreranked_hint(&hits, None)
+    };
     emit_hits("search.query", vault_info, hits, hint, mode)
 }
 
@@ -139,6 +151,12 @@ const VEC_AMBIGUOUS: f64 = 0.80;
 /// a hint that the results may be weak — so a low-confidence result reads as
 /// honest rather than authoritative. We NEVER drop results here (recall-first);
 /// this only annotates them.
+///
+/// This heuristic predates the Tier-2 reranker (v3.4.7) and is now the
+/// **no-reranker fallback only**: it fires solely inside the unreranked branch
+/// of [`rerank_unreranked_hint`], when a query genuinely has no rerank score to
+/// band on. Once every hit carries a `rerank_score`, [`rerank_confidence_band`]
+/// supersedes this per-hit.
 fn vec_confidence_hint(top_score: f64) -> Option<String> {
     if top_score >= VEC_CONFIDENT {
         None
@@ -150,6 +168,51 @@ fn vec_confidence_hint(top_score: f64) -> Option<String> {
         )
     } else {
         Some("no strong semantic match — showing nearest results, likely not relevant".to_string())
+    }
+}
+
+/// PROVISIONAL confidence bands from a reranked hit's calibrated
+/// `rerank_score` — Task 9 recalibrates these against real query/passage
+/// pairs once the reranker model is live in production; treat the thresholds
+/// as placeholders, not tuned values.
+///
+/// `< 0.30` → "no strong match" (below the engine's own [`DEFAULT_RERANK_MIN_SCORE`]
+/// gate — a hit this weak only survives via the never-empty floor);
+/// `0.30..0.60` → "possible match"; `> 0.60` → confident, no label.
+const RERANK_NO_MATCH_BAND: f32 = 0.30;
+const RERANK_POSSIBLE_BAND: f32 = 0.60;
+
+/// Confidence label for one reranked hit's `rerank_score`, or `None` when the
+/// score is confidently above [`RERANK_POSSIBLE_BAND`] (no label needed).
+fn rerank_confidence_band(score: f32) -> Option<&'static str> {
+    if score < RERANK_NO_MATCH_BAND {
+        Some("no strong match")
+    } else if score <= RERANK_POSSIBLE_BAND {
+        Some("possible match")
+    } else {
+        None
+    }
+}
+
+/// One-line, never-silent hint for a semantic verb's (`query` / `vsearch`)
+/// result set when NONE of its hits carry a `rerank_score` — the reranker was
+/// skipped entirely (model not downloaded, load failure, or `enabled: false`).
+/// Distinct from a genuine empty result (handled by `index_hint_for`) and from
+/// a partially-reranked set (the fused tail beyond `candidates` — those hits
+/// simply render with no band, no separate hint line).
+///
+/// `vsearch` additionally folds in the pre-reranker cosine heuristic
+/// ([`vec_confidence_hint`]) as extra detail, since a bare cosine score is
+/// still a meaningful (if noisier) signal for that verb; `query`'s fused RRF
+/// score has no comparable interpretation, so it gets the generic line alone.
+fn rerank_unreranked_hint(hits: &[Hit], vec_top_score: Option<f64>) -> Option<String> {
+    if hits.is_empty() || hits.iter().any(|h| h.rerank_score.is_some()) {
+        return None;
+    }
+    let base = "unreranked (reranker model not downloaded — run `onebrain search reindex`)";
+    match vec_top_score.and_then(vec_confidence_hint) {
+        Some(cosine_hint) => Some(format!("{base} · {cosine_hint}")),
+        None => Some(base.to_string()),
     }
 }
 
@@ -174,12 +237,14 @@ pub fn run_vsearch(
         engine.vector_search(&args.text, args.top_k)?,
         args.min_score,
     );
-    // Never-silent: an empty result explains itself (empty/stale index); a
-    // non-empty one carries a confidence label so a weak vsearch reads as
-    // honest rather than authoritative (bi-encoder cosine can't gate e5 noise).
+    // Never-silent: an empty result explains itself (empty/stale index).
+    // A non-empty, UNRERANKED result still carries a confidence signal — the
+    // pre-reranker cosine heuristic — as a fallback inside
+    // `rerank_unreranked_hint`; a reranked result gets per-hit bands in the
+    // text renderer instead (see `rerank_confidence_band`), no separate hint.
     let hint = match hits.first() {
         None => index_hint_for(&engine, &resolved),
-        Some(top) => vec_confidence_hint(top.score),
+        Some(top) => rerank_unreranked_hint(&hits, Some(top.score)),
     };
     emit_hits("search.vec", vault_info, hits, hint, mode)
 }
@@ -232,6 +297,8 @@ pub fn run_lex(
                 heading_path,
                 score: score as f64,
                 snippet: String::new(),
+                // Pure-lex `search` never reranks — untouched per Task 6 scope.
+                rerank_score: None,
             }
         })
         .collect();
@@ -340,6 +407,9 @@ fn daemon_hits(resp: &serde_json::Value) -> Vec<HitData> {
                 heading_path,
                 score,
                 snippet,
+                // The daemon's `/api/vault/search` doesn't rerank yet (Task 7
+                // adds the daemon-side endpoint) — always unreranked for now.
+                rerank_score: None,
             })
         })
         .collect()
@@ -418,6 +488,13 @@ fn render_text(env: &Envelope<SearchHitsData>) -> String {
                 h.doc_path, h.heading_path, h.score
             )
         };
+        // Reranked hits carry a calibrated relevance band alongside the raw
+        // fused/cosine score — PROVISIONAL thresholds (Task 9 recalibrates).
+        if let Some(rerank_score) = h.rerank_score {
+            if let Some(band) = rerank_confidence_band(rerank_score) {
+                block.push_str(&format!("  ⚠️ {band} ({rerank_score:.3})"));
+            }
+        }
         if !h.snippet.is_empty() {
             block.push_str(&format!("\n     {}", h.snippet));
         }
@@ -466,6 +543,20 @@ mod tests {
         )
     }
 
+    /// Test-only `HitData` builder: fills every field with a harmless default
+    /// (`rerank_score: None`) so each test only spells out the fields it
+    /// actually cares about.
+    fn hit(doc_path: &str, score: f64) -> HitData {
+        HitData {
+            chunk_id: format!("{doc_path}#0"),
+            doc_path: doc_path.to_string(),
+            heading_path: String::new(),
+            score,
+            snippet: String::new(),
+            rerank_score: None,
+        }
+    }
+
     #[test]
     fn text_handles_no_matches() {
         assert_eq!(render_text(&env(Vec::new())), "🔍  No results");
@@ -495,6 +586,7 @@ mod tests {
             heading_path: "Intro".into(),
             score: 0.5,
             snippet: "hello world".into(),
+            rerank_score: None,
         }]));
         assert!(s.contains("📄  1. a.md › Intro  (0.500)"));
         assert!(s.contains("hello world"));
@@ -514,6 +606,7 @@ mod tests {
                     heading_path: String::new(),
                     score: 0.83,
                     snippet: String::new(),
+                    rerank_score: None,
                 }],
                 index_hint: Some("⚠️  low-confidence semantic match".into()),
             },
@@ -534,6 +627,7 @@ mod tests {
             heading_path: String::new(),
             score: 0.5,
             snippet: String::new(),
+            rerank_score: None,
         }]));
         assert!(s.contains("📄  1. a.md  (0.500)"));
         assert!(!s.contains("›"));
@@ -548,6 +642,7 @@ mod tests {
                 heading_path: String::new(),
                 score: 0.9,
                 snippet: "first".into(),
+                rerank_score: None,
             },
             HitData {
                 chunk_id: "b.md#0".into(),
@@ -555,12 +650,136 @@ mod tests {
                 heading_path: String::new(),
                 score: 0.5,
                 snippet: "second".into(),
+                rerank_score: None,
             },
         ]));
         assert!(s.contains("📄  1. a.md"));
         assert!(s.contains("📄  2. b.md"));
         // Blank line separates the two hit blocks.
         assert!(s.contains("first\n\n📄  2."));
+    }
+
+    // ── Rerank confidence bands + hints (v3.4.7 Task 6) ────────────────────
+
+    #[test]
+    fn rerank_confidence_band_thresholds() {
+        // < 0.30 → "no strong match".
+        assert_eq!(rerank_confidence_band(0.0), Some("no strong match"));
+        assert_eq!(rerank_confidence_band(0.29), Some("no strong match"));
+        // 0.30..=0.60 → "possible match".
+        assert_eq!(rerank_confidence_band(0.30), Some("possible match"));
+        assert_eq!(rerank_confidence_band(0.45), Some("possible match"));
+        assert_eq!(rerank_confidence_band(0.60), Some("possible match"));
+        // > 0.60 → confident, no label.
+        assert_eq!(rerank_confidence_band(0.61), None);
+        assert_eq!(rerank_confidence_band(0.95), None);
+    }
+
+    #[test]
+    fn text_renders_band_for_no_strong_match() {
+        let mut h = hit("a.md", 0.5);
+        h.rerank_score = Some(0.10);
+        let s = render_text(&env(vec![h]));
+        assert!(s.contains("no strong match"), "{s}");
+        assert!(s.contains("(0.100)"), "band shows the rerank score: {s}");
+    }
+
+    #[test]
+    fn text_renders_band_for_possible_match() {
+        let mut h = hit("a.md", 0.5);
+        h.rerank_score = Some(0.45);
+        let s = render_text(&env(vec![h]));
+        assert!(s.contains("possible match"), "{s}");
+    }
+
+    #[test]
+    fn text_renders_no_band_for_confident_rerank_score() {
+        let mut h = hit("a.md", 0.5);
+        h.rerank_score = Some(0.95);
+        let s = render_text(&env(vec![h]));
+        assert!(
+            !s.contains("no strong match") && !s.contains("possible match"),
+            "a confident (>0.60) rerank score gets no band label: {s}"
+        );
+    }
+
+    #[test]
+    fn never_empty_case_renders_no_strong_match_label() {
+        // The engine's never-empty floor (RERANK_NO_MATCH_KEEP) keeps hits
+        // even when every candidate is gated out — those survivors carry a
+        // low rerank_score, so the CLI must still show the honest band
+        // rather than rendering them as if they were confident matches.
+        let mut h = hit("only-survivor.md", 0.2);
+        h.rerank_score = Some(0.05);
+        let s = render_text(&env(vec![h]));
+        assert!(s.contains("no strong match"), "{s}");
+    }
+
+    #[test]
+    fn rerank_unreranked_hint_none_when_any_hit_has_rerank_score() {
+        // Mixed reranked-head + unreranked-tail (fused tail beyond
+        // `candidates`) must NOT trigger the unreranked hint — only a set
+        // with NO rerank score anywhere counts as "the reranker was skipped".
+        let mut reranked = engine_hit("a.md", 0.9);
+        reranked.rerank_score = Some(0.8);
+        let unreranked_tail = engine_hit("b.md", 0.5);
+        assert_eq!(
+            rerank_unreranked_hint(&[reranked, unreranked_tail], None),
+            None
+        );
+    }
+
+    #[test]
+    fn rerank_unreranked_hint_none_on_empty_hits() {
+        assert_eq!(rerank_unreranked_hint(&[], Some(0.9)), None);
+    }
+
+    #[test]
+    fn rerank_unreranked_hint_generic_line_for_query_verb() {
+        // `query` (hybrid) has no cosine top score to fold in.
+        let hits = [engine_hit("a.md", 0.9)];
+        let hint = rerank_unreranked_hint(&hits, None).expect("unreranked hits need a hint");
+        assert!(hint.contains("unreranked"), "{hint}");
+        assert!(hint.contains("reranker model not downloaded"), "{hint}");
+        assert!(hint.contains("onebrain search reindex"), "{hint}");
+    }
+
+    #[test]
+    fn rerank_unreranked_hint_folds_in_cosine_heuristic_for_vsearch() {
+        // vsearch still has a meaningful cosine top score, so the unreranked
+        // fallback keeps the old heuristic alongside the generic line.
+        let hits = [engine_hit("a.md", 0.9)];
+        let hint = rerank_unreranked_hint(&hits, Some(0.75)).expect("unreranked hits need a hint");
+        assert!(hint.contains("unreranked"), "{hint}");
+        assert!(
+            hint.contains("no strong semantic match"),
+            "cosine fallback folded in: {hint}"
+        );
+    }
+
+    #[test]
+    fn rerank_unreranked_hint_confident_cosine_omits_heuristic_detail() {
+        // A confident cosine top score (≥0.86) has nothing extra to say, so
+        // only the generic unreranked line appears.
+        let hits = [engine_hit("a.md", 0.9)];
+        let hint = rerank_unreranked_hint(&hits, Some(0.90)).expect("still unreranked");
+        assert_eq!(
+            hint,
+            "unreranked (reranker model not downloaded — run `onebrain search reindex`)"
+        );
+    }
+
+    /// Minimal `onebrain_search::engine::Hit` builder for the pre-`HitData`
+    /// hint-computation tests above.
+    fn engine_hit(doc_path: &str, score: f64) -> Hit {
+        Hit {
+            chunk_id: format!("{doc_path}#0"),
+            doc_path: doc_path.to_string(),
+            heading_path: String::new(),
+            score,
+            snippet: String::new(),
+            rerank_score: None,
+        }
     }
 
     // ── Daemon response mapping (Track 2c) ─────────────────────────────────

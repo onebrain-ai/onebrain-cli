@@ -24,8 +24,10 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use onebrain_core::{load_vault_config, load_vault_config_at, ResolvedVault, VaultRoot};
-use onebrain_search::engine::{short_path_hash, Engine};
+use onebrain_core::{
+    load_vault_config, load_vault_config_at, RerankerConfig, ResolvedVault, VaultRoot,
+};
+use onebrain_search::engine::{short_path_hash, Engine, RerankSettings, DEFAULT_RERANK_MIN_SCORE};
 
 use crate::vault_ctx;
 
@@ -123,7 +125,27 @@ pub fn open_engine(vault_flag: Option<PathBuf>) -> Result<(Engine, ResolvedVault
     let mut engine = Engine::open(&cache_dir, &config.search.embed_model)
         .map_err(|e| map_engine_open_error(e, &cache_dir))?;
     engine.set_exclude_patterns(config.search.exclude.clone());
+    engine.set_rerank_settings(rerank_settings_from_config(&config.search.reranker));
     Ok((engine, resolved))
+}
+
+/// Map the config's `search.reranker` block to the engine-facing
+/// [`RerankSettings`] — the CLI is the only layer that reads config files, so
+/// this is the single seam where `onebrain.yml` values become the engine's
+/// rerank knobs. `min_score` falls back to the engine's calibrated
+/// [`DEFAULT_RERANK_MIN_SCORE`] when the config leaves it unset.
+///
+/// Drift guard: an absent `search.reranker` block must map to EXACTLY
+/// `RerankSettings::default()` — see the test below. If the two defaults
+/// ever diverge (one crate's default changes without the other), this
+/// mapping silently stops being a no-op for the common case.
+pub(crate) fn rerank_settings_from_config(cfg: &RerankerConfig) -> RerankSettings {
+    RerankSettings {
+        enabled: cfg.enabled,
+        model: cfg.model.clone(),
+        candidates: cfg.candidates,
+        min_score: cfg.min_score.unwrap_or(DEFAULT_RERANK_MIN_SCORE),
+    }
 }
 
 /// Turn an `Engine::open` failure into the right typed CLI error. The redb
@@ -389,6 +411,43 @@ mod tests {
         assert!(
             format!("{mapped:#}").contains("route `search get` through warm daemon"),
             "the verb context must be preserved, got: {mapped:#}"
+        );
+    }
+
+    #[test]
+    fn rerank_settings_from_config_default_matches_engine_default() {
+        // Drift guard: an absent `search.reranker` block (config default)
+        // must map to EXACTLY `RerankSettings::default()` — if the two
+        // defaults ever diverge, this test catches it.
+        let mapped = rerank_settings_from_config(&onebrain_core::RerankerConfig::default());
+        assert_eq!(mapped, onebrain_search::engine::RerankSettings::default());
+    }
+
+    #[test]
+    fn rerank_settings_from_config_maps_every_field() {
+        let cfg = onebrain_core::RerankerConfig {
+            enabled: false,
+            model: "onebrain-reranker-v1".to_string(),
+            candidates: 42,
+            min_score: Some(0.55),
+        };
+        let mapped = rerank_settings_from_config(&cfg);
+        assert!(!mapped.enabled);
+        assert_eq!(mapped.model, "onebrain-reranker-v1");
+        assert_eq!(mapped.candidates, 42);
+        assert_eq!(mapped.min_score, 0.55);
+    }
+
+    #[test]
+    fn rerank_settings_from_config_falls_back_to_engine_default_min_score() {
+        let cfg = onebrain_core::RerankerConfig {
+            min_score: None,
+            ..Default::default()
+        };
+        let mapped = rerank_settings_from_config(&cfg);
+        assert_eq!(
+            mapped.min_score,
+            onebrain_search::engine::DEFAULT_RERANK_MIN_SCORE
         );
     }
 

@@ -11,7 +11,8 @@ pub mod scheduler;
 pub mod types;
 
 pub use config::{
-    load_vault_config, load_vault_config_at, CheckpointPolicy, VaultConfig, VaultFolders,
+    load_vault_config, load_vault_config_at, CheckpointPolicy, RerankerConfig, VaultConfig,
+    VaultFolders,
 };
 pub use error::{CoreError, Result};
 pub use path::{

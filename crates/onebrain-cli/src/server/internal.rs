@@ -42,7 +42,9 @@ use serde::{Deserialize, Serialize};
 
 use super::api::{require_vault_root, ApiError};
 use super::{AppState, SharedEngine};
-use crate::commands::search_common::{collection_cache_dir, collection_name_readonly};
+use crate::commands::search_common::{
+    collection_cache_dir, collection_name_readonly, rerank_settings_from_config,
+};
 use onebrain_search::engine::Engine;
 
 /// Build the `/api/internal` sub-router. State + auth are attached by
@@ -116,6 +118,7 @@ fn try_open_held_engine(vault_root: &Path) -> anyhow::Result<Engine> {
     let cache_dir = collection_cache_dir(&collection);
     let mut engine = Engine::open(&cache_dir, &config.search.embed_model)?;
     engine.set_exclude_patterns(config.search.exclude.clone());
+    engine.set_rerank_settings(rerank_settings_from_config(&config.search.reranker));
     Ok(engine)
 }
 
