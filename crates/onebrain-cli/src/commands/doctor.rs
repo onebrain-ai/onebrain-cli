@@ -282,16 +282,29 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
     // Resolve the collection. `collection_for` may persist a generated name on
     // a never-configured vault — the same deterministic name every other
     // `search` command would write; harmless and one-time.
+    // On the two resolution-failure early returns the reranker state is
+    // genuinely uncomputable (no config, no cache dir) — the three fields
+    // are still reported, as `unknown`, so the payload shape is identical
+    // on EVERY return path (consumers never branch on field presence).
+    let unresolved = |msg: String| {
+        let mut r = DoctorResult::warn("search", msg);
+        r.details.extend([
+            "reranker_enabled: unknown".to_string(),
+            "reranker_model: unknown".to_string(),
+            "reranker_downloaded: unknown".to_string(),
+        ]);
+        r
+    };
     let resolved = match crate::vault_ctx::require(Some(vault_root.to_path_buf())) {
         Ok(r) => r,
         Err(e) => {
-            return DoctorResult::warn("search", format!("could not resolve vault: {e}"));
+            return unresolved(format!("could not resolve vault: {e}"));
         }
     };
     let collection = match collection_for(&resolved) {
         Ok(c) => c,
         Err(e) => {
-            return DoctorResult::warn("search", format!("could not resolve collection: {e}"));
+            return unresolved(format!("could not resolve collection: {e}"));
         }
     };
     let cache_dir = collection_cache_dir(&collection);
@@ -2800,6 +2813,19 @@ mod tests {
         assert_eq!(r.check, "search");
         assert_eq!(r.status, DoctorStatus::Warn);
         assert!(r.message.contains("could not resolve vault"), "{r:?}");
+        // Payload shape parity: the reranker fields appear on EVERY return
+        // path — as `unknown` here, since no config/cache dir exists to
+        // compute them from.
+        for field in [
+            "reranker_enabled: unknown",
+            "reranker_model: unknown",
+            "reranker_downloaded: unknown",
+        ] {
+            assert!(
+                r.details.iter().any(|d| d == field),
+                "missing {field}: {r:?}"
+            );
+        }
     }
 
     #[test]
