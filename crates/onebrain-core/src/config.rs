@@ -121,6 +121,51 @@ impl Default for VaultFolders {
     }
 }
 
+/// Reranker config parsed from the config's `search.reranker:` block.
+///
+/// The reranker improves search result relevance by re-scoring candidate results.
+/// Model-name validation happens at the engine/CLI layer, not here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankerConfig {
+    /// Whether reranking is enabled. Default `true`.
+    #[serde(default = "default_reranker_enabled")]
+    pub enabled: bool,
+    /// Reranker model name. Default `"onebrain-reranker-v1"`.
+    /// Validation happens at engine/CLI layer where the supported-names list lives.
+    #[serde(default = "default_reranker_model")]
+    pub model: String,
+    /// Number of candidate results to rerank. Default 30.
+    #[serde(default = "default_reranker_candidates")]
+    pub candidates: usize,
+    /// Minimum reranker score threshold. `None` uses the engine's calibrated default
+    /// (baked in as a constant in Task 9).
+    #[serde(default)]
+    pub min_score: Option<f32>,
+}
+
+fn default_reranker_enabled() -> bool {
+    true
+}
+
+fn default_reranker_model() -> String {
+    "onebrain-reranker-v1".to_string()
+}
+
+fn default_reranker_candidates() -> usize {
+    30
+}
+
+impl Default for RerankerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_reranker_enabled(),
+            model: default_reranker_model(),
+            candidates: default_reranker_candidates(),
+            min_score: None,
+        }
+    }
+}
+
 /// Native search config parsed from the config's `search:` block.
 ///
 /// `collection` falls back to the legacy top-level `qmd_collection` when
@@ -147,6 +192,9 @@ pub struct SearchConfig {
     /// `exclude: []` explicitly to index everything.
     #[serde(default = "default_search_exclude")]
     pub exclude: Vec<String>,
+    /// Reranker config for improving search result relevance.
+    #[serde(default)]
+    pub reranker: RerankerConfig,
 }
 
 fn default_embed_model() -> String {
@@ -164,6 +212,7 @@ impl Default for SearchConfig {
             embed_model: default_embed_model(),
             embed: EmbedGate::default(),
             exclude: default_search_exclude(),
+            reranker: RerankerConfig::default(),
         }
     }
 }
@@ -416,5 +465,36 @@ mod tests {
         let cfg = load_vault_config(&root).unwrap();
         assert_eq!(cfg.search.embed_model, "multilingual-e5-large");
         assert_eq!(cfg.search.collection.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn reranker_absent_uses_all_defaults() {
+        let (_dir, root) = write_vault("search:\n  embed_model: multilingual-e5-small\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert!(cfg.search.reranker.enabled);
+        assert_eq!(cfg.search.reranker.model, "onebrain-reranker-v1");
+        assert_eq!(cfg.search.reranker.candidates, 30);
+        assert_eq!(cfg.search.reranker.min_score, None);
+    }
+
+    #[test]
+    fn reranker_partial_config_uses_defaults_for_missing_fields() {
+        let (_dir, root) = write_vault("search:\n  reranker:\n    enabled: false\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert!(!cfg.search.reranker.enabled);
+        assert_eq!(cfg.search.reranker.model, "onebrain-reranker-v1");
+        assert_eq!(cfg.search.reranker.candidates, 30);
+        assert_eq!(cfg.search.reranker.min_score, None);
+    }
+
+    #[test]
+    fn reranker_full_config_round_trips() {
+        let yaml = "search:\n  reranker:\n    enabled: true\n    model: custom-reranker\n    candidates: 50\n    min_score: 0.5\n";
+        let (_dir, root) = write_vault(yaml);
+        let cfg = load_vault_config(&root).unwrap();
+        assert!(cfg.search.reranker.enabled);
+        assert_eq!(cfg.search.reranker.model, "custom-reranker");
+        assert_eq!(cfg.search.reranker.candidates, 50);
+        assert_eq!(cfg.search.reranker.min_score, Some(0.5));
     }
 }
