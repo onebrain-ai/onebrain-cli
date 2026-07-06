@@ -651,12 +651,15 @@ impl McpServer {
             //
             // Behavioral deltas vs the Direct path (documented in docs/daemon.md
             // + ADR 0023): the daemon returns DOC-LEVEL hits (dedup/fusion keys
-            // on `path`, so at most one hit per document), a `vec` sub-query is
-            // served as `hybrid` (lex mixed in) on the wire, and the daemon caps
-            // candidates at its own `TOP_K` (20) per sub-query — so `fetch_k`'s
-            // over-fetch (used by the Direct arm below) doesn't apply here.
+            // on `path`, so at most one hit per document), and a `vec` sub-query
+            // is served as `hybrid` (lex mixed in) on the wire. Fusion depth
+            // matches the Direct arm: we pass the SAME `fetch_k` over-fetch as
+            // an explicit `top_k` so RRF has depth to fuse. Before v3.4.7 the
+            // server hardcoded 20 here; passing `None` would now fall to the
+            // vault's `search.default_top_k` (10) and shrink fusion depth.
             Backend::Daemon(handle) => {
                 let handle = handle.clone();
+                let fetch_k = limit.max(10) * 3;
                 tokio::task::spawn_blocking(move || {
                     let mut ranked = Vec::with_capacity(params.searches.len());
                     for (i, sub) in params.searches.into_iter().enumerate() {
@@ -668,7 +671,7 @@ impl McpServer {
                         let hits = degrade_vec_error(
                             has_lex && !matches!(sub.r#type, SubQueryType::Lex),
                             handle
-                                .search(&sub.query, mode, None, None)
+                                .search(&sub.query, mode, Some(fetch_k), None)
                                 .and_then(|body| parse_daemon_search_hits(&body)),
                         )?;
                         ranked.push((weight, hits));
