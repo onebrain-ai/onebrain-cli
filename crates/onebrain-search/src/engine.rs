@@ -3543,6 +3543,32 @@ mod tests {
     }
 
     #[test]
+    fn rerank_gate_drops_failing_candidates_without_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        e.index_doc("m1.md", "note zulumark alpha").unwrap();
+        e.index_doc("m2.md", "note zulumark beta").unwrap();
+        for i in 0..3 {
+            e.index_doc(&format!("u{i}.md"), &format!("note gamma{i}"))
+                .unwrap();
+        }
+        e.set_rerank_settings(RerankSettings {
+            min_score: 0.5,
+            ..Default::default()
+        });
+        e.set_reranker_for_tests(Box::new(MarkerReranker { marker: "zulumark" }));
+        let hits = e.query("note", 10).unwrap();
+        // Partial gate: only the two marker docs clear 0.5 (0.9 vs 0.4).
+        // Gate-dropped candidates are REMOVED, never backfilled — the result
+        // shrinks below top_k. (The fused tail beyond `candidates` is a
+        // separate mechanism, covered by the test above.) Track B confidence
+        // bands depend on this exact semantic.
+        assert_eq!(hits.len(), 2, "gate-dropped candidates must not reappear");
+        assert!(hits.iter().all(|h| h.doc_path.starts_with("m")));
+        assert!(hits.iter().all(|h| h.rerank_score == Some(0.9)));
+    }
+
+    #[test]
     fn rerank_active_tracks_settings_and_reranker_availability() {
         let dir = tempfile::tempdir().unwrap();
         let mut e = fake_engine(dir.path());
