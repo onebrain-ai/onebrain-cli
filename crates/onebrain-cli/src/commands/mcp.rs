@@ -349,6 +349,8 @@ fn lex_subquery(resolved: &ResolvedVault, text: &str, top_k: usize) -> anyhow::R
                 heading_path: String::new(),
                 score: score as f64,
                 snippet: String::new(),
+                // Lex-only path — the rerank stage only runs on query/vsearch.
+                rerank_score: None,
             }
         })
         .collect())
@@ -437,6 +439,9 @@ fn parse_daemon_search_hits(body: &serde_json::Value) -> anyhow::Result<Vec<Hit>
             heading_path,
             score,
             snippet,
+            // Daemon-HTTP fallback mapping — rerank fields arrive with the
+            // surface wiring in the Track B task.
+            rerank_score: None,
         });
     }
     Ok(out)
@@ -876,6 +881,7 @@ mod tests {
             heading_path: String::new(),
             score: 0.0,
             snippet: String::new(),
+            rerank_score: None,
         }
     }
 
