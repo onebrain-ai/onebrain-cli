@@ -156,4 +156,41 @@ their first `search query`.
 
 ## Calibration (v3.4.7 final)
 
-PENDING — filled by the calibration run.
+Measured on the real ob-1 vault (585 docs) with `onebrain-reranker-v1`: a
+golden set of 20 answerable + 10 known-no-answer queries.
+
+**Score separation** (the result that justifies the whole stage):
+
+| bucket | top-hit rerank score |
+|---|---|
+| genuine no-answer queries | 0.003 – 0.066 (median 0.011) |
+| genuine relevant matches | 0.73 – 0.99 |
+| tangential / weak matches | 0.20 – 0.52 (sparse) |
+
+Contrast e5 bi-encoder cosine (ADR 0024): relevant 0.83–0.87 vs unrelated
+≈0.84 — total overlap. The cross-encoder's gap (~0.07 → 0.73) is an order of
+magnitude cleaner, so its 0–1 score is a trustworthy gate where cosine never
+was.
+
+**Final constants** (the provisional values held up against real data —
+measure-then-confirm, not measure-then-rubber-stamp):
+
+- `DEFAULT_RERANK_MIN_SCORE = 0.30` — sits in the clean gap (no-answer max
+  0.066 → real-match min ~0.73) with margin both sides.
+- Confidence bands `0.30 / 0.60` — real matches cluster 0.73–0.99 (confident);
+  no-answer all `< 0.10`.
+- **`candidates` lowered 30 → 10** — every golden-set match already lands in
+  the top ~5 after rerank, so 30 buys no quality; bge-reranker-v2-m3 costs
+  ~70 ms/candidate on CPU, so 10 cuts rerank compute ~3×. User-adjustable via
+  `search.reranker.candidates`.
+
+**Latency**: warm rerank for 10 candidates is ~0.5–0.7 s (est.); the
+multi-second figures seen during calibration were a *contended* daemon
+(engine held by a separate MCP → per-request model reloads), not the warm
+path. Cold CLI / Raspberry Pi pay the ~1.9 s model load per query and are
+honestly hinted. The always-on single-owner daemon is what makes warm-load
+pay off (tracked separately for v3.5).
+
+Full report + the ship-blocker caught during this run (the model never
+downloaded — a skip/fetch deadlock between the reindex and query paths) are
+in the project vault.

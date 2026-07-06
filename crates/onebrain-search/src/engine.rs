@@ -489,7 +489,12 @@ impl Default for RerankSettings {
         Self {
             enabled: true,
             model: rerank::reranker_registry()[0].name.to_string(),
-            candidates: 30,
+            // 10, not 30: calibration on real ob-1 (2026-07-06) showed every
+            // golden-set match already lands in the top ~5 after rerank, while
+            // bge-reranker-v2-m3 costs ~70 ms/candidate on CPU — 30 made a warm
+            // search ~2 s (worse on a Pi). 10 keeps the quality and cuts rerank
+            // compute ~3×. Keep in sync with `RerankerConfig`'s config default.
+            candidates: 10,
             min_score: DEFAULT_RERANK_MIN_SCORE,
         }
     }

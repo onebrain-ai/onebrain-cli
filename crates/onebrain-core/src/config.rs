@@ -134,11 +134,11 @@ pub struct RerankerConfig {
     /// Validation happens at engine/CLI layer where the supported-names list lives.
     #[serde(default = "default_reranker_model")]
     pub model: String,
-    /// Number of candidate results to rerank. Default 30.
+    /// Number of top fused candidates to rerank. Default 10 (calibrated).
     #[serde(default = "default_reranker_candidates")]
     pub candidates: usize,
-    /// Minimum reranker score threshold. `None` uses the engine's calibrated default
-    /// (baked in as a constant in Task 9).
+    /// Minimum reranker score threshold. `None` uses the engine's calibrated
+    /// default (`DEFAULT_RERANK_MIN_SCORE` = 0.30, measured on real ob-1).
     #[serde(default)]
     pub min_score: Option<f32>,
 }
@@ -152,7 +152,10 @@ fn default_reranker_model() -> String {
 }
 
 fn default_reranker_candidates() -> usize {
-    30
+    // Calibrated on real ob-1 (2026-07-06): 10 keeps golden-set quality (matches
+    // land in top ~5 after rerank) at ~1/3 the CPU cost of 30. Mirror of
+    // `RerankSettings::default().candidates` in onebrain-search.
+    10
 }
 
 impl Default for RerankerConfig {
@@ -473,7 +476,7 @@ mod tests {
         let cfg = load_vault_config(&root).unwrap();
         assert!(cfg.search.reranker.enabled);
         assert_eq!(cfg.search.reranker.model, "onebrain-reranker-v1");
-        assert_eq!(cfg.search.reranker.candidates, 30);
+        assert_eq!(cfg.search.reranker.candidates, 10);
         assert_eq!(cfg.search.reranker.min_score, None);
     }
 
@@ -483,7 +486,7 @@ mod tests {
         let cfg = load_vault_config(&root).unwrap();
         assert!(!cfg.search.reranker.enabled);
         assert_eq!(cfg.search.reranker.model, "onebrain-reranker-v1");
-        assert_eq!(cfg.search.reranker.candidates, 30);
+        assert_eq!(cfg.search.reranker.candidates, 10);
         assert_eq!(cfg.search.reranker.min_score, None);
     }
 
