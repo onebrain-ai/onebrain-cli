@@ -114,7 +114,8 @@ pub fn run_query(
         return run_query_via_daemon(&handle, &resolved, "hybrid", args, mode);
     }
 
-    let (engine, resolved) = open_engine(vault_flag)?;
+    let (mut engine, resolved) = open_engine(vault_flag)?;
+    apply_min_candidates_override(&mut engine, args.min_candidates);
     let vault_info = crate::vault_ctx::info_from(&resolved);
     let hits = apply_min_score(engine.query(&args.text, args.top_k)?, args.min_score);
     let hint = if hits.is_empty() {
@@ -206,8 +207,8 @@ fn rerank_confidence_band(score: f32) -> Option<&'static str> {
 /// result set when NONE of its hits carry a `rerank_score` — the reranker was
 /// skipped (model not downloaded, load failure) rather than turned off.
 /// Distinct from a genuine empty result (handled by `index_hint_for`) and from
-/// a partially-reranked set (the fused tail beyond `candidates` — those hits
-/// simply render with no band, no separate hint line).
+/// a partially-reranked set (the fused tail beyond `min_candidates` — those
+/// hits simply render with no band, no separate hint line).
 ///
 /// `reranker_enabled: false` is an explicit user choice, not a degraded state —
 /// design calls for NO hint in that case (bands can't appear either, since
@@ -248,7 +249,8 @@ pub fn run_vsearch(
     mode: &OutputMode,
     args: &SearchQueryArgs,
 ) -> Result<()> {
-    let (engine, resolved) = open_engine(vault_flag)?;
+    let (mut engine, resolved) = open_engine(vault_flag)?;
+    apply_min_candidates_override(&mut engine, args.min_candidates);
     let vault_info = crate::vault_ctx::info_from(&resolved);
     let hits = apply_min_score(
         engine.vector_search(&args.text, args.top_k)?,
@@ -357,7 +359,12 @@ fn run_query_via_daemon(
 ) -> Result<()> {
     let vault_info = crate::vault_ctx::info_from(resolved);
     let resp = handle
-        .search(&args.text, daemon_mode)
+        .search(
+            &args.text,
+            daemon_mode,
+            Some(args.top_k),
+            args.min_candidates,
+        )
         .map_err(|e| map_daemon_error(e, "route search through warm daemon"))?;
 
     let mut hits = daemon_hits(&resp);
@@ -498,6 +505,22 @@ fn apply_min_score(mut hits: Vec<Hit>, min_score: Option<f64>) -> Vec<Hit> {
         hits.retain(|h| h.score >= min);
     }
     hits
+}
+
+/// Apply the optional per-query `--min-candidates` override on top of the
+/// engine's config-derived `RerankSettings` (already installed by
+/// `open_engine`). A no-op when the flag is absent — the vault's configured
+/// `search.reranker.min_candidates` stands. `min_candidates` is a FLOOR
+/// (`onebrain_search::engine::Engine::apply_rerank` reranks
+/// `max(min_candidates, top_k)`), so overriding it never shrinks the
+/// reranked window below `--top-k`.
+fn apply_min_candidates_override(
+    engine: &mut onebrain_search::engine::Engine,
+    min_candidates: Option<usize>,
+) {
+    if let Some(min_candidates) = min_candidates {
+        engine.set_rerank_min_candidates(min_candidates);
+    }
 }
 
 fn emit_hits(
@@ -766,7 +789,7 @@ mod tests {
     #[test]
     fn rerank_unreranked_hint_none_when_any_hit_has_rerank_score() {
         // Mixed reranked-head + unreranked-tail (fused tail beyond
-        // `candidates`) must NOT trigger the unreranked hint — only a set
+        // `min_candidates`) must NOT trigger the unreranked hint — only a set
         // with NO rerank score anywhere counts as "the reranker was skipped".
         let mut reranked = engine_hit("a.md", 0.9);
         reranked.rerank_score = Some(0.8);

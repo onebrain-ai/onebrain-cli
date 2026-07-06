@@ -277,8 +277,8 @@ pub struct QueryHit {
     /// Calibrated 0-1 Tier-2 cross-encoder relevance, mirroring
     /// `onebrain_search::engine::Hit::rerank_score`. `None` (omitted, matching
     /// `context`'s optional-field style) for lex-only sub-queries and for any
-    /// hit the rerank stage skipped (disabled, model not downloaded, load
-    /// failure, or outside the fused `candidates` window).
+    /// hit the rerank stage skipped (disabled, model not downloaded, or a
+    /// rerank failure).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rerank_score: Option<f32>,
 }
@@ -668,7 +668,7 @@ impl McpServer {
                         let hits = degrade_vec_error(
                             has_lex && !matches!(sub.r#type, SubQueryType::Lex),
                             handle
-                                .search(&sub.query, mode)
+                                .search(&sub.query, mode, None, None)
                                 .and_then(|body| parse_daemon_search_hits(&body)),
                         )?;
                         ranked.push((weight, hits));

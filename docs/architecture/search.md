@@ -106,8 +106,9 @@ fails, and never returns fewer results, because reranking didn't work. See
 | `search.exclude` | Vault-relative index-exclusion patterns (path prefixes or bare dir names) | `["attachments"]` |
 | `search.reranker.enabled` | Master switch for the Tier-2 cross-encoder rerank stage | `true` (default-on) |
 | `search.reranker.model` | Reranker registry name (see [`rerank::reranker_registry`](../reference/onebrain-search.md)) | `onebrain-reranker-v1` |
-| `search.reranker.candidates` | How many fused/retrieved candidates are cross-encoded per query | `30` **(provisional — calibrated default lands with v3.4.7 final)** |
-| `search.reranker.min_score` | Gate: reranked hits below this calibrated score are dropped (never-empty floor still applies) | `None` → engine's `DEFAULT_RERANK_MIN_SCORE = 0.30` **(provisional — calibrated default lands with v3.4.7 final)** |
+| `search.reranker.min_candidates` | Minimum fused/retrieved candidate pool cross-encoded per query — a FLOOR, not a ceiling. The engine actually reranks `max(min_candidates, top_k)`, auto-raised so every returned result is always reranked; this value only matters when it exceeds `top_k` (a wider pool than the return size improves quality). Overridable per-query via the CLI's `--min-candidates` / the webui API's `min_candidates` param. | `10` (calibrated) |
+| `search.reranker.min_score` | Gate: reranked hits below this calibrated score are dropped (never-empty floor still applies) | `None` → engine's `DEFAULT_RERANK_MIN_SCORE = 0.30` |
+| `search.default_top_k` | Vault-level default result count (`top_k`) for a surface that doesn't specify one explicitly (e.g. the webui API's `top_k` param when omitted). Always overridable per-query (CLI `--top-k` / API param). | `10` |
 | `qmd_collection` (legacy, top-level) | v3.3-era collection key. Still read as fallback by `load_vault_config`; `onebrain doctor --fix` migrates it to `search.collection` and removes it ([ADR 0016](../decisions/0016-qmd-collection-config-migration.md)). | — |
 
 ```mermaid
@@ -383,22 +384,25 @@ flowchart LR
 
 Flow: open engine → embed the query (`embed_query`, model's query prefix) → vector store scan →
 keep the top cluster (`keep_top_cluster`, within 0.02 of the best score), fetched at
-`max(top_k, candidates)` so the rerank stage has a full block to work with → **Tier-2 rerank stage**
-(`apply_rerank`, [ADR 0025](../decisions/0025-tier2-cross-encoder-reranker.md)): cross-encode the
-head of the candidate block against the query text, sort by calibrated score, gate at
-`min_score` (never-empty floor keeps the top 3 on total rejection), append the unreranked tail →
-resolve chunk ids to `Hit`s (doc path, heading path, 200-char snippet, `rerank_score`) from
-`chunk_meta`. Skip-not-fail: no reranker configured/downloaded, a lex-only build, or a runtime
-rerank error all fall back to the plain vector order with `rerank_score: None` on every hit — the
-CLI then surfaces an explicit "unreranked" hint rather than silently looking confident. A non-empty
-but low-confidence *unreranked* result additionally attaches the pre-reranker cosine hint
-(`vec_confidence_hint`); an empty result attaches an `index_hint` ("index is empty…" / "index is
-behind — N doc(s) not yet indexed") from a best-effort status probe. In a **lex-only build** this
-verb errors with `SEMANTIC_UNAVAILABLE` (no lex analogue to degrade to).
+`max(top_k, min_candidates)` so the rerank stage has a full pool to work with → **Tier-2 rerank
+stage** (`apply_rerank`, [ADR 0025](../decisions/0025-tier2-cross-encoder-reranker.md)):
+cross-encode the reranked pool — `max(min_candidates, top_k)` entries, a FLOOR of
+`min_candidates` auto-raised to cover `top_k` so every returned result is always reranked —
+against the query text, sort by calibrated score, gate at `min_score` (never-empty floor keeps
+the top 3 on total rejection), append the unreranked fused tail (dropped by the final truncation
+to `top_k` — it never appears in the returned set) → resolve chunk ids to `Hit`s (doc path,
+heading path, 200-char snippet, `rerank_score`) from `chunk_meta`. Skip-not-fail: no reranker
+configured/downloaded, a lex-only build, or a runtime rerank error all fall back to the plain
+vector order with `rerank_score: None` on every hit — the CLI then surfaces an explicit
+"unreranked" hint rather than silently looking confident. A non-empty but low-confidence
+*unreranked* result additionally attaches the pre-reranker cosine hint (`vec_confidence_hint`);
+an empty result attaches an `index_hint` ("index is empty…" / "index is behind — N doc(s) not
+yet indexed") from a best-effort status probe. In a **lex-only build** this verb errors with
+`SEMANTIC_UNAVAILABLE` (no lex analogue to degrade to).
 
 ```mermaid
 flowchart LR
-    Q["query text"] --> E["embed_query<br/>(model, query prefix)"] --> V["VectorStore top-k<br/>keep top cluster<br/>fetch max(top_k, candidates)"] --> RR["Tier-2 rerank stage<br/>cross-encode head → sort → gate<br/>(skip-not-fail)"] --> M["resolve via engine.redb<br/>chunk_meta"] --> H["Hits (path · heading · snippet · rerank_score)"]
+    Q["query text"] --> E["embed_query<br/>(model, query prefix)"] --> V["VectorStore top-k<br/>keep top cluster<br/>fetch max(top_k, min_candidates)"] --> RR["Tier-2 rerank stage<br/>cross-encode max(min_candidates,top_k) → sort → gate<br/>(skip-not-fail)"] --> M["resolve via engine.redb<br/>chunk_meta"] --> H["Hits (path · heading · snippet · rerank_score)"]
 ```
 
 ### `onebrain search query` — hybrid (RRF)
@@ -416,23 +420,25 @@ flowchart LR
 
 Flow: both legs run inside `Engine::query` — lex top-50 and vector top-50 (the vector leg trimmed as noted in the table above) — then
 `rrf_fuse` combines them by **rank only** (each list contributes `1/(60 + rank)`; scores summed,
-ties broken by chunk id for determinism). The fuse width is `max(--top-k, search.reranker.candidates)`
+ties broken by chunk id for determinism). The fuse width is `max(--top-k, search.reranker.min_candidates)`
 — wider than the caller's requested `top_k` — so the **Tier-2 rerank stage** (`apply_rerank`,
-[ADR 0025](../decisions/0025-tier2-cross-encoder-reranker.md)) always sees a full candidate block:
-cross-encode the head against the query text, sort by calibrated score, gate at `min_score`
-(never-empty floor), append the unreranked tail, truncate to `--top-k`, resolve via `chunk_meta`.
-`--min-score` filters on the fused RRF score — a **separate** knob from the rerank gate
-(`search.reranker.min_score`), which operates on the cross-encoder's calibrated score instead. In a
-**lex-only build**, hybrid degrades to `run_lex` with a one-line stderr notice (the rerank stage
-never runs — no embedder, no fused vec leg to rerank).
+[ADR 0025](../decisions/0025-tier2-cross-encoder-reranker.md)) always sees a full reranked pool:
+cross-encode `max(min_candidates, top_k)` entries (`min_candidates` is a FLOOR, auto-raised to
+cover `top_k` — every returned result is always reranked) against the query text, sort by
+calibrated score, gate at `min_score` (never-empty floor), append the unreranked fused tail
+(dropped by the truncation below — it never appears in the returned set), truncate to `--top-k`,
+resolve via `chunk_meta`. `--min-score` filters on the fused RRF score — a **separate** knob from
+the rerank gate (`search.reranker.min_score`), which operates on the cross-encoder's calibrated
+score instead. In a **lex-only build**, hybrid degrades to `run_lex` with a one-line stderr notice
+(the rerank stage never runs — no embedder, no fused vec leg to rerank).
 
 ```mermaid
 flowchart LR
     Q["query text"] --> LX["lex top-50 (tantivy/)"]
     Q --> EMB["embed_query"] --> VC["vector top-50 → keep_top_cluster"]
-    LX --> F["rrf_fuse k=60, width=max(top_k,candidates)<br/>rank-only, deterministic ties"]
+    LX --> F["rrf_fuse k=60, width=max(top_k,min_candidates)<br/>rank-only, deterministic ties"]
     VC --> F
-    F --> RR["Tier-2 rerank stage<br/>cross-encode head → sort → gate<br/>(skip-not-fail)"]
+    F --> RR["Tier-2 rerank stage<br/>cross-encode max(min_candidates,top_k) → sort → gate<br/>(skip-not-fail)"]
     RR --> RES["resolve via chunk_meta"] --> H["top-k Hits (+ rerank_score)"]
 ```
 

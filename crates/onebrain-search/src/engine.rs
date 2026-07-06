@@ -410,8 +410,10 @@ pub struct Hit {
     pub score: f64,
     pub snippet: String,
     /// Calibrated 0–1 cross-encoder relevance, present when the Tier-2
-    /// rerank stage scored this hit. `None` = unreranked (stage skipped,
-    /// failed, or this hit sits in the fused tail beyond `candidates`).
+    /// rerank stage scored this hit. `None` = unreranked (stage skipped or
+    /// failed for the whole query — the reranked pool is
+    /// `max(min_candidates, top_k)`, so every returned hit is normally
+    /// reranked; nothing beyond that pool survives truncation to `top_k`).
     pub rerank_score: Option<f32>,
 }
 
@@ -468,8 +470,12 @@ pub struct RerankSettings {
     pub enabled: bool,
     /// Reranker registry name (see [`rerank::reranker_registry`]).
     pub model: String,
-    /// How many fused candidates are fed to the cross-encoder.
-    pub candidates: usize,
+    /// Minimum fused-candidate pool fed to the cross-encoder — a FLOOR, not a
+    /// ceiling: [`Engine::apply_rerank`] actually reranks
+    /// `max(min_candidates, top_k)`, auto-raised so every result the caller
+    /// returns is always reranked. `min_candidates` only matters when it
+    /// exceeds `top_k` (a wider pool than the return size improves quality).
+    pub min_candidates: usize,
     /// Gate: reranked hits scoring below this are dropped, subject to the
     /// never-empty floor ([`RERANK_NO_MATCH_KEEP`]).
     pub min_score: f32,
@@ -494,7 +500,7 @@ impl Default for RerankSettings {
             // bge-reranker-v2-m3 costs ~70 ms/candidate on CPU — 30 made a warm
             // search ~2 s (worse on a Pi). 10 keeps the quality and cuts rerank
             // compute ~3×. Keep in sync with `RerankerConfig`'s config default.
-            candidates: 10,
+            min_candidates: 10,
             min_score: DEFAULT_RERANK_MIN_SCORE,
         }
     }
@@ -939,6 +945,19 @@ impl Engine {
         self.rerank_error_logged.set(false);
     }
 
+    /// Override just the `min_candidates` knob of the currently installed
+    /// [`RerankSettings`] — e.g. a per-query `--min-candidates` CLI flag or
+    /// API param overriding the vault's configured
+    /// `search.reranker.min_candidates`. Unlike [`Engine::set_rerank_settings`],
+    /// this does NOT reset the lazy reranker source: `min_candidates` only
+    /// affects how wide a pool [`Engine::apply_rerank`] reranks, not which
+    /// model loads, so there is nothing to re-resolve. Call AFTER the
+    /// settings this overrides are installed (i.e. after `open_engine`'s
+    /// `set_rerank_settings`).
+    pub fn set_rerank_min_candidates(&mut self, min_candidates: usize) {
+        self.rerank_settings.min_candidates = min_candidates;
+    }
+
     /// Whether the Tier-2 reranker is turned on per the currently installed
     /// [`RerankSettings`] (`search.reranker.enabled` in `onebrain.yml`). Lets
     /// callers distinguish an explicit `enabled: false` (no rerank attempted,
@@ -1169,12 +1188,16 @@ impl Engine {
     }
 
     /// Tier-2 rerank stage over an already-fused ranking (ADR 0025):
-    /// cross-encode the first `candidates` entries against `query`, sort that
-    /// block by calibrated score, gate at `min_score` (never-empty: total
-    /// rejection keeps the top [`RERANK_NO_MATCH_KEEP`]), append the
-    /// un-reranked tail, trim to `top_k`, resolve. Skip-not-fail: no
-    /// reranker → fused order with `rerank_score: None`; a rerank error
-    /// falls back the same way — queries never fail because reranking did.
+    /// cross-encode the first `max(min_candidates, top_k)` entries against
+    /// `query` — the reranked pool is a FLOOR of `min_candidates` that
+    /// expands to cover `top_k`, never a ceiling, so every result the caller
+    /// actually returns is always reranked — sort that block by calibrated
+    /// score, gate at `min_score` (never-empty: total rejection keeps the top
+    /// [`RERANK_NO_MATCH_KEEP`]), append the un-reranked fused tail (which
+    /// trim-to-`top_k` then drops, since the block already covers the full
+    /// returned set), trim to `top_k`, resolve. Skip-not-fail: no reranker →
+    /// fused order with `rerank_score: None`; a rerank error falls back the
+    /// same way — queries never fail because reranking did.
     fn apply_rerank(
         &self,
         query: &str,
@@ -1188,7 +1211,15 @@ impl Engine {
             return self.resolve_hits(unreranked);
         };
 
-        let block_len = fused.len().min(self.rerank_settings.candidates);
+        // `min_candidates` is a FLOOR, not a ceiling: every result the caller
+        // actually returns (`top_k`) must be reranked, so the reranked pool is
+        // max(min_candidates, top_k) — auto-raised whenever top_k exceeds the
+        // configured floor. Only the fused tail beyond that
+        // (already-truncated-away by `top_k` at the end of this function)
+        // stays unreranked.
+        let block_len = fused
+            .len()
+            .min(self.rerank_settings.min_candidates.max(top_k));
         let tail = fused.split_off(block_len);
         let head = fused;
 
@@ -1273,9 +1304,9 @@ impl Engine {
         let vec_hits = keep_top_cluster(self.vec.search(&query_vec, VEC_TOP_K), VEC_CLUSTER_WINDOW);
         let lex_hits = self.lex.search(text, LEX_TOP_K)?;
 
-        // Fuse wide enough for the rerank stage to see its full candidate
-        // block even when the caller asks for a small top_k.
-        let fuse_k = top_k.max(self.rerank_settings.candidates);
+        // Fuse wide enough for the rerank stage to see its full reranked
+        // pool even when the caller asks for a small top_k.
+        let fuse_k = top_k.max(self.rerank_settings.min_candidates);
         let fused = rrf_fuse(&lex_hits, &vec_hits, RRF_K, fuse_k);
         self.apply_rerank(text, fused, top_k)
     }
@@ -1286,7 +1317,7 @@ impl Engine {
     /// `search vsearch` verb.
     pub fn vector_search(&self, text: &str, top_k: usize) -> Result<Vec<Hit>> {
         let query_vec = self.embedder()?.embed_query(text)?;
-        let fetch_k = top_k.max(self.rerank_settings.candidates);
+        let fetch_k = top_k.max(self.rerank_settings.min_candidates);
         let vec_hits = keep_top_cluster(self.vec.search(&query_vec, fetch_k), VEC_CLUSTER_WINDOW);
         let ranked: Vec<(String, f64)> = vec_hits
             .into_iter()
@@ -3665,30 +3696,61 @@ mod tests {
     }
 
     #[test]
-    fn rerank_tail_beyond_candidates_is_appended_unreranked() {
+    fn rerank_tail_beyond_top_k_is_dropped_by_truncation() {
+        // `min_candidates` is a FLOOR, auto-raised to `top_k`
+        // (`max(min_candidates, top_k)`): with min_candidates=2 but top_k=4
+        // on a 6-doc corpus, the reranked pool covers all 4 returned hits,
+        // and the fused tail beyond top_k (docs 5-6) is dropped by
+        // truncation — it never appears unreranked within the returned set.
         let dir = tempfile::tempdir().unwrap();
         let mut e = fake_engine(dir.path());
-        for i in 0..4 {
+        for i in 0..6 {
             e.index_doc(&format!("t{i}.md"), &format!("zeta unique{i}"))
                 .unwrap();
         }
         e.set_rerank_settings(RerankSettings {
-            candidates: 2,
+            min_candidates: 2,
             min_score: 0.0,
             ..Default::default()
         });
         e.set_reranker_for_tests(Box::new(FakeReranker));
-        let hits = e.query("zeta", 10).unwrap();
-        assert_eq!(hits.len(), 4);
-        assert!(
-            hits[0].rerank_score.is_some() && hits[1].rerank_score.is_some(),
-            "first `candidates` hits form the reranked block"
+        let hits = e.query("zeta", 4).unwrap();
+        assert_eq!(
+            hits.len(),
+            4,
+            "truncated to top_k, not left at min_candidates"
         );
         assert!(
-            hits[2].rerank_score.is_none() && hits[3].rerank_score.is_none(),
-            "fused tail beyond `candidates` stays unreranked, appended after"
+            hits.iter().all(|h| h.rerank_score.is_some()),
+            "every returned hit is reranked — pool size is max(min_candidates, top_k), not min_candidates alone"
         );
-        assert!(hits[0].rerank_score.unwrap() >= hits[1].rerank_score.unwrap());
+    }
+
+    #[test]
+    fn rerank_pool_covers_full_top_k_when_top_k_exceeds_min_candidates() {
+        // Correctness fix: the rerank window must be
+        // max(min_candidates, top_k), never just `min_candidates`. With
+        // min_candidates=2 and top_k=5 on a 6-doc corpus, all 5 returned
+        // results must carry rerank_score: Some — none may slip through
+        // unreranked within the returned top_k.
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        for i in 0..6 {
+            e.index_doc(&format!("d{i}.md"), &format!("zeta unique{i}"))
+                .unwrap();
+        }
+        e.set_rerank_settings(RerankSettings {
+            min_candidates: 2,
+            min_score: 0.0,
+            ..Default::default()
+        });
+        e.set_reranker_for_tests(Box::new(FakeReranker));
+        let hits = e.query("zeta", 5).unwrap();
+        assert_eq!(hits.len(), 5);
+        assert!(
+            hits.iter().all(|h| h.rerank_score.is_some()),
+            "no unreranked result may appear within the returned top_k"
+        );
     }
 
     #[test]
@@ -3709,7 +3771,7 @@ mod tests {
         let hits = e.query("note", 10).unwrap();
         // Partial gate: only the two marker docs clear 0.5 (0.9 vs 0.4).
         // Gate-dropped candidates are REMOVED, never backfilled — the result
-        // shrinks below top_k. (The fused tail beyond `candidates` is a
+        // shrinks below top_k. (The fused tail beyond `min_candidates` is a
         // separate mechanism, covered by the test above.) Track B confidence
         // bands depend on this exact semantic.
         assert_eq!(hits.len(), 2, "gate-dropped candidates must not reappear");

@@ -28,13 +28,15 @@ now run their fused/retrieved candidates through a cross-encoder rerank stage
 before truncating to `top_k`:
 
 1. **Wide fuse** — the candidate list is fetched at
-   `max(top_k, search.reranker.candidates)`, not just `top_k`, so the rerank
-   stage always has a full candidate block to work with even when the caller
+   `max(top_k, search.reranker.min_candidates)`, not just `top_k`, so the
+   rerank stage always has a full pool to work with even when the caller
    asks for a small number of results.
-2. **Cross-encode candidates** — the first `candidates` fused entries (the
-   "head") are cross-encoded against the query text in one batch call; the
-   remainder (the "tail", beyond the candidate window) is left unreranked
-   and simply appended after the reranked head.
+2. **Cross-encode the reranked pool** — `max(min_candidates, top_k)` fused
+   entries (the "head") are cross-encoded against the query text in one
+   batch call; the remainder (the "tail", beyond that pool) is left
+   unreranked and simply appended after the reranked head. See the Track E
+   addendum below: `min_candidates` is a FLOOR, not a fixed window size — it
+   auto-raises to cover `top_k` so every returned result is always reranked.
 3. **Sort** — the reranked head is sorted by the cross-encoder's calibrated
    score, descending, with a chunk-id tiebreak for determinism (matching
    `rrf_fuse`'s and `vector::search`'s own tie-break convention).
@@ -145,8 +147,8 @@ their first `search query`.
   optional download — mitigated by quantization (int8, ~570 MB vs fp32's
   ~2.27 GB) and by deferring the download to `reindex` time rather than a
   surprise query-time stall.
-- **`search.reranker.min_score`, `.candidates`, and the CLI confidence bands
-  are provisional** at this ADR's landing — see the Calibration section
+- **`search.reranker.min_score`, `.min_candidates`, and the CLI confidence
+  bands are provisional** at this ADR's landing — see the Calibration section
   below.
 - The MCP `query` tool's qmd-compat `rerank: Option<bool>` parameter remains
   deserialize-only and inert: the native engine reranks (or doesn't)
@@ -179,10 +181,11 @@ measure-then-confirm, not measure-then-rubber-stamp):
   0.066 → real-match min ~0.73) with margin both sides.
 - Confidence bands `0.30 / 0.60` — real matches cluster 0.73–0.99 (confident);
   no-answer all `< 0.10`.
-- **`candidates` lowered 30 → 10** — every golden-set match already lands in
-  the top ~5 after rerank, so 30 buys no quality; bge-reranker-v2-m3 costs
+- **`min_candidates` lowered 30 → 10** — every golden-set match already lands
+  in the top ~5 after rerank, so 30 buys no quality; bge-reranker-v2-m3 costs
   ~70 ms/candidate on CPU, so 10 cuts rerank compute ~3×. User-adjustable via
-  `search.reranker.candidates`.
+  `search.reranker.min_candidates` (and per-query via `--min-candidates` /
+  the API's `min_candidates` param — see the Track E addendum below).
 
 **Latency**: warm rerank for 10 candidates is ~0.5–0.7 s (est.); the
 multi-second figures seen during calibration were a *contended* daemon
@@ -194,3 +197,32 @@ pay off (tracked separately for v3.5).
 Full report + the ship-blocker caught during this run (the model never
 downloaded — a skip/fetch deadlock between the reindex and query paths) are
 in the project vault.
+
+## Addendum (v3.4.7 Track E): `min_candidates` is a floor, not a fixed window
+
+The original wording above ("the first `candidates` fused entries... the
+remainder is left unreranked") described a FIXED-SIZE reranked window: exactly
+`candidates` entries, regardless of `top_k`. That was a correctness bug once a
+caller's `top_k` exceeded `candidates` — with the CLI's `top_k` default (10)
+matching the config default (10) this never showed up locally, but the web
+service hardcoded `top_k = 20` against the same `candidates = 10` default, so
+results 11–20 silently bypassed the reranker entirely on every webui search.
+
+**Fix**: the reranked pool is `max(min_candidates, top_k)`, not
+`min_candidates` alone — auto-raised whenever the caller asks for more results
+than the configured pool covers. `min_candidates` is renamed from `candidates`
+to make this floor semantic explicit in the name itself: it is a *minimum*
+pool size, not an exact window, and it only matters when it exceeds `top_k` (a
+wider pool than the return size can still improve quality by giving the
+cross-encoder more to choose from before truncation). The unreranked fused
+tail beyond that pool is still appended before the final truncate-to-`top_k`,
+but since the pool now always covers `top_k`, that tail is always beyond the
+returned set — it is dropped by truncation, never delivered.
+
+Every surface that can request `top_k` can now also override
+`min_candidates` for that one query: `search query --top-k --min-candidates`,
+`search vsearch --top-k --min-candidates`, and the webui's
+`/api/vault/search?top_k=&min_candidates=`. A new `search.default_top_k`
+config key (default 10) gives the web service a vault-level default instead
+of its old hardcoded `20`, so an unspecified request now reranks its entire
+result set by default too.

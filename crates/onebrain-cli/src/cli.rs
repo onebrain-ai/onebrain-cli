@@ -1056,6 +1056,14 @@ pub struct SearchQueryArgs {
     /// raw BM25 score, `query` is an RRF-fused rank score.
     #[arg(long = "min-score")]
     pub min_score: Option<f64>,
+    /// Override `search.reranker.min_candidates` for this query: the minimum
+    /// pool of top fused results fed to the Tier-2 reranker. Acts as a FLOOR
+    /// — the reranked pool is actually `max(min_candidates, top_k)`, so every
+    /// returned hit is always reranked regardless of this value. Omit to use
+    /// the vault's configured value. Applies to `query` and `vsearch`; has no
+    /// effect on the pure-lex `search` verb (never reranked).
+    #[arg(long = "min-candidates")]
+    pub min_candidates: Option<usize>,
 }
 
 #[derive(Args, Debug)]

@@ -143,7 +143,7 @@ pub(crate) fn rerank_settings_from_config(cfg: &RerankerConfig) -> RerankSetting
     RerankSettings {
         enabled: cfg.enabled,
         model: cfg.model.clone(),
-        candidates: cfg.candidates,
+        min_candidates: cfg.min_candidates,
         min_score: cfg.min_score.unwrap_or(DEFAULT_RERANK_MIN_SCORE),
     }
 }
@@ -428,13 +428,13 @@ mod tests {
         let cfg = onebrain_core::RerankerConfig {
             enabled: false,
             model: "onebrain-reranker-v1".to_string(),
-            candidates: 42,
+            min_candidates: 42,
             min_score: Some(0.55),
         };
         let mapped = rerank_settings_from_config(&cfg);
         assert!(!mapped.enabled);
         assert_eq!(mapped.model, "onebrain-reranker-v1");
-        assert_eq!(mapped.candidates, 42);
+        assert_eq!(mapped.min_candidates, 42);
         assert_eq!(mapped.min_score, 0.55);
     }
 
