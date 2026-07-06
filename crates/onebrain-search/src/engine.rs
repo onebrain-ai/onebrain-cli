@@ -958,6 +958,17 @@ impl Engine {
         self.rerank_settings.min_candidates = min_candidates;
     }
 
+    /// Per-query override of the vault's configured `search.reranker.min_score`
+    /// gate. Used to unify the CLI `--min-score` flag with the rerank gate:
+    /// when reranking is active, `--min-score` filters by the calibrated 0–1
+    /// `rerank_score` (this gate) instead of the raw retrieval score. Like
+    /// [`Engine::set_rerank_min_candidates`], it does NOT reset the lazy
+    /// reranker source — it only changes the gate threshold. Call AFTER
+    /// `set_rerank_settings`.
+    pub fn set_rerank_min_score(&mut self, min_score: f32) {
+        self.rerank_settings.min_score = min_score;
+    }
+
     /// Whether the Tier-2 reranker is turned on per the currently installed
     /// [`RerankSettings`] (`search.reranker.enabled` in `onebrain.yml`). Lets
     /// callers distinguish an explicit `enabled: false` (no rerank attempted,
@@ -3777,6 +3788,41 @@ mod tests {
         assert_eq!(hits.len(), 2, "gate-dropped candidates must not reappear");
         assert!(hits.iter().all(|h| h.doc_path.starts_with("m")));
         assert!(hits.iter().all(|h| h.rerank_score == Some(0.9)));
+    }
+
+    #[test]
+    fn set_rerank_min_score_overrides_the_gate_per_query() {
+        // Backs the CLI `--min-score` unification: raising the gate via
+        // `set_rerank_min_score` filters the calibrated rerank_score, and the
+        // never-empty floor still applies when everything is dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        e.index_doc("m1.md", "note zulumark alpha").unwrap();
+        e.index_doc("m2.md", "note zulumark beta").unwrap();
+        for i in 0..3 {
+            e.index_doc(&format!("u{i}.md"), &format!("note gamma{i}"))
+                .unwrap();
+        }
+        e.set_reranker_for_tests(Box::new(MarkerReranker { marker: "zulumark" }));
+
+        // Default gate (0.30) keeps the two marker docs (0.9); the 0.4 tail is
+        // below the MarkerReranker's non-marker score only above 0.4 — verify
+        // the override tightens past 0.9 → nothing clears → never-empty floor.
+        e.set_rerank_min_score(0.95);
+        let hits = e.query("note", 10).unwrap();
+        assert_eq!(
+            hits.len(),
+            RERANK_NO_MATCH_KEEP,
+            "gate at 0.95 drops all (max score 0.9) → never-empty floor keeps top-3"
+        );
+
+        // Loosen the gate below every score → all reranked candidates survive.
+        e.set_rerank_min_score(0.0);
+        let hits = e.query("note", 10).unwrap();
+        assert!(
+            hits.len() >= 2 && hits.iter().all(|h| h.rerank_score.is_some()),
+            "gate at 0.0 keeps every reranked hit"
+        );
     }
 
     #[test]

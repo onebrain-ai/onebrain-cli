@@ -115,9 +115,11 @@ pub fn run_query(
     }
 
     let (mut engine, resolved) = open_engine(vault_flag)?;
-    apply_min_candidates_override(&mut engine, args.min_candidates);
+    // `--min-score` is pushed into the rerank gate when reranking is active;
+    // `raw_min` is `Some` only when it should instead filter the raw score.
+    let raw_min = apply_rerank_overrides(&mut engine, args);
     let vault_info = crate::vault_ctx::info_from(&resolved);
-    let hits = apply_min_score(engine.query(&args.text, args.top_k)?, args.min_score);
+    let hits = apply_min_score(engine.query(&args.text, args.top_k)?, raw_min);
     let hint = if hits.is_empty() {
         index_hint_for(&engine, &resolved)
     } else {
@@ -250,12 +252,9 @@ pub fn run_vsearch(
     args: &SearchQueryArgs,
 ) -> Result<()> {
     let (mut engine, resolved) = open_engine(vault_flag)?;
-    apply_min_candidates_override(&mut engine, args.min_candidates);
+    let raw_min = apply_rerank_overrides(&mut engine, args);
     let vault_info = crate::vault_ctx::info_from(&resolved);
-    let hits = apply_min_score(
-        engine.vector_search(&args.text, args.top_k)?,
-        args.min_score,
-    );
+    let hits = apply_min_score(engine.vector_search(&args.text, args.top_k)?, raw_min);
     // Never-silent: an empty result explains itself (empty/stale index).
     // A non-empty, UNRERANKED result still carries a confidence signal — the
     // pre-reranker cosine heuristic — as a fallback inside
@@ -368,10 +367,6 @@ fn run_query_via_daemon(
         .map_err(|e| map_daemon_error(e, "route search through warm daemon"))?;
 
     let mut hits = daemon_hits(&resp);
-    if let Some(min) = args.min_score {
-        hits.retain(|h| h.score >= min);
-    }
-    hits.truncate(args.top_k);
 
     // Same rerank-enabled knob the direct path reads via `open_engine` —
     // config is read-only here (no engine/embedder is opened on this path),
@@ -379,6 +374,23 @@ fn run_query_via_daemon(
     let rerank_enabled = onebrain_core::load_vault_config(&resolved.root)
         .map(|cfg| rerank_settings_from_config(&cfg.search.reranker).enabled)
         .unwrap_or(true);
+
+    // `--min-score` unification (mirrors the direct path): when the daemon
+    // reranked (hits carry `rerank_score`), filter by that calibrated 0–1
+    // score; otherwise fall back to the raw fused score. NOTE: the daemon
+    // already applied its configured `min_score` gate before returning, so
+    // on this path `--min-score` can only TIGHTEN past that config floor, not
+    // loosen below it — a per-query API override is a v3.4.8 follow-up.
+    if let Some(min) = args.min_score {
+        let reranked = rerank_enabled && hits.iter().any(|h| h.rerank_score.is_some());
+        if reranked {
+            let minf = min as f32;
+            hits.retain(|h| h.rerank_score.map(|rs| rs >= minf).unwrap_or(false));
+        } else {
+            hits.retain(|h| h.score >= min);
+        }
+    }
+    hits.truncate(args.top_k);
 
     let hint = if hits.is_empty() {
         daemon_index_hint(handle)
@@ -507,19 +519,37 @@ fn apply_min_score(mut hits: Vec<Hit>, min_score: Option<f64>) -> Vec<Hit> {
     hits
 }
 
-/// Apply the optional per-query `--min-candidates` override on top of the
-/// engine's config-derived `RerankSettings` (already installed by
-/// `open_engine`). A no-op when the flag is absent — the vault's configured
-/// `search.reranker.min_candidates` stands. `min_candidates` is a FLOOR
-/// (`onebrain_search::engine::Engine::apply_rerank` reranks
-/// `max(min_candidates, top_k)`), so overriding it never shrinks the
-/// reranked window below `--top-k`.
-fn apply_min_candidates_override(
+/// Thread the per-query CLI overrides (`--min-candidates`, `--min-score`) into
+/// the engine's config-derived `RerankSettings` (already installed by
+/// `open_engine`) and decide how `--min-score` is interpreted.
+///
+/// `--min-candidates` is a FLOOR (`Engine::apply_rerank` reranks
+/// `max(min_candidates, top_k)`), so overriding it never shrinks the reranked
+/// window below `--top-k`.
+///
+/// `--min-score` is UNIFIED with the rerank gate: when reranking is **active**
+/// (enabled + model available), the flag overrides the rerank `min_score` gate
+/// so it filters the calibrated 0–1 `rerank_score` — the confidence number a
+/// user can actually reason about — and this returns `None` so the caller does
+/// NOT also filter the raw retrieval score. When reranking is **inactive**
+/// (disabled / model not downloaded / lex-only), the flag keeps its legacy
+/// meaning and this returns `Some(min)` for the caller to apply to the raw
+/// retrieval score (cosine for `vsearch`, RRF for `query`). In a lex-only
+/// build `rerank_active()` is always false, so `--min-score` keeps its legacy
+/// raw-score meaning there.
+fn apply_rerank_overrides(
     engine: &mut onebrain_search::engine::Engine,
-    min_candidates: Option<usize>,
-) {
-    if let Some(min_candidates) = min_candidates {
+    args: &SearchQueryArgs,
+) -> Option<f64> {
+    if let Some(min_candidates) = args.min_candidates {
         engine.set_rerank_min_candidates(min_candidates);
+    }
+    match args.min_score {
+        Some(min) if engine.rerank_active() => {
+            engine.set_rerank_min_score(min as f32);
+            None
+        }
+        other => other,
     }
 }
 

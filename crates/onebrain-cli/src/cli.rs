@@ -1051,9 +1051,13 @@ pub struct SearchQueryArgs {
     /// Maximum hits to return.
     #[arg(long = "top-k", default_value_t = 10)]
     pub top_k: usize,
-    /// Drop hits scoring below this value. Scales differ per verb: `vsearch`
-    /// is cosine similarity (≈0.86+ is a confident e5 match), `search` is a
-    /// raw BM25 score, `query` is an RRF-fused rank score.
+    /// Drop hits scoring below this value. When the Tier-2 reranker is active
+    /// (`query`/`vsearch` with the model available), this filters the
+    /// calibrated 0–1 `rerank_score` — i.e. a confidence threshold (0.30 is the
+    /// default gate; higher = stricter). When reranking is off (reranker
+    /// disabled, model not downloaded, or the pure-lex `search` verb), it
+    /// filters the raw retrieval score instead — cosine for `vsearch`, BM25 for
+    /// `search`, RRF-fused rank for `query`.
     #[arg(long = "min-score")]
     pub min_score: Option<f64>,
     /// Override `search.reranker.min_candidates` for this query: the minimum
