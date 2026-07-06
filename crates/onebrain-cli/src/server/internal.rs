@@ -117,12 +117,19 @@ pub(super) fn open_held_engine(vault_root: &Path) -> Option<SharedEngine> {
 ///
 /// Cheap presence check FIRST (a plain fs stat via [`reranker_download_status`],
 /// done here BEFORE ever touching the engine mutex) — only when the configured
-/// model is actually downloaded does the thread lock the engine at all, so a
+/// model is actually downloaded does the thread touch the engine at all, so a
 /// fresh vault with no model spawns a thread that does no lock work and exits
-/// immediately. When it IS downloaded, the mutex is then held only as long as
-/// `Engine::rerank_active()` takes to resolve the `OnceCell` (construct once,
-/// cache forever) — never for the download itself, which belongs to
-/// `reindex`, not daemon boot.
+/// immediately.
+///
+/// When the model IS downloaded, resolving the `OnceCell` LOADS the
+/// cross-encoder from disk into memory — hundreds of MB, up to seconds —
+/// and the engine mutex is held for that whole construction (it is a
+/// blocking `std::sync::Mutex`; there is no way to construct outside it).
+/// To guarantee the warm-up can only ever run in an idle window and never
+/// serializes a real request behind the load, the thread uses `try_lock`:
+/// if ANYTHING else holds the engine (a query racing daemon boot — which
+/// would resolve the cell itself anyway), the thread just gives up. The
+/// download itself never happens here — that belongs to `reindex`.
 ///
 /// Must never panic the daemon: any failure (poisoned lock, disabled
 /// reranker, load error) is swallowed — `rerank_active()` itself is
@@ -147,10 +154,19 @@ fn spawn_reranker_warm_thread(
             // No model on disk yet — nothing to warm; a reindex will fetch it.
             return;
         }
-        // Resolve the lazy reranker now (short-lived lock: just the OnceCell
-        // construction), so the first real query hits an already-warm cell.
-        let guard = engine.lock().unwrap_or_else(|p| p.into_inner());
-        let _ = guard.rerank_active();
+        // Resolve the lazy reranker now so the first real query hits an
+        // already-warm cell. try_lock: warm-up must only run in an idle
+        // window — if anything else holds the engine, back off and let it
+        // resolve the cell itself (same total cost, no added contention).
+        match engine.try_lock() {
+            Ok(guard) => {
+                let _ = guard.rerank_active();
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                let _ = p.into_inner().rerank_active();
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
     })
 }
 
