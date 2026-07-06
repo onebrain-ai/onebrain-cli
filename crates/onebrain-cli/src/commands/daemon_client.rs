@@ -543,6 +543,27 @@ impl DaemonHandle {
                 .call()
         })
     }
+
+    /// `POST /api/internal/rerank` with `{ query, paths, top_k }` — doc-level
+    /// Tier-2 rerank of a caller-supplied candidate path set (e.g. the MCP
+    /// `query` tool's fused lex+vec result paths) through the daemon's held
+    /// engine. Returns the daemon's `{ hits: [..] }` JSON, in the SAME wire
+    /// shape `search()`'s response carries (`path`, `score`, `title`,
+    /// `snippet`, `rerank_score`?), so callers reuse the same hit parser.
+    /// Retries ONCE via [`ensure_running`] on a transport failure, same as
+    /// every other call on this handle.
+    pub fn rerank(&self, query: &str, paths: &[String], top_k: usize) -> Result<serde_json::Value> {
+        let body = serde_json::json!({ "query": query, "paths": paths, "top_k": top_k });
+        let payload = serde_json::to_string(&body).context("serialize rerank body")?;
+        with_retry(self, |h| {
+            let url = format!("{}/api/internal/rerank", h.info.base_url());
+            h.agent
+                .post(&url)
+                .header("x-onebrain-token", &h.info.token)
+                .header("content-type", "application/json")
+                .send(payload.as_str())
+        })
+    }
 }
 
 /// True when a ureq error means the daemon is UNREACHABLE (transport-level) —
@@ -1539,6 +1560,98 @@ mod tests {
         // And status reflects the in-session index (never busy — routed).
         let status = handle.status().unwrap();
         assert_eq!(status["doc_count"], 1, "status sees the doc: {status}");
+
+        // Rerank the now-indexed doc THROUGH the daemon: one candidate path,
+        // one hit back, mapped to the SAME wire shape `search()` uses. No
+        // reranker model is downloaded in this fresh test cache, so
+        // `rerank_score` is omitted — proving the route + held engine + field
+        // mapping are wired end-to-end without a model download.
+        let rerank = handle
+            .rerank("indexed", &["note.md".to_string()], 5)
+            .unwrap();
+        let hits = rerank["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "rerank: {rerank}");
+        assert_eq!(hits[0]["path"], "note.md", "rerank: {rerank}");
+        assert_eq!(hits[0]["title"], "note", "rerank: {rerank}");
+        assert!(
+            hits[0].get("rerank_score").is_none(),
+            "no model downloaded -> rerank_score omitted: {rerank}"
+        );
+    }
+
+    #[cfg(not(feature = "semantic"))]
+    #[test]
+    fn rerank_503_when_no_engine_held() {
+        // Like search/reindex, rerank 503s when the daemon holds no engine —
+        // exercised at the client layer via a live server started WITHOUT
+        // hold_engine, mirroring the internal.rs route-level 503 test.
+        let vault = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: dc-rerank-no-engine\n",
+        )
+        .unwrap();
+
+        let token = "dc-rerank-no-engine-token-123";
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let port = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let vault_path = vault.path().to_path_buf();
+        let token_thread = token.to_string();
+        let stop_thread = stop.clone();
+        let port_thread = port.clone();
+        let join = std::thread::spawn(move || {
+            // hold_engine defaults to false — this daemon holds no engine.
+            let cfg =
+                crate::server::ServeConfig::localhost(Some(vault_path), 0, token_thread, None);
+            let (router, _state) = crate::server::build_router_with_state(cfg);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                port_thread.store(
+                    listener.local_addr().unwrap().port(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                let server = axum::serve(listener, router);
+                let graceful = server.with_graceful_shutdown(async move {
+                    while !stop_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                });
+                let _ = graceful.await;
+            });
+        });
+        // Wait for the port to be published, same pattern as start_live_server.
+        let bound = loop {
+            let p = port.load(std::sync::atomic::Ordering::SeqCst);
+            if p != 0 {
+                break p;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let info = DaemonInfo {
+            port: bound,
+            token: token.to_string(),
+            pid: std::process::id(),
+            version: own_version().to_string(),
+            vault: canonical_vault_id(vault.path()),
+        };
+        let handle = DaemonHandle::new(info);
+
+        let err = handle
+            .rerank("hello", &["note.md".to_string()], 5)
+            .unwrap_err();
+        assert!(
+            onebrain_search::error::is_engine_busy(&err),
+            "no-engine-held rerank must classify as EngineBusy: {err}"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = join.join();
     }
 
     #[cfg(unix)]
