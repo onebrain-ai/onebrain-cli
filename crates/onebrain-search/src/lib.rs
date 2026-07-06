@@ -62,4 +62,5 @@ pub mod engine;
 pub mod error;
 pub mod hybrid;
 pub mod lex;
+pub mod rerank;
 pub mod vector;
