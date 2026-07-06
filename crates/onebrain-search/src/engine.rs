@@ -1311,6 +1311,97 @@ impl Engine {
         self.resolve_hits(ranked)
     }
 
+    /// Public, chunk-level entry point onto the Tier-2 rerank stage: rerank
+    /// an already-fused `(chunk_id, fused_score)` ranking against `query` and
+    /// resolve to `top_k` [`Hit`]s. Thin wrapper over [`Self::apply_rerank`]
+    /// — callers (e.g. the MCP query-rerank tool) that already have a fused
+    /// candidate list get the same gate + never-empty + skip-not-fail
+    /// behavior as [`Self::query`]/[`Self::vector_search`] without
+    /// reimplementing it.
+    pub fn rerank_hits(
+        &self,
+        query: &str,
+        fused: Vec<(String, f64)>,
+        top_k: usize,
+    ) -> Result<Vec<Hit>> {
+        self.apply_rerank(query, fused, top_k)
+    }
+
+    /// Chunk ids belonging to `doc_path`, via the `DOC_CHUNKS` reverse index
+    /// (doc_path → chunk_ids) already maintained by `index_doc`/`remove_doc`.
+    /// Empty if `doc_path` is absent.
+    fn doc_chunk_ids(&self, doc_path: &str) -> Result<Vec<String>> {
+        let read_txn = self.meta.begin_read()?;
+        let doc_chunks = read_txn.open_table(DOC_CHUNKS)?;
+        match doc_chunks.get(doc_path)? {
+            Some(v) => Ok(serde_json::from_str(v.value())?),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Doc-level rerank: given a set of candidate `paths` (e.g. from a prior
+    /// path-scoped retrieval step), rerank every chunk belonging to those
+    /// paths against `query`, then collapse back down to one [`Hit`] per
+    /// path — the best-scoring chunk — and return the top `top_k` paths.
+    ///
+    /// Reuses [`Self::apply_rerank`] for the actual scoring, so it inherits
+    /// the same gate, never-empty floor, and skip-not-fail fallback: with no
+    /// reranker available this degenerates to fused (insertion) order with
+    /// `rerank_score: None` on every hit, same as [`Self::rerank_hits`].
+    ///
+    /// All candidate chunks are fed through in one rerank pass with a `top_k`
+    /// wide enough to keep every chunk alive through `apply_rerank`'s
+    /// internal truncation — the doc-level `top_k` truncation happens here,
+    /// after dedup, not inside `apply_rerank`.
+    pub fn rerank_paths(&self, query: &str, paths: Vec<String>, top_k: usize) -> Result<Vec<Hit>> {
+        let mut fused: Vec<(String, f64)> = Vec::new();
+        for path in &paths {
+            for chunk_id in self.doc_chunk_ids(path)? {
+                fused.push((chunk_id, 0.0));
+            }
+        }
+
+        // Rerank the whole candidate pool without truncation loss: every
+        // chunk of every candidate path must survive `apply_rerank`'s
+        // internal block/gate logic so dedup-by-path below sees the true
+        // best chunk per path, not one that was cut for being outside a
+        // too-narrow `top_k` window.
+        let big_k = fused.len();
+        let reranked = self.apply_rerank(query, fused, big_k)?;
+
+        // Dedup by doc_path, keeping the highest-`rerank_score` hit per path
+        // (None treated as lowest — matches apply_rerank's own tie/absent
+        // handling). `reranked` is already sorted best-first, so the first
+        // occurrence of each path is its best chunk; preserve that order.
+        let mut best_by_path: std::collections::HashMap<String, Hit> =
+            std::collections::HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+        for hit in reranked {
+            let key = hit.doc_path.clone();
+            match best_by_path.get(&key) {
+                Some(existing)
+                    if existing.rerank_score.unwrap_or(f32::MIN)
+                        >= hit.rerank_score.unwrap_or(f32::MIN) =>
+                {
+                    // Existing entry already scores at least as high; drop this one.
+                }
+                _ => {
+                    if !order.contains(&key) {
+                        order.push(key.clone());
+                    }
+                    best_by_path.insert(key, hit);
+                }
+            }
+        }
+
+        let mut deduped: Vec<Hit> = order
+            .into_iter()
+            .filter_map(|path| best_by_path.remove(&path))
+            .collect();
+        deduped.truncate(top_k);
+        Ok(deduped)
+    }
+
     /// Hybrid search: lex + vec (top ~50 each) fused via RRF, then passed
     /// through the Tier-2 rerank stage ([`Self::apply_rerank`]), resolved to
     /// `top_k` [`Hit`]s. Fused ids whose meta is missing are skipped.
@@ -3846,5 +3937,172 @@ mod tests {
             ..Default::default()
         });
         assert!(!e.rerank_active(), "disabled settings → inactive");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Public rerank entry points: rerank_hits (chunk-level), rerank_paths
+    // (doc-level)
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn rerank_hits_matches_apply_rerank_reorder() {
+        // rerank_hits is a thin pub wrapper over apply_rerank — same
+        // reorder-wins-over-fused-order behavior as the private-method test
+        // above (rerank_reorders_hybrid_hits_with_descending_scores), just
+        // invoked through the public surface with a caller-supplied fused
+        // list rather than one built internally by `query`.
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        e.index_doc("a.md", &format!("{RERANK_QUERY} alphamark"))
+            .unwrap();
+        e.index_doc("b.md", &format!("{RERANK_QUERY} betamark"))
+            .unwrap();
+
+        // Fetch the real fused-order chunk ids/scores via the existing
+        // pipeline (chunk ids are content-derived, not a predictable
+        // "doc.md#N" format) so we have a realistic fused list to hand to
+        // the public wrapper.
+        let before = e.query(RERANK_QUERY, 5).unwrap();
+        assert_eq!(before.len(), 2);
+
+        let loser = before[1].doc_path.clone();
+        let marker: &'static str = if loser == "a.md" {
+            "alphamark"
+        } else {
+            "betamark"
+        };
+        e.set_reranker_for_tests(Box::new(MarkerReranker { marker }));
+
+        let fused: Vec<(String, f64)> = before
+            .iter()
+            .map(|h| (h.chunk_id.clone(), h.score))
+            .collect();
+        let hits = e.rerank_hits(RERANK_QUERY, fused, 5).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].doc_path, loser,
+            "rerank_hits must apply the same reorder as apply_rerank"
+        );
+        assert!(hits.iter().all(|h| h.rerank_score.is_some()));
+    }
+
+    #[test]
+    fn rerank_hits_returns_fused_order_when_reranker_absent() {
+        // Skip-not-fail at the public surface: no reranker configured (lazy
+        // source, model not downloaded in this temp cache dir) must return
+        // the input fused order untouched with rerank_score: None, never
+        // panic or error.
+        let dir = tempfile::tempdir().unwrap();
+        let e = fake_engine(dir.path());
+        let fused = vec![("chunk-b".to_string(), 2.0), ("chunk-a".to_string(), 1.0)];
+        let hits = e.rerank_hits("anything", fused.clone(), 10).unwrap();
+        // No chunk meta exists for these synthetic ids, so resolve_hits
+        // skips them all — the point of this test is that the call
+        // completes without error and yields no rerank scores, not that
+        // hits are non-empty.
+        assert!(hits.is_empty());
+
+        // Repeat with real, indexed chunks so we can check order + None.
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut e2 = fake_engine(dir2.path());
+        e2.index_doc("a.md", "alpha content").unwrap();
+        e2.index_doc("b.md", "beta content").unwrap();
+        let before = e2.query("alpha beta", 5).unwrap();
+        let fused2: Vec<(String, f64)> = before
+            .iter()
+            .map(|h| (h.chunk_id.clone(), h.score))
+            .collect();
+        let hits2 = e2.rerank_hits("alpha beta", fused2, 5).unwrap();
+        assert_eq!(
+            hits2.iter().map(|h| &h.doc_path).collect::<Vec<_>>(),
+            before.iter().map(|h| &h.doc_path).collect::<Vec<_>>(),
+            "no reranker → fused order preserved"
+        );
+        assert!(hits2.iter().all(|h| h.rerank_score.is_none()));
+    }
+
+    #[test]
+    fn rerank_paths_dedups_to_best_chunk_per_path() {
+        // Two docs, each with enough distinct content to form 2+ chunks is
+        // overkill here — instead use MarkerReranker across a doc whose
+        // single chunk should out-score another doc's single chunk, then
+        // verify dedup keeps exactly one Hit per doc_path (the common case
+        // is one chunk per short doc, so this also covers the trivial
+        // single-chunk-per-path dedup path).
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        e.index_doc("m1.md", "note zulumark alpha").unwrap();
+        e.index_doc("m2.md", "note plain beta").unwrap();
+        e.set_reranker_for_tests(Box::new(MarkerReranker { marker: "zulumark" }));
+
+        let paths = vec!["m1.md".to_string(), "m2.md".to_string()];
+        let hits = e.rerank_paths("note", paths, 10).unwrap();
+
+        // One Hit per path.
+        let mut seen_paths: Vec<&str> = hits.iter().map(|h| h.doc_path.as_str()).collect();
+        seen_paths.sort();
+        seen_paths.dedup();
+        assert_eq!(
+            seen_paths.len(),
+            hits.len(),
+            "rerank_paths must return at most one Hit per doc_path"
+        );
+        assert_eq!(hits.len(), 2, "both candidate paths must survive dedup");
+
+        // The marker doc must rank first (0.9 vs 0.4) and its rerank_score
+        // must be the highest among its own chunks (trivially true here
+        // since each doc has one chunk, but exercises the "keep best"
+        // comparison path).
+        assert_eq!(hits[0].doc_path, "m1.md");
+        assert_eq!(hits[0].rerank_score, Some(0.9));
+    }
+
+    #[test]
+    fn rerank_paths_truncates_to_top_k_after_dedup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        for i in 0..5 {
+            e.index_doc(&format!("p{i}.md"), &format!("note common{i}"))
+                .unwrap();
+        }
+        e.set_reranker_for_tests(Box::new(FakeReranker));
+
+        let paths: Vec<String> = (0..5).map(|i| format!("p{i}.md")).collect();
+        let hits = e.rerank_paths("note common", paths, 2).unwrap();
+        assert_eq!(hits.len(), 2, "top_k truncation applies after dedup");
+    }
+
+    #[test]
+    fn rerank_paths_returns_fused_order_when_reranker_absent() {
+        // Skip-not-fail at the doc-level entry point too: no reranker
+        // configured → every chunk carries rerank_score: None and the call
+        // must not error even though `apply_rerank`'s internal gate/sort
+        // logic is bypassed entirely in that branch.
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        e.index_doc("a.md", "alpha content").unwrap();
+        e.index_doc("b.md", "beta content").unwrap();
+
+        let paths = vec!["a.md".to_string(), "b.md".to_string()];
+        let hits = e.rerank_paths("alpha beta", paths, 10).unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "both paths present, no reranker to gate them out"
+        );
+        assert!(hits.iter().all(|h| h.rerank_score.is_none()));
+
+        let mut seen: Vec<&str> = hits.iter().map(|h| h.doc_path.as_str()).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 2, "still one Hit per path with no reranker");
+    }
+
+    #[test]
+    fn rerank_paths_empty_paths_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = fake_engine(dir.path());
+        let hits = e.rerank_paths("anything", Vec::new(), 10).unwrap();
+        assert!(hits.is_empty(), "no candidate paths → no hits, no panic");
     }
 }
