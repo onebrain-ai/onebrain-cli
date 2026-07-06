@@ -516,6 +516,9 @@ pub struct Engine {
     /// flag a persistently failing model would spam a long-running daemon's
     /// stderr on every search.
     rerank_error_logged: std::cell::Cell<bool>,
+    /// Same rate-limit for corrupt chunk-meta warnings during rerank passage
+    /// lookup ([`Engine::chunk_texts`]).
+    chunk_corruption_logged: std::cell::Cell<bool>,
     meta: Database,
 }
 
@@ -631,6 +634,7 @@ impl Engine {
             rerank_settings: RerankSettings::default(),
             reranker: RerankSource::Lazy(OnceCell::new()),
             rerank_error_logged: std::cell::Cell::new(false),
+            chunk_corruption_logged: std::cell::Cell::new(false),
             meta,
         })
     }
@@ -886,6 +890,10 @@ impl Engine {
     pub fn set_rerank_settings(&mut self, settings: RerankSettings) {
         self.rerank_settings = settings;
         self.reranker = RerankSource::Lazy(OnceCell::new());
+        // A settings change (e.g. model swap) is a distinct event — re-arm
+        // the once-per-engine failure log so a NEW model's failure is never
+        // hidden by an old model's suppressed warning.
+        self.rerank_error_logged.set(false);
     }
 
     /// Test seam mirroring [`Engine::open_with_embedder`]: inject a
@@ -1077,10 +1085,18 @@ impl Engine {
                 Some(v) => match serde_json::from_str::<ChunkMeta>(v.value()) {
                     Ok(m) => m.text,
                     Err(e) => {
-                        eprintln!(
-                            "onebrain-search: chunk meta for {chunk_id} is corrupt ({e}) — \
-                             passage blanked for reranking; a `reindex --force` rebuilds it"
-                        );
+                        // Same rate-limit philosophy as the rerank-failure
+                        // log: first corruption is a loud diagnostic, the
+                        // rest stay quiet (widespread corruption would
+                        // otherwise spam a daemon's stderr on every query).
+                        if !self.chunk_corruption_logged.get() {
+                            self.chunk_corruption_logged.set(true);
+                            eprintln!(
+                                "onebrain-search: chunk meta for {chunk_id} is corrupt ({e}) — \
+                                 passage blanked for reranking; a `reindex --force` rebuilds it \
+                                 (further corrupt-chunk warnings on this engine will not be logged)"
+                            );
+                        }
                         String::new()
                     }
                 },
