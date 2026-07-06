@@ -223,7 +223,9 @@ pub enum SubQueryType {
 
 /// Params for the `query` tool. Mirrors the qmd MCP tool surface — several
 /// fields (`candidateLimit`, `collections`, `intent`, `rerank`) are accepted
-/// for compatibility but not yet used by the native engine (see field docs).
+/// for qmd compatibility but are not per-request controls the native engine
+/// reads (see field docs) — `rerank` in particular IS implemented (v3.4.7)
+/// but as vault-wide config, not a request param.
 /// The genuinely inert fields (deserialize-only, never read by Rust code yet)
 /// carry their own `#[allow(dead_code)]` so a FUTURE field that's actually
 /// unused would still trip clippy instead of hiding behind a blanket
@@ -247,7 +249,9 @@ pub struct QueryParams {
     /// Background context to disambiguate. Accepted for compatibility; not yet used in ranking (relevance phase, v3.4.3).
     #[allow(dead_code)]
     pub intent: Option<String>,
-    /// Accepted for qmd compatibility; native rerank lands in v3.4.3.
+    /// Accepted for qmd compatibility; native rerank is implemented (v3.4.7,
+    /// `search.reranker.*` in `onebrain.yml`) but engine-wide/config-driven,
+    /// not a per-request toggle — this field stays deserialize-only.
     #[allow(dead_code)]
     pub rerank: Option<bool>,
 }
@@ -273,8 +277,8 @@ pub struct QueryHit {
     /// Calibrated 0-1 Tier-2 cross-encoder relevance, mirroring
     /// `onebrain_search::engine::Hit::rerank_score`. `None` (omitted, matching
     /// `context`'s optional-field style) for lex-only sub-queries and for any
-    /// hit the rerank stage skipped (disabled, model not downloaded, load
-    /// failure, or outside the fused `candidates` window).
+    /// hit the rerank stage skipped (disabled, model not downloaded, or a
+    /// rerank failure).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rerank_score: Option<f32>,
 }
@@ -647,12 +651,15 @@ impl McpServer {
             //
             // Behavioral deltas vs the Direct path (documented in docs/daemon.md
             // + ADR 0023): the daemon returns DOC-LEVEL hits (dedup/fusion keys
-            // on `path`, so at most one hit per document), a `vec` sub-query is
-            // served as `hybrid` (lex mixed in) on the wire, and the daemon caps
-            // candidates at its own `TOP_K` (20) per sub-query — so `fetch_k`'s
-            // over-fetch (used by the Direct arm below) doesn't apply here.
+            // on `path`, so at most one hit per document), and a `vec` sub-query
+            // is served as `hybrid` (lex mixed in) on the wire. Fusion depth
+            // matches the Direct arm: we pass the SAME `fetch_k` over-fetch as
+            // an explicit `top_k` so RRF has depth to fuse. Before v3.4.7 the
+            // server hardcoded 20 here; passing `None` would now fall to the
+            // vault's `search.default_top_k` (10) and shrink fusion depth.
             Backend::Daemon(handle) => {
                 let handle = handle.clone();
+                let fetch_k = limit.max(10) * 3;
                 tokio::task::spawn_blocking(move || {
                     let mut ranked = Vec::with_capacity(params.searches.len());
                     for (i, sub) in params.searches.into_iter().enumerate() {
@@ -664,7 +671,7 @@ impl McpServer {
                         let hits = degrade_vec_error(
                             has_lex && !matches!(sub.r#type, SubQueryType::Lex),
                             handle
-                                .search(&sub.query, mode)
+                                .search(&sub.query, mode, Some(fetch_k), None)
                                 .and_then(|body| parse_daemon_search_hits(&body)),
                         )?;
                         ranked.push((weight, hits));

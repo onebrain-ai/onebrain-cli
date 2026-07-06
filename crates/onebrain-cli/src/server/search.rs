@@ -46,6 +46,19 @@ pub(crate) struct SearchQuery {
     /// `lex` (BM25 keyword, the default) or `hybrid` (keyword + semantic).
     #[serde(default)]
     mode: Option<String>,
+    /// Max hits to return. When absent, falls back to the vault's
+    /// `search.default_top_k` config (default 10), then to [`TOP_K`] if
+    /// config can't be read.
+    #[serde(default)]
+    top_k: Option<usize>,
+    /// Override `search.reranker.min_candidates` for this request — the
+    /// minimum pool of top fused results fed to the Tier-2 reranker. Acts as
+    /// a FLOOR: the reranked pool is actually `max(min_candidates, top_k)`,
+    /// so every returned result is always reranked; this only widens the
+    /// pool when it exceeds `top_k`. When absent, the vault's configured
+    /// value stands.
+    #[serde(default)]
+    min_candidates: Option<usize>,
 }
 
 /// Response body: a ranked hit list plus the mode actually run.
@@ -70,17 +83,34 @@ struct SearchHit {
     /// `onebrain_search::engine::Hit::rerank_score`. `None` for lex-only hits
     /// (the rerank stage only runs on the hybrid/vector path) and for any
     /// hybrid hit the rerank stage skipped (disabled, model not downloaded,
-    /// load failure, or outside the fused `candidates` window).
+    /// or a rerank failure for the whole query).
     #[serde(skip_serializing_if = "Option::is_none")]
     rerank_score: Option<f32>,
 }
 
-/// Max top-k the webui asks for (native search engine caps at ~20; keep parity).
+/// Fallback top-k when neither the request's `top_k` param nor the vault's
+/// `search.default_top_k` config is available (e.g. config failed to load).
+/// Was previously the ONLY source of truth for every search on this
+/// endpoint — now just the last-resort default.
 const TOP_K: usize = 20;
 
 /// Hard ceiling on one native search. Lex is ~ms; a cold hybrid embed can
 /// take seconds — this sits well above that and only trips on a genuine hang.
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Resolve the effective `top_k` for a request: the explicit query param if
+/// present, else the vault's `search.default_top_k` config, else [`TOP_K`]
+/// when config can't be read (e.g. a malformed `onebrain.yml`) — mirroring
+/// every other config-read-with-fallback seam in this crate (best-effort,
+/// never fails the search over a config hiccup).
+fn resolve_top_k(root: &Path, requested: Option<usize>) -> usize {
+    if let Some(top_k) = requested {
+        return top_k;
+    }
+    onebrain_core::load_vault_config_at(root)
+        .map(|cfg| cfg.search.default_top_k)
+        .unwrap_or(TOP_K)
+}
 
 pub(crate) async fn get_vault_search(
     State(state): State<Arc<AppState>>,
@@ -98,6 +128,9 @@ pub(crate) async fn get_vault_search(
         return Ok(Json(SearchResponse { hits: vec![], mode }).into_response());
     }
 
+    let top_k = resolve_top_k(&root, q.top_k);
+    let min_candidates = q.min_candidates;
+
     // Warm-daemon path: when the process holds a persistent engine, route
     // through it instead of opening a fresh one per request. redb is
     // single-writer, so a per-request `Engine::open` in the daemon process
@@ -108,8 +141,9 @@ pub(crate) async fn get_vault_search(
 
     // Native search is synchronous (tantivy / embedding). Run it off the async
     // runtime and bound it so a slow hybrid embed can't wedge a worker.
-    let search =
-        tokio::task::spawn_blocking(move || run_search(held.as_ref(), &root, &query, mode));
+    let search = tokio::task::spawn_blocking(move || {
+        run_search(held.as_ref(), &root, &query, mode, top_k, min_candidates)
+    });
     let hits = match tokio::time::timeout(SEARCH_TIMEOUT, search).await {
         Ok(Ok(Ok(hits))) => hits,
         Ok(Ok(Err(e))) => return Err(map_search_failure(e)),
@@ -157,10 +191,12 @@ fn run_search(
     root: &Path,
     query: &str,
     mode: &str,
+    top_k: usize,
+    min_candidates: Option<usize>,
 ) -> anyhow::Result<Vec<SearchHit>> {
     // No held engine → the per-request path, unchanged (`serve` / CLI).
     let Some(engine) = held else {
-        return run_native(root, query, mode);
+        return run_native(root, query, mode, top_k, min_candidates);
     };
 
     let collection = collection_name_readonly(root)?;
@@ -177,9 +213,9 @@ fn run_search(
     // even with a held engine — no lock, no contention. Only hybrid reuses the
     // held (sole redb-owning) engine.
     if mode == "hybrid" {
-        run_hybrid_held(engine, &cache_dir, root, query)
+        run_hybrid_held(engine, &cache_dir, root, query, top_k, min_candidates)
     } else {
-        run_lex(&cache_dir, query)
+        run_lex(&cache_dir, query, top_k)
     }
 }
 
@@ -196,13 +232,18 @@ fn run_hybrid_held(
     _cache_dir: &Path,
     root: &Path,
     query: &str,
+    top_k: usize,
+    min_candidates: Option<usize>,
 ) -> anyhow::Result<Vec<SearchHit>> {
-    let engine = engine.lock().unwrap_or_else(|p| p.into_inner());
+    let mut engine = engine.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(min_candidates) = min_candidates {
+        engine.set_rerank_min_candidates(min_candidates);
+    }
     if engine.status(root)?.doc_count == 0 {
         return Ok(vec![]);
     }
     Ok(engine
-        .query(query, TOP_K)?
+        .query(query, top_k)?
         .into_iter()
         .filter(|h| !h.doc_path.is_empty())
         .map(|h| SearchHit {
@@ -229,12 +270,20 @@ fn run_hybrid_held(
     cache_dir: &Path,
     _root: &Path,
     query: &str,
+    top_k: usize,
+    _min_candidates: Option<usize>,
 ) -> anyhow::Result<Vec<SearchHit>> {
-    run_lex(cache_dir, query)
+    run_lex(cache_dir, query, top_k)
 }
 
 /// Synchronous native search. `mode` is `"hybrid"` or `"lex"`.
-fn run_native(root: &Path, query: &str, mode: &str) -> anyhow::Result<Vec<SearchHit>> {
+fn run_native(
+    root: &Path,
+    query: &str,
+    mode: &str,
+    top_k: usize,
+    min_candidates: Option<usize>,
+) -> anyhow::Result<Vec<SearchHit>> {
     let collection = collection_name_readonly(root)?;
     let cache_dir = collection_cache_dir(&collection);
 
@@ -246,9 +295,9 @@ fn run_native(root: &Path, query: &str, mode: &str) -> anyhow::Result<Vec<Search
     }
 
     if mode == "hybrid" {
-        run_hybrid(&cache_dir, root, query)
+        run_hybrid(&cache_dir, root, query, top_k, min_candidates)
     } else {
-        run_lex(&cache_dir, query)
+        run_lex(&cache_dir, query, top_k)
     }
 }
 
@@ -256,9 +305,9 @@ fn run_native(root: &Path, query: &str, mode: &str) -> anyhow::Result<Vec<Search
 /// `LexIndex::search` returns bare `(chunk_id, score)`; `chunk_id` prefixes
 /// the doc path (`<doc_path>#N`), so surface that as the path + title, with
 /// no snippet (the snippet lives in engine metadata this path never opens).
-fn run_lex(cache_dir: &Path, query: &str) -> anyhow::Result<Vec<SearchHit>> {
+fn run_lex(cache_dir: &Path, query: &str, top_k: usize) -> anyhow::Result<Vec<SearchHit>> {
     let lex = LexIndex::open(&cache_dir.join("tantivy"))?;
-    let raw = lex.search(query, TOP_K)?;
+    let raw = lex.search(query, top_k)?;
     Ok(raw
         .into_iter()
         .filter_map(|(chunk_id, score)| {
@@ -303,16 +352,25 @@ fn run_lex(cache_dir: &Path, query: &str) -> anyhow::Result<Vec<SearchHit>> {
 /// `#[cfg(not(feature = "semantic"))]` variant below, which degrades to
 /// [`run_lex`] instead, mirroring `commands::search_query::run_query`.
 #[cfg(feature = "semantic")]
-fn run_hybrid(cache_dir: &Path, root: &Path, query: &str) -> anyhow::Result<Vec<SearchHit>> {
+fn run_hybrid(
+    cache_dir: &Path,
+    root: &Path,
+    query: &str,
+    top_k: usize,
+    min_candidates: Option<usize>,
+) -> anyhow::Result<Vec<SearchHit>> {
     let config = onebrain_core::load_vault_config_at(root)?;
     let mut engine = Engine::open(cache_dir, &config.search.embed_model)?;
     engine.set_exclude_patterns(config.search.exclude.clone());
     engine.set_rerank_settings(rerank_settings_from_config(&config.search.reranker));
+    if let Some(min_candidates) = min_candidates {
+        engine.set_rerank_min_candidates(min_candidates);
+    }
     if engine.status(root)?.doc_count == 0 {
         return Ok(vec![]);
     }
     Ok(engine
-        .query(query, TOP_K)?
+        .query(query, top_k)?
         .into_iter()
         .filter(|h| !h.doc_path.is_empty())
         .map(|h| SearchHit {
@@ -334,8 +392,14 @@ fn run_hybrid(cache_dir: &Path, root: &Path, query: &str) -> anyhow::Result<Vec<
 /// on in this build and would error instead of degrading. `root` is unused
 /// here (only needed to load `search.embed_model` for the real engine).
 #[cfg(not(feature = "semantic"))]
-fn run_hybrid(cache_dir: &Path, _root: &Path, query: &str) -> anyhow::Result<Vec<SearchHit>> {
-    run_lex(cache_dir, query)
+fn run_hybrid(
+    cache_dir: &Path,
+    _root: &Path,
+    query: &str,
+    top_k: usize,
+    _min_candidates: Option<usize>,
+) -> anyhow::Result<Vec<SearchHit>> {
+    run_lex(cache_dir, query, top_k)
 }
 
 /// File stem of a slash-separated vault path (`a/b/note.md` → `note`), used
@@ -372,8 +436,8 @@ mod tests {
         .unwrap();
         let cache = tempfile::tempdir().unwrap();
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
-        let result_lex = run_native(dir.path(), "anything", "lex");
-        let result_hybrid = run_native(dir.path(), "anything", "hybrid");
+        let result_lex = run_native(dir.path(), "anything", "lex", TOP_K, None);
+        let result_hybrid = run_native(dir.path(), "anything", "hybrid", TOP_K, None);
         assert!(result_lex.unwrap().is_empty());
         assert!(result_hybrid.unwrap().is_empty());
     }
@@ -395,13 +459,103 @@ mod tests {
             .unwrap();
             lex.commit().unwrap();
         }
-        let hits = run_lex(cache.path(), "quick fox").unwrap();
+        let hits = run_lex(cache.path(), "quick fox", TOP_K).unwrap();
         assert_eq!(hits.len(), 1, "hits: {hits:?}");
         assert_eq!(hits[0].path, "notes/alpha.md");
         assert_eq!(hits[0].title, "alpha");
         assert!(hits[0].snippet.is_empty());
         // Lex never reranks — every hit's rerank_score stays None.
         assert!(hits[0].rerank_score.is_none());
+    }
+
+    #[test]
+    fn run_lex_honours_a_smaller_top_k() {
+        // Task 4: `top_k` is no longer hardcoded to `TOP_K` — a smaller
+        // caller-supplied value must actually truncate the result set.
+        use onebrain_search::chunk::Chunk;
+        let cache = tempfile::tempdir().unwrap();
+        let tantivy_dir = cache.path().join("tantivy");
+        {
+            let mut lex = LexIndex::open(&tantivy_dir).unwrap();
+            for i in 0..5 {
+                lex.add(&Chunk {
+                    chunk_id: format!("notes/n{i}.md#0"),
+                    doc_path: format!("notes/n{i}.md"),
+                    heading_path: String::new(),
+                    text: "quick fox common".to_string(),
+                    chunk_index: 0,
+                })
+                .unwrap();
+            }
+            lex.commit().unwrap();
+        }
+        let hits = run_lex(cache.path(), "quick fox", 2).unwrap();
+        assert_eq!(hits.len(), 2, "top_k=2 must cap the result set: {hits:?}");
+    }
+
+    // ── top_k / min_candidates params (v3.4.7 Track E) ─────────────────────
+
+    #[test]
+    fn resolve_top_k_prefers_explicit_param() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "search:\n  default_top_k: 33\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_top_k(dir.path(), Some(7)), 7);
+    }
+
+    #[test]
+    fn resolve_top_k_falls_back_to_config_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "search:\n  default_top_k: 33\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_top_k(dir.path(), None), 33);
+    }
+
+    #[test]
+    fn resolve_top_k_falls_back_to_const_when_config_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        // No onebrain.yml at all → load_vault_config_at errors → TOP_K.
+        assert_eq!(resolve_top_k(dir.path(), None), TOP_K);
+    }
+
+    #[test]
+    fn run_native_lex_honours_top_k_param() {
+        use onebrain_search::chunk::Chunk;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "search:\n  collection: rn-top-k\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let cache_dir = collection_cache_dir(&collection_name_readonly(dir.path()).unwrap());
+        {
+            let mut lex = LexIndex::open(&cache_dir.join("tantivy")).unwrap();
+            for i in 0..5 {
+                lex.add(&Chunk {
+                    chunk_id: format!("n{i}.md#0"),
+                    doc_path: format!("n{i}.md"),
+                    heading_path: String::new(),
+                    text: "quick fox common".to_string(),
+                    chunk_index: 0,
+                })
+                .unwrap();
+            }
+            lex.commit().unwrap();
+        }
+        let hits = run_native(dir.path(), "quick fox", "lex", 3, None).unwrap();
+        assert_eq!(
+            hits.len(),
+            3,
+            "top_k param must reach run_lex via run_native"
+        );
     }
 
     // ── SearchHit::rerank_score serialization (Task 7) ─────────────────────
@@ -479,7 +633,7 @@ mod tests {
             lex.commit().unwrap();
         }
 
-        let result = run_native(dir.path(), "quick fox", "hybrid");
+        let result = run_native(dir.path(), "quick fox", "hybrid", TOP_K, None);
 
         let hits = result.expect("hybrid must degrade to lex, not error, in a lex-only build");
         assert_eq!(hits.len(), 1, "hits: {hits:?}");
@@ -530,7 +684,7 @@ mod tests {
     fn run_search_none_delegates_to_native() {
         // No held engine → run_search must behave exactly like run_native.
         let (vault, _cache, _engine, _env) = held_engine_over_lex_seeded_vault("rs-none");
-        let hits = run_search(None, vault.path(), "quick fox", "lex").unwrap();
+        let hits = run_search(None, vault.path(), "quick fox", "lex", TOP_K, None).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "notes/alpha.md");
     }
@@ -539,7 +693,8 @@ mod tests {
     fn run_search_lex_with_held_engine_returns_hits() {
         // A held engine + lex mode → lex path (standalone tantivy, no redb lock).
         let (vault, _cache, engine, _env) = held_engine_over_lex_seeded_vault("rs-lex");
-        let hits = run_search(Some(&engine), vault.path(), "quick fox", "lex").unwrap();
+        let hits =
+            run_search(Some(&engine), vault.path(), "quick fox", "lex", TOP_K, None).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "notes/alpha.md");
     }
@@ -556,14 +711,21 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         let engine = crate::server::internal::open_held_engine(vault.path()).unwrap();
-        assert!(run_search(Some(&engine), vault.path(), "anything", "lex")
-            .unwrap()
-            .is_empty());
         assert!(
-            run_search(Some(&engine), vault.path(), "anything", "hybrid")
+            run_search(Some(&engine), vault.path(), "anything", "lex", TOP_K, None)
                 .unwrap()
                 .is_empty()
         );
+        assert!(run_search(
+            Some(&engine),
+            vault.path(),
+            "anything",
+            "hybrid",
+            TOP_K,
+            None
+        )
+        .unwrap()
+        .is_empty());
     }
 
     /// Lex-only build: hybrid through the HELD engine degrades to lex (no
@@ -573,7 +735,15 @@ mod tests {
     #[test]
     fn run_search_hybrid_held_degrades_to_lex_in_lex_only_build() {
         let (vault, _cache, engine, _env) = held_engine_over_lex_seeded_vault("rs-hybrid-degrade");
-        let hits = run_search(Some(&engine), vault.path(), "quick fox", "hybrid").unwrap();
+        let hits = run_search(
+            Some(&engine),
+            vault.path(),
+            "quick fox",
+            "hybrid",
+            TOP_K,
+            None,
+        )
+        .unwrap();
         assert_eq!(hits.len(), 1, "hits: {hits:?}");
         assert_eq!(hits[0].path, "notes/alpha.md");
     }
@@ -599,7 +769,7 @@ mod tests {
             let mut lex = LexIndex::open(&cache_dir.join("tantivy")).unwrap();
             lex.commit().unwrap();
         }
-        let hits = run_native(vault.path(), "anything", "hybrid").unwrap();
+        let hits = run_native(vault.path(), "anything", "hybrid", TOP_K, None).unwrap();
         assert!(hits.is_empty());
     }
 
@@ -608,7 +778,7 @@ mod tests {
     /// `doc_count == 0` short-circuit (both are pure in-memory struct
     /// assignments, so this is exercisable download-free). A non-default
     /// reranker block (`enabled: false`, a custom `min_score`, a made-up
-    /// `candidates`) plus a non-empty `exclude` list must round-trip through
+    /// `min_candidates`) plus a non-empty `exclude` list must round-trip through
     /// `run_native`/`run_hybrid` with no error — a regression that skipped
     /// applying settings would still pass this (settings are a silent no-op
     /// on an empty index), but a regression that panics or errors while
@@ -623,7 +793,7 @@ mod tests {
         let vault = tempfile::tempdir().unwrap();
         std::fs::write(
             vault.path().join("onebrain.yml"),
-            "search:\n  collection: rn-hybrid-settings\n  exclude:\n    - '06-archive/**'\n  reranker:\n    enabled: false\n    candidates: 7\n    min_score: 0.42\n",
+            "search:\n  collection: rn-hybrid-settings\n  exclude:\n    - '06-archive/**'\n  reranker:\n    enabled: false\n    min_candidates: 7\n    min_score: 0.42\n",
         )
         .unwrap();
         let cache = tempfile::tempdir().unwrap();
@@ -638,7 +808,7 @@ mod tests {
         // that errored while applying a non-default reranker/exclude config
         // would fail this test; today's empty-hits success means the settings
         // application path is safe to reach with real (non-default) values.
-        let hits = run_native(vault.path(), "anything", "hybrid").unwrap();
+        let hits = run_native(vault.path(), "anything", "hybrid", TOP_K, None).unwrap();
         assert!(hits.is_empty());
     }
 
@@ -665,7 +835,15 @@ mod tests {
             lex.commit().unwrap();
         }
         let engine = crate::server::internal::open_held_engine(vault.path()).unwrap();
-        let hits = run_search(Some(&engine), vault.path(), "anything", "hybrid").unwrap();
+        let hits = run_search(
+            Some(&engine),
+            vault.path(),
+            "anything",
+            "hybrid",
+            TOP_K,
+            None,
+        )
+        .unwrap();
         assert!(
             hits.is_empty(),
             "empty index must yield no hits, no download"

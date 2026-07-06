@@ -203,6 +203,32 @@ pub fn sigmoid(logit: f32) -> f32 {
     1.0 / (1.0 + (-logit).exp())
 }
 
+/// Restore fastembed's DESC-sorted `(index, raw_logit)` rerank results to
+/// input order, applying [`sigmoid`] to each score. Guards each `index`
+/// instead of trusting the dependency: an out-of-bounds index (an upstream
+/// bug) degrades to a skipped score (logged once), never a panic inside the
+/// query path — the reranker's skip-not-fail contract. Takes `(index, score)`
+/// pairs rather than fastembed's `RerankResult` so it stays testable in every
+/// build config (no `semantic`/ONNX dependency).
+// Its only non-test caller (`Reranker::rerank`) is semantic-gated, so the
+// lex-only lib build sees it as dead code even though tests exercise it.
+#[cfg_attr(not(feature = "semantic"), allow(dead_code))]
+fn restore_input_order<I: IntoIterator<Item = (usize, f32)>>(
+    passages_len: usize,
+    results: I,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; passages_len];
+    for (index, score) in results {
+        match out.get_mut(index) {
+            Some(slot) => *slot = sigmoid(score),
+            None => eprintln!(
+                "onebrain-search: reranker returned out-of-range index {index} (of {passages_len}) — score skipped"
+            ),
+        }
+    }
+    out
+}
+
 /// Lowercase whitespace tokenization into a set (duplicates collapse).
 fn tokenize(text: &str) -> HashSet<String> {
     text.to_lowercase()
@@ -316,22 +342,12 @@ impl Rerank for Reranker {
             .lock()
             .map_err(|_| anyhow::anyhow!("reranker mutex poisoned"))?;
         let results = model.rerank::<String>(query.to_string(), passages, false, None)?;
-        // rerank() returns results sorted by score DESC; restore input order
-        // via each result's `index`. Guard the index instead of trusting the
-        // dependency: an out-of-bounds index (upstream bug) must degrade to a
-        // skipped score, not a panic inside the query path (skip-not-fail).
-        let mut out = vec![0.0f32; passages.len()];
-        for r in results {
-            match out.get_mut(r.index) {
-                Some(slot) => *slot = sigmoid(r.score),
-                None => eprintln!(
-                    "onebrain-search: reranker returned out-of-range index {} (of {}) — score skipped",
-                    r.index,
-                    passages.len()
-                ),
-            }
-        }
-        Ok(out)
+        // rerank() returns results sorted by score DESC; `restore_input_order`
+        // puts them back in input order (applying sigmoid) and guards the index.
+        Ok(restore_input_order(
+            passages.len(),
+            results.into_iter().map(|r| (r.index, r.score)),
+        ))
     }
 }
 
@@ -391,6 +407,28 @@ mod tests {
     #[test]
     fn sigmoid_midpoint_is_half() {
         assert!((sigmoid(0.0) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn restore_input_order_places_scores_by_index_with_sigmoid() {
+        // DESC-sorted results (index 1 has the higher logit) restored to input
+        // order, each score sigmoid'd.
+        let out = restore_input_order(3, [(1usize, 2.0f32), (0, 0.0), (2, -1.0)]);
+        assert_eq!(out.len(), 3);
+        assert!((out[0] - sigmoid(0.0)).abs() < 1e-6);
+        assert!((out[1] - sigmoid(2.0)).abs() < 1e-6);
+        assert!((out[2] - sigmoid(-1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn restore_input_order_skips_out_of_range_index_without_panic() {
+        // An out-of-range index (upstream fastembed bug) must be dropped, not
+        // panic — the reranker's skip-not-fail guard. index 2 is beyond len 2.
+        let out = restore_input_order(2, [(0usize, 2.0f32), (2, 9.0), (1, -1.0)]);
+        assert_eq!(out.len(), 2, "length stays passages_len; no panic");
+        assert!((out[0] - sigmoid(2.0)).abs() < 1e-6);
+        assert!((out[1] - sigmoid(-1.0)).abs() < 1e-6);
+        // The out-of-range 9.0 left no trace: both slots came from valid indices.
     }
 
     #[test]

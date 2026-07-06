@@ -154,6 +154,16 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
 }
 
 impl SearchStatusData {
+    /// Total pending drift (new + changed + removed). Unknown counts (`None`,
+    /// e.g. engine busy) contribute zero. Single source of truth for the two
+    /// consumers in `render_text` (the status line and the reindex hint) so the
+    /// rollup can't drift between them.
+    fn pending_total(&self) -> usize {
+        self.pending_new.unwrap_or(0)
+            + self.pending_changed.unwrap_or(0)
+            + self.pending_removed.unwrap_or(0)
+    }
+
     /// Indexed doc count (`None` when unknown — engine busy/unreadable). Exposed
     /// `pub(crate)` for the MCP track's tests, which assert the daemon-routed
     /// `status` tool reports the same count as the direct-engine path.
@@ -690,9 +700,7 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
     } else {
         // Pending counts are `Some` on the healthy path; treat an unknown
         // (non-busy open/status failure) as zero pending for this rollup.
-        let pending = d.pending_new.unwrap_or(0)
-            + d.pending_changed.unwrap_or(0)
-            + d.pending_removed.unwrap_or(0);
+        let pending = d.pending_total();
         if pending > 0 {
             lines.push(item(
                 "Status",
@@ -719,9 +727,7 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
 
     // Pending rollup for the hint block below. Unknown/busy counts contribute
     // zero — a busy engine gets no reindex hint (retry, don't reindex).
-    let pending = d.pending_new.unwrap_or(0)
-        + d.pending_changed.unwrap_or(0)
-        + d.pending_removed.unwrap_or(0);
+    let pending = d.pending_total();
 
     // A missing model blocks all search — surface it ahead of pending drift (a
     // reindex selects/downloads the model AND indexes). Suppressed while a

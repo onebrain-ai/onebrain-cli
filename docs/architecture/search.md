@@ -29,7 +29,7 @@ disagree, the code wins.
 
 | Crate | Role in search |
 |---|---|
-| `onebrain-search` | The engine. Six modules: `chunk` (heading-aware chunker), `lex` (tantivy BM25 + script-aware tokenizer), `embed` (fastembed/ONNX embeddings + model registry), `vector` (flat mmap vector store), `hybrid` (RRF fusion), `engine` (ties them together). Depends on no other workspace crate. |
+| `onebrain-search` | The engine. Seven modules: `chunk` (heading-aware chunker), `lex` (tantivy BM25 + script-aware tokenizer), `embed` (fastembed/ONNX embeddings + model registry), `vector` (flat mmap vector store), `hybrid` (RRF fusion), `rerank` (Tier-2 cross-encoder reranker + registry), `engine` (ties them together). Depends on no other workspace crate. |
 | `onebrain-cli` | Every frontend: the `search` verb group (`commands/search_*.rs`), the MCP server (`commands/mcp.rs`), the WebUI daemon search route (`server/search.rs`), and the hook entry points (`search reindex --lex-only` / `--pending-only` in `commands/search_reindex.rs`). Owns collection→cache-dir resolution (`commands/search_common.rs`). |
 | `onebrain-core` | Config parsing: `search.collection` / `search.embed_model` / `search.exclude` (+ legacy top-level `qmd_collection` read-fallback) in `src/config.rs`. |
 | `onebrain-fs` | Config persistence (`persist_search_key` — atomic write with backup) and hook registration specs (`src/register_hooks/hooks.rs`). |
@@ -56,6 +56,7 @@ Inside a collection dir:
 | `vectors/meta.redb` | **Semantic index, metadata.** redb tables: `chunk_to_row`, `row_to_chunk`, `tombstones`, `free_rows` (recyclable tombstoned slots), `header` (`dims`, append cursor). | — | `VectorStore` |
 | `engine.redb` | **Engine metadata** ([`engine.rs`](../../crates/onebrain-search/src/engine.rs)): `chunk_meta` (per-chunk `{doc_path, heading_path, chunk_index, text}` — the *only* place chunk **text** is retrievable: tantivy's `body` field is indexed but not stored, and the vector store keeps no text. Headings are also stored in tantivy, but no search path reads them from there), `doc_chunks` (doc → chunk-id list), `doc_hashes` (per-doc sha256, meaning "vectors current as of this hash"), `lex_hashes` (per-doc sha256 from a lex-only pass — see §2), `engine_header` (`active_model`, `last_indexed_at`). | Doc bytes + chunker output | `Engine` |
 | `models--<org>--<repo>/` | Downloaded ONNX embedding models (hf-hub naming via `ModelInfo::cache_dir_name`, e.g. `models--intfloat--multilingual-e5-small`). | Hugging Face download by fastembed | Lazy embedder construction (`Engine::embedder` → `embed::new`) |
+| `models--onebrain-ai--onebrain-reranker-v1/` | Downloaded Tier-2 cross-encoder reranker model (same hf-hub cache-dir convention, via `RerankerInfo::cache_dir_name`), sha256-verified once per download (`verify_sha256_once`, cached via a `.sha256-verified` marker next to the model file). | Hugging Face download by the reranker loader | Lazy reranker construction (`Engine::reranker` → `rerank::new`), or eagerly at the end of a full `reindex` when `search.reranker.enabled` and not yet downloaded ([`ReindexProgress::LoadingReranker`]) |
 | `reindex-progress.json` | Transient live marker for an in-flight reindex: `{"done":N,"total":M}`. | — | `search reindex` (RAII `LiveProgressFile`, see §4) |
 
 ### Embedding model registry
@@ -80,7 +81,19 @@ never empties a non-empty result set. It **replaced** an absolute per-model
 and silently dropped real matches
 ([ADR 0024](../decisions/0024-vector-confidence-recall-first.md), superseding the
 confidence-floor part of [ADR 0013](../decisions/0013-retrieval-semantics-confidence-gating.md)).
-A calibrated cross-encoder reranker is the follow-up precision gate.
+
+A calibrated cross-encoder reranker — the **Tier-2 rerank stage** — now runs on
+top of this cutoff: both `query` (hybrid) and `vsearch` (vector-only) fuse/fetch
+a wide candidate block, cross-encode the head of that block against the query
+text, sort by the reranker's calibrated 0–1 score, and gate low scorers out —
+subject to a never-empty floor (`RERANK_NO_MATCH_KEEP` = 3) that keeps the
+invariant above alive one layer up. The default reranker is
+`onebrain-reranker-v1` (a `bge-reranker-v2-m3`-based int8 cross-encoder,
+multilingual incl. Thai, ~570 MB). Skip-not-fail throughout: no reranker
+configured, not downloaded, a lex-only build, or a runtime error all fall back
+to the plain fused/vector order with `Hit::rerank_score: None` — a query never
+fails, and never returns fewer results, because reranking didn't work. See
+[ADR 0025](../decisions/0025-tier2-cross-encoder-reranker.md).
 
 ### Config keys (`onebrain.yml`)
 
@@ -91,6 +104,11 @@ A calibrated cross-encoder reranker is the follow-up precision gate.
 | `search.collection` | Collection name → cache dir under the search root | auto-generated `<dir>-<hash>` on first use (§4) |
 | `search.embed_model` | Active embedding model (registry name) | `multilingual-e5-small` (serde default) |
 | `search.exclude` | Vault-relative index-exclusion patterns (path prefixes or bare dir names) | `["attachments"]` |
+| `search.reranker.enabled` | Master switch for the Tier-2 cross-encoder rerank stage | `true` (default-on) |
+| `search.reranker.model` | Reranker registry name (see [`rerank::reranker_registry`](../reference/onebrain-search.md)) | `onebrain-reranker-v1` |
+| `search.reranker.min_candidates` | Minimum fused/retrieved candidate pool cross-encoded per query — a FLOOR, not a ceiling. The engine actually reranks `max(min_candidates, top_k)`, auto-raised so every returned result is always reranked; this value only matters when it exceeds `top_k` (a wider pool than the return size improves quality). Overridable per-query via the CLI's `--min-candidates` / the webui API's `min_candidates` param. | `10` (calibrated) |
+| `search.reranker.min_score` | Gate: reranked hits below this calibrated 0–1 score are dropped (never-empty floor still applies). Because the gate removes low-confidence hits, `query`/`vsearch` can **return fewer than `top_k`** results on a weak-match query — quality-adaptive by design (and, when nothing clears the gate, `RERANK_NO_MATCH_KEEP = 3` survive, labelled "no strong match"). The CLI `--min-score` flag overrides this gate per-query **when reranking is active** (so it filters the calibrated `rerank_score`, the confidence number a user can reason about); when reranking is off (disabled / model absent / pure-lex `search`), `--min-score` filters the raw retrieval score instead. | `None` → engine's `DEFAULT_RERANK_MIN_SCORE = 0.30` |
+| `search.default_top_k` | Vault-level default result count (`top_k`) for a surface that doesn't specify one explicitly (e.g. the webui API's `top_k` param when omitted). Always overridable per-query (CLI `--top-k` / API param). | `10` |
 | `qmd_collection` (legacy, top-level) | v3.3-era collection key. Still read as fallback by `load_vault_config`; `onebrain doctor --fix` migrates it to `search.collection` and removes it ([ADR 0016](../decisions/0016-qmd-collection-config-migration.md)). | — |
 
 ```mermaid
@@ -101,7 +119,7 @@ flowchart LR
         WEB["webui daemon<br/>server/search.rs"]
         HOOK["hook paths<br/>reindex --lex-only / --pending-only"]
     end
-    CFG["onebrain.yml<br/>search.collection · embed_model · exclude"]
+    CFG["onebrain.yml<br/>search.collection · embed_model · exclude · reranker.*"]
     subgraph ENG["crate onebrain-search"]
         E["engine::Engine"]
         CH["chunk"]
@@ -109,13 +127,15 @@ flowchart LR
         EM["embed::Embedder"]
         VS["vector::VectorStore"]
         RRF["hybrid::rrf_fuse"]
+        RR["rerank::Rerank<br/>(Tier-2 cross-encoder)"]
     end
     subgraph DISK["collection cache dir (platform data dir / onebrain / search / collection)"]
         T[("tantivy/")]
         VB[("vectors/vectors.bin")]
         VM[("vectors/meta.redb")]
         ER[("engine.redb")]
-        MD[("models--*/")]
+        MD[("models--*/ (embed)")]
+        MR[("models--onebrain-ai--onebrain-reranker-v1/")]
         PM[("reindex-progress.json")]
     end
     CFG --> VERBS
@@ -133,11 +153,13 @@ flowchart LR
     E --> EM
     E --> VS
     E --> RRF
+    E --> RR
     LX --> T
     VS --> VB
     VS --> VM
     E --> ER
     EM --> MD
+    RR --> MR
     HOOK -. reads gate .-> PM
 ```
 
@@ -188,7 +210,13 @@ flowchart LR
     dropped — `doc_hashes` is authoritative again).
 13. **Removed-doc sweep** — any doc present in `doc_hashes` *or* `lex_hashes` but missing from
     the walk gets `remove_doc` + both hash entries dropped.
-14. **Finish** — `last_indexed_at` recorded in `engine_header` (full mode only), marker removed,
+14. **Reranker fetch (full reindex only)** — `should_fetch_reranker(enabled, downloaded)`: if
+    `search.reranker.enabled` and the configured reranker model isn't already on disk, the engine
+    constructs it now (downloading it), emitting `ReindexProgress::LoadingReranker` once, right
+    before construction — the reranker-side analogue of step 11's `LoadingModel`. Skipped
+    entirely when reranking is disabled, already downloaded, or the model name is unknown to the
+    registry; a lex-only build never fires it (no `semantic` feature to load a cross-encoder with).
+15. **Finish** — `last_indexed_at` recorded in `engine_header` (full mode only), marker removed,
     summary envelope emitted with before/after index size.
 
 A single failing file is counted (`failed`) and skipped, never aborting the batch. Targeted
@@ -210,7 +238,10 @@ flowchart TD
     Z --> J
     J -- yes --> B
     J -- no --> K["sweep: indexed docs gone from disk<br/>remove_doc + drop both hashes"]
-    K --> L["record last_indexed_at (full mode only)"]
+    K --> RR{"reranker enabled AND<br/>not yet downloaded?"}
+    RR -- yes --> RRL["LoadingReranker → download/construct"]
+    RR -- no --> L["record last_indexed_at (full mode only)"]
+    RRL --> L
 ```
 
 ### Incremental drift & pending semantics
@@ -346,20 +377,32 @@ flowchart LR
 | Artifact | Touched |
 |---|---|
 | `vectors/vectors.bin` + `meta.redb` | ✅ scanned (exact cosine top-k, mmap + simsimd dot) |
-| `engine.redb` | ✅ read (`chunk_meta` → doc/heading/snippet) |
-| `models--*` | ✅ embedder loads active model (downloads on first use) |
+| `engine.redb` | ✅ read (`chunk_meta` → doc/heading/snippet, and again for rerank passage text) |
+| `models--*` (embed) | ✅ embedder loads active model (downloads on first use) |
+| `models--onebrain-ai--onebrain-reranker-v1/` | ✅ if `search.reranker.enabled` and downloaded — loads lazily on first reranked query |
 | `tantivy/` | ❌ |
 
 Flow: open engine → embed the query (`embed_query`, model's query prefix) → vector store scan →
-keep the top cluster (`keep_top_cluster`, within 0.02 of the best score) → resolve chunk ids to
-`Hit`s (doc path, heading path, 200-char snippet) from `chunk_meta`. A non-empty but low-confidence
-result attaches an advisory hint (`vec_confidence_hint`); an empty result attaches an `index_hint`
-("index is empty…" / "index is behind — N doc(s) not yet indexed") from a best-effort status probe.
-In a **lex-only build** this verb errors with `SEMANTIC_UNAVAILABLE` (no lex analogue to degrade to).
+keep the top cluster (`keep_top_cluster`, within 0.02 of the best score), fetched at
+`max(top_k, min_candidates)` so the rerank stage has a full pool to work with → **Tier-2 rerank
+stage** (`apply_rerank`, [ADR 0025](../decisions/0025-tier2-cross-encoder-reranker.md)):
+cross-encode the reranked pool — `max(min_candidates, top_k)` entries, a FLOOR of
+`min_candidates` auto-raised to cover `top_k` so every returned result is always reranked —
+against the query text, sort by calibrated score, gate at `min_score` (never-empty floor keeps
+the top 3 on total rejection), append the unreranked fused tail (dropped by the final truncation
+to `top_k` — it never appears in the returned set) → resolve chunk ids to `Hit`s (doc path,
+heading path, 200-char snippet, `rerank_score`) from `chunk_meta`. Skip-not-fail: no reranker
+configured/downloaded, a lex-only build, or a runtime rerank error all fall back to the plain
+vector order with `rerank_score: None` on every hit — the CLI then surfaces an explicit
+"unreranked" hint rather than silently looking confident. A non-empty but low-confidence
+*unreranked* result additionally attaches the pre-reranker cosine hint (`vec_confidence_hint`);
+an empty result attaches an `index_hint` ("index is empty…" / "index is behind — N doc(s) not
+yet indexed") from a best-effort status probe. In a **lex-only build** this verb errors with
+`SEMANTIC_UNAVAILABLE` (no lex analogue to degrade to).
 
 ```mermaid
 flowchart LR
-    Q["query text"] --> E["embed_query<br/>(model, query prefix)"] --> V["VectorStore top-k<br/>keep top cluster"] --> M["resolve via engine.redb<br/>chunk_meta"] --> H["Hits (path · heading · snippet)"]
+    Q["query text"] --> E["embed_query<br/>(model, query prefix)"] --> V["VectorStore top-k<br/>keep top cluster<br/>fetch max(top_k, min_candidates)"] --> RR["Tier-2 rerank stage<br/>cross-encode max(min_candidates,top_k) → sort → gate<br/>(skip-not-fail)"] --> M["resolve via engine.redb<br/>chunk_meta"] --> H["Hits (path · heading · snippet · rerank_score)"]
 ```
 
 ### `onebrain search query` — hybrid (RRF)
@@ -371,22 +414,32 @@ flowchart LR
 |---|---|
 | `tantivy/` | ✅ lex leg (top 50) |
 | `vectors/*` | ✅ vector leg (top 50, trimmed to top cluster via `keep_top_cluster`) |
-| `engine.redb` | ✅ resolve fused hits |
-| `models--*` | ✅ query embedding |
+| `engine.redb` | ✅ resolve fused hits, and again for rerank passage text |
+| `models--*` (embed) | ✅ query embedding |
+| `models--onebrain-ai--onebrain-reranker-v1/` | ✅ if `search.reranker.enabled` and downloaded — loads lazily on first reranked query |
 
 Flow: both legs run inside `Engine::query` — lex top-50 and vector top-50 (the vector leg trimmed as noted in the table above) — then
 `rrf_fuse` combines them by **rank only** (each list contributes `1/(60 + rank)`; scores summed,
-ties broken by chunk id for determinism), truncated to `--top-k`, resolved via `chunk_meta`.
-`--min-score` filters on the fused RRF score. In a **lex-only build**, hybrid degrades to
-`run_lex` with a one-line stderr notice.
+ties broken by chunk id for determinism). The fuse width is `max(--top-k, search.reranker.min_candidates)`
+— wider than the caller's requested `top_k` — so the **Tier-2 rerank stage** (`apply_rerank`,
+[ADR 0025](../decisions/0025-tier2-cross-encoder-reranker.md)) always sees a full reranked pool:
+cross-encode `max(min_candidates, top_k)` entries (`min_candidates` is a FLOOR, auto-raised to
+cover `top_k` — every returned result is always reranked) against the query text, sort by
+calibrated score, gate at `min_score` (never-empty floor), append the unreranked fused tail
+(dropped by the truncation below — it never appears in the returned set), truncate to `--top-k`,
+resolve via `chunk_meta`. `--min-score` filters on the fused RRF score — a **separate** knob from
+the rerank gate (`search.reranker.min_score`), which operates on the cross-encoder's calibrated
+score instead. In a **lex-only build**, hybrid degrades to `run_lex` with a one-line stderr notice
+(the rerank stage never runs — no embedder, no fused vec leg to rerank).
 
 ```mermaid
 flowchart LR
     Q["query text"] --> LX["lex top-50 (tantivy/)"]
     Q --> EMB["embed_query"] --> VC["vector top-50 → keep_top_cluster"]
-    LX --> F["rrf_fuse k=60<br/>rank-only, deterministic ties"]
+    LX --> F["rrf_fuse k=60, width=max(top_k,min_candidates)<br/>rank-only, deterministic ties"]
     VC --> F
-    F --> RES["resolve via chunk_meta"] --> H["top-k Hits"]
+    F --> RR["Tier-2 rerank stage<br/>cross-encode max(min_candidates,top_k) → sort → gate<br/>(skip-not-fail)"]
+    RR --> RES["resolve via chunk_meta"] --> H["top-k Hits (+ rerank_score)"]
 ```
 
 ### `onebrain search get`
@@ -415,7 +468,7 @@ engine's — it fuses N weighted sub-query result lists, normalizing the top sco
 | Sub-query type | Engine path | Artifacts |
 |---|---|---|
 | `lex` | direct `LexIndex::open` (same as `search search` — never the embedder) | `tantivy/` only |
-| `vec` | `Engine::vector_search` | `vectors/*` + `engine.redb` + model |
+| `vec` | `Engine::vector_search` (includes the Tier-2 rerank stage — see §3's `vsearch` section) | `vectors/*` + `engine.redb` + model + reranker |
 | `hyde` | `Engine::vector_search` on a client-written *hypothetical answer passage* (the server treats it identically to `vec` — the HyDE trick is the caller's prompt-side job) | same as `vec` |
 
 Rules (all in `mcp.rs`): 1–10 sub-queries; the **first sub-query gets 2× weight**; each list
@@ -428,8 +481,12 @@ present, any `vec`/`hyde` error (lex-only build, model failure mid-query) degrad
 sub-query to empty hits with a stderr log; with no lex sub-query the error propagates. **No
 index** (`tantivy/` missing): returns empty results plus the note
 "No search index for this vault yet — run `onebrain search reindex`, or fall back to filesystem
-search (grep/Read)." — the qmd-compat params `candidateLimit`/`collections`/`intent`/`rerank`
-are accepted but unused.
+search (grep/Read)." — the qmd-compat params `candidateLimit`/`collections`/`intent` are accepted
+but unused; `rerank: Option<bool>` is likewise deserialize-only and **not** a per-request toggle —
+now that native reranking is genuinely implemented ([ADR 0025](../decisions/0025-tier2-cross-encoder-reranker.md)),
+`vec`/`hyde` sub-queries rerank (or don't) according to the vault's `search.reranker.enabled`
+config, not this request field. Each `QueryHit` carries `rerank_score` (present only when the
+engine actually reranked that hit — see [`docs/reference/mcp.md`](../reference/mcp.md)).
 
 **`get` / `multi_get`** — **direct vault file reads** (`tokio::fs::read_to_string` after
 confining the path under the vault root); the index is not involved at all, so they work with no
@@ -486,6 +543,13 @@ collection set + active model's dir absent, `pending_new/changed/removed`, `last
 `reindexing {done,total}` when a marker is live, `semantic_available` =
 compile-time `semantic` feature.
 
+**Reranker fields** (rendered under a separate "🎯 Reranker" section in text mode):
+`reranker_model` (configured `search.reranker.model` name), `reranker_ready` (config-and-filesystem
+check: `search.reranker.enabled` AND the model's `models--*` dir present — never opens/loads the
+model itself), `reranker_downloaded` (pure filesystem presence check, independent of
+`enabled` — matches the vocabulary `doctor` and the daemon's `/api/internal/status` use), and
+`reranker_disk_bytes` (on-disk size of the downloaded reranker dir, `None` if absent).
+
 ### Degradation matrix
 
 | Mode | No index yet | Model missing | Lex-only build ([ADR 0017](../decisions/0017-platform-tiered-semantic-search.md)) | Reindex in flight |
@@ -499,6 +563,7 @@ compile-time `semantic` feature.
 | WebUI `lex` | empty hits, 200 | unaffected | works | works |
 | WebUI `hybrid` | empty hits, 200 (short-circuit) | may download in-daemon; embed failure → 500 | silently runs lex path | works |
 | `search status` | `indexed:false`, zero counts | `current_model_missing:true` | `semantic_available:false` | reports `reindexing{done,total}`; counts may lag |
+| reranker (all semantic verbs) | n/a (reranks whatever candidates exist) | not downloaded → `rerank_score:None` on every hit + CLI "unreranked" hint (skip-not-fail; never errors) | never runs (no `semantic` feature) | works (reranks against the current committed index) |
 | hook `--lex-only`/`--pending-only` | skip `no-index` | skip `model-not-downloaded` | both flags normally skip `model-not-downloaded` (nothing ever downloads in this build); if a model dir exists from a prior semantic build, lex-only runs and pending-only skips `semantic-unavailable` | skip `reindex-in-flight` |
 
 ---
@@ -561,4 +626,6 @@ pre-reindex WebUI search and the eventual first reindex agree on the collection.
   [0017](../decisions/0017-platform-tiered-semantic-search.md) (platform tiers),
   [0019](../decisions/0019-native-mcp-server-staged-qmd-cutover.md) (MCP cutover),
   [0020](../decisions/0020-cpu-only-embedding-runtime.md) (CPU-only runtime),
-  [0021](../decisions/0021-search-state-persistent-data-dir.md) (persistent data dir).
+  [0021](../decisions/0021-search-state-persistent-data-dir.md) (persistent data dir),
+  [0024](../decisions/0024-vector-confidence-recall-first.md) (recall-first vector cutoff),
+  [0025](../decisions/0025-tier2-cross-encoder-reranker.md) (Tier-2 cross-encoder reranker).

@@ -134,11 +134,13 @@ pub struct RerankerConfig {
     /// Validation happens at engine/CLI layer where the supported-names list lives.
     #[serde(default = "default_reranker_model")]
     pub model: String,
-    /// Number of candidate results to rerank. Default 30.
-    #[serde(default = "default_reranker_candidates")]
-    pub candidates: usize,
-    /// Minimum reranker score threshold. `None` uses the engine's calibrated default
-    /// (baked in as a constant in Task 9).
+    /// Minimum fused-candidate pool to rerank — a FLOOR, not a ceiling: the
+    /// reranked pool is actually `max(min_candidates, top_k)`, auto-raised so
+    /// every returned result is always reranked. Default 10 (calibrated).
+    #[serde(default = "default_reranker_min_candidates")]
+    pub min_candidates: usize,
+    /// Minimum reranker score threshold. `None` uses the engine's calibrated
+    /// default (`DEFAULT_RERANK_MIN_SCORE` = 0.30, measured on real ob-1).
     #[serde(default)]
     pub min_score: Option<f32>,
 }
@@ -151,8 +153,11 @@ fn default_reranker_model() -> String {
     "onebrain-reranker-v1".to_string()
 }
 
-fn default_reranker_candidates() -> usize {
-    30
+fn default_reranker_min_candidates() -> usize {
+    // Calibrated on real ob-1 (2026-07-06): 10 keeps golden-set quality (matches
+    // land in top ~5 after rerank) at ~1/3 the CPU cost of 30. Mirror of
+    // `RerankSettings::default().min_candidates` in onebrain-search.
+    10
 }
 
 impl Default for RerankerConfig {
@@ -160,7 +165,7 @@ impl Default for RerankerConfig {
         Self {
             enabled: default_reranker_enabled(),
             model: default_reranker_model(),
-            candidates: default_reranker_candidates(),
+            min_candidates: default_reranker_min_candidates(),
             min_score: None,
         }
     }
@@ -195,6 +200,13 @@ pub struct SearchConfig {
     /// Reranker config for improving search result relevance.
     #[serde(default)]
     pub reranker: RerankerConfig,
+    /// Vault-level default result count (`top_k`) for a search surface that
+    /// doesn't specify one explicitly (e.g. the webui's `/api/vault/search`
+    /// when its `top_k` query param is omitted). Per-query callers — the CLI's
+    /// `--top-k` flag, or an explicit API param — always override this.
+    /// Default 10.
+    #[serde(default = "default_search_default_top_k")]
+    pub default_top_k: usize,
 }
 
 fn default_embed_model() -> String {
@@ -205,6 +217,10 @@ fn default_search_exclude() -> Vec<String> {
     vec!["attachments".to_string()]
 }
 
+fn default_search_default_top_k() -> usize {
+    10
+}
+
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
@@ -213,6 +229,7 @@ impl Default for SearchConfig {
             embed: EmbedGate::default(),
             exclude: default_search_exclude(),
             reranker: RerankerConfig::default(),
+            default_top_k: default_search_default_top_k(),
         }
     }
 }
@@ -473,7 +490,7 @@ mod tests {
         let cfg = load_vault_config(&root).unwrap();
         assert!(cfg.search.reranker.enabled);
         assert_eq!(cfg.search.reranker.model, "onebrain-reranker-v1");
-        assert_eq!(cfg.search.reranker.candidates, 30);
+        assert_eq!(cfg.search.reranker.min_candidates, 10);
         assert_eq!(cfg.search.reranker.min_score, None);
     }
 
@@ -483,18 +500,35 @@ mod tests {
         let cfg = load_vault_config(&root).unwrap();
         assert!(!cfg.search.reranker.enabled);
         assert_eq!(cfg.search.reranker.model, "onebrain-reranker-v1");
-        assert_eq!(cfg.search.reranker.candidates, 30);
+        assert_eq!(cfg.search.reranker.min_candidates, 10);
         assert_eq!(cfg.search.reranker.min_score, None);
     }
 
     #[test]
     fn reranker_full_config_round_trips() {
-        let yaml = "search:\n  reranker:\n    enabled: true\n    model: custom-reranker\n    candidates: 50\n    min_score: 0.5\n";
+        let yaml = "search:\n  reranker:\n    enabled: true\n    model: custom-reranker\n    min_candidates: 50\n    min_score: 0.5\n";
         let (_dir, root) = write_vault(yaml);
         let cfg = load_vault_config(&root).unwrap();
         assert!(cfg.search.reranker.enabled);
         assert_eq!(cfg.search.reranker.model, "custom-reranker");
-        assert_eq!(cfg.search.reranker.candidates, 50);
+        assert_eq!(cfg.search.reranker.min_candidates, 50);
         assert_eq!(cfg.search.reranker.min_score, Some(0.5));
+    }
+
+    #[test]
+    fn default_top_k_absent_defaults_to_ten() {
+        let (_dir, root) = write_vault("search:\n  embed_model: multilingual-e5-small\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.search.default_top_k, 10);
+        assert_eq!(SearchConfig::default().default_top_k, 10);
+    }
+
+    #[test]
+    fn default_top_k_overrides_from_yaml() {
+        let (_dir, root) = write_vault("search:\n  default_top_k: 25\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.search.default_top_k, 25);
+        // Other search defaults preserved alongside the override.
+        assert_eq!(cfg.search.embed_model, "multilingual-e5-small");
     }
 }

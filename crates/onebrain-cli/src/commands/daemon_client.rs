@@ -514,13 +514,29 @@ impl DaemonHandle {
         }
     }
 
-    /// `GET /api/vault/search?q=&mode=` → the webui search response JSON.
-    /// Retries ONCE via [`ensure_running`] on a transport failure.
-    pub fn search(&self, query: &str, mode: &str) -> Result<serde_json::Value> {
+    /// `GET /api/vault/search?q=&mode=[&top_k=][&min_candidates=]` → the
+    /// webui search response JSON. `top_k`/`min_candidates` are optional
+    /// per-query overrides (e.g. the CLI's `--top-k`/`--min-candidates`
+    /// flags) — omitted entirely when `None`, so the server falls back to
+    /// its own config-derived defaults exactly as before this param was
+    /// added. Retries ONCE via [`ensure_running`] on a transport failure.
+    pub fn search(
+        &self,
+        query: &str,
+        mode: &str,
+        top_k: Option<usize>,
+        min_candidates: Option<usize>,
+    ) -> Result<serde_json::Value> {
         let q = urlencode(query);
         let m = urlencode(mode);
         with_retry(self, |h| {
-            let url = format!("{}/api/vault/search?q={}&mode={}", h.info.base_url(), q, m);
+            let mut url = format!("{}/api/vault/search?q={}&mode={}", h.info.base_url(), q, m);
+            if let Some(top_k) = top_k {
+                url.push_str(&format!("&top_k={top_k}"));
+            }
+            if let Some(min_candidates) = min_candidates {
+                url.push_str(&format!("&min_candidates={min_candidates}"));
+            }
             h.agent
                 .get(&url)
                 .header("x-onebrain-token", &h.info.token)
@@ -1423,7 +1439,7 @@ mod tests {
         let status = handle.status().unwrap();
         assert!(status["doc_count"].is_number(), "status: {status}");
 
-        let search = handle.search("quick", "lex").unwrap();
+        let search = handle.search("quick", "lex", None, None).unwrap();
         let hits = search["hits"].as_array().unwrap();
         assert_eq!(hits.len(), 1, "search: {search}");
         assert_eq!(hits[0]["path"], "alpha.md");

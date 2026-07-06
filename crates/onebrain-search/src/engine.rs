@@ -410,8 +410,10 @@ pub struct Hit {
     pub score: f64,
     pub snippet: String,
     /// Calibrated 0–1 cross-encoder relevance, present when the Tier-2
-    /// rerank stage scored this hit. `None` = unreranked (stage skipped,
-    /// failed, or this hit sits in the fused tail beyond `candidates`).
+    /// rerank stage scored this hit. `None` = unreranked (stage skipped or
+    /// failed for the whole query — the reranked pool is
+    /// `max(min_candidates, top_k)`, so every returned hit is normally
+    /// reranked; nothing beyond that pool survives truncation to `top_k`).
     pub rerank_score: Option<f32>,
 }
 
@@ -468,8 +470,12 @@ pub struct RerankSettings {
     pub enabled: bool,
     /// Reranker registry name (see [`rerank::reranker_registry`]).
     pub model: String,
-    /// How many fused candidates are fed to the cross-encoder.
-    pub candidates: usize,
+    /// Minimum fused-candidate pool fed to the cross-encoder — a FLOOR, not a
+    /// ceiling: [`Engine::apply_rerank`] actually reranks
+    /// `max(min_candidates, top_k)`, auto-raised so every result the caller
+    /// returns is always reranked. `min_candidates` only matters when it
+    /// exceeds `top_k` (a wider pool than the return size improves quality).
+    pub min_candidates: usize,
     /// Gate: reranked hits scoring below this are dropped, subject to the
     /// never-empty floor ([`RERANK_NO_MATCH_KEEP`]).
     pub min_score: f32,
@@ -489,7 +495,12 @@ impl Default for RerankSettings {
         Self {
             enabled: true,
             model: rerank::reranker_registry()[0].name.to_string(),
-            candidates: 30,
+            // 10, not 30: calibration on real ob-1 (2026-07-06) showed every
+            // golden-set match already lands in the top ~5 after rerank, while
+            // bge-reranker-v2-m3 costs ~70 ms/candidate on CPU — 30 made a warm
+            // search ~2 s (worse on a Pi). 10 keeps the quality and cuts rerank
+            // compute ~3×. Keep in sync with `RerankerConfig`'s config default.
+            min_candidates: 10,
             min_score: DEFAULT_RERANK_MIN_SCORE,
         }
     }
@@ -894,6 +905,43 @@ impl Engine {
         }
     }
 
+    /// Download the configured reranker model if it isn't on disk yet — the
+    /// reindex fetch path. This is DISTINCT from [`Engine::reranker`]: the
+    /// lazy accessor deliberately skips (returns `None`) when the model is
+    /// absent, because a query must never trigger a multi-hundred-MB
+    /// download on the request path. Reindex, by contrast, WANTS the
+    /// download, so it goes straight to [`rerank::new`] (which fetches via
+    /// hf-hub + verifies the pinned sha256). Without this split the two
+    /// contracts deadlock — reindex asks `reranker()` to download, but
+    /// `reranker()` refuses to construct until already downloaded, so the
+    /// model can never arrive (found on real ob-1, 2026-07-06).
+    ///
+    /// Skip-not-fail: an unknown model name or a download/verify error is
+    /// logged and swallowed — a failed fetch leaves search unreranked, never
+    /// fails the reindex.
+    fn fetch_reranker_model(&self) {
+        #[cfg(feature = "semantic")]
+        {
+            if !rerank::is_supported_reranker(&self.rerank_settings.model) {
+                // A typo'd `search.reranker.model` is the one skip-not-fail
+                // branch that would otherwise leave no trace in reindex stderr
+                // (download/verify/load errors all log below) — say it once so
+                // a config typo is diagnosable without cross-referencing status.
+                eprintln!(
+                    "onebrain-search: reranker model '{}' is not a known model — search stays unreranked (check `search.reranker.model`)",
+                    self.rerank_settings.model
+                );
+                return;
+            }
+            if let Err(e) = rerank::new(&self.rerank_settings.model, &self.cache_dir) {
+                eprintln!(
+                    "onebrain-search: reranker model '{}' failed to fetch — search stays unreranked: {e:#}",
+                    self.rerank_settings.model
+                );
+            }
+        }
+    }
+
     /// Install rerank settings (the CLI layer maps `search.reranker` here).
     /// Resets the lazy reranker source so a model change re-resolves.
     pub fn set_rerank_settings(&mut self, settings: RerankSettings) {
@@ -903,6 +951,30 @@ impl Engine {
         // the once-per-engine failure log so a NEW model's failure is never
         // hidden by an old model's suppressed warning.
         self.rerank_error_logged.set(false);
+    }
+
+    /// Override just the `min_candidates` knob of the currently installed
+    /// [`RerankSettings`] — e.g. a per-query `--min-candidates` CLI flag or
+    /// API param overriding the vault's configured
+    /// `search.reranker.min_candidates`. Unlike [`Engine::set_rerank_settings`],
+    /// this does NOT reset the lazy reranker source: `min_candidates` only
+    /// affects how wide a pool [`Engine::apply_rerank`] reranks, not which
+    /// model loads, so there is nothing to re-resolve. Call AFTER the
+    /// settings this overrides are installed (i.e. after `open_engine`'s
+    /// `set_rerank_settings`).
+    pub fn set_rerank_min_candidates(&mut self, min_candidates: usize) {
+        self.rerank_settings.min_candidates = min_candidates;
+    }
+
+    /// Per-query override of the vault's configured `search.reranker.min_score`
+    /// gate. Used to unify the CLI `--min-score` flag with the rerank gate:
+    /// when reranking is active, `--min-score` filters by the calibrated 0–1
+    /// `rerank_score` (this gate) instead of the raw retrieval score. Like
+    /// [`Engine::set_rerank_min_candidates`], it does NOT reset the lazy
+    /// reranker source — it only changes the gate threshold. Call AFTER
+    /// `set_rerank_settings`.
+    pub fn set_rerank_min_score(&mut self, min_score: f32) {
+        self.rerank_settings.min_score = min_score;
     }
 
     /// Whether the Tier-2 reranker is turned on per the currently installed
@@ -1135,12 +1207,16 @@ impl Engine {
     }
 
     /// Tier-2 rerank stage over an already-fused ranking (ADR 0025):
-    /// cross-encode the first `candidates` entries against `query`, sort that
-    /// block by calibrated score, gate at `min_score` (never-empty: total
-    /// rejection keeps the top [`RERANK_NO_MATCH_KEEP`]), append the
-    /// un-reranked tail, trim to `top_k`, resolve. Skip-not-fail: no
-    /// reranker → fused order with `rerank_score: None`; a rerank error
-    /// falls back the same way — queries never fail because reranking did.
+    /// cross-encode the first `max(min_candidates, top_k)` entries against
+    /// `query` — the reranked pool is a FLOOR of `min_candidates` that
+    /// expands to cover `top_k`, never a ceiling, so every result the caller
+    /// actually returns is always reranked — sort that block by calibrated
+    /// score, gate at `min_score` (never-empty: total rejection keeps the top
+    /// [`RERANK_NO_MATCH_KEEP`]), append the un-reranked fused tail (which
+    /// trim-to-`top_k` then drops, since the block already covers the full
+    /// returned set), trim to `top_k`, resolve. Skip-not-fail: no reranker →
+    /// fused order with `rerank_score: None`; a rerank error falls back the
+    /// same way — queries never fail because reranking did.
     fn apply_rerank(
         &self,
         query: &str,
@@ -1154,7 +1230,15 @@ impl Engine {
             return self.resolve_hits(unreranked);
         };
 
-        let block_len = fused.len().min(self.rerank_settings.candidates);
+        // `min_candidates` is a FLOOR, not a ceiling: every result the caller
+        // actually returns (`top_k`) must be reranked, so the reranked pool is
+        // max(min_candidates, top_k) — auto-raised whenever top_k exceeds the
+        // configured floor. Only the fused tail beyond that
+        // (already-truncated-away by `top_k` at the end of this function)
+        // stays unreranked.
+        let block_len = fused
+            .len()
+            .min(self.rerank_settings.min_candidates.max(top_k));
         let tail = fused.split_off(block_len);
         let head = fused;
 
@@ -1239,9 +1323,9 @@ impl Engine {
         let vec_hits = keep_top_cluster(self.vec.search(&query_vec, VEC_TOP_K), VEC_CLUSTER_WINDOW);
         let lex_hits = self.lex.search(text, LEX_TOP_K)?;
 
-        // Fuse wide enough for the rerank stage to see its full candidate
-        // block even when the caller asks for a small top_k.
-        let fuse_k = top_k.max(self.rerank_settings.candidates);
+        // Fuse wide enough for the rerank stage to see its full reranked
+        // pool even when the caller asks for a small top_k.
+        let fuse_k = top_k.max(self.rerank_settings.min_candidates);
         let fused = rrf_fuse(&lex_hits, &vec_hits, RRF_K, fuse_k);
         self.apply_rerank(text, fused, top_k)
     }
@@ -1252,7 +1336,7 @@ impl Engine {
     /// `search vsearch` verb.
     pub fn vector_search(&self, text: &str, top_k: usize) -> Result<Vec<Hit>> {
         let query_vec = self.embedder()?.embed_query(text)?;
-        let fetch_k = top_k.max(self.rerank_settings.candidates);
+        let fetch_k = top_k.max(self.rerank_settings.min_candidates);
         let vec_hits = keep_top_cluster(self.vec.search(&query_vec, fetch_k), VEC_CLUSTER_WINDOW);
         let ranked: Vec<(String, f64)> = vec_hits
             .into_iter()
@@ -1765,11 +1849,14 @@ impl Engine {
                 .unwrap_or(true);
             if should_fetch_reranker(self.rerank_settings.enabled, downloaded) {
                 progress(ReindexProgress::LoadingReranker);
-                // Resolve the lazy reranker once so the download/construction
-                // happens now (hf-hub prints its own progress), not on the
-                // next query. `reranker()` is skip-not-fail by design — a
-                // download error never fails the reindex.
-                self.reranker();
+                // Download the model NOW via the dedicated fetch path (hf-hub
+                // prints its own progress). Must be `fetch_reranker_model`,
+                // NOT `reranker()`: the lazy accessor skips when the model is
+                // absent (queries must not trigger a 570MB download), so it
+                // would never actually fetch here — the model could never
+                // arrive. Skip-not-fail — a download error never fails the
+                // reindex.
+                self.fetch_reranker_model();
             }
         }
         Ok(stats)
@@ -2408,6 +2495,46 @@ mod tests {
                 .iter()
                 .any(|p| matches!(p, ReindexProgress::LoadingReranker)),
             "disabled reranker must never emit LoadingReranker: {events:?}"
+        );
+    }
+
+    // Live network test: a full reindex with the reranker enabled and its
+    // model NOT yet on disk must actually DOWNLOAD it (not just emit the
+    // event). Gated behind ONEBRAIN_TEST_RERANK because it fetches ~570MB
+    // from Hugging Face. This is the test the unit suite structurally could
+    // not have: it exercises the real hf-hub path, and it fails on the
+    // circular-skip deadlock (reindex→reranker()→build_reranker skips) that
+    // shipped in the first v3.4.7 cut and was caught only on the real vault.
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn reindex_downloads_reranker_model_when_missing() {
+        if std::env::var("ONEBRAIN_TEST_RERANK").is_err() {
+            return; // gated: multi-hundred-MB network download
+        }
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        // Fake embedder (so embedding needs no model), real reranker source
+        // (default settings: enabled + onebrain-reranker-v1). The reranker
+        // fetch path is independent of the injected embedder.
+        let mut e = fake_engine(cache_dir.path());
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
+
+        let info = rerank::reranker_registry()
+            .iter()
+            .find(|m| m.name == "onebrain-reranker-v1")
+            .unwrap();
+        assert!(
+            !rerank::reranker_download_status(info, cache_dir.path()).downloaded,
+            "precondition: model must be absent before reindex"
+        );
+
+        e.reindex_all_with_progress(vault_dir.path(), &mut |_| {})
+            .unwrap();
+
+        assert!(
+            rerank::reranker_download_status(info, cache_dir.path()).downloaded,
+            "reindex must leave the reranker model on disk — a query-path skip \
+             would silently never download it"
         );
     }
 
@@ -3588,30 +3715,61 @@ mod tests {
     }
 
     #[test]
-    fn rerank_tail_beyond_candidates_is_appended_unreranked() {
+    fn rerank_tail_beyond_top_k_is_dropped_by_truncation() {
+        // `min_candidates` is a FLOOR, auto-raised to `top_k`
+        // (`max(min_candidates, top_k)`): with min_candidates=2 but top_k=4
+        // on a 6-doc corpus, the reranked pool covers all 4 returned hits,
+        // and the fused tail beyond top_k (docs 5-6) is dropped by
+        // truncation — it never appears unreranked within the returned set.
         let dir = tempfile::tempdir().unwrap();
         let mut e = fake_engine(dir.path());
-        for i in 0..4 {
+        for i in 0..6 {
             e.index_doc(&format!("t{i}.md"), &format!("zeta unique{i}"))
                 .unwrap();
         }
         e.set_rerank_settings(RerankSettings {
-            candidates: 2,
+            min_candidates: 2,
             min_score: 0.0,
             ..Default::default()
         });
         e.set_reranker_for_tests(Box::new(FakeReranker));
-        let hits = e.query("zeta", 10).unwrap();
-        assert_eq!(hits.len(), 4);
-        assert!(
-            hits[0].rerank_score.is_some() && hits[1].rerank_score.is_some(),
-            "first `candidates` hits form the reranked block"
+        let hits = e.query("zeta", 4).unwrap();
+        assert_eq!(
+            hits.len(),
+            4,
+            "truncated to top_k, not left at min_candidates"
         );
         assert!(
-            hits[2].rerank_score.is_none() && hits[3].rerank_score.is_none(),
-            "fused tail beyond `candidates` stays unreranked, appended after"
+            hits.iter().all(|h| h.rerank_score.is_some()),
+            "every returned hit is reranked — pool size is max(min_candidates, top_k), not min_candidates alone"
         );
-        assert!(hits[0].rerank_score.unwrap() >= hits[1].rerank_score.unwrap());
+    }
+
+    #[test]
+    fn rerank_pool_covers_full_top_k_when_top_k_exceeds_min_candidates() {
+        // Correctness fix: the rerank window must be
+        // max(min_candidates, top_k), never just `min_candidates`. With
+        // min_candidates=2 and top_k=5 on a 6-doc corpus, all 5 returned
+        // results must carry rerank_score: Some — none may slip through
+        // unreranked within the returned top_k.
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        for i in 0..6 {
+            e.index_doc(&format!("d{i}.md"), &format!("zeta unique{i}"))
+                .unwrap();
+        }
+        e.set_rerank_settings(RerankSettings {
+            min_candidates: 2,
+            min_score: 0.0,
+            ..Default::default()
+        });
+        e.set_reranker_for_tests(Box::new(FakeReranker));
+        let hits = e.query("zeta", 5).unwrap();
+        assert_eq!(hits.len(), 5);
+        assert!(
+            hits.iter().all(|h| h.rerank_score.is_some()),
+            "no unreranked result may appear within the returned top_k"
+        );
     }
 
     #[test]
@@ -3632,12 +3790,47 @@ mod tests {
         let hits = e.query("note", 10).unwrap();
         // Partial gate: only the two marker docs clear 0.5 (0.9 vs 0.4).
         // Gate-dropped candidates are REMOVED, never backfilled — the result
-        // shrinks below top_k. (The fused tail beyond `candidates` is a
+        // shrinks below top_k. (The fused tail beyond `min_candidates` is a
         // separate mechanism, covered by the test above.) Track B confidence
         // bands depend on this exact semantic.
         assert_eq!(hits.len(), 2, "gate-dropped candidates must not reappear");
         assert!(hits.iter().all(|h| h.doc_path.starts_with("m")));
         assert!(hits.iter().all(|h| h.rerank_score == Some(0.9)));
+    }
+
+    #[test]
+    fn set_rerank_min_score_overrides_the_gate_per_query() {
+        // Backs the CLI `--min-score` unification: raising the gate via
+        // `set_rerank_min_score` filters the calibrated rerank_score, and the
+        // never-empty floor still applies when everything is dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        e.index_doc("m1.md", "note zulumark alpha").unwrap();
+        e.index_doc("m2.md", "note zulumark beta").unwrap();
+        for i in 0..3 {
+            e.index_doc(&format!("u{i}.md"), &format!("note gamma{i}"))
+                .unwrap();
+        }
+        e.set_reranker_for_tests(Box::new(MarkerReranker { marker: "zulumark" }));
+
+        // Default gate (0.30) keeps the two marker docs (0.9); the 0.4 tail is
+        // below the MarkerReranker's non-marker score only above 0.4 — verify
+        // the override tightens past 0.9 → nothing clears → never-empty floor.
+        e.set_rerank_min_score(0.95);
+        let hits = e.query("note", 10).unwrap();
+        assert_eq!(
+            hits.len(),
+            RERANK_NO_MATCH_KEEP,
+            "gate at 0.95 drops all (max score 0.9) → never-empty floor keeps top-3"
+        );
+
+        // Loosen the gate below every score → all reranked candidates survive.
+        e.set_rerank_min_score(0.0);
+        let hits = e.query("note", 10).unwrap();
+        assert!(
+            hits.len() >= 2 && hits.iter().all(|h| h.rerank_score.is_some()),
+            "gate at 0.0 keeps every reranked hit"
+        );
     }
 
     #[test]

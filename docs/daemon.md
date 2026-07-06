@@ -18,7 +18,7 @@ The search engine's metadata store (`engine.redb`) is **single-process**: only o
 >
 > Consolidating the remaining surfaces (config/tree/file/chat) behind the daemon is later cleanup.
 >
-> **Daemon-routed `query` deltas (MCP tool):** the daemon-backed `query` path differs slightly from the direct-engine path — results are **doc-level** (dedup/fusion keys on `path`, so at most one hit per document, vs multiple chunks of one doc directly); a `vec` sub-query is served as **`hybrid`** (lex mixed in) on the wire; and the daemon caps candidates at **`TOP_K` = 20** per sub-query (the direct path over-fetches ≥30). `hyde` ≡ `vec` on **both** paths already (both embed the passage text), so daemon routing adds no new hyde loss. `status` is unaffected — its response shape is identical on both paths.
+> **Daemon-routed `query` deltas (MCP tool):** the daemon-backed `query` path differs slightly from the direct-engine path — results are **doc-level** (dedup/fusion keys on `path`, so at most one hit per document, vs multiple chunks of one doc directly); a `vec` sub-query is served as **`hybrid`** (lex mixed in) on the wire; and the fan-out over-fetches the same depth as the direct path (`fetch_k` ≈30 per sub-query, v3.4.7+) so RRF fusion depth matches — no 20-vs-30 asymmetry. `hyde` ≡ `vec` on **both** paths already (both embed the passage text), so daemon routing adds no new hyde loss. `status` is unaffected — its response shape is identical on both paths.
 
 ## Persistent engine + internal endpoints
 

@@ -70,7 +70,7 @@ A zero-config `--dir`-only mode (no `onebrain.yml` required) is on the backlog �
 
 ## Tools
 
-> **Warm daemon routing (v3.4.6+).** When a warm daemon is running for this vault (`onebrain daemon` — the MCP server auto-starts one), `query` and `status` are served by the daemon over its local HTTP API instead of this process opening its own search engine, so **multiple concurrent MCP sessions coexist** without racing redb's single-writer lock. Daemon-routed `query` has documented deltas vs a direct open: results are **doc-level** (deduped by `path` → at most one hit per document), `vec`/`hyde` sub-queries are served as `hybrid` on the wire, and candidates are capped at `TOP_K`=20 per sub-query (`status`'s shape is identical either way). `get`/`multi_get` are always direct filesystem reads. If the daemon can't start, the tools fall back to a direct engine open. See [docs/daemon.md](../daemon.md).
+> **Warm daemon routing (v3.4.6+).** When a warm daemon is running for this vault (`onebrain daemon` — the MCP server auto-starts one), `query` and `status` are served by the daemon over its local HTTP API instead of this process opening its own search engine, so **multiple concurrent MCP sessions coexist** without racing redb's single-writer lock. Daemon-routed `query` has documented deltas vs a direct open: results are **doc-level** (deduped by `path` → at most one hit per document) and `vec`/`hyde` sub-queries are served as `hybrid` on the wire; the fan-out over-fetches the same depth as a direct open (`fetch_k` ≈30 per sub-query) so RRF fusion depth matches (`status`'s shape is identical either way). `get`/`multi_get` are always direct filesystem reads. If the daemon can't start, the tools fall back to a direct engine open. See [docs/daemon.md](../daemon.md).
 
 ### `query`
 
@@ -86,7 +86,7 @@ Search the vault with typed sub-queries (`lex` = BM25 keywords, `vec` = semantic
 | `candidateLimit` | number | no | — | **Compatibility only, not used by the native engine.** Accepted for qmd schema compatibility; deserializes without error, has no effect. |
 | `collections` | array of string | no | — | **Compatibility only, not used by the native engine.** The native index is single-collection per vault, so there's nothing to select between. |
 | `intent` | string | no | — | **Compatibility only, not used by the native engine yet.** Background context for disambiguation; native intent-aware ranking is not yet implemented. |
-| `rerank` | boolean | no | — | **Compatibility only, not used by the native engine.** Native rerank (bge-reranker-v2-m3) is not yet implemented. |
+| `rerank` | boolean | no | — | **Compatibility only, not used by the native engine.** Native cross-encoder reranking (`onebrain-reranker-v1`, a `bge-reranker-v2-m3`-based model — [ADR 0025](../decisions/0025-tier2-cross-encoder-reranker.md)) IS implemented, but as an engine-wide, config-driven stage (`search.reranker.enabled` in `onebrain.yml`) rather than a per-request toggle — this field stays deserialize-only and has no effect either way. `vec`/`hyde` sub-queries are reranked (or not) according to the vault's configuration; `lex` sub-queries are never reranked. |
 
 **Result shape**
 
@@ -99,13 +99,14 @@ Search the vault with typed sub-queries (`lex` = BM25 keywords, `vec` = semantic
       "title": "meeting",
       "score": 1.0,
       "context": "Decisions > Q3 roadmap",
-      "snippet": "…agreed to ship the native search engine before…"
+      "snippet": "…agreed to ship the native search engine before…",
+      "rerank_score": 0.87
     }
   ]
 }
 ```
 
-`context` is omitted entirely (not `null`) when the hit has no heading path.
+`context` is omitted entirely (not `null`) when the hit has no heading path. `rerank_score` (calibrated 0–1, from the Tier-2 cross-encoder) is likewise omitted entirely — not `null` — for `lex` sub-query hits (never reranked) and for any `vec`/`hyde` hit the rerank stage skipped: reranking disabled, the model not downloaded, or a load/runtime failure. (The reranked pool auto-raises to cover the returned count, so a *returned* hit is never omitted merely for its rank — an unreranked returned hit always means the whole stage was skipped.) A missing key and an unreranked hit are the same thing; there is no separate boolean flag for "was this reranked."
 
 When the vault has **no search index yet** (never reindexed, or the cache was purged), `query` does not error — it returns an empty `results` array plus a `note` string telling the agent to run `onebrain search reindex` or fall back to filesystem search (grep/read). `note` is omitted entirely once an index exists:
 
