@@ -923,6 +923,14 @@ impl Engine {
         #[cfg(feature = "semantic")]
         {
             if !rerank::is_supported_reranker(&self.rerank_settings.model) {
+                // A typo'd `search.reranker.model` is the one skip-not-fail
+                // branch that would otherwise leave no trace in reindex stderr
+                // (download/verify/load errors all log below) — say it once so
+                // a config typo is diagnosable without cross-referencing status.
+                eprintln!(
+                    "onebrain-search: reranker model '{}' is not a known model — search stays unreranked (check `search.reranker.model`)",
+                    self.rerank_settings.model
+                );
                 return;
             }
             if let Err(e) = rerank::new(&self.rerank_settings.model, &self.cache_dir) {

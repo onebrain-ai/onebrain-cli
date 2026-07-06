@@ -368,12 +368,15 @@ fn run_query_via_daemon(
 
     let mut hits = daemon_hits(&resp);
 
-    // Same rerank-enabled knob the direct path reads via `open_engine` —
+    // Same rerank-enabled/gate knobs the direct path reads via `open_engine` —
     // config is read-only here (no engine/embedder is opened on this path),
     // so this can't trigger a model download.
-    let rerank_enabled = onebrain_core::load_vault_config(&resolved.root)
-        .map(|cfg| rerank_settings_from_config(&cfg.search.reranker).enabled)
-        .unwrap_or(true);
+    let (rerank_enabled, config_gate) = onebrain_core::load_vault_config(&resolved.root)
+        .map(|cfg| {
+            let s = rerank_settings_from_config(&cfg.search.reranker);
+            (s.enabled, s.min_score)
+        })
+        .unwrap_or((true, onebrain_search::engine::DEFAULT_RERANK_MIN_SCORE));
 
     // `--min-score` unification (mirrors the direct path): when the daemon
     // reranked (hits carry `rerank_score`), filter by that calibrated 0–1
@@ -385,6 +388,17 @@ fn run_query_via_daemon(
         let reranked = rerank_enabled && hits.iter().any(|h| h.rerank_score.is_some());
         if reranked {
             let minf = min as f32;
+            // Never-silent: the daemon already gated at its config `min_score`
+            // before returning, so a LOOSER `--min-score` here can't restore
+            // dropped hits — only tighten. Say so rather than let the flag
+            // appear to do nothing. (The direct, non-daemon path can loosen.)
+            if minf < config_gate {
+                eprintln!(
+                    "note: this vault's live daemon already gated at min_score {config_gate:.2}; \
+                     --min-score {min:.2} only tightens further on the daemon path (run with \
+                     ONEBRAIN_NO_DAEMON=1 for a direct query that can loosen it)"
+                );
+            }
             hits.retain(|h| h.rerank_score.map(|rs| rs >= minf).unwrap_or(false));
         } else {
             hits.retain(|h| h.score >= min);

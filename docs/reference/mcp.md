@@ -106,7 +106,7 @@ Search the vault with typed sub-queries (`lex` = BM25 keywords, `vec` = semantic
 }
 ```
 
-`context` is omitted entirely (not `null`) when the hit has no heading path. `rerank_score` (calibrated 0–1, from the Tier-2 cross-encoder) is likewise omitted entirely — not `null` — for `lex` sub-query hits (never reranked) and for any `vec`/`hyde` hit the rerank stage skipped: reranking disabled, the model not downloaded, a load/runtime failure, or the hit falling outside the fused `candidates` window. A missing key and an unreranked hit are the same thing; there is no separate boolean flag for "was this reranked."
+`context` is omitted entirely (not `null`) when the hit has no heading path. `rerank_score` (calibrated 0–1, from the Tier-2 cross-encoder) is likewise omitted entirely — not `null` — for `lex` sub-query hits (never reranked) and for any `vec`/`hyde` hit the rerank stage skipped: reranking disabled, the model not downloaded, or a load/runtime failure. (The reranked pool auto-raises to cover the returned count, so a *returned* hit is never omitted merely for its rank — an unreranked returned hit always means the whole stage was skipped.) A missing key and an unreranked hit are the same thing; there is no separate boolean flag for "was this reranked."
 
 When the vault has **no search index yet** (never reindexed, or the cache was purged), `query` does not error — it returns an empty `results` array plus a `note` string telling the agent to run `onebrain search reindex` or fall back to filesystem search (grep/read). `note` is omitted entirely once an index exists:
 
