@@ -1,6 +1,6 @@
 # @onebrain-ai/cli
 
-npm wrapper for the [OneBrain CLI](https://github.com/onebrain-ai/onebrain-cli) — the local-first Rust binary that powers the [OneBrain](https://onebrain.run) personal AI OS for Obsidian.
+npm wrapper for the [OneBrain CLI](https://github.com/onebrain-ai/onebrain-cli) — the local-first Rust binary that powers the [OneBrain](https://onebrain.run) personal AI OS.
 
 ```bash
 npm install -g @onebrain-ai/cli
