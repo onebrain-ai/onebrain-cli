@@ -145,10 +145,15 @@ fn verify_sha256_once(path: &Path, expected_hex: &str) -> Result<()> {
     let actual_hex = format!("{:x}", hasher.finalize());
 
     if !actual_hex.eq_ignore_ascii_case(expected_hex) {
+        // Recovery hint deliberately gives the manual path: `search model
+        // remove` only knows embedding models until the Track B CLI wiring
+        // teaches it reranker names — hinting a command that errors would be
+        // a second failure on top of a corruption report.
         bail!(
             "model file {} failed integrity check: expected sha256 {expected_hex}, got {actual_hex}. \
-             The download is likely corrupt or tampered. Delete and re-fetch it: \
-             `onebrain search model remove onebrain-reranker-v1`, then reindex.",
+             The download is likely corrupt or tampered. Delete the model's cache directory \
+             (the `models--*` folder containing this file), then run `onebrain search reindex` \
+             to re-download it.",
             path.display()
         );
     }
@@ -306,10 +311,19 @@ impl Rerank for Reranker {
             .map_err(|_| anyhow::anyhow!("reranker mutex poisoned"))?;
         let results = model.rerank::<String>(query.to_string(), passages, false, None)?;
         // rerank() returns results sorted by score DESC; restore input order
-        // via each result's `index`.
+        // via each result's `index`. Guard the index instead of trusting the
+        // dependency: an out-of-bounds index (upstream bug) must degrade to a
+        // skipped score, not a panic inside the query path (skip-not-fail).
         let mut out = vec![0.0f32; passages.len()];
         for r in results {
-            out[r.index] = sigmoid(r.score);
+            match out.get_mut(r.index) {
+                Some(slot) => *slot = sigmoid(r.score),
+                None => eprintln!(
+                    "onebrain-search: reranker returned out-of-range index {} (of {}) — score skipped",
+                    r.index,
+                    passages.len()
+                ),
+            }
         }
         Ok(out)
     }

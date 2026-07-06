@@ -510,6 +510,12 @@ pub struct Engine {
     rerank_settings: RerankSettings,
     /// Tier-2 reranker source; see [`RerankSource`].
     reranker: RerankSource,
+    /// True once a rerank RUNTIME failure has been logged for this engine
+    /// instance. Unlike the load failure (OnceCell-cached, logs once by
+    /// construction), the runtime path re-runs every query — without this
+    /// flag a persistently failing model would spam a long-running daemon's
+    /// stderr on every search.
+    rerank_error_logged: std::cell::Cell<bool>,
     meta: Database,
 }
 
@@ -624,6 +630,7 @@ impl Engine {
             embedder,
             rerank_settings: RerankSettings::default(),
             reranker: RerankSource::Lazy(OnceCell::new()),
+            rerank_error_logged: std::cell::Cell::new(false),
             meta,
         })
     }
@@ -1063,9 +1070,22 @@ impl Engine {
         let mut texts = Vec::with_capacity(ids.len());
         for (chunk_id, _) in ids {
             let text = match chunk_meta.get(chunk_id.as_str())? {
-                Some(v) => serde_json::from_str::<ChunkMeta>(v.value())
-                    .map(|m| m.text)
-                    .unwrap_or_default(),
+                // Deliberately default-not-propagate: a bad passage must not
+                // fail the whole query (skip-not-fail), but corruption is a
+                // real data signal — say so instead of silently demoting the
+                // hit with a near-zero rerank score.
+                Some(v) => match serde_json::from_str::<ChunkMeta>(v.value()) {
+                    Ok(m) => m.text,
+                    Err(e) => {
+                        eprintln!(
+                            "onebrain-search: chunk meta for {chunk_id} is corrupt ({e}) — \
+                             passage blanked for reranking; a `reindex --force` rebuilds it"
+                        );
+                        String::new()
+                    }
+                },
+                // Missing meta = stale index entry; resolve_hits skips these
+                // silently by design, so stay quiet here too.
                 None => String::new(),
             };
             texts.push(text);
@@ -1144,7 +1164,18 @@ impl Engine {
                     .collect()
             }
             Err(e) => {
-                eprintln!("onebrain-search: rerank failed — falling back to fused order: {e:#}");
+                // Log the first runtime failure per engine instance, then go
+                // quiet: a persistently failing model would otherwise spam a
+                // long-running daemon's stderr on every query. The unreranked
+                // state itself stays visible per-query via rerank_score: None
+                // (the CLI hint layer surfaces it).
+                if !self.rerank_error_logged.get() {
+                    self.rerank_error_logged.set(true);
+                    eprintln!(
+                        "onebrain-search: rerank failed — falling back to fused order \
+                         (further rerank failures on this engine will not be logged): {e:#}"
+                    );
+                }
                 head.into_iter()
                     .chain(tail)
                     .map(|(id, s)| (id, s, None))
