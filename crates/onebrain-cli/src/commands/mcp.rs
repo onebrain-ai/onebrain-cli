@@ -799,8 +799,19 @@ impl McpServer {
                 }
                 Backend::Daemon(handle) => {
                     let handle = handle.clone();
+                    // Cap the reranked candidate set to the top `limit.max(10)`
+                    // fused survivors (they are RRF-ordered, best first).
+                    // Without this cap the daemon's doc-level `rerank_paths`
+                    // cross-encodes EVERY chunk of EVERY survivor path (up to
+                    // fetch_k≈30 docs → 100+ chunks) — far more than the Direct
+                    // arm, whose `rerank_hits`→`apply_rerank` bounds the pool to
+                    // max(min_candidates, top_k). 10 mirrors the calibrated
+                    // default `search.reranker.min_candidates`; taking the top
+                    // fused paths keeps the same top-k results at a fraction of
+                    // the cross-encode cost.
                     let paths: Vec<String> = survivors
                         .iter()
+                        .take(limit.max(10))
                         .map(|(_, hit)| hit.doc_path.clone())
                         .collect();
                     // The daemon's doc-level `/api/internal/rerank` seeds fused
