@@ -157,7 +157,7 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchReindexA
         match &p {
             ReindexProgress::Walked { total } => live.record(0, *total),
             ReindexProgress::Indexing { done, total, .. } => live.record(*done, *total),
-            ReindexProgress::LoadingModel => {}
+            ReindexProgress::LoadingModel | ReindexProgress::LoadingReranker => {}
         }
         reporter.handle(p);
     };
@@ -536,7 +536,7 @@ fn run_lex_only(
         match &p {
             ReindexProgress::Walked { total } => live.record(0, *total),
             ReindexProgress::Indexing { done, total, .. } => live.record(*done, *total),
-            ReindexProgress::LoadingModel => {}
+            ReindexProgress::LoadingModel | ReindexProgress::LoadingReranker => {}
         }
         reporter.handle(p);
     };
@@ -631,7 +631,7 @@ fn run_pending_only(
         match &p {
             ReindexProgress::Walked { total } => live.record(0, *total),
             ReindexProgress::Indexing { done, total, .. } => live.record(*done, *total),
-            ReindexProgress::LoadingModel => {}
+            ReindexProgress::LoadingModel | ReindexProgress::LoadingReranker => {}
         }
         reporter.handle(p);
     };
@@ -846,6 +846,24 @@ impl ProgressReporter {
                     ..
                 } => {
                     eprintln!("{load_notice}");
+                    *printed = true;
+                }
+                Self::Silent => {}
+            },
+            // Fires at most once, at the end of a full reindex, only when
+            // reranking is enabled and the model isn't downloaded yet —
+            // hf-hub prints its own download progress, so this is just a
+            // one-line heads-up (no embed-model-specific `load_notice`: the
+            // reranker is a distinct model with its own name/size).
+            ReindexProgress::LoadingReranker => match self {
+                Self::Bar { pb, printed, .. } => {
+                    pb.suspend(|| {
+                        eprintln!("🧠  Fetching reranker model…");
+                    });
+                    *printed = true;
+                }
+                Self::PlainLines { printed, .. } => {
+                    eprintln!("🧠  Fetching reranker model…");
                     *printed = true;
                 }
                 Self::Silent => {}

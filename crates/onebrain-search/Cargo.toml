@@ -44,6 +44,20 @@ fastembed = { version = "5.17", default-features = false, features = [
     "ort-download-binaries-rustls-tls",
 ], optional = true }
 
+# Explicit `hf-hub` dep for the reranker's own model download: fastembed only
+# drives hf-hub downloads through `TextEmbedding`/`TextRerank::try_new`, not
+# through the "bring your own model" path (`try_new_from_user_defined`) that
+# `Reranker::new` uses, so this crate talks to hf-hub's sync `Api`/`ApiRepo`
+# directly to fetch the ONNX + tokenizer files first. Same version fastembed
+# already pulls in transitively (kept in sync via Cargo.lock) and the same
+# rustls-only feature shape as `hf-hub-rustls-tls` above: `ureq` (required for
+# the sync API — see hf-hub's `api::sync` module gate) + `rustls-tls` (no
+# native-tls/openssl-sys, matching the rest of this crate).
+hf-hub = { version = "0.5", default-features = false, features = [
+    "ureq",
+    "rustls-tls",
+], optional = true }
+
 # Memory-mapped file access for on-disk index/vector stores.
 memmap2 = { workspace = true }
 
@@ -69,7 +83,7 @@ simsimd = "6.5"
 # registry metadata — so keyword search and the full index lifecycle work on
 # platforms with no ONNX Runtime prebuilt. See ADR 0017.
 default = ["semantic"]
-semantic = ["dep:fastembed"]
+semantic = ["dep:fastembed", "dep:hf-hub"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

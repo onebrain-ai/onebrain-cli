@@ -31,6 +31,7 @@ use crate::chunk::chunk_markdown;
 use crate::embed::{self, Embed};
 use crate::hybrid::rrf_fuse;
 use crate::lex::LexIndex;
+use crate::rerank::{self, Rerank};
 use crate::vector::VectorStore;
 
 const CHUNK_META: TableDefinition<&str, &str> = TableDefinition::new("chunk_meta");
@@ -60,6 +61,20 @@ const RRF_K: f64 = 60.0;
 /// agnostic (relative), replacing the old per-model absolute `vec_floor`.
 const VEC_CLUSTER_WINDOW: f32 = 0.02;
 const SNIPPET_MAX_CHARS: usize = 200;
+
+/// When the rerank gate rejects every candidate, keep this many top-scored
+/// hits (the CLI labels them "no strong match") instead of returning nothing —
+/// ADR 0024's "never empties a non-empty result set" invariant carried into
+/// the Tier-2 rerank stage.
+const RERANK_NO_MATCH_KEEP: usize = 3;
+
+/// Default rerank-score gate. PROVISIONAL — like the retired `vec_floor`,
+/// any unmeasured constant is a guess: the v3.4.7 Track C calibration run on
+/// real vault content (golden set from the 2026-07-06 floor investigation)
+/// replaces this value. Unlike `vec_floor`, a bad value here cannot silence
+/// results: total rejection keeps the top [`RERANK_NO_MATCH_KEEP`] hits and
+/// the CLI labels weak results instead of hiding them.
+pub const DEFAULT_RERANK_MIN_SCORE: f32 = 0.30;
 
 /// Error message returned by embedder-backed operations (`query`,
 /// `vector_search`, model switch, and the lazy embedder) in a lex-only build
@@ -99,6 +114,14 @@ pub enum ReindexProgress {
         total: usize,
         doc_path: String,
     },
+    /// Emitted at most once, at the END of a full reindex, right before the
+    /// engine constructs the reranker for the first time — i.e. where the
+    /// reranker model download happens (mirrors [`ReindexProgress::LoadingModel`]
+    /// for the embedder). Only fires when reranking is enabled and the
+    /// configured reranker model is not yet downloaded; a run where it's
+    /// already present, disabled, or the model name is unknown never emits
+    /// it. See [`should_fetch_reranker`].
+    LoadingReranker,
 }
 
 /// Outcome counts of a [`Engine::reindex_paths`] / [`Engine::reindex_all`] run.
@@ -386,6 +409,10 @@ pub struct Hit {
     pub heading_path: String,
     pub score: f64,
     pub snippet: String,
+    /// Calibrated 0–1 cross-encoder relevance, present when the Tier-2
+    /// rerank stage scored this hit. `None` = unreranked (stage skipped,
+    /// failed, or this hit sits in the fused tail beyond `candidates`).
+    pub rerank_score: Option<f32>,
 }
 
 /// Per-chunk metadata stored in `engine.redb` (the text and heading path
@@ -417,6 +444,48 @@ enum EmbedSource {
     Injected(Box<dyn Embed>),
 }
 
+/// How an [`Engine`] obtains its reranker (the Tier-2 cross-encoder stage).
+/// Mirrors [`EmbedSource`] with one extra honesty rule: the lazy path
+/// resolves to `None` — skip reranking, never fail the query — when the
+/// model is not downloaded, the build has no `semantic` feature, or
+/// construction fails. Downloads belong to `reindex`, not the query path.
+enum RerankSource {
+    /// Real reranker, constructed lazily on the first reranked query.
+    /// `None` inside the cell means resolution ran and reranking is skipped.
+    Lazy(OnceCell<Option<Box<dyn Rerank>>>),
+    /// Pre-built reranker injected by the test-only
+    /// [`Engine::set_reranker_for_tests`] seam.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Injected(Box<dyn Rerank>),
+}
+
+/// Engine-facing rerank settings, mapped from the config's `search.reranker`
+/// block by the CLI layer (this crate does not read config files).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RerankSettings {
+    /// Master switch. Reranking is default-on: an absent config block means
+    /// exactly these defaults.
+    pub enabled: bool,
+    /// Reranker registry name (see [`rerank::reranker_registry`]).
+    pub model: String,
+    /// How many fused candidates are fed to the cross-encoder.
+    pub candidates: usize,
+    /// Gate: reranked hits scoring below this are dropped, subject to the
+    /// never-empty floor ([`RERANK_NO_MATCH_KEEP`]).
+    pub min_score: f32,
+}
+
+impl Default for RerankSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: rerank::reranker_registry()[0].name.to_string(),
+            candidates: 30,
+            min_score: DEFAULT_RERANK_MIN_SCORE,
+        }
+    }
+}
+
 /// The assembled search engine: lexical index, vector store, embedder, and
 /// a `redb` metadata database, all rooted at one `cache_dir`.
 ///
@@ -437,7 +506,29 @@ pub struct Engine {
     model_name: String,
     cache_dir: PathBuf,
     embedder: EmbedSource,
+    /// Tier-2 rerank stage configuration; see [`Engine::set_rerank_settings`].
+    rerank_settings: RerankSettings,
+    /// Tier-2 reranker source; see [`RerankSource`].
+    reranker: RerankSource,
+    /// True once a rerank RUNTIME failure has been logged for this engine
+    /// instance. Unlike the load failure (OnceCell-cached, logs once by
+    /// construction), the runtime path re-runs every query — without this
+    /// flag a persistently failing model would spam a long-running daemon's
+    /// stderr on every search.
+    rerank_error_logged: std::cell::Cell<bool>,
+    /// Same rate-limit for corrupt chunk-meta warnings during rerank passage
+    /// lookup ([`Engine::chunk_texts`]).
+    chunk_corruption_logged: std::cell::Cell<bool>,
     meta: Database,
+}
+
+/// Pure decision for the reindex-time reranker fetch: fetch only when
+/// reranking is enabled AND the configured model isn't already downloaded.
+/// An unknown model name is treated as "downloaded" by the caller (mirrors
+/// [`Engine::build_reranker`]'s skip-on-unknown-model behavior), so this
+/// function never needs to know about the registry itself.
+fn should_fetch_reranker(enabled: bool, downloaded: bool) -> bool {
+    enabled && !downloaded
 }
 
 /// Truncate `text` to at most `max_chars` characters on a char boundary,
@@ -540,6 +631,10 @@ impl Engine {
             model_name: embed_model.to_string(),
             cache_dir: cache_dir.to_path_buf(),
             embedder,
+            rerank_settings: RerankSettings::default(),
+            reranker: RerankSource::Lazy(OnceCell::new()),
+            rerank_error_logged: std::cell::Cell::new(false),
+            chunk_corruption_logged: std::cell::Cell::new(false),
             meta,
         })
     }
@@ -747,6 +842,75 @@ impl Engine {
         }
     }
 
+    /// The Tier-2 reranker, or `None` when reranking is skipped (disabled,
+    /// model not downloaded, lex-only build, or load failure). Lazy like
+    /// [`Engine::embedder`], but skip-not-fail: a query must never error
+    /// because reranking is unavailable.
+    fn reranker(&self) -> Option<&dyn Rerank> {
+        if !self.rerank_settings.enabled {
+            return None;
+        }
+        match &self.reranker {
+            RerankSource::Injected(r) => Some(r.as_ref()),
+            RerankSource::Lazy(cell) => cell.get_or_init(|| self.build_reranker()).as_deref(),
+        }
+    }
+
+    /// Construct the real reranker for the lazy path. `None` = skip, with a
+    /// stderr note only for the genuinely unexpected load-failure case (a
+    /// missing model is normal until the first `reindex` fetches it).
+    fn build_reranker(&self) -> Option<Box<dyn Rerank>> {
+        #[cfg(feature = "semantic")]
+        {
+            let info = rerank::reranker_registry()
+                .iter()
+                .find(|m| m.name == self.rerank_settings.model)?;
+            if !rerank::reranker_download_status(info, &self.cache_dir).downloaded {
+                return None;
+            }
+            match rerank::new(&self.rerank_settings.model, &self.cache_dir) {
+                Ok(r) => Some(Box::new(r) as Box<dyn Rerank>),
+                Err(e) => {
+                    eprintln!(
+                        "onebrain-search: reranker '{}' failed to load — results are unreranked: {e:#}",
+                        self.rerank_settings.model
+                    );
+                    None
+                }
+            }
+        }
+        #[cfg(not(feature = "semantic"))]
+        {
+            None
+        }
+    }
+
+    /// Install rerank settings (the CLI layer maps `search.reranker` here).
+    /// Resets the lazy reranker source so a model change re-resolves.
+    pub fn set_rerank_settings(&mut self, settings: RerankSettings) {
+        self.rerank_settings = settings;
+        self.reranker = RerankSource::Lazy(OnceCell::new());
+        // A settings change (e.g. model swap) is a distinct event — re-arm
+        // the once-per-engine failure log so a NEW model's failure is never
+        // hidden by an old model's suppressed warning.
+        self.rerank_error_logged.set(false);
+    }
+
+    /// Test seam mirroring [`Engine::open_with_embedder`]: inject a
+    /// deterministic reranker. Call AFTER [`Engine::set_rerank_settings`] —
+    /// installing settings resets the reranker source.
+    #[cfg(test)]
+    pub(crate) fn set_reranker_for_tests(&mut self, reranker: Box<dyn Rerank>) {
+        self.reranker = RerankSource::Injected(reranker);
+    }
+
+    /// True when queries will actually be reranked: settings enabled AND a
+    /// reranker is loaded (or loadable). Status/doctor surfaces use this for
+    /// honest reporting.
+    pub fn rerank_active(&self) -> bool {
+        self.reranker().is_some()
+    }
+
     /// Whether this engine can produce embeddings at all. Always `true` for an
     /// injected embedder (tests). For the lazy production source it's `true`
     /// only in a `semantic` build — a lex-only build has no ONNX runtime to
@@ -876,16 +1040,17 @@ impl Engine {
         Ok(())
     }
 
-    /// Resolve a list of `(chunk_id, score)` pairs (already ranked, already
-    /// truncated to the caller's desired top-k) into full [`Hit`]s by
-    /// looking up each chunk's stored meta. Ids whose meta is missing are
-    /// skipped. Shared by [`Self::query`] and [`Self::vector_search`].
-    fn resolve_hits(&self, ranked: Vec<(String, f64)>) -> Result<Vec<Hit>> {
+    /// Resolve a list of `(chunk_id, fused_score, rerank_score)` triples
+    /// (already ranked, already truncated to the caller's desired top-k)
+    /// into full [`Hit`]s by looking up each chunk's stored meta. Ids whose
+    /// meta is missing are skipped. Shared by [`Self::query`] and
+    /// [`Self::vector_search`] via [`Self::apply_rerank`].
+    fn resolve_hits(&self, ranked: Vec<(String, f64, Option<f32>)>) -> Result<Vec<Hit>> {
         let read_txn = self.meta.begin_read()?;
         let chunk_meta = read_txn.open_table(CHUNK_META)?;
 
         let mut hits = Vec::with_capacity(ranked.len());
-        for (chunk_id, score) in ranked {
+        for (chunk_id, score, rerank_score) in ranked {
             let Some(encoded) = chunk_meta
                 .get(chunk_id.as_str())?
                 .map(|v| v.value().to_string())
@@ -899,36 +1064,176 @@ impl Engine {
                 heading_path: record.heading_path,
                 score,
                 snippet: truncate_snippet(&record.text, SNIPPET_MAX_CHARS),
+                rerank_score,
             });
         }
         Ok(hits)
     }
 
-    /// Hybrid search: lex + vec (top ~50 each) fused via RRF, resolved to
+    /// Full stored text for each candidate chunk, index-aligned with `ids`
+    /// (missing meta yields an empty string so reranker scores stay aligned).
+    fn chunk_texts(&self, ids: &[(String, f64)]) -> Result<Vec<String>> {
+        let read_txn = self.meta.begin_read()?;
+        let chunk_meta = read_txn.open_table(CHUNK_META)?;
+        let mut texts = Vec::with_capacity(ids.len());
+        for (chunk_id, _) in ids {
+            let text = match chunk_meta.get(chunk_id.as_str())? {
+                // Deliberately default-not-propagate: a bad passage must not
+                // fail the whole query (skip-not-fail), but corruption is a
+                // real data signal — say so instead of silently demoting the
+                // hit with a near-zero rerank score.
+                Some(v) => match serde_json::from_str::<ChunkMeta>(v.value()) {
+                    Ok(m) => m.text,
+                    Err(e) => {
+                        // Same rate-limit philosophy as the rerank-failure
+                        // log: first corruption is a loud diagnostic, the
+                        // rest stay quiet (widespread corruption would
+                        // otherwise spam a daemon's stderr on every query).
+                        if !self.chunk_corruption_logged.get() {
+                            self.chunk_corruption_logged.set(true);
+                            eprintln!(
+                                "onebrain-search: chunk meta for {chunk_id} is corrupt ({e}) — \
+                                 passage blanked for reranking; a `reindex --force` rebuilds it \
+                                 (further corrupt-chunk warnings on this engine will not be logged)"
+                            );
+                        }
+                        String::new()
+                    }
+                },
+                // Missing meta = stale index entry; resolve_hits skips these
+                // silently by design, so stay quiet here too.
+                None => String::new(),
+            };
+            texts.push(text);
+        }
+        Ok(texts)
+    }
+
+    /// Tier-2 rerank stage over an already-fused ranking (ADR 0025):
+    /// cross-encode the first `candidates` entries against `query`, sort that
+    /// block by calibrated score, gate at `min_score` (never-empty: total
+    /// rejection keeps the top [`RERANK_NO_MATCH_KEEP`]), append the
+    /// un-reranked tail, trim to `top_k`, resolve. Skip-not-fail: no
+    /// reranker → fused order with `rerank_score: None`; a rerank error
+    /// falls back the same way — queries never fail because reranking did.
+    fn apply_rerank(
+        &self,
+        query: &str,
+        mut fused: Vec<(String, f64)>,
+        top_k: usize,
+    ) -> Result<Vec<Hit>> {
+        let Some(reranker) = self.reranker() else {
+            let mut unreranked: Vec<(String, f64, Option<f32>)> =
+                fused.into_iter().map(|(id, s)| (id, s, None)).collect();
+            unreranked.truncate(top_k);
+            return self.resolve_hits(unreranked);
+        };
+
+        let block_len = fused.len().min(self.rerank_settings.candidates);
+        let tail = fused.split_off(block_len);
+        let head = fused;
+
+        // The tokenizer enforces the model's hard context limit; this char
+        // cap (~4 chars/token upper bound) just keeps huge chunks from
+        // dominating tokenization time.
+        let max_chars = rerank::reranker_registry()
+            .iter()
+            .find(|m| m.name == self.rerank_settings.model)
+            .map(|m| m.max_length * 4)
+            .unwrap_or(2048);
+        let texts: Vec<String> = self
+            .chunk_texts(&head)?
+            .into_iter()
+            .map(|t| t.chars().take(max_chars).collect())
+            .collect();
+
+        let mut ranked: Vec<(String, f64, Option<f32>)> = match reranker.rerank(query, &texts) {
+            Ok(scores) => {
+                let mut block: Vec<(String, f64, Option<f32>)> = head
+                    .into_iter()
+                    .zip(scores)
+                    .map(|((id, fused_score), s)| (id, fused_score, Some(s)))
+                    .collect();
+                // Sort by cross-encoder score descending (total_cmp: no NaN
+                // panic), ties by chunk_id for determinism — matching
+                // `rrf_fuse`'s tie-break convention.
+                block.sort_by(|a, b| {
+                    b.2.unwrap_or(0.0)
+                        .total_cmp(&a.2.unwrap_or(0.0))
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                // The block is sorted, so gate survivors form its prefix.
+                let min_score = self.rerank_settings.min_score;
+                let survivors = block
+                    .iter()
+                    .take_while(|(_, _, s)| s.unwrap_or(0.0) >= min_score)
+                    .count();
+                let keep = if survivors == 0 {
+                    RERANK_NO_MATCH_KEEP.min(block.len())
+                } else {
+                    survivors
+                };
+                block.truncate(keep);
+                block
+                    .into_iter()
+                    .chain(tail.into_iter().map(|(id, s)| (id, s, None)))
+                    .collect()
+            }
+            Err(e) => {
+                // Log the first runtime failure per engine instance, then go
+                // quiet: a persistently failing model would otherwise spam a
+                // long-running daemon's stderr on every query. The unreranked
+                // state itself stays visible per-query via rerank_score: None
+                // (the CLI hint layer surfaces it).
+                if !self.rerank_error_logged.get() {
+                    self.rerank_error_logged.set(true);
+                    eprintln!(
+                        "onebrain-search: rerank failed — falling back to fused order \
+                         (further rerank failures on this engine will not be logged): {e:#}"
+                    );
+                }
+                head.into_iter()
+                    .chain(tail)
+                    .map(|(id, s)| (id, s, None))
+                    .collect()
+            }
+        };
+        ranked.truncate(top_k);
+        self.resolve_hits(ranked)
+    }
+
+    /// Hybrid search: lex + vec (top ~50 each) fused via RRF, then passed
+    /// through the Tier-2 rerank stage ([`Self::apply_rerank`]), resolved to
     /// `top_k` [`Hit`]s. Fused ids whose meta is missing are skipped.
     pub fn query(&self, text: &str, top_k: usize) -> Result<Vec<Hit>> {
         let query_vec = self.embedder()?.embed_query(text)?;
-        // Recall-first: keep the vec top cluster (relative) and let RRF + lex
-        // provide precision. The old absolute floor silently dropped ALL vec
-        // hits for e5 (scores ~0.83–0.87 < 0.85), degrading hybrid to lex-only.
+        // Recall-first: keep the vec top cluster (relative) and let RRF + the
+        // rerank stage provide precision. The old absolute floor silently
+        // dropped ALL vec hits for e5 (scores ~0.83–0.87 < 0.85), degrading
+        // hybrid to lex-only.
         let vec_hits = keep_top_cluster(self.vec.search(&query_vec, VEC_TOP_K), VEC_CLUSTER_WINDOW);
         let lex_hits = self.lex.search(text, LEX_TOP_K)?;
 
-        let fused = rrf_fuse(&lex_hits, &vec_hits, RRF_K, top_k);
-        self.resolve_hits(fused)
+        // Fuse wide enough for the rerank stage to see its full candidate
+        // block even when the caller asks for a small top_k.
+        let fuse_k = top_k.max(self.rerank_settings.candidates);
+        let fused = rrf_fuse(&lex_hits, &vec_hits, RRF_K, fuse_k);
+        self.apply_rerank(text, fused, top_k)
     }
 
-    /// Vector-only semantic search (no lex/RRF fusion): embed `text` and
-    /// return the top-k nearest chunks by cosine similarity, resolved to
-    /// full [`Hit`]s. Used by the CLI's `search vsearch` verb.
+    /// Vector-only semantic search (no lex/RRF fusion): embed `text`, take
+    /// the top nearest chunks by cosine similarity, then pass them through
+    /// the Tier-2 rerank stage ([`Self::apply_rerank`]). Used by the CLI's
+    /// `search vsearch` verb.
     pub fn vector_search(&self, text: &str, top_k: usize) -> Result<Vec<Hit>> {
         let query_vec = self.embedder()?.embed_query(text)?;
-        let vec_hits = keep_top_cluster(self.vec.search(&query_vec, top_k), VEC_CLUSTER_WINDOW);
+        let fetch_k = top_k.max(self.rerank_settings.candidates);
+        let vec_hits = keep_top_cluster(self.vec.search(&query_vec, fetch_k), VEC_CLUSTER_WINDOW);
         let ranked: Vec<(String, f64)> = vec_hits
             .into_iter()
             .map(|(id, score)| (id, score as f64))
             .collect();
-        self.resolve_hits(ranked)
+        self.apply_rerank(text, ranked, top_k)
     }
 
     /// Full stored text of a doc (its chunks concatenated in
@@ -1419,6 +1724,28 @@ impl Engine {
         // "vectors are current as of", which a lex-only run never makes true.
         if mode == IndexMode::Full {
             self.record_last_indexed(now_epoch_secs())?;
+
+            // End-of-run reranker fetch: a lex-only pass never embeds, so it
+            // has no business fetching the (embed-adjacent) reranker model
+            // either. Downloaded-status is a plain filesystem check (never
+            // feature-gated), so this is safe to evaluate in lex-only
+            // builds too — `should_fetch_reranker` just comes back false
+            // once the model directory exists, and an unknown model name is
+            // treated as "downloaded" (nothing to fetch), mirroring
+            // `build_reranker`'s skip-on-unknown-model.
+            let downloaded = rerank::reranker_registry()
+                .iter()
+                .find(|m| m.name == self.rerank_settings.model)
+                .map(|info| rerank::reranker_download_status(info, &self.cache_dir).downloaded)
+                .unwrap_or(true);
+            if should_fetch_reranker(self.rerank_settings.enabled, downloaded) {
+                progress(ReindexProgress::LoadingReranker);
+                // Resolve the lazy reranker once so the download/construction
+                // happens now (hf-hub prints its own progress), not on the
+                // next query. `reranker()` is skip-not-fail by design — a
+                // download error never fails the reindex.
+                self.reranker();
+            }
         }
         Ok(stats)
     }
@@ -1972,6 +2299,90 @@ mod tests {
                 .filter(|p| matches!(p, ReindexProgress::Indexing { .. }))
                 .count(),
             3
+        );
+    }
+
+    #[test]
+    fn should_fetch_reranker_truth_table() {
+        assert!(
+            should_fetch_reranker(true, false),
+            "enabled + not downloaded => fetch"
+        );
+        assert!(
+            !should_fetch_reranker(true, true),
+            "enabled + already downloaded => no fetch"
+        );
+        assert!(
+            !should_fetch_reranker(false, false),
+            "disabled + not downloaded => no fetch"
+        );
+        assert!(
+            !should_fetch_reranker(false, true),
+            "disabled + already downloaded => no fetch"
+        );
+    }
+
+    #[test]
+    fn fake_reindex_all_with_progress_emits_loading_reranker_after_indexing() {
+        // Default rerank settings are enabled, and a fresh temp cache_dir has
+        // no reranker model downloaded, so `should_fetch_reranker` is true.
+        // The fake embedder engine still resolves the LAZY reranker path
+        // (cheaply, to None) — assert LoadingReranker fires exactly once,
+        // after every Indexing event.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
+        std::fs::write(vault_dir.path().join("b.md"), "# B\nbeta content").unwrap();
+
+        let mut events = Vec::new();
+        e.reindex_all_with_progress(vault_dir.path(), &mut |p| events.push(p))
+            .unwrap();
+
+        let loading_reranker_count = events
+            .iter()
+            .filter(|p| matches!(p, ReindexProgress::LoadingReranker))
+            .count();
+        assert_eq!(
+            loading_reranker_count, 1,
+            "LoadingReranker must fire exactly once: {events:?}"
+        );
+        let last_indexing = events
+            .iter()
+            .rposition(|p| matches!(p, ReindexProgress::Indexing { .. }))
+            .unwrap();
+        let loading_reranker_pos = events
+            .iter()
+            .position(|p| matches!(p, ReindexProgress::LoadingReranker))
+            .unwrap();
+        assert!(
+            loading_reranker_pos > last_indexing,
+            "LoadingReranker must come after every Indexing event: {events:?}"
+        );
+    }
+
+    #[test]
+    fn fake_reindex_all_with_progress_skips_loading_reranker_when_disabled() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+        e.set_rerank_settings(RerankSettings {
+            enabled: false,
+            ..Default::default()
+        });
+
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
+
+        let mut events = Vec::new();
+        e.reindex_all_with_progress(vault_dir.path(), &mut |p| events.push(p))
+            .unwrap();
+
+        assert!(
+            !events
+                .iter()
+                .any(|p| matches!(p, ReindexProgress::LoadingReranker)),
+            "disabled reranker must never emit LoadingReranker: {events:?}"
         );
     }
 
@@ -2926,5 +3337,296 @@ mod tests {
             e.pending_vector_paths(vault_dir.path()).unwrap(),
             Vec::<String>::new()
         );
+    }
+    // ─────────────────────────────────────────────────────────────────
+    // Rerank stage: pipeline + gate + never-empty + fallback
+    // ─────────────────────────────────────────────────────────────────
+
+    use crate::rerank::{FakeReranker, Rerank};
+
+    /// A reranker whose every call fails. Proves queries NEVER fail because
+    /// reranking failed — the engine must fall back to fused order.
+    struct FailingReranker;
+
+    impl Rerank for FailingReranker {
+        fn rerank(&self, _query: &str, _passages: &[String]) -> Result<Vec<f32>> {
+            anyhow::bail!("FailingReranker always fails")
+        }
+    }
+
+    /// A reranker with a hardcoded preference: passages containing `marker`
+    /// score high, everything else low. Used where a deterministic
+    /// retrieval-vs-rerank disagreement is needed — on the pure vector path
+    /// [`FakeReranker`]'s Jaccard correlates with [`FakeEmbedder`]'s cosine
+    /// (both measure token overlap with the query), so it cannot flip a
+    /// cosine ordering there.
+    struct MarkerReranker {
+        marker: &'static str,
+    }
+
+    impl Rerank for MarkerReranker {
+        fn rerank(&self, _query: &str, passages: &[String]) -> Result<Vec<f32>> {
+            Ok(passages
+                .iter()
+                .map(|p| if p.contains(self.marker) { 0.9 } else { 0.4 })
+                .collect())
+        }
+    }
+
+    /// Ten distinct query tokens for the rerank reorder scenarios.
+    const RERANK_QUERY: &str = "alpha bravo charlie delta echo foxtrot golf hotel india juliet";
+
+    /// Two-doc corpus engineered so retrieval order and rerank order
+    /// disagree (see math in header note).
+    fn rerank_corpus(e: &mut Engine) {
+        let bait = format!("{RERANK_QUERY} {RERANK_QUERY} zulumark");
+        e.index_doc("bait.md", &bait).unwrap();
+        e.index_doc("target.md", RERANK_QUERY).unwrap();
+    }
+
+    #[test]
+    fn rerank_reorders_hybrid_hits_with_descending_scores() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        e.index_doc("a.md", &format!("{RERANK_QUERY} alphamark"))
+            .unwrap();
+        e.index_doc("b.md", &format!("{RERANK_QUERY} betamark"))
+            .unwrap();
+
+        // Precondition: without a reranker (lazy source, model not
+        // downloaded into this temp cache dir) nothing carries a rerank
+        // score — i.e. today's pipeline.
+        let before = e.query(RERANK_QUERY, 5).unwrap();
+        assert_eq!(before.len(), 2);
+        assert!(before.iter().all(|h| h.rerank_score.is_none()));
+
+        // Whichever doc RRF ranks SECOND, a reranker that prefers it must
+        // put it first — proving rerank order wins over fused order without
+        // depending on BM25 length-normalization details (an earlier fixture
+        // that predicted the exact BM25 winner got them wrong).
+        let loser = before[1].doc_path.clone();
+        let marker: &'static str = if loser == "a.md" {
+            "alphamark"
+        } else {
+            "betamark"
+        };
+
+        e.set_reranker_for_tests(Box::new(MarkerReranker { marker }));
+        let hits = e.query(RERANK_QUERY, 5).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].doc_path, loser,
+            "reranker order must win over RRF order"
+        );
+        for h in &hits {
+            let s = h
+                .rerank_score
+                .expect("every reranked hit carries Some(score)");
+            assert!(s > 0.0 && s < 1.0, "score {s} out of (0,1)");
+        }
+        assert!(
+            hits[0].rerank_score.unwrap() > hits[1].rerank_score.unwrap(),
+            "reranked block must be sorted descending by rerank score"
+        );
+    }
+
+    #[test]
+    fn rerank_gate_keeps_top_three_when_nothing_clears_min_score() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        for i in 0..5 {
+            e.index_doc(&format!("d{i}.md"), &format!("note filler{i}a filler{i}b"))
+                .unwrap();
+        }
+        // FakeReranker scores are strictly below sigmoid(2) ≈ 0.881, so a
+        // 0.999 gate rejects everything → never-empty keeps exactly
+        // RERANK_NO_MATCH_KEEP.
+        e.set_rerank_settings(RerankSettings {
+            min_score: 0.999,
+            ..Default::default()
+        });
+        e.set_reranker_for_tests(Box::new(FakeReranker));
+        let hits = e.query("note", 10).unwrap();
+        assert_eq!(hits.len(), 3, "gate rejects all → keep exactly top 3");
+        assert!(hits.iter().all(|h| h.rerank_score.is_some()));
+
+        // Fewer candidates than the never-empty floor: keep all n, not 3.
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut e2 = fake_engine(dir2.path());
+        e2.index_doc("a.md", "note aa ab").unwrap();
+        e2.index_doc("b.md", "note ba bb").unwrap();
+        e2.set_rerank_settings(RerankSettings {
+            min_score: 0.999,
+            ..Default::default()
+        });
+        e2.set_reranker_for_tests(Box::new(FakeReranker));
+        let hits2 = e2.query("note", 10).unwrap();
+        assert_eq!(hits2.len(), 2, "min(3, n) with n = 2");
+        assert!(hits2.iter().all(|h| h.rerank_score.is_some()));
+    }
+
+    #[test]
+    fn rerank_failure_falls_back_to_fused_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        rerank_corpus(&mut e);
+        let before: Vec<String> = e
+            .query(RERANK_QUERY, 5)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.doc_path)
+            .collect();
+
+        e.set_reranker_for_tests(Box::new(FailingReranker));
+        let hits = e.query(RERANK_QUERY, 5).unwrap();
+        let after: Vec<String> = hits.iter().map(|h| h.doc_path.clone()).collect();
+        assert_eq!(after, before, "reranker failure must preserve RRF order");
+        assert!(
+            hits.iter().all(|h| h.rerank_score.is_none()),
+            "failed rerank leaves every score None"
+        );
+    }
+
+    #[test]
+    fn rerank_disabled_or_absent_matches_unreranked_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        e.index_doc("rust.md", "# Rust\nerror handling and memory safety")
+            .unwrap();
+        e.index_doc("cook.md", "# Cooking\npasta recipe with tomato")
+            .unwrap();
+
+        // Absent: default settings (enabled) but the lazy reranker's model
+        // is not downloaded → silently skipped. Pre-change snapshot
+        // expectation: rust.md tops the hybrid ranking (same assertion as
+        // fake_index_doc_then_query_returns_expected_top_hit).
+        let absent = e.query("memory safety", 3).unwrap();
+        assert!(!absent.is_empty());
+        assert_eq!(absent[0].doc_path, "rust.md");
+        assert!(absent.iter().all(|h| h.rerank_score.is_none()));
+
+        // Disabled: enabled=false must gate even an injected reranker.
+        e.set_rerank_settings(RerankSettings {
+            enabled: false,
+            ..Default::default()
+        });
+        e.set_reranker_for_tests(Box::new(FakeReranker));
+        let disabled = e.query("memory safety", 3).unwrap();
+        assert_eq!(
+            disabled.iter().map(|h| &h.doc_path).collect::<Vec<_>>(),
+            absent.iter().map(|h| &h.doc_path).collect::<Vec<_>>(),
+            "disabled rerank must leave the pipeline unchanged"
+        );
+        assert!(disabled.iter().all(|h| h.rerank_score.is_none()));
+    }
+
+    #[test]
+    fn rerank_vector_search_reorders_and_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        rerank_corpus(&mut e);
+
+        // Precondition: pure cosine ranks the exact-text target doc first
+        // (1.0 vs ≈ 0.988 for the doubled bait — which must survive the
+        // 0.02 cluster window).
+        let before = e.vector_search(RERANK_QUERY, 5).unwrap();
+        assert_eq!(before.len(), 2, "bait must survive the cluster window");
+        assert_eq!(before[0].doc_path, "target.md");
+        assert!(before.iter().all(|h| h.rerank_score.is_none()));
+
+        // MarkerReranker favors the bait doc → rerank order must win.
+        e.set_reranker_for_tests(Box::new(MarkerReranker { marker: "zulumark" }));
+        let hits = e.vector_search(RERANK_QUERY, 5).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].doc_path, "bait.md",
+            "rerank order must win over cosine order"
+        );
+        assert!(hits[0].rerank_score.unwrap() > hits[1].rerank_score.unwrap());
+
+        // Gate on the vector path: nothing clears an absurd threshold →
+        // never-empty keeps min(3, n).
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut e2 = fake_engine(dir2.path());
+        for i in 0..4 {
+            e2.index_doc(&format!("s{i}.md"), "note common tokens")
+                .unwrap();
+        }
+        e2.set_rerank_settings(RerankSettings {
+            min_score: 0.999,
+            ..Default::default()
+        });
+        e2.set_reranker_for_tests(Box::new(FakeReranker));
+        let gated = e2.vector_search("note common tokens", 10).unwrap();
+        assert_eq!(gated.len(), 3, "vsearch gate keeps exactly top 3");
+        assert!(gated.iter().all(|h| h.rerank_score.is_some()));
+    }
+
+    #[test]
+    fn rerank_tail_beyond_candidates_is_appended_unreranked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        for i in 0..4 {
+            e.index_doc(&format!("t{i}.md"), &format!("zeta unique{i}"))
+                .unwrap();
+        }
+        e.set_rerank_settings(RerankSettings {
+            candidates: 2,
+            min_score: 0.0,
+            ..Default::default()
+        });
+        e.set_reranker_for_tests(Box::new(FakeReranker));
+        let hits = e.query("zeta", 10).unwrap();
+        assert_eq!(hits.len(), 4);
+        assert!(
+            hits[0].rerank_score.is_some() && hits[1].rerank_score.is_some(),
+            "first `candidates` hits form the reranked block"
+        );
+        assert!(
+            hits[2].rerank_score.is_none() && hits[3].rerank_score.is_none(),
+            "fused tail beyond `candidates` stays unreranked, appended after"
+        );
+        assert!(hits[0].rerank_score.unwrap() >= hits[1].rerank_score.unwrap());
+    }
+
+    #[test]
+    fn rerank_gate_drops_failing_candidates_without_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        e.index_doc("m1.md", "note zulumark alpha").unwrap();
+        e.index_doc("m2.md", "note zulumark beta").unwrap();
+        for i in 0..3 {
+            e.index_doc(&format!("u{i}.md"), &format!("note gamma{i}"))
+                .unwrap();
+        }
+        e.set_rerank_settings(RerankSettings {
+            min_score: 0.5,
+            ..Default::default()
+        });
+        e.set_reranker_for_tests(Box::new(MarkerReranker { marker: "zulumark" }));
+        let hits = e.query("note", 10).unwrap();
+        // Partial gate: only the two marker docs clear 0.5 (0.9 vs 0.4).
+        // Gate-dropped candidates are REMOVED, never backfilled — the result
+        // shrinks below top_k. (The fused tail beyond `candidates` is a
+        // separate mechanism, covered by the test above.) Track B confidence
+        // bands depend on this exact semantic.
+        assert_eq!(hits.len(), 2, "gate-dropped candidates must not reappear");
+        assert!(hits.iter().all(|h| h.doc_path.starts_with("m")));
+        assert!(hits.iter().all(|h| h.rerank_score == Some(0.9)));
+    }
+
+    #[test]
+    fn rerank_active_tracks_settings_and_reranker_availability() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        // Lazy source, model not downloaded into this temp cache dir.
+        assert!(!e.rerank_active());
+        e.set_reranker_for_tests(Box::new(FakeReranker));
+        assert!(e.rerank_active(), "injected reranker → active");
+        e.set_rerank_settings(RerankSettings {
+            enabled: false,
+            ..Default::default()
+        });
+        assert!(!e.rerank_active(), "disabled settings → inactive");
     }
 }

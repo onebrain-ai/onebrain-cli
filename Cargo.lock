@@ -2183,6 +2183,7 @@ version = "3.4.6"
 dependencies = [
  "anyhow",
  "fastembed",
+ "hf-hub",
  "memmap2",
  "redb",
  "serde",
