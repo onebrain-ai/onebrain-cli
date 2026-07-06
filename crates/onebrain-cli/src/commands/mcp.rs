@@ -270,6 +270,13 @@ pub struct QueryHit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<String>, // heading path, if any
     pub snippet: String,
+    /// Calibrated 0-1 Tier-2 cross-encoder relevance, mirroring
+    /// `onebrain_search::engine::Hit::rerank_score`. `None` (omitted, matching
+    /// `context`'s optional-field style) for lex-only sub-queries and for any
+    /// hit the rerank stage skipped (disabled, model not downloaded, load
+    /// failure, or outside the fused `candidates` window).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerank_score: Option<f32>,
 }
 
 const RRF_K: f64 = 60.0;
@@ -396,7 +403,11 @@ fn daemon_mode_for(t: &SubQueryType) -> &'static str {
 /// Parse the daemon's `GET /api/vault/search` response body into `Hit`s — the
 /// WIRE CONTRACT between `server::search::SearchResponse`/`SearchHit` (producer)
 /// and this consumer. The daemon emits
-/// `{ "hits": [ { "path", "score", "title", "snippet" }, .. ], "mode": ".." }`.
+/// `{ "hits": [ { "path", "score", "title", "snippet", "rerank_score"? }, .. ], "mode": ".." }`
+/// — `rerank_score` is present only when the daemon's hybrid/vector path
+/// actually reranked the hit (the producer's `#[serde(skip_serializing_if =
+/// "Option::is_none")]`), so a missing key and an unreranked hit are the same
+/// thing: `None`.
 ///
 /// The daemon's hits are DOC-level (no chunk id — that lives in the engine's
 /// redb, which the daemon owns and doesn't expose), so `chunk_id` is set to the
@@ -433,15 +444,22 @@ fn parse_daemon_search_hits(body: &serde_json::Value) -> anyhow::Result<Vec<Hit>
         } else {
             title.to_string()
         };
+        // A non-numeric `rerank_score` (contract break) degrades to `None`
+        // rather than erroring the whole search — an unreranked hit is a
+        // normal, expected shape, so this stays lenient like the other
+        // optional fields above (`title`/`snippet` default to "" on a bad
+        // type instead of failing the request).
+        let rerank_score = h
+            .get("rerank_score")
+            .and_then(|v| v.as_f64())
+            .map(|s| s as f32);
         out.push(Hit {
             chunk_id: path.clone(),
             doc_path: path,
             heading_path,
             score,
             snippet,
-            // Daemon-HTTP fallback mapping — rerank fields arrive with the
-            // surface wiring in the Track B task.
-            rerank_score: None,
+            rerank_score,
         });
     }
     Ok(out)
@@ -496,6 +514,7 @@ impl From<Hit> for QueryHit {
             score: h.score,
             context: (!h.heading_path.is_empty()).then_some(h.heading_path),
             snippet: h.snippet,
+            rerank_score: h.rerank_score,
         }
     }
 }
@@ -885,6 +904,32 @@ mod tests {
         }
     }
 
+    // ── QueryHit::rerank_score serialization (Task 7) ──────────────────────
+
+    #[test]
+    fn query_hit_serializes_rerank_score_when_present() {
+        let mut h = hit("a");
+        h.rerank_score = Some(0.75);
+        let qh = QueryHit::from(h);
+        let v = serde_json::to_value(&qh).unwrap();
+        let got = v["rerank_score"]
+            .as_f64()
+            .expect("rerank_score is a number");
+        assert!((got - 0.75).abs() < 1e-6, "got {got}");
+    }
+
+    #[test]
+    fn query_hit_omits_rerank_score_when_none() {
+        // Matches `context`'s existing optional-field style: omit the key
+        // entirely (not `null`) when there's no rerank score to report.
+        let qh = QueryHit::from(hit("a"));
+        let v = serde_json::to_value(&qh).unwrap();
+        assert!(
+            v.get("rerank_score").is_none(),
+            "rerank_score must be omitted, not null: {v}"
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // Wire-contract tests: deserialize from raw JSON using the camelCase
     // wire keys an actual MCP client sends. These exist because the
@@ -1197,6 +1242,10 @@ mod tests {
         assert_eq!(hits[0].chunk_id, "notes/a.md", "chunk_id defaults to path");
         assert_eq!(hits[0].score, 3.5);
         assert!(hits[0].heading_path.is_empty());
+        // Neither hit's body carries `rerank_score` (an unreranked daemon
+        // response, e.g. lex mode) → both map to None.
+        assert!(hits[0].rerank_score.is_none());
+        assert!(hits[1].rerank_score.is_none());
         // A real heading path (not the stem) is preserved as heading_path.
         assert_eq!(hits[1].heading_path, "A Heading > Sub");
         assert_eq!(hits[1].snippet, "…text…");
@@ -1208,6 +1257,30 @@ mod tests {
         let qh1 = QueryHit::from(it.next().unwrap());
         assert!(qh0.context.is_none());
         assert_eq!(qh1.context.as_deref(), Some("A Heading > Sub"));
+        assert!(qh0.rerank_score.is_none());
+    }
+
+    #[test]
+    fn parse_daemon_search_hits_reads_rerank_score_when_present() {
+        // The producer (`server::search::SearchHit`) only emits `rerank_score`
+        // when the daemon's hybrid path actually reranked the hit
+        // (`skip_serializing_if`) — this is the present-key branch of that
+        // wire contract.
+        let body = serde_json::json!({
+            "hits": [
+                {"path": "notes/a.md", "score": 1.0, "title": "a", "snippet": "", "rerank_score": 0.93}
+            ],
+            "mode": "hybrid"
+        });
+        let hits = parse_daemon_search_hits(&body).unwrap();
+        assert_eq!(hits.len(), 1);
+        let score = hits[0].rerank_score.expect("rerank_score must be Some");
+        assert!((score - 0.93).abs() < 1e-6, "got {score}");
+
+        // Propagates through into the MCP-facing QueryHit unchanged.
+        let qh = QueryHit::from(hits.into_iter().next().unwrap());
+        let qh_score = qh.rerank_score.expect("QueryHit must carry rerank_score");
+        assert!((qh_score - 0.93).abs() < 1e-6, "got {qh_score}");
     }
 
     #[test]

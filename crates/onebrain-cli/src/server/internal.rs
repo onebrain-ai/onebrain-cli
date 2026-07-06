@@ -29,7 +29,7 @@
 //! - `paths`   → `Engine::reindex_paths` over the caller-supplied doc paths
 //!   (mirrors `search reindex <paths…>`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
@@ -46,6 +46,7 @@ use crate::commands::search_common::{
     collection_cache_dir, collection_name_readonly, rerank_settings_from_config,
 };
 use onebrain_search::engine::Engine;
+use onebrain_search::rerank::{reranker_download_status, reranker_registry};
 
 /// Build the `/api/internal` sub-router. State + auth are attached by
 /// [`super::build_router`] for the whole tree, so this stays a pure route table.
@@ -90,12 +91,14 @@ async fn get_health(State(state): State<Arc<AppState>>) -> Response {
 /// diagnosable from `daemon.log`.
 pub(super) fn open_held_engine(vault_root: &Path) -> Option<SharedEngine> {
     match try_open_held_engine(vault_root) {
-        Ok(engine) => {
+        Ok((engine, reranker_model, cache_dir)) => {
             tracing::info!(
                 vault = %vault_root.display(),
                 "daemon holding search engine for process lifetime"
             );
-            Some(Arc::new(std::sync::Mutex::new(engine)))
+            let shared = Arc::new(std::sync::Mutex::new(engine));
+            spawn_reranker_warm_thread(shared.clone(), reranker_model, cache_dir);
+            Some(shared)
         }
         Err(e) => {
             tracing::warn!(
@@ -108,18 +111,64 @@ pub(super) fn open_held_engine(vault_root: &Path) -> Option<SharedEngine> {
     }
 }
 
+/// Fire-and-forget background warm-load: nudge the lazy Tier-2 reranker to
+/// resolve now, off the request path, so the FIRST reranked query after boot
+/// doesn't pay the (multi-hundred-MB) cross-encoder's cold-load latency.
+///
+/// Cheap presence check FIRST (a plain fs stat via [`reranker_download_status`],
+/// done here BEFORE ever touching the engine mutex) — only when the configured
+/// model is actually downloaded does the thread lock the engine at all, so a
+/// fresh vault with no model spawns a thread that does no lock work and exits
+/// immediately. When it IS downloaded, the mutex is then held only as long as
+/// `Engine::rerank_active()` takes to resolve the `OnceCell` (construct once,
+/// cache forever) — never for the download itself, which belongs to
+/// `reindex`, not daemon boot.
+///
+/// Must never panic the daemon: any failure (poisoned lock, disabled
+/// reranker, load error) is swallowed — `rerank_active()` itself is
+/// skip-not-fail by design (see `Engine::reranker`), and a poisoned mutex is
+/// recovered via `into_inner()` like every other engine lock site in this
+/// module.
+///
+/// Returns the `JoinHandle` so tests can join it deterministically instead of
+/// racing a detached thread; [`open_held_engine`] (the production caller)
+/// drops it, which is exactly a fire-and-forget spawn.
+fn spawn_reranker_warm_thread(
+    engine: SharedEngine,
+    reranker_model: String,
+    cache_dir: PathBuf,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let downloaded = reranker_registry()
+            .iter()
+            .find(|m| m.name == reranker_model)
+            .is_some_and(|info| reranker_download_status(info, &cache_dir).downloaded);
+        if !downloaded {
+            // No model on disk yet — nothing to warm; a reindex will fetch it.
+            return;
+        }
+        // Resolve the lazy reranker now (short-lived lock: just the OnceCell
+        // construction), so the first real query hits an already-warm cell.
+        let guard = engine.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = guard.rerank_active();
+    })
+}
+
 /// Fallible core of [`open_held_engine`]: resolve the collection (read-only),
 /// open the engine at its cache dir, and apply the vault's exclude patterns —
 /// exactly what `search_common::open_engine` does, minus the config-persisting
-/// collection resolver (the daemon must never write config).
-fn try_open_held_engine(vault_root: &Path) -> anyhow::Result<Engine> {
+/// collection resolver (the daemon must never write config). Also returns the
+/// configured reranker model name + the collection's cache dir, so the caller
+/// can spawn the warm-load thread without re-deriving them (and without any
+/// new `Engine` accessor).
+fn try_open_held_engine(vault_root: &Path) -> anyhow::Result<(Engine, String, PathBuf)> {
     let config = onebrain_core::load_vault_config_at(vault_root)?;
     let collection = collection_name_readonly(vault_root)?;
     let cache_dir = collection_cache_dir(&collection);
     let mut engine = Engine::open(&cache_dir, &config.search.embed_model)?;
     engine.set_exclude_patterns(config.search.exclude.clone());
     engine.set_rerank_settings(rerank_settings_from_config(&config.search.reranker));
-    Ok(engine)
+    Ok((engine, config.search.reranker.model, cache_dir))
 }
 
 /// Pull the held engine out of state, or 503 when the daemon holds none. The
@@ -157,6 +206,20 @@ struct InternalStatusResponse {
     /// "real index" definition `search status` uses, not mere cache-dir
     /// existence.
     indexed: bool,
+    /// Configured `search.reranker.model` name (Tier-2 cross-encoder). Mirrors
+    /// the CLI's `SearchStatusData::reranker_model`.
+    reranker_model: String,
+    /// `true` when the Tier-2 rerank stage will actually run for the NEXT
+    /// query: unlike the CLI's config+filesystem-only `reranker_ready` (see
+    /// `search_status.rs::reranker_status_fields`), this reads the LIVE held
+    /// engine's `Engine::rerank_active()` — settings enabled AND a reranker
+    /// that is loaded (or successfully loadable) right now. The daemon is the
+    /// one place that can ask the engine directly, so this is the most
+    /// honest of the three surfaces.
+    reranker_ready: bool,
+    /// On-disk byte size of the configured reranker's downloaded model dir,
+    /// `None` if not downloaded. Mirrors the CLI's `reranker_download`.
+    reranker_download: Option<u64>,
 }
 
 async fn get_internal_status(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
@@ -164,20 +227,35 @@ async fn get_internal_status(State(state): State<Arc<AppState>>) -> Result<Respo
     let engine = require_engine(&state)?.clone();
 
     // Engine status is a synchronous hash-walk (no async, no embedder) — run it
-    // off the async runtime under the blocking mutex.
-    let status = tokio::task::spawn_blocking(move || {
-        let engine = engine.lock().unwrap_or_else(|p| p.into_inner());
-        engine.status(&root)
-    })
-    .await
-    .map_err(|e| {
-        tracing::warn!(error = %e, "internal status task panicked");
-        ApiError::Internal("status failed".to_string())
-    })?
-    .map_err(|e| {
-        tracing::warn!(error = %e, "engine status failed");
-        ApiError::Internal("status failed".to_string())
-    })?;
+    // off the async runtime under the blocking mutex. The reranker fields piggy-
+    // back on the SAME blocking closure + lock (rather than a second
+    // spawn_blocking) since `rerank_active()` also needs the engine.
+    let (status, reranker_model, reranker_ready, reranker_download) =
+        tokio::task::spawn_blocking(move || {
+            let config = onebrain_core::load_vault_config_at(&root)?;
+            let collection = collection_name_readonly(&root)?;
+            let cache_dir = collection_cache_dir(&collection);
+            let reranker_model = config.search.reranker.model.clone();
+            let download = reranker_registry()
+                .iter()
+                .find(|r| r.name == reranker_model)
+                .map(|r| reranker_download_status(r, &cache_dir));
+            let reranker_download = download.and_then(|d| d.disk_size);
+
+            let engine = engine.lock().unwrap_or_else(|p| p.into_inner());
+            let reranker_ready = engine.rerank_active();
+            let status = engine.status(&root)?;
+            Ok::<_, anyhow::Error>((status, reranker_model, reranker_ready, reranker_download))
+        })
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "internal status task panicked");
+            ApiError::Internal("status failed".to_string())
+        })?
+        .map_err(|e| {
+            tracing::warn!(error = %e, "engine status failed");
+            ApiError::Internal("status failed".to_string())
+        })?;
 
     let resp = InternalStatusResponse {
         doc_count: status.doc_count,
@@ -187,6 +265,9 @@ async fn get_internal_status(State(state): State<Arc<AppState>>) -> Result<Respo
         pending_total: status.pending_total(),
         last_indexed: status.last_indexed_at,
         indexed: status.doc_count > 0,
+        reranker_model,
+        reranker_ready,
+        reranker_download,
     };
     Ok(Json(resp).into_response())
 }
@@ -428,6 +509,36 @@ mod tests {
         assert!(open_held_engine(vault.path()).is_some());
     }
 
+    /// Brief 7.2: the warm-load thread must exit silently (no panic, no lock
+    /// contention) when the configured reranker model is NOT downloaded — the
+    /// common case for a fresh vault. Joins the spawned thread directly so a
+    /// regression that blocks on the engine mutex (e.g. a bug that tries to
+    /// download inline) fails the test instead of hanging the suite.
+    #[test]
+    fn warm_thread_exits_silently_when_model_not_downloaded() {
+        let (vault, cache) = vault_with_empty_index();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let engine = open_held_engine(vault.path()).expect("engine opens");
+
+        // Directly exercise the spawn helper (not just relying on
+        // `open_held_engine`'s internal call) so this test pins the "model
+        // absent -> exits without touching the lock" contract even if the
+        // call site inside `open_held_engine` changes.
+        let cache_dir = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap());
+        let handle = spawn_reranker_warm_thread(
+            engine.clone(),
+            "onebrain-reranker-v1".to_string(),
+            cache_dir,
+        );
+        handle.join().expect("warm thread must not panic");
+
+        // The engine must still be lockable afterwards (no poisoning, no
+        // held lock) — a sanity check that the warm thread released
+        // everything cleanly.
+        let guard = engine.lock().unwrap();
+        drop(guard);
+    }
+
     #[test]
     fn status_response_serializes_expected_shape() {
         let v = serde_json::to_value(InternalStatusResponse {
@@ -438,12 +549,42 @@ mod tests {
             pending_total: 3,
             last_indexed: Some(42),
             indexed: true,
+            reranker_model: "onebrain-reranker-v1".to_string(),
+            reranker_ready: true,
+            reranker_download: Some(1024),
         })
         .unwrap();
         assert_eq!(v["doc_count"], 3);
         assert_eq!(v["pending_total"], 3);
         assert_eq!(v["last_indexed"], 42);
         assert_eq!(v["indexed"], true);
+        assert_eq!(v["reranker_model"], "onebrain-reranker-v1");
+        assert_eq!(v["reranker_ready"], true);
+        assert_eq!(v["reranker_download"], 1024);
+    }
+
+    #[test]
+    fn status_response_serializes_reranker_download_none_as_null() {
+        // `reranker_download: None` (model not on disk) must serialize as JSON
+        // `null`, not be omitted — the daemon status shape has no
+        // `skip_serializing_if` on this field (unlike the CLI's
+        // `SearchStatusData`), so a client can distinguish "checked, absent"
+        // from a missing key.
+        let v = serde_json::to_value(InternalStatusResponse {
+            doc_count: 0,
+            pending_new: 0,
+            pending_changed: 0,
+            pending_removed: 0,
+            pending_total: 0,
+            last_indexed: None,
+            indexed: false,
+            reranker_model: "onebrain-reranker-v1".to_string(),
+            reranker_ready: false,
+            reranker_download: None,
+        })
+        .unwrap();
+        assert!(v.get("reranker_download").is_some(), "{v}");
+        assert!(v["reranker_download"].is_null(), "{v}");
     }
 
     #[tokio::test]
@@ -1020,6 +1161,49 @@ mod tests {
         assert_eq!(v["doc_count"], 0);
         assert_eq!(v["indexed"], false);
         assert_eq!(v["pending_total"], 0);
+        // Reranker fields: default config (no `search.reranker` block) names
+        // the default model, but it isn't downloaded in a fresh test cache dir
+        // → not ready, no download size.
+        assert_eq!(v["reranker_model"], "onebrain-reranker-v1");
+        assert_eq!(v["reranker_ready"], false);
+        assert!(v["reranker_download"].is_null());
+    }
+
+    /// Brief 7.1: `open_held_engine` must apply the vault's `RerankSettings` —
+    /// asserted here via the LIVE `/api/internal/status` `reranker_ready`
+    /// field with `search.reranker.enabled: false` configured. Even though the
+    /// registry's default model isn't downloaded in this fresh test cache
+    /// (so `reranker_ready` would be `false` either way), the disabled-vs-
+    /// default-model-name distinction proves the config's `reranker.model`
+    /// actually reached the held engine's settings — a config the daemon
+    /// never read would report the hard-coded default name instead.
+    #[tokio::test]
+    async fn internal_status_reflects_configured_reranker_model_and_disabled_flag() {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: internal-status-reranker-cfg\n  reranker:\n    enabled: false\n    model: onebrain-reranker-v1\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let router = router_holding_engine(vault.path());
+
+        let resp = router
+            .oneshot(
+                Request::get("/api/internal/status")
+                    .header("x-onebrain-token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["reranker_model"], "onebrain-reranker-v1");
+        // Disabled in config → never ready, regardless of download status.
+        assert_eq!(v["reranker_ready"], false);
     }
 
     #[tokio::test]
