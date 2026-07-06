@@ -223,7 +223,9 @@ pub enum SubQueryType {
 
 /// Params for the `query` tool. Mirrors the qmd MCP tool surface — several
 /// fields (`candidateLimit`, `collections`, `intent`, `rerank`) are accepted
-/// for compatibility but not yet used by the native engine (see field docs).
+/// for qmd compatibility but are not per-request controls the native engine
+/// reads (see field docs) — `rerank` in particular IS implemented (v3.4.7)
+/// but as vault-wide config, not a request param.
 /// The genuinely inert fields (deserialize-only, never read by Rust code yet)
 /// carry their own `#[allow(dead_code)]` so a FUTURE field that's actually
 /// unused would still trip clippy instead of hiding behind a blanket
@@ -247,7 +249,9 @@ pub struct QueryParams {
     /// Background context to disambiguate. Accepted for compatibility; not yet used in ranking (relevance phase, v3.4.3).
     #[allow(dead_code)]
     pub intent: Option<String>,
-    /// Accepted for qmd compatibility; native rerank lands in v3.4.3.
+    /// Accepted for qmd compatibility; native rerank is implemented (v3.4.7,
+    /// `search.reranker.*` in `onebrain.yml`) but engine-wide/config-driven,
+    /// not a per-request toggle — this field stays deserialize-only.
     #[allow(dead_code)]
     pub rerank: Option<bool>,
 }

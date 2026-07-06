@@ -1,6 +1,6 @@
 # 0024 — Recall-first vector cutoff + honest confidence (retire the absolute floor)
 
-Status: accepted (v3.4.6)
+Status: accepted (v3.4.6) — **superseded in part by [ADR 0025](0025-tier2-cross-encoder-reranker.md)** (v3.4.7): the Tier-2 cross-encoder reranker is now the real precision gate for every reranked hit. `vec_confidence_hint`'s bi-encoder cosine heuristic (below) is **not removed** — it remains the fallback confidence signal for the narrow case where a hit genuinely has no `rerank_score` to band on (reranker disabled, not downloaded, or a lex-only build). `keep_top_cluster` (the recall-first vector cutoff itself) is unaffected — reranking runs on top of it, not instead of it.
 
 ## Context
 
@@ -65,12 +65,12 @@ not a hand-tuned per-model constant):
 - The confidence bands (0.86/0.80) are e5-calibrated globals; a mislabel for
   another model only affects the advisory text, never what's returned.
 
-## The real fix is next (Tier 2, v3.4.x)
+## The real fix landed next (Tier 2, v3.4.7)
 
-This ADR is the **Tier-1 stopgap**. The proper fix — as qmd (`@tobilu/qmd`) did —
-is a **cross-encoder reranker** (`bge-reranker-v2-m3`, already supported by our
-`fastembed-rs`, ONNX, no new dependency): retrieve recall-first, then rerank the
-top-K. The reranker's calibrated 0–1 score **replaces this confidence heuristic**
-as a reliable gate. Tracked as a dedicated v3.4.x epic (search is finished within
-v3.4.x before v3.5). Details in the project vault's
-`2026-07-06-search-quality-reranker-research` note.
+This ADR was the **Tier-1 stopgap**. The proper fix — as qmd (`@tobilu/qmd`) did —
+is a **cross-encoder reranker**: retrieve recall-first, then rerank the top-K.
+That reranker (`onebrain-reranker-v1`, a `bge-reranker-v2-m3`-based int8
+cross-encoder) landed in v3.4.7 — see [ADR 0025](0025-tier2-cross-encoder-reranker.md).
+Its calibrated 0–1 score **replaces this confidence heuristic** as a reliable
+gate for every hit it actually reranks; the heuristic below now serves only
+the unreranked-fallback case (see the status note at the top of this ADR).

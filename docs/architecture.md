@@ -7,7 +7,8 @@ onebrain-cli          Binary crate — clap dispatch over the v3.1 command tree,
   │                   output rendering, TTY/spinner concerns. Knows about the user.
   │
   ├─ onebrain-search  Native vault search — tantivy BM25 · fastembed embeddings
-  │                   · flat vector store · RRF hybrid. Knows about the index.
+  │                   · flat vector store · RRF hybrid · Tier-2 cross-encoder rerank.
+  │                   Knows about the index.
   │
   ├─ onebrain-fs      Vault walks · frontmatter parsing · plugin tarball overlay
   │                   · init bootstrap · doctor checks · update install path · backups.
