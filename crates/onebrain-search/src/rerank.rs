@@ -6,8 +6,17 @@
 //! passage, in the same order as the input — callers combine this with the
 //! retrieval score (or replace it outright) to re-order top-k results.
 
+use crate::embed;
 use anyhow::Result;
 use std::collections::HashSet;
+use std::path::Path;
+#[cfg(feature = "semantic")]
+use std::sync::Mutex;
+
+#[cfg(feature = "semantic")]
+use fastembed::{
+    OnnxSource, RerankInitOptionsUserDefined, TextRerank, TokenizerFiles, UserDefinedRerankingModel,
+};
 
 /// A reranking backend: scores a batch of passages against one query.
 /// [`FakeReranker`] is a deterministic in-memory stand-in used by tests so
@@ -85,6 +94,31 @@ pub fn is_supported_reranker(name: &str) -> bool {
     reranker_registry().iter().any(|r| r.name == name)
 }
 
+/// Compute the download status of `info` given the collection's `cache_dir`.
+/// Pure filesystem check — reuses [`embed::model_download_status`]'s logic
+/// (same `models--*` cache dir layout, since both fastembed and this
+/// `hf-hub`-backed reranker download share the HF hub cache convention), just
+/// adapted to [`RerankerInfo`]'s field names instead of [`embed::ModelInfo`].
+pub fn reranker_download_status(
+    info: &RerankerInfo,
+    cache_dir: &Path,
+) -> embed::ModelDownloadStatus {
+    let path = cache_dir.join(info.cache_dir_name());
+    if path.is_dir() {
+        embed::ModelDownloadStatus {
+            downloaded: true,
+            disk_size: Some(embed::dir_size_bytes(&path)),
+            path,
+        }
+    } else {
+        embed::ModelDownloadStatus {
+            downloaded: false,
+            disk_size: None,
+            path,
+        }
+    }
+}
+
 /// Logistic sigmoid: maps a raw logit to a calibrated (0, 1) probability.
 /// `sigmoid(0.0) == 0.5`; monotonically increasing; bounded strictly between
 /// 0 and 1.
@@ -130,6 +164,79 @@ impl Rerank for FakeReranker {
                 sigmoid(4.0 * overlap - 2.0)
             })
             .collect())
+    }
+}
+
+/// Wraps a loaded `fastembed` cross-encoder reranking model. Only compiled
+/// with the `semantic` feature — lex-only builds have no ONNX runtime to
+/// back it. Mirrors [`embed::Embedder`]'s shape: model behind a `Mutex`
+/// (`TextRerank::rerank` takes `&mut self`), constructed once, shared across
+/// threads via `Rerank: Send + Sync`.
+#[cfg(feature = "semantic")]
+#[derive(Debug)]
+pub struct Reranker {
+    model: Mutex<TextRerank>,
+    pub model_name: String,
+}
+
+/// Load a `fastembed` cross-encoder reranking model via `hf-hub`, caching
+/// downloaded files under `cache_dir` using the same `models--org--repo`
+/// layout [`RerankerInfo::cache_dir_name`] expects.
+#[cfg(feature = "semantic")]
+pub fn new(model_name: &str, cache_dir: &Path) -> Result<Reranker> {
+    let info = reranker_registry()
+        .iter()
+        .find(|r| r.name == model_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "unsupported reranker model '{model_name}': supported names are {}",
+                reranker_registry()
+                    .iter()
+                    .map(|r| r.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+
+    let api = hf_hub::api::sync::ApiBuilder::new()
+        .with_cache_dir(cache_dir.to_path_buf())
+        .build()?;
+    let repo = api.model(info.hf_repo.to_string());
+
+    let model_path = repo.get(info.model_file)?;
+    let tokenizer_files = TokenizerFiles {
+        tokenizer_file: std::fs::read(repo.get("tokenizer.json")?)?,
+        config_file: std::fs::read(repo.get("config.json")?)?,
+        special_tokens_map_file: std::fs::read(repo.get("special_tokens_map.json")?)?,
+        tokenizer_config_file: std::fs::read(repo.get("tokenizer_config.json")?)?,
+    };
+
+    let model = TextRerank::try_new_from_user_defined(
+        UserDefinedRerankingModel::new(OnnxSource::File(model_path), tokenizer_files),
+        RerankInitOptionsUserDefined::default().with_max_length(info.max_length),
+    )?;
+
+    Ok(Reranker {
+        model: Mutex::new(model),
+        model_name: model_name.to_string(),
+    })
+}
+
+#[cfg(feature = "semantic")]
+impl Rerank for Reranker {
+    fn rerank(&self, query: &str, passages: &[String]) -> Result<Vec<f32>> {
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|_| anyhow::anyhow!("reranker mutex poisoned"))?;
+        let results = model.rerank::<String>(query.to_string(), passages, false, None)?;
+        // rerank() returns results sorted by score DESC; restore input order
+        // via each result's `index`.
+        let mut out = vec![0.0f32; passages.len()];
+        for r in results {
+            out[r.index] = sigmoid(r.score);
+        }
+        Ok(out)
     }
 }
 
@@ -264,5 +371,74 @@ mod tests {
         for s in scores {
             assert!((0.0..1.0).contains(&s), "score {s} out of bounds");
         }
+    }
+
+    #[test]
+    fn reranker_download_status_not_downloaded_when_dir_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = &reranker_registry()[0];
+        let st = reranker_download_status(info, dir.path());
+        assert!(!st.downloaded);
+        assert_eq!(st.disk_size, None);
+        assert!(st
+            .path
+            .ends_with("models--onebrain-ai--onebrain-reranker-v1"));
+    }
+
+    #[test]
+    fn reranker_download_status_sums_file_sizes_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = &reranker_registry()[0];
+        let model_dir = dir.path().join(info.cache_dir_name());
+        std::fs::create_dir_all(model_dir.join("snapshots/abc")).unwrap();
+        std::fs::write(
+            model_dir.join("snapshots/abc/model_int8.onnx"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
+        std::fs::write(model_dir.join("config.json"), vec![0u8; 200]).unwrap();
+        let st = reranker_download_status(info, dir.path());
+        assert!(st.downloaded);
+        assert_eq!(st.disk_size, Some(4296));
+        assert_eq!(st.path, model_dir);
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn new_rejects_unknown_reranker_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = new("not-a-real-reranker", dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unsupported reranker model"), "{msg}");
+        assert!(msg.contains("onebrain-reranker-v1"), "{msg}");
+    }
+
+    /// Gated live test: downloads the real `onebrain-reranker-v1` model from
+    /// HF and exercises a real cross-encoder pass. Skipped by default — the
+    /// model repo doesn't exist on HF yet at the time this test was written;
+    /// exercised later once the model is published. Set
+    /// `ONEBRAIN_TEST_RERANK=1` to run it.
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn reranker_scores_relevant_passage_higher() {
+        if std::env::var("ONEBRAIN_TEST_RERANK").is_err() {
+            return; // gated: downloads a model
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let r = new("onebrain-reranker-v1", dir.path()).unwrap();
+        let passages = vec![
+            "The cat sat on the mat.".to_string(),
+            "Quantum entanglement links particle states.".to_string(),
+        ];
+        let scores = r.rerank("Where did the cat sit?", &passages).unwrap();
+        assert_eq!(scores.len(), 2);
+        for s in &scores {
+            assert!(*s > 0.0 && *s < 1.0, "score {s} out of (0,1)");
+        }
+        assert!(
+            scores[0] > scores[1],
+            "relevant passage should outscore irrelevant: {:?}",
+            scores
+        );
     }
 }
