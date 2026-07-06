@@ -379,6 +379,14 @@ fn resolve_query_results(
             .take(limit)
             .map(|(score, mut hit)| {
                 hit.score = score;
+                // Skip-not-fail contract: when the post-fusion rerank stage did
+                // not run (error / empty / no survivors), the returned hits must
+                // carry NO rerank_score. A fused survivor may already hold a
+                // rerank_score from a fetch-time rerank pass (vec/hyde sub-query
+                // or the daemon's hybrid mode) that was scored against a
+                // DIFFERENT sub-query's text — surfacing it here would be a
+                // stale, mislabeled confidence number. Clear it.
+                hit.rerank_score = None;
                 QueryHit::from(hit)
             })
             .collect(),
@@ -795,10 +803,28 @@ impl McpServer {
                         .iter()
                         .map(|(_, hit)| hit.doc_path.clone())
                         .collect();
+                    // The daemon's doc-level `/api/internal/rerank` seeds fused
+                    // scores at 0.0 (it ranks by the cross-encoder, not the
+                    // fused rank), so its hits come back with `score: 0.0`.
+                    // Re-stamp the real fused RRF score from `survivors` by
+                    // doc_path — daemon survivors are doc-level (one hit per
+                    // path), so this is a 1:1 map. The Direct arm already
+                    // threads the true fused score through `rerank_hits`, so
+                    // only the daemon path needs this restamp.
+                    let fused_by_path: std::collections::HashMap<String, f64> = survivors
+                        .iter()
+                        .map(|(score, hit)| (hit.doc_path.clone(), *score))
+                        .collect();
                     let query = primary_query.clone();
                     tokio::task::spawn_blocking(move || {
                         let value = handle.rerank(&query, &paths, limit)?;
-                        parse_daemon_search_hits(&value)
+                        let mut hits = parse_daemon_search_hits(&value)?;
+                        for hit in &mut hits {
+                            if let Some(score) = fused_by_path.get(&hit.doc_path) {
+                                hit.score = *score;
+                            }
+                        }
+                        Ok(hits)
                     })
                     .await
                     .map_err(|e| anyhow::anyhow!(e))
@@ -1096,6 +1122,30 @@ mod tests {
         // The fused score itself must still be applied to the fallback hits.
         assert_eq!(results[0].score, 1.0);
         assert_eq!(results[1].score, 0.5);
+    }
+
+    #[test]
+    fn resolve_query_results_clears_stale_rerank_score_on_fallback() {
+        // Regression: a fused survivor may already carry a `rerank_score` from
+        // a fetch-time rerank pass (a vec/hyde sub-query, or the daemon's
+        // hybrid mode) scored against a DIFFERENT sub-query's text. When the
+        // post-fusion rerank stage does NOT run (error / empty resolve), that
+        // stale score must be cleared — the fallback contract is "no
+        // rerank_score", and surfacing a score computed against another query
+        // would mislead. The plain `hit()` fixture starts at `None`, so this
+        // seeds `Some(_)` explicitly to lock in the clearing behavior.
+        let mut stale = hit("a");
+        stale.rerank_score = Some(0.91); // as if from the vec sub-query's fetch-time rerank
+        let survivors = vec![(1.0, stale), (0.5, hit("b"))];
+        let outcome: anyhow::Result<Vec<Hit>> = Err(anyhow::anyhow!("primary-query rerank failed"));
+
+        let results = resolve_query_results(survivors, Some(outcome), 10);
+
+        assert!(
+            results.iter().all(|r| r.rerank_score.is_none()),
+            "fallback must clear a fetch-time rerank_score, not leak it"
+        );
+        assert_eq!(results[0].score, 1.0);
     }
 
     #[test]
