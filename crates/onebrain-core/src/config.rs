@@ -130,7 +130,7 @@ pub struct RerankerConfig {
     /// Whether reranking is enabled. Default `true`.
     #[serde(default = "default_reranker_enabled")]
     pub enabled: bool,
-    /// Reranker model name. Default `"onebrain-reranker-v1"`.
+    /// Reranker model name. Default `"onebrain-rerank-v1"`.
     /// Validation happens at engine/CLI layer where the supported-names list lives.
     #[serde(default = "default_reranker_model")]
     pub model: String,
@@ -150,7 +150,7 @@ fn default_reranker_enabled() -> bool {
 }
 
 fn default_reranker_model() -> String {
-    "onebrain-reranker-v1".to_string()
+    "onebrain-rerank-v1".to_string()
 }
 
 fn default_reranker_min_candidates() -> usize {
@@ -489,7 +489,7 @@ mod tests {
         let (_dir, root) = write_vault("search:\n  embed_model: multilingual-e5-small\n");
         let cfg = load_vault_config(&root).unwrap();
         assert!(cfg.search.reranker.enabled);
-        assert_eq!(cfg.search.reranker.model, "onebrain-reranker-v1");
+        assert_eq!(cfg.search.reranker.model, "onebrain-rerank-v1");
         assert_eq!(cfg.search.reranker.min_candidates, 10);
         assert_eq!(cfg.search.reranker.min_score, None);
     }
@@ -499,7 +499,7 @@ mod tests {
         let (_dir, root) = write_vault("search:\n  reranker:\n    enabled: false\n");
         let cfg = load_vault_config(&root).unwrap();
         assert!(!cfg.search.reranker.enabled);
-        assert_eq!(cfg.search.reranker.model, "onebrain-reranker-v1");
+        assert_eq!(cfg.search.reranker.model, "onebrain-rerank-v1");
         assert_eq!(cfg.search.reranker.min_candidates, 10);
         assert_eq!(cfg.search.reranker.min_score, None);
     }

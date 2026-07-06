@@ -133,9 +133,9 @@ Cross-encoder reranking: the Tier-2 precision stage over already-retrieved candi
 
 | name | approx size | max length | note |
 |---|---|---|---|
-| `onebrain-reranker-v1` | ~570 MB | 512 | `bge-reranker-v2-m3` base, int8, multilingual incl. Thai |
+| `onebrain-rerank-v1` | ~570 MB | 512 | `bge-reranker-v2-m3` base, int8, multilingual incl. Thai |
 
-The registry name is **versioned** (`onebrain-reranker-v1`, `-v2`, …), independent of the upstream base model's own naming — each version is a distinct entry, **sha256-pinned** to one specific model file, so a base-model upgrade is always a new registry entry, never a silent swap under an existing name. See [ADR 0025](../decisions/0025-tier2-cross-encoder-reranker.md) for the model-choice rationale (why int8 over fp32, why not `jina-reranker-v2` or `BGE-reranker-base`).
+The registry name is **versioned** (`onebrain-rerank-v1`, `-v2`, …), independent of the upstream base model's own naming — each version is a distinct entry, **sha256-pinned** to one specific model file, so a base-model upgrade is always a new registry entry, never a silent swap under an existing name. See [ADR 0025](../decisions/0025-tier2-cross-encoder-reranker.md) for the model-choice rationale (why int8 over fp32, why not `jina-reranker-v2` or `BGE-reranker-base`).
 
 **Key functions**
 - `new(model_name, cache_dir) -> Result<Reranker>` (behind `semantic`) — resolves the registry entry, downloads via `hf-hub` (same `models--org--repo` cache convention as `embed.rs`), verifies the model file's sha256 once (`verify_sha256_once`, short-circuited on later loads via a `.sha256-verified` marker file next to the model), loads the tokenizer + `TextRerank`.

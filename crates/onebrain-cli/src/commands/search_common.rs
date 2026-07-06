@@ -427,13 +427,13 @@ mod tests {
     fn rerank_settings_from_config_maps_every_field() {
         let cfg = onebrain_core::RerankerConfig {
             enabled: false,
-            model: "onebrain-reranker-v1".to_string(),
+            model: "onebrain-rerank-v1".to_string(),
             min_candidates: 42,
             min_score: Some(0.55),
         };
         let mapped = rerank_settings_from_config(&cfg);
         assert!(!mapped.enabled);
-        assert_eq!(mapped.model, "onebrain-reranker-v1");
+        assert_eq!(mapped.model, "onebrain-rerank-v1");
         assert_eq!(mapped.min_candidates, 42);
         assert_eq!(mapped.min_score, 0.55);
     }

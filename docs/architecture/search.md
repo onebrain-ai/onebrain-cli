@@ -56,7 +56,7 @@ Inside a collection dir:
 | `vectors/meta.redb` | **Semantic index, metadata.** redb tables: `chunk_to_row`, `row_to_chunk`, `tombstones`, `free_rows` (recyclable tombstoned slots), `header` (`dims`, append cursor). | — | `VectorStore` |
 | `engine.redb` | **Engine metadata** ([`engine.rs`](../../crates/onebrain-search/src/engine.rs)): `chunk_meta` (per-chunk `{doc_path, heading_path, chunk_index, text}` — the *only* place chunk **text** is retrievable: tantivy's `body` field is indexed but not stored, and the vector store keeps no text. Headings are also stored in tantivy, but no search path reads them from there), `doc_chunks` (doc → chunk-id list), `doc_hashes` (per-doc sha256, meaning "vectors current as of this hash"), `lex_hashes` (per-doc sha256 from a lex-only pass — see §2), `engine_header` (`active_model`, `last_indexed_at`). | Doc bytes + chunker output | `Engine` |
 | `models--<org>--<repo>/` | Downloaded ONNX embedding models (hf-hub naming via `ModelInfo::cache_dir_name`, e.g. `models--intfloat--multilingual-e5-small`). | Hugging Face download by fastembed | Lazy embedder construction (`Engine::embedder` → `embed::new`) |
-| `models--onebrain-ai--onebrain-reranker-v1/` | Downloaded Tier-2 cross-encoder reranker model (same hf-hub cache-dir convention, via `RerankerInfo::cache_dir_name`), sha256-verified once per download (`verify_sha256_once`, cached via a `.sha256-verified` marker next to the model file). | Hugging Face download by the reranker loader | Lazy reranker construction (`Engine::reranker` → `rerank::new`), or eagerly at the end of a full `reindex` when `search.reranker.enabled` and not yet downloaded ([`ReindexProgress::LoadingReranker`]) |
+| `models--onebrain-ai--onebrain-rerank-v1/` | Downloaded Tier-2 cross-encoder reranker model (same hf-hub cache-dir convention, via `RerankerInfo::cache_dir_name`), sha256-verified once per download (`verify_sha256_once`, cached via a `.sha256-verified` marker next to the model file). | Hugging Face download by the reranker loader | Lazy reranker construction (`Engine::reranker` → `rerank::new`), or eagerly at the end of a full `reindex` when `search.reranker.enabled` and not yet downloaded ([`ReindexProgress::LoadingReranker`]) |
 | `reindex-progress.json` | Transient live marker for an in-flight reindex: `{"done":N,"total":M}`. | — | `search reindex` (RAII `LiveProgressFile`, see §4) |
 
 ### Embedding model registry
@@ -88,7 +88,7 @@ a wide candidate block, cross-encode the head of that block against the query
 text, sort by the reranker's calibrated 0–1 score, and gate low scorers out —
 subject to a never-empty floor (`RERANK_NO_MATCH_KEEP` = 3) that keeps the
 invariant above alive one layer up. The default reranker is
-`onebrain-reranker-v1` (a `bge-reranker-v2-m3`-based int8 cross-encoder,
+`onebrain-rerank-v1` (a `bge-reranker-v2-m3`-based int8 cross-encoder,
 multilingual incl. Thai, ~570 MB). Skip-not-fail throughout: no reranker
 configured, not downloaded, a lex-only build, or a runtime error all fall back
 to the plain fused/vector order with `Hit::rerank_score: None` — a query never
@@ -105,7 +105,7 @@ fails, and never returns fewer results, because reranking didn't work. See
 | `search.embed_model` | Active embedding model (registry name) | `multilingual-e5-small` (serde default) |
 | `search.exclude` | Vault-relative index-exclusion patterns (path prefixes or bare dir names) | `["attachments"]` |
 | `search.reranker.enabled` | Master switch for the Tier-2 cross-encoder rerank stage | `true` (default-on) |
-| `search.reranker.model` | Reranker registry name (see [`rerank::reranker_registry`](../reference/onebrain-search.md)) | `onebrain-reranker-v1` |
+| `search.reranker.model` | Reranker registry name (see [`rerank::reranker_registry`](../reference/onebrain-search.md)) | `onebrain-rerank-v1` |
 | `search.reranker.min_candidates` | Minimum fused/retrieved candidate pool cross-encoded per query — a FLOOR, not a ceiling. The engine actually reranks `max(min_candidates, top_k)`, auto-raised so every returned result is always reranked; this value only matters when it exceeds `top_k` (a wider pool than the return size improves quality). Overridable per-query via the CLI's `--min-candidates` / the webui API's `min_candidates` param. | `10` (calibrated) |
 | `search.reranker.min_score` | Gate: reranked hits below this calibrated 0–1 score are dropped (never-empty floor still applies). Because the gate removes low-confidence hits, `query`/`vsearch` can **return fewer than `top_k`** results on a weak-match query — quality-adaptive by design (and, when nothing clears the gate, `RERANK_NO_MATCH_KEEP = 3` survive, labelled "no strong match"). The CLI `--min-score` flag overrides this gate per-query **when reranking is active** (so it filters the calibrated `rerank_score`, the confidence number a user can reason about); when reranking is off (disabled / model absent / pure-lex `search`), `--min-score` filters the raw retrieval score instead. | `None` → engine's `DEFAULT_RERANK_MIN_SCORE = 0.30` |
 | `search.default_top_k` | Vault-level default result count (`top_k`) for a surface that doesn't specify one explicitly (e.g. the webui API's `top_k` param when omitted). Always overridable per-query (CLI `--top-k` / API param). | `10` |
@@ -135,7 +135,7 @@ flowchart LR
         VM[("vectors/meta.redb")]
         ER[("engine.redb")]
         MD[("models--*/ (embed)")]
-        MR[("models--onebrain-ai--onebrain-reranker-v1/")]
+        MR[("models--onebrain-ai--onebrain-rerank-v1/")]
         PM[("reindex-progress.json")]
     end
     CFG --> VERBS
@@ -379,7 +379,7 @@ flowchart LR
 | `vectors/vectors.bin` + `meta.redb` | ✅ scanned (exact cosine top-k, mmap + simsimd dot) |
 | `engine.redb` | ✅ read (`chunk_meta` → doc/heading/snippet, and again for rerank passage text) |
 | `models--*` (embed) | ✅ embedder loads active model (downloads on first use) |
-| `models--onebrain-ai--onebrain-reranker-v1/` | ✅ if `search.reranker.enabled` and downloaded — loads lazily on first reranked query |
+| `models--onebrain-ai--onebrain-rerank-v1/` | ✅ if `search.reranker.enabled` and downloaded — loads lazily on first reranked query |
 | `tantivy/` | ❌ |
 
 Flow: open engine → embed the query (`embed_query`, model's query prefix) → vector store scan →
@@ -416,7 +416,7 @@ flowchart LR
 | `vectors/*` | ✅ vector leg (top 50, trimmed to top cluster via `keep_top_cluster`) |
 | `engine.redb` | ✅ resolve fused hits, and again for rerank passage text |
 | `models--*` (embed) | ✅ query embedding |
-| `models--onebrain-ai--onebrain-reranker-v1/` | ✅ if `search.reranker.enabled` and downloaded — loads lazily on first reranked query |
+| `models--onebrain-ai--onebrain-rerank-v1/` | ✅ if `search.reranker.enabled` and downloaded — loads lazily on first reranked query |
 
 Flow: both legs run inside `Engine::query` — lex top-50 and vector top-50 (the vector leg trimmed as noted in the table above) — then
 `rrf_fuse` combines them by **rank only** (each list contributes `1/(60 + rank)`; scores summed,

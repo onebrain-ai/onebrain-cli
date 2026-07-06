@@ -203,7 +203,7 @@ fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
     std::fs::create_dir_all(
         cache
             .path()
-            .join("search/doctor-it-green/models--onebrain-ai--onebrain-reranker-v1"),
+            .join("search/doctor-it-green/models--onebrain-ai--onebrain-rerank-v1"),
     )
     .unwrap();
 

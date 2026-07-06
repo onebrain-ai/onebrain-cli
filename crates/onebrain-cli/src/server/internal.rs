@@ -660,11 +660,8 @@ mod tests {
         // absent -> exits without touching the lock" contract even if the
         // call site inside `open_held_engine` changes.
         let cache_dir = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap());
-        let handle = spawn_reranker_warm_thread(
-            engine.clone(),
-            "onebrain-reranker-v1".to_string(),
-            cache_dir,
-        );
+        let handle =
+            spawn_reranker_warm_thread(engine.clone(), "onebrain-rerank-v1".to_string(), cache_dir);
         handle.join().expect("warm thread must not panic");
 
         // The engine must still be lockable afterwards (no poisoning, no
@@ -684,7 +681,7 @@ mod tests {
             pending_total: 3,
             last_indexed: Some(42),
             indexed: true,
-            reranker_model: "onebrain-reranker-v1".to_string(),
+            reranker_model: "onebrain-rerank-v1".to_string(),
             reranker_ready: true,
             reranker_downloaded: true,
             reranker_disk_bytes: Some(1024),
@@ -694,7 +691,7 @@ mod tests {
         assert_eq!(v["pending_total"], 3);
         assert_eq!(v["last_indexed"], 42);
         assert_eq!(v["indexed"], true);
-        assert_eq!(v["reranker_model"], "onebrain-reranker-v1");
+        assert_eq!(v["reranker_model"], "onebrain-rerank-v1");
         assert_eq!(v["reranker_ready"], true);
         assert_eq!(v["reranker_downloaded"], true);
         assert_eq!(v["reranker_disk_bytes"], 1024);
@@ -715,7 +712,7 @@ mod tests {
             pending_total: 0,
             last_indexed: None,
             indexed: false,
-            reranker_model: "onebrain-reranker-v1".to_string(),
+            reranker_model: "onebrain-rerank-v1".to_string(),
             reranker_ready: false,
             reranker_downloaded: false,
             reranker_disk_bytes: None,
@@ -1302,7 +1299,7 @@ mod tests {
         // Reranker fields: default config (no `search.reranker` block) names
         // the default model, but it isn't downloaded in a fresh test cache dir
         // → not ready, no download size.
-        assert_eq!(v["reranker_model"], "onebrain-reranker-v1");
+        assert_eq!(v["reranker_model"], "onebrain-rerank-v1");
         assert_eq!(v["reranker_ready"], false);
         assert_eq!(v["reranker_downloaded"], false);
         assert!(v["reranker_disk_bytes"].is_null());
@@ -1321,7 +1318,7 @@ mod tests {
         let vault = tempfile::tempdir().unwrap();
         std::fs::write(
             vault.path().join("onebrain.yml"),
-            "search:\n  collection: internal-status-reranker-cfg\n  reranker:\n    enabled: false\n    model: onebrain-reranker-v1\n",
+            "search:\n  collection: internal-status-reranker-cfg\n  reranker:\n    enabled: false\n    model: onebrain-rerank-v1\n",
         )
         .unwrap();
         let cache = tempfile::tempdir().unwrap();
@@ -1340,7 +1337,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["reranker_model"], "onebrain-reranker-v1");
+        assert_eq!(v["reranker_model"], "onebrain-rerank-v1");
         // Disabled in config → never ready, regardless of download status.
         assert_eq!(v["reranker_ready"], false);
     }

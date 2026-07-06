@@ -113,7 +113,7 @@ fn search_status_json_reports_reranker_fields_without_downloading() {
 
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     // Config default reranker.
-    assert_eq!(v["data"]["reranker_model"], "onebrain-reranker-v1");
+    assert_eq!(v["data"]["reranker_model"], "onebrain-rerank-v1");
     // Nothing downloaded on a fresh vault → not ready, no size.
     assert_eq!(v["data"]["reranker_ready"], false);
     assert_eq!(v["data"]["reranker_downloaded"], false);
@@ -804,8 +804,8 @@ fn search_model_list_json_reports_reranker_section() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let rerankers = v["data"]["rerankers"].as_array().unwrap();
     assert_eq!(rerankers.len(), 1);
-    assert_eq!(rerankers[0]["name"], "onebrain-reranker-v1");
-    // Default `search.reranker.model` is `onebrain-reranker-v1` (config default).
+    assert_eq!(rerankers[0]["name"], "onebrain-rerank-v1");
+    // Default `search.reranker.model` is `onebrain-rerank-v1` (config default).
     assert_eq!(rerankers[0]["current"], true);
     // Nothing downloaded in a fresh cache.
     assert_eq!(rerankers[0]["downloaded"], false);
@@ -823,19 +823,13 @@ fn search_model_remove_accepts_reranker_name() {
     let reranker_dir = seed_fake_model(
         cache.path(),
         "t-vault",
-        "models--onebrain-ai--onebrain-reranker-v1",
+        "models--onebrain-ai--onebrain-rerank-v1",
         16384,
     );
     assert!(reranker_dir.exists());
 
     let out = onebrain(vault.path(), cache.path())
-        .args([
-            "search",
-            "model",
-            "remove",
-            "onebrain-reranker-v1",
-            "--force",
-        ])
+        .args(["search", "model", "remove", "onebrain-rerank-v1", "--force"])
         .output()
         .unwrap();
     assert!(
@@ -846,7 +840,7 @@ fn search_model_remove_accepts_reranker_name() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["data"]["removed"], true);
     assert_eq!(v["data"]["freed_bytes"], 16384);
-    // Default config's `reranker.model` IS `onebrain-reranker-v1`, so this
+    // Default config's `reranker.model` IS `onebrain-rerank-v1`, so this
     // is the active reranker — hence `--force`.
     assert_eq!(v["data"]["was_current"], true);
     assert!(!reranker_dir.exists(), "reranker dir should be gone");
@@ -870,7 +864,7 @@ fn search_model_remove_unknown_name_lists_both_registries() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let message = v["error"]["message"].as_str().unwrap_or_default();
     assert!(message.contains("multilingual-e5-small"), "{message}");
-    assert!(message.contains("onebrain-reranker-v1"), "{message}");
+    assert!(message.contains("onebrain-rerank-v1"), "{message}");
 }
 
 // ── Gated: real embeddings (reindex + query + vsearch) ─────────────────────

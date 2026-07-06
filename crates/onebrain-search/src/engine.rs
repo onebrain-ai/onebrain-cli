@@ -2605,14 +2605,14 @@ mod tests {
         let cache_dir = tempfile::tempdir().unwrap();
         let vault_dir = tempfile::tempdir().unwrap();
         // Fake embedder (so embedding needs no model), real reranker source
-        // (default settings: enabled + onebrain-reranker-v1). The reranker
+        // (default settings: enabled + onebrain-rerank-v1). The reranker
         // fetch path is independent of the injected embedder.
         let mut e = fake_engine(cache_dir.path());
         std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
 
         let info = rerank::reranker_registry()
             .iter()
-            .find(|m| m.name == "onebrain-reranker-v1")
+            .find(|m| m.name == "onebrain-rerank-v1")
             .unwrap();
         assert!(
             !rerank::reranker_download_status(info, cache_dir.path()).downloaded,

@@ -832,7 +832,7 @@ mod tests {
                 busy: false,
                 status_error: None,
                 semantic_available: true,
-                reranker_model: "onebrain-reranker-v1".to_string(),
+                reranker_model: "onebrain-rerank-v1".to_string(),
                 reranker_ready: false,
                 reranker_downloaded: false,
                 reranker_disk_bytes: None,
@@ -861,7 +861,7 @@ mod tests {
     fn text_shows_reranker_section_not_downloaded_by_default() {
         let s = render_text(&env(Some("ob-1"), true));
         assert!(s.contains("🎯  Reranker"), "{s}");
-        assert!(s.contains("    Name          onebrain-reranker-v1"), "{s}");
+        assert!(s.contains("    Name          onebrain-rerank-v1"), "{s}");
         assert!(s.contains("    Ready         —  no"), "{s}");
         assert!(s.contains("    Size          not downloaded"), "{s}");
     }
@@ -890,7 +890,7 @@ mod tests {
             search: Default::default(),
         };
         let (model, ready, downloaded, disk_bytes) = reranker_status_fields(&config, cache.path());
-        assert_eq!(model, "onebrain-reranker-v1");
+        assert_eq!(model, "onebrain-rerank-v1");
         assert!(!ready, "nothing downloaded yet");
         assert!(!downloaded);
         assert_eq!(disk_bytes, None);
@@ -1444,7 +1444,7 @@ mod tests {
             busy: false,
             status_error: None,
             semantic_available: cfg!(feature = "semantic"),
-            reranker_model: "onebrain-reranker-v1".to_string(),
+            reranker_model: "onebrain-rerank-v1".to_string(),
             reranker_ready: false,
             reranker_downloaded: false,
             reranker_disk_bytes: None,

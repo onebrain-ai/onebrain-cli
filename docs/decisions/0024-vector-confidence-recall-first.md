@@ -69,7 +69,7 @@ not a hand-tuned per-model constant):
 
 This ADR was the **Tier-1 stopgap**. The proper fix — as qmd (`@tobilu/qmd`) did —
 is a **cross-encoder reranker**: retrieve recall-first, then rerank the top-K.
-That reranker (`onebrain-reranker-v1`, a `bge-reranker-v2-m3`-based int8
+That reranker (`onebrain-rerank-v1`, a `bge-reranker-v2-m3`-based int8
 cross-encoder) landed in v3.4.7 — see [ADR 0025](0025-tier2-cross-encoder-reranker.md).
 Its calibrated 0–1 score **replaces this confidence heuristic** as a reliable
 gate for every hit it actually reranks; the heuristic below now serves only
