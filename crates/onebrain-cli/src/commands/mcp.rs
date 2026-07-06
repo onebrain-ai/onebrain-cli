@@ -336,6 +336,55 @@ fn tantivy_index_present(cache_dir: &Path) -> bool {
     cache_dir.join("tantivy").is_dir()
 }
 
+/// Final `query`-tool result assembly (design A1's rerank-after-RRF stage,
+/// pulled out as a pure function so the skip-not-fail decision is unit
+/// testable without a live engine or daemon). `survivors` is the fused,
+/// `min_score`-filtered pool in RRF order; `rerank_outcome` is `None` when
+/// there were no survivors to rerank, `Some(Ok(hits))` when a rerank call
+/// returned (possibly empty) hits, and `Some(Err(_))` when the rerank call
+/// itself failed.
+///
+/// Skip-not-fail: a rerank error, or an `Ok` result that resolved to zero
+/// hits (e.g. lex-only chunk ids with no metadata row to resolve against —
+/// `resolve_hits` silently drops those), falls back to the fused order with
+/// `rerank_score: None` on every hit — the query must never fail, or lose
+/// results outright, just because reranking didn't pan out.
+fn resolve_query_results(
+    survivors: Vec<(f64, Hit)>,
+    rerank_outcome: Option<anyhow::Result<Vec<Hit>>>,
+    limit: usize,
+) -> Vec<QueryHit> {
+    let reranked = match rerank_outcome {
+        Some(Ok(hits)) if !hits.is_empty() => Some(hits),
+        Some(Ok(_)) => {
+            eprintln!(
+                "onebrain mcp: query-tool rerank resolved 0 of {} candidates — falling back to fused order",
+                survivors.len()
+            );
+            None
+        }
+        Some(Err(e)) => {
+            eprintln!(
+                "onebrain mcp: query-tool rerank failed — falling back to fused order: {e:#}"
+            );
+            None
+        }
+        None => None,
+    };
+
+    match reranked {
+        Some(hits) => hits.into_iter().take(limit).map(QueryHit::from).collect(),
+        None => survivors
+            .into_iter()
+            .take(limit)
+            .map(|(score, mut hit)| {
+                hit.score = score;
+                QueryHit::from(hit)
+            })
+            .collect(),
+    }
+}
+
 /// Agent-facing note returned by `query` when the vault has no index yet, so
 /// the caller degrades to filesystem search instead of treating it as an error.
 fn no_index_note() -> String {
@@ -633,6 +682,10 @@ impl McpServer {
             .searches
             .iter()
             .any(|s| matches!(s.r#type, SubQueryType::Lex));
+        // Capture the primary (2x-weighted) sub-query text BEFORE `params.searches`
+        // is consumed below — this is the query the post-fusion rerank stage scores
+        // candidates against.
+        let primary_query = params.searches[0].query.clone();
 
         let collection = collection_for(&self.resolved).map_err(internal)?;
         let cache_dir = collection_cache_dir(&collection);
@@ -709,15 +762,52 @@ impl McpServer {
         };
 
         let fused = rrf_fuse(ranked);
-        let results: Vec<QueryHit> = fused
+        let survivors: Vec<(f64, Hit)> = fused
             .into_iter()
             .filter(|(score, _)| *score >= min_score)
-            .take(limit)
-            .map(|(score, mut hit)| {
-                hit.score = score;
-                QueryHit::from(hit)
-            })
             .collect();
+
+        // Rerank stage (design A1): rerank the fused, min_score-filtered pool
+        // against the primary sub-query text, branching on the same backend the
+        // fetch used above. Skip-not-fail: any rerank error, OR a resolved pool
+        // that came back empty (e.g. lex-only chunk ids with no metadata row to
+        // resolve against — `resolve_hits` silently drops those, same as the
+        // engine's own query/vector_search paths), keeps the current fused
+        // order with `rerank_score: None` — the query must never fail, or lose
+        // results outright, because reranking didn't pan out.
+        let rerank_outcome: Option<anyhow::Result<Vec<Hit>>> = if survivors.is_empty() {
+            None
+        } else {
+            Some(match &self.backend {
+                Backend::Direct(_) => {
+                    let fused_pairs: Vec<(String, f64)> = survivors
+                        .iter()
+                        .map(|(score, hit)| (hit.chunk_id.clone(), *score))
+                        .collect();
+                    let query = primary_query.clone();
+                    self.with_engine(move |eng| eng.rerank_hits(&query, fused_pairs, limit))
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))
+                }
+                Backend::Daemon(handle) => {
+                    let handle = handle.clone();
+                    let paths: Vec<String> = survivors
+                        .iter()
+                        .map(|(_, hit)| hit.doc_path.clone())
+                        .collect();
+                    let query = primary_query.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let value = handle.rerank(&query, &paths, limit)?;
+                        parse_daemon_search_hits(&value)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))
+                    .and_then(|inner| inner)
+                }
+            })
+        };
+
+        let results = resolve_query_results(survivors, rerank_outcome, limit);
 
         Ok(Json(QueryOut {
             results,
@@ -944,6 +1034,91 @@ mod tests {
             v.get("rerank_score").is_none(),
             "rerank_score must be omitted, not null: {v}"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // `resolve_query_results` — the `query` tool's post-RRF rerank stage
+    // (design A1). Pure function, so both the reranked-order path and every
+    // skip-not-fail branch are exercised without a live engine or daemon.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_query_results_uses_reranked_order_and_surfaces_rerank_score() {
+        // Fused (RRF) order is a, b, c — the reranker flips it to c, a, b and
+        // stamps each hit with a calibrated score. The final results must
+        // follow the RERANKED order and carry `rerank_score`, not the fused
+        // order/plain fused `score`.
+        let survivors = vec![(1.0, hit("a")), (0.6, hit("b")), (0.3, hit("c"))];
+        let mut c = hit("c");
+        c.rerank_score = Some(0.95);
+        let mut a = hit("a");
+        a.rerank_score = Some(0.80);
+        let mut b = hit("b");
+        b.rerank_score = Some(0.40);
+        let reranked = vec![c, a, b];
+
+        let results = resolve_query_results(survivors, Some(Ok(reranked)), 10);
+
+        assert_eq!(
+            results.iter().map(|r| r.docid.as_str()).collect::<Vec<_>>(),
+            vec!["c", "a", "b"],
+            "results must follow the reranked order, not fused RRF order"
+        );
+        assert_eq!(results[0].rerank_score, Some(0.95));
+        assert_eq!(results[1].rerank_score, Some(0.80));
+        assert_eq!(results[2].rerank_score, Some(0.40));
+    }
+
+    #[test]
+    fn resolve_query_results_respects_limit_after_rerank() {
+        let survivors = vec![(1.0, hit("a")), (0.5, hit("b"))];
+        let reranked = vec![hit("b"), hit("a")];
+        let results = resolve_query_results(survivors, Some(Ok(reranked)), 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].docid, "b");
+    }
+
+    #[test]
+    fn resolve_query_results_falls_back_to_fused_order_when_rerank_errors() {
+        // Skip-not-fail: a rerank `Err` must NOT propagate as a query failure —
+        // it keeps the fused RRF order with `rerank_score` absent on every hit.
+        let survivors = vec![(1.0, hit("a")), (0.5, hit("b"))];
+        let outcome: anyhow::Result<Vec<Hit>> = Err(anyhow::anyhow!("reranker model crashed"));
+
+        let results = resolve_query_results(survivors, Some(outcome), 10);
+
+        assert_eq!(
+            results.iter().map(|r| r.docid.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "must keep fused RRF order on rerank error"
+        );
+        assert!(results.iter().all(|r| r.rerank_score.is_none()));
+        // The fused score itself must still be applied to the fallback hits.
+        assert_eq!(results[0].score, 1.0);
+        assert_eq!(results[1].score, 0.5);
+    }
+
+    #[test]
+    fn resolve_query_results_falls_back_when_rerank_resolves_to_empty() {
+        // A rerank call can return `Ok(vec![])` without erroring (e.g. every
+        // candidate chunk id had no metadata row to resolve against). That
+        // must be treated the same as an error: fall back to fused order
+        // rather than silently returning zero results.
+        let survivors = vec![(1.0, hit("a")), (0.5, hit("b"))];
+        let results = resolve_query_results(survivors, Some(Ok(Vec::new())), 10);
+        assert_eq!(
+            results.iter().map(|r| r.docid.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert!(results.iter().all(|r| r.rerank_score.is_none()));
+    }
+
+    #[test]
+    fn resolve_query_results_no_survivors_is_empty_regardless_of_outcome() {
+        // No fused survivors → nothing to rerank; `rerank_outcome` is `None`
+        // (the caller never issues a rerank call), and the result is empty.
+        let results = resolve_query_results(Vec::new(), None, 10);
+        assert!(results.is_empty());
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -1584,6 +1759,15 @@ mod tests {
             let out = block_on(server.query(lex_query())).expect("direct query");
             assert_eq!(out.0.results.len(), 1, "direct: {:?}", out.0.results);
             assert_eq!(out.0.results[0].file, "alpha.md");
+            // End-to-end skip-not-fail: this vault has no reranker configured
+            // and its lex-only seed has no redb chunk metadata, so the
+            // rerank stage resolves to nothing and the query tool must fall
+            // back to fused RRF order with `rerank_score` absent rather than
+            // dropping the (only) result.
+            assert!(
+                out.0.results[0].rerank_score.is_none(),
+                "no reranker configured — rerank_score must be absent"
+            );
 
             let st = block_on(server.status()).expect("direct status");
             // The lex-only seed doesn't populate the engine's redb, so the
