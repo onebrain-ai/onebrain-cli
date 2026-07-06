@@ -163,6 +163,11 @@ fn doctor_search_check_reads_engine_status_after_reindex() {
 /// dir exists, so no download is needed). The `search` row reports `ok`, the
 /// footer shows the ✅ verdict with zero warnings, and a `--fix` run finds
 /// nothing to do (the `issues.is_empty()` branch).
+///
+/// The reranker is enabled by default (Task 8), so its `models--*` dir is
+/// fabricated here too — otherwise doctor would (correctly) warn that the
+/// reranker model isn't downloaded and this wouldn't be an all-green fixture
+/// anymore.
 #[test]
 fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
     let vault = tempdir().unwrap();
@@ -180,7 +185,8 @@ fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
     .unwrap();
 
     // Empty-vault reindex (no docs → no model download) + a fabricated
-    // downloaded-model dir for the default model.
+    // downloaded-model dir for the default embedding model and the default
+    // reranker model.
     Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(vault.path())
@@ -192,6 +198,12 @@ fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
         cache
             .path()
             .join("search/doctor-it-green/models--intfloat--multilingual-e5-small"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(
+        cache
+            .path()
+            .join("search/doctor-it-green/models--onebrain-ai--onebrain-reranker-v1"),
     )
     .unwrap();
 
