@@ -121,7 +121,7 @@ pub fn run_query(
         // `query`'s fused RRF score has no cosine interpretation, so the
         // unreranked fallback gets the generic reranker-not-downloaded line
         // only (no `vec_top_score`).
-        rerank_unreranked_hint(&hits, None)
+        rerank_unreranked_hint(&hits, None, engine.rerank_enabled())
     };
     emit_hits("search.query", vault_info, hits, hint, mode)
 }
@@ -176,10 +176,16 @@ fn vec_confidence_hint(top_score: f64) -> Option<String> {
 /// pairs once the reranker model is live in production; treat the thresholds
 /// as placeholders, not tuned values.
 ///
-/// `< 0.30` → "no strong match" (below the engine's own [`DEFAULT_RERANK_MIN_SCORE`]
-/// gate — a hit this weak only survives via the never-empty floor);
-/// `0.30..0.60` → "possible match"; `> 0.60` → confident, no label.
-const RERANK_NO_MATCH_BAND: f32 = 0.30;
+/// The low band edge IS the engine's own rerank gate default — a hit this
+/// weak only survives via the never-empty floor, so `RERANK_NO_MATCH_BAND`
+/// references [`onebrain_search::engine::DEFAULT_RERANK_MIN_SCORE`] directly
+/// rather than duplicating its value as a literal (they must never drift
+/// apart). `0.60` (`RERANK_POSSIBLE_BAND`) has no such counterpart yet — it
+/// stays a standalone provisional tunable pending Track C.
+///
+/// `< DEFAULT_RERANK_MIN_SCORE` → "no strong match"; `DEFAULT_RERANK_MIN_SCORE..0.60`
+/// → "possible match"; `> 0.60` → confident, no label.
+const RERANK_NO_MATCH_BAND: f32 = onebrain_search::engine::DEFAULT_RERANK_MIN_SCORE;
 const RERANK_POSSIBLE_BAND: f32 = 0.60;
 
 /// Confidence label for one reranked hit's `rerank_score`, or `None` when the
@@ -196,17 +202,26 @@ fn rerank_confidence_band(score: f32) -> Option<&'static str> {
 
 /// One-line, never-silent hint for a semantic verb's (`query` / `vsearch`)
 /// result set when NONE of its hits carry a `rerank_score` — the reranker was
-/// skipped entirely (model not downloaded, load failure, or `enabled: false`).
+/// skipped (model not downloaded, load failure) rather than turned off.
 /// Distinct from a genuine empty result (handled by `index_hint_for`) and from
 /// a partially-reranked set (the fused tail beyond `candidates` — those hits
 /// simply render with no band, no separate hint line).
+///
+/// `reranker_enabled: false` is an explicit user choice, not a degraded state —
+/// design calls for NO hint in that case (bands can't appear either, since
+/// scores stay `None`), so this returns `None` immediately rather than the
+/// misleading "model not downloaded" line.
 ///
 /// `vsearch` additionally folds in the pre-reranker cosine heuristic
 /// ([`vec_confidence_hint`]) as extra detail, since a bare cosine score is
 /// still a meaningful (if noisier) signal for that verb; `query`'s fused RRF
 /// score has no comparable interpretation, so it gets the generic line alone.
-fn rerank_unreranked_hint(hits: &[Hit], vec_top_score: Option<f64>) -> Option<String> {
-    if hits.is_empty() || hits.iter().any(|h| h.rerank_score.is_some()) {
+fn rerank_unreranked_hint(
+    hits: &[Hit],
+    vec_top_score: Option<f64>,
+    reranker_enabled: bool,
+) -> Option<String> {
+    if !reranker_enabled || hits.is_empty() || hits.iter().any(|h| h.rerank_score.is_some()) {
         return None;
     }
     let base = "unreranked (reranker model not downloaded — run `onebrain search reindex`)";
@@ -244,7 +259,7 @@ pub fn run_vsearch(
     // text renderer instead (see `rerank_confidence_band`), no separate hint.
     let hint = match hits.first() {
         None => index_hint_for(&engine, &resolved),
-        Some(top) => rerank_unreranked_hint(&hits, Some(top.score)),
+        Some(top) => rerank_unreranked_hint(&hits, Some(top.score), engine.rerank_enabled()),
     };
     emit_hits("search.vec", vault_info, hits, hint, mode)
 }
@@ -724,21 +739,21 @@ mod tests {
         reranked.rerank_score = Some(0.8);
         let unreranked_tail = engine_hit("b.md", 0.5);
         assert_eq!(
-            rerank_unreranked_hint(&[reranked, unreranked_tail], None),
+            rerank_unreranked_hint(&[reranked, unreranked_tail], None, true),
             None
         );
     }
 
     #[test]
     fn rerank_unreranked_hint_none_on_empty_hits() {
-        assert_eq!(rerank_unreranked_hint(&[], Some(0.9)), None);
+        assert_eq!(rerank_unreranked_hint(&[], Some(0.9), true), None);
     }
 
     #[test]
     fn rerank_unreranked_hint_generic_line_for_query_verb() {
         // `query` (hybrid) has no cosine top score to fold in.
         let hits = [engine_hit("a.md", 0.9)];
-        let hint = rerank_unreranked_hint(&hits, None).expect("unreranked hits need a hint");
+        let hint = rerank_unreranked_hint(&hits, None, true).expect("unreranked hits need a hint");
         assert!(hint.contains("unreranked"), "{hint}");
         assert!(hint.contains("reranker model not downloaded"), "{hint}");
         assert!(hint.contains("onebrain search reindex"), "{hint}");
@@ -749,7 +764,8 @@ mod tests {
         // vsearch still has a meaningful cosine top score, so the unreranked
         // fallback keeps the old heuristic alongside the generic line.
         let hits = [engine_hit("a.md", 0.9)];
-        let hint = rerank_unreranked_hint(&hits, Some(0.75)).expect("unreranked hits need a hint");
+        let hint =
+            rerank_unreranked_hint(&hits, Some(0.75), true).expect("unreranked hits need a hint");
         assert!(hint.contains("unreranked"), "{hint}");
         assert!(
             hint.contains("no strong semantic match"),
@@ -762,11 +778,21 @@ mod tests {
         // A confident cosine top score (≥0.86) has nothing extra to say, so
         // only the generic unreranked line appears.
         let hits = [engine_hit("a.md", 0.9)];
-        let hint = rerank_unreranked_hint(&hits, Some(0.90)).expect("still unreranked");
+        let hint = rerank_unreranked_hint(&hits, Some(0.90), true).expect("still unreranked");
         assert_eq!(
             hint,
             "unreranked (reranker model not downloaded — run `onebrain search reindex`)"
         );
+    }
+
+    #[test]
+    fn rerank_unreranked_hint_none_when_reranker_disabled() {
+        // `enabled: false` is an explicit user choice, not a degraded state —
+        // design calls for NO hint (bands can't appear either, since scores
+        // stay `None`), never the misleading "model not downloaded" line.
+        let hits = [engine_hit("a.md", 0.9)];
+        assert_eq!(rerank_unreranked_hint(&hits, None, false), None);
+        assert_eq!(rerank_unreranked_hint(&hits, Some(0.5), false), None);
     }
 
     /// Minimal `onebrain_search::engine::Hit` builder for the pre-`HitData`

@@ -896,6 +896,15 @@ impl Engine {
         self.rerank_error_logged.set(false);
     }
 
+    /// Whether the Tier-2 reranker is turned on per the currently installed
+    /// [`RerankSettings`] (`search.reranker.enabled` in `onebrain.yml`). Lets
+    /// callers distinguish an explicit `enabled: false` (no rerank attempted,
+    /// no hint should be shown) from "enabled but skipped" (model not
+    /// downloaded / load failure — the unreranked hint IS warranted).
+    pub fn rerank_enabled(&self) -> bool {
+        self.rerank_settings.enabled
+    }
+
     /// Test seam mirroring [`Engine::open_with_embedder`]: inject a
     /// deterministic reranker. Call AFTER [`Engine::set_rerank_settings`] —
     /// installing settings resets the reranker source.

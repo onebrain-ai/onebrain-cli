@@ -299,7 +299,16 @@ fn rrf_fuse(ranked: Vec<(f64, Vec<Hit>)>) -> Vec<(f64, Hit)> {
         for (rank, hit) in hits.into_iter().enumerate() {
             let s = weight / (RRF_K + rank as f64 + 1.0);
             acc.entry(hit.chunk_id.clone())
-                .and_modify(|(total, _)| *total += s)
+                .and_modify(|(total, kept)| {
+                    *total += s;
+                    // A duplicate across sub-queries keeps the first-seen
+                    // `Hit` for position/fusion semantics, but that must not
+                    // silently drop a later duplicate's real `rerank_score` —
+                    // if the kept hit has none yet and this one does, adopt it.
+                    if kept.rerank_score.is_none() {
+                        kept.rerank_score = hit.rerank_score;
+                    }
+                })
                 .or_insert((s, hit));
         }
     }
@@ -1030,6 +1039,33 @@ mod tests {
         let fused = rrf_fuse(vec![(1.0, vec![hit("b")]), (1.0, vec![hit("a")])]);
         assert_eq!(fused[0].1.chunk_id, "a");
         assert_eq!(fused[1].1.chunk_id, "b");
+    }
+
+    #[test]
+    fn rrf_fuse_dedup_adopts_later_duplicates_rerank_score() {
+        // lex-first duplicate has no rerank_score; vec-second duplicate does.
+        // The dedup must NOT silently drop the real score just because the
+        // first-seen hit (kept for position/fusion semantics) had `None`.
+        let mut lex_dup = hit("x");
+        lex_dup.rerank_score = None;
+        let mut vec_dup = hit("x");
+        vec_dup.rerank_score = Some(0.8);
+        let fused = rrf_fuse(vec![(2.0, vec![lex_dup]), (1.0, vec![vec_dup])]);
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].1.rerank_score, Some(0.8));
+    }
+
+    #[test]
+    fn rrf_fuse_dedup_keeps_first_seen_rerank_score_when_present() {
+        // Reverse order: first-seen duplicate already has a score — it must
+        // be kept (not clobbered by a later `None`).
+        let mut vec_dup = hit("x");
+        vec_dup.rerank_score = Some(0.8);
+        let mut lex_dup = hit("x");
+        lex_dup.rerank_score = None;
+        let fused = rrf_fuse(vec![(2.0, vec![vec_dup]), (1.0, vec![lex_dup])]);
+        assert_eq!(fused.len(), 1);
+        assert_eq!(fused[0].1.rerank_score, Some(0.8));
     }
 
     #[test]
