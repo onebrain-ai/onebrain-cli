@@ -102,6 +102,10 @@ pub fn is_supported_reranker(name: &str) -> bool {
 /// digest at the time of verification, so a stale/mismatched marker (model
 /// file replaced without updating the marker) is detected on the next
 /// verify-once call rather than trusted blindly.
+// Pure-fs helper; its only non-test caller (`Reranker::new`) is
+// semantic-gated, so the lex-only clippy pass sees it as dead code even
+// though tests exercise it in every configuration.
+#[cfg_attr(not(feature = "semantic"), allow(dead_code))]
 fn marker_path(model_path: &Path) -> std::path::PathBuf {
     let mut s = model_path.as_os_str().to_owned();
     s.push(".sha256-verified");
@@ -123,6 +127,8 @@ fn marker_path(model_path: &Path) -> std::path::PathBuf {
 ///
 /// Pure filesystem + hashing, no `fastembed`/ONNX types involved, so this
 /// stays compiled and tested in default (non-`semantic`) configurations too.
+// See marker_path's note: semantic-gated caller, unconditional tests.
+#[cfg_attr(not(feature = "semantic"), allow(dead_code))]
 fn verify_sha256_once(path: &Path, expected_hex: &str) -> Result<()> {
     let marker = marker_path(path);
     if let Ok(existing) = std::fs::read_to_string(&marker) {
