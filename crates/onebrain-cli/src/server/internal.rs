@@ -233,9 +233,12 @@ struct InternalStatusResponse {
     /// one place that can ask the engine directly, so this is the most
     /// honest of the three surfaces.
     reranker_ready: bool,
+    /// `true` when the configured reranker model's `models--*` dir is present
+    /// on disk. Mirrors the CLI's `SearchStatusData::reranker_downloaded`.
+    reranker_downloaded: bool,
     /// On-disk byte size of the configured reranker's downloaded model dir,
-    /// `None` if not downloaded. Mirrors the CLI's `reranker_download`.
-    reranker_download: Option<u64>,
+    /// `None` if not downloaded. Mirrors the CLI's `reranker_disk_bytes`.
+    reranker_disk_bytes: Option<u64>,
 }
 
 async fn get_internal_status(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
@@ -246,7 +249,7 @@ async fn get_internal_status(State(state): State<Arc<AppState>>) -> Result<Respo
     // off the async runtime under the blocking mutex. The reranker fields piggy-
     // back on the SAME blocking closure + lock (rather than a second
     // spawn_blocking) since `rerank_active()` also needs the engine.
-    let (status, reranker_model, reranker_ready, reranker_download) =
+    let (status, reranker_model, reranker_ready, reranker_downloaded, reranker_disk_bytes) =
         tokio::task::spawn_blocking(move || {
             let config = onebrain_core::load_vault_config_at(&root)?;
             let collection = collection_name_readonly(&root)?;
@@ -256,12 +259,19 @@ async fn get_internal_status(State(state): State<Arc<AppState>>) -> Result<Respo
                 .iter()
                 .find(|r| r.name == reranker_model)
                 .map(|r| reranker_download_status(r, &cache_dir));
-            let reranker_download = download.and_then(|d| d.disk_size);
+            let reranker_downloaded = download.as_ref().is_some_and(|d| d.downloaded);
+            let reranker_disk_bytes = download.and_then(|d| d.disk_size);
 
             let engine = engine.lock().unwrap_or_else(|p| p.into_inner());
             let reranker_ready = engine.rerank_active();
             let status = engine.status(&root)?;
-            Ok::<_, anyhow::Error>((status, reranker_model, reranker_ready, reranker_download))
+            Ok::<_, anyhow::Error>((
+                status,
+                reranker_model,
+                reranker_ready,
+                reranker_downloaded,
+                reranker_disk_bytes,
+            ))
         })
         .await
         .map_err(|e| {
@@ -283,7 +293,8 @@ async fn get_internal_status(State(state): State<Arc<AppState>>) -> Result<Respo
         indexed: status.doc_count > 0,
         reranker_model,
         reranker_ready,
-        reranker_download,
+        reranker_downloaded,
+        reranker_disk_bytes,
     };
     Ok(Json(resp).into_response())
 }
@@ -567,7 +578,8 @@ mod tests {
             indexed: true,
             reranker_model: "onebrain-reranker-v1".to_string(),
             reranker_ready: true,
-            reranker_download: Some(1024),
+            reranker_downloaded: true,
+            reranker_disk_bytes: Some(1024),
         })
         .unwrap();
         assert_eq!(v["doc_count"], 3);
@@ -576,13 +588,14 @@ mod tests {
         assert_eq!(v["indexed"], true);
         assert_eq!(v["reranker_model"], "onebrain-reranker-v1");
         assert_eq!(v["reranker_ready"], true);
-        assert_eq!(v["reranker_download"], 1024);
+        assert_eq!(v["reranker_downloaded"], true);
+        assert_eq!(v["reranker_disk_bytes"], 1024);
     }
 
     #[test]
-    fn status_response_serializes_reranker_download_none_as_null() {
-        // `reranker_download: None` (model not on disk) must serialize as JSON
-        // `null`, not be omitted — the daemon status shape has no
+    fn status_response_serializes_reranker_disk_bytes_none_as_null() {
+        // `reranker_disk_bytes: None` (model not on disk) must serialize as
+        // JSON `null`, not be omitted — the daemon status shape has no
         // `skip_serializing_if` on this field (unlike the CLI's
         // `SearchStatusData`), so a client can distinguish "checked, absent"
         // from a missing key.
@@ -596,11 +609,12 @@ mod tests {
             indexed: false,
             reranker_model: "onebrain-reranker-v1".to_string(),
             reranker_ready: false,
-            reranker_download: None,
+            reranker_downloaded: false,
+            reranker_disk_bytes: None,
         })
         .unwrap();
-        assert!(v.get("reranker_download").is_some(), "{v}");
-        assert!(v["reranker_download"].is_null(), "{v}");
+        assert!(v.get("reranker_disk_bytes").is_some(), "{v}");
+        assert!(v["reranker_disk_bytes"].is_null(), "{v}");
     }
 
     #[tokio::test]
@@ -1182,7 +1196,8 @@ mod tests {
         // → not ready, no download size.
         assert_eq!(v["reranker_model"], "onebrain-reranker-v1");
         assert_eq!(v["reranker_ready"], false);
-        assert!(v["reranker_download"].is_null());
+        assert_eq!(v["reranker_downloaded"], false);
+        assert!(v["reranker_disk_bytes"].is_null());
     }
 
     /// Brief 7.1: `open_held_engine` must apply the vault's `RerankSettings` —

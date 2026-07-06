@@ -2869,6 +2869,8 @@ mod tests {
         // details regardless of index state — here on the "no index" arm,
         // using the default config (reranker enabled, default model, not
         // downloaded on a fresh cache dir).
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         let d = tempdir().unwrap();
         let collection = format!(
             "doctor-unit-reranker-fields-{}",
@@ -2905,6 +2907,8 @@ mod tests {
 
     #[test]
     fn native_search_check_warns_when_reranker_enabled_but_not_downloaded() {
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         let d = tempdir().unwrap();
         let collection = format!(
             "doctor-unit-reranker-warn-{}",
@@ -2934,6 +2938,8 @@ mod tests {
     fn native_search_check_no_reranker_warn_when_disabled_and_not_downloaded() {
         // Disabled is an explicit user choice — never warn about the reranker
         // model even though it isn't downloaded. Fields must still be reported.
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         let d = tempdir().unwrap();
         let collection = format!(
             "doctor-unit-reranker-disabled-{}",
@@ -2974,6 +2980,8 @@ mod tests {
         // Cache has model X downloaded but config says Y (the configured
         // model) — the check must warn specifically about Y, not treat "some
         // model is downloaded" as good enough.
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         let d = tempdir().unwrap();
         let collection = format!(
             "doctor-unit-configured-model-missing-{}",
@@ -3006,9 +3014,8 @@ mod tests {
             "expected configured-model wording: {r:?}"
         );
 
-        // Cleanup: remove the cache dir we created so we don't leak into
-        // other tests / the real cache root.
-        let _ = fs::remove_dir_all(&cache_dir);
+        // Cache lives under the guard-scoped tempdir (`cache`), which is
+        // removed on drop — no manual cleanup of the real cache root needed.
     }
 
     // ── fix_settings_hooks: success path ─────────────────────────────────────

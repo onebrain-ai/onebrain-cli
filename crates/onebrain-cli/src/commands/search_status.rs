@@ -105,9 +105,14 @@ pub(crate) struct SearchStatusData {
     /// unreranked (see `Engine::rerank_active`, which the daemon status
     /// endpoint will surface directly in Task 7).
     reranker_ready: bool,
+    /// `true` when the configured reranker model's `models--*` dir is present
+    /// on disk (matches doctor's `reranker_downloaded:` vocabulary — see
+    /// `doctor.rs`'s `native_search_check`). Distinct from `reranker_ready`,
+    /// which additionally requires `search.reranker.enabled`.
+    reranker_downloaded: bool,
     /// On-disk byte size of the configured reranker's downloaded model dir,
     /// `None` if not downloaded. Mirrors `model_size_bytes` for the embedder.
-    reranker_download: Option<u64>,
+    reranker_disk_bytes: Option<u64>,
 }
 
 pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
@@ -285,10 +290,11 @@ pub(crate) fn status_data(
     // No collection → no cache dir to check a reranker download against; the
     // model name still reports from config (it's meaningful even unindexed),
     // but readiness/download default to "nothing on disk yet".
-    let (reranker_model, reranker_ready, reranker_download) = match cache_dir.as_deref() {
-        Some(dir) => reranker_status_fields(&config, dir),
-        None => (config.search.reranker.model.clone(), false, None),
-    };
+    let (reranker_model, reranker_ready, reranker_downloaded, reranker_disk_bytes) =
+        match cache_dir.as_deref() {
+            Some(dir) => reranker_status_fields(&config, dir),
+            None => (config.search.reranker.model.clone(), false, false, None),
+        };
 
     Ok(SearchStatusData {
         collection,
@@ -312,7 +318,8 @@ pub(crate) fn status_data(
         semantic_available: cfg!(feature = "semantic"),
         reranker_model,
         reranker_ready,
-        reranker_download,
+        reranker_downloaded,
+        reranker_disk_bytes,
     })
 }
 
@@ -423,10 +430,11 @@ pub(crate) fn status_data_for(
     // Collection is always set on this path, so the signal hinges only on a
     // semantic build with no downloaded model.
     let current_model_missing = cfg!(feature = "semantic") && model_size_bytes.is_none();
-    let (reranker_model, reranker_ready, reranker_download) = reranker_status_fields(
-        &config,
-        cache_dir.as_deref().expect("cache_dir always set here"),
-    );
+    let (reranker_model, reranker_ready, reranker_downloaded, reranker_disk_bytes) =
+        reranker_status_fields(
+            &config,
+            cache_dir.as_deref().expect("cache_dir always set here"),
+        );
 
     Ok(SearchStatusData {
         collection: Some(collection),
@@ -453,7 +461,8 @@ pub(crate) fn status_data_for(
         semantic_available: cfg!(feature = "semantic"),
         reranker_model,
         reranker_ready,
-        reranker_download,
+        reranker_downloaded,
+        reranker_disk_bytes,
     })
 }
 
@@ -502,7 +511,8 @@ pub(crate) fn status_data_from_daemon(
         .then(|| onebrain_search::embed::dir_size_bytes(&dir));
 
     let current_model_missing = cfg!(feature = "semantic") && model_size_bytes.is_none();
-    let (reranker_model, reranker_ready, reranker_download) = reranker_status_fields(&config, &dir);
+    let (reranker_model, reranker_ready, reranker_downloaded, reranker_disk_bytes) =
+        reranker_status_fields(&config, &dir);
 
     Ok(SearchStatusData {
         collection: Some(collection),
@@ -525,7 +535,8 @@ pub(crate) fn status_data_from_daemon(
         semantic_available: cfg!(feature = "semantic"),
         reranker_model,
         reranker_ready,
-        reranker_download,
+        reranker_downloaded,
+        reranker_disk_bytes,
     })
 }
 
@@ -546,24 +557,30 @@ fn active_model_dir_stats(cache_dir: &Path, active_model: &str) -> Option<(u64, 
     Some((size, dir_mtime_secs(&status.path)))
 }
 
-/// The three reranker status fields (`reranker_model`, `reranker_ready`,
-/// `reranker_download`), computed from config + a pure filesystem check of
-/// the collection cache dir — never opens the engine, never downloads.
-/// Shared by all three `SearchStatusData` builders below so the readiness
-/// definition can't drift between the direct, held-engine, and daemon paths.
+/// The four reranker status fields (`reranker_model`, `reranker_ready`,
+/// `reranker_downloaded`, `reranker_disk_bytes`), computed from config + a
+/// pure filesystem check of the collection cache dir — never opens the
+/// engine, never downloads. Shared by all three `SearchStatusData` builders
+/// below so the readiness definition can't drift between the direct,
+/// held-engine, and daemon paths.
 fn reranker_status_fields(
     config: &onebrain_core::VaultConfig,
     cache_dir: &Path,
-) -> (String, bool, Option<u64>) {
+) -> (String, bool, bool, Option<u64>) {
     let reranker_model = config.search.reranker.model.clone();
     let download = reranker_registry()
         .iter()
         .find(|r| r.name == reranker_model)
         .map(|r| reranker_download_status(r, cache_dir));
-    let downloaded = download.as_ref().is_some_and(|d| d.downloaded);
-    let reranker_ready = config.search.reranker.enabled && downloaded;
-    let reranker_download = download.and_then(|d| d.disk_size);
-    (reranker_model, reranker_ready, reranker_download)
+    let reranker_downloaded = download.as_ref().is_some_and(|d| d.downloaded);
+    let reranker_ready = config.search.reranker.enabled && reranker_downloaded;
+    let reranker_disk_bytes = download.and_then(|d| d.disk_size);
+    (
+        reranker_model,
+        reranker_ready,
+        reranker_downloaded,
+        reranker_disk_bytes,
+    )
 }
 
 /// `root`'s own mtime as epoch seconds, or `None` if unreadable.
@@ -622,7 +639,7 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
             "—  no"
         },
     ));
-    match d.reranker_download {
+    match d.reranker_disk_bytes {
         Some(size) => lines.push(item("Size", &format_size(size))),
         None => lines.push(item("Size", "not downloaded")),
     }
@@ -811,7 +828,8 @@ mod tests {
                 semantic_available: true,
                 reranker_model: "onebrain-reranker-v1".to_string(),
                 reranker_ready: false,
-                reranker_download: None,
+                reranker_downloaded: false,
+                reranker_disk_bytes: None,
             },
         )
     }
@@ -848,7 +866,8 @@ mod tests {
         {
             let d = e.data.as_mut().unwrap();
             d.reranker_ready = true;
-            d.reranker_download = Some(569_011_484);
+            d.reranker_downloaded = true;
+            d.reranker_disk_bytes = Some(569_011_484);
         }
         let s = render_text(&e);
         assert!(s.contains("    Ready         ✅  yes"), "{s}");
@@ -864,10 +883,11 @@ mod tests {
             folders: Default::default(),
             search: Default::default(),
         };
-        let (model, ready, download) = reranker_status_fields(&config, cache.path());
+        let (model, ready, downloaded, disk_bytes) = reranker_status_fields(&config, cache.path());
         assert_eq!(model, "onebrain-reranker-v1");
         assert!(!ready, "nothing downloaded yet");
-        assert_eq!(download, None);
+        assert!(!downloaded);
+        assert_eq!(disk_bytes, None);
     }
 
     #[test]
@@ -884,10 +904,11 @@ mod tests {
             folders: Default::default(),
             search: Default::default(), // reranker.enabled defaults true
         };
-        let (model, ready, download) = reranker_status_fields(&config, cache.path());
+        let (model, ready, downloaded, disk_bytes) = reranker_status_fields(&config, cache.path());
         assert_eq!(model, info.name);
         assert!(ready, "enabled + downloaded → ready");
-        assert!(download.unwrap() > 0);
+        assert!(downloaded);
+        assert!(disk_bytes.unwrap() > 0);
     }
 
     #[test]
@@ -905,13 +926,14 @@ mod tests {
             search: Default::default(),
         };
         config.search.reranker.enabled = false;
-        let (_model, ready, download) = reranker_status_fields(&config, cache.path());
+        let (_model, ready, downloaded, disk_bytes) = reranker_status_fields(&config, cache.path());
         assert!(
             !ready,
             "disabled reranker is never ready, even if downloaded"
         );
-        // Download size is still reported (it's on disk), only readiness gates.
-        assert!(download.unwrap() > 0);
+        // Downloaded/size are still reported (it's on disk), only readiness gates.
+        assert!(downloaded);
+        assert!(disk_bytes.unwrap() > 0);
     }
 
     #[test]
@@ -1418,7 +1440,8 @@ mod tests {
             semantic_available: cfg!(feature = "semantic"),
             reranker_model: "onebrain-reranker-v1".to_string(),
             reranker_ready: false,
-            reranker_download: None,
+            reranker_downloaded: false,
+            reranker_disk_bytes: None,
         };
 
         assert_eq!(data.doc_count, Some(3));

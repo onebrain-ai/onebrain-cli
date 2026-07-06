@@ -476,6 +476,15 @@ pub struct RerankSettings {
 }
 
 impl Default for RerankSettings {
+    /// Defensive note: `enabled: true` here means a freshly-`Engine::open`ed
+    /// engine (before any `set_rerank_settings` call) reports reranking as
+    /// ON. Every production `open` path applies `set_rerank_settings` from
+    /// the vault's config immediately after opening (see
+    /// `search_common::open_engine`, `server::internal::try_open_held_engine`),
+    /// so this default is never actually observed there. But a future call
+    /// site that reads [`Engine::rerank_enabled`] before installing settings
+    /// would silently get this default-on value instead of the vault's real
+    /// `search.reranker.enabled` — install settings first.
     fn default() -> Self {
         Self {
             enabled: true,
@@ -901,6 +910,13 @@ impl Engine {
     /// callers distinguish an explicit `enabled: false` (no rerank attempted,
     /// no hint should be shown) from "enabled but skipped" (model not
     /// downloaded / load failure — the unreranked hint IS warranted).
+    ///
+    /// Reads whatever [`RerankSettings`] is CURRENTLY installed — if this is
+    /// called before [`Engine::set_rerank_settings`] on a freshly-opened
+    /// engine, it reports `RerankSettings::default()`'s `enabled: true`
+    /// rather than the vault's configured value (see the defensive note on
+    /// that `Default` impl). Every production caller installs settings
+    /// immediately after `open`, so this is a latent footgun, not a live bug.
     pub fn rerank_enabled(&self) -> bool {
         self.rerank_settings.enabled
     }

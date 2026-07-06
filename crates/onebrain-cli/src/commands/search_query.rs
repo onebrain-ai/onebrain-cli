@@ -19,7 +19,9 @@ use crate::cli::SearchQueryArgs;
 use crate::commands::daemon_client::DaemonHandle;
 use crate::commands::search_common::{collection_cache_dir, open_engine, resolve_collection};
 #[cfg(feature = "semantic")]
-use crate::commands::search_common::{map_daemon_error, route_to_daemon};
+use crate::commands::search_common::{
+    map_daemon_error, rerank_settings_from_config, route_to_daemon,
+};
 use crate::output::{emit, Envelope, OutputMode};
 use onebrain_search::engine::Hit;
 use onebrain_search::lex::LexIndex;
@@ -39,9 +41,9 @@ struct HitData {
     snippet: String,
     /// Calibrated 0–1 cross-encoder relevance from the Tier-2 rerank stage
     /// (see `onebrain_search::engine::Hit::rerank_score`). `None` on the
-    /// pure-lex `search` verb (never reranked), on a daemon-routed hit (the
-    /// daemon doesn't rerank yet — Task 7), or when the reranker was
-    /// skipped/unavailable for this query.
+    /// pure-lex `search` verb (never reranked), on a daemon-routed hit when
+    /// the daemon didn't rerank it (old daemon binary predating the wire
+    /// field, or the reranker was skipped/unavailable for this query).
     #[serde(skip_serializing_if = "Option::is_none")]
     rerank_score: Option<f32>,
 }
@@ -364,10 +366,20 @@ fn run_query_via_daemon(
     }
     hits.truncate(args.top_k);
 
+    // Same rerank-enabled knob the direct path reads via `open_engine` —
+    // config is read-only here (no engine/embedder is opened on this path),
+    // so this can't trigger a model download.
+    let rerank_enabled = onebrain_core::load_vault_config(&resolved.root)
+        .map(|cfg| rerank_settings_from_config(&cfg.search.reranker).enabled)
+        .unwrap_or(true);
+
     let hint = if hits.is_empty() {
         daemon_index_hint(handle)
     } else {
-        None
+        // Mirror the direct `query` path's generic (no cosine-top-score)
+        // unreranked hint — the daemon's fused score has no cosine
+        // interpretation either.
+        rerank_unreranked_hint_data(&hits, rerank_enabled)
     };
     let command = if daemon_mode == "hybrid" {
         "search.query"
@@ -386,12 +398,31 @@ fn run_query_via_daemon(
     Ok(())
 }
 
+/// [`rerank_unreranked_hint`]'s counterpart for the daemon path, which works
+/// in terms of `HitData` (already mapped from the daemon's JSON) rather than
+/// the engine's `Hit`. Same generic-line-only shape as the direct `query`
+/// path: the daemon's fused score has no cosine interpretation to fold in.
+#[cfg(feature = "semantic")]
+fn rerank_unreranked_hint_data(hits: &[HitData], reranker_enabled: bool) -> Option<String> {
+    if !reranker_enabled || hits.is_empty() || hits.iter().any(|h| h.rerank_score.is_some()) {
+        return None;
+    }
+    Some("unreranked (reranker model not downloaded — run `onebrain search reindex`)".to_string())
+}
+
 /// Map the daemon `/api/vault/search` response (`{hits:[{path,score,title,
-/// snippet}], mode}`) into the CLI's `HitData`. `chunk_id`/`doc_path` both take
-/// the doc path (the daemon collapses per-chunk hits to one row per doc);
-/// `heading_path` takes the title UNLESS it equals the file stem (which the
-/// daemon substitutes when a doc has no heading) — so the text render doesn't
-/// print `note.md › note`. A malformed / missing `hits` array maps to empty.
+/// snippet,rerank_score?}], mode}`) into the CLI's `HitData`. `chunk_id`/
+/// `doc_path` both take the doc path (the daemon collapses per-chunk hits to
+/// one row per doc); `heading_path` takes the title UNLESS it equals the file
+/// stem (which the daemon substitutes when a doc has no heading) — so the
+/// text render doesn't print `note.md › note`. A malformed / missing `hits`
+/// array maps to empty.
+///
+/// `rerank_score` is read the same lenient way `mcp.rs`'s
+/// `parse_daemon_search_hits` reads it: `get(...).and_then(as_f64)`, so a
+/// missing key (old daemon binary predating the wire field) or a non-numeric
+/// value (contract break) both degrade to `None` rather than erroring the
+/// whole search — an unreranked hit is a normal, expected shape.
 #[cfg(feature = "semantic")]
 fn daemon_hits(resp: &serde_json::Value) -> Vec<HitData> {
     let Some(arr) = resp.get("hits").and_then(|h| h.as_array()) else {
@@ -416,15 +447,17 @@ fn daemon_hits(resp: &serde_json::Value) -> Vec<HitData> {
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
+            let rerank_score = h
+                .get("rerank_score")
+                .and_then(|v| v.as_f64())
+                .map(|s| s as f32);
             Some(HitData {
                 chunk_id: path.clone(),
                 doc_path: path,
                 heading_path,
                 score,
                 snippet,
-                // The daemon's `/api/vault/search` doesn't rerank yet (Task 7
-                // adds the daemon-side endpoint) — always unreranked for now.
-                rerank_score: None,
+                rerank_score,
             })
         })
         .collect()
@@ -849,5 +882,73 @@ mod tests {
         // A row missing `path` is skipped (filter_map), not panicked on.
         let resp = serde_json::json!({"hits": [{"score": 1.0}]});
         assert!(daemon_hits(&resp).is_empty());
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn daemon_hits_parses_rerank_score_when_present() {
+        let resp = serde_json::json!({
+            "hits": [
+                {"path": "a.md", "score": 0.9, "title": "a", "snippet": "", "rerank_score": 0.75},
+            ]
+        });
+        let hits = daemon_hits(&resp);
+        assert_eq!(hits[0].rerank_score, Some(0.75));
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn daemon_hits_rerank_score_none_when_field_absent_old_daemon_compat() {
+        // Old daemon binaries predate the `rerank_score` wire field entirely —
+        // the same shape as a hit the daemon chose not to rerank.
+        let resp = serde_json::json!({
+            "hits": [{"path": "a.md", "score": 0.9, "title": "a", "snippet": ""}]
+        });
+        let hits = daemon_hits(&resp);
+        assert_eq!(hits[0].rerank_score, None);
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn daemon_hits_rerank_score_none_when_non_numeric_contract_break() {
+        let resp = serde_json::json!({
+            "hits": [{"path": "a.md", "score": 0.9, "title": "a", "snippet": "", "rerank_score": "bogus"}]
+        });
+        let hits = daemon_hits(&resp);
+        assert_eq!(hits[0].rerank_score, None);
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn rerank_unreranked_hint_data_none_when_any_hit_has_rerank_score() {
+        let mut reranked = hit("a.md", 0.9);
+        reranked.rerank_score = Some(0.8);
+        let unreranked_tail = hit("b.md", 0.5);
+        assert_eq!(
+            rerank_unreranked_hint_data(&[reranked, unreranked_tail], true),
+            None
+        );
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn rerank_unreranked_hint_data_fires_when_no_hit_has_rerank_score() {
+        let hits = [hit("a.md", 0.9)];
+        let hint = rerank_unreranked_hint_data(&hits, true).expect("unreranked hits need a hint");
+        assert!(hint.contains("unreranked"), "{hint}");
+        assert!(hint.contains("reranker model not downloaded"), "{hint}");
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn rerank_unreranked_hint_data_none_when_disabled() {
+        let hits = [hit("a.md", 0.9)];
+        assert_eq!(rerank_unreranked_hint_data(&hits, false), None);
+    }
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn rerank_unreranked_hint_data_none_on_empty_hits() {
+        assert_eq!(rerank_unreranked_hint_data(&[], true), None);
     }
 }
