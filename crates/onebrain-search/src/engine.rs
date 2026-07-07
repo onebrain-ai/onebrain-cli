@@ -1362,34 +1362,59 @@ impl Engine {
     }
 
     /// Doc-level rerank: given a set of candidate `paths` (e.g. from a prior
-    /// path-scoped retrieval step), rerank every chunk belonging to those
-    /// paths against `query`, then collapse back down to one [`Hit`] per
-    /// path — the best-scoring chunk — and return the top `top_k` paths.
+    /// path-scoped retrieval step), rerank a BOUNDED set of their chunks
+    /// against `query`, then collapse down to one [`Hit`] per path — its
+    /// best-scoring reranked chunk — and return the top `top_k` paths.
     ///
-    /// Reuses [`Self::apply_rerank`] for the actual scoring, so it inherits
-    /// the same gate, never-empty floor, and skip-not-fail fallback: with no
-    /// reranker available this degenerates to fused (insertion) order with
-    /// `rerank_score: None` on every hit, same as [`Self::rerank_hits`].
+    /// **Bounded cost.** Reranking *every* chunk of *every* candidate path
+    /// blows up on long-document vaults (a few candidate docs can be 100+
+    /// chunks), far exceeding the chunk-level [`Self::rerank_hits`] path. This
+    /// instead cross-encodes at most `budget = max(min_candidates, top_k)`
+    /// chunks — the same pool size [`Self::apply_rerank`] bounds `rerank_hits`
+    /// to — gathered ROUND-ROBIN across the candidate paths (every path's 1st
+    /// chunk, then every path's 2nd, …). So each candidate contributes at
+    /// least its first chunk before any path contributes a second: a long doc
+    /// cannot crowd the budget and leave other candidates unreranked, and the
+    /// total cross-encode cost is independent of document length.
     ///
-    /// All candidate chunks are fed through in one rerank pass with a `top_k`
-    /// wide enough to keep every chunk alive through `apply_rerank`'s
-    /// internal truncation — the doc-level `top_k` truncation happens here,
-    /// after dedup, not inside `apply_rerank`.
+    /// Reuses [`Self::apply_rerank`] for scoring, so it inherits the same gate,
+    /// never-empty floor, and skip-not-fail fallback: with no reranker
+    /// available this degenerates to fused (insertion) order with
+    /// `rerank_score: None`, same as [`Self::rerank_hits`].
     pub fn rerank_paths(&self, query: &str, paths: Vec<String>, top_k: usize) -> Result<Vec<Hit>> {
+        // Chunk ids per candidate path (order preserved for the round-robin).
+        let per_path: Vec<Vec<String>> = paths
+            .iter()
+            .map(|p| self.doc_chunk_ids(p))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Round-robin gather up to `budget` chunks so every candidate path is
+        // represented (its first chunk) before any path adds a second — bounds
+        // the cross-encode cost regardless of how long the candidate docs are.
+        let budget = self.rerank_settings.min_candidates.max(top_k);
         let mut fused: Vec<(String, f64)> = Vec::new();
-        for path in &paths {
-            for chunk_id in self.doc_chunk_ids(path)? {
-                fused.push((chunk_id, 0.0));
+        let mut round = 0;
+        'gather: loop {
+            let mut progressed = false;
+            for chunks in &per_path {
+                if let Some(chunk_id) = chunks.get(round) {
+                    fused.push((chunk_id.clone(), 0.0));
+                    progressed = true;
+                    if fused.len() >= budget {
+                        break 'gather;
+                    }
+                }
             }
+            if !progressed {
+                break; // every path exhausted before reaching the budget
+            }
+            round += 1;
         }
 
-        // Rerank the whole candidate pool without truncation loss: every
-        // chunk of every candidate path must survive `apply_rerank`'s
-        // internal block/gate logic so dedup-by-path below sees the true
-        // best chunk per path, not one that was cut for being outside a
-        // too-narrow `top_k` window.
-        let big_k = fused.len();
-        let reranked = self.apply_rerank(query, fused, big_k)?;
+        // `fused.len() <= budget`, so passing `budget` as top_k keeps every
+        // gathered chunk alive through apply_rerank's internal block cap — the
+        // doc-level `top_k` truncation happens below, after dedup.
+        let reranked = self.apply_rerank(query, fused, budget)?;
 
         // Dedup by doc_path, keeping the highest-`rerank_score` hit per path
         // (None treated as lowest — matches apply_rerank's own tie/absent
@@ -3642,6 +3667,21 @@ mod tests {
         }
     }
 
+    /// Records how many passages it was asked to cross-encode (total across
+    /// calls), and scores them all high so none is gated out. Used to assert
+    /// `rerank_paths` bounds the number of chunks it reranks.
+    struct CountingReranker {
+        seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Rerank for CountingReranker {
+        fn rerank(&self, _query: &str, passages: &[String]) -> Result<Vec<f32>> {
+            self.seen
+                .fetch_add(passages.len(), std::sync::atomic::Ordering::Relaxed);
+            Ok(vec![0.9; passages.len()])
+        }
+    }
+
     /// Ten distinct query tokens for the rerank reorder scenarios.
     const RERANK_QUERY: &str = "alpha bravo charlie delta echo foxtrot golf hotel india juliet";
 
@@ -4096,6 +4136,62 @@ mod tests {
         let paths: Vec<String> = (0..5).map(|i| format!("p{i}.md")).collect();
         let hits = e.rerank_paths("note common", paths, 2).unwrap();
         assert_eq!(hits.len(), 2, "top_k truncation applies after dedup");
+    }
+
+    #[test]
+    fn rerank_paths_bounds_total_chunks_to_budget() {
+        // Long, multi-section docs → many chunks each. rerank_paths must
+        // cross-encode at most budget = max(min_candidates, top_k) chunks
+        // TOTAL (gathered round-robin), never "every chunk of every doc" —
+        // that is the whole point of the bound on long-document vaults.
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        let body: String = (0..12)
+            .map(|j| {
+                format!("## Section {j}\ncontent about search and rerank paragraph number {j} with several extra filler words here\n\n")
+            })
+            .collect();
+        for i in 0..3 {
+            e.index_doc(&format!("d{i}.md"), &format!("# Doc {i}\n{body}"))
+                .unwrap();
+        }
+        // Precondition: the corpus must actually chunk into MORE than budget,
+        // or the bound would be exercised only vacuously.
+        let total_chunks: usize = (0..3)
+            .map(|i| e.doc_chunk_ids(&format!("d{i}.md")).unwrap().len())
+            .sum();
+        assert!(
+            total_chunks > 4,
+            "test corpus must produce >budget chunks to be meaningful, got {total_chunks}"
+        );
+
+        // budget = max(min_candidates, top_k) = max(4, 4) = 4.
+        e.set_rerank_settings(RerankSettings {
+            enabled: true,
+            min_candidates: 4,
+            ..Default::default()
+        });
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        e.set_reranker_for_tests(Box::new(CountingReranker { seen: seen.clone() }));
+
+        let paths: Vec<String> = (0..3).map(|i| format!("d{i}.md")).collect();
+        let hits = e.rerank_paths("search rerank", paths, 4).unwrap();
+
+        let seen = seen.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            seen <= 4,
+            "must cross-encode at most budget (4) chunks regardless of doc length, saw {seen}"
+        );
+        // Round-robin fairness: with 3 paths and budget 4, round 0 reranks
+        // every path's first chunk — so every candidate path is represented.
+        let mut paths_seen: Vec<&str> = hits.iter().map(|h| h.doc_path.as_str()).collect();
+        paths_seen.sort();
+        paths_seen.dedup();
+        assert_eq!(
+            paths_seen.len(),
+            3,
+            "round-robin must rerank at least one chunk of every candidate path"
+        );
     }
 
     #[test]
