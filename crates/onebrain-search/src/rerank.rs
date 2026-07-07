@@ -24,8 +24,8 @@ use fastembed::{
 /// A reranking backend: scores a batch of passages against one query.
 /// [`FakeReranker`] is a deterministic in-memory stand-in used by tests so
 /// engine query/rerank logic can be exercised without a multi-GB model
-/// download; a later task adds the real `fastembed`-backed cross-encoder
-/// behind this same trait.
+/// download. The real [`Reranker`] implementation lives later in this file
+/// behind `#[cfg(feature = "semantic")]`, backed by `fastembed`.
 ///
 /// `Send + Sync`: mirrors [`crate::embed::Embed`] — the engine holds its
 /// boxed reranker behind an `Arc<Mutex<_>>` shared across threads.

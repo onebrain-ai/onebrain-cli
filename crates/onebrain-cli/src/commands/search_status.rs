@@ -1234,8 +1234,11 @@ mod tests {
         }
         let s = render_text(&e);
         // Every rendered emoji row starts with `<emoji>  ` (two spaces).
+        // The list must match the emojis `render_text`'s `section(...)` calls
+        // actually emit — Model, Reranker, Index, Cache — so each section's
+        // alignment (incl. the Reranker section) is exercised.
         for line in s.lines() {
-            for emoji in ["🔍", "🧠", "📦", "📁", "📊", "🕐"] {
+            for emoji in ["🧠", "🎯", "📊", "📁"] {
                 if let Some(rest) = line.strip_prefix(emoji) {
                     assert!(
                         rest.starts_with("  ") && !rest.starts_with("   "),
