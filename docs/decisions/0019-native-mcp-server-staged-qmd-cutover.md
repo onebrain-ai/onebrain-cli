@@ -3,6 +3,8 @@
 - **Status:** accepted
 - **Date:** 2026-07-03
 
+> **Update (v3.4.7):** native cross-encoder reranking has since landed ([ADR 0025](0025-tier2-cross-encoder-reranker.md)) — it runs on `query`/`vsearch` across every surface, including the MCP `query` tool (which now reranks its fused pool and surfaces `rerank_score`). So "native rerank … is relevance-phase work (v3.4.3)" below is historical: rerank is implemented and **config-driven** (`search.reranker.*` in `onebrain.yml`). The compat-only `rerank`/`candidateLimit` params stay **deserialize-only and inert** — reranking is engine-wide, not a per-request toggle — so the "schema promises more than it does" note below still holds for those specific params, not for reranking as a whole.
+
 ## Context
 
 The native search engine (`onebrain-search`, [ADR 0012](0012-native-search-replace-qmd.md)) needed an MCP-facing entry point so agent harnesses could query the vault the same way they already do through the external `qmd` MCP server. Two decisions had to be made together: how to host MCP over a synchronous engine, and how to cut an existing, working integration (the plugin's `qmd` MCP config + every agent instruction that names its tools) over to the new server without breaking it mid-flight.
