@@ -929,12 +929,16 @@ impl Engine {
     fn fetch_reranker_model(&self) {
         // Test seam: a unit test that only asserts the `LoadingReranker`
         // progress event (emitted by the caller BEFORE this call) must not
-        // trigger the real ~570 MB hf-hub download. Never set in production.
-        if self.skip_reranker_fetch {
-            return;
-        }
+        // trigger the real ~570 MB hf-hub download. Only meaningful in the
+        // semantic build (lex-only never downloads); the `not(semantic)` read
+        // keeps the field live there without a needless early `return`.
+        #[cfg(not(feature = "semantic"))]
+        let _ = self.skip_reranker_fetch;
         #[cfg(feature = "semantic")]
         {
+            if self.skip_reranker_fetch {
+                return;
+            }
             if !rerank::is_supported_reranker(&self.rerank_settings.model) {
                 // A typo'd `search.reranker.model` is the one skip-not-fail
                 // branch that would otherwise leave no trace in reindex stderr
