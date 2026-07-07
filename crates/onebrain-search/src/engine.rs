@@ -539,6 +539,12 @@ pub struct Engine {
     /// Same rate-limit for corrupt chunk-meta warnings during rerank passage
     /// lookup ([`Engine::chunk_texts`]).
     chunk_corruption_logged: std::cell::Cell<bool>,
+    /// Test seam: when true, [`Engine::fetch_reranker_model`] skips the real
+    /// hf-hub download. A unit test that only needs a reindex to EMIT the
+    /// `LoadingReranker` event must not pull the ~570 MB model over the
+    /// network. Always false in production; set via
+    /// [`Engine::skip_reranker_fetch_for_tests`].
+    skip_reranker_fetch: bool,
     meta: Database,
 }
 
@@ -655,6 +661,7 @@ impl Engine {
             reranker: RerankSource::Lazy(OnceCell::new()),
             rerank_error_logged: std::cell::Cell::new(false),
             chunk_corruption_logged: std::cell::Cell::new(false),
+            skip_reranker_fetch: false,
             meta,
         })
     }
@@ -920,6 +927,12 @@ impl Engine {
     /// logged and swallowed — a failed fetch leaves search unreranked, never
     /// fails the reindex.
     fn fetch_reranker_model(&self) {
+        // Test seam: a unit test that only asserts the `LoadingReranker`
+        // progress event (emitted by the caller BEFORE this call) must not
+        // trigger the real ~570 MB hf-hub download. Never set in production.
+        if self.skip_reranker_fetch {
+            return;
+        }
         #[cfg(feature = "semantic")]
         {
             if !rerank::is_supported_reranker(&self.rerank_settings.model) {
@@ -999,6 +1012,15 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn set_reranker_for_tests(&mut self, reranker: Box<dyn Rerank>) {
         self.reranker = RerankSource::Injected(reranker);
+    }
+
+    /// Test seam: suppress the reindex-time reranker download so a hermetic
+    /// unit test can exercise the `LoadingReranker` progress event (emitted
+    /// before the fetch) without pulling the real ~570 MB model over the
+    /// network. Call before `reindex_all_with_progress`.
+    #[cfg(test)]
+    pub(crate) fn skip_reranker_fetch_for_tests(&mut self) {
+        self.skip_reranker_fetch = true;
     }
 
     /// True when queries will actually be reranked: settings enabled AND a
@@ -2528,13 +2550,17 @@ mod tests {
     #[test]
     fn fake_reindex_all_with_progress_emits_loading_reranker_after_indexing() {
         // Default rerank settings are enabled, and a fresh temp cache_dir has
-        // no reranker model downloaded, so `should_fetch_reranker` is true.
-        // The fake embedder engine still resolves the LAZY reranker path
-        // (cheaply, to None) — assert LoadingReranker fires exactly once,
-        // after every Indexing event.
+        // no reranker model downloaded, so `should_fetch_reranker` is true and
+        // the reindex EMITS `LoadingReranker`. This test asserts only that
+        // event's presence + ordering — it must NOT actually fetch the model,
+        // so we suppress the ~570 MB hf-hub download via the test seam. (The
+        // real download is covered by the network-gated `ONEBRAIN_TEST_RERANK`
+        // test below.) Assert LoadingReranker fires exactly once, after every
+        // Indexing event.
         let cache_dir = tempfile::tempdir().unwrap();
         let vault_dir = tempfile::tempdir().unwrap();
         let mut e = fake_engine(cache_dir.path());
+        e.skip_reranker_fetch_for_tests();
 
         std::fs::write(vault_dir.path().join("a.md"), "# A\nalpha content").unwrap();
         std::fs::write(vault_dir.path().join("b.md"), "# B\nbeta content").unwrap();
