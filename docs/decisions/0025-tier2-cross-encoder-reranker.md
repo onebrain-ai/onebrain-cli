@@ -1,4 +1,4 @@
-# 0025 — Tier-2 cross-encoder reranker (`onebrain-reranker-v1`)
+# 0025 — Tier-2 cross-encoder reranker (`onebrain-rerank-v1`)
 
 Status: accepted (v3.4.7)
 
@@ -59,9 +59,9 @@ reranked hit from an unreranked one; the CLI surfaces an explicit "unreranked"
 hint when a semantic verb's entire result set carries no score, so a degraded
 state is never silently indistinguishable from a confident one.
 
-### Model choice: `onebrain-reranker-v1`, and what was rejected
+### Model choice: `onebrain-rerank-v1`, and what was rejected
 
-The default (and currently only) registry entry is `onebrain-reranker-v1` — a
+The default (and currently only) registry entry is `onebrain-rerank-v1` — a
 cross-encoder based on `bge-reranker-v2-m3`, quantized to int8, ~570 MB,
 multilingual including Thai. Alternatives considered and rejected:
 
@@ -85,16 +85,16 @@ multilingual including Thai. Alternatives considered and rejected:
 
 ### OneBrain's own model-line naming, not a bare upstream name
 
-The registry name is `onebrain-reranker-v1`, not `bge-reranker-v2-m3` or a raw
+The registry name is `onebrain-rerank-v1`, not `bge-reranker-v2-m3` or a raw
 Hugging Face repo id. This follows the same shape as future model swaps in
-the embedding registry: the model line is **versioned** (`onebrain-reranker-v1`,
+the embedding registry: the model line is **versioned** (`onebrain-rerank-v1`,
 `-v2`, …), each version is a **distinct registry entry**, and each entry is
 **sha256-pinned** to one specific model file
 (`RerankerInfo::sha256`, verified once per download via `verify_sha256_once`
 and cached behind a `.sha256-verified` marker). Upgrading the underlying base
 model — a new quantization, a newer BGE checkpoint, a different backbone
 entirely — is always a new registry entry under a new version name, never a
-silent swap of what `onebrain-reranker-v1` points at. The base-model lineage
+silent swap of what `onebrain-rerank-v1` points at. The base-model lineage
 (`bge-reranker-v2-m3`, int8) is disclosed in the registry entry's `note`
 field and in this ADR, rather than hidden behind the OneBrain-branded name —
 users and auditors can trace exactly what's running.
@@ -158,7 +158,7 @@ their first `search query`.
 
 ## Calibration (v3.4.7 final)
 
-Measured on the real ob-1 vault (585 docs) with `onebrain-reranker-v1`: a
+Measured on the real ob-1 vault (585 docs) with `onebrain-rerank-v1`: a
 golden set of 20 answerable + 10 known-no-answer queries.
 
 **Score separation** (the result that justifies the whole stage):

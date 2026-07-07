@@ -13,6 +13,9 @@
 //!                                → run the engine reindex, return a status JSON
 //!   GET  /api/internal/status    → live { doc_count, pending_*, last_indexed,
 //!                                          indexed } from the held engine
+//!   POST /api/internal/rerank    { query, paths: [..], top_k }
+//!                                → doc-level Tier-2 rerank of the given
+//!                                  candidate paths, returns `{ hits: [..] }`
 //! ```
 //!
 //! Both routes are gated by the same token-auth middleware as the rest of the
@@ -61,6 +64,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/internal/status", get(get_internal_status))
         .route("/internal/get", get(get_internal_get))
         .route("/internal/reindex", post(post_internal_reindex))
+        .route("/internal/rerank", post(post_internal_rerank))
 }
 
 /// `GET /api/health` — the engine-independent liveness probe. Returns
@@ -487,6 +491,110 @@ async fn post_internal_reindex(
     Ok(Json(resp).into_response())
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// POST /api/internal/rerank
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Doc-level rerank request: a query plus a caller-supplied candidate path
+/// set (e.g. from a prior path-scoped retrieval step), and how many of the
+/// best-scoring paths to keep.
+#[derive(Debug, Deserialize)]
+struct RerankReq {
+    query: String,
+    paths: Vec<String>,
+    top_k: usize,
+}
+
+/// One reranked hit, in the SAME wire shape as `server::search::SearchHit`
+/// (the webui/MCP search response) so a client can reuse the exact same
+/// parser for both endpoints.
+#[derive(Debug, Serialize, PartialEq)]
+struct RerankHit {
+    /// Vault-relative, slash-separated doc path.
+    path: String,
+    /// Relevance score (RRF-fused; unused input here since `rerank_paths`
+    /// seeds every candidate chunk at 0.0 and lets the cross-encoder rank —
+    /// kept for wire-shape parity with `SearchHit`).
+    score: f64,
+    /// Note title — the heading path if present, else the file stem.
+    title: String,
+    /// Short one-line excerpt of the best-scoring chunk for this doc.
+    snippet: String,
+    /// Calibrated 0-1 Tier-2 cross-encoder relevance. `None` when the rerank
+    /// stage was skipped (disabled, model not downloaded, or a rerank
+    /// failure for the whole query) — mirrors `Hit::rerank_score`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rerank_score: Option<f32>,
+}
+
+/// Response body: the reranked, doc-deduped hit list.
+#[derive(Debug, Serialize, PartialEq)]
+struct RerankResponse {
+    hits: Vec<RerankHit>,
+}
+
+/// `POST /api/internal/rerank` — the held engine's `Engine::rerank_paths`: a
+/// doc-level Tier-2 rerank over a caller-supplied candidate path set (e.g. the
+/// MCP `query` tool's fused lex+vec result paths). Like `reindex`/`get`, this
+/// REQUIRES the single-owner held engine — no per-request fallback — because
+/// its callers route here precisely to avoid a second redb opener.
+///
+/// No path confinement is needed here (unlike `reindex {mode:"paths"}`):
+/// `rerank_paths` never touches the filesystem — it looks up already-indexed
+/// chunk ids for each `doc_path` in redb (a plain key miss for an unknown/
+/// hostile path just yields zero chunks, never a read), so there is no
+/// traversal surface to guard.
+async fn post_internal_rerank(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RerankReq>,
+) -> Result<Response, ApiError> {
+    let engine = require_engine(&state)?.clone();
+
+    // Rerank is synchronous (redb reads + the Tier-2 cross-encoder). Run it
+    // off the async runtime, holding the engine mutex for its duration, same
+    // as reindex/status.
+    let hits = tokio::task::spawn_blocking(move || {
+        let engine = engine.lock().unwrap_or_else(|p| p.into_inner());
+        engine.rerank_paths(&req.query, req.paths, req.top_k)
+    })
+    .await
+    .map_err(|e| {
+        tracing::warn!(error = %e, "internal rerank task panicked");
+        ApiError::Internal("rerank failed".to_string())
+    })?
+    .map_err(|e| {
+        tracing::warn!(error = %e, "engine rerank failed");
+        ApiError::Internal("rerank failed".to_string())
+    })?;
+
+    let resp = RerankResponse {
+        hits: hits
+            .into_iter()
+            .map(|h| RerankHit {
+                title: if h.heading_path.is_empty() {
+                    title_from_doc_path(&h.doc_path)
+                } else {
+                    h.heading_path.clone()
+                },
+                path: h.doc_path,
+                score: h.score,
+                snippet: h.snippet,
+                rerank_score: h.rerank_score,
+            })
+            .collect(),
+    };
+    Ok(Json(resp).into_response())
+}
+
+/// File stem of a slash-separated vault path (`a/b/note.md` → `note`), used as
+/// a fallback title when there is no heading path. Mirrors
+/// `server::search::title_from_path` (kept as a separate copy since that one
+/// is private to its module).
+fn title_from_doc_path(path: &str) -> String {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    file.strip_suffix(".md").unwrap_or(file).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,11 +660,8 @@ mod tests {
         // absent -> exits without touching the lock" contract even if the
         // call site inside `open_held_engine` changes.
         let cache_dir = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap());
-        let handle = spawn_reranker_warm_thread(
-            engine.clone(),
-            "onebrain-reranker-v1".to_string(),
-            cache_dir,
-        );
+        let handle =
+            spawn_reranker_warm_thread(engine.clone(), "onebrain-rerank-v1".to_string(), cache_dir);
         handle.join().expect("warm thread must not panic");
 
         // The engine must still be lockable afterwards (no poisoning, no
@@ -576,7 +681,7 @@ mod tests {
             pending_total: 3,
             last_indexed: Some(42),
             indexed: true,
-            reranker_model: "onebrain-reranker-v1".to_string(),
+            reranker_model: "onebrain-rerank-v1".to_string(),
             reranker_ready: true,
             reranker_downloaded: true,
             reranker_disk_bytes: Some(1024),
@@ -586,7 +691,7 @@ mod tests {
         assert_eq!(v["pending_total"], 3);
         assert_eq!(v["last_indexed"], 42);
         assert_eq!(v["indexed"], true);
-        assert_eq!(v["reranker_model"], "onebrain-reranker-v1");
+        assert_eq!(v["reranker_model"], "onebrain-rerank-v1");
         assert_eq!(v["reranker_ready"], true);
         assert_eq!(v["reranker_downloaded"], true);
         assert_eq!(v["reranker_disk_bytes"], 1024);
@@ -607,7 +712,7 @@ mod tests {
             pending_total: 0,
             last_indexed: None,
             indexed: false,
-            reranker_model: "onebrain-reranker-v1".to_string(),
+            reranker_model: "onebrain-rerank-v1".to_string(),
             reranker_ready: false,
             reranker_downloaded: false,
             reranker_disk_bytes: None,
@@ -1194,7 +1299,7 @@ mod tests {
         // Reranker fields: default config (no `search.reranker` block) names
         // the default model, but it isn't downloaded in a fresh test cache dir
         // → not ready, no download size.
-        assert_eq!(v["reranker_model"], "onebrain-reranker-v1");
+        assert_eq!(v["reranker_model"], "onebrain-rerank-v1");
         assert_eq!(v["reranker_ready"], false);
         assert_eq!(v["reranker_downloaded"], false);
         assert!(v["reranker_disk_bytes"].is_null());
@@ -1213,7 +1318,7 @@ mod tests {
         let vault = tempfile::tempdir().unwrap();
         std::fs::write(
             vault.path().join("onebrain.yml"),
-            "search:\n  collection: internal-status-reranker-cfg\n  reranker:\n    enabled: false\n    model: onebrain-reranker-v1\n",
+            "search:\n  collection: internal-status-reranker-cfg\n  reranker:\n    enabled: false\n    model: onebrain-rerank-v1\n",
         )
         .unwrap();
         let cache = tempfile::tempdir().unwrap();
@@ -1232,7 +1337,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["reranker_model"], "onebrain-reranker-v1");
+        assert_eq!(v["reranker_model"], "onebrain-rerank-v1");
         // Disabled in config → never ready, regardless of download status.
         assert_eq!(v["reranker_ready"], false);
     }
@@ -1371,5 +1476,184 @@ mod tests {
         let (search_resp, status_resp) = tokio::join!(search, status);
         assert_eq!(search_resp.unwrap().status(), StatusCode::OK);
         assert_eq!(status_resp.unwrap().status(), StatusCode::OK);
+    }
+
+    // ── POST /api/internal/rerank ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rerank_503_when_no_engine_held() {
+        // Like reindex/get, rerank also 503s (never opens an engine
+        // per-request) when the process holds none.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: rerank-no-engine\n",
+        )
+        .unwrap();
+        let cfg =
+            ServeConfig::localhost(Some(vault.path().to_path_buf()), 0, TOKEN.to_string(), None);
+        let router = build_router(cfg);
+
+        let resp = router
+            .oneshot(
+                Request::post("/api/internal/rerank")
+                    .header("x-onebrain-token", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"query":"hello","paths":["note.md"],"top_k":5}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn rerank_rejects_malformed_json() {
+        let (vault, cache) = vault_with_empty_index();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let router = router_holding_engine(vault.path());
+
+        let resp = router
+            .oneshot(
+                Request::post("/api/internal/rerank")
+                    .header("x-onebrain-token", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query": "hello""#)) // truncated / malformed
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Malformed JSON fails axum's `Json` extractor → 4xx, never a 5xx.
+        assert!(resp.status().is_client_error(), "got {}", resp.status());
+    }
+
+    #[tokio::test]
+    async fn rerank_missing_required_field_is_bad_request() {
+        // `top_k` is required (no `#[serde(default)]`) — an omitted field is
+        // also a Json-extractor rejection, same 4xx family as malformed JSON.
+        let (vault, cache) = vault_with_empty_index();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let router = router_holding_engine(vault.path());
+
+        let resp = router
+            .oneshot(
+                Request::post("/api/internal/rerank")
+                    .header("x-onebrain-token", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"hello","paths":["note.md"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error(), "got {}", resp.status());
+    }
+
+    /// End-to-end doc-level rerank against a held engine: index a real doc via
+    /// `/internal/reindex`, then rerank it via `/internal/rerank` and assert
+    /// the mapped fields (`path`, `title`, `snippet`) — mirroring
+    /// `reindex_paths_adds_a_new_doc_and_maps_fields`'s harness. Lex-only
+    /// build: no reranker model is downloaded, so `rerank_score` stays `None`
+    /// (the skip-not-fail path in `apply_rerank`/`Engine::reranker`) — this
+    /// still proves the route + held engine + field mapping are wired
+    /// end-to-end without requiring a model download.
+    #[cfg(not(feature = "semantic"))]
+    #[tokio::test]
+    async fn rerank_paths_reranks_indexed_doc_and_maps_fields() {
+        let (vault, cache) = vault_with_empty_index();
+        std::fs::write(vault.path().join("note.md"), "hello indexed world\n").unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let router = router_holding_engine(vault.path());
+
+        // Index the doc first — rerank_paths looks up already-indexed chunk
+        // meta in redb, so it needs a prior reindex to have anything to rank.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::post("/api/internal/reindex")
+                    .header("x-onebrain-token", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"paths","paths":["note.md"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "seed reindex should succeed");
+
+        let resp = router
+            .oneshot(
+                Request::post("/api/internal/rerank")
+                    .header("x-onebrain-token", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"query":"hello","paths":["note.md"],"top_k":5}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "rerank should succeed");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["hits"].as_array().map(|a| a.len()), Some(1), "{v}");
+        assert_eq!(v["hits"][0]["path"], "note.md", "{v}");
+        assert_eq!(v["hits"][0]["title"], "note", "{v}");
+        assert!(
+            v["hits"][0]["snippet"]
+                .as_str()
+                .unwrap()
+                .contains("hello indexed world"),
+            "{v}"
+        );
+        // No reranker model downloaded in this fresh test cache → the field is
+        // omitted (skip_serializing_if), never a stray null.
+        assert!(v["hits"][0].get("rerank_score").is_none(), "{v}");
+    }
+
+    /// An unknown candidate path (never indexed) yields zero chunks in redb —
+    /// `rerank_paths` returns an empty hit list rather than erroring, since a
+    /// path miss is a plain, expected redb-table miss (see
+    /// `Engine::doc_chunk_ids`), not a traversal or malformed-input case.
+    #[tokio::test]
+    async fn rerank_unknown_path_returns_empty_hits() {
+        let (vault, cache) = vault_with_empty_index();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let router = router_holding_engine(vault.path());
+
+        let resp = router
+            .oneshot(
+                Request::post("/api/internal/rerank")
+                    .header("x-onebrain-token", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"query":"hello","paths":["never-indexed.md"],"top_k":5}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["hits"].as_array().map(|a| a.len()), Some(0), "{v}");
+    }
+
+    #[tokio::test]
+    async fn rerank_requires_token() {
+        let (vault, cache) = vault_with_empty_index();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let router = router_holding_engine(vault.path());
+
+        let resp = router
+            .oneshot(
+                Request::post("/api/internal/rerank")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"hello","paths":[],"top_k":5}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

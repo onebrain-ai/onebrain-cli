@@ -1,7 +1,7 @@
 //! Cross-encoder reranking: re-scores a query/passage pair set for calibrated
 //! relevance, sharpening the ranking that lex/vector retrieval produces.
 //!
-//! Default model is `onebrain-reranker-v1` (multilingual incl. Thai,
+//! Default model is `onebrain-rerank-v1` (multilingual incl. Thai,
 //! ~570MB). [`Rerank::rerank`] returns a calibrated 0–1 relevance score per
 //! passage, in the same order as the input — callers combine this with the
 //! retrieval score (or replace it outright) to re-order top-k results.
@@ -38,7 +38,7 @@ pub trait Rerank: Send + Sync {
 /// static metadata mirroring [`crate::embed::ModelInfo`]'s shape.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RerankerInfo {
-    /// Config-facing name, e.g. `"onebrain-reranker-v1"`.
+    /// Config-facing name, e.g. `"onebrain-rerank-v1"`.
     pub name: &'static str,
     /// Approximate on-disk download size, human-readable.
     pub approx_size: &'static str,
@@ -50,7 +50,7 @@ pub struct RerankerInfo {
     /// Short human-readable guidance shown alongside the entry.
     pub note: &'static str,
     /// The Hugging Face repo id this model downloads from, e.g.
-    /// `"onebrain-ai/onebrain-reranker-v1"`. Used to compute the
+    /// `"onebrain-ai/onebrain-rerank-v1"`. Used to compute the
     /// on-disk cache subdirectory name — see [`RerankerInfo::cache_dir_name`].
     pub hf_repo: &'static str,
     /// The model file name inside the HF repo, e.g. `"model_int8.onnx"`.
@@ -74,18 +74,18 @@ impl RerankerInfo {
 /// order. Single source of truth for reranker names — [`is_supported_reranker`]
 /// derives from it rather than duplicating the name list.
 ///
-/// The OneBrain reranker model line is versioned (`onebrain-reranker-v1`,
+/// The OneBrain reranker model line is versioned (`onebrain-rerank-v1`,
 /// `-v2`, …): each version is a distinct registry entry pinned to a specific
 /// model file by its `sha256`, so upgrading the underlying base model is an
 /// explicit new entry, never a silent swap under an existing name.
 pub fn reranker_registry() -> &'static [RerankerInfo] {
     const REGISTRY: &[RerankerInfo] = &[RerankerInfo {
-        name: "onebrain-reranker-v1",
+        name: "onebrain-rerank-v1",
         approx_size: "~570 MB",
         approx_bytes: 569_011_484,
         max_length: 512,
         note: "OneBrain Reranker v1 — cross-encoder (bge-reranker-v2-m3 base, int8) · multilingual incl. Thai",
-        hf_repo: "onebrain-ai/onebrain-reranker-v1",
+        hf_repo: "onebrain-ai/onebrain-rerank-v1",
         model_file: "model_int8.onnx",
         sha256: "dd7b26f4a233732aefbe857bef026050582dc7c1bdb8aeda909080bf15b2ad88",
     }];
@@ -358,13 +358,13 @@ mod tests {
     #[test]
     fn registry_has_exactly_one_seeded_reranker() {
         let names: Vec<&str> = reranker_registry().iter().map(|r| r.name).collect();
-        assert_eq!(names, vec!["onebrain-reranker-v1"]);
+        assert_eq!(names, vec!["onebrain-rerank-v1"]);
     }
 
     #[test]
     fn registry_entry_matches_seeded_metadata() {
         let r = &reranker_registry()[0];
-        assert_eq!(r.hf_repo, "onebrain-ai/onebrain-reranker-v1");
+        assert_eq!(r.hf_repo, "onebrain-ai/onebrain-rerank-v1");
         assert_eq!(r.model_file, "model_int8.onnx");
         assert_eq!(
             r.sha256,
@@ -384,7 +384,7 @@ mod tests {
         let r = &reranker_registry()[0];
         assert_eq!(
             r.cache_dir_name(),
-            "models--onebrain-ai--onebrain-reranker-v1"
+            "models--onebrain-ai--onebrain-rerank-v1"
         );
     }
 
@@ -522,9 +522,7 @@ mod tests {
         let st = reranker_download_status(info, dir.path());
         assert!(!st.downloaded);
         assert_eq!(st.disk_size, None);
-        assert!(st
-            .path
-            .ends_with("models--onebrain-ai--onebrain-reranker-v1"));
+        assert!(st.path.ends_with("models--onebrain-ai--onebrain-rerank-v1"));
     }
 
     #[test]
@@ -597,10 +595,10 @@ mod tests {
         let err = new("not-a-real-reranker", dir.path()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("unsupported reranker model"), "{msg}");
-        assert!(msg.contains("onebrain-reranker-v1"), "{msg}");
+        assert!(msg.contains("onebrain-rerank-v1"), "{msg}");
     }
 
-    /// Gated live test: downloads the real `onebrain-reranker-v1` model from
+    /// Gated live test: downloads the real `onebrain-rerank-v1` model from
     /// HF and exercises a real cross-encoder pass. Skipped by default — the
     /// model repo doesn't exist on HF yet at the time this test was written;
     /// exercised later once the model is published. Set
@@ -612,7 +610,7 @@ mod tests {
             return; // gated: downloads a model
         }
         let dir = tempfile::tempdir().unwrap();
-        let r = new("onebrain-reranker-v1", dir.path()).unwrap();
+        let r = new("onebrain-rerank-v1", dir.path()).unwrap();
         let passages = vec![
             "The cat sat on the mat.".to_string(),
             "Quantum entanglement links particle states.".to_string(),

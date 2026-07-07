@@ -2894,7 +2894,7 @@ mod tests {
         assert!(
             r.details
                 .iter()
-                .any(|d| d.contains("reranker_model: onebrain-reranker-v1")),
+                .any(|d| d.contains("reranker_model: onebrain-rerank-v1")),
             "{r:?}"
         );
         assert!(
