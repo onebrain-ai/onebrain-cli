@@ -675,15 +675,36 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
             }
             None => lines.push(item("Size", "not downloaded")),
         }
+        // Ready = embedding-backed search will actually run: a semantic build
+        // (we're inside this branch, so that's already true) AND the active
+        // model is downloaded. Last row of the section, parallel to the
+        // Reranker section's Ready row below (#195 follow-up UX polish).
+        lines.push(item(
+            "Ready",
+            if d.model_size_bytes.is_some() {
+                "✅  yes"
+            } else {
+                "—  no"
+            },
+        ));
     } else {
         // Lex-only build: no ONNX runtime for this platform, so the model is
-        // never downloaded and semantic verbs are unavailable.
+        // never downloaded and semantic verbs are unavailable. No Ready row
+        // here — readiness isn't a meaningful question for this build.
         lines.push(item("Semantic", "unavailable in this build (keyword-only)"));
     }
 
     lines.push(String::new());
     lines.push(section("🎯", "Reranker"));
     lines.push(item("Name", &d.reranker_model));
+    match d.reranker_disk_bytes {
+        Some(size) => lines.push(item("Size", &format_size(size))),
+        None => lines.push(item("Size", "not downloaded")),
+    }
+    if let Some(when) = d.reranker_downloaded_at.and_then(format_local) {
+        lines.push(item("Downloaded", &when));
+    }
+    // Ready is the section's last row, mirroring the Embedding section above.
     lines.push(item(
         "Ready",
         if d.reranker_ready {
@@ -692,13 +713,6 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
             "—  no"
         },
     ));
-    match d.reranker_disk_bytes {
-        Some(size) => lines.push(item("Size", &format_size(size))),
-        None => lines.push(item("Size", "not downloaded")),
-    }
-    if let Some(when) = d.reranker_downloaded_at.and_then(format_local) {
-        lines.push(item("Downloaded", &when));
-    }
 
     lines.push(String::new());
     lines.push(section("📊", "Index"));
@@ -900,6 +914,66 @@ mod tests {
         // it independently reports its own "not downloaded").
         let model_section = s.split("🎯  Reranker").next().unwrap();
         assert!(!model_section.contains("not downloaded"), "{model_section}");
+        // A lex-only build has no Ready row in the Embedding section —
+        // readiness isn't a meaningful question without semantic support.
+        assert!(!model_section.contains("Ready"), "{model_section}");
+    }
+
+    // ── Embedding "Ready" row (#195 follow-up UX polish) ───────────────────
+
+    #[test]
+    fn text_shows_embedding_ready_as_last_row_when_downloaded() {
+        let mut e = env(Some("ob-1"), true);
+        e.data.as_mut().unwrap().model_size_bytes = Some(493_921_024);
+        let s = render_text(&e);
+        let embedding = s.split("🧠  Embedding").nth(1).unwrap();
+        let embedding = embedding.split("🎯  Reranker").next().unwrap();
+        assert!(embedding.contains("    Ready         ✅  yes"), "{s}");
+        // Ready is the section's LAST row: Size precedes it.
+        let size_at = embedding.find("Size").unwrap();
+        let ready_at = embedding.find("Ready").unwrap();
+        assert!(size_at < ready_at, "Size must precede Ready: {embedding}");
+    }
+
+    #[test]
+    fn text_shows_embedding_ready_no_when_not_downloaded() {
+        let s = render_text(&env(Some("ob-1"), true)); // model_size_bytes defaults to None
+        let embedding = s.split("🧠  Embedding").nth(1).unwrap();
+        let embedding = embedding.split("🎯  Reranker").next().unwrap();
+        assert!(embedding.contains("    Ready         —  no"), "{s}");
+        let size_at = embedding.find("Size").unwrap();
+        let ready_at = embedding.find("Ready").unwrap();
+        assert!(size_at < ready_at, "Size must precede Ready: {embedding}");
+    }
+
+    #[test]
+    fn text_embedding_ready_is_last_row_even_with_downloaded_at() {
+        // Name · Size · Downloaded · Ready — Ready must sit after Downloaded
+        // when both are present.
+        let mut e = env(Some("ob-1"), true);
+        {
+            let d = e.data.as_mut().unwrap();
+            d.model_size_bytes = Some(471 * 1024 * 1024);
+            d.model_downloaded_at = Some(1_700_000_000);
+        }
+        let s = render_text(&e);
+        let embedding = s.split("🧠  Embedding").nth(1).unwrap();
+        let embedding = embedding.split("🎯  Reranker").next().unwrap();
+        let name_at = embedding.find("Name").unwrap();
+        let size_at = embedding.find("Size").unwrap();
+        let downloaded_at = embedding.find("Downloaded").unwrap();
+        let ready_at = embedding.find("Ready").unwrap();
+        assert!(
+            name_at < size_at && size_at < downloaded_at && downloaded_at < ready_at,
+            "expected order Name < Size < Downloaded < Ready: {embedding}"
+        );
+        // Ready is the LAST line of the section (only trailing blank line
+        // after it, before the Reranker section starts).
+        let trimmed = embedding.trim_end();
+        assert!(
+            trimmed.ends_with("✅  yes"),
+            "Ready must be the section's last row: {embedding}"
+        );
     }
 
     // ── Reranker status fields (v3.4.7 Task 6) ─────────────────────────────
@@ -911,6 +985,16 @@ mod tests {
         assert!(s.contains("    Name          onebrain-rerank-v1"), "{s}");
         assert!(s.contains("    Ready         —  no"), "{s}");
         assert!(s.contains("    Size          not downloaded"), "{s}");
+        // Row order pinned: Name · Size · Ready (Downloaded absent here).
+        let reranker = s.split("🎯  Reranker").nth(1).unwrap();
+        let reranker = reranker.split("📊  Index").next().unwrap();
+        let name_at = reranker.find("Name").unwrap();
+        let size_at = reranker.find("Size").unwrap();
+        let ready_at = reranker.find("Ready").unwrap();
+        assert!(
+            name_at < size_at && size_at < ready_at,
+            "expected order Name < Size < Ready: {reranker}"
+        );
     }
 
     #[test]
@@ -925,6 +1009,16 @@ mod tests {
         let s = render_text(&e);
         assert!(s.contains("    Ready         ✅  yes"), "{s}");
         assert!(s.contains("    Size          543 MB"), "{s}");
+        // Ready is the section's LAST row.
+        let reranker = s.split("🎯  Reranker").nth(1).unwrap();
+        let reranker = reranker.split("📊  Index").next().unwrap();
+        let size_at = reranker.find("Size").unwrap();
+        let ready_at = reranker.find("Ready").unwrap();
+        assert!(size_at < ready_at, "Size must precede Ready: {reranker}");
+        assert!(
+            reranker.trim_end().ends_with("✅  yes"),
+            "Ready must be the section's last row: {reranker}"
+        );
     }
 
     #[test]
@@ -942,6 +1036,17 @@ mod tests {
         let reranker = s.split("🎯  Reranker").nth(1).unwrap();
         let reranker = reranker.split("📊  Index").next().unwrap();
         assert!(reranker.contains("    Downloaded    "), "{s}");
+        // Row order pinned: Downloaded precedes Ready, and Ready is last.
+        let downloaded_at = reranker.find("Downloaded").unwrap();
+        let ready_at = reranker.find("Ready").unwrap();
+        assert!(
+            downloaded_at < ready_at,
+            "Downloaded must precede Ready: {reranker}"
+        );
+        assert!(
+            reranker.trim_end().ends_with("Ready         —  no"),
+            "Ready must be the section's last row: {reranker}"
+        );
     }
 
     #[test]
