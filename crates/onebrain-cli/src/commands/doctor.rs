@@ -2028,7 +2028,7 @@ fn build_sections(results: &[DoctorResult]) -> Vec<crate::output::Section> {
 /// framing rules:
 ///
 /// ```text
-/// ⚠️  10 ok · 1 warning · 0 fail · 11 checks
+/// ⚠️  11 ok · 1 warning · 0 fail · 12 checks
 /// 💡  Run onebrain doctor --fix to auto-repair
 /// ```
 ///
