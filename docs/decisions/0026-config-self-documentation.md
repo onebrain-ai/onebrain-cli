@@ -109,12 +109,15 @@ first touched the file.
   both crates use the identical editor). Only degenerate shapes (non-mapping
   or flow-style roots, which carry no meaningful comments) keep the legacy
   serde rewrite.
-- **Known limitation (follow-up: issue #200):** exactly three structural
-  writers still whole-file-serialize and drop comments —
-  `fix_vault_yml_keys`, `fix_legacy_qmd_collection`, and `onebrain-fs`'s
-  `persist_search_key` (the first `search reindex`/`model set` on a fresh
-  vault). Each discloses the comment loss in its output; migrating them
-  onto `yaml_edit` is deferred to issue #200.
+- **Known limitation (follow-up: issue #200):** four structural writers
+  still whole-file-serialize and drop comments — `fix_vault_yml_keys`,
+  `fix_legacy_qmd_collection`, `onebrain-fs`'s `persist_search_key` (the
+  first `search reindex`/`model set` on a fresh vault), and `onebrain-fs`'s
+  `remove_search_key` (backup.rs — fired by `reconcile_missing_model` on
+  routine `search reindex`/`model` surfaces when the configured model isn't
+  downloaded; **silent** — its caller discards the result, so no disclosure
+  reaches the user). The first three disclose the comment loss in their
+  output; migrating all four onto `yaml_edit` is deferred to issue #200.
 - Doctor is now 12 checks (was 11); `config-values` renders in the ⚙️ Config
   section as "config values".
 - **Existing vaults get the self-documentation via `doctor --fix`**
