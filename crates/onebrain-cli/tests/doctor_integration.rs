@@ -1064,3 +1064,117 @@ fn doctor_flags_empty_folder_value_as_report_only() {
         "folders findings are report-only: {folder_finding}"
     );
 }
+
+/// Run `doctor --fix --json` under a fake HOME (so home-based recipes like
+/// plugin-cache can't touch the real machine) and return raw stdout.
+#[cfg(unix)]
+fn run_doctor_fix_json(dir: &Path, cache: &Path, home: &Path) -> String {
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(dir)
+        .env("HOME", home)
+        .env("ONEBRAIN_CACHE_DIR", cache)
+        .env("PATH", "/usr/bin:/bin")
+        .args(["doctor", "--fix", "--json"])
+        .assert();
+    String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default()
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_fix_resets_tunables_but_never_folders() {
+    let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    vault_with_config(
+        d.path(),
+        "# my precious comment\n\
+         update_channel: stable\n\
+         folders:\n  \
+           inbox: my-custom-inbox\n  \
+           projects: 01-projects\n  \
+           areas: 02-areas\n  \
+           knowledge: 03-knowledge\n  \
+           resources: 04-resources\n  \
+           agent: 05-agent\n  \
+           archive: 06-archive\n  \
+           logs: 07-logs\n\
+         checkpoint:\n  \
+           # keep my checkpoint block comment too\n  \
+           messages: 0\n\
+         search:\n  \
+           reranker:\n    \
+             min_score: 7.5\n",
+    );
+    // The customised inbox folder exists on disk so the `folders` check
+    // (and its mkdir recipe) stays quiet.
+    std::fs::create_dir_all(d.path().join("my-custom-inbox")).unwrap();
+
+    let out = run_doctor_fix_json(d.path(), cache.path(), home.path());
+    let cfg = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    assert!(
+        cfg.contains("# my precious comment"),
+        "comments must survive:\n{cfg}"
+    );
+    assert!(
+        cfg.contains("# keep my checkpoint block comment too"),
+        "nested comments must survive:\n{cfg}"
+    );
+    assert!(cfg.contains("messages: 15"), "{cfg}");
+    assert!(!cfg.contains("min_score: 7.5"), "{cfg}");
+    assert!(
+        cfg.contains("inbox: my-custom-inbox"),
+        "folders NEVER auto-reset:\n{cfg}"
+    );
+    assert!(
+        out.contains("reset"),
+        "fix output must report resets:\n{out}"
+    );
+    // Post-fix re-check: the config-values row is now clean.
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let row = doc["checks"]
+        .as_array()
+        .expect("checks[]")
+        .iter()
+        .find(|c| c["check"] == "config-values")
+        .expect("config-values row present")
+        .clone();
+    assert_eq!(row["status"], "ok", "post-fix re-check must pass: {row}");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_fix_embed_model_reset_warns_reindex_required() {
+    let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    vault_with_config(
+        d.path(),
+        &format!(
+            "update_channel: stable\n\
+             {FULL_FOLDERS_BLOCK}\
+             search:\n  \
+               embed_model: not-a-model\n"
+        ),
+    );
+    let out = run_doctor_fix_json(d.path(), cache.path(), home.path());
+    let cfg = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    assert!(
+        cfg.contains("embed_model: multilingual-e5-small"),
+        "embed_model must reset to the registry default:\n{cfg}"
+    );
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let fix = doc["fix"]
+        .as_array()
+        .expect("fix[]")
+        .iter()
+        .find(|f| f["check"] == "config-values")
+        .expect("config-values fix entry")
+        .clone();
+    assert_eq!(fix["outcome"], "fixed", "{fix}");
+    let msg = fix["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("reindex"),
+        "embed_model reset must warn that a reindex is required: {msg}"
+    );
+}

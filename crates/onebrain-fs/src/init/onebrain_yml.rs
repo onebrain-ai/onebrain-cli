@@ -123,11 +123,12 @@ search:
         struct ScheduleBlock {
             schedule: Vec<ScheduleEntry>,
         }
-        let block =
-            serde_yaml::to_string(&ScheduleBlock { schedule: entries }).map_err(|e| FsError::Io {
+        let block = serde_yaml::to_string(&ScheduleBlock { schedule: entries }).map_err(|e| {
+            FsError::Io {
                 path: std::path::PathBuf::from(CONFIG_FILENAME),
                 source: std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
-            })?;
+            }
+        })?;
         out.push_str("\n# Scheduled skill runs, compiled to the OS scheduler by `onebrain schedule register`.\n");
         out.push_str(&block);
     }
