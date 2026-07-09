@@ -265,41 +265,47 @@ async fn get_internal_status(State(state): State<Arc<AppState>>) -> Result<Respo
     // off the async runtime under the blocking mutex. The reranker fields piggy-
     // back on the SAME blocking closure + lock (rather than a second
     // spawn_blocking) since `rerank_active()` also needs the engine.
-    let (status, embed_model, reranker_model, reranker_ready, reranker_downloaded, reranker_disk_bytes) =
-        tokio::task::spawn_blocking(move || {
-            let config = onebrain_core::load_vault_config_at(&root)?;
-            let collection = collection_name_readonly(&root)?;
-            let cache_dir = collection_cache_dir(&collection);
-            let embed_model = config.search.embed_model.clone();
-            let reranker_model = config.search.reranker.model.clone();
-            let download = reranker_registry()
-                .iter()
-                .find(|r| r.name == reranker_model)
-                .map(|r| reranker_download_status(r, &cache_dir));
-            let reranker_downloaded = download.as_ref().is_some_and(|d| d.downloaded);
-            let reranker_disk_bytes = download.and_then(|d| d.disk_size);
+    let (
+        status,
+        embed_model,
+        reranker_model,
+        reranker_ready,
+        reranker_downloaded,
+        reranker_disk_bytes,
+    ) = tokio::task::spawn_blocking(move || {
+        let config = onebrain_core::load_vault_config_at(&root)?;
+        let collection = collection_name_readonly(&root)?;
+        let cache_dir = collection_cache_dir(&collection);
+        let embed_model = config.search.embed_model.clone();
+        let reranker_model = config.search.reranker.model.clone();
+        let download = reranker_registry()
+            .iter()
+            .find(|r| r.name == reranker_model)
+            .map(|r| reranker_download_status(r, &cache_dir));
+        let reranker_downloaded = download.as_ref().is_some_and(|d| d.downloaded);
+        let reranker_disk_bytes = download.and_then(|d| d.disk_size);
 
-            let engine = engine.lock().unwrap_or_else(|p| p.into_inner());
-            let reranker_ready = engine.rerank_active();
-            let status = engine.status(&root)?;
-            Ok::<_, anyhow::Error>((
-                status,
-                embed_model,
-                reranker_model,
-                reranker_ready,
-                reranker_downloaded,
-                reranker_disk_bytes,
-            ))
-        })
-        .await
-        .map_err(|e| {
-            tracing::warn!(error = %e, "internal status task panicked");
-            ApiError::Internal("status failed".to_string())
-        })?
-        .map_err(|e| {
-            tracing::warn!(error = %e, "engine status failed");
-            ApiError::Internal("status failed".to_string())
-        })?;
+        let engine = engine.lock().unwrap_or_else(|p| p.into_inner());
+        let reranker_ready = engine.rerank_active();
+        let status = engine.status(&root)?;
+        Ok::<_, anyhow::Error>((
+            status,
+            embed_model,
+            reranker_model,
+            reranker_ready,
+            reranker_downloaded,
+            reranker_disk_bytes,
+        ))
+    })
+    .await
+    .map_err(|e| {
+        tracing::warn!(error = %e, "internal status task panicked");
+        ApiError::Internal("status failed".to_string())
+    })?
+    .map_err(|e| {
+        tracing::warn!(error = %e, "engine status failed");
+        ApiError::Internal("status failed".to_string())
+    })?;
 
     let resp = InternalStatusResponse {
         doc_count: status.doc_count,

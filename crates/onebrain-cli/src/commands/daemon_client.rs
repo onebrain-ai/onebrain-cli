@@ -1516,6 +1516,25 @@ mod tests {
         // record → the daemon 404s → the client maps that to Ok(None) (Track 2c).
         let got = handle.get("alpha.md").unwrap();
         assert!(got.is_none(), "unindexed doc → Ok(None): {got:?}");
+
+        // The no-retry status probes (the `daemon status` dashboard, #197):
+        // health carries engine_held + a PRESENT-but-null dist_dir (embedded
+        // UI), and the internal status carries the live index + model fields.
+        let health = handle.probe_health().expect("health probe");
+        assert_eq!(health["ok"], true, "{health}");
+        assert!(health["engine_held"].is_boolean(), "{health}");
+        assert!(health.get("dist_dir").is_some(), "{health}");
+        assert!(health["dist_dir"].is_null(), "{health}");
+        let internal = handle.probe_status_no_retry().expect("status probe");
+        assert!(internal["doc_count"].is_number(), "{internal}");
+        assert!(internal["embed_model"].is_string(), "{internal}");
+        assert!(internal["reranker_model"].is_string(), "{internal}");
+
+        // A dead server degrades both probes to None — never an error, never a
+        // respawn (drop stops the server; the handle still points at the port).
+        drop(srv);
+        assert!(handle.probe_health().is_none());
+        assert!(handle.probe_status_no_retry().is_none());
     }
 
     /// PASSIVE vault-match (Track 2c): `discover_matching` routes to a live

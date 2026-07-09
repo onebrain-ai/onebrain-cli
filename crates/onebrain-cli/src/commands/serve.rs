@@ -139,14 +139,12 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
     // routing kill switch) skips discovery entirely. Explicit listener flags
     // skip it too: the user asked for a specific standalone server.
     let explicit_listener = args.port.is_some() || args.host.is_some() || args.dir.is_some();
-    let daemon_info = if explicit_listener
-        || crate::commands::search_common::daemon_routing_disabled()
-    {
-        None
-    } else {
-        daemon_client::discover_matching(Some(&vault_root))?
-            .map(|handle| handle.info().clone())
-    };
+    let daemon_info =
+        if explicit_listener || crate::commands::search_common::daemon_routing_disabled() {
+            None
+        } else {
+            daemon_client::discover_matching(Some(&vault_root))?.map(|handle| handle.info().clone())
+        };
     if let ServePlan::OpenDaemon { url } = plan_serve(daemon_info.as_ref(), explicit_listener) {
         print!("{}", build_daemon_banner(&url));
         if args.open {
@@ -379,7 +377,10 @@ mod tests {
         // `--port` / `--host` / `--dir` mean "the user asked for a specific
         // standalone listener" — never silently reroute to the daemon.
         let info = daemon_info(6789, "sekret");
-        assert!(matches!(plan_serve(Some(&info), true), ServePlan::Standalone));
+        assert!(matches!(
+            plan_serve(Some(&info), true),
+            ServePlan::Standalone
+        ));
     }
 
     #[test]
