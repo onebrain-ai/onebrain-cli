@@ -7,12 +7,16 @@
 //! Shares the entire server with `daemon __run` via [`crate::server`] — the
 //! only difference is the shutdown trigger (Ctrl-C here, SIGTERM there). See
 //! the build-level design `2026-06-04-daemon-serve-design.md` §2–4.
-//
-// step 2b: daemon-aware reuse — "if a daemon already runs, reuse its HTTP
-//          surface instead of starting a second listener" (design §2). For now
-//          `serve` always starts its own ephemeral server.
+//!
+//! **Daemon-aware since v3.4.8 (#197, design §2's "step 2b"):** when a daemon
+//! is already serving THIS vault, `serve` does not bind a second listener (the
+//! two share port 6789 by design, and both would want the engine) — it prints
+//! the daemon's webui URL, honours `--open`, and exits. Explicit `--port` /
+//! `--host` / `--dir` flags always mean a standalone server (see
+//! [`plan_serve`]).
 
 use crate::cli::ServeArgs;
+use crate::commands::daemon_client::{self, DaemonInfo};
 use crate::output::{item, section, OutputMode};
 use crate::server::{self, resolve_token, ServeConfig};
 use anyhow::{Context, Result};
@@ -66,6 +70,56 @@ fn build_banner(url: &str, vault: &str, ui_line: &str) -> String {
     out
 }
 
+/// What `serve` should do, decided from the daemon landscape (see [`plan_serve`]).
+#[derive(Debug)]
+enum ServePlan {
+    /// A live daemon already serves this vault — print its webui URL (and
+    /// `--open` it); do NOT bind a second listener or open a second engine.
+    OpenDaemon { url: String },
+    /// No matching daemon (or the user asked for a specific listener) — start
+    /// the foreground server exactly as before.
+    Standalone,
+}
+
+/// Decide between routing to an existing daemon and standalone serving.
+///
+/// `daemon` is the discovery record of a live, version- AND vault-matched
+/// daemon (`daemon_client::discover_matching` already applied every guard —
+/// a mismatch arrives here as `None`). `explicit_listener` is `true` when the
+/// user passed `--port`, `--host`, or `--dir`: they asked for a SPECIFIC
+/// standalone listener, so a daemon never hijacks that (the standalone bind
+/// will fail loudly on a port conflict rather than silently rerouting).
+///
+/// Extracted from [`run`] so the decision is unit-testable without sockets.
+fn plan_serve(daemon: Option<&DaemonInfo>, explicit_listener: bool) -> ServePlan {
+    match daemon {
+        Some(info) if !explicit_listener => ServePlan::OpenDaemon {
+            // Same Jupyter-style token-bearing URL shape the daemon's own
+            // `daemon status` dashboard prints (the daemon always binds
+            // 127.0.0.1 — see `daemon::addr_from`).
+            url: format!("http://127.0.0.1:{}/?token={}", info.port, info.token),
+        },
+        _ => ServePlan::Standalone,
+    }
+}
+
+/// The banner printed when `serve` routes to an already-running daemon instead
+/// of binding its own listener. Grouped-status convention, plus a hint at the
+/// dashboard and the standalone escape hatch.
+fn build_daemon_banner(url: &str) -> String {
+    let mut out = String::new();
+    out.push_str(&section("🌐", "Daemon already serving this vault"));
+    out.push('\n');
+    out.push_str(&item("URL", url));
+    out.push('\n');
+    out.push_str(&item(
+        "Hint",
+        "`onebrain daemon status` for the dashboard · pass --port/--host/--dir for a standalone server",
+    ));
+    out.push('\n');
+    out
+}
+
 /// Run the foreground serve command. `mode` is currently unused for output
 /// shaping (serve streams `tracing` lines, not an envelope) but is accepted for
 /// signature parity with the other command handlers and future `--json`
@@ -75,6 +129,34 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
     // vault-required — the API has nothing to serve without one.
     let resolved = crate::vault_ctx::require(args.vault_dir.clone())?;
     let vault_root = resolved.root.as_path().to_path_buf();
+
+    // Daemon-aware routing (#197): if a live daemon already serves THIS vault,
+    // don't bind a second listener (shared port, and two engine owners would
+    // collide on the redb lock) — hand the user the daemon's webui URL instead.
+    // PASSIVE discovery only (`discover_matching`): a version/vault mismatch or
+    // a dead record yields `None` and we serve standalone — `serve` never
+    // starts, stops, or restarts a daemon. `$ONEBRAIN_NO_DAEMON` (the CLI-wide
+    // routing kill switch) skips discovery entirely. Explicit listener flags
+    // skip it too: the user asked for a specific standalone server.
+    let explicit_listener = args.port.is_some() || args.host.is_some() || args.dir.is_some();
+    let daemon_info = if explicit_listener
+        || crate::commands::search_common::daemon_routing_disabled()
+    {
+        None
+    } else {
+        daemon_client::discover_matching(Some(&vault_root))?
+            .map(|handle| handle.info().clone())
+    };
+    if let ServePlan::OpenDaemon { url } = plan_serve(daemon_info.as_ref(), explicit_listener) {
+        print!("{}", build_daemon_banner(&url));
+        if args.open {
+            // Best-effort, same as the standalone path below.
+            if let Err(e) = open_browser(&url) {
+                eprintln!("warning: could not open browser: {e}");
+            }
+        }
+        return Ok(());
+    }
 
     // Host: default 127.0.0.1; `--host 0.0.0.0` opts into remote self-host.
     let host: IpAddr = match args.host.as_deref() {
@@ -264,6 +346,53 @@ mod tests {
             b.contains("    Web UI        placeholder page (this binary has no bundled web UI)"),
             "{b:?}"
         );
+    }
+
+    fn daemon_info(port: u16, token: &str) -> DaemonInfo {
+        DaemonInfo {
+            port,
+            token: token.to_string(),
+            pid: 1,
+            version: "3.4.8".to_string(),
+            vault: Some("/v".to_string()),
+        }
+    }
+
+    #[test]
+    fn plan_serve_routes_to_a_matching_daemon() {
+        let info = daemon_info(6789, "sekret");
+        match plan_serve(Some(&info), false) {
+            ServePlan::OpenDaemon { url } => {
+                assert_eq!(url, "http://127.0.0.1:6789/?token=sekret");
+            }
+            other => panic!("expected OpenDaemon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_serve_standalone_when_no_daemon() {
+        assert!(matches!(plan_serve(None, false), ServePlan::Standalone));
+    }
+
+    #[test]
+    fn plan_serve_explicit_listener_flags_win_over_a_daemon() {
+        // `--port` / `--host` / `--dir` mean "the user asked for a specific
+        // standalone listener" — never silently reroute to the daemon.
+        let info = daemon_info(6789, "sekret");
+        assert!(matches!(plan_serve(Some(&info), true), ServePlan::Standalone));
+    }
+
+    #[test]
+    fn daemon_banner_carries_url_and_hint() {
+        let b = build_daemon_banner("http://127.0.0.1:6789/?token=abc");
+        assert!(b.contains("🌐  Daemon already serving this vault"), "{b:?}");
+        assert!(
+            b.contains("    URL           http://127.0.0.1:6789/?token=abc"),
+            "{b:?}"
+        );
+        // Points at the dashboard + the standalone escape hatch.
+        assert!(b.contains("daemon status"), "{b:?}");
+        assert!(b.contains("--port"), "{b:?}");
     }
 
     #[test]
