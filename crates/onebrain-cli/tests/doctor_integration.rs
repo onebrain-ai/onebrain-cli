@@ -1262,41 +1262,71 @@ fn doctor_never_strips_template_comments() {
 /// doctor run — `open_engine` → `collection_for` persisted the generated
 /// name via a comment-destroying whole-file serde rewrite. The engine path
 /// must now be strictly read-only.
+///
+/// Two-phase, platform-proof design: the generated collection name is NOT
+/// recomputed in the test (an earlier version hashed the test's own
+/// `canonicalize()` output, which diverges from the runtime's resolved path
+/// on Windows — `\\?\` verbatim prefixes — and behind macOS `/var` symlinks).
+/// Instead, phase 1 runs the real binary and reads the name from the search
+/// row's own `collection: <name>` detail — the exact value the production
+/// resolver derived — then phase 2 pre-creates that cache dir and re-runs.
+/// Same binary, same helper, same value on every platform by construction.
 #[test]
 fn doctor_engine_path_never_persists_generated_collection() {
     let d = tempdir().unwrap();
     let cache = tempdir().unwrap();
     write_minimal_vault(d.path());
     std::fs::remove_file(d.path().join("vault.yml")).unwrap();
-    let before = "# precious header\nupdate_channel: stable\nfolders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n";
-    std::fs::write(d.path().join("onebrain.yml"), before).unwrap();
+    let original = "# precious header\nupdate_channel: stable\nfolders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n";
+    std::fs::write(d.path().join("onebrain.yml"), original).unwrap();
 
-    // Pre-create the generated collection's cache dir so `is_indexed` is
-    // true and doctor takes the engine-open path. The name must match what
-    // the binary derives at runtime: `<dir>-<short_path_hash(root)>` on the
-    // CANONICAL vault path (macOS tempdirs live behind a /var → /private/var
-    // symlink and the walk-up resolves through the real cwd).
-    let canonical = std::fs::canonicalize(d.path()).unwrap();
-    let name = format!(
-        "{}-{}",
-        canonical.file_name().unwrap().to_string_lossy(),
-        onebrain_search::engine::short_path_hash(&canonical)
-    );
-    std::fs::create_dir_all(cache.path().join("search").join(&name)).unwrap();
-
+    // Phase 1 — no index yet: doctor reports the generated collection name
+    // in the search row's details. Capture it from the binary itself.
     let out = run_doctor_json(d.path(), cache.path());
     let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
-    let search_row = doc["checks"]
+    let search_row = |doc: &serde_json::Value| -> serde_json::Value {
+        doc["checks"]
+            .as_array()
+            .expect("checks[]")
+            .iter()
+            .find(|c| c["check"] == "search")
+            .expect("search row")
+            .clone()
+    };
+    let row = search_row(&doc);
+    assert!(
+        row["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no index for"),
+        "phase 1 must be the no-index arm: {row}"
+    );
+    let name = row["details"]
         .as_array()
-        .expect("checks[]")
+        .expect("details[]")
         .iter()
-        .find(|c| c["check"] == "search")
-        .expect("search row")
-        .clone();
+        .filter_map(|v| v.as_str())
+        .find_map(|s| s.strip_prefix("collection: "))
+        .expect("search row reports its collection name")
+        .to_string();
+    // Phase 1 also stamps `stats.last_doctor_run` (comment-preserving,
+    // same-day idempotent) — snapshot the file now as the byte baseline.
+    let before = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    assert!(
+        before.starts_with(original),
+        "phase 1 must only append the stats stamp:\n{before}"
+    );
+
+    // Phase 2 — pre-create that exact cache dir so `is_indexed` is true and
+    // doctor takes the engine-open path.
+    std::fs::create_dir_all(cache.path().join("search").join(&name)).unwrap();
+    let out = run_doctor_json(d.path(), cache.path());
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let row = search_row(&doc);
     // Non-vacuous: the engine path must actually have been exercised — if
     // the pre-created dir didn't match the runtime collection name the row
-    // would say "no index for …" and this test must fail.
-    let msg = search_row["message"].as_str().unwrap_or_default();
+    // would still say "no index for …" and this test must fail.
+    let msg = row["message"].as_str().unwrap_or_default();
     assert!(
         !msg.contains("no index for"),
         "engine path not exercised (collection name mismatch?): {msg}"
@@ -1307,10 +1337,10 @@ fn doctor_engine_path_never_persists_generated_collection() {
         !after.contains("collection:"),
         "doctor must never persist a generated collection:\n{after}"
     );
-    // The only permitted mutation is the appended comment-preserving stats
-    // stamp — everything before it is byte-identical.
-    assert!(
-        after.starts_with(before),
+    // The engine-path run makes NO mutation at all (the same-day stats stamp
+    // is already present) — byte-identical to the phase-1 snapshot.
+    assert_eq!(
+        after, before,
         "config rewritten by a read path:\nBEFORE:\n{before}\nAFTER:\n{after}"
     );
 }
