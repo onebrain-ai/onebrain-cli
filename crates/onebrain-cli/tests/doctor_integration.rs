@@ -1178,3 +1178,37 @@ fn doctor_fix_embed_model_reset_warns_reindex_required() {
         "embed_model reset must warn that a reindex is required: {msg}"
     );
 }
+
+/// The epic's core promise end-to-end: a plain `onebrain doctor` run on a
+/// freshly scaffolded (commented) config never strips the comments — the
+/// stats stamp is a comment-preserving line edit and the search check
+/// resolves its collection read-only.
+#[test]
+fn doctor_never_strips_template_comments() {
+    let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write_minimal_vault(d.path());
+    std::fs::remove_file(d.path().join("vault.yml")).unwrap();
+    let template =
+        onebrain_fs::render_onebrain_yml(onebrain_fs::SchedulePreset::Skip).unwrap();
+    std::fs::write(d.path().join("onebrain.yml"), &template).unwrap();
+
+    let out = run_doctor_json(d.path(), cache.path());
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    assert_eq!(doc["ok"], true, "template config must be healthy: {out}");
+
+    let after = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    assert!(
+        after.starts_with("# onebrain.yml"),
+        "header comment must survive a doctor run:\n{after}"
+    );
+    let comment_lines = |s: &str| s.lines().filter(|l| l.trim_start().starts_with('#')).count();
+    assert_eq!(
+        comment_lines(&after),
+        comment_lines(&template),
+        "no comment line may be lost:\n{after}"
+    );
+    // The only mutation is the (comment-preserving) stats stamp.
+    assert!(after.contains("stats:"), "{after}");
+    assert!(after.contains("last_doctor_run:"), "{after}");
+}
