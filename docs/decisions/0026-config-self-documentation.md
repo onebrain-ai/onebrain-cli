@@ -97,12 +97,24 @@ first touched the file.
   `Run onebrain doctor --fix …` hint when at least one finding is
   auto-resettable; pre-v3.4.8, checkpoint-only warnings from
   `onebrain.yml-keys` carried no hint at all.
-- **Known limitation (follow-up: issue #200):** three structural writers
-  still whole-file-serialize and drop comments — `fix_vault_yml_keys`,
-  `fix_legacy_qmd_collection`, and `onebrain-fs`'s `persist_search_key`
-  (the first `search reindex`/`model set` on a fresh vault). Each discloses
-  the comment loss in its output; migrating them onto comment-preserving
-  edits is deferred to issue #200.
+- **Vault-sync's config writer is comment-preserving and change-detecting**
+  (R3 fix). `update_vault_yml` (sync step 7 — runs on default `onebrain
+  init`, every `vault-sync`/plugin update, and `doctor --fix`'s plugin-files
+  repair) previously whole-file-serialized the config, which destroyed the
+  template's comments on first contact with the DEFAULT install path. It
+  now (a) does not write at all when `update_channel` already carries the
+  resolved channel — the fresh-template and re-sync cases — and (b) applies
+  a needed change via the shared comment-preserving line editor
+  (`onebrain_fs::yaml_edit`, extracted from doctor's reset machinery so
+  both crates use the identical editor). Only degenerate shapes (non-mapping
+  or flow-style roots, which carry no meaningful comments) keep the legacy
+  serde rewrite.
+- **Known limitation (follow-up: issue #200):** exactly three structural
+  writers still whole-file-serialize and drop comments —
+  `fix_vault_yml_keys`, `fix_legacy_qmd_collection`, and `onebrain-fs`'s
+  `persist_search_key` (the first `search reindex`/`model set` on a fresh
+  vault). Each discloses the comment loss in its output; migrating them
+  onto `yaml_edit` is deferred to issue #200.
 - Doctor is now 12 checks (was 11); `config-values` renders in the ⚙️ Config
   section as "config values".
 - Existing vaults keep their uncommented files until scaffolded anew —

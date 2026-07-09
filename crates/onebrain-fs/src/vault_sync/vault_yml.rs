@@ -1,20 +1,30 @@
-//! Step 7 · write `update_channel` into the vault config file. Port of Bun's
-//! `updateVaultYml`.
+//! Step 7 · ensure `update_channel` in the vault config file carries the
+//! resolved channel. Port of Bun's `updateVaultYml`, rewritten for the
+//! v3.4.8 self-documenting template (ADR 0026).
 //!
 //! - Reads the existing config file (canonical `onebrain.yml` preferred ·
 //!   legacy `vault.yml` fallback · empty doc when neither exists).
-//! - Overwrites the `update_channel` key with the resolved channel.
-//! - Atomic-writes the result back to the SAME path that was read · so
-//!   vault-sync stays filename-agnostic and never resurrects a legacy
-//!   `vault.yml` after `doctor --fix` migrated it.
+//! - **Change-detects first:** when `update_channel` already equals the
+//!   resolved channel the file is NOT touched at all — no rewrite, no
+//!   backup, no mtime bump. This is the common case: a freshly scaffolded
+//!   template (default `onebrain init`), and every re-sync of an
+//!   already-synced vault.
+//! - When a change IS needed, it lands as a **comment-preserving line edit**
+//!   (`crate::yaml_edit`): replace the existing key line's value portion, or
+//!   append the key when absent. The pre-v3.4.8 whole-file
+//!   `serde_yaml::to_string` rewrite destroyed every comment in the new
+//!   template on the very first sync.
+//! - Atomic-writes back to the SAME path that was read · so vault-sync stays
+//!   filename-agnostic and never resurrects a legacy `vault.yml` after
+//!   `doctor --fix` migrated it.
 //! - For a fresh vault (no config yet) writes the canonical `onebrain.yml`.
-//!
-//! Divergence from Bun: serde_yaml emits keys in alphabetical order regardless
-//! of insertion order. The vault-sync tests don't pin key order beyond a
-//! `.toContain` check, so this is acceptable.
+//! - Degenerate shapes keep the legacy behavior: a non-mapping root is
+//!   replaced with a fresh single-key mapping; a mapping the line editor
+//!   can't address (e.g. flow-style `{…}` root) falls back to the serde
+//!   rewrite — correctness over comments in that corner.
 
 use onebrain_core::{find_config_file, CONFIG_FILENAME};
-use serde_yaml::{Mapping, Value};
+use serde_yaml::Value;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -32,36 +42,67 @@ pub fn update_vault_yml(vault_root: &Path, update_channel: &str) -> std::io::Res
         Err(e) => return Err(e),
     };
 
-    let mut raw: Value = if text.trim().is_empty() {
-        Value::Mapping(Mapping::new())
-    } else {
-        serde_yaml::from_str(&text).map_err(io_err)?
+    let fresh_single_key = format!("update_channel: {update_channel}\n");
+
+    // Missing / empty config → seed a minimal one.
+    if text.trim().is_empty() {
+        crate::backup::backup_config_file(&config_path).map_err(io_err)?;
+        return atomic_write(&config_path, fresh_single_key.as_bytes());
+    }
+
+    // Invalid YAML stays a hard error (unchanged contract).
+    let parsed: Value = serde_yaml::from_str(&text).map_err(io_err)?;
+    let Some(mapping) = parsed.as_mapping() else {
+        // Degenerate non-mapping root (scalar/sequence): legacy behavior —
+        // replace with a fresh mapping carrying only the channel.
+        crate::backup::backup_config_file(&config_path).map_err(io_err)?;
+        return atomic_write(&config_path, fresh_single_key.as_bytes());
     };
 
-    // Normalize to mapping if the file was e.g. a top-level scalar.
-    if !raw.is_mapping() {
-        raw = Value::Mapping(Mapping::new());
+    let channel_key = Value::String("update_channel".to_string());
+    let current = mapping.get(&channel_key).and_then(|v| v.as_str());
+    if current == Some(update_channel) {
+        // Already correct — do not touch the file (the template scaffolds
+        // `update_channel: stable`, so the default init path lands here).
+        return Ok(());
     }
+
+    let updated = if mapping.contains_key(&channel_key) {
+        // Key present with a different (or non-string) value → surgical
+        // replace. The line editor only fails on shapes it can't address
+        // (flow-style root) — fall back to the legacy serde rewrite there,
+        // since a correct file beats a comment-preserving broken one.
+        match crate::yaml_edit::set_value(&text, &["update_channel"], update_channel) {
+            Some(t) => t,
+            None => serde_rewrite_with_channel(&text, update_channel)?,
+        }
+    } else {
+        // Key genuinely absent at the top level → append (duplicate-safe).
+        crate::yaml_edit::append_top_level(&text, "update_channel", update_channel)
+    };
+
+    // Defense-in-depth: back up the existing config before overwriting it.
+    // Hard precondition — if the backup can't be made, refuse the write.
+    crate::backup::backup_config_file(&config_path).map_err(io_err)?;
+    atomic_write(&config_path, updated.as_bytes())
+}
+
+/// Legacy whole-file rewrite (comments NOT preserved) — kept only as the
+/// fallback for mapping shapes the line editor refuses, e.g. a flow-style
+/// `{…}` root. Never reached for block-form configs.
+fn serde_rewrite_with_channel(text: &str, update_channel: &str) -> std::io::Result<String> {
+    let mut raw: Value = serde_yaml::from_str(text).map_err(io_err)?;
     if let Value::Mapping(m) = &mut raw {
         m.insert(
             Value::String("update_channel".to_string()),
             Value::String(update_channel.to_string()),
         );
     }
-
     let mut serialized = serde_yaml::to_string(&raw).map_err(io_err)?;
-    // serde_yaml may emit a leading `---\n` for empty maps; strip it to keep
-    // the file looking like Bun's output (`yaml.stringify` doesn't emit `---`
-    // by default).
     if let Some(stripped) = serialized.strip_prefix("---\n") {
         serialized = stripped.to_string();
     }
-
-    // Defense-in-depth: back up the existing config before overwriting it.
-    // Hard precondition — if the backup can't be made, refuse the write.
-    crate::backup::backup_config_file(&config_path).map_err(io_err)?;
-
-    atomic_write(&config_path, serialized.as_bytes())
+    Ok(serialized)
 }
 
 fn io_err<E: std::error::Error>(e: E) -> std::io::Error {
@@ -154,6 +195,78 @@ mod tests {
             !dir.path().join("vault.yml").exists(),
             "vault-sync must not recreate vault.yml when onebrain.yml is canonical"
         );
+    }
+
+    #[test]
+    fn no_write_when_channel_already_correct() {
+        // The default init path: the freshly scaffolded template already
+        // carries `update_channel: stable` — sync must not touch the file at
+        // all (no rewrite, no backup).
+        let dir = tempdir().unwrap();
+        let template =
+            crate::init::render_onebrain_yml(crate::init::SchedulePreset::Essentials).unwrap();
+        fs::write(dir.path().join("onebrain.yml"), &template).unwrap();
+        update_vault_yml(dir.path(), "stable").unwrap();
+        let after = fs::read_to_string(dir.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after, template, "no-op sync must not rewrite the file");
+        assert!(
+            !dir.path().join(crate::backup::BACKUP_DIR).exists(),
+            "no write ⇒ no backup"
+        );
+    }
+
+    #[test]
+    fn channel_change_preserves_comments() {
+        let dir = tempdir().unwrap();
+        let text = "# header comment
+                    update_channel: next
+                    folders:
+                        # inbox comment
+                        inbox: 00-inbox
+";
+        fs::write(dir.path().join("onebrain.yml"), text).unwrap();
+        update_vault_yml(dir.path(), "stable").unwrap();
+        let after = fs::read_to_string(dir.path().join("onebrain.yml")).unwrap();
+        assert!(after.contains("update_channel: stable"), "{after}");
+        assert!(after.contains("# header comment"), "{after}");
+        assert!(after.contains("# inbox comment"), "{after}");
+        assert!(after.contains("inbox: 00-inbox"), "{after}");
+    }
+
+    #[test]
+    fn missing_channel_key_appends_without_touching_comments() {
+        let dir = tempdir().unwrap();
+        let text = "# header comment
+folders:
+  # inbox comment
+  inbox: 00-inbox
+";
+        fs::write(dir.path().join("onebrain.yml"), text).unwrap();
+        update_vault_yml(dir.path(), "stable").unwrap();
+        let after = fs::read_to_string(dir.path().join("onebrain.yml")).unwrap();
+        assert!(after.contains("update_channel: stable"), "{after}");
+        assert!(after.contains("# header comment"), "{after}");
+        assert!(after.contains("# inbox comment"), "{after}");
+        // Still valid YAML with both keys.
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&after).unwrap();
+        assert_eq!(parsed["update_channel"].as_str(), Some("stable"), "{after}");
+        assert_eq!(parsed["folders"]["inbox"].as_str(), Some("00-inbox"));
+    }
+
+    #[test]
+    fn scalar_root_is_replaced_with_fresh_mapping() {
+        // Legacy behavior for a degenerate config (non-mapping root): replace
+        // with a fresh mapping carrying the channel.
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("onebrain.yml"),
+            "just-a-scalar
+",
+        )
+        .unwrap();
+        update_vault_yml(dir.path(), "stable").unwrap();
+        let after = fs::read_to_string(dir.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after, "update_channel: stable\n");
     }
 
     #[test]

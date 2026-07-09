@@ -20,6 +20,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 - **doctor is now strictly read-only outside `--fix`:** the search check resolves the collection without persisting a generated name on BOTH the no-index and index-exists paths (previously a `doctor` run could re-serialize the config and strip its comments), and the `onebrain.yml-keys` recipe no longer serde-rewrites the file for out-of-range checkpoint values — the comment-preserving `config-values` recipe owns value repair.
 - **`doctor --fix` gains an honest `partial` outcome** (JSON `fix[].outcome`, text glyph `◐`) for mixed runs where some values reset while others sit in unsupported YAML shapes; value findings now carry a `doctor --fix` hint (checkpoint-only warnings previously had none). Remaining comment-dropping structural writers tracked in #200.
+- **vault-sync no longer rewrites `onebrain.yml` on every run:** its `update_channel` step is change-detecting (already-correct config → file untouched — the default `init` and re-sync cases) and, when a change is needed, comment-preserving via the shared `yaml_edit` line editor — the template survives the default install path, plugin updates, and `doctor --fix` plugin repairs.
 
 ### Fixed
 - **`search model list`: the Rerankers box can no longer break.** Both tables now share one boxed-table renderer with a 100-column width cap; an over-long registry NOTE is truncated with an ellipsis (unicode-width-aware) instead of blowing the box border past the terminal. (#195)

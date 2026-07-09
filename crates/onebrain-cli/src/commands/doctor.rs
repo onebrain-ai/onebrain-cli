@@ -1550,118 +1550,17 @@ fn value_is_positive_number(v: &serde_yaml::Value) -> bool {
 }
 
 /// Reset one config value to `default_value` in raw config text via a
-/// comment-preserving line edit — the mid-file counterpart of
-/// [`upsert_doctor_stats`]. `segments` is the key path
-/// (`["search", "reranker", "min_score"]`); parents are located as
-/// block-form section headers by walking each block's extent, and only the
-/// final key line's VALUE portion is replaced — indentation, surrounding
-/// comment lines, an inline `# …` comment on the key line itself, and the
-/// file's CRLF/LF style all survive.
+/// comment-preserving line edit. Thin wrapper over the shared
+/// [`onebrain_fs::yaml_edit::set_value`] (extracted there in the R3 fix
+/// round so vault-sync's `update_vault_yml` uses the identical editor) —
+/// kept as a named seam because every `--fix` call site and the unit tests
+/// speak in terms of "reset".
 ///
 /// Returns `None` (caller reports the value un-fixable) when a parent is an
 /// inline mapping (`checkpoint: {messages: 0}`) or the key line can't be
 /// found — never guesses on a shape it doesn't understand.
 fn reset_config_value(text: &str, segments: &[&str], default_value: &str) -> Option<String> {
-    let (last, parents) = segments.split_last()?;
-    let indent_of = |l: &str| l.len() - l.trim_start().len();
-    let is_blank = |l: &str| l.trim().is_empty();
-    let is_comment = |l: &str| l.trim_start().starts_with('#');
-
-    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
-    let ends_with_newline = text.ends_with('\n');
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-
-    // Window (start..end) of the current block; top level = whole file with
-    // parent indent -1 (any indent 0 line qualifies as a child).
-    let (mut start, mut end) = (0usize, lines.len());
-    let mut parent_indent: isize = -1;
-
-    // The window's direct-child indent level: the SHALLOWEST non-blank,
-    // non-comment line — deeper lines are grandchildren and must never
-    // match a key lookup for this level (a nested `model:` must not shadow
-    // a sibling `model:`, and vice versa).
-    let child_indent = |lines: &[String], start: usize, end: usize| -> Option<usize> {
-        (start..end)
-            .filter(|&i| !is_blank(&lines[i]) && !is_comment(&lines[i]))
-            .map(|i| indent_of(&lines[i]))
-            .min()
-    };
-
-    for seg in parents {
-        let header = format!("{seg}:");
-        let level = child_indent(&lines, start, end)?;
-        // The section header: first non-blank, non-comment line in the window
-        // sitting exactly at the direct-child level and starting with `seg:`.
-        let idx = (start..end).find(|&i| {
-            let l = &lines[i];
-            !is_blank(l)
-                && !is_comment(l)
-                && indent_of(l) == level
-                && (level as isize) > parent_indent
-                && l.trim_start().starts_with(&header)
-        })?;
-        // Refuse inline mappings (`seg: {…}` / `seg: null`) — only a
-        // block-form header can carry the child lines we walk next. A
-        // trailing `# …` comment on the header line is fine (`search:  # my
-        // search config`); anything else after the colon means an inline
-        // value.
-        let after_header = lines[idx].trim_start()[header.len()..].trim_start();
-        if !(after_header.is_empty() || after_header.starts_with('#')) {
-            return None;
-        }
-        let header_indent = indent_of(&lines[idx]) as isize;
-        // Block extent: subsequent blank lines, comment lines, or lines
-        // indented deeper than the header.
-        let mut block_end = idx + 1;
-        while block_end < end {
-            let l = &lines[block_end];
-            if is_blank(l) || is_comment(l) || (indent_of(l) as isize) > header_indent {
-                block_end += 1;
-            } else {
-                break;
-            }
-        }
-        start = idx + 1;
-        end = block_end;
-        parent_indent = header_indent;
-    }
-
-    // The key line inside the final window, at the direct-child level only.
-    let key_prefix = format!("{last}:");
-    let level = child_indent(&lines, start, end)?;
-    if (level as isize) <= parent_indent {
-        return None;
-    }
-    let idx = (start..end).find(|&i| {
-        let l = &lines[i];
-        !is_blank(l)
-            && !is_comment(l)
-            && indent_of(l) == level
-            && l.trim_start().starts_with(&key_prefix)
-    })?;
-
-    let line = &lines[idx];
-    let indent = &line[..indent_of(line)];
-    let after_key = &line.trim_start()[key_prefix.len()..];
-    // Preserve an inline comment on the key line (including its exact
-    // leading whitespace) — conservatively, only when the value portion
-    // carries no quote characters (a `#` inside a quoted scalar is data,
-    // not a comment).
-    let comment_suffix = match after_key.find('#') {
-        Some(h)
-            if h > 0 && after_key[..h].ends_with(' ') && !after_key[..h].contains(['"', '\'']) =>
-        {
-            &after_key[after_key[..h].trim_end_matches(' ').len()..]
-        }
-        _ => "",
-    };
-    lines[idx] = format!("{indent}{last}: {default_value}{comment_suffix}");
-
-    let mut out = lines.join(newline);
-    if ends_with_newline {
-        out.push_str(newline);
-    }
-    Some(out)
+    onebrain_fs::yaml_edit::set_value(text, segments, default_value)
 }
 
 /// Recipe — `config-values` warning means one or more PRESENT config values

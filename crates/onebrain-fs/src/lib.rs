@@ -19,6 +19,7 @@ pub mod run_skill;
 pub mod task;
 pub mod update;
 pub mod vault_sync;
+pub mod yaml_edit;
 
 pub use backup::{atomic_write_text, backup_config_file, persist_search_key, remove_search_key};
 pub use error::{FsError, Result};
