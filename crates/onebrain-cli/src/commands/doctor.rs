@@ -39,6 +39,11 @@ use std::path::{Path, PathBuf};
 enum FixOutcome {
     /// Fix ran cleanly and the underlying issue should be resolved.
     Fixed(String),
+    /// Fix made REAL progress but part of the issue remains (e.g. some
+    /// values were reset to disk while others sat in an unsupported YAML
+    /// shape). The message itemises both halves. Counts toward a non-zero
+    /// exit like `Failed` — something still needs a manual edit.
+    Partial(String),
     /// Fix was attempted but did not finish (subprocess failed, timed out,
     /// etc.). The message explains why.
     Failed(String),
@@ -139,12 +144,13 @@ pub fn run(
                     .collect();
                 any_recipe_failed = outcomes
                     .iter()
-                    .any(|(_, o)| matches!(o, FixOutcome::Failed(_)));
+                    .any(|(_, o)| matches!(o, FixOutcome::Failed(_) | FixOutcome::Partial(_)));
                 fix_outcomes_json = outcomes
                     .iter()
                     .map(|(check, o)| {
                         let (outcome, message) = match o {
                             FixOutcome::Fixed(m) => ("fixed", m.as_str()),
+                            FixOutcome::Partial(m) => ("partial", m.as_str()),
                             FixOutcome::Failed(m) => ("failed", m.as_str()),
                             FixOutcome::Manual(m) => ("manual", m.as_str()),
                         };
@@ -201,7 +207,7 @@ pub fn run(
                         .collect();
                     any_recipe_failed = outcomes
                         .iter()
-                        .any(|(_, o)| matches!(o, FixOutcome::Failed(_)));
+                        .any(|(_, o)| matches!(o, FixOutcome::Failed(_) | FixOutcome::Partial(_)));
                     print_fix_summary(&outcomes);
                     results = all_checks(vault_root.as_path(), &config);
                 } else {
@@ -601,7 +607,7 @@ fn config_values_check(vault_root: &Path) -> DoctorResult {
 ///   exit code only escalates on `error`, so this check never fails the run.
 fn native_search_check(vault_root: &Path) -> DoctorResult {
     use crate::commands::search_common::{
-        collection_cache_dir, collection_name_readonly, is_indexed, open_engine,
+        collection_cache_dir, collection_name_readonly, is_indexed, open_engine_with_collection,
     };
     use onebrain_core::load_vault_config;
     use onebrain_search::embed::model_download_status;
@@ -641,7 +647,7 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
     let cache_dir = collection_cache_dir(&collection);
 
     // Read-only config load — same config the rest of the check already
-    // resolves through `collection_for`/`open_engine`. Never persisted here.
+    // resolves through the read-only helpers. Never persisted here.
     // A load failure degrades gracefully to reranker-disabled defaults +
     // an unknown configured embed model name, rather than aborting the whole
     // check — the index/model-on-disk facts below are still worth reporting.
@@ -724,10 +730,15 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
     }
 
     // Index exists → open the engine (lazy embedder, no download) and read
-    // status. A hard open/status failure is advisory, not fatal.
+    // status. A hard open/status failure is advisory, not fatal. The open
+    // goes through `open_engine_with_collection` (NOT `open_engine`): the
+    // latter resolves via `collection_for`, which PERSISTS a generated
+    // collection name through a comment-destroying serde rewrite when the
+    // `search.collection` key is absent — doctor's read path must never
+    // write the config.
     let (last_indexed_at, doc_count, pending) =
-        match open_engine(Some(resolved.root.as_path().to_path_buf())) {
-            Ok((engine, r)) => match engine.status(r.root.as_path()) {
+        match open_engine_with_collection(&resolved, &collection) {
+            Ok(engine) => match engine.status(resolved.root.as_path()) {
                 Ok(s) => (s.last_indexed_at, s.doc_count, s.pending_total()),
                 Err(e) => {
                     return finish(
@@ -1518,8 +1529,9 @@ fn fix_vault_config_migration(vault_root: &Path, json: bool) -> FixOutcome {
 }
 
 /// Match Bun's `typeof value === 'number' && value > 0` for YAML values.
-/// Used by `fix_vault_yml_keys` to decide whether to repair a checkpoint
-/// number — mirrors `vault_yml_keys::is_positive_number`.
+/// Used by `collect_config_findings` to validate `checkpoint.messages` /
+/// `checkpoint.minutes` (v3.4.8 — value validation moved here from the
+/// fs-layer `vault_yml_keys` check).
 fn value_is_positive_number(v: &serde_yaml::Value) -> bool {
     match v {
         serde_yaml::Value::Number(n) => {
@@ -1588,9 +1600,13 @@ fn reset_config_value(text: &str, segments: &[&str], default_value: &str) -> Opt
                 && (level as isize) > parent_indent
                 && l.trim_start().starts_with(&header)
         })?;
-        // Refuse inline mappings (`seg: {…}` / `seg: null`) — only a bare
-        // block-form header can carry the child lines we walk next.
-        if lines[idx].trim_end().trim_start() != header {
+        // Refuse inline mappings (`seg: {…}` / `seg: null`) — only a
+        // block-form header can carry the child lines we walk next. A
+        // trailing `# …` comment on the header line is fine (`search:  # my
+        // search config`); anything else after the colon means an inline
+        // value.
+        let after_header = lines[idx].trim_start()[header.len()..].trim_start();
+        if !(after_header.is_empty() || after_header.starts_with('#')) {
             return None;
         }
         let header_indent = indent_of(&lines[idx]) as isize;
@@ -1739,7 +1755,14 @@ fn fix_config_values(vault_root: &Path, json: bool) -> FixOutcome {
             "could not reset (unsupported YAML shape, e.g. inline mapping): {} — edit manually",
             unfixable.join(", ")
         ));
-        return FixOutcome::Failed(parts.join(" · "));
+        // Honest tri-state: real resets landed on disk AND something remains
+        // → Partial (distinct glyph, still a non-zero exit); nothing landed
+        // → Failed.
+        return if resets.is_empty() {
+            FixOutcome::Failed(parts.join(" · "))
+        } else {
+            FixOutcome::Partial(parts.join(" · "))
+        };
     }
     FixOutcome::Fixed(parts.join(" · "))
 }
@@ -1900,6 +1923,7 @@ fn stamp_doctor_run(vault_root: &Path, fix: bool, quiet: bool) {
 
 fn print_fix_summary(outcomes: &[(String, FixOutcome)]) {
     let mut fixed = 0;
+    let mut partial = 0;
     let mut failed = 0;
     let mut manual = 0;
     for (check, outcome) in outcomes {
@@ -1907,6 +1931,10 @@ fn print_fix_summary(outcomes: &[(String, FixOutcome)]) {
             FixOutcome::Fixed(msg) => {
                 fixed += 1;
                 println!("  ✓ {check}: {msg}");
+            }
+            FixOutcome::Partial(msg) => {
+                partial += 1;
+                println!("  ◐ {check}: {msg}");
             }
             FixOutcome::Failed(msg) => {
                 failed += 1;
@@ -1918,7 +1946,14 @@ fn print_fix_summary(outcomes: &[(String, FixOutcome)]) {
             }
         }
     }
-    println!("\nFix summary: {fixed} fixed · {failed} failed · {manual} manual",);
+    // `partial` is rendered only when present, keeping the common line
+    // byte-identical to the pre-Partial format.
+    let partial_part = if partial > 0 {
+        format!(" · {partial} partial")
+    } else {
+        String::new()
+    };
+    println!("\nFix summary: {fixed} fixed{partial_part} · {failed} failed · {manual} manual",);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -3555,8 +3590,9 @@ mod tests {
                 "expected 'hooks registered': {msg}"
             ),
             // register-hooks can fail in CI if the vault has no config; accept
-            // both Fixed and Failed but not Manual.
+            // both Fixed and Failed but not Partial/Manual.
             FixOutcome::Failed(_) => {}
+            FixOutcome::Partial(msg) => panic!("unexpected Partial: {msg}"),
             FixOutcome::Manual(msg) => panic!("unexpected Manual: {msg}"),
         }
     }
@@ -3572,6 +3608,7 @@ mod tests {
         // Accept Fixed or Failed; not Manual.
         match &outcome {
             FixOutcome::Fixed(_) | FixOutcome::Failed(_) => {}
+            FixOutcome::Partial(m) => panic!("unexpected Partial: {m}"),
             FixOutcome::Manual(m) => panic!("unexpected Manual: {m}"),
         }
     }
@@ -4663,6 +4700,59 @@ mod tests {
         };
         assert!(msg.contains("checkpoint.messages"), "msg: {msg}");
         assert!(msg.contains("edit manually"), "msg: {msg}");
+    }
+
+    #[test]
+    fn reset_config_value_header_inline_comment_is_still_a_block_header() {
+        // A trailing `# …` comment on a section header must not disable
+        // resets for every child under it.
+        let text = "search:  # my search config\n  reranker:\n    min_score: 7.5\n";
+        let out = reset_config_value(text, &["search", "reranker", "min_score"], "0.30").unwrap();
+        assert!(out.contains("min_score: 0.30"), "{out}");
+        assert!(out.contains("search:  # my search config"), "{out}");
+        // Inline mappings and inline scalars are still refused.
+        assert!(reset_config_value(
+            "checkpoint: {messages: 0}\n",
+            &["checkpoint", "messages"],
+            "15"
+        )
+        .is_none());
+        assert!(reset_config_value(
+            "checkpoint: null\n  messages: 0\n",
+            &["checkpoint", "messages"],
+            "15"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn fix_config_values_partial_when_mixed_reset_and_unfixable() {
+        // One value resettable (block form), one stuck in an inline mapping:
+        // the reset must land on disk AND the outcome must be the honest
+        // tri-state Partial — not Failed (real work happened) and not Fixed
+        // (something remains).
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "checkpoint: {messages: 0}\nsearch:\n  default_top_k: 0\n",
+        )
+        .unwrap();
+        let outcome = fix_config_values(d.path(), false);
+        let FixOutcome::Partial(msg) = outcome else {
+            panic!("expected Partial, got: {outcome:?}");
+        };
+        assert!(msg.contains("search.default_top_k → 10"), "msg: {msg}");
+        assert!(msg.contains("checkpoint.messages"), "msg: {msg}");
+        assert!(msg.contains("edit manually"), "msg: {msg}");
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert!(
+            after.contains("default_top_k: 10"),
+            "reset must be on disk: {after}"
+        );
+        assert!(
+            after.contains("checkpoint: {messages: 0}"),
+            "unfixable shape untouched: {after}"
+        );
     }
 
     #[test]

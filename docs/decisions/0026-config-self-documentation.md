@@ -63,7 +63,14 @@ first touched the file.
    indentation, surrounding comment lines, inline `# …` comments on the key
    line, key order, and the file's CRLF/LF style. Unsupported shapes (inline
    mappings like `checkpoint: {messages: 0}`) are refused and reported as
-   un-fixable rather than guessed at.
+   un-fixable rather than guessed at. A trailing `# …` comment on a section
+   header (`search:  # my search config`) is accepted as block form. When a
+   `--fix` pass lands SOME resets while others are un-fixable, the recipe
+   reports the honest tri-state **`partial`** — a new `FixOutcome` value
+   (JSON `fix[].outcome: "partial"`, text glyph `◐`) added alongside
+   `fixed`/`failed`/`manual`; it counts toward a non-zero exit like `failed`
+   because a manual edit is still required, but the message itemises the
+   resets that DID land.
 
 ## Consequences / migrations
 
@@ -82,7 +89,20 @@ first touched the file.
   collection via `collection_name_readonly` instead of `collection_for`;
   the latter persisted a generated collection name through a serde
   re-serialization on never-configured vaults — which would have stripped
-  the new template's comments on the very first `doctor` run.
+  the new template's comments on the very first `doctor` run. The engine
+  open on the index-exists path goes through the new
+  `open_engine_with_collection` (never `collection_for`) for the same
+  reason.
+- **Hint behavior change (intentional):** value findings now always carry a
+  `Run onebrain doctor --fix …` hint when at least one finding is
+  auto-resettable; pre-v3.4.8, checkpoint-only warnings from
+  `onebrain.yml-keys` carried no hint at all.
+- **Known limitation (follow-up: issue #200):** three structural writers
+  still whole-file-serialize and drop comments — `fix_vault_yml_keys`,
+  `fix_legacy_qmd_collection`, and `onebrain-fs`'s `persist_search_key`
+  (the first `search reindex`/`model set` on a fresh vault). Each discloses
+  the comment loss in its output; migrating them onto comment-preserving
+  edits is deferred to issue #200.
 - Doctor is now 12 checks (was 11); `config-values` renders in the ⚙️ Config
   section as "config values".
 - Existing vaults keep their uncommented files until scaffolded anew —

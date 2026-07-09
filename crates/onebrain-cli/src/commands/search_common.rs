@@ -129,6 +129,23 @@ pub fn open_engine(vault_flag: Option<PathBuf>) -> Result<(Engine, ResolvedVault
     Ok((engine, resolved))
 }
 
+/// Open the engine for an ALREADY-RESOLVED collection name **without any
+/// config persistence** — the doctor read path. Unlike [`open_engine`], this
+/// never calls [`collection_for`], so a vault whose index dir exists while
+/// its `search.collection` key is absent (e.g. after a hand edit) is NOT
+/// silently rewritten — `collection_for`'s persist goes through a whole-file
+/// serde re-serialization that would strip the commented template's
+/// comments. Pair it with [`collection_name_readonly`].
+pub fn open_engine_with_collection(resolved: &ResolvedVault, collection: &str) -> Result<Engine> {
+    let config = load_vault_config(&resolved.root).context("load vault config")?;
+    let cache_dir = collection_cache_dir(collection);
+    let mut engine = Engine::open(&cache_dir, &config.search.embed_model)
+        .map_err(|e| map_engine_open_error(e, &cache_dir))?;
+    engine.set_exclude_patterns(config.search.exclude.clone());
+    engine.set_rerank_settings(rerank_settings_from_config(&config.search.reranker));
+    Ok(engine)
+}
+
 /// Map the config's `search.reranker` block to the engine-facing
 /// [`RerankSettings`] — the CLI is the only layer that reads config files, so
 /// this is the single seam where `onebrain.yml` values become the engine's

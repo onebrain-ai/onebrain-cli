@@ -18,7 +18,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **`doctor --fix` resets out-of-range tunables to their defaults** through a comment-preserving line editor (comments, key order, inline `# …` notes, and CRLF all survive; every reset itemised in the fix footer as `key → default`). `search.embed_model` resets print a reindex-required warning; `folders.*` + `search.collection` are report-only, never auto-reset.
 
 ### Changed
-- **doctor is now strictly read-only outside `--fix`:** the search check resolves the collection without persisting a generated name (previously a first `doctor` on a never-indexed vault re-serialized the config, which would have stripped its comments), and the `onebrain.yml-keys` recipe no longer serde-rewrites the file for out-of-range checkpoint values — the comment-preserving `config-values` recipe owns value repair.
+- **doctor is now strictly read-only outside `--fix`:** the search check resolves the collection without persisting a generated name on BOTH the no-index and index-exists paths (previously a `doctor` run could re-serialize the config and strip its comments), and the `onebrain.yml-keys` recipe no longer serde-rewrites the file for out-of-range checkpoint values — the comment-preserving `config-values` recipe owns value repair.
+- **`doctor --fix` gains an honest `partial` outcome** (JSON `fix[].outcome`, text glyph `◐`) for mixed runs where some values reset while others sit in unsupported YAML shapes; value findings now carry a `doctor --fix` hint (checkpoint-only warnings previously had none). Remaining comment-dropping structural writers tracked in #200.
 
 ### Fixed
 - **`search model list`: the Rerankers box can no longer break.** Both tables now share one boxed-table renderer with a 100-column width cap; an over-long registry NOTE is truncated with an ellipsis (unicode-width-aware) instead of blowing the box border past the terminal. (#195)
