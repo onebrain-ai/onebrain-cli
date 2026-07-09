@@ -35,7 +35,7 @@ pub mod walker;
 mod orchestrate;
 mod types;
 
-pub use branch::resolve_branch;
+pub use branch::{resolve_branch, DEFAULT_UPDATE_CHANNEL, VALID_UPDATE_CHANNELS};
 pub use download::build_tar_spawn_overrides;
 pub use orchestrate::{default_installed_plugins_path, read_plugin_version, run_vault_sync};
 pub use pin::normalize_path;

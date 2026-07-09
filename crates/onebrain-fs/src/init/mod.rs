@@ -33,6 +33,7 @@ mod safety;
 mod wizard;
 
 pub use folders::{INBOX_IMPORTS_SUBDIR, STANDARD_FOLDERS};
+pub use onebrain_yml::{render_onebrain_yml, TEMPLATE_RERANK_MIN_SCORE};
 pub use presets::{ScheduleEntry, SchedulePreset};
 
 use crate::error::FsError;
