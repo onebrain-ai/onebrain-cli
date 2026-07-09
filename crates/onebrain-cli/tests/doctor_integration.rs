@@ -187,16 +187,12 @@ fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
     assert!(config.contains("collection: doctor-it-green"), "{config}");
     std::fs::write(vault.path().join("onebrain.yml"), config).unwrap();
 
-    // Empty-vault reindex (no docs → no model download) + a fabricated
-    // downloaded-model dir for the default embedding model and the default
-    // reranker model.
-    Command::cargo_bin("onebrain")
-        .unwrap()
-        .current_dir(vault.path())
-        .env("ONEBRAIN_CACHE_DIR", cache.path())
-        .args(["search", "reindex"])
-        .assert()
-        .success();
+    // Fabricate the downloaded-model dirs BEFORE the reindex: with no model
+    // dir on disk, reindex's missing-model reconcile would drop the
+    // `search.embed_model` key via a comment-destroying serde rewrite
+    // (tracked with the other structural writers in #200) and un-document
+    // the commented fixture. Then run the empty-vault reindex (no docs →
+    // no real download).
     std::fs::create_dir_all(
         cache
             .path()
@@ -209,6 +205,13 @@ fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
             .join("search/doctor-it-green/models--onebrain-ai--onebrain-rerank-v1"),
     )
     .unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .args(["search", "reindex"])
+        .assert()
+        .success();
 
     Command::cargo_bin("onebrain")
         .unwrap()
@@ -499,13 +502,22 @@ fn doctor_fix_migrates_vault_yml_with_vault_flag() {
         "expected vault.yml to be gone after --fix"
     );
     let after = std::fs::read_to_string(vault.path().join("onebrain.yml")).unwrap();
-    // The migration preserves the original content as a prefix; `doctor` then
-    // stamps the run timestamps (v3.2.3) into a trailing `stats:` block — and
-    // because `--fix` ran, both run and fix dates are written.
-    assert!(
-        after.starts_with(&original),
-        "rename must preserve original content as a prefix · got:\n{after}"
-    );
+    // The migration preserves every original value line (v3.4.8's --fix also
+    // backfills self-documentation comments and stamps `stats:`, so assert on
+    // the non-comment lines rather than a strict byte prefix).
+    let value_lines = |s: &str| -> Vec<String> {
+        s.lines()
+            .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let after_values = value_lines(&after);
+    for line in value_lines(&original) {
+        assert!(
+            after_values.contains(&line),
+            "migrated config must keep original line {line:?} · got:\n{after}"
+        );
+    }
     assert!(
         after.contains("stats:")
             && after.contains("last_doctor_run:")
@@ -593,11 +605,13 @@ fn doctor_fix_does_not_resurrect_vault_yml_after_migration() {
 #[test]
 fn doctor_fix_text_mode_manual_issues_shows_manual_step_section() {
     let vault = tempdir().unwrap();
-    // Write canonical onebrain.yml (no migration warning) with all keys present.
+    // Write canonical onebrain.yml (no migration warning). Since v3.4.8 an
+    // UNCOMMENTED config is itself an auto-fixable finding (comment
+    // backfill), so this manual-only scenario needs the fully-documented
+    // template.
     std::fs::write(
         vault.path().join("onebrain.yml"),
-        "update_channel: stable\n\
-         folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n",
+        onebrain_fs::render_onebrain_yml(onebrain_fs::SchedulePreset::Skip).unwrap(),
     )
     .unwrap();
     for f in [
@@ -992,7 +1006,12 @@ fn doctor_flags_out_of_range_config_values() {
     assert!(
         details
             .iter()
-            .filter(|v| !v.as_str().unwrap_or("").contains("never auto-reset"))
+            .filter(|v| {
+                let s = v.as_str().unwrap_or("");
+                // Report-only findings and the self-documentation summary
+                // line are not value resets.
+                !s.contains("never auto-reset") && !s.contains("lack self-documentation")
+            })
             .all(|v| v.as_str().unwrap_or("").contains("default:")),
         "each resettable finding must state its default: {details:?}"
     );
