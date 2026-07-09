@@ -2043,6 +2043,29 @@ mod tests {
         assert_eq!(rich["idle_ttl_secs"], 1800);
     }
 
+    /// RAII teardown for the real-daemon integration tests: runs
+    /// `onebrain daemon stop` (with the test's own HOME/env) on drop, so a
+    /// FAILED assertion between `daemon start` and the test's own `stop` never
+    /// leaks a detached daemon — with `ONEBRAIN_DAEMON_IDLE_SECS=0` a leaked
+    /// daemon runs forever. (An external SIGKILL of the test runner still
+    /// can't be covered: the daemon is setsid-detached by design.)
+    #[cfg(unix)]
+    struct StopDaemonOnDrop {
+        bin: PathBuf,
+        envs: Vec<(String, String)>,
+    }
+    #[cfg(unix)]
+    impl Drop for StopDaemonOnDrop {
+        fn drop(&mut self) {
+            let mut cmd = std::process::Command::new(&self.bin);
+            for (k, v) in &self.envs {
+                cmd.env(k, v);
+            }
+            // Best-effort: a double stop is an idempotent no-op.
+            let _ = cmd.args(["daemon", "stop"]).output();
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Lifecycle integration test — drives the REAL `onebrain` binary through
     // status → start → status → stop → status. Unlike the unit tests above,
@@ -2061,6 +2084,13 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let home = tempdir().unwrap();
+        let _teardown = StopDaemonOnDrop {
+            bin: assert_cmd::cargo::cargo_bin("onebrain"),
+            envs: vec![
+                ("HOME".into(), home.path().display().to_string()),
+                ("ONEBRAIN_DAEMON_PORT".into(), "0".into()),
+            ],
+        };
 
         // Small helper: run `onebrain daemon <verb>` with HOME overridden,
         // returning combined stdout as a String. We assert success separately.
@@ -2203,6 +2233,13 @@ mod tests {
             }
             cmd.args(["daemon", verb]).output().expect("spawn onebrain")
         };
+        let _teardown = StopDaemonOnDrop {
+            bin: assert_cmd::cargo::cargo_bin("onebrain"),
+            envs: envs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect(),
+        };
 
         // Start the daemon.
         assert!(run("start").status.success(), "daemon start failed");
@@ -2322,6 +2359,10 @@ mod tests {
         let home = tempdir().unwrap();
         let home_path = home.path().to_path_buf();
         let bin = cargo_bin("onebrain");
+        let _teardown = StopDaemonOnDrop {
+            bin: bin.clone(),
+            envs: vec![("HOME".into(), home_path.display().to_string())],
+        };
 
         // Spawn N threads that each run `onebrain daemon start` as close to
         // simultaneously as possible, collecting each invocation's stdout.
