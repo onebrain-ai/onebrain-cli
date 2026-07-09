@@ -807,8 +807,12 @@ fn terminate(_pid: u32) -> Result<()> {
 ///   vault (see [`resolve_daemon_vault`]). Otherwise `None`.
 /// - **port** — the shared default ([`crate::commands::serve::DEFAULT_PORT`]).
 /// - **token** — freshly generated per process.
-/// - **dist_dir** — `$ONEBRAIN_DIST` if set, else `None` (API-only). The plugin
-///   passes the pinned webui dist via this env when it launches the daemon.
+/// - **dist_dir** — `$ONEBRAIN_DIST` if set, else `None`. `$ONEBRAIN_DIST` is
+///   an OVERRIDE (webui development / the plugin launcher pinning a dist);
+///   with it unset the daemon serves the web UI EMBEDDED in the binary,
+///   exactly like `serve` (see `server::static::serve_static` — a binary built
+///   without bundled assets falls back to a token-bearing placeholder page).
+///   The daemon is always webui-ready; there is no API-only mode.
 ///
 /// VAULT RESOLUTION (fix A): because the detached child `chdir`s to `/`, walk-up
 /// from cwd can't find the vault the user started from, so the daemon relies on

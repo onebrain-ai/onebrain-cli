@@ -1,12 +1,16 @@
 //! Static SPA serving + per-session token injection.
 //!
 //! Two cases:
-//! 1. **`dist_dir` set** — serve it with `tower_http::services::ServeDir`,
-//!    falling back to `index.html` for unknown routes (client-side routing).
-//!    `index.html` is NOT served straight off disk: it's passed through
-//!    [`inject_token`] so the browser SPA can read the session token.
-//! 2. **`dist_dir` None** — serve a tiny built-in placeholder page so the API
-//!    is still reachable for API-only testing (`serve` with no UI mounted).
+//! 1. **`dist_dir` set** (`--dir` / `$ONEBRAIN_DIST`) — an explicit dist
+//!    OVERRIDES the embedded UI: serve it with
+//!    `tower_http::services::ServeDir`, falling back to `index.html` for
+//!    unknown routes (client-side routing). `index.html` is NOT served
+//!    straight off disk: it's passed through [`inject_token`] so the browser
+//!    SPA can read the session token.
+//! 2. **`dist_dir` None** (the default for both `serve` and the daemon) —
+//!    serve the web UI EMBEDDED in the binary. A binary built without bundled
+//!    assets (a fresh checkout) falls back to a tiny built-in placeholder page
+//!    so the API surface is still reachable.
 //!
 //! The token is injected by replacing a `__ONEBRAIN_TOKEN__` placeholder if the
 //! HTML contains one, otherwise by inserting a `<script>` that sets
@@ -47,7 +51,7 @@ struct WebAssets;
 /// Whether this binary was built with a bundled web UI (the `webui/` folder was
 /// populated at build time). With no `--dir`, an embedded build still serves the
 /// full UI via [`serve_from_embedded`] — so `serve`'s startup banner uses this to
-/// report "embedded web UI" instead of the API-only placeholder.
+/// report "embedded web UI" instead of the no-bundle placeholder.
 pub fn has_embedded_ui() -> bool {
     WebAssets::get("index.html").is_some()
 }
@@ -276,9 +280,10 @@ async fn serve_injected_index(dist: &Path, token: &str) -> Response {
     }
 }
 
-/// The built-in placeholder served when no dist is mounted (or its index is
-/// missing). One line of body text + the token script so an API-only `serve`
-/// still hands the token to anything that loads the root.
+/// The built-in placeholder served when this binary has no bundled web UI and
+/// no dist is mounted (or a mounted dist's index is missing). One line of body
+/// text + the token script so a UI-less `serve`/daemon still hands the token
+/// to anything that loads the root.
 fn placeholder_html(token: &str) -> Response {
     let html = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\

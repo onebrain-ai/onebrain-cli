@@ -131,7 +131,7 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
             Some(v) => ui_label(&v, server::webui_released().as_deref()),
             None => "embedded web UI".to_string(),
         },
-        None => "no UI — API only (placeholder page)".to_string(),
+        None => "placeholder page (this binary has no bundled web UI)".to_string(),
     };
     // Grouped-convention banner (matches `search status` / `doctor`): a
     // `🌐  Serving` section header, then indented `Label  value` rows, a blank
@@ -254,14 +254,14 @@ mod tests {
 
     #[test]
     fn banner_no_ui_placeholder_line_preserved() {
-        // The "none — API only" description still flows into the Web UI row.
+        // The no-bundle placeholder description still flows into the Web UI row.
         let b = build_banner(
             "http://127.0.0.1:6789/?token=x",
             "/v",
-            "no UI — API only (placeholder page)",
+            "placeholder page (this binary has no bundled web UI)",
         );
         assert!(
-            b.contains("    Web UI        no UI — API only (placeholder page)"),
+            b.contains("    Web UI        placeholder page (this binary has no bundled web UI)"),
             "{b:?}"
         );
     }
