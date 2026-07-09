@@ -118,6 +118,7 @@ fn search_status_json_reports_reranker_fields_without_downloading() {
     assert_eq!(v["data"]["reranker_ready"], false);
     assert_eq!(v["data"]["reranker_downloaded"], false);
     assert!(v["data"]["reranker_disk_bytes"].is_null());
+    assert!(v["data"]["reranker_downloaded_at"].is_null());
 
     // Never downloads the reranker either.
     let model_cache = cache.path().join("search").join("t-vault");

@@ -193,7 +193,12 @@ Show the status of the search index: collection, embed model, document counts, p
   "pending_changed": 2,
   "pending_removed": 0,
   "cache_size_bytes": 510000000,
-  "semantic_available": true
+  "semantic_available": true,
+  "reranker_model": "onebrain-rerank-v1",
+  "reranker_ready": true,
+  "reranker_downloaded": true,
+  "reranker_disk_bytes": 569011484,
+  "reranker_downloaded_at": 1751500000
 }
 ```
 
@@ -217,7 +222,12 @@ The same result **while a reindex is in progress** (note the added `reindexing` 
   "pending_removed": 0,
   "cache_size_bytes": 510000000,
   "reindexing": { "done": 10, "total": 100 },
-  "semantic_available": true
+  "semantic_available": true,
+  "reranker_model": "onebrain-rerank-v1",
+  "reranker_ready": true,
+  "reranker_downloaded": true,
+  "reranker_disk_bytes": 569011484,
+  "reranker_downloaded_at": 1751500000
 }
 ```
 

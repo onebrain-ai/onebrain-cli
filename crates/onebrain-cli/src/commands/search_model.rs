@@ -254,6 +254,81 @@ fn pad_display(s: &str, w: usize) -> String {
 const ACTIVE_ROW_ANSI: &str = "\x1b[1;32m";
 const ANSI_RESET: &str = "\x1b[0m";
 
+/// Hard cap on a rendered box's TOTAL display width (borders included). A
+/// box normally fits its widest row, but a long registry NOTE (the reranker's
+/// is ~95 columns on its own) would otherwise push the border past a normal
+/// terminal and wrap — visually "breaking" the box (#195). Rows wider than
+/// the cap get their tail truncated with an ellipsis instead.
+const MAX_BOX_WIDTH: usize = 100;
+
+/// Truncate `s` to at most `max` DISPLAY columns (unicode-width-aware, like
+/// [`pad_display`]), appending `…` — which itself occupies one of the `max`
+/// columns — when anything was cut. Strings already within the cap pass
+/// through untouched.
+fn truncate_display(s: &str, max: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if s.width() <= max {
+        return s.to_string();
+    }
+    let budget = max.saturating_sub(1); // reserve one column for the `…`
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// Assemble a titled single-line box around pre-formatted content rows —
+/// the shared renderer behind both the `Available Embedding Models` table
+/// and the `Rerankers` section, so the two boxes can't drift apart (#195).
+///
+/// `content` is `(uncolored row text, is-active-row)`. Rows are first capped
+/// to [`MAX_BOX_WIDTH`] via [`truncate_display`] (the 4 non-content columns
+/// are the two `│` borders + their 1-space pads), then padded to one shared
+/// inner width. When `color` is set the active row's padded content is
+/// wrapped in bold-green SGR INSIDE the borders — padding is always computed
+/// on the uncolored text, so the right border stays flush in both modes.
+fn render_boxed_table(title: &str, content: &[(String, bool)], color: bool) -> Vec<String> {
+    use unicode_width::UnicodeWidthStr;
+
+    let capped: Vec<(String, bool)> = content
+        .iter()
+        .map(|(l, active)| (truncate_display(l, MAX_BOX_WIDTH - 4), *active))
+        .collect();
+    let inner = capped
+        .iter()
+        .map(|(l, _)| l.width())
+        .max()
+        .unwrap_or(0)
+        .max(title.width());
+    // Padded content width between the two `│` (1-space pad each side).
+    let boxed = inner + 2;
+    let mut lines = Vec::with_capacity(capped.len() + 2);
+    lines.push(format!(
+        "┌{title}{}┐",
+        "─".repeat(boxed.saturating_sub(title.width()))
+    ));
+    for (l, active) in &capped {
+        let padded = pad_display(l, inner);
+        if color && *active {
+            // SGR wraps the padded content only — the borders stay unstyled
+            // and the visible width is identical to the mono row.
+            lines.push(format!("│ {ACTIVE_ROW_ANSI}{padded}{ANSI_RESET} │"));
+        } else {
+            lines.push(format!("│ {padded} │"));
+        }
+    }
+    lines.push(format!("└{}┘", "─".repeat(boxed)));
+    lines
+}
+
 /// Render the boxed model table. `color` is the resolved colour bit
 /// (`output::is_color_text` on the active mode — the same gate the banner
 /// and doctor use, so `--no-color` / `NO_COLOR` / piped stdout all drop the
@@ -262,8 +337,6 @@ const ANSI_RESET: &str = "\x1b[0m";
 /// text and the SGR codes wrap the padded content INSIDE the `│ … │` borders,
 /// so the right border stays flush in both modes.
 fn render_list_text(env: &Envelope<ModelListData>, color: bool) -> String {
-    use unicode_width::UnicodeWidthStr;
-
     let d = env.data.as_ref().expect("ok envelope always has data");
     // Fixed-width columns: marker · MODEL · DOWNLOADED · DISK · DIM · THAI ·
     // NOTE. The marker column is `●` for the active model, blank otherwise.
@@ -326,33 +399,9 @@ fn render_list_text(env: &Envelope<ModelListData>, color: bool) -> String {
     // Wrap the table in a plain single-line box with the title embedded in
     // the top border — same look as the interactive TUI's ratatui block
     // (`┌ Available Embedding Models ────┐` … `└────┘`). Width fits the
-    // widest row (not the terminal); every content line gets one space of
-    // breathing room inside each border.
-    const TITLE: &str = " Available Embedding Models ";
-    let inner = content
-        .iter()
-        .map(|(l, _)| l.width())
-        .max()
-        .unwrap_or(0)
-        .max(TITLE.width());
-    // Padded content width between the two `│` (1-space pad each side).
-    let boxed = inner + 2;
-    let mut lines = Vec::with_capacity(content.len() + 3);
-    lines.push(format!(
-        "┌{TITLE}{}┐",
-        "─".repeat(boxed.saturating_sub(TITLE.width()))
-    ));
-    for (l, active) in &content {
-        let padded = pad_display(l, inner);
-        if color && *active {
-            // SGR wraps the padded content only — the borders stay unstyled
-            // and the visible width is identical to the mono row.
-            lines.push(format!("│ {ACTIVE_ROW_ANSI}{padded}{ANSI_RESET} │"));
-        } else {
-            lines.push(format!("│ {padded} │"));
-        }
-    }
-    lines.push(format!("└{}┘", "─".repeat(boxed)));
+    // widest row (not the terminal, capped at MAX_BOX_WIDTH); every content
+    // line gets one space of breathing room inside each border.
+    let mut lines = render_boxed_table(" Available Embedding Models ", &content, color);
     lines.push(format!("📁  Cache dir: {}", d.cache_dir.display()));
     // No downloaded active model (never chosen, or the chosen model's download
     // was purged) → tell the user how to get a working index.
@@ -377,8 +426,6 @@ fn render_list_text(env: &Envelope<ModelListData>, color: bool) -> String {
 /// same look (title-in-border box, bold-green active row), simpler columns
 /// (no dims/Thai score): marker · MODEL · DOWNLOADED · DISK · NOTE.
 fn render_reranker_section(rerankers: &[RerankerListEntry], color: bool) -> String {
-    use unicode_width::UnicodeWidthStr;
-
     const MARKER: usize = 2;
     const NAME: usize = 24;
     const DL: usize = 12;
@@ -404,28 +451,7 @@ fn render_reranker_section(rerankers: &[RerankerListEntry], color: bool) -> Stri
         content.push((row(marker, r.name, downloaded, &disk, r.note), active));
     }
 
-    const TITLE: &str = " Rerankers ";
-    let inner = content
-        .iter()
-        .map(|(l, _)| l.width())
-        .max()
-        .unwrap_or(0)
-        .max(TITLE.width());
-    let boxed = inner + 2;
-    let mut lines = Vec::with_capacity(content.len() + 3);
-    lines.push(format!(
-        "┌{TITLE}{}┐",
-        "─".repeat(boxed.saturating_sub(TITLE.width()))
-    ));
-    for (l, active) in &content {
-        let padded = pad_display(l, inner);
-        if color && *active {
-            lines.push(format!("│ {ACTIVE_ROW_ANSI}{padded}{ANSI_RESET} │"));
-        } else {
-            lines.push(format!("│ {padded} │"));
-        }
-    }
-    lines.push(format!("└{}┘", "─".repeat(boxed)));
+    let mut lines = render_boxed_table(" Rerankers ", &content, color);
     if !rerankers.iter().any(|r| r.current && r.downloaded) {
         lines.push(
             "⚠️  No reranker downloaded — run `onebrain search reindex` to select, download + index."
@@ -1047,6 +1073,51 @@ mod tests {
             widths.windows(2).all(|w| w[0] == w[1]),
             "box lines share one display width after stripping ANSI: {widths:?}"
         );
+    }
+
+    #[test]
+    fn reranker_box_lines_share_one_width_and_stay_capped() {
+        use unicode_width::UnicodeWidthStr;
+        // The real registry NOTE for onebrain-rerank-v1 — long enough that an
+        // uncapped box would blow past a normal terminal width (#195).
+        let entries = vec![RerankerListEntry {
+            name: "onebrain-rerank-v1",
+            approx_size: "~570 MB",
+            note: "OneBrain Reranker v1 — cross-encoder (bge-reranker-v2-m3 base, int8) · multilingual incl. Thai",
+            current: true,
+            downloaded: false,
+            disk_bytes: None,
+        }];
+        let s = render_reranker_section(&entries, false);
+        let lines: Vec<&str> = s.lines().collect();
+        assert!(lines[0].starts_with("┌ Rerankers ─"), "{s}");
+        let w = lines[0].width();
+        // Every box line (┌…┐, │…│, └…┘) must have the SAME display width…
+        for l in lines.iter().take_while(|l| l.starts_with(['┌', '│', '└'])) {
+            assert_eq!(l.width(), w, "border broken by line {l:?} in\n{s}");
+        }
+        // …and the box must fit a normal terminal: cap inner width so a long
+        // registry NOTE can never blow the border past the cap.
+        assert!(w <= MAX_BOX_WIDTH, "box width {w} exceeds cap in\n{s}");
+        // Long NOTE is truncated with an ellipsis, not wrapped.
+        assert!(s.contains('…'), "expected truncated NOTE in\n{s}");
+    }
+
+    #[test]
+    fn truncate_display_is_width_aware_and_appends_ellipsis() {
+        use unicode_width::UnicodeWidthStr;
+        // Short strings pass through untouched.
+        assert_eq!(truncate_display("abc", 10), "abc");
+        // Exact fit passes through untouched (no gratuitous ellipsis).
+        assert_eq!(truncate_display("abcde", 5), "abcde");
+        // Over-long input is cut to the cap WITH the ellipsis counted in.
+        let cut = truncate_display("abcdefghij", 5);
+        assert_eq!(cut, "abcd…");
+        assert_eq!(cut.width(), 5);
+        // Width-aware: wide CJK chars count 2 columns, so fewer fit.
+        let cjk = truncate_display("ไทย中文字字字", 6);
+        assert!(cjk.ends_with('…'), "{cjk}");
+        assert!(cjk.width() <= 6, "width {} of {cjk}", cjk.width());
     }
 
     #[test]
