@@ -98,7 +98,9 @@ struct ModelListData {
     /// Reranker registry rows (Tier-2 cross-encoder), same shape idea as
     /// `models` but keyed off `search.reranker.model` for `current`.
     rerankers: Vec<RerankerListEntry>,
-    /// Collection cache dir where downloaded models live (footer + JSON).
+    /// Collection cache dir where downloaded models live (JSON-only — the
+    /// text render no longer prints it; `search status`'s Cache section is
+    /// the human-facing surface for this path).
     cache_dir: PathBuf,
 }
 
@@ -402,7 +404,9 @@ fn render_list_text(env: &Envelope<ModelListData>, color: bool) -> String {
     // widest row (not the terminal, capped at MAX_BOX_WIDTH); every content
     // line gets one space of breathing room inside each border.
     let mut lines = render_boxed_table(" Available Embedding Models ", &content, color);
-    lines.push(format!("📁  Cache dir: {}", d.cache_dir.display()));
+    // No `Cache dir:` footer in the text render (UX polish): it's an internal
+    // path that crowded the list — `search status`'s Cache section owns it.
+    // The path still rides the JSON payload (`cache_dir`).
     // No downloaded active model (never chosen, or the chosen model's download
     // was purged) → tell the user how to get a working index.
     if !d.models.iter().any(|m| m.current && m.downloaded) {
@@ -951,25 +955,100 @@ mod tests {
     }
 
     #[test]
-    fn list_text_has_header_footer_and_all_models() {
+    fn list_text_has_header_and_all_models() {
         let s = render_list_text(&list_env("multilingual-e5-small"), false);
         assert!(s.contains("MODEL"));
         assert!(s.contains("DOWNLOADED"));
         assert!(s.contains("DISK"));
+        // The Cache dir footer was dropped from the text render (UX polish —
+        // it's an internal path; `search status`'s Cache section owns it).
+        // The path stays in the JSON payload (see
+        // `json_list_still_carries_cache_dir`).
         assert!(
-            s.contains("📁  Cache dir:"),
-            "footer with cache dir present"
+            !s.contains("Cache dir"),
+            "text render must not show the cache dir: {s}"
         );
         for m in model_registry() {
             assert!(s.contains(m.name), "missing {} in rendered list", m.name);
         }
     }
 
+    #[test]
+    fn json_list_still_carries_cache_dir() {
+        // Dropping the text footer is display-only: machine consumers keep
+        // getting `cache_dir` in the JSON payload.
+        let v = serde_json::to_value(list_env("bge-m3").data.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            v["cache_dir"], "/tmp/onebrain-test-cache/my-collection",
+            "cache_dir must remain in the JSON payload: {v}"
+        );
+    }
+
+    #[test]
+    fn list_text_separates_boxes_with_exactly_one_blank_line() {
+        // Default (current model downloaded → no ⚠️ guidance line): the
+        // embedding box's bottom border is followed by exactly one blank
+        // line, then the reranker box's top border.
+        let s = render_list_text(&list_env("bge-m3"), false);
+        let lines: Vec<&str> = s.lines().collect();
+        let embed_bottom = lines
+            .iter()
+            .position(|l| l.starts_with('└'))
+            .expect("embedding box bottom border");
+        assert_eq!(
+            lines[embed_bottom + 1],
+            "",
+            "exactly one blank line after the embedding box: {s}"
+        );
+        assert!(
+            lines[embed_bottom + 2].starts_with("┌ Rerankers "),
+            "reranker box follows the blank line directly: {s}"
+        );
+    }
+
+    #[test]
+    fn list_text_no_model_warning_stays_attached_to_embedding_box() {
+        // With no downloaded model, the ⚠️ guidance line sits directly under
+        // the embedding box's bottom border (before the blank line + reranker
+        // box) — its position relative to its box is unchanged by the footer
+        // removal.
+        let cache_dir = PathBuf::from("/tmp/onebrain-test-cache/empty-collection");
+        let models: Vec<ModelListEntry> = model_registry()
+            .iter()
+            .map(|m| ModelListEntry::from_info(m, "bge-m3", &cache_dir))
+            .collect();
+        let rerankers = empty_reranker_rows(&cache_dir);
+        let env = Envelope::ok(
+            "search.model.list",
+            None,
+            ModelListData {
+                models,
+                rerankers,
+                cache_dir,
+            },
+        );
+        let s = render_list_text(&env, false);
+        let lines: Vec<&str> = s.lines().collect();
+        let embed_bottom = lines
+            .iter()
+            .position(|l| l.starts_with('└'))
+            .expect("embedding box bottom border");
+        assert!(
+            lines[embed_bottom + 1].starts_with("⚠️  No model downloaded"),
+            "warning directly under the embedding box: {s}"
+        );
+        assert_eq!(lines[embed_bottom + 2], "", "blank line after warning: {s}");
+        assert!(
+            lines[embed_bottom + 3].starts_with("┌ Rerankers "),
+            "reranker box after the blank line: {s}"
+        );
+    }
+
     /// The embedding-model box's lines only — the render now appends a
     /// second (reranker) box below it (Task 6), so tests asserting on ONE
     /// box's structure must scope to it rather than the whole render. Ends
     /// right after the embed-model box's own bottom border (before the
-    /// "Cache dir:" footer / no-model guidance / reranker section).
+    /// no-model guidance / reranker section).
     fn embed_box_lines(s: &str) -> Vec<&str> {
         let mut out = Vec::new();
         for line in s.lines() {
@@ -998,7 +1077,7 @@ mod tests {
             lines[0]
         );
         assert!(lines[0].ends_with('┐'), "top-right corner: {}", lines[0]);
-        // Bottom border closes the box; the Cache dir footer stays OUTSIDE.
+        // Bottom border closes the box.
         let bottom = lines[lines.len() - 1];
         assert!(
             bottom.starts_with('└') && bottom.ends_with('┘'),
@@ -1007,10 +1086,6 @@ mod tests {
         assert!(
             bottom.chars().filter(|c| *c == '─').count() > 0,
             "bottom rule dashes: {bottom}"
-        );
-        assert!(
-            s.lines().any(|l| l.starts_with("📁  Cache dir:")),
-            "footer present outside the box: {s:?}"
         );
         // Every box line — borders and │-wrapped rows — has the same display
         // width, so the right border stays flush despite ✓ ● — cells.

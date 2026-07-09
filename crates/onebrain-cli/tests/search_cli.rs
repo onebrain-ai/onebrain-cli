@@ -523,11 +523,13 @@ fn search_model_bare_non_tty_text_mode_renders_static_table() {
     );
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // The static-list header + rows + footer, not a TUI or a hint string.
+    // The static-list header + rows, not a TUI or a hint string. The
+    // `Cache dir:` footer was dropped from the text render (display-only;
+    // `cache_dir` still rides the JSON payload).
     assert!(stdout.contains("MODEL"));
     assert!(stdout.contains("DOWNLOADED"));
     assert!(stdout.contains("multilingual-e5-small"));
-    assert!(stdout.contains("📁  Cache dir:"));
+    assert!(!stdout.contains("Cache dir"));
 }
 
 #[test]
