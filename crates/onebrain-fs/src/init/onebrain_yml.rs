@@ -31,14 +31,166 @@ use std::path::Path;
 /// constant by a cross-crate test in `onebrain-cli` (`init` command tests).
 pub const TEMPLATE_RERANK_MIN_SCORE: &str = "0.30";
 
-/// Build the onebrain.yml text content for the given preset. Pure function —
-/// useful for unit testing without touching the filesystem.
-pub fn render_onebrain_yml(preset: SchedulePreset) -> Result<String, FsError> {
+/// One template-known config key: its path segments and the exact
+/// self-documentation comment line the fresh template writes directly above
+/// it (leading `# ` included · indentation excluded).
+///
+/// Single source of truth shared by [`render_onebrain_yml`] (which
+/// interpolates these very strings into the template) and doctor's `--fix`
+/// comment-backfill recipe (which inserts them above uncommented keys in
+/// EXISTING configs) — the two can never drift.
+#[derive(Debug, Clone)]
+pub struct ConfigKeyDoc {
+    /// Key path, e.g. `["search", "reranker", "min_score"]`.
+    pub segments: &'static [&'static str],
+    /// The full comment line, e.g. `# Rerank stage on/off · default: true`.
+    pub comment: String,
+}
+
+/// The self-documentation table: every key the template knows, with its
+/// comment. Defaults are interpolated from the same `onebrain_core` default
+/// fns the runtime uses.
+pub fn config_key_docs() -> Vec<ConfigKeyDoc> {
     let channels = VALID_UPDATE_CHANNELS.join(" | ");
     let f = VaultFolders::default();
     let cp = CheckpointPolicy::default();
     let sc = SearchConfig::default();
     let rr = RerankerConfig::default();
+    let doc =
+        |segments: &'static [&'static str], comment: String| ConfigKeyDoc { segments, comment };
+    vec![
+        doc(
+            &["update_channel"],
+            format!(
+                "# Release channel for plugin updates: {channels} · default: {DEFAULT_UPDATE_CHANNEL}"
+            ),
+        ),
+        doc(
+            &["folders", "inbox"],
+            format!("# Raw braindumps and quick captures · default: {}", f.inbox),
+        ),
+        doc(
+            &["folders", "projects"],
+            format!(
+                "# Active projects with tasks and notes · default: {}",
+                f.projects
+            ),
+        ),
+        doc(
+            &["folders", "areas"],
+            format!(
+                "# Ongoing responsibilities (health, finances, ...) · default: {}",
+                f.areas
+            ),
+        ),
+        doc(
+            &["folders", "knowledge"],
+            format!(
+                "# Your own synthesized thinking and insights · default: {}",
+                f.knowledge
+            ),
+        ),
+        doc(
+            &["folders", "resources"],
+            format!(
+                "# External info: research output, summaries, reference · default: {}",
+                f.resources
+            ),
+        ),
+        doc(
+            &["folders", "agent"],
+            format!("# AI-specific context and memory · default: {}", f.agent),
+        ),
+        doc(
+            &["folders", "archive"],
+            format!(
+                "# Completed projects and archived areas · default: {}",
+                f.archive
+            ),
+        ),
+        doc(
+            &["folders", "logs"],
+            format!(
+                "# Session logs, checkpoints, and system logs · default: {}",
+                f.logs
+            ),
+        ),
+        doc(
+            &["checkpoint", "messages"],
+            format!(
+                "# Message count between checkpoint emissions (>= 1) · default: {}",
+                cp.messages
+            ),
+        ),
+        doc(
+            &["checkpoint", "minutes"],
+            format!(
+                "# Minutes between checkpoint emissions (>= 1) · default: {}",
+                cp.minutes
+            ),
+        ),
+        doc(
+            &["search", "collection"],
+            "# Collection name binding this vault to its index · default: unset".to_string(),
+        ),
+        doc(
+            &["search", "embed_model"],
+            format!(
+                "# Embedding model, from `onebrain search model list` · default: {}",
+                sc.embed_model
+            ),
+        ),
+        doc(
+            &["search", "default_top_k"],
+            format!(
+                "# Result count when a caller doesn't pass top_k (>= 1) · default: {}",
+                sc.default_top_k
+            ),
+        ),
+        doc(
+            &["search", "reranker", "enabled"],
+            format!("# Rerank stage on/off · default: {}", rr.enabled),
+        ),
+        doc(
+            &["search", "reranker", "model"],
+            format!(
+                "# Reranker model, from `onebrain search model list` · default: {}",
+                rr.model
+            ),
+        ),
+        doc(
+            &["search", "reranker", "min_candidates"],
+            format!(
+                "# Minimum candidate pool to rerank, a floor not a ceiling (>= 1) · default: {}",
+                rr.min_candidates
+            ),
+        ),
+        doc(
+            &["search", "reranker", "min_score"],
+            format!(
+                "# Score gate: hits below this calibrated 0-1 score are dropped · default: {TEMPLATE_RERANK_MIN_SCORE}"
+            ),
+        ),
+    ]
+}
+
+/// Build the onebrain.yml text content for the given preset. Pure function —
+/// useful for unit testing without touching the filesystem. Every per-key
+/// comment line is interpolated from [`config_key_docs`], so template and
+/// backfill share one definition.
+pub fn render_onebrain_yml(preset: SchedulePreset) -> Result<String, FsError> {
+    let f = VaultFolders::default();
+    let cp = CheckpointPolicy::default();
+    let sc = SearchConfig::default();
+    let rr = RerankerConfig::default();
+    let docs = config_key_docs();
+    let c = |segments: &[&str]| -> String {
+        docs.iter()
+            .find(|d| d.segments == segments)
+            .expect("every template key has a doc entry")
+            .comment
+            .clone()
+    };
     let mut out = format!(
         "\
 # onebrain.yml — vault configuration.
@@ -47,56 +199,74 @@ pub fn render_onebrain_yml(preset: SchedulePreset) -> Result<String, FsError> {
 # out-of-range tunables to their defaults (folders.* and search.collection
 # are reported only — never auto-reset).
 
-# Release channel for plugin updates: {channels} · default: {DEFAULT_UPDATE_CHANNEL}
+{c_update_channel}
 update_channel: {DEFAULT_UPDATE_CHANNEL}
 
 # Vault folder layout (PARA). Renaming a folder here does NOT move notes on
 # disk — doctor reports problems but never rewrites these values.
 folders:
-  # Raw braindumps and quick captures · default: {inbox}
+  {c_inbox}
   inbox: {inbox}
-  # Active projects with tasks and notes · default: {projects}
+  {c_projects}
   projects: {projects}
-  # Ongoing responsibilities (health, finances, ...) · default: {areas}
+  {c_areas}
   areas: {areas}
-  # Your own synthesized thinking and insights · default: {knowledge}
+  {c_knowledge}
   knowledge: {knowledge}
-  # External info: research output, summaries, reference · default: {resources}
+  {c_resources}
   resources: {resources}
-  # AI-specific context and memory · default: {agent}
+  {c_agent}
   agent: {agent}
-  # Completed projects and archived areas · default: {archive}
+  {c_archive}
   archive: {archive}
-  # Session logs, checkpoints, and system logs · default: {logs}
+  {c_logs}
   logs: {logs}
 
 # Stop-hook checkpoint thresholds (when to snapshot session context).
 checkpoint:
-  # Message count between checkpoint emissions (>= 1) · default: {messages}
+  {c_messages}
   messages: {messages}
-  # Minutes between checkpoint emissions (>= 1) · default: {minutes}
+  {c_minutes}
   minutes: {minutes}
 
 # Native search (BM25 + vector + Tier-2 reranker).
 search:
-  # Collection name binding this vault to its index · default: unset
+  {c_collection}
   # (leave commented to keep search disabled — `onebrain search reindex` sets it)
   # collection: <set by onebrain search reindex>
-  # Embedding model, from `onebrain search model list` · default: {embed_model}
+  {c_embed_model}
   embed_model: {embed_model}
-  # Result count when a caller doesn't pass top_k (>= 1) · default: {default_top_k}
+  {c_default_top_k}
   default_top_k: {default_top_k}
   # Tier-2 cross-encoder reranker (re-scores fused candidates for relevance).
   reranker:
-    # Rerank stage on/off · default: {enabled}
+    {c_enabled}
     enabled: {enabled}
-    # Reranker model, from `onebrain search model list` · default: {model}
+    {c_model}
     model: {model}
-    # Minimum candidate pool to rerank, a floor not a ceiling (>= 1) · default: {min_candidates}
+    {c_min_candidates}
     min_candidates: {min_candidates}
-    # Score gate: hits below this calibrated 0-1 score are dropped · default: {min_score}
+    {c_min_score}
     min_score: {min_score}
 ",
+        c_update_channel = c(&["update_channel"]),
+        c_inbox = c(&["folders", "inbox"]),
+        c_projects = c(&["folders", "projects"]),
+        c_areas = c(&["folders", "areas"]),
+        c_knowledge = c(&["folders", "knowledge"]),
+        c_resources = c(&["folders", "resources"]),
+        c_agent = c(&["folders", "agent"]),
+        c_archive = c(&["folders", "archive"]),
+        c_logs = c(&["folders", "logs"]),
+        c_messages = c(&["checkpoint", "messages"]),
+        c_minutes = c(&["checkpoint", "minutes"]),
+        c_collection = c(&["search", "collection"]),
+        c_embed_model = c(&["search", "embed_model"]),
+        c_default_top_k = c(&["search", "default_top_k"]),
+        c_enabled = c(&["search", "reranker", "enabled"]),
+        c_model = c(&["search", "reranker", "model"]),
+        c_min_candidates = c(&["search", "reranker", "min_candidates"]),
+        c_min_score = c(&["search", "reranker", "min_score"]),
         inbox = f.inbox,
         projects = f.projects,
         areas = f.areas,
@@ -288,6 +458,37 @@ mod tests {
             parsed.get("update_channel").and_then(|v| v.as_str()),
             Some(crate::vault_sync::DEFAULT_UPDATE_CHANNEL)
         );
+    }
+
+    #[test]
+    fn template_comment_above_each_key_is_exactly_the_doc_table_entry() {
+        // The backfill recipe inserts `config_key_docs` comments into
+        // existing configs; the template interpolates the same strings. This
+        // pins the pairing per key: the line directly above each ACTIVE key
+        // is exactly the table's comment (indentation aside). `collection`
+        // is a commented placeholder — its doc comment appears above the
+        // placeholder block instead.
+        let yaml = render_onebrain_yml(SchedulePreset::Skip).unwrap();
+        let lines: Vec<&str> = yaml.lines().collect();
+        for doc in config_key_docs() {
+            let key = doc.segments.last().unwrap();
+            if doc.segments == ["search", "collection"] {
+                assert!(
+                    yaml.contains(&format!("  {}\n", doc.comment)),
+                    "collection doc comment missing:\n{yaml}"
+                );
+                continue;
+            }
+            let idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with(&format!("{key}:")))
+                .unwrap_or_else(|| panic!("key {key} not in template"));
+            assert_eq!(
+                lines[idx - 1].trim_start(),
+                doc.comment,
+                "comment above {key} drifted from config_key_docs"
+            );
+        }
     }
 
     #[test]

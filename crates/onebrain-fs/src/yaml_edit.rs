@@ -13,24 +13,22 @@
 //! delegates here). The remaining serde-based structural writers are tracked
 //! in issue #200.
 
-/// Set `segments`' value to `value` in raw config text via a
-/// comment-preserving line edit. `segments` is the key path
-/// (`["search", "reranker", "min_score"]`); parents are located as
-/// block-form section headers by walking each block's extent, and only the
-/// final key line's VALUE portion is replaced.
-///
-/// Returns `None` (caller decides the fallback) when a parent is an inline
-/// mapping (`checkpoint: {messages: 0}`), the key line can't be found, or
-/// the shape is otherwise not understood — never guesses.
-pub fn set_value(text: &str, segments: &[&str], value: &str) -> Option<String> {
-    let (last, parents) = segments.split_last()?;
-    let indent_of = |l: &str| l.len() - l.trim_start().len();
-    let is_blank = |l: &str| l.trim().is_empty();
-    let is_comment = |l: &str| l.trim_start().starts_with('#');
+fn indent_of(l: &str) -> usize {
+    l.len() - l.trim_start().len()
+}
+fn is_blank(l: &str) -> bool {
+    l.trim().is_empty()
+}
+fn is_comment(l: &str) -> bool {
+    l.trim_start().starts_with('#')
+}
 
-    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
-    let ends_with_newline = text.ends_with('\n');
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+/// Locate the line index of the key at `segments` by walking block-form
+/// section headers. Returns `None` when a parent is an inline mapping
+/// (`checkpoint: {messages: 0}`), the key line can't be found, or the shape
+/// is otherwise not understood — never guesses.
+fn locate(lines: &[String], segments: &[&str]) -> Option<usize> {
+    let (last, parents) = segments.split_last()?;
 
     // Window (start..end) of the current block; top level = whole file with
     // parent indent -1 (any indent 0 line qualifies as a child).
@@ -50,7 +48,7 @@ pub fn set_value(text: &str, segments: &[&str], value: &str) -> Option<String> {
 
     for seg in parents {
         let header = format!("{seg}:");
-        let level = child_indent(&lines, start, end)?;
+        let level = child_indent(lines, start, end)?;
         // The section header: first non-blank, non-comment line in the window
         // sitting exactly at the direct-child level and starting with `seg:`.
         let idx = (start..end).find(|&i| {
@@ -89,17 +87,51 @@ pub fn set_value(text: &str, segments: &[&str], value: &str) -> Option<String> {
 
     // The key line inside the final window, at the direct-child level only.
     let key_prefix = format!("{last}:");
-    let level = child_indent(&lines, start, end)?;
+    let level = child_indent(lines, start, end)?;
     if (level as isize) <= parent_indent {
         return None;
     }
-    let idx = (start..end).find(|&i| {
+    (start..end).find(|&i| {
         let l = &lines[i];
         !is_blank(l)
             && !is_comment(l)
             && indent_of(l) == level
             && l.trim_start().starts_with(&key_prefix)
-    })?;
+    })
+}
+
+/// Split `text` into lines plus its newline style and trailing-newline flag,
+/// and re-join edits with both preserved.
+fn split(text: &str) -> (Vec<String>, &'static str, bool) {
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    (
+        text.lines().map(str::to_string).collect(),
+        newline,
+        text.ends_with('\n'),
+    )
+}
+
+fn join(lines: Vec<String>, newline: &str, ends_with_newline: bool) -> String {
+    let mut out = lines.join(newline);
+    if ends_with_newline {
+        out.push_str(newline);
+    }
+    out
+}
+
+/// Set `segments`' value to `value` in raw config text via a
+/// comment-preserving line edit. `segments` is the key path
+/// (`["search", "reranker", "min_score"]`); parents are located as
+/// block-form section headers by walking each block's extent, and only the
+/// final key line's VALUE portion is replaced.
+///
+/// Returns `None` (caller decides the fallback) when [`locate`] can't
+/// address the key.
+pub fn set_value(text: &str, segments: &[&str], value: &str) -> Option<String> {
+    let (mut lines, newline, ends_with_newline) = split(text);
+    let idx = locate(&lines, segments)?;
+    let last = segments.last()?;
+    let key_prefix = format!("{last}:");
 
     let line = &lines[idx];
     let indent = &line[..indent_of(line)];
@@ -117,12 +149,35 @@ pub fn set_value(text: &str, segments: &[&str], value: &str) -> Option<String> {
         _ => "",
     };
     lines[idx] = format!("{indent}{last}: {value}{comment_suffix}");
+    Some(join(lines, newline, ends_with_newline))
+}
 
-    let mut out = lines.join(newline);
-    if ends_with_newline {
-        out.push_str(newline);
+/// True when the key at `segments` exists (addressable by [`locate`]) AND
+/// the line directly above it is not a comment — i.e. the key lacks
+/// self-documentation. Absent/unaddressable keys return `false` (nothing to
+/// document).
+pub fn key_lacks_comment(text: &str, segments: &[&str]) -> bool {
+    let (lines, _, _) = split(text);
+    match locate(&lines, segments) {
+        Some(idx) => idx == 0 || !is_comment(&lines[idx - 1]),
+        None => false,
     }
-    Some(out)
+}
+
+/// Insert `comment` (a full `# …` line, indentation excluded) directly above
+/// the key at `segments`, matching the key line's indentation. Returns
+/// `None` — no change — when the key can't be located OR the line directly
+/// above it is already a comment (the user's own comments always win; never
+/// replaced, never deduped).
+pub fn insert_comment_above(text: &str, segments: &[&str], comment: &str) -> Option<String> {
+    let (mut lines, newline, ends_with_newline) = split(text);
+    let idx = locate(&lines, segments)?;
+    if idx > 0 && is_comment(&lines[idx - 1]) {
+        return None;
+    }
+    let indent = lines[idx][..indent_of(&lines[idx])].to_string();
+    lines.insert(idx, format!("{indent}{comment}"));
+    Some(join(lines, newline, ends_with_newline))
 }
 
 /// Append a top-level `key: value` line to `text`, preserving the file's

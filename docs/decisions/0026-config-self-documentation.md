@@ -117,9 +117,19 @@ first touched the file.
   onto `yaml_edit` is deferred to issue #200.
 - Doctor is now 12 checks (was 11); `config-values` renders in the ⚙️ Config
   section as "config values".
-- Existing vaults keep their uncommented files until scaffolded anew —
-  `doctor --fix` deliberately does NOT rewrite a healthy config to add
-  comments (minimal footprint; the reference doc covers every key instead).
+- **Existing vaults get the self-documentation via `doctor --fix`**
+  (sanctioned scope addition, 2026-07-09). The `config-values` check counts
+  template-known keys that exist without a comment line directly above them
+  and reports "N undocumented key(s)" (read-only — zero writes on a plain
+  run); `--fix` inserts the template's own `# <what it is> · default: …`
+  line above each, at the key's indentation. Guarantees: a key under the
+  user's OWN comment is never touched (no replace, no dedupe), missing keys
+  are never added (absent = defaults by design; the `# collection:`
+  placeholder is never injected next to an active `collection:`), nothing
+  is reordered, and the pass is idempotent. Single source of truth: the
+  comment strings come from `config_key_docs()` in `onebrain-fs`, the SAME
+  table `render_onebrain_yml` interpolates into the fresh template — the
+  two cannot drift (plus a template↔table pin test).
 
 ## Related
 

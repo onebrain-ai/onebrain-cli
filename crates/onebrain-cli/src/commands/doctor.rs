@@ -577,20 +577,59 @@ fn config_values_check(vault_root: &Path) -> DoctorResult {
             "skipped — invalid YAML (see onebrain.yml-keys)",
         );
     };
-    if findings.is_empty() {
+    // Self-documentation coverage: template-known keys that exist in this
+    // config but carry no comment line directly above them (`--fix`
+    // backfills the template's own comment; keys under a user comment are
+    // never counted — the user's comments win). Read-only here: zero writes
+    // on a plain doctor run.
+    let undocumented = undocumented_keys(&text);
+    if findings.is_empty() && undocumented.is_empty() {
         return DoctorResult::ok(CONFIG_VALUES_CHECK, "all values in range");
     }
-    let n = findings.len();
-    let details: Vec<String> = findings.iter().map(ConfigFinding::detail_line).collect();
+    let mut message_parts: Vec<String> = Vec::new();
+    let mut details: Vec<String> = findings.iter().map(ConfigFinding::detail_line).collect();
+    if !findings.is_empty() {
+        message_parts.push(format!("{} invalid value(s)", findings.len()));
+    }
+    if !undocumented.is_empty() {
+        message_parts.push(format!("{} undocumented key(s)", undocumented.len()));
+        details.push(format!(
+            "{} key(s) lack self-documentation comments — doctor --fix will add them: {}",
+            undocumented.len(),
+            undocumented.join(", ")
+        ));
+    }
     let any_resettable = findings.iter().any(|f| f.resettable);
-    let mut r = DoctorResult::warn(CONFIG_VALUES_CHECK, format!("{n} invalid value(s)"))
-        .with_details(details);
-    if any_resettable {
-        r = r.with_hint(
-            "Run onebrain doctor --fix to reset out-of-range tunables to their defaults",
-        );
+    let mut r =
+        DoctorResult::warn(CONFIG_VALUES_CHECK, message_parts.join(" · ")).with_details(details);
+    let hint = match (any_resettable, !undocumented.is_empty()) {
+        (true, true) => Some(
+            "Run onebrain doctor --fix to reset out-of-range tunables and add the missing self-documentation comments",
+        ),
+        (true, false) => {
+            Some("Run onebrain doctor --fix to reset out-of-range tunables to their defaults")
+        }
+        (false, true) => {
+            Some("Run onebrain doctor --fix to add the missing self-documentation comments")
+        }
+        (false, false) => None,
+    };
+    if let Some(h) = hint {
+        r = r.with_hint(h);
     }
     r
+}
+
+/// Dotted paths of template-known keys that exist in `text` without a
+/// comment line directly above them — the `--fix` comment-backfill targets.
+/// Missing keys are never listed (absent = defaults by design), and keys the
+/// line editor can't address (inline mappings) are skipped.
+fn undocumented_keys(text: &str) -> Vec<String> {
+    onebrain_fs::config_key_docs()
+        .iter()
+        .filter(|d| onebrain_fs::yaml_edit::key_lacks_comment(text, d.segments))
+        .map(|d| d.segments.join("."))
+        .collect()
 }
 
 /// Native-search index check (`check = "search"`). Read-only and
@@ -995,7 +1034,9 @@ fn planned_action(result: &DoctorResult) -> Option<&'static str> {
         "plugin-files" => Some("re-download plugin files from upstream"),
         "folders" => Some("create the missing standard folders"),
         "onebrain.yml-keys" => Some("backfill missing onebrain.yml keys"),
-        "config-values" => Some("reset out-of-range values to their documented defaults"),
+        "config-values" => {
+            Some("reset out-of-range values to defaults · add missing self-documentation comments")
+        }
         "claude-settings" => Some("remove the stale marketplace entry"),
         "plugin-cache" => Some("remove the stale plugin cache"),
         "vault-config-migration" => Some("migrate vault.yml → onebrain.yml"),
@@ -1589,8 +1630,10 @@ fn fix_config_values(vault_root: &Path, json: bool) -> FixOutcome {
     let Some(findings) = collect_config_findings(&text) else {
         return FixOutcome::Failed(format!("{filename} is not a YAML mapping"));
     };
-    if findings.is_empty() {
-        return FixOutcome::Fixed(format!("{filename}: all values already in range"));
+    if findings.is_empty() && undocumented_keys(&text).is_empty() {
+        return FixOutcome::Fixed(format!(
+            "{filename}: all values already in range and documented"
+        ));
     }
 
     let mut current = text;
@@ -1615,7 +1658,26 @@ fn fix_config_values(vault_root: &Path, json: bool) -> FixOutcome {
         }
     }
 
-    if !resets.is_empty() {
+    // Comment backfill for existing vaults (sanctioned scope, 2026-07-09):
+    // insert the template's own `# … · default: …` line above every
+    // template-known key that exists here without one. Runs AFTER the value
+    // resets so the inserted comments sit above the corrected lines. Keys
+    // under a user's own comment are skipped (`insert_comment_above` refuses
+    // — user comments win); missing keys are never added.
+    let mut comments_added: Vec<String> = Vec::new();
+    for doc in onebrain_fs::config_key_docs() {
+        if !onebrain_fs::yaml_edit::key_lacks_comment(&current, doc.segments) {
+            continue;
+        }
+        if let Some(updated) =
+            onebrain_fs::yaml_edit::insert_comment_above(&current, doc.segments, &doc.comment)
+        {
+            current = updated;
+            comments_added.push(doc.segments.join("."));
+        }
+    }
+
+    if !resets.is_empty() || !comments_added.is_empty() {
         // Defense-in-depth backup before the write, mirroring every other
         // config-writing recipe — even though this edit preserves comments.
         if let Err(e) = onebrain_fs::backup_config_file(&path) {
@@ -1642,6 +1704,13 @@ fn fix_config_values(vault_root: &Path, json: bool) -> FixOutcome {
     }
     if reindex_required {
         parts.push("embedding model reset — run `onebrain search reindex`".to_string());
+    }
+    if !comments_added.is_empty() {
+        parts.push(format!(
+            "added {} self-documentation comment(s): {}",
+            comments_added.len(),
+            comments_added.join(", ")
+        ));
     }
     if !untouched.is_empty() {
         parts.push(format!(
@@ -4466,15 +4535,42 @@ mod tests {
         let r = config_values_check(d.path());
         assert_eq!(r.status, DoctorStatus::Ok);
         assert!(r.message.contains("skipped"), "{}", r.message);
-        // In-range values → ok.
-        fs::write(d.path().join("onebrain.yml"), "update_channel: next\n").unwrap();
+        // In-range, documented values → ok. (An in-range key WITHOUT a doc
+        // comment is the undocumented-keys warn — covered below.)
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "# channel comment\nupdate_channel: next\n",
+        )
+        .unwrap();
         let r = config_values_check(d.path());
         assert_eq!(r.status, DoctorStatus::Ok);
         assert_eq!(r.message, "all values in range");
-        // Out-of-range → warn with a per-key detail line + fix hint.
+        // In-range but UNDOCUMENTED key → warn with the backfill detail +
+        // comment-specific hint (still zero writes — read-only check).
+        fs::write(d.path().join("onebrain.yml"), "update_channel: next\n").unwrap();
+        let r = config_values_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Warn);
+        assert_eq!(r.message, "1 undocumented key(s)");
+        assert!(
+            r.details
+                .iter()
+                .any(|l| l.contains("lack self-documentation") && l.contains("update_channel")),
+            "{:?}",
+            r.details
+        );
+        assert!(
+            r.hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("add the missing self-documentation comments"),
+            "{:?}",
+            r.hint
+        );
+        // Out-of-range → warn with a per-key detail line + fix hint (the key
+        // is commented here so only the value finding fires).
         fs::write(
             d.path().join("onebrain.yml"),
-            "checkpoint:\n  messages: 0\n",
+            "checkpoint:\n  # messages comment\n  messages: 0\n",
         )
         .unwrap();
         let r = config_values_check(d.path());
@@ -4488,8 +4584,30 @@ mod tests {
             r.details
         );
         assert!(r.hint.as_deref().unwrap_or("").contains("doctor --fix"));
-        // Report-only-only findings carry no --fix hint (nothing to auto-reset).
-        fs::write(d.path().join("onebrain.yml"), "folders:\n  inbox: \"\"\n").unwrap();
+        // Invalid value AND undocumented key combine into one message.
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "checkpoint:\n  messages: 0\n",
+        )
+        .unwrap();
+        let r = config_values_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Warn);
+        assert_eq!(r.message, "1 invalid value(s) · 1 undocumented key(s)");
+        assert!(
+            r.hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("reset out-of-range tunables and add the missing"),
+            "{:?}",
+            r.hint
+        );
+        // Report-only findings (documented key) carry no reset wording — but
+        // an undocumented report-only key still gets the comment hint.
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "folders:\n  # inbox comment\n  inbox: \"\"\n",
+        )
+        .unwrap();
         let r = config_values_check(d.path());
         assert_eq!(r.status, DoctorStatus::Warn);
         assert!(r.hint.is_none(), "{:?}", r.hint);
@@ -4655,9 +4773,11 @@ mod tests {
     }
 
     #[test]
-    fn fix_config_values_clean_config_is_noop() {
+    fn fix_config_values_clean_documented_config_is_noop() {
+        // A fully-commented, in-range config (the fresh template) is the true
+        // no-op: byte-identical after --fix, "already" message.
         let d = tempdir().unwrap();
-        let clean = "update_channel: stable\n";
+        let clean = "# channel comment\nupdate_channel: stable\n";
         fs::write(d.path().join("onebrain.yml"), clean).unwrap();
         let outcome = fix_config_values(d.path(), false);
         let FixOutcome::Fixed(msg) = outcome else {
@@ -4666,5 +4786,119 @@ mod tests {
         assert!(msg.contains("already in range"), "msg: {msg}");
         let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert_eq!(after, clean);
+    }
+
+    #[test]
+    fn fix_config_values_backfills_template_comments_on_legacy_config() {
+        // Scope test (a): a bare legacy config gains the EXACT template
+        // comment above every known key; values and key order untouched.
+        let d = tempdir().unwrap();
+        let legacy = "update_channel: stable\n\
+             folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n\
+             checkpoint:\n  messages: 15\n  minutes: 30\n\
+             search:\n  collection: my-col\n  embed_model: multilingual-e5-small\n";
+        fs::write(d.path().join("onebrain.yml"), legacy).unwrap();
+        let outcome = fix_config_values(d.path(), false);
+        let FixOutcome::Fixed(msg) = outcome else {
+            panic!("expected Fixed, got: {outcome:?}");
+        };
+        assert!(
+            msg.contains("added 13 self-documentation comment(s)"),
+            "msg: {msg}"
+        );
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        // Every known present key now carries EXACTLY the template comment,
+        // sourced from the shared table.
+        for doc in onebrain_fs::config_key_docs() {
+            let key = doc.segments.last().unwrap();
+            // Keys not present in this legacy config are never added.
+            if doc.segments.join(".").starts_with("search.reranker")
+                || doc.segments == ["search", "default_top_k"]
+            {
+                assert!(
+                    !after
+                        .lines()
+                        .any(|l| l.trim_start().starts_with(&format!("{key}:"))),
+                    "absent key {key} must not be injected:\n{after}"
+                );
+                continue;
+            }
+            let lines: Vec<&str> = after.lines().collect();
+            let idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with(&format!("{key}:")))
+                .unwrap_or_else(|| panic!("{key} missing:\n{after}"));
+            assert_eq!(
+                lines[idx - 1].trim_start(),
+                doc.comment,
+                "comment above {key} must be the template's:\n{after}"
+            );
+        }
+        // Values + key order untouched.
+        assert!(after.contains("collection: my-col"), "{after}");
+        let key_order: Vec<&str> = after
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .collect();
+        let legacy_order: Vec<&str> = legacy
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .collect();
+        assert_eq!(key_order, legacy_order, "key lines must be untouched");
+        // Scope test (c): a user's own comment wins — and (d) idempotency:
+        // second run changes nothing.
+        let outcome = fix_config_values(d.path(), false);
+        let FixOutcome::Fixed(msg) = outcome else {
+            panic!("expected Fixed, got: {outcome:?}");
+        };
+        assert!(msg.contains("already in range"), "msg: {msg}");
+        let after2 = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after2, after, "second --fix run must be byte-identical");
+    }
+
+    #[test]
+    fn fix_config_values_never_replaces_user_comments() {
+        // Scope test (b): a key already under the user's own comment is left
+        // alone — no insertion, no dedupe, no replacement.
+        let d = tempdir().unwrap();
+        let cfg = "# my own words about the channel\nupdate_channel: stable\n";
+        fs::write(d.path().join("onebrain.yml"), cfg).unwrap();
+        let outcome = fix_config_values(d.path(), false);
+        let FixOutcome::Fixed(msg) = outcome else {
+            panic!("expected Fixed, got: {outcome:?}");
+        };
+        assert!(msg.contains("already in range"), "msg: {msg}");
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after, cfg);
+    }
+
+    #[test]
+    fn fix_config_values_reset_and_backfill_in_one_run() {
+        // Scope test (d): a value reset and the comment backfill land in the
+        // same run, one report.
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "update_channel: stable\ncheckpoint:\n  messages: 0\n",
+        )
+        .unwrap();
+        let outcome = fix_config_values(d.path(), false);
+        let FixOutcome::Fixed(msg) = outcome else {
+            panic!("expected Fixed, got: {outcome:?}");
+        };
+        assert!(msg.contains("checkpoint.messages → 15"), "msg: {msg}");
+        assert!(msg.contains("self-documentation comment(s)"), "msg: {msg}");
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert!(after.contains("messages: 15"), "{after}");
+        // The backfilled comment sits above the CORRECTED value line.
+        let lines: Vec<&str> = after.lines().collect();
+        let idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("messages:"))
+            .unwrap();
+        assert!(
+            lines[idx - 1].trim_start().starts_with('#') && lines[idx - 1].contains("default: 15"),
+            "{after}"
+        );
     }
 }

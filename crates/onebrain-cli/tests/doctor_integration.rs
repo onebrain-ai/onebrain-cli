@@ -174,15 +174,18 @@ fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
     let cache = tempdir().unwrap();
     write_minimal_vault(vault.path());
     // All-green needs the CANONICAL config filename (a legacy vault.yml would
-    // trip the vault-config-migration warn).
-    let legacy = vault.path().join("vault.yml");
-    let existing = std::fs::read_to_string(&legacy).unwrap();
-    std::fs::remove_file(&legacy).unwrap();
-    std::fs::write(
-        vault.path().join("onebrain.yml"),
-        format!("search:\n  collection: doctor-it-green\n{existing}"),
-    )
-    .unwrap();
+    // trip the vault-config-migration warn) and, since v3.4.8, a fully
+    // self-documented config (uncommented keys are a config-values warn that
+    // --fix repairs) — so use the commented template with the collection
+    // placeholder activated.
+    std::fs::remove_file(vault.path().join("vault.yml")).unwrap();
+    let template = onebrain_fs::render_onebrain_yml(onebrain_fs::SchedulePreset::Skip).unwrap();
+    let config = template.replace(
+        "  # collection: <set by onebrain search reindex>",
+        "  collection: doctor-it-green",
+    );
+    assert!(config.contains("collection: doctor-it-green"), "{config}");
+    std::fs::write(vault.path().join("onebrain.yml"), config).unwrap();
 
     // Empty-vault reindex (no docs → no model download) + a fabricated
     // downloaded-model dir for the default embedding model and the default
@@ -999,20 +1002,39 @@ fn doctor_flags_out_of_range_config_values() {
 fn doctor_config_values_in_range_reports_ok() {
     let d = tempdir().unwrap();
     let cache = tempdir().unwrap();
+    // Every key carries a (user) comment so the assertion isolates VALUE
+    // validation from the undocumented-keys warn.
     vault_with_config(
         d.path(),
-        &format!(
-            "update_channel: next\n\
-             {FULL_FOLLDERS}\
-             checkpoint:\n  \
-               messages: 20\n  \
-               minutes: 45\n\
-             search:\n  \
-               default_top_k: 25\n  \
-               reranker:\n    \
-                 min_score: 0.5\n",
-            FULL_FOLLDERS = FULL_FOLDERS_BLOCK
-        ),
+        "# c\nupdate_channel: next\n\
+         folders:\n  \
+           # c\n  \
+           inbox: 00-inbox\n  \
+           # c\n  \
+           projects: 01-projects\n  \
+           # c\n  \
+           areas: 02-areas\n  \
+           # c\n  \
+           knowledge: 03-knowledge\n  \
+           # c\n  \
+           resources: 04-resources\n  \
+           # c\n  \
+           agent: 05-agent\n  \
+           # c\n  \
+           archive: 06-archive\n  \
+           # c\n  \
+           logs: 07-logs\n\
+         checkpoint:\n  \
+           # c\n  \
+           messages: 20\n  \
+           # c\n  \
+           minutes: 45\n\
+         search:\n  \
+           # c\n  \
+           default_top_k: 25\n  \
+           reranker:\n    \
+             # c\n    \
+             min_score: 0.5\n",
     );
     let out = run_doctor_json(d.path(), cache.path());
     let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
@@ -1317,4 +1339,86 @@ fn doctor_fix_text_mode_partial_outcome_renders_distinct_glyph() {
         cfg.contains("checkpoint: {messages: 0}"),
         "inline shape untouched: {cfg}"
     );
+}
+
+/// End-to-end comment backfill for an EXISTING (legacy, uncommented) vault:
+/// plain doctor reports the undocumented keys read-only; `--fix` inserts the
+/// template's comments; the next plain doctor is clean and a second `--fix`
+/// is byte-identical (idempotent).
+#[cfg(unix)]
+#[test]
+fn doctor_fix_backfills_comments_on_legacy_vault_end_to_end() {
+    let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let legacy = format!(
+        "update_channel: stable\n\
+         {FULL_FOLDERS_BLOCK}\
+         checkpoint:\n  \
+           messages: 15\n  \
+           minutes: 30\n"
+    );
+    vault_with_config(d.path(), &legacy);
+
+    // Plain doctor: discovers, never writes.
+    let out = run_doctor_json(d.path(), cache.path());
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let row = doc["checks"]
+        .as_array()
+        .expect("checks[]")
+        .iter()
+        .find(|c| c["check"] == "config-values")
+        .expect("config-values row")
+        .clone();
+    assert_eq!(row["status"], "warn", "row: {row}");
+    assert!(
+        row["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("undocumented key(s)"),
+        "row: {row}"
+    );
+    let cfg_after_plain = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    assert!(
+        cfg_after_plain.starts_with(&legacy),
+        "plain doctor must not write (stats stamp appended only):\n{cfg_after_plain}"
+    );
+
+    // --fix: every known key gains the exact template comment.
+    let out = run_doctor_fix_json(d.path(), cache.path(), home.path());
+    assert!(
+        out.contains("self-documentation comment(s)"),
+        "fix must report the backfill: {out}"
+    );
+    let cfg = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    for doc_entry in onebrain_fs::config_key_docs() {
+        let key = doc_entry.segments.last().unwrap();
+        let lines: Vec<&str> = cfg.lines().collect();
+        let Some(idx) = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with(&format!("{key}:")))
+        else {
+            continue; // absent keys stay absent
+        };
+        assert_eq!(
+            lines[idx - 1].trim_start(),
+            doc_entry.comment,
+            "comment above {key}:\n{cfg}"
+        );
+    }
+    // Post-fix re-check row is clean.
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let row = doc["checks"]
+        .as_array()
+        .expect("checks[]")
+        .iter()
+        .find(|c| c["check"] == "config-values")
+        .expect("config-values row")
+        .clone();
+    assert_eq!(row["status"], "ok", "post-fix: {row}");
+
+    // Idempotency: a second --fix changes nothing.
+    let _ = run_doctor_fix_json(d.path(), cache.path(), home.path());
+    let cfg2 = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    assert_eq!(cfg2, cfg, "second --fix must be byte-identical");
 }

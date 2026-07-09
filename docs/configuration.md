@@ -19,6 +19,11 @@ Two safety nets back the comments:
   disk) and `search.collection` (changing it detaches the index) are
   report-only; edit them deliberately.
 
+**Existing vaults:** configs created before v3.4.8 have no comments —
+`onebrain doctor` reports the undocumented keys and `onebrain doctor --fix`
+inserts the same per-key comment lines the fresh template ships, without
+touching your values, your key order, or any comment you wrote yourself.
+
 Legacy note: v3.0 named this file `vault.yml`. The CLI still reads the old
 name with a deprecation warning; `onebrain doctor --fix` migrates it.
 
