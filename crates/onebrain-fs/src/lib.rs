@@ -19,11 +19,15 @@ pub mod run_skill;
 pub mod task;
 pub mod update;
 pub mod vault_sync;
+pub mod yaml_edit;
 
 pub use backup::{atomic_write_text, backup_config_file, persist_search_key, remove_search_key};
 pub use error::{FsError, Result};
 pub use harness::{detect_harness, detect_harnesses};
-pub use init::{run_init, InitOptions, InitResult, ScheduleEntry, SchedulePreset};
+pub use init::{
+    config_key_docs, render_onebrain_yml, run_init, ConfigKeyDoc, InitOptions, InitResult,
+    ScheduleEntry, SchedulePreset, TEMPLATE_RERANK_MIN_SCORE,
+};
 pub use migrate::{run_backfill_recapped, MigrateResult};
 pub use orphan::{scan_orphans, OrphanScanResult};
 pub use run_skill::{

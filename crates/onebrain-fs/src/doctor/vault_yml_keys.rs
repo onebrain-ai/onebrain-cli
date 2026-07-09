@@ -6,11 +6,15 @@
 //! - soft-required top-level keys (warnings: `update_channel`)
 //! - required `folders.*` sub-keys (errors)
 //! - `update_channel` enum value (errors)
-//! - `checkpoint.messages` / `checkpoint.minutes` numeric > 0 (warnings)
 //! - deprecated keys: `onebrain_version`, `method`, `runtime.harness` (warnings)
 //!
 //! Hint strings differ by which combination of errors/warnings fired — see
 //! the Bun branch logic for parity.
+//!
+//! v3.4.8: out-of-range VALUE validation (`checkpoint.messages/minutes > 0`
+//! and the `search.*` tunables) moved to the CLI-layer `config-values` check,
+//! whose `--fix` recipe resets values through a comment-preserving line
+//! editor. This check stays focused on key PRESENCE and shape.
 
 use crate::doctor::Check;
 use onebrain_core::{DoctorResult, VaultConfig};
@@ -99,31 +103,18 @@ impl Check for VaultYmlKeysCheck {
             }
         }
 
-        // update_channel value validation (only when present)
+        // update_channel value validation (only when present). Valid set is
+        // shared with the scaffold + the CLI `config-values` check.
         if let Some(uc) = raw.get(Value::String("update_channel".to_string())) {
-            let is_valid = matches!(uc.as_str(), Some("stable") | Some("next"));
+            let is_valid = uc
+                .as_str()
+                .is_some_and(|s| crate::vault_sync::VALID_UPDATE_CHANNELS.contains(&s));
             if !is_valid {
                 errors.push(format!(
-                    "invalid update_channel: {} (must be stable or next)",
-                    yaml_to_display(uc)
+                    "invalid update_channel: {} (must be {})",
+                    yaml_to_display(uc),
+                    crate::vault_sync::VALID_UPDATE_CHANNELS.join(" or ")
                 ));
-            }
-        }
-
-        // checkpoint.messages / checkpoint.minutes (warnings)
-        let checkpoint_map = raw
-            .get(Value::String("checkpoint".to_string()))
-            .and_then(|v| v.as_mapping());
-        if let Some(cp) = checkpoint_map {
-            if let Some(v) = cp.get(Value::String("messages".to_string())) {
-                if !is_positive_number(v) {
-                    warnings.push("checkpoint.messages should be a number > 0".to_string());
-                }
-            }
-            if let Some(v) = cp.get(Value::String("minutes".to_string())) {
-                if !is_positive_number(v) {
-                    warnings.push("checkpoint.minutes should be a number > 0".to_string());
-                }
             }
         }
 
@@ -204,25 +195,6 @@ impl Check for VaultYmlKeysCheck {
         }
 
         DoctorResult::ok(CHECK_NAME, "schema ok")
-    }
-}
-
-/// Match Bun's `typeof value === 'number' && value > 0`. We accept both
-/// integer and float YAML numbers; anything non-numeric or non-positive fails.
-fn is_positive_number(v: &Value) -> bool {
-    match v {
-        Value::Number(n) => {
-            if let Some(f) = n.as_f64() {
-                f > 0.0
-            } else if let Some(i) = n.as_i64() {
-                i > 0
-            } else if let Some(u) = n.as_u64() {
-                u > 0
-            } else {
-                false
-            }
-        }
-        _ => false,
     }
 }
 
@@ -461,21 +433,6 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_messages_zero_is_warning() {
-        let d = tempdir().unwrap();
-        write_yaml(
-            d.path(),
-            &format!("{}checkpoint:\n  messages: 0\n", valid_schema()),
-        );
-        let r = VaultYmlKeysCheck.run(d.path(), &cfg());
-        assert_eq!(r.status, DoctorStatus::Warn);
-        assert!(r
-            .details
-            .iter()
-            .any(|x| x == "checkpoint.messages should be a number > 0"));
-    }
-
-    #[test]
     fn clean_schema_is_ok() {
         let d = tempdir().unwrap();
         write_yaml(d.path(), valid_schema());
@@ -603,85 +560,6 @@ mod tests {
             r.hint.as_deref(),
             Some("Run onebrain doctor --fix to remove deprecated keys")
         );
-    }
-
-    // ── checkpoint.minutes ─────────────────────────────────────────────
-
-    #[test]
-    fn checkpoint_minutes_zero_is_warning() {
-        // Lines 122-127 — the `minutes` branch inside the checkpoint block
-        // is a distinct code path from the already-tested `messages` branch.
-        let d = tempdir().unwrap();
-        write_yaml(
-            d.path(),
-            &format!("{}checkpoint:\n  minutes: 0\n", valid_schema()),
-        );
-        let r = VaultYmlKeysCheck.run(d.path(), &cfg());
-        assert_eq!(r.status, DoctorStatus::Warn);
-        assert!(r
-            .details
-            .iter()
-            .any(|x| x == "checkpoint.minutes should be a number > 0"));
-    }
-
-    #[test]
-    fn checkpoint_both_messages_and_minutes_invalid_produces_two_warnings_with_no_hint() {
-        // Both fields zero → 2 warnings; neither deprecated nor missing soft
-        // key, so the warnings branch picks hint = None.
-        let d = tempdir().unwrap();
-        write_yaml(
-            d.path(),
-            &format!(
-                "{}checkpoint:\n  messages: 0\n  minutes: 0\n",
-                valid_schema()
-            ),
-        );
-        let r = VaultYmlKeysCheck.run(d.path(), &cfg());
-        assert_eq!(r.status, DoctorStatus::Warn);
-        let count = r
-            .details
-            .iter()
-            .filter(|x| x.contains("should be a number > 0"))
-            .count();
-        assert_eq!(count, 2, "expected exactly 2 checkpoint warnings");
-        // checkpoint-only warnings → hint = None (lines 186-188)
-        assert!(
-            r.hint.is_none(),
-            "checkpoint-only warnings must have no hint"
-        );
-    }
-
-    #[test]
-    fn checkpoint_messages_negative_is_warning() {
-        // Negative integers are not > 0; is_positive_number returns false via
-        // the f64 branch (`-5.0 > 0.0` is false).
-        let d = tempdir().unwrap();
-        write_yaml(
-            d.path(),
-            &format!("{}checkpoint:\n  messages: -5\n", valid_schema()),
-        );
-        let r = VaultYmlKeysCheck.run(d.path(), &cfg());
-        assert_eq!(r.status, DoctorStatus::Warn);
-        assert!(r
-            .details
-            .iter()
-            .any(|x| x == "checkpoint.messages should be a number > 0"));
-    }
-
-    #[test]
-    fn checkpoint_messages_non_number_value_is_warning() {
-        // String value hits `_ => false` in is_positive_number (line 223).
-        let d = tempdir().unwrap();
-        write_yaml(
-            d.path(),
-            &format!("{}checkpoint:\n  messages: foo\n", valid_schema()),
-        );
-        let r = VaultYmlKeysCheck.run(d.path(), &cfg());
-        assert_eq!(r.status, DoctorStatus::Warn);
-        assert!(r
-            .details
-            .iter()
-            .any(|x| x == "checkpoint.messages should be a number > 0"));
     }
 
     // ── multiple folder sub-key errors ─────────────────────────────────

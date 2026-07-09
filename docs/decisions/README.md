@@ -51,5 +51,8 @@ ADRs are immutable once accepted — if a decision changes, write a new ADR that
 | [0021](0021-search-state-persistent-data-dir.md) | Native-search state moves to the persistent data dir | accepted |
 | [0022](0022-honest-search-lock-errors.md) | Honest search lock & status errors (`E_ENGINE_BUSY`, exit 77) | accepted |
 | [0023](0023-warm-daemon-mcp-search.md) | Warm daemon owns the search engine for mcp + CLI search | accepted |
+| [0024](0024-vector-confidence-recall-first.md) | Recall-first vector cutoff + honest confidence | accepted · superseded in part by [0025](0025-tier2-cross-encoder-reranker.md) |
+| [0025](0025-tier2-cross-encoder-reranker.md) | Tier-2 cross-encoder reranker on every search surface | accepted |
+| [0026](0026-config-self-documentation.md) | Self-documenting onebrain.yml + doctor validate/reset-to-default | accepted |
 
 > These ADRs distill the public-facing rationale; the full design notes live in the project tracker. Numbers are stable IDs assigned at authoring time — see each ADR's **Date** for chronology.

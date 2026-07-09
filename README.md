@@ -72,7 +72,7 @@ onebrain init --yes
 - **Single static binary** — one self-contained file, no runtime to install, cross-platform down to a Raspberry Pi Zero.
 - **Embedded web UI** — `onebrain serve` hosts a local, token-gated file explorer + reading view + search panel + agent chat, with nothing extra to install. See [`docs/serve.md`](docs/serve.md).
 - **Interactive model picker** — a TUI over 6 embedding models (see [Choosing an embedding model](docs/reference/onebrain-search.md#choosing-an-embedding-model)) to trade off speed, accuracy, and Thai support.
-- **Vault doctor + config migration** — eleven health checks with `--fix` recipes, plus automatic `onebrain.yml` schema migration.
+- **Vault doctor + config migration** — twelve health checks with `--fix` recipes (out-of-range config values reset to their documented defaults, comments preserved), plus automatic `onebrain.yml` schema migration.
 - **Local scheduler** — cron-style recurring skills (daily briefing, weekly review, reindex) via the OS scheduler, no cloud runner needed.
 
 ## Commands

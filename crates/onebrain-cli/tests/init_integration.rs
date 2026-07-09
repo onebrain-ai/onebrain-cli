@@ -9,6 +9,24 @@ use std::fs;
 use std::time::Duration;
 use tempfile::tempdir;
 
+/// Cross-crate drift guard: the `min_score` value the onebrain.yml template
+/// scaffolds (`onebrain-fs`, which cannot depend on `onebrain-search`) must
+/// equal the engine's calibrated default gate.
+#[test]
+fn template_min_score_matches_engine_default() {
+    let pinned: f32 = onebrain_fs::TEMPLATE_RERANK_MIN_SCORE.parse().unwrap();
+    assert_eq!(pinned, onebrain_search::engine::DEFAULT_RERANK_MIN_SCORE);
+    // And the rendered template carries exactly that value.
+    let yaml = onebrain_fs::render_onebrain_yml(onebrain_fs::SchedulePreset::Skip).unwrap();
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    // Compare in f32 — the constant is f32; a lossless f64 widening of 0.30
+    // would spuriously differ (0.30000001192…).
+    assert_eq!(
+        parsed["search"]["reranker"]["min_score"].as_f64().unwrap() as f32,
+        onebrain_search::engine::DEFAULT_RERANK_MIN_SCORE
+    );
+}
+
 #[test]
 fn cli_yes_fresh_vault_writes_files_and_emits_header() {
     let d = tempdir().unwrap();

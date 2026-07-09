@@ -174,26 +174,25 @@ fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
     let cache = tempdir().unwrap();
     write_minimal_vault(vault.path());
     // All-green needs the CANONICAL config filename (a legacy vault.yml would
-    // trip the vault-config-migration warn).
-    let legacy = vault.path().join("vault.yml");
-    let existing = std::fs::read_to_string(&legacy).unwrap();
-    std::fs::remove_file(&legacy).unwrap();
-    std::fs::write(
-        vault.path().join("onebrain.yml"),
-        format!("search:\n  collection: doctor-it-green\n{existing}"),
-    )
-    .unwrap();
+    // trip the vault-config-migration warn) and, since v3.4.8, a fully
+    // self-documented config (uncommented keys are a config-values warn that
+    // --fix repairs) — so use the commented template with the collection
+    // placeholder activated.
+    std::fs::remove_file(vault.path().join("vault.yml")).unwrap();
+    let template = onebrain_fs::render_onebrain_yml(onebrain_fs::SchedulePreset::Skip).unwrap();
+    let config = template.replace(
+        "  # collection: <set by onebrain search reindex>",
+        "  collection: doctor-it-green",
+    );
+    assert!(config.contains("collection: doctor-it-green"), "{config}");
+    std::fs::write(vault.path().join("onebrain.yml"), config).unwrap();
 
-    // Empty-vault reindex (no docs → no model download) + a fabricated
-    // downloaded-model dir for the default embedding model and the default
-    // reranker model.
-    Command::cargo_bin("onebrain")
-        .unwrap()
-        .current_dir(vault.path())
-        .env("ONEBRAIN_CACHE_DIR", cache.path())
-        .args(["search", "reindex"])
-        .assert()
-        .success();
+    // Fabricate the downloaded-model dirs BEFORE the reindex: with no model
+    // dir on disk, reindex's missing-model reconcile would drop the
+    // `search.embed_model` key via a comment-destroying serde rewrite
+    // (tracked with the other structural writers in #200) and un-document
+    // the commented fixture. Then run the empty-vault reindex (no docs →
+    // no real download).
     std::fs::create_dir_all(
         cache
             .path()
@@ -206,6 +205,13 @@ fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
             .join("search/doctor-it-green/models--onebrain-ai--onebrain-rerank-v1"),
     )
     .unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .args(["search", "reindex"])
+        .assert()
+        .success();
 
     Command::cargo_bin("onebrain")
         .unwrap()
@@ -496,13 +502,22 @@ fn doctor_fix_migrates_vault_yml_with_vault_flag() {
         "expected vault.yml to be gone after --fix"
     );
     let after = std::fs::read_to_string(vault.path().join("onebrain.yml")).unwrap();
-    // The migration preserves the original content as a prefix; `doctor` then
-    // stamps the run timestamps (v3.2.3) into a trailing `stats:` block — and
-    // because `--fix` ran, both run and fix dates are written.
-    assert!(
-        after.starts_with(&original),
-        "rename must preserve original content as a prefix · got:\n{after}"
-    );
+    // The migration preserves every original value line (v3.4.8's --fix also
+    // backfills self-documentation comments and stamps `stats:`, so assert on
+    // the non-comment lines rather than a strict byte prefix).
+    let value_lines = |s: &str| -> Vec<String> {
+        s.lines()
+            .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let after_values = value_lines(&after);
+    for line in value_lines(&original) {
+        assert!(
+            after_values.contains(&line),
+            "migrated config must keep original line {line:?} · got:\n{after}"
+        );
+    }
     assert!(
         after.contains("stats:")
             && after.contains("last_doctor_run:")
@@ -590,11 +605,13 @@ fn doctor_fix_does_not_resurrect_vault_yml_after_migration() {
 #[test]
 fn doctor_fix_text_mode_manual_issues_shows_manual_step_section() {
     let vault = tempdir().unwrap();
-    // Write canonical onebrain.yml (no migration warning) with all keys present.
+    // Write canonical onebrain.yml (no migration warning). Since v3.4.8 an
+    // UNCOMMENTED config is itself an auto-fixable finding (comment
+    // backfill), so this manual-only scenario needs the fully-documented
+    // template.
     std::fs::write(
         vault.path().join("onebrain.yml"),
-        "update_channel: stable\n\
-         folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n",
+        onebrain_fs::render_onebrain_yml(onebrain_fs::SchedulePreset::Skip).unwrap(),
     )
     .unwrap();
     for f in [
@@ -904,4 +921,553 @@ fn doctor_fix_prunes_stale_plugin_cache_under_fake_home() {
         "stale cache dir must be pruned by --fix: {}",
         stale.display()
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// config-values check + --fix reset-to-default (v3.4.8, #196)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// All 8 folder keys present so `onebrain.yml-keys` stays quiet and the
+/// assertions isolate the new `config-values` check.
+const FULL_FOLDERS_BLOCK: &str = "folders:\n  \
+       inbox: 00-inbox\n  \
+       projects: 01-projects\n  \
+       areas: 02-areas\n  \
+       knowledge: 03-knowledge\n  \
+       resources: 04-resources\n  \
+       agent: 05-agent\n  \
+       archive: 06-archive\n  \
+       logs: 07-logs\n";
+
+/// Like `write_minimal_vault`, but writes the given text to the canonical
+/// `onebrain.yml` (no legacy `vault.yml`) so config-value tests control the
+/// exact file content doctor sees.
+fn vault_with_config(dir: &Path, config: &str) {
+    write_minimal_vault(dir);
+    std::fs::remove_file(dir.join("vault.yml")).unwrap();
+    std::fs::write(dir.join("onebrain.yml"), config).unwrap();
+}
+
+/// Run `doctor --json` (no fix) and return raw stdout. `ONEBRAIN_CACHE_DIR`
+/// is pointed at a tempdir so the search check never touches the real cache.
+fn run_doctor_json(dir: &Path, cache: &Path) -> String {
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(dir)
+        .env("ONEBRAIN_CACHE_DIR", cache)
+        .env("PATH", "/usr/bin:/bin")
+        .args(["doctor", "--json"])
+        .assert();
+    String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default()
+}
+
+#[test]
+fn doctor_flags_out_of_range_config_values() {
+    let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    vault_with_config(
+        d.path(),
+        &format!(
+            "update_channel: weekly-maybe\n\
+             {FULL_FOLDERS_BLOCK}\
+             checkpoint:\n  \
+               messages: 0\n\
+             search:\n  \
+               default_top_k: 0\n  \
+               embed_model: not-a-model\n  \
+               reranker:\n    \
+                 min_candidates: 0\n    \
+                 min_score: 7.5\n"
+        ),
+    );
+    let out = run_doctor_json(d.path(), cache.path());
+    for needle in [
+        "update_channel",
+        "checkpoint.messages",
+        "search.default_top_k",
+        "search.embed_model",
+        "reranker.min_candidates",
+        "reranker.min_score",
+    ] {
+        assert!(out.contains(needle), "missing finding for {needle}:\n{out}");
+    }
+    // The findings live on the new `config-values` check row.
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let row = doc["checks"]
+        .as_array()
+        .expect("checks[]")
+        .iter()
+        .find(|c| c["check"] == "config-values")
+        .expect("config-values row present")
+        .clone();
+    assert_eq!(row["status"], "warn", "row: {row}");
+    // Every finding names the documented default it would reset to.
+    let details = row["details"].as_array().expect("details[]");
+    assert!(
+        details
+            .iter()
+            .filter(|v| {
+                let s = v.as_str().unwrap_or("");
+                // Report-only findings and the self-documentation summary
+                // line are not value resets.
+                !s.contains("never auto-reset") && !s.contains("lack self-documentation")
+            })
+            .all(|v| v.as_str().unwrap_or("").contains("default:")),
+        "each resettable finding must state its default: {details:?}"
+    );
+}
+
+#[test]
+fn doctor_config_values_in_range_reports_ok() {
+    let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    // Every key carries a (user) comment so the assertion isolates VALUE
+    // validation from the undocumented-keys warn.
+    vault_with_config(
+        d.path(),
+        "# c\nupdate_channel: next\n\
+         folders:\n  \
+           # c\n  \
+           inbox: 00-inbox\n  \
+           # c\n  \
+           projects: 01-projects\n  \
+           # c\n  \
+           areas: 02-areas\n  \
+           # c\n  \
+           knowledge: 03-knowledge\n  \
+           # c\n  \
+           resources: 04-resources\n  \
+           # c\n  \
+           agent: 05-agent\n  \
+           # c\n  \
+           archive: 06-archive\n  \
+           # c\n  \
+           logs: 07-logs\n\
+         checkpoint:\n  \
+           # c\n  \
+           messages: 20\n  \
+           # c\n  \
+           minutes: 45\n\
+         search:\n  \
+           # c\n  \
+           default_top_k: 25\n  \
+           reranker:\n    \
+             # c\n    \
+             min_score: 0.5\n",
+    );
+    let out = run_doctor_json(d.path(), cache.path());
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let row = doc["checks"]
+        .as_array()
+        .expect("checks[]")
+        .iter()
+        .find(|c| c["check"] == "config-values")
+        .expect("config-values row present")
+        .clone();
+    assert_eq!(row["status"], "ok", "in-range values must pass: {row}");
+}
+
+#[test]
+fn doctor_flags_empty_folder_value_as_report_only() {
+    let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    vault_with_config(
+        d.path(),
+        "update_channel: stable\n\
+         folders:\n  \
+           inbox: \"\"\n  \
+           projects: 01-projects\n  \
+           areas: 02-areas\n  \
+           knowledge: 03-knowledge\n  \
+           resources: 04-resources\n  \
+           agent: 05-agent\n  \
+           archive: 06-archive\n  \
+           logs: 07-logs\n",
+    );
+    let out = run_doctor_json(d.path(), cache.path());
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let row = doc["checks"]
+        .as_array()
+        .expect("checks[]")
+        .iter()
+        .find(|c| c["check"] == "config-values")
+        .expect("config-values row present")
+        .clone();
+    assert_eq!(row["status"], "warn", "row: {row}");
+    let details = row["details"].as_array().expect("details[]").clone();
+    let folder_finding = details
+        .iter()
+        .filter_map(|v| v.as_str())
+        .find(|s| s.contains("folders.inbox"))
+        .expect("folders.inbox finding present");
+    assert!(
+        folder_finding.contains("never auto-reset"),
+        "folders findings are report-only: {folder_finding}"
+    );
+}
+
+/// Run `doctor --fix --json` under a fake HOME (so home-based recipes like
+/// plugin-cache can't touch the real machine) and return raw stdout.
+#[cfg(unix)]
+fn run_doctor_fix_json(dir: &Path, cache: &Path, home: &Path) -> String {
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(dir)
+        .env("HOME", home)
+        .env("ONEBRAIN_CACHE_DIR", cache)
+        .env("PATH", "/usr/bin:/bin")
+        .args(["doctor", "--fix", "--json"])
+        .assert();
+    String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default()
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_fix_resets_tunables_but_never_folders() {
+    let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    vault_with_config(
+        d.path(),
+        "# my precious comment\n\
+         update_channel: stable\n\
+         folders:\n  \
+           inbox: my-custom-inbox\n  \
+           projects: 01-projects\n  \
+           areas: 02-areas\n  \
+           knowledge: 03-knowledge\n  \
+           resources: 04-resources\n  \
+           agent: 05-agent\n  \
+           archive: 06-archive\n  \
+           logs: 07-logs\n\
+         checkpoint:\n  \
+           # keep my checkpoint block comment too\n  \
+           messages: 0\n\
+         search:\n  \
+           reranker:\n    \
+             min_score: 7.5\n",
+    );
+    // The customised inbox folder exists on disk so the `folders` check
+    // (and its mkdir recipe) stays quiet.
+    std::fs::create_dir_all(d.path().join("my-custom-inbox")).unwrap();
+
+    let out = run_doctor_fix_json(d.path(), cache.path(), home.path());
+    let cfg = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    assert!(
+        cfg.contains("# my precious comment"),
+        "comments must survive:\n{cfg}"
+    );
+    assert!(
+        cfg.contains("# keep my checkpoint block comment too"),
+        "nested comments must survive:\n{cfg}"
+    );
+    assert!(cfg.contains("messages: 15"), "{cfg}");
+    assert!(!cfg.contains("min_score: 7.5"), "{cfg}");
+    assert!(
+        cfg.contains("inbox: my-custom-inbox"),
+        "folders NEVER auto-reset:\n{cfg}"
+    );
+    assert!(
+        out.contains("reset"),
+        "fix output must report resets:\n{out}"
+    );
+    // Post-fix re-check: the config-values row is now clean.
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let row = doc["checks"]
+        .as_array()
+        .expect("checks[]")
+        .iter()
+        .find(|c| c["check"] == "config-values")
+        .expect("config-values row present")
+        .clone();
+    assert_eq!(row["status"], "ok", "post-fix re-check must pass: {row}");
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_fix_embed_model_reset_warns_reindex_required() {
+    let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    vault_with_config(
+        d.path(),
+        &format!(
+            "update_channel: stable\n\
+             {FULL_FOLDERS_BLOCK}\
+             search:\n  \
+               embed_model: not-a-model\n"
+        ),
+    );
+    let out = run_doctor_fix_json(d.path(), cache.path(), home.path());
+    let cfg = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    assert!(
+        cfg.contains("embed_model: multilingual-e5-small"),
+        "embed_model must reset to the registry default:\n{cfg}"
+    );
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let fix = doc["fix"]
+        .as_array()
+        .expect("fix[]")
+        .iter()
+        .find(|f| f["check"] == "config-values")
+        .expect("config-values fix entry")
+        .clone();
+    assert_eq!(fix["outcome"], "fixed", "{fix}");
+    let msg = fix["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("reindex"),
+        "embed_model reset must warn that a reindex is required: {msg}"
+    );
+}
+
+/// The epic's core promise end-to-end: a plain `onebrain doctor` run on a
+/// freshly scaffolded (commented) config never strips the comments — the
+/// stats stamp is a comment-preserving line edit and the search check
+/// resolves its collection read-only.
+#[test]
+fn doctor_never_strips_template_comments() {
+    let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write_minimal_vault(d.path());
+    std::fs::remove_file(d.path().join("vault.yml")).unwrap();
+    let template = onebrain_fs::render_onebrain_yml(onebrain_fs::SchedulePreset::Skip).unwrap();
+    std::fs::write(d.path().join("onebrain.yml"), &template).unwrap();
+
+    let out = run_doctor_json(d.path(), cache.path());
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    assert_eq!(doc["ok"], true, "template config must be healthy: {out}");
+
+    let after = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    assert!(
+        after.starts_with("# onebrain.yml"),
+        "header comment must survive a doctor run:\n{after}"
+    );
+    let comment_lines = |s: &str| {
+        s.lines()
+            .filter(|l| l.trim_start().starts_with('#'))
+            .count()
+    };
+    assert_eq!(
+        comment_lines(&after),
+        comment_lines(&template),
+        "no comment line may be lost:\n{after}"
+    );
+    // The only mutation is the (comment-preserving) stats stamp.
+    assert!(after.contains("stats:"), "{after}");
+    assert!(after.contains("last_doctor_run:"), "{after}");
+}
+
+/// Regression (PR #199 review R1-4a): a vault whose index dir EXISTS while
+/// `search.collection` is absent used to get silently rewritten by a plain
+/// doctor run — `open_engine` → `collection_for` persisted the generated
+/// name via a comment-destroying whole-file serde rewrite. The engine path
+/// must now be strictly read-only.
+///
+/// Two-phase, platform-proof design: the generated collection name is NOT
+/// recomputed in the test (an earlier version hashed the test's own
+/// `canonicalize()` output, which diverges from the runtime's resolved path
+/// on Windows — `\\?\` verbatim prefixes — and behind macOS `/var` symlinks).
+/// Instead, phase 1 runs the real binary and reads the name from the search
+/// row's own `collection: <name>` detail — the exact value the production
+/// resolver derived — then phase 2 pre-creates that cache dir and re-runs.
+/// Same binary, same helper, same value on every platform by construction.
+#[test]
+fn doctor_engine_path_never_persists_generated_collection() {
+    let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write_minimal_vault(d.path());
+    std::fs::remove_file(d.path().join("vault.yml")).unwrap();
+    let original = "# precious header\nupdate_channel: stable\nfolders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n";
+    std::fs::write(d.path().join("onebrain.yml"), original).unwrap();
+
+    // Phase 1 — no index yet: doctor reports the generated collection name
+    // in the search row's details. Capture it from the binary itself.
+    let out = run_doctor_json(d.path(), cache.path());
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let search_row = |doc: &serde_json::Value| -> serde_json::Value {
+        doc["checks"]
+            .as_array()
+            .expect("checks[]")
+            .iter()
+            .find(|c| c["check"] == "search")
+            .expect("search row")
+            .clone()
+    };
+    let row = search_row(&doc);
+    assert!(
+        row["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no index for"),
+        "phase 1 must be the no-index arm: {row}"
+    );
+    let name = row["details"]
+        .as_array()
+        .expect("details[]")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .find_map(|s| s.strip_prefix("collection: "))
+        .expect("search row reports its collection name")
+        .to_string();
+    // Phase 1 also stamps `stats.last_doctor_run` (comment-preserving,
+    // same-day idempotent) — snapshot the file now as the byte baseline.
+    let before = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    assert!(
+        before.starts_with(original),
+        "phase 1 must only append the stats stamp:\n{before}"
+    );
+
+    // Phase 2 — pre-create that exact cache dir so `is_indexed` is true and
+    // doctor takes the engine-open path.
+    std::fs::create_dir_all(cache.path().join("search").join(&name)).unwrap();
+    let out = run_doctor_json(d.path(), cache.path());
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let row = search_row(&doc);
+    // Non-vacuous: the engine path must actually have been exercised — if
+    // the pre-created dir didn't match the runtime collection name the row
+    // would still say "no index for …" and this test must fail.
+    let msg = row["message"].as_str().unwrap_or_default();
+    assert!(
+        !msg.contains("no index for"),
+        "engine path not exercised (collection name mismatch?): {msg}"
+    );
+
+    let after = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    assert!(
+        !after.contains("collection:"),
+        "doctor must never persist a generated collection:\n{after}"
+    );
+    // The engine-path run makes NO mutation at all (the same-day stats stamp
+    // is already present) — byte-identical to the phase-1 snapshot.
+    assert_eq!(
+        after, before,
+        "config rewritten by a read path:\nBEFORE:\n{before}\nAFTER:\n{after}"
+    );
+}
+
+/// Text-mode mixed outcome: one value reset on disk, one stuck in an inline
+/// mapping → the recipe reports ◐ Partial (not ✗ Failed), the summary line
+/// counts it, and the process still exits non-zero (manual edit remains).
+#[cfg(unix)]
+#[test]
+fn doctor_fix_text_mode_partial_outcome_renders_distinct_glyph() {
+    let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    vault_with_config(
+        d.path(),
+        &format!(
+            "update_channel: stable\n\
+             {FULL_FOLDERS_BLOCK}\
+             checkpoint: {{messages: 0}}\n\
+             search:\n  \
+               default_top_k: 0\n"
+        ),
+    );
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(d.path())
+        .env("HOME", home.path())
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .env("PATH", "/usr/bin:/bin")
+        .args(["doctor", "--fix", "--yes"])
+        .assert()
+        .failure(); // exit 1: the inline mapping still needs a manual edit
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default();
+    assert!(
+        stdout.contains("◐ config-values"),
+        "expected partial glyph · got: {stdout}"
+    );
+    assert!(
+        stdout.contains("1 partial"),
+        "summary counts partial: {stdout}"
+    );
+    let cfg = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    assert!(cfg.contains("default_top_k: 10"), "reset landed: {cfg}");
+    assert!(
+        cfg.contains("checkpoint: {messages: 0}"),
+        "inline shape untouched: {cfg}"
+    );
+}
+
+/// End-to-end comment backfill for an EXISTING (legacy, uncommented) vault:
+/// plain doctor reports the undocumented keys read-only; `--fix` inserts the
+/// template's comments; the next plain doctor is clean and a second `--fix`
+/// is byte-identical (idempotent).
+#[cfg(unix)]
+#[test]
+fn doctor_fix_backfills_comments_on_legacy_vault_end_to_end() {
+    let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let legacy = format!(
+        "update_channel: stable\n\
+         {FULL_FOLDERS_BLOCK}\
+         checkpoint:\n  \
+           messages: 15\n  \
+           minutes: 30\n"
+    );
+    vault_with_config(d.path(), &legacy);
+
+    // Plain doctor: discovers, never writes.
+    let out = run_doctor_json(d.path(), cache.path());
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let row = doc["checks"]
+        .as_array()
+        .expect("checks[]")
+        .iter()
+        .find(|c| c["check"] == "config-values")
+        .expect("config-values row")
+        .clone();
+    assert_eq!(row["status"], "warn", "row: {row}");
+    assert!(
+        row["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("undocumented key(s)"),
+        "row: {row}"
+    );
+    let cfg_after_plain = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    assert!(
+        cfg_after_plain.starts_with(&legacy),
+        "plain doctor must not write (stats stamp appended only):\n{cfg_after_plain}"
+    );
+
+    // --fix: every known key gains the exact template comment.
+    let out = run_doctor_fix_json(d.path(), cache.path(), home.path());
+    assert!(
+        out.contains("self-documentation comment(s)"),
+        "fix must report the backfill: {out}"
+    );
+    let cfg = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    for doc_entry in onebrain_fs::config_key_docs() {
+        let key = doc_entry.segments.last().unwrap();
+        let lines: Vec<&str> = cfg.lines().collect();
+        let Some(idx) = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with(&format!("{key}:")))
+        else {
+            continue; // absent keys stay absent
+        };
+        assert_eq!(
+            lines[idx - 1].trim_start(),
+            doc_entry.comment,
+            "comment above {key}:\n{cfg}"
+        );
+    }
+    // Post-fix re-check row is clean.
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let row = doc["checks"]
+        .as_array()
+        .expect("checks[]")
+        .iter()
+        .find(|c| c["check"] == "config-values")
+        .expect("config-values row")
+        .clone();
+    assert_eq!(row["status"], "ok", "post-fix: {row}");
+
+    // Idempotency: a second --fix changes nothing.
+    let _ = run_doctor_fix_json(d.path(), cache.path(), home.path());
+    let cfg2 = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    assert_eq!(cfg2, cfg, "second --fix must be byte-identical");
 }

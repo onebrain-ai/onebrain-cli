@@ -39,6 +39,11 @@ use std::path::{Path, PathBuf};
 enum FixOutcome {
     /// Fix ran cleanly and the underlying issue should be resolved.
     Fixed(String),
+    /// Fix made REAL progress but part of the issue remains (e.g. some
+    /// values were reset to disk while others sat in an unsupported YAML
+    /// shape). The message itemises both halves. Counts toward a non-zero
+    /// exit like `Failed` — something still needs a manual edit.
+    Partial(String),
     /// Fix was attempted but did not finish (subprocess failed, timed out,
     /// etc.). The message explains why.
     Failed(String),
@@ -139,12 +144,13 @@ pub fn run(
                     .collect();
                 any_recipe_failed = outcomes
                     .iter()
-                    .any(|(_, o)| matches!(o, FixOutcome::Failed(_)));
+                    .any(|(_, o)| matches!(o, FixOutcome::Failed(_) | FixOutcome::Partial(_)));
                 fix_outcomes_json = outcomes
                     .iter()
                     .map(|(check, o)| {
                         let (outcome, message) = match o {
                             FixOutcome::Fixed(m) => ("fixed", m.as_str()),
+                            FixOutcome::Partial(m) => ("partial", m.as_str()),
                             FixOutcome::Failed(m) => ("failed", m.as_str()),
                             FixOutcome::Manual(m) => ("manual", m.as_str()),
                         };
@@ -201,7 +207,7 @@ pub fn run(
                         .collect();
                     any_recipe_failed = outcomes
                         .iter()
-                        .any(|(_, o)| matches!(o, FixOutcome::Failed(_)));
+                        .any(|(_, o)| matches!(o, FixOutcome::Failed(_) | FixOutcome::Partial(_)));
                     print_fix_summary(&outcomes);
                     results = all_checks(vault_root.as_path(), &config);
                 } else {
@@ -255,8 +261,375 @@ pub fn run(
 /// "Index & state" section), replacing the removed `qmd-embeddings` row.
 fn all_checks(vault_root: &Path, config: &onebrain_core::VaultConfig) -> Vec<DoctorResult> {
     let mut results = run_all_checks(vault_root, config);
+    // CLI-layer checks: both need `onebrain-search` (model/reranker registry
+    // access), which `onebrain-fs` doesn't depend on — so they're spliced in
+    // here rather than living alongside the fs-layer checks.
+    results.push(config_values_check(vault_root));
     results.push(native_search_check(vault_root));
     results
+}
+
+/// One out-of-range (or otherwise invalid) config value found by
+/// [`config_values_check`]. Carries everything the check needs to render a
+/// finding line AND everything the `--fix` recipe needs to reset the value.
+#[derive(Debug)]
+struct ConfigFinding {
+    /// Dotted key path as the user knows it, e.g. `search.reranker.min_score`.
+    dotted: String,
+    /// Path segments for the line editor, e.g. `["search", "reranker", "min_score"]`.
+    segments: Vec<&'static str>,
+    /// What's wrong, e.g. `is 7.5 — must be between 0 and 1`.
+    problem: String,
+    /// The documented default the value resets to, as a YAML scalar.
+    default_repr: String,
+    /// Whether `--fix` may auto-reset it. `folders.*` and `search.collection`
+    /// are report-only — never auto-reset (renaming folders orphans notes;
+    /// changing the collection detaches the index).
+    resettable: bool,
+    /// True for `search.embed_model` — resetting it invalidates existing
+    /// vectors, so the fix footer must tell the user to reindex.
+    reindex_required: bool,
+}
+
+impl ConfigFinding {
+    /// Render the finding as a doctor detail line.
+    fn detail_line(&self) -> String {
+        if self.resettable {
+            format!(
+                "{}: {} · default: {}",
+                self.dotted, self.problem, self.default_repr
+            )
+        } else {
+            format!(
+                "{}: {} (never auto-reset — edit manually)",
+                self.dotted, self.problem
+            )
+        }
+    }
+}
+
+/// Best-effort display of a YAML scalar for finding messages.
+fn display_yaml_value(v: &serde_yaml::Value) -> String {
+    match v {
+        serde_yaml::Value::Null => "null".to_string(),
+        serde_yaml::Value::Bool(b) => b.to_string(),
+        serde_yaml::Value::Number(n) => n.to_string(),
+        serde_yaml::Value::String(s) => s.clone(),
+        other => serde_yaml::to_string(other)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+    }
+}
+
+/// Validate every tunable in raw config text against the same defaults and
+/// registries the runtime uses (`onebrain_core` default fns, the
+/// `onebrain-search` model/reranker registries, `onebrain-fs`'s
+/// `VALID_UPDATE_CHANNELS`) — no duplicated range literals. Returns `None`
+/// when the text isn't a YAML mapping (the `onebrain.yml-keys` check already
+/// reports that); absent keys are fine (serde falls back to the default), so
+/// only PRESENT-but-invalid values produce findings.
+fn collect_config_findings(text: &str) -> Option<Vec<ConfigFinding>> {
+    use onebrain_core::config::SearchConfig;
+    use onebrain_core::{CheckpointPolicy, RerankerConfig};
+    use onebrain_fs::vault_sync::{DEFAULT_UPDATE_CHANNEL, VALID_UPDATE_CHANNELS};
+    use onebrain_search::embed::is_supported_model;
+    use onebrain_search::rerank::is_supported_reranker;
+    use serde_yaml::Value;
+
+    let parsed: Value = serde_yaml::from_str(text).ok()?;
+    // A comment-only / empty file parses as Null — that's a valid "all
+    // defaults" config, not a shape error.
+    if parsed.is_null() {
+        return Some(Vec::new());
+    }
+    let root = parsed.as_mapping()?;
+    let get = |m: &serde_yaml::Mapping, k: &str| m.get(Value::String(k.to_string())).cloned();
+    let child = |m: &serde_yaml::Mapping, k: &str| get(m, k).and_then(|v| v.as_mapping().cloned());
+
+    let mut findings: Vec<ConfigFinding> = Vec::new();
+
+    // update_channel ∈ VALID_UPDATE_CHANNELS.
+    if let Some(v) = get(root, "update_channel") {
+        let valid = v
+            .as_str()
+            .is_some_and(|s| VALID_UPDATE_CHANNELS.contains(&s));
+        if !valid {
+            findings.push(ConfigFinding {
+                dotted: "update_channel".to_string(),
+                segments: vec!["update_channel"],
+                problem: format!(
+                    "is {} — must be one of: {}",
+                    display_yaml_value(&v),
+                    VALID_UPDATE_CHANNELS.join(", ")
+                ),
+                default_repr: DEFAULT_UPDATE_CHANNEL.to_string(),
+                resettable: true,
+                reindex_required: false,
+            });
+        }
+    }
+
+    // checkpoint.messages / checkpoint.minutes ≥ 1.
+    if let Some(cp) = child(root, "checkpoint") {
+        let defaults = CheckpointPolicy::default();
+        for (key, default) in [
+            ("messages", defaults.messages),
+            ("minutes", defaults.minutes),
+        ] {
+            if let Some(v) = get(&cp, key) {
+                if !value_is_positive_number(&v) {
+                    findings.push(ConfigFinding {
+                        dotted: format!("checkpoint.{key}"),
+                        segments: vec!["checkpoint", key],
+                        problem: format!("is {} — must be a number >= 1", display_yaml_value(&v)),
+                        default_repr: default.to_string(),
+                        resettable: true,
+                        reindex_required: false,
+                    });
+                }
+            }
+        }
+    }
+
+    // folders.* — non-empty strings; report-only.
+    if let Some(folders) = child(root, "folders") {
+        let standard = [
+            "inbox",
+            "projects",
+            "areas",
+            "knowledge",
+            "resources",
+            "agent",
+            "archive",
+            "logs",
+        ];
+        for key in standard {
+            if let Some(v) = get(&folders, key) {
+                let valid = v.as_str().is_some_and(|s| !s.trim().is_empty());
+                if !valid {
+                    findings.push(ConfigFinding {
+                        dotted: format!("folders.{key}"),
+                        segments: vec!["folders", key],
+                        problem: format!(
+                            "is {} — must be a non-empty folder name",
+                            display_yaml_value(&v)
+                        ),
+                        default_repr: String::new(),
+                        resettable: false,
+                        reindex_required: false,
+                    });
+                }
+            }
+        }
+    }
+
+    // search.* block.
+    if let Some(search) = child(root, "search") {
+        let sc = SearchConfig::default();
+
+        // search.collection — non-empty string; report-only.
+        if let Some(v) = get(&search, "collection") {
+            let valid = v.as_str().is_some_and(|s| !s.trim().is_empty());
+            if !valid {
+                findings.push(ConfigFinding {
+                    dotted: "search.collection".to_string(),
+                    segments: vec!["search", "collection"],
+                    problem: format!(
+                        "is {} — must be a non-empty collection name (or absent to disable search)",
+                        display_yaml_value(&v)
+                    ),
+                    default_repr: String::new(),
+                    resettable: false,
+                    reindex_required: false,
+                });
+            }
+        }
+
+        // search.embed_model ∈ model registry.
+        if let Some(v) = get(&search, "embed_model") {
+            let valid = v.as_str().is_some_and(is_supported_model);
+            if !valid {
+                findings.push(ConfigFinding {
+                    dotted: "search.embed_model".to_string(),
+                    segments: vec!["search", "embed_model"],
+                    problem: format!(
+                        "is {} — not in the model registry (see `onebrain search model list`)",
+                        display_yaml_value(&v)
+                    ),
+                    default_repr: sc.embed_model.clone(),
+                    resettable: true,
+                    reindex_required: true,
+                });
+            }
+        }
+
+        // search.default_top_k ≥ 1 (integer).
+        if let Some(v) = get(&search, "default_top_k") {
+            let valid = v.as_u64().is_some_and(|n| n >= 1);
+            if !valid {
+                findings.push(ConfigFinding {
+                    dotted: "search.default_top_k".to_string(),
+                    segments: vec!["search", "default_top_k"],
+                    problem: format!("is {} — must be an integer >= 1", display_yaml_value(&v)),
+                    default_repr: sc.default_top_k.to_string(),
+                    resettable: true,
+                    reindex_required: false,
+                });
+            }
+        }
+
+        // search.reranker.* block.
+        if let Some(rr) = child(&search, "reranker") {
+            let rd = RerankerConfig::default();
+
+            if let Some(v) = get(&rr, "enabled") {
+                if v.as_bool().is_none() {
+                    findings.push(ConfigFinding {
+                        dotted: "search.reranker.enabled".to_string(),
+                        segments: vec!["search", "reranker", "enabled"],
+                        problem: format!("is {} — must be true or false", display_yaml_value(&v)),
+                        default_repr: rd.enabled.to_string(),
+                        resettable: true,
+                        reindex_required: false,
+                    });
+                }
+            }
+
+            if let Some(v) = get(&rr, "model") {
+                let valid = v.as_str().is_some_and(is_supported_reranker);
+                if !valid {
+                    findings.push(ConfigFinding {
+                        dotted: "search.reranker.model".to_string(),
+                        segments: vec!["search", "reranker", "model"],
+                        problem: format!(
+                            "is {} — not in the reranker registry (see `onebrain search model list`)",
+                            display_yaml_value(&v)
+                        ),
+                        default_repr: rd.model.clone(),
+                        resettable: true,
+                        reindex_required: false,
+                    });
+                }
+            }
+
+            if let Some(v) = get(&rr, "min_candidates") {
+                let valid = v.as_u64().is_some_and(|n| n >= 1);
+                if !valid {
+                    findings.push(ConfigFinding {
+                        dotted: "search.reranker.min_candidates".to_string(),
+                        segments: vec!["search", "reranker", "min_candidates"],
+                        problem: format!("is {} — must be an integer >= 1", display_yaml_value(&v)),
+                        default_repr: rd.min_candidates.to_string(),
+                        resettable: true,
+                        reindex_required: false,
+                    });
+                }
+            }
+
+            if let Some(v) = get(&rr, "min_score") {
+                let valid = v.as_f64().is_some_and(|f| (0.0..=1.0).contains(&f));
+                if !valid {
+                    findings.push(ConfigFinding {
+                        dotted: "search.reranker.min_score".to_string(),
+                        segments: vec!["search", "reranker", "min_score"],
+                        problem: format!(
+                            "is {} — must be a number between 0 and 1",
+                            display_yaml_value(&v)
+                        ),
+                        // Pinned to the engine's calibrated default by the
+                        // cross-crate test in `init_integration.rs`.
+                        default_repr: onebrain_fs::TEMPLATE_RERANK_MIN_SCORE.to_string(),
+                        resettable: true,
+                        reindex_required: false,
+                    });
+                }
+            }
+        }
+    }
+
+    Some(findings)
+}
+
+const CONFIG_VALUES_CHECK: &str = "config-values";
+
+/// Per-key config value validation (`check = "config-values"`). Validates
+/// every PRESENT tunable in `onebrain.yml` against the runtime defaults and
+/// model/reranker registries — the self-documentation counterpart of the
+/// commented `init` template (ADR 0026). Missing keys are fine (serde falls
+/// back to defaults); a missing or unparsable file is the `onebrain.yml` /
+/// `onebrain.yml-keys` checks' territory, so this check skips quietly then.
+///
+/// All findings are advisory (`warn`): `--fix` auto-resets the tunables to
+/// their documented defaults; `folders.*` / `search.collection` findings are
+/// report-only (never auto-reset).
+fn config_values_check(vault_root: &Path) -> DoctorResult {
+    use onebrain_core::find_config_file;
+    let Some(path) = find_config_file(vault_root) else {
+        return DoctorResult::ok(CONFIG_VALUES_CHECK, "skipped — no config file");
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return DoctorResult::ok(CONFIG_VALUES_CHECK, "skipped — config unreadable");
+    };
+    let Some(findings) = collect_config_findings(&text) else {
+        return DoctorResult::ok(
+            CONFIG_VALUES_CHECK,
+            "skipped — invalid YAML (see onebrain.yml-keys)",
+        );
+    };
+    // Self-documentation coverage: template-known keys that exist in this
+    // config but carry no comment line directly above them (`--fix`
+    // backfills the template's own comment; keys under a user comment are
+    // never counted — the user's comments win). Read-only here: zero writes
+    // on a plain doctor run.
+    let undocumented = undocumented_keys(&text);
+    if findings.is_empty() && undocumented.is_empty() {
+        return DoctorResult::ok(CONFIG_VALUES_CHECK, "all values in range");
+    }
+    let mut message_parts: Vec<String> = Vec::new();
+    let mut details: Vec<String> = findings.iter().map(ConfigFinding::detail_line).collect();
+    if !findings.is_empty() {
+        message_parts.push(format!("{} invalid value(s)", findings.len()));
+    }
+    if !undocumented.is_empty() {
+        message_parts.push(format!("{} undocumented key(s)", undocumented.len()));
+        details.push(format!(
+            "{} key(s) lack self-documentation comments — doctor --fix will add them: {}",
+            undocumented.len(),
+            undocumented.join(", ")
+        ));
+    }
+    let any_resettable = findings.iter().any(|f| f.resettable);
+    let mut r =
+        DoctorResult::warn(CONFIG_VALUES_CHECK, message_parts.join(" · ")).with_details(details);
+    let hint = match (any_resettable, !undocumented.is_empty()) {
+        (true, true) => Some(
+            "Run onebrain doctor --fix to reset out-of-range tunables and add the missing self-documentation comments",
+        ),
+        (true, false) => {
+            Some("Run onebrain doctor --fix to reset out-of-range tunables to their defaults")
+        }
+        (false, true) => {
+            Some("Run onebrain doctor --fix to add the missing self-documentation comments")
+        }
+        (false, false) => None,
+    };
+    if let Some(h) = hint {
+        r = r.with_hint(h);
+    }
+    r
+}
+
+/// Dotted paths of template-known keys that exist in `text` without a
+/// comment line directly above them — the `--fix` comment-backfill targets.
+/// Missing keys are never listed (absent = defaults by design), and keys the
+/// line editor can't address (inline mappings) are skipped.
+fn undocumented_keys(text: &str) -> Vec<String> {
+    onebrain_fs::config_key_docs()
+        .iter()
+        .filter(|d| onebrain_fs::yaml_edit::key_lacks_comment(text, d.segments))
+        .map(|d| d.segments.join("."))
+        .collect()
 }
 
 /// Native-search index check (`check = "search"`). Read-only and
@@ -273,15 +646,18 @@ fn all_checks(vault_root: &Path, config: &onebrain_core::VaultConfig) -> Vec<Doc
 ///   exit code only escalates on `error`, so this check never fails the run.
 fn native_search_check(vault_root: &Path) -> DoctorResult {
     use crate::commands::search_common::{
-        collection_cache_dir, collection_for, is_indexed, open_engine,
+        collection_cache_dir, collection_name_readonly, is_indexed, open_engine_with_collection,
     };
     use onebrain_core::load_vault_config;
     use onebrain_search::embed::model_download_status;
     use onebrain_search::rerank::{reranker_download_status, reranker_registry};
 
-    // Resolve the collection. `collection_for` may persist a generated name on
-    // a never-configured vault — the same deterministic name every other
-    // `search` command would write; harmless and one-time.
+    // Resolve the collection READ-ONLY (`collection_name_readonly`): doctor
+    // must never rewrite the config as a side effect — the pre-v3.4.8
+    // `collection_for` persisted a generated name on a never-configured
+    // vault via a serde re-serialization, which would have destroyed the
+    // commented template's comments on the first doctor run. The generated
+    // name is the same deterministic one a later `search reindex` adopts.
     // On the two resolution-failure early returns the reranker state is
     // genuinely uncomputable (no config, no cache dir) — the three fields
     // are still reported, as `unknown`, so the payload shape is identical
@@ -301,7 +677,7 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
             return unresolved(format!("could not resolve vault: {e}"));
         }
     };
-    let collection = match collection_for(&resolved) {
+    let collection = match collection_name_readonly(resolved.root.as_path()) {
         Ok(c) => c,
         Err(e) => {
             return unresolved(format!("could not resolve collection: {e}"));
@@ -310,7 +686,7 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
     let cache_dir = collection_cache_dir(&collection);
 
     // Read-only config load — same config the rest of the check already
-    // resolves through `collection_for`/`open_engine`. Never persisted here.
+    // resolves through the read-only helpers. Never persisted here.
     // A load failure degrades gracefully to reranker-disabled defaults +
     // an unknown configured embed model name, rather than aborting the whole
     // check — the index/model-on-disk facts below are still worth reporting.
@@ -393,10 +769,15 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
     }
 
     // Index exists → open the engine (lazy embedder, no download) and read
-    // status. A hard open/status failure is advisory, not fatal.
+    // status. A hard open/status failure is advisory, not fatal. The open
+    // goes through `open_engine_with_collection` (NOT `open_engine`): the
+    // latter resolves via `collection_for`, which PERSISTS a generated
+    // collection name through a comment-destroying serde rewrite when the
+    // `search.collection` key is absent — doctor's read path must never
+    // write the config.
     let (last_indexed_at, doc_count, pending) =
-        match open_engine(Some(resolved.root.as_path().to_path_buf())) {
-            Ok((engine, r)) => match engine.status(r.root.as_path()) {
+        match open_engine_with_collection(&resolved, &collection) {
+            Ok(engine) => match engine.status(resolved.root.as_path()) {
                 Ok(s) => (s.last_indexed_at, s.doc_count, s.pending_total()),
                 Err(e) => {
                     return finish(
@@ -608,6 +989,10 @@ fn attempt_fix(result: &DoctorResult, vault_root: &Path, json: bool) -> FixOutco
         // Backfill missing standard folder keys + default `update_channel`
         // in onebrain.yml. Safe (additive) — never overwrites user values.
         "onebrain.yml-keys" => fix_vault_yml_keys(vault_root, json),
+        // Reset out-of-range tunables to their documented defaults via the
+        // comment-preserving line editor. folders.* / search.collection are
+        // never auto-reset (report-only).
+        "config-values" => fix_config_values(vault_root, json),
         // Strip the stale `extraKnownMarketplaces.onebrain` entry from
         // `.claude/settings.json`. Cosmetic config cleanup; no behavioral
         // change at runtime (the plugin is enabled via `enabledPlugins`).
@@ -649,6 +1034,9 @@ fn planned_action(result: &DoctorResult) -> Option<&'static str> {
         "plugin-files" => Some("re-download plugin files from upstream"),
         "folders" => Some("create the missing standard folders"),
         "onebrain.yml-keys" => Some("backfill missing onebrain.yml keys"),
+        "config-values" => {
+            Some("reset out-of-range values to defaults · add missing self-documentation comments")
+        }
         "claude-settings" => Some("remove the stale marketplace entry"),
         "plugin-cache" => Some("remove the stale plugin cache"),
         "vault-config-migration" => Some("migrate vault.yml → onebrain.yml"),
@@ -946,11 +1334,15 @@ fn fix_plugin_cache(json: bool) -> FixOutcome {
 ///   - `update_channel` not set
 ///   - deprecated keys still present (`onebrain_version`, `method`,
 ///     `runtime.harness`)
-///   - `checkpoint.messages` / `checkpoint.minutes` ≤ 0
 ///
-/// The recipe handles all four. YAML comments are not preserved (serde_yaml
-/// re-serializes from the parsed model) — the Fixed message calls this out
-/// so the user knows what changed besides the keys.
+/// The recipe handles all three. Out-of-range VALUES (e.g. non-positive
+/// `checkpoint.messages`) are the `config-values` check's territory since
+/// v3.4.8 — its recipe resets them via the comment-preserving line editor,
+/// so they must NOT be repaired here (this recipe's serde re-serialization
+/// would destroy the file's comments first). YAML comments are not preserved
+/// when this recipe does write (serde_yaml re-serializes from the parsed
+/// model) — the Fixed message calls this out so the user knows what changed
+/// besides the keys.
 fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
     use onebrain_core::{find_config_file, CONFIG_FILENAME};
     // Operate on whichever config file is present — canonical preferred,
@@ -978,7 +1370,6 @@ fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
 
     let mut added: Vec<&'static str> = Vec::new();
     let mut removed: Vec<&'static str> = Vec::new();
-    let mut repaired: Vec<&'static str> = Vec::new();
 
     // 1. Backfill `update_channel`.
     let channel_key = serde_yaml::Value::String("update_channel".to_string());
@@ -1049,27 +1440,7 @@ fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
         }
     }
 
-    // 4. Repair non-positive `checkpoint.messages` / `checkpoint.minutes`.
-    //    Defaults match Bun: 15 messages, 30 minutes.
-    let checkpoint_key = serde_yaml::Value::String("checkpoint".to_string());
-    if let Some(checkpoint) = mapping
-        .get_mut(&checkpoint_key)
-        .and_then(|v| v.as_mapping_mut())
-    {
-        for (key, default) in &[("messages", 15_u64), ("minutes", 30_u64)] {
-            let k = serde_yaml::Value::String((*key).to_string());
-            let needs_fix = checkpoint
-                .get(&k)
-                .map(|v| !value_is_positive_number(v))
-                .unwrap_or(false);
-            if needs_fix {
-                checkpoint.insert(k, serde_yaml::Value::Number((*default).into()));
-                repaired.push(*key);
-            }
-        }
-    }
-
-    if added.is_empty() && removed.is_empty() && repaired.is_empty() {
+    if added.is_empty() && removed.is_empty() {
         return FixOutcome::Fixed(format!("{filename} already in expected shape"));
     }
 
@@ -1095,13 +1466,6 @@ fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
             "removed deprecated {}: {}",
             removed.len(),
             removed.join(", ")
-        ));
-    }
-    if !repaired.is_empty() {
-        parts.push(format!(
-            "repaired {} checkpoint key(s): {}",
-            repaired.len(),
-            repaired.join(", ")
         ));
     }
     FixOutcome::Fixed(format!(
@@ -1206,8 +1570,9 @@ fn fix_vault_config_migration(vault_root: &Path, json: bool) -> FixOutcome {
 }
 
 /// Match Bun's `typeof value === 'number' && value > 0` for YAML values.
-/// Used by `fix_vault_yml_keys` to decide whether to repair a checkpoint
-/// number — mirrors `vault_yml_keys::is_positive_number`.
+/// Used by `collect_config_findings` to validate `checkpoint.messages` /
+/// `checkpoint.minutes` (v3.4.8 — value validation moved here from the
+/// fs-layer `vault_yml_keys` check).
 fn value_is_positive_number(v: &serde_yaml::Value) -> bool {
     match v {
         serde_yaml::Value::Number(n) => {
@@ -1223,6 +1588,151 @@ fn value_is_positive_number(v: &serde_yaml::Value) -> bool {
         }
         _ => false,
     }
+}
+
+/// Reset one config value to `default_value` in raw config text via a
+/// comment-preserving line edit. Thin wrapper over the shared
+/// [`onebrain_fs::yaml_edit::set_value`] (extracted there in the R3 fix
+/// round so vault-sync's `update_vault_yml` uses the identical editor) —
+/// kept as a named seam because every `--fix` call site and the unit tests
+/// speak in terms of "reset".
+///
+/// Returns `None` (caller reports the value un-fixable) when a parent is an
+/// inline mapping (`checkpoint: {messages: 0}`) or the key line can't be
+/// found — never guesses on a shape it doesn't understand.
+fn reset_config_value(text: &str, segments: &[&str], default_value: &str) -> Option<String> {
+    onebrain_fs::yaml_edit::set_value(text, segments, default_value)
+}
+
+/// Recipe — `config-values` warning means one or more PRESENT config values
+/// are out of range / not in a registry. Re-collect the findings from the
+/// file (the check's `DoctorResult` doesn't carry them structurally), then
+/// reset each auto-resettable one to its documented default through
+/// [`reset_config_value`] — comments, key order, and the user's other values
+/// all survive. `folders.*` / `search.collection` findings are never touched
+/// (report-only by design: renaming folders orphans notes; changing the
+/// collection detaches the index). An `embed_model` reset additionally warns
+/// that a reindex is required — the old model's vectors are now stale.
+fn fix_config_values(vault_root: &Path, json: bool) -> FixOutcome {
+    use onebrain_core::{find_config_file, CONFIG_FILENAME};
+    let path = find_config_file(vault_root).unwrap_or_else(|| vault_root.join(CONFIG_FILENAME));
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(CONFIG_FILENAME)
+        .to_string();
+    status_line(json, &format!("running: reset config values in {filename}"));
+
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => return FixOutcome::Failed(format!("read {filename}: {e}")),
+    };
+    let Some(findings) = collect_config_findings(&text) else {
+        return FixOutcome::Failed(format!("{filename} is not a YAML mapping"));
+    };
+    if findings.is_empty() && undocumented_keys(&text).is_empty() {
+        return FixOutcome::Fixed(format!(
+            "{filename}: all values already in range and documented"
+        ));
+    }
+
+    let mut current = text;
+    let mut resets: Vec<String> = Vec::new();
+    let mut untouched: Vec<String> = Vec::new();
+    let mut unfixable: Vec<String> = Vec::new();
+    let mut reindex_required = false;
+    for f in &findings {
+        if !f.resettable {
+            untouched.push(f.dotted.clone());
+            continue;
+        }
+        match reset_config_value(&current, &f.segments, &f.default_repr) {
+            Some(updated) => {
+                current = updated;
+                resets.push(format!("{} → {}", f.dotted, f.default_repr));
+                if f.reindex_required {
+                    reindex_required = true;
+                }
+            }
+            None => unfixable.push(f.dotted.clone()),
+        }
+    }
+
+    // Comment backfill for existing vaults (sanctioned scope, 2026-07-09):
+    // insert the template's own `# … · default: …` line above every
+    // template-known key that exists here without one. Runs AFTER the value
+    // resets so the inserted comments sit above the corrected lines. Keys
+    // under a user's own comment are skipped (`insert_comment_above` refuses
+    // — user comments win); missing keys are never added.
+    let mut comments_added: Vec<String> = Vec::new();
+    for doc in onebrain_fs::config_key_docs() {
+        if !onebrain_fs::yaml_edit::key_lacks_comment(&current, doc.segments) {
+            continue;
+        }
+        if let Some(updated) =
+            onebrain_fs::yaml_edit::insert_comment_above(&current, doc.segments, &doc.comment)
+        {
+            current = updated;
+            comments_added.push(doc.segments.join("."));
+        }
+    }
+
+    if !resets.is_empty() || !comments_added.is_empty() {
+        // Defense-in-depth backup before the write, mirroring every other
+        // config-writing recipe — even though this edit preserves comments.
+        if let Err(e) = onebrain_fs::backup_config_file(&path) {
+            return FixOutcome::Failed(format!("backup {filename} before write: {e}"));
+        }
+        if let Err(e) = onebrain_fs::atomic_write_text(&path, &current) {
+            return FixOutcome::Failed(format!("write {filename}: {e}"));
+        }
+    }
+    if reindex_required {
+        status_line(
+            json,
+            "⚠️ embedding model reset — run `onebrain search reindex` to rebuild vectors",
+        );
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if !resets.is_empty() {
+        parts.push(format!(
+            "reset {} value(s) to default: {}",
+            resets.len(),
+            resets.join(", ")
+        ));
+    }
+    if reindex_required {
+        parts.push("embedding model reset — run `onebrain search reindex`".to_string());
+    }
+    if !comments_added.is_empty() {
+        parts.push(format!(
+            "added {} self-documentation comment(s): {}",
+            comments_added.len(),
+            comments_added.join(", ")
+        ));
+    }
+    if !untouched.is_empty() {
+        parts.push(format!(
+            "left untouched (never auto-reset): {} — edit manually",
+            untouched.join(", ")
+        ));
+    }
+    if !unfixable.is_empty() {
+        parts.push(format!(
+            "could not reset (unsupported YAML shape, e.g. inline mapping): {} — edit manually",
+            unfixable.join(", ")
+        ));
+        // Honest tri-state: real resets landed on disk AND something remains
+        // → Partial (distinct glyph, still a non-zero exit); nothing landed
+        // → Failed.
+        return if resets.is_empty() {
+            FixOutcome::Failed(parts.join(" · "))
+        } else {
+            FixOutcome::Partial(parts.join(" · "))
+        };
+    }
+    FixOutcome::Fixed(parts.join(" · "))
 }
 
 /// True when the config's top-level `stats` key is an inline mapping or
@@ -1381,6 +1891,7 @@ fn stamp_doctor_run(vault_root: &Path, fix: bool, quiet: bool) {
 
 fn print_fix_summary(outcomes: &[(String, FixOutcome)]) {
     let mut fixed = 0;
+    let mut partial = 0;
     let mut failed = 0;
     let mut manual = 0;
     for (check, outcome) in outcomes {
@@ -1388,6 +1899,10 @@ fn print_fix_summary(outcomes: &[(String, FixOutcome)]) {
             FixOutcome::Fixed(msg) => {
                 fixed += 1;
                 println!("  ✓ {check}: {msg}");
+            }
+            FixOutcome::Partial(msg) => {
+                partial += 1;
+                println!("  ◐ {check}: {msg}");
             }
             FixOutcome::Failed(msg) => {
                 failed += 1;
@@ -1399,7 +1914,14 @@ fn print_fix_summary(outcomes: &[(String, FixOutcome)]) {
             }
         }
     }
-    println!("\nFix summary: {fixed} fixed · {failed} failed · {manual} manual",);
+    // `partial` is rendered only when present, keeping the common line
+    // byte-identical to the pre-Partial format.
+    let partial_part = if partial > 0 {
+        format!(" · {partial} partial")
+    } else {
+        String::new()
+    };
+    println!("\nFix summary: {fixed} fixed{partial_part} · {failed} failed · {manual} manual",);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1422,6 +1944,7 @@ const DOCTOR_SECTIONS: [(&str, &str, &[&str]); 4] = [
         &[
             "onebrain.yml",
             "onebrain.yml-keys",
+            "config-values",
             "vault-config-migration",
             "legacy-qmd-collection",
         ],
@@ -1442,6 +1965,7 @@ fn display_label(check: &str) -> &str {
     match check {
         "onebrain.yml" => "onebrain.yml",
         "onebrain.yml-keys" => "schema",
+        "config-values" => "config values",
         "vault-config-migration" => "config migration",
         "legacy-qmd-collection" => "qmd_collection",
         "folders" => "folders",
@@ -1524,7 +2048,7 @@ fn build_sections(results: &[DoctorResult]) -> Vec<crate::output::Section> {
 /// framing rules:
 ///
 /// ```text
-/// ⚠️  10 ok · 1 warning · 0 fail · 11 checks
+/// ⚠️  11 ok · 1 warning · 0 fail · 12 checks
 /// 💡  Run onebrain doctor --fix to auto-repair
 /// ```
 ///
@@ -2124,23 +2648,23 @@ mod tests {
     }
 
     #[test]
-    fn fix_vault_yml_keys_repairs_checkpoint_nums() {
+    fn fix_vault_yml_keys_leaves_out_of_range_checkpoint_values_alone() {
+        // v3.4.8: value repair moved to the `config-values` recipe (comment-
+        // preserving). This recipe must no longer touch out-of-range values —
+        // if it did, its serde re-serialization would destroy comments before
+        // `fix_config_values` gets its turn.
         let d = tempdir().unwrap();
-        fs::write(
-            d.path().join("onebrain.yml"),
-            "update_channel: stable\n\
+        let original = "update_channel: stable\n\
              checkpoint:\n  messages: 0\n  minutes: -5\n\
-             folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n",
-        )
-        .unwrap();
+             folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n";
+        fs::write(d.path().join("onebrain.yml"), original).unwrap();
         let outcome = fix_vault_yml_keys(d.path(), false);
         match outcome {
-            FixOutcome::Fixed(msg) => assert!(msg.contains("checkpoint"), "msg: {msg}"),
-            other => panic!("expected Fixed, got: {other:?}"),
+            FixOutcome::Fixed(msg) => assert!(msg.contains("already"), "msg: {msg}"),
+            other => panic!("expected Fixed (no-op), got: {other:?}"),
         }
         let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
-        assert!(after.contains("messages: 15"));
-        assert!(after.contains("minutes: 30"));
+        assert_eq!(after, original, "file untouched — values are not its job");
     }
 
     #[test]
@@ -3034,8 +3558,9 @@ mod tests {
                 "expected 'hooks registered': {msg}"
             ),
             // register-hooks can fail in CI if the vault has no config; accept
-            // both Fixed and Failed but not Manual.
+            // both Fixed and Failed but not Partial/Manual.
             FixOutcome::Failed(_) => {}
+            FixOutcome::Partial(msg) => panic!("unexpected Partial: {msg}"),
             FixOutcome::Manual(msg) => panic!("unexpected Manual: {msg}"),
         }
     }
@@ -3051,6 +3576,7 @@ mod tests {
         // Accept Fixed or Failed; not Manual.
         match &outcome {
             FixOutcome::Fixed(_) | FixOutcome::Failed(_) => {}
+            FixOutcome::Partial(m) => panic!("unexpected Partial: {m}"),
             FixOutcome::Manual(m) => panic!("unexpected Manual: {m}"),
         }
     }
@@ -3902,5 +4428,477 @@ mod tests {
         let mut dir_perms = fs::metadata(d.path()).unwrap().permissions();
         dir_perms.set_mode(0o755);
         fs::set_permissions(d.path(), dir_perms).unwrap();
+    }
+    // ── config-values check + reset (v3.4.8, #196) ─────────────────────
+
+    #[test]
+    fn collect_config_findings_clean_config_is_empty() {
+        let text = "update_channel: stable\n\
+                    checkpoint:\n  messages: 15\n  minutes: 30\n\
+                    search:\n  default_top_k: 10\n  embed_model: multilingual-e5-small\n  \
+                    reranker:\n    enabled: true\n    model: onebrain-rerank-v1\n    min_candidates: 10\n    min_score: 0.30\n";
+        let findings = collect_config_findings(text).unwrap();
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn collect_config_findings_absent_keys_are_fine() {
+        // Absent keys fall back to serde defaults — no findings.
+        let findings = collect_config_findings("# empty\n").unwrap();
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn collect_config_findings_non_mapping_returns_none() {
+        assert!(collect_config_findings("- a\n- b\n").is_none());
+        assert!(collect_config_findings("not: : valid").is_none());
+    }
+
+    #[test]
+    fn collect_config_findings_flags_every_rule() {
+        let text = "update_channel: weekly-maybe\n\
+                    checkpoint:\n  messages: 0\n  minutes: foo\n\
+                    folders:\n  inbox: \"\"\n\
+                    search:\n  collection: \"\"\n  default_top_k: -3\n  embed_model: nope\n  \
+                    reranker:\n    enabled: maybe\n    model: nope\n    min_candidates: 0\n    min_score: 7.5\n";
+        let findings = collect_config_findings(text).unwrap();
+        let dotted: Vec<&str> = findings.iter().map(|f| f.dotted.as_str()).collect();
+        for expect in [
+            "update_channel",
+            "checkpoint.messages",
+            "checkpoint.minutes",
+            "folders.inbox",
+            "search.collection",
+            "search.default_top_k",
+            "search.embed_model",
+            "search.reranker.enabled",
+            "search.reranker.model",
+            "search.reranker.min_candidates",
+            "search.reranker.min_score",
+        ] {
+            assert!(dotted.contains(&expect), "missing {expect}: {dotted:?}");
+        }
+        // Report-only findings are folders.* + search.collection, nothing else.
+        let report_only: Vec<&str> = findings
+            .iter()
+            .filter(|f| !f.resettable)
+            .map(|f| f.dotted.as_str())
+            .collect();
+        assert_eq!(report_only, vec!["folders.inbox", "search.collection"]);
+        // Only embed_model requires a reindex after reset.
+        let reindex: Vec<&str> = findings
+            .iter()
+            .filter(|f| f.reindex_required)
+            .map(|f| f.dotted.as_str())
+            .collect();
+        assert_eq!(reindex, vec!["search.embed_model"]);
+        // Defaults come from the runtime default fns / registries.
+        let by = |d: &str| {
+            findings
+                .iter()
+                .find(|f| f.dotted == d)
+                .unwrap()
+                .default_repr
+                .clone()
+        };
+        assert_eq!(by("checkpoint.messages"), "15");
+        assert_eq!(by("checkpoint.minutes"), "30");
+        assert_eq!(by("search.default_top_k"), "10");
+        assert_eq!(by("search.embed_model"), "multilingual-e5-small");
+        assert_eq!(by("search.reranker.model"), "onebrain-rerank-v1");
+        assert_eq!(by("search.reranker.min_score"), "0.30");
+        assert_eq!(by("update_channel"), "stable");
+    }
+
+    #[test]
+    fn collect_config_findings_min_score_bounds() {
+        // Boundary values 0 and 1 are valid; just outside is not.
+        let ok = "search:\n  reranker:\n    min_score: 0.0\n";
+        assert!(collect_config_findings(ok).unwrap().is_empty());
+        let ok = "search:\n  reranker:\n    min_score: 1.0\n";
+        assert!(collect_config_findings(ok).unwrap().is_empty());
+        let bad = "search:\n  reranker:\n    min_score: -0.1\n";
+        assert_eq!(collect_config_findings(bad).unwrap().len(), 1);
+        let bad = "search:\n  reranker:\n    min_score: not-a-number\n";
+        assert_eq!(collect_config_findings(bad).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn config_values_check_ok_warn_and_skip_paths() {
+        let d = tempdir().unwrap();
+        // No config file → skipped, ok.
+        let r = config_values_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Ok);
+        assert!(r.message.contains("skipped"), "{}", r.message);
+        // Invalid YAML → skipped, ok (onebrain.yml-keys owns that error).
+        fs::write(d.path().join("onebrain.yml"), "not: : valid").unwrap();
+        let r = config_values_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Ok);
+        assert!(r.message.contains("skipped"), "{}", r.message);
+        // In-range, documented values → ok. (An in-range key WITHOUT a doc
+        // comment is the undocumented-keys warn — covered below.)
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "# channel comment\nupdate_channel: next\n",
+        )
+        .unwrap();
+        let r = config_values_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Ok);
+        assert_eq!(r.message, "all values in range");
+        // In-range but UNDOCUMENTED key → warn with the backfill detail +
+        // comment-specific hint (still zero writes — read-only check).
+        fs::write(d.path().join("onebrain.yml"), "update_channel: next\n").unwrap();
+        let r = config_values_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Warn);
+        assert_eq!(r.message, "1 undocumented key(s)");
+        assert!(
+            r.details
+                .iter()
+                .any(|l| l.contains("lack self-documentation") && l.contains("update_channel")),
+            "{:?}",
+            r.details
+        );
+        assert!(
+            r.hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("add the missing self-documentation comments"),
+            "{:?}",
+            r.hint
+        );
+        // Out-of-range → warn with a per-key detail line + fix hint (the key
+        // is commented here so only the value finding fires).
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "checkpoint:\n  # messages comment\n  messages: 0\n",
+        )
+        .unwrap();
+        let r = config_values_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Warn);
+        assert_eq!(r.message, "1 invalid value(s)");
+        assert!(
+            r.details
+                .iter()
+                .any(|l| l.contains("checkpoint.messages") && l.contains("default: 15")),
+            "{:?}",
+            r.details
+        );
+        assert!(r.hint.as_deref().unwrap_or("").contains("doctor --fix"));
+        // Invalid value AND undocumented key combine into one message.
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "checkpoint:\n  messages: 0\n",
+        )
+        .unwrap();
+        let r = config_values_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Warn);
+        assert_eq!(r.message, "1 invalid value(s) · 1 undocumented key(s)");
+        assert!(
+            r.hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("reset out-of-range tunables and add the missing"),
+            "{:?}",
+            r.hint
+        );
+        // Report-only findings (documented key) carry no reset wording — but
+        // an undocumented report-only key still gets the comment hint.
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "folders:\n  # inbox comment\n  inbox: \"\"\n",
+        )
+        .unwrap();
+        let r = config_values_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Warn);
+        assert!(r.hint.is_none(), "{:?}", r.hint);
+    }
+
+    #[test]
+    fn reset_config_value_top_level_key() {
+        let text = "# header\nupdate_channel: weekly-maybe\nfolders:\n  inbox: 00-inbox\n";
+        let out = reset_config_value(text, &["update_channel"], "stable").unwrap();
+        assert_eq!(
+            out,
+            "# header\nupdate_channel: stable\nfolders:\n  inbox: 00-inbox\n"
+        );
+    }
+
+    #[test]
+    fn reset_config_value_three_level_walk_preserves_comments() {
+        let text = "search:\n  \
+                    # embed model comment\n  \
+                    embed_model: multilingual-e5-small\n  \
+                    reranker:\n    \
+                    # gate comment\n    \
+                    min_score: 7.5\n    \
+                    min_candidates: 10\nother:\n  min_score: 9.9\n";
+        let out = reset_config_value(text, &["search", "reranker", "min_score"], "0.30").unwrap();
+        assert!(out.contains("    min_score: 0.30\n"), "{out}");
+        assert!(out.contains("# gate comment"), "{out}");
+        assert!(out.contains("# embed model comment"), "{out}");
+        // A same-named key in a DIFFERENT block is untouched.
+        assert!(out.contains("  min_score: 9.9"), "{out}");
+        assert!(out.contains("min_candidates: 10"), "{out}");
+    }
+
+    #[test]
+    fn reset_config_value_preserves_inline_comment_and_crlf() {
+        let text = "checkpoint:\r\n  messages: 0  # my threshold\r\n  minutes: 30\r\n";
+        let out = reset_config_value(text, &["checkpoint", "messages"], "15").unwrap();
+        assert_eq!(
+            out,
+            "checkpoint:\r\n  messages: 15  # my threshold\r\n  minutes: 30\r\n"
+        );
+    }
+
+    #[test]
+    fn reset_config_value_refuses_inline_mapping() {
+        let text = "checkpoint: {messages: 0, minutes: 30}\n";
+        assert!(reset_config_value(text, &["checkpoint", "messages"], "15").is_none());
+    }
+
+    #[test]
+    fn reset_config_value_missing_key_returns_none() {
+        let text = "checkpoint:\n  minutes: 30\n";
+        assert!(reset_config_value(text, &["checkpoint", "messages"], "15").is_none());
+        assert!(reset_config_value(text, &["search", "default_top_k"], "10").is_none());
+        assert!(reset_config_value(text, &[], "x").is_none());
+    }
+
+    #[test]
+    fn reset_config_value_never_matches_a_grandchild_key() {
+        // `model:` exists only one level DEEPER than requested — the lookup
+        // must not reach into the nested block and clobber it.
+        let text = "search:\n  reranker:\n    model: onebrain-rerank-v1\n";
+        assert!(reset_config_value(text, &["search", "model"], "x").is_none());
+        // And a top-level lookup must not match a nested occurrence.
+        let text = "search:\n  update_channel: nested\n";
+        assert!(reset_config_value(text, &["update_channel"], "stable").is_none());
+    }
+
+    #[test]
+    fn reset_config_value_quoted_hash_is_not_a_comment() {
+        // A '#' inside a quoted scalar is data — the conservative guard keeps
+        // the whole remainder from being treated as a trailing comment.
+        let text = "search:\n  embed_model: \"weird # name\"\n";
+        let out =
+            reset_config_value(text, &["search", "embed_model"], "multilingual-e5-small").unwrap();
+        assert_eq!(out, "search:\n  embed_model: multilingual-e5-small\n");
+    }
+
+    #[test]
+    fn fix_config_values_resets_and_reports() {
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "# precious\nupdate_channel: stable\nfolders:\n  inbox: \"\"\ncheckpoint:\n  messages: 0\n",
+        )
+        .unwrap();
+        let outcome = fix_config_values(d.path(), false);
+        let FixOutcome::Fixed(msg) = outcome else {
+            panic!("expected Fixed, got: {outcome:?}");
+        };
+        assert!(msg.contains("checkpoint.messages → 15"), "msg: {msg}");
+        assert!(msg.contains("never auto-reset"), "msg: {msg}");
+        assert!(msg.contains("folders.inbox"), "msg: {msg}");
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert!(after.contains("# precious"), "{after}");
+        assert!(after.contains("messages: 15"), "{after}");
+        assert!(after.contains("inbox: \"\""), "folders untouched: {after}");
+    }
+
+    #[test]
+    fn fix_config_values_inline_mapping_is_failed_outcome() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("onebrain.yml"), "checkpoint: {messages: 0}\n").unwrap();
+        let outcome = fix_config_values(d.path(), false);
+        let FixOutcome::Failed(msg) = outcome else {
+            panic!("expected Failed, got: {outcome:?}");
+        };
+        assert!(msg.contains("checkpoint.messages"), "msg: {msg}");
+        assert!(msg.contains("edit manually"), "msg: {msg}");
+    }
+
+    #[test]
+    fn reset_config_value_header_inline_comment_is_still_a_block_header() {
+        // A trailing `# …` comment on a section header must not disable
+        // resets for every child under it.
+        let text = "search:  # my search config\n  reranker:\n    min_score: 7.5\n";
+        let out = reset_config_value(text, &["search", "reranker", "min_score"], "0.30").unwrap();
+        assert!(out.contains("min_score: 0.30"), "{out}");
+        assert!(out.contains("search:  # my search config"), "{out}");
+        // Inline mappings and inline scalars are still refused.
+        assert!(reset_config_value(
+            "checkpoint: {messages: 0}\n",
+            &["checkpoint", "messages"],
+            "15"
+        )
+        .is_none());
+        assert!(reset_config_value(
+            "checkpoint: null\n  messages: 0\n",
+            &["checkpoint", "messages"],
+            "15"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn fix_config_values_partial_when_mixed_reset_and_unfixable() {
+        // One value resettable (block form), one stuck in an inline mapping:
+        // the reset must land on disk AND the outcome must be the honest
+        // tri-state Partial — not Failed (real work happened) and not Fixed
+        // (something remains).
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "checkpoint: {messages: 0}\nsearch:\n  default_top_k: 0\n",
+        )
+        .unwrap();
+        let outcome = fix_config_values(d.path(), false);
+        let FixOutcome::Partial(msg) = outcome else {
+            panic!("expected Partial, got: {outcome:?}");
+        };
+        assert!(msg.contains("search.default_top_k → 10"), "msg: {msg}");
+        assert!(msg.contains("checkpoint.messages"), "msg: {msg}");
+        assert!(msg.contains("edit manually"), "msg: {msg}");
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert!(
+            after.contains("default_top_k: 10"),
+            "reset must be on disk: {after}"
+        );
+        assert!(
+            after.contains("checkpoint: {messages: 0}"),
+            "unfixable shape untouched: {after}"
+        );
+    }
+
+    #[test]
+    fn fix_config_values_clean_documented_config_is_noop() {
+        // A fully-commented, in-range config (the fresh template) is the true
+        // no-op: byte-identical after --fix, "already" message.
+        let d = tempdir().unwrap();
+        let clean = "# channel comment\nupdate_channel: stable\n";
+        fs::write(d.path().join("onebrain.yml"), clean).unwrap();
+        let outcome = fix_config_values(d.path(), false);
+        let FixOutcome::Fixed(msg) = outcome else {
+            panic!("expected Fixed, got: {outcome:?}");
+        };
+        assert!(msg.contains("already in range"), "msg: {msg}");
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after, clean);
+    }
+
+    #[test]
+    fn fix_config_values_backfills_template_comments_on_legacy_config() {
+        // Scope test (a): a bare legacy config gains the EXACT template
+        // comment above every known key; values and key order untouched.
+        let d = tempdir().unwrap();
+        let legacy = "update_channel: stable\n\
+             folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n\
+             checkpoint:\n  messages: 15\n  minutes: 30\n\
+             search:\n  collection: my-col\n  embed_model: multilingual-e5-small\n";
+        fs::write(d.path().join("onebrain.yml"), legacy).unwrap();
+        let outcome = fix_config_values(d.path(), false);
+        let FixOutcome::Fixed(msg) = outcome else {
+            panic!("expected Fixed, got: {outcome:?}");
+        };
+        assert!(
+            msg.contains("added 13 self-documentation comment(s)"),
+            "msg: {msg}"
+        );
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        // Every known present key now carries EXACTLY the template comment,
+        // sourced from the shared table.
+        for doc in onebrain_fs::config_key_docs() {
+            let key = doc.segments.last().unwrap();
+            // Keys not present in this legacy config are never added.
+            if doc.segments.join(".").starts_with("search.reranker")
+                || doc.segments == ["search", "default_top_k"]
+            {
+                assert!(
+                    !after
+                        .lines()
+                        .any(|l| l.trim_start().starts_with(&format!("{key}:"))),
+                    "absent key {key} must not be injected:\n{after}"
+                );
+                continue;
+            }
+            let lines: Vec<&str> = after.lines().collect();
+            let idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with(&format!("{key}:")))
+                .unwrap_or_else(|| panic!("{key} missing:\n{after}"));
+            assert_eq!(
+                lines[idx - 1].trim_start(),
+                doc.comment,
+                "comment above {key} must be the template's:\n{after}"
+            );
+        }
+        // Values + key order untouched.
+        assert!(after.contains("collection: my-col"), "{after}");
+        let key_order: Vec<&str> = after
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .collect();
+        let legacy_order: Vec<&str> = legacy
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .collect();
+        assert_eq!(key_order, legacy_order, "key lines must be untouched");
+        // Scope test (c): a user's own comment wins — and (d) idempotency:
+        // second run changes nothing.
+        let outcome = fix_config_values(d.path(), false);
+        let FixOutcome::Fixed(msg) = outcome else {
+            panic!("expected Fixed, got: {outcome:?}");
+        };
+        assert!(msg.contains("already in range"), "msg: {msg}");
+        let after2 = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after2, after, "second --fix run must be byte-identical");
+    }
+
+    #[test]
+    fn fix_config_values_never_replaces_user_comments() {
+        // Scope test (b): a key already under the user's own comment is left
+        // alone — no insertion, no dedupe, no replacement.
+        let d = tempdir().unwrap();
+        let cfg = "# my own words about the channel\nupdate_channel: stable\n";
+        fs::write(d.path().join("onebrain.yml"), cfg).unwrap();
+        let outcome = fix_config_values(d.path(), false);
+        let FixOutcome::Fixed(msg) = outcome else {
+            panic!("expected Fixed, got: {outcome:?}");
+        };
+        assert!(msg.contains("already in range"), "msg: {msg}");
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after, cfg);
+    }
+
+    #[test]
+    fn fix_config_values_reset_and_backfill_in_one_run() {
+        // Scope test (d): a value reset and the comment backfill land in the
+        // same run, one report.
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "update_channel: stable\ncheckpoint:\n  messages: 0\n",
+        )
+        .unwrap();
+        let outcome = fix_config_values(d.path(), false);
+        let FixOutcome::Fixed(msg) = outcome else {
+            panic!("expected Fixed, got: {outcome:?}");
+        };
+        assert!(msg.contains("checkpoint.messages → 15"), "msg: {msg}");
+        assert!(msg.contains("self-documentation comment(s)"), "msg: {msg}");
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert!(after.contains("messages: 15"), "{after}");
+        // The backfilled comment sits above the CORRECTED value line.
+        let lines: Vec<&str> = after.lines().collect();
+        let idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("messages:"))
+            .unwrap();
+        assert!(
+            lines[idx - 1].trim_start().starts_with('#') && lines[idx - 1].contains("default: 15"),
+            "{after}"
+        );
     }
 }

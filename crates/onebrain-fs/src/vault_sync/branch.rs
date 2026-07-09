@@ -8,6 +8,15 @@
 //! absent/unknown channels to `next` would 404 the tarball fetch on
 //! `plugin update` for any vault without an explicit `update_channel`.
 
+/// The `update_channel` values the CLI understands — the single source of
+/// truth for scaffold comments and doctor validation. Anything else resolves
+/// to `main` at fetch time (see [`resolve_branch`]) but is flagged by
+/// `onebrain doctor` as an invalid value.
+pub const VALID_UPDATE_CHANNELS: &[&str] = &["stable", "next"];
+
+/// The `update_channel` value `init` scaffolds and `doctor --fix` resets to.
+pub const DEFAULT_UPDATE_CHANNEL: &str = "stable";
+
 /// Resolve the upstream branch to fetch the tarball from.
 ///
 /// `update_channel === 'next'` ⇒ `next`; any other channel (or absence) ⇒

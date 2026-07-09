@@ -358,3 +358,184 @@ fn harness_files_get_new_imports_injected() {
         .count();
     assert_eq!(dup, 1);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// v3.4.8 (#196 / PR #199 R3): the self-documenting template must survive
+// vault-sync — its Step 7 config writer is change-detecting and
+// comment-preserving. All four scenarios run the REAL binary with the
+// tarball fixture (no network).
+// ─────────────────────────────────────────────────────────────────────────
+
+fn comment_lines(s: &str) -> usize {
+    s.lines()
+        .filter(|l| l.trim_start().starts_with('#'))
+        .count()
+}
+
+/// (a) Default install path: `onebrain init --yes` runs vault-sync INLINE.
+/// The scaffolded template must come out the other side untouched.
+#[test]
+fn default_init_with_inline_sync_keeps_template_comments() {
+    let dir = tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    let tarball = build_tarball("onebrain-ai-onebrain-abc1234", "1.11.0", &[]);
+    let tarball_path = dir.path().join("fixture.tar.gz");
+    fs::write(&tarball_path, &tarball).unwrap();
+    let isolated = dir.path().join("isolated-installed_plugins.json");
+
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["init", "--yes"])
+        .current_dir(&vault)
+        .env("ONEBRAIN_VAULT_SYNC_FIXTURE", &tarball_path)
+        .env("ONEBRAIN_INSTALLED_PLUGINS_PATH", &isolated)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let cfg = fs::read_to_string(vault.join("onebrain.yml")).unwrap();
+    let template =
+        onebrain_fs::render_onebrain_yml(onebrain_fs::SchedulePreset::Essentials).unwrap();
+    assert_eq!(
+        comment_lines(&cfg),
+        comment_lines(&template),
+        "inline vault-sync must not strip template comments:\n{cfg}"
+    );
+    assert!(
+        cfg.contains("# collection:"),
+        "commented collection placeholder must survive:\n{cfg}"
+    );
+    assert!(
+        cfg.contains("min_score: 0.30"),
+        "min_score must stay verbatim (not re-serialized to 0.3):\n{cfg}"
+    );
+    assert!(cfg.contains("update_channel: stable"), "{cfg}");
+}
+
+/// (b) Re-sync of an already-synced commented config: byte-identical no-op.
+#[test]
+fn resync_of_commented_config_is_a_no_write() {
+    let dir = tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    fs::create_dir_all(vault.join(".claude")).unwrap();
+    let template = onebrain_fs::render_onebrain_yml(onebrain_fs::SchedulePreset::Skip).unwrap();
+    fs::write(vault.join("onebrain.yml"), &template).unwrap();
+    let tarball = build_tarball("onebrain-ai-onebrain-abc1234", "1.11.0", &[]);
+    let (status, _stdout, stderr) = run_sync(&vault, &tarball, &[]);
+    assert!(status.success(), "stderr: {stderr}");
+    let after = fs::read_to_string(vault.join("onebrain.yml")).unwrap();
+    assert_eq!(
+        after, template,
+        "already-correct config must not be rewritten"
+    );
+    assert!(
+        !vault.join(".onebrain-backups").exists(),
+        "no write ⇒ no backup dir"
+    );
+}
+
+/// (c) Sync that genuinely must add `update_channel` to a commented config:
+/// the key lands, every comment stays.
+#[test]
+fn sync_adding_channel_key_keeps_comments() {
+    let dir = tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    fs::create_dir_all(vault.join(".claude")).unwrap();
+    let template = onebrain_fs::render_onebrain_yml(onebrain_fs::SchedulePreset::Skip).unwrap();
+    // Strip the update_channel line (and keep its doc comment — comments are
+    // never load-bearing) so sync has a real change to make.
+    let without_channel: String = template
+        .lines()
+        .filter(|l| !l.starts_with("update_channel:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(vault.join("onebrain.yml"), &without_channel).unwrap();
+    let tarball = build_tarball("onebrain-ai-onebrain-abc1234", "1.11.0", &[]);
+    let (status, _stdout, stderr) = run_sync(&vault, &tarball, &[]);
+    assert!(status.success(), "stderr: {stderr}");
+    let after = fs::read_to_string(vault.join("onebrain.yml")).unwrap();
+    assert!(after.contains("update_channel: stable"), "{after}");
+    assert_eq!(
+        comment_lines(&after),
+        comment_lines(&without_channel),
+        "adding a key must not cost a single comment line:\n{after}"
+    );
+    let parsed: serde_json::Value = serde_yaml::from_str::<serde_yaml::Value>(&after)
+        .map(|v| serde_json::to_value(v).unwrap())
+        .unwrap();
+    assert_eq!(parsed["update_channel"], "stable");
+    assert_eq!(parsed["search"]["default_top_k"], 10);
+}
+
+/// (d) `doctor --fix` whose plugin-files repair triggers a full
+/// `run_vault_sync`: the commented config survives the repair.
+#[cfg(unix)]
+#[test]
+fn doctor_fix_plugin_files_repair_keeps_config_comments() {
+    let home = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let dir = tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    // Full healthy vault EXCEPT the plugin files — that failing check maps to
+    // the vault-sync repair recipe.
+    for f in [
+        "00-inbox",
+        "01-projects",
+        "02-areas",
+        "03-knowledge",
+        "04-resources",
+        "05-agent",
+        "06-archive",
+        "07-logs",
+    ] {
+        fs::create_dir_all(vault.join(f)).unwrap();
+    }
+    fs::create_dir_all(vault.join(".claude")).unwrap();
+    fs::write(
+        vault.join(".claude/settings.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"command":"onebrain","args":["checkpoint","stop"]}]}]},"permissions":{"allow":["Bash(onebrain *)"]}}"#,
+    )
+    .unwrap();
+    let template = onebrain_fs::render_onebrain_yml(onebrain_fs::SchedulePreset::Skip).unwrap();
+    fs::write(vault.join("onebrain.yml"), &template).unwrap();
+
+    let tarball = build_tarball("onebrain-ai-onebrain-abc1234", "1.11.0", &[]);
+    let tarball_path = dir.path().join("fixture.tar.gz");
+    fs::write(&tarball_path, &tarball).unwrap();
+    let isolated = dir.path().join("isolated-installed_plugins.json");
+
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["doctor", "--fix", "--yes"])
+        .current_dir(&vault)
+        .env("HOME", home.path())
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .env("ONEBRAIN_VAULT_SYNC_FIXTURE", &tarball_path)
+        .env("ONEBRAIN_INSTALLED_PLUGINS_PATH", &isolated)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("plugin files re-overlaid"),
+        "vault-sync repair must have run: {stdout}"
+    );
+    assert!(
+        vault
+            .join(".claude/plugins/onebrain/INSTRUCTIONS.md")
+            .exists(),
+        "repair must restore plugin files"
+    );
+    let after = fs::read_to_string(vault.join("onebrain.yml")).unwrap();
+    assert_eq!(
+        comment_lines(&after),
+        comment_lines(&template),
+        "plugin-files repair must not strip config comments:\n{after}"
+    );
+    assert!(after.contains("# collection:"), "{after}");
+}
