@@ -645,8 +645,9 @@ fn dir_mtime_secs(root: &Path) -> Option<u64> {
 }
 
 /// Format epoch seconds as local `YYYY-MM-DD HH:MM`, or `None` on an
-/// out-of-range timestamp.
-fn format_local(secs: u64) -> Option<String> {
+/// out-of-range timestamp. `pub(crate)` so `daemon status`'s dashboard renders
+/// its `started` / `last indexed` timestamps in the same house format.
+pub(crate) fn format_local(secs: u64) -> Option<String> {
     chrono::DateTime::from_timestamp(secs as i64, 0).map(|dt| {
         dt.with_timezone(&chrono::Local)
             .format("%Y-%m-%d %H:%M")
