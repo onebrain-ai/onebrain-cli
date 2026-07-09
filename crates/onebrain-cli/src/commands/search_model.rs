@@ -1093,10 +1093,7 @@ mod tests {
         assert!(lines[0].starts_with("┌ Rerankers ─"), "{s}");
         let w = lines[0].width();
         // Every box line (┌…┐, │…│, └…┘) must have the SAME display width…
-        for l in lines
-            .iter()
-            .take_while(|l| l.starts_with(['┌', '│', '└']))
-        {
+        for l in lines.iter().take_while(|l| l.starts_with(['┌', '│', '└'])) {
             assert_eq!(l.width(), w, "border broken by line {l:?} in\n{s}");
         }
         // …and the box must fit a normal terminal: cap inner width so a long
