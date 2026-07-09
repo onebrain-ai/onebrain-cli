@@ -177,7 +177,7 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchReindexA
     // Re-measure after indexing so the summary can show the resulting size and
     // its delta vs. before the run.
     let size_after = cache_dir.as_deref().and_then(index_size_bytes);
-    // Active model for the summary's 🧠  Model section — read from vault
+    // Active model for the summary's 🧠  Embedding section — read from vault
     // config (same source `model_load_notice_for` uses); serde fills the
     // default when the key is absent.
     let embed_model = onebrain_core::load_vault_config(&resolved.root)
@@ -996,9 +996,10 @@ fn index_size_suffix(size: Option<u64>, delta: Option<i64>) -> Option<String> {
 fn render_text(env: &Envelope<ReindexData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     // Grouped convention, exactly like `search status`: a ✅  confirm line,
-    // then emoji-headed sections of indented label/value rows. The 🧠  Model
-    // section always renders (an all-unchanged run names the model exactly
-    // like a run that embedded); zero doc categories are omitted (a section
+    // then emoji-headed sections of indented label/value rows. The
+    // 🧠  Embedding section always renders (an all-unchanged run names the
+    // model exactly like a run that embedded — the label matches `search
+    // status`'s Embedding section, #195); zero doc categories are omitted (a section
     // with no rows is omitted entirely); `failed` carries a ⚠️  so it stands
     // out.
     let mut doc_rows: Vec<String> = Vec::new();
@@ -1025,7 +1026,7 @@ fn render_text(env: &Envelope<ReindexData>) -> String {
         "✅  Reindexed".to_string()
     };
 
-    out.push_str(&format!("\n\n{}", section("🧠", "Model")));
+    out.push_str(&format!("\n\n{}", section("🧠", "Embedding")));
     out.push_str(&format!("\n{}", item("Name", &d.embed_model)));
 
     if !doc_rows.is_empty() {
@@ -1103,7 +1104,7 @@ mod tests {
         assert!(s.starts_with("✅  Reindexed\n"), "{s}");
         // The model is always named, between the headline and the Docs section.
         assert!(
-            s.contains("\n\n🧠  Model\n    Name          multilingual-e5-small"),
+            s.contains("\n\n🧠  Embedding\n    Name          multilingual-e5-small"),
             "{s}"
         );
         // Counts sit under the 📄  Docs section header.
@@ -1132,11 +1133,11 @@ mod tests {
     #[test]
     fn text_reports_noop_when_all_zero() {
         // No counts and no size → the confirm line + the always-present
-        // Model section, no Docs / Index sections.
+        // Embedding section, no Docs / Index sections.
         let e = Envelope::ok("search.reindex", None, data(0, 0, 0, 0, 0));
         assert_eq!(
             render_text(&e),
-            "✅  Reindexed — nothing to update\n\n🧠  Model\n    Name          multilingual-e5-small"
+            "✅  Reindexed — nothing to update\n\n🧠  Embedding\n    Name          multilingual-e5-small"
         );
     }
 
@@ -1147,10 +1148,10 @@ mod tests {
         let e = Envelope::ok("search.reindex", None, d);
         let s = render_text(&e);
         assert!(s.starts_with("✅  Reindexed — nothing to update"), "{s}");
-        // The Model section names the model even on a no-op run; the Docs
+        // The Embedding section names the model even on a no-op run; the Docs
         // section stays omitted (no rows); the Index section still reports
         // the size.
-        assert!(s.contains("\n\n🧠  Model\n    Name          "), "{s}");
+        assert!(s.contains("\n\n🧠  Embedding\n    Name          "), "{s}");
         assert!(!s.contains("📄  Docs"), "{s}");
         assert!(s.contains("\n\n📊  Index\n    Size          5.0 MB"), "{s}");
     }
