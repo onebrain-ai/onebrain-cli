@@ -255,8 +255,348 @@ pub fn run(
 /// "Index & state" section), replacing the removed `qmd-embeddings` row.
 fn all_checks(vault_root: &Path, config: &onebrain_core::VaultConfig) -> Vec<DoctorResult> {
     let mut results = run_all_checks(vault_root, config);
+    // CLI-layer checks: both need `onebrain-search` (model/reranker registry
+    // access), which `onebrain-fs` doesn't depend on — so they're spliced in
+    // here rather than living alongside the fs-layer checks.
+    results.push(config_values_check(vault_root));
     results.push(native_search_check(vault_root));
     results
+}
+
+/// One out-of-range (or otherwise invalid) config value found by
+/// [`config_values_check`]. Carries everything the check needs to render a
+/// finding line AND everything the `--fix` recipe needs to reset the value.
+#[derive(Debug)]
+struct ConfigFinding {
+    /// Dotted key path as the user knows it, e.g. `search.reranker.min_score`.
+    dotted: String,
+    /// Path segments for the line editor, e.g. `["search", "reranker", "min_score"]`.
+    segments: Vec<&'static str>,
+    /// What's wrong, e.g. `is 7.5 — must be between 0 and 1`.
+    problem: String,
+    /// The documented default the value resets to, as a YAML scalar.
+    default_repr: String,
+    /// Whether `--fix` may auto-reset it. `folders.*` and `search.collection`
+    /// are report-only — never auto-reset (renaming folders orphans notes;
+    /// changing the collection detaches the index).
+    resettable: bool,
+    /// True for `search.embed_model` — resetting it invalidates existing
+    /// vectors, so the fix footer must tell the user to reindex.
+    reindex_required: bool,
+}
+
+impl ConfigFinding {
+    /// Render the finding as a doctor detail line.
+    fn detail_line(&self) -> String {
+        if self.resettable {
+            format!(
+                "{}: {} · default: {}",
+                self.dotted, self.problem, self.default_repr
+            )
+        } else {
+            format!(
+                "{}: {} (never auto-reset — edit manually)",
+                self.dotted, self.problem
+            )
+        }
+    }
+}
+
+/// Best-effort display of a YAML scalar for finding messages.
+fn display_yaml_value(v: &serde_yaml::Value) -> String {
+    match v {
+        serde_yaml::Value::Null => "null".to_string(),
+        serde_yaml::Value::Bool(b) => b.to_string(),
+        serde_yaml::Value::Number(n) => n.to_string(),
+        serde_yaml::Value::String(s) => s.clone(),
+        other => serde_yaml::to_string(other)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+    }
+}
+
+/// Validate every tunable in raw config text against the same defaults and
+/// registries the runtime uses (`onebrain_core` default fns, the
+/// `onebrain-search` model/reranker registries, `onebrain-fs`'s
+/// `VALID_UPDATE_CHANNELS`) — no duplicated range literals. Returns `None`
+/// when the text isn't a YAML mapping (the `onebrain.yml-keys` check already
+/// reports that); absent keys are fine (serde falls back to the default), so
+/// only PRESENT-but-invalid values produce findings.
+fn collect_config_findings(text: &str) -> Option<Vec<ConfigFinding>> {
+    use onebrain_core::config::SearchConfig;
+    use onebrain_core::{CheckpointPolicy, RerankerConfig};
+    use onebrain_fs::vault_sync::{DEFAULT_UPDATE_CHANNEL, VALID_UPDATE_CHANNELS};
+    use onebrain_search::embed::is_supported_model;
+    use onebrain_search::rerank::is_supported_reranker;
+    use serde_yaml::Value;
+
+    let parsed: Value = serde_yaml::from_str(text).ok()?;
+    let root = parsed.as_mapping()?;
+    let get = |m: &serde_yaml::Mapping, k: &str| m.get(Value::String(k.to_string())).cloned();
+    let child = |m: &serde_yaml::Mapping, k: &str| {
+        get(m, k).and_then(|v| v.as_mapping().cloned())
+    };
+
+    let mut findings: Vec<ConfigFinding> = Vec::new();
+
+    // update_channel ∈ VALID_UPDATE_CHANNELS.
+    if let Some(v) = get(root, "update_channel") {
+        let valid = v
+            .as_str()
+            .is_some_and(|s| VALID_UPDATE_CHANNELS.contains(&s));
+        if !valid {
+            findings.push(ConfigFinding {
+                dotted: "update_channel".to_string(),
+                segments: vec!["update_channel"],
+                problem: format!(
+                    "is {} — must be one of: {}",
+                    display_yaml_value(&v),
+                    VALID_UPDATE_CHANNELS.join(", ")
+                ),
+                default_repr: DEFAULT_UPDATE_CHANNEL.to_string(),
+                resettable: true,
+                reindex_required: false,
+            });
+        }
+    }
+
+    // checkpoint.messages / checkpoint.minutes ≥ 1.
+    if let Some(cp) = child(root, "checkpoint") {
+        let defaults = CheckpointPolicy::default();
+        for (key, default) in [
+            ("messages", defaults.messages),
+            ("minutes", defaults.minutes),
+        ] {
+            if let Some(v) = get(&cp, key) {
+                if !value_is_positive_number(&v) {
+                    findings.push(ConfigFinding {
+                        dotted: format!("checkpoint.{key}"),
+                        segments: vec!["checkpoint", key],
+                        problem: format!(
+                            "is {} — must be a number >= 1",
+                            display_yaml_value(&v)
+                        ),
+                        default_repr: default.to_string(),
+                        resettable: true,
+                        reindex_required: false,
+                    });
+                }
+            }
+        }
+    }
+
+    // folders.* — non-empty strings; report-only.
+    if let Some(folders) = child(root, "folders") {
+        let standard = [
+            "inbox",
+            "projects",
+            "areas",
+            "knowledge",
+            "resources",
+            "agent",
+            "archive",
+            "logs",
+        ];
+        for key in standard {
+            if let Some(v) = get(&folders, key) {
+                let valid = v.as_str().is_some_and(|s| !s.trim().is_empty());
+                if !valid {
+                    findings.push(ConfigFinding {
+                        dotted: format!("folders.{key}"),
+                        segments: vec!["folders", key],
+                        problem: format!(
+                            "is {} — must be a non-empty folder name",
+                            display_yaml_value(&v)
+                        ),
+                        default_repr: String::new(),
+                        resettable: false,
+                        reindex_required: false,
+                    });
+                }
+            }
+        }
+    }
+
+    // search.* block.
+    if let Some(search) = child(root, "search") {
+        let sc = SearchConfig::default();
+
+        // search.collection — non-empty string; report-only.
+        if let Some(v) = get(&search, "collection") {
+            let valid = v.as_str().is_some_and(|s| !s.trim().is_empty());
+            if !valid {
+                findings.push(ConfigFinding {
+                    dotted: "search.collection".to_string(),
+                    segments: vec!["search", "collection"],
+                    problem: format!(
+                        "is {} — must be a non-empty collection name (or absent to disable search)",
+                        display_yaml_value(&v)
+                    ),
+                    default_repr: String::new(),
+                    resettable: false,
+                    reindex_required: false,
+                });
+            }
+        }
+
+        // search.embed_model ∈ model registry.
+        if let Some(v) = get(&search, "embed_model") {
+            let valid = v.as_str().is_some_and(is_supported_model);
+            if !valid {
+                findings.push(ConfigFinding {
+                    dotted: "search.embed_model".to_string(),
+                    segments: vec!["search", "embed_model"],
+                    problem: format!(
+                        "is {} — not in the model registry (see `onebrain search model list`)",
+                        display_yaml_value(&v)
+                    ),
+                    default_repr: sc.embed_model.clone(),
+                    resettable: true,
+                    reindex_required: true,
+                });
+            }
+        }
+
+        // search.default_top_k ≥ 1 (integer).
+        if let Some(v) = get(&search, "default_top_k") {
+            let valid = v.as_u64().is_some_and(|n| n >= 1);
+            if !valid {
+                findings.push(ConfigFinding {
+                    dotted: "search.default_top_k".to_string(),
+                    segments: vec!["search", "default_top_k"],
+                    problem: format!(
+                        "is {} — must be an integer >= 1",
+                        display_yaml_value(&v)
+                    ),
+                    default_repr: sc.default_top_k.to_string(),
+                    resettable: true,
+                    reindex_required: false,
+                });
+            }
+        }
+
+        // search.reranker.* block.
+        if let Some(rr) = child(&search, "reranker") {
+            let rd = RerankerConfig::default();
+
+            if let Some(v) = get(&rr, "enabled") {
+                if v.as_bool().is_none() {
+                    findings.push(ConfigFinding {
+                        dotted: "search.reranker.enabled".to_string(),
+                        segments: vec!["search", "reranker", "enabled"],
+                        problem: format!(
+                            "is {} — must be true or false",
+                            display_yaml_value(&v)
+                        ),
+                        default_repr: rd.enabled.to_string(),
+                        resettable: true,
+                        reindex_required: false,
+                    });
+                }
+            }
+
+            if let Some(v) = get(&rr, "model") {
+                let valid = v.as_str().is_some_and(is_supported_reranker);
+                if !valid {
+                    findings.push(ConfigFinding {
+                        dotted: "search.reranker.model".to_string(),
+                        segments: vec!["search", "reranker", "model"],
+                        problem: format!(
+                            "is {} — not in the reranker registry (see `onebrain search model list`)",
+                            display_yaml_value(&v)
+                        ),
+                        default_repr: rd.model.clone(),
+                        resettable: true,
+                        reindex_required: false,
+                    });
+                }
+            }
+
+            if let Some(v) = get(&rr, "min_candidates") {
+                let valid = v.as_u64().is_some_and(|n| n >= 1);
+                if !valid {
+                    findings.push(ConfigFinding {
+                        dotted: "search.reranker.min_candidates".to_string(),
+                        segments: vec!["search", "reranker", "min_candidates"],
+                        problem: format!(
+                            "is {} — must be an integer >= 1",
+                            display_yaml_value(&v)
+                        ),
+                        default_repr: rd.min_candidates.to_string(),
+                        resettable: true,
+                        reindex_required: false,
+                    });
+                }
+            }
+
+            if let Some(v) = get(&rr, "min_score") {
+                let valid = v
+                    .as_f64()
+                    .is_some_and(|f| (0.0..=1.0).contains(&f));
+                if !valid {
+                    findings.push(ConfigFinding {
+                        dotted: "search.reranker.min_score".to_string(),
+                        segments: vec!["search", "reranker", "min_score"],
+                        problem: format!(
+                            "is {} — must be a number between 0 and 1",
+                            display_yaml_value(&v)
+                        ),
+                        // Pinned to the engine's calibrated default by the
+                        // cross-crate test in `init_integration.rs`.
+                        default_repr: onebrain_fs::TEMPLATE_RERANK_MIN_SCORE.to_string(),
+                        resettable: true,
+                        reindex_required: false,
+                    });
+                }
+            }
+        }
+    }
+
+    Some(findings)
+}
+
+const CONFIG_VALUES_CHECK: &str = "config-values";
+
+/// Per-key config value validation (`check = "config-values"`). Validates
+/// every PRESENT tunable in `onebrain.yml` against the runtime defaults and
+/// model/reranker registries — the self-documentation counterpart of the
+/// commented `init` template (ADR 0026). Missing keys are fine (serde falls
+/// back to defaults); a missing or unparsable file is the `onebrain.yml` /
+/// `onebrain.yml-keys` checks' territory, so this check skips quietly then.
+///
+/// All findings are advisory (`warn`): `--fix` auto-resets the tunables to
+/// their documented defaults; `folders.*` / `search.collection` findings are
+/// report-only (never auto-reset).
+fn config_values_check(vault_root: &Path) -> DoctorResult {
+    use onebrain_core::find_config_file;
+    let Some(path) = find_config_file(vault_root) else {
+        return DoctorResult::ok(CONFIG_VALUES_CHECK, "skipped — no config file");
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return DoctorResult::ok(CONFIG_VALUES_CHECK, "skipped — config unreadable");
+    };
+    let Some(findings) = collect_config_findings(&text) else {
+        return DoctorResult::ok(
+            CONFIG_VALUES_CHECK,
+            "skipped — invalid YAML (see onebrain.yml-keys)",
+        );
+    };
+    if findings.is_empty() {
+        return DoctorResult::ok(CONFIG_VALUES_CHECK, "all values in range");
+    }
+    let n = findings.len();
+    let details: Vec<String> = findings.iter().map(ConfigFinding::detail_line).collect();
+    let any_resettable = findings.iter().any(|f| f.resettable);
+    let mut r = DoctorResult::warn(
+        CONFIG_VALUES_CHECK,
+        format!("{n} invalid value(s)"),
+    )
+    .with_details(details);
+    if any_resettable {
+        r = r.with_hint("Run onebrain doctor --fix to reset out-of-range tunables to their defaults");
+    }
+    r
 }
 
 /// Native-search index check (`check = "search"`). Read-only and
@@ -273,15 +613,18 @@ fn all_checks(vault_root: &Path, config: &onebrain_core::VaultConfig) -> Vec<Doc
 ///   exit code only escalates on `error`, so this check never fails the run.
 fn native_search_check(vault_root: &Path) -> DoctorResult {
     use crate::commands::search_common::{
-        collection_cache_dir, collection_for, is_indexed, open_engine,
+        collection_cache_dir, collection_name_readonly, is_indexed, open_engine,
     };
     use onebrain_core::load_vault_config;
     use onebrain_search::embed::model_download_status;
     use onebrain_search::rerank::{reranker_download_status, reranker_registry};
 
-    // Resolve the collection. `collection_for` may persist a generated name on
-    // a never-configured vault — the same deterministic name every other
-    // `search` command would write; harmless and one-time.
+    // Resolve the collection READ-ONLY (`collection_name_readonly`): doctor
+    // must never rewrite the config as a side effect — the pre-v3.4.8
+    // `collection_for` persisted a generated name on a never-configured
+    // vault via a serde re-serialization, which would have destroyed the
+    // commented template's comments on the first doctor run. The generated
+    // name is the same deterministic one a later `search reindex` adopts.
     // On the two resolution-failure early returns the reranker state is
     // genuinely uncomputable (no config, no cache dir) — the three fields
     // are still reported, as `unknown`, so the payload shape is identical
@@ -301,7 +644,7 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
             return unresolved(format!("could not resolve vault: {e}"));
         }
     };
-    let collection = match collection_for(&resolved) {
+    let collection = match collection_name_readonly(resolved.root.as_path()) {
         Ok(c) => c,
         Err(e) => {
             return unresolved(format!("could not resolve collection: {e}"));
@@ -1422,6 +1765,7 @@ const DOCTOR_SECTIONS: [(&str, &str, &[&str]); 4] = [
         &[
             "onebrain.yml",
             "onebrain.yml-keys",
+            "config-values",
             "vault-config-migration",
             "legacy-qmd-collection",
         ],
@@ -1442,6 +1786,7 @@ fn display_label(check: &str) -> &str {
     match check {
         "onebrain.yml" => "onebrain.yml",
         "onebrain.yml-keys" => "schema",
+        "config-values" => "config values",
         "vault-config-migration" => "config migration",
         "legacy-qmd-collection" => "qmd_collection",
         "folders" => "folders",

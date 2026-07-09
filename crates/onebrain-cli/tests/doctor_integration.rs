@@ -905,3 +905,162 @@ fn doctor_fix_prunes_stale_plugin_cache_under_fake_home() {
         stale.display()
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// config-values check + --fix reset-to-default (v3.4.8, #196)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// All 8 folder keys present so `onebrain.yml-keys` stays quiet and the
+/// assertions isolate the new `config-values` check.
+const FULL_FOLDERS_BLOCK: &str = "folders:\n  \
+       inbox: 00-inbox\n  \
+       projects: 01-projects\n  \
+       areas: 02-areas\n  \
+       knowledge: 03-knowledge\n  \
+       resources: 04-resources\n  \
+       agent: 05-agent\n  \
+       archive: 06-archive\n  \
+       logs: 07-logs\n";
+
+/// Like `write_minimal_vault`, but writes the given text to the canonical
+/// `onebrain.yml` (no legacy `vault.yml`) so config-value tests control the
+/// exact file content doctor sees.
+fn vault_with_config(dir: &Path, config: &str) {
+    write_minimal_vault(dir);
+    std::fs::remove_file(dir.join("vault.yml")).unwrap();
+    std::fs::write(dir.join("onebrain.yml"), config).unwrap();
+}
+
+/// Run `doctor --json` (no fix) and return raw stdout. `ONEBRAIN_CACHE_DIR`
+/// is pointed at a tempdir so the search check never touches the real cache.
+fn run_doctor_json(dir: &Path, cache: &Path) -> String {
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(dir)
+        .env("ONEBRAIN_CACHE_DIR", cache)
+        .env("PATH", "/usr/bin:/bin")
+        .args(["doctor", "--json"])
+        .assert();
+    String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default()
+}
+
+#[test]
+fn doctor_flags_out_of_range_config_values() {
+    let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    vault_with_config(
+        d.path(),
+        &format!(
+            "update_channel: weekly-maybe\n\
+             {FULL_FOLDERS_BLOCK}\
+             checkpoint:\n  \
+               messages: 0\n\
+             search:\n  \
+               default_top_k: 0\n  \
+               embed_model: not-a-model\n  \
+               reranker:\n    \
+                 min_candidates: 0\n    \
+                 min_score: 7.5\n"
+        ),
+    );
+    let out = run_doctor_json(d.path(), cache.path());
+    for needle in [
+        "update_channel",
+        "checkpoint.messages",
+        "search.default_top_k",
+        "search.embed_model",
+        "reranker.min_candidates",
+        "reranker.min_score",
+    ] {
+        assert!(out.contains(needle), "missing finding for {needle}:\n{out}");
+    }
+    // The findings live on the new `config-values` check row.
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let row = doc["checks"]
+        .as_array()
+        .expect("checks[]")
+        .iter()
+        .find(|c| c["check"] == "config-values")
+        .expect("config-values row present")
+        .clone();
+    assert_eq!(row["status"], "warn", "row: {row}");
+    // Every finding names the documented default it would reset to.
+    let details = row["details"].as_array().expect("details[]");
+    assert!(
+        details
+            .iter()
+            .filter(|v| !v.as_str().unwrap_or("").contains("never auto-reset"))
+            .all(|v| v.as_str().unwrap_or("").contains("default:")),
+        "each resettable finding must state its default: {details:?}"
+    );
+}
+
+#[test]
+fn doctor_config_values_in_range_reports_ok() {
+    let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    vault_with_config(
+        d.path(),
+        &format!(
+            "update_channel: next\n\
+             {FULL_FOLLDERS}\
+             checkpoint:\n  \
+               messages: 20\n  \
+               minutes: 45\n\
+             search:\n  \
+               default_top_k: 25\n  \
+               reranker:\n    \
+                 min_score: 0.5\n",
+            FULL_FOLLDERS = FULL_FOLDERS_BLOCK
+        ),
+    );
+    let out = run_doctor_json(d.path(), cache.path());
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let row = doc["checks"]
+        .as_array()
+        .expect("checks[]")
+        .iter()
+        .find(|c| c["check"] == "config-values")
+        .expect("config-values row present")
+        .clone();
+    assert_eq!(row["status"], "ok", "in-range values must pass: {row}");
+}
+
+#[test]
+fn doctor_flags_empty_folder_value_as_report_only() {
+    let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    vault_with_config(
+        d.path(),
+        "update_channel: stable\n\
+         folders:\n  \
+           inbox: \"\"\n  \
+           projects: 01-projects\n  \
+           areas: 02-areas\n  \
+           knowledge: 03-knowledge\n  \
+           resources: 04-resources\n  \
+           agent: 05-agent\n  \
+           archive: 06-archive\n  \
+           logs: 07-logs\n",
+    );
+    let out = run_doctor_json(d.path(), cache.path());
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let row = doc["checks"]
+        .as_array()
+        .expect("checks[]")
+        .iter()
+        .find(|c| c["check"] == "config-values")
+        .expect("config-values row present")
+        .clone();
+    assert_eq!(row["status"], "warn", "row: {row}");
+    let details = row["details"].as_array().expect("details[]").clone();
+    let folder_finding = details
+        .iter()
+        .filter_map(|v| v.as_str())
+        .find(|s| s.contains("folders.inbox"))
+        .expect("folders.inbox finding present");
+    assert!(
+        folder_finding.contains("never auto-reset"),
+        "folders findings are report-only: {folder_finding}"
+    );
+}
