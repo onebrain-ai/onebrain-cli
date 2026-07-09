@@ -10,6 +10,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
+## [3.4.8] — Unreleased
+
+### Fixed
+- **`search model list`: the Rerankers box can no longer break.** Both tables now share one boxed-table renderer with a 100-column width cap; an over-long registry NOTE is truncated with an ellipsis (unicode-width-aware) instead of blowing the box border past the terminal. (#195)
+- **`search status`: Embedding/Reranker section parity.** The "🧠 Model" section header is renamed "🧠 Embedding" (parallels "🎯 Reranker"; emoji unchanged), and the Reranker section gains a `Downloaded <local date>` row backed by a new `reranker_downloaded_at` field (epoch-seconds dir mtime, `null` when not downloaded) on the status payload — mirroring the embedder's `model_downloaded_at` across all three status builders (direct, held-engine/MCP, daemon). (#195)
+
 ## [3.4.7] — Tier-2 cross-encoder reranker
 
 ### Added

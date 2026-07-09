@@ -543,12 +543,15 @@ collection set + active model's dir absent, `pending_new/changed/removed`, `last
 `reindexing {done,total}` when a marker is live, `semantic_available` =
 compile-time `semantic` feature.
 
-**Reranker fields** (rendered under a separate "🎯 Reranker" section in text mode):
-`reranker_model` (configured `search.reranker.model` name), `reranker_ready` (config-and-filesystem
+**Reranker fields** (rendered under a separate "🎯 Reranker" section in text mode, parallel to
+the embedder's "🧠 Embedding" section): `reranker_model` (configured `search.reranker.model`
+name), `reranker_ready` (config-and-filesystem
 check: `search.reranker.enabled` AND the model's `models--*` dir present — never opens/loads the
 model itself), `reranker_downloaded` (pure filesystem presence check, independent of
-`enabled` — matches the vocabulary `doctor` and the daemon's `/api/internal/status` use), and
-`reranker_disk_bytes` (on-disk size of the downloaded reranker dir, `None` if absent).
+`enabled` — matches the vocabulary `doctor` and the daemon's `/api/internal/status` use),
+`reranker_disk_bytes` (on-disk size of the downloaded reranker dir, `None` if absent), and
+`reranker_downloaded_at` (epoch-seconds mtime of the downloaded reranker dir, `None` if absent —
+mirrors the embedder's `model_downloaded_at`).
 
 ### Degradation matrix
 
