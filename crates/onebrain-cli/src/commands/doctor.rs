@@ -1564,15 +1564,28 @@ fn reset_config_value(text: &str, segments: &[&str], default_value: &str) -> Opt
     let (mut start, mut end) = (0usize, lines.len());
     let mut parent_indent: isize = -1;
 
+    // The window's direct-child indent level: the SHALLOWEST non-blank,
+    // non-comment line — deeper lines are grandchildren and must never
+    // match a key lookup for this level (a nested `model:` must not shadow
+    // a sibling `model:`, and vice versa).
+    let child_indent = |lines: &[String], start: usize, end: usize| -> Option<usize> {
+        (start..end)
+            .filter(|&i| !is_blank(&lines[i]) && !is_comment(&lines[i]))
+            .map(|i| indent_of(&lines[i]))
+            .min()
+    };
+
     for seg in parents {
         let header = format!("{seg}:");
+        let level = child_indent(&lines, start, end)?;
         // The section header: first non-blank, non-comment line in the window
-        // that starts with `seg:` at a depth below the parent.
+        // sitting exactly at the direct-child level and starting with `seg:`.
         let idx = (start..end).find(|&i| {
             let l = &lines[i];
             !is_blank(l)
                 && !is_comment(l)
-                && (indent_of(l) as isize) > parent_indent
+                && indent_of(l) == level
+                && (level as isize) > parent_indent
                 && l.trim_start().starts_with(&header)
         })?;
         // Refuse inline mappings (`seg: {…}` / `seg: null`) — only a bare
@@ -1597,13 +1610,17 @@ fn reset_config_value(text: &str, segments: &[&str], default_value: &str) -> Opt
         parent_indent = header_indent;
     }
 
-    // The key line inside the final window.
+    // The key line inside the final window, at the direct-child level only.
     let key_prefix = format!("{last}:");
+    let level = child_indent(&lines, start, end)?;
+    if (level as isize) <= parent_indent {
+        return None;
+    }
     let idx = (start..end).find(|&i| {
         let l = &lines[i];
         !is_blank(l)
             && !is_comment(l)
-            && (indent_of(l) as isize) > parent_indent
+            && indent_of(l) == level
             && l.trim_start().starts_with(&key_prefix)
     })?;
 
@@ -4592,6 +4609,17 @@ mod tests {
         assert!(reset_config_value(text, &["checkpoint", "messages"], "15").is_none());
         assert!(reset_config_value(text, &["search", "default_top_k"], "10").is_none());
         assert!(reset_config_value(text, &[], "x").is_none());
+    }
+
+    #[test]
+    fn reset_config_value_never_matches_a_grandchild_key() {
+        // `model:` exists only one level DEEPER than requested — the lookup
+        // must not reach into the nested block and clobber it.
+        let text = "search:\n  reranker:\n    model: onebrain-rerank-v1\n";
+        assert!(reset_config_value(text, &["search", "model"], "x").is_none());
+        // And a top-level lookup must not match a nested occurrence.
+        let text = "search:\n  update_channel: nested\n";
+        assert!(reset_config_value(text, &["update_channel"], "stable").is_none());
     }
 
     #[test]

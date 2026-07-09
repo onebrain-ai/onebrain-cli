@@ -1189,8 +1189,7 @@ fn doctor_never_strips_template_comments() {
     let cache = tempdir().unwrap();
     write_minimal_vault(d.path());
     std::fs::remove_file(d.path().join("vault.yml")).unwrap();
-    let template =
-        onebrain_fs::render_onebrain_yml(onebrain_fs::SchedulePreset::Skip).unwrap();
+    let template = onebrain_fs::render_onebrain_yml(onebrain_fs::SchedulePreset::Skip).unwrap();
     std::fs::write(d.path().join("onebrain.yml"), &template).unwrap();
 
     let out = run_doctor_json(d.path(), cache.path());
@@ -1202,7 +1201,11 @@ fn doctor_never_strips_template_comments() {
         after.starts_with("# onebrain.yml"),
         "header comment must survive a doctor run:\n{after}"
     );
-    let comment_lines = |s: &str| s.lines().filter(|l| l.trim_start().starts_with('#')).count();
+    let comment_lines = |s: &str| {
+        s.lines()
+            .filter(|l| l.trim_start().starts_with('#'))
+            .count()
+    };
     assert_eq!(
         comment_lines(&after),
         comment_lines(&template),
