@@ -61,6 +61,9 @@ pub mod embed;
 pub mod engine;
 pub mod error;
 pub mod hybrid;
+pub mod layout;
 pub mod lex;
 pub mod rerank;
 pub mod vector;
+
+pub use layout::{CacheLayoutState, CollectionLayout};
