@@ -471,6 +471,82 @@ fn doctor_fix_json_reports_legacy_qmd_collection_outcome() {
     assert_eq!(row["status"], "ok", "row: {row}");
 }
 
+/// Non-interactive safety: the structured `--fix --json` path (driven by the
+/// `/doctor` skill and the scheduler) runs every recipe WITHOUT a
+/// confirmation prompt — so the qmd-leftovers recipe must NEVER delete
+/// anything there, even on a first encounter (no declined flag). The
+/// leftovers must survive on disk, the outcome must be `manual`, and no
+/// `stats.qmd_cleanup_declined` flag may be written (only an interactive
+/// decline records that).
+///
+/// unix-only: the `HOME` override that isolates the fake `.cache/qmd` /
+/// `.config/qmd` only affects `dirs::home_dir()` on unix.
+#[cfg(unix)]
+#[test]
+fn doctor_fix_json_never_deletes_qmd_leftovers() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    // Vault with native search genuinely configured (real `search.collection`,
+    // no legacy `qmd_collection`) → the qmd-leftovers check is gated IN.
+    vault_with_config(
+        vault.path(),
+        &format!(
+            "update_channel: stable\n\
+             {FULL_FOLDERS_BLOCK}\
+             search:\n  collection: doctor-it-qmd-json\n"
+        ),
+    );
+    // Fresh qmd leftovers in the fake home (first encounter — no declined flag).
+    let cache_dir = home.path().join(".cache/qmd");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(cache_dir.join("index.sqlite"), vec![0u8; 128]).unwrap();
+    let config_dir = home.path().join(".config/qmd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin") // no real qmd binary reachable
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .args(["doctor", "--fix", "--json"])
+        .assert();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default();
+    let doc: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("doctor --fix --json emits one JSON document");
+
+    // Outcome is manual — the recipe did not execute.
+    let fixes = doc["fix"].as_array().expect("fix[] present");
+    let qmd = fixes
+        .iter()
+        .find(|f| f["check"] == "qmd-leftovers")
+        .expect("qmd-leftovers outcome present");
+    assert_eq!(qmd["outcome"], "manual", "outcome: {qmd}");
+    let msg = qmd["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("interactively") && msg.contains("rm -rf"),
+        "actionable manual message: {msg}"
+    );
+
+    // BOTH leftover dirs survived on disk.
+    assert!(
+        cache_dir.is_dir() && cache_dir.join("index.sqlite").is_file(),
+        "~/.cache/qmd must survive a --fix --json run"
+    );
+    assert!(
+        config_dir.is_dir(),
+        "~/.config/qmd must survive a --fix --json run"
+    );
+
+    // No declined flag was recorded — only an interactive decline writes it.
+    let cfg = std::fs::read_to_string(vault.path().join("onebrain.yml")).unwrap();
+    assert!(
+        !cfg.contains("qmd_cleanup_declined"),
+        "non-interactive run must not write the declined flag:\n{cfg}"
+    );
+}
+
 #[test]
 fn doctor_missing_folder_exits_1() {
     let d = tempdir().unwrap();

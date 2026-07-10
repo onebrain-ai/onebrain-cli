@@ -1391,11 +1391,13 @@ fn attempt_fix(result: &DoctorResult, vault_root: &Path, json: bool) -> FixOutco
             "run `/wrapup` in Claude to consolidate orphan checkpoints into a session log"
                 .to_string(),
         ),
-        // Legacy qmd leftover cleanup (npm uninstall + delete caches). Skips
-        // straight to Manual, without touching the filesystem, once the user
-        // has already declined once (`result.hint` is `None` in that case —
-        // see `qmd_leftovers_check`) so `--fix --json` automation can't
-        // silently redo a destructive action the user opted out of.
+        // Legacy qmd leftover cleanup (npm uninstall + delete caches).
+        // Destructive actions run ONLY on the interactive text path (after
+        // the batch [y/N] confirm). Two Manual short-circuits: a previously
+        // declined cleanup (`result.hint` is `None` — see
+        // `qmd_leftovers_check`) and any structured/non-interactive run
+        // (`json == true` — the `/doctor` skill and the scheduler drive
+        // `--fix --json` with no prompt, so nothing may be deleted there).
         "qmd-leftovers" => fix_qmd_leftovers(result, json),
         _ => FixOutcome::Manual(manual_message(result)),
     }
@@ -1438,15 +1440,24 @@ fn planned_action(result: &DoctorResult) -> Option<&'static str> {
 /// recipe stays correct even if leftovers changed between the report and the
 /// fix pass.
 ///
-/// `result.hint.is_none()` means the user already declined this cleanup on
-/// an earlier `--fix` run (`qmd_leftovers_check` omits the hint once
-/// `stats.qmd_cleanup_declined` is set) — short-circuit to Manual without
-/// touching the filesystem so `--fix --json` automation can't silently redo
-/// something the user opted out of.
+/// Two Manual short-circuits guard the destructive actions:
 ///
-/// `npm uninstall` runs in the foreground; a non-zero exit (or a failure to
-/// even launch `npm`) is surfaced as `Partial` rather than aborting — the
-/// cache/config directories are still worth removing on their own.
+/// - `result.hint.is_none()` — the user already declined this cleanup on an
+///   earlier `--fix` run (`qmd_leftovers_check` omits the hint once
+///   `stats.qmd_cleanup_declined` is set). No filesystem access at all.
+/// - `json == true` — the structured/non-interactive path (`--fix --json`,
+///   driven by the `/doctor` plugin skill and the scheduler) runs every
+///   recipe WITHOUT a confirmation prompt, and deleting a user's global npm
+///   package + gigabytes of cache is never acceptable without live
+///   confirmation. Mirror the orphan-checkpoints Manual-routing precedent:
+///   report what was found and steer to an interactive `onebrain doctor
+///   --fix` (or manual removal). Detection here is read-only.
+///
+/// The interactive text path (batch preview → explicit [y/N] confirm) is the
+/// only route that executes. `npm uninstall` runs in the foreground; a
+/// non-zero exit (or a failure to even launch `npm`) is surfaced as
+/// `Partial` rather than aborting — the cache/config directories are still
+/// worth removing on their own.
 fn fix_qmd_leftovers(result: &DoctorResult, json: bool) -> FixOutcome {
     if result.hint.is_none() {
         return FixOutcome::Manual(
@@ -1462,6 +1473,40 @@ fn fix_qmd_leftovers(result: &DoctorResult, json: bool) -> FixOutcome {
     let leftovers = detect_qmd_leftovers(&home, &path_var);
     if leftovers.is_empty() {
         return FixOutcome::Fixed("nothing to remove — already clean".to_string());
+    }
+    if json {
+        // Non-interactive: NEVER destructive. Compose an actionable message
+        // from the (read-only) detection above so the JSON consumer can relay
+        // exact removal commands.
+        let size_note = leftovers
+            .cache_dir
+            .as_ref()
+            .map(|(_, size)| {
+                format!(
+                    " ({} reclaimable)",
+                    crate::commands::search_common::format_size(*size)
+                )
+            })
+            .unwrap_or_default();
+        let mut commands: Vec<String> = Vec::new();
+        if let Some(pkg) = &leftovers.npm_package {
+            commands.push(format!("npm uninstall -g {pkg}"));
+        }
+        let mut rm_targets: Vec<String> = Vec::new();
+        if let Some((dir, _)) = &leftovers.cache_dir {
+            rm_targets.push(tildify(dir, &home));
+        }
+        if let Some(dir) = &leftovers.config_dir {
+            rm_targets.push(tildify(dir, &home));
+        }
+        if !rm_targets.is_empty() {
+            commands.push(format!("rm -rf {}", rm_targets.join(" ")));
+        }
+        return FixOutcome::Manual(format!(
+            "legacy qmd found{size_note} — run `onebrain doctor --fix` interactively to \
+             review and confirm removal, or remove manually: {}",
+            commands.join(" && ")
+        ));
     }
 
     let mut npm_failed = false;
@@ -6847,6 +6892,26 @@ mod tests {
         assert_eq!(found_cache_dir, cache_dir);
         assert_eq!(size, 1234, "size must equal the fixture bytes exactly");
         assert_eq!(leftovers.config_dir, Some(config_dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_package_from_symlink_parses_unscoped_package() {
+        // Unscoped install layout: .../node_modules/qmd/bin/qmd (no @scope)
+        // → package name is just `qmd`.
+        let tree = tempdir().unwrap();
+        let real_bin = tree.path().join("lib/node_modules/qmd/bin/qmd");
+        fs::create_dir_all(real_bin.parent().unwrap()).unwrap();
+        fs::write(&real_bin, b"#!/bin/sh\n").unwrap();
+        let bin_dir = tree.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let symlink_path = bin_dir.join("qmd");
+        std::os::unix::fs::symlink(&real_bin, &symlink_path).unwrap();
+
+        assert_eq!(
+            npm_package_from_symlink(&symlink_path).as_deref(),
+            Some("qmd")
+        );
     }
 
     #[test]
