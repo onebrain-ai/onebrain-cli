@@ -352,7 +352,7 @@ fn open_browser(url: &str) -> Result<()> {
     // argv element, not through a shell), so this costs nothing there.
     if !url_safe_for_cmd(url) {
         anyhow::bail!(
-            "refusing to open browser: URL contains `\"` or `%`, which can \
+            "refusing to open browser: URL contains `\"`, `%`, or `!`, which can \
              escape or expand inside a Windows `cmd /C start` command line: {url}"
         );
     }
@@ -390,13 +390,14 @@ fn open_browser(url: &str) -> Result<()> {
 
 /// `true` when `url` is safe to embed inside a double-quoted Windows `cmd.exe`
 /// command line: no `"` (would close the quote early, turning whatever
-/// follows back into live cmd grammar) and no `%` (cmd expands `%VAR%` even
-/// *inside* double quotes, unlike `&`/`^`/`|`/etc. which quoting alone stops).
+/// follows back into live cmd grammar), no `%` (cmd expands `%VAR%` even
+/// *inside* double quotes, unlike `&`/`^`/`|`/etc. which quoting alone stops),
+/// and no `!` (which expands under cmd delayed expansion when `DelayedExpansion=1`).
 ///
 /// Always compiled (not `#[cfg(windows)]`) so it's unit-testable on any host;
 /// only the Windows [`open_browser`] branch calls it at runtime.
 fn url_safe_for_cmd(url: &str) -> bool {
-    !url.contains('"') && !url.contains('%')
+    !url.contains('"') && !url.contains('%') && !url.contains('!')
 }
 
 /// `start "" "<url>"` — the raw cmd.exe command line (after `cmd /C`) to open
@@ -506,6 +507,13 @@ mod tests {
         // `%VAR%` expands even inside double quotes — quoting alone can't
         // neutralize it.
         assert!(!url_safe_for_cmd("http://x/?token=%PATH%"));
+    }
+
+    #[test]
+    fn url_safe_for_cmd_rejects_exclamation() {
+        // `!VAR!` expands under cmd delayed expansion (when `DelayedExpansion=1`)
+        // even inside double quotes — quoting alone can't neutralize it.
+        assert!(!url_safe_for_cmd("http://x/?token=abc!def!"));
     }
 
     #[test]
