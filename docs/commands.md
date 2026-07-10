@@ -7,7 +7,7 @@ onebrain
 ├── init                       create / re-scaffold a vault (--yes · --force · --no-sync)
 ├── update                     self-update the binary (--check · --plan)
 ├── doctor [--fix]             12 health checks + auto-repair recipes
-├── serve                      local web UI + vault JSON API (--port · --host · --open)
+├── serve                      local web UI + vault JSON API (--port · --open)
 ├── mcp                        MCP stdio server — vault search tools (--vault)
 │
 ├── vault       sync · current

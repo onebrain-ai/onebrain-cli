@@ -1258,10 +1258,6 @@ pub struct ServeArgs {
     /// Bind port (default 6789).
     #[arg(long, value_name = "PORT")]
     pub port: Option<u16>,
-    /// Bind host (default 127.0.0.1). Use `0.0.0.0` for single-tenant remote
-    /// self-host — MUST sit behind TLS.
-    #[arg(long, value_name = "ADDR")]
-    pub host: Option<String>,
     /// Open the served URL in the default browser after binding.
     #[arg(long)]
     pub open: bool,
@@ -1860,8 +1856,6 @@ mod tests {
             "/tmp/dist",
             "--port",
             "8080",
-            "--host",
-            "0.0.0.0",
             "--open",
         ])
         .unwrap();
@@ -1869,11 +1863,17 @@ mod tests {
             Cmd::Serve(args) => {
                 assert_eq!(args.dir.as_deref(), Some(std::path::Path::new("/tmp/dist")));
                 assert_eq!(args.port, Some(8080));
-                assert_eq!(args.host.as_deref(), Some("0.0.0.0"));
                 assert!(args.open);
             }
             _ => panic!("expected Serve"),
         }
+    }
+
+    #[test]
+    fn serve_host_flag_is_gone() {
+        // #205: `--host` was REMOVED (localhost-only bind; `$ONEBRAIN_BIND` is
+        // the container escape hatch). The flag must now be a parse error.
+        assert!(Cli::try_parse_from(["onebrain", "serve", "--host", "0.0.0.0"]).is_err());
     }
 
     #[test]

@@ -62,10 +62,73 @@ use std::path::{Path, PathBuf};
 // ─────────────────────────────────────────────────────────────────────────
 
 /// `daemon status` payload. `pid` is `Some` only when a live daemon was found.
-#[derive(Debug, Serialize, PartialEq, Eq)]
+///
+/// Beyond the core `running`/`pid` pair, every field is a **best-effort
+/// dashboard enrichment** (v3.4.8, #197) resolved from `daemon.json` + the
+/// daemon's `/api/health` and `/api/internal/status` probes. All of them are
+/// `Option` + `skip_serializing_if` so:
+/// - the not-running JSON shape stays the minimal `{running, pid}` it always
+///   was, and
+/// - a probe failure degrades to ABSENT fields — `daemon status` never exits
+///   non-zero because an HTTP probe failed.
+///
+/// `url` carries the token-bearing webui URL (`http://127.0.0.1:PORT/?token=…`).
+/// Printing it to the user's own terminal is fine — the token already lives
+/// user-readable in `daemon.json` — but it must NEVER be written to tracing
+/// logs (`~/.onebrain/run/daemon.log` is long-lived).
+#[derive(Debug, Serialize, PartialEq, Eq, Default)]
 pub struct DaemonStatusData {
     pub running: bool,
     pub pid: Option<u32>,
+    /// CLI version stamped in `daemon.json` by the running daemon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Epoch seconds the daemon came up (the `daemon.json` mtime — written
+    /// once, right after bind).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started: Option<u64>,
+    /// Idle-shutdown TTL in seconds (`$ONEBRAIN_DAEMON_IDLE_SECS` resolution;
+    /// `0` = disabled). Resolved in THIS process's environment — normally the
+    /// same user env the daemon started under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_ttl_secs: Option<u64>,
+    /// The daemon's actual bound port (from `daemon.json`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Canonical path of the bound vault (`daemon.json.vault`); absent when
+    /// the daemon bound vault-less.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vault: Option<String>,
+    /// Where the served web UI comes from: `"embedded"`, or the
+    /// `$ONEBRAIN_DIST` override path. Absent when the daemon didn't report it
+    /// (pre-3.4.8 daemon, or the health probe failed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webui_source: Option<String>,
+    /// The clickable token-bearing webui URL. See the type-level note on token
+    /// handling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Whether the daemon holds the search engine (`/api/health.engine_held`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_held: Option<bool>,
+    /// Live index stats from `/api/internal/status` (absent when the daemon
+    /// holds no engine — that route 503s — or the probe failed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_indexed: Option<u64>,
+    /// Model line from `/api/internal/status`: configured embed model +
+    /// Tier-2 reranker name/readiness/download state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embed_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reranker_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reranker_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reranker_downloaded: Option<bool>,
 }
 
 /// `daemon start` payload. `already_running` distinguishes a fresh spawn from
@@ -107,6 +170,7 @@ fn compute_status(pid_path: &Path, is_alive: impl Fn(u32) -> bool) -> DaemonStat
         Some(pid) if is_alive(pid) => DaemonStatusData {
             running: true,
             pid: Some(pid),
+            ..Default::default()
         },
         // No file, garbage file, or a recorded-but-dead PID all collapse to
         // "not running". A stale PID file is left on disk here — `run_start`
@@ -114,6 +178,7 @@ fn compute_status(pid_path: &Path, is_alive: impl Fn(u32) -> bool) -> DaemonStat
         _ => DaemonStatusData {
             running: false,
             pid: None,
+            ..Default::default()
         },
     }
 }
@@ -450,19 +515,224 @@ fn remove_pid_lock_stale(lock_path: &Path) -> Result<()> {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// `onebrain daemon status` — read the PID file, probe liveness, report.
+///
+/// When the daemon is running, the report is a full dashboard: `daemon.json`
+/// supplies port/token/version/vault, `GET /api/health` supplies
+/// `engine_held` + the webui source, and `GET /api/internal/status` supplies
+/// the live index + model fields. Every probe is best-effort — a failure
+/// leaves its fields absent, and `status` still exits 0 (see
+/// [`DaemonStatusData`]). Probes NEVER start, stop, or restart a daemon.
 pub fn run_status(mode: &OutputMode) -> Result<()> {
-    let data = compute_status(&pid_path()?, is_alive);
+    let mut data = compute_status(&pid_path()?, is_alive);
+    if data.running {
+        let discovery = discovery_path()?;
+        if let Ok(Some(info)) = crate::commands::daemon_client::DaemonInfo::read(&discovery) {
+            let handle = crate::commands::daemon_client::DaemonHandle::new(info.clone());
+            let health = handle.probe_health();
+            let internal = handle.probe_status_no_retry();
+            enrich_status(
+                &mut data,
+                &info,
+                file_mtime_secs(&discovery),
+                resolve_idle_secs(),
+                health.as_ref(),
+                internal.as_ref(),
+            );
+        }
+    }
     let env = Envelope::ok("daemon.status", None, data);
     emit(&env, mode, std::io::stdout().lock(), render_status_text)?;
     Ok(())
 }
 
-fn render_status_text(env: &Envelope<DaemonStatusData>) -> String {
-    let d = env.data.as_ref().expect("ok envelope always has data");
-    match d.pid {
-        Some(pid) if d.running => format!("daemon running (pid {pid})"),
-        _ => "daemon not running".to_string(),
+/// Fill the dashboard fields of `data` from the discovery record + the two
+/// HTTP probes. Pure (no I/O — the probes are passed in already-resolved) so
+/// the field mapping, including the degrade-to-absent policy, is unit-testable
+/// without a live daemon.
+///
+/// - `health` is the parsed `GET /api/health` body (`None` = probe failed).
+/// - `internal` is the parsed `GET /api/internal/status` body (`None` = probe
+///   failed OR the daemon holds no engine — that route 503s).
+/// - `started_epoch` is the `daemon.json` mtime (written once, after bind).
+fn enrich_status(
+    data: &mut DaemonStatusData,
+    info: &crate::commands::daemon_client::DaemonInfo,
+    started_epoch: Option<u64>,
+    idle_ttl_secs: u64,
+    health: Option<&serde_json::Value>,
+    internal: Option<&serde_json::Value>,
+) {
+    data.version = Some(info.version.clone());
+    data.port = Some(info.port);
+    data.vault = info.vault.clone();
+    // The one token-bearing line (stdout only — never tracing; see the
+    // DaemonStatusData doc).
+    data.url = Some(format!(
+        "http://127.0.0.1:{}/?token={}",
+        info.port, info.token
+    ));
+    data.started = started_epoch;
+    data.idle_ttl_secs = Some(idle_ttl_secs);
+
+    if let Some(h) = health {
+        data.engine_held = h.get("engine_held").and_then(serde_json::Value::as_bool);
+        // `dist_dir` (v3.4.8): present-and-null = the binary's own UI, string
+        // = the $ONEBRAIN_DIST override. A MISSING key (pre-3.4.8 daemon)
+        // stays `None` — unknown, not "embedded". With no override, the
+        // sibling `embedded_ui` flag distinguishes a real bundled UI from the
+        // asset-less build's placeholder page — `false` must not report a
+        // dishonest "embedded". The flag ships in the same daemon version as
+        // `dist_dir`, so on the null arm an absent flag can only be a skewed
+        // (newer-client/older-daemon) probe — default to "embedded", the
+        // release-binary truth.
+        data.webui_source = match h.get("dist_dir") {
+            Some(serde_json::Value::Null) => {
+                match h.get("embedded_ui").and_then(serde_json::Value::as_bool) {
+                    Some(false) => Some("placeholder".to_string()),
+                    _ => Some("embedded".to_string()),
+                }
+            }
+            Some(serde_json::Value::String(dist)) => Some(dist.clone()),
+            _ => None,
+        };
     }
+
+    if let Some(s) = internal {
+        let num = |k: &str| s.get(k).and_then(serde_json::Value::as_u64);
+        let text = |k: &str| {
+            s.get(k)
+                .and_then(serde_json::Value::as_str)
+                .map(String::from)
+        };
+        let flag = |k: &str| s.get(k).and_then(serde_json::Value::as_bool);
+        data.doc_count = num("doc_count");
+        data.pending_total = num("pending_total");
+        data.last_indexed = num("last_indexed");
+        data.embed_model = text("embed_model");
+        data.reranker_model = text("reranker_model");
+        data.reranker_ready = flag("reranker_ready");
+        data.reranker_downloaded = flag("reranker_downloaded");
+    }
+}
+
+/// `path`'s mtime as epoch seconds, or `None` if unreadable.
+fn file_mtime_secs(path: &Path) -> Option<u64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Humanize an idle-TTL for the status dashboard: `0` is the documented
+/// "disabled" sentinel; whole hours/minutes render as such; anything else
+/// falls back to raw seconds.
+fn format_ttl(secs: u64) -> String {
+    match secs {
+        0 => "disabled (runs until stopped)".to_string(),
+        s if s % 3600 == 0 => format!("{} h", s / 3600),
+        s if s % 60 == 0 => format!("{} min", s / 60),
+        s => format!("{s} s"),
+    }
+}
+
+fn render_status_text(env: &Envelope<DaemonStatusData>) -> String {
+    use crate::commands::search_status::format_local;
+    use crate::output::{item, section};
+
+    let d = env.data.as_ref().expect("ok envelope always has data");
+    let pid = match d.pid {
+        Some(pid) if d.running => pid,
+        _ => return "daemon not running".to_string(),
+    };
+
+    // Grouped-status convention (matches `search status` / `serve`'s banner):
+    // emoji only on section headers, plain-space-indented label rows. Sections
+    // whose fields are all absent (a failed probe, an engine-less daemon) are
+    // omitted entirely — the dashboard degrades, it never errors.
+    let mut lines = Vec::new();
+
+    lines.push(section("🟢", "Process"));
+    lines.push(item("Running", &format!("yes (pid {pid})")));
+    if let Some(v) = &d.version {
+        lines.push(item("Version", v));
+    }
+    if let Some(started) = d.started.and_then(format_local) {
+        lines.push(item("Started", &started));
+    }
+    if let Some(ttl) = d.idle_ttl_secs {
+        lines.push(item("Idle TTL", &format_ttl(ttl)));
+    }
+
+    if d.port.is_some() || d.vault.is_some() || d.webui_source.is_some() {
+        lines.push(String::new());
+        lines.push(section("🔌", "Bind"));
+        if let Some(port) = d.port {
+            lines.push(item("Port", &port.to_string()));
+        }
+        match &d.vault {
+            Some(vault) => lines.push(item("Vault", vault)),
+            // We read daemon.json (port present) and it carried no vault →
+            // the daemon genuinely bound vault-less; say so rather than hide it.
+            None if d.port.is_some() => {
+                lines.push(item("Vault", "none bound (vault endpoints 503)"))
+            }
+            None => {}
+        }
+        if let Some(source) = &d.webui_source {
+            // "placeholder" is the machine token (JSON); spell it out for humans.
+            let shown = if source == "placeholder" {
+                "placeholder page (no bundled web UI in this binary)"
+            } else {
+                source.as_str()
+            };
+            lines.push(item("Web UI", shown));
+        }
+    }
+
+    if let Some(url) = &d.url {
+        lines.push(String::new());
+        lines.push(section("🌐", "Webui"));
+        lines.push(item("URL", url));
+    }
+
+    if d.engine_held.is_some() || d.doc_count.is_some() {
+        lines.push(String::new());
+        lines.push(section("🧠", "Engine"));
+        if let Some(held) = d.engine_held {
+            lines.push(item("Held", if held { "✅  yes" } else { "—  no" }));
+        }
+        if let Some(docs) = d.doc_count {
+            lines.push(item("Docs", &docs.to_string()));
+            lines.push(item(
+                "Pending",
+                &d.pending_total.unwrap_or_default().to_string(),
+            ));
+            match d.last_indexed.and_then(format_local) {
+                Some(when) => lines.push(item("Last indexed", &when)),
+                None => lines.push(item("Last indexed", "never")),
+            }
+        }
+    }
+
+    if d.embed_model.is_some() || d.reranker_model.is_some() {
+        lines.push(String::new());
+        lines.push(section("🎯", "Models"));
+        if let Some(model) = &d.embed_model {
+            lines.push(item("Embed", model));
+        }
+        if let Some(model) = &d.reranker_model {
+            let readiness = match (d.reranker_ready, d.reranker_downloaded) {
+                (Some(true), _) => " (ready)",
+                (Some(false), Some(false)) => " (not downloaded)",
+                (Some(false), _) => " (not ready)",
+                (None, _) => "",
+            };
+            lines.push(item("Reranker", &format!("{model}{readiness}")));
+        }
+    }
+
+    lines.join("\n")
 }
 
 /// `onebrain daemon start` — spawn a detached `__run` child if not already
@@ -480,6 +750,7 @@ pub fn run_start(mode: &OutputMode, vault: Option<&Path>) -> Result<()> {
     if let DaemonStatusData {
         running: true,
         pid: Some(pid),
+        ..
     } = compute_status(&pid_path, is_alive)
     {
         return emit_already_running(mode, pid);
@@ -506,6 +777,7 @@ pub fn run_start(mode: &OutputMode, vault: Option<&Path>) -> Result<()> {
     if let DaemonStatusData {
         running: true,
         pid: Some(pid),
+        ..
     } = compute_status(&pid_path, is_alive)
     {
         return emit_already_running(mode, pid);
@@ -613,6 +885,7 @@ pub fn run_stop(mode: &OutputMode) -> Result<()> {
         DaemonStatusData {
             running: true,
             pid: Some(pid),
+            ..
         } => {
             terminate(pid).with_context(|| format!("signal daemon pid {pid}"))?;
             // Best-effort: the daemon's SIGTERM handler removes the PID +
@@ -807,8 +1080,12 @@ fn terminate(_pid: u32) -> Result<()> {
 ///   vault (see [`resolve_daemon_vault`]). Otherwise `None`.
 /// - **port** — the shared default ([`crate::commands::serve::DEFAULT_PORT`]).
 /// - **token** — freshly generated per process.
-/// - **dist_dir** — `$ONEBRAIN_DIST` if set, else `None` (API-only). The plugin
-///   passes the pinned webui dist via this env when it launches the daemon.
+/// - **dist_dir** — `$ONEBRAIN_DIST` if set, else `None`. `$ONEBRAIN_DIST` is
+///   an OVERRIDE (webui development / the plugin launcher pinning a dist);
+///   with it unset the daemon serves the web UI EMBEDDED in the binary,
+///   exactly like `serve` (see `server::static::serve_static` — a binary built
+///   without bundled assets falls back to a token-bearing placeholder page).
+///   The daemon is always webui-ready; there is no API-only mode.
 ///
 /// VAULT RESOLUTION (fix A): because the detached child `chdir`s to `/`, walk-up
 /// from cwd can't find the vault the user started from, so the daemon relies on
@@ -873,8 +1150,9 @@ pub fn run_internal(vault: Option<&Path>) -> Result<()> {
         .unwrap_or(DEFAULT_PORT);
 
     // Daemon always binds localhost — a persistent boot-time engine should never
-    // listen on a public interface implicitly. `serve --host 0.0.0.0` is the
-    // explicit, foreground-only path for remote self-host.
+    // listen on a public interface implicitly. Remote access is tunnel-only
+    // (docs/daemon.md § Remote access); `serve` under `$ONEBRAIN_BIND` is the
+    // explicit, foreground-only non-loopback path (containers, #205).
     let mut cfg = ServeConfig::localhost(vault_root, port, token.clone(), dist_dir);
     // The daemon is the SOLE redb owner: hold the search engine for the process
     // lifetime so mcp + CLI search route through `/api/vault/search` /
@@ -887,10 +1165,7 @@ pub fn run_internal(vault: Option<&Path>) -> Result<()> {
     // daemon exits (dropping the engine → releasing the redb lock). Configurable
     // via `$ONEBRAIN_DAEMON_IDLE_SECS`; default 30 min. `0` disables it (run
     // forever) — handy for a pinned always-on daemon.
-    let idle_secs = std::env::var("ONEBRAIN_DAEMON_IDLE_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_IDLE_SECS);
+    let idle_secs = resolve_idle_secs();
 
     let discovery_path = discovery_path()?;
 
@@ -952,6 +1227,17 @@ pub fn run_internal(vault: Option<&Path>) -> Result<()> {
 
 /// Default idle-shutdown TTL: 30 minutes with no authenticated request.
 const DEFAULT_IDLE_SECS: u64 = 30 * 60;
+
+/// Resolve the idle-shutdown TTL: `$ONEBRAIN_DAEMON_IDLE_SECS` (a `0` disables
+/// idle-shutdown), else [`DEFAULT_IDLE_SECS`]. Shared by the daemon body
+/// (`run_internal`) and the `daemon status` dashboard so both report the same
+/// resolution.
+fn resolve_idle_secs() -> u64 {
+    std::env::var("ONEBRAIN_DAEMON_IDLE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_IDLE_SECS)
+}
 
 /// The localhost socket address for `port` (the daemon always binds 127.0.0.1).
 fn addr_from(port: u16) -> std::net::SocketAddr {
@@ -1114,7 +1400,8 @@ mod tests {
             status,
             DaemonStatusData {
                 running: false,
-                pid: None
+                pid: None,
+                ..Default::default()
             }
         );
     }
@@ -1130,7 +1417,8 @@ mod tests {
             status,
             DaemonStatusData {
                 running: true,
-                pid: Some(4242)
+                pid: Some(4242),
+                ..Default::default()
             }
         );
     }
@@ -1146,7 +1434,8 @@ mod tests {
             status,
             DaemonStatusData {
                 running: false,
-                pid: None
+                pid: None,
+                ..Default::default()
             }
         );
     }
@@ -1163,7 +1452,8 @@ mod tests {
             status,
             DaemonStatusData {
                 running: false,
-                pid: None
+                pid: None,
+                ..Default::default()
             }
         );
     }
@@ -1439,17 +1729,259 @@ mod tests {
 
     #[test]
     fn status_text_running_includes_pid() {
+        // Bare running state (no daemon.json / all probes failed): the
+        // dashboard degrades to just the Process section — never an error.
         let env = Envelope::ok(
             "daemon.status",
             None,
             DaemonStatusData {
                 running: true,
                 pid: Some(555),
+                ..Default::default()
             },
         );
         let s = render_status_text(&env);
-        assert!(s.contains("running"), "got: {s}");
-        assert!(s.contains("555"), "got: {s}");
+        assert!(s.contains("🟢  Process"), "got: {s}");
+        assert!(s.contains("Running"), "got: {s}");
+        assert!(s.contains("pid 555"), "got: {s}");
+        // No probe data → no Bind/Webui/Engine/Models sections.
+        for absent in ["🔌", "🌐", "🧠", "🎯"] {
+            assert!(!s.contains(absent), "unexpected section {absent}: {s}");
+        }
+    }
+
+    /// A fully-probed running daemon — every dashboard field present.
+    fn rich_status_fixture() -> DaemonStatusData {
+        DaemonStatusData {
+            running: true,
+            pid: Some(555),
+            version: Some("3.4.8".to_string()),
+            started: Some(1_760_000_000),
+            idle_ttl_secs: Some(1800),
+            port: Some(6789),
+            vault: Some("/Users/keng/ob-1".to_string()),
+            webui_source: Some("embedded".to_string()),
+            url: Some("http://127.0.0.1:6789/?token=sekret".to_string()),
+            engine_held: Some(true),
+            doc_count: Some(812),
+            pending_total: Some(3),
+            last_indexed: Some(1_760_000_100),
+            embed_model: Some("multilingual-e5-small".to_string()),
+            reranker_model: Some("onebrain-rerank-v1".to_string()),
+            reranker_ready: Some(true),
+            reranker_downloaded: Some(true),
+        }
+    }
+
+    #[test]
+    fn status_text_rich_dashboard_has_grouped_sections() {
+        let env = Envelope::ok("daemon.status", None, rich_status_fixture());
+        let s = render_status_text(&env);
+        // The five grouped sections, in the house convention.
+        for section in [
+            "🟢  Process",
+            "🔌  Bind",
+            "🌐  Webui",
+            "🧠  Engine",
+            "🎯  Models",
+        ] {
+            assert!(s.contains(section), "missing section {section:?}: {s}");
+        }
+        // Process: pid · version · started · idle TTL.
+        assert!(s.contains("pid 555"), "{s}");
+        assert!(s.contains("3.4.8"), "{s}");
+        assert!(s.contains("    Started       "), "{s}");
+        assert!(s.contains("    Idle TTL      30 min"), "{s}");
+        // Bind: port · vault · webui source.
+        assert!(s.contains("    Port          6789"), "{s}");
+        assert!(s.contains("    Vault         /Users/keng/ob-1"), "{s}");
+        assert!(s.contains("    Web UI        embedded"), "{s}");
+        // Webui: the clickable token-bearing URL.
+        assert!(
+            s.contains("    URL           http://127.0.0.1:6789/?token=sekret"),
+            "{s}"
+        );
+        // Engine: held · docs · pending · last indexed.
+        assert!(s.contains("    Held          ✅  yes"), "{s}");
+        assert!(s.contains("    Docs          812"), "{s}");
+        assert!(s.contains("    Pending       3"), "{s}");
+        assert!(s.contains("    Last indexed  "), "{s}");
+        // Models: embed + reranker name/readiness.
+        assert!(s.contains("    Embed         multilingual-e5-small"), "{s}");
+        assert!(
+            s.contains("    Reranker      onebrain-rerank-v1 (ready)"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn status_text_engine_probe_failure_omits_engine_and_models() {
+        // daemon.json read fine (Bind/Webui present) but both HTTP probes
+        // failed → Engine + Models sections are absent, output still renders.
+        let data = DaemonStatusData {
+            engine_held: None,
+            doc_count: None,
+            pending_total: None,
+            last_indexed: None,
+            embed_model: None,
+            reranker_model: None,
+            reranker_ready: None,
+            reranker_downloaded: None,
+            webui_source: None,
+            ..rich_status_fixture()
+        };
+        let env = Envelope::ok("daemon.status", None, data);
+        let s = render_status_text(&env);
+        assert!(s.contains("🔌  Bind"), "{s}");
+        assert!(s.contains("🌐  Webui"), "{s}");
+        assert!(!s.contains("🧠"), "engine section must be omitted: {s}");
+        assert!(!s.contains("🎯"), "models section must be omitted: {s}");
+    }
+
+    #[test]
+    fn status_text_vaultless_daemon_says_none_bound() {
+        let data = DaemonStatusData {
+            vault: None,
+            ..rich_status_fixture()
+        };
+        let env = Envelope::ok("daemon.status", None, data);
+        let s = render_status_text(&env);
+        assert!(
+            s.contains("    Vault         none bound (vault endpoints 503)"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn format_ttl_humanizes() {
+        assert_eq!(format_ttl(0), "disabled (runs until stopped)");
+        assert_eq!(format_ttl(1800), "30 min");
+        assert_eq!(format_ttl(3600), "1 h");
+        assert_eq!(format_ttl(90), "90 s");
+    }
+
+    #[test]
+    fn enrich_status_fills_from_info_and_probes() {
+        let info = crate::commands::daemon_client::DaemonInfo {
+            port: 7001,
+            token: "tok-abc".to_string(),
+            pid: 42,
+            version: "3.4.8".to_string(),
+            vault: Some("/v".to_string()),
+        };
+        let health = serde_json::json!({
+            "ok": true, "engine_held": true, "dist_dir": null, "embedded_ui": true
+        });
+        let internal = serde_json::json!({
+            "doc_count": 10, "pending_total": 2, "last_indexed": 123,
+            "embed_model": "e5", "reranker_model": "rr",
+            "reranker_ready": false, "reranker_downloaded": true
+        });
+        let mut data = DaemonStatusData {
+            running: true,
+            pid: Some(42),
+            ..Default::default()
+        };
+        enrich_status(
+            &mut data,
+            &info,
+            Some(99),
+            1800,
+            Some(&health),
+            Some(&internal),
+        );
+        assert_eq!(data.version.as_deref(), Some("3.4.8"));
+        assert_eq!(data.port, Some(7001));
+        assert_eq!(data.vault.as_deref(), Some("/v"));
+        assert_eq!(
+            data.url.as_deref(),
+            Some("http://127.0.0.1:7001/?token=tok-abc")
+        );
+        assert_eq!(data.started, Some(99));
+        assert_eq!(data.idle_ttl_secs, Some(1800));
+        assert_eq!(data.engine_held, Some(true));
+        // dist_dir null → embedded.
+        assert_eq!(data.webui_source.as_deref(), Some("embedded"));
+        assert_eq!(data.doc_count, Some(10));
+        assert_eq!(data.pending_total, Some(2));
+        assert_eq!(data.last_indexed, Some(123));
+        assert_eq!(data.embed_model.as_deref(), Some("e5"));
+        assert_eq!(data.reranker_model.as_deref(), Some("rr"));
+        assert_eq!(data.reranker_ready, Some(false));
+        assert_eq!(data.reranker_downloaded, Some(true));
+    }
+
+    #[test]
+    fn enrich_status_probe_failures_leave_fields_absent() {
+        let info = crate::commands::daemon_client::DaemonInfo {
+            port: 7001,
+            token: "tok".to_string(),
+            pid: 42,
+            version: "3.4.8".to_string(),
+            vault: None,
+        };
+        let mut data = DaemonStatusData {
+            running: true,
+            pid: Some(42),
+            ..Default::default()
+        };
+        // Both probes failed → daemon.json-derived fields only.
+        enrich_status(&mut data, &info, None, 0, None, None);
+        assert_eq!(data.port, Some(7001));
+        assert!(data.engine_held.is_none());
+        assert!(data.webui_source.is_none());
+        assert!(data.doc_count.is_none());
+        assert!(data.embed_model.is_none());
+        assert!(data.reranker_model.is_none());
+    }
+
+    #[test]
+    fn enrich_status_dist_dir_string_is_the_override_path() {
+        let info = crate::commands::daemon_client::DaemonInfo {
+            port: 1,
+            token: "t".to_string(),
+            pid: 1,
+            version: "3.4.8".to_string(),
+            vault: None,
+        };
+        let mut data = DaemonStatusData::default();
+        let health = serde_json::json!({ "ok": true, "dist_dir": "/opt/webui-dist" });
+        enrich_status(&mut data, &info, None, 0, Some(&health), None);
+        assert_eq!(data.webui_source.as_deref(), Some("/opt/webui-dist"));
+
+        // No override + no bundled assets (a from-source build) → the honest
+        // "placeholder", not "embedded".
+        let mut data = DaemonStatusData::default();
+        let bare = serde_json::json!({ "ok": true, "dist_dir": null, "embedded_ui": false });
+        enrich_status(&mut data, &info, None, 0, Some(&bare), None);
+        assert_eq!(data.webui_source.as_deref(), Some("placeholder"));
+
+        // No override + a missing embedded_ui flag (version-skewed daemon on
+        // the null arm) → default "embedded" (the release-binary truth).
+        let mut data = DaemonStatusData::default();
+        let skewed = serde_json::json!({ "ok": true, "dist_dir": null });
+        enrich_status(&mut data, &info, None, 0, Some(&skewed), None);
+        assert_eq!(data.webui_source.as_deref(), Some("embedded"));
+
+        // A pre-3.4.8 daemon that doesn't report dist_dir at all → unknown.
+        let mut data = DaemonStatusData::default();
+        let old_health = serde_json::json!({ "ok": true, "engine_held": false });
+        enrich_status(&mut data, &info, None, 0, Some(&old_health), None);
+        assert!(data.webui_source.is_none());
+    }
+
+    #[test]
+    fn status_text_placeholder_webui_is_spelled_out() {
+        let data = DaemonStatusData {
+            webui_source: Some("placeholder".to_string()),
+            ..rich_status_fixture()
+        };
+        let env = Envelope::ok("daemon.status", None, data);
+        let s = render_status_text(&env);
+        assert!(
+            s.contains("    Web UI        placeholder page (no bundled web UI in this binary)"),
+            "{s}"
+        );
     }
 
     #[test]
@@ -1460,6 +1992,7 @@ mod tests {
             DaemonStatusData {
                 running: false,
                 pid: None,
+                ..Default::default()
             },
         );
         assert_eq!(render_status_text(&env), "daemon not running");
@@ -1517,10 +2050,13 @@ mod tests {
 
     #[test]
     fn status_data_serializes_to_expected_json() {
-        // Lock the JSON shape: { "running": bool, "pid": N|null }.
+        // Lock the MINIMAL JSON shape: { "running": bool, "pid": N|null } —
+        // every dashboard field is skip_serializing_if, so a not-running (or
+        // probe-less) status keeps the exact pre-3.4.8 shape.
         let running = serde_json::to_value(DaemonStatusData {
             running: true,
             pid: Some(3),
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(running["running"], true);
@@ -1529,10 +2065,53 @@ mod tests {
         let stopped = serde_json::to_value(DaemonStatusData {
             running: false,
             pid: None,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(stopped["running"], false);
         assert!(stopped["pid"].is_null());
+        // Absent dashboard fields are OMITTED, not null.
+        assert_eq!(
+            stopped.as_object().unwrap().len(),
+            2,
+            "not-running JSON must stay minimal: {stopped}"
+        );
+
+        // And a rich status serializes every dashboard field.
+        let rich = serde_json::to_value(rich_status_fixture()).unwrap();
+        assert_eq!(rich["url"], "http://127.0.0.1:6789/?token=sekret");
+        assert_eq!(rich["port"], 6789);
+        assert_eq!(rich["engine_held"], true);
+        assert_eq!(rich["doc_count"], 812);
+        assert_eq!(rich["embed_model"], "multilingual-e5-small");
+        assert_eq!(rich["reranker_model"], "onebrain-rerank-v1");
+        assert_eq!(rich["webui_source"], "embedded");
+        assert_eq!(rich["idle_ttl_secs"], 1800);
+    }
+
+    /// RAII teardown for the real-daemon integration tests: runs
+    /// `onebrain daemon stop` (with the test's own HOME/env) on drop, so a
+    /// FAILED assertion between `daemon start` and the test's own `stop` never
+    /// leaks a detached daemon — with `ONEBRAIN_DAEMON_IDLE_SECS=0` a leaked
+    /// daemon runs forever. Two gaps remain by nature: an external SIGKILL of
+    /// the test runner (the daemon is setsid-detached by design), and a
+    /// `panic = "abort"` test profile (e.g. `cargo test --release` with abort
+    /// panics), where no unwinding happens so Drop never runs.
+    #[cfg(unix)]
+    struct StopDaemonOnDrop {
+        bin: PathBuf,
+        envs: Vec<(String, String)>,
+    }
+    #[cfg(unix)]
+    impl Drop for StopDaemonOnDrop {
+        fn drop(&mut self) {
+            let mut cmd = std::process::Command::new(&self.bin);
+            for (k, v) in &self.envs {
+                cmd.env(k, v);
+            }
+            // Best-effort: a double stop is an idempotent no-op.
+            let _ = cmd.args(["daemon", "stop"]).output();
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1553,6 +2132,13 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let home = tempdir().unwrap();
+        let _teardown = StopDaemonOnDrop {
+            bin: assert_cmd::cargo::cargo_bin("onebrain"),
+            envs: vec![
+                ("HOME".into(), home.path().display().to_string()),
+                ("ONEBRAIN_DAEMON_PORT".into(), "0".into()),
+            ],
+        };
 
         // Small helper: run `onebrain daemon <verb>` with HOME overridden,
         // returning combined stdout as a String. We assert success separately.
@@ -1596,7 +2182,9 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3);
         let last = loop {
             let status = run("status");
-            if status.contains("running") && status.contains("pid") {
+            // Rich dashboard (v3.4.8): the running state renders as a grouped
+            // `Process` section with a `Running  yes (pid N)` row.
+            if status.contains("Running") && status.contains("pid") {
                 break status;
             }
             if Instant::now() >= deadline {
@@ -1607,7 +2195,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         };
         assert!(
-            last.contains("running") && last.contains("pid"),
+            last.contains("Running") && last.contains("pid"),
             "running status should carry a pid, got: {last}"
         );
 
@@ -1692,6 +2280,13 @@ mod tests {
                 cmd.env(k, v);
             }
             cmd.args(["daemon", verb]).output().expect("spawn onebrain")
+        };
+        let _teardown = StopDaemonOnDrop {
+            bin: assert_cmd::cargo::cargo_bin("onebrain"),
+            envs: envs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect(),
         };
 
         // Start the daemon.
@@ -1812,6 +2407,10 @@ mod tests {
         let home = tempdir().unwrap();
         let home_path = home.path().to_path_buf();
         let bin = cargo_bin("onebrain");
+        let _teardown = StopDaemonOnDrop {
+            bin: bin.clone(),
+            envs: vec![("HOME".into(), home_path.display().to_string())],
+        };
 
         // Spawn N threads that each run `onebrain daemon start` as close to
         // simultaneously as possible, collecting each invocation's stdout.
@@ -1912,6 +2511,10 @@ mod tests {
 
         let home = tempdir().unwrap();
         let bin = cargo_bin("onebrain");
+        let _teardown = StopDaemonOnDrop {
+            bin: bin.clone(),
+            envs: vec![("HOME".into(), home.path().display().to_string())],
+        };
         let run_dir = home.path().join(".onebrain").join("run");
         std::fs::create_dir_all(&run_dir).unwrap();
         let lock = run_dir.join("daemon.lock");
@@ -1963,7 +2566,8 @@ mod tests {
             discovery.exists(),
             "recovered daemon never published daemon.json"
         );
-        let _ = daemon("stop");
+        // Teardown: `_teardown` (StopDaemonOnDrop) stops the recovered daemon
+        // on EVERY exit path, panicking asserts included.
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1989,6 +2593,10 @@ mod tests {
         )
         .unwrap();
         let bin = cargo_bin("onebrain");
+        let _teardown = StopDaemonOnDrop {
+            bin: bin.clone(),
+            envs: vec![("HOME".into(), home.path().display().to_string())],
+        };
 
         // Start WITH --vault and WITHOUT $ONEBRAIN_VAULT (env_remove makes the
         // arg the only possible source of the bound vault).
@@ -2017,10 +2625,7 @@ mod tests {
                 break info;
             }
             if Instant::now() >= deadline {
-                let _ = StdCommand::new(&bin)
-                    .env("HOME", home.path())
-                    .args(["daemon", "stop"])
-                    .output();
+                // `_teardown` stops the daemon (if any) on this panic.
                 panic!("daemon never published daemon.json");
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -2034,10 +2639,7 @@ mod tests {
             info.vault, expected,
             "daemon.json.vault must be the --vault path (arg carried the vault, not env)"
         );
-
-        let _ = StdCommand::new(&bin)
-            .env("HOME", home.path())
-            .args(["daemon", "stop"])
-            .output();
+        // Teardown: `_teardown` (StopDaemonOnDrop) stops the daemon on every
+        // exit path, the failing-assert ones included.
     }
 }

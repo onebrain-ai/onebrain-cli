@@ -12,10 +12,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [3.4.8] — Unreleased
 
+### Breaking
+- **Removed `serve --host`.** Every listener binds `127.0.0.1` only, same as the daemon — remote access goes through an encrypted tunnel (docs/daemon.md § Remote access). Containers use the `ONEBRAIN_BIND` env var instead (invalid value = hard error; non-loopback prints the plaintext-HTTP warning). Maintainer-approved breaking change in a patch: zero known users of the flag. (#205)
+
 ### Added
 - **Self-documenting `onebrain.yml`.** `init` now scaffolds a hand-authored commented template — every key preceded by `# <what it is> · default: <value>`, values interpolated from the runtime's own default fns so template and binary can't drift. The full `search:` block (incl. the v3.4.7 reranker keys) ships active on day one; `collection` stays a commented placeholder (absent = search disabled). ([ADR 0026](docs/decisions/0026-config-self-documentation.md) · [docs/configuration.md](docs/configuration.md)) (#196)
 - **doctor `config-values` check (12th check).** Validates every present config value per key against the runtime defaults + model/reranker registries — `update_channel`, `checkpoint.*`, `search.default_top_k`/`embed_model`, `search.reranker.*`, plus non-empty `folders.*`/`search.collection` — one finding per violation, each naming its documented default.
 - **`doctor --fix` resets out-of-range tunables to their defaults** through a comment-preserving line editor (comments, key order, inline `# …` notes, and CRLF all survive; every reset itemised in the fix footer as `key → default`). `search.embed_model` resets print a reindex-required warning; `folders.*` + `search.collection` are report-only, never auto-reset.
+- `onebrain daemon status` is now a full dashboard (#197): process/bind/webui/engine/models sections incl. the clickable `http://127.0.0.1:PORT/?token=TOKEN`; probe failures degrade to absent fields (exit stays 0); JSON gains the same optional fields
+- `onebrain serve` is daemon-aware (#197): with a daemon already serving the vault it prints the daemon's webui URL (+ `--open` opens it) instead of binding a second listener; explicit `--port`/`--dir`/`$ONEBRAIN_BIND` still means standalone
+- `GET /api/health` reports `dist_dir` (webui source); `GET /api/internal/status` reports `embed_model` (both additive)
 
 ### Changed
 - **doctor is now strictly read-only outside `--fix`:** the search check resolves the collection without persisting a generated name on BOTH the no-index and index-exists paths (previously a `doctor` run could re-serialize the config and strip its comments), and the `onebrain.yml-keys` recipe no longer serde-rewrites the file for out-of-range checkpoint values — the comment-preserving `config-values` recipe owns value repair.
@@ -26,6 +32,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 - **`search model list`: the Rerankers box can no longer break.** Both tables now share one boxed-table renderer with a 100-column width cap; an over-long registry NOTE is truncated with an ellipsis (unicode-width-aware) instead of blowing the box border past the terminal. (#195)
 - **`search status`: Embedding/Reranker section parity.** The "🧠 Model" section header is renamed "🧠 Embedding" (parallels "🎯 Reranker"; emoji unchanged — the `search reindex` summary's matching section is renamed too), and the Reranker section gains a `Downloaded <local date>` row backed by a new `reranker_downloaded_at` field (epoch-seconds dir mtime, `null` when not downloaded) on the status payload — mirroring the embedder's `model_downloaded_at` across all three status builders (direct, held-engine/MCP, daemon). Both sections now render a `Ready` row as their LAST row (Name · Size · Downloaded · Ready); the Reranker section's existing `Ready` row moved from 2nd to last, and the Embedding section gains a display-only `Ready` row (semantic build + active model downloaded) with no new JSON field. `search model list` drops its `📁 Cache dir:` footer from the text render (`search status`'s Cache section owns that path; `cache_dir` stays in the JSON payload). (#195)
+- Retired the stale "API-only" wording: the daemon has always served the embedded webui without `$ONEBRAIN_DIST` (which remains a dev/plugin override); a regression test now pins the embedded fallback (#197)
 
 ## [3.4.7] — Tier-2 cross-encoder reranker
 

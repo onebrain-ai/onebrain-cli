@@ -90,8 +90,9 @@ pub async fn require_token(
                 // HttpOnly: JS never needs to read it (the SPA reads the token
                 // from the injected HTML for its API headers). SameSite=Strict:
                 // the browser won't attach it to cross-site requests, so the
-                // cookie can't be abused for CSRF reads of a `--host 0.0.0.0`
-                // instance. Secure: added when served over HTTPS (see above).
+                // cookie can't be abused for CSRF reads of a non-loopback
+                // (`$ONEBRAIN_BIND`) instance. Secure: added when served over
+                // HTTPS (see above).
                 let secure_attr = if secure { "; Secure" } else { "" };
                 if let Ok(v) = HeaderValue::from_str(&format!(
                     "{TOKEN_COOKIE}={}; HttpOnly; SameSite=Strict; Path=/{secure_attr}",
@@ -211,8 +212,8 @@ fn query_param_token(query: &str) -> Option<&str> {
 /// takes to reject a guess leaks how many leading bytes were correct. An
 /// attacker who can measure that timing can recover the token one byte at a
 /// time. This matters here because the surface can be exposed beyond localhost
-/// via `serve --host 0.0.0.0` (single-tenant self-host), where request timing is
-/// observable. We therefore compare in time that depends only on the LENGTH,
+/// via `$ONEBRAIN_BIND` (single-tenant container/self-host, #205), where
+/// request timing is observable. We therefore compare in time that depends only on the LENGTH,
 /// not the contents:
 ///
 /// 1. Length check first. (Length is not the secret — it's fixed at 32 hex

@@ -4,7 +4,7 @@ The **daemon** is a long-lived, detached process that runs the same local HTTP s
 
 ```bash
 onebrain daemon start    # spawn the detached daemon (no-op if one is already running)
-onebrain daemon status   # is it running? which PID?
+onebrain daemon status   # full dashboard: process / bind / webui URL / engine / models
 onebrain daemon stop     # SIGTERM it, clean up its runtime files
 ```
 
@@ -27,15 +27,40 @@ The search engine's metadata store (`engine.redb`) is **single-process**: only o
 | route | body / returns |
 |-------|----------------|
 | `POST /api/internal/reindex` | `{ "mode": "pending" \| "paths" \| "lex" \| "all", "paths"?: [..] }` → runs the corresponding engine reindex, returns `{ added, updated, removed, unchanged, failed, doc_count, embed_model }` |
-| `GET  /api/internal/status`  | `{ doc_count, pending_new, pending_changed, pending_removed, pending_total, last_indexed, indexed }` — live status from the held engine |
+| `GET  /api/internal/status`  | `{ doc_count, pending_new, pending_changed, pending_removed, pending_total, last_indexed, indexed, embed_model, reranker_model, reranker_ready, reranker_downloaded, reranker_disk_bytes }` — live status from the held engine (model fields v3.4.7/v3.4.8) |
 | `GET  /api/internal/get`     | `?path=<vault-relative doc>` → `{ doc_path, content }`, or `404` when the doc isn't indexed — the held engine's `Engine::get` (a redb read) |
 | `POST /api/internal/rerank`  | `{ "query": <text>, "paths": [<vault-relative doc>..], "top_k": <n> }` → doc-level Tier-2 rerank of the candidate `paths` against `query` via the held engine (`Engine::rerank_paths`), returns `{ "hits": [{ path, score, title, snippet, rerank_score? }] }`. Lets the MCP `query` tool rerank its fused pool through the warm daemon instead of opening a second engine (model stays single-owner). `503` when no engine is held; `400` on malformed JSON |
-| `GET  /api/health`           | `{ ok, engine_held }` — **engine-independent** liveness: 200 whenever the process is up, whether or not an engine is held (the vault a client matches against is read from `daemon.json`'s `vault`, not surfaced here) |
+| `GET  /api/health`           | `{ ok, engine_held, dist_dir }` — **engine-independent** liveness: 200 whenever the process is up, whether or not an engine is held. `dist_dir` (v3.4.8) is the served web UI source: `null` = the UI embedded in the binary, a string = the `$ONEBRAIN_DIST` override path. (The vault a client matches against is read from `daemon.json`'s `vault`, not surfaced here) |
 
 - `mode: "pending"` embeds exactly the docs `Engine::pending_vector_paths` reports as drifted (same as `onebrain search reindex --pending-only`). `mode: "paths"` reindexes the caller-supplied vault-relative doc paths. `mode: "lex"` is a keyword-only whole-vault pass with **no embedding** (mirrors `--lex-only`; the PostToolUse hook uses it in-session without a per-write model load). `mode: "all"` is a full whole-vault reindex + embed (a bare `search reindex`).
 - **Path safety (defense-in-depth):** every `paths` entry is confined to the vault at the HTTP layer before it reaches the engine — absolute paths, `..` traversal, symlink-escapes, and tooling dirs (`.git`/`.claude`/…) are rejected with `400`, so a reindex can't be steered into arbitrary files (`../../etc/passwd`). The **engine** (`Engine::reindex_paths`) ALSO confines each path (rejects absolute/`..`/symlink-escape as "outside the vault", skips it, indexes nothing) — so the DIRECT reindex path that bypasses the daemon (`ONEBRAIN_NO_DAEMON=1`, daemon-unavailable fallback, plain `onebrain search reindex <paths>`) is protected by the same rule, not just the HTTP boundary (#175).
 - The `/internal/*` routes require the daemon to actually **hold** an engine; a `serve` process (which doesn't) returns `503` rather than opening one per-request. `/api/health` does NOT — it's a pure liveness check. Reindex writes serialise on the engine mutex, so a concurrent `/api/vault/search` interleaves between batches.
 - The webui `GET /api/vault/search` uses the **held** engine when the daemon is running (lex still uses the standalone tantivy index, which never touches redb).
+
+## The daemon serves the web UI — always
+
+The daemon runs the **same static surface as [`serve`](serve.md)**: with `$ONEBRAIN_DIST` unset (the default) it serves the **web UI embedded in the binary**; `$ONEBRAIN_DIST` is an override for webui development / the plugin launcher pinning a dist. There is **no API-only mode** — a release binary's daemon always answers `GET /` with the full UI (a from-source build without bundled assets falls back to a token-bearing placeholder page). Every route, the UI shell included, is behind the per-process token.
+
+Two ways to open it without ever reading `daemon.json` by hand:
+
+- **`onebrain daemon status`** prints the clickable `http://127.0.0.1:PORT/?token=TOKEN` as part of its dashboard (below).
+- **`onebrain serve --open`** detects a daemon already serving the current vault and opens the browser at the daemon's URL instead of binding a second listener — see [serve.md](serve.md).
+
+## `daemon status` — a real dashboard
+
+`daemon status` reports much more than running/pid (v3.4.8, #197). It reads `daemon.json` and best-effort-probes `GET /api/health` + `GET /api/internal/status`, then renders grouped sections:
+
+```text
+🟢  Process        pid · version · started · idle TTL
+🔌  Bind           port · bound vault · web UI source (embedded vs $ONEBRAIN_DIST)
+🌐  Webui          http://127.0.0.1:6789/?token=…   ← click/copy to open
+🧠  Engine         held · docs · pending · last indexed
+🎯  Models         embed model · reranker (readiness)
+```
+
+- **Degrades, never fails:** every dashboard field is optional — a failed probe (or an engine-less daemon, whose `/api/internal/status` 503s) just omits its section; `status` still exits 0. `--json` carries the same fields (`skip_serializing_if`, so the not-running shape stays the minimal `{running, pid}`).
+- **Read-only:** the status probes never start, stop, or restart a daemon.
+- **Token note:** the webui URL carries the token. Printing it to your own terminal is fine — it already sits user-readable in `daemon.json` (0600) — and it is never written to `daemon.log`/tracing.
 
 ## CLI search verbs route through the daemon (Track 2c)
 
@@ -91,6 +116,33 @@ The client library (`commands/daemon_client.rs`) is what the CLI/MCP tracks call
 - **Uncanonicalizable expected vault (safety hardening).** All three functions turn the caller's `expected_vault` into a `VaultExpectation` (`Any` / `Vault(id)` / `Unresolvable`) via `vault_expectation`, rather than the old `expected_vault.and_then(canonical_vault_id)` which flattened "has a vault but it wouldn't canonicalize" into "no expectation". If the caller HAS a vault but `canonical_vault_id` returns `None` (the dir vanished mid-op), the expectation is `Unresolvable` → `vault_decision` treats it as a **mismatch**: the CLI routes direct, and the MCP active path refuses to adopt/spawn a daemon it can't verify. This closes a narrow wrong-vault TOCTOU where a caller whose vault vanished would otherwise reuse whatever daemon was up.
 - `DaemonHandle::search` / `reindex` / `status` / `get` — typed HTTP calls carrying the token. Each **retries once via `ensure_running()`** (reconnecting to the handle's OWN bound vault) on a transport error (a daemon that vanished mid-call), while an HTTP status error propagates unchanged; `get` additionally maps a `404` to `Ok(None)` (doc not indexed) so the CLI renders its "not indexed yet" hint.
 - **Version / vault skew (ACTIVE path):** when `daemon.json`'s `version` or bound `vault` differs from the caller's, `discover`/`ensure_running` restart the daemon (stop + start) for the caller's vault before use, so a daemon from an older install or a different vault can't serve the wrong engine. A failed stop is surfaced as a warning (the old daemon may still hold the engine lock), not swallowed. The PASSIVE `discover_matching` never restarts — it routes direct instead.
+
+## Remote access
+
+The daemon deliberately binds **`127.0.0.1` only** — there is no bind-address override. To use the web UI from another machine, put an **encrypted tunnel** in front of it; never expose port 6789 directly (the token and all vault content would travel as plain HTTP).
+
+Three recommended paths, in increasing order of setup:
+
+1. **SSH port forward** — simplest, good for occasional use from another machine you already SSH into:
+
+   ```bash
+   ssh -L 6789:127.0.0.1:6789 user@host
+   ```
+
+   Then open `http://127.0.0.1:6789/?token=TOKEN` in the *local* machine's browser — `onebrain daemon status` on the daemon's machine prints the full clickable URL.
+
+2. **Tailscale Serve** — recommended for regular or mobile use; HTTPS with tailnet-only identity, no ports exposed to the internet:
+
+   ```bash
+   tailscale serve https / http://127.0.0.1:6789
+   ```
+
+3. **Cloudflare Tunnel + Access** — for reaching it over the public internet behind SSO.
+
+Notes:
+
+- Set `ONEBRAIN_TOKEN` (**≥ 32 chars**, e.g. `openssl rand -hex 16`) in the daemon's environment for a **stable, bookmarkable URL** across daemon restarts — otherwise every restart mints a fresh token and saved URLs go stale. A too-short value is ignored (with a warning) in favour of a random token.
+- Do **not** run a standalone `serve` alongside a running daemon on the default port — they share port 6789 and the engine lock (a plain `serve` detects the daemon and routes instead of binding; forcing a second listener needs an explicit `--port`). The `serve --host` flag no longer exists (#205): the only non-loopback bind is the container-scoped `ONEBRAIN_BIND` env var, which warns loudly that it speaks plaintext HTTP (see [serve.md](serve.md#containers--self-host--onebrain_bind)).
 
 ## Lifecycle
 

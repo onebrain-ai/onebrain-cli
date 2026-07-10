@@ -630,6 +630,58 @@ async fn no_dir_serve_injects_the_token() {
 }
 
 #[tokio::test]
+async fn dist_none_serves_html_ui_never_404() {
+    // REGRESSION PIN (#197): with `dist_dir: None` — the daemon's default when
+    // `$ONEBRAIN_DIST` is unset, and `serve`'s without `--dir` — the router
+    // must answer `GET /` with 200 + HTML (the embedded web UI, or the
+    // placeholder page in a binary built without bundled assets). There is NO
+    // API-only mode: the daemon is always webui-ready. This pins the
+    // `serve_static` embedded fallback the stale daemon.rs doc comment used to
+    // contradict.
+    let (_dir, router) = vault_router(None);
+    let res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("X-OneBrain-Token", TOKEN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "GET / must never 404");
+    let content_type = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/html"),
+        "GET / must serve HTML, got content-type {content_type:?}"
+    );
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(!body.is_empty(), "GET / must carry an HTML body");
+
+    // And an explicit dist still OVERRIDES the embedded UI.
+    let dist = tempfile::tempdir().unwrap();
+    fs::write(
+        dist.path().join("index.html"),
+        "<html><head></head><body>dist override shell</body></html>",
+    )
+    .unwrap();
+    let (_dir2, router2) = vault_router(Some(dist.path().to_path_buf()));
+    let (status, body) = get_authed(&router2, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("dist override shell"),
+        "an explicit dist must win over the embedded UI: {body}"
+    );
+}
+
+#[tokio::test]
 async fn every_response_carries_security_headers() {
     // The headers layer is outermost, so even an unauthenticated 401 is stamped.
     let (_dir, router) = vault_router(None);
@@ -872,7 +924,7 @@ async fn run_server_binds_serves_and_shuts_down_cleanly() {
         Some(root.to_path_buf()),
         port,
         TOKEN.to_string(),
-        None, // API-only (placeholder static page)
+        None, // no dist override → embedded UI (or the placeholder in an asset-less build)
     );
 
     // Shared shutdown flag; the future polls it until set.

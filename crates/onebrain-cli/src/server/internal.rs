@@ -68,10 +68,19 @@ pub(super) fn router() -> Router<Arc<AppState>> {
 }
 
 /// `GET /api/health` — the engine-independent liveness probe. Returns
-/// `{ ok: true, engine_held }` with 200 whenever the daemon is up. Still behind
-/// the token-auth middleware (the whole surface is), so it leaks nothing to an
-/// unauthenticated caller; it just doesn't depend on the search engine being
-/// held, which is exactly what a liveness check must not do.
+/// `{ ok: true, engine_held, dist_dir }` with 200 whenever the daemon is up.
+/// Still behind the token-auth middleware (the whole surface is), so it leaks
+/// nothing to an unauthenticated caller; it just doesn't depend on the search
+/// engine being held, which is exactly what a liveness check must not do.
+///
+/// `dist_dir` (v3.4.8, #197) reports the served web UI's source for the
+/// `daemon status` dashboard: `null` = no override (the binary's own UI), a
+/// string = the `--dir` / `$ONEBRAIN_DIST` override path. Explicitly emitted
+/// even when `null` so a client can tell "no override" apart from a pre-3.4.8
+/// daemon that doesn't report the key at all. `embedded_ui` (same version)
+/// says whether this binary actually BUNDLES a web UI — `false` means a
+/// from-source build serving the token-bearing placeholder page, so the
+/// dashboard can report "placeholder" instead of a dishonest "embedded".
 ///
 /// The vault identity a CLI client vault-matches against is NOT surfaced here —
 /// it reads the daemon's canonical bound vault from `daemon.json` (`DaemonInfo.
@@ -82,6 +91,8 @@ async fn get_health(State(state): State<Arc<AppState>>) -> Response {
     Json(serde_json::json!({
         "ok": true,
         "engine_held": state.search_engine.is_some(),
+        "dist_dir": state.dist_dir.as_ref().map(|p| p.display().to_string()),
+        "embedded_ui": super::has_embedded_ui(),
     }))
     .into_response()
 }
@@ -226,6 +237,10 @@ struct InternalStatusResponse {
     /// "real index" definition `search status` uses, not mere cache-dir
     /// existence.
     indexed: bool,
+    /// Configured `search.embed_model` name (v3.4.8, #197 — surfaced so the
+    /// `daemon status` dashboard's Models section can report it). Mirrors the
+    /// CLI's `SearchStatusData::embed_model`.
+    embed_model: String,
     /// Configured `search.reranker.model` name (Tier-2 cross-encoder). Mirrors
     /// the CLI's `SearchStatusData::reranker_model`.
     reranker_model: String,
@@ -253,39 +268,47 @@ async fn get_internal_status(State(state): State<Arc<AppState>>) -> Result<Respo
     // off the async runtime under the blocking mutex. The reranker fields piggy-
     // back on the SAME blocking closure + lock (rather than a second
     // spawn_blocking) since `rerank_active()` also needs the engine.
-    let (status, reranker_model, reranker_ready, reranker_downloaded, reranker_disk_bytes) =
-        tokio::task::spawn_blocking(move || {
-            let config = onebrain_core::load_vault_config_at(&root)?;
-            let collection = collection_name_readonly(&root)?;
-            let cache_dir = collection_cache_dir(&collection);
-            let reranker_model = config.search.reranker.model.clone();
-            let download = reranker_registry()
-                .iter()
-                .find(|r| r.name == reranker_model)
-                .map(|r| reranker_download_status(r, &cache_dir));
-            let reranker_downloaded = download.as_ref().is_some_and(|d| d.downloaded);
-            let reranker_disk_bytes = download.and_then(|d| d.disk_size);
+    let (
+        status,
+        embed_model,
+        reranker_model,
+        reranker_ready,
+        reranker_downloaded,
+        reranker_disk_bytes,
+    ) = tokio::task::spawn_blocking(move || {
+        let config = onebrain_core::load_vault_config_at(&root)?;
+        let collection = collection_name_readonly(&root)?;
+        let cache_dir = collection_cache_dir(&collection);
+        let embed_model = config.search.embed_model.clone();
+        let reranker_model = config.search.reranker.model.clone();
+        let download = reranker_registry()
+            .iter()
+            .find(|r| r.name == reranker_model)
+            .map(|r| reranker_download_status(r, &cache_dir));
+        let reranker_downloaded = download.as_ref().is_some_and(|d| d.downloaded);
+        let reranker_disk_bytes = download.and_then(|d| d.disk_size);
 
-            let engine = engine.lock().unwrap_or_else(|p| p.into_inner());
-            let reranker_ready = engine.rerank_active();
-            let status = engine.status(&root)?;
-            Ok::<_, anyhow::Error>((
-                status,
-                reranker_model,
-                reranker_ready,
-                reranker_downloaded,
-                reranker_disk_bytes,
-            ))
-        })
-        .await
-        .map_err(|e| {
-            tracing::warn!(error = %e, "internal status task panicked");
-            ApiError::Internal("status failed".to_string())
-        })?
-        .map_err(|e| {
-            tracing::warn!(error = %e, "engine status failed");
-            ApiError::Internal("status failed".to_string())
-        })?;
+        let engine = engine.lock().unwrap_or_else(|p| p.into_inner());
+        let reranker_ready = engine.rerank_active();
+        let status = engine.status(&root)?;
+        Ok::<_, anyhow::Error>((
+            status,
+            embed_model,
+            reranker_model,
+            reranker_ready,
+            reranker_downloaded,
+            reranker_disk_bytes,
+        ))
+    })
+    .await
+    .map_err(|e| {
+        tracing::warn!(error = %e, "internal status task panicked");
+        ApiError::Internal("status failed".to_string())
+    })?
+    .map_err(|e| {
+        tracing::warn!(error = %e, "engine status failed");
+        ApiError::Internal("status failed".to_string())
+    })?;
 
     let resp = InternalStatusResponse {
         doc_count: status.doc_count,
@@ -295,6 +318,7 @@ async fn get_internal_status(State(state): State<Arc<AppState>>) -> Result<Respo
         pending_total: status.pending_total(),
         last_indexed: status.last_indexed_at,
         indexed: status.doc_count > 0,
+        embed_model,
         reranker_model,
         reranker_ready,
         reranker_downloaded,
@@ -681,6 +705,7 @@ mod tests {
             pending_total: 3,
             last_indexed: Some(42),
             indexed: true,
+            embed_model: "multilingual-e5-small".to_string(),
             reranker_model: "onebrain-rerank-v1".to_string(),
             reranker_ready: true,
             reranker_downloaded: true,
@@ -691,6 +716,7 @@ mod tests {
         assert_eq!(v["pending_total"], 3);
         assert_eq!(v["last_indexed"], 42);
         assert_eq!(v["indexed"], true);
+        assert_eq!(v["embed_model"], "multilingual-e5-small");
         assert_eq!(v["reranker_model"], "onebrain-rerank-v1");
         assert_eq!(v["reranker_ready"], true);
         assert_eq!(v["reranker_downloaded"], true);
@@ -712,6 +738,7 @@ mod tests {
             pending_total: 0,
             last_indexed: None,
             indexed: false,
+            embed_model: "multilingual-e5-small".to_string(),
             reranker_model: "onebrain-rerank-v1".to_string(),
             reranker_ready: false,
             reranker_downloaded: false,
@@ -1148,6 +1175,48 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["engine_held"], false);
+        // `dist_dir` must be PRESENT and null for the no-override default —
+        // a missing key is how a client detects a pre-3.4.8 daemon.
+        assert!(v.get("dist_dir").is_some(), "{v}");
+        assert!(v["dist_dir"].is_null(), "{v}");
+        // `embedded_ui` reports whether this binary bundles a web UI — it must
+        // be present and match the build's actual asset state (false in a
+        // fresh checkout, true in a dist-embedded build).
+        assert_eq!(v["embedded_ui"], crate::server::has_embedded_ui(), "{v}");
+    }
+
+    #[tokio::test]
+    async fn health_reports_dist_dir_override() {
+        // With an explicit dist mounted, /api/health surfaces its path so the
+        // `daemon status` dashboard can report the webui source.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: health-dist\n",
+        )
+        .unwrap();
+        let dist = tempfile::tempdir().unwrap();
+        let cfg = ServeConfig::localhost(
+            Some(vault.path().to_path_buf()),
+            0,
+            TOKEN.to_string(),
+            Some(dist.path().to_path_buf()),
+        );
+        let router = build_router(cfg);
+
+        let resp = router
+            .oneshot(
+                Request::get("/api/health")
+                    .header("x-onebrain-token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["dist_dir"], dist.path().display().to_string(), "{v}");
     }
 
     #[tokio::test]

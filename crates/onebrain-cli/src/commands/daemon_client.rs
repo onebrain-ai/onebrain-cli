@@ -400,6 +400,13 @@ const START_TIMEOUT: Duration = Duration::from_secs(10);
 /// wedged and should be treated as dead.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Timeout for `daemon status`'s best-effort dashboard probes
+/// ([`DaemonHandle::probe_health`] / [`DaemonHandle::probe_status_no_retry`]).
+/// Longer than [`PROBE_TIMEOUT`] because `/api/internal/status` does a
+/// synchronous hash-walk of the vault, but far below [`CLIENT_TIMEOUT`] — a
+/// wedged daemon must degrade the dashboard quickly, not hang the command.
+const STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl DaemonHandle {
     /// Build a handle around a discovery record. `pub(crate)` so the mcp track's
     /// tests can construct one pointing at a test-owned live server (the normal
@@ -563,6 +570,42 @@ impl DaemonHandle {
                 .header("content-type", "application/json")
                 .send(payload.as_str())
         })
+    }
+
+    /// `GET /api/health` → parsed JSON (`{ ok, engine_held, dist_dir }`), or
+    /// `None` on ANY failure. **No retry, no respawn** — the `daemon status`
+    /// dashboard is a read-only report and must never start, stop, or restart
+    /// a daemon (unlike [`with_retry`]'s `ensure_running` reconnect).
+    pub(crate) fn probe_health(&self) -> Option<serde_json::Value> {
+        self.probe_get("/api/health")
+    }
+
+    /// `GET /api/internal/status` → parsed JSON, or `None` on ANY failure —
+    /// including the engine-less daemon's 503, which the dashboard renders as
+    /// absent Engine/Models fields. Same no-retry/no-respawn contract as
+    /// [`Self::probe_health`]. Named apart from [`Self::status`] (the warm-
+    /// client call that DOES reconnect-respawn) so a caller can't reach for
+    /// the wrong lifecycle behaviour by accident.
+    pub(crate) fn probe_status_no_retry(&self) -> Option<serde_json::Value> {
+        self.probe_get("/api/internal/status")
+    }
+
+    /// One best-effort GET with the short [`STATUS_PROBE_TIMEOUT`], parsed as
+    /// JSON. Any transport error, HTTP status error, or parse failure → `None`.
+    /// The URL carries no token (it rides the header), so nothing sensitive
+    /// can leak into error text or logs.
+    fn probe_get(&self, path: &str) -> Option<serde_json::Value> {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(STATUS_PROBE_TIMEOUT))
+            .build()
+            .into();
+        let url = format!("{}{}", self.info.base_url(), path);
+        let mut resp = agent
+            .get(&url)
+            .header("x-onebrain-token", &self.info.token)
+            .call()
+            .ok()?;
+        read_json(&mut resp).ok()
     }
 }
 
@@ -1473,6 +1516,25 @@ mod tests {
         // record → the daemon 404s → the client maps that to Ok(None) (Track 2c).
         let got = handle.get("alpha.md").unwrap();
         assert!(got.is_none(), "unindexed doc → Ok(None): {got:?}");
+
+        // The no-retry status probes (the `daemon status` dashboard, #197):
+        // health carries engine_held + a PRESENT-but-null dist_dir (embedded
+        // UI), and the internal status carries the live index + model fields.
+        let health = handle.probe_health().expect("health probe");
+        assert_eq!(health["ok"], true, "{health}");
+        assert!(health["engine_held"].is_boolean(), "{health}");
+        assert!(health.get("dist_dir").is_some(), "{health}");
+        assert!(health["dist_dir"].is_null(), "{health}");
+        let internal = handle.probe_status_no_retry().expect("status probe");
+        assert!(internal["doc_count"].is_number(), "{internal}");
+        assert!(internal["embed_model"].is_string(), "{internal}");
+        assert!(internal["reranker_model"].is_string(), "{internal}");
+
+        // A dead server degrades both probes to None — never an error, never a
+        // respawn (drop stops the server; the handle still points at the port).
+        drop(srv);
+        assert!(handle.probe_health().is_none());
+        assert!(handle.probe_status_no_retry().is_none());
     }
 
     /// PASSIVE vault-match (Track 2c): `discover_matching` routes to a live
