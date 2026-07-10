@@ -232,7 +232,12 @@ fn recap_pending(vault_root: &Path, logs_folder: &str) -> Option<u64> {
 /// True when `path` starts with a *closed* `---` frontmatter block containing
 /// a top-level `{key}:` line (no leading whitespace — an indented `{key}:` is
 /// a nested mapping entry, not a frontmatter field). A leading UTF-8 BOM is
-/// tolerated before the opening `---`. Files with no frontmatter, an
+/// tolerated before the opening `---`, as are leading single-line HTML
+/// comments (`<!-- ... -->`) — orphan recovery prepends a
+/// `<!-- recovery-of: <token>:<date> -->` marker line above the frontmatter
+/// of auto-recovered session logs, and those files must still be recognised
+/// as recapped once `/recap` stamps them. Only complete single-line comments
+/// are skipped; no multi-line comment parsing. Files with no frontmatter, an
 /// unterminated block (no closing `---` before EOF), or an unreadable file
 /// all return `false`; content after the closing `---` (the note body) is
 /// never inspected.
@@ -241,7 +246,9 @@ fn frontmatter_has_key(path: &Path, key: &str) -> bool {
         return false;
     };
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
-    let mut lines = text.lines();
+    let mut lines = text
+        .lines()
+        .skip_while(|line| line.trim().starts_with("<!--") && line.trim().ends_with("-->"));
     if lines.next().map(str::trim) != Some("---") {
         return false;
     }
@@ -824,6 +831,42 @@ mod tests {
         assert!(
             !frontmatter_has_key(&body_only, "recapped"),
             "a body-only mention after the closing --- must not match"
+        );
+    }
+
+    #[test]
+    fn frontmatter_behind_recovery_comment_is_detected() {
+        // Orphan recovery prepends `<!-- recovery-of: ... -->` above the
+        // frontmatter of auto-recovered session logs; a `recapped:` key in the
+        // actual frontmatter must still be found (real-vault audit: 11 files
+        // misclassified as pending forever without this).
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("2026-07-01-session-01.md");
+        std::fs::write(
+            &file,
+            "<!-- recovery-of: abc12:2026-07-01 -->\n---\ntags: [session-log]\nrecapped: 2026-07-05\n---\n",
+        )
+        .unwrap();
+        assert!(
+            frontmatter_has_key(&file, "recapped"),
+            "frontmatter behind a leading recovery comment must still match"
+        );
+    }
+
+    #[test]
+    fn recovery_comment_without_recapped_is_still_pending() {
+        // Converse: the leading comment is skipped, but a frontmatter block
+        // without the key still counts as pending.
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("2026-07-08-session-01.md");
+        std::fs::write(
+            &file,
+            "<!-- recovery-of: abc12:2026-07-08 -->\n---\ntags: [session-log]\n---\n# body\n",
+        )
+        .unwrap();
+        assert!(
+            !frontmatter_has_key(&file, "recapped"),
+            "a recovered log without `recapped:` must stay pending"
         );
     }
 
