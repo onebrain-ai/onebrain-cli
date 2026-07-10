@@ -2254,7 +2254,10 @@ mod tests {
 
         // Pre-seed the lex index (no model, no redb vector writes) so the
         // daemon's held engine + `/api/vault/search?mode=lex` have data.
-        let tantivy = cache.path().join("warm-daemon-it").join("tantivy");
+        let tantivy = crate::commands::search_common::index_artifact_path(
+            &cache.path().join("warm-daemon-it"),
+            "tantivy",
+        );
         {
             let mut lex = LexIndex::open(&tantivy).unwrap();
             lex.add(&Chunk {

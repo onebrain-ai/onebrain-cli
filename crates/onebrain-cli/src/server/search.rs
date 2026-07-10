@@ -33,7 +33,9 @@ use super::api::{require_vault_root, ApiError};
 use super::{AppState, SharedEngine};
 #[cfg(feature = "semantic")]
 use crate::commands::search_common::rerank_settings_from_config;
-use crate::commands::search_common::{collection_cache_dir, collection_name_readonly};
+use crate::commands::search_common::{
+    collection_cache_dir, collection_name_readonly, index_artifact_path,
+};
 #[cfg(feature = "semantic")]
 use onebrain_search::engine::Engine;
 use onebrain_search::lex::LexIndex;
@@ -205,7 +207,7 @@ fn run_search(
     // Never-indexed vault → empty hits (200), not an error — mirrors
     // `run_native`'s short-circuit so a held engine on an empty index behaves
     // identically to the per-request path.
-    if !cache_dir.join("tantivy").exists() {
+    if !index_artifact_path(&cache_dir, "tantivy").exists() {
         return Ok(vec![]);
     }
 
@@ -290,7 +292,7 @@ fn run_native(
     // Never-indexed vault → empty hits (200), not an error. The lex path
     // would create an empty index and return nothing anyway; short-circuit
     // so hybrid never opens the engine / embeds against an empty index.
-    if !cache_dir.join("tantivy").exists() {
+    if !index_artifact_path(&cache_dir, "tantivy").exists() {
         return Ok(vec![]);
     }
 
@@ -306,7 +308,7 @@ fn run_native(
 /// the doc path (`<doc_path>#N`), so surface that as the path + title, with
 /// no snippet (the snippet lives in engine metadata this path never opens).
 fn run_lex(cache_dir: &Path, query: &str, top_k: usize) -> anyhow::Result<Vec<SearchHit>> {
-    let lex = LexIndex::open(&cache_dir.join("tantivy"))?;
+    let lex = LexIndex::open(&index_artifact_path(cache_dir, "tantivy"))?;
     let raw = lex.search(query, top_k)?;
     Ok(raw
         .into_iter()
@@ -412,6 +414,7 @@ fn title_from_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::search_common::index_artifact_path;
 
     #[test]
     fn title_from_path_strips_dirs_and_md_suffix() {
@@ -446,7 +449,7 @@ mod tests {
     fn run_lex_returns_hits_from_a_prebuilt_index() {
         use onebrain_search::chunk::Chunk;
         let cache = tempfile::tempdir().unwrap();
-        let tantivy_dir = cache.path().join("tantivy");
+        let tantivy_dir = index_artifact_path(cache.path(), "tantivy");
         {
             let mut lex = LexIndex::open(&tantivy_dir).unwrap();
             lex.add(&Chunk {
@@ -474,7 +477,7 @@ mod tests {
         // caller-supplied value must actually truncate the result set.
         use onebrain_search::chunk::Chunk;
         let cache = tempfile::tempdir().unwrap();
-        let tantivy_dir = cache.path().join("tantivy");
+        let tantivy_dir = index_artifact_path(cache.path(), "tantivy");
         {
             let mut lex = LexIndex::open(&tantivy_dir).unwrap();
             for i in 0..5 {
@@ -537,7 +540,7 @@ mod tests {
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         let cache_dir = collection_cache_dir(&collection_name_readonly(dir.path()).unwrap());
         {
-            let mut lex = LexIndex::open(&cache_dir.join("tantivy")).unwrap();
+            let mut lex = LexIndex::open(&index_artifact_path(&cache_dir, "tantivy")).unwrap();
             for i in 0..5 {
                 lex.add(&Chunk {
                     chunk_id: format!("n{i}.md#0"),
@@ -621,7 +624,7 @@ mod tests {
         let collection = collection_name_readonly(dir.path()).unwrap();
         let cache_dir = collection_cache_dir(&collection);
         {
-            let mut lex = LexIndex::open(&cache_dir.join("tantivy")).unwrap();
+            let mut lex = LexIndex::open(&index_artifact_path(&cache_dir, "tantivy")).unwrap();
             lex.add(&Chunk {
                 chunk_id: "notes/alpha.md#0".to_string(),
                 doc_path: "notes/alpha.md".to_string(),
@@ -664,7 +667,7 @@ mod tests {
         let env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         let cache_dir = collection_cache_dir(collection);
         {
-            let mut lex = LexIndex::open(&cache_dir.join("tantivy")).unwrap();
+            let mut lex = LexIndex::open(&index_artifact_path(&cache_dir, "tantivy")).unwrap();
             lex.add(&Chunk {
                 chunk_id: "notes/alpha.md#0".to_string(),
                 doc_path: "notes/alpha.md".to_string(),
@@ -766,7 +769,7 @@ mod tests {
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         let cache_dir = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap());
         {
-            let mut lex = LexIndex::open(&cache_dir.join("tantivy")).unwrap();
+            let mut lex = LexIndex::open(&index_artifact_path(&cache_dir, "tantivy")).unwrap();
             lex.commit().unwrap();
         }
         let hits = run_native(vault.path(), "anything", "hybrid", TOP_K, None).unwrap();
@@ -800,7 +803,7 @@ mod tests {
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         let cache_dir = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap());
         {
-            let mut lex = LexIndex::open(&cache_dir.join("tantivy")).unwrap();
+            let mut lex = LexIndex::open(&index_artifact_path(&cache_dir, "tantivy")).unwrap();
             lex.commit().unwrap();
         }
         // Empty index → the doc_count==0 guard trips AFTER settings are
@@ -831,7 +834,7 @@ mod tests {
         // passes, but the engine's doc_count is 0.
         let cache_dir = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap());
         {
-            let mut lex = LexIndex::open(&cache_dir.join("tantivy")).unwrap();
+            let mut lex = LexIndex::open(&index_artifact_path(&cache_dir, "tantivy")).unwrap();
             lex.commit().unwrap();
         }
         let engine = crate::server::internal::open_held_engine(vault.path()).unwrap();

@@ -17,8 +17,8 @@ use onebrain_core::path::ResolvedVault;
 use serde::Serialize;
 
 use crate::commands::search_common::{
-    collection_cache_dir, collection_for, format_size, index_size_bytes, read_reindex_progress,
-    resolve_collection, ReindexLiveProgress,
+    collection_cache_dir, collection_for, format_size, index_size_bytes, models_cache_dir,
+    read_reindex_progress, resolve_collection, ReindexLiveProgress,
 };
 use crate::output::{emit, item, section, Envelope, OutputMode};
 use onebrain_core::load_vault_config;
@@ -566,7 +566,7 @@ pub(crate) fn status_data_from_daemon(
 /// `cache_size_bytes`.
 fn active_model_dir_stats(cache_dir: &Path, active_model: &str) -> Option<(u64, Option<u64>)> {
     let info = model_registry().iter().find(|m| m.name == active_model)?;
-    let status = model_download_status(info, cache_dir);
+    let status = model_download_status(info, &models_cache_dir(cache_dir));
     let size = status.disk_size?;
     Some((size, dir_mtime_secs(&status.path)))
 }
@@ -612,10 +612,11 @@ fn reranker_status_fields(
     cache_dir: &Path,
 ) -> RerankerStatusFields {
     let model = config.search.reranker.model.clone();
+    let models = models_cache_dir(cache_dir);
     let download = reranker_registry()
         .iter()
         .find(|r| r.name == model)
-        .map(|r| reranker_download_status(r, cache_dir));
+        .map(|r| reranker_download_status(r, &models));
     let downloaded = download.as_ref().is_some_and(|d| d.downloaded);
     let ready = config.search.reranker.enabled && downloaded;
     // Same mtime source as the embedder's `model_downloaded_at` (see
@@ -1552,8 +1553,8 @@ mod tests {
     fn active_model_dir_stats_none_when_active_model_not_on_disk() {
         let dir = tempdir().unwrap();
         // A cache dir with unrelated subdirs but no `models--*`.
-        std::fs::create_dir(dir.path().join("tantivy")).unwrap();
-        std::fs::create_dir(dir.path().join("vectors")).unwrap();
+        std::fs::create_dir(dir.path().join("index")).unwrap();
+        std::fs::create_dir(dir.path().join("models")).unwrap();
         assert!(active_model_dir_stats(dir.path(), "multilingual-e5-small").is_none());
     }
 
@@ -1565,8 +1566,8 @@ mod tests {
         std::fs::write(model.join("snapshots/abc/model.onnx"), vec![0u8; 1000]).unwrap();
         std::fs::write(model.join("config.json"), vec![0u8; 24]).unwrap();
         // A non-model sibling dir must NOT be counted.
-        std::fs::create_dir(dir.path().join("tantivy")).unwrap();
-        std::fs::write(dir.path().join("tantivy/meta.json"), vec![0u8; 5000]).unwrap();
+        std::fs::create_dir(dir.path().join("index")).unwrap();
+        std::fs::write(dir.path().join("index/meta.json"), vec![0u8; 5000]).unwrap();
 
         let (size, mtime) = active_model_dir_stats(dir.path(), "multilingual-e5-small").unwrap();
         // Exact equality is intentional and portable: `dir_size_bytes` sums

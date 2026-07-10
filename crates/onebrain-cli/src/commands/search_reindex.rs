@@ -13,9 +13,9 @@ use serde::Serialize;
 use crate::cli::SearchReindexArgs;
 use crate::commands::daemon_client::DaemonHandle;
 use crate::commands::search_common::{
-    collection_cache_dir, collection_for, collection_name_readonly, index_size_bytes,
-    map_daemon_error, model_not_chosen, open_engine, read_reindex_progress,
-    reconcile_missing_model, reindex_progress_path, route_to_daemon,
+    collection_cache_dir, collection_for, collection_name_readonly, index_artifact_path,
+    index_size_bytes, map_daemon_error, model_not_chosen, models_cache_dir, open_engine,
+    read_reindex_progress, reconcile_missing_model, reindex_progress_path, route_to_daemon,
 };
 use crate::output::{emit, item, section, Envelope, OutputMode};
 use onebrain_search::engine::{ReindexProgress, ReindexStats};
@@ -352,7 +352,7 @@ fn run_hook_path(
     }
 
     // Gate reason 2: no index yet.
-    if !cache_dir.join("tantivy").is_dir() {
+    if !index_artifact_path(&cache_dir, "tantivy").is_dir() {
         return emit_skip(mode, Some(vault_info), "no-index");
     }
 
@@ -365,10 +365,11 @@ fn run_hook_path(
         .unwrap_or_default();
     let model_downloaded = {
         use onebrain_search::embed::{model_download_status, model_registry};
+        let models = models_cache_dir(&cache_dir);
         model_registry()
             .iter()
             .find(|m| m.name == embed_model)
-            .is_some_and(|info| model_download_status(info, &cache_dir).downloaded)
+            .is_some_and(|info| model_download_status(info, &models).downloaded)
     };
     if !model_downloaded {
         return emit_skip(mode, Some(vault_info), "model-not-downloaded");
@@ -703,13 +704,13 @@ fn wipe_index_files(vault_flag: Option<PathBuf>) -> Result<()> {
     let collection = collection_for(&resolved)?;
     let cache_dir = collection_cache_dir(&collection);
     for sub in ["tantivy", "vectors"] {
-        match std::fs::remove_dir_all(cache_dir.join(sub)) {
+        match std::fs::remove_dir_all(index_artifact_path(&cache_dir, sub)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
     }
-    match std::fs::remove_file(cache_dir.join("engine.redb")) {
+    match std::fs::remove_file(index_artifact_path(&cache_dir, "engine.redb")) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
@@ -952,7 +953,10 @@ fn model_load_notice_for(resolved: &onebrain_core::ResolvedVault) -> String {
     match info {
         Some(i) => {
             let downloaded = collection_for(resolved)
-                .map(|c| model_download_status(i, &collection_cache_dir(&c)).downloaded)
+                .map(|c| {
+                    model_download_status(i, &models_cache_dir(&collection_cache_dir(&c)))
+                        .downloaded
+                })
                 .unwrap_or(false);
             model_load_notice(&model, downloaded, i.approx_size)
         }

@@ -805,7 +805,8 @@ fn daemon_status_counts(v: &serde_json::Value) -> Option<(Option<u64>, usize, us
 ///   exit code only escalates on `error`, so this check never fails the run.
 fn native_search_check(vault_root: &Path) -> DoctorResult {
     use crate::commands::search_common::{
-        collection_cache_dir, collection_name_readonly, is_indexed, open_engine_with_collection,
+        collection_cache_dir, collection_name_readonly, is_indexed, models_cache_dir,
+        open_engine_with_collection,
     };
     use onebrain_core::load_vault_config;
     use onebrain_search::embed::model_download_status;
@@ -843,6 +844,10 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
         }
     };
     let cache_dir = collection_cache_dir(&collection);
+    // Model probes look in the split-layout `models/` base (read-only fallback
+    // resolution — doctor never migrates), so a post-migration collection's
+    // downloaded models are still detected.
+    let models_dir = models_cache_dir(&cache_dir);
 
     // Read-only config load — same config the rest of the check already
     // resolves through the read-only helpers. Never persisted here.
@@ -859,7 +864,7 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
     let reranker_downloaded = reranker_registry()
         .iter()
         .find(|r| r.name == reranker_model)
-        .is_some_and(|r| reranker_download_status(r, &cache_dir).downloaded);
+        .is_some_and(|r| reranker_download_status(r, &models_dir).downloaded);
     let configured_embed_model = config
         .as_ref()
         .map(|c| c.search.embed_model.clone())
@@ -867,14 +872,14 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
     let configured_model_downloaded = onebrain_search::embed::model_registry()
         .iter()
         .find(|m| m.name == configured_embed_model)
-        .is_some_and(|m| model_download_status(m, &cache_dir).downloaded);
+        .is_some_and(|m| model_download_status(m, &models_dir).downloaded);
     // "Any model downloaded" still gates the coarser "nothing at all is
     // downloaded" wording used below (kept byte-identical to the pre-Task-8
     // messages so existing consumers aren't surprised); the finer-grained
     // "wrong model downloaded" case is reported separately.
     let any_model_downloaded = onebrain_search::embed::model_registry()
         .iter()
-        .any(|m| model_download_status(m, &cache_dir).downloaded);
+        .any(|m| model_download_status(m, &models_dir).downloaded);
 
     let reranker_details = vec![
         format!("reranker_enabled: {reranker_enabled}"),

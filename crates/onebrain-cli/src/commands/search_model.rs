@@ -20,7 +20,7 @@ use serde::Serialize;
 
 use crate::cli::{ModelSortCol, SearchModelListArgs, SearchModelRemoveArgs, SearchModelSetArgs};
 use crate::commands::search_common::{
-    collection_cache_dir, collection_for, format_size, open_engine,
+    collection_cache_dir, collection_for, format_size, models_cache_dir, open_engine,
 };
 use crate::output::{emit, Envelope, OutputMode};
 use onebrain_core::load_vault_config;
@@ -48,7 +48,7 @@ struct ModelListEntry {
 
 impl ModelListEntry {
     fn from_info(info: &ModelInfo, current_model: &str, cache_dir: &Path) -> Self {
-        let status = model_download_status(info, cache_dir);
+        let status = model_download_status(info, &models_cache_dir(cache_dir));
         Self {
             name: info.name,
             dims: info.dims,
@@ -80,7 +80,7 @@ struct RerankerListEntry {
 
 impl RerankerListEntry {
     fn from_info(info: &RerankerInfo, current_reranker: &str, cache_dir: &Path) -> Self {
-        let status = reranker_download_status(info, cache_dir);
+        let status = reranker_download_status(info, &models_cache_dir(cache_dir));
         Self {
             name: info.name,
             approx_size: info.approx_size,
@@ -573,6 +573,7 @@ pub fn run_remove(
     let config = load_vault_config(&resolved.root).context("load vault config")?;
     let collection = collection_for(&resolved).context("resolve collection")?;
     let cache_dir = collection_cache_dir(&collection);
+    let models_dir = models_cache_dir(&cache_dir);
 
     // Small branch: the two registries carry different metadata shapes
     // (`ModelInfo` vs `RerankerInfo`), so status lookup + the "active name"
@@ -584,7 +585,7 @@ pub fn run_remove(
             .find(|r| r.name == args.name)
             .expect("name validated as a supported reranker above");
         (
-            reranker_download_status(info, &cache_dir),
+            reranker_download_status(info, &models_dir),
             config.search.reranker.model == args.name,
         )
     } else {
@@ -593,7 +594,7 @@ pub fn run_remove(
             .find(|m| m.name == args.name)
             .expect("name validated as a supported embedding model above");
         (
-            model_download_status(info, &cache_dir),
+            model_download_status(info, &models_dir),
             config.search.embed_model == args.name,
         )
     };

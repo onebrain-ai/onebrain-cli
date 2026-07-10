@@ -1403,7 +1403,8 @@ mod tests {
         .unwrap();
         {
             let cache_dir = crate::commands::search_common::collection_cache_dir("dc-live");
-            let tantivy = cache_dir.join("tantivy");
+            let tantivy =
+                crate::commands::search_common::index_artifact_path(&cache_dir, "tantivy");
             let mut lex = LexIndex::open(&tantivy).unwrap();
             lex.add(&Chunk {
                 chunk_id: "alpha.md#0".to_string(),

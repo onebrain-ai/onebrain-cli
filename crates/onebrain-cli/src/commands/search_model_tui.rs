@@ -41,7 +41,7 @@ use anyhow::{Context, Result};
 use crate::cli::ModelSortCol;
 use crate::commands::search_common::format_size;
 use crate::commands::search_common::{
-    collection_cache_dir, collection_for, reconcile_missing_model,
+    collection_cache_dir, collection_for, models_cache_dir, reconcile_missing_model,
 };
 #[cfg(feature = "semantic")]
 use crate::commands::search_model::apply_model_change;
@@ -417,9 +417,13 @@ pub fn run(vault_flag: Option<PathBuf>) -> Result<()> {
     // renders as the active model and the user re-selects + downloads.
     reconcile_missing_model(resolved.root.as_path(), &cache_dir, &current);
 
-    let rows = build_rows(&current, &cache_dir);
+    // The TUI only ever touches the hf-hub model cache (status probes +
+    // downloads), so it works off the collection's split-layout `models/`
+    // base — never the collection root.
+    let models_dir = models_cache_dir(&cache_dir);
+    let rows = build_rows(&current, &models_dir);
     let height = viewport_height(rows.len());
-    let mut state = AppState::new(rows, cache_dir);
+    let mut state = AppState::new(rows, models_dir);
 
     enable_raw_mode().context("entering raw mode")?;
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
