@@ -20,7 +20,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **doctor `config-values` check (12th check).** Validates every present config value per key against the runtime defaults + model/reranker registries — `update_channel`, `checkpoint.*`, `search.default_top_k`/`embed_model`, `search.reranker.*`, plus non-empty `folders.*`/`search.collection` — one finding per violation, each naming its documented default.
 - **`doctor --fix` resets out-of-range tunables to their defaults** through a comment-preserving line editor (comments, key order, inline `# …` notes, and CRLF all survive; every reset itemised in the fix footer as `key → default`). `search.embed_model` resets print a reindex-required warning; `folders.*` + `search.collection` are report-only, never auto-reset.
 - `onebrain daemon status` is now a full dashboard (#197): process/bind/webui/engine/models sections incl. the clickable `http://127.0.0.1:PORT/?token=TOKEN`; probe failures degrade to absent fields (exit stays 0); JSON gains the same optional fields
-- `onebrain serve` is daemon-aware (#197): with a daemon already serving the vault it prints the daemon's webui URL (+ `--open` opens it) instead of binding a second listener; explicit `--port`/`--host`/`--dir` still means standalone
+- `onebrain serve` is daemon-aware (#197): with a daemon already serving the vault it prints the daemon's webui URL (+ `--open` opens it) instead of binding a second listener; explicit `--port`/`--dir`/`$ONEBRAIN_BIND` still means standalone
 - `GET /api/health` reports `dist_dir` (webui source); `GET /api/internal/status` reports `embed_model` (both additive)
 
 ### Changed
