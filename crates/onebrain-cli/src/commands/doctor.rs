@@ -583,7 +583,12 @@ fn config_values_check(vault_root: &Path) -> DoctorResult {
     // never counted — the user's comments win). Read-only here: zero writes
     // on a plain doctor run.
     let undocumented = undocumented_keys(&text);
-    if findings.is_empty() && undocumented.is_empty() {
+    // Section-layout drift: the top-level blocks are out of template order or
+    // missing their section banners. Read-only here — reported now, restructured
+    // by `--fix`. `config_layout_matches` is conservative (never flags a shape
+    // it declines to restructure), so this only fires on an addressable mapping.
+    let layout_drift = !onebrain_fs::config_layout_matches(&text);
+    if findings.is_empty() && undocumented.is_empty() && !layout_drift {
         return DoctorResult::ok(CONFIG_VALUES_CHECK, "all values in range");
     }
     let mut message_parts: Vec<String> = Vec::new();
@@ -599,25 +604,44 @@ fn config_values_check(vault_root: &Path) -> DoctorResult {
             undocumented.join(", ")
         ));
     }
+    if layout_drift {
+        message_parts.push("layout drift".to_string());
+        details.push(
+            "config layout differs from template — doctor --fix will restructure (reorder sections, add banners; values and comments preserved)".to_string(),
+        );
+    }
     let any_resettable = findings.iter().any(|f| f.resettable);
+    // Any of the three repair actions warrants a `--fix` hint; compose it from
+    // whichever apply so the message never over-promises.
+    let mut actions: Vec<&str> = Vec::new();
+    if any_resettable {
+        actions.push("reset out-of-range tunables to their defaults");
+    }
+    if !undocumented.is_empty() {
+        actions.push("add the missing self-documentation comments");
+    }
+    if layout_drift {
+        actions.push("restructure the layout to the template");
+    }
     let mut r =
         DoctorResult::warn(CONFIG_VALUES_CHECK, message_parts.join(" · ")).with_details(details);
-    let hint = match (any_resettable, !undocumented.is_empty()) {
-        (true, true) => Some(
-            "Run onebrain doctor --fix to reset out-of-range tunables and add the missing self-documentation comments",
-        ),
-        (true, false) => {
-            Some("Run onebrain doctor --fix to reset out-of-range tunables to their defaults")
-        }
-        (false, true) => {
-            Some("Run onebrain doctor --fix to add the missing self-documentation comments")
-        }
-        (false, false) => None,
-    };
-    if let Some(h) = hint {
-        r = r.with_hint(h);
+    if !actions.is_empty() {
+        r = r.with_hint(format!(
+            "Run onebrain doctor --fix to {}",
+            join_actions(&actions)
+        ));
     }
     r
+}
+
+/// Join action phrases into an English list ("a", "a and b", "a, b, and c").
+fn join_actions(actions: &[&str]) -> String {
+    match actions {
+        [] => String::new(),
+        [a] => a.to_string(),
+        [a, b] => format!("{a} and {b}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
 }
 
 /// Dotted paths of template-known keys that exist in `text` without a
@@ -1034,9 +1058,9 @@ fn planned_action(result: &DoctorResult) -> Option<&'static str> {
         "plugin-files" => Some("re-download plugin files from upstream"),
         "folders" => Some("create the missing standard folders"),
         "onebrain.yml-keys" => Some("backfill missing onebrain.yml keys"),
-        "config-values" => {
-            Some("reset out-of-range values to defaults · add missing self-documentation comments")
-        }
+        "config-values" => Some(
+            "reset out-of-range values to defaults · add missing self-documentation comments · restructure layout",
+        ),
         "claude-settings" => Some("remove the stale marketplace entry"),
         "plugin-cache" => Some("remove the stale plugin cache"),
         "vault-config-migration" => Some("migrate vault.yml → onebrain.yml"),
@@ -1630,12 +1654,19 @@ fn fix_config_values(vault_root: &Path, json: bool) -> FixOutcome {
     let Some(findings) = collect_config_findings(&text) else {
         return FixOutcome::Failed(format!("{filename} is not a YAML mapping"));
     };
-    if findings.is_empty() && undocumented_keys(&text).is_empty() {
+    if findings.is_empty()
+        && undocumented_keys(&text).is_empty()
+        && onebrain_fs::config_layout_matches(&text)
+    {
         return FixOutcome::Fixed(format!(
-            "{filename}: all values already in range and documented"
+            "{filename}: all values already in range, documented, and in template layout"
         ));
     }
 
+    // Whether the check-time read promised a restructure ("layout drift").
+    // Captured BEFORE any edit so a fix-time decline of that promise can be
+    // surfaced honestly instead of silently skipped.
+    let layout_drift_at_read = !onebrain_fs::config_layout_matches(&text);
     let mut current = text;
     let mut resets: Vec<String> = Vec::new();
     let mut untouched: Vec<String> = Vec::new();
@@ -1677,7 +1708,37 @@ fn fix_config_values(vault_root: &Path, json: bool) -> FixOutcome {
         }
     }
 
-    if !resets.is_empty() || !comments_added.is_empty() {
+    // Section restructure (v3.4.8): reorder the top-level blocks into the
+    // template's section order and insert the Style-A banners, moving each
+    // block as opaque bytes so the just-reset values and just-added comments
+    // (and every user comment) survive verbatim. Runs LAST so it operates on
+    // the fully-corrected text; idempotent, so a second `--fix` is a no-op.
+    let mut restructured = false;
+    match onebrain_fs::restructure_config(&current) {
+        Some(reordered) => {
+            if reordered != current {
+                current = reordered;
+                restructured = true;
+            }
+        }
+        None => {
+            // The restructure declined the shape. When the check-time read
+            // reported layout drift, silence here would break the promise
+            // plain doctor made ("--fix will restructure") — surface it as
+            // un-fixable so the run lands Partial, not a clean Fixed. In
+            // practice this arm-with-drift is unreachable: every declined
+            // shape (invalid YAML / non-mapping / flow-style root / no
+            // top-level keys) also makes `config_layout_matches` return true
+            // (never drift), and the value/comment line edits above cannot
+            // change the root shape — a unit test pins that agreement. Kept
+            // as defense-in-depth for honesty over silence.
+            if layout_drift_at_read {
+                unfixable.push("layout restructure (unsupported top-level shape)".to_string());
+            }
+        }
+    }
+
+    if !resets.is_empty() || !comments_added.is_empty() || restructured {
         // Defense-in-depth backup before the write, mirroring every other
         // config-writing recipe — even though this edit preserves comments.
         if let Err(e) = onebrain_fs::backup_config_file(&path) {
@@ -1712,6 +1773,12 @@ fn fix_config_values(vault_root: &Path, json: bool) -> FixOutcome {
             comments_added.join(", ")
         ));
     }
+    if restructured {
+        parts.push(
+            "restructured layout into template sections (reordered blocks, added banners)"
+                .to_string(),
+        );
+    }
     if !untouched.is_empty() {
         parts.push(format!(
             "left untouched (never auto-reset): {} — edit manually",
@@ -1723,13 +1790,14 @@ fn fix_config_values(vault_root: &Path, json: bool) -> FixOutcome {
             "could not reset (unsupported YAML shape, e.g. inline mapping): {} — edit manually",
             unfixable.join(", ")
         ));
-        // Honest tri-state: real resets landed on disk AND something remains
-        // → Partial (distinct glyph, still a non-zero exit); nothing landed
-        // → Failed.
-        return if resets.is_empty() {
-            FixOutcome::Failed(parts.join(" · "))
-        } else {
+        // Honest tri-state: real progress landed on disk (a value reset, a
+        // comment backfill, or a restructure) AND something remains → Partial
+        // (distinct glyph, still a non-zero exit); nothing landed → Failed.
+        let made_progress = !resets.is_empty() || !comments_added.is_empty() || restructured;
+        return if made_progress {
             FixOutcome::Partial(parts.join(" · "))
+        } else {
+            FixOutcome::Failed(parts.join(" · "))
         };
     }
     FixOutcome::Fixed(parts.join(" · "))
@@ -1870,7 +1938,21 @@ fn stamp_doctor_run(vault_root: &Path, fix: bool, quiet: bool) {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     match upsert_doctor_stats(&text, &today, fix) {
         Some(updated) => {
-            if let Err(e) = onebrain_fs::atomic_write_text(&path, &updated) {
+            // Stamping a config that has NO `stats:` block appends a bare one
+            // at the end. On a config that was already in canonical section
+            // layout (e.g. a freshly-init'd vault), that bare append would
+            // introduce layout drift the very next run would report. Re-run
+            // the byte-preserving restructure so the stamp keeps its own write
+            // canonical (System banner + managed note around the new stats
+            // block). A config that was ALREADY drifted is left as-is — plain
+            // doctor never restructures a user's legacy layout; that stays
+            // `--fix`'s job.
+            let final_text = if onebrain_fs::config_layout_matches(&text) {
+                onebrain_fs::restructure_config(&updated).unwrap_or(updated)
+            } else {
+                updated
+            };
+            if let Err(e) = onebrain_fs::atomic_write_text(&path, &final_text) {
                 if !quiet {
                     eprintln!("doctor: could not update last_doctor_run: {e}");
                 }
@@ -4535,26 +4617,30 @@ mod tests {
         let r = config_values_check(d.path());
         assert_eq!(r.status, DoctorStatus::Ok);
         assert!(r.message.contains("skipped"), "{}", r.message);
-        // In-range, documented values → ok. (An in-range key WITHOUT a doc
-        // comment is the undocumented-keys warn — covered below.)
-        fs::write(
-            d.path().join("onebrain.yml"),
-            "# channel comment\nupdate_channel: next\n",
-        )
-        .unwrap();
+        // In-range, documented, ALREADY in template layout → ok. (Layout is
+        // canonicalized via the shared restructure so no banner drift fires.)
+        let canonical =
+            onebrain_fs::restructure_config("# channel comment\nupdate_channel: next\n").unwrap();
+        fs::write(d.path().join("onebrain.yml"), &canonical).unwrap();
         let r = config_values_check(d.path());
-        assert_eq!(r.status, DoctorStatus::Ok);
+        assert_eq!(r.status, DoctorStatus::Ok, "{}", r.message);
         assert_eq!(r.message, "all values in range");
-        // In-range but UNDOCUMENTED key → warn with the backfill detail +
-        // comment-specific hint (still zero writes — read-only check).
+        // In-range but UNDOCUMENTED key (and, lacking a banner, layout drift)
+        // → warn combining both, with the comment-specific hint (still zero
+        // writes — read-only check).
         fs::write(d.path().join("onebrain.yml"), "update_channel: next\n").unwrap();
         let r = config_values_check(d.path());
         assert_eq!(r.status, DoctorStatus::Warn);
-        assert_eq!(r.message, "1 undocumented key(s)");
+        assert_eq!(r.message, "1 undocumented key(s) · layout drift");
         assert!(
             r.details
                 .iter()
                 .any(|l| l.contains("lack self-documentation") && l.contains("update_channel")),
+            "{:?}",
+            r.details
+        );
+        assert!(
+            r.details.iter().any(|l| l.contains("layout differs")),
             "{:?}",
             r.details
         );
@@ -4567,7 +4653,8 @@ mod tests {
             r.hint
         );
         // Out-of-range → warn with a per-key detail line + fix hint (the key
-        // is commented here so only the value finding fires).
+        // is commented here so only the value finding fires; the missing
+        // banner adds layout drift).
         fs::write(
             d.path().join("onebrain.yml"),
             "checkpoint:\n  # messages comment\n  messages: 0\n",
@@ -4575,7 +4662,7 @@ mod tests {
         .unwrap();
         let r = config_values_check(d.path());
         assert_eq!(r.status, DoctorStatus::Warn);
-        assert_eq!(r.message, "1 invalid value(s)");
+        assert_eq!(r.message, "1 invalid value(s) · layout drift");
         assert!(
             r.details
                 .iter()
@@ -4584,7 +4671,7 @@ mod tests {
             r.details
         );
         assert!(r.hint.as_deref().unwrap_or("").contains("doctor --fix"));
-        // Invalid value AND undocumented key combine into one message.
+        // Invalid value AND undocumented key AND layout drift combine.
         fs::write(
             d.path().join("onebrain.yml"),
             "checkpoint:\n  messages: 0\n",
@@ -4592,17 +4679,20 @@ mod tests {
         .unwrap();
         let r = config_values_check(d.path());
         assert_eq!(r.status, DoctorStatus::Warn);
-        assert_eq!(r.message, "1 invalid value(s) · 1 undocumented key(s)");
+        assert_eq!(
+            r.message,
+            "1 invalid value(s) · 1 undocumented key(s) · layout drift"
+        );
+        let hint = r.hint.as_deref().unwrap_or("");
         assert!(
-            r.hint
-                .as_deref()
-                .unwrap_or("")
-                .contains("reset out-of-range tunables and add the missing"),
+            hint.contains("reset out-of-range tunables to their defaults")
+                && hint.contains("add the missing self-documentation comments")
+                && hint.contains("restructure the layout"),
             "{:?}",
             r.hint
         );
-        // Report-only findings (documented key) carry no reset wording — but
-        // an undocumented report-only key still gets the comment hint.
+        // A documented, report-only value finding still yields an actionable
+        // hint now: the restructure is the fixable part.
         fs::write(
             d.path().join("onebrain.yml"),
             "folders:\n  # inbox comment\n  inbox: \"\"\n",
@@ -4610,7 +4700,22 @@ mod tests {
         .unwrap();
         let r = config_values_check(d.path());
         assert_eq!(r.status, DoctorStatus::Warn);
-        assert!(r.hint.is_none(), "{:?}", r.hint);
+        assert!(
+            r.hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("restructure the layout"),
+            "{:?}",
+            r.hint
+        );
+    }
+
+    #[test]
+    fn join_actions_renders_english_lists() {
+        assert_eq!(join_actions(&[]), "");
+        assert_eq!(join_actions(&["a"]), "a");
+        assert_eq!(join_actions(&["a", "b"]), "a and b");
+        assert_eq!(join_actions(&["a", "b", "c"]), "a, b, and c");
     }
 
     #[test]
@@ -4708,15 +4813,25 @@ mod tests {
     }
 
     #[test]
-    fn fix_config_values_inline_mapping_is_failed_outcome() {
+    fn fix_config_values_inline_mapping_is_partial_outcome() {
+        // The inline-mapping value can't be reset, but the restructure still
+        // adds the section banner — honest tri-state Partial (progress landed
+        // on disk; the value needs a manual edit).
         let d = tempdir().unwrap();
         fs::write(d.path().join("onebrain.yml"), "checkpoint: {messages: 0}\n").unwrap();
         let outcome = fix_config_values(d.path(), false);
-        let FixOutcome::Failed(msg) = outcome else {
-            panic!("expected Failed, got: {outcome:?}");
+        let FixOutcome::Partial(msg) = outcome else {
+            panic!("expected Partial, got: {outcome:?}");
         };
         assert!(msg.contains("checkpoint.messages"), "msg: {msg}");
         assert!(msg.contains("edit manually"), "msg: {msg}");
+        assert!(msg.contains("restructured"), "msg: {msg}");
+        // The banner landed even though the value could not be reset.
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert!(after.contains(&onebrain_fs::config_layout::section_banner(
+            "Agent behavior"
+        )));
+        assert!(after.contains("checkpoint: {messages: 0}"));
     }
 
     #[test]
@@ -4773,12 +4888,66 @@ mod tests {
     }
 
     #[test]
-    fn fix_config_values_clean_documented_config_is_noop() {
-        // A fully-commented, in-range config (the fresh template) is the true
-        // no-op: byte-identical after --fix, "already" message.
+    fn fix_config_values_flow_style_root_declines_without_phantom_layout_complaint() {
+        // A flow-style root parses as a mapping (findings ARE collected) but
+        // nothing is line-editable and the restructure declines the shape.
+        // No layout drift was ever promised for it (see the agreement test
+        // below), so the outcome lists only the value — never a phantom
+        // "layout restructure" entry — and the file is untouched.
         let d = tempdir().unwrap();
-        let clean = "# channel comment\nupdate_channel: stable\n";
-        fs::write(d.path().join("onebrain.yml"), clean).unwrap();
+        let flow = "{checkpoint: {messages: 0}}\n";
+        fs::write(d.path().join("onebrain.yml"), flow).unwrap();
+        let outcome = fix_config_values(d.path(), false);
+        let FixOutcome::Failed(msg) = outcome else {
+            panic!("expected Failed (no progress possible), got: {outcome:?}");
+        };
+        assert!(msg.contains("checkpoint.messages"), "msg: {msg}");
+        assert!(
+            !msg.contains("layout restructure"),
+            "no phantom layout complaint: {msg}"
+        );
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after, flow, "declined shape must be left untouched");
+    }
+
+    #[test]
+    fn layout_drift_is_never_promised_for_shapes_restructure_declines() {
+        // Pins the check/fix agreement the fix recipe's decline arm relies
+        // on: every shape `restructure_config` declines also makes
+        // `config_layout_matches` return true, so plain doctor never reports
+        // "layout drift" for a file `--fix` would then decline to
+        // restructure — the promise-then-silent-decline mismatch is
+        // unreachable (the decline arm in `fix_config_values` is
+        // defense-in-depth only).
+        for text in [
+            "- a\n- b\n",        // sequence root
+            "",                  // empty
+            "# only comments\n", // no top-level keys
+            "{a: 1, b: 2}\n",    // flow-style root mapping
+            "  {a: 1}\n",        // flow-style root, indented
+            "a: [1, 2\n",        // invalid YAML
+            "a: 1\na: 2\n",      // duplicate top-level keys
+        ] {
+            assert!(
+                onebrain_fs::restructure_config(text).is_none(),
+                "expected decline for {text:?}"
+            );
+            assert!(
+                onebrain_fs::config_layout_matches(text),
+                "declined shape must never report drift: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fix_config_values_clean_documented_config_is_noop() {
+        // A fully-commented, in-range, canonical-layout config (the fresh
+        // template shape) is the true no-op: byte-identical after --fix,
+        // "already" message.
+        let d = tempdir().unwrap();
+        let clean =
+            onebrain_fs::restructure_config("# channel comment\nupdate_channel: stable\n").unwrap();
+        fs::write(d.path().join("onebrain.yml"), &clean).unwrap();
         let outcome = fix_config_values(d.path(), false);
         let FixOutcome::Fixed(msg) = outcome else {
             panic!("expected Fixed, got: {outcome:?}");
@@ -4811,9 +4980,15 @@ mod tests {
         // sourced from the shared table.
         for doc in onebrain_fs::config_key_docs() {
             let key = doc.segments.last().unwrap();
-            // Keys not present in this legacy config are never added.
+            // Keys not present in this legacy config are never added
+            // (recap.*, schedule, and the search reranker/top_k/exclude/
+            // embed.* keys are all absent here).
             if doc.segments.join(".").starts_with("search.reranker")
                 || doc.segments == ["search", "default_top_k"]
+                || doc.segments == ["search", "exclude"]
+                || doc.segments.get(1) == Some(&"embed")
+                || doc.segments.first() == Some(&"recap")
+                || doc.segments == ["schedule"]
             {
                 assert!(
                     !after
@@ -4834,6 +5009,13 @@ mod tests {
                 "comment above {key} must be the template's:\n{after}"
             );
         }
+        // The restructure landed in the same run: outcome names it and the
+        // section banners are on disk (the legacy config had none).
+        assert!(msg.contains("restructured layout"), "msg: {msg}");
+        assert!(
+            after.contains(&onebrain_fs::config_layout::section_banner("General")),
+            "General banner must be present after --fix:\n{after}"
+        );
         // Values + key order untouched.
         assert!(after.contains("collection: my-col"), "{after}");
         let key_order: Vec<&str> = after
@@ -4859,10 +5041,14 @@ mod tests {
     #[test]
     fn fix_config_values_never_replaces_user_comments() {
         // Scope test (b): a key already under the user's own comment is left
-        // alone — no insertion, no dedupe, no replacement.
+        // alone — no insertion, no dedupe, no replacement. Fixture is already
+        // in canonical layout so this isolates the comment-preservation path.
         let d = tempdir().unwrap();
-        let cfg = "# my own words about the channel\nupdate_channel: stable\n";
-        fs::write(d.path().join("onebrain.yml"), cfg).unwrap();
+        let cfg = onebrain_fs::restructure_config(
+            "# my own words about the channel\nupdate_channel: stable\n",
+        )
+        .unwrap();
+        fs::write(d.path().join("onebrain.yml"), &cfg).unwrap();
         let outcome = fix_config_values(d.path(), false);
         let FixOutcome::Fixed(msg) = outcome else {
             panic!("expected Fixed, got: {outcome:?}");
@@ -4870,6 +5056,8 @@ mod tests {
         assert!(msg.contains("already in range"), "msg: {msg}");
         let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert_eq!(after, cfg);
+        // The user's own comment survived verbatim.
+        assert!(after.contains("# my own words about the channel"));
     }
 
     #[test]

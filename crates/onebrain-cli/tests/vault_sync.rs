@@ -415,6 +415,13 @@ fn default_init_with_inline_sync_keeps_template_comments() {
         "min_score must stay verbatim (not re-serialized to 0.3):\n{cfg}"
     );
     assert!(cfg.contains("update_channel: stable"), "{cfg}");
+    // Section banners survive end-to-end on disk (comment_lines counts them,
+    // but presence must be explicit — a banner-free file with the same
+    // comment count would otherwise pass).
+    assert!(
+        cfg.contains("# ── General "),
+        "section banner must be on disk after init + inline sync:\n{cfg}"
+    );
 }
 
 /// (b) Re-sync of an already-synced commented config: byte-identical no-op.
@@ -532,10 +539,20 @@ fn doctor_fix_plugin_files_repair_keeps_config_comments() {
         "repair must restore plugin files"
     );
     let after = fs::read_to_string(vault.join("onebrain.yml")).unwrap();
+    // No template comment is stripped; the only additions are the canonical
+    // stats section's two structural comments (System banner + managed note),
+    // stamped in by the doctor run.
     assert_eq!(
         comment_lines(&after),
-        comment_lines(&template),
+        comment_lines(&template) + 2,
         "plugin-files repair must not strip config comments:\n{after}"
     );
+    for tmpl_comment in template.lines().filter(|l| l.trim_start().starts_with('#')) {
+        assert!(
+            after.contains(tmpl_comment),
+            "template comment lost: {tmpl_comment:?}\n{after}"
+        );
+    }
+    assert!(after.contains(onebrain_fs::SYSTEM_MANAGED_NOTE), "{after}");
     assert!(after.contains("# collection:"), "{after}");
 }
