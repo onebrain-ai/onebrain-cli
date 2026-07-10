@@ -67,6 +67,30 @@ const SECTIONS: &[SectionDef] = &[
 /// Index of the `System` section (stats) — the always-last bucket.
 const SYSTEM_SECTION: usize = 5;
 
+/// Const-context `&str` equality (`==` on `&str` is not const-stable).
+const fn const_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+// Compile-time guard against drift between `SYSTEM_SECTION` and `SECTIONS`:
+// inserting a section before "System" becomes a build error, not a silent
+// misplacement of `stats` / SYSTEM_MANAGED_NOTE.
+const _: () = {
+    assert!(SYSTEM_SECTION < SECTIONS.len());
+    assert!(const_str_eq(SECTIONS[SYSTEM_SECTION].title, "System"));
+};
+
 /// Render a Style-A banner line for `title`, padded with box-drawing dashes to
 /// [`BANNER_WIDTH`] columns. Deterministic — the fresh template and the
 /// restructure emit byte-identical banners.
