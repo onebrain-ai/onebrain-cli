@@ -701,6 +701,15 @@ fn search_exclude_check(vault_root: &Path) -> DoctorResult {
     let Ok(text) = std::fs::read_to_string(&path) else {
         return DoctorResult::ok(SEARCH_EXCLUDE_CHECK, "skipped — config unreadable");
     };
+    // Unparseable YAML is the `onebrain.yml-keys` check's territory — skip
+    // quietly (same convention as `config_values_check`) rather than
+    // reporting a misleading "search.exclude ok".
+    if serde_yaml::from_str::<serde_yaml::Value>(&text).is_err() {
+        return DoctorResult::ok(
+            SEARCH_EXCLUDE_CHECK,
+            "skipped — invalid YAML (see onebrain.yml-keys)",
+        );
+    }
     if !search_exclude_missing(&text) {
         return DoctorResult::ok(SEARCH_EXCLUDE_CHECK, "search.exclude ok");
     }
@@ -1624,16 +1633,24 @@ fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
 
 /// Insert the commented `search.exclude` block (doc comment + `exclude:` +
 /// its two list items) as the last child of the top-level `search:` block.
-/// Only called when [`search_exclude_missing`] is true, so `search:` is
-/// guaranteed to already be an addressable block-form mapping (an
-/// absent/inline `search:` couldn't carry the `search.collection` value the
-/// gate requires) — `None` here would mean that invariant broke.
+/// Called when [`search_exclude_missing`] is true — which guarantees a
+/// `search` MAPPING exists in the parsed YAML, but NOT that it's in
+/// block form: serde_yaml parses a flow mapping (`search: {collection: c}`)
+/// identically, and splicing indented child lines under a flow line would
+/// write unparseable YAML. Returns `None` for any header that isn't a pure
+/// block-form `search:` line (same `after.is_empty() || after.starts_with('#')`
+/// guard as `onebrain_fs::yaml_edit::upsert_child` at the equivalent branch)
+/// — the caller surfaces that as `Failed` with a manual-edit message rather
+/// than ever corrupting the file.
 ///
-/// Mirrors `onebrain_fs::yaml_edit::upsert_child`'s "block header present,
-/// key absent" branch (same last-direct-child scan, same indentation
-/// inference), extended to insert a MULTI-line value plus its doc comment in
-/// one edit. Kept local to `doctor.rs` (Task 4's file scope) rather than
-/// growing the shared line editor for a single caller.
+/// Mirrors `upsert_child`'s "block header present, key absent" branch (same
+/// last-direct-child scan, same indentation inference), extended to insert a
+/// MULTI-line value plus its doc comment in one edit. Deliberately does NOT
+/// mirror `upsert_child`'s flow-form splice (which replaces the inline line
+/// with a fresh block carrying only the new key — fine for a scalar/null
+/// parent, but here it would drop the user's `collection` value). Kept local
+/// to `doctor.rs` (Task 4's file scope) rather than growing the shared line
+/// editor for a single caller.
 fn insert_search_exclude_block(text: &str, comment: &str, archive: &str) -> Option<String> {
     fn is_blank(l: &str) -> bool {
         l.trim().is_empty()
@@ -1652,6 +1669,15 @@ fn insert_search_exclude_block(text: &str, comment: &str, archive: &str) -> Opti
     let header_idx = lines.iter().position(|l| {
         indent_of(l) == 0 && !is_comment(l) && l.trim_start().starts_with("search:")
     })?;
+
+    // Refuse anything but a pure block-form header (optionally with a
+    // trailing `# …` comment): a flow mapping / scalar / null after the
+    // colon cannot carry spliced child lines — the write would be
+    // unparseable YAML. Same guard as `upsert_child`'s block-extend branch.
+    let after_header = lines[header_idx].trim_start()["search:".len()..].trim_start();
+    if !(after_header.is_empty() || after_header.starts_with('#')) {
+        return None;
+    }
 
     // Scan the block's direct children to find the last one and infer the
     // child indent — identical logic to `upsert_child`'s block-extend branch.
@@ -1741,8 +1767,15 @@ fn fix_search_exclude(vault_root: &Path, json: bool) -> FixOutcome {
         .unwrap_or_default();
 
     let Some(updated) = insert_search_exclude_block(&text, &comment, &archive) else {
+        // Gate said the exclude is missing but the `search:` line isn't an
+        // addressable block-form header (inline flow mapping like
+        // `search: {collection: c}`, or an unlocatable shape). Never splice
+        // into it — that would write unparseable YAML. Honest Failed with
+        // the manual step instead.
         return FixOutcome::Failed(format!(
-            "{filename}: could not locate an addressable `search:` block"
+            "{filename}: `search:` is not a block-form mapping (e.g. inline `search: {{…}}`) — \
+             convert it to block form, then re-run onebrain doctor --fix (or add \
+             `exclude: [attachments, {archive}]` manually)"
         ));
     };
 
@@ -6022,6 +6055,17 @@ mod tests {
         fs::write(d.path().join("onebrain.yml"), "update_channel: stable\n").unwrap();
         let r = search_exclude_check(d.path());
         assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
+
+        // Invalid YAML — the onebrain.yml-keys check owns that error; this
+        // check skips (never a misleading "search.exclude ok").
+        fs::write(d.path().join("onebrain.yml"), "not: : valid").unwrap();
+        let r = search_exclude_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
+        assert!(
+            r.message.contains("skipped — invalid YAML"),
+            "{}",
+            r.message
+        );
     }
 
     #[test]
@@ -6090,6 +6134,89 @@ mod tests {
             "{after}"
         );
         assert!(!after.contains("- 06-archive"), "{after}");
+    }
+
+    #[test]
+    fn fix_search_exclude_flow_form_search_fails_without_corrupting_yaml() {
+        // Regression (R1 Important): serde_yaml parses a flow mapping
+        // (`search: {collection: my-col}`) identically to block form, so the
+        // gate fires — but splicing indented child lines under the flow line
+        // would write UNPARSEABLE YAML while reporting Fixed. The recipe must
+        // refuse (honest Failed with a manual step) and leave the file
+        // byte-identical and re-parseable.
+        let d = tempdir().unwrap();
+        let flow = "search: {collection: my-col}\ncheckpoint:\n  messages: 15\n";
+        fs::write(d.path().join("onebrain.yml"), flow).unwrap();
+
+        let outcome = fix_search_exclude(d.path(), false);
+        let FixOutcome::Failed(msg) = outcome else {
+            panic!("expected Failed, got: {outcome:?}");
+        };
+        assert!(msg.contains("block form"), "actionable message: {msg}");
+
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after, flow, "declined shape must be left untouched");
+        // The file must still parse — never write (or leave) corrupt YAML.
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&after).unwrap();
+        assert_eq!(
+            parsed["search"]["collection"].as_str(),
+            Some("my-col"),
+            "collection value must survive"
+        );
+    }
+
+    #[test]
+    fn fix_search_exclude_lands_as_last_child_with_nested_blocks_intact() {
+        // Pins the insertion position deliberately: with `search:` carrying
+        // multiple sub-keys including NESTED blocks (reranker, embed), the
+        // exclude block lands as the LAST direct child of `search:`, the
+        // result re-parses, and every pre-existing key survives.
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "search:\n  collection: my-col\n  reranker:\n    enabled: true\n    model: onebrain-rerank-v1\n  embed:\n    auto: true\n",
+        )
+        .unwrap();
+
+        let outcome = fix_search_exclude(d.path(), false);
+        assert!(matches!(outcome, FixOutcome::Fixed(_)), "{outcome:?}");
+
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        // Re-parses with all keys intact.
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&after).unwrap();
+        assert_eq!(parsed["search"]["collection"].as_str(), Some("my-col"));
+        assert_eq!(
+            parsed["search"]["reranker"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["search"]["reranker"]["model"].as_str(),
+            Some("onebrain-rerank-v1")
+        );
+        assert_eq!(parsed["search"]["embed"]["auto"].as_bool(), Some(true));
+        let exclude: Vec<&str> = parsed["search"]["exclude"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(exclude, ["attachments", "06-archive"]);
+        // Position pinned: the exclude block (comment + key + 2 items) is
+        // the last direct child of `search:` — after the embed block's
+        // final line. Comment text sourced from the shared table so wording
+        // changes there don't break this position assertion.
+        let comment = onebrain_fs::config_key_docs()
+            .into_iter()
+            .find(|dd| dd.segments == ["search", "exclude"])
+            .unwrap()
+            .comment;
+        let expected_tail = format!(
+            "  embed:\n    auto: true\n  {comment}\n  exclude:\n  - attachments\n  - 06-archive\n"
+        );
+        assert!(
+            after.ends_with(&expected_tail),
+            "exclude must land as the last child of search:\n{after}"
+        );
     }
 
     #[test]
