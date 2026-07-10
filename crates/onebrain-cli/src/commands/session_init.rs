@@ -301,7 +301,7 @@ fn render_text(result: &SessionInitResult) -> String {
             };
             let recap_pending = match out.recap_pending {
                 Some(n) => format!("{n}"),
-                None => "unknown (scan timed out)".to_string(),
+                None => "unknown (couldn't scan)".to_string(),
             };
             format!(
                 "Session ready · token={token} · datetime={datetime}\nsearch index: {unembedded}\nRecap pending: {recap_pending}",
