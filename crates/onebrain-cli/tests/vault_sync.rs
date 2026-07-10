@@ -532,10 +532,20 @@ fn doctor_fix_plugin_files_repair_keeps_config_comments() {
         "repair must restore plugin files"
     );
     let after = fs::read_to_string(vault.join("onebrain.yml")).unwrap();
+    // No template comment is stripped; the only additions are the canonical
+    // stats section's two structural comments (System banner + managed note),
+    // stamped in by the doctor run.
     assert_eq!(
         comment_lines(&after),
-        comment_lines(&template),
+        comment_lines(&template) + 2,
         "plugin-files repair must not strip config comments:\n{after}"
     );
+    for tmpl_comment in template.lines().filter(|l| l.trim_start().starts_with('#')) {
+        assert!(
+            after.contains(tmpl_comment),
+            "template comment lost: {tmpl_comment:?}\n{after}"
+        );
+    }
+    assert!(after.contains(onebrain_fs::SYSTEM_MANAGED_NOTE), "{after}");
     assert!(after.contains("# collection:"), "{after}");
 }

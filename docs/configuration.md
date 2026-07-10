@@ -24,6 +24,27 @@ Two safety nets back the comments:
 inserts the same per-key comment lines the fresh template ships, without
 touching your values, your key order, or any comment you wrote yourself.
 
+## Section layout
+
+The template groups keys under labelled banners in a fixed order:
+
+```
+# ── General ──…          update_channel
+# ── Vault layout ──…     folders
+# ── Agent behavior ──…   checkpoint, recap
+# ── Search ──…           search
+# ── Automation ──…       schedule
+# ── System ──…           stats   (managed by OneBrain — do not edit)
+```
+
+`onebrain doctor` reports "layout differs from template" when an existing
+config's top-level blocks are out of this order or missing their banners;
+`onebrain doctor --fix` restructures it — reordering the blocks and inserting
+the banners while moving each block as opaque bytes, so every value and comment
+survives. The restructure is idempotent (a second `--fix` changes nothing) and
+never touches a config it can't safely address. Unknown top-level keys keep
+their relative order and are placed after the known blocks, before `stats`.
+
 Legacy note: v3.0 named this file `vault.yml`. The CLI still reads the old
 name with a deprecation warning; `onebrain doctor --fix` migrates it.
 
@@ -50,6 +71,8 @@ name with a deprecation warning; `onebrain doctor --fix` migrates it.
 | `search.reranker.model` | Reranker model (see `onebrain search model list`) | `onebrain-rerank-v1` | reranker-registry name | yes |
 | `search.reranker.min_candidates` | Minimum candidate pool to rerank (a floor, not a ceiling) | `10` | integer ≥ 1 | yes |
 | `search.reranker.min_score` | Score gate: hits below this calibrated 0–1 score are dropped | `0.30` (engine-calibrated; key may also be omitted) | number in `[0, 1]` | yes |
+| `recap.min_sessions` | Unrecapped session logs required before `/recap` runs (plugin key) | `6` | integer ≥ 1 | not validated (plugin-level) |
+| `recap.min_frequency` | Sessions a topic must recur in to be promoted to memory (plugin key) | `2` | integer ≥ 1 | not validated (plugin-level) |
 | `schedule` | Scheduled skill/command entries compiled by `onebrain schedule register` | *(none)* | see `schedule register` docs | not validated |
 | `stats.*` | Doctor run timestamps, stamped by `onebrain doctor` | — | managed automatically | — |
 

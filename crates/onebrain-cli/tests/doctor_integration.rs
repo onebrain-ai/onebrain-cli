@@ -1008,9 +1008,11 @@ fn doctor_flags_out_of_range_config_values() {
             .iter()
             .filter(|v| {
                 let s = v.as_str().unwrap_or("");
-                // Report-only findings and the self-documentation summary
-                // line are not value resets.
-                !s.contains("never auto-reset") && !s.contains("lack self-documentation")
+                // Report-only findings, the self-documentation summary line,
+                // and the layout-drift line are not value resets.
+                !s.contains("never auto-reset")
+                    && !s.contains("lack self-documentation")
+                    && !s.contains("layout differs")
             })
             .all(|v| v.as_str().unwrap_or("").contains("default:")),
         "each resettable finding must state its default: {details:?}"
@@ -1022,10 +1024,11 @@ fn doctor_config_values_in_range_reports_ok() {
     let d = tempdir().unwrap();
     let cache = tempdir().unwrap();
     // Every key carries a (user) comment so the assertion isolates VALUE
-    // validation from the undocumented-keys warn.
-    vault_with_config(
-        d.path(),
-        "# c\nupdate_channel: next\n\
+    // validation from the undocumented-keys warn. The fixture is passed
+    // through the shared restructure so it is already in canonical section
+    // layout — otherwise the missing banners would (correctly) report layout
+    // drift and this VALUE-only assertion would see a warn.
+    let raw = "# c\nupdate_channel: next\n\
          folders:\n  \
            # c\n  \
            inbox: 00-inbox\n  \
@@ -1053,7 +1056,10 @@ fn doctor_config_values_in_range_reports_ok() {
            default_top_k: 25\n  \
            reranker:\n    \
              # c\n    \
-             min_score: 0.5\n",
+             min_score: 0.5\n";
+    vault_with_config(
+        d.path(),
+        &onebrain_fs::restructure_config(raw).expect("fixture is a mapping"),
     );
     let out = run_doctor_json(d.path(), cache.path());
     let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
@@ -1247,14 +1253,210 @@ fn doctor_never_strips_template_comments() {
             .filter(|l| l.trim_start().starts_with('#'))
             .count()
     };
+    // No template comment is lost; the stamp adds exactly the canonical stats
+    // section's two structural comments (System banner + managed note).
     assert_eq!(
         comment_lines(&after),
-        comment_lines(&template),
-        "no comment line may be lost:\n{after}"
+        comment_lines(&template) + 2,
+        "only the System banner + managed note may be added:\n{after}"
     );
-    // The only mutation is the (comment-preserving) stats stamp.
+    for tmpl_comment in template.lines().filter(|l| l.trim_start().starts_with('#')) {
+        assert!(
+            after.contains(tmpl_comment),
+            "template comment lost: {tmpl_comment:?}\n{after}"
+        );
+    }
+    // The stats stamp lands in a canonical, system-managed section.
+    assert!(
+        after.contains(&onebrain_fs::config_layout::section_banner("System")),
+        "{after}"
+    );
+    assert!(after.contains(onebrain_fs::SYSTEM_MANAGED_NOTE), "{after}");
     assert!(after.contains("stats:"), "{after}");
     assert!(after.contains("last_doctor_run:"), "{after}");
+    // The stamped config is now itself canonical — a second doctor run reports
+    // no layout drift (idempotent), matching a freshly-init'd vault's steady
+    // state.
+    assert!(
+        onebrain_fs::config_layout_matches(&after),
+        "stamped config must stay canonical:\n{after}"
+    );
+}
+
+/// End-to-end T2b: `doctor --fix` restructures an EXISTING vault whose config
+/// has the pre-v3.4.8 layout — stats mid-file, no banners, recap undocumented,
+/// schedule before search (the real-vault shape after #199's backfill). The
+/// restructure reorders the top-level blocks into template section order,
+/// inserts the banners, backfills the recap docs, and moves stats last —
+/// preserving every value and comment byte-for-byte. A second `--fix` is a
+/// no-op (byte-identical).
+#[cfg(unix)]
+#[test]
+fn doctor_fix_restructures_existing_vault_end_to_end() {
+    let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    write_minimal_vault(d.path());
+    std::fs::remove_file(d.path().join("vault.yml")).unwrap();
+    // Pre-v3.4.8 layout: documented folders/checkpoint/search (from #199),
+    // UNDOCUMENTED recap, stats stranded mid-file, schedule before search.
+    let legacy = "\
+# Release channel for plugin updates: stable | next · default: stable
+update_channel: stable
+folders:
+  # Raw braindumps and quick captures · default: 00-inbox
+  inbox: 00-inbox
+  projects: 01-projects
+  areas: 02-areas
+  knowledge: 03-knowledge
+  resources: 04-resources
+  agent: 05-agent
+  archive: 06-archive
+  logs: 07-logs
+checkpoint:
+  # Message count between checkpoint emissions (>= 1) · default: 15
+  messages: 15
+  minutes: 30
+recap:
+  min_sessions: 6
+  min_frequency: 2
+stats:
+  last_doctor_run: 2020-01-01
+  last_recap: 2020-01-01
+schedule:
+- cron: 0 9 * * *
+  skill: /daily
+- cron: 45 8 * * *
+  command: onebrain
+  args:
+  - search
+  - reindex
+search:
+  # Collection name binding this vault to its index · default: unset
+  collection: ob-restructure-it
+  embed_model: multilingual-e5-small
+";
+    std::fs::write(d.path().join("onebrain.yml"), legacy).unwrap();
+    // Plain doctor (read-only) must REPORT the drift without rewriting the
+    // user's layout.
+    let plain = run_doctor_json(d.path(), cache.path());
+    assert!(plain.contains("layout differs from template"), "{plain}");
+    let after_plain = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    // A plain run only stamps stats in place — it never restructures a legacy
+    // layout, so the block order is still the scrambled original.
+    let plain_keys: Vec<&str> = after_plain
+        .lines()
+        .filter(|l| {
+            !l.starts_with(' ')
+                && !l.starts_with('-')
+                && !l.trim_start().starts_with('#')
+                && l.contains(':')
+        })
+        .map(|l| l.split(':').next().unwrap())
+        .collect();
+    assert_eq!(
+        plain_keys,
+        vec![
+            "update_channel",
+            "folders",
+            "checkpoint",
+            "recap",
+            "stats",
+            "schedule",
+            "search"
+        ],
+        "plain doctor must not reorder:\n{after_plain}"
+    );
+
+    // --fix restructures.
+    let _ = run_doctor_fix_json(d.path(), cache.path(), home.path());
+    let fixed = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+
+    // Banners for every present section.
+    for title in [
+        "General",
+        "Vault layout",
+        "Agent behavior",
+        "Search",
+        "Automation",
+        "System",
+    ] {
+        assert!(
+            fixed.contains(&onebrain_fs::config_layout::section_banner(title)),
+            "missing {title} banner:\n{fixed}"
+        );
+    }
+    // System banner carries the managed note; stats is LAST.
+    assert!(fixed.contains(onebrain_fs::SYSTEM_MANAGED_NOTE), "{fixed}");
+    let key_order: Vec<&str> = fixed
+        .lines()
+        .filter(|l| {
+            !l.starts_with(' ')
+                && !l.starts_with('-')
+                && !l.trim_start().starts_with('#')
+                && l.contains(':')
+        })
+        .map(|l| l.split(':').next().unwrap())
+        .collect();
+    assert_eq!(
+        key_order,
+        vec![
+            "update_channel",
+            "folders",
+            "checkpoint",
+            "recap",
+            "search",
+            "schedule",
+            "stats"
+        ],
+        "restructured order:\n{fixed}"
+    );
+    // recap keys are now documented with the verified plugin defaults.
+    let lines: Vec<&str> = fixed.lines().collect();
+    for (key, needle) in [
+        ("min_sessions:", "default: 6"),
+        ("min_frequency:", "default: 2"),
+    ] {
+        let idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with(key))
+            .unwrap_or_else(|| panic!("{key} missing:\n{fixed}"));
+        assert!(
+            lines[idx - 1].trim_start().starts_with('#') && lines[idx - 1].contains(needle),
+            "recap doc for {key} missing ({needle}):\n{fixed}"
+        );
+    }
+    // The schedule block gained the template's entry-shape header (directly
+    // above `schedule:`, under the Automation banner) — never per-entry
+    // comments.
+    let sched_idx = lines
+        .iter()
+        .position(|l| *l == "schedule:")
+        .unwrap_or_else(|| panic!("schedule: missing:\n{fixed}"));
+    assert!(
+        lines[sched_idx - 1].contains("`command` + `args` (any CLI)"),
+        "schedule entry-shape header missing:\n{fixed}"
+    );
+    // Values + user/existing comments preserved verbatim.
+    assert!(fixed.contains("collection: ob-restructure-it"), "{fixed}");
+    assert!(
+        fixed.contains("# Raw braindumps and quick captures · default: 00-inbox"),
+        "{fixed}"
+    );
+    // The schedule list body (skill entry + command/args entry) is intact.
+    assert!(
+        fixed.contains("- cron: 0 9 * * *\n  skill: /daily"),
+        "{fixed}"
+    );
+    assert!(
+        fixed.contains("  args:\n  - search\n  - reindex"),
+        "{fixed}"
+    );
+
+    // Second --fix is byte-identical (idempotent).
+    let _ = run_doctor_fix_json(d.path(), cache.path(), home.path());
+    let twice = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+    assert_eq!(twice, fixed, "second --fix must be byte-identical");
 }
 
 /// Regression (PR #199 review R1-4a): a vault whose index dir EXISTS while

@@ -134,6 +134,65 @@ first touched the file.
   table `render_onebrain_yml` interpolates into the fresh template — the
   two cannot drift (plus a template↔table pin test).
 
+## Addendum (2026-07-09) — section layout + full restructure
+
+Live-testing #199's comment backfill on a real vault surfaced three gaps: the
+plugin-level `recap:` and `schedule:` keys were undocumented, `stats:` sat
+mid-file, and the config had no visual grouping. Design locked **Style A —
+section banners, English only**.
+
+1. **Locked section order + banners.** The config is grouped under
+   `# ── <Section> ──…` banners in the order **General → Vault layout →
+   Agent behavior (checkpoint, recap) → Search → Automation (schedule) →
+   System**. `stats:` is the sole member of System and always lands last,
+   under a `# Managed by OneBrain — do not edit.` note. The order, banner
+   format, and assembler live in ONE module — `onebrain-fs::config_layout` —
+   consumed by both `render_onebrain_yml` (fresh template) and
+   `doctor --fix` (existing vaults), so the two cannot drift. A round-trip
+   test asserts `restructure(render(preset)) == render(preset)` for every
+   preset (the fresh template is already canonical, so a restructure of a
+   freshly-init'd vault is a byte-identical no-op).
+
+2. **`config_key_docs` gains `recap.min_sessions`/`min_frequency`.** These are
+   PLUGIN-level keys, not part of `VaultConfig` — the fresh template never
+   emits a `recap:` block (absent = the plugin uses its own defaults, so CLI
+   and plugin can't drift). The docs exist only so `doctor --fix` backfills the
+   comments for EXISTING vaults that already carry a recap block. Defaults
+   (min_sessions 6, min_frequency 2) verified against the plugin source
+   `skills/recap/SKILL.md`. The `schedule:` block gains a header comment
+   documenting the entry shape (a cron expression plus either `skill: /name`
+   or `command` + `args`) — never per-entry comments.
+
+3. **Full restructure for existing vaults** (maintainer chose full over
+   comments-only). `restructure_config` reorders the top-level blocks into the
+   section order and inserts the banners **without reparsing YAML**: it strips
+   the structural lines (banners + managed note), segments the file into
+   opaque top-level blocks (each block = its attached lead comments + header +
+   indented/sequence body, trimmed of surrounding blanks), reorders them
+   (known blocks by section order, unknown top-level keys kept in their
+   original relative order after the known blocks and before `stats`), and
+   re-assembles with canonical banners. Every value, user comment, inline
+   comment, and the file's CRLF/LF style survive byte-for-byte. Stripping the
+   structural lines before re-segmentation makes a second `--fix`
+   byte-identical (idempotent). The restructure runs as the LAST step of the
+   `config-values` recipe, after the value resets and comment backfill, so it
+   canonicalises the fully-corrected text.
+
+4. **Plain `doctor` reports drift read-only.** `config_layout_matches` (a
+   restructure-equals-input check) drives a "config layout differs from
+   template — doctor --fix will restructure" finding on the `config-values`
+   row. `config_layout_matches` is conservative: a shape `restructure_config`
+   declines to touch (non-mapping / no top-level keys) never reports drift.
+
+5. **The stats stamp stays canonical.** `stamp_doctor_run` appends a bare
+   `stats:` block when none exists; on a config that was ALREADY in canonical
+   layout (e.g. a freshly-init'd vault) it re-runs the byte-preserving
+   restructure after the stamp so the appended block gets its System banner +
+   managed note — otherwise the next plain `doctor` would report drift the
+   stamp itself introduced. A config that was already drifted is left as-is
+   (plain doctor never restructures a user's legacy layout — that stays
+   `--fix`'s job).
+
 ## Related
 
 - [ADR 0025](0025-tier2-cross-encoder-reranker.md) — the reranker keys this

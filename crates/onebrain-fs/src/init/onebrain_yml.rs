@@ -171,6 +171,35 @@ pub fn config_key_docs() -> Vec<ConfigKeyDoc> {
                 "# Score gate: hits below this calibrated 0-1 score are dropped · default: {TEMPLATE_RERANK_MIN_SCORE}"
             ),
         ),
+        // Plugin-level recap thresholds (`/recap` skill). Not part of
+        // VaultConfig — the CLI never emits a recap block in the fresh
+        // template (absent = the plugin uses its own defaults, so the two
+        // can't drift). These docs exist so `doctor --fix` backfills the
+        // comments for EXISTING vaults that already carry a recap block.
+        // Defaults verified against the plugin source
+        // (`skills/recap/SKILL.md`): min_sessions 6, min_frequency 2.
+        doc(
+            &["recap", "min_sessions"],
+            "# Unrecapped session logs required before /recap runs (plugin) · default: 6"
+                .to_string(),
+        ),
+        doc(
+            &["recap", "min_frequency"],
+            "# Sessions a topic must recur in to be promoted to memory (plugin) · default: 2"
+                .to_string(),
+        ),
+        // Block-level header for `schedule:` documenting the entry shape —
+        // one multi-line comment (never per-entry comments; entry data is
+        // never touched). Shared verbatim by the fresh template and the
+        // `doctor --fix` backfill. Deliberately avoids the literal `cron:`
+        // token so tests counting entries by that token stay accurate.
+        doc(
+            &["schedule"],
+            "# Scheduled skill runs, compiled to the OS scheduler by `onebrain schedule register`.\n\
+             # Each entry pairs a cron expression with either `skill: /name` (a OneBrain\n\
+             # skill) or `command` + `args` (any CLI)."
+                .to_string(),
+        ),
     ]
 }
 
@@ -191,17 +220,38 @@ pub fn render_onebrain_yml(preset: SchedulePreset) -> Result<String, FsError> {
             .comment
             .clone()
     };
-    let mut out = format!(
-        "\
+    // File header (preamble): stays above the first section banner.
+    let preamble: Vec<String> = "\
 # onebrain.yml — vault configuration.
 # Every key is annotated with what it does and its default value.
 # `onebrain doctor` validates these values; `onebrain doctor --fix` resets
 # out-of-range tunables to their defaults (folders.* and search.collection
-# are reported only — never auto-reset).
+# are reported only — never auto-reset)."
+        .lines()
+        .map(str::to_string)
+        .collect();
 
-{c_update_channel}
-update_channel: {DEFAULT_UPDATE_CHANNEL}
+    // Each top-level block is built here (lead comment + header + body) and
+    // handed to the shared `config_layout::assemble`, which emits the section
+    // banners and blank separators. Sharing the assembler with `doctor --fix`
+    // guarantees the fresh template is already in canonical layout, so a
+    // restructure of it is a byte-identical no-op (asserted by a round-trip
+    // test).
+    let lines_of = |s: String| -> Vec<String> { s.lines().map(str::to_string).collect() };
+    let mut blocks: Vec<crate::config_layout::Block> = Vec::new();
 
+    blocks.push(crate::config_layout::Block {
+        key: "update_channel".to_string(),
+        lines: lines_of(format!(
+            "{}\nupdate_channel: {DEFAULT_UPDATE_CHANNEL}",
+            c(&["update_channel"])
+        )),
+    });
+
+    blocks.push(crate::config_layout::Block {
+        key: "folders".to_string(),
+        lines: lines_of(format!(
+            "\
 # Vault folder layout (PARA). Renaming a folder here does NOT move notes on
 # disk — doctor reports problems but never rewrites these values.
 folders:
@@ -220,15 +270,47 @@ folders:
   {c_archive}
   archive: {archive}
   {c_logs}
-  logs: {logs}
+  logs: {logs}",
+            c_inbox = c(&["folders", "inbox"]),
+            c_projects = c(&["folders", "projects"]),
+            c_areas = c(&["folders", "areas"]),
+            c_knowledge = c(&["folders", "knowledge"]),
+            c_resources = c(&["folders", "resources"]),
+            c_agent = c(&["folders", "agent"]),
+            c_archive = c(&["folders", "archive"]),
+            c_logs = c(&["folders", "logs"]),
+            inbox = f.inbox,
+            projects = f.projects,
+            areas = f.areas,
+            knowledge = f.knowledge,
+            resources = f.resources,
+            agent = f.agent,
+            archive = f.archive,
+            logs = f.logs,
+        )),
+    });
 
+    blocks.push(crate::config_layout::Block {
+        key: "checkpoint".to_string(),
+        lines: lines_of(format!(
+            "\
 # Stop-hook checkpoint thresholds (when to snapshot session context).
 checkpoint:
   {c_messages}
   messages: {messages}
   {c_minutes}
-  minutes: {minutes}
+  minutes: {minutes}",
+            c_messages = c(&["checkpoint", "messages"]),
+            c_minutes = c(&["checkpoint", "minutes"]),
+            messages = cp.messages,
+            minutes = cp.minutes,
+        )),
+    });
 
+    blocks.push(crate::config_layout::Block {
+        key: "search".to_string(),
+        lines: lines_of(format!(
+            "\
 # Native search (BM25 + vector + Tier-2 reranker).
 search:
   {c_collection}
@@ -247,62 +329,49 @@ search:
     {c_min_candidates}
     min_candidates: {min_candidates}
     {c_min_score}
-    min_score: {min_score}
-",
-        c_update_channel = c(&["update_channel"]),
-        c_inbox = c(&["folders", "inbox"]),
-        c_projects = c(&["folders", "projects"]),
-        c_areas = c(&["folders", "areas"]),
-        c_knowledge = c(&["folders", "knowledge"]),
-        c_resources = c(&["folders", "resources"]),
-        c_agent = c(&["folders", "agent"]),
-        c_archive = c(&["folders", "archive"]),
-        c_logs = c(&["folders", "logs"]),
-        c_messages = c(&["checkpoint", "messages"]),
-        c_minutes = c(&["checkpoint", "minutes"]),
-        c_collection = c(&["search", "collection"]),
-        c_embed_model = c(&["search", "embed_model"]),
-        c_default_top_k = c(&["search", "default_top_k"]),
-        c_enabled = c(&["search", "reranker", "enabled"]),
-        c_model = c(&["search", "reranker", "model"]),
-        c_min_candidates = c(&["search", "reranker", "min_candidates"]),
-        c_min_score = c(&["search", "reranker", "min_score"]),
-        inbox = f.inbox,
-        projects = f.projects,
-        areas = f.areas,
-        knowledge = f.knowledge,
-        resources = f.resources,
-        agent = f.agent,
-        archive = f.archive,
-        logs = f.logs,
-        messages = cp.messages,
-        minutes = cp.minutes,
-        embed_model = sc.embed_model,
-        default_top_k = sc.default_top_k,
-        enabled = rr.enabled,
-        model = rr.model,
-        min_candidates = rr.min_candidates,
-        min_score = TEMPLATE_RERANK_MIN_SCORE,
-    );
+    min_score: {min_score}",
+            c_collection = c(&["search", "collection"]),
+            c_embed_model = c(&["search", "embed_model"]),
+            c_default_top_k = c(&["search", "default_top_k"]),
+            c_enabled = c(&["search", "reranker", "enabled"]),
+            c_model = c(&["search", "reranker", "model"]),
+            c_min_candidates = c(&["search", "reranker", "min_candidates"]),
+            c_min_score = c(&["search", "reranker", "min_score"]),
+            embed_model = sc.embed_model,
+            default_top_k = sc.default_top_k,
+            enabled = rr.enabled,
+            model = rr.model,
+            min_candidates = rr.min_candidates,
+            min_score = TEMPLATE_RERANK_MIN_SCORE,
+        )),
+    });
 
     let entries = preset.entries();
     if !entries.is_empty() {
-        // The block header comment is appended only alongside the entries so
-        // the Skip preset's file contains no `schedule` mention at all.
+        // The schedule block is emitted only when the preset carries entries,
+        // so the Skip preset's file contains no `schedule` mention at all.
         #[derive(Serialize)]
         struct ScheduleBlock {
             schedule: Vec<ScheduleEntry>,
         }
-        let block = serde_yaml::to_string(&ScheduleBlock { schedule: entries }).map_err(|e| {
-            FsError::Io {
-                path: std::path::PathBuf::from(CONFIG_FILENAME),
-                source: std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
-            }
-        })?;
-        out.push_str("\n# Scheduled skill runs, compiled to the OS scheduler by `onebrain schedule register`.\n");
-        out.push_str(&block);
+        let serialized =
+            serde_yaml::to_string(&ScheduleBlock { schedule: entries }).map_err(|e| {
+                FsError::Io {
+                    path: std::path::PathBuf::from(CONFIG_FILENAME),
+                    source: std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
+                }
+            })?;
+        let mut lines = lines_of(c(&["schedule"]));
+        lines.extend(serialized.trim_end().lines().map(str::to_string));
+        blocks.push(crate::config_layout::Block {
+            key: "schedule".to_string(),
+            lines,
+        });
     }
-    Ok(out)
+
+    Ok(crate::config_layout::assemble(
+        &preamble, &blocks, "\n", true,
+    ))
 }
 
 /// Write `onebrain.yml` into `vault_dir` with the chosen preset's schedule
@@ -464,11 +533,13 @@ mod tests {
     fn template_comment_above_each_key_is_exactly_the_doc_table_entry() {
         // The backfill recipe inserts `config_key_docs` comments into
         // existing configs; the template interpolates the same strings. This
-        // pins the pairing per key: the line directly above each ACTIVE key
-        // is exactly the table's comment (indentation aside). `collection`
-        // is a commented placeholder — its doc comment appears above the
-        // placeholder block instead.
-        let yaml = render_onebrain_yml(SchedulePreset::Skip).unwrap();
+        // pins the pairing per key: the line(s) directly above each ACTIVE
+        // key are exactly the table's comment (indentation aside; multi-line
+        // comments like the schedule header are compared line by line).
+        // `collection` is a commented placeholder — its doc comment appears
+        // above the placeholder block instead. Essentials preset so the
+        // `schedule` block (and its header doc) is present.
+        let yaml = render_onebrain_yml(SchedulePreset::Essentials).unwrap();
         let lines: Vec<&str> = yaml.lines().collect();
         for doc in config_key_docs() {
             let key = doc.segments.last().unwrap();
@@ -479,14 +550,73 @@ mod tests {
                 );
                 continue;
             }
+            // recap.* keys are plugin-level: their docs exist only for the
+            // doctor --fix backfill on existing vaults; the fresh template
+            // never emits a recap block (absent = plugin defaults).
+            if doc.segments.first() == Some(&"recap") {
+                assert!(
+                    !yaml.contains("recap:"),
+                    "fresh template must not emit a recap block:\n{yaml}"
+                );
+                continue;
+            }
             let idx = lines
                 .iter()
                 .position(|l| l.trim_start().starts_with(&format!("{key}:")))
                 .unwrap_or_else(|| panic!("key {key} not in template"));
+            let doc_lines: Vec<&str> = doc.comment.split('\n').collect();
+            let above: Vec<&str> = lines[idx - doc_lines.len()..idx]
+                .iter()
+                .map(|l| l.trim_start())
+                .collect();
             assert_eq!(
-                lines[idx - 1].trim_start(),
-                doc.comment,
+                above, doc_lines,
                 "comment above {key} drifted from config_key_docs"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_template_carries_section_banners() {
+        let yaml = render_onebrain_yml(SchedulePreset::Essentials).unwrap();
+        for title in [
+            "General",
+            "Vault layout",
+            "Agent behavior",
+            "Search",
+            "Automation",
+        ] {
+            assert!(
+                yaml.contains(&crate::config_layout::section_banner(title)),
+                "missing {title} banner:\n{yaml}"
+            );
+        }
+        // Sections present in the template but not System (no stats scaffolded).
+        assert!(!yaml.contains(&crate::config_layout::section_banner("System")));
+        // Schedule entry-shape documentation is present.
+        assert!(yaml.contains("`command` + `args` (any CLI)"));
+    }
+
+    #[test]
+    fn restructure_of_fresh_template_is_a_noop() {
+        // The fresh template must already be in canonical section layout, so
+        // `doctor --fix`'s restructure never touches a freshly init'd vault
+        // (idempotency + zero drift). Guards render↔restructure agreement.
+        for preset in [
+            SchedulePreset::Skip,
+            SchedulePreset::Minimal,
+            SchedulePreset::Essentials,
+            SchedulePreset::MaintenancePlus,
+        ] {
+            let yaml = render_onebrain_yml(preset).unwrap();
+            assert!(
+                crate::config_layout::config_layout_matches(&yaml),
+                "fresh template ({preset:?}) drifts from canonical layout:\n{yaml}"
+            );
+            assert_eq!(
+                crate::config_layout::restructure_config(&yaml).as_deref(),
+                Some(yaml.as_str()),
+                "restructure of fresh template ({preset:?}) is not byte-identical"
             );
         }
     }

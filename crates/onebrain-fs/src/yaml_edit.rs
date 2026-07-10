@@ -164,11 +164,13 @@ pub fn key_lacks_comment(text: &str, segments: &[&str]) -> bool {
     }
 }
 
-/// Insert `comment` (a full `# …` line, indentation excluded) directly above
-/// the key at `segments`, matching the key line's indentation. Returns
-/// `None` — no change — when the key can't be located OR the line directly
-/// above it is already a comment (the user's own comments always win; never
-/// replaced, never deduped).
+/// Insert `comment` (one or more full `# …` lines separated by `\n`,
+/// indentation excluded) directly above the key at `segments`, matching the
+/// key line's indentation. Multi-line comments are inserted line by line and
+/// re-joined with the FILE's newline style, so a CRLF config never gains bare
+/// LFs. Returns `None` — no change — when the key can't be located OR the
+/// line directly above it is already a comment (the user's own comments
+/// always win; never replaced, never deduped).
 pub fn insert_comment_above(text: &str, segments: &[&str], comment: &str) -> Option<String> {
     let (mut lines, newline, ends_with_newline) = split(text);
     let idx = locate(&lines, segments)?;
@@ -176,7 +178,9 @@ pub fn insert_comment_above(text: &str, segments: &[&str], comment: &str) -> Opt
         return None;
     }
     let indent = lines[idx][..indent_of(&lines[idx])].to_string();
-    lines.insert(idx, format!("{indent}{comment}"));
+    for (n, comment_line) in comment.split('\n').enumerate() {
+        lines.insert(idx + n, format!("{indent}{comment_line}"));
+    }
     Some(join(lines, newline, ends_with_newline))
 }
 
@@ -227,6 +231,20 @@ mod tests {
         )
         .is_none());
         assert!(set_value("a: 1\n", &[], "x").is_none());
+    }
+
+    #[test]
+    fn insert_comment_above_multi_line_and_crlf() {
+        // A multi-line comment (the schedule header) lands as one line per
+        // Vec entry, re-joined with the FILE's newline style.
+        let text = "a: 1\r\nschedule:\r\n- cron: 0 9 * * *\r\n  skill: /daily\r\n";
+        let out = insert_comment_above(text, &["schedule"], "# line one\n# line two").unwrap();
+        assert_eq!(
+            out,
+            "a: 1\r\n# line one\r\n# line two\r\nschedule:\r\n- cron: 0 9 * * *\r\n  skill: /daily\r\n"
+        );
+        // Refused when the key already sits under a comment.
+        assert!(insert_comment_above(&out, &["schedule"], "# again").is_none());
     }
 
     #[test]

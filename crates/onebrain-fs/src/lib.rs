@@ -6,6 +6,7 @@
 //! is crate-private (used transitively by orphan-scan).
 
 pub mod backup;
+pub mod config_layout;
 pub mod doctor;
 pub mod error;
 pub(crate) mod frontmatter;
@@ -22,6 +23,7 @@ pub mod vault_sync;
 pub mod yaml_edit;
 
 pub use backup::{atomic_write_text, backup_config_file, persist_search_key, remove_search_key};
+pub use config_layout::{config_layout_matches, restructure_config, SYSTEM_MANAGED_NOTE};
 pub use error::{FsError, Result};
 pub use harness::{detect_harness, detect_harnesses};
 pub use init::{
