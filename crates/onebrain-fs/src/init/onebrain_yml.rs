@@ -24,6 +24,20 @@ use onebrain_core::{CheckpointPolicy, RerankerConfig, VaultFolders, CONFIG_FILEN
 use serde::Serialize;
 use std::path::Path;
 
+/// The `search.exclude` doc comment, shared by [`config_key_docs`] (generic
+/// default, using `VaultFolders::default().archive`),
+/// [`render_onebrain_yml_for_folders`] (the archive folder actually used for
+/// that render), and doctor's `--fix` search-exclude backfill in
+/// `onebrain-cli` (the existing vault's own resolved archive), so the
+/// comment and the emitted value always agree — never a hard-coded
+/// `"06-archive"` literal in any caller.
+pub fn search_exclude_comment(archive: &str) -> String {
+    format!(
+        "# Extra index-exclusion patterns: vault-relative prefix or bare dir name \
+         (hidden dirs and node_modules always skipped) · default: [attachments, {archive}]"
+    )
+}
+
 /// Engine-calibrated reranker score gate, documented in the template. The
 /// runtime source of truth is `onebrain_search::engine::DEFAULT_RERANK_MIN_SCORE`
 /// — this crate cannot depend on `onebrain-search` (the init scaffold must
@@ -172,20 +186,17 @@ pub fn config_key_docs() -> Vec<ConfigKeyDoc> {
                 "# Score gate: hits below this calibrated 0-1 score are dropped · default: {TEMPLATE_RERANK_MIN_SCORE}"
             ),
         ),
-        // `search.exclude` and the `search.embed.*` gate are real VaultConfig
-        // keys the fresh template deliberately does not emit (exclude's
-        // default covers the common case; the embed gate is parsed but not
-        // yet enforced). Their docs exist so `doctor --fix` backfills the
-        // comments on EXISTING vaults that carry them — same backfill-only
-        // pattern as recap.*. The completeness guard test keeps this table
-        // in sync with the config structs.
-        doc(
-            &["search", "exclude"],
-            format!(
-                "# Extra index-exclusion patterns: vault-relative prefix or bare dir name (hidden dirs and node_modules always skipped) · default: [{}]",
-                sc.exclude.join(", ")
-            ),
-        ),
+        // `search.exclude` IS emitted by the fresh template (v3.4.9+): the
+        // template-purpose value is `[attachments, <archive>]`, resolved from
+        // the render's `VaultFolders` — never the bare runtime serde default
+        // (`default_search_exclude()` in onebrain-core stays `[attachments]`
+        // only; that's a separate, deliberately unchanged spec decision for
+        // existing vaults). The `search.embed.*` gate remains backfill-only
+        // (parsed but not yet enforced) — same pattern as recap.*. Their docs
+        // exist so `doctor --fix` backfills the comments on EXISTING vaults
+        // that carry them. The completeness guard test keeps this table in
+        // sync with the config structs.
+        doc(&["search", "exclude"], search_exclude_comment(&f.archive)),
         doc(
             &["search", "embed", "auto"],
             format!("# Auto-embed changed docs on/off · default: {}", eg.auto),
@@ -252,7 +263,20 @@ pub fn config_key_docs() -> Vec<ConfigKeyDoc> {
 /// comment line is interpolated from [`config_key_docs`], so template and
 /// backfill share one definition.
 pub fn render_onebrain_yml(preset: SchedulePreset) -> Result<String, FsError> {
-    let f = VaultFolders::default();
+    render_onebrain_yml_for_folders(preset, &VaultFolders::default())
+}
+
+/// Same as [`render_onebrain_yml`], parameterized by the vault's resolved
+/// [`VaultFolders`] — the `search.exclude` block's archive entry is derived
+/// from `folders.archive` at generation time rather than a hard-coded
+/// literal. `render_onebrain_yml` is the production entry point (always
+/// `VaultFolders::default()` — `onebrain init` does not yet let users
+/// customize folder names); this parameterized variant exists so a test can
+/// prove the archive value is resolved, not hard-coded.
+fn render_onebrain_yml_for_folders(
+    preset: SchedulePreset,
+    f: &VaultFolders,
+) -> Result<String, FsError> {
     let cp = CheckpointPolicy::default();
     let sc = SearchConfig::default();
     let rr = RerankerConfig::default();
@@ -364,6 +388,10 @@ search:
   embed_model: {embed_model}
   {c_default_top_k}
   default_top_k: {default_top_k}
+  {c_exclude}
+  exclude:
+  - attachments
+  - {archive}
   # Tier-2 cross-encoder reranker (re-scores fused candidates for relevance).
   reranker:
     {c_enabled}
@@ -377,6 +405,8 @@ search:
             c_collection = c(&["search", "collection"]),
             c_embed_model = c(&["search", "embed_model"]),
             c_default_top_k = c(&["search", "default_top_k"]),
+            c_exclude = search_exclude_comment(&f.archive),
+            archive = f.archive,
             c_enabled = c(&["search", "reranker", "enabled"]),
             c_model = c(&["search", "reranker", "model"]),
             c_min_candidates = c(&["search", "reranker", "min_candidates"]),
@@ -597,8 +627,10 @@ mod tests {
             // Backfill-only entries: their docs exist only for the doctor
             // --fix backfill on existing vaults; the fresh template never
             // emits these keys (recap.* = plugin-level, absent = plugin
-            // defaults; search.exclude = default covers the common case;
-            // search.embed.* = parsed but not yet enforced).
+            // defaults; search.embed.* = parsed but not yet enforced).
+            // search.exclude is NOT backfill-only — the fresh template emits
+            // it (see `render_onebrain_yml_for_folders`); it falls through
+            // to the normal assertion below like any other emitted key.
             if doc.segments.first() == Some(&"recap") {
                 assert!(
                     !yaml.contains("recap:"),
@@ -606,10 +638,10 @@ mod tests {
                 );
                 continue;
             }
-            if doc.segments == ["search", "exclude"] || doc.segments.get(1) == Some(&"embed") {
+            if doc.segments.get(1) == Some(&"embed") {
                 assert!(
-                    !yaml.contains("\n  exclude:") && !yaml.contains("\n  embed:"),
-                    "fresh template must not emit exclude/embed blocks:\n{yaml}"
+                    !yaml.contains("\n  embed:"),
+                    "fresh template must not emit an embed block:\n{yaml}"
                 );
                 continue;
             }
@@ -749,6 +781,31 @@ mod tests {
                 "restructure of fresh template ({preset:?}) is not byte-identical"
             );
         }
+    }
+
+    #[test]
+    fn fresh_template_excludes_configured_archive_folder() {
+        // The exclude block's second entry must be resolved from the
+        // vault's `folders.archive` at generation time, never a hard-coded
+        // "06-archive" literal — this proves it by rendering with a
+        // deliberately non-default archive folder name.
+        fn render_fresh_template_with_archive(archive: &str) -> String {
+            let folders = VaultFolders {
+                archive: archive.to_string(),
+                ..VaultFolders::default()
+            };
+            render_onebrain_yml_for_folders(SchedulePreset::Skip, &folders).unwrap()
+        }
+        let yaml = render_fresh_template_with_archive("z-archive");
+        assert!(yaml.contains("\n  exclude:\n  - attachments\n  - z-archive\n"));
+        // Scoped to the exclude block itself (not a blanket check over the
+        // whole template): the pre-existing `folders.archive` doc comment
+        // documents the tool's generic DEFAULT ("06-archive"), same as every
+        // other folders.* comment — that's unrelated, unchanged behavior.
+        // What must never happen is the exclude block falling back to the
+        // hard-coded default instead of the resolved archive folder.
+        assert!(!yaml.contains("- 06-archive"));
+        assert!(!yaml.contains("attachments, 06-archive"));
     }
 
     #[test]

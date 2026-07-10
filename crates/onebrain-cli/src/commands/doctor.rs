@@ -273,6 +273,7 @@ fn all_checks(vault_root: &Path, config: &onebrain_core::VaultConfig) -> Vec<Doc
     // access), which `onebrain-fs` doesn't depend on — so they're spliced in
     // here rather than living alongside the fs-layer checks.
     results.push(config_values_check(vault_root));
+    results.push(search_exclude_check(vault_root));
     results.push(native_search_check(vault_root));
     results
 }
@@ -664,6 +665,61 @@ fn undocumented_keys(text: &str) -> Vec<String> {
         .collect()
 }
 
+const SEARCH_EXCLUDE_CHECK: &str = "search-exclude";
+
+/// True when `search.collection` is set (key present, non-null) AND
+/// `search.exclude` is entirely absent. A present-but-empty `exclude: []`
+/// is the user's explicit choice, never counted as missing — this is a key
+/// PRESENCE gate, deliberately separate from `undocumented_keys`'s
+/// comment-only backfill (which never touches an absent key by design).
+fn search_exclude_missing(text: &str) -> bool {
+    let Ok(parsed) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+        return false;
+    };
+    let Some(search) = parsed.get("search").and_then(|v| v.as_mapping()) else {
+        return false;
+    };
+    let key = |k: &str| serde_yaml::Value::String(k.to_string());
+    let collection_set = search.get(key("collection")).is_some_and(|v| !v.is_null());
+    let exclude_absent = search.get(key("exclude")).is_none();
+    collection_set && exclude_absent
+}
+
+/// `search.exclude` presence check (`check = "search-exclude"`). A vault
+/// that adopted search (`search.collection` set) before the v3.4.9 template
+/// started scaffolding the exclude block (Task 3) is silently indexing its
+/// own archive folder on every reindex. Fires only under that exact gate —
+/// vaults that never adopted search, or that already carry an explicit
+/// `exclude:` (even `[]`), are never flagged. Advisory only (`warn`, not
+/// `error`): a missing exclude list degrades index quality, it doesn't
+/// break anything.
+fn search_exclude_check(vault_root: &Path) -> DoctorResult {
+    use onebrain_core::find_config_file;
+    let Some(path) = find_config_file(vault_root) else {
+        return DoctorResult::ok(SEARCH_EXCLUDE_CHECK, "skipped — no config file");
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return DoctorResult::ok(SEARCH_EXCLUDE_CHECK, "skipped — config unreadable");
+    };
+    // Unparseable YAML is the `onebrain.yml-keys` check's territory — skip
+    // quietly (same convention as `config_values_check`) rather than
+    // reporting a misleading "search.exclude ok".
+    if serde_yaml::from_str::<serde_yaml::Value>(&text).is_err() {
+        return DoctorResult::ok(
+            SEARCH_EXCLUDE_CHECK,
+            "skipped — invalid YAML (see onebrain.yml-keys)",
+        );
+    }
+    if !search_exclude_missing(&text) {
+        return DoctorResult::ok(SEARCH_EXCLUDE_CHECK, "search.exclude ok");
+    }
+    DoctorResult::warn(
+        SEARCH_EXCLUDE_CHECK,
+        "search.exclude not set — archive folder is being indexed",
+    )
+    .with_hint("Run onebrain doctor --fix to insert the search.exclude block")
+}
+
 /// Map a daemon `/api/internal/status` JSON body into the
 /// `(last_indexed_at, doc_count, pending_total)` triple `native_search_check`
 /// needs. Pure (no I/O) so it's unit-testable without a live daemon. Mirrors
@@ -1052,6 +1108,11 @@ fn attempt_fix(result: &DoctorResult, vault_root: &Path, json: bool) -> FixOutco
         // comment-preserving line editor. folders.* / search.collection are
         // never auto-reset (report-only).
         "config-values" => fix_config_values(vault_root, json),
+        // Insert the commented `search.exclude` block for a vault that
+        // adopted search before the block existed — value resolved from
+        // this vault's own `folders.archive`, comment from the shared
+        // `config_key_docs` table (Task 3's doc entry).
+        "search-exclude" => fix_search_exclude(vault_root, json),
         // Strip the stale `extraKnownMarketplaces.onebrain` entry from
         // `.claude/settings.json`. Cosmetic config cleanup; no behavioral
         // change at runtime (the plugin is enabled via `enabledPlugins`).
@@ -1096,6 +1157,7 @@ fn planned_action(result: &DoctorResult) -> Option<&'static str> {
         "config-values" => Some(
             "reset out-of-range values to defaults · add missing self-documentation comments · restructure layout",
         ),
+        "search-exclude" => Some("insert the search.exclude block"),
         "claude-settings" => Some("remove the stale marketplace entry"),
         "plugin-cache" => Some("remove the stale plugin cache"),
         "vault-config-migration" => Some("migrate vault.yml → onebrain.yml"),
@@ -1567,6 +1629,197 @@ fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
         };
     }
     FixOutcome::Fixed(parts.join(" · "))
+}
+
+/// Insert the commented `search.exclude` block (doc comment + `exclude:` +
+/// its two list items) into the top-level `search:` block at the fresh
+/// template's position — immediately before the first direct child named
+/// `reranker:` or `embed:` (falling back to last child when neither
+/// exists), so a backfilled vault matches the canonical in-block key order.
+/// Called when [`search_exclude_missing`] is true — which guarantees a
+/// `search` MAPPING exists in the parsed YAML, but NOT that it's in
+/// block form: serde_yaml parses a flow mapping (`search: {collection: c}`)
+/// identically, and splicing indented child lines under a flow line would
+/// write unparseable YAML. Returns `None` for any header that isn't a pure
+/// block-form `search:` line (same `after.is_empty() || after.starts_with('#')`
+/// guard as `onebrain_fs::yaml_edit::upsert_child` at the equivalent branch)
+/// — the caller surfaces that as `Failed` with a manual-edit message rather
+/// than ever corrupting the file.
+///
+/// Mirrors `upsert_child`'s "block header present, key absent" branch (same
+/// last-direct-child scan, same indentation inference), extended to insert a
+/// MULTI-line value plus its doc comment in one edit. Deliberately does NOT
+/// mirror `upsert_child`'s flow-form splice (which replaces the inline line
+/// with a fresh block carrying only the new key — fine for a scalar/null
+/// parent, but here it would drop the user's `collection` value). Kept local
+/// to `doctor.rs` (Task 4's file scope) rather than growing the shared line
+/// editor for a single caller.
+fn insert_search_exclude_block(text: &str, comment: &str, archive: &str) -> Option<String> {
+    fn is_blank(l: &str) -> bool {
+        l.trim().is_empty()
+    }
+    fn is_comment(l: &str) -> bool {
+        l.trim_start().starts_with('#')
+    }
+    fn indent_of(l: &str) -> usize {
+        l.len() - l.trim_start().len()
+    }
+
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let ends_with_newline = text.ends_with('\n');
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+
+    let header_idx = lines.iter().position(|l| {
+        indent_of(l) == 0 && !is_comment(l) && l.trim_start().starts_with("search:")
+    })?;
+
+    // Refuse anything but a pure block-form header (optionally with a
+    // trailing `# …` comment): a flow mapping / scalar / null after the
+    // colon cannot carry spliced child lines — the write would be
+    // unparseable YAML. Same guard as `upsert_child`'s block-extend branch.
+    let after_header = lines[header_idx].trim_start()["search:".len()..].trim_start();
+    if !(after_header.is_empty() || after_header.starts_with('#')) {
+        return None;
+    }
+
+    // Scan the block's direct children: find the last one, infer the child
+    // indent (identical logic to `upsert_child`'s block-extend branch), and
+    // locate the template-order anchor — the first DIRECT child named
+    // `reranker:` or `embed:`. The fresh template places `exclude:` between
+    // `default_top_k:` and `reranker:` (onebrain_yml.rs), so inserting
+    // before that anchor keeps backfilled vaults on the canonical in-block
+    // order (`restructure_config` only reorders top-level blocks, never
+    // within one). Only direct-child-level lines can anchor — a nested
+    // `model:`-style grandchild never matches.
+    let mut last_child = header_idx;
+    let mut child_indent: Option<usize> = None;
+    let mut anchor: Option<usize> = None;
+    let mut j = header_idx + 1;
+    while j < lines.len() {
+        let l = &lines[j];
+        if is_blank(l) {
+            j += 1;
+            continue;
+        }
+        if indent_of(l) == 0 {
+            break;
+        }
+        if !is_comment(l) {
+            let ind = indent_of(l);
+            if child_indent.is_none() {
+                child_indent = Some(ind);
+            }
+            let t = l.trim_start();
+            if anchor.is_none()
+                && Some(ind) == child_indent
+                && (t.starts_with("reranker:") || t.starts_with("embed:"))
+            {
+                anchor = Some(j);
+            }
+        }
+        last_child = j;
+        j += 1;
+    }
+    let indent = " ".repeat(child_indent.unwrap_or(2));
+
+    // Insertion point: before the anchor (backing up over its contiguous
+    // lead comment lines so the block never splits a comment from the key
+    // it documents — e.g. the template's own "# Tier-2 cross-encoder
+    // reranker" header); with no anchor, after the last child (a vault
+    // without `reranker:`/`embed:` keeps the previous last-child position).
+    let at = match anchor {
+        Some(mut idx) => {
+            while idx > header_idx + 1 && is_comment(&lines[idx - 1]) {
+                idx -= 1;
+            }
+            idx
+        }
+        None => last_child + 1,
+    };
+
+    let mut block: Vec<String> = comment
+        .split('\n')
+        .map(|c| format!("{indent}{c}"))
+        .collect();
+    block.push(format!("{indent}exclude:"));
+    block.push(format!("{indent}- attachments"));
+    block.push(format!("{indent}- {archive}"));
+
+    for (n, line) in block.into_iter().enumerate() {
+        lines.insert(at + n, line);
+    }
+    let mut out = lines.join(newline);
+    if ends_with_newline {
+        out.push_str(newline);
+    }
+    Some(out)
+}
+
+/// Recipe — `search-exclude` warning means `search.collection` is set but
+/// `search.exclude` is entirely absent. Insert the same commented block the
+/// fresh v3.4.9 template now scaffolds (Task 3): both the doc comment AND
+/// the value's second entry are built from this vault's OWN resolved
+/// `folders.archive` via the shared
+/// [`onebrain_fs::search_exclude_comment`] — the identical single source
+/// the template render uses — so comment and value always agree even on a
+/// vault with a customized archive folder (never a hard-coded
+/// `"06-archive"` literal, and never the table's generic-default comment
+/// contradicting a custom value). Idempotent: a second run finds
+/// `search_exclude_missing` already false and no-ops.
+fn fix_search_exclude(vault_root: &Path, json: bool) -> FixOutcome {
+    use onebrain_core::{find_config_file, VaultFolders, CONFIG_FILENAME};
+    let path = find_config_file(vault_root).unwrap_or_else(|| vault_root.join(CONFIG_FILENAME));
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(CONFIG_FILENAME)
+        .to_string();
+    status_line(
+        json,
+        &format!("running: insert search.exclude in {filename}"),
+    );
+
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => return FixOutcome::Failed(format!("read {filename}: {e}")),
+    };
+    if !search_exclude_missing(&text) {
+        return FixOutcome::Fixed(format!(
+            "{filename}: search.exclude already set (or search not adopted)"
+        ));
+    }
+
+    let archive = serde_yaml::from_str::<serde_yaml::Value>(&text)
+        .ok()
+        .and_then(|v| {
+            v.get("folders")
+                .and_then(|f| f.get("archive"))
+                .and_then(|a| a.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or(VaultFolders::default().archive);
+    let comment = onebrain_fs::search_exclude_comment(&archive);
+
+    let Some(updated) = insert_search_exclude_block(&text, &comment, &archive) else {
+        // Gate said the exclude is missing but the `search:` line isn't an
+        // addressable block-form header (inline flow mapping like
+        // `search: {collection: c}`, or an unlocatable shape). Never splice
+        // into it — that would write unparseable YAML. Honest Failed with
+        // the manual step instead.
+        return FixOutcome::Failed(format!(
+            "{filename}: `search:` is not a block-form mapping (e.g. inline `search: {{…}}`) — \
+             convert it to block form, then re-run onebrain doctor --fix (or add \
+             `exclude: [attachments, {archive}]` manually)"
+        ));
+    };
+
+    if let Err(e) = onebrain_fs::backup_config_file(&path) {
+        return FixOutcome::Failed(format!("backup {filename} before write: {e}"));
+    }
+    if let Err(e) = onebrain_fs::atomic_write_text(&path, &updated) {
+        return FixOutcome::Failed(format!("write {filename}: {e}"));
+    }
+    FixOutcome::Fixed(format!("inserted search.exclude: [attachments, {archive}]"))
 }
 
 /// Recipe — `claude-settings` warning means `.claude/settings.json`
@@ -2112,6 +2365,7 @@ const DOCTOR_SECTIONS: [(&str, &str, &[&str]); 4] = [
             "onebrain.yml",
             "onebrain.yml-keys",
             "config-values",
+            "search-exclude",
             "vault-config-migration",
             "legacy-qmd-collection",
         ],
@@ -2133,6 +2387,7 @@ fn display_label(check: &str) -> &str {
         "onebrain.yml" => "onebrain.yml",
         "onebrain.yml-keys" => "schema",
         "config-values" => "config values",
+        "search-exclude" => "search exclude",
         "vault-config-migration" => "config migration",
         "legacy-qmd-collection" => "qmd_collection",
         "folders" => "folders",
@@ -5794,5 +6049,339 @@ mod tests {
             lines[idx - 1].trim_start().starts_with('#') && lines[idx - 1].contains("default: 15"),
             "{after}"
         );
+    }
+
+    // ── search-exclude: doctor flags + --fix inserts (Task 4) ────────────
+
+    #[test]
+    fn doctor_flags_missing_search_exclude_when_collection_set() {
+        let d = tempdir().unwrap();
+
+        // search.collection set, exclude key entirely absent → warn finding.
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "search:\n  collection: my-col\n",
+        )
+        .unwrap();
+        let r = search_exclude_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Warn, "{r:?}");
+        assert_eq!(
+            r.message,
+            "search.exclude not set — archive folder is being indexed"
+        );
+        assert!(
+            r.hint.as_deref().unwrap_or("").contains("doctor --fix"),
+            "{:?}",
+            r.hint
+        );
+
+        // `exclude: []` present — explicit user choice, never flagged.
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "search:\n  collection: my-col\n  exclude: []\n",
+        )
+        .unwrap();
+        let r = search_exclude_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
+
+        // No `search.collection` at all — vault never adopted search, so a
+        // missing `exclude:` is expected (not migrated yet), never flagged.
+        fs::write(d.path().join("onebrain.yml"), "update_channel: stable\n").unwrap();
+        let r = search_exclude_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
+
+        // Invalid YAML — the onebrain.yml-keys check owns that error; this
+        // check skips (never a misleading "search.exclude ok").
+        fs::write(d.path().join("onebrain.yml"), "not: : valid").unwrap();
+        let r = search_exclude_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
+        assert!(
+            r.message.contains("skipped — invalid YAML"),
+            "{}",
+            r.message
+        );
+    }
+
+    #[test]
+    fn doctor_fix_inserts_exclude_block_with_comment() {
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "search:\n  collection: my-col\n",
+        )
+        .unwrap();
+
+        let outcome = fix_search_exclude(d.path(), false);
+        let FixOutcome::Fixed(msg) = outcome else {
+            panic!("expected Fixed, got: {outcome:?}");
+        };
+        assert!(msg.contains("attachments"), "msg: {msg}");
+
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert!(
+            after.contains("  exclude:\n  - attachments\n  - 06-archive"),
+            "{after}"
+        );
+        // Preceded by the shared table's own comment line — never a
+        // hand-rolled duplicate.
+        let expected_comment = onebrain_fs::config_key_docs()
+            .into_iter()
+            .find(|dd| dd.segments == ["search", "exclude"])
+            .unwrap()
+            .comment;
+        let lines: Vec<&str> = after.lines().collect();
+        let idx = lines
+            .iter()
+            .position(|l| l.trim_start() == "exclude:")
+            .unwrap();
+        assert_eq!(lines[idx - 1].trim_start(), expected_comment, "{after}");
+
+        // Doctor now reports clean.
+        let r = search_exclude_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
+
+        // Idempotence: a second `--fix` run is a byte-identical no-op.
+        let outcome2 = fix_search_exclude(d.path(), false);
+        let FixOutcome::Fixed(msg2) = outcome2 else {
+            panic!("expected Fixed, got: {outcome2:?}");
+        };
+        assert!(msg2.contains("already set"), "msg: {msg2}");
+        let after2 = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after2, after, "second --fix run must be byte-identical");
+    }
+
+    #[test]
+    fn fix_search_exclude_resolves_archive_from_vault_folders() {
+        // The exclude block's second entry must come from THIS vault's
+        // `folders.archive`, never a hard-coded "06-archive" literal.
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "search:\n  collection: my-col\nfolders:\n  archive: z-archive\n",
+        )
+        .unwrap();
+        let outcome = fix_search_exclude(d.path(), false);
+        assert!(matches!(outcome, FixOutcome::Fixed(_)), "{outcome:?}");
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert!(
+            after.contains("  exclude:\n  - attachments\n  - z-archive"),
+            "{after}"
+        );
+        // Comment and value AGREE on the vault's own archive (R2 Minor):
+        // the inserted doc comment is `search_exclude_comment(&archive)` —
+        // its "default:" text names z-archive, never the generic table
+        // default that would contradict the value right below it.
+        let expected_comment = onebrain_fs::search_exclude_comment("z-archive");
+        assert!(
+            after.contains(&format!("  {expected_comment}\n  exclude:")),
+            "comment must document the vault's own archive:\n{after}"
+        );
+        assert!(!after.contains("06-archive"), "{after}");
+    }
+
+    #[test]
+    fn fix_search_exclude_flow_form_search_fails_without_corrupting_yaml() {
+        // Regression (R1 Important): serde_yaml parses a flow mapping
+        // (`search: {collection: my-col}`) identically to block form, so the
+        // gate fires — but splicing indented child lines under the flow line
+        // would write UNPARSEABLE YAML while reporting Fixed. The recipe must
+        // refuse (honest Failed with a manual step) and leave the file
+        // byte-identical and re-parseable.
+        let d = tempdir().unwrap();
+        let flow = "search: {collection: my-col}\ncheckpoint:\n  messages: 15\n";
+        fs::write(d.path().join("onebrain.yml"), flow).unwrap();
+
+        let outcome = fix_search_exclude(d.path(), false);
+        let FixOutcome::Failed(msg) = outcome else {
+            panic!("expected Failed, got: {outcome:?}");
+        };
+        assert!(msg.contains("block form"), "actionable message: {msg}");
+
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after, flow, "declined shape must be left untouched");
+        // The file must still parse — never write (or leave) corrupt YAML.
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&after).unwrap();
+        assert_eq!(
+            parsed["search"]["collection"].as_str(),
+            Some("my-col"),
+            "collection value must survive"
+        );
+    }
+
+    /// Direct-child key names of the top-level `search:` block in raw
+    /// config text, in file order (indent == 2, non-comment). Used to
+    /// compare a backfilled vault's in-block key order against the fresh
+    /// template's.
+    fn search_block_key_order(text: &str) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut in_search = false;
+        for l in text.lines() {
+            if !l.starts_with(' ') && !l.trim().is_empty() {
+                in_search = l.trim_start().starts_with("search:");
+                continue;
+            }
+            if !in_search {
+                continue;
+            }
+            let indent = l.len() - l.trim_start().len();
+            let t = l.trim_start();
+            if indent == 2 && !t.starts_with('#') && !t.starts_with('-') {
+                if let Some(key) = t.split(':').next() {
+                    keys.push(key.to_string());
+                }
+            }
+        }
+        keys
+    }
+
+    #[test]
+    fn fix_search_exclude_lands_before_reranker_matching_template_order() {
+        // Pins the insertion position deliberately (R2 Important): the fresh
+        // template places `exclude:` BETWEEN `default_top_k:` and
+        // `reranker:`, and `restructure_config` only reorders top-level
+        // blocks — never within one — so the backfill must land at the same
+        // in-block position or backfilled vaults diverge from canonical
+        // layout forever. With `search:` carrying multiple sub-keys
+        // including NESTED blocks (reranker, embed), the exclude block lands
+        // immediately before `reranker:`, the result re-parses, and every
+        // pre-existing key survives.
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "search:\n  collection: my-col\n  embed_model: multilingual-e5-small\n  default_top_k: 10\n  reranker:\n    enabled: true\n    model: onebrain-rerank-v1\n  embed:\n    auto: true\n",
+        )
+        .unwrap();
+
+        let outcome = fix_search_exclude(d.path(), false);
+        assert!(matches!(outcome, FixOutcome::Fixed(_)), "{outcome:?}");
+
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        // Re-parses with all keys intact.
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&after).unwrap();
+        assert_eq!(parsed["search"]["collection"].as_str(), Some("my-col"));
+        assert_eq!(
+            parsed["search"]["embed_model"].as_str(),
+            Some("multilingual-e5-small")
+        );
+        assert_eq!(parsed["search"]["default_top_k"].as_u64(), Some(10));
+        assert_eq!(
+            parsed["search"]["reranker"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["search"]["reranker"]["model"].as_str(),
+            Some("onebrain-rerank-v1")
+        );
+        assert_eq!(parsed["search"]["embed"]["auto"].as_bool(), Some(true));
+        let exclude: Vec<&str> = parsed["search"]["exclude"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(exclude, ["attachments", "06-archive"]);
+        // Position pinned: the exclude block (comment + key + 2 items)
+        // sits between `default_top_k:` and `reranker:` — the fresh
+        // template's position.
+        let comment = onebrain_fs::search_exclude_comment("06-archive");
+        let expected_mid = format!(
+            "  default_top_k: 10\n  {comment}\n  exclude:\n  - attachments\n  - 06-archive\n  reranker:\n"
+        );
+        assert!(
+            after.contains(&expected_mid),
+            "exclude must land between default_top_k and reranker:\n{after}"
+        );
+        // In-block key order matches the fresh template for the key set
+        // present in both (the template has no `embed:` block and its
+        // `collection` is a commented placeholder; `embed:` here trails
+        // last in both orderings' shared subsequence check).
+        let template = onebrain_fs::render_onebrain_yml(onebrain_fs::SchedulePreset::Skip).unwrap();
+        let template_order = search_block_key_order(&template);
+        let after_order = search_block_key_order(&after);
+        let shared: Vec<&String> = after_order
+            .iter()
+            .filter(|k| template_order.contains(k))
+            .collect();
+        let template_shared: Vec<&String> = template_order
+            .iter()
+            .filter(|k| after_order.contains(k))
+            .collect();
+        assert_eq!(
+            shared, template_shared,
+            "backfilled search-block key order must match the fresh template\nafter: {after_order:?}\ntemplate: {template_order:?}"
+        );
+    }
+
+    #[test]
+    fn fix_search_exclude_backs_up_over_reranker_lead_comments() {
+        // Covers the anchor comment-backup branch (R3 Minor): the real-world
+        // common case is a pre-v3.4.9 template vault where `reranker:`
+        // carries its "# Tier-2 cross-encoder reranker" lead comment. The
+        // exclude block must land ABOVE that lead comment — never between
+        // the comment and the key it documents — and the comment must stay
+        // glued to `reranker:`.
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "search:\n  collection: my-col\n  default_top_k: 10\n  # Tier-2 cross-encoder reranker (re-scores fused candidates for relevance).\n  # second lead comment line\n  reranker:\n    enabled: true\n",
+        )
+        .unwrap();
+
+        let outcome = fix_search_exclude(d.path(), false);
+        assert!(matches!(outcome, FixOutcome::Fixed(_)), "{outcome:?}");
+
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        // (a) + (b): exclude block sits above the FULL lead-comment run,
+        // which stays contiguous and glued to `reranker:`.
+        let comment = onebrain_fs::search_exclude_comment("06-archive");
+        let expected_mid = format!(
+            "  default_top_k: 10\n  {comment}\n  exclude:\n  - attachments\n  - 06-archive\n  # Tier-2 cross-encoder reranker (re-scores fused candidates for relevance).\n  # second lead comment line\n  reranker:\n"
+        );
+        assert!(
+            after.contains(&expected_mid),
+            "exclude must land above reranker's lead comments, comments glued to reranker:\n{after}"
+        );
+        // (b) pinned line-by-line too: the line directly above `reranker:`
+        // is still its own lead comment, not an exclude item.
+        let lines: Vec<&str> = after.lines().collect();
+        let idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("reranker:"))
+            .unwrap();
+        assert_eq!(
+            lines[idx - 1].trim_start(),
+            "# second lead comment line",
+            "{after}"
+        );
+        // (c) re-parses with all keys intact.
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&after).unwrap();
+        assert_eq!(parsed["search"]["collection"].as_str(), Some("my-col"));
+        assert_eq!(parsed["search"]["default_top_k"].as_u64(), Some(10));
+        assert_eq!(
+            parsed["search"]["reranker"]["enabled"].as_bool(),
+            Some(true)
+        );
+        let exclude: Vec<&str> = parsed["search"]["exclude"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(exclude, ["attachments", "06-archive"]);
+    }
+
+    #[test]
+    fn fix_search_exclude_noop_when_not_gated() {
+        // search.collection absent → nothing to do, no write.
+        let d = tempdir().unwrap();
+        let original = "update_channel: stable\n";
+        fs::write(d.path().join("onebrain.yml"), original).unwrap();
+        let outcome = fix_search_exclude(d.path(), false);
+        let FixOutcome::Fixed(msg) = outcome else {
+            panic!("expected Fixed, got: {outcome:?}");
+        };
+        assert!(msg.contains("already set"), "msg: {msg}");
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after, original, "untouched when not gated");
     }
 }
