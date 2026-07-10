@@ -12,6 +12,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [3.4.8] — Unreleased
 
+### Breaking
+- **Removed `serve --host`.** Every listener binds `127.0.0.1` only, same as the daemon — remote access goes through an encrypted tunnel (docs/daemon.md § Remote access). Containers use the `ONEBRAIN_BIND` env var instead (invalid value = hard error; non-loopback prints the plaintext-HTTP warning). Maintainer-approved breaking change in a patch: zero known users of the flag. (#205)
+
 ### Added
 - **Self-documenting `onebrain.yml`.** `init` now scaffolds a hand-authored commented template — every key preceded by `# <what it is> · default: <value>`, values interpolated from the runtime's own default fns so template and binary can't drift. The full `search:` block (incl. the v3.4.7 reranker keys) ships active on day one; `collection` stays a commented placeholder (absent = search disabled). ([ADR 0026](docs/decisions/0026-config-self-documentation.md) · [docs/configuration.md](docs/configuration.md)) (#196)
 - **doctor `config-values` check (12th check).** Validates every present config value per key against the runtime defaults + model/reranker registries — `update_channel`, `checkpoint.*`, `search.default_top_k`/`embed_model`, `search.reranker.*`, plus non-empty `folders.*`/`search.collection` — one finding per violation, each naming its documented default.

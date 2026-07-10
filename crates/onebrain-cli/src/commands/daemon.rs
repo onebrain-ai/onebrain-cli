@@ -1150,8 +1150,9 @@ pub fn run_internal(vault: Option<&Path>) -> Result<()> {
         .unwrap_or(DEFAULT_PORT);
 
     // Daemon always binds localhost — a persistent boot-time engine should never
-    // listen on a public interface implicitly. `serve --host 0.0.0.0` is the
-    // explicit, foreground-only path for remote self-host.
+    // listen on a public interface implicitly. Remote access is tunnel-only
+    // (docs/daemon.md § Remote access); `serve` under `$ONEBRAIN_BIND` is the
+    // explicit, foreground-only non-loopback path (containers, #205).
     let mut cfg = ServeConfig::localhost(vault_root, port, token.clone(), dist_dir);
     // The daemon is the SOLE redb owner: hold the search engine for the process
     // lifetime so mcp + CLI search route through `/api/vault/search` /

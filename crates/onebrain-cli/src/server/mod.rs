@@ -30,8 +30,9 @@
 //! keeps every handler unit-testable via `tower::ServiceExt::oneshot`.
 //!
 //! ## Security model (single-tenant, localhost)
-//! - Bind `127.0.0.1` by default — the primary boundary. A remote self-host
-//!   (`--host 0.0.0.0`) is single-tenant only and MUST run behind TLS.
+//! - Bind `127.0.0.1` — the primary boundary. The `--host` flag was removed
+//!   (#205); a non-loopback bind (`$ONEBRAIN_BIND`, containers only) is
+//!   single-tenant only and MUST run behind TLS.
 //! - EVERY route — `/api/*` AND the static SPA — requires the per-session token
 //!   (header, `?token=` query, or the `onebrain_token` cookie seeded by the
 //!   first `?token=` load), the **sole** exception being `GET`/`HEAD /robots.txt`

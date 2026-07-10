@@ -1,4 +1,4 @@
-//! `onebrain serve [--dir <dist>] [--port N] [--host <addr>] [--open]`
+//! `onebrain serve [--dir <dist>] [--port N] [--open]`
 //!
 //! Foreground, ephemeral HTTP surface for the current session. Brings up ONE
 //! local listener that serves a static web dist (SPA) + the read-only vault
@@ -12,8 +12,15 @@
 //! is already serving THIS vault, `serve` does not bind a second listener (the
 //! two share port 6789 by design, and both would want the engine) — it prints
 //! the daemon's webui URL, honours `--open`, and exits. Explicit `--port` /
-//! `--host` / `--dir` flags always mean a standalone server (see
-//! [`plan_serve`]).
+//! `--dir` flags (or a set `$ONEBRAIN_BIND`) always mean a standalone server
+//! (see [`plan_serve`]).
+//!
+//! **Localhost-only since v3.4.8 (#205):** the `--host` flag was REMOVED —
+//! every listener binds `127.0.0.1`, same as the daemon. Remote access goes
+//! through an encrypted tunnel (see docs/daemon.md § Remote access). The one
+//! escape hatch is the `$ONEBRAIN_BIND` env var (containers: loopback inside
+//! Docker is unreachable from the host), which prints a loud plaintext-HTTP
+//! warning when it names a non-loopback address.
 
 use crate::cli::ServeArgs;
 use crate::commands::daemon_client::{self, DaemonInfo};
@@ -86,9 +93,10 @@ enum ServePlan {
 /// `daemon` is the discovery record of a live, version- AND vault-matched
 /// daemon (`daemon_client::discover_matching` already applied every guard —
 /// a mismatch arrives here as `None`). `explicit_listener` is `true` when the
-/// user passed `--port`, `--host`, or `--dir`: they asked for a SPECIFIC
-/// standalone listener, so a daemon never hijacks that (the standalone bind
-/// will fail loudly on a port conflict rather than silently rerouting).
+/// user passed `--port` or `--dir`, or set `$ONEBRAIN_BIND`: they asked for a
+/// SPECIFIC standalone listener, so a daemon never hijacks that (the
+/// standalone bind will fail loudly on a port conflict rather than silently
+/// rerouting).
 ///
 /// Extracted from [`run`] so the decision is unit-testable without sockets.
 fn plan_serve(daemon: Option<&DaemonInfo>, explicit_listener: bool) -> ServePlan {
@@ -104,13 +112,52 @@ fn plan_serve(daemon: Option<&DaemonInfo>, explicit_listener: bool) -> ServePlan
 }
 
 /// Whether `serve` should even LOOK for a running daemon. `false` when the
-/// user asked for a specific standalone listener (`--port`/`--host`/`--dir`)
+/// user asked for a specific standalone listener (`--port`/`--dir`/`$ONEBRAIN_BIND`)
 /// or the CLI-wide `$ONEBRAIN_NO_DAEMON` kill switch is set — the same switch
 /// the search verbs honour ([`crate::commands::search_common::daemon_routing_disabled`]).
 /// Extracted from [`run`] so the routing gate is unit-testable (the composition
 /// with `discover_matching` is exercised live by the release-binary audit).
 fn wants_daemon_routing(explicit_listener: bool) -> bool {
     !explicit_listener && !crate::commands::search_common::daemon_routing_disabled()
+}
+
+/// Read `$ONEBRAIN_BIND` — the container-only bind override (#205). A set-but-
+/// empty/whitespace value counts as unset (mirrors `$ONEBRAIN_NO_DAEMON`'s
+/// convention for hook-managed env blocks).
+fn bind_env() -> Option<String> {
+    std::env::var("ONEBRAIN_BIND")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+}
+
+/// Resolve the bind address: `127.0.0.1` unless a `$ONEBRAIN_BIND` value is
+/// supplied (containers: loopback inside Docker is unreachable from the host,
+/// and 0.0.0.0-in-container behind Docker's published-port NAT is the standard
+/// pattern). An INVALID value is a hard error, never a silent loopback
+/// fallback — a container operator must not believe they bound `0.0.0.0` when
+/// they didn't. Pure (env injected) so every arm is unit-testable.
+fn resolve_bind(bind: Option<&str>) -> Result<IpAddr> {
+    match bind {
+        None => Ok(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        Some(raw) => raw
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid ONEBRAIN_BIND address: {raw:?}")),
+    }
+}
+
+/// The plaintext-HTTP warning printed when `$ONEBRAIN_BIND` names a
+/// non-loopback address. Relocated from the removed `--host` path (#205) —
+/// the guard survives, only its trigger changed. Returned as a String (not
+/// printed here) so the wording is unit-testable.
+fn non_loopback_warning(host: &IpAddr) -> String {
+    format!(
+        "\n  ⚠️  WARNING: ONEBRAIN_BIND={host} exposes OneBrain beyond this machine over PLAIN HTTP.\n\
+         \x20    The auth token and all vault content would travel UNENCRYPTED.\n\
+         \x20    Do NOT expose this port directly. Put a TLS tunnel/proxy in front:\n\
+         \x20      • Cloudflare Tunnel + Access   • Tailscale Serve   • Caddy + Let's Encrypt\n\
+         \x20    Unset ONEBRAIN_BIND (loopback-only) unless you've set one up.\n\n"
+    )
 }
 
 /// The banner printed when `serve` routes to an already-running daemon instead
@@ -124,7 +171,7 @@ fn build_daemon_banner(url: &str) -> String {
     out.push('\n');
     out.push_str(&item(
         "Hint",
-        "`onebrain daemon status` for the dashboard · pass --port/--host/--dir for a standalone server",
+        "`onebrain daemon status` for the dashboard · pass --port/--dir for a standalone server",
     ));
     out.push('\n');
     out
@@ -146,9 +193,11 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
     // PASSIVE discovery only (`discover_matching`): a version/vault mismatch or
     // a dead record yields `None` and we serve standalone — `serve` never
     // starts, stops, or restarts a daemon. `$ONEBRAIN_NO_DAEMON` (the CLI-wide
-    // routing kill switch) skips discovery entirely. Explicit listener flags
-    // skip it too: the user asked for a specific standalone server.
-    let explicit_listener = args.port.is_some() || args.host.is_some() || args.dir.is_some();
+    // routing kill switch) skips discovery entirely. Explicit listener flags —
+    // and a set `$ONEBRAIN_BIND` (a container operator NEEDS a reachable
+    // listener, not a redirect to a loopback-bound daemon) — skip it too.
+    let bind_override = bind_env();
+    let explicit_listener = args.port.is_some() || args.dir.is_some() || bind_override.is_some();
     let daemon_info = if wants_daemon_routing(explicit_listener) {
         daemon_client::discover_matching(Some(&vault_root))?.map(|handle| handle.info().clone())
     } else {
@@ -165,13 +214,11 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
         return Ok(());
     }
 
-    // Host: default 127.0.0.1; `--host 0.0.0.0` opts into remote self-host.
-    let host: IpAddr = match args.host.as_deref() {
-        None => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        Some(h) => h
-            .parse()
-            .with_context(|| format!("invalid --host address: {h}"))?,
-    };
+    // Bind address: always 127.0.0.1 (#205 — the `--host` flag is gone);
+    // `$ONEBRAIN_BIND` is the container-only escape hatch. Invalid values are
+    // a HARD error — an operator must never believe they bound an address
+    // they didn't.
+    let host: IpAddr = resolve_bind(bind_override.as_deref())?;
     let port = args.port.unwrap_or(DEFAULT_PORT);
     // Honours $ONEBRAIN_TOKEN (≥16 chars) for a stable, bookmarkable URL behind a
     // tunnel; otherwise a fresh random per-process token.
@@ -234,21 +281,13 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
         )
     );
 
-    // Binding beyond loopback exposes the daemon on the network over PLAIN HTTP
-    // — the token + vault content would travel unencrypted. Warn loudly and
-    // point at the safe way to do it (a TLS tunnel/proxy in front).
+    // Binding beyond loopback exposes the server on the network over PLAIN
+    // HTTP — the token + vault content would travel unencrypted. Only
+    // `$ONEBRAIN_BIND` can get here (#205: no `--host` flag anymore), so the
+    // warning guards the env path. Warn loudly and point at the safe way to
+    // do it (a TLS tunnel/proxy in front).
     if !host.is_loopback() {
-        eprintln!();
-        eprintln!(
-            "  ⚠️  WARNING: --host {host} exposes OneBrain beyond this machine over PLAIN HTTP."
-        );
-        eprintln!("     The auth token and all vault content would travel UNENCRYPTED.");
-        eprintln!("     Do NOT expose this port directly. Put a TLS tunnel/proxy in front:");
-        eprintln!(
-            "       • Cloudflare Tunnel + Access   • Tailscale Serve   • Caddy + Let's Encrypt"
-        );
-        eprintln!("     Keep the default --host 127.0.0.1 unless you've set one up.");
-        eprintln!();
+        eprint!("{}", non_loopback_warning(&host));
     }
 
     if args.open {
@@ -383,13 +422,63 @@ mod tests {
 
     #[test]
     fn plan_serve_explicit_listener_flags_win_over_a_daemon() {
-        // `--port` / `--host` / `--dir` mean "the user asked for a specific
-        // standalone listener" — never silently reroute to the daemon.
+        // `--port` / `--dir` / `$ONEBRAIN_BIND` mean "the user asked for a
+        // specific standalone listener" — never silently reroute to the daemon.
         let info = daemon_info(6789, "sekret");
         assert!(matches!(
             plan_serve(Some(&info), true),
             ServePlan::Standalone
         ));
+    }
+
+    #[test]
+    fn resolve_bind_defaults_to_loopback() {
+        // No env → 127.0.0.1, same as the daemon. Empty/whitespace values are
+        // filtered out by `bind_env` before they reach here.
+        assert_eq!(resolve_bind(None).unwrap(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn resolve_bind_accepts_explicit_addresses() {
+        // The container pattern: 0.0.0.0 inside Docker.
+        let all = resolve_bind(Some("0.0.0.0")).unwrap();
+        assert_eq!(all, "0.0.0.0".parse::<IpAddr>().unwrap());
+        assert!(!all.is_loopback());
+        // IPv6 + whitespace-tolerant.
+        assert!(resolve_bind(Some(" ::1 ")).unwrap().is_loopback());
+    }
+
+    #[test]
+    fn resolve_bind_invalid_is_a_hard_error() {
+        // Never a silent loopback fallback — the operator asked for a bind.
+        for bad in ["not-an-ip", "0.0.0.0:6789", "localhost"] {
+            let err = resolve_bind(Some(bad)).unwrap_err().to_string();
+            assert!(err.contains("ONEBRAIN_BIND"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn bind_env_reads_and_filters_empty() {
+        // Env-locked (crate convention): a set-but-empty value counts as unset.
+        {
+            let _empty = crate::test_env::set_var("ONEBRAIN_BIND", "");
+            assert_eq!(bind_env(), None);
+        }
+        {
+            let _set = crate::test_env::set_var("ONEBRAIN_BIND", "0.0.0.0");
+            assert_eq!(bind_env().as_deref(), Some("0.0.0.0"));
+        }
+    }
+
+    #[test]
+    fn non_loopback_warning_names_env_and_risks() {
+        let w = non_loopback_warning(&"0.0.0.0".parse::<IpAddr>().unwrap());
+        assert!(w.contains("ONEBRAIN_BIND=0.0.0.0"), "{w}");
+        assert!(w.contains("PLAIN HTTP"), "{w}");
+        assert!(w.contains("UNENCRYPTED"), "{w}");
+        assert!(w.contains("Tailscale Serve"), "{w}");
+        // The removed flag must not resurface in the wording.
+        assert!(!w.contains("--host"), "{w}");
     }
 
     #[test]
@@ -400,7 +489,7 @@ mod tests {
             assert!(wants_daemon_routing(false), "default: routing wanted");
             assert!(
                 !wants_daemon_routing(true),
-                "--port/--host/--dir always means standalone"
+                "--port/--dir/ONEBRAIN_BIND always means standalone"
             );
         }
         {
