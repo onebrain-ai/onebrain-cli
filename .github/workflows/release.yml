@@ -3,6 +3,16 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Manual re-publish of the npm wrapper for an EXISTING tag (e.g. when the
+  # npm job alone failed). Runs ONLY the npm-publish job: the `webui` job is
+  # push-gated below, and every other job is skipped transitively via the
+  # `needs` chain. Usage: gh workflow run release.yml -f tag=v3.4.8
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to publish the npm wrapper for (e.g. v3.4.8)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -22,6 +32,9 @@ jobs:
   # faster than rebuilding from source. Bump the pin to ship a newer webui.
   webui:
     name: Fetch prebuilt web UI
+    # push-only: on workflow_dispatch (npm re-publish) this job is skipped,
+    # and the `needs` chain transitively skips build/release/brew/site.
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read # download-only job — override the workflow-wide write
@@ -410,7 +423,7 @@ jobs:
     # rule). Prereleases still produce GitHub Release artifacts so users on
     # `cargo binstall` / brew tap / direct download paths can pick them up;
     # the npm wrapper just doesn't track them.
-    if: ${{ !contains(github.ref, '-') }}
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.release.result == 'success') && !contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-') }}
     permissions:
       contents: read
       # Required for npm Trusted Publishers (OIDC). With the matching
@@ -419,8 +432,15 @@ jobs:
       # OIDC token for publish rights — no long-lived NPM_TOKEN secret to
       # rotate. The publish attestation also gets recorded by Sigstore.
       id-token: write
+    env:
+      # Single tag source for this job: the pushed tag ref, or the dispatch
+      # input formatted to the same refs/tags/<tag> shape so the version
+      # derivation below works identically on both triggers.
+      RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -432,8 +452,10 @@ jobs:
       # `_authToken` in ~/.npmrc and gets a 404 on the scoped PUT — even with
       # a correctly configured trusted publisher. Upgrading npm here is what
       # actually activates the OIDC token exchange (id-token: write above).
+      # PINNED to npm@11: npm@12 requires node >= 22 and EBADENGINEs on this
+      # job's node20 (broke the v3.4.8 publish when @latest crossed to 12).
       - name: Upgrade npm to a version that supports OIDC trusted publishing
-        run: npm install -g npm@latest
+        run: npm install -g npm@11
 
       # Single source of version truth = the git tag. The committed
       # `npm-wrapper/package.json` version is a placeholder for local dev
@@ -445,19 +467,15 @@ jobs:
       # directly into run scripts).
       - name: Sync wrapper version to git tag
         working-directory: npm-wrapper
-        env:
-          REF: ${{ github.ref }}
         run: |
-          VERSION="${REF#refs/tags/v}"
+          VERSION="${RELEASE_REF#refs/tags/v}"
           npm version "$VERSION" --no-git-tag-version --allow-same-version
 
       - name: Publish to npm with provenance
         working-directory: npm-wrapper
-        env:
-          REF: ${{ github.ref }}
         run: |
           set -euo pipefail
-          VERSION="${REF#refs/tags/v}"
+          VERSION="${RELEASE_REF#refs/tags/v}"
           # Idempotent: a recovery re-tag of an already-published version
           # would otherwise hit npm's "cannot publish over existing version"
           # (403) and fail the whole release. Skip cleanly if this exact
