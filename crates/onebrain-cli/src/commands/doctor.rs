@@ -52,6 +52,23 @@ enum FixOutcome {
     Manual(String),
 }
 
+/// How the text-mode `--fix` confirmation was resolved. Distinguishing a
+/// genuine interactive "y" from the auto-proceed paths lets recipes that are
+/// destructive OUTSIDE the vault (qmd-leftovers: global npm uninstall +
+/// deleting home-dir caches) require a real human answer, while every
+/// vault-scoped recipe keeps the pre-3.2.4 automation-compat behaviour of
+/// running on any non-`Declined` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixConsent {
+    /// A human answered "y" to the `[y/N]` prompt on an interactive TTY.
+    InteractiveYes,
+    /// Proceeded without a prompt: `--yes`, non-TTY stdin/stdout (cron /
+    /// piped scripts), or the structured-guard short-circuit.
+    AutoProceed,
+    /// Explicit non-"y" answer or a stdin read error — no fixes run.
+    Declined,
+}
+
 /// Entry point — returns `Ok(0)` on no errors, `Ok(1)` when any check
 /// produced `DoctorStatus::Error`. With `--fix`, the run is two-pass: initial
 /// check, then fix attempts — on the auto-fixable issues after a confirmation
@@ -147,9 +164,16 @@ pub fn run(
             // Machine path (the `/doctor` skill drives `--fix --json`): no
             // prompt, run every recipe, capture outcomes for the `fix[]` array.
             if !issues.is_empty() {
+                // No prompt was (or could be) shown on this path, so no
+                // recipe ever receives `interactive_confirmed = true` here.
                 let outcomes: Vec<(String, FixOutcome)> = issues
                     .iter()
-                    .map(|r| (r.check.clone(), attempt_fix(r, vault_root.as_path(), true)))
+                    .map(|r| {
+                        (
+                            r.check.clone(),
+                            attempt_fix(r, vault_root.as_path(), true, false),
+                        )
+                    })
                     .collect();
                 any_recipe_failed = outcomes
                     .iter()
@@ -209,10 +233,22 @@ pub fn run(
                     // Nothing to auto-apply — don't ask a misleading "Apply
                     // fixes?" when confirming would change nothing.
                     println!("\nNothing to auto-fix — see the manual steps above.");
-                } else if confirm_fix(auto.len(), false, yes) {
+                } else if let consent @ (FixConsent::InteractiveYes | FixConsent::AutoProceed) =
+                    confirm_fix(auto.len(), false, yes)
+                {
+                    // `interactive_confirmed` is true ONLY for a genuine
+                    // human "y" on a TTY — the auto-proceed paths (non-TTY
+                    // pipes, `--yes`) run the vault-scoped recipes as before
+                    // but never unlock the qmd-leftovers destructive branch.
+                    let interactive_confirmed = consent == FixConsent::InteractiveYes;
                     let outcomes: Vec<(String, FixOutcome)> = auto
                         .iter()
-                        .map(|r| (r.check.clone(), attempt_fix(r, vault_root.as_path(), false)))
+                        .map(|r| {
+                            (
+                                r.check.clone(),
+                                attempt_fix(r, vault_root.as_path(), false, interactive_confirmed),
+                            )
+                        })
                         .collect();
                     any_recipe_failed = outcomes
                         .iter()
@@ -1231,13 +1267,19 @@ fn qmd_leftovers_check_prod(config: &onebrain_core::VaultConfig) -> DoctorResult
 /// interactive TTY. A non-interactive plain run (piped stdin/stdout — e.g. cron
 /// without `--yes`) proceeds without prompting, matching pre-3.2.4 behaviour so
 /// existing automation keeps working. A read error is treated as "decline".
-fn confirm_fix(fixable_count: usize, structured: bool, yes: bool) -> bool {
+///
+/// The return distinguishes HOW consent was reached, not just whether to
+/// proceed: recipes that are destructive outside the vault (qmd-leftovers)
+/// run only on [`FixConsent::InteractiveYes`] — a genuine human "y" — while
+/// every pre-existing recipe treats any non-`Declined` value as before, so
+/// the automation-compat contract is unchanged for them.
+fn confirm_fix(fixable_count: usize, structured: bool, yes: bool) -> FixConsent {
     use std::io::{IsTerminal, Write};
     if structured || yes {
-        return true;
+        return FixConsent::AutoProceed;
     }
     if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
-        return true;
+        return FixConsent::AutoProceed;
     }
     // The plan (the bulleted action list) is printed by the caller just above
     // this prompt, so keep the question itself short.
@@ -1245,9 +1287,13 @@ fn confirm_fix(fixable_count: usize, structured: bool, yes: bool) -> bool {
     let _ = std::io::stdout().flush();
     let mut input = String::new();
     if std::io::stdin().read_line(&mut input).is_err() {
-        return false;
+        return FixConsent::Declined;
     }
-    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    if matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        FixConsent::InteractiveYes
+    } else {
+        FixConsent::Declined
+    }
 }
 
 /// Render `results` + optional fix outcomes as a single JSON document.
@@ -1338,7 +1384,18 @@ fn emit_structured(
 /// on the message content too). Hidden hints that say "Run onebrain doctor
 /// --fix to ..." are silently rewritten to a non-circular message when no
 /// recipe maps.
-fn attempt_fix(result: &DoctorResult, vault_root: &Path, json: bool) -> FixOutcome {
+///
+/// `interactive_confirmed` is `true` only when the text-mode batch `[y/N]`
+/// prompt was genuinely answered "y" on an interactive TTY
+/// ([`FixConsent::InteractiveYes`]) — every auto-proceed route (structured
+/// `--fix --json`, `--yes`, non-TTY pipes) passes `false`. Only recipes
+/// that are destructive outside the vault (qmd-leftovers) consult it.
+fn attempt_fix(
+    result: &DoctorResult,
+    vault_root: &Path,
+    json: bool,
+    interactive_confirmed: bool,
+) -> FixOutcome {
     match result.check.as_str() {
         // Migrate the deprecated top-level `qmd_collection` key to
         // `search.collection` and remove it. Auto-fixable — one atomic
@@ -1392,13 +1449,13 @@ fn attempt_fix(result: &DoctorResult, vault_root: &Path, json: bool) -> FixOutco
                 .to_string(),
         ),
         // Legacy qmd leftover cleanup (npm uninstall + delete caches).
-        // Destructive actions run ONLY on the interactive text path (after
-        // the batch [y/N] confirm). Two Manual short-circuits: a previously
-        // declined cleanup (`result.hint` is `None` — see
-        // `qmd_leftovers_check`) and any structured/non-interactive run
-        // (`json == true` — the `/doctor` skill and the scheduler drive
-        // `--fix --json` with no prompt, so nothing may be deleted there).
-        "qmd-leftovers" => fix_qmd_leftovers(result, json),
+        // Destructive actions require `interactive_confirmed` — a genuine
+        // human "y" to the batch [y/N] prompt on a TTY. Everything else
+        // (structured `--fix --json`, `--yes`, non-TTY piped text mode) gets
+        // a Manual outcome with the removal commands; a previously declined
+        // cleanup (`result.hint` is `None` — see `qmd_leftovers_check`)
+        // short-circuits to Manual before touching the filesystem at all.
+        "qmd-leftovers" => fix_qmd_leftovers(result, interactive_confirmed),
         _ => FixOutcome::Manual(manual_message(result)),
     }
 }
@@ -1445,20 +1502,23 @@ fn planned_action(result: &DoctorResult) -> Option<&'static str> {
 /// - `result.hint.is_none()` — the user already declined this cleanup on an
 ///   earlier `--fix` run (`qmd_leftovers_check` omits the hint once
 ///   `stats.qmd_cleanup_declined` is set). No filesystem access at all.
-/// - `json == true` — the structured/non-interactive path (`--fix --json`,
-///   driven by the `/doctor` plugin skill and the scheduler) runs every
-///   recipe WITHOUT a confirmation prompt, and deleting a user's global npm
-///   package + gigabytes of cache is never acceptable without live
-///   confirmation. Mirror the orphan-checkpoints Manual-routing precedent:
-///   report what was found and steer to an interactive `onebrain doctor
-///   --fix` (or manual removal). Detection here is read-only.
+/// - `!interactive_confirmed` — EVERY consent route other than a genuine
+///   human "y" to the batch `[y/N]` prompt on an interactive TTY: the
+///   structured `--fix --json` path (the `/doctor` plugin skill, the
+///   scheduler), `--yes`, and non-TTY piped text mode (`doctor --fix
+///   </dev/null | cat` — cron command-mode / scripts) all auto-proceed
+///   without a prompt, and deleting a user's global npm package + gigabytes
+///   of cache is never acceptable without live confirmation. Mirror the
+///   orphan-checkpoints Manual-routing precedent: report what was found
+///   (detection is read-only) and steer to an interactive `onebrain doctor
+///   --fix` or manual removal.
 ///
-/// The interactive text path (batch preview → explicit [y/N] confirm) is the
-/// only route that executes. `npm uninstall` runs in the foreground; a
-/// non-zero exit (or a failure to even launch `npm`) is surfaced as
-/// `Partial` rather than aborting — the cache/config directories are still
-/// worth removing on their own.
-fn fix_qmd_leftovers(result: &DoctorResult, json: bool) -> FixOutcome {
+/// The destructive branch therefore runs ONLY after a real interactive
+/// confirmation. `npm uninstall` runs in the foreground; a non-zero exit
+/// (or a failure to even launch `npm`) is surfaced as `Partial` rather than
+/// aborting — the cache/config directories are still worth removing on
+/// their own.
+fn fix_qmd_leftovers(result: &DoctorResult, interactive_confirmed: bool) -> FixOutcome {
     if result.hint.is_none() {
         return FixOutcome::Manual(
             "cleanup previously declined — remove `stats.qmd_cleanup_declined` from \
@@ -1474,10 +1534,10 @@ fn fix_qmd_leftovers(result: &DoctorResult, json: bool) -> FixOutcome {
     if leftovers.is_empty() {
         return FixOutcome::Fixed("nothing to remove — already clean".to_string());
     }
-    if json {
-        // Non-interactive: NEVER destructive. Compose an actionable message
-        // from the (read-only) detection above so the JSON consumer can relay
-        // exact removal commands.
+    if !interactive_confirmed {
+        // No genuine interactive confirmation: NEVER destructive. Compose an
+        // actionable message from the (read-only) detection above so the
+        // consumer can relay exact removal commands.
         let size_note = leftovers
             .cache_dir
             .as_ref()
@@ -1509,9 +1569,12 @@ fn fix_qmd_leftovers(result: &DoctorResult, json: bool) -> FixOutcome {
         ));
     }
 
+    // From here on we're on the interactive text path (the guard above
+    // filtered every structured/auto-proceed route), so status lines go to
+    // stdout unconditionally — `status_line(false, …)`.
     let mut npm_failed = false;
     if let Some(pkg) = &leftovers.npm_package {
-        status_line(json, &format!("running: npm uninstall -g {pkg}"));
+        status_line(false, &format!("running: npm uninstall -g {pkg}"));
         match std::process::Command::new("npm")
             .args(["uninstall", "-g", pkg])
             .status()
@@ -1520,13 +1583,13 @@ fn fix_qmd_leftovers(result: &DoctorResult, json: bool) -> FixOutcome {
             Ok(status) => {
                 npm_failed = true;
                 status_line(
-                    json,
+                    false,
                     &format!("npm uninstall -g {pkg} exited with {status}"),
                 );
             }
             Err(e) => {
                 npm_failed = true;
-                status_line(json, &format!("could not run npm uninstall -g {pkg}: {e}"));
+                status_line(false, &format!("could not run npm uninstall -g {pkg}: {e}"));
             }
         }
     }
@@ -1542,7 +1605,7 @@ fn fix_qmd_leftovers(result: &DoctorResult, json: bool) -> FixOutcome {
             Ok(()) => removed.push(tildify(&dir, &home)),
             Err(e) => {
                 removal_failed = true;
-                status_line(json, &format!("could not remove {}: {e}", dir.display()));
+                status_line(false, &format!("could not remove {}: {e}", dir.display()));
             }
         }
     }
@@ -4273,20 +4336,25 @@ mod tests {
     #[test]
     fn confirm_fix_auto_yes_in_structured_mode() {
         // The /doctor skill drives `--fix --json` — it must never block.
-        assert!(confirm_fix(3, true, false));
+        // AutoProceed, NOT InteractiveYes: no human answered a prompt, so
+        // the qmd-leftovers destructive branch stays locked.
+        assert_eq!(confirm_fix(3, true, false), FixConsent::AutoProceed);
     }
 
     #[test]
     fn confirm_fix_auto_yes_with_yes_flag() {
-        assert!(confirm_fix(3, false, true));
+        // `--yes` skips the prompt — proceed, but never as InteractiveYes.
+        assert_eq!(confirm_fix(3, false, true), FixConsent::AutoProceed);
     }
 
     #[test]
     fn confirm_fix_proceeds_when_non_interactive() {
         // Under `cargo test` stdin/stdout aren't TTYs → no prompt, proceed
-        // (matches pre-3.2.4 cron/piped behaviour). The interactive decline
-        // path needs a real TTY and is verified manually.
-        assert!(confirm_fix(3, false, false));
+        // (matches pre-3.2.4 cron/piped behaviour) — as AutoProceed, so the
+        // qmd-leftovers destructive branch stays locked on piped runs. The
+        // interactive InteractiveYes/Declined paths need a real TTY and are
+        // verified manually.
+        assert_eq!(confirm_fix(3, false, false), FixConsent::AutoProceed);
     }
 
     #[test]
@@ -5503,7 +5571,7 @@ mod tests {
     fn attempt_fix_orphan_checkpoints_returns_manual() {
         let d = tempdir().unwrap();
         let r = DoctorResult::warn("orphan-checkpoints", "3 unmerged");
-        let outcome = attempt_fix(&r, d.path(), false);
+        let outcome = attempt_fix(&r, d.path(), false, false);
         match outcome {
             FixOutcome::Manual(msg) => assert!(
                 msg.contains("wrapup"),
@@ -5517,7 +5585,7 @@ mod tests {
     fn attempt_fix_unknown_check_returns_manual_with_check_name() {
         let d = tempdir().unwrap();
         let r = DoctorResult::warn("some-future-check", "not yet known").with_hint("do something");
-        let outcome = attempt_fix(&r, d.path(), false);
+        let outcome = attempt_fix(&r, d.path(), false, false);
         match outcome {
             FixOutcome::Manual(msg) => {
                 assert!(
@@ -5535,7 +5603,7 @@ mod tests {
         let d = tempdir().unwrap();
         let r = DoctorResult::warn("future-check", "problem")
             .with_hint("Run onebrain doctor --fix to fix this");
-        let outcome = attempt_fix(&r, d.path(), false);
+        let outcome = attempt_fix(&r, d.path(), false, false);
         match outcome {
             FixOutcome::Manual(msg) => assert!(
                 msg.contains("recipe not yet implemented"),
@@ -5693,7 +5761,7 @@ mod tests {
             "legacy-qmd-collection",
             "legacy qmd_collection (ob-1) — migrate to search.collection",
         );
-        let outcome = attempt_fix(&r, d.path(), false);
+        let outcome = attempt_fix(&r, d.path(), false, false);
         assert!(matches!(outcome, FixOutcome::Fixed(_)), "{outcome:?}");
         // The legacy key was actually removed.
         let text = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
@@ -5708,7 +5776,7 @@ mod tests {
         // An unmapped check falls to the `_ =>` Manual arm.
         let d = tempdir().unwrap();
         let r = DoctorResult::warn("brand-new-check", "hmm").with_hint("do the thing manually");
-        let outcome = attempt_fix(&r, d.path(), false);
+        let outcome = attempt_fix(&r, d.path(), false, false);
         match outcome {
             FixOutcome::Manual(msg) => {
                 assert!(msg.contains("brand-new-check"), "check name in msg: {msg}");
@@ -6979,10 +7047,12 @@ mod tests {
         assert_eq!(result.status, DoctorStatus::Warn, "{result:?}");
         assert!(!result.details.is_empty(), "{result:?}");
         // --fix does not re-offer: no hint, no planned auto-fix action, and
-        // `attempt_fix` short-circuits to Manual without touching disk.
+        // `attempt_fix` short-circuits to Manual without touching disk —
+        // even with `interactive_confirmed = true`, the recorded decline
+        // wins over a fresh confirmation.
         assert!(result.hint.is_none(), "{result:?}");
         assert!(planned_action(&result).is_none(), "{result:?}");
-        let outcome = attempt_fix(&result, home.path(), false);
+        let outcome = attempt_fix(&result, home.path(), false, true);
         match outcome {
             FixOutcome::Manual(msg) => assert!(msg.contains("previously declined"), "msg: {msg}"),
             other => panic!("expected Manual for a declined cleanup, got: {other:?}"),

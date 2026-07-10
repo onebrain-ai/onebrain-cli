@@ -547,6 +547,74 @@ fn doctor_fix_json_never_deletes_qmd_leftovers() {
     );
 }
 
+/// Piped/non-TTY TEXT-mode safety (the reviewer's exact repro:
+/// `doctor --fix </dev/null | cat`, i.e. cron command-mode / scripts):
+/// `confirm_fix` deliberately auto-proceeds when stdin/stdout aren't TTYs
+/// (pre-3.2.4 automation compat, unchanged for vault-scoped recipes) — but
+/// that auto-proceed is NOT a real confirmation, so the qmd-leftovers
+/// destructive branch must stay locked. Spawning the binary under the test
+/// harness gives exactly this shape: stdin is null, stdout is piped.
+///
+/// unix-only for the same `HOME`-override reason as the json variant above.
+#[cfg(unix)]
+#[test]
+fn doctor_fix_piped_text_mode_never_deletes_qmd_leftovers() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    vault_with_config(
+        vault.path(),
+        &format!(
+            "update_channel: stable\n\
+             {FULL_FOLDERS_BLOCK}\
+             search:\n  collection: doctor-it-qmd-piped\n"
+        ),
+    );
+    // Fresh qmd leftovers (first encounter — no declined flag).
+    let cache_dir = home.path().join(".cache/qmd");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(cache_dir.join("index.sqlite"), vec![0u8; 128]).unwrap();
+    let config_dir = home.path().join(".config/qmd");
+    std::fs::create_dir_all(&config_dir).unwrap();
+
+    // Plain text-mode --fix: no --json, no --yes. Under the harness stdin is
+    // null and stdout is piped — the auto-proceed route.
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin") // no real qmd binary reachable
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .args(["doctor", "--fix"])
+        .assert();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap_or_default();
+
+    // The manual guidance is in the output — the recipe reported instead of
+    // executing.
+    assert!(
+        stdout.contains("interactively") && stdout.contains("rm -rf"),
+        "piped --fix must print the manual guidance, got:\n{stdout}"
+    );
+
+    // BOTH leftover dirs survived on disk.
+    assert!(
+        cache_dir.is_dir() && cache_dir.join("index.sqlite").is_file(),
+        "~/.cache/qmd must survive a piped text-mode --fix run"
+    );
+    assert!(
+        config_dir.is_dir(),
+        "~/.config/qmd must survive a piped text-mode --fix run"
+    );
+
+    // No declined flag was recorded — auto-proceed is neither a confirmation
+    // nor a decline.
+    let cfg = std::fs::read_to_string(vault.path().join("onebrain.yml")).unwrap();
+    assert!(
+        !cfg.contains("qmd_cleanup_declined"),
+        "piped run must not write the declined flag:\n{cfg}"
+    );
+}
+
 #[test]
 fn doctor_missing_folder_exits_1() {
     let d = tempdir().unwrap();
