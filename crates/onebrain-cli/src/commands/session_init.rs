@@ -202,20 +202,22 @@ where
 /// the vault-config-resolved `folders.logs` value (e.g. `07-logs`); the
 /// session logs live under `<logs_folder>/session/**/*-session-*.md`. A vault
 /// with no `session/` directory yet (fresh vault, never wrapped up) reports a
-/// genuine `Some(0)` rather than `None` — this is a pure filesystem walk with
-/// no engine/index to fail, so "couldn't scan" isn't a real outcome here
-/// short of an I/O error, which `walkdir` silently skips per-entry.
+/// genuine `Some(0)` rather than `None`. Any walk error (e.g. a
+/// permission-denied subtree) aborts the probe with `None` — a partial count
+/// would look like a determined figure while silently missing files, and
+/// `null` = "couldn't determine" is exactly the contract `search_unembedded`
+/// already established.
 fn recap_pending(vault_root: &Path, logs_folder: &str) -> Option<u64> {
     let session_dir = vault_root.join(logs_folder).join("session");
     if !session_dir.is_dir() {
         return Some(0);
     }
     let mut pending = 0u64;
-    for entry in walkdir::WalkDir::new(&session_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
+    for entry in walkdir::WalkDir::new(&session_dir) {
+        let entry = entry.ok()?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
         let name = entry.file_name().to_string_lossy();
         if !(name.ends_with(".md") && name.contains("-session-")) {
             continue;
@@ -227,25 +229,34 @@ fn recap_pending(vault_root: &Path, logs_folder: &str) -> Option<u64> {
     Some(pending)
 }
 
-/// True when `path` starts with a `---` frontmatter block containing a
-/// `{key}:` line. Reads only up to the closing `---`; malformed or absent
-/// frontmatter (including an unreadable file) returns `false`.
+/// True when `path` starts with a *closed* `---` frontmatter block containing
+/// a top-level `{key}:` line (no leading whitespace — an indented `{key}:` is
+/// a nested mapping entry, not a frontmatter field). A leading UTF-8 BOM is
+/// tolerated before the opening `---`. Files with no frontmatter, an
+/// unterminated block (no closing `---` before EOF), or an unreadable file
+/// all return `false`; content after the closing `---` (the note body) is
+/// never inspected.
 fn frontmatter_has_key(path: &Path, key: &str) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
     let mut lines = text.lines();
     if lines.next().map(str::trim) != Some("---") {
         return false;
     }
+    let prefix = format!("{key}:");
+    let mut seen = false;
     for line in lines {
         if line.trim() == "---" {
-            return false;
+            // Key only counts when the block is actually closed.
+            return seen;
         }
-        if line.trim_start().starts_with(&format!("{key}:")) {
-            return true;
+        if line.starts_with(&prefix) {
+            seen = true;
         }
     }
+    // EOF without a closing `---` → not a valid frontmatter block.
     false
 }
 
@@ -742,6 +753,77 @@ mod tests {
             result,
             Some(2),
             "expected the two non-recapped session logs, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn frontmatter_unclosed_block_is_not_recapped() {
+        // No closing `---` before EOF → not a valid frontmatter block, even
+        // though a body line happens to start with `recapped:` — the file
+        // must count as pending.
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("2026-07-08-session-01.md");
+        std::fs::write(
+            &file,
+            "---\ntags: [foo]\n# discussing\nrecapped: 2026-07-05\n",
+        )
+        .unwrap();
+        assert!(
+            !frontmatter_has_key(&file, "recapped"),
+            "an unterminated frontmatter block must not match"
+        );
+    }
+
+    #[test]
+    fn frontmatter_nested_key_is_not_recapped() {
+        // `recapped:` indented under another mapping is a nested entry, not a
+        // top-level frontmatter field — must count as pending.
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("2026-07-08-session-01.md");
+        std::fs::write(&file, "---\nmeta:\n  recapped: true\n---\n# session\n").unwrap();
+        assert!(
+            !frontmatter_has_key(&file, "recapped"),
+            "a nested (indented) key must not match"
+        );
+    }
+
+    #[test]
+    fn frontmatter_bom_prefixed_recapped_is_detected() {
+        // A UTF-8 BOM before the opening `---` must not hide a genuine
+        // top-level `recapped:` key (would overcount pending).
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("2026-07-01-session-01.md");
+        std::fs::write(&file, "\u{FEFF}---\nrecapped: 2026-07-05\n---\n").unwrap();
+        assert!(
+            frontmatter_has_key(&file, "recapped"),
+            "a BOM-prefixed frontmatter block must still match"
+        );
+    }
+
+    #[test]
+    fn frontmatter_recapped_before_close_matches_despite_body_content() {
+        // Regression guard for the scan-to-completion rewrite: a key seen
+        // BEFORE the closing `---` still matches (stays not-pending), and the
+        // body after the close is never inspected.
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("2026-07-01-session-01.md");
+        std::fs::write(
+            &file,
+            "---\nrecapped: 2026-07-05\n---\n# body mentioning recapped: again\n",
+        )
+        .unwrap();
+        assert!(
+            frontmatter_has_key(&file, "recapped"),
+            "key inside a closed block must match regardless of body content"
+        );
+
+        // Converse: body-only mention after a closed, key-less block must NOT
+        // match — the file stays pending.
+        let body_only = dir.path().join("2026-07-09-session-01.md");
+        std::fs::write(&body_only, "---\ntags: [foo]\n---\nrecapped: 2026-07-05\n").unwrap();
+        assert!(
+            !frontmatter_has_key(&body_only, "recapped"),
+            "a body-only mention after the closing --- must not match"
         );
     }
 
