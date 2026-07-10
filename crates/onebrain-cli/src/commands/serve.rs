@@ -103,6 +103,16 @@ fn plan_serve(daemon: Option<&DaemonInfo>, explicit_listener: bool) -> ServePlan
     }
 }
 
+/// Whether `serve` should even LOOK for a running daemon. `false` when the
+/// user asked for a specific standalone listener (`--port`/`--host`/`--dir`)
+/// or the CLI-wide `$ONEBRAIN_NO_DAEMON` kill switch is set — the same switch
+/// the search verbs honour ([`crate::commands::search_common::daemon_routing_disabled`]).
+/// Extracted from [`run`] so the routing gate is unit-testable (the composition
+/// with `discover_matching` is exercised live by the release-binary audit).
+fn wants_daemon_routing(explicit_listener: bool) -> bool {
+    !explicit_listener && !crate::commands::search_common::daemon_routing_disabled()
+}
+
 /// The banner printed when `serve` routes to an already-running daemon instead
 /// of binding its own listener. Grouped-status convention, plus a hint at the
 /// dashboard and the standalone escape hatch.
@@ -139,12 +149,11 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
     // routing kill switch) skips discovery entirely. Explicit listener flags
     // skip it too: the user asked for a specific standalone server.
     let explicit_listener = args.port.is_some() || args.host.is_some() || args.dir.is_some();
-    let daemon_info =
-        if explicit_listener || crate::commands::search_common::daemon_routing_disabled() {
-            None
-        } else {
-            daemon_client::discover_matching(Some(&vault_root))?.map(|handle| handle.info().clone())
-        };
+    let daemon_info = if wants_daemon_routing(explicit_listener) {
+        daemon_client::discover_matching(Some(&vault_root))?.map(|handle| handle.info().clone())
+    } else {
+        None
+    };
     if let ServePlan::OpenDaemon { url } = plan_serve(daemon_info.as_ref(), explicit_listener) {
         print!("{}", build_daemon_banner(&url));
         if args.open {
@@ -381,6 +390,27 @@ mod tests {
             plan_serve(Some(&info), true),
             ServePlan::Standalone
         ));
+    }
+
+    #[test]
+    fn wants_daemon_routing_honours_kill_switch_and_explicit_flags() {
+        // Env-locked (crate-wide non-reentrant guard): empty = switch unset.
+        {
+            let _routing_on = crate::test_env::set_var("ONEBRAIN_NO_DAEMON", "");
+            assert!(wants_daemon_routing(false), "default: routing wanted");
+            assert!(
+                !wants_daemon_routing(true),
+                "--port/--host/--dir always means standalone"
+            );
+        }
+        {
+            let _killed = crate::test_env::set_var("ONEBRAIN_NO_DAEMON", "1");
+            assert!(
+                !wants_daemon_routing(false),
+                "ONEBRAIN_NO_DAEMON disables serve's daemon detection too"
+            );
+            assert!(!wants_daemon_routing(true));
+        }
     }
 
     #[test]

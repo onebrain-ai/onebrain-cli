@@ -576,11 +576,22 @@ fn enrich_status(
 
     if let Some(h) = health {
         data.engine_held = h.get("engine_held").and_then(serde_json::Value::as_bool);
-        // `dist_dir` (v3.4.8): present-and-null = embedded UI, string = the
-        // $ONEBRAIN_DIST override. A MISSING key (pre-3.4.8 daemon) stays
-        // `None` — unknown, not "embedded".
+        // `dist_dir` (v3.4.8): present-and-null = the binary's own UI, string
+        // = the $ONEBRAIN_DIST override. A MISSING key (pre-3.4.8 daemon)
+        // stays `None` — unknown, not "embedded". With no override, the
+        // sibling `embedded_ui` flag distinguishes a real bundled UI from the
+        // asset-less build's placeholder page — `false` must not report a
+        // dishonest "embedded". The flag ships in the same daemon version as
+        // `dist_dir`, so on the null arm an absent flag can only be a skewed
+        // (newer-client/older-daemon) probe — default to "embedded", the
+        // release-binary truth.
         data.webui_source = match h.get("dist_dir") {
-            Some(serde_json::Value::Null) => Some("embedded".to_string()),
+            Some(serde_json::Value::Null) => {
+                match h.get("embedded_ui").and_then(serde_json::Value::as_bool) {
+                    Some(false) => Some("placeholder".to_string()),
+                    _ => Some("embedded".to_string()),
+                }
+            }
             Some(serde_json::Value::String(dist)) => Some(dist.clone()),
             _ => None,
         };
@@ -669,7 +680,13 @@ fn render_status_text(env: &Envelope<DaemonStatusData>) -> String {
             None => {}
         }
         if let Some(source) = &d.webui_source {
-            lines.push(item("Web UI", source));
+            // "placeholder" is the machine token (JSON); spell it out for humans.
+            let shown = if source == "placeholder" {
+                "placeholder page (no bundled web UI in this binary)"
+            } else {
+                source.as_str()
+            };
+            lines.push(item("Web UI", shown));
         }
     }
 
@@ -1852,7 +1869,7 @@ mod tests {
             vault: Some("/v".to_string()),
         };
         let health = serde_json::json!({
-            "ok": true, "engine_held": true, "dist_dir": null
+            "ok": true, "engine_held": true, "dist_dir": null, "embedded_ui": true
         });
         let internal = serde_json::json!({
             "doc_count": 10, "pending_total": 2, "last_indexed": 123,
@@ -1931,11 +1948,39 @@ mod tests {
         enrich_status(&mut data, &info, None, 0, Some(&health), None);
         assert_eq!(data.webui_source.as_deref(), Some("/opt/webui-dist"));
 
-        // A pre-3.4.8 daemon that doesn't report the key at all → unknown.
+        // No override + no bundled assets (a from-source build) → the honest
+        // "placeholder", not "embedded".
+        let mut data = DaemonStatusData::default();
+        let bare = serde_json::json!({ "ok": true, "dist_dir": null, "embedded_ui": false });
+        enrich_status(&mut data, &info, None, 0, Some(&bare), None);
+        assert_eq!(data.webui_source.as_deref(), Some("placeholder"));
+
+        // No override + a missing embedded_ui flag (version-skewed daemon on
+        // the null arm) → default "embedded" (the release-binary truth).
+        let mut data = DaemonStatusData::default();
+        let skewed = serde_json::json!({ "ok": true, "dist_dir": null });
+        enrich_status(&mut data, &info, None, 0, Some(&skewed), None);
+        assert_eq!(data.webui_source.as_deref(), Some("embedded"));
+
+        // A pre-3.4.8 daemon that doesn't report dist_dir at all → unknown.
         let mut data = DaemonStatusData::default();
         let old_health = serde_json::json!({ "ok": true, "engine_held": false });
         enrich_status(&mut data, &info, None, 0, Some(&old_health), None);
         assert!(data.webui_source.is_none());
+    }
+
+    #[test]
+    fn status_text_placeholder_webui_is_spelled_out() {
+        let data = DaemonStatusData {
+            webui_source: Some("placeholder".to_string()),
+            ..rich_status_fixture()
+        };
+        let env = Envelope::ok("daemon.status", None, data);
+        let s = render_status_text(&env);
+        assert!(
+            s.contains("    Web UI        placeholder page (no bundled web UI in this binary)"),
+            "{s}"
+        );
     }
 
     #[test]
@@ -2047,8 +2092,10 @@ mod tests {
     /// `onebrain daemon stop` (with the test's own HOME/env) on drop, so a
     /// FAILED assertion between `daemon start` and the test's own `stop` never
     /// leaks a detached daemon — with `ONEBRAIN_DAEMON_IDLE_SECS=0` a leaked
-    /// daemon runs forever. (An external SIGKILL of the test runner still
-    /// can't be covered: the daemon is setsid-detached by design.)
+    /// daemon runs forever. Two gaps remain by nature: an external SIGKILL of
+    /// the test runner (the daemon is setsid-detached by design), and a
+    /// `panic = "abort"` test profile (e.g. `cargo test --release` with abort
+    /// panics), where no unwinding happens so Drop never runs.
     #[cfg(unix)]
     struct StopDaemonOnDrop {
         bin: PathBuf,
@@ -2463,6 +2510,10 @@ mod tests {
 
         let home = tempdir().unwrap();
         let bin = cargo_bin("onebrain");
+        let _teardown = StopDaemonOnDrop {
+            bin: bin.clone(),
+            envs: vec![("HOME".into(), home.path().display().to_string())],
+        };
         let run_dir = home.path().join(".onebrain").join("run");
         std::fs::create_dir_all(&run_dir).unwrap();
         let lock = run_dir.join("daemon.lock");
@@ -2514,7 +2565,8 @@ mod tests {
             discovery.exists(),
             "recovered daemon never published daemon.json"
         );
-        let _ = daemon("stop");
+        // Teardown: `_teardown` (StopDaemonOnDrop) stops the recovered daemon
+        // on EVERY exit path, panicking asserts included.
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -2540,6 +2592,10 @@ mod tests {
         )
         .unwrap();
         let bin = cargo_bin("onebrain");
+        let _teardown = StopDaemonOnDrop {
+            bin: bin.clone(),
+            envs: vec![("HOME".into(), home.path().display().to_string())],
+        };
 
         // Start WITH --vault and WITHOUT $ONEBRAIN_VAULT (env_remove makes the
         // arg the only possible source of the bound vault).
@@ -2568,10 +2624,7 @@ mod tests {
                 break info;
             }
             if Instant::now() >= deadline {
-                let _ = StdCommand::new(&bin)
-                    .env("HOME", home.path())
-                    .args(["daemon", "stop"])
-                    .output();
+                // `_teardown` stops the daemon (if any) on this panic.
                 panic!("daemon never published daemon.json");
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -2585,10 +2638,7 @@ mod tests {
             info.vault, expected,
             "daemon.json.vault must be the --vault path (arg carried the vault, not env)"
         );
-
-        let _ = StdCommand::new(&bin)
-            .env("HOME", home.path())
-            .args(["daemon", "stop"])
-            .output();
+        // Teardown: `_teardown` (StopDaemonOnDrop) stops the daemon on every
+        // exit path, the failing-assert ones included.
     }
 }

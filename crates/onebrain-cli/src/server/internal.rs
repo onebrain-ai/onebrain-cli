@@ -74,11 +74,13 @@ pub(super) fn router() -> Router<Arc<AppState>> {
 /// engine being held, which is exactly what a liveness check must not do.
 ///
 /// `dist_dir` (v3.4.8, #197) reports the served web UI's source for the
-/// `daemon status` dashboard: `null` = the UI embedded in the binary (the
-/// default — there is no API-only mode), a string = the `--dir` /
-/// `$ONEBRAIN_DIST` override path. Explicitly emitted even when `null` so a
-/// client can tell "embedded" apart from a pre-3.4.8 daemon that doesn't
-/// report the key at all.
+/// `daemon status` dashboard: `null` = no override (the binary's own UI), a
+/// string = the `--dir` / `$ONEBRAIN_DIST` override path. Explicitly emitted
+/// even when `null` so a client can tell "no override" apart from a pre-3.4.8
+/// daemon that doesn't report the key at all. `embedded_ui` (same version)
+/// says whether this binary actually BUNDLES a web UI — `false` means a
+/// from-source build serving the token-bearing placeholder page, so the
+/// dashboard can report "placeholder" instead of a dishonest "embedded".
 ///
 /// The vault identity a CLI client vault-matches against is NOT surfaced here —
 /// it reads the daemon's canonical bound vault from `daemon.json` (`DaemonInfo.
@@ -90,6 +92,7 @@ async fn get_health(State(state): State<Arc<AppState>>) -> Response {
         "ok": true,
         "engine_held": state.search_engine.is_some(),
         "dist_dir": state.dist_dir.as_ref().map(|p| p.display().to_string()),
+        "embedded_ui": super::has_embedded_ui(),
     }))
     .into_response()
 }
@@ -1172,10 +1175,14 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["engine_held"], false);
-        // `dist_dir` must be PRESENT and null for the embedded-UI default —
+        // `dist_dir` must be PRESENT and null for the no-override default —
         // a missing key is how a client detects a pre-3.4.8 daemon.
         assert!(v.get("dist_dir").is_some(), "{v}");
         assert!(v["dist_dir"].is_null(), "{v}");
+        // `embedded_ui` reports whether this binary bundles a web UI — it must
+        // be present and match the build's actual asset state (false in a
+        // fresh checkout, true in a dist-embedded build).
+        assert_eq!(v["embedded_ui"], crate::server::has_embedded_ui(), "{v}");
     }
 
     #[tokio::test]
