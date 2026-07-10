@@ -1663,6 +1663,10 @@ fn fix_config_values(vault_root: &Path, json: bool) -> FixOutcome {
         ));
     }
 
+    // Whether the check-time read promised a restructure ("layout drift").
+    // Captured BEFORE any edit so a fix-time decline of that promise can be
+    // surfaced honestly instead of silently skipped.
+    let layout_drift_at_read = !onebrain_fs::config_layout_matches(&text);
     let mut current = text;
     let mut resets: Vec<String> = Vec::new();
     let mut untouched: Vec<String> = Vec::new();
@@ -1710,10 +1714,27 @@ fn fix_config_values(vault_root: &Path, json: bool) -> FixOutcome {
     // (and every user comment) survive verbatim. Runs LAST so it operates on
     // the fully-corrected text; idempotent, so a second `--fix` is a no-op.
     let mut restructured = false;
-    if let Some(reordered) = onebrain_fs::restructure_config(&current) {
-        if reordered != current {
-            current = reordered;
-            restructured = true;
+    match onebrain_fs::restructure_config(&current) {
+        Some(reordered) => {
+            if reordered != current {
+                current = reordered;
+                restructured = true;
+            }
+        }
+        None => {
+            // The restructure declined the shape. When the check-time read
+            // reported layout drift, silence here would break the promise
+            // plain doctor made ("--fix will restructure") — surface it as
+            // un-fixable so the run lands Partial, not a clean Fixed. In
+            // practice this arm-with-drift is unreachable: every declined
+            // shape (invalid YAML / non-mapping / flow-style root / no
+            // top-level keys) also makes `config_layout_matches` return true
+            // (never drift), and the value/comment line edits above cannot
+            // change the root shape — a unit test pins that agreement. Kept
+            // as defense-in-depth for honesty over silence.
+            if layout_drift_at_read {
+                unfixable.push("layout restructure (unsupported top-level shape)".to_string());
+            }
         }
     }
 
@@ -4867,6 +4888,58 @@ mod tests {
     }
 
     #[test]
+    fn fix_config_values_flow_style_root_declines_without_phantom_layout_complaint() {
+        // A flow-style root parses as a mapping (findings ARE collected) but
+        // nothing is line-editable and the restructure declines the shape.
+        // No layout drift was ever promised for it (see the agreement test
+        // below), so the outcome lists only the value — never a phantom
+        // "layout restructure" entry — and the file is untouched.
+        let d = tempdir().unwrap();
+        let flow = "{checkpoint: {messages: 0}}\n";
+        fs::write(d.path().join("onebrain.yml"), flow).unwrap();
+        let outcome = fix_config_values(d.path(), false);
+        let FixOutcome::Failed(msg) = outcome else {
+            panic!("expected Failed (no progress possible), got: {outcome:?}");
+        };
+        assert!(msg.contains("checkpoint.messages"), "msg: {msg}");
+        assert!(
+            !msg.contains("layout restructure"),
+            "no phantom layout complaint: {msg}"
+        );
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after, flow, "declined shape must be left untouched");
+    }
+
+    #[test]
+    fn layout_drift_is_never_promised_for_shapes_restructure_declines() {
+        // Pins the check/fix agreement the fix recipe's decline arm relies
+        // on: every shape `restructure_config` declines also makes
+        // `config_layout_matches` return true, so plain doctor never reports
+        // "layout drift" for a file `--fix` would then decline to
+        // restructure — the promise-then-silent-decline mismatch is
+        // unreachable (the decline arm in `fix_config_values` is
+        // defense-in-depth only).
+        for text in [
+            "- a\n- b\n",        // sequence root
+            "",                  // empty
+            "# only comments\n", // no top-level keys
+            "{a: 1, b: 2}\n",    // flow-style root mapping
+            "  {a: 1}\n",        // flow-style root, indented
+            "a: [1, 2\n",        // invalid YAML
+            "a: 1\na: 2\n",      // duplicate top-level keys
+        ] {
+            assert!(
+                onebrain_fs::restructure_config(text).is_none(),
+                "expected decline for {text:?}"
+            );
+            assert!(
+                onebrain_fs::config_layout_matches(text),
+                "declined shape must never report drift: {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn fix_config_values_clean_documented_config_is_noop() {
         // A fully-commented, in-range, canonical-layout config (the fresh
         // template shape) is the true no-op: byte-identical after --fix,
@@ -4908,10 +4981,12 @@ mod tests {
         for doc in onebrain_fs::config_key_docs() {
             let key = doc.segments.last().unwrap();
             // Keys not present in this legacy config are never added
-            // (recap.*, schedule, and the search reranker/top_k keys are all
-            // absent here).
+            // (recap.*, schedule, and the search reranker/top_k/exclude/
+            // embed.* keys are all absent here).
             if doc.segments.join(".").starts_with("search.reranker")
                 || doc.segments == ["search", "default_top_k"]
+                || doc.segments == ["search", "exclude"]
+                || doc.segments.get(1) == Some(&"embed")
                 || doc.segments.first() == Some(&"recap")
                 || doc.segments == ["schedule"]
             {
@@ -4934,6 +5009,13 @@ mod tests {
                 "comment above {key} must be the template's:\n{after}"
             );
         }
+        // The restructure landed in the same run: outcome names it and the
+        // section banners are on disk (the legacy config had none).
+        assert!(msg.contains("restructured layout"), "msg: {msg}");
+        assert!(
+            after.contains(&onebrain_fs::config_layout::section_banner("General")),
+            "General banner must be present after --fix:\n{after}"
+        );
         // Values + key order untouched.
         assert!(after.contains("collection: my-col"), "{after}");
         let key_order: Vec<&str> = after

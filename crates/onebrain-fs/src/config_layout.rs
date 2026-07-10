@@ -77,10 +77,18 @@ pub fn section_banner(title: &str) -> String {
     format!("{prefix}{}", "─".repeat(dashes))
 }
 
-/// True when `line` is a section banner (`# ── … ─────`). Structural — stripped
-/// before re-segmentation.
+/// True when `line` is one of the module's OWN section banners — an exact
+/// match against the canonical [`section_banner`] render of a known section
+/// title. Structural — stripped before re-segmentation.
+///
+/// Exact-match on purpose: a looser prefix test (e.g. `# ─`) would classify a
+/// user's own dash-art comment (`# ─ my divider`) as structural and silently
+/// delete it on restructure, violating the byte-for-byte contract — and make
+/// `config_layout_matches` report perpetual drift on such a file. Only lines
+/// this module itself emits are ever stripped.
 fn is_banner_line(line: &str) -> bool {
-    line.trim_start().starts_with("# ─")
+    let trimmed = line.trim_start();
+    SECTIONS.iter().any(|s| trimmed == section_banner(s.title))
 }
 
 /// True when `line` is the system-managed note. Structural — stripped before
@@ -271,14 +279,25 @@ fn reorder(blocks: Vec<Block>) -> Vec<Block> {
 
 /// Restructure an existing `onebrain.yml`'s top-level blocks into the canonical
 /// sectioned layout, preserving each block's internal bytes and inserting the
-/// section banners. Idempotent. Returns `None` when the text is not a YAML
-/// mapping or has no top-level keys (nothing safe to restructure) — the caller
-/// leaves the file untouched then.
+/// section banners. Idempotent.
+///
+/// Returns `None` — the caller leaves the file untouched — for every shape
+/// the line-oriented block mover can't safely address: invalid YAML, a
+/// non-mapping root (sequence/scalar/empty), a FLOW-STYLE root mapping
+/// (`{a: 1, b: 2}` — a valid mapping, but it has no block-form top-level key
+/// lines to move), or a block mapping with no recognisable top-level keys.
 pub fn restructure_config(text: &str) -> Option<String> {
     // Only operate on a genuine mapping — a non-mapping / empty (Null) file is
     // some other check's territory; never guess at a shape we don't own.
     let parsed: serde_yaml::Value = serde_yaml::from_str(text).ok()?;
     parsed.as_mapping()?;
+    // Decline a flow-style root explicitly. It parses as a mapping (so the
+    // gate above does not fire) and would only survive segmentation by the
+    // accident of `top_level_key` lumping the whole `{…}` into one opaque
+    // block — declining is the honest contract, not accidental safety.
+    if text.trim_start().starts_with('{') {
+        return None;
+    }
 
     let (lines, newline, ends_with_newline) = split(text);
     // Strip structural lines (banners + managed note) so re-segmentation sees
@@ -484,6 +503,58 @@ checkpoint:
         assert!(restructure_config("- a\n- b\n").is_none());
         assert!(restructure_config("# only comments\n").is_none());
         assert!(restructure_config("").is_none());
+    }
+
+    #[test]
+    fn flow_style_root_mapping_is_declined() {
+        // `{a: 1}` IS a valid YAML mapping, so the as_mapping gate alone
+        // would let it through — the explicit flow-style guard must decline
+        // it (there are no block-form top-level key lines to move) and it
+        // must never report drift.
+        let flow = "{update_channel: stable, checkpoint: {messages: 15}}\n";
+        assert!(restructure_config(flow).is_none());
+        assert!(config_layout_matches(flow));
+        // Leading whitespace before `{` still declines.
+        assert!(restructure_config("  {a: 1}\n").is_none());
+    }
+
+    #[test]
+    fn user_dash_art_comment_is_not_structural_and_survives() {
+        // A user's own dash-art comment (single U+2500 — NOT the canonical
+        // banner) must survive the restructure byte-for-byte; only banners
+        // this module itself emits are structural.
+        let text = "\
+checkpoint:
+  # ─ my custom divider ─
+  messages: 15
+update_channel: stable
+";
+        let out = restructure_config(text).unwrap();
+        assert!(
+            out.contains("  # ─ my custom divider ─\n  messages: 15"),
+            "user dash-art comment must survive in place:\n{out}"
+        );
+        // A canonical file containing that comment reports NO drift.
+        assert!(config_layout_matches(&out));
+        assert_eq!(restructure_config(&out).unwrap(), out);
+        // A banner-lookalike with a non-section title is a user comment too.
+        let lookalike = format!("update_channel: stable # {}\n", "─".repeat(10));
+        assert!(config_layout_matches(
+            &restructure_config(&lookalike).unwrap()
+        ));
+    }
+
+    #[test]
+    fn eof_without_trailing_newline_is_preserved() {
+        let text = "stats:\n  x: 1\nupdate_channel: stable"; // no final \n
+        let out = restructure_config(text).unwrap();
+        assert!(
+            !out.ends_with('\n'),
+            "missing final newline must be preserved: {out:?}"
+        );
+        assert_eq!(keys_in_order(&out), vec!["update_channel", "stats"]);
+        // Idempotent in that shape too.
+        assert_eq!(restructure_config(&out).unwrap(), out);
     }
 
     #[test]

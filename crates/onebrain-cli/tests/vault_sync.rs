@@ -415,6 +415,13 @@ fn default_init_with_inline_sync_keeps_template_comments() {
         "min_score must stay verbatim (not re-serialized to 0.3):\n{cfg}"
     );
     assert!(cfg.contains("update_channel: stable"), "{cfg}");
+    // Section banners survive end-to-end on disk (comment_lines counts them,
+    // but presence must be explicit — a banner-free file with the same
+    // comment count would otherwise pass).
+    assert!(
+        cfg.contains("# ── General "),
+        "section banner must be on disk after init + inline sync:\n{cfg}"
+    );
 }
 
 /// (b) Re-sync of an already-synced commented config: byte-identical no-op.

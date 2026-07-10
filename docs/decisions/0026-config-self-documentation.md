@@ -161,7 +161,10 @@ section banners, English only**.
    (min_sessions 6, min_frequency 2) verified against the plugin source
    `skills/recap/SKILL.md`. The `schedule:` block gains a header comment
    documenting the entry shape (a cron expression plus either `skill: /name`
-   or `command` + `args`) — never per-entry comments.
+   or `command` + `args`) — never per-entry comments. Adding a config key
+   requires a `config_key_docs` entry: a completeness guard test walks every
+   key path of the serde config structs and fails naming any path missing
+   from the table (explicit allowlist: `qmd_collection`, legacy-deprecated).
 
 3. **Full restructure for existing vaults** (maintainer chose full over
    comments-only). `restructure_config` reorders the top-level blocks into the
@@ -181,8 +184,11 @@ section banners, English only**.
 4. **Plain `doctor` reports drift read-only.** `config_layout_matches` (a
    restructure-equals-input check) drives a "config layout differs from
    template — doctor --fix will restructure" finding on the `config-values`
-   row. `config_layout_matches` is conservative: a shape `restructure_config`
-   declines to touch (non-mapping / no top-level keys) never reports drift.
+   row. `config_layout_matches` is conservative: the declined shapes (below)
+   never report drift, so plain doctor can never promise a restructure that
+   `--fix` would then decline — a unit test pins that agreement (the fix
+   recipe still carries a defense-in-depth "restructure declined" un-fixable
+   line for the theoretical mismatch).
 
 5. **The stats stamp stays canonical.** `stamp_doctor_run` appends a bare
    `stats:` block when none exists; on a config that was ALREADY in canonical
@@ -192,6 +198,27 @@ section banners, English only**.
    stamp itself introduced. A config that was already drifted is left as-is
    (plain doctor never restructures a user's legacy layout — that stays
    `--fix`'s job).
+
+6. **Declined shapes and known limitations.** `restructure_config` declines —
+   returns the file untouched, and never reports drift — exactly these root
+   shapes, each already surfaced by the existing `onebrain.yml` validity
+   checks rather than the layout check:
+   - **invalid YAML** (parse error, including duplicate top-level keys, which
+     `serde_yaml` rejects);
+   - **a non-mapping root** (sequence / scalar / empty document);
+   - **a flow-style root mapping** (`{a: 1, b: 2}` — a valid mapping, but it
+     has no block-form top-level key lines to move; declined explicitly, not
+     by accident of segmentation);
+   - **a block mapping with no recognisable top-level keys**.
+
+   Known cosmetic limitations of the line-oriented block mover (accepted;
+   exotic shapes only):
+   - a keep-chomped block scalar (`|+`) under an UNKNOWN top-level key can
+     lose trailing blank value lines during block separation (blank trimming
+     at block edges); template-known keys never carry block scalars;
+   - a comment separated from its key by a blank line is not "attached lead
+     comments" and travels with the PRECEDING block (position shifts;
+     nothing is lost).
 
 ## Related
 

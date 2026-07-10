@@ -56,6 +56,7 @@ pub fn config_key_docs() -> Vec<ConfigKeyDoc> {
     let cp = CheckpointPolicy::default();
     let sc = SearchConfig::default();
     let rr = RerankerConfig::default();
+    let eg = onebrain_core::config::EmbedGate::default();
     let doc =
         |segments: &'static [&'static str], comment: String| ConfigKeyDoc { segments, comment };
     vec![
@@ -170,6 +171,49 @@ pub fn config_key_docs() -> Vec<ConfigKeyDoc> {
             format!(
                 "# Score gate: hits below this calibrated 0-1 score are dropped · default: {TEMPLATE_RERANK_MIN_SCORE}"
             ),
+        ),
+        // `search.exclude` and the `search.embed.*` gate are real VaultConfig
+        // keys the fresh template deliberately does not emit (exclude's
+        // default covers the common case; the embed gate is parsed but not
+        // yet enforced). Their docs exist so `doctor --fix` backfills the
+        // comments on EXISTING vaults that carry them — same backfill-only
+        // pattern as recap.*. The completeness guard test keeps this table
+        // in sync with the config structs.
+        doc(
+            &["search", "exclude"],
+            format!(
+                "# Extra index-exclusion patterns: vault-relative prefix or bare dir name (hidden dirs and node_modules always skipped) · default: [{}]",
+                sc.exclude.join(", ")
+            ),
+        ),
+        doc(
+            &["search", "embed", "auto"],
+            format!("# Auto-embed changed docs on/off · default: {}", eg.auto),
+        ),
+        doc(
+            &["search", "embed", "threshold"],
+            format!(
+                "# Changed docs required before an auto-embed run triggers (>= 1) · default: {}",
+                eg.threshold
+            ),
+        ),
+        doc(
+            &["search", "embed", "debounce_seconds"],
+            format!(
+                "# Debounce window in seconds before an auto-embed run fires (>= 1) · default: {}",
+                eg.debounce_seconds
+            ),
+        ),
+        doc(
+            &["search", "embed", "max_batch"],
+            format!(
+                "# Max docs embedded per batch (>= 1) · default: {}",
+                eg.max_batch
+            ),
+        ),
+        doc(
+            &["search", "embed", "schedule"],
+            "# Cron schedule for a periodic full re-embed · default: unset".to_string(),
         ),
         // Plugin-level recap thresholds (`/recap` skill). Not part of
         // VaultConfig — the CLI never emits a recap block in the fresh
@@ -550,13 +594,22 @@ mod tests {
                 );
                 continue;
             }
-            // recap.* keys are plugin-level: their docs exist only for the
-            // doctor --fix backfill on existing vaults; the fresh template
-            // never emits a recap block (absent = plugin defaults).
+            // Backfill-only entries: their docs exist only for the doctor
+            // --fix backfill on existing vaults; the fresh template never
+            // emits these keys (recap.* = plugin-level, absent = plugin
+            // defaults; search.exclude = default covers the common case;
+            // search.embed.* = parsed but not yet enforced).
             if doc.segments.first() == Some(&"recap") {
                 assert!(
                     !yaml.contains("recap:"),
                     "fresh template must not emit a recap block:\n{yaml}"
+                );
+                continue;
+            }
+            if doc.segments == ["search", "exclude"] || doc.segments.get(1) == Some(&"embed") {
+                assert!(
+                    !yaml.contains("\n  exclude:") && !yaml.contains("\n  embed:"),
+                    "fresh template must not emit exclude/embed blocks:\n{yaml}"
                 );
                 continue;
             }
@@ -572,6 +625,83 @@ mod tests {
             assert_eq!(
                 above, doc_lines,
                 "comment above {key} drifted from config_key_docs"
+            );
+        }
+    }
+
+    #[test]
+    fn every_config_struct_key_has_a_doc_entry() {
+        // Completeness guard (maintainer standing requirement): every real
+        // user-facing config key must have a comment + default in
+        // `config_key_docs` — the table drives BOTH the init template and
+        // the doctor --fix backfill, so a key missing here ships
+        // undocumented on every surface. Enumerate the key paths from the
+        // serde config structs themselves (fully populated: every Option
+        // Some, every Vec non-empty) so adding a struct field without a doc
+        // entry fails THIS test with instructions.
+        //
+        // `stats.*` never appears in this walk: it is not a VaultConfig
+        // field at all — doctor writes it as raw text (system-managed), so
+        // no allowlist entry is needed for it.
+        use onebrain_core::config::EmbedGate;
+        use onebrain_core::VaultConfig;
+        let cfg = VaultConfig {
+            qmd_collection: Some("legacy".to_string()),
+            checkpoint: CheckpointPolicy::default(),
+            folders: VaultFolders::default(),
+            search: SearchConfig {
+                collection: Some("c".to_string()),
+                embed: EmbedGate {
+                    schedule: Some("0 3 * * 0".to_string()),
+                    ..EmbedGate::default()
+                },
+                reranker: RerankerConfig {
+                    min_score: Some(0.30),
+                    ..RerankerConfig::default()
+                },
+                ..SearchConfig::default()
+            },
+        };
+        fn walk(v: &serde_yaml::Value, prefix: &[String], out: &mut Vec<String>) {
+            match v.as_mapping() {
+                Some(m) => {
+                    for (k, child) in m {
+                        let mut p = prefix.to_vec();
+                        p.push(k.as_str().expect("string config key").to_string());
+                        walk(child, &p, out);
+                    }
+                }
+                None => out.push(prefix.join(".")),
+            }
+        }
+        let value = serde_yaml::to_value(&cfg).unwrap();
+        let mut paths: Vec<String> = Vec::new();
+        walk(&value, &[], &mut paths);
+        assert!(
+            paths.len() >= 20,
+            "walk must see the full config: {paths:?}"
+        );
+
+        // Explicit allowlist — every entry carries its written reason.
+        let allowlist: &[(&str, &str)] = &[(
+            "qmd_collection",
+            "legacy v2 key, deprecated: replaced by search.collection; \
+             doctor --fix migrates it away, so it must never be documented \
+             as a current key",
+        )];
+        let documented: Vec<String> = config_key_docs()
+            .iter()
+            .map(|d| d.segments.join("."))
+            .collect();
+        for path in &paths {
+            if allowlist.iter().any(|(k, _)| k == path) {
+                continue;
+            }
+            assert!(
+                documented.contains(path),
+                "new config key `{path}` has no config_key_docs entry — add its \
+                 comment/default/section to the table in onebrain_yml.rs (this \
+                 drives the init template AND doctor --fix backfill)"
             );
         }
     }
