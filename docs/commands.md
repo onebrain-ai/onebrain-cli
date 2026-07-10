@@ -6,7 +6,7 @@ v3.1 locks a singular-noun, two-level grammar — `onebrain <noun> <verb>` — s
 onebrain
 ├── init                       create / re-scaffold a vault (--yes · --force · --no-sync)
 ├── update                     self-update the binary (--check · --plan)
-├── doctor [--fix]             12 health checks + auto-repair recipes
+├── doctor [--fix]             12 health checks (text folds the 2 migration checks into 1 row) + auto-repair recipes
 ├── serve                      local web UI + vault JSON API (--port · --open)
 ├── mcp                        MCP stdio server — vault search tools (--vault)
 │

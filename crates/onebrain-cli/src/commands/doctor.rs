@@ -115,12 +115,20 @@ pub fn run(
         }
     });
 
+    // Vault directory basename for the report header.
+    let vault_name = vault_root
+        .as_path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("vault")
+        .to_string();
+
     let mut results = all_checks(vault_root.as_path(), &config);
     if !want_structured {
-        // Under `--fix` the verdict footer is deferred until after the fix pass
-        // (one final footer, not a redundant before-and-after pair); a plain
+        // Under `--fix` the Summary box is deferred until after the fix pass
+        // (one final summary, not a redundant before-and-after pair); a plain
         // run prints it inline with the report.
-        emit_text_report(&results, mode, quiet, !fix)?;
+        emit_text_report(&results, &vault_name, mode, quiet, !fix)?;
     }
 
     let mut any_recipe_failed = false;
@@ -214,9 +222,9 @@ pub fn run(
                     println!("\nNo changes made.");
                 }
             }
-            // Single deferred verdict footer — the pre-fix report omitted its
-            // own footer so this is the only one the user sees.
-            write_summary_footer(&mut std::io::stdout(), &results)?;
+            // Single deferred Summary box — the pre-fix report omitted its own
+            // summary so this is the only one the user sees.
+            emit_summary_box(&results, mode)?;
         }
     }
 
@@ -656,6 +664,22 @@ fn undocumented_keys(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Map a daemon `/api/internal/status` JSON body into the
+/// `(last_indexed_at, doc_count, pending_total)` triple `native_search_check`
+/// needs. Pure (no I/O) so it's unit-testable without a live daemon. Mirrors
+/// `search_status::probe_from_daemon_status`: a body with no numeric
+/// `doc_count` is a broken read, not a healthy zero — return `None` so the
+/// caller falls back to the direct engine open rather than asserting an empty
+/// index.
+fn daemon_status_counts(v: &serde_json::Value) -> Option<(Option<u64>, usize, usize)> {
+    let field = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
+    let doc_count = field("doc_count")? as usize;
+    let pending = (field("pending_new").unwrap_or(0)
+        + field("pending_changed").unwrap_or(0)
+        + field("pending_removed").unwrap_or(0)) as usize;
+    Some((field("last_indexed"), doc_count, pending))
+}
+
 /// Native-search index check (`check = "search"`). Read-only and
 /// download-free: it resolves the collection, checks whether the on-disk index
 /// exists, and — only if it does — opens the engine (lazy embedder, so
@@ -792,15 +816,25 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
         );
     }
 
-    // Index exists → open the engine (lazy embedder, no download) and read
-    // status. A hard open/status failure is advisory, not fatal. The open
-    // goes through `open_engine_with_collection` (NOT `open_engine`): the
-    // latter resolves via `collection_for`, which PERSISTS a generated
-    // collection name through a comment-destroying serde rewrite when the
-    // `search.collection` key is absent — doctor's read path must never
-    // write the config.
-    let (last_indexed_at, doc_count, pending) =
-        match open_engine_with_collection(&resolved, &collection) {
+    // Index exists → read status. Warm-daemon FIRST (same passive discovery
+    // `search status` uses): when an `onebrain mcp` session holds the engine it
+    // owns the redb lock, so opening a second engine here reports a misleading
+    // "engine busy: index locked". Route through the daemon's
+    // `/api/internal/status` instead and read the real counts. Passive
+    // discovery only — doctor is read-only and NEVER starts/restarts a daemon.
+    //
+    // Fallback to a direct open only when no matching daemon serves this vault,
+    // or the daemon probe didn't yield counts. The direct open goes through
+    // `open_engine_with_collection` (NOT `open_engine`): the latter resolves via
+    // `collection_for`, which PERSISTS a generated collection name through a
+    // comment-destroying serde rewrite when `search.collection` is absent —
+    // doctor's read path must never write the config.
+    let daemon_counts = crate::commands::search_common::route_to_daemon(&resolved)
+        .and_then(|handle| handle.status().ok())
+        .and_then(|body| daemon_status_counts(&body));
+    let (last_indexed_at, doc_count, pending) = match daemon_counts {
+        Some(counts) => counts,
+        None => match open_engine_with_collection(&resolved, &collection) {
             Ok(engine) => match engine.status(resolved.root.as_path()) {
                 Ok(s) => (s.last_indexed_at, s.doc_count, s.pending_total()),
                 Err(e) => {
@@ -816,7 +850,8 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
                         .with_details(vec![format!("collection: {collection}")]),
                 );
             }
-        };
+        },
+    };
 
     let never_indexed = last_indexed_at.is_none();
     let mut details = vec![format!("collection: {collection}")];
@@ -1102,10 +1137,12 @@ fn status_line(json: bool, msg: &str) {
 /// `qmd_collection` value; then remove the legacy key. If `search.collection`
 /// is already set, don't overwrite it — just drop the legacy key.
 ///
-/// Writes via the established config-mutation pattern (parse → mutate → backup
-/// → atomic write), preserving every other key. YAML comments are not
-/// preserved (serde_yaml re-serializes from the parsed model), matching
-/// `fix_vault_yml_keys`; the Fixed message notes this.
+/// Parses read-only to CLASSIFY the change (legacy value, whether
+/// `search.collection` is already set), then applies it as comment-preserving
+/// line edits ([`onebrain_fs::yaml_edit::upsert_child`] to seed the collection,
+/// [`onebrain_fs::yaml_edit::delete_key`] to drop the legacy key) before the
+/// backup → atomic write. Every other key AND every comment survives (v3.4.8,
+/// issue #200 — the pre-v3.4.8 serde re-serialization dropped all comments).
 fn fix_legacy_qmd_collection(vault_root: &Path, json: bool) -> FixOutcome {
     use onebrain_core::{find_config_file, CONFIG_FILENAME};
     let path = find_config_file(vault_root).unwrap_or_else(|| vault_root.join(CONFIG_FILENAME));
@@ -1123,17 +1160,19 @@ fn fix_legacy_qmd_collection(vault_root: &Path, json: bool) -> FixOutcome {
         Ok(t) => t,
         Err(e) => return FixOutcome::Failed(format!("read {filename}: {e}")),
     };
-    let mut yaml: serde_yaml::Value = match serde_yaml::from_str(&text) {
+    // Read-only parse — used ONLY to decide what to change, never to
+    // re-serialize (that would drop comments).
+    let yaml: serde_yaml::Value = match serde_yaml::from_str(&text) {
         Ok(v) => v,
         Err(e) => return FixOutcome::Failed(format!("parse {filename}: {e}")),
     };
-    let mapping = match yaml.as_mapping_mut() {
+    let mapping = match yaml.as_mapping() {
         Some(m) => m,
         None => return FixOutcome::Failed(format!("{filename} root is not a mapping")),
     };
 
     let qmd_key = serde_yaml::Value::String("qmd_collection".to_string());
-    let Some(legacy_value) = mapping.remove(&qmd_key) else {
+    let Some(legacy_value) = mapping.get(&qmd_key) else {
         // Already migrated (or never present) — idempotent no-op.
         return FixOutcome::Fixed(format!(
             "{filename}: no qmd_collection key — nothing to migrate"
@@ -1141,9 +1180,8 @@ fn fix_legacy_qmd_collection(vault_root: &Path, json: bool) -> FixOutcome {
     };
     let legacy_str = legacy_value.as_str().map(str::to_string);
 
-    // Decide whether to seed `search.collection` from the legacy value: only
-    // when `search.collection` isn't already set (never overwrite the user's
-    // current value).
+    // Seed `search.collection` from the legacy value ONLY when it isn't
+    // already set (never overwrite the user's current value).
     let search_key = serde_yaml::Value::String("search".to_string());
     let collection_key = serde_yaml::Value::String("collection".to_string());
     let search_collection_set = mapping
@@ -1152,39 +1190,32 @@ fn fix_legacy_qmd_collection(vault_root: &Path, json: bool) -> FixOutcome {
         .map(|s| s.contains_key(&collection_key))
         .unwrap_or(false);
 
+    // Apply the change as line edits on the original text.
+    let mut current = text.clone();
     let mut seeded = false;
     if !search_collection_set {
         if let Some(value) = &legacy_str {
-            // Ensure `search` is a mapping, then set `collection`.
-            let needs_replace = match mapping.get(&search_key) {
-                Some(v) => !v.is_mapping(),
-                None => true,
-            };
-            if needs_replace {
-                mapping.insert(
-                    search_key.clone(),
-                    serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
-                );
-            }
-            let search = mapping
-                .get_mut(&search_key)
-                .and_then(|v| v.as_mapping_mut())
-                .expect("search key ensured to be a mapping");
-            search.insert(collection_key, serde_yaml::Value::String(value.clone()));
+            current = onebrain_fs::yaml_edit::upsert_child(&current, "search", "collection", value);
             seeded = true;
         }
     }
+    // Remove the legacy key — located above via the parse, so this succeeds
+    // for the block-form key.
+    match onebrain_fs::yaml_edit::delete_key(&current, &["qmd_collection"]) {
+        Some(updated) => current = updated,
+        None => {
+            return FixOutcome::Failed(format!(
+                "{filename}: could not remove legacy qmd_collection key (unsupported shape)"
+            ))
+        }
+    }
 
-    let serialized = match serde_yaml::to_string(&yaml) {
-        Ok(s) => s,
-        Err(e) => return FixOutcome::Failed(format!("serialize {filename}: {e}")),
-    };
-    // Defense-in-depth: back up before the re-serializing write (drops
-    // comments). Hard precondition — no write without a backup.
+    // Defense-in-depth: back up before the write. Hard precondition — no write
+    // without a backup.
     if let Err(e) = onebrain_fs::backup_config_file(&path) {
         return FixOutcome::Failed(format!("backup {filename} before write: {e}"));
     }
-    if let Err(e) = onebrain_fs::atomic_write_text(&path, &serialized) {
+    if let Err(e) = onebrain_fs::atomic_write_text(&path, &current) {
         return FixOutcome::Failed(format!("write {filename}: {e}"));
     }
 
@@ -1198,7 +1229,7 @@ fn fix_legacy_qmd_collection(vault_root: &Path, json: bool) -> FixOutcome {
         // seeding (nothing sensible to seed from).
         "removed legacy qmd_collection (non-string value — not migrated)".to_string()
     };
-    FixOutcome::Fixed(format!("{action} (note: YAML comments not preserved)"))
+    FixOutcome::Fixed(action)
 }
 
 /// Recipe — `settings-hooks` warning means the Stop hook, PostToolUse
@@ -1361,12 +1392,15 @@ fn fix_plugin_cache(json: bool) -> FixOutcome {
 ///
 /// The recipe handles all three. Out-of-range VALUES (e.g. non-positive
 /// `checkpoint.messages`) are the `config-values` check's territory since
-/// v3.4.8 — its recipe resets them via the comment-preserving line editor,
-/// so they must NOT be repaired here (this recipe's serde re-serialization
-/// would destroy the file's comments first). YAML comments are not preserved
-/// when this recipe does write (serde_yaml re-serializes from the parsed
-/// model) — the Fixed message calls this out so the user knows what changed
-/// besides the keys.
+/// v3.4.8 — its recipe resets them via the comment-preserving line editor.
+///
+/// v3.4.8 (issue #200): this recipe now writes via comment-preserving line
+/// edits too ([`onebrain_fs::yaml_edit`] — `append_top_level` / `upsert_child`
+/// for backfills, `delete_key` for deprecated keys), so it no longer destroys
+/// the file's comments. That also makes recipe ORDER irrelevant: it runs
+/// before the `config-values` recipe, but since neither drops comments a
+/// legacy vault's user comments survive the whole `--fix` pass. serde is used
+/// ONLY read-only, to classify what needs changing.
 fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
     use onebrain_core::{find_config_file, CONFIG_FILENAME};
     // Operate on whichever config file is present — canonical preferred,
@@ -1383,102 +1417,129 @@ fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
         Ok(t) => t,
         Err(e) => return FixOutcome::Failed(format!("read {filename}: {e}")),
     };
-    let mut yaml: serde_yaml::Value = match serde_yaml::from_str(&text) {
+    // Read-only parse — used ONLY to classify the changes, never to
+    // re-serialize (that would drop comments).
+    let yaml: serde_yaml::Value = match serde_yaml::from_str(&text) {
         Ok(v) => v,
         Err(e) => return FixOutcome::Failed(format!("parse {filename}: {e}")),
     };
-    let mapping = match yaml.as_mapping_mut() {
+    let mapping = match yaml.as_mapping() {
         Some(m) => m,
         None => return FixOutcome::Failed(format!("{filename} root is not a mapping")),
     };
+    let get = |key: &str| mapping.get(serde_yaml::Value::String(key.to_string()));
+    let submap = |key: &str| get(key).and_then(|v| v.as_mapping()).map(|m| m.to_owned());
 
     let mut added: Vec<&'static str> = Vec::new();
     let mut removed: Vec<&'static str> = Vec::new();
+    // Apply every change as a comment-preserving line edit on the original text.
+    let mut current = text.clone();
 
-    // 1. Backfill `update_channel`.
-    let channel_key = serde_yaml::Value::String("update_channel".to_string());
-    if !mapping.contains_key(&channel_key) {
-        mapping.insert(channel_key, serde_yaml::Value::String("stable".to_string()));
+    // 1. Backfill `update_channel` (top-level append when genuinely absent).
+    if get("update_channel").is_none() {
+        current = onebrain_fs::yaml_edit::append_top_level(&current, "update_channel", "stable");
         added.push("update_channel");
     }
 
-    // 2. Backfill `folders.<key>` defaults. If `folders` is missing OR null
-    //    OR not a mapping, replace it with an empty mapping before inserting.
-    //    `entry().or_insert_with()` does NOT replace existing nulls, hence
-    //    the explicit check.
-    let folders_key = serde_yaml::Value::String("folders".to_string());
-    let needs_replace = match mapping.get(&folders_key) {
-        Some(v) => !v.is_mapping(),
-        None => true,
-    };
-    if needs_replace {
-        mapping.insert(
-            folders_key.clone(),
-            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
-        );
+    // 2. Backfill `folders.<key>` defaults. `upsert_child` creates the
+    //    `folders:` block when it is missing / null / non-mapping, then
+    //    inserts each absent child — comments and existing children intact.
+    const STANDARD: &[(&str, &str)] = &[
+        ("inbox", "00-inbox"),
+        ("projects", "01-projects"),
+        ("areas", "02-areas"),
+        ("knowledge", "03-knowledge"),
+        ("resources", "04-resources"),
+        ("agent", "05-agent"),
+        ("archive", "06-archive"),
+        ("logs", "07-logs"),
+    ];
+    let folders = submap("folders");
+    for (key, default) in STANDARD {
+        let present = folders
+            .as_ref()
+            .map(|f| f.contains_key(serde_yaml::Value::String((*key).to_string())))
+            .unwrap_or(false);
+        if !present {
+            current = onebrain_fs::yaml_edit::upsert_child(&current, "folders", key, default);
+            added.push(*key);
+        }
     }
-    if let Some(folders) = mapping
-        .get_mut(&folders_key)
-        .and_then(|v| v.as_mapping_mut())
-    {
-        const STANDARD: &[(&str, &str)] = &[
-            ("inbox", "00-inbox"),
-            ("projects", "01-projects"),
-            ("areas", "02-areas"),
-            ("knowledge", "03-knowledge"),
-            ("resources", "04-resources"),
-            ("agent", "05-agent"),
-            ("archive", "06-archive"),
-            ("logs", "07-logs"),
-        ];
-        for (key, default) in STANDARD {
-            let yaml_key = serde_yaml::Value::String((*key).to_string());
-            if !folders.contains_key(&yaml_key) {
-                folders.insert(yaml_key, serde_yaml::Value::String((*default).to_string()));
-                added.push(*key);
+
+    // 3. Strip deprecated keys (comment-preserving delete). Any key the
+    //    classification says is PRESENT but the line editor cannot remove
+    //    (e.g. it lives inside an inline flow mapping) must surface as
+    //    un-fixable — never a silent success that leaves the deprecated key
+    //    behind forever (matches `fix_legacy_qmd_collection`'s contract).
+    let mut unfixable: Vec<&'static str> = Vec::new();
+    for key in &["onebrain_version", "method"] {
+        if get(key).is_some() {
+            match onebrain_fs::yaml_edit::delete_key(&current, &[key]) {
+                Some(updated) => {
+                    current = updated;
+                    removed.push(*key);
+                }
+                None => unfixable.push(*key),
+            }
+        }
+    }
+    if let Some(runtime) = submap("runtime") {
+        let has_harness = runtime.contains_key(serde_yaml::Value::String("harness".to_string()));
+        // Whether removing `harness` leaves the block empty (only child), so
+        // the whole `runtime` block should go — keeps the file tidy.
+        let only_harness = runtime.len() == usize::from(has_harness);
+        if has_harness {
+            match onebrain_fs::yaml_edit::delete_key(&current, &["runtime", "harness"]) {
+                Some(updated) => {
+                    current = updated;
+                    removed.push("runtime.harness");
+                    if only_harness {
+                        if let Some(updated) =
+                            onebrain_fs::yaml_edit::delete_key(&current, &["runtime"])
+                        {
+                            current = updated;
+                        }
+                    }
+                }
+                // The nested delete refuses an inline parent
+                // (`runtime: {harness: x}`). When harness is the ONLY entry,
+                // removing the whole top-level line is equivalent — the final
+                // key of a delete path may carry an inline value. With a
+                // sibling key inside the flow mapping there is no safe line
+                // edit: surface it instead of silently succeeding.
+                None if only_harness => {
+                    match onebrain_fs::yaml_edit::delete_key(&current, &["runtime"]) {
+                        Some(updated) => {
+                            current = updated;
+                            removed.push("runtime.harness");
+                        }
+                        None => unfixable.push("runtime.harness"),
+                    }
+                }
+                None => unfixable.push("runtime.harness"),
+            }
+        } else if runtime.is_empty() {
+            // Pre-existing tidy-up: an already-empty `runtime:` block is
+            // dropped (not counted in `removed`, matching the old message).
+            if let Some(updated) = onebrain_fs::yaml_edit::delete_key(&current, &["runtime"]) {
+                current = updated;
             }
         }
     }
 
-    // 3. Strip deprecated keys.
-    for key in &["onebrain_version", "method"] {
-        let k = serde_yaml::Value::String((*key).to_string());
-        if mapping.remove(&k).is_some() {
-            removed.push(*key);
-        }
-    }
-    let runtime_key = serde_yaml::Value::String("runtime".to_string());
-    if let Some(runtime) = mapping
-        .get_mut(&runtime_key)
-        .and_then(|v| v.as_mapping_mut())
-    {
-        let harness_key = serde_yaml::Value::String("harness".to_string());
-        if runtime.remove(&harness_key).is_some() {
-            removed.push("runtime.harness");
-        }
-        // Drop the parent `runtime` block if it's now empty — keeps the
-        // file tidy after the deprecated child key is removed.
-        let now_empty = runtime.is_empty();
-        if now_empty {
-            mapping.remove(&runtime_key);
-        }
-    }
-
-    if added.is_empty() && removed.is_empty() {
+    if added.is_empty() && removed.is_empty() && unfixable.is_empty() {
         return FixOutcome::Fixed(format!("{filename} already in expected shape"));
     }
 
-    let serialized = match serde_yaml::to_string(&yaml) {
-        Ok(s) => s,
-        Err(e) => return FixOutcome::Failed(format!("serialize {filename}: {e}")),
-    };
-    // Defense-in-depth: back up the config before this re-serializing write
-    // (which drops comments). Hard precondition — no write without a backup.
-    if let Err(e) = onebrain_fs::backup_config_file(&path) {
-        return FixOutcome::Failed(format!("backup {filename} before write: {e}"));
-    }
-    if let Err(e) = onebrain_fs::atomic_write_text(&path, &serialized) {
-        return FixOutcome::Failed(format!("write {filename}: {e}"));
+    if !added.is_empty() || !removed.is_empty() {
+        // Defense-in-depth: back up before the write. Hard precondition — no
+        // write without a backup.
+        if let Err(e) = onebrain_fs::backup_config_file(&path) {
+            return FixOutcome::Failed(format!("backup {filename} before write: {e}"));
+        }
+        if let Err(e) = onebrain_fs::atomic_write_text(&path, &current) {
+            return FixOutcome::Failed(format!("write {filename}: {e}"));
+        }
     }
 
     let mut parts = Vec::new();
@@ -1492,10 +1553,20 @@ fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
             removed.join(", ")
         ));
     }
-    FixOutcome::Fixed(format!(
-        "{} (note: YAML comments not preserved)",
-        parts.join(" · ")
-    ))
+    if !unfixable.is_empty() {
+        parts.push(format!(
+            "could not remove deprecated (unsupported YAML shape, e.g. inline mapping): {} — edit manually",
+            unfixable.join(", ")
+        ));
+        // Honest tri-state, mirroring fix_config_values: real progress landed
+        // AND something remains → Partial; nothing landed → Failed.
+        return if !added.is_empty() || !removed.is_empty() {
+            FixOutcome::Partial(parts.join(" · "))
+        } else {
+            FixOutcome::Failed(parts.join(" · "))
+        };
+    }
+    FixOutcome::Fixed(parts.join(" · "))
 }
 
 /// Recipe — `claude-settings` warning means `.claude/settings.json`
@@ -1826,6 +1897,14 @@ fn config_has_inline_stats(text: &str) -> bool {
 /// defaulting to two spaces. An inline `stats: {…}` mapping is left
 /// untouched (returns `None`) rather than risk corrupting it.
 fn upsert_doctor_stats(text: &str, today: &str, also_fix: bool) -> Option<String> {
+    // Decline a flow-style root (`{…}`) the same way `restructure_config` does:
+    // it parses as a mapping but has no block-form lines, so appending a block
+    // `stats:` after it would produce invalid YAML on the next read. Exotic (no
+    // tool writes a flow-root config), but cheap to guard now that stamping
+    // shares the yaml_edit-family shape rules.
+    if text.trim_start().starts_with('{') {
+        return None;
+    }
     let is_indented = |l: &str| l.starts_with(' ') || l.starts_with('\t');
     // Preserve the file's existing line ending (CRLF on Windows-authored
     // configs) — `lines()` strips the `\r`, so we rejoin with whichever the
@@ -1967,6 +2046,12 @@ fn stamp_doctor_run(vault_root: &Path, fix: bool, quiet: bool) {
                 path.display()
             );
         }
+        None if !quiet && text.trim_start().starts_with('{') => {
+            eprintln!(
+                "doctor: {} has a flow-style (`{{…}}`) root; last_doctor_run not stamped — convert it to block form to enable stamping",
+                path.display()
+            );
+        }
         None => {}
     }
 }
@@ -2071,28 +2156,129 @@ fn step_status_of(status: DoctorStatus) -> crate::output::StepStatus {
     }
 }
 
+// ── Summary box: colour + display-fold helpers ───────────────────────────
+// Width-stable glyphs only (the ✓/⚠/✗ set the check rows already render
+// aligned in the user's terminal — no variation-selector emoji, whose
+// unicode-width can disagree with the drawn width and break the box border).
+const SGR_GREEN: &str = "\x1b[32m";
+const SGR_YELLOW: &str = "\x1b[33m";
+const SGR_RED: &str = "\x1b[31m";
+const SGR_CYAN: &str = "\x1b[36m";
+
+/// `true` for a warn/fail result (an "issue").
+fn is_issue(r: &DoctorResult) -> bool {
+    matches!(r.status, DoctorStatus::Warn | DoctorStatus::Error)
+}
+
+/// Worst of two optional statuses (fail dominates warn dominates ok). `None`
+/// contributes nothing.
+fn worse(a: Option<DoctorStatus>, b: Option<DoctorStatus>) -> Option<DoctorStatus> {
+    let rank = |s: DoctorStatus| match s {
+        DoctorStatus::Error => 2,
+        DoctorStatus::Warn => 1,
+        DoctorStatus::Ok => 0,
+    };
+    match (a, b) {
+        (Some(x), Some(y)) => Some(if rank(x) >= rank(y) { x } else { y }),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+/// One display row (post-migration-merge) shown in the checking sections AND
+/// counted in the summary box. Text-display only — JSON keeps the underlying
+/// checks separate.
+struct DisplayRow {
+    name: String,
+    status: DoctorStatus,
+    message: String,
+}
+
+/// Fold `vault-config-migration` + `legacy-qmd-collection` into one `migration`
+/// row: severity = worst of the two, message names the legacy items actually
+/// present. Returns `None` only when NEITHER underlying check ran.
+fn migration_row(results: &[DoctorResult]) -> Option<DisplayRow> {
+    let vc = results.iter().find(|r| r.check == "vault-config-migration");
+    let qc = results.iter().find(|r| r.check == "legacy-qmd-collection");
+    if vc.is_none() && qc.is_none() {
+        return None;
+    }
+    let status = worse(vc.map(|r| r.status), qc.map(|r| r.status)).unwrap_or(DoctorStatus::Ok);
+    let mut items: Vec<&str> = Vec::new();
+    if vc.is_some_and(is_issue) {
+        items.push("legacy vault.yml");
+    }
+    if qc.is_some_and(is_issue) {
+        items.push("qmd_collection key");
+    }
+    let message = if items.is_empty() {
+        "nothing to migrate".to_string()
+    } else {
+        items.join(" · ")
+    };
+    Some(DisplayRow {
+        name: "migration".to_string(),
+        status,
+        message,
+    })
+}
+
+/// The checks in canonical (section) display order, with the two migration
+/// checks folded into a single `migration` row. Drives both the section render
+/// and the summary box so their tallies and ordering can't drift.
+fn display_rows(results: &[DoctorResult]) -> Vec<DisplayRow> {
+    let mut rows: Vec<DisplayRow> = Vec::new();
+    let mut placed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (_, _, checks) in DOCTOR_SECTIONS {
+        for name in checks {
+            if *name == "legacy-qmd-collection" {
+                placed.insert(name);
+                continue; // folded into the `migration` row below
+            }
+            if *name == "vault-config-migration" {
+                placed.insert("vault-config-migration");
+                placed.insert("legacy-qmd-collection");
+                if let Some(row) = migration_row(results) {
+                    rows.push(row);
+                }
+                continue;
+            }
+            if let Some(r) = results.iter().find(|r| r.check == *name) {
+                rows.push(DisplayRow {
+                    name: display_label(&r.check).to_string(),
+                    status: r.status,
+                    message: r.message.clone(),
+                });
+                placed.insert(name);
+            }
+        }
+    }
+    // Defensive: any unmapped check still shows, so nothing is silently dropped.
+    for r in results
+        .iter()
+        .filter(|r| !placed.contains(r.check.as_str()))
+    {
+        rows.push(DisplayRow {
+            name: display_label(&r.check).to_string(),
+            status: r.status,
+            message: r.message.clone(),
+        });
+    }
+    rows
+}
+
 /// Bucket `results` into the 4 display sections as [`Section`]s of [`Step`]s.
 ///
-/// - Detail = the check's `message` (the right-hand status text).
-/// - Hint = the check's `hint`, but only carried for warn / fail (passes stay
-///   quiet per the design; the primitive also drops hints on OK steps).
-/// - Any result whose check name isn't in [`DOCTOR_SECTIONS`] is appended to a
-///   trailing "Other" section so nothing is silently dropped — a defensive
-///   guard against a new check landing without a section assignment.
+/// NO inline hints (v3.4.8 — every hint moved to the bottom Summary box). The
+/// two legacy-migration checks fold into one `migration` row. Any result whose
+/// check name isn't in [`DOCTOR_SECTIONS`] is appended to a trailing "Other"
+/// section so nothing is silently dropped.
 fn build_sections(results: &[DoctorResult]) -> Vec<crate::output::Section> {
     use crate::output::{Section, Step};
 
-    let to_step = |r: &DoctorResult| {
-        let hint = match r.status {
-            DoctorStatus::Ok => None,
-            _ => r.hint.clone(),
-        };
-        Step::new(
-            display_label(&r.check),
-            step_status_of(r.status),
-            Some(r.message.clone()),
-            hint,
-        )
+    // Detail = message; hint always None (moved to the Summary box).
+    let step = |name: &str, status: DoctorStatus, message: String| {
+        Step::new(name, step_status_of(status), Some(message), None)
     };
 
     let mut sections: Vec<Section> = Vec::with_capacity(DOCTOR_SECTIONS.len());
@@ -2101,9 +2287,21 @@ fn build_sections(results: &[DoctorResult]) -> Vec<crate::output::Section> {
     for (emoji, header, checks) in DOCTOR_SECTIONS {
         let mut steps = Vec::new();
         for name in checks {
+            if *name == "legacy-qmd-collection" {
+                placed.insert(name);
+                continue; // folded into `migration`
+            }
+            if *name == "vault-config-migration" {
+                placed.insert("vault-config-migration");
+                placed.insert("legacy-qmd-collection");
+                if let Some(row) = migration_row(results) {
+                    steps.push(step(&row.name, row.status, row.message));
+                }
+                continue;
+            }
             if let Some(r) = results.iter().find(|r| r.check == *name) {
-                steps.push(to_step(r));
-                placed.insert(*name);
+                steps.push(step(display_label(&r.check), r.status, r.message.clone()));
+                placed.insert(name);
             }
         }
         if !steps.is_empty() {
@@ -2115,7 +2313,7 @@ fn build_sections(results: &[DoctorResult]) -> Vec<crate::output::Section> {
     let leftovers: Vec<Step> = results
         .iter()
         .filter(|r| !placed.contains(r.check.as_str()))
-        .map(to_step)
+        .map(|r| step(display_label(&r.check), r.status, r.message.clone()))
         .collect();
     if !leftovers.is_empty() {
         sections.push(Section::with_emoji("❓", "Other", leftovers));
@@ -2124,98 +2322,253 @@ fn build_sections(results: &[DoctorResult]) -> Vec<crate::output::Section> {
     sections
 }
 
-/// Render the summary footer: a rule, the verdict line (overall glyph, the
-/// ok/warn/fail counts, and the total), plus an optional `--fix` next-action
-/// hint when there are repairable issues. Plain grouped-convention lines — no
-/// framing rules:
-///
-/// ```text
-/// ⚠️  11 ok · 1 warning · 0 fail · 12 checks
-/// 💡  Run onebrain doctor --fix to auto-repair
-/// ```
-///
-/// The verdict emoji follows the row-glyph semantics (fail dominates, then
-/// warn, then ok): ✅ / ⚠️ / ❌.
-fn write_summary_footer<W: Write>(w: &mut W, results: &[DoctorResult]) -> Result<()> {
-    let total = results.len();
-    let errors = results
+/// First whitespace-delimited integer in `msg` (e.g. the leading count in
+/// "3 unmerged checkpoint(s) …").
+fn leading_count(msg: &str) -> Option<usize> {
+    msg.split_whitespace().next()?.parse().ok()
+}
+
+/// The integer immediately before the word `pending` in `msg` (e.g. `6` in
+/// "721 indexed · 6 pending").
+fn pending_count(msg: &str) -> Option<usize> {
+    let toks: Vec<&str> = msg.split_whitespace().collect();
+    toks.windows(2)
+        .find(|w| w[1].trim_end_matches(['.', ',']) == "pending")
+        .and_then(|w| w[0].parse().ok())
+}
+
+/// Short outcome phrase for each auto-fixable check — what `--fix` will do.
+fn fix_phrase(check: &str) -> Option<&'static str> {
+    match check {
+        "onebrain.yml-keys" => Some("backfill missing keys"),
+        "config-values" => Some("document keys + restructure layout"),
+        "folders" => Some("create missing folders"),
+        "plugin-files" => Some("re-download plugin files"),
+        "plugin-cache" => Some("clear stale plugin cache"),
+        "settings-hooks" => Some("register hooks"),
+        "claude-settings" => Some("remove stale marketplace entry"),
+        _ => None,
+    }
+}
+
+/// Compose the single `onebrain doctor --fix` outcome from every present
+/// fixable finding — migration items listed by what's actually present, other
+/// recipes by their short phrase, in canonical order. Deduped into one line.
+fn fix_outcome_summary(results: &[DoctorResult]) -> String {
+    let issue = |name: &str| results.iter().any(|r| r.check == name && is_issue(r));
+    let mut phrases: Vec<String> = Vec::new();
+
+    let mut legacy: Vec<&str> = Vec::new();
+    if issue("vault-config-migration") {
+        legacy.push("vault.yml");
+    }
+    if issue("legacy-qmd-collection") {
+        legacy.push("qmd_collection key");
+    }
+    if !legacy.is_empty() {
+        phrases.push(format!("migrate legacy config ({})", legacy.join(" · ")));
+    }
+    for (_, _, checks) in DOCTOR_SECTIONS {
+        for name in checks {
+            if issue(name) {
+                if let Some(p) = fix_phrase(name) {
+                    phrases.push(p.to_string());
+                }
+            }
+        }
+    }
+    if phrases.is_empty() {
+        "auto-repair".to_string()
+    } else {
+        phrases.join(" · ")
+    }
+}
+
+/// One `(command, outcome)` action line for a non-fixable finding's hint.
+/// `outcome` is empty when there's no distinct outcome to spell out (rendered
+/// as a bare `💡 <command>`).
+fn action_from_result(r: &DoctorResult) -> (String, String) {
+    let hint = r.hint.as_deref().unwrap_or("");
+    if hint.contains("/wrapup") {
+        let n = leading_count(&r.message).unwrap_or(0);
+        return ("/wrapup".to_string(), format!("merge {n} checkpoint(s)"));
+    }
+    if hint.contains("search reindex") {
+        let outcome = match pending_count(&r.message) {
+            Some(n) => format!("embed {n} pending doc(s)"),
+            None => "reindex the search index".to_string(),
+        };
+        return ("onebrain search reindex".to_string(), outcome);
+    }
+    (hint.to_string(), String::new())
+}
+
+/// The deduplicated action lines for the summary box: the single
+/// `onebrain doctor --fix` line first (when anything is auto-fixable), then
+/// each unique non-fixable action in canonical check order.
+fn summary_action_lines(results: &[DoctorResult]) -> Vec<(String, String)> {
+    let ordered: Vec<&DoctorResult> = DOCTOR_SECTIONS
+        .iter()
+        .flat_map(|(_, _, checks)| checks.iter())
+        .filter_map(|name| results.iter().find(|r| r.check == *name))
+        .chain(results.iter().filter(|r| {
+            !DOCTOR_SECTIONS
+                .iter()
+                .any(|(_, _, cs)| cs.contains(&r.check.as_str()))
+        }))
+        .collect();
+
+    let mut lines: Vec<(String, String)> = Vec::new();
+    if ordered
+        .iter()
+        .any(|r| is_issue(r) && planned_action(r).is_some())
+    {
+        lines.push((
+            "onebrain doctor --fix".to_string(),
+            fix_outcome_summary(results),
+        ));
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in ordered.iter().filter(|r| is_issue(r)) {
+        // Auto-fixable findings are covered by the single --fix line above.
+        if planned_action(r).is_some() || r.hint.is_none() {
+            continue;
+        }
+        let (cmd, outcome) = action_from_result(r);
+        if cmd.is_empty() {
+            continue;
+        }
+        if seen.insert(cmd.clone()) {
+            lines.push((cmd, outcome));
+        }
+    }
+    lines
+}
+
+/// Render the bottom Summary box (Variant A): a titled single-line box sharing
+/// [`crate::output::boxed::render_boxed_table`] with `search model list` so the
+/// two box styles can't drift. Contents: the `N ok · N warnings · N fail`
+/// tally (migration folded to ONE row), the non-ok findings (fails before
+/// warnings), then the deduplicated `💡 command → outcome` action lines. An
+/// all-ok run collapses to a single `✓ N checks · all ok` line. Colour wraps
+/// content only (borders unstyled) so the right border stays flush.
+fn render_summary_box<W: Write>(w: &mut W, results: &[DoctorResult], color: bool) -> Result<()> {
+    let rows = display_rows(results);
+    let total = rows.len();
+    let fails = rows
         .iter()
         .filter(|r| r.status == DoctorStatus::Error)
         .count();
-    let warnings = results
+    let warns = rows
         .iter()
         .filter(|r| r.status == DoctorStatus::Warn)
         .count();
-    let passing = total - errors - warnings;
+    let oks = total - fails - warns;
 
-    // Overall verdict emoji: fail dominates, then warn, then ok.
-    let verdict = if errors > 0 {
-        "❌"
-    } else if warnings > 0 {
-        "⚠️"
+    let mut content: Vec<(String, Option<&str>)> = Vec::new();
+    if fails == 0 && warns == 0 {
+        content.push((format!("✓ {total} checks · all ok"), Some(SGR_GREEN)));
     } else {
-        "✅"
-    };
+        let warn_word = if warns == 1 { "warning" } else { "warnings" };
+        content.push((
+            format!("{oks} ok · {warns} {warn_word} · {fails} fail"),
+            None,
+        ));
+        content.push((String::new(), None));
 
-    // "fail" has no plural form; "warning" does.
-    let warnings_word = if warnings == 1 { "warning" } else { "warnings" };
+        // Findings — fails first, then warnings; name column padded so messages
+        // align. Whole row coloured by severity (SGR wraps content only).
+        let name_w = rows
+            .iter()
+            .filter(|r| is_row_issue(r))
+            .map(|r| r.name.len())
+            .max()
+            .unwrap_or(0);
+        for status in [DoctorStatus::Error, DoctorStatus::Warn] {
+            let (glyph, sgr) = if status == DoctorStatus::Error {
+                ("✗", SGR_RED)
+            } else {
+                ("⚠", SGR_YELLOW)
+            };
+            for r in rows.iter().filter(|r| r.status == status) {
+                content.push((
+                    format!("{glyph}  {:<name_w$}  {}", r.name, r.message),
+                    Some(sgr),
+                ));
+            }
+        }
 
+        // Action lines — deduped, two-column (command padded so arrows align).
+        let actions = summary_action_lines(results);
+        if !actions.is_empty() {
+            content.push((String::new(), None));
+            let cmd_w = actions.iter().map(|(c, _)| c.len()).max().unwrap_or(0);
+            for (cmd, outcome) in &actions {
+                let line = if outcome.is_empty() {
+                    format!("💡 {cmd}")
+                } else {
+                    format!("💡 {cmd:<cmd_w$}  →  {outcome}")
+                };
+                content.push((line, Some(SGR_CYAN)));
+            }
+        }
+    }
+
+    let lines = crate::output::boxed::render_boxed_table(" Summary ", &content, color);
     writeln!(w)?;
-    writeln!(
-        w,
-        "{verdict}  {passing} ok · {warnings} {warnings_word} · {errors} fail · {total} checks"
-    )?;
-    // `--fix` next-action — shown only when at least one issue has an
-    // automated recipe. A manual-only remainder (e.g. a pending search
-    // reindex) gets no pointer, since `--fix` can't repair it.
-    let any_auto_fixable = results.iter().any(|r| {
-        matches!(r.status, DoctorStatus::Warn | DoctorStatus::Error) && planned_action(r).is_some()
-    });
-    if any_auto_fixable {
-        writeln!(w, "💡  Run onebrain doctor --fix to auto-repair")?;
+    for l in lines {
+        writeln!(w, "{l}")?;
     }
     Ok(())
 }
 
-/// Render the full grouped report to `w` via a [`ProgressRenderer`].
+/// `true` for a warn/fail display row.
+fn is_row_issue(r: &DisplayRow) -> bool {
+    matches!(r.status, DoctorStatus::Warn | DoctorStatus::Error)
+}
+
+/// The doctor report header line: `🩺  Doctor · <vault> · onebrain <version>`.
+fn doctor_header(vault_name: &str) -> String {
+    format!(
+        "🩺  Doctor · {vault_name} · onebrain {}",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// Render the full grouped report to `w`: the `🩺 Doctor …` header, the four
+/// grouped checking sections (NO inline hints), then — when `show_summary` —
+/// the bottom Summary box.
 ///
-/// Grouped-status convention throughout: no framed header, no rules — the
-/// report opens directly with the first emoji-headed section, body rows are
-/// four-space indented with their verdict glyphs, and the footer is plain
-/// convention lines.
+/// `animate` drives the gating seam: true paints the braille spinner + paced
+/// reveal (colour TTY, non-quiet, text mode); false emits only the static
+/// lines (deterministic tests). `color` is the resolved colour bit.
 ///
-/// `animate` drives the gating seam: when true the renderer paints the
-/// braille spinner + paced reveal (colour TTY, non-quiet, text mode); when
-/// false it emits only the static lines (deterministic tests). `color` is the
-/// resolved colour bit (row/hint styling).
-///
-/// This is the single rendering entry point used for BOTH the initial report
-/// and the post-`--fix` re-render, so they share one layout.
-///
-/// `show_footer` is false for the pre-fix report under `--fix`: the verdict
-/// footer is deferred until after the fix pass so the run shows exactly one
-/// (final) footer instead of a redundant before-and-after pair.
+/// `show_summary` is false for the pre-fix report under `--fix`: the Summary
+/// box is deferred until after the fix pass so the run shows exactly one
+/// (final) summary.
 fn render_grouped_report<W: Write>(
     mut w: W,
     results: &[DoctorResult],
+    vault_name: &str,
     color: bool,
     animate: bool,
-    show_footer: bool,
+    show_summary: bool,
 ) -> Result<()> {
     use crate::output::ProgressRenderer;
+    writeln!(w, "{}", doctor_header(vault_name))?;
     let sections = build_sections(results);
     {
         // force_static = !animate.
         let mut renderer = ProgressRenderer::with_writer(&mut w, !animate, color);
         // Grouped-convention body rows: four-space indent under the emoji
-        // section headers (hints indent three columns deeper).
+        // section headers.
         renderer.set_row_indent("    ");
         for section in &sections {
             renderer.render_section(section)?;
         }
     }
-    if show_footer {
-        write_summary_footer(&mut w, results)?;
+    if show_summary {
+        render_summary_box(&mut w, results, color)?;
     }
     Ok(())
 }
@@ -2224,23 +2577,33 @@ fn render_grouped_report<W: Write>(
 /// colour, non-quiet, interactive terminal (the [`ProgressRenderer`] gate);
 /// piped / non-TTY / structured / `--no-color` / `--quiet` get the instant
 /// static layout.
-///
-/// The gating decision (and colour bit) come from the pure
-/// [`crate::output::should_animate`] / [`crate::output::is_color_text`]
-/// helpers — the single source of truth for "should this animate?" shared
-/// with [`ProgressRenderer::new`].
 fn emit_text_report(
     results: &[DoctorResult],
+    vault_name: &str,
     mode: &OutputMode,
     quiet: bool,
-    show_footer: bool,
+    show_summary: bool,
 ) -> Result<()> {
     use crate::output::{is_color_text, should_animate};
     use std::io::IsTerminal;
     // Compute the gating decision directly — no throwaway renderer round-trip.
     let animate = should_animate(mode, std::io::stdout().is_terminal(), quiet);
     let color = is_color_text(mode);
-    render_grouped_report(std::io::stdout(), results, color, animate, show_footer)
+    render_grouped_report(
+        std::io::stdout(),
+        results,
+        vault_name,
+        color,
+        animate,
+        show_summary,
+    )
+}
+
+/// Emit ONLY the bottom Summary box to stdout (the deferred post-`--fix`
+/// render). Colour is resolved the same way as the full report.
+fn emit_summary_box(results: &[DoctorResult], mode: &OutputMode) -> Result<()> {
+    let color = crate::output::is_color_text(mode);
+    render_summary_box(&mut std::io::stdout(), results, color)
 }
 
 #[cfg(test)]
@@ -2271,14 +2634,27 @@ mod tests {
 
     fn render_static_report(results: &[DoctorResult], color: bool) -> String {
         let mut buf = Vec::new();
-        render_grouped_report(&mut buf, results, color, false, true).unwrap();
+        render_grouped_report(&mut buf, results, "my-vault", color, false, true).unwrap();
         String::from_utf8(buf).unwrap()
+    }
+
+    /// The lines of the bottom Summary box (between its `┌` and `└` borders,
+    /// borders included), for width-integrity + content assertions.
+    fn summary_box_lines(out: &str) -> Vec<&str> {
+        let start = out
+            .lines()
+            .position(|l| l.starts_with("┌ Summary "))
+            .expect("summary box top border");
+        out.lines()
+            .skip(start)
+            .take_while(|l| l.starts_with('┌') || l.starts_with('│') || l.starts_with('└'))
+            .collect()
     }
 
     // ── Section grouping ─────────────────────────────────────────────────
 
     #[test]
-    fn build_sections_assigns_each_check_to_its_section() {
+    fn build_sections_merges_migration_and_assigns_sections() {
         let results = sample_results();
         let sections = build_sections(&results);
         assert_eq!(sections.len(), 4, "expected 4 sections");
@@ -2291,14 +2667,10 @@ mod tests {
                 )
             })
             .collect();
+        // The two legacy-migration checks collapse into one `migration` row.
         assert_eq!(
             by_header["Config"],
-            vec![
-                "onebrain.yml",
-                "schema",
-                "config migration",
-                "qmd_collection"
-            ]
+            vec!["onebrain.yml", "schema", "migration"]
         );
         assert_eq!(
             by_header["Vault structure"],
@@ -2319,36 +2691,77 @@ mod tests {
     }
 
     #[test]
-    fn build_sections_carries_hint_only_for_non_ok() {
+    fn build_sections_never_carry_inline_hints() {
+        // Every hint moved to the Summary box — no section step carries one.
         let results = vec![
             DoctorResult::ok("onebrain.yml", "valid").with_hint("ignored on ok"),
             DoctorResult::warn("settings-hooks", "dup").with_hint("onebrain doctor --fix"),
+            DoctorResult::warn("search", "6 pending").with_hint("onebrain search reindex"),
         ];
         let sections = build_sections(&results);
-        let ok_step = &sections
-            .iter()
-            .flat_map(|s| &s.steps)
-            .find(|st| st.label == "onebrain.yml")
-            .unwrap();
-        assert!(ok_step.hint.is_none(), "OK steps must not carry a hint");
-        let warn_step = sections
-            .iter()
-            .flat_map(|s| &s.steps)
-            .find(|st| st.label == "hooks")
-            .unwrap();
-        assert_eq!(warn_step.hint.as_deref(), Some("onebrain doctor --fix"));
+        assert!(
+            sections
+                .iter()
+                .flat_map(|s| &s.steps)
+                .all(|st| st.hint.is_none()),
+            "no section step may carry an inline hint"
+        );
     }
 
-    // ── Static rendered output: glyphs / labels / hints ──────────────────
+    // ── Merged migration row: four state combos + worst severity ──────────
 
     #[test]
-    fn static_report_shows_header_section_labels_and_glyphs() {
+    fn migration_row_combos_and_worst_severity() {
+        let ok = |check: &'static str| DoctorResult::ok(check, "clean");
+        // Both clean → "nothing to migrate", ok.
+        let row =
+            migration_row(&[ok("vault-config-migration"), ok("legacy-qmd-collection")]).unwrap();
+        assert_eq!(row.message, "nothing to migrate");
+        assert_eq!(row.status, DoctorStatus::Ok);
+        // Legacy vault.yml only.
+        let row = migration_row(&[
+            DoctorResult::warn("vault-config-migration", "vault.yml present"),
+            ok("legacy-qmd-collection"),
+        ])
+        .unwrap();
+        assert_eq!(row.message, "legacy vault.yml");
+        assert_eq!(row.status, DoctorStatus::Warn);
+        // Legacy qmd_collection only.
+        let row = migration_row(&[
+            ok("vault-config-migration"),
+            DoctorResult::warn("legacy-qmd-collection", "qmd key present"),
+        ])
+        .unwrap();
+        assert_eq!(row.message, "qmd_collection key");
+        // Both present → worst severity (error dominates) + both items.
+        let row = migration_row(&[
+            DoctorResult::error("vault-config-migration", "x"),
+            DoctorResult::warn("legacy-qmd-collection", "y"),
+        ])
+        .unwrap();
+        assert_eq!(row.message, "legacy vault.yml · qmd_collection key");
+        assert_eq!(row.status, DoctorStatus::Error);
+        // Neither ran → no row.
+        assert!(migration_row(&[ok("folders")]).is_none());
+    }
+
+    // ── Header + checking sections (no inline hints) ──────────────────────
+
+    #[test]
+    fn report_header_names_vault_and_version() {
         let out = render_static_report(&sample_results(), false);
-        // Grouped convention: no framed header, no rules — the report opens
-        // with the first emoji-headed section.
-        assert!(!out.contains("OneBrain Doctor"), "no framed title: {out:?}");
-        assert!(!out.contains("──"), "no rules anywhere: {out:?}");
-        // Emoji section headers in the `{emoji}  {Title}` shape.
+        assert!(
+            out.lines()
+                .next()
+                .unwrap()
+                .starts_with("🩺  Doctor · my-vault · onebrain "),
+            "header line: {out:?}"
+        );
+    }
+
+    #[test]
+    fn checking_sections_show_labels_glyphs_and_no_inline_hints() {
+        let out = render_static_report(&sample_results(), false);
         for header in [
             "⚙️  Config",
             "📁  Vault structure",
@@ -2357,31 +2770,22 @@ mod tests {
         ] {
             assert!(out.contains(header), "section {header}: {out:?}");
         }
-        // Four-space-indented rows: verdict glyph + label + detail.
         assert!(out.contains("    ✓ onebrain.yml"), "ok line: {out:?}");
-        assert!(out.contains("    ✓ schema"), "schema line: {out:?}");
-        // Warn glyph + label + the indented hint line.
+        assert!(
+            out.contains("    ✓ migration"),
+            "merged migration row: {out:?}"
+        );
         assert!(out.contains("    ⚠ hooks"), "warn line: {out:?}");
+        // NO inline `└ hint` lines anywhere in the checking sections — the
+        // search reindex + doctor --fix hints live only in the Summary box.
         assert!(
-            out.contains("       └ onebrain doctor --fix"),
-            "warn hint line: {out:?}"
+            !out.contains("└ onebrain search reindex"),
+            "no inline reindex hint: {out:?}"
         );
         assert!(
-            out.contains("       └ onebrain search reindex"),
-            "search hint line: {out:?}"
+            !out.contains("└ onebrain doctor --fix"),
+            "no inline --fix hint: {out:?}"
         );
-    }
-
-    #[test]
-    fn static_report_passes_have_no_hint_line() {
-        // A pass that happens to carry a hint must stay quiet.
-        let results = vec![DoctorResult::ok("onebrain.yml", "valid").with_hint("never-shown-hint")];
-        let out = render_static_report(&results, false);
-        assert!(
-            !out.contains("never-shown-hint"),
-            "pass hint leaked: {out:?}"
-        );
-        assert!(!out.contains("└"), "pass must not show └ line: {out:?}");
     }
 
     #[test]
@@ -2393,81 +2797,144 @@ mod tests {
         }
     }
 
-    // ── Summary footer: counts + verdict + --fix action ──────────────────
+    // ── Bottom Summary box ────────────────────────────────────────────────
 
     #[test]
-    fn footer_counts_and_warn_verdict_with_fix_action() {
+    fn summary_box_counts_findings_and_actions() {
         let out = render_static_report(&sample_results(), false);
-        // Plain convention footer: verdict emoji + counts + total on one line.
+        let box_text = summary_box_lines(&out).join("\n");
+        // Tally line — migration folded, so 9 display rows (7 ok · 2 warn).
         assert!(
-            out.contains("⚠️  8 ok · 2 warnings · 0 fail · 10 checks"),
-            "footer line: {out:?}"
+            box_text.contains("7 ok · 2 warnings · 0 fail"),
+            "tally: {box_text}"
         );
-        // Fixable issues → --fix next-action hint shown.
+        // Findings: both warnings listed with their messages.
+        assert!(box_text.contains("⚠"), "warn glyph: {box_text}");
+        assert!(box_text.contains("721 indexed · 6 pending"), "{box_text}");
+        // Deduped action lines: one --fix line, plus the reindex line WITH the
+        // carried pending count.
         assert!(
-            out.contains("💡  Run onebrain doctor --fix to auto-repair"),
-            "fix action: {out:?}"
+            box_text.contains("💡 onebrain doctor --fix"),
+            "fix line: {box_text}"
+        );
+        assert!(
+            box_text.contains("💡 onebrain search reindex")
+                && box_text.contains("embed 6 pending doc(s)"),
+            "reindex action with count: {box_text}"
         );
     }
 
     #[test]
-    fn footer_is_plain_convention_lines_no_rules() {
-        // The grouped convention has no framing rules anywhere: the footer is
-        // the verdict line (+ optional 💡 hint), preceded by one blank line.
-        let out = render_static_report(&sample_results(), false);
+    fn summary_box_fails_before_warnings() {
+        let mut results = sample_results();
+        results[4] = DoctorResult::error("folders", "0/8 present");
+        let out = render_static_report(&results, false);
+        let lines = summary_box_lines(&out);
+        let fail_pos = lines
+            .iter()
+            .position(|l| l.contains("✗"))
+            .expect("fail row");
+        let warn_pos = lines
+            .iter()
+            .position(|l| l.contains("⚠"))
+            .expect("warn row");
         assert!(
-            !out.lines().any(|l| l.chars().any(|c| c == '─')),
-            "no rule lines: {out:?}"
+            fail_pos < warn_pos,
+            "fails must render before warnings: {lines:?}"
         );
-        let verdict = out
-            .lines()
-            .find(|l| l.contains("ok ·") && l.contains("checks"))
-            .expect("verdict line");
         assert!(
-            verdict.starts_with("⚠️  "),
-            "verdict emoji + two spaces: {verdict:?}"
-        );
-        assert!(
-            verdict.trim_end().ends_with("10 checks"),
-            "total on the same line: {verdict:?}"
+            lines.iter().any(|l| l.contains("1 fail")),
+            "fail count: {lines:?}"
         );
     }
 
     #[test]
-    fn footer_all_ok_shows_check_verdict_and_no_fix_action() {
+    fn summary_box_dedupes_fix_line() {
+        // Several fixable findings → exactly ONE `onebrain doctor --fix` line.
+        let results = vec![
+            DoctorResult::warn("settings-hooks", "dup").with_hint("onebrain doctor --fix"),
+            DoctorResult::warn("onebrain.yml-keys", "missing keys").with_hint("x"),
+            DoctorResult::warn("folders", "3/8").with_hint("y"),
+        ];
+        let out = render_static_report(&results, false);
+        let n = summary_box_lines(&out)
+            .iter()
+            .filter(|l| l.contains("onebrain doctor --fix"))
+            .count();
+        assert_eq!(n, 1, "exactly one --fix line: {out}");
+    }
+
+    #[test]
+    fn summary_box_wrapup_action_carries_checkpoint_count() {
+        let results = vec![
+            DoctorResult::ok("onebrain.yml", "ok"),
+            DoctorResult::warn("orphan-checkpoints", "4 unmerged checkpoint(s) in 07-logs/")
+                .with_hint("Run /wrapup to synthesize and merge them"),
+        ];
+        let out = render_static_report(&results, false);
+        let box_text = summary_box_lines(&out).join("\n");
+        assert!(
+            box_text.contains("💡 /wrapup") && box_text.contains("merge 4 checkpoint(s)"),
+            "wrapup action with count: {box_text}"
+        );
+    }
+
+    #[test]
+    fn summary_box_all_ok_is_single_line() {
         let results: Vec<DoctorResult> = sample_results()
             .into_iter()
             .map(|r| DoctorResult::ok(r.check, "ok"))
             .collect();
         let out = render_static_report(&results, false);
+        let box_text = summary_box_lines(&out).join("\n");
+        // 10 checks fold to 9 display rows (migration merged), all ok.
         assert!(
-            out.contains("✅  10 ok · 0 warnings · 0 fail · 10 checks"),
-            "counts: {out:?}"
+            box_text.contains("✓ 9 checks · all ok"),
+            "all-ok line: {box_text}"
         );
-        // All-clean → no --fix pointer.
         assert!(
-            !out.contains("to auto-repair"),
-            "clean run must not show --fix action: {out:?}"
+            !box_text.contains("💡"),
+            "no action lines when clean: {box_text}"
+        );
+        assert!(
+            !box_text.contains("ok ·"),
+            "no tally/findings when clean: {box_text}"
         );
     }
 
     #[test]
-    fn footer_fail_verdict_when_any_error() {
+    fn summary_box_borders_are_flush_including_truncation() {
+        use unicode_width::UnicodeWidthStr;
         let mut results = sample_results();
-        // Index 4 is the `folders` check (Config now carries an extra
-        // legacy-qmd-collection row before it).
-        results[4] =
-            DoctorResult::error("folders", "0/8 present").with_hint("onebrain init --force");
+        results[4] = DoctorResult::error("folders", "0/8 present");
+        // A very long message must be truncated inside the box, not blow the
+        // border out past the cap.
+        results[9] = DoctorResult::warn(
+            "search",
+            "a very long search status message that certainly exceeds the hundred column box width cap and then keeps going well past it",
+        )
+        .with_hint("onebrain search reindex");
         let out = render_static_report(&results, false);
-        assert!(out.contains("✗ folders"), "fail line: {out:?}");
+        let lines = summary_box_lines(&out);
+        let w = lines[0].width();
+        for l in &lines {
+            assert_eq!(l.width(), w, "every box line must share one width: {l:?}");
+            assert!(w <= 100, "box width {w} exceeds the 100-col cap");
+        }
+        // All three glyph types present (✗ fail, ⚠ warn, 💡 action).
+        let joined = lines.join("\n");
+        assert!(joined.contains('✗') && joined.contains('⚠') && joined.contains('💡'));
+    }
+
+    #[test]
+    fn summary_box_no_color_has_no_sgr_but_color_does() {
+        let mono = summary_box_lines(&render_static_report(&sample_results(), false)).join("\n");
         assert!(
-            out.contains("❌  7 ok · 2 warnings · 1 fail · 10 checks"),
-            "fail verdict footer: {out:?}"
+            !mono.contains('\x1b'),
+            "no-color box must carry no SGR: {mono:?}"
         );
-        assert!(
-            out.contains("💡  Run onebrain doctor --fix to auto-repair"),
-            "fix action still shown: {out:?}"
-        );
+        let colored = summary_box_lines(&render_static_report(&sample_results(), true)).join("\n");
+        assert!(colored.contains('\x1b'), "color box must carry SGR");
     }
 
     // ── TTY-gating decision (doctor's emit path) ─────────────────────────
@@ -2620,6 +3087,61 @@ mod tests {
         assert_eq!(doc["checks"][0]["details"][1], "d2");
     }
 
+    /// Pins the text/JSON split invariant for the merged `migration` row:
+    /// JSON `checks[]` carries BOTH `vault-config-migration` and
+    /// `legacy-qmd-collection` as separate entries WITH their hints, while the
+    /// text render folds them into the single `migration` row (neither
+    /// underlying label appears).
+    #[test]
+    fn json_keeps_both_migration_checks_while_text_merges_them() {
+        let results = vec![
+            DoctorResult::warn("vault-config-migration", "vault.yml present")
+                .with_hint("Run onebrain doctor --fix to migrate vault.yml to onebrain.yml"),
+            DoctorResult::warn("legacy-qmd-collection", "qmd_collection key present")
+                .with_hint("onebrain doctor --fix"),
+        ];
+
+        // JSON: two separate entries, hints intact.
+        let mut buf = Vec::new();
+        print_report_structured(
+            &results,
+            false,
+            vec![],
+            true,
+            &legacy_json_compat_mode(),
+            &mut buf,
+        )
+        .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        let checks = doc["checks"].as_array().unwrap();
+        let by_name = |name: &str| {
+            checks
+                .iter()
+                .find(|c| c["check"] == name)
+                .unwrap_or_else(|| panic!("JSON checks[] must keep {name}: {doc}"))
+        };
+        assert_eq!(
+            by_name("vault-config-migration")["hint"],
+            "Run onebrain doctor --fix to migrate vault.yml to onebrain.yml"
+        );
+        assert_eq!(
+            by_name("legacy-qmd-collection")["hint"],
+            "onebrain doctor --fix"
+        );
+
+        // Text: one merged `migration` row naming both legacy items; the
+        // underlying per-check labels never render.
+        let out = render_static_report(&results, false);
+        assert!(
+            out.contains("⚠ migration") && out.contains("legacy vault.yml · qmd_collection key"),
+            "merged row: {out:?}"
+        );
+        assert!(
+            !out.contains("config migration") && !out.contains("⚠ qmd_collection "),
+            "underlying labels must not render in text: {out:?}"
+        );
+    }
+
     /// v3.1 regression guard: doctor must honor `--yaml` and emit YAML, not
     /// the bare JSON envelope (the bug the user found in alpha smoke).
     #[test]
@@ -2747,6 +3269,103 @@ mod tests {
         }
         let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert_eq!(after, original, "file untouched — values are not its job");
+    }
+
+    #[test]
+    fn fix_vault_yml_keys_removes_inline_runtime_harness_when_sole_entry() {
+        // `runtime: {harness: x}` — inline flow mapping whose ONLY entry is the
+        // deprecated key. The nested delete refuses the inline parent, but
+        // removing the whole top-level line is equivalent → must succeed and be
+        // reported as removed (R2 blocker: this used to silently discard the
+        // change).
+        let d = tempdir().unwrap();
+        let full_folders = "folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n";
+        fs::write(
+            d.path().join("onebrain.yml"),
+            format!("update_channel: stable\nruntime: {{harness: claude-code}}\n{full_folders}"),
+        )
+        .unwrap();
+        match fix_vault_yml_keys(d.path(), false) {
+            FixOutcome::Fixed(msg) => assert!(msg.contains("runtime.harness"), "{msg}"),
+            other => panic!("expected Fixed, got {other:?}"),
+        }
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert!(!after.contains("runtime"), "runtime line gone: {after}");
+        assert!(!after.contains("harness"), "harness gone: {after}");
+        assert!(after.contains("inbox: 00-inbox"), "{after}");
+    }
+
+    #[test]
+    fn fix_vault_yml_keys_inline_runtime_with_sibling_surfaces_unfixable() {
+        // `runtime: {harness: x, other: v}` — the deprecated key sits inside an
+        // inline flow mapping WITH a sibling, so no line edit can remove it
+        // without touching the sibling. Must surface as un-fixable (Failed /
+        // Partial), NEVER a silent Fixed that leaves the key behind forever
+        // (R2 blocker).
+        let d = tempdir().unwrap();
+        let full_folders = "folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n";
+        // Variant 1: nothing else to repair → Failed, file untouched.
+        let original = format!(
+            "update_channel: stable\nruntime: {{harness: claude-code, other: v}}\n{full_folders}"
+        );
+        fs::write(d.path().join("onebrain.yml"), &original).unwrap();
+        match fix_vault_yml_keys(d.path(), false) {
+            FixOutcome::Failed(msg) => {
+                assert!(msg.contains("runtime.harness"), "{msg}");
+                assert!(msg.contains("edit manually"), "{msg}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after, original, "un-fixable run must not touch the file");
+
+        // Variant 2: a backfill also lands → Partial (progress + remainder).
+        let d2 = tempdir().unwrap();
+        fs::write(
+            d2.path().join("onebrain.yml"),
+            "runtime: {harness: claude-code, other: v}\nfolders:\n  inbox: 00-inbox\n",
+        )
+        .unwrap();
+        match fix_vault_yml_keys(d2.path(), false) {
+            FixOutcome::Partial(msg) => {
+                assert!(msg.contains("backfilled"), "{msg}");
+                assert!(msg.contains("runtime.harness"), "{msg}");
+                assert!(msg.contains("edit manually"), "{msg}");
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+        let after2 = fs::read_to_string(d2.path().join("onebrain.yml")).unwrap();
+        assert!(after2.contains("update_channel: stable"), "{after2}");
+        assert!(
+            after2.contains("runtime: {harness: claude-code, other: v}"),
+            "inline runtime untouched: {after2}"
+        );
+    }
+
+    #[test]
+    fn fix_vault_yml_keys_preserves_user_comments_through_backfill() {
+        // A legacy vault missing folder keys with user comments: after the
+        // comment-preserving backfill, EVERY user comment survives and the new
+        // folder keys land under an inserted `folders:` block (issue #200 R3 —
+        // ordering no longer destroys comments).
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "# My personal OneBrain config\nupdate_channel: stable\n\
+             folders:\n  # inbox is where captures land\n  inbox: 00-inbox\n\
+             search:\n  collection: ob-1  # my index\n",
+        )
+        .unwrap();
+        let outcome = fix_vault_yml_keys(d.path(), false);
+        assert!(matches!(outcome, FixOutcome::Fixed(_)), "{outcome:?}");
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert!(after.contains("# My personal OneBrain config"), "{after}");
+        assert!(after.contains("# inbox is where captures land"), "{after}");
+        assert!(after.contains("collection: ob-1  # my index"), "{after}");
+        // Missing folder keys backfilled under the existing folders block.
+        assert!(after.contains("projects: 01-projects"), "{after}");
+        assert!(after.contains("logs: 07-logs"), "{after}");
+        assert!(after.contains("inbox: 00-inbox"), "{after}");
     }
 
     #[test]
@@ -3002,8 +3621,14 @@ mod tests {
             DoctorResult::ok("search", "602 indexed · up to date"),
         ];
         let mut buf = Vec::new();
-        render_grouped_report(&mut buf, &results, false, false, true).unwrap();
+        render_grouped_report(&mut buf, &results, "demo-vault", false, false, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
+        // Redact the live version in the header so the snapshot survives version
+        // bumps (the header carries `onebrain <version>`).
+        let output = output.replace(
+            &format!("onebrain {}", env!("CARGO_PKG_VERSION")),
+            "onebrain X.Y.Z",
+        );
         insta::assert_snapshot!(output);
     }
 
@@ -3149,6 +3774,15 @@ mod tests {
     }
 
     #[test]
+    fn upsert_declines_flow_style_root() {
+        // A flow-style (`{…}`) root parses as a mapping but has no block-form
+        // lines — appending a block `stats:` after it would be invalid YAML.
+        // Decline like `restructure_config` does (issue #200 R3).
+        let text = "{update_channel: stable, folders: {inbox: 00-inbox}}\n";
+        assert!(upsert_doctor_stats(text, "2026-05-27", false).is_none());
+    }
+
+    #[test]
     fn stamp_doctor_run_writes_today_into_onebrain_yml() {
         let d = tempdir().unwrap();
         fs::write(d.path().join("onebrain.yml"), "qmd_collection: ob\n").unwrap();
@@ -3287,6 +3921,45 @@ mod tests {
     }
 
     #[test]
+    fn fix_legacy_qmd_collection_preserves_comments_exactly_and_is_idempotent() {
+        // Real commented fixture: top-of-file comment, a lead comment ABOVE the
+        // legacy key itself, an inline comment ON the legacy key line, and a
+        // comment inside an unrelated block. Pinned behavior:
+        // - every comment NOT attached to the deleted key survives verbatim;
+        // - the legacy key's own lead comment and inline comment leave WITH the
+        //   key (delete_key's documented design — a doc comment dangling above
+        //   nothing reads worse than losing it);
+        // - the seeded search block lands at EOF; second run is a no-op.
+        let d = tempdir().unwrap();
+        let original = "# my vault config\n\
+             update_channel: stable\n\
+             # legacy search collection — migrate me\n\
+             qmd_collection: ob-1  # the old key\n\
+             folders:\n  # inbox is sacred\n  inbox: 00-inbox\n";
+        fs::write(d.path().join("onebrain.yml"), original).unwrap();
+
+        let outcome = fix_legacy_qmd_collection(d.path(), false);
+        assert!(matches!(outcome, FixOutcome::Fixed(_)), "{outcome:?}");
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(
+            after,
+            "# my vault config\n\
+             update_channel: stable\n\
+             folders:\n  # inbox is sacred\n  inbox: 00-inbox\n\
+             search:\n  collection: ob-1\n"
+        );
+
+        // Idempotency: a second run reports nothing to migrate and the file is
+        // byte-identical.
+        match fix_legacy_qmd_collection(d.path(), false) {
+            FixOutcome::Fixed(msg) => assert!(msg.contains("nothing to migrate"), "{msg}"),
+            other => panic!("expected Fixed no-op, got {other:?}"),
+        }
+        let after2 = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after2, after, "second run must not rewrite the file");
+    }
+
+    #[test]
     fn fix_legacy_qmd_collection_keeps_existing_search_collection() {
         // Both present → don't overwrite search.collection; just drop the
         // legacy key.
@@ -3406,6 +4079,40 @@ mod tests {
         let yaml = read_config_yaml(d.path());
         assert!(yaml.get("qmd_collection").is_none(), "legacy key remained");
         assert_eq!(yaml["search"]["collection"].as_str(), Some("ob-1"));
+    }
+
+    // ── daemon_status_counts: pure mapping (the warm-daemon routing core) ────
+
+    #[test]
+    fn daemon_status_counts_maps_counts_and_pending() {
+        let body = serde_json::json!({
+            "doc_count": 721,
+            "last_indexed": 1_700_000_000_u64,
+            "pending_new": 4,
+            "pending_changed": 1,
+            "pending_removed": 1,
+        });
+        assert_eq!(
+            daemon_status_counts(&body),
+            Some((Some(1_700_000_000), 721, 6))
+        );
+    }
+
+    #[test]
+    fn daemon_status_counts_defaults_missing_pending_and_last_indexed() {
+        // A healthy, fully-indexed daemon (no drift, no last_indexed field yet)
+        // still maps: doc_count present, pending → 0, last_indexed → None.
+        let body = serde_json::json!({ "doc_count": 0 });
+        assert_eq!(daemon_status_counts(&body), Some((None, 0, 0)));
+    }
+
+    #[test]
+    fn daemon_status_counts_missing_doc_count_is_none() {
+        // A malformed body (no numeric doc_count) is a broken read, NOT a
+        // healthy zero — return None so the caller falls back to a direct open
+        // rather than asserting an empty index.
+        assert!(daemon_status_counts(&serde_json::json!({ "pending_new": 3 })).is_none());
+        assert!(daemon_status_counts(&serde_json::json!({ "doc_count": "nope" })).is_none());
     }
 
     // ── native_search_check: headlessly-testable arms ────────────────────────
@@ -4238,20 +4945,20 @@ mod tests {
         }
     }
 
-    // ── footer: "1 warning" singular form ────────────────────────────────────
+    // ── summary box: "1 warning" singular form ───────────────────────────────
 
     #[test]
-    fn footer_uses_singular_warning_form() {
+    fn summary_box_uses_singular_warning_form() {
         // Exactly 1 warning → "1 warning" not "1 warnings".
         let results = vec![
             DoctorResult::ok("onebrain.yml", "ok"),
             DoctorResult::warn("settings-hooks", "dup"),
         ];
         let mut buf = Vec::new();
-        write_summary_footer(&mut buf, &results).unwrap();
+        render_summary_box(&mut buf, &results, false).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(
-            out.contains("1 warning") && !out.contains("1 warnings"),
+            out.contains("1 warning ·") && !out.contains("1 warnings"),
             "singular form: {out:?}"
         );
     }
@@ -4438,27 +5145,26 @@ mod tests {
         );
     }
 
-    // ── write_summary_footer: manual-only warns → no fix pointer ─────────────
+    // ── summary box: manual-only warns → no --fix line ───────────────────────
 
     #[test]
-    fn write_summary_footer_manual_only_warn_shows_no_fix_action() {
-        // orphan-checkpoints is manual-only (planned_action returns None).
-        // any_auto_fixable = false even though there is a Warn → no fix pointer.
+    fn summary_box_manual_only_warn_shows_no_fix_line() {
+        // orphan-checkpoints is manual-only (planned_action returns None), so
+        // no `onebrain doctor --fix` line — only its own /wrapup action line.
         let results = vec![
             DoctorResult::ok("onebrain.yml", "ok"),
-            DoctorResult::warn("orphan-checkpoints", "2 orphans").with_hint("run /wrapup"),
+            DoctorResult::warn("orphan-checkpoints", "2 unmerged checkpoint(s) in 07-logs/")
+                .with_hint("Run /wrapup to synthesize and merge them"),
         ];
         let mut buf = Vec::new();
-        write_summary_footer(&mut buf, &results).unwrap();
+        render_summary_box(&mut buf, &results, false).unwrap();
         let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("1 warning ·"), "warning counted: {out:?}");
         assert!(
-            out.contains("1 warning"),
-            "warning counted in footer: {out:?}"
+            !out.contains("onebrain doctor --fix"),
+            "no --fix line for manual-only warn: {out:?}"
         );
-        assert!(
-            !out.contains("to auto-repair"),
-            "no fix pointer for manual-only warn: {out:?}"
-        );
+        assert!(out.contains("💡 /wrapup"), "wrapup action present: {out:?}");
     }
 
     // ── step_status_of: all three DoctorStatus → StepStatus arms ────────────

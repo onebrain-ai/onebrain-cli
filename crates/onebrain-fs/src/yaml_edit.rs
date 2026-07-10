@@ -198,6 +198,143 @@ pub fn append_top_level(text: &str, key: &str, value: &str) -> String {
     out
 }
 
+/// Append a top-level `key:` block with `children` (each rendered `  k: v`) to
+/// the end of `text`, preserving newline style and ensuring exactly one
+/// trailing newline before the block. Callers must have verified `key` is
+/// absent at the top level.
+fn append_block(text: &str, key: &str, children: &[(&str, &str)]) -> String {
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut out = text.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push_str(newline);
+    }
+    out.push_str(&format!("{key}:{newline}"));
+    for (k, v) in children {
+        out.push_str(&format!("  {k}: {v}{newline}"));
+    }
+    out
+}
+
+/// Delete the key at `segments` from `text` via a comment-preserving line
+/// edit. Returns `Some(new_text)` on success, or `None` when [`locate`] can't
+/// address the key — a missing key, or a parent that is an inline mapping
+/// (`checkpoint: {…}`) — mirroring [`set_value`]'s locate semantics exactly
+/// (exact indent-level match, block-form parents only).
+///
+/// The deleted region is the key's own line plus its continuation lines: any
+/// following lines indented deeper than the key (the block value's children)
+/// and blank lines interleaved among them. **Design decision:** it also
+/// removes a contiguous run of comment lines sitting directly above the key —
+/// its lead doc-comment — because a doc comment left dangling above nothing
+/// reads worse than dropping it with its key. Blank separators above the key
+/// and sibling keys/comments below are preserved.
+pub fn delete_key(text: &str, segments: &[&str]) -> Option<String> {
+    let (mut lines, newline, ends_with_newline) = split(text);
+    let idx = locate(&lines, segments)?;
+    let key_indent = indent_of(&lines[idx]);
+
+    // End of the deleted region: consume deeper-indented continuation lines
+    // plus interior blanks that still sit inside the deeper block.
+    let mut end = idx + 1;
+    while end < lines.len() {
+        let l = &lines[end];
+        let deeper = !is_blank(l) && indent_of(l) > key_indent;
+        // An interior blank belongs to the block only when the next non-blank
+        // line is still a deeper-indented child.
+        let interior_blank = is_blank(l)
+            && lines[end + 1..]
+                .iter()
+                .find(|n| !is_blank(n))
+                .is_some_and(|n| indent_of(n) > key_indent);
+        if deeper || interior_blank {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+
+    // Start of the deleted region: back up over the key's contiguous lead
+    // comment lines (at any indent).
+    let mut start = idx;
+    while start > 0 && is_comment(&lines[start - 1]) {
+        start -= 1;
+    }
+
+    lines.drain(start..end);
+    Some(join(lines, newline, ends_with_newline))
+}
+
+/// Upsert `parent.key = value` where `parent` is a TOP-LEVEL block key,
+/// preserving comments and every other line. Handles four shapes:
+///
+/// - `parent.key` already present → replace its value ([`set_value`], keeping
+///   any inline comment).
+/// - `parent:` block present, `key` absent → insert `  key: value` as the
+///   block's last child (child indentation matched from an existing child,
+///   else two spaces).
+/// - `parent:` present but inline / scalar / null (not a block header) →
+///   replace that single line with a fresh `parent:` block carrying
+///   `key: value` (the pre-v3.4.8 "replace the non-mapping value" behaviour,
+///   done as a line edit).
+/// - `parent:` absent entirely → append a fresh block at EOF.
+///
+/// Always succeeds (returns `String`): the parent is a top-level key of a
+/// mapping-rooted config, the invariant each writer upholds after its own
+/// read.
+pub fn upsert_child(text: &str, parent: &str, key: &str, value: &str) -> String {
+    // Existing child → value replace (preserves an inline comment).
+    if let Some(out) = set_value(text, &[parent, key], value) {
+        return out;
+    }
+
+    let (mut lines, newline, ends_with_newline) = split(text);
+    let header = format!("{parent}:");
+    let parent_idx = lines
+        .iter()
+        .position(|l| indent_of(l) == 0 && !is_comment(l) && l.trim_start().starts_with(&header));
+
+    let Some(pidx) = parent_idx else {
+        // No `parent:` line at all → append a fresh block.
+        return append_block(text, parent, &[(key, value)]);
+    };
+
+    // Only `parent:` (optionally with a trailing `# comment`) is a block we
+    // can extend; anything else after the colon is an inline/scalar value.
+    let after = lines[pidx].trim_start()[header.len()..].trim_start();
+    if !(after.is_empty() || after.starts_with('#')) {
+        lines.splice(
+            pidx..pidx + 1,
+            [format!("{parent}:"), format!("  {key}: {value}")],
+        );
+        return join(lines, newline, ends_with_newline);
+    }
+
+    // Block header present but `key` absent → insert after the last direct
+    // child (interior blanks skipped; a top-level line or comment ends the
+    // block).
+    let mut last_child = pidx;
+    let mut child_indent: Option<usize> = None;
+    let mut j = pidx + 1;
+    while j < lines.len() {
+        let l = &lines[j];
+        if is_blank(l) {
+            j += 1;
+            continue;
+        }
+        if indent_of(l) == 0 {
+            break;
+        }
+        if !is_comment(l) && child_indent.is_none() {
+            child_indent = Some(indent_of(l));
+        }
+        last_child = j;
+        j += 1;
+    }
+    let indent = " ".repeat(child_indent.unwrap_or(2));
+    lines.insert(last_child + 1, format!("{indent}{key}: {value}"));
+    join(lines, newline, ends_with_newline)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +382,109 @@ mod tests {
         );
         // Refused when the key already sits under a comment.
         assert!(insert_comment_above(&out, &["schedule"], "# again").is_none());
+    }
+
+    #[test]
+    fn delete_key_removes_top_level_key_and_its_lead_comment() {
+        let text = "# doc for a\na: 1\nb: 2\n";
+        let out = delete_key(text, &["a"]).unwrap();
+        assert_eq!(out, "b: 2\n");
+    }
+
+    #[test]
+    fn delete_key_removes_nested_key_preserving_siblings_and_comments() {
+        let text = "search:\n  # keep me\n  collection: c\n  embed_model: m\n";
+        let out = delete_key(text, &["search", "embed_model"]).unwrap();
+        assert_eq!(out, "search:\n  # keep me\n  collection: c\n");
+    }
+
+    #[test]
+    fn delete_key_removes_block_value_children() {
+        let text = "runtime:\n  harness: claude\nfolders:\n  inbox: x\n";
+        let out = delete_key(text, &["runtime"]).unwrap();
+        assert_eq!(out, "folders:\n  inbox: x\n");
+    }
+
+    #[test]
+    fn delete_key_crlf_preserved() {
+        let text = "a: 1\r\nqmd_collection: ob-1\r\nb: 2\r\n";
+        let out = delete_key(text, &["qmd_collection"]).unwrap();
+        assert_eq!(out, "a: 1\r\nb: 2\r\n");
+    }
+
+    #[test]
+    fn delete_key_at_eof_without_trailing_newline() {
+        let text = "a: 1\nb: 2";
+        let out = delete_key(text, &["b"]).unwrap();
+        assert_eq!(out, "a: 1");
+    }
+
+    #[test]
+    fn delete_key_missing_or_inline_parent_is_none() {
+        assert!(delete_key("a: 1\n", &["nope"]).is_none());
+        assert!(delete_key("checkpoint: {messages: 0}\n", &["checkpoint", "messages"]).is_none());
+        assert!(delete_key("a: 1\n", &[]).is_none());
+    }
+
+    #[test]
+    fn delete_key_is_idempotent_second_call_is_none() {
+        let text = "a: 1\nb: 2\n";
+        let out = delete_key(text, &["b"]).unwrap();
+        assert_eq!(out, "a: 1\n");
+        assert!(delete_key(&out, &["b"]).is_none());
+    }
+
+    #[test]
+    fn upsert_child_replaces_existing_value_and_keeps_inline_comment() {
+        let text = "search:\n  collection: old  # my index\n";
+        let out = upsert_child(text, "search", "collection", "new");
+        assert_eq!(out, "search:\n  collection: new  # my index\n");
+    }
+
+    #[test]
+    fn upsert_child_inserts_into_existing_block_before_sibling() {
+        let text = "search:\n  collection: c\nfolders:\n  inbox: x\n";
+        let out = upsert_child(text, "search", "embed_model", "m");
+        assert_eq!(
+            out,
+            "search:\n  collection: c\n  embed_model: m\nfolders:\n  inbox: x\n"
+        );
+    }
+
+    #[test]
+    fn upsert_child_creates_block_when_parent_absent() {
+        let text = "folders:\n  inbox: x\n";
+        let out = upsert_child(text, "search", "collection", "c");
+        assert_eq!(out, "folders:\n  inbox: x\nsearch:\n  collection: c\n");
+    }
+
+    #[test]
+    fn upsert_child_replaces_inline_parent_with_block() {
+        let text = "search: not-a-mapping\n";
+        let out = upsert_child(text, "search", "collection", "c");
+        assert_eq!(out, "search:\n  collection: c\n");
+    }
+
+    #[test]
+    fn upsert_child_into_empty_block_header() {
+        let text = "search:\nfolders:\n  inbox: x\n";
+        let out = upsert_child(text, "search", "collection", "c");
+        assert_eq!(out, "search:\n  collection: c\nfolders:\n  inbox: x\n");
+    }
+
+    #[test]
+    fn upsert_child_on_empty_text_creates_block() {
+        assert_eq!(
+            upsert_child("", "search", "collection", "c"),
+            "search:\n  collection: c\n"
+        );
+    }
+
+    #[test]
+    fn upsert_child_crlf_preserved_on_insert() {
+        let text = "search:\r\n  collection: c\r\n";
+        let out = upsert_child(text, "search", "embed_model", "m");
+        assert_eq!(out, "search:\r\n  collection: c\r\n  embed_model: m\r\n");
     }
 
     #[test]

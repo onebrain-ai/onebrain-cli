@@ -8,6 +8,7 @@
 //! `SessionInitOutput`) live in [`crate::legacy_output`] and remain
 //! byte-stable for the back-compat aliases.
 
+pub mod boxed;
 pub mod dispatcher;
 pub mod envelope;
 pub mod layout;
