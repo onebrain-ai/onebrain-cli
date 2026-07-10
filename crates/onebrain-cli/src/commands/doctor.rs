@@ -264,6 +264,15 @@ pub fn run(
                     // plain report; only the re-prompt is suppressed.
                     if auto.iter().any(|r| r.check == "qmd-leftovers") {
                         decline_qmd_cleanup(vault_root.as_path());
+                        // Re-check with a RELOADED config (mirrors the
+                        // "fixed" branch) so the Summary box below reflects
+                        // the decline just recorded — without this it would
+                        // still show the `--fix` CTA the user just said no
+                        // to. The in-memory `config` predates the flag write,
+                        // so a fresh load is required for the hint gate.
+                        let refreshed =
+                            load_vault_config(&vault_root).unwrap_or_else(|_| config.clone());
+                        results = all_checks(vault_root.as_path(), &refreshed);
                     }
                 }
             }
@@ -1538,40 +1547,66 @@ fn fix_qmd_leftovers(result: &DoctorResult, interactive_confirmed: bool) -> FixO
         // No genuine interactive confirmation: NEVER destructive. Compose an
         // actionable message from the (read-only) detection above so the
         // consumer can relay exact removal commands.
-        let size_note = leftovers
-            .cache_dir
-            .as_ref()
-            .map(|(_, size)| {
-                format!(
-                    " ({} reclaimable)",
-                    crate::commands::search_common::format_size(*size)
-                )
-            })
-            .unwrap_or_default();
-        let mut commands: Vec<String> = Vec::new();
-        if let Some(pkg) = &leftovers.npm_package {
-            commands.push(format!("npm uninstall -g {pkg}"));
-        }
-        let mut rm_targets: Vec<String> = Vec::new();
-        if let Some((dir, _)) = &leftovers.cache_dir {
-            rm_targets.push(tildify(dir, &home));
-        }
-        if let Some(dir) = &leftovers.config_dir {
-            rm_targets.push(tildify(dir, &home));
-        }
-        if !rm_targets.is_empty() {
-            commands.push(format!("rm -rf {}", rm_targets.join(" ")));
-        }
-        return FixOutcome::Manual(format!(
-            "legacy qmd found{size_note} — run `onebrain doctor --fix` interactively to \
-             review and confirm removal, or remove manually: {}",
-            commands.join(" && ")
-        ));
+        return qmd_manual_outcome(&leftovers, &home);
     }
+    qmd_remove_leftovers(&leftovers, &home)
+}
 
-    // From here on we're on the interactive text path (the guard above
-    // filtered every structured/auto-proceed route), so status lines go to
-    // stdout unconditionally — `status_line(false, …)`.
+/// Non-destructive outcome for the qmd cleanup: report what was found with
+/// the exact removal commands. Pure (no filesystem writes, no subprocesses)
+/// — used by every non-interactive route of [`fix_qmd_leftovers`].
+///
+/// A binary with NO detected npm package (a non-npm install) gets its own
+/// `rm <path>` command — `npm uninstall` wouldn't touch it, and without
+/// this a binary-only leftover would render a dangling "remove manually: ".
+/// When an npm package IS detected, its uninstall removes the bin symlink,
+/// so no separate `rm` is emitted for the binary.
+fn qmd_manual_outcome(leftovers: &QmdLeftovers, home: &Path) -> FixOutcome {
+    let size_note = leftovers
+        .cache_dir
+        .as_ref()
+        .map(|(_, size)| {
+            format!(
+                " ({} reclaimable)",
+                crate::commands::search_common::format_size(*size)
+            )
+        })
+        .unwrap_or_default();
+    let mut commands: Vec<String> = Vec::new();
+    if let Some(pkg) = &leftovers.npm_package {
+        commands.push(format!("npm uninstall -g {pkg}"));
+    } else if let Some(bin) = &leftovers.binary {
+        commands.push(format!("rm {}", tildify(bin, home)));
+    }
+    let mut rm_targets: Vec<String> = Vec::new();
+    if let Some((dir, _)) = &leftovers.cache_dir {
+        rm_targets.push(tildify(dir, home));
+    }
+    if let Some(dir) = &leftovers.config_dir {
+        rm_targets.push(tildify(dir, home));
+    }
+    if !rm_targets.is_empty() {
+        commands.push(format!("rm -rf {}", rm_targets.join(" ")));
+    }
+    FixOutcome::Manual(format!(
+        "legacy qmd found{size_note} — run `onebrain doctor --fix` interactively to \
+         review and confirm removal, or remove manually: {}",
+        commands.join(" && ")
+    ))
+}
+
+/// The destructive half of [`fix_qmd_leftovers`] — reached ONLY after a
+/// genuine interactive confirmation (status lines therefore go to stdout
+/// unconditionally, `status_line(false, …)`). Split out so unit tests can
+/// drive it with fixture `leftovers`/`home` without touching the real
+/// machine's `$HOME`/`$PATH`.
+///
+/// Honesty contract: an unknown non-npm binary is NEVER auto-deleted (we
+/// only understand npm installs; anything else is the user's to remove),
+/// and the outcome must say so — a surviving binary downgrades `Fixed` to
+/// `Partial` (dirs were removed) or `Manual` (nothing was removable at
+/// all), each carrying the exact `rm` command.
+fn qmd_remove_leftovers(leftovers: &QmdLeftovers, home: &Path) -> FixOutcome {
     let mut npm_failed = false;
     if let Some(pkg) = &leftovers.npm_package {
         status_line(false, &format!("running: npm uninstall -g {pkg}"));
@@ -1602,7 +1637,7 @@ fn fix_qmd_leftovers(result: &DoctorResult, interactive_confirmed: bool) -> FixO
     ];
     for dir in dirs_to_remove.into_iter().flatten() {
         match std::fs::remove_dir_all(&dir) {
-            Ok(()) => removed.push(tildify(&dir, &home)),
+            Ok(()) => removed.push(tildify(&dir, home)),
             Err(e) => {
                 removal_failed = true;
                 status_line(false, &format!("could not remove {}: {e}", dir.display()));
@@ -1615,23 +1650,47 @@ fn fix_qmd_leftovers(result: &DoctorResult, interactive_confirmed: bool) -> FixO
         removed.join(", ")
     };
 
+    // Re-probe AFTER the actions: a binary still on disk means the cleanup
+    // is not complete — either npm's uninstall failed to drop its symlink,
+    // or (the common case here) there was no npm package to uninstall
+    // because this is a non-npm install we deliberately never auto-delete.
+    let surviving_binary = leftovers
+        .binary
+        .as_ref()
+        .filter(|b| b.symlink_metadata().is_ok());
+
     if npm_failed || removal_failed {
-        FixOutcome::Partial(format!(
+        return FixOutcome::Partial(format!(
             "removed {removed_summary} · {}",
             if npm_failed {
                 "npm uninstall failed — remove the package manually"
             } else {
                 "some directories could not be removed — check permissions"
             }
-        ))
-    } else {
-        let pkg_note = leftovers
-            .npm_package
-            .as_deref()
-            .map(|p| format!("uninstalled {p} · "))
-            .unwrap_or_default();
-        FixOutcome::Fixed(format!("{pkg_note}removed {removed_summary}"))
+        ));
     }
+    if let Some(bin) = surviving_binary {
+        let rm_cmd = format!("rm {}", tildify(bin, home));
+        if removed.is_empty() {
+            // Nothing was done at all — don't dress it up as progress.
+            return FixOutcome::Manual(format!(
+                "nothing removed — qmd binary at {} is not an npm install (never \
+                 auto-deleted); remove it manually: {rm_cmd}",
+                tildify(bin, home)
+            ));
+        }
+        return FixOutcome::Partial(format!(
+            "removed {removed_summary} · qmd binary at {} is not an npm install (never \
+             auto-deleted) — remove it manually: {rm_cmd}",
+            tildify(bin, home)
+        ));
+    }
+    let pkg_note = leftovers
+        .npm_package
+        .as_deref()
+        .map(|p| format!("uninstalled {p} · "))
+        .unwrap_or_default();
+    FixOutcome::Fixed(format!("{pkg_note}removed {removed_summary}"))
 }
 
 /// Compose the per-warning Manual message. Strips any circular
@@ -6980,6 +7039,97 @@ mod tests {
             npm_package_from_symlink(&symlink_path).as_deref(),
             Some("qmd")
         );
+    }
+
+    /// Binary-only leftovers fixture: a REAL file (not an npm symlink), so
+    /// `npm_package` is `None`. Shared by the non-npm honesty tests below.
+    fn binary_only_leftovers(home: &Path) -> QmdLeftovers {
+        let bin_dir = home.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join("qmd");
+        fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        QmdLeftovers {
+            binary: Some(bin),
+            npm_package: None,
+            cache_dir: None,
+            config_dir: None,
+        }
+    }
+
+    #[test]
+    fn qmd_manual_outcome_binary_only_includes_rm_command() {
+        // Non-interactive message for a non-npm binary-only leftover: the
+        // command list must carry `rm <binary>` — without it the message
+        // ended in a dangling "remove manually: ".
+        let home = tempdir().unwrap();
+        let leftovers = binary_only_leftovers(home.path());
+        let bin_display = tildify(leftovers.binary.as_ref().unwrap(), home.path());
+        let FixOutcome::Manual(msg) = qmd_manual_outcome(&leftovers, home.path()) else {
+            panic!("expected Manual");
+        };
+        assert!(
+            msg.contains(&format!("rm {bin_display}")),
+            "rm command for the binary: {msg}"
+        );
+        assert!(
+            !msg.trim_end().ends_with(':'),
+            "no dangling command list: {msg}"
+        );
+    }
+
+    #[test]
+    fn qmd_remove_leftovers_binary_only_returns_manual_without_deleting() {
+        // Interactive-confirmed path, but the ONLY leftover is a non-npm
+        // binary: nothing is removable automatically (unknown binaries are
+        // never auto-deleted), so the honest outcome is Manual with the rm
+        // command — never a false "Fixed".
+        let home = tempdir().unwrap();
+        let leftovers = binary_only_leftovers(home.path());
+        let bin = leftovers.binary.clone().unwrap();
+        let outcome = qmd_remove_leftovers(&leftovers, home.path());
+        match outcome {
+            FixOutcome::Manual(msg) => {
+                assert!(msg.contains("nothing removed"), "honest wording: {msg}");
+                assert!(
+                    msg.contains(&format!("rm {}", tildify(&bin, home.path()))),
+                    "rm command present: {msg}"
+                );
+            }
+            other => panic!("expected Manual for binary-only leftovers, got: {other:?}"),
+        }
+        assert!(bin.is_file(), "non-npm binary must never be auto-deleted");
+    }
+
+    #[test]
+    fn qmd_remove_leftovers_non_npm_binary_with_dirs_is_partial() {
+        // Interactive-confirmed path with cache+config dirs AND a non-npm
+        // binary: the dirs are removed, but the surviving binary downgrades
+        // the outcome to Partial (not Fixed) with the exact rm command.
+        let home = tempdir().unwrap();
+        let mut leftovers = binary_only_leftovers(home.path());
+        let cache_dir = home.path().join(".cache/qmd");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(cache_dir.join("index.sqlite"), vec![0u8; 64]).unwrap();
+        let config_dir = home.path().join(".config/qmd");
+        fs::create_dir_all(&config_dir).unwrap();
+        leftovers.cache_dir = Some((cache_dir.clone(), 64));
+        leftovers.config_dir = Some(config_dir.clone());
+        let bin = leftovers.binary.clone().unwrap();
+
+        let outcome = qmd_remove_leftovers(&leftovers, home.path());
+        match outcome {
+            FixOutcome::Partial(msg) => {
+                assert!(msg.contains("~/.cache/qmd"), "removed dirs listed: {msg}");
+                assert!(
+                    msg.contains(&format!("rm {}", tildify(&bin, home.path()))),
+                    "rm command present: {msg}"
+                );
+            }
+            other => panic!("expected Partial when the binary survives, got: {other:?}"),
+        }
+        assert!(!cache_dir.exists(), "cache dir removed");
+        assert!(!config_dir.exists(), "config dir removed");
+        assert!(bin.is_file(), "non-npm binary must never be auto-deleted");
     }
 
     #[test]
