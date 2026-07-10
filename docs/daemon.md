@@ -141,7 +141,7 @@ Three recommended paths, in increasing order of setup:
 
 Notes:
 
-- Set `ONEBRAIN_TOKEN` (**≥ 32 chars**, e.g. `openssl rand -hex 16`) in the daemon's environment for a **stable, bookmarkable URL** across daemon restarts — otherwise every restart mints a fresh token and saved URLs go stale. A too-short value is ignored (with a warning) in favour of a random token.
+- Set `ONEBRAIN_TOKEN` (**≥ 32 chars**, e.g. `openssl rand -hex 16`) in the daemon's environment for a **stable, bookmarkable URL** across daemon restarts — otherwise every restart mints a fresh token and saved URLs go stale. The value must match the charset `[A-Za-z0-9_-]`; a too-short or invalid value is a hard error that prevents the daemon from starting. Unset the variable to get a generated token instead.
 - Do **not** run a standalone `serve` alongside a running daemon on the default port — they share port 6789 and the engine lock (a plain `serve` detects the daemon and routes instead of binding; forcing a second listener needs an explicit `--port`). The `serve --host` flag no longer exists (#205): the only non-loopback bind is the container-scoped `ONEBRAIN_BIND` env var, which warns loudly that it speaks plaintext HTTP (see [serve.md](serve.md#containers--self-host--onebrain_bind)).
 
 ## Lifecycle

@@ -335,11 +335,12 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
 /// around the URL reach cmd verbatim (`Command`'s normal arg quoting would
 /// re-escape or drop them).
 ///
-/// That still leaves two characters that defeat the quoting itself: a literal
+/// That still leaves three characters that defeat the quoting itself: a literal
 /// `"` inside the URL closes the quote early (whatever follows becomes
-/// unquoted cmd grammar again), and `%NAME%` expands even *inside* quotes (cmd
-/// environment-variable substitution ignores quoting). [`url_safe_for_cmd`]
-/// rejects both before we ever spawn — belt-and-suspenders on top of the
+/// unquoted cmd grammar again), `%NAME%` expands even *inside* quotes (cmd
+/// environment-variable substitution ignores quoting), and `!` triggers
+/// history expansion in certain cmd modes. [`url_safe_for_cmd`]
+/// rejects all three before we ever spawn — belt-and-suspenders on top of the
 /// token-charset validation in [`crate::server::resolve_token`], which already
 /// keeps the only free-form component of `url` (the auth token) restricted to
 /// `[A-Za-z0-9_-]`. That makes this branch unreachable in practice; the check
@@ -407,7 +408,7 @@ fn url_safe_for_cmd(url: &str) -> bool {
 /// (which re-tokenizes on spaces, `&`, `^`, `|`, ...) treats it as one atomic
 /// token rather than re-parsing it as further cmd syntax — see [`open_browser`]
 /// for why plain argv-quoting isn't enough on Windows, and [`url_safe_for_cmd`]
-/// for the two characters (`"`, `%`) that defeat quoting outright.
+/// for the three characters (`"`, `%`, `!`) that defeat quoting outright.
 ///
 /// On non-windows the `#[cfg(windows)]` caller above is compiled out, so the
 /// function is only reachable from unit tests there. `dead_code` would
