@@ -1,6 +1,6 @@
 ---
-latest_version: 3.4.7
-released: 2026-07-06
+latest_version: 3.4.8
+released: 2026-07-10
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -10,33 +10,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
-## [3.4.8] — Unreleased
+## [3.4.8] — 2026-07-10 — CLI-UX polish + self-documenting config
 
-### Breaking
-- **Removed `serve --host`.** Every listener binds `127.0.0.1` only, same as the daemon — remote access goes through an encrypted tunnel (docs/daemon.md § Remote access). Containers use the `ONEBRAIN_BIND` env var instead (invalid value = hard error; non-loopback prints the plaintext-HTTP warning). Maintainer-approved breaking change in a patch: zero known users of the flag. (#205)
-
-### Added
-- **Self-documenting `onebrain.yml`.** `init` now scaffolds a hand-authored commented template — every key preceded by `# <what it is> · default: <value>`, values interpolated from the runtime's own default fns so template and binary can't drift. The full `search:` block (incl. the v3.4.7 reranker keys) ships active on day one; `collection` stays a commented placeholder (absent = search disabled). ([ADR 0026](docs/decisions/0026-config-self-documentation.md) · [docs/configuration.md](docs/configuration.md)) (#196)
-- **doctor `config-values` check (12th check).** Validates every present config value per key against the runtime defaults + model/reranker registries — `update_channel`, `checkpoint.*`, `search.default_top_k`/`embed_model`, `search.reranker.*`, plus non-empty `folders.*`/`search.collection` — one finding per violation, each naming its documented default.
-- **`doctor --fix` resets out-of-range tunables to their defaults** through a comment-preserving line editor (comments, key order, inline `# …` notes, and CRLF all survive; every reset itemised in the fix footer as `key → default`). `search.embed_model` resets print a reindex-required warning; `folders.*` + `search.collection` are report-only, never auto-reset.
-- **Section layout for `onebrain.yml`.** The template now groups keys under Style-A banners (General → Vault layout → Agent behavior → Search → Automation → System), documents the plugin `recap.min_sessions`/`min_frequency` keys (defaults 6/2), the `schedule:` entry shape, and the `search.exclude`/`search.embed.*` keys (backfill-only), and puts the system-managed `stats:` block last. `doctor` reports layout drift read-only; `doctor --fix` restructures an existing vault into this order — moving each top-level block as opaque bytes so every value and comment survives — and is idempotent. A completeness test walks the config structs so a new key can't ship without its doc entry. ([ADR 0026](docs/decisions/0026-config-self-documentation.md) · [docs/configuration.md](docs/configuration.md)) (#203)
-- `onebrain daemon status` is now a full dashboard (#197): process/bind/webui/engine/models sections incl. the clickable `http://127.0.0.1:PORT/?token=TOKEN`; probe failures degrade to absent fields (exit stays 0); JSON gains the same optional fields
-- `onebrain serve` is daemon-aware (#197): with a daemon already serving the vault it prints the daemon's webui URL (+ `--open` opens it) instead of binding a second listener; explicit `--port`/`--dir`/`$ONEBRAIN_BIND` still means standalone
-- `GET /api/health` reports `dist_dir` (webui source); `GET /api/internal/status` reports `embed_model` (both additive)
-
-### Changed
-- **doctor is now strictly read-only outside `--fix`:** the search check resolves the collection without persisting a generated name on BOTH the no-index and index-exists paths (previously a `doctor` run could re-serialize the config and strip its comments), and the `onebrain.yml-keys` recipe no longer serde-rewrites the file for out-of-range checkpoint values — the comment-preserving `config-values` recipe owns value repair.
-- **`doctor --fix` gains an honest `partial` outcome** (JSON `fix[].outcome`, text glyph `◐`) for mixed runs where some values reset while others sit in unsupported YAML shapes; value findings now carry a `doctor --fix` hint (checkpoint-only warnings previously had none). Remaining comment-dropping structural writers tracked in #200.
-- **Existing vaults get the self-documentation via `doctor --fix`:** the `config-values` check reports template-known keys lacking a comment; `--fix` inserts the template's own `# <what> · default: <value>` line above each (user comments always win, missing keys never added, idempotent) — sourced from the same table the fresh template renders from.
-- **vault-sync no longer rewrites `onebrain.yml` on every run:** its `update_channel` step is change-detecting (already-correct config → file untouched — the default `init` and re-sync cases) and, when a change is needed, comment-preserving via the shared `yaml_edit` line editor — the template survives the default install path, plugin updates, and `doctor --fix` plugin repairs.
-- **All config writers are now comment-preserving (#200).** The last four whole-file re-serializing writers — `fix_vault_yml_keys`, `fix_legacy_qmd_collection`, and `onebrain-fs`'s `persist_search_key`/`remove_search_key` (first `search reindex`/`model set` + missing-model reconcile) — migrated onto `yaml_edit`: a read-only serde parse classifies the change, then `append_top_level`/`upsert_child`/the new `delete_key` primitive apply it as line edits. User comments survive a full `doctor --fix` on a legacy vault regardless of recipe order; the old "comments not preserved" disclosures are gone; `reconcile_missing_model` now logs the config mutation instead of discarding it. The only remaining `serde_yaml::to_string` writes are template creation and the documented degenerate-root fallback, and `stamp_doctor_run` now declines flow-style roots too.
-- **`doctor` search check routes through the warm daemon (#200).** When an `onebrain mcp` session holds the engine, the check reads doc/pending counts from the daemon's `/api/internal/status` (passive discovery — never starts one) instead of opening a second engine and reporting a misleading "index locked"; it falls back to a direct open only when no daemon serves the vault.
-- **`doctor` text output redesigned (#200).** A `🩺 Doctor · <vault> · onebrain <version>` header, aligned check rows with NO inline hints, and a bottom boxed `Summary` (shared with `search model list`): tally line, the non-ok findings (fails before warnings), then deduplicated `💡 command → outcome` action lines. The two legacy-migration checks fold into one `migration` row; counts are carried into the `/wrapup`/`search reindex` outcomes. JSON output is unchanged.
-
-### Fixed
-- **`search model list`: the Rerankers box can no longer break.** Both tables now share one boxed-table renderer with a 100-column width cap; an over-long registry NOTE is truncated with an ellipsis (unicode-width-aware) instead of blowing the box border past the terminal. (#195)
-- **`search status`: Embedding/Reranker section parity.** The "🧠 Model" section header is renamed "🧠 Embedding" (parallels "🎯 Reranker"; emoji unchanged — the `search reindex` summary's matching section is renamed too), and the Reranker section gains a `Downloaded <local date>` row backed by a new `reranker_downloaded_at` field (epoch-seconds dir mtime, `null` when not downloaded) on the status payload — mirroring the embedder's `model_downloaded_at` across all three status builders (direct, held-engine/MCP, daemon). Both sections now render a `Ready` row as their LAST row (Name · Size · Downloaded · Ready); the Reranker section's existing `Ready` row moved from 2nd to last, and the Embedding section gains a display-only `Ready` row (semantic build + active model downloaded) with no new JSON field. `search model list` drops its `📁 Cache dir:` footer from the text render (`search status`'s Cache section owns that path; `cache_dir` stays in the JSON payload). (#195)
-- Retired the stale "API-only" wording: the daemon has always served the embedded webui without `$ONEBRAIN_DIST` (which remains a dev/plugin override); a regression test now pins the embedded fallback (#197)
+- **Breaking:** `serve --host` removed — localhost-only; containers use `ONEBRAIN_BIND` (#205)
+- Self-documenting `onebrain.yml` template + doctor value validation/reset (#196)
+- Section-banner layout + `doctor --fix` restructures existing vaults (#203)
+- All config writers comment-preserving via shared `yaml_edit` (#200)
+- Doctor output redesign: boxed Summary, no inline hints, daemon-routed search check (#200)
+- `daemon status` full dashboard + daemon-aware `serve --open` (#197)
+- `search model list`/`status` display parity + Ready row (#195)
 
 ## [3.4.7] — Tier-2 cross-encoder reranker
 
