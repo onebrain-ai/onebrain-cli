@@ -117,6 +117,33 @@ The client library (`commands/daemon_client.rs`) is what the CLI/MCP tracks call
 - `DaemonHandle::search` / `reindex` / `status` / `get` — typed HTTP calls carrying the token. Each **retries once via `ensure_running()`** (reconnecting to the handle's OWN bound vault) on a transport error (a daemon that vanished mid-call), while an HTTP status error propagates unchanged; `get` additionally maps a `404` to `Ok(None)` (doc not indexed) so the CLI renders its "not indexed yet" hint.
 - **Version / vault skew (ACTIVE path):** when `daemon.json`'s `version` or bound `vault` differs from the caller's, `discover`/`ensure_running` restart the daemon (stop + start) for the caller's vault before use, so a daemon from an older install or a different vault can't serve the wrong engine. A failed stop is surfaced as a warning (the old daemon may still hold the engine lock), not swallowed. The PASSIVE `discover_matching` never restarts — it routes direct instead.
 
+## Remote access
+
+The daemon deliberately binds **`127.0.0.1` only** — there is no bind-address override. To use the web UI from another machine, put an **encrypted tunnel** in front of it; never expose port 6789 directly (the token and all vault content would travel as plain HTTP).
+
+Three recommended paths, in increasing order of setup:
+
+1. **SSH port forward** — simplest, good for occasional use from another machine you already SSH into:
+
+   ```bash
+   ssh -L 6789:127.0.0.1:6789 user@host
+   ```
+
+   Then open `http://127.0.0.1:6789/?token=TOKEN` in the *local* machine's browser — `onebrain daemon status` on the daemon's machine prints the full clickable URL.
+
+2. **Tailscale Serve** — recommended for regular or mobile use; HTTPS with tailnet-only identity, no ports exposed to the internet:
+
+   ```bash
+   tailscale serve https / http://127.0.0.1:6789
+   ```
+
+3. **Cloudflare Tunnel + Access** — for reaching it over the public internet behind SSO.
+
+Notes:
+
+- Set `ONEBRAIN_TOKEN` (**≥ 32 chars**, e.g. `openssl rand -hex 16`) in the daemon's environment for a **stable, bookmarkable URL** across daemon restarts — otherwise every restart mints a fresh token and saved URLs go stale. A too-short value is ignored (with a warning) in favour of a random token.
+- Do **not** run `serve --host 0.0.0.0` while a daemon is running — they share port 6789 and the engine lock. `serve --host` is the foreground-only remote path for when **no daemon** runs, and it warns loudly that it speaks plaintext HTTP (see [serve.md](serve.md)).
+
 ## Lifecycle
 
 - **Idle-shutdown TTL** — after `$ONEBRAIN_DAEMON_IDLE_SECS` (default **30 min**) with no authenticated request, the daemon exits, dropping the engine and releasing the redb lock. Set `0` to disable (run forever — e.g. a pinned always-on daemon).
