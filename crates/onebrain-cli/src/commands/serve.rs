@@ -220,9 +220,10 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
     // they didn't.
     let host: IpAddr = resolve_bind(bind_override.as_deref())?;
     let port = args.port.unwrap_or(DEFAULT_PORT);
-    // Honours $ONEBRAIN_TOKEN (≥16 chars) for a stable, bookmarkable URL behind a
-    // tunnel; otherwise a fresh random per-process token.
-    let token = resolve_token();
+    // Honours $ONEBRAIN_TOKEN (≥32 chars, [A-Za-z0-9_-]) for a stable,
+    // bookmarkable URL behind a tunnel; otherwise a fresh random per-process
+    // token. A malformed pinned token is a hard error (see `resolve_token`).
+    let token = resolve_token()?;
 
     let cfg = ServeConfig {
         dist_dir: args.dir.clone(),
@@ -320,9 +321,43 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
 
 /// Open `url` in the platform default browser (best-effort).
 ///
-/// macOS → `open`; other Unix → `xdg-open`. Windows isn't wired (the daemon /
-/// serve are Unix-first); it returns an error the caller logs as a warning.
+/// macOS → `open`; other Unix → `xdg-open`; Windows → `cmd /C start "" "<url>"`.
+///
+/// **Windows quoting (security).** `cmd.exe` re-parses its ENTIRE raw command
+/// line as cmd grammar, not argv — `&`, `^`, `|` split/chain commands there,
+/// and `%VAR%` expands even *inside* double quotes. `std::process::Command`
+/// only auto-quotes an arg when it contains a space, so a plain `.args([...])`
+/// call (the previous shape) passed the URL through unquoted for any other
+/// cmd metacharacter — `&calc&` in the URL became `& calc &`, a second command
+/// cmd happily ran. We now build the raw command line ourselves via
+/// [`windows_start_cmdline`] and hand it to cmd with
+/// [`std::os::windows::process::CommandExt::raw_arg`] so the literal quotes
+/// around the URL reach cmd verbatim (`Command`'s normal arg quoting would
+/// re-escape or drop them).
+///
+/// That still leaves three characters that defeat the quoting itself: a literal
+/// `"` inside the URL closes the quote early (whatever follows becomes
+/// unquoted cmd grammar again), `%NAME%` expands even *inside* quotes (cmd
+/// environment-variable substitution ignores quoting), and `!` triggers
+/// history expansion in certain cmd modes. [`url_safe_for_cmd`]
+/// rejects all three before we ever spawn — belt-and-suspenders on top of the
+/// token-charset validation in [`crate::server::resolve_token`], which already
+/// keeps the only free-form component of `url` (the auth token) restricted to
+/// `[A-Za-z0-9_-]`. That makes this branch unreachable in practice; the check
+/// exists so "unreachable" is enforced, not assumed.
 fn open_browser(url: &str) -> Result<()> {
+    // Checked unconditionally (not just under `#[cfg(windows)]`) so the guard
+    // is exercised by calling `open_browser` directly on any host, including
+    // in CI on macOS/Linux where the Windows spawn path never compiles. It's
+    // a no-op restriction on Unix (`open`/`xdg-open` take the URL as a plain
+    // argv element, not through a shell), so this costs nothing there.
+    if !url_safe_for_cmd(url) {
+        anyhow::bail!(
+            "refusing to open browser: URL contains `\"`, `%`, or `!`, which can \
+             escape or expand inside a Windows `cmd /C start` command line: {url}"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     let cmd = "open";
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -336,11 +371,51 @@ fn open_browser(url: &str) -> Result<()> {
             .with_context(|| format!("spawn `{cmd} {url}`"))?;
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let cmdline = windows_start_cmdline(url);
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .raw_arg(&cmdline)
+            .spawn()
+            .with_context(|| format!("spawn `cmd /C {cmdline}`"))?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = url;
         anyhow::bail!("--open is not supported on this platform yet")
     }
+}
+
+/// `true` when `url` is safe to embed inside a double-quoted Windows `cmd.exe`
+/// command line: no `"` (would close the quote early, turning whatever
+/// follows back into live cmd grammar), no `%` (cmd expands `%VAR%` even
+/// *inside* double quotes, unlike `&`/`^`/`|`/etc. which quoting alone stops),
+/// and no `!` (which expands under cmd delayed expansion when `DelayedExpansion=1`).
+///
+/// Always compiled (not `#[cfg(windows)]`) so it's unit-testable on any host;
+/// only the Windows [`open_browser`] branch calls it at runtime.
+fn url_safe_for_cmd(url: &str) -> bool {
+    !url.contains('"') && !url.contains('%') && !url.contains('!')
+}
+
+/// `start "" "<url>"` — the raw cmd.exe command line (after `cmd /C`) to open
+/// `url` in the default browser. The first quoted arg to `start` is a window
+/// title; the empty `""` slot fills that so `start` doesn't mistake the URL
+/// for the title. The URL itself is double-quoted so `cmd.exe`'s line parser
+/// (which re-tokenizes on spaces, `&`, `^`, `|`, ...) treats it as one atomic
+/// token rather than re-parsing it as further cmd syntax — see [`open_browser`]
+/// for why plain argv-quoting isn't enough on Windows, and [`url_safe_for_cmd`]
+/// for the three characters (`"`, `%`, `!`) that defeat quoting outright.
+///
+/// On non-windows the `#[cfg(windows)]` caller above is compiled out, so the
+/// function is only reachable from unit tests there. `dead_code` would
+/// otherwise fire on non-windows prod builds.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_start_cmdline(url: &str) -> String {
+    format!("start \"\" \"{url}\"")
 }
 
 #[cfg(test)]
@@ -392,6 +467,65 @@ mod tests {
             b.contains("    Web UI        placeholder page (this binary has no bundled web UI)"),
             "{b:?}"
         );
+    }
+
+    #[test]
+    fn windows_start_cmdline_keeps_empty_title_slot_and_quotes_url() {
+        // `start` treats its first quoted arg as a window title; the empty
+        // `""` slot prevents it from eating the URL, and the URL itself is
+        // double-quoted so cmd.exe's line parser treats it as one token.
+        let cmdline = windows_start_cmdline("http://127.0.0.1:7777/?token=abc");
+        assert_eq!(cmdline, "start \"\" \"http://127.0.0.1:7777/?token=abc\"");
+    }
+
+    #[test]
+    fn windows_start_cmdline_does_not_escape_embedded_metacharacters() {
+        // The cmdline builder itself does no filtering — that's the job of
+        // `url_safe_for_cmd` / the token-charset validation upstream. This
+        // test documents that a `&`-bearing URL is quoted (not rejected) at
+        // this layer, matching the "quoting is layer 2, charset is layer 1 +
+        // the `"`/`%` bail is the belt-and-suspenders check" split.
+        let cmdline = windows_start_cmdline("http://x/?token=aaaa&calc&");
+        assert_eq!(cmdline, "start \"\" \"http://x/?token=aaaa&calc&\"");
+    }
+
+    #[test]
+    fn url_safe_for_cmd_accepts_a_normal_token_url() {
+        assert!(url_safe_for_cmd(
+            "http://127.0.0.1:6789/?token=0123456789abcdef0123456789abcdef"
+        ));
+    }
+
+    #[test]
+    fn url_safe_for_cmd_rejects_double_quote() {
+        // A literal `"` closes the quoted arg early — whatever follows
+        // becomes live, unquoted cmd grammar again.
+        assert!(!url_safe_for_cmd("http://x/?token=a\"&calc&\"a"));
+    }
+
+    #[test]
+    fn url_safe_for_cmd_rejects_percent() {
+        // `%VAR%` expands even inside double quotes — quoting alone can't
+        // neutralize it.
+        assert!(!url_safe_for_cmd("http://x/?token=%PATH%"));
+    }
+
+    #[test]
+    fn url_safe_for_cmd_rejects_exclamation() {
+        // `!VAR!` expands under cmd delayed expansion (when `DelayedExpansion=1`)
+        // even inside double quotes — quoting alone can't neutralize it.
+        assert!(!url_safe_for_cmd("http://x/?token=abc!def!"));
+    }
+
+    #[test]
+    fn open_browser_rejects_quote_and_percent_bearing_urls() {
+        // The `"` / `%` guard runs unconditionally at the top of
+        // `open_browser` (not just under `#[cfg(windows)]`), so calling it
+        // directly exercises the rejection on any host, including macOS CI.
+        for bad in ["http://x/?token=a\"b", "http://x/?token=%PATH%"] {
+            let err = open_browser(bad).unwrap_err().to_string();
+            assert!(err.contains(bad), "{bad}: {err}");
+        }
     }
 
     fn daemon_info(port: u16, token: &str) -> DaemonInfo {
