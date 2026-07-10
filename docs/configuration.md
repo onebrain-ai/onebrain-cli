@@ -125,6 +125,18 @@ The only `onebrain.yml` writes that don't preserve comments are the initial
 template scaffold (there are no comments to keep) and a fallback for
 degenerate non-mapping / flow-style roots.
 
+One caveat when a `--fix` recipe removes a deprecated or legacy key (e.g. the
+`onebrain.yml-keys` backfill stripping `onebrain_version`/`method`): the
+`delete_key` primitive that performs the removal takes the key's own
+continuation lines *and* its lead comment — the comment block sitting
+directly above it — on the theory that a doc comment left dangling above
+nothing reads worse than losing it. If you've written your own note above a
+key that later becomes deprecated, that note is removed along with the key,
+not preserved elsewhere. Position durable comments so they aren't read as a
+single key's lead comment — e.g. on their own line with a blank line
+separating them from the key below, or attached to a key you don't expect to
+deprecate.
+
 ## Reading the `doctor` report
 
 `onebrain doctor` opens with a `🩺 Doctor · <vault> · onebrain <version>`

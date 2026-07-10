@@ -77,14 +77,17 @@ first touched the file.
 - **Value validation moved out of `onebrain.yml-keys`.** The fs-layer
   `VaultYmlKeysCheck` no longer warns on non-positive
   `checkpoint.messages/minutes`, and its `--fix` recipe
-  (`fix_vault_yml_keys`) no longer repairs them — that recipe re-serializes
-  through serde_yaml (comments destroyed), and it runs before the new
-  recipe, so leaving the old repair in place would have wiped the comments
-  this epic exists to protect. The check keeps key-presence, deprecated-key,
-  and `update_channel` enum validation (now sourced from
-  `VALID_UPDATE_CHANNELS`); an invalid `update_channel` is therefore
-  reported by both checks, but only `fix_config_values` repairs it and the
-  post-fix re-check clears both rows.
+  (`fix_vault_yml_keys`) no longer repairs them — at the time, that recipe
+  re-serialized through serde_yaml (comments destroyed), and it ran before
+  the new recipe, so leaving the old repair in place would have wiped the
+  comments this epic exists to protect. (`fix_vault_yml_keys` was later
+  migrated onto the comment-preserving `yaml_edit` editor in issue #200 (PR #208) — see the
+  "All config writers are comment-preserving" entry below — but the
+  validation split documented here was not reverted.) The check keeps
+  key-presence, deprecated-key, and `update_channel` enum validation (now
+  sourced from `VALID_UPDATE_CHANNELS`); an invalid `update_channel` is
+  therefore reported by both checks, but only `fix_config_values` repairs it
+  and the post-fix re-check clears both rows.
 - **Doctor's search check is now strictly read-only.** It resolves the
   collection via `collection_name_readonly` instead of `collection_for`;
   the latter persisted a generated collection name through a serde
