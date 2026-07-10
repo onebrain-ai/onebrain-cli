@@ -453,4 +453,29 @@ mod tests {
             "# top comment\nsearch:\n  # which index\n  collection: my-vault\n  embed_model: bge-m3\nfolders:\n  inbox: 00-inbox\n"
         );
     }
+
+    /// Removing the LAST child of `search:` leaves a bare block header
+    /// (`search:` with a null value). The file must still parse AND a full
+    /// `VaultConfig` load must yield the default `SearchConfig` — a bare
+    /// header must never brick config loading (R1-F2).
+    #[test]
+    fn remove_search_key_emptying_block_keeps_config_loadable() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "update_channel: stable\nsearch:\n  embed_model: bge-m3\n",
+        )
+        .unwrap();
+        assert!(remove_search_key(dir.path(), "embed_model").unwrap());
+        let text = std::fs::read_to_string(dir.path().join("onebrain.yml")).unwrap();
+        assert!(text.contains("search:"), "bare header kept: {text}");
+        // Still valid YAML…
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+        assert!(parsed.is_mapping(), "{text}");
+        // …and a full config load succeeds with the default SearchConfig.
+        let cfg: onebrain_core::VaultConfig = serde_yaml::from_str(&text)
+            .unwrap_or_else(|e| panic!("config load failed: {e}\n{text}"));
+        assert_eq!(cfg.search.collection, None);
+        assert_eq!(cfg.search.embed_model, "multilingual-e5-small");
+    }
 }

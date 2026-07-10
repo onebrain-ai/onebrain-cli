@@ -158,6 +158,184 @@ fn doctor_search_check_reads_engine_status_after_reindex() {
         .stdout(predicate::str::contains("0 indexed · 1 pending"));
 }
 
+/// Minimal mock daemon: a raw HTTP/1.1 server answering `GET /api/health`
+/// (the `discover_matching` liveness probe) with `{}` and any other request
+/// (`GET /api/internal/status`) with `status_body`. Same live-test-server
+/// approach as `daemon_client`'s own handle tests, without needing a real
+/// engine. The serving thread ends with the process.
+#[cfg(unix)]
+fn spawn_mock_daemon(status_body: &'static str) -> u16 {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let Ok(clone) = stream.try_clone() else {
+                continue;
+            };
+            let mut reader = BufReader::new(clone);
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_err() {
+                continue;
+            }
+            // Drain headers until the blank line.
+            loop {
+                let mut h = String::new();
+                match reader.read_line(&mut h) {
+                    Ok(0) => break,
+                    Ok(_) if h == "\r\n" || h == "\n" => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            let body = if request_line.contains("/api/health") {
+                "{}"
+            } else {
+                status_body
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+    port
+}
+
+/// Write a `daemon.json` discovery record under `home` pointing at `port`,
+/// bound to `vault` (canonicalized — `vault_decision` compares canonical
+/// identities) at THIS crate's version (`version_decision` requires an exact
+/// match with the spawned binary, which shares the workspace version).
+#[cfg(unix)]
+fn write_daemon_record(home: &Path, vault: &Path, port: u16) {
+    let run = home.join(".onebrain/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let canon = std::fs::canonicalize(vault).unwrap();
+    std::fs::write(
+        run.join("daemon.json"),
+        serde_json::json!({
+            "port": port,
+            "token": "test-token",
+            "pid": std::process::id(),
+            "version": env!("CARGO_PKG_VERSION"),
+            "vault": canon.display().to_string(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// The doctor search check's warm-daemon path (#200): when a live daemon
+/// serves THIS vault, the check's doc/pending counts come from the daemon's
+/// `/api/internal/status` — not from a second engine open. A mock daemon
+/// reports 42 docs / 6 pending on an index the direct path would read as
+/// empty, so the counts appearing in the check message prove the routed
+/// branch ran. `#[cfg(unix)]` because the isolation hinges on `$HOME`
+/// steering `dirs::home_dir()` (same gate as the plugin-cache test).
+#[cfg(unix)]
+#[test]
+fn doctor_search_check_reads_counts_from_matching_daemon() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    write_minimal_vault(vault.path());
+    let cfg = vault.path().join("vault.yml");
+    let existing = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        format!("search:\n  collection: doctor-it-daemon\n{existing}"),
+    )
+    .unwrap();
+    // An existing cache dir (is_indexed) whose DIRECT read would report an
+    // empty, never-reindexed index — so daemon counts are unmistakable.
+    std::fs::create_dir_all(cache.path().join("search/doctor-it-daemon")).unwrap();
+
+    let port = spawn_mock_daemon(
+        r#"{"doc_count":42,"last_indexed":1700000000,"pending_new":4,"pending_changed":1,"pending_removed":1}"#,
+    );
+    write_daemon_record(home.path(), vault.path(), port);
+
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("HOME", home.path())
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .env_remove("ONEBRAIN_NO_DAEMON")
+        .args(["doctor", "--json"])
+        .assert()
+        .success(); // warn-only run — exit-code contract unchanged
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let search = doc["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["check"] == "search")
+        .expect("search check present");
+    let msg = search["message"].as_str().unwrap();
+    assert!(
+        msg.contains("42 indexed") && msg.contains("6 pending"),
+        "daemon counts must drive the check message, got: {msg}"
+    );
+}
+
+/// Fallback honesty: a SAME-vault daemon record whose daemon is gone (dead
+/// port) must not poison the check — `discover_matching`'s liveness probe
+/// fails, the check falls back to the direct engine open, and the message
+/// reflects the on-disk (empty) index instead of any daemon counts.
+#[cfg(unix)]
+#[test]
+fn doctor_search_check_falls_back_direct_when_daemon_unreachable() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    write_minimal_vault(vault.path());
+    let cfg = vault.path().join("vault.yml");
+    let existing = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        format!("search:\n  collection: doctor-it-dead-daemon\n{existing}"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(cache.path().join("search/doctor-it-dead-daemon")).unwrap();
+
+    // A port that WAS bindable but is closed now — the liveness probe fails.
+    let dead_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    write_daemon_record(home.path(), vault.path(), dead_port);
+
+    let assert = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("HOME", home.path())
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .env_remove("ONEBRAIN_NO_DAEMON")
+        .args(["doctor", "--json"])
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON document");
+    let search = doc["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["check"] == "search")
+        .expect("search check present");
+    let msg = search["message"].as_str().unwrap();
+    assert!(
+        !msg.contains("42 indexed"),
+        "dead daemon must not contribute counts: {msg}"
+    );
+    assert!(
+        msg.contains("0 indexed"),
+        "direct probe of the empty index must drive the message: {msg}"
+    );
+}
+
 /// The all-green path: index up to date AND the embedding model present (its
 /// dir is fabricated — `model_download_status` only checks the `models--*`
 /// dir exists, so no download is needed). The `search` row reports `ok`, the
@@ -797,25 +975,34 @@ fn doctor_fix_json_mode_emits_fix_array_with_outcomes() {
 }
 
 /// CRITICAL data-safety regression: `doctor --fix` must NEVER lose config
-/// keys. The vault carries a legacy `vault.yml` holding `qmd_collection` and a
-/// custom key but MISSING `update_channel`, so the `vault-config-migration`
-/// rename, the `legacy-qmd-collection` migration, AND the `onebrain.yml-keys`
-/// backfill all fire. After --fix the config lives at canonical
-/// `onebrain.yml`; the deprecated `qmd_collection` is migrated to
+/// keys. The vault carries a legacy `vault.yml` holding `qmd_collection`, a
+/// custom key, and USER COMMENTS, but MISSING `update_channel`, so the
+/// `vault-config-migration` rename, the `legacy-qmd-collection` migration, AND
+/// the `onebrain.yml-keys` backfill all fire. After --fix the config lives at
+/// canonical `onebrain.yml`; the deprecated `qmd_collection` is migrated to
 /// `search.collection` and its old key removed (v3.4); the unknown custom key
-/// survives the re-serialization; the missing `update_channel` is backfilled;
-/// and a timestamped backup was written before any destructive write.
+/// AND every user comment survive the multi-recipe pass — the v3.4.8
+/// end-to-end proof that recipe ORDERING no longer destroys comments (#200);
+/// the missing `update_channel` is backfilled; and a timestamped backup was
+/// written before any destructive write.
 #[test]
 fn doctor_fix_preserves_custom_keys_and_backs_up() {
     let vault = tempdir().unwrap();
     write_minimal_vault(vault.path()); // folders + plugin files + (complete) vault.yml
-                                       // Replace the config: keep all folders, add qmd_collection + a custom key,
-                                       // drop update_channel so the keys-backfill recipe has work to do.
+                                       // Replace the config: keep all folders, add qmd_collection + a custom key
+                                       // + user comments, drop update_channel so the keys-backfill recipe has
+                                       // work to do.
+                                       // NOTE: the user comments sit above keys that SURVIVE the pass. A comment
+                                       // directly above `qmd_collection` itself would leave with the deleted key —
+                                       // that's delete_key's pinned lead-comment design, covered by the unit test
+                                       // `fix_legacy_qmd_collection_preserves_comments_exactly_and_is_idempotent`.
     std::fs::write(
         vault.path().join("vault.yml"),
-        "qmd_collection: ob-1-441565\n\
-         custom_key: keepme\n\
+        "# hand-tuned by me — keep this header\n\
+         custom_key: keepme  # my note on the custom key\n\
+         qmd_collection: ob-1-441565\n\
          folders:\n  \
+           # inbox is sacred\n  \
            inbox: 00-inbox\n  \
            projects: 01-projects\n  \
            areas: 02-areas\n  \
@@ -855,6 +1042,19 @@ fn doctor_fix_preserves_custom_keys_and_backs_up() {
         after.contains("update_channel"),
         "missing required key should be backfilled (onebrain.yml-keys recipe ran) · got:\n{after}"
     );
+    // v3.4.8 (#200): EVERY user comment survives the full multi-recipe --fix
+    // pass — key backfill (runs FIRST), qmd migration, comment backfill, and
+    // layout restructure are all comment-preserving, so order can't matter.
+    for comment in [
+        "# hand-tuned by me — keep this header",
+        "# my note on the custom key",
+        "# inbox is sacred",
+    ] {
+        assert!(
+            after.contains(comment),
+            "user comment {comment:?} must survive the full --fix pass · got:\n{after}"
+        );
+    }
     // A backup was taken before the destructive (rename + re-serialize) writes.
     let backups = vault.path().join(".onebrain-backups");
     assert!(backups.is_dir(), "expected .onebrain-backups/ to exist");

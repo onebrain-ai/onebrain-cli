@@ -7,7 +7,7 @@ expression: output
 ⚙️  Config
     ✓ onebrain.yml       valid · stable
     ✓ schema             all keys ok
-    ✓ migration          none needed
+    ✓ migration          nothing to migrate
 
 📁  Vault structure
     ✗ folders            7/8 present

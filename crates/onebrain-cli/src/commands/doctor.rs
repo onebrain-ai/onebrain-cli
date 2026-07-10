@@ -1466,47 +1466,80 @@ fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
         }
     }
 
-    // 3. Strip deprecated keys (comment-preserving delete).
+    // 3. Strip deprecated keys (comment-preserving delete). Any key the
+    //    classification says is PRESENT but the line editor cannot remove
+    //    (e.g. it lives inside an inline flow mapping) must surface as
+    //    un-fixable — never a silent success that leaves the deprecated key
+    //    behind forever (matches `fix_legacy_qmd_collection`'s contract).
+    let mut unfixable: Vec<&'static str> = Vec::new();
     for key in &["onebrain_version", "method"] {
         if get(key).is_some() {
-            if let Some(updated) = onebrain_fs::yaml_edit::delete_key(&current, &[key]) {
-                current = updated;
-                removed.push(*key);
+            match onebrain_fs::yaml_edit::delete_key(&current, &[key]) {
+                Some(updated) => {
+                    current = updated;
+                    removed.push(*key);
+                }
+                None => unfixable.push(*key),
             }
         }
     }
     if let Some(runtime) = submap("runtime") {
         let has_harness = runtime.contains_key(serde_yaml::Value::String("harness".to_string()));
+        // Whether removing `harness` leaves the block empty (only child), so
+        // the whole `runtime` block should go — keeps the file tidy.
+        let only_harness = runtime.len() == usize::from(has_harness);
         if has_harness {
-            if let Some(updated) =
-                onebrain_fs::yaml_edit::delete_key(&current, &["runtime", "harness"])
-            {
-                current = updated;
-                removed.push("runtime.harness");
+            match onebrain_fs::yaml_edit::delete_key(&current, &["runtime", "harness"]) {
+                Some(updated) => {
+                    current = updated;
+                    removed.push("runtime.harness");
+                    if only_harness {
+                        if let Some(updated) =
+                            onebrain_fs::yaml_edit::delete_key(&current, &["runtime"])
+                        {
+                            current = updated;
+                        }
+                    }
+                }
+                // The nested delete refuses an inline parent
+                // (`runtime: {harness: x}`). When harness is the ONLY entry,
+                // removing the whole top-level line is equivalent — the final
+                // key of a delete path may carry an inline value. With a
+                // sibling key inside the flow mapping there is no safe line
+                // edit: surface it instead of silently succeeding.
+                None if only_harness => {
+                    match onebrain_fs::yaml_edit::delete_key(&current, &["runtime"]) {
+                        Some(updated) => {
+                            current = updated;
+                            removed.push("runtime.harness");
+                        }
+                        None => unfixable.push("runtime.harness"),
+                    }
+                }
+                None => unfixable.push("runtime.harness"),
             }
-        }
-        // Drop the parent `runtime` block if it is now empty (only child was
-        // `harness`, or it was already empty) — keeps the file tidy. Not
-        // counted in `removed` (matches the pre-v3.4.8 message).
-        let now_empty = runtime.len() == usize::from(has_harness);
-        if now_empty {
+        } else if runtime.is_empty() {
+            // Pre-existing tidy-up: an already-empty `runtime:` block is
+            // dropped (not counted in `removed`, matching the old message).
             if let Some(updated) = onebrain_fs::yaml_edit::delete_key(&current, &["runtime"]) {
                 current = updated;
             }
         }
     }
 
-    if added.is_empty() && removed.is_empty() {
+    if added.is_empty() && removed.is_empty() && unfixable.is_empty() {
         return FixOutcome::Fixed(format!("{filename} already in expected shape"));
     }
 
-    // Defense-in-depth: back up before the write. Hard precondition — no write
-    // without a backup.
-    if let Err(e) = onebrain_fs::backup_config_file(&path) {
-        return FixOutcome::Failed(format!("backup {filename} before write: {e}"));
-    }
-    if let Err(e) = onebrain_fs::atomic_write_text(&path, &current) {
-        return FixOutcome::Failed(format!("write {filename}: {e}"));
+    if !added.is_empty() || !removed.is_empty() {
+        // Defense-in-depth: back up before the write. Hard precondition — no
+        // write without a backup.
+        if let Err(e) = onebrain_fs::backup_config_file(&path) {
+            return FixOutcome::Failed(format!("backup {filename} before write: {e}"));
+        }
+        if let Err(e) = onebrain_fs::atomic_write_text(&path, &current) {
+            return FixOutcome::Failed(format!("write {filename}: {e}"));
+        }
     }
 
     let mut parts = Vec::new();
@@ -1519,6 +1552,19 @@ fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
             removed.len(),
             removed.join(", ")
         ));
+    }
+    if !unfixable.is_empty() {
+        parts.push(format!(
+            "could not remove deprecated (unsupported YAML shape, e.g. inline mapping): {} — edit manually",
+            unfixable.join(", ")
+        ));
+        // Honest tri-state, mirroring fix_config_values: real progress landed
+        // AND something remains → Partial; nothing landed → Failed.
+        return if !added.is_empty() || !removed.is_empty() {
+            FixOutcome::Partial(parts.join(" · "))
+        } else {
+            FixOutcome::Failed(parts.join(" · "))
+        };
     }
     FixOutcome::Fixed(parts.join(" · "))
 }
@@ -2166,7 +2212,7 @@ fn migration_row(results: &[DoctorResult]) -> Option<DisplayRow> {
         items.push("qmd_collection key");
     }
     let message = if items.is_empty() {
-        "none needed".to_string()
+        "nothing to migrate".to_string()
     } else {
         items.join(" · ")
     };
@@ -2667,10 +2713,10 @@ mod tests {
     #[test]
     fn migration_row_combos_and_worst_severity() {
         let ok = |check: &'static str| DoctorResult::ok(check, "clean");
-        // Both clean → "none needed", ok.
+        // Both clean → "nothing to migrate", ok.
         let row =
             migration_row(&[ok("vault-config-migration"), ok("legacy-qmd-collection")]).unwrap();
-        assert_eq!(row.message, "none needed");
+        assert_eq!(row.message, "nothing to migrate");
         assert_eq!(row.status, DoctorStatus::Ok);
         // Legacy vault.yml only.
         let row = migration_row(&[
@@ -3041,6 +3087,61 @@ mod tests {
         assert_eq!(doc["checks"][0]["details"][1], "d2");
     }
 
+    /// Pins the text/JSON split invariant for the merged `migration` row:
+    /// JSON `checks[]` carries BOTH `vault-config-migration` and
+    /// `legacy-qmd-collection` as separate entries WITH their hints, while the
+    /// text render folds them into the single `migration` row (neither
+    /// underlying label appears).
+    #[test]
+    fn json_keeps_both_migration_checks_while_text_merges_them() {
+        let results = vec![
+            DoctorResult::warn("vault-config-migration", "vault.yml present")
+                .with_hint("Run onebrain doctor --fix to migrate vault.yml to onebrain.yml"),
+            DoctorResult::warn("legacy-qmd-collection", "qmd_collection key present")
+                .with_hint("onebrain doctor --fix"),
+        ];
+
+        // JSON: two separate entries, hints intact.
+        let mut buf = Vec::new();
+        print_report_structured(
+            &results,
+            false,
+            vec![],
+            true,
+            &legacy_json_compat_mode(),
+            &mut buf,
+        )
+        .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        let checks = doc["checks"].as_array().unwrap();
+        let by_name = |name: &str| {
+            checks
+                .iter()
+                .find(|c| c["check"] == name)
+                .unwrap_or_else(|| panic!("JSON checks[] must keep {name}: {doc}"))
+        };
+        assert_eq!(
+            by_name("vault-config-migration")["hint"],
+            "Run onebrain doctor --fix to migrate vault.yml to onebrain.yml"
+        );
+        assert_eq!(
+            by_name("legacy-qmd-collection")["hint"],
+            "onebrain doctor --fix"
+        );
+
+        // Text: one merged `migration` row naming both legacy items; the
+        // underlying per-check labels never render.
+        let out = render_static_report(&results, false);
+        assert!(
+            out.contains("⚠ migration") && out.contains("legacy vault.yml · qmd_collection key"),
+            "merged row: {out:?}"
+        );
+        assert!(
+            !out.contains("config migration") && !out.contains("⚠ qmd_collection "),
+            "underlying labels must not render in text: {out:?}"
+        );
+    }
+
     /// v3.1 regression guard: doctor must honor `--yaml` and emit YAML, not
     /// the bare JSON envelope (the bug the user found in alpha smoke).
     #[test]
@@ -3168,6 +3269,77 @@ mod tests {
         }
         let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert_eq!(after, original, "file untouched — values are not its job");
+    }
+
+    #[test]
+    fn fix_vault_yml_keys_removes_inline_runtime_harness_when_sole_entry() {
+        // `runtime: {harness: x}` — inline flow mapping whose ONLY entry is the
+        // deprecated key. The nested delete refuses the inline parent, but
+        // removing the whole top-level line is equivalent → must succeed and be
+        // reported as removed (R2 blocker: this used to silently discard the
+        // change).
+        let d = tempdir().unwrap();
+        let full_folders = "folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n";
+        fs::write(
+            d.path().join("onebrain.yml"),
+            format!("update_channel: stable\nruntime: {{harness: claude-code}}\n{full_folders}"),
+        )
+        .unwrap();
+        match fix_vault_yml_keys(d.path(), false) {
+            FixOutcome::Fixed(msg) => assert!(msg.contains("runtime.harness"), "{msg}"),
+            other => panic!("expected Fixed, got {other:?}"),
+        }
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert!(!after.contains("runtime"), "runtime line gone: {after}");
+        assert!(!after.contains("harness"), "harness gone: {after}");
+        assert!(after.contains("inbox: 00-inbox"), "{after}");
+    }
+
+    #[test]
+    fn fix_vault_yml_keys_inline_runtime_with_sibling_surfaces_unfixable() {
+        // `runtime: {harness: x, other: v}` — the deprecated key sits inside an
+        // inline flow mapping WITH a sibling, so no line edit can remove it
+        // without touching the sibling. Must surface as un-fixable (Failed /
+        // Partial), NEVER a silent Fixed that leaves the key behind forever
+        // (R2 blocker).
+        let d = tempdir().unwrap();
+        let full_folders = "folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  archive: 06-archive\n  logs: 07-logs\n";
+        // Variant 1: nothing else to repair → Failed, file untouched.
+        let original = format!(
+            "update_channel: stable\nruntime: {{harness: claude-code, other: v}}\n{full_folders}"
+        );
+        fs::write(d.path().join("onebrain.yml"), &original).unwrap();
+        match fix_vault_yml_keys(d.path(), false) {
+            FixOutcome::Failed(msg) => {
+                assert!(msg.contains("runtime.harness"), "{msg}");
+                assert!(msg.contains("edit manually"), "{msg}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after, original, "un-fixable run must not touch the file");
+
+        // Variant 2: a backfill also lands → Partial (progress + remainder).
+        let d2 = tempdir().unwrap();
+        fs::write(
+            d2.path().join("onebrain.yml"),
+            "runtime: {harness: claude-code, other: v}\nfolders:\n  inbox: 00-inbox\n",
+        )
+        .unwrap();
+        match fix_vault_yml_keys(d2.path(), false) {
+            FixOutcome::Partial(msg) => {
+                assert!(msg.contains("backfilled"), "{msg}");
+                assert!(msg.contains("runtime.harness"), "{msg}");
+                assert!(msg.contains("edit manually"), "{msg}");
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+        let after2 = fs::read_to_string(d2.path().join("onebrain.yml")).unwrap();
+        assert!(after2.contains("update_channel: stable"), "{after2}");
+        assert!(
+            after2.contains("runtime: {harness: claude-code, other: v}"),
+            "inline runtime untouched: {after2}"
+        );
     }
 
     #[test]
@@ -3746,6 +3918,45 @@ mod tests {
         );
         // Unrelated keys preserved.
         assert_eq!(yaml["folders"]["inbox"].as_str(), Some("00-inbox"));
+    }
+
+    #[test]
+    fn fix_legacy_qmd_collection_preserves_comments_exactly_and_is_idempotent() {
+        // Real commented fixture: top-of-file comment, a lead comment ABOVE the
+        // legacy key itself, an inline comment ON the legacy key line, and a
+        // comment inside an unrelated block. Pinned behavior:
+        // - every comment NOT attached to the deleted key survives verbatim;
+        // - the legacy key's own lead comment and inline comment leave WITH the
+        //   key (delete_key's documented design — a doc comment dangling above
+        //   nothing reads worse than losing it);
+        // - the seeded search block lands at EOF; second run is a no-op.
+        let d = tempdir().unwrap();
+        let original = "# my vault config\n\
+             update_channel: stable\n\
+             # legacy search collection — migrate me\n\
+             qmd_collection: ob-1  # the old key\n\
+             folders:\n  # inbox is sacred\n  inbox: 00-inbox\n";
+        fs::write(d.path().join("onebrain.yml"), original).unwrap();
+
+        let outcome = fix_legacy_qmd_collection(d.path(), false);
+        assert!(matches!(outcome, FixOutcome::Fixed(_)), "{outcome:?}");
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(
+            after,
+            "# my vault config\n\
+             update_channel: stable\n\
+             folders:\n  # inbox is sacred\n  inbox: 00-inbox\n\
+             search:\n  collection: ob-1\n"
+        );
+
+        // Idempotency: a second run reports nothing to migrate and the file is
+        // byte-identical.
+        match fix_legacy_qmd_collection(d.path(), false) {
+            FixOutcome::Fixed(msg) => assert!(msg.contains("nothing to migrate"), "{msg}"),
+            other => panic!("expected Fixed no-op, got {other:?}"),
+        }
+        let after2 = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after2, after, "second run must not rewrite the file");
     }
 
     #[test]
