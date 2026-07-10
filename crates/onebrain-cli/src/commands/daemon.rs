@@ -1137,8 +1137,10 @@ pub fn run_internal(vault: Option<&Path>) -> Result<()> {
         .and_then(crate::commands::daemon_client::canonical_vault_id);
     // Optional pre-built webui dist, passed by the plugin launcher.
     let dist_dir = std::env::var_os("ONEBRAIN_DIST").map(PathBuf::from);
-    // Honours $ONEBRAIN_TOKEN (≥16 chars) for a stable token across restarts.
-    let token = resolve_token();
+    // Honours $ONEBRAIN_TOKEN (≥32 chars, [A-Za-z0-9_-]) for a stable token
+    // across restarts. A malformed pinned token is a hard error (see
+    // `resolve_token`) rather than a silent swap for a random one.
+    let token = resolve_token()?;
 
     // Port: `$ONEBRAIN_DAEMON_PORT` overrides the shared default. The override
     // exists mainly so the lifecycle integration test can bind a free port and

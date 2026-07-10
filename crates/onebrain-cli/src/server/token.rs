@@ -18,33 +18,62 @@
 
 /// Resolve the session token for a server run.
 ///
-/// Honours a caller-supplied `ONEBRAIN_TOKEN` env var (≥ 32 chars) so a remote /
-/// tunnel deploy can PIN a stable token across restarts — the `?token=` URL then
-/// stays valid and bookmarkable, which is what makes `app.example.com` usable
-/// without re-reading a fresh token after every restart. The operator is
-/// responsible for making a pinned token long + unguessable. Otherwise (unset,
-/// or too short) we generate a fresh random one as before.
-pub fn resolve_token() -> String {
+/// Honours a caller-supplied `ONEBRAIN_TOKEN` env var (≥ 32 chars, charset
+/// `[A-Za-z0-9_-]`) so a remote / tunnel deploy can PIN a stable token across
+/// restarts — the `?token=` URL then stays valid and bookmarkable, which is
+/// what makes `app.example.com` usable without re-reading a fresh token after
+/// every restart. The operator is responsible for making a pinned token long +
+/// unguessable. If it's set but too short (unset is fine — we generate one),
+/// or set but contains characters outside `[A-Za-z0-9_-]`, this returns an
+/// error instead of silently swapping in a random token: the token round-trips
+/// through `serve --open`'s Windows `cmd /C start` launch (see
+/// `commands::serve::open_browser`), and a token with shell/cmd metacharacters
+/// (`&`, `%`, `"`, spaces, ...) is exactly what an operator pins BY MISTAKE if
+/// they typo or copy a secret with the wrong shape — silently replacing it
+/// with a random value would also break their tunnel setup (the URL they
+/// bookmarked stops working) with no visible cause. A hard error is loud and
+/// actionable in a way a silent swap or a buried warning log is not.
+pub fn resolve_token() -> anyhow::Result<String> {
     resolve_token_from(std::env::var("ONEBRAIN_TOKEN").ok())
 }
 
 /// Pure core of [`resolve_token`] (env value injected) so the rule is testable
 /// without touching process-global env state.
-fn resolve_token_from(env: Option<String>) -> String {
+fn resolve_token_from(env: Option<String>) -> anyhow::Result<String> {
     if let Some(raw) = env {
         let t = raw.trim();
-        if t.len() >= 32 {
-            return t.to_string();
-        }
         if !t.is_empty() {
-            tracing::warn!(
-                "ONEBRAIN_TOKEN is too short (< 32 chars) — ignoring it and \
-                 generating a fresh random token instead. Pin a strong value, \
-                 e.g. the output of `openssl rand -hex 16`."
-            );
+            if t.len() < 32 {
+                anyhow::bail!(
+                    "ONEBRAIN_TOKEN is too short ({} chars, need >= 32) — refusing to \
+                     silently swap in a random token (that would break a pinned tunnel \
+                     URL with no visible cause). Pin a strong value, e.g. the output of \
+                     `openssl rand -hex 16`, or unset $ONEBRAIN_TOKEN to use a generated one.",
+                    t.chars().count()
+                );
+            }
+            if !t.chars().all(is_token_char) {
+                anyhow::bail!(
+                    "ONEBRAIN_TOKEN contains characters outside [A-Za-z0-9_-] — refusing \
+                     to use it (and refusing to silently swap in a random token instead, \
+                     which would break a pinned tunnel URL with no visible cause). This \
+                     token rides in a URL and, on Windows, in a `cmd /C start` command \
+                     line — metacharacters like `&`, `%`, `\"`, or spaces are unsafe there. \
+                     Pin a value made only of letters, digits, `_`, and `-`, e.g. the \
+                     output of `openssl rand -hex 16`."
+                );
+            }
+            return Ok(t.to_string());
         }
     }
-    generate_token()
+    Ok(generate_token())
+}
+
+/// `true` for the charset a pinned `ONEBRAIN_TOKEN` must stick to:
+/// `[A-Za-z0-9_-]`. Generated tokens are hex (a strict subset), so this only
+/// ever rejects operator-supplied values.
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
 
 /// Generate a fresh 32-hex-char (128-bit) session token from the OS CSPRNG.
@@ -118,26 +147,55 @@ mod tests {
 
     #[test]
     fn resolve_pins_a_strong_env_token() {
-        let pinned = "my-stable-remote-pinned-token-0123456789"; // ≥ 32 chars
-        assert_eq!(resolve_token_from(Some(pinned.to_string())), pinned);
+        let pinned = "my-stable-remote-pinned-token-0123456789"; // ≥ 32 chars, valid charset
+        assert_eq!(
+            resolve_token_from(Some(pinned.to_string())).unwrap(),
+            pinned
+        );
         // surrounding whitespace is trimmed
-        assert_eq!(resolve_token_from(Some(format!("  {pinned}  "))), pinned);
+        assert_eq!(
+            resolve_token_from(Some(format!("  {pinned}  "))).unwrap(),
+            pinned
+        );
     }
 
     #[test]
-    fn resolve_falls_back_when_env_absent_or_too_short() {
+    fn resolve_falls_back_when_env_absent() {
         // unset → fresh 32-hex token
-        assert_eq!(resolve_token_from(None).len(), 32);
-        // too short (< 32) → ignored, fresh token instead (not the short value)
-        let short = "abc";
-        let got = resolve_token_from(Some(short.to_string()));
-        assert_ne!(got, short);
-        assert_eq!(got.len(), 32);
-        // a 20-char token (honoured under the old 16-char floor) is now rejected
-        let medium = "0123456789abcdef0123"; // 20 chars
-        assert_ne!(resolve_token_from(Some(medium.to_string())), medium);
+        assert_eq!(resolve_token_from(None).unwrap().len(), 32);
         // empty → fresh token
-        assert_eq!(resolve_token_from(Some(String::new())).len(), 32);
+        assert_eq!(resolve_token_from(Some(String::new())).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn resolve_rejects_too_short_env_token() {
+        // too short (< 32) → hard error, never silently swapped for a fresh
+        // token (that would break a pinned tunnel URL with no visible cause).
+        let short = "abc";
+        let err = resolve_token_from(Some(short.to_string())).unwrap_err();
+        assert!(err.to_string().contains("too short"), "{err}");
+
+        // a 20-char token (honoured under the old 16-char floor) is now rejected too
+        let medium = "0123456789abcdef0123"; // 20 chars
+        assert!(resolve_token_from(Some(medium.to_string())).is_err());
+    }
+
+    #[test]
+    fn resolve_rejects_bad_charset_env_token() {
+        // ≥ 32 chars but containing characters unsafe in a Windows `cmd /C
+        // start` command line — must be a hard error, not a silent swap.
+        for bad in [
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&calc&", // & (cmd command separator)
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa with space",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa%PATH%", // % (cmd/env expansion)
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"quoted\"",
+        ] {
+            assert!(bad.trim().chars().count() >= 32, "fixture too short: {bad}");
+            let err = resolve_token_from(Some(bad.to_string()))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("[A-Za-z0-9_-]"), "{bad}: {err}");
+        }
     }
 
     #[test]
