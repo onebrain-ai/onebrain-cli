@@ -320,8 +320,7 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
 
 /// Open `url` in the platform default browser (best-effort).
 ///
-/// macOS → `open`; other Unix → `xdg-open`. Windows isn't wired (the daemon /
-/// serve are Unix-first); it returns an error the caller logs as a warning.
+/// macOS → `open`; other Unix → `xdg-open`; Windows → `cmd /C start`.
 fn open_browser(url: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     let cmd = "open";
@@ -336,11 +335,30 @@ fn open_browser(url: &str) -> Result<()> {
             .with_context(|| format!("spawn `{cmd} {url}`"))?;
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let argv = windows_open_argv(url);
+        std::process::Command::new("cmd")
+            .args(argv)
+            .spawn()
+            .with_context(|| format!("spawn `cmd /C start {url}`"))?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = url;
         anyhow::bail!("--open is not supported on this platform yet")
     }
+}
+
+/// `cmd /C start "" <url>` argv — the empty string is the window-title slot.
+///
+/// On non-windows the `#[cfg(windows)]` caller above is compiled out, so the
+/// function is only reachable from unit tests there. `dead_code` would
+/// otherwise fire on non-windows prod builds.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_open_argv(url: &str) -> [&str; 4] {
+    ["/C", "start", "", url]
 }
 
 #[cfg(test)]
@@ -391,6 +409,17 @@ mod tests {
         assert!(
             b.contains("    Web UI        placeholder page (this binary has no bundled web UI)"),
             "{b:?}"
+        );
+    }
+
+    #[test]
+    fn windows_open_argv_keeps_empty_title_slot() {
+        // `start` treats its first quoted arg as a window title; the empty
+        // string slot prevents it from eating the URL.
+        let argv = windows_open_argv("http://127.0.0.1:7777/?token=abc");
+        assert_eq!(
+            argv,
+            ["/C", "start", "", "http://127.0.0.1:7777/?token=abc"]
         );
     }
 
