@@ -12,58 +12,58 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [3.4.8] — 2026-07-10 — CLI-UX polish + self-documenting config
 
-- **Breaking:** `serve --host` removed — localhost-only; containers use `ONEBRAIN_BIND` (#205)
-- Self-documenting `onebrain.yml` template + doctor value validation/reset (#196)
-- Section-banner layout + `doctor --fix` restructures existing vaults (#203)
-- All config writers comment-preserving via shared `yaml_edit` (#200)
-- Doctor output redesign: boxed Summary, no inline hints, daemon-routed search check (#200)
-- `daemon status` full dashboard + daemon-aware `serve --open` (#197)
-- `search model list`/`status` display parity + Ready row (#195)
+- **Breaking:** `serve --host` removed — localhost-only; containers use `ONEBRAIN_BIND` ([#205](https://github.com/onebrain-ai/onebrain-cli/issues/205))
+- Self-documenting `onebrain.yml` template + doctor value validation/reset ([#196](https://github.com/onebrain-ai/onebrain-cli/issues/196))
+- Section-banner layout + `doctor --fix` restructures existing vaults ([#203](https://github.com/onebrain-ai/onebrain-cli/issues/203))
+- All config writers comment-preserving via shared `yaml_edit` ([#200](https://github.com/onebrain-ai/onebrain-cli/issues/200))
+- Doctor output redesign: boxed Summary, no inline hints, daemon-routed search check ([#200](https://github.com/onebrain-ai/onebrain-cli/issues/200))
+- `daemon status` full dashboard + daemon-aware `serve --open` ([#197](https://github.com/onebrain-ai/onebrain-cli/issues/197))
+- `search model list`/`status` display parity + Ready row ([#195](https://github.com/onebrain-ai/onebrain-cli/issues/195))
 
-## [3.4.7] — Tier-2 cross-encoder reranker
+## [3.4.7] — 2026-07-07 — Tier-2 cross-encoder reranker
 
-- Added Tier-2 cross-encoder reranker (`onebrain-rerank-v1`, self-hosted bge-reranker-v2-m3 int8), default-on, replacing the ADR 0024 cosine gate with a calibrated 0–1 score. ([ADR 0025](docs/decisions/0025-tier2-cross-encoder-reranker.md)) (#190, #191)
+- Added Tier-2 cross-encoder reranker (`onebrain-rerank-v1`, self-hosted bge-reranker-v2-m3 int8), default-on, replacing the ADR 0024 cosine gate with a calibrated 0–1 score. ([ADR 0025](docs/decisions/0025-tier2-cross-encoder-reranker.md)) ([#190](https://github.com/onebrain-ai/onebrain-cli/issues/190), [#191](https://github.com/onebrain-ai/onebrain-cli/issues/191))
 - Added `search.reranker` config (`enabled`, `model`, `min_candidates` default 10, `min_score` default 0.30); model downloads + sha256-verifies during `reindex`.
 - `top_k`/`min_candidates` are now settable on every surface (CLI flags, config, `/api/vault/search` query params).
 - `--min-score` now filters the calibrated `rerank_score` when reranking is active (legacy raw-score meaning when off).
 - MCP `query` tool now reranks and surfaces `rerank_score` like every other surface.
 - Fixed: reindex previously couldn't download the reranker model (wrong accessor path), leaving it inert for every user.
 
-## [3.4.6] — warm daemon + honest search-engine lock contention
+## [3.4.6] — 2026-07-06 — warm daemon + honest search-engine lock contention
 
-- Added: warm daemon (`daemon __run`) owns the native-search engine as sole redb owner; token-gated internal reindex/status/get endpoints + daemon discovery + idle-shutdown TTL. ([ADR 0023](docs/decisions/0023-warm-daemon-mcp-search.md) · [docs/daemon.md](docs/daemon.md)) (#164)
-- Added: `onebrain mcp` and CLI search now route through the daemon so multiple concurrent sessions coexist; passive per-vault discovery never disrupts another vault's session. (#168, #169)
+- Added: warm daemon (`daemon __run`) owns the native-search engine as sole redb owner; token-gated internal reindex/status/get endpoints + daemon discovery + idle-shutdown TTL. ([ADR 0023](docs/decisions/0023-warm-daemon-mcp-search.md) · [docs/daemon.md](docs/daemon.md)) ([#164](https://github.com/onebrain-ai/onebrain-cli/issues/164))
+- Added: `onebrain mcp` and CLI search now route through the daemon so multiple concurrent sessions coexist; passive per-vault discovery never disrupts another vault's session. ([#168](https://github.com/onebrain-ai/onebrain-cli/issues/168), [#169](https://github.com/onebrain-ai/onebrain-cli/issues/169))
 - Fixed: search-engine lock contention now surfaces honestly (`E_ENGINE_BUSY` exit 77 for user verbs, silent skip for hooks) instead of misreporting.
 - Fixed: `search search` (lex) now populates `heading_path` from the stored tantivy field in a single pass.
-- Fixed: auto-started daemon receives its vault via an explicit argument (no env-var mutation); reindex-path confinement now also runs in the engine, not just the HTTP layer. (#175)
-- Fixed: honest `E_ENGINE_BUSY`/503 errors during the pre-daemon-to-daemon upgrade transition window instead of opaque `E_INTERNAL`/503 strings. (#179)
-- Fixed: semantic search no longer silently returns nothing — per-model `vec_floor` cutoff replaced with a recall-first `keep_top_cluster` cutoff + confidence label. ([ADR 0024](docs/decisions/0024-vector-confidence-recall-first.md)) (#183)
+- Fixed: auto-started daemon receives its vault via an explicit argument (no env-var mutation); reindex-path confinement now also runs in the engine, not just the HTTP layer. ([#175](https://github.com/onebrain-ai/onebrain-cli/issues/175))
+- Fixed: honest `E_ENGINE_BUSY`/503 errors during the pre-daemon-to-daemon upgrade transition window instead of opaque `E_INTERNAL`/503 strings. ([#179](https://github.com/onebrain-ai/onebrain-cli/issues/179))
+- Fixed: semantic search no longer silently returns nothing — per-model `vec_floor` cutoff replaced with a recall-first `keep_top_cluster` cutoff + confidence label. ([ADR 0024](docs/decisions/0024-vector-confidence-recall-first.md)) ([#183](https://github.com/onebrain-ai/onebrain-cli/issues/183))
 
-## [3.4.5] — native search · no dependency · auto reindex/embed · model reindex ux/ui (the qmd epic)
+## [3.4.5] — 2026-07-05 — native search · no dependency · auto reindex/embed · model reindex ux/ui (the qmd epic)
 
-- **Breaking:** removed the `onebrain qmd …` command group and the external `@tobilu/qmd` dependency — native `onebrain-search` now powers webui search + the reindex hook; use `onebrain search …` instead (hooks/schedules auto-rewritten on next `plugin update`/`schedule register`; the reindex hook now runs synchronously, tracked in #133).
-- **Breaking:** native-search state (model + index + `engine.redb`) now lives in the OS data dir instead of the purgeable cache dir, after macOS cleanup wiped a ~536 MB index (#114); existing state auto-migrates on next command. ([ADR 0021](docs/decisions/0021-search-state-persistent-data-dir.md))
+- **Breaking:** removed the `onebrain qmd …` command group and the external `@tobilu/qmd` dependency — native `onebrain-search` now powers webui search + the reindex hook; use `onebrain search …` instead (hooks/schedules auto-rewritten on next `plugin update`/`schedule register`; the reindex hook now runs synchronously, tracked in [#133](https://github.com/onebrain-ai/onebrain-cli/issues/133)).
+- **Breaking:** native-search state (model + index + `engine.redb`) now lives in the OS data dir instead of the purgeable cache dir, after macOS cleanup wiped a ~536 MB index ([#114](https://github.com/onebrain-ai/onebrain-cli/issues/114)); existing state auto-migrates on next command. ([ADR 0021](docs/decisions/0021-search-state-persistent-data-dir.md))
 - Fixed: `doctor` now flags a missing index on a configured collection as a possible OS-purge instead of "no index yet"; `search status`/MCP `query` degrade honestly with no index.
-- Added: auto reindex/embed hook — `search reindex --lex-only` on PostToolUse, `--pending-only` on Stop; both auto-migrate from the old qmd hook entries. (#133)
+- Added: auto reindex/embed hook — `search reindex --lex-only` on PostToolUse, `--pending-only` on Stop; both auto-migrate from the old qmd hook entries. ([#133](https://github.com/onebrain-ai/onebrain-cli/issues/133))
 - Added (transition): `session init --json` emits the canonical `search_unembedded` key alongside the deprecated `qmd_unembedded` alias.
-- Internal: renamed `HookSpec::QMD` → `REINDEX`, removed the dead `.obsidian/` seeding path. Closes onebrain-ai/onebrain-cli#142.
+- Internal: renamed `HookSpec::QMD` → `REINDEX`, removed the dead `.obsidian/` seeding path. Closes [#142](https://github.com/onebrain-ai/onebrain-cli/issues/142).
 - Fixed: `plugin update` on a vault with no `update_channel` no longer 404s — absent/unknown channel now defaults to `main` instead of the nonexistent `next` branch.
 
 ## [3.4.4] — 2026-07-03 — scheduler runs actually fire
 
-- Fixed: scheduled cron skills no longer exit 78 (EX_CONFIG) — `skill run` now prepends its own binary dir to the headless `claude` child's PATH. (#124)
-- Fixed: generated plists use the current `skill run` subcommand instead of the deprecated `run-skill` alias, so scheduled runs stop logging a deprecation notice. (#125)
+- Fixed: scheduled cron skills no longer exit 78 (EX_CONFIG) — `skill run` now prepends its own binary dir to the headless `claude` child's PATH. ([#124](https://github.com/onebrain-ai/onebrain-cli/issues/124))
+- Fixed: generated plists use the current `skill run` subcommand instead of the deprecated `run-skill` alias, so scheduled runs stop logging a deprecation notice. ([#125](https://github.com/onebrain-ai/onebrain-cli/issues/125))
 
 ## [3.4.3] — 2026-07-03 — scheduler fixes + housekeeping
 
-- Scheduler cron now accepts step (`*/N`), list (`a,b,c`), and range (`a-b`) syntax per field, emitted as launchd `StartCalendarInterval` arrays. (#116)
-- Scheduler command-mode plists are now disambiguated by their args so two entries for the same binary no longer collide; `schedule register` auto-migrates stale pre-#116 plists. (#116)
+- Scheduler cron now accepts step (`*/N`), list (`a,b,c`), and range (`a-b`) syntax per field, emitted as launchd `StartCalendarInterval` arrays. ([#116](https://github.com/onebrain-ai/onebrain-cli/issues/116))
+- Scheduler command-mode plists are now disambiguated by their args so two entries for the same binary no longer collide; `schedule register` auto-migrates stale pre-[#116](https://github.com/onebrain-ai/onebrain-cli/issues/116) plists. ([#116](https://github.com/onebrain-ai/onebrain-cli/issues/116))
 - Scheduler cron `weekday` now accepts the standard `0`-`7` range (both mean Sunday), normalizing `7`→`0`.
 - Scheduler cron now rejects strings that restrict both day-of-month AND day-of-week (cron ORs them, launchd ANDs them) — use two `schedule:` entries instead.
 - Scheduler cron combination cap raised from 366 to 1000, accepting the "every day of every month" idiom while still rejecting `*/1 */1 * * *`.
-- `onebrain schedule list` is now implemented (was a stub), reusing the existing status view. (#116)
-- CI now runs the lex-only (`--no-default-features`) test suite alongside clippy. (#119)
-- Polish (#120): `SearchMcpServer` renamed to `McpServer`; `get` tool documents line clamping; `QueryParams` dead-code allowance tightened.
+- `onebrain schedule list` is now implemented (was a stub), reusing the existing status view. ([#116](https://github.com/onebrain-ai/onebrain-cli/issues/116))
+- CI now runs the lex-only (`--no-default-features`) test suite alongside clippy. ([#119](https://github.com/onebrain-ai/onebrain-cli/issues/119))
+- Polish ([#120](https://github.com/onebrain-ai/onebrain-cli/issues/120)): `SearchMcpServer` renamed to `McpServer`; `get` tool documents line clamping; `QueryParams` dead-code allowance tightened.
 
 ## [3.4.2] — 2026-07-03 — fix: weak server auth token on Windows
 
@@ -82,7 +82,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `dot_scalar` gains a debug-build equal-length assertion; simsimd fallback logs before returning `NEG_INFINITY`.
 - ADR 0018 polish: sysroot typo fixed, win-arm64 decision restructured into sub-bullets.
 
-## [3.4.0] — 2026-07-01 — native search engine (`onebrain-search`)
+## [3.4.0] — 2026-07-03 — native search engine (`onebrain-search`)
 
 - Added native Rust search engine: tantivy BM25 + fastembed embeddings + flat mmap vector store + RRF hybrid ranking — no Node/Python runtime.
 - Added `onebrain search query/search/vsearch/get/status/reindex` (`--json`) plus `search model list/set` and an interactive TTY model picker.
@@ -102,7 +102,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Release workflow now downloads the prebuilt webui dist (from onebrain-webui's own GH Release tarball, sha256-verified) instead of rebuilding it — releases are minutes faster and reproducible.
 - Fail-closed: missing/malformed pin metadata, missing asset, or hash mismatch aborts the release loudly.
 
-## [3.3.25] — 2026-07-01 — webview preflight route
+## [3.3.25] — 2026-07-02 — webview preflight route
 
 - Added `GET /api/webview/preflight?url=` — inspects `X-Frame-Options`/CSP `frame-ancestors` so the web UI can decide iframe-embed vs new-tab.
 - Fail-safe: any probe failure (bad scheme, network error, timeout) degrades to `frameable:false`, never an HTTP error.
@@ -147,25 +147,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Core line coverage 93.62% → 94.28%; residuals tracked in `docs/coverage.md`.
 - No behavior change — tests only.
 
-## [3.3.18] — 2026-06-29 — coverage phase 2 (command modules)
+## [3.3.18] — 2026-06-30 — coverage phase 2 (command modules)
 
 - test(cli): closes coverage gaps in the command-module layer — `doctor.rs` 87.55%→94.20%, `register_schedule.rs` 72.08%→91.30%, `vault_ctx.rs` 51.35%→100%, `run_skill.rs` +110 tests.
 - Core line coverage 92.59% → 93.62%; residuals documented in `docs/coverage.md`.
 - Test isolation hardening: plugin-cache/qmd-embeddings fix-path tests now run via subprocess with a tempdir `$HOME`/`PATH`.
 - No behavior change — tests only.
 
-## [3.3.17] — 2026-06-29 — fix `onebrain update` hang on Homebrew + tighter --help indent
+## [3.3.17] — 2026-06-30 — fix `onebrain update` hang on Homebrew + tighter --help indent
 
 - Fixed: `onebrain update` no longer hangs on Homebrew — Homebrew 4.4+'s "proceed? [y/n]" prompt was corrupted by the install spinner redrawing the TTY; `HOMEBREW_NO_ASK=1` fixes it.
 - style(cli): tighter `--help` layout — category headings flush left, commands indent 2 spaces.
 
-## [3.3.16] — 2026-06-29 — coverage foundation + dispatch tests
+## [3.3.16] — 2026-06-30 — coverage foundation + dispatch tests
 
 - test(cli): adds `scripts/coverage.sh` + `docs/coverage.md` (excluded-files list + rationale + baselines); targets 100% line coverage on testable core code.
 - test(cli): covers `v31/dispatch.rs` stub + verb arms — 76.94% → 86.70% line.
 - Measured baselines: whole-workspace 89.58% line; core (exclusions applied) 92.59% line. No behavior change.
 
-## [3.3.15] — 2026-06-29 — categorized root --help
+## [3.3.15] — 2026-06-30 — categorized root --help
 
 - feat(cli): groups root `--help` commands into 4 named category sections (⚙️ System Management, 🧠 Vault Management, 🔄 Session Management, 🚀 Launch Management).
 - Category headings show emoji on a terminal, render plain when piped, so `onebrain --help | cat` stays clean.
@@ -175,7 +175,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Options section keeps its compact format, unaffected by the categorized block injection.
 - Fixed `is_root_help_request` to not intercept `--version`/`-V`.
 
-## [3.3.14] — 2026-06-29 — surface note + task in --help
+## [3.3.14] — 2026-06-30 — surface note + task in --help
 
 - feat(cli): surfaces the `note` and `task` command groups in `onebrain --help` — all 14 `note` verbs + `task list` were implemented but hidden.
 - Stub verbs `task add`/`task done` stay hidden until implemented; all-stub groups and v3.0 legacy aliases remain hidden.
@@ -196,7 +196,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - fix(serve): OWASP A03 — `GET /api/vault/file`/`/raw` now refuse vault tooling dirs (`.git`/`.obsidian`/`.claude`/`.trash`/`node_modules`), matching the write paths.
 - fix(serve): OWASP A03 — the `claude` chat subprocess argv ends options with `--` so a message starting with `-`/`--` can't be smuggled as a flag.
 
-## [3.3.10] — 2026-06-27 — serve: qmd-backed vault search
+## [3.3.10] — 2026-06-28 — serve: qmd-backed vault search
 
 - feat(serve): new `GET /api/vault/search?q=&mode=lex|hybrid` shells out to the `qmd` index for the web UI's search panel.
 - fix(serve): the endpoint returns 503 when `qmd_collection`/`qmd` binary is missing, falling back to filename/path search.
@@ -249,7 +249,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - feat(note): `onebrain note mkdir <path>` — create a folder.
 - These are the CLI counterparts to the v3.3.1 daemon write endpoints — both surfaces now share one implementation.
 
-## [3.3.1] — 2026-06-24 — daemon write / media / chat surface
+## [3.3.1] — 2026-06-25 — daemon write / media / chat surface
 
 - feat(daemon): note write surface — `POST/PUT/DELETE /api/vault/file`, `POST /api/vault/move` (rewrites incoming wikilinks), `POST`+`DELETE /api/vault/folder`.
 - feat(daemon): `GET /api/vault/raw` (image/PDF preview) and `POST /api/vault/upload` (binary attachments), behind a body-size limit.
@@ -285,8 +285,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Internal: removed the dead `tokio_helper` runtime shim (zero callers); the daemon (v3.3) re-introduces `tokio` deliberately.
 - Dep: `serde_yaml` (archived upstream) → `serde_yaml_ng`, an actively-maintained drop-in.
 - Internal: dropped the unused `clap` `env` feature.
-- Internal: unified the two `plugin update` text renderers into one, removing a trait that existed only for test doubles (PR #57).
-- Internal: renamed `vault_sync::run_silent` + `register_schedule::run_quiet` → both `run_embedded` for naming consistency (PR #57).
+- Internal: unified the two `plugin update` text renderers into one, removing a trait that existed only for test doubles (PR [#57](https://github.com/onebrain-ai/onebrain-cli/issues/57)).
+- Internal: renamed `vault_sync::run_silent` + `register_schedule::run_quiet` → both `run_embedded` for naming consistency (PR [#57](https://github.com/onebrain-ai/onebrain-cli/issues/57)).
 
 ## [3.2.17] — 2026-05-29 — `onebrain update`: refresh Homebrew tap before upgrade + dedicated npm channel
 
@@ -408,7 +408,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Feat: banner wordmark gradient — continuous horizontal cyan→purple→pink gradient across `ONEBRAIN` in truecolor.
 - Polish: `onebrain update`'s post-update hint now names the direct `onebrain plugin update` path alongside `/update`.
 
-## [3.2.0] — 2026-05-27 — `note` resource group (11 verbs)
+## [3.2.0] — 2026-05-26 — `note` resource group (11 verbs)
 
 - Feat: `onebrain note <verb>` — 11 native vault note operations (`search`/`list`/`find`/`read`/`stat`/`backlinks`/`orphans`/`append`/`new`/`archive`/`move`) replacing ad-hoc `grep`/`ls`/`find`/`cat`.
 - All verbs emit the canonical `Envelope<T>` (text/json/yaml), vault-required, backed by 100+ fs-layer + CLI unit tests plus a 22-case fixture-vault integration suite.
@@ -441,7 +441,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fix: `session init` unembedded count now works and is vault-aware — parses the text form instead of `--json` (which qmd ignores).
 - Feat: animated `doctor` on an interactive TTY — checks reveal one at a time with a short per-step delay.
 
-## [3.1.0] — 2026-05-25 — Consistency Standard · locked command tree · canonical JSON envelope
+## [3.1.0] — 2026-05-26 — Consistency Standard · locked command tree · canonical JSON envelope
 
 - Feat: R1 branded banner — 5-line FIGlet "Slant" `OneBrain` wordmark + tagline on interactive sessions and every `--help` screen, gated on a 6-rule TTY chain.
 - Feat: locked 27-entry command tree — 3 root verbs + 24 resource groups, singular-noun 2-level `onebrain <noun> <verb>`; other 200+ verbs stubbed with `E_NOT_IMPLEMENTED` (exit 72).
@@ -452,7 +452,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Feat: output-format compliance — interactive commands default to text and honor `--json`/`--json --pretty`/`--yaml`/`--output` consistently via one canonical dispatcher.
 - **Breaking:** config file renamed `vault.yml` → `onebrain.yml` — CLI v3.1+ dual-reads for back-compat (one-time deprecation warning on legacy); `doctor --fix` migrates via atomic rename; v4.0.0 drops `vault.yml` support entirely.
 
-## [3.0.x] — post-GA follow-ups
+## [3.0.x] — 2026-05-26 — post-GA follow-ups
 
 These shipped under the v3.0.x patch line after the 2026-05-22 GA and are not part of v3.1.0 itself.
 
@@ -461,10 +461,10 @@ These shipped under the v3.0.x patch line after the 2026-05-22 GA and are not pa
 - postinstall verifies SHA256 against the published `.sha256` before extracting, closing the gap between attested publish and binary integrity.
 - bin shim re-raises signal terminations (`128 + signum`) so Ctrl-C/SIGTERM is distinguishable from a real error in CI.
 - README + CONTRIBUTING signpost the new `npm-wrapper/` layout; install table promotes npm + Homebrew out of "planned" (both live since v3.0.0 GA).
-- postinstall hardening: retry-with-backoff on HTTP 404, Alpine/musl detection, Windows tar fallback to PowerShell `Expand-Archive`, post-install smoke test, escape-hatch env overrides. (PR #29)
+- postinstall hardening: retry-with-backoff on HTTP 404, Alpine/musl detection, Windows tar fallback to PowerShell `Expand-Archive`, post-install smoke test, escape-hatch env overrides. (PR [#29](https://github.com/onebrain-ai/onebrain-cli/issues/29))
 - Raspberry Pi + 32-bit ARM Linux support — release matrix adds `armv7`/`arm-unknown-linux-gnueabihf`; every Pi from 1 to 5 now has a published binary.
 
-## v3.0.0 — Rust rewrite GA · 7-platform release pipeline · stable JSON contracts
+## [3.0.0] — 2026-05-22 — Rust rewrite GA · 7-platform release pipeline · stable JSON contracts
 
 - Complete Rust rewrite of OneBrain CLI replacing v2.x TypeScript/Bun — 4-crate workspace, ~10× less memory, 92% smaller binary, startup within 10ms of Bun on warm cache.
 - 7-platform release pipeline (macOS Apple Silicon + Intel, Linux ARM64 + x86_64 glibc/musl, Windows ARM64 + x86_64), `cargo-binstall`-ready.
@@ -475,7 +475,7 @@ These shipped under the v3.0.x patch line after the 2026-05-22 GA and are not pa
 - `doctor` ships 8 read-only checks and 5 `--fix` recipes; remaining recipes + Windows zip extraction deferred to v3.0.1.
 - Distribution at GA: GitHub Releases + `onebrain update` is the primary path; npm-wrapper and Homebrew tap are planned for the v3.0.x window, not published at GA.
 
-## v3.0.0-alpha.9 — GA candidate: fix `onebrain update` install path · TTY spinner · direct harness · real `--test` · Windows pin
+## [3.0.0-alpha.9] — 2026-05-20 — GA candidate: fix `onebrain update` install path · TTY spinner · direct harness · real `--test` · Windows pin
 
 - `onebrain update` install path rewritten to fetch directly from GitHub Releases (alpha.1–alpha.8 shelled out to `bun`/`npm install -g`, which never had the Rust binary published — every real update failed). Downloads over HTTPS (rustls TLS, no checksum verification yet — trust model matches rustup/deno/bun), atomically swaps via tmp + rename. Windows zip extraction intentionally stubbed for v3.0.0.
 - TTY spinner + colorized output for `onebrain update`; non-TTY output stays plain-text byte-for-byte; `--json` suppresses all log output.
@@ -486,7 +486,7 @@ These shipped under the v3.0.x patch line after the 2026-05-22 GA and are not pa
 - `--vault-dir` flag pattern audited across all subcommands (Reviewer C-I4) — user-visible flag name is consistent everywhere; no code change.
 - Defense-in-depth: `extract_tar_gz` now guards on `entry_type().is_file()` so a malicious tar can't promote a symlink/dir to "the binary"; deleted the dead bun/npm install-command code path.
 
-## v3.0.0-alpha.8 — feat: JSON output modes for `doctor` + `update` · cosmetic
+## [3.0.0-alpha.8] — 2026-05-20 — feat: JSON output modes for `doctor` + `update` · cosmetic
 
 - feat: `doctor --json` emits a single JSON document (`{ok, summary, checks[]}`); combines with `--fix` for a post-fix `fix[]` array; schema stable for v3.x.
 - `doctor --json` outside a vault now emits a JSON failure envelope on stdout with exit code 1, instead of an anyhow plain-text error.
@@ -496,7 +496,7 @@ These shipped under the v3.0.x patch line after the 2026-05-22 GA and are not pa
 - `register-schedule` resolves `folders.logs` from `vault.yml` instead of hardcoding `07-logs/scheduler/...`, with path-traversal guards.
 - 3-round review consensus fix-pass: `version_at_least` promoted to `pub`; `progress_writer` option added to `VaultSyncOptions`; +5 unit tests.
 
-## v3.0.0-alpha.7 — feat(doctor): four new `--fix` recipes (settings-hooks · plugin-files · vault.yml-keys · claude-settings)
+## [3.0.0-alpha.7] — 2026-05-20 — feat(doctor): four new `--fix` recipes (settings-hooks · plugin-files · vault.yml-keys · claude-settings)
 
 - `doctor --fix` now repairs four more check types: `settings-hooks`, `plugin-files`, `vault.yml-keys` (backfills keys, strips deprecated ones, repairs non-positive checkpoint values), `claude-settings`.
 - Dispatch widened to Warn AND Error so previously-bypassed failure modes are now repaired by `--fix`.
@@ -505,20 +505,20 @@ These shipped under the v3.0.x patch line after the 2026-05-22 GA and are not pa
 - `orphan-checkpoints` routes to Manual with a clearer hint pointing at `/wrapup` — auto-deletion intentionally off the table.
 - Five recipes total ship with the auto-fix flow; the `vault.yml-keys` message notes YAML comments aren't preserved yet.
 
-## v3.0.0-alpha.6 — fix(update): target CLI repo + prerelease-safe · ci: GHA Node 24 · docs: README hero + badges
+## [3.0.0-alpha.6] — 2026-05-20 — fix(update): target CLI repo + prerelease-safe · ci: GHA Node 24 · docs: README hero + badges
 
 - `onebrain update` now targets the CLI repo (`onebrain-ai/onebrain-cli`) instead of the plugin repo, fixing a bug where the non-`--check` form could downgrade users to the plugin repo's last Bun release.
 - Semver-aware version comparison via the `semver` crate replaces the string-equality check, preventing silent downgrades.
 - GitHub Actions Node 24 bump across `ci.yml`/`release.yml`, clearing deprecation warnings ahead of the forced cutover.
 - README hero/banner + CLI-only badges aligned with the plugin repo's presentation; license badge updated to AGPL-3.0.
 
-## v3.0.0-alpha.5 — feat: doctor --fix lands · cleaner --help output
+## [3.0.0-alpha.5] — 2026-05-20 — feat: doctor --fix lands · cleaner --help output
 
 - `doctor --fix` now actually attempts repair instead of a stub — first recipe is `qmd-embeddings`, re-running all checks after the fix pass.
 - Removed `(Slice N)` internal porting markers from every subcommand description shown in `--help`.
 - New `FixOutcome { Fixed, Failed, Manual }` enum + summary block so the user can quickly read what changed.
 
-## v3.0.0-alpha.4 — perf: faster doctor + warm-cache update --check
+## [3.0.0-alpha.4] — 2026-05-20 — perf: faster doctor + warm-cache update --check
 
 - `update --check` warm-path 480ms → 10ms (~48× faster) via an on-disk JSON cache with a 1-hour TTL; `--fresh` bypasses it.
 - `doctor` wall time ~980ms → ~890ms by running the `qmd-embeddings` probe on a background thread while the other 7 checks run serially.
@@ -526,7 +526,7 @@ These shipped under the v3.0.x patch line after the 2026-05-22 GA and are not pa
 - `onebrain update` no longer spawns a subprocess for the current version, using `env!("CARGO_PKG_VERSION")` instead.
 - New unit/integration tests cover the cache hit/miss/staleness paths and the in-process version constant.
 
-## v3.0.0-alpha.3 — fix(parity): close all 6 Bun-CLI argv gaps + init becomes one-step + safety + friendlier release notes
+## [3.0.0-alpha.3] — 2026-05-20 — fix(parity): close all 6 Bun-CLI argv gaps + init becomes one-step + safety + friendlier release notes
 
 - `init` now runs `vault-sync` automatically, collapsing the previous 2-step bootstrap into one; `--no-sync` skips it for offline/CI use.
 - Closes 6 Bun-CLI argv gaps the Rust port had dropped (`vault-sync --branch`, positional args on `session-init`/`checkpoint`/`register-schedule`/`init`, `migrate` positional).
@@ -537,22 +537,22 @@ These shipped under the v3.0.x patch line after the 2026-05-22 GA and are not pa
 - README rewritten with the platform table + one-step quickstart; CONTRIBUTING.md added.
 - Adds 9 new integration tests; suite now at 634 passing.
 
-## v3.0.0-alpha.2 — fix(release): Windows TARGET expansion in release pipeline
+## [3.0.0-alpha.2] — 2026-05-20 — fix(release): Windows TARGET expansion in release pipeline
 
-- fix(release): adds `shell: bash` to Build/Strip steps so `$TARGET` expands correctly on Windows runners; unblocks 7/7 platform builds. (PR #20)
+- fix(release): adds `shell: bash` to Build/Strip steps so `$TARGET` expands correctly on Windows runners; unblocks 7/7 platform builds. (PR [#20](https://github.com/onebrain-ai/onebrain-cli/issues/20))
 
-## v3.0.0-alpha.1 — feat(slices-7-13): Bun parity port + 2 v3.0.1 fixes
+## [3.0.0-alpha.1] — 2026-05-20 — feat(slices-7-13): Bun parity port + 2 v3.0.1 fixes
 
-- Ports the full Bun CLI parity surface (slices 7–13): `init` (vault bootstrap + schedule presets + `register-hooks`), `vault-sync` (9-step release-overlay flow), `register-hooks`, `register-schedule` (launchd plists, skill/command mode, one-shot `at:`), `update` (GitHub releases fetch + atomic swap), `run-skill`, `migrate`, `doctor` (8 read-only checks), and `orphan-scan` (Active-Session Guard). (PR #2, #3, #9–#16)
+- Ports the full Bun CLI parity surface (slices 7–13): `init` (vault bootstrap + schedule presets + `register-hooks`), `vault-sync` (9-step release-overlay flow), `register-hooks`, `register-schedule` (launchd plists, skill/command mode, one-shot `at:`), `update` (GitHub releases fetch + atomic swap), `run-skill`, `migrate`, `doctor` (8 read-only checks), and `orphan-scan` (Active-Session Guard). (PR [#2](https://github.com/onebrain-ai/onebrain-cli/issues/2), [#3](https://github.com/onebrain-ai/onebrain-cli/issues/3), [#9](https://github.com/onebrain-ai/onebrain-cli/issues/9)–[#16](https://github.com/onebrain-ai/onebrain-cli/issues/16))
 - Fixes 2 parity regressions found during the port: `init` reporting `hooks: ok` while `.claude/settings.json` was never written (slice 10); `vault-sync` silently exiting 0 on a caught error with no message (slice 13).
 - New core modules: `onebrain-core::scheduler` (cron/launchd, ports Bun 1:1), `onebrain-fs::init`/`orphan` (injectable IO closures for offline/TTY-free tests), `load_vault_config_at` for direct-path config loading.
 - `VaultFolders` extended from 1 key (`logs`) to all 8 standard PARA keys, matching Bun's `DEFAULT_FOLDERS`.
 - `doctor --fix` auto-repair deferred to v3.0.1 per spec §7.10 — flag is parsed but emits a stub message; doctor itself is parity-green.
 - New workspace deps: `regex`, `dirs`, `libc`, `indexmap`, `inquire` (interactive prompts).
-- `.github/workflows/release.yml` 7-platform release pipeline (tar.gz/zip + sha256); `CHANGELOG.md` reformatted to the repo's compact style (PR #5).
-- Post-merge hardening on PR #3 (ENOENT vs EACCES differentiation, `frontmatter` visibility fix, boundary tests) plus repo metadata (description, homepage, topics, branch ruleset).
+- `.github/workflows/release.yml` 7-platform release pipeline (tar.gz/zip + sha256); `CHANGELOG.md` reformatted to the repo's compact style (PR [#5](https://github.com/onebrain-ai/onebrain-cli/issues/5)).
+- Post-merge hardening on PR [#3](https://github.com/onebrain-ai/onebrain-cli/issues/3) (ENOENT vs EACCES differentiation, `frontmatter` visibility fix, boundary tests) plus repo metadata (description, homepage, topics, branch ruleset).
 
-## v3.0.0-alpha.0 — feat(slice-1): session-init + 4-crate workspace foundation
+## [3.0.0-alpha.0] — 2026-05-19 — feat(slice-1): session-init + 4-crate workspace foundation
 
 - 4-crate Cargo workspace (`onebrain-core`/`onebrain-fs`/`onebrain-cache`/`onebrain-cli`) scaffolding all 13 subcommands (12 still `todo!()`).
 - `session-init` subcommand with 8-layer session token resolution (Bun v2.3.3 parity): env vars → process ancestor walk-up → day-scoped cache → PID fallback.
