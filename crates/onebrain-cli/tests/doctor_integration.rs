@@ -346,10 +346,17 @@ fn doctor_search_check_falls_back_direct_when_daemon_unreachable() {
 /// fabricated here too — otherwise doctor would (correctly) warn that the
 /// reranker model isn't downloaded and this wouldn't be an all-green fixture
 /// anymore.
+// `HOME` is overridden below to isolate the new `qmd-leftovers` doctor check
+// (reads `dirs::home_dir()` / `.cache`, `.config`) from whatever's actually
+// installed on the machine running the test — `dirs::home_dir()` only
+// honors `$HOME` on unix (Windows resolves `%USERPROFILE%` instead), so this
+// override — and the test — is unix-only.
+#[cfg(unix)]
 #[test]
 fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
     let vault = tempdir().unwrap();
     let cache = tempdir().unwrap();
+    let home = tempdir().unwrap();
     write_minimal_vault(vault.path());
     // All-green needs the CANONICAL config filename (a legacy vault.yml would
     // trip the vault-config-migration warn) and, since v3.4.8, a fully
@@ -386,6 +393,10 @@ fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
     Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(vault.path())
+        .env("HOME", home.path())
+        // Isolate `$PATH` too (not just `$HOME`) so the new `qmd-leftovers`
+        // check can't find a real `qmd` binary on this machine.
+        .env("PATH", "/usr/bin:/bin")
         .env("ONEBRAIN_CACHE_DIR", cache.path())
         .args(["search", "reindex"])
         .assert()
@@ -394,6 +405,10 @@ fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
     Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(vault.path())
+        .env("HOME", home.path())
+        // Isolate `$PATH` too (not just `$HOME`) so the new `qmd-leftovers`
+        // check can't find a real `qmd` binary on this machine.
+        .env("PATH", "/usr/bin:/bin")
         .env("ONEBRAIN_CACHE_DIR", cache.path())
         .arg("doctor")
         .assert()
@@ -406,6 +421,10 @@ fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
     Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(vault.path())
+        .env("HOME", home.path())
+        // Isolate `$PATH` too (not just `$HOME`) so the new `qmd-leftovers`
+        // check can't find a real `qmd` binary on this machine.
+        .env("PATH", "/usr/bin:/bin")
         .env("ONEBRAIN_CACHE_DIR", cache.path())
         .args(["doctor", "--fix"])
         .assert()

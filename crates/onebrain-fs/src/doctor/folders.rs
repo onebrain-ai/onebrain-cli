@@ -58,6 +58,7 @@ mod tests {
             checkpoint: Default::default(),
             folders: Default::default(),
             search: Default::default(),
+            stats: Default::default(),
         }
     }
 

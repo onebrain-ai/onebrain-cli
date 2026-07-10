@@ -243,6 +243,17 @@ pub fn config_key_docs() -> Vec<ConfigKeyDoc> {
             "# Sessions a topic must recur in to be promoted to memory (plugin) · default: 2"
                 .to_string(),
         ),
+        // System-managed doctor flag. Not part of the fresh template (a new
+        // vault has never been prompted, so there's nothing to record yet) —
+        // `doctor --fix` writes this key only after the user declines the
+        // qmd leftover cleanup prompt, via the same comment-preserving line
+        // edit `stamp_doctor_run` uses for `last_doctor_run`. The doc entry
+        // exists so a manually-added or hand-edited `stats:` block still
+        // gets the self-documentation comment backfilled.
+        doc(
+            &["stats", "qmd_cleanup_declined"],
+            "# Set by doctor --fix after you decline the qmd cleanup prompt — suppresses re-prompting · default: unset".to_string(),
+        ),
         // Block-level header for `schedule:` documenting the entry shape —
         // one multi-line comment (never per-entry comments; entry data is
         // never touched). Shared verbatim by the fresh template and the
@@ -627,7 +638,8 @@ mod tests {
             // Backfill-only entries: their docs exist only for the doctor
             // --fix backfill on existing vaults; the fresh template never
             // emits these keys (recap.* = plugin-level, absent = plugin
-            // defaults; search.embed.* = parsed but not yet enforced).
+            // defaults; stats.* = doctor-managed, absent until the first
+            // `--fix` decline; search.embed.* = parsed but not yet enforced).
             // search.exclude is NOT backfill-only — the fresh template emits
             // it (see `render_onebrain_yml_for_folders`); it falls through
             // to the normal assertion below like any other emitted key.
@@ -635,6 +647,13 @@ mod tests {
                 assert!(
                     !yaml.contains("recap:"),
                     "fresh template must not emit a recap block:\n{yaml}"
+                );
+                continue;
+            }
+            if doc.segments.first() == Some(&"stats") {
+                assert!(
+                    !yaml.contains("stats:"),
+                    "fresh template must not emit a stats block:\n{yaml}"
                 );
                 continue;
             }
@@ -672,11 +691,14 @@ mod tests {
         // Some, every Vec non-empty) so adding a struct field without a doc
         // entry fails THIS test with instructions.
         //
-        // `stats.*` never appears in this walk: it is not a VaultConfig
-        // field at all — doctor writes it as raw text (system-managed), so
-        // no allowlist entry is needed for it.
+        // `stats.last_doctor_run` / `stats.last_doctor_fix` never appear in
+        // this walk: they are not `VaultStats` fields — doctor writes them as
+        // raw text (system-managed timestamps), so no allowlist entry is
+        // needed for either. `stats.qmd_cleanup_declined` IS a real
+        // `VaultStats` field (read back to gate the `doctor --fix` re-prompt),
+        // so it walks like any other key and needs its own doc entry below.
         use onebrain_core::config::EmbedGate;
-        use onebrain_core::VaultConfig;
+        use onebrain_core::{VaultConfig, VaultStats};
         let cfg = VaultConfig {
             qmd_collection: Some("legacy".to_string()),
             checkpoint: CheckpointPolicy::default(),
@@ -692,6 +714,9 @@ mod tests {
                     ..RerankerConfig::default()
                 },
                 ..SearchConfig::default()
+            },
+            stats: VaultStats {
+                qmd_cleanup_declined: Some(true),
             },
         };
         fn walk(v: &serde_yaml::Value, prefix: &[String], out: &mut Vec<String>) {

@@ -20,6 +20,29 @@ pub struct VaultConfig {
     /// Defaults supplied by `SearchConfig::default`.
     #[serde(default)]
     pub search: SearchConfig,
+
+    /// Doctor-managed housekeeping flags parsed from the config's `stats:`
+    /// block. `last_doctor_run` / `last_doctor_fix` are NOT modeled here —
+    /// they're pure timestamps written by a specialized comment-preserving
+    /// line edit (`doctor.rs`'s `stamp_doctor_run`) and never read back.
+    /// `qmd_cleanup_declined` IS read back (it gates whether `doctor --fix`
+    /// re-offers the qmd leftover cleanup prompt), so it gets its own typed
+    /// field. Defaults supplied by `VaultStats::default`.
+    #[serde(default)]
+    pub stats: VaultStats,
+}
+
+/// Doctor-managed housekeeping flags parsed read-only from the config's
+/// `stats:` block. See [`VaultConfig::stats`] for why this only carries
+/// `qmd_cleanup_declined` and not the timestamp fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VaultStats {
+    /// Set to `true` once the user declines the `doctor --fix` qmd leftover
+    /// cleanup prompt — suppresses re-prompting on later `--fix` runs while
+    /// still surfacing the advisory finding. `None`/absent means "never
+    /// declined" (prompt normally).
+    #[serde(default)]
+    pub qmd_cleanup_declined: Option<bool>,
 }
 
 /// Checkpoint policy fields parsed from the config's `checkpoint:` block.

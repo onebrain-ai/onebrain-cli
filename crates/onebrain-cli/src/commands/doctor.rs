@@ -112,6 +112,7 @@ pub fn run(
             checkpoint: Default::default(),
             folders: Default::default(),
             search: Default::default(),
+            stats: Default::default(),
         }
     });
 
@@ -220,6 +221,14 @@ pub fn run(
                     results = all_checks(vault_root.as_path(), &config);
                 } else {
                     println!("\nNo changes made.");
+                    // Declining the batch necessarily declines the qmd
+                    // cleanup too (when it was offered) — record that so the
+                    // NEXT `doctor --fix` doesn't ask again. The advisory
+                    // `qmd-leftovers` finding itself keeps showing in the
+                    // plain report; only the re-prompt is suppressed.
+                    if auto.iter().any(|r| r.check == "qmd-leftovers") {
+                        decline_qmd_cleanup(vault_root.as_path());
+                    }
                 }
             }
             // Single deferred Summary box — the pre-fix report omitted its own
@@ -275,6 +284,7 @@ fn all_checks(vault_root: &Path, config: &onebrain_core::VaultConfig) -> Vec<Doc
     results.push(config_values_check(vault_root));
     results.push(search_exclude_check(vault_root));
     results.push(native_search_check(vault_root));
+    results.push(qmd_leftovers_check_prod(config));
     results
 }
 
@@ -968,6 +978,251 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
     )
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Legacy `qmd` leftover detection + guided cleanup (v3.4.9)
+//
+// Pre-v3.4 vaults used an npm-installed CLI (`@tobilu/qmd`, invoked as
+// `qmd`) for semantic search, wired up via a Claude Code hook. v3.4 replaced
+// it with the native `onebrain search` engine (issue-tracked migration —
+// `legacy-qmd-collection` migrates the config key; this check handles what's
+// left on disk: the npm package, its PATH-resolved binary/symlink, and two
+// caches — `~/.cache/qmd` (models + the sqlite index, commonly gigabytes) and
+// `~/.config/qmd`). Once native search is actually configured, none of that
+// is needed anymore.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Legacy `qmd` leftovers detected on the local machine. Every field is
+/// independently optional — a partial uninstall (binary removed, cache left
+/// behind, or vice versa) is common, and each leftover is safe to report or
+/// remove on its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QmdLeftovers {
+    /// Absolute path to the first `qmd` (`.exe`/`.cmd` probed too on
+    /// Windows) found by walking `$PATH` in order — matches shell lookup
+    /// semantics (`command -v qmd`).
+    pub binary: Option<PathBuf>,
+    /// npm package name parsed from the binary's resolved symlink target
+    /// (`.../node_modules/<scope>/<name>/...` → `<scope>/<name>`, or
+    /// `.../node_modules/<name>/...` → `<name>`). `None` when the binary
+    /// isn't a symlink into a `node_modules` tree — nothing to
+    /// `npm uninstall`.
+    pub npm_package: Option<String>,
+    /// `~/.cache/qmd` and its recursive size in bytes, when the directory
+    /// exists. (Same relative path on Windows: `home` already resolves to
+    /// `%USERPROFILE%`, so no separate probe is needed.)
+    pub cache_dir: Option<(PathBuf, u64)>,
+    /// `~/.config/qmd`, when the directory exists.
+    pub config_dir: Option<PathBuf>,
+}
+
+impl QmdLeftovers {
+    /// `true` when nothing was found at all — the check short-circuits to OK.
+    fn is_empty(&self) -> bool {
+        self.binary.is_none() && self.cache_dir.is_none() && self.config_dir.is_none()
+    }
+}
+
+/// Pure detection — no side effects, safe to call from the check (read-only)
+/// and from unit tests alike. `home` and `path_var` are passed in explicitly
+/// (rather than reading `dirs::home_dir()` / `$PATH` internally) so tests can
+/// point it at a fixture tree instead of the real machine.
+fn detect_qmd_leftovers(home: &Path, path_var: &str) -> QmdLeftovers {
+    let binary = find_qmd_binary(path_var);
+    let npm_package = binary.as_deref().and_then(npm_package_from_symlink);
+    let cache_path = home.join(".cache").join("qmd");
+    let cache_dir = cache_path.is_dir().then(|| {
+        let size = dir_size(&cache_path);
+        (cache_path.clone(), size)
+    });
+    let config_path = home.join(".config").join("qmd");
+    let config_dir = config_path.is_dir().then_some(config_path);
+    QmdLeftovers {
+        binary,
+        npm_package,
+        cache_dir,
+        config_dir,
+    }
+}
+
+/// Locate the first `qmd` executable on `$PATH` (Windows also probes
+/// `.exe`/`.cmd` suffixes, in npm's install-shim order). Existence is
+/// checked with `symlink_metadata` so a dangling symlink still counts as
+/// "found" — matching what a shell's `command -v qmd` would report, and what
+/// `npm_package_from_symlink` needs (a dangling link's target string is still
+/// informative even though it can't be canonicalized).
+fn find_qmd_binary(path_var: &str) -> Option<PathBuf> {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let names: &[&str] = if cfg!(windows) {
+        &["qmd.exe", "qmd.cmd", "qmd"]
+    } else {
+        &["qmd"]
+    };
+    for dir in path_var.split(sep).filter(|d| !d.is_empty()) {
+        for name in names {
+            let candidate = Path::new(dir).join(name);
+            if candidate.symlink_metadata().is_ok() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Parse the npm package name from a global-bin symlink's resolved target,
+/// e.g. `/opt/homebrew/lib/node_modules/@tobilu/qmd/bin/qmd` → `@tobilu/qmd`.
+/// Resolves the full symlink chain (`canonicalize`) so a chain of hops (npm's
+/// own shim → the Homebrew Cellar path) lands on the real file; falls back to
+/// a single `read_link` hop for a dangling symlink whose target no longer
+/// exists (`canonicalize` requires the target to be real). Returns `None` for
+/// a plain file or a path with no `node_modules` segment — nothing to
+/// `npm uninstall`.
+fn npm_package_from_symlink(binary: &Path) -> Option<String> {
+    let resolved = binary
+        .canonicalize()
+        .or_else(|_| std::fs::read_link(binary))
+        .ok()?;
+    let comps: Vec<&std::ffi::OsStr> = resolved.iter().collect();
+    let idx = comps.iter().position(|c| *c == "node_modules")?;
+    let first = comps.get(idx + 1)?.to_str()?;
+    if let Some(scope) = first.strip_prefix('@') {
+        let name = comps.get(idx + 2)?.to_str()?;
+        Some(format!("@{scope}/{name}"))
+    } else {
+        Some(first.to_string())
+    }
+}
+
+/// Recursive directory size in bytes. Best-effort: unreadable entries
+/// (permission errors mid-walk, races) are skipped rather than failing the
+/// whole walk — a doctor check reporting "somewhat less than the true size"
+/// beats crashing on a single bad entry.
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if let Ok(meta) = entry.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+/// Tilde-relative display for a path under `home` (cosmetic only — used in
+/// finding text so `~/.cache/qmd` reads shorter than the absolute path).
+/// Falls back to the absolute path when `dir` isn't under `home`.
+fn tildify(dir: &Path, home: &Path) -> String {
+    match dir.strip_prefix(home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => dir.display().to_string(),
+    }
+}
+
+const QMD_LEFTOVERS_CHECK: &str = "qmd-leftovers";
+
+/// `true` when native search is genuinely configured via `search.collection`
+/// — NOT when that field's only source is [`onebrain_core::load_vault_config`]'s
+/// read-fallback from the deprecated top-level `qmd_collection` key. A vault
+/// that still carries `qmd_collection` hasn't migrated yet (the
+/// `legacy-qmd-collection` check already nags about that); piling the
+/// qmd-uninstall nag on top would read as "remove the tool you haven't
+/// finished migrating away from yet" — confusing, not helpful.
+fn native_search_genuinely_configured(config: &onebrain_core::VaultConfig) -> bool {
+    config.search.collection.is_some() && config.qmd_collection.is_none()
+}
+
+/// Legacy-qmd leftover check (`check = "qmd-leftovers"`). Advisory only —
+/// `DoctorStatus` has no `Info` variant, so `Warn` is the established
+/// stand-in for "worth knowing, nothing broken" (same as `search`'s "no
+/// index yet" case). Detects the pre-v3.4 npm-based `qmd` still installed
+/// alongside the now-redundant native `onebrain search` engine, and — via
+/// `--fix` — offers a guided cleanup (see [`fix_qmd_leftovers`]).
+///
+/// Gated on native search actually being configured (see
+/// [`native_search_genuinely_configured`]): a vault that never adopted
+/// native search has no reason to be told to remove its search tool.
+///
+/// Pure aside from the two params — takes `home` and `path_var` directly
+/// (rather than resolving them internally) so it's unit-testable against a
+/// fixture tree; see [`qmd_leftovers_check_prod`] for the production
+/// entry point.
+fn qmd_leftovers_check(
+    config: &onebrain_core::VaultConfig,
+    home: &Path,
+    path_var: &str,
+) -> DoctorResult {
+    if !native_search_genuinely_configured(config) {
+        return DoctorResult::ok(
+            QMD_LEFTOVERS_CHECK,
+            "skipped — native search not configured",
+        );
+    }
+    let leftovers = detect_qmd_leftovers(home, path_var);
+    if leftovers.is_empty() {
+        return DoctorResult::ok(QMD_LEFTOVERS_CHECK, "no legacy qmd install found");
+    }
+
+    let mut details: Vec<String> = Vec::new();
+    if let Some(bin) = &leftovers.binary {
+        details.push(format!("binary: {}", bin.display()));
+    }
+    if let Some(pkg) = &leftovers.npm_package {
+        details.push(format!("npm package: {pkg}"));
+    }
+    match &leftovers.cache_dir {
+        Some((dir, size)) => details.push(format!(
+            "{} — {} reclaimable",
+            tildify(dir, home),
+            crate::commands::search_common::format_size(*size)
+        )),
+        None if leftovers.binary.is_some() => {
+            details.push(
+                "no cache directory found (binary present, nothing to reclaim there)".to_string(),
+            );
+        }
+        None => {}
+    }
+    if let Some(dir) = &leftovers.config_dir {
+        details.push(tildify(dir, home));
+    }
+
+    let declined = config.stats.qmd_cleanup_declined.unwrap_or(false);
+    let mut result = DoctorResult::warn(
+        QMD_LEFTOVERS_CHECK,
+        "legacy qmd install found — safe to remove now that native search is active",
+    )
+    .with_details(details);
+    if !declined {
+        result = result
+            .with_hint("onebrain doctor --fix to remove it (npm uninstall + delete the caches)");
+    }
+    result
+}
+
+/// Production entry point — resolves the real home directory and `$PATH`,
+/// then delegates to the pure, unit-tested [`qmd_leftovers_check`]. A
+/// home-directory resolution failure degrades to an OK skip rather than an
+/// error — this check is advisory, never worth failing the whole run over.
+fn qmd_leftovers_check_prod(config: &onebrain_core::VaultConfig) -> DoctorResult {
+    let Some(home) = dirs::home_dir() else {
+        return DoctorResult::ok(
+            QMD_LEFTOVERS_CHECK,
+            "skipped — could not resolve home directory",
+        );
+    };
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    qmd_leftovers_check(config, &home, &path_var)
+}
+
 /// Decide whether the text-mode `--fix` should apply its recipes.
 ///
 /// `structured` short-circuits to `true` as a defensive guard — production
@@ -1136,6 +1391,12 @@ fn attempt_fix(result: &DoctorResult, vault_root: &Path, json: bool) -> FixOutco
             "run `/wrapup` in Claude to consolidate orphan checkpoints into a session log"
                 .to_string(),
         ),
+        // Legacy qmd leftover cleanup (npm uninstall + delete caches). Skips
+        // straight to Manual, without touching the filesystem, once the user
+        // has already declined once (`result.hint` is `None` in that case —
+        // see `qmd_leftovers_check`) so `--fix --json` automation can't
+        // silently redo a destructive action the user opted out of.
+        "qmd-leftovers" => fix_qmd_leftovers(result, json),
         _ => FixOutcome::Manual(manual_message(result)),
     }
 }
@@ -1161,7 +1422,107 @@ fn planned_action(result: &DoctorResult) -> Option<&'static str> {
         "claude-settings" => Some("remove the stale marketplace entry"),
         "plugin-cache" => Some("remove the stale plugin cache"),
         "vault-config-migration" => Some("migrate vault.yml → onebrain.yml"),
+        // Only offered while `qmd_leftovers_check` still carries a hint — a
+        // previously-declined cleanup (`hint: None`) falls to `None` here too,
+        // so the batch preview/confirmation stops mentioning it.
+        "qmd-leftovers" => result.hint.is_some().then_some(
+            "npm uninstall the legacy qmd package + delete ~/.cache/qmd and ~/.config/qmd",
+        ),
         _ => None,
+    }
+}
+
+/// Recipe — `qmd-leftovers` warning means the pre-v3.4 npm `qmd` package is
+/// still installed alongside the native search engine. Re-detects fresh
+/// (rather than trusting the check's cached `details` strings) so the
+/// recipe stays correct even if leftovers changed between the report and the
+/// fix pass.
+///
+/// `result.hint.is_none()` means the user already declined this cleanup on
+/// an earlier `--fix` run (`qmd_leftovers_check` omits the hint once
+/// `stats.qmd_cleanup_declined` is set) — short-circuit to Manual without
+/// touching the filesystem so `--fix --json` automation can't silently redo
+/// something the user opted out of.
+///
+/// `npm uninstall` runs in the foreground; a non-zero exit (or a failure to
+/// even launch `npm`) is surfaced as `Partial` rather than aborting — the
+/// cache/config directories are still worth removing on their own.
+fn fix_qmd_leftovers(result: &DoctorResult, json: bool) -> FixOutcome {
+    if result.hint.is_none() {
+        return FixOutcome::Manual(
+            "cleanup previously declined — remove `stats.qmd_cleanup_declined` from \
+             onebrain.yml to be offered this again"
+                .to_string(),
+        );
+    }
+    let Some(home) = dirs::home_dir() else {
+        return FixOutcome::Failed("could not resolve home directory".to_string());
+    };
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    let leftovers = detect_qmd_leftovers(&home, &path_var);
+    if leftovers.is_empty() {
+        return FixOutcome::Fixed("nothing to remove — already clean".to_string());
+    }
+
+    let mut npm_failed = false;
+    if let Some(pkg) = &leftovers.npm_package {
+        status_line(json, &format!("running: npm uninstall -g {pkg}"));
+        match std::process::Command::new("npm")
+            .args(["uninstall", "-g", pkg])
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                npm_failed = true;
+                status_line(
+                    json,
+                    &format!("npm uninstall -g {pkg} exited with {status}"),
+                );
+            }
+            Err(e) => {
+                npm_failed = true;
+                status_line(json, &format!("could not run npm uninstall -g {pkg}: {e}"));
+            }
+        }
+    }
+
+    let mut removed: Vec<String> = Vec::new();
+    let mut removal_failed = false;
+    let dirs_to_remove = [
+        leftovers.cache_dir.as_ref().map(|(d, _)| d.clone()),
+        leftovers.config_dir.clone(),
+    ];
+    for dir in dirs_to_remove.into_iter().flatten() {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => removed.push(tildify(&dir, &home)),
+            Err(e) => {
+                removal_failed = true;
+                status_line(json, &format!("could not remove {}: {e}", dir.display()));
+            }
+        }
+    }
+    let removed_summary = if removed.is_empty() {
+        "no cache/config directories found".to_string()
+    } else {
+        removed.join(", ")
+    };
+
+    if npm_failed || removal_failed {
+        FixOutcome::Partial(format!(
+            "removed {removed_summary} · {}",
+            if npm_failed {
+                "npm uninstall failed — remove the package manually"
+            } else {
+                "some directories could not be removed — check permissions"
+            }
+        ))
+    } else {
+        let pkg_note = leftovers
+            .npm_package
+            .as_deref()
+            .map(|p| format!("uninstalled {p} · "))
+            .unwrap_or_default();
+        FixOutcome::Fixed(format!("{pkg_note}removed {removed_summary}"))
     }
 }
 
@@ -1333,6 +1694,7 @@ fn fix_folders(vault_root: &Path, json: bool) -> FixOutcome {
         checkpoint: Default::default(),
         folders: Default::default(),
         search: Default::default(),
+        stats: Default::default(),
     });
     let f = &config.folders;
     // Order mirrors FoldersCheck so the post-fix re-check reports 8/8.
@@ -2309,6 +2671,44 @@ fn stamp_doctor_run(vault_root: &Path, fix: bool, quiet: bool) {
     }
 }
 
+/// Record that the user declined the qmd cleanup prompt so the NEXT
+/// `doctor --fix` run doesn't offer it again — [`planned_action`] and
+/// [`fix_qmd_leftovers`] both check `qmd_leftovers_check`'s hint, which is
+/// omitted once this flag is set. The advisory `qmd-leftovers` finding
+/// itself keeps showing on every plain `doctor` run regardless (only the
+/// re-prompt is suppressed).
+///
+/// Same comment-preserving `stats:` block writer [`stamp_doctor_run`] uses
+/// for `last_doctor_run`, generalized to an arbitrary key via
+/// [`onebrain_fs::yaml_edit::upsert_child`] (the same primitive
+/// `fix_legacy_qmd_collection` already uses for `search.collection`). Best
+/// effort: a write failure is noted on stderr, never surfaced as a doctor
+/// exit-code failure — this is a convenience flag, not a check result.
+fn decline_qmd_cleanup(vault_root: &Path) {
+    use onebrain_core::find_config_file;
+    let Some(path) = find_config_file(vault_root) else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let updated =
+        onebrain_fs::yaml_edit::upsert_child(&text, "stats", "qmd_cleanup_declined", "true");
+    if updated == text {
+        return; // already recorded
+    }
+    if let Err(e) = onebrain_fs::backup_config_file(&path) {
+        eprintln!(
+            "doctor: could not back up {} before recording qmd cleanup decline: {e}",
+            path.display()
+        );
+        return;
+    }
+    if let Err(e) = onebrain_fs::atomic_write_text(&path, &updated) {
+        eprintln!("doctor: could not record qmd cleanup decline: {e}");
+    }
+}
+
 fn print_fix_summary(outcomes: &[(String, FixOutcome)]) {
     let mut fixed = 0;
     let mut partial = 0;
@@ -2376,7 +2776,11 @@ const DOCTOR_SECTIONS: [(&str, &str, &[&str]); 4] = [
         &["folders", "plugin-files", "plugin-cache"],
     ),
     ("🔌", "Integration", &["settings-hooks", "claude-settings"]),
-    ("📊", "Index & state", &["orphan-checkpoints", "search"]),
+    (
+        "📊",
+        "Index & state",
+        &["orphan-checkpoints", "search", "qmd-leftovers"],
+    ),
 ];
 
 /// Short, scannable display label for a check name (matches the approved
@@ -2397,6 +2801,7 @@ fn display_label(check: &str) -> &str {
         "claude-settings" => "claude settings",
         "orphan-checkpoints" => "checkpoints",
         "search" => "search",
+        "qmd-leftovers" => "qmd cleanup",
         other => other,
     }
 }
@@ -5942,13 +6347,14 @@ mod tests {
         for doc in onebrain_fs::config_key_docs() {
             let key = doc.segments.last().unwrap();
             // Keys not present in this legacy config are never added
-            // (recap.*, schedule, and the search reranker/top_k/exclude/
-            // embed.* keys are all absent here).
+            // (recap.*, stats.*, schedule, and the search reranker/top_k/
+            // exclude/embed.* keys are all absent here).
             if doc.segments.join(".").starts_with("search.reranker")
                 || doc.segments == ["search", "default_top_k"]
                 || doc.segments == ["search", "exclude"]
                 || doc.segments.get(1) == Some(&"embed")
                 || doc.segments.first() == Some(&"recap")
+                || doc.segments.first() == Some(&"stats")
                 || doc.segments == ["schedule"]
             {
                 assert!(
@@ -6383,5 +6789,169 @@ mod tests {
         assert!(msg.contains("already set"), "msg: {msg}");
         let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert_eq!(after, original, "untouched when not gated");
+    }
+
+    // ── qmd leftover detection + guided cleanup ──────────────────────────────
+
+    use onebrain_core::config::SearchConfig;
+
+    /// Config fixture with native search genuinely configured (real
+    /// `search.collection`, not the legacy fallback) and no declined flag.
+    fn cfg_native_search(collection: &str) -> onebrain_core::VaultConfig {
+        onebrain_core::VaultConfig {
+            qmd_collection: None,
+            checkpoint: Default::default(),
+            folders: Default::default(),
+            search: SearchConfig {
+                collection: Some(collection.to_string()),
+                ..Default::default()
+            },
+            stats: Default::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detects_qmd_binary_package_and_cache_sizes() {
+        let home = tempdir().unwrap();
+        let path_dir = tempdir().unwrap();
+
+        // Fake npm global install tree: .../lib/node_modules/@tobilu/qmd/bin/qmd
+        let real_bin = path_dir.path().join("lib/node_modules/@tobilu/qmd/bin/qmd");
+        fs::create_dir_all(real_bin.parent().unwrap()).unwrap();
+        fs::write(&real_bin, b"#!/bin/sh\n").unwrap();
+
+        // PATH entry with a `qmd` symlink into that tree (Homebrew-style
+        // global bin shim — matches พี่เก่ง's real machine layout).
+        let bin_dir = path_dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let symlink_path = bin_dir.join("qmd");
+        std::os::unix::fs::symlink(&real_bin, &symlink_path).unwrap();
+
+        // Fake ~/.cache/qmd with sized fixture files (models/ + index.sqlite,
+        // matching the real ground truth: 1000 + 234 = 1234 bytes total).
+        let cache_dir = home.path().join(".cache").join("qmd");
+        fs::create_dir_all(cache_dir.join("models")).unwrap();
+        fs::write(cache_dir.join("models").join("m.bin"), vec![0u8; 1000]).unwrap();
+        fs::write(cache_dir.join("index.sqlite"), vec![0u8; 234]).unwrap();
+
+        // Fake ~/.config/qmd.
+        let config_dir = home.path().join(".config").join("qmd");
+        fs::create_dir_all(&config_dir).unwrap();
+
+        let leftovers = detect_qmd_leftovers(home.path(), &bin_dir.display().to_string());
+
+        assert_eq!(leftovers.binary.as_deref(), Some(symlink_path.as_path()));
+        assert_eq!(leftovers.npm_package.as_deref(), Some("@tobilu/qmd"));
+        let (found_cache_dir, size) = leftovers.cache_dir.expect("cache dir detected");
+        assert_eq!(found_cache_dir, cache_dir);
+        assert_eq!(size, 1234, "size must equal the fixture bytes exactly");
+        assert_eq!(leftovers.config_dir, Some(config_dir));
+    }
+
+    #[test]
+    fn no_finding_when_collection_unset() {
+        let config = onebrain_core::VaultConfig {
+            qmd_collection: None,
+            checkpoint: Default::default(),
+            folders: Default::default(),
+            search: Default::default(),
+            stats: Default::default(),
+        };
+        let home = tempdir().unwrap();
+        let result = qmd_leftovers_check(&config, home.path(), "");
+        assert_eq!(result.status, DoctorStatus::Ok);
+        assert!(result.message.contains("skipped"), "{result:?}");
+    }
+
+    #[test]
+    fn gate_skips_when_only_legacy_qmd_collection_set() {
+        // A vault that still carries the deprecated top-level `qmd_collection`
+        // key hasn't migrated yet — even though `load_vault_config`'s
+        // read-fallback would backfill `search.collection` from it in
+        // production. The qmd-uninstall nag must not pile onto the
+        // still-open `legacy-qmd-collection` migration warning.
+        let config = onebrain_core::VaultConfig {
+            qmd_collection: Some("ob-1".to_string()),
+            checkpoint: Default::default(),
+            folders: Default::default(),
+            search: SearchConfig {
+                collection: Some("ob-1".to_string()),
+                ..Default::default()
+            },
+            stats: Default::default(),
+        };
+        let home = tempdir().unwrap();
+        let result = qmd_leftovers_check(&config, home.path(), "");
+        assert_eq!(result.status, DoctorStatus::Ok, "{result:?}");
+    }
+
+    #[test]
+    fn warns_with_hint_when_gated_in_and_leftovers_found() {
+        let home = tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".config").join("qmd")).unwrap();
+        let config = cfg_native_search("c1");
+
+        let result = qmd_leftovers_check(&config, home.path(), "");
+        assert_eq!(result.status, DoctorStatus::Warn, "{result:?}");
+        assert!(result.hint.is_some(), "{result:?}");
+        assert!(planned_action(&result).is_some(), "{result:?}");
+    }
+
+    #[test]
+    fn declined_flag_suppresses_refix_prompt_but_keeps_info() {
+        let home = tempdir().unwrap();
+        let cache_dir = home.path().join(".cache").join("qmd");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(cache_dir.join("index.sqlite"), vec![0u8; 10]).unwrap();
+
+        let mut config = cfg_native_search("c1");
+        config.stats.qmd_cleanup_declined = Some(true);
+
+        let result = qmd_leftovers_check(&config, home.path(), "");
+        // INFO listed: still a Warn finding with the leftover details, so the
+        // user keeps seeing it in a plain `doctor` run.
+        assert_eq!(result.status, DoctorStatus::Warn, "{result:?}");
+        assert!(!result.details.is_empty(), "{result:?}");
+        // --fix does not re-offer: no hint, no planned auto-fix action, and
+        // `attempt_fix` short-circuits to Manual without touching disk.
+        assert!(result.hint.is_none(), "{result:?}");
+        assert!(planned_action(&result).is_none(), "{result:?}");
+        let outcome = attempt_fix(&result, home.path(), false);
+        match outcome {
+            FixOutcome::Manual(msg) => assert!(msg.contains("previously declined"), "msg: {msg}"),
+            other => panic!("expected Manual for a declined cleanup, got: {other:?}"),
+        }
+        // No side effects — the cache fixture created above must survive.
+        assert!(
+            cache_dir.is_dir(),
+            "declined path must not touch the filesystem"
+        );
+    }
+
+    #[test]
+    fn qmd_leftovers_in_doctor_sections_and_display_label() {
+        assert_eq!(display_label("qmd-leftovers"), "qmd cleanup");
+        assert!(
+            DOCTOR_SECTIONS
+                .iter()
+                .any(|(_, _, checks)| checks.contains(&"qmd-leftovers")),
+            "qmd-leftovers must be assigned to a section, not fall through to Other"
+        );
+    }
+
+    #[test]
+    fn decline_qmd_cleanup_writes_stats_key_preserving_comments() {
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "# my comment\nupdate_channel: stable\n",
+        )
+        .unwrap();
+        decline_qmd_cleanup(d.path());
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert!(after.contains("# my comment"), "{after}");
+        assert!(after.contains("stats:"), "{after}");
+        assert!(after.contains("qmd_cleanup_declined: true"), "{after}");
     }
 }
