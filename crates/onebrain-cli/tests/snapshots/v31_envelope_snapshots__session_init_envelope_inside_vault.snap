@@ -7,5 +7,6 @@ expression: v
   "session_token": "<SESSION_TOKEN>",
   "search_unembedded": null,
   "qmd_unembedded": null,
+  "recap_pending": 0,
   "headless": false
 }

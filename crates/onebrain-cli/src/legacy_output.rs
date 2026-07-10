@@ -39,6 +39,14 @@ pub struct SessionInitOutput {
     /// for one transition version so pre-v3.4.5 plugins keep parsing. Remove
     /// once the plugin reads `search_unembedded` everywhere.
     pub qmd_unembedded: Option<usize>,
+    /// Count of session logs under `<logs>/session/**/*-session-*.md` whose
+    /// frontmatter has no `recapped:` key — the same discovery criterion the
+    /// `/recap` skill uses. `null` means the probe couldn't determine the
+    /// count (timeout or scan error); `0` means a genuine zero (including a
+    /// fresh vault with no session logs yet); `N` means N session logs are
+    /// awaiting `/recap`. Always
+    /// serialised (never skipped) so the hook contract keeps the key.
+    pub recap_pending: Option<u64>,
     pub headless: bool,
 }
 

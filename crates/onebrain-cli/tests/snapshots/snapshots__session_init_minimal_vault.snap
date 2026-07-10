@@ -7,5 +7,6 @@ expression: normalize_volatile(raw)
   "session_token": "<NORMALIZED>",
   "search_unembedded": null,
   "qmd_unembedded": null,
+  "recap_pending": 0,
   "headless": false
 }

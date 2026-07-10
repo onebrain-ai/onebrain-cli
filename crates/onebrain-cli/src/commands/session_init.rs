@@ -92,6 +92,11 @@ fn compute_result(
         None => Some(0),
     };
 
+    // Recap-pending count · always computed (unlike the search probe, this
+    // isn't gated behind a configured collection — it's a plain filesystem
+    // scan of the session-log directory that every vault has).
+    let recap_pending = recap_pending_bounded(vault_root.as_path(), &config.folders.logs);
+
     let datetime = chrono::Local::now()
         .format("%a · %d %b %Y · %H:%M")
         .to_string();
@@ -112,6 +117,7 @@ fn compute_result(
         // `SessionInitOutput`).
         search_unembedded: unembedded,
         qmd_unembedded: unembedded,
+        recap_pending,
         headless,
     }))
 }
@@ -190,6 +196,89 @@ where
     rx.recv_timeout(cap).unwrap_or(None)
 }
 
+/// Count session logs whose frontmatter lacks a `recapped:` key — the same
+/// criterion the `/recap` skill uses for discovery (`skills/recap/SKILL.md`:
+/// "filter to files WITHOUT `recapped:` frontmatter field"). `logs_folder` is
+/// the vault-config-resolved `folders.logs` value (e.g. `07-logs`); the
+/// session logs live under `<logs_folder>/session/**/*-session-*.md`. A vault
+/// with no `session/` directory yet (fresh vault, never wrapped up) reports a
+/// genuine `Some(0)` rather than `None`. Any walk error (e.g. a
+/// permission-denied subtree) aborts the probe with `None` — a partial count
+/// would look like a determined figure while silently missing files, and
+/// `null` = "couldn't determine" is exactly the contract `search_unembedded`
+/// already established.
+fn recap_pending(vault_root: &Path, logs_folder: &str) -> Option<u64> {
+    let session_dir = vault_root.join(logs_folder).join("session");
+    if !session_dir.is_dir() {
+        return Some(0);
+    }
+    let mut pending = 0u64;
+    for entry in walkdir::WalkDir::new(&session_dir) {
+        let entry = entry.ok()?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy();
+        if !(name.ends_with(".md") && name.contains("-session-")) {
+            continue;
+        }
+        if !frontmatter_has_key(entry.path(), "recapped") {
+            pending += 1;
+        }
+    }
+    Some(pending)
+}
+
+/// True when `path` starts with a *closed* `---` frontmatter block containing
+/// a top-level `{key}:` line (no leading whitespace — an indented `{key}:` is
+/// a nested mapping entry, not a frontmatter field). A leading UTF-8 BOM is
+/// tolerated before the opening `---`, as are leading single-line HTML
+/// comments (`<!-- ... -->`) — orphan recovery prepends a
+/// `<!-- recovery-of: <token>:<date> -->` marker line above the frontmatter
+/// of auto-recovered session logs, and those files must still be recognised
+/// as recapped once `/recap` stamps them. Only complete single-line comments
+/// are skipped; no multi-line comment parsing. Files with no frontmatter, an
+/// unterminated block (no closing `---` before EOF), or an unreadable file
+/// all return `false`; content after the closing `---` (the note body) is
+/// never inspected.
+fn frontmatter_has_key(path: &Path, key: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
+    let mut lines = text
+        .lines()
+        .skip_while(|line| line.trim().starts_with("<!--") && line.trim().ends_with("-->"));
+    if lines.next().map(str::trim) != Some("---") {
+        return false;
+    }
+    let prefix = format!("{key}:");
+    let mut seen = false;
+    for line in lines {
+        if line.trim() == "---" {
+            // Key only counts when the block is actually closed.
+            return seen;
+        }
+        if line.starts_with(&prefix) {
+            seen = true;
+        }
+    }
+    // EOF without a closing `---` → not a valid frontmatter block.
+    false
+}
+
+/// Bounded wrapper mirroring [`native_pending_bounded`]: `recap_pending` is
+/// also a SessionStart hot-path filesystem scan, so it shares the same time
+/// budget as the search probe rather than a separate tunable.
+fn recap_pending_bounded(vault_root: &Path, logs_folder: &str) -> Option<u64> {
+    let vault_root = vault_root.to_path_buf();
+    let logs_folder = logs_folder.to_string();
+    bounded(
+        move || recap_pending(&vault_root, &logs_folder),
+        NATIVE_PENDING_CAP,
+    )
+}
+
 /// Render `result` for the requested output mode.
 ///
 /// v3.1: text is the default. Machine consumers (Claude Code SessionStart
@@ -217,8 +306,12 @@ fn render_text(result: &SessionInitResult) -> String {
                 Some(n) => format!("{n} unembedded"),
                 None => "unknown (search index unavailable)".to_string(),
             };
+            let recap_pending = match out.recap_pending {
+                Some(n) => format!("{n}"),
+                None => "unknown (couldn't scan)".to_string(),
+            };
             format!(
-                "Session ready · token={token} · datetime={datetime}\nsearch index: {unembedded}",
+                "Session ready · token={token} · datetime={datetime}\nsearch index: {unembedded}\nRecap pending: {recap_pending}",
                 token = out.session_token,
                 datetime = out.datetime,
             )
@@ -273,6 +366,8 @@ mod tests {
         // `qmd_unembedded` alias both emitted with the same value.
         assert_eq!(v.get("search_unembedded").and_then(|n| n.as_u64()), Some(0));
         assert_eq!(v.get("qmd_unembedded").and_then(|n| n.as_u64()), Some(0));
+        // Fresh tempdir has no `07-logs/session/` — genuine Some(0), not null.
+        assert_eq!(v.get("recap_pending").and_then(|n| n.as_u64()), Some(0));
         assert!(
             v.get("decision").is_none(),
             "happy path must not include decision field"
@@ -624,6 +719,168 @@ mod tests {
             result,
             Some(0),
             "an indexed-but-empty vault must report a determined Some(0), not None"
+        );
+    }
+
+    // ── recap_pending: session logs missing `recapped:` frontmatter ──────
+
+    #[test]
+    fn recap_pending_counts_only_unrecapped_session_logs() {
+        let vault = tempdir().unwrap();
+        let session_dir = vault
+            .path()
+            .join("07-logs")
+            .join("session")
+            .join("2026")
+            .join("07");
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        // Already recapped — excluded.
+        std::fs::write(
+            session_dir.join("2026-07-01-session-01.md"),
+            "---\nrecapped: 2026-07-05\n---\n# session\n",
+        )
+        .unwrap();
+        // Has frontmatter, but no `recapped:` key — counted.
+        std::fs::write(
+            session_dir.join("2026-07-08-session-01.md"),
+            "---\ntags: [foo]\n---\n# session\n",
+        )
+        .unwrap();
+        // No frontmatter at all — counted.
+        std::fs::write(
+            session_dir.join("2026-07-09-session-02.md"),
+            "# session, no frontmatter\n",
+        )
+        .unwrap();
+
+        let result = recap_pending(vault.path(), "07-logs");
+
+        assert_eq!(
+            result,
+            Some(2),
+            "expected the two non-recapped session logs, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn frontmatter_unclosed_block_is_not_recapped() {
+        // No closing `---` before EOF → not a valid frontmatter block, even
+        // though a body line happens to start with `recapped:` — the file
+        // must count as pending.
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("2026-07-08-session-01.md");
+        std::fs::write(
+            &file,
+            "---\ntags: [foo]\n# discussing\nrecapped: 2026-07-05\n",
+        )
+        .unwrap();
+        assert!(
+            !frontmatter_has_key(&file, "recapped"),
+            "an unterminated frontmatter block must not match"
+        );
+    }
+
+    #[test]
+    fn frontmatter_nested_key_is_not_recapped() {
+        // `recapped:` indented under another mapping is a nested entry, not a
+        // top-level frontmatter field — must count as pending.
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("2026-07-08-session-01.md");
+        std::fs::write(&file, "---\nmeta:\n  recapped: true\n---\n# session\n").unwrap();
+        assert!(
+            !frontmatter_has_key(&file, "recapped"),
+            "a nested (indented) key must not match"
+        );
+    }
+
+    #[test]
+    fn frontmatter_bom_prefixed_recapped_is_detected() {
+        // A UTF-8 BOM before the opening `---` must not hide a genuine
+        // top-level `recapped:` key (would overcount pending).
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("2026-07-01-session-01.md");
+        std::fs::write(&file, "\u{FEFF}---\nrecapped: 2026-07-05\n---\n").unwrap();
+        assert!(
+            frontmatter_has_key(&file, "recapped"),
+            "a BOM-prefixed frontmatter block must still match"
+        );
+    }
+
+    #[test]
+    fn frontmatter_recapped_before_close_matches_despite_body_content() {
+        // Regression guard for the scan-to-completion rewrite: a key seen
+        // BEFORE the closing `---` still matches (stays not-pending), and the
+        // body after the close is never inspected.
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("2026-07-01-session-01.md");
+        std::fs::write(
+            &file,
+            "---\nrecapped: 2026-07-05\n---\n# body mentioning recapped: again\n",
+        )
+        .unwrap();
+        assert!(
+            frontmatter_has_key(&file, "recapped"),
+            "key inside a closed block must match regardless of body content"
+        );
+
+        // Converse: body-only mention after a closed, key-less block must NOT
+        // match — the file stays pending.
+        let body_only = dir.path().join("2026-07-09-session-01.md");
+        std::fs::write(&body_only, "---\ntags: [foo]\n---\nrecapped: 2026-07-05\n").unwrap();
+        assert!(
+            !frontmatter_has_key(&body_only, "recapped"),
+            "a body-only mention after the closing --- must not match"
+        );
+    }
+
+    #[test]
+    fn frontmatter_behind_recovery_comment_is_detected() {
+        // Orphan recovery prepends `<!-- recovery-of: ... -->` above the
+        // frontmatter of auto-recovered session logs; a `recapped:` key in the
+        // actual frontmatter must still be found (real-vault audit: 11 files
+        // misclassified as pending forever without this).
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("2026-07-01-session-01.md");
+        std::fs::write(
+            &file,
+            "<!-- recovery-of: abc12:2026-07-01 -->\n---\ntags: [session-log]\nrecapped: 2026-07-05\n---\n",
+        )
+        .unwrap();
+        assert!(
+            frontmatter_has_key(&file, "recapped"),
+            "frontmatter behind a leading recovery comment must still match"
+        );
+    }
+
+    #[test]
+    fn recovery_comment_without_recapped_is_still_pending() {
+        // Converse: the leading comment is skipped, but a frontmatter block
+        // without the key still counts as pending.
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("2026-07-08-session-01.md");
+        std::fs::write(
+            &file,
+            "<!-- recovery-of: abc12:2026-07-08 -->\n---\ntags: [session-log]\n---\n# body\n",
+        )
+        .unwrap();
+        assert!(
+            !frontmatter_has_key(&file, "recapped"),
+            "a recovered log without `recapped:` must stay pending"
+        );
+    }
+
+    #[test]
+    fn recap_pending_zero_when_session_dir_absent() {
+        let vault = tempdir().unwrap();
+        // Fresh vault — no `07-logs/session/` directory at all.
+
+        let result = recap_pending(vault.path(), "07-logs");
+
+        assert_eq!(
+            result,
+            Some(0),
+            "a fresh vault with no session logs must report a genuine Some(0), not None"
         );
     }
 
