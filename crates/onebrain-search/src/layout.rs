@@ -153,25 +153,42 @@ impl CollectionLayout {
 
     /// Migrate every legacy artifact at `root` into the split layout.
     ///
+    /// `models/` and `index/` are created unconditionally (even for a fresh
+    /// or already-`Split` collection), so after a successful `migrate()` the
+    /// parent of every [`CollectionLayout::index_artifact`] resolution is
+    /// guaranteed to exist — consumers like redb's `Database::create` do NOT
+    /// create parent directories themselves.
+    ///
     /// Per-entry `fs::rename`, so each move is atomic on the same volume.
     /// Idempotent: entries already migrated are skipped, and running this on
     /// an already-`Split` collection is a no-op. Race-safe: if the target
     /// already exists (a concurrent migration/open beat this one to that
     /// entry), the source is left alone rather than erroring or clobbering.
     ///
+    /// # Errors and partial failure
+    ///
+    /// If a rename fails mid-loop (e.g. a permission error), the `Err` is
+    /// returned immediately and the collection may be left in **any partial
+    /// state** — some entries moved, some not — with no state information in
+    /// the error itself. This is safe by design:
+    ///
+    /// - the partial state stays **fully functional**, because every read
+    ///   path ([`CollectionLayout::models_base`],
+    ///   [`CollectionLayout::index_artifact`]) resolves per-artifact with
+    ///   legacy fallback (the module's core invariant);
+    /// - retrying `migrate()` is always safe: already-moved entries are
+    ///   skipped (idempotent), and the retry picks up where the failure left
+    ///   off. Call [`CollectionLayout::detect`] after an `Err` if the caller
+    ///   needs to know where things stand.
+    ///
     /// Returns the resulting [`CacheLayoutState`] (normally `Split`, unless a
     /// race left some entries unmoved, in which case `Partial`).
     pub fn migrate(&self) -> std::io::Result<CacheLayoutState> {
         let models = self.root.join("models");
         let index = self.root.join("index");
-
-        let Ok(read_dir) = std::fs::read_dir(&self.root) else {
-            // No root directory yet — nothing to migrate.
-            return Ok(self.detect());
-        };
-
-        let mut to_move = Vec::new();
-        for entry in read_dir {
+        std::fs::create_dir_all(&models)?;
+        std::fs::create_dir_all(&index)?;
+        for entry in std::fs::read_dir(&self.root)? {
             let entry = entry?;
             let name = entry.file_name();
             let n = name.to_string_lossy();
@@ -182,23 +199,11 @@ impl CollectionLayout {
             } else {
                 continue; // models/, index/, live-reindex markers, unknown files
             };
-            to_move.push((entry.path(), target));
-        }
-
-        if to_move.is_empty() {
-            return Ok(self.detect());
-        }
-
-        std::fs::create_dir_all(&models)?;
-        std::fs::create_dir_all(&index)?;
-
-        for (source, target) in to_move {
             if target.exists() {
                 continue; // lost a concurrent-migration race for this entry — fine
             }
-            std::fs::rename(source, &target)?; // same volume: atomic + instant
+            std::fs::rename(entry.path(), &target)?; // same volume: atomic + instant
         }
-
         Ok(self.detect())
     }
 
@@ -354,5 +359,90 @@ mod tests {
             .join("tantivy")
             .join("new-marker")
             .exists());
+    }
+
+    /// `migrate()` on a fresh empty collection must still create `models/`
+    /// and `index/`, so that the parent of every `index_artifact` resolution
+    /// exists — redb's `Database::create` does NOT create parents, and
+    /// without this guarantee a fresh collection would hit ENOENT.
+    #[test]
+    fn migrate_on_fresh_dir_creates_index_artifact_parents() {
+        let dir = tempdir().unwrap();
+        let layout = CollectionLayout::new(dir.path());
+
+        let state = layout.migrate().unwrap();
+        assert_eq!(state, CacheLayoutState::Split);
+
+        let redb_path = layout.index_artifact("engine.redb");
+        assert_eq!(redb_path, dir.path().join("index").join("engine.redb"));
+        assert!(
+            redb_path.parent().unwrap().is_dir(),
+            "index_artifact parent must exist after migrate() on a fresh dir"
+        );
+        assert!(layout.models_base().is_dir());
+    }
+
+    /// A rename failure mid-migration returns `Err` and may leave a partial
+    /// state — but that state must stay fully readable via per-artifact
+    /// fallback, and retrying `migrate()` must complete the job.
+    #[cfg(unix)]
+    #[test]
+    fn migrate_partial_failure_stays_functional_and_retry_completes() {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        // chmod 000 is a no-op under root (the rename still succeeds), so
+        // the test would spuriously see Ok. Skip when running as root.
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("models--org--name")).unwrap();
+        fs::write(dir.path().join("engine.redb"), b"db").unwrap();
+        // Pre-create index/ with no permissions: renaming into it fails.
+        fs::create_dir(dir.path().join("index")).unwrap();
+        fs::set_permissions(dir.path().join("index"), fs::Permissions::from_mode(0o000)).unwrap();
+        let layout = CollectionLayout::new(dir.path());
+
+        let result = layout.migrate();
+        assert!(result.is_err(), "rename into unwritable index/ must fail");
+
+        // The blocked artifact is still at the legacy root, and the read
+        // path resolves it there — the partial state is fully functional.
+        assert!(dir.path().join("engine.redb").is_file());
+        assert_eq!(
+            layout.index_artifact("engine.redb"),
+            dir.path().join("engine.redb")
+        );
+
+        // Restore permissions: retrying is safe and completes the migration.
+        fs::set_permissions(dir.path().join("index"), fs::Permissions::from_mode(0o755)).unwrap();
+        let state = layout.migrate().unwrap();
+        assert_eq!(state, CacheLayoutState::Split);
+        assert!(dir.path().join("index").join("engine.redb").is_file());
+        assert!(dir.path().join("models").join("models--org--name").is_dir());
+    }
+
+    /// The "correct mid-migration" invariant: size functions must count each
+    /// artifact wherever it actually lives. Here models are already moved
+    /// but the index artifacts are still legacy at the root.
+    #[test]
+    fn size_fns_count_artifacts_mid_migration() {
+        let dir = tempdir().unwrap();
+        // Models migrated: 10 bytes under models/models--org--name/.
+        let model_dir = dir.path().join("models").join("models--org--name");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("weights.bin"), [0u8; 10]).unwrap();
+        // Index still legacy at root: 7 bytes in tantivy/ + 5 in engine.redb.
+        fs::create_dir(dir.path().join("tantivy")).unwrap();
+        fs::write(dir.path().join("tantivy").join("seg"), [0u8; 7]).unwrap();
+        fs::write(dir.path().join("engine.redb"), [0u8; 5]).unwrap();
+        let layout = CollectionLayout::new(dir.path());
+
+        assert_eq!(layout.detect(), CacheLayoutState::Partial);
+        assert_eq!(layout.models_size_bytes(), 10);
+        assert_eq!(layout.index_size_bytes(), 12);
     }
 }
