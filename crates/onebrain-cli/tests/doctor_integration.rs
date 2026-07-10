@@ -221,7 +221,8 @@ fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
         .assert()
         .success()
         .stdout(predicate::str::contains("indexed · up to date"))
-        .stdout(predicate::str::contains("0 warnings · 0 fail"));
+        // All-ok run collapses the Summary box to a single line.
+        .stdout(predicate::str::contains("checks · all ok"));
 
     // All checks pass → --fix has nothing to do.
     Command::cargo_bin("onebrain")
@@ -285,10 +286,11 @@ fn doctor_missing_folder_exits_1() {
         .assert()
         .failure()
         .code(1)
-        // v3.2.1 grouped layout: fail glyph `✗` on the folders row, with the
-        // check's hint surfaced on the indented `└` line.
+        // v3.4.8 grouped layout: fail glyph `✗` on the folders row (the folders
+        // detail no longer renders inline — it stays in the JSON payload); the
+        // missing folder also surfaces as a fail finding in the Summary box.
         .stdout(predicate::str::contains("\u{2717} folders"))
-        .stdout(predicate::str::contains("Missing: 01-projects"));
+        .stdout(predicate::str::contains("7/8 present"));
 }
 
 #[test]

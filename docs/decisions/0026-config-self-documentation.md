@@ -109,15 +109,30 @@ first touched the file.
   both crates use the identical editor). Only degenerate shapes (non-mapping
   or flow-style roots, which carry no meaningful comments) keep the legacy
   serde rewrite.
-- **Known limitation (follow-up: issue #200):** four structural writers
-  still whole-file-serialize and drop comments — `fix_vault_yml_keys`,
-  `fix_legacy_qmd_collection`, `onebrain-fs`'s `persist_search_key` (the
-  first `search reindex`/`model set` on a fresh vault), and `onebrain-fs`'s
-  `remove_search_key` (backup.rs — fired by `reconcile_missing_model` on
-  routine `search reindex`/`model` surfaces when the configured model isn't
-  downloaded; **silent** — its caller discards the result, so no disclosure
-  reaches the user). The first three disclose the comment loss in their
-  output; migrating all four onto `yaml_edit` is deferred to issue #200.
+- **All config writers are comment-preserving as of v3.4.8 (issue #200,
+  historical note).** The four structural writers that used to whole-file
+  re-serialize through `serde_yaml::to_string` and drop every comment —
+  `fix_vault_yml_keys`, `fix_legacy_qmd_collection`, `onebrain-fs`'s
+  `persist_search_key` (the first `search reindex`/`model set` on a fresh
+  vault), and `onebrain-fs`'s `remove_search_key` (fired by
+  `reconcile_missing_model`) — were migrated onto `onebrain_fs::yaml_edit`.
+  Each classifies its change with a **read-only** serde parse, then applies it
+  as comment-preserving line edits: `append_top_level`/`upsert_child` for
+  backfills and search-key writes, and a new `delete_key` primitive for
+  removing deprecated/legacy keys (top-level and nested, exact indent-level
+  match, refuses inline mappings; it takes the key's continuation lines and
+  its lead doc-comment — a doc comment dangling above nothing reads worse than
+  losing it). Their "YAML comments not preserved" disclosures were removed
+  with them, and `remove_search_key` now returns whether it removed a key so
+  `reconcile_missing_model` logs the config mutation instead of discarding it.
+  Because `fix_vault_yml_keys` no longer drops comments, recipe **ordering**
+  ceased to matter — it runs before the `config-values` recipe, but a legacy
+  vault's user comments survive the whole `--fix` pass regardless. The only
+  remaining `serde_yaml::to_string` writes to `onebrain.yml` are
+  `render_onebrain_yml`'s schedule-block generation (template creation, not an
+  edit) and vault-sync's documented degenerate-root fallback (non-mapping /
+  flow-style roots, which carry no meaningful comments). `stamp_doctor_run`
+  now also declines flow-style roots the same way `restructure_config` does.
 - Doctor is now 12 checks (was 11); `config-values` renders in the ⚙️ Config
   section as "config values".
 - **Existing vaults get the self-documentation via `doctor --fix`**

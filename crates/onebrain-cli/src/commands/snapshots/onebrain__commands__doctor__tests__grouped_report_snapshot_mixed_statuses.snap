@@ -2,26 +2,30 @@
 source: crates/onebrain-cli/src/commands/doctor.rs
 expression: output
 ---
+🩺  Doctor · demo-vault · onebrain X.Y.Z
 
 ⚙️  Config
     ✓ onebrain.yml       valid · stable
     ✓ schema             all keys ok
-    ✓ config migration   onebrain.yml in use
-    ✓ qmd_collection     no legacy qmd_collection key
+    ✓ migration          none needed
 
 📁  Vault structure
     ✗ folders            7/8 present
-       └ onebrain init --force
     ✓ plugin files       complete
 
 🔌  Integration
     ⚠ hooks              PostToolUse (qmd) duplicated (×2)
-       └ onebrain doctor --fix
     ✓ claude settings    ok
 
 📊  Index & state
     ✓ checkpoints        0 orphans
     ✓ search             602 indexed · up to date
 
-❌  8 ok · 1 warning · 1 fail · 10 checks
-💡  Run onebrain doctor --fix to auto-repair
+┌ Summary ─────────────────────────────────────────────────────────────┐
+│ 7 ok · 1 warning · 1 fail                                            │
+│                                                                      │
+│ ✗  folders  7/8 present                                              │
+│ ⚠  hooks    PostToolUse (qmd) duplicated (×2)                        │
+│                                                                      │
+│ 💡 onebrain doctor --fix  →  create missing folders · register hooks │
+└──────────────────────────────────────────────────────────────────────┘

@@ -242,94 +242,7 @@ pub(crate) fn parse_approx_size(s: &str) -> u64 {
     (num * mult) as u64
 }
 
-/// Pad `s` with trailing spaces to `w` DISPLAY columns (not chars/bytes) —
-/// `unicode-width` keeps the box's right border flush even with the ✓ ● —
-/// cells and `·` note separators.
-fn pad_display(s: &str, w: usize) -> String {
-    use unicode_width::UnicodeWidthStr;
-    let vis = s.width();
-    format!("{s}{}", " ".repeat(w.saturating_sub(vis)))
-}
-
-/// Bold-green SGR prefix for the active model's row — the same styling the
-/// interactive TUI gives the ● row (`Color::Green + BOLD`).
-const ACTIVE_ROW_ANSI: &str = "\x1b[1;32m";
-const ANSI_RESET: &str = "\x1b[0m";
-
-/// Hard cap on a rendered box's TOTAL display width (borders included). A
-/// box normally fits its widest row, but a long registry NOTE (the reranker's
-/// is ~95 columns on its own) would otherwise push the border past a normal
-/// terminal and wrap — visually "breaking" the box (#195). Rows wider than
-/// the cap get their tail truncated with an ellipsis instead.
-const MAX_BOX_WIDTH: usize = 100;
-
-/// Truncate `s` to at most `max` DISPLAY columns (unicode-width-aware, like
-/// [`pad_display`]), appending `…` — which itself occupies one of the `max`
-/// columns — when anything was cut. Strings already within the cap pass
-/// through untouched.
-fn truncate_display(s: &str, max: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-    if s.width() <= max {
-        return s.to_string();
-    }
-    let budget = max.saturating_sub(1); // reserve one column for the `…`
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in s.chars() {
-        let w = ch.width().unwrap_or(0);
-        if used + w > budget {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    out.push('…');
-    out
-}
-
-/// Assemble a titled single-line box around pre-formatted content rows —
-/// the shared renderer behind both the `Available Embedding Models` table
-/// and the `Rerankers` section, so the two boxes can't drift apart (#195).
-///
-/// `content` is `(uncolored row text, is-active-row)`. Rows are first capped
-/// to [`MAX_BOX_WIDTH`] via [`truncate_display`] (the 4 non-content columns
-/// are the two `│` borders + their 1-space pads), then padded to one shared
-/// inner width. When `color` is set the active row's padded content is
-/// wrapped in bold-green SGR INSIDE the borders — padding is always computed
-/// on the uncolored text, so the right border stays flush in both modes.
-fn render_boxed_table(title: &str, content: &[(String, bool)], color: bool) -> Vec<String> {
-    use unicode_width::UnicodeWidthStr;
-
-    let capped: Vec<(String, bool)> = content
-        .iter()
-        .map(|(l, active)| (truncate_display(l, MAX_BOX_WIDTH - 4), *active))
-        .collect();
-    let inner = capped
-        .iter()
-        .map(|(l, _)| l.width())
-        .max()
-        .unwrap_or(0)
-        .max(title.width());
-    // Padded content width between the two `│` (1-space pad each side).
-    let boxed = inner + 2;
-    let mut lines = Vec::with_capacity(capped.len() + 2);
-    lines.push(format!(
-        "┌{title}{}┐",
-        "─".repeat(boxed.saturating_sub(title.width()))
-    ));
-    for (l, active) in &capped {
-        let padded = pad_display(l, inner);
-        if color && *active {
-            // SGR wraps the padded content only — the borders stay unstyled
-            // and the visible width is identical to the mono row.
-            lines.push(format!("│ {ACTIVE_ROW_ANSI}{padded}{ANSI_RESET} │"));
-        } else {
-            lines.push(format!("│ {padded} │"));
-        }
-    }
-    lines.push(format!("└{}┘", "─".repeat(boxed)));
-    lines
-}
+use crate::output::boxed::{pad_display, render_boxed_table, ACTIVE_ROW_ANSI};
 
 /// Render the boxed model table. `color` is the resolved colour bit
 /// (`output::is_color_text` on the active mode — the same gate the banner
@@ -365,9 +278,9 @@ fn render_list_text(env: &Envelope<ModelListData>, color: bool) -> String {
 
     // (uncolored content line, is the active-model row) — colouring is applied
     // at box-assembly time so width math never sees ANSI codes.
-    let mut content = vec![(
+    let mut content: Vec<(String, Option<&str>)> = vec![(
         row("", "MODEL", "DOWNLOADED", "DISK", "DIM", "THAI", "NOTE"),
-        false,
+        None,
     )];
     for m in &d.models {
         // The active marker/highlight only means something if the chosen
@@ -394,7 +307,7 @@ fn render_list_text(env: &Envelope<ModelListData>, color: bool) -> String {
                 &thai,
                 m.note,
             ),
-            active,
+            active.then_some(ACTIVE_ROW_ANSI),
         ));
     }
 
@@ -446,13 +359,17 @@ fn render_reranker_section(rerankers: &[RerankerListEntry], color: bool) -> Stri
         )
     };
 
-    let mut content = vec![(row("", "MODEL", "DOWNLOADED", "DISK", "NOTE"), false)];
+    let mut content: Vec<(String, Option<&str>)> =
+        vec![(row("", "MODEL", "DOWNLOADED", "DISK", "NOTE"), None)];
     for r in rerankers {
         let active = r.current && r.downloaded;
         let marker = if active { "●" } else { "" };
         let downloaded = if r.downloaded { "✓" } else { "—" };
         let disk = disk_cell(r.downloaded, r.disk_bytes, r.approx_size);
-        content.push((row(marker, r.name, downloaded, &disk, r.note), active));
+        content.push((
+            row(marker, r.name, downloaded, &disk, r.note),
+            active.then_some(ACTIVE_ROW_ANSI),
+        ));
     }
 
     let mut lines = render_boxed_table(" Rerankers ", &content, color);
@@ -854,6 +771,7 @@ fn persist_embed_model(vault_root: &Path, model_name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output::boxed::{ANSI_RESET, MAX_BOX_WIDTH};
     use tempfile::tempdir;
 
     /// Reranker rows for a given collection cache dir, current model unset
@@ -1176,23 +1094,6 @@ mod tests {
         assert!(w <= MAX_BOX_WIDTH, "box width {w} exceeds cap in\n{s}");
         // Long NOTE is truncated with an ellipsis, not wrapped.
         assert!(s.contains('…'), "expected truncated NOTE in\n{s}");
-    }
-
-    #[test]
-    fn truncate_display_is_width_aware_and_appends_ellipsis() {
-        use unicode_width::UnicodeWidthStr;
-        // Short strings pass through untouched.
-        assert_eq!(truncate_display("abc", 10), "abc");
-        // Exact fit passes through untouched (no gratuitous ellipsis).
-        assert_eq!(truncate_display("abcde", 5), "abcde");
-        // Over-long input is cut to the cap WITH the ellipsis counted in.
-        let cut = truncate_display("abcdefghij", 5);
-        assert_eq!(cut, "abcd…");
-        assert_eq!(cut.width(), 5);
-        // Width-aware: wide CJK chars count 2 columns, so fewer fit.
-        let cjk = truncate_display("ไทย中文字字字", 6);
-        assert!(cjk.ends_with('…'), "{cjk}");
-        assert!(cjk.width() <= 6, "width {} of {cjk}", cjk.width());
     }
 
     #[test]

@@ -109,10 +109,12 @@ pub fn backup_config_file(config_path: &Path) -> Result<Option<PathBuf>> {
 
 /// Persist a single `search.<key> = value` into the vault's config file
 /// (`onebrain.yml`, or legacy `vault.yml` if that's what's present),
-/// preserving every other key. Reads the file (treating a missing/empty file
-/// as an empty mapping), ensures a `search:` mapping exists, sets `key`,
-/// backs the file up ([`backup_config_file`] is a hard precondition), then
-/// atomically writes it back ([`atomic_write_text`]).
+/// preserving every other key AND every comment. The write is a
+/// comment-preserving line edit ([`crate::yaml_edit::upsert_child`]): the
+/// `search:` block is created if absent, the child key inserted or its value
+/// replaced in place. Reads the file (treating a missing/empty file as an
+/// empty mapping), then backs it up ([`backup_config_file`] is a hard
+/// precondition) and atomically writes it back ([`atomic_write_text`]).
 ///
 /// This is the shared home for the read → mutate `search.*` → backup →
 /// atomic-write pattern formerly duplicated in `onebrain-cli`'s
@@ -128,80 +130,59 @@ pub fn persist_search_key(vault_root: &Path, key: &str, value: &str) -> anyhow::
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
 
-    let mut yaml: serde_yaml::Value = if text.trim().is_empty() {
-        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+    let updated = if text.trim().is_empty() {
+        // Fresh/empty config → seed a minimal `search:` block.
+        crate::yaml_edit::upsert_child(&text, "search", key, value)
     } else {
-        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
+        // Parse read-only ONLY to classify the root shape (never to
+        // re-serialize — that would drop comments). Invalid YAML still errors,
+        // matching the pre-v3.4.8 contract.
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        if parsed.is_mapping() {
+            crate::yaml_edit::upsert_child(&text, "search", key, value)
+        } else {
+            // Degenerate non-mapping root (scalar/sequence — never produced by
+            // OneBrain): replace with a fresh single-key mapping rather than
+            // append a block that would yield invalid YAML. No comments to lose.
+            format!("search:\n  {key}: {value}\n")
+        }
     };
-    if !yaml.is_mapping() {
-        yaml = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
-    }
-    let mapping = yaml.as_mapping_mut().expect("normalized to mapping above");
-
-    let search_key = serde_yaml::Value::String("search".to_string());
-    let needs_replace = match mapping.get(&search_key) {
-        Some(v) => !v.is_mapping(),
-        None => true,
-    };
-    if needs_replace {
-        mapping.insert(
-            search_key.clone(),
-            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
-        );
-    }
-    let search = mapping
-        .get_mut(&search_key)
-        .and_then(|v| v.as_mapping_mut())
-        .expect("search key was just ensured to be a mapping");
-    search.insert(
-        serde_yaml::Value::String(key.to_string()),
-        serde_yaml::Value::String(value.to_string()),
-    );
-
-    let serialized = serde_yaml::to_string(&yaml).context("serializing updated config")?;
 
     // Defense-in-depth: back up the existing config before overwriting it.
     // Hard precondition — refuse the write if the backup couldn't be made.
     backup_config_file(&path)
         .with_context(|| format!("backing up {} before write", path.display()))?;
 
-    atomic_write_text(&path, &serialized).with_context(|| format!("writing {}", path.display()))
+    atomic_write_text(&path, &updated).with_context(|| format!("writing {}", path.display()))
 }
 
 /// Remove a single `search.<key>` from the vault's config, preserving every
-/// other key. No-op (returns `Ok(())` without touching the file) when the
-/// config is missing, has no `search` mapping, or doesn't contain `key`. Backs
-/// the file up before any real write, exactly like `persist_search_key`.
-pub fn remove_search_key(vault_root: &Path, key: &str) -> anyhow::Result<()> {
+/// other key AND every comment (a comment-preserving line delete via
+/// [`crate::yaml_edit::delete_key`]). Returns `Ok(true)` when a key was
+/// removed and the file rewritten, `Ok(false)` when there was nothing to
+/// remove — config missing, no `search` block, the key absent, or an inline
+/// `search: {…}` the line editor won't touch — in which case the file is left
+/// untouched (no write, no backup). Backs the file up before any real write,
+/// exactly like `persist_search_key`. Callers that ignore the returned flag
+/// should at least log it — a silent discard hides a real config mutation.
+pub fn remove_search_key(vault_root: &Path, key: &str) -> anyhow::Result<bool> {
     use anyhow::Context;
     use onebrain_core::{find_config_file, CONFIG_FILENAME};
 
     let path = find_config_file(vault_root).unwrap_or_else(|| vault_root.join(CONFIG_FILENAME));
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let mut yaml: serde_yaml::Value =
-        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-    let Some(search) = yaml
-        .as_mapping_mut()
-        .and_then(|m| m.get_mut(serde_yaml::Value::String("search".to_string())))
-        .and_then(|v| v.as_mapping_mut())
-    else {
-        return Ok(());
+    let Some(updated) = crate::yaml_edit::delete_key(&text, &["search", key]) else {
+        return Ok(false);
     };
-    if search
-        .remove(serde_yaml::Value::String(key.to_string()))
-        .is_none()
-    {
-        return Ok(());
-    }
-
-    let serialized = serde_yaml::to_string(&yaml).context("serializing updated config")?;
     backup_config_file(&path)
         .with_context(|| format!("backing up {} before write", path.display()))?;
-    atomic_write_text(&path, &serialized).with_context(|| format!("writing {}", path.display()))
+    atomic_write_text(&path, &updated).with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -435,9 +416,41 @@ mod tests {
             "search:\n  collection: my-vault\n",
         )
         .unwrap();
-        remove_search_key(dir.path(), "embed_model").unwrap();
-        remove_search_key(&dir.path().join("nope"), "embed_model").unwrap();
+        assert!(!remove_search_key(dir.path(), "embed_model").unwrap());
+        assert!(!remove_search_key(&dir.path().join("nope"), "embed_model").unwrap());
         let yaml = std::fs::read_to_string(dir.path().join("onebrain.yml")).unwrap();
         assert!(yaml.contains("collection: my-vault"), "{yaml}");
+    }
+
+    #[test]
+    fn remove_search_key_returns_true_and_preserves_comments() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "# my config\nsearch:\n  collection: my-vault  # the index\n  embed_model: bge-m3\n",
+        )
+        .unwrap();
+        assert!(remove_search_key(dir.path(), "embed_model").unwrap());
+        let yaml = std::fs::read_to_string(dir.path().join("onebrain.yml")).unwrap();
+        assert_eq!(
+            yaml,
+            "# my config\nsearch:\n  collection: my-vault  # the index\n"
+        );
+    }
+
+    #[test]
+    fn persist_search_key_preserves_comments() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "# top comment\nsearch:\n  # which index\n  collection: my-vault\nfolders:\n  inbox: 00-inbox\n",
+        )
+        .unwrap();
+        persist_search_key(dir.path(), "embed_model", "bge-m3").unwrap();
+        let yaml = std::fs::read_to_string(dir.path().join("onebrain.yml")).unwrap();
+        assert_eq!(
+            yaml,
+            "# top comment\nsearch:\n  # which index\n  collection: my-vault\n  embed_model: bge-m3\nfolders:\n  inbox: 00-inbox\n"
+        );
     }
 }

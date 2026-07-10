@@ -297,10 +297,12 @@ pub fn model_not_chosen(vault_root: &Path, cache_dir: &Path) -> bool {
 ///
 /// Race-safe + best-effort — does nothing when a reindex is in progress (it
 /// downloads the model, so the dir is legitimately absent mid-run), when no
-/// model key is committed, or when the configured model IS downloaded. A write
-/// failure is swallowed: reconciliation is advisory, never fatal. Call only
-/// from mutating surfaces (`search model` TUI, `search reindex`) — NOT the
-/// read-only `search status` / `search model list` paths.
+/// model key is committed, or when the configured model IS downloaded.
+/// Reconciliation is advisory, never fatal: a write failure is logged to
+/// stderr (not swallowed) and a successful drop is announced so the config
+/// mutation is never silent. Call only from mutating surfaces (`search model`
+/// TUI, `search reindex`) — NOT the read-only `search status` / `search model
+/// list` paths.
 pub(crate) fn reconcile_missing_model(vault_root: &Path, cache_dir: &Path, embed_model: &str) {
     use onebrain_search::embed::{model_download_status, model_registry};
 
@@ -312,7 +314,15 @@ pub(crate) fn reconcile_missing_model(vault_root: &Path, cache_dir: &Path, embed
         .find(|m| m.name == embed_model)
         .is_some_and(|m| model_download_status(m, cache_dir).downloaded);
     if !downloaded {
-        let _ = onebrain_fs::remove_search_key(vault_root, "embed_model");
+        // Surface the outcome instead of discarding it (`let _ =` hid a real
+        // config mutation): a removal is announced, a failure is logged.
+        match onebrain_fs::remove_search_key(vault_root, "embed_model") {
+            Ok(true) => eprintln!(
+                "search: cleared stale search.embed_model = {embed_model} (model not downloaded)"
+            ),
+            Ok(false) => {}
+            Err(e) => eprintln!("search: could not clear stale search.embed_model: {e:#}"),
+        }
     }
 }
 

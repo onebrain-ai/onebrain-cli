@@ -113,3 +113,25 @@ Unsupported YAML shapes (e.g. inline mappings like
 `checkpoint: {messages: 0}`) are refused rather than guessed at — doctor
 reports the key as un-fixable and you edit it by hand. Every write is
 preceded by a timestamped backup under `<vault>/.onebrain-backups/`.
+
+## Comments always survive (v3.4.8)
+
+Every writer that touches `onebrain.yml` is comment-preserving as of v3.4.8
+(issue #200): the key-backfill, legacy `qmd_collection` → `search.collection`
+migration, and the first `search reindex`/`model set` config write all apply
+surgical line edits, so your comments, key order, and CRLF/LF style survive a
+full `doctor --fix` on a legacy vault — regardless of which recipe runs first.
+The only `onebrain.yml` writes that don't preserve comments are the initial
+template scaffold (there are no comments to keep) and a fallback for
+degenerate non-mapping / flow-style roots.
+
+## Reading the `doctor` report
+
+`onebrain doctor` opens with a `🩺 Doctor · <vault> · onebrain <version>`
+header, lists the checks grouped into Config / Vault structure / Integration /
+Index & state (the two legacy-migration checks collapse into one `migration`
+row in the text view — the JSON keeps them separate), and closes with a boxed
+**Summary**: the ok/warning/fail tally, the non-ok findings (failures first),
+and deduplicated `💡 command → outcome` next-actions. When a warm daemon
+(`onebrain mcp`) is holding the search index, the search check reads its
+doc/pending counts from the daemon instead of reporting the index as locked.
