@@ -81,7 +81,7 @@ first touched the file.
   re-serialized through serde_yaml (comments destroyed), and it ran before
   the new recipe, so leaving the old repair in place would have wiped the
   comments this epic exists to protect. (`fix_vault_yml_keys` was later
-  migrated onto the comment-preserving `yaml_edit` editor in #208 — see the
+  migrated onto the comment-preserving `yaml_edit` editor in issue #200 (PR #208) — see the
   "All config writers are comment-preserving" entry below — but the
   validation split documented here was not reverted.) The check keeps
   key-presence, deprecated-key, and `update_channel` enum validation (now
