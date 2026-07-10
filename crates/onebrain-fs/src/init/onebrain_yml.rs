@@ -25,11 +25,13 @@ use serde::Serialize;
 use std::path::Path;
 
 /// The `search.exclude` doc comment, shared by [`config_key_docs`] (generic
-/// default, using `VaultFolders::default().archive`) and
+/// default, using `VaultFolders::default().archive`),
 /// [`render_onebrain_yml_for_folders`] (the archive folder actually used for
-/// that render), so the comment and the emitted value always agree — never a
-/// hard-coded `"06-archive"` literal in either caller.
-fn search_exclude_comment(archive: &str) -> String {
+/// that render), and doctor's `--fix` search-exclude backfill in
+/// `onebrain-cli` (the existing vault's own resolved archive), so the
+/// comment and the emitted value always agree — never a hard-coded
+/// `"06-archive"` literal in any caller.
+pub fn search_exclude_comment(archive: &str) -> String {
     format!(
         "# Extra index-exclusion patterns: vault-relative prefix or bare dir name \
          (hidden dirs and node_modules always skipped) · default: [attachments, {archive}]"

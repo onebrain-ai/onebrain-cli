@@ -1632,7 +1632,10 @@ fn fix_vault_yml_keys(vault_root: &Path, json: bool) -> FixOutcome {
 }
 
 /// Insert the commented `search.exclude` block (doc comment + `exclude:` +
-/// its two list items) as the last child of the top-level `search:` block.
+/// its two list items) into the top-level `search:` block at the fresh
+/// template's position — immediately before the first direct child named
+/// `reranker:` or `embed:` (falling back to last child when neither
+/// exists), so a backfilled vault matches the canonical in-block key order.
 /// Called when [`search_exclude_missing`] is true — which guarantees a
 /// `search` MAPPING exists in the parsed YAML, but NOT that it's in
 /// block form: serde_yaml parses a flow mapping (`search: {collection: c}`)
@@ -1679,10 +1682,18 @@ fn insert_search_exclude_block(text: &str, comment: &str, archive: &str) -> Opti
         return None;
     }
 
-    // Scan the block's direct children to find the last one and infer the
-    // child indent — identical logic to `upsert_child`'s block-extend branch.
+    // Scan the block's direct children: find the last one, infer the child
+    // indent (identical logic to `upsert_child`'s block-extend branch), and
+    // locate the template-order anchor — the first DIRECT child named
+    // `reranker:` or `embed:`. The fresh template places `exclude:` between
+    // `default_top_k:` and `reranker:` (onebrain_yml.rs), so inserting
+    // before that anchor keeps backfilled vaults on the canonical in-block
+    // order (`restructure_config` only reorders top-level blocks, never
+    // within one). Only direct-child-level lines can anchor — a nested
+    // `model:`-style grandchild never matches.
     let mut last_child = header_idx;
     let mut child_indent: Option<usize> = None;
+    let mut anchor: Option<usize> = None;
     let mut j = header_idx + 1;
     while j < lines.len() {
         let l = &lines[j];
@@ -1693,13 +1704,38 @@ fn insert_search_exclude_block(text: &str, comment: &str, archive: &str) -> Opti
         if indent_of(l) == 0 {
             break;
         }
-        if !is_comment(l) && child_indent.is_none() {
-            child_indent = Some(indent_of(l));
+        if !is_comment(l) {
+            let ind = indent_of(l);
+            if child_indent.is_none() {
+                child_indent = Some(ind);
+            }
+            let t = l.trim_start();
+            if anchor.is_none()
+                && Some(ind) == child_indent
+                && (t.starts_with("reranker:") || t.starts_with("embed:"))
+            {
+                anchor = Some(j);
+            }
         }
         last_child = j;
         j += 1;
     }
     let indent = " ".repeat(child_indent.unwrap_or(2));
+
+    // Insertion point: before the anchor (backing up over its contiguous
+    // lead comment lines so the block never splits a comment from the key
+    // it documents — e.g. the template's own "# Tier-2 cross-encoder
+    // reranker" header); with no anchor, after the last child (a vault
+    // without `reranker:`/`embed:` keeps the previous last-child position).
+    let at = match anchor {
+        Some(mut idx) => {
+            while idx > header_idx + 1 && is_comment(&lines[idx - 1]) {
+                idx -= 1;
+            }
+            idx
+        }
+        None => last_child + 1,
+    };
 
     let mut block: Vec<String> = comment
         .split('\n')
@@ -1710,7 +1746,7 @@ fn insert_search_exclude_block(text: &str, comment: &str, archive: &str) -> Opti
     block.push(format!("{indent}- {archive}"));
 
     for (n, line) in block.into_iter().enumerate() {
-        lines.insert(last_child + 1 + n, line);
+        lines.insert(at + n, line);
     }
     let mut out = lines.join(newline);
     if ends_with_newline {
@@ -1721,12 +1757,14 @@ fn insert_search_exclude_block(text: &str, comment: &str, archive: &str) -> Opti
 
 /// Recipe — `search-exclude` warning means `search.collection` is set but
 /// `search.exclude` is entirely absent. Insert the same commented block the
-/// fresh v3.4.9 template now scaffolds (Task 3): the doc comment is the
-/// GENERIC entry from [`onebrain_fs::config_key_docs`] (every table comment
-/// documents the tool's default, never a per-vault value — same convention
-/// as every other backfilled comment), while the VALUE's second entry is
-/// resolved from this vault's OWN `folders.archive`, never a hard-coded
-/// `"06-archive"` literal. Idempotent: a second run finds
+/// fresh v3.4.9 template now scaffolds (Task 3): both the doc comment AND
+/// the value's second entry are built from this vault's OWN resolved
+/// `folders.archive` via the shared
+/// [`onebrain_fs::search_exclude_comment`] — the identical single source
+/// the template render uses — so comment and value always agree even on a
+/// vault with a customized archive folder (never a hard-coded
+/// `"06-archive"` literal, and never the table's generic-default comment
+/// contradicting a custom value). Idempotent: a second run finds
 /// `search_exclude_missing` already false and no-ops.
 fn fix_search_exclude(vault_root: &Path, json: bool) -> FixOutcome {
     use onebrain_core::{find_config_file, VaultFolders, CONFIG_FILENAME};
@@ -1760,11 +1798,7 @@ fn fix_search_exclude(vault_root: &Path, json: bool) -> FixOutcome {
                 .map(str::to_string)
         })
         .unwrap_or(VaultFolders::default().archive);
-    let comment = onebrain_fs::config_key_docs()
-        .into_iter()
-        .find(|d| d.segments == ["search", "exclude"])
-        .map(|d| d.comment)
-        .unwrap_or_default();
+    let comment = onebrain_fs::search_exclude_comment(&archive);
 
     let Some(updated) = insert_search_exclude_block(&text, &comment, &archive) else {
         // Gate said the exclude is missing but the `search:` line isn't an
@@ -6133,7 +6167,16 @@ mod tests {
             after.contains("  exclude:\n  - attachments\n  - z-archive"),
             "{after}"
         );
-        assert!(!after.contains("- 06-archive"), "{after}");
+        // Comment and value AGREE on the vault's own archive (R2 Minor):
+        // the inserted doc comment is `search_exclude_comment(&archive)` —
+        // its "default:" text names z-archive, never the generic table
+        // default that would contradict the value right below it.
+        let expected_comment = onebrain_fs::search_exclude_comment("z-archive");
+        assert!(
+            after.contains(&format!("  {expected_comment}\n  exclude:")),
+            "comment must document the vault's own archive:\n{after}"
+        );
+        assert!(!after.contains("06-archive"), "{after}");
     }
 
     #[test]
@@ -6165,16 +6208,47 @@ mod tests {
         );
     }
 
+    /// Direct-child key names of the top-level `search:` block in raw
+    /// config text, in file order (indent == 2, non-comment). Used to
+    /// compare a backfilled vault's in-block key order against the fresh
+    /// template's.
+    fn search_block_key_order(text: &str) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut in_search = false;
+        for l in text.lines() {
+            if !l.starts_with(' ') && !l.trim().is_empty() {
+                in_search = l.trim_start().starts_with("search:");
+                continue;
+            }
+            if !in_search {
+                continue;
+            }
+            let indent = l.len() - l.trim_start().len();
+            let t = l.trim_start();
+            if indent == 2 && !t.starts_with('#') && !t.starts_with('-') {
+                if let Some(key) = t.split(':').next() {
+                    keys.push(key.to_string());
+                }
+            }
+        }
+        keys
+    }
+
     #[test]
-    fn fix_search_exclude_lands_as_last_child_with_nested_blocks_intact() {
-        // Pins the insertion position deliberately: with `search:` carrying
-        // multiple sub-keys including NESTED blocks (reranker, embed), the
-        // exclude block lands as the LAST direct child of `search:`, the
-        // result re-parses, and every pre-existing key survives.
+    fn fix_search_exclude_lands_before_reranker_matching_template_order() {
+        // Pins the insertion position deliberately (R2 Important): the fresh
+        // template places `exclude:` BETWEEN `default_top_k:` and
+        // `reranker:`, and `restructure_config` only reorders top-level
+        // blocks — never within one — so the backfill must land at the same
+        // in-block position or backfilled vaults diverge from canonical
+        // layout forever. With `search:` carrying multiple sub-keys
+        // including NESTED blocks (reranker, embed), the exclude block lands
+        // immediately before `reranker:`, the result re-parses, and every
+        // pre-existing key survives.
         let d = tempdir().unwrap();
         fs::write(
             d.path().join("onebrain.yml"),
-            "search:\n  collection: my-col\n  reranker:\n    enabled: true\n    model: onebrain-rerank-v1\n  embed:\n    auto: true\n",
+            "search:\n  collection: my-col\n  embed_model: multilingual-e5-small\n  default_top_k: 10\n  reranker:\n    enabled: true\n    model: onebrain-rerank-v1\n  embed:\n    auto: true\n",
         )
         .unwrap();
 
@@ -6185,6 +6259,11 @@ mod tests {
         // Re-parses with all keys intact.
         let parsed: serde_yaml::Value = serde_yaml::from_str(&after).unwrap();
         assert_eq!(parsed["search"]["collection"].as_str(), Some("my-col"));
+        assert_eq!(
+            parsed["search"]["embed_model"].as_str(),
+            Some("multilingual-e5-small")
+        );
+        assert_eq!(parsed["search"]["default_top_k"].as_u64(), Some(10));
         assert_eq!(
             parsed["search"]["reranker"]["enabled"].as_bool(),
             Some(true)
@@ -6201,21 +6280,35 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(exclude, ["attachments", "06-archive"]);
-        // Position pinned: the exclude block (comment + key + 2 items) is
-        // the last direct child of `search:` — after the embed block's
-        // final line. Comment text sourced from the shared table so wording
-        // changes there don't break this position assertion.
-        let comment = onebrain_fs::config_key_docs()
-            .into_iter()
-            .find(|dd| dd.segments == ["search", "exclude"])
-            .unwrap()
-            .comment;
-        let expected_tail = format!(
-            "  embed:\n    auto: true\n  {comment}\n  exclude:\n  - attachments\n  - 06-archive\n"
+        // Position pinned: the exclude block (comment + key + 2 items)
+        // sits between `default_top_k:` and `reranker:` — the fresh
+        // template's position.
+        let comment = onebrain_fs::search_exclude_comment("06-archive");
+        let expected_mid = format!(
+            "  default_top_k: 10\n  {comment}\n  exclude:\n  - attachments\n  - 06-archive\n  reranker:\n"
         );
         assert!(
-            after.ends_with(&expected_tail),
-            "exclude must land as the last child of search:\n{after}"
+            after.contains(&expected_mid),
+            "exclude must land between default_top_k and reranker:\n{after}"
+        );
+        // In-block key order matches the fresh template for the key set
+        // present in both (the template has no `embed:` block and its
+        // `collection` is a commented placeholder; `embed:` here trails
+        // last in both orderings' shared subsequence check).
+        let template = onebrain_fs::render_onebrain_yml(onebrain_fs::SchedulePreset::Skip).unwrap();
+        let template_order = search_block_key_order(&template);
+        let after_order = search_block_key_order(&after);
+        let shared: Vec<&String> = after_order
+            .iter()
+            .filter(|k| template_order.contains(k))
+            .collect();
+        let template_shared: Vec<&String> = template_order
+            .iter()
+            .filter(|k| after_order.contains(k))
+            .collect();
+        assert_eq!(
+            shared, template_shared,
+            "backfilled search-block key order must match the fresh template\nafter: {after_order:?}\ntemplate: {template_order:?}"
         );
     }
 
