@@ -6313,6 +6313,64 @@ mod tests {
     }
 
     #[test]
+    fn fix_search_exclude_backs_up_over_reranker_lead_comments() {
+        // Covers the anchor comment-backup branch (R3 Minor): the real-world
+        // common case is a pre-v3.4.9 template vault where `reranker:`
+        // carries its "# Tier-2 cross-encoder reranker" lead comment. The
+        // exclude block must land ABOVE that lead comment — never between
+        // the comment and the key it documents — and the comment must stay
+        // glued to `reranker:`.
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "search:\n  collection: my-col\n  default_top_k: 10\n  # Tier-2 cross-encoder reranker (re-scores fused candidates for relevance).\n  # second lead comment line\n  reranker:\n    enabled: true\n",
+        )
+        .unwrap();
+
+        let outcome = fix_search_exclude(d.path(), false);
+        assert!(matches!(outcome, FixOutcome::Fixed(_)), "{outcome:?}");
+
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        // (a) + (b): exclude block sits above the FULL lead-comment run,
+        // which stays contiguous and glued to `reranker:`.
+        let comment = onebrain_fs::search_exclude_comment("06-archive");
+        let expected_mid = format!(
+            "  default_top_k: 10\n  {comment}\n  exclude:\n  - attachments\n  - 06-archive\n  # Tier-2 cross-encoder reranker (re-scores fused candidates for relevance).\n  # second lead comment line\n  reranker:\n"
+        );
+        assert!(
+            after.contains(&expected_mid),
+            "exclude must land above reranker's lead comments, comments glued to reranker:\n{after}"
+        );
+        // (b) pinned line-by-line too: the line directly above `reranker:`
+        // is still its own lead comment, not an exclude item.
+        let lines: Vec<&str> = after.lines().collect();
+        let idx = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("reranker:"))
+            .unwrap();
+        assert_eq!(
+            lines[idx - 1].trim_start(),
+            "# second lead comment line",
+            "{after}"
+        );
+        // (c) re-parses with all keys intact.
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&after).unwrap();
+        assert_eq!(parsed["search"]["collection"].as_str(), Some("my-col"));
+        assert_eq!(parsed["search"]["default_top_k"].as_u64(), Some(10));
+        assert_eq!(
+            parsed["search"]["reranker"]["enabled"].as_bool(),
+            Some(true)
+        );
+        let exclude: Vec<&str> = parsed["search"]["exclude"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(exclude, ["attachments", "06-archive"]);
+    }
+
+    #[test]
     fn fix_search_exclude_noop_when_not_gated() {
         // search.collection absent → nothing to do, no write.
         let d = tempdir().unwrap();
