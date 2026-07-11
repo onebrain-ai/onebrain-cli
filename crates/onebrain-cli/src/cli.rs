@@ -148,8 +148,8 @@ pub enum Cmd {
     Skill(SkillCmd),
     #[command(display_order = 16)]
     Task(TaskCmd),
-    /// Token-optimization telemetry (`gain` today · `check`/`discover` land
-    /// in later v3.4.10 tracks).
+    /// Token-optimization telemetry — `gain` (savings), `check` (read-hook
+    /// gate), `discover` (field-test measurement).
     #[command(display_order = 22)]
     Token(TokenCmd),
     #[command(display_order = 10)]
@@ -1443,7 +1443,7 @@ pub struct TaskListArgs {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// token (v3.4.10 · gain today · check/discover land in later tracks)
+// token (v3.4.10 · gain · check · discover)
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
@@ -1460,6 +1460,17 @@ pub struct TokenCmd {
 pub enum TokenVerb {
     /// Report token-optimization savings — summary, `--by` pivot, or `--history`.
     Gain(TokenGainArgs),
+    /// Gate a repeat vault-doc read for the PreToolUse read-hook (design §5b).
+    ///
+    /// Exit 0 = allow (stdout empty). Exit 2 = deny — the already-sent
+    /// reference envelope JSON is on stdout. Fails open (exit 0) on any
+    /// error, timeout, missing daemon, or unresolvable session — a read is
+    /// NEVER blocked by infrastructure trouble.
+    Check(TokenCheckArgs),
+    /// Scan Claude Code session transcripts for direct `Read`/`Grep` calls on
+    /// vault docs that bypassed the already-sent ledger — the read-hook
+    /// field-test measurement instrument (design §5c).
+    Discover(TokenDiscoverArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1497,6 +1508,24 @@ pub struct TokenGainArgs {
     /// Rebuild the rollup tables from the raw JSONL log (recovery / drift fix).
     #[arg(long, default_value_t = false)]
     pub rebuild: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct TokenCheckArgs {
+    /// Doc path the hook is about to let `Read` touch (vault-relative or
+    /// absolute, under the vault).
+    pub path: String,
+}
+
+#[derive(Args, Debug)]
+pub struct TokenDiscoverArgs {
+    /// Emit the full result as JSON. Still renders through the canonical
+    /// envelope dispatcher.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+    /// Only scan transcript files modified within the last N days.
+    #[arg(long = "since-days", value_name = "N")]
+    pub since_days: Option<u32>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────

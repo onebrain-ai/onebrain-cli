@@ -38,6 +38,8 @@ pub mod serve;
 pub mod session_init;
 pub mod skill_inspect;
 pub mod task_list;
+pub mod token_check;
+pub mod token_discover;
 pub mod token_gain;
 pub mod token_runner;
 pub mod update;

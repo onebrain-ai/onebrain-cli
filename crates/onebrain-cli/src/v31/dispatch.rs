@@ -533,6 +533,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         },
         Cmd::Token(TokenCmd { verb }) => match verb {
             TokenVerb::Gain(args) => commands::token_gain::run(vault_flag.clone(), &mode, &args),
+            TokenVerb::Check(args) => {
+                let code = commands::token_check::run(vault_flag.clone(), &args.path)?;
+                std::process::exit(code);
+            }
+            TokenVerb::Discover(args) => {
+                commands::token_discover::run(vault_flag.clone(), &mode, &args)
+            }
         },
 
         // ───── Hidden v3.0 aliases — emit migration notice + dispatch ─
