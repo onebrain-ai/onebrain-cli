@@ -63,12 +63,19 @@ pub enum Signal {
     },
 }
 
-/// Per-call parameters transforms may need. Not itself part of the frozen
-/// interface list — [`crate::guard::run_funnel`] derives sane per-level
-/// defaults (`TransformCtx::for_level`); later tracks may construct one
-/// directly for finer per-surface control.
+/// Per-call parameters the funnel and transforms need. [`run_funnel`] takes
+/// this by reference so a caller can build defaults via
+/// [`TransformCtx::for_level`] and then mutate per-call overrides (level,
+/// caps, `doc_path`) before dispatching — without any new funnel signature.
+/// Extra fields later tracks need (e.g. ledger `session_token`, `force`) can
+/// be added here without breaking the `&TransformCtx` signature.
+///
+/// [`run_funnel`]: crate::guard::run_funnel
 #[derive(Debug, Clone, Default)]
 pub struct TransformCtx {
+    /// The ladder rung the funnel gates transforms against. A transform runs
+    /// iff `transform.min_level() <= ctx.level`.
+    pub level: OptLevel,
     pub model: ModelFamily,
     /// `get`-style continuation cap, in estimated tokens. `None`/`Some(0)`
     /// means unlimited — the cap transform is a no-op.
@@ -84,6 +91,8 @@ impl TransformCtx {
     /// Sane per-level defaults for the caps the ladder table (design §2)
     /// assigns to each rung: `get_cap` 6k/4k/4k tokens, snippet 200/150/120
     /// chars. `off` carries no caps since no transform runs at that level.
+    /// Sets `.level = level` so the funnel gates correctly with no extra
+    /// argument.
     pub fn for_level(level: OptLevel) -> Self {
         let (get_max_tokens, snippet_max_chars) = match level {
             OptLevel::Off => (None, None),
@@ -92,6 +101,7 @@ impl TransformCtx {
             OptLevel::Aggressive => (Some(4000), Some(120)),
         };
         TransformCtx {
+            level,
             model: ModelFamily::default(),
             get_max_tokens,
             snippet_max_chars,
@@ -149,8 +159,16 @@ mod tests {
     #[test]
     fn for_level_off_has_no_caps() {
         let ctx = TransformCtx::for_level(OptLevel::Off);
+        assert_eq!(ctx.level, OptLevel::Off);
         assert!(ctx.get_max_tokens.is_none());
         assert!(ctx.snippet_max_chars.is_none());
+    }
+
+    #[test]
+    fn for_level_sets_the_level_field() {
+        for level in OptLevel::ALL {
+            assert_eq!(TransformCtx::for_level(level).level, level);
+        }
     }
 
     #[test]

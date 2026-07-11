@@ -11,8 +11,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 /// The four rungs of the optimization ladder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum OptLevel {
+    /// Default: byte-for-byte today's behavior — safe when no level is set.
+    #[default]
     Off,
     Conservative,
     Balanced,

@@ -68,8 +68,7 @@ mod tests {
         TransformCtx {
             model: ModelFamily::ClaudeGeneric,
             get_max_tokens: Some(tokens),
-            snippet_max_chars: None,
-            doc_path: None,
+            ..TransformCtx::default()
         }
     }
 
