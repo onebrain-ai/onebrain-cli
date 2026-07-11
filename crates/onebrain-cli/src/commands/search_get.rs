@@ -12,7 +12,10 @@ use serde::Serialize;
 use crate::cli::SearchGetArgs;
 use crate::commands::daemon_client::DaemonHandle;
 use crate::commands::search_common::{map_daemon_error, open_engine, route_to_daemon};
+use crate::commands::token_runner;
 use crate::output::{emit, Envelope, OutputMode};
+use onebrain_token::gain::Surface;
+use onebrain_token::{CacheKind, GainEvent};
 
 #[derive(Debug, Serialize)]
 struct SearchGetData {
@@ -56,11 +59,51 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchGetArgs)
             .get(&doc_path)
             .map_err(|e| anyhow::anyhow!("{e}\n{NOT_INDEXED_HINT}"))?
     };
+
+    // Meter the agent-facing (structured) path (design §5d — no surface escapes
+    // metering). `search get` returns a whole document body; the ladder's
+    // doc-body transforms (whitespace/frontmatter/get_cap) are gated to the MCP
+    // `get`/`multi_get` surfaces (design §2a matrix — there is no CLI doc-body
+    // surface this release), and the query-surface transforms MUST NOT run on a
+    // doc body (snippet's fallback would truncate it). So this records a
+    // metering event for the surface without reshaping the body. `--force` is
+    // the documented re-materialize path (the reference envelope points here);
+    // it returns full content, which this command already does.
+    if mode.is_structured() {
+        let cfg = onebrain_core::load_vault_config(&resolved.root)
+            .map(|c| c.token_optimization)
+            .unwrap_or_default();
+        let level =
+            token_runner::resolve_level(args.opt_level.as_deref(), &cfg).unwrap_or(cfg.level);
+        let bytes = content.len() as u64;
+        token_runner::record_gain(
+            &resolved,
+            GainEvent {
+                ts: now_ts(),
+                surface: Surface::CliSearch,
+                transform: "none".to_string(),
+                level,
+                bytes_before: bytes,
+                bytes_after: bytes,
+                cache: CacheKind::None,
+                session_token: None,
+            },
+        );
+    }
+
     let data = SearchGetData { doc_path, content };
 
     let envelope = Envelope::ok("search.get", Some(vault_info), data);
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
+}
+
+/// Epoch seconds for the metering gain event.
+fn now_ts() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Fetch a doc's indexed text through the warm daemon's `/api/internal/get`. A

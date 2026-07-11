@@ -1072,12 +1072,28 @@ pub struct SearchQueryArgs {
     /// effect on the pure-lex `search` verb (never reranked).
     #[arg(long = "min-candidates")]
     pub min_candidates: Option<usize>,
+    /// Token-optimization level override for this call
+    /// (`off|conservative|balanced|aggressive`). Only shapes structured
+    /// (`--output json`/`yaml`) output; human TTY output is never altered.
+    /// Precedence: this flag > `onebrain.yml token_optimization.level` > default.
+    #[arg(long = "opt-level")]
+    pub opt_level: Option<String>,
 }
 
 #[derive(Args, Debug)]
 pub struct SearchGetArgs {
     /// Doc path, relative to the vault root (as indexed).
     pub doc_path: String,
+    /// Re-materialize the FULL body, bypassing the already-sent ledger and the
+    /// size cap (design §3c) — this is the command a reference envelope's
+    /// `rematerialize` field points back to.
+    #[arg(long)]
+    pub force: bool,
+    /// Token-optimization level override for this call
+    /// (`off|conservative|balanced|aggressive`). Only shapes structured
+    /// (`--output json`/`yaml`) output; human TTY output is never altered.
+    #[arg(long = "opt-level")]
+    pub opt_level: Option<String>,
 }
 
 #[derive(Args, Debug)]
