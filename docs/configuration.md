@@ -95,7 +95,7 @@ a completeness test enforces this against the config structs.
 | `token_optimization.level` | Token-optimization ladder rung — see [`token-optimization.md`](token-optimization.md) | `conservative` | `off`, `conservative`, `balanced`, `aggressive` | not validated |
 | `token_optimization.get_max_tokens` | `search get` / MCP `get` continuation cap, in estimated tokens; `0` = unlimited | `6000` | integer ≥ 0 | not validated |
 | `token_optimization.snippet_max_chars` | Per-hit query snippet length cap, in characters | `200` | integer ≥ 1 | not validated |
-| `token_optimization.strip_frontmatter` | When to strip YAML frontmatter from `get`/`multi_get` doc bodies | `auto` | `auto`, `always`, `never` | not validated |
+| `token_optimization.strip_frontmatter` | When to strip YAML frontmatter from `get`/`multi_get` doc bodies | `auto` | `auto`, `always`, `never` | not validated · ⚠️ **v3.4.10: only `auto` is wired** — frontmatter strips at balanced+ per the ladder; `always`/`never` are accepted but not yet honored (config-wiring lands in v3.4.11) |
 | `token_optimization.model` | Model-family hint for token estimation calibration + pricing | `auto` | any string | not validated |
 | `token_optimization.read_hook` | Vault-read ledger-gate hook mode (plugin registers the PreToolUse hook; this key only gates the CLI's ledger check) | `off` | `off`, `ledger` | not validated |
 | `recap.min_sessions` | Unrecapped session logs required before `/recap` runs (plugin key) | `6` | integer ≥ 1 | not validated (plugin-level) |

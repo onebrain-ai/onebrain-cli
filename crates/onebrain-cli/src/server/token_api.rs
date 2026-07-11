@@ -26,8 +26,8 @@
 //! contract: a daemon too old to have the route answers 404 → the client skips
 //! optimization; a present route answers 200 with the real-or-empty pivot.
 //!
-//! `GET /api/token/status`'s `level` is a best-effort default (`conservative`,
-//! the product default) until Track 4 wires per-call/config level resolution.
+//! `GET /api/token/status`'s `level` reflects the vault's resolved
+//! `token_optimization.level` (`resolve_level`, Track 4 / M3).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -172,8 +172,8 @@ async fn get_token_gain(
 
 #[derive(Debug, Serialize, PartialEq)]
 struct TokenStatusResponse {
-    /// Effective optimization level. Best-effort `"conservative"` (the product
-    /// default) until Track 4 wires per-call/config level resolution.
+    /// Effective optimization level, resolved from the vault's
+    /// `token_optimization.level` config (`resolve_level`, Track 4 / M3).
     level: String,
     /// Whether the already-sent ledger is active — true at level 2↑
     /// (`balanced`/`aggressive`), matching design §3b's activation rule.
