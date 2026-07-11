@@ -3,15 +3,21 @@
 //!
 //! Everything in [`transform`], [`level`], and [`guard`] is pure: no I/O,
 //! no clock reads beyond what callers pass in. The deliberate I/O
-//! boundaries are `gain::writer` (the append-only JSONL gain log) and
-//! `gain::rollup` (the Tier-2 redb rollup tables `gain::pivot` reads from).
+//! boundaries are `gain::writer` (the append-only JSONL gain log),
+//! `gain::rollup` (the Tier-2 redb rollup tables `gain::pivot` reads
+//! from), and [`cache`] (the redb-backed memoization + already-sent
+//! ledger layers in `token.redb`).
 
+pub mod cache;
 pub mod estimate;
 pub mod gain;
 pub mod guard;
 pub mod level;
 pub mod transform;
 
+pub use cache::{
+    CacheError, CacheResult, Ledger, LedgerEntry, LedgerVerdict, Memo, MemoKey, TokenCache,
+};
 pub use estimate::{estimate_tokens, ModelFamily};
 pub use gain::{
     CacheKind, Dim, GainEvent, GainSink, JsonlGainWriter, PivotQuery, PivotResult, PivotRow,

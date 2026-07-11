@@ -86,6 +86,19 @@ pub struct TransformCtx {
     /// The document path this payload was sourced from, when known — used
     /// by transforms that need it for signal context (e.g. dedup identity).
     pub doc_path: Option<String>,
+    /// Re-materialize / force flag (design §3c): when `true`, the caller has
+    /// asked for full content — the ledger AND the size cap are bypassed so a
+    /// doc that was already sent (or is over the cap) comes back in full. Set
+    /// by MCP `get`'s `force` param and the CLI `--force` flag. Deferred from
+    /// Track 1 as YAGNI; the ledger path (Track 3) is the first consumer.
+    pub force: bool,
+    /// The resolved session token for this call, when one is available
+    /// (design §3b). The already-sent ledger keys on `(session_token,
+    /// doc_path)`; a `None` here means no token was resolvable (headless / odd
+    /// host), so the ledger is silently inactive for this call and content is
+    /// inlined normally — never guessed. Session-independent memoization is
+    /// unaffected.
+    pub session_token: Option<String>,
 }
 
 impl TransformCtx {
@@ -107,6 +120,8 @@ impl TransformCtx {
             get_max_tokens,
             snippet_max_chars,
             doc_path: None,
+            force: false,
+            session_token: None,
         }
     }
 }

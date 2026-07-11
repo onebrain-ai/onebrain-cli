@@ -12,9 +12,12 @@ serde      = { workspace = true }
 serde_json = { workspace = true }
 chrono     = { workspace = true }
 thiserror  = { workspace = true }
-# Track 2's rollup tables (GAIN_DAILY/MONTHLY/YEARLY) live in the same
-# token.redb the Track 3 cache/ledger module owns — same version pin as
-# onebrain-search's redb dep (not a workspace dep there either; mirrored here).
+# Content-hash of the memoization key components (design §3a). Same version
+# the rest of the workspace uses (onebrain-search / onebrain-fs).
+sha2       = { workspace = true }
+# Embedded KV store shared by Track 2's rollup tables (GAIN_DAILY/MONTHLY/
+# YEARLY) and Track 3's memoization + already-sent ledger layers, all in
+# `token.redb` — same version pin as onebrain-search's index store.
 redb       = "4.1"
 
 [dev-dependencies]
