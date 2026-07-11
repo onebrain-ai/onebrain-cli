@@ -41,7 +41,16 @@ pub(crate) fn set_vars(pairs: &[(&'static str, &OsStr)]) -> EnvVarGuard {
         .map(|(key, _)| (*key, std::env::var_os(key)))
         .collect();
     for (key, value) in pairs {
-        std::env::set_var(key, value);
+        // SAFETY: the shared lock (held above) serializes this mutation
+        // against every other env mutation in this crate's tests — the
+        // single-process precondition edition-2024 will require `unsafe`
+        // to assert. Wrapped now for forward compatibility; `allow`
+        // suppresses today's unused-unsafe warning under the current
+        // edition (parity with the Drop impl below — #226).
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var(key, value);
+        }
     }
     EnvVarGuard { saved, _lock: lock }
 }
