@@ -19,6 +19,7 @@ onebrain
 ├── task        list
 ├── plugin      install · update · migrate
 ├── schedule    register · list
+├── token       gain · check · discover
 ├── skill       run
 └── harness     detect
 ```
@@ -31,6 +32,7 @@ onebrain
 | **MCP** | `mcp` | Stdio [Model Context Protocol](reference/mcp.md) server exposing `query`/`get`/`multi_get`/`status` over the native search engine — for Claude Code, Cursor, or any MCP client. See [`reference/mcp.md`](reference/mcp.md) for the full tool reference. |
 | **Notes** | `note read · list · find · search · stat · new · append · edit · move · mkdir · archive · delete · orphans · backlinks` | Structured vault-note operations — wikilink-aware moves, dated archiving, orphan/backlink graph queries. |
 | **Tasks** | `task list` | List dated vault tasks (fence-aware), filterable by due date and folder. |
+| **Token optimization** | `token gain · check · discover` | Report/administer the token-optimization ladder + cache (v3.4.10): `gain` reports byte-exact savings (summary, `--by` pivot, `--history`, `--reset`, `--rebuild`); `check` is the read-hook's 0/2 allow/deny verdict over the already-sent ledger; `discover` estimates missed savings from direct `Read`/`Grep` bypass traffic in Claude Code session transcripts. See [`token-optimization.md`](token-optimization.md). |
 | **Web UI** | `serve` | Host the binary-embedded web UI + token-gated vault JSON API on `127.0.0.1:6789` — file explorer, reading view, search panel, agent chat; `--open` launches the browser. See [`serve.md`](serve.md). |
 | **Maintenance** | `doctor [--fix]`, `plugin update · migrate`, `schedule register` | Thirteen read-only checks + `--fix` recipes (incl. per-key config-value validation with comment-preserving reset-to-default), self-update the binary + rewrite hooks + rebind launchd plists, compile the `onebrain.yml schedule:` block into OS scheduler artifacts. |
 | **Diagnostics** | `vault current`, `harness detect` | Report which mechanism resolved the active vault, and which AI harness is running. |
@@ -48,8 +50,10 @@ onebrain doctor                 # TTY: animated per-check report, colorized
 onebrain doctor --json          # { version, command, ok, vault, data, warnings, error }
 onebrain vault current --yaml   # same envelope, YAML
 onebrain search status --json | jq .data
+onebrain token gain --json --by month,surface   # same envelope, Tier-2 pivot data
 ```
 
 - `--output {text,json,yaml,table,tsv}` — full matrix on every command; `--json` / `--yaml` are shorthands.
 - `--pretty` forces indented JSON even when stdout is piped; `--no-color` (or `NO_COLOR`) forces monochrome; `-q` drops info logs (errors still hit stderr).
 - Output auto-adapts: piped/CI invocations drop color and the startup banner, so machine consumers get clean bytes with no flags. Closed-pipe writes (`onebrain search reindex | head`) exit `0`, not a panic.
+- **`token gain` / `token discover`** follow the same matrix (`--json` is a local shorthand for `--output json`, still rendered through the canonical envelope). **`token check`** is the one exception: it's a hook-facing verdict, not a report — no `--output` flag; it always answers with a bare **exit 0** (allow, stdout empty) or **exit 2** (deny, a reference-envelope JSON object on stdout) — see [`token-optimization.md`](token-optimization.md#token-check--the-hooks-verdict).

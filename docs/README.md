@@ -9,6 +9,7 @@ User guides for the tool, plus design & internals docs for people reading the so
 | [`install.md`](install.md) | Install or update the binary — Homebrew / npm / direct download, the per-platform binary table, self-update behavior, build from source, and the security & trust model. |
 | [`commands.md`](commands.md) | See the full `onebrain <noun> <verb>` command tree, what each verb group does, and the output modes (`--json` / `--yaml` / envelope contract). |
 | [`configuration.md`](configuration.md) | Look up every `onebrain.yml` key — what it does, its default, valid range, and whether `doctor --fix` can reset it. |
+| [`token-optimization.md`](token-optimization.md) | Understand the token-optimization level ladder, the two cache layers, `onebrain token gain/check/discover`, and the honesty-signal contract. |
 | [`platform-support.md`](platform-support.md) | Check which release targets ship full semantic search vs keyword-only. |
 | [`serve.md`](serve.md) | Run the embedded local web UI (`onebrain serve`) — file explorer, reading view, search, agent chat — and understand its security posture. |
 | [`reference/mcp.md`](reference/mcp.md) | Plug OneBrain into Claude Code / Cursor / any MCP client (`onebrain mcp`) — including standalone vault-search use on any Markdown folder. |
