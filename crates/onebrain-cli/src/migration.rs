@@ -305,12 +305,12 @@ mod tests {
         let old = root.path().join("cache/onebrain/search");
         let new = root.path().join("data/onebrain/search");
         fs::create_dir_all(&old).unwrap();
-        fs::write(old.join("engine.redb"), b"index").unwrap();
+        fs::write(old.join("seed.dat"), b"index").unwrap();
 
         migrate_dir_once(&old, &new);
 
         assert!(!old.exists(), "old search dir should be gone after move");
-        assert_eq!(fs::read(new.join("engine.redb")).unwrap(), b"index");
+        assert_eq!(fs::read(new.join("seed.dat")).unwrap(), b"index");
     }
 
     #[test]
@@ -319,15 +319,15 @@ mod tests {
         let old = root.path().join("cache/onebrain/search");
         let new = root.path().join("data/onebrain/search");
         fs::create_dir_all(&old).unwrap();
-        fs::write(old.join("engine.redb"), b"OLD").unwrap();
+        fs::write(old.join("seed.dat"), b"OLD").unwrap();
         fs::create_dir_all(&new).unwrap();
-        fs::write(new.join("engine.redb"), b"NEW").unwrap();
+        fs::write(new.join("seed.dat"), b"NEW").unwrap();
 
         migrate_dir_once(&old, &new);
 
         // Destination is never clobbered; source is left untouched.
-        assert_eq!(fs::read(new.join("engine.redb")).unwrap(), b"NEW");
-        assert_eq!(fs::read(old.join("engine.redb")).unwrap(), b"OLD");
+        assert_eq!(fs::read(new.join("seed.dat")).unwrap(), b"NEW");
+        assert_eq!(fs::read(old.join("seed.dat")).unwrap(), b"OLD");
     }
 
     #[test]

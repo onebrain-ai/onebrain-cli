@@ -28,6 +28,7 @@ use onebrain_core::{
     load_vault_config, load_vault_config_at, RerankerConfig, ResolvedVault, VaultRoot,
 };
 use onebrain_search::engine::{short_path_hash, Engine, RerankSettings, DEFAULT_RERANK_MIN_SCORE};
+use onebrain_search::CollectionLayout;
 
 use crate::vault_ctx;
 
@@ -103,9 +104,33 @@ fn generate_collection_name(dir_name: String, abs_path: &Path) -> String {
     format!("{dir_name}-{}", short_path_hash(abs_path))
 }
 
-/// Collection's on-disk cache dir: `<search_cache_root>/<collection>/`.
+/// Collection's on-disk cache dir: `<search_cache_root>/<collection>/`. This
+/// is the collection ROOT — the parent of the split `index/` + `models/`
+/// layout, unchanged by the split (see [`CollectionLayout`]).
 pub fn collection_cache_dir(collection: &str) -> PathBuf {
     search_cache_root().join(collection)
+}
+
+/// The hf-hub model DOWNLOAD cache base for a collection whose root is
+/// `cache_dir`: always `<cache_dir>/models` (see
+/// [`CollectionLayout::models_base`]). Feed this to download-triggering
+/// calls (`embed::new*` / `rerank::new`) so fresh downloads land in the
+/// split layout. Read-only "is this model downloaded?" probes must NOT use
+/// it — `model_download_status` / `reranker_download_status` take the
+/// collection ROOT and resolve per model with legacy fallback internally.
+pub(crate) fn models_cache_dir(cache_dir: &Path) -> PathBuf {
+    CollectionLayout::new(cache_dir).models_base()
+}
+
+/// Resolve one of the collection's index artifacts (`"tantivy"`, `"vectors"`,
+/// or `"engine.redb"`) through the split layout: `<cache_dir>/index/<name>`
+/// once migrated, legacy `<cache_dir>/<name>` while it hasn't moved yet. This
+/// is the read-only resolution every consumer OUTSIDE `Engine::open` (which
+/// migrates eagerly) must use to find artifacts — presence checks and direct
+/// `LexIndex::open`s alike. Pure path resolution; never mutates (no
+/// `migrate()`).
+pub(crate) fn index_artifact_path(cache_dir: &Path, name: &str) -> PathBuf {
+    CollectionLayout::new(cache_dir).index_artifact(name)
 }
 
 /// Resolve the vault and open the engine rooted at its collection's cache
@@ -224,28 +249,18 @@ pub fn is_indexed(cache_dir: &Path) -> bool {
 }
 
 /// Total on-disk bytes of the index itself under `cache_dir`: the `tantivy/`
-/// and `vectors/` directories plus the `engine.redb` file. The downloaded
-/// `models--*` dirs are deliberately excluded — those are the model's size,
-/// reported separately. Returns `None` when none of the three exist yet (no
-/// index). Pure fs; reuses the shared `onebrain_search::embed::dir_size_bytes`.
+/// and `vectors/` directories plus the `engine.redb` file, resolved through
+/// the split layout so each artifact is counted wherever it actually lives
+/// (new `index/` location or legacy root, mid-migration split included). The
+/// downloaded `models--*` dirs are deliberately excluded — those are the
+/// model's size, reported separately. Returns `None` when none of the three
+/// exist yet (no index). Pure fs, never mutates (no `migrate()`).
 pub fn index_size_bytes(cache_dir: &Path) -> Option<u64> {
-    use onebrain_search::embed::dir_size_bytes;
-    let mut total = 0u64;
-    let mut any = false;
-    for sub in ["tantivy", "vectors"] {
-        let dir = cache_dir.join(sub);
-        if dir.is_dir() {
-            any = true;
-            total += dir_size_bytes(&dir);
-        }
-    }
-    if let Ok(meta) = std::fs::metadata(cache_dir.join("engine.redb")) {
-        if meta.is_file() {
-            any = true;
-            total += meta.len();
-        }
-    }
-    any.then_some(total)
+    let layout = CollectionLayout::new(cache_dir);
+    let any = ["tantivy", "vectors", "engine.redb"]
+        .iter()
+        .any(|name| layout.index_artifact(name).exists());
+    any.then(|| layout.index_size_bytes())
 }
 
 /// `true` when the vault's config file physically contains a
@@ -627,13 +642,22 @@ mod tests {
         // No index yet → None.
         assert!(index_size_bytes(dir.path()).is_none());
 
-        std::fs::create_dir_all(dir.path().join("tantivy")).unwrap();
-        std::fs::write(dir.path().join("tantivy/meta.json"), vec![0u8; 100]).unwrap();
-        std::fs::create_dir_all(dir.path().join("vectors")).unwrap();
-        std::fs::write(dir.path().join("vectors/data.bin"), vec![0u8; 200]).unwrap();
-        std::fs::write(dir.path().join("engine.redb"), vec![0u8; 44]).unwrap();
+        // Build the three artifacts under the split `index/` layout (paths
+        // resolved via the layout so this test carries no literal artifact
+        // path). tantivy 100 + vectors 200 + engine.redb 44 = 344.
+        let tantivy = index_artifact_path(dir.path(), "tantivy");
+        std::fs::create_dir_all(&tantivy).unwrap();
+        std::fs::write(tantivy.join("meta.json"), vec![0u8; 100]).unwrap();
+        let vectors = index_artifact_path(dir.path(), "vectors");
+        std::fs::create_dir_all(&vectors).unwrap();
+        std::fs::write(vectors.join("data.bin"), vec![0u8; 200]).unwrap();
+        std::fs::write(
+            index_artifact_path(dir.path(), "engine.redb"),
+            vec![0u8; 44],
+        )
+        .unwrap();
         // A model dir must NOT be counted toward the index size.
-        let model = dir.path().join("models--intfloat--multilingual-e5-small");
+        let model = models_cache_dir(dir.path()).join("models--intfloat--multilingual-e5-small");
         std::fs::create_dir_all(&model).unwrap();
         std::fs::write(model.join("model.onnx"), vec![0u8; 9999]).unwrap();
 

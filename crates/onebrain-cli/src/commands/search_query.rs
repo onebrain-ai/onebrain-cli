@@ -17,7 +17,9 @@ use serde::Serialize;
 use crate::cli::SearchQueryArgs;
 #[cfg(feature = "semantic")]
 use crate::commands::daemon_client::DaemonHandle;
-use crate::commands::search_common::{collection_cache_dir, open_engine, resolve_collection};
+use crate::commands::search_common::{
+    collection_cache_dir, index_artifact_path, open_engine, resolve_collection,
+};
 #[cfg(feature = "semantic")]
 use crate::commands::search_common::{
     map_daemon_error, rerank_settings_from_config, route_to_daemon,
@@ -287,7 +289,7 @@ pub fn run_lex(
         );
     };
     let cache_dir = collection_cache_dir(&collection);
-    let lex = LexIndex::open(&cache_dir.join("tantivy"))
+    let lex = LexIndex::open(&index_artifact_path(&cache_dir, "tantivy"))
         .with_context(|| format!("opening lex index at {}", cache_dir.display()))?;
 
     let mut raw_hits = lex.search_with_heading(&args.text, args.top_k)?;

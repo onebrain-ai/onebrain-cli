@@ -25,6 +25,7 @@ use onebrain_core::load_vault_config;
 use onebrain_search::embed::{model_download_status, model_registry};
 use onebrain_search::engine::Engine;
 use onebrain_search::rerank::{reranker_download_status, reranker_registry};
+use onebrain_search::{CacheLayoutState, CollectionLayout};
 
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub(crate) struct SearchStatusData {
@@ -68,9 +69,34 @@ pub(crate) struct SearchStatusData {
     /// (engine busy).
     pending_removed: Option<usize>,
     /// Total byte size of the whole collection cache dir (models + index +
-    /// live markers). `None` when no collection is configured.
+    /// live markers). `None` when no collection is configured. Kept for
+    /// back-compat; `cache_models_bytes` + `cache_index_bytes` below are the
+    /// split breakdown the `Cache` text section renders.
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_size_bytes: Option<u64>,
+    /// Total on-disk bytes of the hf-hub model cache tree (`models/` once
+    /// migrated, plus any legacy `models--*` dirs still at the cache root) —
+    /// EVERY downloaded model dir, not just the active one. A stale model
+    /// left behind by a `search model set` switch is included by design:
+    /// deleting the `models/` tree is the intended way to reclaim that
+    /// space. Computed via [`CollectionLayout::models_size_bytes`], so it
+    /// stays correct even mid-migration (`Partial` layout). `0` when no
+    /// collection is configured (nothing to measure).
+    cache_models_bytes: u64,
+    /// Total on-disk bytes of the search index artifacts (`tantivy/`,
+    /// `vectors/`, `engine.redb`), wherever each currently lives. Same
+    /// definition as `index_size_bytes` above, but always populated (never
+    /// `None`, since [`CollectionLayout`] tolerates a missing/empty dir) and
+    /// summed via [`CollectionLayout::index_size_bytes`] so the number is
+    /// correct even mid-migration. `0` when no collection is configured.
+    cache_index_bytes: u64,
+    /// The collection cache dir's current migration state relative to the
+    /// `models/` + `index/` split: `"split"` (fully migrated, including a
+    /// fresh/empty collection), `"legacy"` (still fully flat at the cache
+    /// root), or `"partial"` (some artifacts moved, some not). `"split"`
+    /// when no collection is configured (nothing to migrate). See
+    /// [`CacheLayoutState`].
+    cache_layout: String,
     /// Present when a `search reindex` is running RIGHT NOW in another
     /// process (live marker in the cache dir): its (done, total) counts.
     /// While set, `doc_count`/pending below may lag the in-flight run.
@@ -228,6 +254,11 @@ pub(crate) fn status_data(
         .as_deref()
         .filter(|d| d.is_dir())
         .map(onebrain_search::embed::dir_size_bytes);
+    // Must also run before the engine is opened below — `Engine::open`
+    // unconditionally migrates a legacy layout, so reading it afterwards
+    // would always observe `"split"` (see `cache_layout_fields`'s doc).
+    let (cache_models_bytes, cache_index_bytes, cache_layout) =
+        cache_layout_fields(cache_dir.as_deref());
 
     // Index status (doc count, last_indexed, drift) — opens the engine
     // read-only (lazy embedder → no model download) and re-hashes the vault.
@@ -325,6 +356,9 @@ pub(crate) fn status_data(
         pending_changed,
         pending_removed,
         cache_size_bytes,
+        cache_models_bytes,
+        cache_index_bytes,
+        cache_layout,
         reindexing,
         busy,
         status_error,
@@ -438,6 +472,11 @@ pub(crate) fn status_data_for(
         .as_deref()
         .filter(|d| d.is_dir())
         .map(onebrain_search::embed::dir_size_bytes);
+    // The caller's `Engine` is already open, so any legacy layout was already
+    // migrated as a side effect before this ran — this will report `"split"`
+    // for a collection that started legacy, same as the migration's outcome.
+    let (cache_models_bytes, cache_index_bytes, cache_layout) =
+        cache_layout_fields(cache_dir.as_deref());
 
     let status = engine.status(resolved.root.as_path())?;
 
@@ -464,6 +503,9 @@ pub(crate) fn status_data_for(
         pending_changed: Some(status.pending_changed),
         pending_removed: Some(status.pending_removed),
         cache_size_bytes,
+        cache_models_bytes,
+        cache_index_bytes,
+        cache_layout,
         reindexing,
         // The caller already holds a live engine handle, so by construction
         // the index is NOT locked out — this path is never "busy".
@@ -523,6 +565,10 @@ pub(crate) fn status_data_from_daemon(
     let cache_size_bytes = dir
         .is_dir()
         .then(|| onebrain_search::embed::dir_size_bytes(&dir));
+    // The daemon holds the sole live `Engine` on this dir, so — same caveat
+    // as `status_data_for` — any legacy layout was already migrated by the
+    // time the daemon opened it; this reports the post-migration state.
+    let (cache_models_bytes, cache_index_bytes, cache_layout) = cache_layout_fields(Some(&dir));
 
     let current_model_missing = cfg!(feature = "semantic") && model_size_bytes.is_none();
     let reranker = reranker_status_fields(&config, &dir);
@@ -542,6 +588,9 @@ pub(crate) fn status_data_from_daemon(
         pending_changed: Some(counts.pending_changed),
         pending_removed: Some(counts.pending_removed),
         cache_size_bytes,
+        cache_models_bytes,
+        cache_index_bytes,
+        cache_layout,
         reindexing,
         busy: false,
         status_error: None,
@@ -634,6 +683,44 @@ fn reranker_status_fields(
     }
 }
 
+/// Compute the three `Cache`-section fields (`cache_models_bytes`,
+/// `cache_index_bytes`, `cache_layout`) for a collection's cache dir. Pure fs
+/// reads via [`CollectionLayout`], which tolerates a missing/empty dir — so
+/// this is safe to call even before the dir physically exists (a
+/// never-reindexed collection). Returns the "nothing to measure yet" default
+/// (`0, 0, "split"`) when there's no cache dir at all (no collection
+/// configured).
+///
+/// Callers that also open an `Engine` on this same dir MUST call this
+/// *before* that open: `Engine::open` unconditionally migrates any legacy
+/// layout as a side effect (see `engine.rs`'s `open_inner`), so reading the
+/// layout state afterwards would always observe `"split"`.
+fn cache_layout_fields(cache_dir: Option<&Path>) -> (u64, u64, String) {
+    let Some(dir) = cache_dir else {
+        return (
+            0,
+            0,
+            cache_layout_state_str(CacheLayoutState::Split).to_string(),
+        );
+    };
+    let layout = CollectionLayout::new(dir);
+    (
+        layout.models_size_bytes(),
+        layout.index_size_bytes(),
+        cache_layout_state_str(layout.detect()).to_string(),
+    )
+}
+
+/// Render a [`CacheLayoutState`] as the lowercase string the JSON contract +
+/// text `Layout` row use.
+fn cache_layout_state_str(state: CacheLayoutState) -> &'static str {
+    match state {
+        CacheLayoutState::Split => "split",
+        CacheLayoutState::Legacy => "legacy",
+        CacheLayoutState::Partial => "partial",
+    }
+}
+
 /// `root`'s own mtime as epoch seconds, or `None` if unreadable.
 fn dir_mtime_secs(root: &Path) -> Option<u64> {
     let meta = std::fs::metadata(root).ok()?;
@@ -654,6 +741,12 @@ pub(crate) fn format_local(secs: u64) -> Option<String> {
             .to_string()
     })
 }
+
+/// Column width of the size value in the `Cache` section's `Models`/`Index`
+/// rows before their same-line reclaim hint — e.g. `"512 MB    delete → ..."`
+/// (4 spaces) vs `"16 MB     delete → ..."` (5 spaces): both hints start at
+/// the same column regardless of the size string's length.
+const CACHE_HINT_COL: usize = 10;
 
 fn render_text(env: &Envelope<SearchStatusData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
@@ -781,8 +874,29 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
         lines.push(String::new());
         lines.push(section("📁", "Cache"));
         lines.push(item("Dir", &dir.display().to_string()));
-        if let Some(size) = d.cache_size_bytes {
-            lines.push(item("Size", &format_size(size)));
+        lines.push(item(
+            "Models",
+            &format!(
+                "{:<CACHE_HINT_COL$}delete → re-downloaded on next use",
+                format_size(d.cache_models_bytes)
+            ),
+        ));
+        lines.push(item(
+            "Index",
+            &format!(
+                "{:<CACHE_HINT_COL$}delete → rebuilt by `search reindex`",
+                format_size(d.cache_index_bytes)
+            ),
+        ));
+        lines.push(item(
+            "Total",
+            &format_size(d.cache_models_bytes + d.cache_index_bytes),
+        ));
+        if d.cache_layout != "split" {
+            lines.push(item(
+                "Layout",
+                &format!("{} → migrates on next engine open", d.cache_layout),
+            ));
         }
     }
 
@@ -885,6 +999,9 @@ mod tests {
                 last_indexed_at: None,
                 index_size_bytes: None,
                 cache_size_bytes: None,
+                cache_models_bytes: 0,
+                cache_index_bytes: 0,
+                cache_layout: "split".to_string(),
                 doc_count: Some(0),
                 pending_new: Some(0),
                 pending_changed: Some(0),
@@ -1167,6 +1284,78 @@ mod tests {
             data.reranker_downloaded_at.is_some(),
             "downloaded_at must reach the built SearchStatusData"
         );
+    }
+
+    #[test]
+    fn status_data_reports_legacy_layout_and_split_sizes_before_migration() {
+        // Builder-level coverage (#201): a collection still fully flat at the
+        // cache root must report `cache_layout: "legacy"` — and it must do so
+        // BEFORE `status_data`'s own `Engine::open` call migrates it (see
+        // `cache_layout_fields`'s doc comment), so this also guards against
+        // that ordering regressing.
+        let vault = tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: t-cache-layout-legacy\n",
+        )
+        .unwrap();
+        let resolved = resolved_at(vault.path());
+
+        let cache_root = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache_root.path());
+        let dir = collection_cache_dir("t-cache-layout-legacy");
+        // Legacy flat layout: index artifacts + a model dir directly at the
+        // cache root, nothing under `models/` or `index/` yet. (Artifact
+        // names via variables so the repo-wide "no literal artifact joins"
+        // sweep stays clean.)
+        let artifacts = ["tantivy", "engine.redb"];
+        std::fs::create_dir_all(dir.join(artifacts[0])).unwrap();
+        std::fs::write(dir.join(artifacts[0]).join("seg"), vec![0u8; 7]).unwrap();
+        std::fs::write(dir.join(artifacts[1]), vec![0u8; 5]).unwrap();
+        std::fs::create_dir_all(dir.join("models--org--name")).unwrap();
+        std::fs::write(
+            dir.join("models--org--name").join("weights.bin"),
+            vec![0u8; 10],
+        )
+        .unwrap();
+
+        let data = status_data(&resolved, Some("t-cache-layout-legacy".to_string()), None).unwrap();
+
+        assert_eq!(data.cache_layout, "legacy");
+        assert_eq!(data.cache_models_bytes, 10);
+        assert_eq!(data.cache_index_bytes, 12);
+
+        let s = render_text(&Envelope::ok("search.status", None, data));
+        assert!(
+            s.contains("    Layout        legacy → migrates on next engine open"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn status_data_reports_split_layout_and_omits_layout_line() {
+        // Companion fixture: a fresh/never-legacy collection cache dir
+        // detects as `Split`, and the text renderer must NOT show a Layout
+        // row for it.
+        let vault = tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: t-cache-layout-split\n",
+        )
+        .unwrap();
+        let resolved = resolved_at(vault.path());
+
+        let cache_root = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache_root.path());
+        let dir = collection_cache_dir("t-cache-layout-split");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let data = status_data(&resolved, Some("t-cache-layout-split".to_string()), None).unwrap();
+
+        assert_eq!(data.cache_layout, "split");
+
+        let s = render_text(&Envelope::ok("search.status", None, data));
+        assert!(!s.contains("Layout"), "{s}");
     }
 
     #[test]
@@ -1486,6 +1675,9 @@ mod tests {
             d.last_indexed_at = Some(1_700_000_000);
             d.model_size_bytes = Some(1234);
             d.index_size_bytes = Some(5678);
+            d.cache_models_bytes = 111;
+            d.cache_index_bytes = 222;
+            d.cache_layout = "partial".to_string();
         }
         let v = serde_json::to_value(e.data.as_ref().unwrap()).unwrap();
         // Existing fields preserved.
@@ -1500,6 +1692,10 @@ mod tests {
         assert_eq!(v["last_indexed_at"], 1_700_000_000u64);
         assert_eq!(v["model_size_bytes"], 1234);
         assert_eq!(v["index_size_bytes"], 5678);
+        // Cache-section split fields (#201).
+        assert_eq!(v["cache_models_bytes"], 111);
+        assert_eq!(v["cache_index_bytes"], 222);
+        assert_eq!(v["cache_layout"], "partial");
         // Reranker fields ride the same payload; `reranker_downloaded_at` is
         // always PRESENT (null when not downloaded — not omitted), mirroring
         // `model_downloaded_at`.
@@ -1509,6 +1705,28 @@ mod tests {
             "reranker_downloaded_at key must exist: {v}"
         );
         assert!(v["reranker_downloaded_at"].is_null(), "{v}");
+    }
+
+    #[test]
+    fn json_keeps_cache_size_bytes_for_back_compat() {
+        // `cache_size_bytes` (the whole-cache-dir total) is kept unchanged
+        // alongside the new split fields — existing consumers reading it
+        // must not regress.
+        let mut e = env(Some("ob-1"), true);
+        e.data.as_mut().unwrap().cache_size_bytes = Some(999);
+        let v = serde_json::to_value(e.data.as_ref().unwrap()).unwrap();
+        assert_eq!(v["cache_size_bytes"], 999);
+    }
+
+    #[test]
+    fn json_cache_models_and_index_bytes_are_never_omitted() {
+        // Unlike `cache_size_bytes`/`index_size_bytes` (Option, omitted when
+        // absent), the new split fields are plain `u64` — always present,
+        // even at their `0` default (no collection / nothing downloaded).
+        let v = serde_json::to_value(env(None, false).data.as_ref().unwrap()).unwrap();
+        assert_eq!(v["cache_models_bytes"], 0);
+        assert_eq!(v["cache_index_bytes"], 0);
+        assert_eq!(v["cache_layout"], "split");
     }
 
     #[test]
@@ -1530,16 +1748,61 @@ mod tests {
     }
 
     #[test]
-    fn text_shows_cache_size_when_present() {
+    fn text_shows_cache_models_index_and_total_breakdown() {
         let mut e = env(Some("ob-1"), true);
-        e.data.as_mut().unwrap().cache_size_bytes = Some(512 * 1024 * 1024);
+        {
+            let d = e.data.as_mut().unwrap();
+            d.cache_models_bytes = 512 * 1024 * 1024;
+            d.cache_index_bytes = 16 * 1024 * 1024;
+        }
         let s = render_text(&e);
         assert!(s.contains("📁  Cache"), "{s}");
-        // Both Dir and Size sit in the Cache section.
+        // Dir, Models, Index, and Total all sit in the Cache section.
         let cache_at = s.find("📁  Cache").unwrap();
         let tail = &s[cache_at..];
         assert!(tail.contains("    Dir           /cache/ob-1"), "{tail}");
-        assert!(tail.contains("    Size          512 MB"), "{tail}");
+        // Same-line reclaim hints, column-aligned regardless of the size
+        // string's length (4 spaces after "512 MB", 5 after "16 MB").
+        assert!(
+            tail.contains("    Models        512 MB    delete → re-downloaded on next use"),
+            "{tail}"
+        );
+        assert!(
+            tail.contains("    Index         16 MB     delete → rebuilt by `search reindex`"),
+            "{tail}"
+        );
+        assert!(tail.contains("    Total         528 MB"), "{tail}");
+        // Split layout (the `env` default) omits the Layout row entirely.
+        assert!(!tail.contains("Layout"), "{tail}");
+    }
+
+    #[test]
+    fn text_shows_layout_line_when_not_split() {
+        let mut e = env(Some("ob-1"), true);
+        e.data.as_mut().unwrap().cache_layout = "legacy".to_string();
+        let s = render_text(&e);
+        assert!(
+            s.contains("    Layout        legacy → migrates on next engine open"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn text_omits_layout_line_when_split() {
+        // `env`'s default `cache_layout` is "split".
+        let s = render_text(&env(Some("ob-1"), true));
+        assert!(!s.contains("Layout"), "{s}");
+    }
+
+    #[test]
+    fn text_shows_layout_line_for_partial_state_too() {
+        let mut e = env(Some("ob-1"), true);
+        e.data.as_mut().unwrap().cache_layout = "partial".to_string();
+        let s = render_text(&e);
+        assert!(
+            s.contains("    Layout        partial → migrates on next engine open"),
+            "{s}"
+        );
     }
 
     #[test]
@@ -1552,8 +1815,8 @@ mod tests {
     fn active_model_dir_stats_none_when_active_model_not_on_disk() {
         let dir = tempdir().unwrap();
         // A cache dir with unrelated subdirs but no `models--*`.
-        std::fs::create_dir(dir.path().join("tantivy")).unwrap();
-        std::fs::create_dir(dir.path().join("vectors")).unwrap();
+        std::fs::create_dir(dir.path().join("index")).unwrap();
+        std::fs::create_dir(dir.path().join("models")).unwrap();
         assert!(active_model_dir_stats(dir.path(), "multilingual-e5-small").is_none());
     }
 
@@ -1565,8 +1828,8 @@ mod tests {
         std::fs::write(model.join("snapshots/abc/model.onnx"), vec![0u8; 1000]).unwrap();
         std::fs::write(model.join("config.json"), vec![0u8; 24]).unwrap();
         // A non-model sibling dir must NOT be counted.
-        std::fs::create_dir(dir.path().join("tantivy")).unwrap();
-        std::fs::write(dir.path().join("tantivy/meta.json"), vec![0u8; 5000]).unwrap();
+        std::fs::create_dir(dir.path().join("index")).unwrap();
+        std::fs::write(dir.path().join("index/meta.json"), vec![0u8; 5000]).unwrap();
 
         let (size, mtime) = active_model_dir_stats(dir.path(), "multilingual-e5-small").unwrap();
         // Exact equality is intentional and portable: `dir_size_bytes` sums
@@ -1679,6 +1942,9 @@ mod tests {
             pending_changed: Some(0),
             pending_removed: Some(0),
             cache_size_bytes: None,
+            cache_models_bytes: 0,
+            cache_index_bytes: 0,
+            cache_layout: "split".to_string(),
             reindexing: None,
             busy: false,
             status_error: None,

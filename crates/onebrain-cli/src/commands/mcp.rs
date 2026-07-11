@@ -21,7 +21,9 @@ use onebrain_search::engine::{Engine, Hit};
 use onebrain_search::lex::LexIndex;
 
 use super::daemon_client::{self, DaemonHandle};
-use super::search_common::{collection_cache_dir, collection_for, open_engine};
+use super::search_common::{
+    collection_cache_dir, collection_for, index_artifact_path, open_engine,
+};
 use super::search_status::{
     status_data_for, status_data_from_daemon, DaemonStatusCounts, SearchStatusData,
 };
@@ -333,7 +335,7 @@ fn rrf_fuse(ranked: Vec<(f64, Vec<Hit>)>) -> Vec<(f64, Hit)> {
 /// The `tantivy/` lexical index dir exists under a collection cache dir.
 /// Pure fs — the cheapest "is there an index to search?" probe.
 fn tantivy_index_present(cache_dir: &Path) -> bool {
-    cache_dir.join("tantivy").is_dir()
+    index_artifact_path(cache_dir, "tantivy").is_dir()
 }
 
 /// Final `query`-tool result assembly (design A1's rerank-after-RRF stage,
@@ -410,7 +412,7 @@ fn no_index_note() -> String {
 fn lex_subquery(resolved: &ResolvedVault, text: &str, top_k: usize) -> anyhow::Result<Vec<Hit>> {
     let collection = collection_for(resolved)?;
     let cache_dir = collection_cache_dir(&collection);
-    let lex = LexIndex::open(&cache_dir.join("tantivy"))
+    let lex = LexIndex::open(&index_artifact_path(&cache_dir, "tantivy"))
         .with_context(|| format!("opening lex index at {}", cache_dir.display()))?;
     let raw_hits = lex.search(text, top_k)?;
     Ok(raw_hits
@@ -1475,9 +1477,9 @@ mod tests {
     #[test]
     fn index_present_false_when_tantivy_dir_absent() {
         let dir = tempfile::tempdir().unwrap();
-        // A cache dir with no `tantivy/` subdir → no index.
+        // A cache dir with no tantivy index → no index.
         assert!(!tantivy_index_present(dir.path()));
-        std::fs::create_dir_all(dir.path().join("tantivy")).unwrap();
+        std::fs::create_dir_all(index_artifact_path(dir.path(), "tantivy")).unwrap();
         assert!(tantivy_index_present(dir.path()));
     }
 
@@ -1616,7 +1618,7 @@ mod tests {
     mod daemon_backed {
         use super::*;
         use crate::commands::daemon_client::{canonical_vault_id, DaemonHandle, DaemonInfo};
-        use crate::commands::search_common::collection_cache_dir;
+        use crate::commands::search_common::{collection_cache_dir, index_artifact_path};
         use onebrain_search::chunk::Chunk;
         use onebrain_search::lex::LexIndex;
         use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
@@ -1636,7 +1638,7 @@ mod tests {
             )
             .unwrap();
             let cache_dir = collection_cache_dir(COLLECTION);
-            let mut lex = LexIndex::open(&cache_dir.join("tantivy")).unwrap();
+            let mut lex = LexIndex::open(&index_artifact_path(&cache_dir, "tantivy")).unwrap();
             lex.add(&Chunk {
                 chunk_id: "alpha.md#0".to_string(),
                 doc_path: "alpha.md".to_string(),

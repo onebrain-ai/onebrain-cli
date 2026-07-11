@@ -41,7 +41,7 @@ use anyhow::{Context, Result};
 use crate::cli::ModelSortCol;
 use crate::commands::search_common::format_size;
 use crate::commands::search_common::{
-    collection_cache_dir, collection_for, reconcile_missing_model,
+    collection_cache_dir, collection_for, models_cache_dir, reconcile_missing_model,
 };
 #[cfg(feature = "semantic")]
 use crate::commands::search_model::apply_model_change;
@@ -200,8 +200,10 @@ pub struct AppState {
     pub pending_delete: Option<usize>,
     /// Flipped by [`AppState::request_quit`]; the event loop reads it to exit.
     pub should_quit: bool,
-    /// The collection's model cache dir — kept so a successful switch can
-    /// re-scan download status (DOWNLOADED/DISK go stale otherwise).
+    /// The collection's cache ROOT — kept so a successful switch can re-scan
+    /// download status (DOWNLOADED/DISK go stale otherwise; probes resolve
+    /// each model through the split layout) and so download workers can
+    /// derive the `<root>/models` hf-hub download base.
     pub cache_dir: PathBuf,
     /// Set while an Enter-triggered download is running: the row named here
     /// renders an in-table progress bar instead of its NOTE text.
@@ -417,6 +419,10 @@ pub fn run(vault_flag: Option<PathBuf>) -> Result<()> {
     // renders as the active model and the user re-selects + downloads.
     reconcile_missing_model(resolved.root.as_path(), &cache_dir, &current);
 
+    // Rows carry per-model resolved paths (`model_download_status` resolves
+    // each `models--*` dir through the split layout with legacy fallback), so
+    // the TUI state keeps the collection ROOT; download workers derive the
+    // hf-hub download base (`<root>/models`) from it when they need to write.
     let rows = build_rows(&current, &cache_dir);
     let height = viewport_height(rows.len());
     let mut state = AppState::new(rows, cache_dir);
@@ -583,8 +589,12 @@ fn perform_switch<B: ratatui::backend::Backend>(
 
     let (tx, rx) = std::sync::mpsc::channel();
     let worker_resolved = resolved.clone();
-    let worker_cache = state.cache_dir.clone();
+    // Downloads go to the split-layout hf-hub base (`<root>/models`), created
+    // up front — the TUI can download before any engine open has migrated
+    // the collection, and hf-hub expects its cache base's parent chain.
+    let worker_cache = models_cache_dir(&state.cache_dir);
     std::thread::spawn(move || {
+        let _ = std::fs::create_dir_all(&worker_cache);
         // Lex-only build (no `semantic` feature): there's no embedder to switch
         // to, so refuse the switch cleanly rather than pretend to download.
         #[cfg(not(feature = "semantic"))]
@@ -715,7 +725,11 @@ fn perform_redownload_active<B: ratatui::backend::Backend>(
     use std::sync::mpsc::TryRecvError;
     use std::time::Duration;
 
-    let model_dir = state.cache_dir.join(
+    // Poll the DOWNLOAD destination for growth: hf-hub writes into the
+    // split-layout `models/` base, regardless of where a legacy copy of this
+    // model may still sit.
+    let download_base = models_cache_dir(&state.cache_dir);
+    let model_dir = download_base.join(
         model_registry()
             .iter()
             .find(|m| m.name == name)
@@ -729,8 +743,9 @@ fn perform_redownload_active<B: ratatui::backend::Backend>(
         .unwrap_or(0);
 
     let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
-    let worker_cache = state.cache_dir.clone();
+    let worker_cache = download_base;
     std::thread::spawn(move || {
+        let _ = std::fs::create_dir_all(&worker_cache);
         #[cfg(not(feature = "semantic"))]
         {
             let _ = (&worker_cache, name);

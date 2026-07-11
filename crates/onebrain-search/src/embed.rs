@@ -127,11 +127,15 @@ pub struct ModelDownloadStatus {
     pub path: PathBuf,
 }
 
-/// Compute the download status of `info` given the collection's `cache_dir`.
+/// Compute the download status of `info` given the collection's cache ROOT
+/// (`cache_dir`). The model dir is resolved PER MODEL through
+/// [`crate::layout::CollectionLayout::model_dir`] — `<root>/models/<name>` if
+/// present, else the legacy flat `<root>/<name>` — so a split-brain cache
+/// (one model migrated, another still legacy) reports each model correctly.
 /// Pure filesystem: checks whether the model's `models--*` dir exists and
 /// sums file sizes natively (no `du`, no subprocess, no model download).
 pub fn model_download_status(info: &ModelInfo, cache_dir: &Path) -> ModelDownloadStatus {
-    let path = cache_dir.join(info.cache_dir_name());
+    let path = crate::layout::CollectionLayout::new(cache_dir).model_dir(&info.cache_dir_name());
     if path.is_dir() {
         ModelDownloadStatus {
             downloaded: true,
@@ -555,6 +559,34 @@ mod tests {
         assert!(st.downloaded);
         assert_eq!(st.disk_size, Some(2148));
         assert_eq!(st.path, model_dir);
+    }
+
+    /// Split-brain cache: model A still legacy at the collection root, model
+    /// B already migrated under `models/`. Per-model resolution must report
+    /// BOTH as downloaded, each at its actual location with its own size —
+    /// a single shared probe base would misreport one of them as absent
+    /// (and trigger a pointless re-download).
+    #[test]
+    fn download_status_resolves_split_brain_models_individually() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = info("multilingual-e5-small");
+        let migrated = info("bge-m3");
+        let legacy_dir = dir.path().join(legacy.cache_dir_name());
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("model.onnx"), vec![0u8; 10]).unwrap();
+        let migrated_dir = dir.path().join("models").join(migrated.cache_dir_name());
+        std::fs::create_dir_all(&migrated_dir).unwrap();
+        std::fs::write(migrated_dir.join("model.onnx"), vec![0u8; 20]).unwrap();
+
+        let st_legacy = model_download_status(legacy, dir.path());
+        assert!(st_legacy.downloaded, "legacy-root model must be found");
+        assert_eq!(st_legacy.disk_size, Some(10));
+        assert_eq!(st_legacy.path, legacy_dir);
+
+        let st_migrated = model_download_status(migrated, dir.path());
+        assert!(st_migrated.downloaded, "migrated model must be found");
+        assert_eq!(st_migrated.disk_size, Some(20));
+        assert_eq!(st_migrated.path, migrated_dir);
     }
 
     #[cfg(feature = "semantic")]

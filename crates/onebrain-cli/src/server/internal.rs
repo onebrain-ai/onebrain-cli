@@ -622,6 +622,7 @@ fn title_from_doc_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::search_common::index_artifact_path;
     use crate::server::{build_router, ServeConfig};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -812,8 +813,10 @@ mod tests {
         // assertion below is proven against a real, searchable index — not a
         // vacuously-empty one (where every query returns 0 regardless).
         {
-            let tantivy = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap())
-                .join("tantivy");
+            let tantivy = index_artifact_path(
+                &collection_cache_dir(&collection_name_readonly(vault.path()).unwrap()),
+                "tantivy",
+            );
             let mut lex = LexIndex::open(&tantivy).unwrap();
             lex.add(&Chunk {
                 chunk_id: "legit.md#0".to_string(),
@@ -1229,8 +1232,10 @@ mod tests {
         let (vault, cache) = vault_with_empty_index();
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         {
-            let tantivy = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap())
-                .join("tantivy");
+            let tantivy = index_artifact_path(
+                &collection_cache_dir(&collection_name_readonly(vault.path()).unwrap()),
+                "tantivy",
+            );
             let mut lex = LexIndex::open(&tantivy).unwrap();
             lex.add(&Chunk {
                 chunk_id: "beta.md#0".to_string(),
@@ -1285,8 +1290,10 @@ mod tests {
         let (vault, cache) = vault_with_empty_index();
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         {
-            let tantivy = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap())
-                .join("tantivy");
+            let tantivy = index_artifact_path(
+                &collection_cache_dir(&collection_name_readonly(vault.path()).unwrap()),
+                "tantivy",
+            );
             let mut lex = LexIndex::open(&tantivy).unwrap();
             lex.add(&Chunk {
                 chunk_id: "gamma.md#0".to_string(),
@@ -1515,7 +1522,7 @@ mod tests {
             use onebrain_search::lex::LexIndex;
             let collection = collection_name_readonly(vault.path()).unwrap();
             let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
-            let tantivy = collection_cache_dir(&collection).join("tantivy");
+            let tantivy = index_artifact_path(&collection_cache_dir(&collection), "tantivy");
             let mut lex = LexIndex::open(&tantivy).unwrap();
             lex.add(&Chunk {
                 chunk_id: "alpha.md#0".to_string(),

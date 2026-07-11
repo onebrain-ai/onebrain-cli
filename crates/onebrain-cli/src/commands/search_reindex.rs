@@ -13,8 +13,8 @@ use serde::Serialize;
 use crate::cli::SearchReindexArgs;
 use crate::commands::daemon_client::DaemonHandle;
 use crate::commands::search_common::{
-    collection_cache_dir, collection_for, collection_name_readonly, index_size_bytes,
-    map_daemon_error, model_not_chosen, open_engine, read_reindex_progress,
+    collection_cache_dir, collection_for, collection_name_readonly, index_artifact_path,
+    index_size_bytes, map_daemon_error, model_not_chosen, open_engine, read_reindex_progress,
     reconcile_missing_model, reindex_progress_path, route_to_daemon,
 };
 use crate::output::{emit, item, section, Envelope, OutputMode};
@@ -352,7 +352,7 @@ fn run_hook_path(
     }
 
     // Gate reason 2: no index yet.
-    if !cache_dir.join("tantivy").is_dir() {
+    if !index_artifact_path(&cache_dir, "tantivy").is_dir() {
         return emit_skip(mode, Some(vault_info), "no-index");
     }
 
@@ -698,21 +698,36 @@ impl Drop for LiveProgressFile {
 /// Delete the collection's index files — `tantivy/`, `vectors/`, and
 /// `engine.redb` — while keeping the downloaded `models--*` dirs. The next
 /// `Engine::open` recreates everything empty.
+///
+/// Each artifact is wiped at BOTH candidate locations (split `index/<name>`
+/// AND legacy `<root>/<name>`), not just the one the layout currently
+/// resolves. A lost migration race can leave an orphaned duplicate at the
+/// root (`migrate()` skips an entry whose target already exists); wiping only
+/// the resolved copy would let a later `Engine::open` resurrect the stale
+/// legacy one via fallback resolution — a wiped index must stay wiped.
 fn wipe_index_files(vault_flag: Option<PathBuf>) -> Result<()> {
     let resolved = crate::vault_ctx::require(vault_flag)?;
     let collection = collection_for(&resolved)?;
     let cache_dir = collection_cache_dir(&collection);
-    for sub in ["tantivy", "vectors"] {
-        match std::fs::remove_dir_all(cache_dir.join(sub)) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+    let index_dir = cache_dir.join("index");
+    for name in ["tantivy", "vectors", "engine.redb"] {
+        for candidate in [index_dir.join(name), cache_dir.join(name)] {
+            let meta = match std::fs::symlink_metadata(&candidate) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let removed = if meta.is_dir() {
+                std::fs::remove_dir_all(&candidate)
+            } else {
+                std::fs::remove_file(&candidate)
+            };
+            match removed {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
-    }
-    match std::fs::remove_file(cache_dir.join("engine.redb")) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
     }
     Ok(())
 }
@@ -1046,6 +1061,54 @@ fn render_text(env: &Envelope<ReindexData>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--force` wipe must remove every index artifact at BOTH candidate
+    /// locations. A lost migration race can leave an orphaned legacy
+    /// duplicate at the collection root next to the migrated copy under
+    /// `index/`; wiping only the resolved path would let the next
+    /// `Engine::open` resurrect the stale legacy copy via fallback
+    /// resolution. Model dirs must survive untouched.
+    #[test]
+    fn wipe_index_files_removes_both_split_and_legacy_duplicates() {
+        let cache = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: wipe-dup-collection\n",
+        )
+        .unwrap();
+
+        // Duplicates at BOTH locations (artifact names via a variable so the
+        // repo-wide "no literal artifact joins" sweep stays clean).
+        let artifacts = ["tantivy", "vectors", "engine.redb"];
+        let collection_dir = cache.path().join("search").join("wipe-dup-collection");
+        let index_dir = collection_dir.join("index");
+        for name in [artifacts[0], artifacts[1]] {
+            std::fs::create_dir_all(index_dir.join(name)).unwrap();
+            std::fs::create_dir_all(collection_dir.join(name)).unwrap();
+        }
+        std::fs::write(index_dir.join(artifacts[2]), b"new").unwrap();
+        std::fs::write(collection_dir.join(artifacts[2]), b"stale").unwrap();
+        // Downloaded models are NOT index files — they must survive.
+        let model = collection_dir.join("models").join("models--org--m");
+        std::fs::create_dir_all(&model).unwrap();
+
+        wipe_index_files(Some(vault.path().to_path_buf())).unwrap();
+
+        for name in artifacts {
+            assert!(
+                !index_dir.join(name).exists(),
+                "split copy of {name} must be gone"
+            );
+            assert!(
+                !collection_dir.join(name).exists(),
+                "legacy duplicate of {name} must be gone — fallback resolution \
+                 would resurrect it on the next open"
+            );
+        }
+        assert!(model.is_dir(), "model cache must survive the wipe");
+    }
 
     #[test]
     fn live_progress_file_records_json_and_removes_on_drop() {

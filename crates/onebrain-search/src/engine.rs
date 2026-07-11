@@ -11,9 +11,14 @@
 //! `search.exclude` patterns.
 //!
 //! ## On-disk layout (under `cache_dir`)
-//! - `<cache_dir>/tantivy/` — [`crate::lex::LexIndex`] (BM25 lexical index).
-//! - `<cache_dir>/vectors/` — [`crate::vector::VectorStore`] (flat mmap vector store).
-//! - `<cache_dir>/engine.redb` — chunk metadata (see [`ChunkMeta`]) and the
+//! The collection cache root is split into `index/` (search artifacts) and
+//! `models/` (the hf-hub embedding/reranker download cache) — see
+//! [`crate::layout::CollectionLayout`], which resolves each artifact with a
+//! legacy-flat-root fallback and migrates the flat layout into the split one
+//! eagerly on open.
+//! - `<cache_dir>/index/tantivy/` — [`crate::lex::LexIndex`] (BM25 lexical index).
+//! - `<cache_dir>/index/vectors/` — [`crate::vector::VectorStore`] (flat mmap vector store).
+//! - `<cache_dir>/index/engine.redb` — chunk metadata (see [`ChunkMeta`]) and the
 //!   per-doc chunk-id list, both keyed by strings and serialized with
 //!   `serde_json`. Neither `lex` nor `vector` stores the chunk's text or
 //!   heading path, so this database is the only place [`Engine::get`] and
@@ -30,6 +35,7 @@ use sha2::{Digest, Sha256};
 use crate::chunk::chunk_markdown;
 use crate::embed::{self, Embed};
 use crate::hybrid::rrf_fuse;
+use crate::layout::CollectionLayout;
 use crate::lex::LexIndex;
 use crate::rerank::{self, Rerank};
 use crate::vector::VectorStore;
@@ -524,7 +530,11 @@ pub struct Engine {
     /// `status`). Empty by default; set via [`Engine::set_exclude_patterns`].
     exclude_patterns: Vec<String>,
     model_name: String,
-    cache_dir: PathBuf,
+    /// Split-layout resolver for this collection's cache root. All on-disk
+    /// paths (index artifacts + the hf-hub model cache base) go through it,
+    /// so every consumer sees the same `models/` + `index/` layout the
+    /// eager `migrate()` on open established.
+    layout: CollectionLayout,
     embedder: EmbedSource,
     /// Tier-2 rerank stage configuration; see [`Engine::set_rerank_settings`].
     rerank_settings: RerankSettings,
@@ -628,11 +638,20 @@ impl Engine {
         std::fs::create_dir_all(cache_dir)
             .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
 
-        let lex = LexIndex::open(&cache_dir.join("tantivy"))?;
+        // Eager migration on the write path: fold any legacy flat artifacts
+        // (and `models--*` dirs) into the `models/` + `index/` split, and
+        // (unconditionally) create both subdirs so redb's `Database::create`
+        // — which does NOT create parents — finds `index/` already present.
+        let layout = CollectionLayout::new(cache_dir);
+        layout
+            .migrate()
+            .with_context(|| format!("migrating cache layout at {}", cache_dir.display()))?;
 
-        let vec = VectorStore::open(&cache_dir.join("vectors"), dims)?;
+        let lex = LexIndex::open(&layout.index_artifact("tantivy"))?;
 
-        let meta_path = cache_dir.join("engine.redb");
+        let vec = VectorStore::open(&layout.index_artifact("vectors"), dims)?;
+
+        let meta_path = layout.index_artifact("engine.redb");
         let meta = Database::create(&meta_path)
             .with_context(|| format!("opening redb database {}", meta_path.display()))?;
         {
@@ -655,7 +674,7 @@ impl Engine {
             vec,
             exclude_patterns: Vec::new(),
             model_name: embed_model.to_string(),
-            cache_dir: cache_dir.to_path_buf(),
+            layout,
             embedder,
             rerank_settings: RerankSettings::default(),
             reranker: RerankSource::Lazy(OnceCell::new()),
@@ -666,9 +685,10 @@ impl Engine {
         })
     }
 
-    /// Path to the vector store directory, rooted at `cache_dir`.
+    /// Path to the vector store directory, resolved through the split layout
+    /// (`index/vectors` post-migration, legacy root fallback otherwise).
     fn vectors_dir(&self) -> PathBuf {
-        self.cache_dir.join("vectors")
+        self.layout.index_artifact("vectors")
     }
 
     /// The active embedding model recorded in `engine_header`, if any has
@@ -853,7 +873,7 @@ impl Engine {
                 #[cfg(feature = "semantic")]
                 {
                     let e: Box<dyn Embed> =
-                        Box::new(embed::new(&self.model_name, &self.cache_dir)?);
+                        Box::new(embed::new(&self.model_name, &self.layout.models_base())?);
                     let _ = cell.set(e);
                     Ok(cell.get().expect("embedder was just set above").as_ref())
                 }
@@ -862,7 +882,7 @@ impl Engine {
                     // Silence unused-field warnings in the lex-only build; the
                     // real embedder is what would consume these.
                     let _ = &self.model_name;
-                    let _ = &self.cache_dir;
+                    let _ = &self.layout;
                     anyhow::bail!(SEMANTIC_UNAVAILABLE)
                 }
             }
@@ -892,10 +912,10 @@ impl Engine {
             let info = rerank::reranker_registry()
                 .iter()
                 .find(|m| m.name == self.rerank_settings.model)?;
-            if !rerank::reranker_download_status(info, &self.cache_dir).downloaded {
+            if !rerank::reranker_download_status(info, self.layout.root()).downloaded {
                 return None;
             }
-            match rerank::new(&self.rerank_settings.model, &self.cache_dir) {
+            match rerank::new(&self.rerank_settings.model, &self.layout.models_base()) {
                 Ok(r) => Some(Box::new(r) as Box<dyn Rerank>),
                 Err(e) => {
                     eprintln!(
@@ -950,7 +970,7 @@ impl Engine {
                 );
                 return;
             }
-            if let Err(e) = rerank::new(&self.rerank_settings.model, &self.cache_dir) {
+            if let Err(e) = rerank::new(&self.rerank_settings.model, &self.layout.models_base()) {
                 eprintln!(
                     "onebrain-search: reranker model '{}' failed to fetch — search stays unreranked: {e:#}",
                     self.rerank_settings.model
@@ -1987,7 +2007,7 @@ impl Engine {
             let downloaded = rerank::reranker_registry()
                 .iter()
                 .find(|m| m.name == self.rerank_settings.model)
-                .map(|info| rerank::reranker_download_status(info, &self.cache_dir).downloaded)
+                .map(|info| rerank::reranker_download_status(info, self.layout.root()).downloaded)
                 .unwrap_or(true);
             if should_fetch_reranker(self.rerank_settings.enabled, downloaded) {
                 progress(ReindexProgress::LoadingReranker);
@@ -4230,5 +4250,90 @@ mod tests {
         let e = fake_engine(dir.path());
         let hits = e.rerank_paths("anything", Vec::new(), 10).unwrap();
         assert!(hits.is_empty(), "no candidate paths → no hits, no panic");
+    }
+
+    /// Opening an engine on a collection whose artifacts are still at the
+    /// legacy flat root must migrate them under `index/` and keep the existing
+    /// index intact — the doc stays searchable, its stored vector survives
+    /// (exact-text cosine ~1.0), and `doc_count` is unchanged (no wipe, no
+    /// re-embed). This is the integration guarantee behind PR-5b.
+    #[test]
+    fn engine_open_migrates_legacy_layout_without_reindex() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = cache.path();
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("rust.md"),
+            "# Rust\nerror handling and memory safety",
+        )
+        .unwrap();
+
+        // 1. Build a real tiny index with the current API (reindex_all records
+        //    DOC_HASHES, so doc_count is meaningful), then drop it to release
+        //    redb's single-process lock.
+        let doc_count_before = {
+            let mut e = fake_engine(root);
+            e.skip_reranker_fetch_for_tests(); // no ~570 MB hf-hub download in a unit test
+            e.reindex_all(vault.path()).unwrap();
+            let s = e.status(vault.path()).unwrap();
+            assert_eq!(s.doc_count, 1);
+            assert_eq!(s.pending_total(), 0);
+            s.doc_count
+        };
+
+        // 2. Fake a legacy flat layout: move every index artifact from wherever
+        //    it lives back to the collection root, and clear the split dirs so
+        //    the collection looks genuinely un-migrated. (Artifact names come
+        //    from a variable so this test carries no literal `index/<name>`
+        //    path — the layout module owns those.)
+        let artifacts = ["tantivy", "vectors", "engine.redb"];
+        let index_dir = root.join("index");
+        for name in artifacts {
+            let from = CollectionLayout::new(root).index_artifact(name);
+            if from != root.join(name) && from.exists() {
+                std::fs::rename(&from, root.join(name)).unwrap();
+            }
+        }
+        let _ = std::fs::remove_dir_all(&index_dir);
+        for name in artifacts {
+            assert!(
+                root.join(name).exists(),
+                "precondition: {name} must sit at the legacy root"
+            );
+            assert!(!index_dir.join(name).exists());
+        }
+
+        // 3. Reopen → open_inner migrates eagerly.
+        let e = fake_engine(root);
+        for name in artifacts {
+            assert!(
+                index_dir.join(name).exists(),
+                "{name} must move under index/ on open"
+            );
+            assert!(
+                !root.join(name).exists(),
+                "legacy {name} at root must be gone after migration"
+            );
+        }
+
+        // The index survived intact: the doc is still searchable, its stored
+        // vector was reused (exact-text cosine ~1.0), doc_count is unchanged,
+        // and nothing reads as pending — i.e. no wipe and no re-embed.
+        let hits = e
+            .vector_search("error handling and memory safety", 3)
+            .unwrap();
+        assert!(hits.iter().any(|h| h.doc_path == "rust.md"));
+        assert!(hits[0].score > 0.99, "score was {}", hits[0].score);
+
+        let after = e.status(vault.path()).unwrap();
+        assert_eq!(
+            after.doc_count, doc_count_before,
+            "doc_count must survive migration (no re-embed / wipe)"
+        );
+        assert_eq!(
+            after.pending_total(),
+            0,
+            "nothing should read as pending after migration — vectors were reused, not rebuilt"
+        );
     }
 }

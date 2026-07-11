@@ -1254,8 +1254,12 @@ fn lex_only_end_to_end_indexes_lex_only_and_leaves_vectors_pending() {
 
     // No SECOND model dir appeared — only the one fake dir seeded above by
     // the test itself, proving the run never constructed a real embedder
-    // (which would create/touch its own `models--*` dir).
-    let model_dirs: Vec<_> = std::fs::read_dir(cache.path().join("search/t-vault"))
+    // (which would create/touch its own `models--*` dir). Opening the engine
+    // migrated the flat layout into the split one, so the seeded model now
+    // lives under `<collection>/models/` — scan there.
+    let models_base =
+        onebrain_search::CollectionLayout::new(cache.path().join("search/t-vault")).models_base();
+    let model_dirs: Vec<_> = std::fs::read_dir(&models_base)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| {

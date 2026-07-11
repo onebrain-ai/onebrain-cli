@@ -171,16 +171,20 @@ fn verify_sha256_once(path: &Path, expected_hex: &str) -> Result<()> {
     Ok(())
 }
 
-/// Compute the download status of `info` given the collection's `cache_dir`.
-/// Pure filesystem check — reuses [`embed::model_download_status`]'s logic
-/// (same `models--*` cache dir layout, since both fastembed and this
-/// `hf-hub`-backed reranker download share the HF hub cache convention), just
-/// adapted to [`RerankerInfo`]'s field names instead of [`embed::ModelInfo`].
+/// Compute the download status of `info` given the collection's cache ROOT
+/// (`cache_dir`). Pure filesystem check — reuses
+/// [`embed::model_download_status`]'s logic (same `models--*` cache dir
+/// layout, since both fastembed and this `hf-hub`-backed reranker download
+/// share the HF hub cache convention), just adapted to [`RerankerInfo`]'s
+/// field names instead of [`embed::ModelInfo`]. Like the embed variant, the
+/// model dir is resolved PER MODEL through
+/// [`crate::layout::CollectionLayout::model_dir`] (split layout with legacy
+/// fallback).
 pub fn reranker_download_status(
     info: &RerankerInfo,
     cache_dir: &Path,
 ) -> embed::ModelDownloadStatus {
-    let path = cache_dir.join(info.cache_dir_name());
+    let path = crate::layout::CollectionLayout::new(cache_dir).model_dir(&info.cache_dir_name());
     if path.is_dir() {
         embed::ModelDownloadStatus {
             downloaded: true,
