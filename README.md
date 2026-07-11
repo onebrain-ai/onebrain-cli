@@ -69,6 +69,7 @@ onebrain init --yes
 
 - **🔍 Built-in native search** — hybrid keyword + semantic search over your vault's Markdown, multilingual (Thai/CJK-aware keyword bigrams + ~100-language embeddings), zero external dependencies: no Node, no Python, no separate search binary to install. Semantic availability per platform: [support matrix](docs/platform-support.md).
 - **🔌 Built-in MCP server** — `onebrain mcp` plugs OneBrain into Claude Code, Cursor, or any MCP client as a vault search engine — works standalone on any Markdown folder too. See [`docs/reference/mcp.md`](docs/reference/mcp.md).
+- **📉 Token optimization** — uses less of your context than anything else, measured: a 4-rung level ladder (lossless by default), an already-sent ledger that turns a repeat doc read into a small reference receipt instead of resending the full body, and `onebrain token gain` reporting exactly what was saved. See [`docs/token-optimization.md`](docs/token-optimization.md).
 - **Single static binary** — one self-contained file, no runtime to install, cross-platform down to a Raspberry Pi Zero.
 - **Embedded web UI** — `onebrain serve` hosts a local, token-gated file explorer + reading view + search panel + agent chat, with nothing extra to install. See [`docs/serve.md`](docs/serve.md).
 - **Interactive model picker** — a TUI over 6 embedding models (see [Choosing an embedding model](docs/reference/onebrain-search.md#choosing-an-embedding-model)) to trade off speed, accuracy, and Thai support.
@@ -82,7 +83,7 @@ Five root verbs cover the common flow; eleven `<noun> <verb>` groups cluster the
 ```text
 onebrain init | update | doctor | serve | mcp                # root verbs
 onebrain <noun> <verb>                                       # vault · session · checkpoint · search
-                                                             # · note · task · plugin · schedule
+                                                             # · note · task · plugin · schedule · token
                                                              # · skill · harness
 ```
 
@@ -96,6 +97,7 @@ Interactive commands print human-readable text; every command also speaks struct
 |---|---|
 | [Install](docs/install.md) | Channels, platform binaries, self-update, build from source, security & trust model. |
 | [Commands](docs/commands.md) | Full `<noun> <verb>` tree, verb groups, output modes. |
+| [Token optimization](docs/token-optimization.md) | Level ladder, cache, gain reporting, read hook. |
 | [Platform support](docs/platform-support.md) | Semantic vs keyword-only search per release target. |
 | [Local web UI](docs/serve.md) | `onebrain serve` — embedded web UI + vault JSON API. |
 | [MCP reference](docs/reference/mcp.md) | `onebrain mcp` tools, client registration, standalone vault-search use. |

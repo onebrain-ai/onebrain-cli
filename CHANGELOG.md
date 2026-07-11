@@ -1,6 +1,6 @@
 ---
-latest_version: 3.4.9
-released: 2026-07-11
+latest_version: 3.4.10
+released: 2026-07-12
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,16 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.10] — 2026-07-12 — Token Optimization
+
+- **Token-optimization layer** — a 4-rung level ladder (off/conservative/balanced/aggressive; lossless by default) shapes agent-facing `search`/`get` output through a transform funnel, with an honesty-signal contract: any truncation or omission is always disclosed to the agent (with a `--force` re-fetch cursor), never silent ([#237](https://github.com/onebrain-ai/onebrain-cli/issues/237), [#241](https://github.com/onebrain-ai/onebrain-cli/issues/241))
+- **Two-tier cache** — query-result memoization + an already-sent ledger that turns a repeat read of an unchanged doc into a small reference receipt instead of resending the full body; `onebrain search get <path> --force` re-materializes on purpose ([#239](https://github.com/onebrain-ai/onebrain-cli/issues/239), [#241](https://github.com/onebrain-ai/onebrain-cli/issues/241))
+- **`onebrain token gain`** — measures exactly what was saved: a raw per-call log plus precomputed daily/monthly/yearly rollups, `--by` pivots, and `--reset` epochs for baseline comparisons ([#240](https://github.com/onebrain-ai/onebrain-cli/issues/240))
+- **`onebrain token check` + `token discover`** — a fail-open PreToolUse read-hook gate (200 ms budget, off by default) plus a field-test tool that scans Claude Code transcripts for repeat reads the ledger could have saved ([#242](https://github.com/onebrain-ai/onebrain-cli/issues/242))
+- Dedicated [token-optimization guide](docs/token-optimization.md) + a Token Gain dashboard in the embedded WebUI ([#243](https://github.com/onebrain-ai/onebrain-cli/issues/243))
+- **Hardening:** collection-lock acquired before migration, doctor legacy-stub detection, artifact-dedup path guard, test-support parity, `session --vault` ([#238](https://github.com/onebrain-ai/onebrain-cli/issues/238))
+- Known limitation: the level ladder differentiates by which transforms run, but the `get`/snippet caps use the flat configured value at every level — per-level cap tightening lands in v3.4.11.
 
 ## [3.4.9] — 2026-07-11 — Cache layout split + field fixes
 
