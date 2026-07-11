@@ -18,6 +18,8 @@ pub mod orphan;
 pub mod register_hooks;
 pub mod run_skill;
 pub mod task;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod update;
 pub mod vault_sync;
 pub mod yaml_edit;

@@ -8,6 +8,8 @@ pub mod config;
 pub mod error;
 pub mod path;
 pub mod scheduler;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod types;
 
 pub use config::{

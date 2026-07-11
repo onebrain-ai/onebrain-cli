@@ -255,6 +255,7 @@ pub fn require_vault(inputs: &VaultResolveInputs) -> crate::error::Result<Resolv
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::EnvVarGuard;
     use tempfile::tempdir;
 
     fn make_vault(dir: &Path) {
@@ -444,11 +445,11 @@ mod tests {
         make_legacy_vault(dir.path());
 
         // Suppress the stderr line in tests; the sentinel still flips so
-        // we can assert the fallback fired.
-        std::env::set_var(ENV_QUIET_DEPRECATION, "1");
+        // we can assert the fallback fired. Guard restores the env var on
+        // drop, including if an assertion below panics.
+        let _quiet = EnvVarGuard::set(ENV_QUIET_DEPRECATION, "1");
         let root = find_vault_root(dir.path()).unwrap();
         let cfg = root.config_path().unwrap();
-        std::env::remove_var(ENV_QUIET_DEPRECATION);
 
         assert_eq!(cfg.file_name().unwrap(), LEGACY_CONFIG_FILENAME);
         assert!(
@@ -465,8 +466,9 @@ mod tests {
         make_legacy_vault(dir.path());
 
         // Quiet the stderr line — we only care about the sentinel + that
-        // it's idempotent across multiple resolution attempts.
-        std::env::set_var(ENV_QUIET_DEPRECATION, "1");
+        // it's idempotent across multiple resolution attempts. Guard
+        // restores the env var on drop, including if an assertion panics.
+        let _quiet = EnvVarGuard::set(ENV_QUIET_DEPRECATION, "1");
         let _ = find_vault_root(dir.path()).unwrap();
         assert!(legacy_warning_was_emitted());
         // Second call must not toggle the sentinel back off; the
@@ -475,7 +477,6 @@ mod tests {
         // return without re-emitting.
         let _ = find_vault_root(dir.path()).unwrap();
         assert!(legacy_warning_was_emitted());
-        std::env::remove_var(ENV_QUIET_DEPRECATION);
     }
 
     #[test]
