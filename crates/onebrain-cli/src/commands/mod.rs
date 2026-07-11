@@ -39,5 +39,6 @@ pub mod session_init;
 pub mod skill_inspect;
 pub mod task_list;
 pub mod token_gain;
+pub mod token_runner;
 pub mod update;
 pub mod vault_sync;
