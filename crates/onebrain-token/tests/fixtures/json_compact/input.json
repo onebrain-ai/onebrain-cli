@@ -1,0 +1,15 @@
+{
+  "hits": [
+    {
+      "doc_path": "01-projects/onebrain/cli/OneBrain CLI.md",
+      "score": 0.8231,
+      "text": "OneBrain CLI v3.4.9 released 2026-07-11 with cache split models/+index/ auto-migration."
+    },
+    {
+      "doc_path": "01-projects/onebrain/cli/2026-07-11-v3.4.10-design.md",
+      "score": 0.7912,
+      "text": "New crate onebrain-token holds all transforms as pure functions."
+    }
+  ],
+  "total": 2
+}

@@ -1,0 +1,22 @@
+[
+  {
+    "doc_path": "01-projects/onebrain/cli/2026-07-11-v3.4.10-design.md",
+    "score": 0.91,
+    "text": "New crate onebrain-token holds all transforms as pure functions, no I/O in transform functions."
+  },
+  {
+    "doc_path": "01-projects/onebrain/cli/2026-07-11-v3.4.10-design.md",
+    "score": 0.87,
+    "text": "New crate onebrain-token holds all transforms as pure functions, no I/O in transform functions."
+  },
+  {
+    "doc_path": "01-projects/onebrain/cli/2026-07-11-v3.4.10-design.md",
+    "score": 0.88,
+    "text": "Ledger activates at balanced+ (level 2 up); conservative default never emits references."
+  },
+  {
+    "doc_path": "01-projects/onebrain/cli/2026-07-11-v3.4.10-plan.md",
+    "score": 0.70,
+    "text": "Track 1 ships the pure-logic foundation crate that later tracks build on."
+  }
+]

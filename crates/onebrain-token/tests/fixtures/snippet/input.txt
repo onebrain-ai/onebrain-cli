@@ -1,0 +1,1 @@
+The daemon owns token.redb under the collection cache and serves ledger and gain operations over internal HTTP routes, mirroring the existing status and rerank pattern already used by the warm daemon for other cache-backed operations.
