@@ -39,6 +39,9 @@ impl Transform for GetCap {
             return input.clone();
         }
 
+        // Preserve the doc's line-ending style — `.lines()` strips `\r`, so
+        // rejoining a CRLF doc with `\n` would silently normalize it to LF.
+        let eol = super::whitespace::detect_eol(&input.text);
         let lines: Vec<&str> = input.text.lines().collect();
         let mut acc = String::new();
         let mut cut_at = lines.len();
@@ -46,7 +49,7 @@ impl Transform for GetCap {
             let candidate = if acc.is_empty() {
                 (*line).to_string()
             } else {
-                format!("{acc}\n{line}")
+                format!("{acc}{eol}{line}")
             };
             if estimate_tokens(&candidate, ctx.model) > max_tokens {
                 if acc.is_empty() {
@@ -163,5 +166,24 @@ mod tests {
         );
         // Resuming at the cursor consumes the whole 1-line input — no infinite loop.
         assert_eq!(one_long_line.lines().skip(cursor).count(), 0);
+    }
+
+    #[test]
+    fn preserves_crlf_when_truncating_a_crlf_doc() {
+        // Multi-line CRLF doc, capped so it truncates. The delivered head must
+        // keep CRLF (a `get` on a CRLF vault note stays CRLF), not normalize
+        // to LF via the rejoin. Built from an explicit `\r\n` literal.
+        let doc =
+            "line one is here\r\nline two is here\r\nline three is here\r\nline four is here\r\n";
+        let full = estimate_tokens(doc, ModelFamily::ClaudeGeneric);
+        let ctx = ctx_with_cap((full / 2).max(3) as u32);
+
+        let out = GetCap.apply(&Payload::new(doc), &ctx);
+        assert!(out.text.len() < doc.len(), "should have truncated");
+        assert!(
+            out.text.contains("\r\n"),
+            "CRLF must be preserved in the delivered head, got {:?}",
+            out.text
+        );
     }
 }

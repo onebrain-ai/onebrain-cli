@@ -37,6 +37,11 @@ impl Transform for Whitespace {
 }
 
 fn compact_whitespace(text: &str) -> String {
+    // Preserve the document's line-ending style: `.lines()` strips `\r`, so a
+    // CRLF doc would silently normalize to LF on rejoin. A `get` on a CRLF
+    // vault note must keep CRLF (CRLF-safety, matching frontmatter).
+    let eol = detect_eol(text);
+
     let mut out_lines: Vec<String> = Vec::new();
     let mut in_fence = false;
     let mut blank_run = 0u32;
@@ -71,7 +76,18 @@ fn compact_whitespace(text: &str) -> String {
             out_lines.push(collapsed);
         }
     }
-    out_lines.join("\n")
+    out_lines.join(eol)
+}
+
+/// The dominant line ending of `text`: `\r\n` if any CRLF is present, else
+/// `\n`. Used so line-oriented transforms rejoin without silently converting
+/// a CRLF document to LF.
+pub(super) fn detect_eol(text: &str) -> &'static str {
+    if text.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
 }
 
 /// True for a fenced-code-block delimiter line (``` or ~~~, after any leading
@@ -219,5 +235,29 @@ mod tests {
         let out = Whitespace.apply(&input, &TransformCtx::default()).text;
         assert!(out.contains("a\tb\tc"), "tabs must survive: {out:?}");
         assert!(out.contains("x y z"), "space runs still collapse: {out:?}");
+    }
+
+    #[test]
+    fn preserves_crlf_line_endings_on_a_crlf_doc() {
+        // `.lines()` strips `\r`; without eol detection the rejoin would
+        // silently convert a CRLF vault note to LF on every `get`. Built from
+        // an explicit `\r\n` literal (platform-independent).
+        let input = Payload::new("a  b\r\nc  d\r\n");
+        let out = Whitespace.apply(&input, &TransformCtx::default()).text;
+        assert!(
+            out.contains("\r\n"),
+            "CRLF line endings must be preserved, got {out:?}"
+        );
+        assert!(out.contains("a b"), "space runs still collapse: {out:?}");
+    }
+
+    #[test]
+    fn keeps_lf_on_an_lf_doc() {
+        let input = Payload::new("a  b\nc  d\n");
+        let out = Whitespace.apply(&input, &TransformCtx::default()).text;
+        assert!(
+            !out.contains('\r'),
+            "must NOT introduce CR into an LF doc: {out:?}"
+        );
     }
 }

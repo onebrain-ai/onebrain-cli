@@ -43,11 +43,29 @@ impl Transform for FrontmatterStrip {
 }
 
 fn strip_frontmatter(text: &str) -> Option<String> {
-    let rest = text.strip_prefix("---\n")?;
+    // CRLF-safe: a Windows vault checks notes out with `\r\n`, so the opener,
+    // the closing fence, and the newline after it can each be `\n` or `\r\n`.
+    // The body itself is returned with its original line endings intact — a
+    // `get` on a CRLF doc must stay CRLF; only the frontmatter block is cut.
+    let rest = text
+        .strip_prefix("---\n")
+        .or_else(|| text.strip_prefix("---\r\n"))?;
+
+    // Closing fence: `\n---` or `\r\n---`. Find the earliest one so a stray
+    // `---` later in the body can't be mistaken for the closer. `rest[end]` is
+    // the `\n` of the closer; a preceding `\r` belongs to the fence line, not
+    // the body, so nothing to trim there (it's before `end`).
     let end = rest.find("\n---")?;
-    let after = &rest[end + "\n---".len()..];
-    let after = after.strip_prefix('\n').unwrap_or(after);
-    Some(after.to_string())
+    let after_fence = &rest[end + "\n---".len()..];
+
+    // Consume the rest of the closing `---` line up to and including its EOL
+    // (`\r\n` or `\n`), so the returned body starts on the next line.
+    let body = after_fence
+        .strip_prefix("\r\n")
+        .or_else(|| after_fence.strip_prefix('\n'))
+        .unwrap_or(after_fence);
+
+    Some(body.to_string())
 }
 
 #[cfg(test)]
@@ -89,5 +107,38 @@ mod tests {
     fn is_lossy_at_balanced() {
         assert_eq!(FrontmatterStrip.min_level(), OptLevel::Balanced);
         assert!(FrontmatterStrip.lossy());
+    }
+
+    /// CRLF regression (Windows CI red): a note with `\r\n` line endings must
+    /// still have its frontmatter stripped. Built from an explicit `\r\n`
+    /// literal so it does NOT depend on how git checks out the fixture — this
+    /// reproduces the real-user bug (a CRLF vault) on every platform, not just
+    /// Windows.
+    #[test]
+    fn strips_crlf_frontmatter_and_keeps_crlf_body() {
+        let input =
+            "---\r\ntags: [x]\r\ncreated: 2026-07-11\r\n---\r\n# Body\r\n\r\nBody line.\r\n";
+        let out = FrontmatterStrip.apply(&Payload::new(input), &TransformCtx::default());
+
+        assert!(
+            !out.text.contains("tags: [x]"),
+            "CRLF frontmatter must be stripped, got:\n{:?}",
+            out.text
+        );
+        assert!(!out.text.starts_with("---"));
+        assert!(out.text.contains("# Body"), "body heading must survive");
+        assert!(out.text.contains("Body line."), "body must survive");
+        // Body line endings preserved verbatim — a CRLF doc stays CRLF.
+        assert!(
+            out.text.contains("\r\n"),
+            "body CRLF line endings must be preserved, got:\n{:?}",
+            out.text
+        );
+        assert_eq!(
+            out.signals,
+            vec![Signal::Truncated {
+                next: "frontmatter".to_string()
+            }]
+        );
     }
 }

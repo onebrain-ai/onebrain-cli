@@ -4,3 +4,9 @@
 # legs — so the embedded web UI must stay LF for a correct build everywhere.
 *.sh text eol=lf
 *.py text eol=lf
+
+# onebrain-token transform fixtures must check out identically on every OS —
+# a CRLF checkout on Windows changed byte counts and broke `include_str!`-based
+# assertions. Pin them to LF. (This is in ADDITION to the transforms being
+# CRLF-safe at runtime, never instead of it.)
+crates/onebrain-token/tests/fixtures/** text eol=lf

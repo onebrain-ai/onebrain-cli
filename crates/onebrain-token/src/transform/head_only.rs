@@ -44,13 +44,16 @@ impl Transform for HeadOnly {
             return input.clone();
         }
 
+        // Preserve the doc's line-ending style — `.lines()` strips `\r`, so
+        // rejoining a CRLF doc with `\n` would silently normalize it to LF.
+        let eol = super::whitespace::detect_eol(&input.text);
         let lines: Vec<&str> = input.text.lines().collect();
         let mut acc = String::new();
         for line in &lines {
             let candidate = if acc.is_empty() {
                 (*line).to_string()
             } else {
-                format!("{acc}\n{line}")
+                format!("{acc}{eol}{line}")
             };
             if estimate_tokens(&candidate, ctx.model) > max_tokens {
                 if acc.is_empty() {
@@ -138,6 +141,24 @@ mod tests {
         assert!(
             !out.text.is_empty(),
             "multi_get head must never be empty for non-empty input"
+        );
+    }
+
+    #[test]
+    fn preserves_crlf_when_capping_a_crlf_doc() {
+        let doc = "line one here\r\nline two here\r\nline three here\r\nline four here\r\n";
+        let full = estimate_tokens(doc, ModelFamily::ClaudeGeneric);
+        let ctx = TransformCtx {
+            get_max_tokens: Some((full / 2).max(3) as u32),
+            ..TransformCtx::default()
+        };
+
+        let out = HeadOnly.apply(&Payload::new(doc), &ctx);
+        assert!(out.text.len() < doc.len(), "should have capped");
+        assert!(
+            out.text.contains("\r\n"),
+            "CRLF must be preserved in the head, got {:?}",
+            out.text
         );
     }
 }
