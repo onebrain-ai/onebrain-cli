@@ -74,6 +74,11 @@ struct SearchHitsData {
     /// "you forgot to reindex".
     #[serde(skip_serializing_if = "Option::is_none")]
     index_hint: Option<String>,
+    /// Honesty signals for lossy shaping applied to the hit list (snippet
+    /// cap/omission, duplicate chunks collapsed) — design §4, never a silent
+    /// drop. Empty (omitted) when nothing lossy happened.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    signals: Vec<onebrain_token::Signal>,
 }
 
 /// Why an empty result might not mean "no matching notes": an empty or
@@ -616,15 +621,19 @@ fn emit_hits_data(
     opt_level: Option<&str>,
     mode: &OutputMode,
 ) -> Result<()> {
-    let hits = if mode.is_structured() {
-        shape_cli_hits(resolved, hits, opt_level)
+    let (hits, signals) = if mode.is_structured() {
+        shape_cli_hits(resolved, hits, opt_level)?
     } else {
-        hits
+        (hits, Vec::new())
     };
     let envelope = Envelope::ok(
         command,
         Some(vault_info),
-        SearchHitsData { hits, index_hint },
+        SearchHitsData {
+            hits,
+            index_hint,
+            signals,
+        },
     );
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
@@ -632,21 +641,27 @@ fn emit_hits_data(
 
 /// Shape a CLI hit list through the funnel: map `HitData` to the canonical
 /// `doc_path`+`text` hit JSON the query transforms understand (design §1),
-/// funnel it (`CliSearch`), and map back. Records one gain event. Level
-/// resolves per-call `--opt-level` > config > default.
+/// funnel it (`CliSearch`), and map back. Records one gain event. Returns the
+/// shaped hits AND the honesty signals (design §4). Level resolves per-call
+/// `--opt-level` > config > default; a bad `--opt-level` is an error surfaced to
+/// the caller (no silent fallback).
 fn shape_cli_hits(
     resolved: &ResolvedVault,
     hits: Vec<HitData>,
     opt_level: Option<&str>,
-) -> Vec<HitData> {
+) -> Result<(Vec<HitData>, Vec<onebrain_token::Signal>)> {
     let cfg = onebrain_core::load_vault_config(&resolved.root)
         .map(|c| c.token_optimization)
         .unwrap_or_default();
-    let level = token_runner::resolve_level(opt_level, &cfg).unwrap_or(cfg.level);
+    let level = token_runner::resolve_level(opt_level, &cfg)?;
     let ctx = token_runner::ctx_for(level, &cfg, None, false, None);
     let canonical: Vec<serde_json::Value> = hits.iter().map(hitdata_to_canonical).collect();
-    let shaped = token_runner::shape_query_hits(resolved, Surface::CliSearch, canonical, &ctx);
-    shaped.into_iter().filter_map(canonical_from).collect()
+    let (shaped, signals) =
+        token_runner::shape_query_hits(resolved, Surface::CliSearch, canonical, &ctx);
+    Ok((
+        shaped.into_iter().filter_map(canonical_from).collect(),
+        signals,
+    ))
 }
 
 /// `HitData` → canonical hit JSON (`snippet`→`text`; `doc_path` already
@@ -744,6 +759,7 @@ mod tests {
             SearchHitsData {
                 hits,
                 index_hint: None,
+                signals: Vec::new(),
             },
         )
     }
@@ -775,6 +791,7 @@ mod tests {
             SearchHitsData {
                 hits: Vec::new(),
                 index_hint: Some("index is empty — run `onebrain search reindex` first".into()),
+                signals: Vec::new(),
             },
         );
         let s = render_text(&e);
@@ -814,6 +831,7 @@ mod tests {
                     rerank_score: None,
                 }],
                 index_hint: Some("⚠️  low-confidence semantic match".into()),
+                signals: Vec::new(),
             },
         );
         let s = render_text(&e);

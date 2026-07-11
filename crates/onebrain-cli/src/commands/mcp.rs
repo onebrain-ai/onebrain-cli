@@ -22,9 +22,7 @@ use onebrain_search::lex::LexIndex;
 
 use onebrain_core::config::{TokenOptimizationConfig, VaultConfig};
 use onebrain_token::gain::Surface;
-use onebrain_token::{
-    CacheKind, GainEvent, LedgerVerdict, MemoKey, OptLevel, ReferenceEnvelope, TokenCache,
-};
+use onebrain_token::{CacheKind, GainEvent, MemoKey, OptLevel, ReferenceEnvelope, TokenCache};
 
 use super::daemon_client::{self, DaemonHandle};
 use super::search_common::{
@@ -74,17 +72,6 @@ const DEFAULT_MAX_BYTES: u64 = 10_240;
 /// how to force it.
 const REFERENCE_NOTE: &str = "⤷ already sent this session (unchanged) — reference below; \
      read `rematerialize` to fetch the full body:";
-
-/// Best-effort session-token resolution for the Direct-mode ledger (design
-/// §3b) — same resolution the daemon client uses on the daemon path. `None`
-/// when no token is resolvable (headless / odd host): the ledger is then
-/// silently inactive for the call and the body inlines, never guessed.
-fn resolve_session_token_opt() -> Option<String> {
-    let inputs = onebrain_cache::ResolveInputs::from_env();
-    onebrain_cache::resolve_session_token(&inputs)
-        .ok()
-        .map(|t| t.to_string())
-}
 
 /// Epoch seconds, for surface-recorded gain events (the cache-hit paths that
 /// bypass the funnel's own timestamp).
@@ -297,6 +284,10 @@ pub struct QueryParams {
     /// not a per-request toggle — this field stays deserialize-only.
     #[allow(dead_code)]
     pub rerank: Option<bool>,
+    /// Per-call optimization level override ('off'|'conservative'|'balanced'|'aggressive').
+    /// Precedence: this > onebrain.yml `token_optimization.level` > default.
+    #[serde(rename = "optLevel")]
+    pub opt_level: Option<String>,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
@@ -306,6 +297,12 @@ pub struct QueryOut {
     /// erroring — lets the calling agent degrade to filesystem search.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Honesty signals for lossy shaping applied to the hit list (snippet
+    /// capped/omitted, duplicate chunks collapsed) — design §4, never a silent
+    /// drop. Empty (omitted) when nothing lossy happened.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(with = "Vec<serde_json::Value>")]
+    pub signals: Vec<onebrain_token::Signal>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -765,20 +762,10 @@ impl McpServer {
         self.vault_config().token_optimization
     }
 
-    /// `<collection_cache>/token/token.redb` for Direct-mode memoization — the
-    /// daemon owns this file in daemon mode, so the memo path is Direct-only
-    /// (this release adds no daemon memo route). Creates the parent dir.
-    fn token_db_path(&self) -> Option<PathBuf> {
-        let collection = collection_for(&self.resolved).ok()?;
-        let dir = collection_cache_dir(&collection).join("token");
-        std::fs::create_dir_all(&dir).ok()?;
-        Some(dir.join("token.redb"))
-    }
-
     /// Read a memoized result set for `key` (Direct mode). Best-effort — any
     /// open/read failure is a clean miss, never an error.
     fn memo_get(&self, key: &MemoKey) -> Option<String> {
-        let path = self.token_db_path()?;
+        let path = token_runner::token_db_path(&self.resolved)?;
         let cache = TokenCache::open(&path).ok()?;
         cache.memo().get(key).ok().flatten()
     }
@@ -786,7 +773,7 @@ impl McpServer {
     /// Store `results` under `key` (Direct mode). Best-effort — a write failure
     /// is swallowed so a cache hiccup never fails a live query.
     fn memo_put(&self, key: &MemoKey, results: &str) {
-        if let Some(path) = self.token_db_path() {
+        if let Some(path) = token_runner::token_db_path(&self.resolved) {
             if let Ok(cache) = TokenCache::open(&path) {
                 let _ = cache.memo().put(key, results);
             }
@@ -794,76 +781,47 @@ impl McpServer {
     }
 
     /// Resolve the effective level for a tool call (per-call > config >
-    /// default), falling back to the config level on an unparseable per-call
-    /// override rather than failing the call.
-    fn resolve_level(&self, per_call: Option<&str>, cfg: &TokenOptimizationConfig) -> OptLevel {
-        token_runner::resolve_level(per_call, cfg).unwrap_or(cfg.level)
+    /// default). A bad per-call override is surfaced as a tool error rather than
+    /// silently downgrading to the config level (design contract: no silent
+    /// fallback on a typo'd `optLevel`).
+    fn resolve_level(
+        &self,
+        per_call: Option<&str>,
+        cfg: &TokenOptimizationConfig,
+    ) -> Result<OptLevel, ErrorData> {
+        token_runner::resolve_level(per_call, cfg)
+            .map_err(|e| ErrorData::invalid_params(e.to_string(), None))
     }
 
-    /// Check the already-sent ledger for `doc_path` and, on an `unchanged`
-    /// verdict, return the reference envelope the caller sends instead of the
-    /// body (design §3b). `record: true` semantics — the FIRST send is stamped
-    /// so the next repeat is caught. Works in BOTH backends (design §5d):
-    ///
-    /// - **Daemon**: the daemon owns `token.redb`; go through
-    ///   `POST /api/token/ledger/check`, which also enforces the M3 level gate.
-    /// - **Direct**: no daemon, so open `token.redb` in-process and run the
-    ///   ledger against the locally-owned engine's `doc_hash`. The caller has
-    ///   already applied the level gate (`level >= Balanced`) before calling.
-    ///
-    /// Any other verdict (`first_send`/`changed`/`inactive`/`no_session`/
-    /// `unknown_doc`), a 404 old daemon, an unresolvable session token, or any
-    /// error yields `None` → the caller inlines the full body. `full_len` is the
-    /// body size credited to `bytes_saved` on the Direct path.
-    async fn ledger_reference(&self, doc_path: String, full_len: u64) -> Option<ReferenceEnvelope> {
+    /// Check the already-sent ledger for `doc_path`, hashing the EXACT `content`
+    /// about to be delivered (design §3b/§5d) so an out-of-band edit is caught.
+    /// Returns the reference envelope only on `unchanged`; every other outcome
+    /// (first send, changed, inactive, no session, 404 old daemon, any error)
+    /// yields `None` → the caller inlines. Level gate applied by the caller
+    /// (Direct) / the daemon route (Daemon). Runs the blocking cache/HTTP work
+    /// off the async runtime.
+    async fn ledger_reference(
+        &self,
+        doc_path: String,
+        content: String,
+    ) -> Option<ReferenceEnvelope> {
+        let resolved = self.resolved.clone();
         match &self.backend {
             Backend::Daemon(handle) => {
                 let handle = handle.clone();
-                let path = doc_path.clone();
-                let value =
-                    tokio::task::spawn_blocking(move || handle.token_ledger_check(&path, true))
-                        .await
-                        .ok()?
-                        .ok()??; // JoinError / anyhow::Err / Ok(None) all → None
-                if value.get("verdict").and_then(|v| v.as_str()) != Some("unchanged") {
-                    return None;
-                }
-                serde_json::from_value::<ReferenceEnvelope>(value.get("reference")?.clone()).ok()
-            }
-            Backend::Direct(_) => {
-                // No daemon → resolve the session locally and run the ledger
-                // over the in-process engine + `token.redb`. No session token
-                // resolvable → ledger inactive for this call (never guessed).
-                let session = resolve_session_token_opt()?;
-                let db_path = self.token_db_path()?;
-                let path = doc_path.clone();
-                self.with_engine(move |eng| {
-                    let Some(hash) = eng.doc_hash(&path) else {
-                        return Ok(None); // unindexed doc → can't claim unchanged
-                    };
-                    let cache = TokenCache::open(&db_path).map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let ledger = cache.ledger();
-                    match ledger
-                        .check(&session, &path, &hash)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?
-                    {
-                        LedgerVerdict::Unchanged { sent_hash } => Ok(Some(ReferenceEnvelope::new(
-                            path.clone(),
-                            sent_hash,
-                            full_len,
-                        ))),
-                        LedgerVerdict::FirstSend | LedgerVerdict::Changed => {
-                            ledger
-                                .record(&session, &path, &hash)
-                                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                            Ok(None)
-                        }
-                    }
+                tokio::task::spawn_blocking(move || {
+                    token_runner::daemon_ledger_reference(&handle, &doc_path, &content)
                 })
                 .await
                 .ok()
                 .flatten()
             }
+            Backend::Direct(_) => tokio::task::spawn_blocking(move || {
+                token_runner::direct_ledger_reference(&resolved, &doc_path, &content)
+            })
+            .await
+            .ok()
+            .flatten(),
         }
     }
 
@@ -929,12 +887,14 @@ impl McpServer {
             return Ok(Json(QueryOut {
                 results: vec![],
                 note: Some(no_index_note()),
+                signals: Vec::new(),
             }));
         }
 
         let vault_cfg = self.vault_config();
         let opt_cfg = &vault_cfg.token_optimization;
-        let level = self.resolve_level(None, opt_cfg);
+        let level = self.resolve_level(params.opt_level.as_deref(), opt_cfg)?;
+        let session = token_runner::resolve_session_token_opt();
         let q_norm = query_norm(&params.searches);
         let weights = fusion_weights(params.searches.len());
 
@@ -973,11 +933,12 @@ impl McpServer {
                 if let Ok(cached_hits) = serde_json::from_str::<Vec<QueryHit>>(&cached) {
                     let before = cached.len() as u64;
                     let ctx = token_runner::ctx_for(level, opt_cfg, None, false, None);
-                    let shaped = decanonicalize_hits(token_runner::shape_query_hits_unmetered(
+                    let (shaped_vals, signals) = token_runner::shape_query_hits_unmetered(
                         Surface::McpQuery,
                         canonicalize_hits(&cached_hits),
                         &ctx,
-                    ));
+                    );
+                    let shaped = decanonicalize_hits(shaped_vals);
                     let after = serde_json::to_string(&shaped)
                         .map(|s| s.len() as u64)
                         .unwrap_or(before);
@@ -991,12 +952,13 @@ impl McpServer {
                             bytes_before: before,
                             bytes_after: after,
                             cache: CacheKind::MemoHit,
-                            session_token: None,
+                            session_token: session.clone(),
                         },
                     );
                     return Ok(Json(QueryOut {
                         results: shaped,
                         note: None,
+                        signals,
                     }));
                 }
             }
@@ -1152,18 +1114,20 @@ impl McpServer {
 
         // Shape the fused/reranked hit list through the funnel (McpQuery:
         // json_compact + doc_dedup at conservative, snippet at balanced,
-        // disclosure at aggressive) — records one gain event.
+        // disclosure at aggressive) — records one gain event. Signals surface on
+        // the response so a snippet cap/omission is never silent (design §4).
         let ctx = token_runner::ctx_for(level, opt_cfg, None, false, None);
-        let shaped = decanonicalize_hits(token_runner::shape_query_hits(
+        let (shaped_vals, signals) = token_runner::shape_query_hits(
             &self.resolved,
             Surface::McpQuery,
             canonicalize_hits(&results),
             &ctx,
-        ));
+        );
 
         Ok(Json(QueryOut {
-            results: shaped,
+            results: decanonicalize_hits(shaped_vals),
             note: None,
+            signals,
         }))
     }
 
@@ -1197,17 +1161,19 @@ impl McpServer {
         let windowed = from_line.is_some() || params.max_lines.is_some();
 
         let cfg = self.opt_config();
-        let level = self.resolve_level(params.opt_level.as_deref(), &cfg);
+        let level = self.resolve_level(params.opt_level.as_deref(), &cfg)?;
         let force = params.force.unwrap_or(false);
+        let session = token_runner::resolve_session_token_opt();
 
         // Already-sent ledger (design §3b, level 2↑): a repeat, unchanged,
         // WHOLE-doc read comes back as a reference the agent can re-materialize
         // with `--force`, not the full body again. Works in both backends
-        // (daemon route or in-process `token.redb`, design §5d). The level gate
-        // is applied here; `force` and windowed reads always inline.
+        // (daemon route or in-process `token.redb`, design §5d). The ledger keys
+        // on a hash of the disk body (`text`) about to be delivered, so an
+        // out-of-band edit is caught. `force` and windowed reads always inline.
         if !force && !windowed && level >= OptLevel::Balanced {
             let full_bytes = text.len() as u64;
-            if let Some(reference) = self.ledger_reference(path_part.clone(), full_bytes).await {
+            if let Some(reference) = self.ledger_reference(path_part.clone(), text.clone()).await {
                 let ref_json =
                     serde_json::to_string_pretty(&reference).unwrap_or_else(|_| String::new());
                 token_runner::record_gain(
@@ -1220,7 +1186,7 @@ impl McpServer {
                         bytes_before: full_bytes,
                         bytes_after: ref_json.len() as u64,
                         cache: CacheKind::LedgerRef,
-                        session_token: None,
+                        session_token: session.clone(),
                     },
                 );
                 let body = format!("{REFERENCE_NOTE}\n{ref_json}");
@@ -1236,9 +1202,15 @@ impl McpServer {
         );
 
         // Shape the doc body through the funnel (whitespace / frontmatter /
-        // get_cap per level + surface). `force` bypasses the size cap.
+        // get_cap per level + surface). `force` bypasses the size cap. Any
+        // honesty signal (e.g. get_cap truncation) is appended as a plain-text
+        // marker so a shortened body is never silently short (design §4).
         let ctx = token_runner::ctx_for(level, &cfg, Some(path_part.clone()), force, None);
-        let shaped = token_runner::shape_document(&self.resolved, Surface::McpGet, sliced, &ctx);
+        let (mut shaped, signals) =
+            token_runner::shape_document(&self.resolved, Surface::McpGet, sliced, &ctx);
+        if let Some(marker) = token_runner::doc_signal_marker(&signals, &path_part) {
+            shaped.push_str(&marker);
+        }
         Ok(CallToolResult::success(vec![ContentBlock::text(shaped)]))
     }
 
@@ -1316,14 +1288,18 @@ impl McpServer {
         // call (the §5d "exactly one GainEvent per optimized call" rule). Uses
         // the config-resolved level; multi_get has no per-call override.
         let cfg = self.opt_config();
-        let level = self.resolve_level(None, &cfg);
+        let level = self.resolve_level(None, &cfg)?;
         let ctx = token_runner::ctx_for(level, &cfg, None, false, None);
-        let shaped = token_runner::shape_document(
+        let (mut shaped, signals) = token_runner::shape_document(
             &self.resolved,
             Surface::McpMultiGet,
             sections.join("\n\n"),
             &ctx,
         );
+        // head_only truncation etc. surfaced as a plain-text marker (design §4).
+        if let Some(marker) = token_runner::doc_signal_marker(&signals, "<multi_get>") {
+            shaped.push_str(&marker);
+        }
         Ok(CallToolResult::success(vec![ContentBlock::text(shaped)]))
     }
 }
@@ -2207,6 +2183,7 @@ mod tests {
                 collections: None,
                 intent: None,
                 rerank: None,
+                opt_level: None,
             })
         }
 
