@@ -12,6 +12,10 @@ serde      = { workspace = true }
 serde_json = { workspace = true }
 chrono     = { workspace = true }
 thiserror  = { workspace = true }
+# Track 2's rollup tables (GAIN_DAILY/MONTHLY/YEARLY) live in the same
+# token.redb the Track 3 cache/ledger module owns — same version pin as
+# onebrain-search's redb dep (not a workspace dep there either; mirrored here).
+redb       = "4.1"
 
 [dev-dependencies]
 tempfile          = { workspace = true }
