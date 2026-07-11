@@ -1353,7 +1353,16 @@ mod tests {
             .unwrap();
 
             // Simulate the integration-test environment: override URL set.
-            std::env::set_var(GITHUB_ENV_OVERRIDE, "http://test.example/releases");
+            // `with_cache_path` already holds the shared env lock via its own
+            // `EnvGuard::set` call above in the call stack, so this nested
+            // mutation uses `set_within_lock` — nesting two `set()` calls on
+            // the same thread would deadlock the non-reentrant lock. The
+            // guard restores the prior value on drop, even if an assertion
+            // below panics.
+            let _guard = crate::test_support::EnvGuard::set_within_lock(
+                GITHUB_ENV_OVERRIDE,
+                "http://test.example/releases",
+            );
 
             // Hand-roll the write path that the orchestrator would have hit
             // after a "successful fetch" against the override URL. The guard
@@ -1371,8 +1380,6 @@ mod tests {
             let bytes = std::fs::read(&cache_path).unwrap();
             let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(json["tag_name"], "v-known-good");
-
-            std::env::remove_var(GITHUB_ENV_OVERRIDE);
         });
     }
 
