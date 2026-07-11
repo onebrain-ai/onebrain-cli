@@ -233,6 +233,17 @@ struct LedgerCheckRequest {
     /// so the NEXT repeat read is caught. Default `false` (pure check).
     #[serde(default)]
     record: bool,
+    /// Hash of the EXACT bytes the caller is about to deliver (design §3b).
+    /// When present the ledger keys on THIS hash — reflecting delivered-vs-
+    /// current content — instead of the stored index hash, so a doc edited on
+    /// disk but not yet reindexed is correctly re-delivered. Absent (the
+    /// read-hook, which only has a path) → derive the hash from the engine.
+    #[serde(default)]
+    content_hash: Option<String>,
+    /// Size of those bytes, credited to `bytes_saved` on an `unchanged`
+    /// verdict when `content_hash` is supplied (avoids a second engine read).
+    #[serde(default)]
+    bytes: Option<u64>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -284,16 +295,23 @@ async fn post_ledger_check(
     let path = req.path.clone();
     let session = req.session_token.clone();
     let record = req.record;
+    let provided_hash = req.content_hash.clone();
+    let provided_bytes = req.bytes;
 
     let response = tokio::task::spawn_blocking(move || -> Result<LedgerCheckResponse, ApiError> {
-        // Current content hash from the held engine. Unknown/unindexed doc →
-        // we cannot compare, so the ledger can't claim "unchanged".
-        let current_hash = match &engine {
-            Some(shared) => {
-                let guard = shared.lock().unwrap_or_else(|p| p.into_inner());
-                guard.doc_hash(&path)
-            }
-            None => None,
+        // Prefer the caller's delivered-content hash (reflects the exact bytes
+        // being sent — the fix for the "edited on disk, not reindexed" window).
+        // Absent (the read-hook) → derive from the engine; unknown/unindexed doc
+        // then can't be compared, so the ledger can't claim "unchanged".
+        let current_hash = match provided_hash {
+            Some(h) => Some(h),
+            None => match &engine {
+                Some(shared) => {
+                    let guard = shared.lock().unwrap_or_else(|p| p.into_inner());
+                    guard.doc_hash(&path)
+                }
+                None => None,
+            },
         };
         let Some(current_hash) = current_hash else {
             return Ok(LedgerCheckResponse {
@@ -309,16 +327,16 @@ async fn post_ledger_check(
 
         let response = match &verdict {
             LedgerVerdict::Unchanged { sent_hash } => {
-                // Credit the full avoided inline size when the body is cheaply
-                // reconstructable; best-effort (0 on any error — never fail the
-                // decision on a size estimate).
-                let bytes_saved = engine
-                    .as_ref()
-                    .and_then(|s| {
-                        let guard = s.lock().unwrap_or_else(|p| p.into_inner());
-                        guard.get(&path).ok()
+                // Credit the avoided inline size: the caller's own body size
+                // when supplied, else a best-effort engine read (0 on error —
+                // never fail the decision on a size estimate).
+                let bytes_saved = provided_bytes
+                    .or_else(|| {
+                        engine.as_ref().and_then(|s| {
+                            let guard = s.lock().unwrap_or_else(|p| p.into_inner());
+                            guard.get(&path).ok().map(|body| body.len() as u64)
+                        })
                     })
-                    .map(|body| body.len() as u64)
                     .unwrap_or(0);
                 LedgerCheckResponse {
                     verdict: "unchanged".to_string(),
