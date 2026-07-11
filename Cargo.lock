@@ -2106,6 +2106,7 @@ dependencies = [
  "onebrain-core",
  "onebrain-fs",
  "onebrain-search",
+ "onebrain-token",
  "percent-encoding",
  "predicates",
  "pretty_assertions",
@@ -2136,6 +2137,7 @@ dependencies = [
  "chrono",
  "indexmap",
  "insta",
+ "onebrain-token",
  "pretty_assertions",
  "regex",
  "serde",
@@ -2200,6 +2202,7 @@ version = "3.4.9"
 dependencies = [
  "chrono",
  "pretty_assertions",
+ "redb",
  "serde",
  "serde_json",
  "tempfile",

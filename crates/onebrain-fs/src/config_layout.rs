@@ -55,6 +55,10 @@ const SECTIONS: &[SectionDef] = &[
         keys: &["search"],
     },
     SectionDef {
+        title: "Token optimization",
+        keys: &["token_optimization"],
+    },
+    SectionDef {
         title: "Automation",
         keys: &["schedule"],
     },
@@ -65,7 +69,7 @@ const SECTIONS: &[SectionDef] = &[
 ];
 
 /// Index of the `System` section (stats) — the always-last bucket.
-const SYSTEM_SECTION: usize = 5;
+const SYSTEM_SECTION: usize = 6;
 
 /// Const-context `&str` equality (`==` on `&str` is not const-stable).
 const fn const_str_eq(a: &str, b: &str) -> bool {

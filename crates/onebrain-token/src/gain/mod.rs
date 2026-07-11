@@ -1,9 +1,15 @@
-//! Gain telemetry: [`event::GainEvent`] plus the append-only JSONL writer.
+//! Gain telemetry: [`event::GainEvent`] plus the append-only JSONL writer,
+//! the Tier-2 [`rollup`] redb tables, and the [`pivot`] engine that reads
+//! from them.
 
 pub mod event;
+pub mod pivot;
+pub mod rollup;
 pub mod writer;
 
 pub use event::{CacheKind, GainEvent, Surface};
+pub use pivot::{Dim, PivotQuery, PivotResult, PivotRow, PivotTotals, TimeAxis};
+pub use rollup::{RebuildStats, RollupError, RollupKey, RollupValue};
 pub use writer::JsonlGainWriter;
 
 /// Where a recorded [`GainEvent`] goes. [`crate::guard::run_funnel`] takes

@@ -1,10 +1,10 @@
-//! Clap subcommand tree — 3 root verbs + 25 resource groups + hidden v3.0
+//! Clap subcommand tree — 3 root verbs + 26 resource groups + hidden v3.0
 //! aliases. Locked at v3.1 per [[cli/specs/01-architecture §2.4]]; `search`
 //! (v3.4.0) is the first post-lock addition — a new native-search command
 //! surface, not a v3.1 tree-shape change. `mcp` (v3.4.1) promotes the MCP
 //! stdio server from `search mcp` to a top-level command — it hosts search
 //! tools today, with more vault tool groups mounting on the same command
-//! later.
+//! later. `token` (v3.4.10) is the second post-lock addition.
 //!
 //! Every group's verb list is captured as a `Subcommand` enum even when the
 //! body is `unimplemented!()` — the tree shape itself is the v3.1 deliverable
@@ -148,6 +148,10 @@ pub enum Cmd {
     Skill(SkillCmd),
     #[command(display_order = 16)]
     Task(TaskCmd),
+    /// Token-optimization telemetry (`gain` today · `check`/`discover` land
+    /// in later v3.4.10 tracks).
+    #[command(display_order = 22)]
+    Token(TokenCmd),
     #[command(display_order = 10)]
     Vault(VaultCmd),
 
@@ -1420,6 +1424,63 @@ pub struct TaskListArgs {
     /// Include done (`- [x]`) tasks. Default returns open tasks only.
     #[arg(long)]
     pub all: bool,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// token (v3.4.10 · gain today · check/discover land in later tracks)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[derive(Args, Debug)]
+#[command(
+    about = "Token-optimization telemetry (savings, pivots, epoch resets)",
+    disable_help_subcommand = true
+)]
+pub struct TokenCmd {
+    #[command(subcommand)]
+    pub verb: TokenVerb,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TokenVerb {
+    /// Report token-optimization savings — summary, `--by` pivot, or `--history`.
+    Gain(TokenGainArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct TokenGainArgs {
+    /// Pivot axes as "<time>[,<dim>]" or "<dim>" — time: day|week|month|year;
+    /// dim: surface|transform|level|cache. Either axis alone is valid; omit
+    /// entirely for a single grand-total summary.
+    #[arg(long = "by", value_name = "AXES")]
+    pub by: Option<String>,
+    /// Report all-time cumulative traffic across every epoch (including
+    /// archived pre-`--reset` windows). Without this, and without `--since`,
+    /// the default report is scoped to the current epoch — traffic since the
+    /// last `--reset` (or all-time when no reset has happened).
+    #[arg(long = "all-time", default_value_t = false)]
+    pub all_time: bool,
+    /// Inclusive lower bound on the window, `YYYY-MM-DD`. Queries all epochs
+    /// (like `--all-time`) filtered to on-or-after this date.
+    #[arg(long = "since", value_name = "DATE")]
+    pub since: Option<String>,
+    /// Show the recent per-call raw log (tails the JSONL) instead of a
+    /// summary/pivot — the only mode that reads the raw log directly.
+    #[arg(long, default_value_t = false)]
+    pub history: bool,
+    /// Emit the full pivot structure as JSON. Shorthand for `--output json`;
+    /// still renders through the canonical envelope dispatcher.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+    /// Archive the current window to `token/gain/archive/<ts>-<label>/`
+    /// (never deletes) and start counting fresh. Pair with `--label`.
+    #[arg(long, default_value_t = false)]
+    pub reset: bool,
+    /// Label for the archived epoch. Requires `--reset`.
+    #[arg(long, requires = "reset")]
+    pub label: Option<String>,
+    /// Rebuild the rollup tables from the raw JSONL log (recovery / drift fix).
+    #[arg(long, default_value_t = false)]
+    pub rebuild: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────

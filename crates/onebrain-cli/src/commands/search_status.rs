@@ -1185,6 +1185,7 @@ mod tests {
             checkpoint: Default::default(),
             folders: Default::default(),
             search: Default::default(),
+            token_optimization: Default::default(),
             stats: Default::default(),
         };
         let r = reranker_status_fields(&config, cache.path());
@@ -1208,6 +1209,7 @@ mod tests {
             checkpoint: Default::default(),
             folders: Default::default(),
             search: Default::default(), // reranker.enabled defaults true
+            token_optimization: Default::default(),
             stats: Default::default(),
         };
         let r = reranker_status_fields(&config, cache.path());
@@ -1235,6 +1237,7 @@ mod tests {
             checkpoint: Default::default(),
             folders: Default::default(),
             search: Default::default(),
+            token_optimization: Default::default(),
             stats: Default::default(),
         };
         config.search.reranker.enabled = false;

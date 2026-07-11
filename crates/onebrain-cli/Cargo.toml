@@ -21,6 +21,7 @@ onebrain-cache  = { workspace = true }
 # produces a lex-only binary with no fastembed/ONNX dep — the tier used on
 # release targets with no ONNX Runtime prebuilt (see ADR 0017).
 onebrain-search = { workspace = true }
+onebrain-token  = { workspace = true }
 clap           = { workspace = true }
 clap_complete  = { workspace = true }
 serde          = { workspace = true }

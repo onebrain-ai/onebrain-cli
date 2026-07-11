@@ -19,7 +19,7 @@
 use crate::error::FsError;
 use crate::init::presets::{ScheduleEntry, SchedulePreset};
 use crate::vault_sync::{DEFAULT_UPDATE_CHANNEL, VALID_UPDATE_CHANNELS};
-use onebrain_core::config::SearchConfig;
+use onebrain_core::config::{SearchConfig, TokenOptimizationConfig};
 use onebrain_core::{CheckpointPolicy, RerankerConfig, VaultFolders, CONFIG_FILENAME};
 use serde::Serialize;
 use std::path::Path;
@@ -71,6 +71,7 @@ pub fn config_key_docs() -> Vec<ConfigKeyDoc> {
     let sc = SearchConfig::default();
     let rr = RerankerConfig::default();
     let eg = onebrain_core::config::EmbedGate::default();
+    let tok = TokenOptimizationConfig::default();
     let doc =
         |segments: &'static [&'static str], comment: String| ConfigKeyDoc { segments, comment };
     vec![
@@ -226,6 +227,47 @@ pub fn config_key_docs() -> Vec<ConfigKeyDoc> {
             &["search", "embed", "schedule"],
             "# Cron schedule for a periodic full re-embed · default: unset".to_string(),
         ),
+        // Token-optimization ladder + cache + read-hook config (v3.4.10
+        // design §5). The fresh template DOES emit this block (unlike
+        // recap/stats/search.embed below) — token-opt is a headline feature,
+        // documented in full in docs/token-optimization.md (Track 9).
+        doc(
+            &["token_optimization", "level"],
+            format!(
+                "# Optimization ladder rung: off | conservative | balanced | aggressive · default: {}",
+                tok.level
+            ),
+        ),
+        doc(
+            &["token_optimization", "get_max_tokens"],
+            format!(
+                "# `get` continuation cap in estimated tokens, 0 = unlimited · default: {}",
+                tok.get_max_tokens
+            ),
+        ),
+        doc(
+            &["token_optimization", "snippet_max_chars"],
+            format!(
+                "# Per-hit snippet length cap in characters · default: {}",
+                tok.snippet_max_chars
+            ),
+        ),
+        doc(
+            &["token_optimization", "strip_frontmatter"],
+            "# Strip YAML frontmatter from get/multi_get bodies: auto | always | never · default: auto"
+                .to_string(),
+        ),
+        doc(
+            &["token_optimization", "model"],
+            format!(
+                "# Model family hint for token estimation + pricing · default: {}",
+                tok.model
+            ),
+        ),
+        doc(
+            &["token_optimization", "read_hook"],
+            "# Vault-read ledger-gate hook: off | ledger · default: off".to_string(),
+        ),
         // Plugin-level recap thresholds (`/recap` skill). Not part of
         // VaultConfig — the CLI never emits a recap block in the fresh
         // template (absent = the plugin uses its own defaults, so the two
@@ -291,6 +333,7 @@ fn render_onebrain_yml_for_folders(
     let cp = CheckpointPolicy::default();
     let sc = SearchConfig::default();
     let rr = RerankerConfig::default();
+    let tok = TokenOptimizationConfig::default();
     let docs = config_key_docs();
     let c = |segments: &[&str]| -> String {
         docs.iter()
@@ -431,6 +474,39 @@ search:
         )),
     });
 
+    blocks.push(crate::config_layout::Block {
+        key: "token_optimization".to_string(),
+        lines: lines_of(format!(
+            "\
+# Token optimization ladder + cache + read-hook (see docs/token-optimization.md).
+token_optimization:
+  {c_level}
+  level: {level}
+  {c_get_max_tokens}
+  get_max_tokens: {get_max_tokens}
+  {c_snippet_max_chars}
+  snippet_max_chars: {snippet_max_chars}
+  {c_strip_frontmatter}
+  strip_frontmatter: {strip_frontmatter}
+  {c_model}
+  model: {model}
+  {c_read_hook}
+  read_hook: {read_hook}",
+            c_level = c(&["token_optimization", "level"]),
+            c_get_max_tokens = c(&["token_optimization", "get_max_tokens"]),
+            c_snippet_max_chars = c(&["token_optimization", "snippet_max_chars"]),
+            c_strip_frontmatter = c(&["token_optimization", "strip_frontmatter"]),
+            c_model = c(&["token_optimization", "model"]),
+            c_read_hook = c(&["token_optimization", "read_hook"]),
+            level = tok.level,
+            get_max_tokens = tok.get_max_tokens,
+            snippet_max_chars = tok.snippet_max_chars,
+            strip_frontmatter = tok.strip_frontmatter,
+            model = tok.model,
+            read_hook = tok.read_hook,
+        )),
+    });
+
     let entries = preset.entries();
     if !entries.is_empty() {
         // The schedule block is emitted only when the preset carries entries,
@@ -506,6 +582,11 @@ mod tests {
             "min_candidates",
             "min_score",
             "collection",
+            "level",
+            "get_max_tokens",
+            "snippet_max_chars",
+            "strip_frontmatter",
+            "read_hook",
         ] {
             // The line ABOVE each key line must be a `# … · default: …`
             // comment — walk the lines and assert the pairing, not just
@@ -612,6 +693,32 @@ mod tests {
             parsed.get("update_channel").and_then(|v| v.as_str()),
             Some(crate::vault_sync::DEFAULT_UPDATE_CHANNEL)
         );
+
+        let tok = TokenOptimizationConfig::default();
+        assert_eq!(
+            parsed["token_optimization"]["level"].as_str(),
+            Some(tok.level.to_string()).as_deref()
+        );
+        assert_eq!(
+            parsed["token_optimization"]["get_max_tokens"].as_u64(),
+            Some(tok.get_max_tokens as u64)
+        );
+        assert_eq!(
+            parsed["token_optimization"]["snippet_max_chars"].as_u64(),
+            Some(tok.snippet_max_chars as u64)
+        );
+        assert_eq!(
+            parsed["token_optimization"]["strip_frontmatter"].as_str(),
+            Some(tok.strip_frontmatter.to_string()).as_deref()
+        );
+        assert_eq!(
+            parsed["token_optimization"]["model"].as_str(),
+            Some(tok.model.as_str())
+        );
+        assert_eq!(
+            parsed["token_optimization"]["read_hook"].as_str(),
+            Some(tok.read_hook.to_string()).as_deref()
+        );
     }
 
     #[test]
@@ -626,6 +733,13 @@ mod tests {
         // `schedule` block (and its header doc) is present.
         let yaml = render_onebrain_yml(SchedulePreset::Essentials).unwrap();
         let lines: Vec<&str> = yaml.lines().collect();
+        // Two leaf keys share a bare name across different blocks
+        // (`search.reranker.model` and `token_optimization.model`) — track how
+        // many times each literal key text has already been matched so the
+        // Nth occurrence in the template pairs with the Nth entry in
+        // `config_key_docs()` (both walk in the same top-to-bottom order).
+        let mut occurrence_seen: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
         for doc in config_key_docs() {
             let key = doc.segments.last().unwrap();
             if doc.segments == ["search", "collection"] {
@@ -664,10 +778,15 @@ mod tests {
                 );
                 continue;
             }
+            let skip = *occurrence_seen.get(*key).unwrap_or(&0);
             let idx = lines
                 .iter()
-                .position(|l| l.trim_start().starts_with(&format!("{key}:")))
-                .unwrap_or_else(|| panic!("key {key} not in template"));
+                .enumerate()
+                .filter(|(_, l)| l.trim_start().starts_with(&format!("{key}:")))
+                .nth(skip)
+                .map(|(i, _)| i)
+                .unwrap_or_else(|| panic!("key {key} (occurrence {skip}) not in template"));
+            occurrence_seen.insert(*key, skip + 1);
             let doc_lines: Vec<&str> = doc.comment.split('\n').collect();
             let above: Vec<&str> = lines[idx - doc_lines.len()..idx]
                 .iter()
@@ -697,7 +816,7 @@ mod tests {
         // needed for either. `stats.qmd_cleanup_declined` IS a real
         // `VaultStats` field (read back to gate the `doctor --fix` re-prompt),
         // so it walks like any other key and needs its own doc entry below.
-        use onebrain_core::config::EmbedGate;
+        use onebrain_core::config::{EmbedGate, TokenOptimizationConfig};
         use onebrain_core::{VaultConfig, VaultStats};
         let cfg = VaultConfig {
             qmd_collection: Some("legacy".to_string()),
@@ -715,6 +834,10 @@ mod tests {
                 },
                 ..SearchConfig::default()
             },
+            // Every field is a concrete scalar/enum (no `Option`), so the
+            // plain default already exercises every leaf path the walk
+            // below needs to see.
+            token_optimization: TokenOptimizationConfig::default(),
             stats: VaultStats {
                 qmd_cleanup_declined: Some(true),
             },
@@ -771,6 +894,7 @@ mod tests {
             "Vault layout",
             "Agent behavior",
             "Search",
+            "Token optimization",
             "Automation",
         ] {
             assert!(
