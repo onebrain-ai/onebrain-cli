@@ -67,7 +67,7 @@ pub enum Signal {
 /// interface list — [`crate::guard::run_funnel`] derives sane per-level
 /// defaults (`TransformCtx::for_level`); later tracks may construct one
 /// directly for finer per-surface control.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TransformCtx {
     pub model: ModelFamily,
     /// `get`-style continuation cap, in estimated tokens. `None`/`Some(0)`
@@ -78,17 +78,6 @@ pub struct TransformCtx {
     /// The document path this payload was sourced from, when known — used
     /// by transforms that need it for signal context (e.g. dedup identity).
     pub doc_path: Option<String>,
-}
-
-impl Default for TransformCtx {
-    fn default() -> Self {
-        TransformCtx {
-            model: ModelFamily::default(),
-            get_max_tokens: None,
-            snippet_max_chars: None,
-            doc_path: None,
-        }
-    }
 }
 
 impl TransformCtx {
