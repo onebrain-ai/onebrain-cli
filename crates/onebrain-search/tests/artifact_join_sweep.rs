@@ -78,6 +78,32 @@ fn visit_rust_sources(dir: &Path, crates_dir: &Path, offenders: &mut Vec<String>
     }
 }
 
+/// #224 dedup guard: `search_common::index_size_bytes` and
+/// `search_reindex::wipe_index_files` must enumerate
+/// `onebrain_search::layout::INDEX_ARTIFACTS` rather than a private duplicate
+/// of the same three literal names — a future 4th artifact added only to
+/// `INDEX_ARTIFACTS` must be picked up by both size accounting and `--force`
+/// wipe without a second edit (see issue #224 / R3 of the v3.4.9 #201 PR).
+#[test]
+fn size_and_wipe_do_not_duplicate_the_artifact_list() {
+    let crates_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let targets = [
+        "onebrain-cli/src/commands/search_common.rs",
+        "onebrain-cli/src/commands/search_reindex.rs",
+    ];
+    let needle = "\"tantivy\", \"vectors\", \"engine.redb\"";
+    for rel in targets {
+        let path = crates_dir.join(rel);
+        let contents =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
+        assert!(
+            !contents.contains(needle),
+            "{rel} hardcodes the index-artifact list — consume \
+             onebrain_search::layout::INDEX_ARTIFACTS instead (see issue #224)"
+        );
+    }
+}
+
 fn check_file(path: &Path, crates_dir: &Path, offenders: &mut Vec<String>) {
     if path.file_name().and_then(|n| n.to_str()) == Some("layout.rs") {
         return;

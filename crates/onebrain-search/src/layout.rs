@@ -39,8 +39,11 @@
 
 use std::path::{Path, PathBuf};
 
-/// The index artifact names this module knows how to relocate.
-const INDEX_ARTIFACTS: [&str; 3] = ["tantivy", "vectors", "engine.redb"];
+/// The index artifact names this module knows how to relocate. Exported so
+/// every consumer that needs to enumerate index artifacts (size accounting,
+/// `--force` wipe) shares this ONE list instead of a private duplicate that
+/// would silently miss a future 4th artifact (issue #224).
+pub const INDEX_ARTIFACTS: [&str; 3] = ["tantivy", "vectors", "engine.redb"];
 
 /// Where a collection's on-disk cache currently stands relative to the
 /// `models/` + `index/` split.

@@ -257,7 +257,7 @@ pub fn is_indexed(cache_dir: &Path) -> bool {
 /// exist yet (no index). Pure fs, never mutates (no `migrate()`).
 pub fn index_size_bytes(cache_dir: &Path) -> Option<u64> {
     let layout = CollectionLayout::new(cache_dir);
-    let any = ["tantivy", "vectors", "engine.redb"]
+    let any = onebrain_search::layout::INDEX_ARTIFACTS
         .iter()
         .any(|name| layout.index_artifact(name).exists());
     any.then(|| layout.index_size_bytes())

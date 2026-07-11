@@ -710,7 +710,7 @@ fn wipe_index_files(vault_flag: Option<PathBuf>) -> Result<()> {
     let collection = collection_for(&resolved)?;
     let cache_dir = collection_cache_dir(&collection);
     let index_dir = cache_dir.join("index");
-    for name in ["tantivy", "vectors", "engine.redb"] {
+    for name in onebrain_search::layout::INDEX_ARTIFACTS {
         for candidate in [index_dir.join(name), cache_dir.join(name)] {
             let meta = match std::fs::symlink_metadata(&candidate) {
                 Ok(m) => m,
@@ -1079,9 +1079,11 @@ mod tests {
         )
         .unwrap();
 
-        // Duplicates at BOTH locations (artifact names via a variable so the
-        // repo-wide "no literal artifact joins" sweep stays clean).
-        let artifacts = ["tantivy", "vectors", "engine.redb"];
+        // Duplicates at BOTH locations — artifact names come from the shared
+        // `onebrain_search::layout::INDEX_ARTIFACTS` (issue #224), not a
+        // local literal, so this fixture stays correct if a 4th artifact is
+        // ever added.
+        let artifacts = onebrain_search::layout::INDEX_ARTIFACTS;
         let collection_dir = cache.path().join("search").join("wipe-dup-collection");
         let index_dir = collection_dir.join("index");
         for name in [artifacts[0], artifacts[1]] {
