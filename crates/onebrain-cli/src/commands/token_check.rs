@@ -240,7 +240,14 @@ pub fn run(vault_flag: Option<PathBuf>, path: &str) -> Result<i32> {
 mod tests {
     use super::*;
     use onebrain_token::JsonlGainWriter;
+    // Daemon-backed test infra is Unix-only: these tests isolate daemon
+    // discovery via $HOME, which `dirs::home_dir()` honours only on Unix
+    // (Windows reads %USERPROFILE%). Matches the repo-wide `#[cfg(unix)]`
+    // convention for HOME-based daemon tests (see daemon_client.rs). The
+    // production code is cross-platform; only the home-isolation is Unix-only.
+    #[cfg(unix)]
     use std::io::{Read, Write};
+    #[cfg(unix)]
     use std::net::TcpListener;
 
     // ── Pure verdict→outcome mapping (plan 5.1's primary TDD target) ───────
@@ -430,6 +437,7 @@ mod tests {
     /// `port`/`token`, bound to `vault` — the exact record format
     /// `discover_matching` reads (mirrors the daemon's own `DaemonInfo::write`
     /// but skipped here since the test doesn't need the private perms path).
+    #[cfg(unix)]
     fn write_daemon_json(home: &Path, vault: &Path, port: u16, token: &str) {
         let run_dir = home.join(".onebrain").join("run");
         std::fs::create_dir_all(&run_dir).unwrap();
@@ -454,6 +462,7 @@ mod tests {
     /// (as 200 JSON) for `/api/token/ledger/check`; `ledger_status` overrides
     /// the status line when non-200 (e.g. 404 for version-skew); `ledger_delay`
     /// sleeps before responding, to simulate a wedged daemon.
+    #[cfg(unix)]
     fn start_fake_daemon(
         ledger_status: u16,
         ledger_body: &'static str,
@@ -494,6 +503,7 @@ mod tests {
         port
     }
 
+    #[cfg(unix)]
     #[test]
     fn daemon_predates_token_routes_fails_open_and_records_event() {
         let (vault, cache) = test_vault();
@@ -513,6 +523,7 @@ mod tests {
         assert_eq!(events[0].transform, "daemon_version_skew");
     }
 
+    #[cfg(unix)]
     #[test]
     fn no_session_response_fails_open_and_records_event() {
         let (vault, cache) = test_vault();
@@ -532,6 +543,7 @@ mod tests {
         assert_eq!(events[0].transform, "no_session_token");
     }
 
+    #[cfg(unix)]
     #[test]
     fn timeout_fails_open_fast_and_records_event() {
         let (vault, cache) = test_vault();
@@ -560,6 +572,7 @@ mod tests {
         assert_eq!(events[0].transform, "timeout_200ms");
     }
 
+    #[cfg(unix)]
     #[test]
     fn unchanged_verdict_denies_with_reference_json_on_stdout() {
         let (vault, cache) = test_vault();
@@ -579,6 +592,7 @@ mod tests {
         assert!(gain_events(cache.path()).is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn allow_verdict_produces_no_gain_event() {
         let (vault, cache) = test_vault();
