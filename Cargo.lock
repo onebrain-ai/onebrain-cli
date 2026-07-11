@@ -2106,6 +2106,7 @@ dependencies = [
  "onebrain-core",
  "onebrain-fs",
  "onebrain-search",
+ "onebrain-token",
  "percent-encoding",
  "predicates",
  "pretty_assertions",

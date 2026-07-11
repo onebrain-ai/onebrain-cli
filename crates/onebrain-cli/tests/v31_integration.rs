@@ -55,6 +55,7 @@ fn root_help_shows_3_root_verbs_and_visible_groups() {
         "schedule",
         "session",
         "skill",
+        "token",
         "vault",
     ] {
         assert!(
@@ -175,6 +176,7 @@ fn top_level_help_hides_stub_groups() {
         "skill",
         "task",
         "serve",
+        "token",
     ] {
         // v3.3.17 categorized-help format: commands appear as `  {name}  `
         // (2-space indent inside category sections, inline description).

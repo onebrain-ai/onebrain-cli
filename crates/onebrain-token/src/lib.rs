@@ -14,9 +14,14 @@ pub mod transform;
 
 pub use estimate::{estimate_tokens, ModelFamily};
 pub use gain::{
-    CacheKind, Dim, GainEvent, GainSink, PivotQuery, PivotResult, PivotRow, PivotTotals,
-    RebuildStats, RollupError, RollupKey, RollupValue, Surface, TimeAxis,
+    CacheKind, Dim, GainEvent, GainSink, JsonlGainWriter, PivotQuery, PivotResult, PivotRow,
+    PivotTotals, RebuildStats, RollupError, RollupKey, RollupValue, Surface, TimeAxis,
 };
 pub use guard::{never_worse, run_funnel};
 pub use level::OptLevel;
 pub use transform::{Payload, Signal, Transform, TransformCtx};
+
+// Re-exported so callers that only need to open a `token.redb` handle (the
+// CLI's `token gain` command today; the daemon's routes in Track 3) don't
+// need their own direct `redb` dependency — one version pin, here.
+pub use redb::Database;

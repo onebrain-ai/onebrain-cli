@@ -531,6 +531,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 stubs::not_implemented_vault_required(vault_flag.clone(), "task done")
             }
         },
+        Cmd::Token(TokenCmd { verb }) => match verb {
+            TokenVerb::Gain(args) => commands::token_gain::run(vault_flag.clone(), &mode, &args),
+        },
 
         // ───── Hidden v3.0 aliases — emit migration notice + dispatch ─
         Cmd::SessionInitAlias(a) => {
