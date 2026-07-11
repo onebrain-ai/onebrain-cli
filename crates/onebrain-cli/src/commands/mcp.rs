@@ -20,6 +20,12 @@ use onebrain_core::path::ResolvedVault;
 use onebrain_search::engine::{Engine, Hit};
 use onebrain_search::lex::LexIndex;
 
+use onebrain_core::config::{TokenOptimizationConfig, VaultConfig};
+use onebrain_token::gain::Surface;
+use onebrain_token::{
+    CacheKind, GainEvent, LedgerVerdict, MemoKey, OptLevel, ReferenceEnvelope, TokenCache,
+};
+
 use super::daemon_client::{self, DaemonHandle};
 use super::search_common::{
     collection_cache_dir, collection_for, index_artifact_path, open_engine,
@@ -27,6 +33,7 @@ use super::search_common::{
 use super::search_status::{
     status_data_for, status_data_from_daemon, DaemonStatusCounts, SearchStatusData,
 };
+use super::token_runner;
 
 /// How the MCP server reaches the search engine.
 ///
@@ -61,6 +68,32 @@ fn internal(e: impl std::fmt::Display) -> ErrorData {
 /// Default per-file byte cap for `multi_get` — files larger than this are
 /// skipped (with a one-line note in the output) rather than dumped whole.
 const DEFAULT_MAX_BYTES: u64 = 10_240;
+
+/// Prefix on a `get` response that returns an already-sent reference instead
+/// of the body (design §3b) — tells the agent why the body isn't inline and
+/// how to force it.
+const REFERENCE_NOTE: &str = "⤷ already sent this session (unchanged) — reference below; \
+     read `rematerialize` to fetch the full body:";
+
+/// Best-effort session-token resolution for the Direct-mode ledger (design
+/// §3b) — same resolution the daemon client uses on the daemon path. `None`
+/// when no token is resolvable (headless / odd host): the ledger is then
+/// silently inactive for the call and the body inlines, never guessed.
+fn resolve_session_token_opt() -> Option<String> {
+    let inputs = onebrain_cache::ResolveInputs::from_env();
+    onebrain_cache::resolve_session_token(&inputs)
+        .ok()
+        .map(|t| t.to_string())
+}
+
+/// Epoch seconds, for surface-recorded gain events (the cache-hit paths that
+/// bypass the funnel's own timestamp).
+fn now_ts() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// Splits a trailing `:N` line-number suffix off a path, e.g.
 /// `notes/a.md:100` -> (`notes/a.md`, `Some(100)`). Only a purely-numeric
@@ -143,6 +176,14 @@ pub struct GetParams {
     /// Add line numbers ('N: content').
     #[serde(rename = "lineNumbers")]
     pub line_numbers: Option<bool>,
+    /// Re-materialize the FULL body, bypassing both the already-sent ledger and
+    /// the size cap (design §3c). Set this when a reference envelope pointed you
+    /// back here — it always returns the complete document.
+    pub force: Option<bool>,
+    /// Per-call optimization level override ('off'|'conservative'|'balanced'|'aggressive').
+    /// Precedence: this > onebrain.yml `token_optimization.level` > default.
+    #[serde(rename = "optLevel")]
+    pub opt_level: Option<String>,
 }
 
 /// Params for the `multi_get` tool.
@@ -267,7 +308,7 @@ pub struct QueryOut {
     pub note: Option<String>,
 }
 
-#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct QueryHit {
     pub docid: String, // chunk id
     pub file: String,  // vault-relative doc path
@@ -393,6 +434,76 @@ fn resolve_query_results(
             })
             .collect(),
     }
+}
+
+/// Map `QueryHit`s to the canonical hit-list JSON the query transforms
+/// understand (design §1: shared transform layer, per-surface field names).
+/// The transforms key on `doc_path` (dedup identity) and `text` (snippet
+/// cap/disclosure), so `file`→`doc_path` and `snippet`→`text` are renamed in;
+/// every other field (docid/title/score/context/rerank_score) rides along
+/// untouched. [`decanonicalize_hits`] reverses it.
+fn canonicalize_hits(hits: &[QueryHit]) -> Vec<serde_json::Value> {
+    hits.iter()
+        .map(|h| {
+            let mut v = serde_json::to_value(h).unwrap_or(serde_json::Value::Null);
+            if let Some(obj) = v.as_object_mut() {
+                if let Some(file) = obj.remove("file") {
+                    obj.insert("doc_path".to_string(), file);
+                }
+                if let Some(snippet) = obj.remove("snippet") {
+                    obj.insert("text".to_string(), snippet);
+                }
+            }
+            v
+        })
+        .collect()
+}
+
+/// Reverse [`canonicalize_hits`]: `doc_path`→`file`, `text`→`snippet` (absent
+/// after `disclosure` stripped it → empty snippet, matching `QueryHit`'s
+/// required `String` field), then deserialize back. A hit that fails to
+/// round-trip is dropped rather than corrupting the result set.
+fn decanonicalize_hits(values: Vec<serde_json::Value>) -> Vec<QueryHit> {
+    values
+        .into_iter()
+        .filter_map(|mut v| {
+            if let Some(obj) = v.as_object_mut() {
+                if let Some(dp) = obj.remove("doc_path") {
+                    obj.insert("file".to_string(), dp);
+                }
+                let text = obj
+                    .remove("text")
+                    .unwrap_or_else(|| serde_json::Value::String(String::new()));
+                obj.insert("snippet".to_string(), text);
+            }
+            serde_json::from_value::<QueryHit>(v).ok()
+        })
+        .collect()
+}
+
+/// A stable, normalized descriptor of a `query` request's sub-queries for the
+/// memo key — `"<type>:<trimmed query>"` per sub-query, newline-joined, in the
+/// caller's order (order matters: the first sub-query gets 2x fusion weight).
+fn query_norm(searches: &[SubQuery]) -> String {
+    searches
+        .iter()
+        .map(|s| {
+            let ty = match s.r#type {
+                SubQueryType::Lex => "lex",
+                SubQueryType::Vec => "vec",
+                SubQueryType::Hyde => "hyde",
+            };
+            format!("{ty}:{}", s.query.trim())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The RRF fusion weights `rrf_fuse` applies for `n` sub-queries — the first
+/// gets 2x, the rest 1x. Folded into the memo key so a different sub-query
+/// arity can't alias.
+fn fusion_weights(n: usize) -> Vec<f64> {
+    (0..n).map(|i| if i == 0 { 2.0 } else { 1.0 }).collect()
 }
 
 /// Agent-facing note returned by `query` when the vault has no index yet, so
@@ -641,6 +752,121 @@ impl McpServer {
         .map_err(internal)
     }
 
+    /// Load this vault's full config (default on any read error — a config
+    /// problem must never fail a read tool).
+    fn vault_config(&self) -> VaultConfig {
+        onebrain_core::config::load_vault_config_at(self.resolved.root.as_path())
+            .unwrap_or_default()
+    }
+
+    /// Load this vault's `token_optimization` config (default on any read
+    /// error — a config problem must never fail a read tool).
+    fn opt_config(&self) -> TokenOptimizationConfig {
+        self.vault_config().token_optimization
+    }
+
+    /// `<collection_cache>/token/token.redb` for Direct-mode memoization — the
+    /// daemon owns this file in daemon mode, so the memo path is Direct-only
+    /// (this release adds no daemon memo route). Creates the parent dir.
+    fn token_db_path(&self) -> Option<PathBuf> {
+        let collection = collection_for(&self.resolved).ok()?;
+        let dir = collection_cache_dir(&collection).join("token");
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir.join("token.redb"))
+    }
+
+    /// Read a memoized result set for `key` (Direct mode). Best-effort — any
+    /// open/read failure is a clean miss, never an error.
+    fn memo_get(&self, key: &MemoKey) -> Option<String> {
+        let path = self.token_db_path()?;
+        let cache = TokenCache::open(&path).ok()?;
+        cache.memo().get(key).ok().flatten()
+    }
+
+    /// Store `results` under `key` (Direct mode). Best-effort — a write failure
+    /// is swallowed so a cache hiccup never fails a live query.
+    fn memo_put(&self, key: &MemoKey, results: &str) {
+        if let Some(path) = self.token_db_path() {
+            if let Ok(cache) = TokenCache::open(&path) {
+                let _ = cache.memo().put(key, results);
+            }
+        }
+    }
+
+    /// Resolve the effective level for a tool call (per-call > config >
+    /// default), falling back to the config level on an unparseable per-call
+    /// override rather than failing the call.
+    fn resolve_level(&self, per_call: Option<&str>, cfg: &TokenOptimizationConfig) -> OptLevel {
+        token_runner::resolve_level(per_call, cfg).unwrap_or(cfg.level)
+    }
+
+    /// Check the already-sent ledger for `doc_path` and, on an `unchanged`
+    /// verdict, return the reference envelope the caller sends instead of the
+    /// body (design §3b). `record: true` semantics — the FIRST send is stamped
+    /// so the next repeat is caught. Works in BOTH backends (design §5d):
+    ///
+    /// - **Daemon**: the daemon owns `token.redb`; go through
+    ///   `POST /api/token/ledger/check`, which also enforces the M3 level gate.
+    /// - **Direct**: no daemon, so open `token.redb` in-process and run the
+    ///   ledger against the locally-owned engine's `doc_hash`. The caller has
+    ///   already applied the level gate (`level >= Balanced`) before calling.
+    ///
+    /// Any other verdict (`first_send`/`changed`/`inactive`/`no_session`/
+    /// `unknown_doc`), a 404 old daemon, an unresolvable session token, or any
+    /// error yields `None` → the caller inlines the full body. `full_len` is the
+    /// body size credited to `bytes_saved` on the Direct path.
+    async fn ledger_reference(&self, doc_path: String, full_len: u64) -> Option<ReferenceEnvelope> {
+        match &self.backend {
+            Backend::Daemon(handle) => {
+                let handle = handle.clone();
+                let path = doc_path.clone();
+                let value =
+                    tokio::task::spawn_blocking(move || handle.token_ledger_check(&path, true))
+                        .await
+                        .ok()?
+                        .ok()??; // JoinError / anyhow::Err / Ok(None) all → None
+                if value.get("verdict").and_then(|v| v.as_str()) != Some("unchanged") {
+                    return None;
+                }
+                serde_json::from_value::<ReferenceEnvelope>(value.get("reference")?.clone()).ok()
+            }
+            Backend::Direct(_) => {
+                // No daemon → resolve the session locally and run the ledger
+                // over the in-process engine + `token.redb`. No session token
+                // resolvable → ledger inactive for this call (never guessed).
+                let session = resolve_session_token_opt()?;
+                let db_path = self.token_db_path()?;
+                let path = doc_path.clone();
+                self.with_engine(move |eng| {
+                    let Some(hash) = eng.doc_hash(&path) else {
+                        return Ok(None); // unindexed doc → can't claim unchanged
+                    };
+                    let cache = TokenCache::open(&db_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let ledger = cache.ledger();
+                    match ledger
+                        .check(&session, &path, &hash)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                    {
+                        LedgerVerdict::Unchanged { sent_hash } => Ok(Some(ReferenceEnvelope::new(
+                            path.clone(),
+                            sent_hash,
+                            full_len,
+                        ))),
+                        LedgerVerdict::FirstSend | LedgerVerdict::Changed => {
+                            ledger
+                                .record(&session, &path, &hash)
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            Ok(None)
+                        }
+                    }
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+        }
+    }
+
     #[tool(
         name = "status",
         description = "Show the status of the search index: collection, embed model, document counts, pending changes, and health information."
@@ -704,6 +930,76 @@ impl McpServer {
                 results: vec![],
                 note: Some(no_index_note()),
             }));
+        }
+
+        let vault_cfg = self.vault_config();
+        let opt_cfg = &vault_cfg.token_optimization;
+        let level = self.resolve_level(None, opt_cfg);
+        let q_norm = query_norm(&params.searches);
+        let weights = fusion_weights(params.searches.len());
+
+        // Query-result memoization (design §3a / M2) — Direct mode only (the
+        // daemon owns `token.redb`; no daemon memo route this release). The key
+        // folds the index identity (generation + nonce) AND every
+        // result-determining knob that changes without a reindex (reranker
+        // on/off + model, the rerank-score gate, fusion weights), so a config
+        // change can never serve stale hits.
+        let memo_key = if matches!(self.backend, Backend::Direct(_)) {
+            let (generation, index_nonce) = self
+                .with_engine(|e| Ok((e.generation(), e.index_nonce())))
+                .await?;
+            let r = &vault_cfg.search.reranker;
+            Some(MemoKey::new(
+                &q_norm,
+                "mcp",
+                limit,
+                r.min_candidates,
+                min_score as f32,
+                generation,
+                &index_nonce,
+                r.enabled,
+                &r.model,
+                r.min_score.unwrap_or(0.30),
+                &weights,
+            ))
+        } else {
+            None
+        };
+
+        // Memo HIT: skip embedding + rerank entirely, shape the cached result
+        // set for the current level, and record a single `MemoHit` gain event.
+        if let Some(key) = &memo_key {
+            if let Some(cached) = self.memo_get(key) {
+                if let Ok(cached_hits) = serde_json::from_str::<Vec<QueryHit>>(&cached) {
+                    let before = cached.len() as u64;
+                    let ctx = token_runner::ctx_for(level, opt_cfg, None, false, None);
+                    let shaped = decanonicalize_hits(token_runner::shape_query_hits_unmetered(
+                        Surface::McpQuery,
+                        canonicalize_hits(&cached_hits),
+                        &ctx,
+                    ));
+                    let after = serde_json::to_string(&shaped)
+                        .map(|s| s.len() as u64)
+                        .unwrap_or(before);
+                    token_runner::record_gain(
+                        &self.resolved,
+                        GainEvent {
+                            ts: now_ts(),
+                            surface: Surface::McpQuery,
+                            transform: "memo".to_string(),
+                            level,
+                            bytes_before: before,
+                            bytes_after: after,
+                            cache: CacheKind::MemoHit,
+                            session_token: None,
+                        },
+                    );
+                    return Ok(Json(QueryOut {
+                        results: shaped,
+                        note: None,
+                    }));
+                }
+            }
         }
 
         let ranked: Vec<(f64, Vec<Hit>)> = match &self.backend {
@@ -844,8 +1140,29 @@ impl McpServer {
 
         let results = resolve_query_results(survivors, rerank_outcome, limit);
 
+        // Memo MISS: cache the resolved (pre-shaping) result set so a repeat of
+        // the same query skips embedding + rerank. Memoization is
+        // level-independent — token shaping is presentation, applied fresh on
+        // both hit and miss, so it stays out of the memo value and the key.
+        if let Some(key) = &memo_key {
+            if let Ok(serialized) = serde_json::to_string(&results) {
+                self.memo_put(key, &serialized);
+            }
+        }
+
+        // Shape the fused/reranked hit list through the funnel (McpQuery:
+        // json_compact + doc_dedup at conservative, snippet at balanced,
+        // disclosure at aggressive) — records one gain event.
+        let ctx = token_runner::ctx_for(level, opt_cfg, None, false, None);
+        let shaped = decanonicalize_hits(token_runner::shape_query_hits(
+            &self.resolved,
+            Surface::McpQuery,
+            canonicalize_hits(&results),
+            &ctx,
+        ));
+
         Ok(Json(QueryOut {
-            results,
+            results: shaped,
             note: None,
         }))
     }
@@ -862,11 +1179,13 @@ impl McpServer {
         let path_part = path_part.to_string();
         let vault_root = self.resolved.root.as_path().to_path_buf();
 
-        let resolved_path =
-            tokio::task::spawn_blocking(move || resolve_under_vault(&vault_root, &path_part))
+        let resolved_path = {
+            let path_for_resolve = path_part.clone();
+            tokio::task::spawn_blocking(move || resolve_under_vault(&vault_root, &path_for_resolve))
                 .await
                 .map_err(internal)?
-                .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+                .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?
+        };
 
         let text = tokio::fs::read_to_string(&resolved_path)
             .await
@@ -875,13 +1194,52 @@ impl McpServer {
             })?;
 
         let from_line = suffix_line.or(params.from_line);
+        let windowed = from_line.is_some() || params.max_lines.is_some();
+
+        let cfg = self.opt_config();
+        let level = self.resolve_level(params.opt_level.as_deref(), &cfg);
+        let force = params.force.unwrap_or(false);
+
+        // Already-sent ledger (design §3b, level 2↑): a repeat, unchanged,
+        // WHOLE-doc read comes back as a reference the agent can re-materialize
+        // with `--force`, not the full body again. Works in both backends
+        // (daemon route or in-process `token.redb`, design §5d). The level gate
+        // is applied here; `force` and windowed reads always inline.
+        if !force && !windowed && level >= OptLevel::Balanced {
+            let full_bytes = text.len() as u64;
+            if let Some(reference) = self.ledger_reference(path_part.clone(), full_bytes).await {
+                let ref_json =
+                    serde_json::to_string_pretty(&reference).unwrap_or_else(|_| String::new());
+                token_runner::record_gain(
+                    &self.resolved,
+                    GainEvent {
+                        ts: now_ts(),
+                        surface: Surface::McpGet,
+                        transform: "ledger_ref".to_string(),
+                        level,
+                        bytes_before: full_bytes,
+                        bytes_after: ref_json.len() as u64,
+                        cache: CacheKind::LedgerRef,
+                        session_token: None,
+                    },
+                );
+                let body = format!("{REFERENCE_NOTE}\n{ref_json}");
+                return Ok(CallToolResult::success(vec![ContentBlock::text(body)]));
+            }
+        }
+
         let sliced = slice_lines(
             &text,
             from_line,
             params.max_lines,
             params.line_numbers.unwrap_or(false),
         );
-        Ok(CallToolResult::success(vec![ContentBlock::text(sliced)]))
+
+        // Shape the doc body through the funnel (whitespace / frontmatter /
+        // get_cap per level + surface). `force` bypasses the size cap.
+        let ctx = token_runner::ctx_for(level, &cfg, Some(path_part.clone()), force, None);
+        let shaped = token_runner::shape_document(&self.resolved, Surface::McpGet, sliced, &ctx);
+        Ok(CallToolResult::success(vec![ContentBlock::text(shaped)]))
     }
 
     #[tool(
@@ -953,9 +1311,20 @@ impl McpServer {
             }
         }
 
-        Ok(CallToolResult::success(vec![ContentBlock::text(
+        // Shape the combined fan-out body once (whitespace + head_only per
+        // level) — a single funnel call, so one gain event lands per multi_get
+        // call (the §5d "exactly one GainEvent per optimized call" rule). Uses
+        // the config-resolved level; multi_get has no per-call override.
+        let cfg = self.opt_config();
+        let level = self.resolve_level(None, &cfg);
+        let ctx = token_runner::ctx_for(level, &cfg, None, false, None);
+        let shaped = token_runner::shape_document(
+            &self.resolved,
+            Surface::McpMultiGet,
             sections.join("\n\n"),
-        )]))
+            &ctx,
+        );
+        Ok(CallToolResult::success(vec![ContentBlock::text(shaped)]))
     }
 }
 
@@ -1001,17 +1370,29 @@ pub fn run(vault_flag: Option<PathBuf>) -> Result<()> {
     // Fallback: if the daemon genuinely can't start (e.g. spawn failed), open
     // the engine directly so a lone session still works — today's behaviour.
     // This is the ONLY safe direct-open: as the sole owner there's no lock race.
-    let server = match daemon_client::ensure_running(Some(resolved.root.as_path())) {
-        Ok(handle) => McpServer::with_daemon(handle, resolved),
-        Err(daemon_err) => {
-            tracing::warn!(
-                error = %daemon_err,
-                "warm daemon unavailable; falling back to a direct single-process engine open"
-            );
-            let (engine, resolved) = open_engine(vault_flag).with_context(|| {
-                format!("daemon unavailable ({daemon_err:#}) and direct engine open also failed")
-            })?;
-            McpServer::with_direct_engine(engine, resolved)
+    // `ONEBRAIN_NO_DAEMON` kill-switch: skip discovery/auto-start entirely and
+    // open the engine directly — the same escape hatch the search verbs honor
+    // (`search_common::daemon_routing_disabled`). Direct mode is fully
+    // supported (memoization + ledger open `token.redb` in-process, design
+    // §5d), so this is a first-class path, not a degraded one.
+    let server = if super::search_common::daemon_routing_disabled() {
+        let (engine, resolved) = open_engine(vault_flag)?;
+        McpServer::with_direct_engine(engine, resolved)
+    } else {
+        match daemon_client::ensure_running(Some(resolved.root.as_path())) {
+            Ok(handle) => McpServer::with_daemon(handle, resolved),
+            Err(daemon_err) => {
+                tracing::warn!(
+                    error = %daemon_err,
+                    "warm daemon unavailable; falling back to a direct single-process engine open"
+                );
+                let (engine, resolved) = open_engine(vault_flag).with_context(|| {
+                    format!(
+                        "daemon unavailable ({daemon_err:#}) and direct engine open also failed"
+                    )
+                })?;
+                McpServer::with_direct_engine(engine, resolved)
+            }
         }
     };
 
@@ -1043,6 +1424,86 @@ mod tests {
             snippet: String::new(),
             rerank_score: None,
         }
+    }
+
+    // ── Token-surface shaping helpers (Track 4) ────────────────────────────
+
+    fn query_hit(file: &str, snippet: &str, rerank: Option<f32>) -> QueryHit {
+        QueryHit {
+            docid: format!("{file}#0"),
+            file: file.into(),
+            title: file.trim_end_matches(".md").into(),
+            score: 0.9,
+            context: Some("Heading".into()),
+            snippet: snippet.into(),
+            rerank_score: rerank,
+        }
+    }
+
+    #[test]
+    fn canonicalize_renames_file_and_snippet_for_the_transforms() {
+        let hits = vec![query_hit("a.md", "hello world", Some(0.8))];
+        let canonical = canonicalize_hits(&hits);
+        let obj = canonical[0].as_object().unwrap();
+        // Transforms key on `doc_path` (dedup) + `text` (snippet cap/disclosure).
+        assert_eq!(obj["doc_path"], "a.md");
+        assert_eq!(obj["text"], "hello world");
+        assert!(obj.get("file").is_none(), "file renamed away");
+        assert!(obj.get("snippet").is_none(), "snippet renamed away");
+        // Carry-through fields survive untouched.
+        assert_eq!(obj["docid"], "a.md#0");
+        assert_eq!(obj["rerank_score"].as_f64().unwrap() as f32, 0.8_f32);
+    }
+
+    #[test]
+    fn canonical_round_trip_preserves_hits() {
+        let hits = vec![
+            query_hit("a.md", "one", Some(0.7)),
+            query_hit("b.md", "two", None),
+        ];
+        let back = decanonicalize_hits(canonicalize_hits(&hits));
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].file, "a.md");
+        assert_eq!(back[0].snippet, "one");
+        assert_eq!(back[0].rerank_score, Some(0.7));
+        assert_eq!(back[1].file, "b.md");
+        assert_eq!(back[1].rerank_score, None);
+    }
+
+    #[test]
+    fn decanonicalize_missing_text_yields_empty_snippet() {
+        // disclosure removes `text` at aggressive — a hit with no text must
+        // deserialize to an empty snippet (required String), not be dropped.
+        let mut v = serde_json::to_value(query_hit("a.md", "x", None)).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        let file = obj.remove("file").unwrap();
+        obj.insert("doc_path".into(), file);
+        obj.remove("snippet");
+        // no `text` key at all (disclosure stripped it)
+        let back = decanonicalize_hits(vec![v]);
+        assert_eq!(back.len(), 1, "hit kept despite missing snippet");
+        assert_eq!(back[0].snippet, "");
+    }
+
+    #[test]
+    fn query_norm_encodes_type_query_and_order() {
+        let searches = vec![
+            SubQuery {
+                r#type: SubQueryType::Lex,
+                query: "  errors  ".into(),
+            },
+            SubQuery {
+                r#type: SubQueryType::Vec,
+                query: "why fail".into(),
+            },
+        ];
+        assert_eq!(query_norm(&searches), "lex:errors\nvec:why fail");
+    }
+
+    #[test]
+    fn fusion_weights_first_is_double() {
+        assert_eq!(fusion_weights(1), vec![2.0]);
+        assert_eq!(fusion_weights(3), vec![2.0, 1.0, 1.0]);
     }
 
     // ── QueryHit::rerank_score serialization (Task 7) ──────────────────────
