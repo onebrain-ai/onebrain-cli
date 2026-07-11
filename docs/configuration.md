@@ -33,6 +33,7 @@ The template groups keys under labelled banners in a fixed order:
 # ── Vault layout ──…     folders
 # ── Agent behavior ──…   checkpoint, recap
 # ── Search ──…           search
+# ── Token optimization ──… token_optimization
 # ── Automation ──…       schedule
 # ── System ──…           stats   (managed by OneBrain — do not edit)
 ```
@@ -91,6 +92,12 @@ a completeness test enforces this against the config structs.
 | `search.reranker.model` | Reranker model (see `onebrain search model list`) | `onebrain-rerank-v1` | reranker-registry name | yes |
 | `search.reranker.min_candidates` | Minimum candidate pool to rerank (a floor, not a ceiling) | `10` | integer ≥ 1 | yes |
 | `search.reranker.min_score` | Score gate: hits below this calibrated 0–1 score are dropped | `0.30` (engine-calibrated; key may also be omitted) | number in `[0, 1]` | yes |
+| `token_optimization.level` | Token-optimization ladder rung — see [`token-optimization.md`](token-optimization.md) | `conservative` | `off`, `conservative`, `balanced`, `aggressive` | not validated |
+| `token_optimization.get_max_tokens` | `search get` / MCP `get` continuation cap, in estimated tokens; `0` = unlimited | `6000` | integer ≥ 0 | not validated |
+| `token_optimization.snippet_max_chars` | Per-hit query snippet length cap, in characters | `200` | integer ≥ 1 | not validated |
+| `token_optimization.strip_frontmatter` | When to strip YAML frontmatter from `get`/`multi_get` doc bodies | `auto` | `auto`, `always`, `never` | not validated |
+| `token_optimization.model` | Model-family hint for token estimation calibration + pricing | `auto` | any string | not validated |
+| `token_optimization.read_hook` | Vault-read ledger-gate hook mode (plugin registers the PreToolUse hook; this key only gates the CLI's ledger check) | `off` | `off`, `ledger` | not validated |
 | `recap.min_sessions` | Unrecapped session logs required before `/recap` runs (plugin key) | `6` | integer ≥ 1 | not validated (plugin-level) |
 | `recap.min_frequency` | Sessions a topic must recur in to be promoted to memory (plugin key) | `2` | integer ≥ 1 | not validated (plugin-level) |
 | `schedule` | Scheduled skill/command entries compiled by `onebrain schedule register` | *(none)* | see `schedule register` docs | not validated |
