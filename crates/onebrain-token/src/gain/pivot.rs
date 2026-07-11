@@ -4,12 +4,21 @@
 //! [`PivotResult`] — "one pivot engine ... serves all three consumers," not
 //! three re-derivations of the same aggregation logic.
 //!
-//! Always sources from the [`GAIN_DAILY`] rollup table (the finest tier-2
-//! table), never the raw JSONL: `week` buckets and `--since` windows both
-//! need day-level granularity to compute correctly, and the daily table is
-//! still a small, precomputed rollup — scanning it is not the "live scan of
-//! the append-only log" the design explicitly reserves for `--history`.
-//! `month`/`week`/`year` buckets are re-grouped from daily rows in memory.
+//! Two sources, one bucketing pipeline:
+//! - [`query`] pivots the cumulative [`GAIN_DAILY`] rollup table — the
+//!   **all-time** view across every epoch (archived + current). `week`
+//!   buckets and `--since` windows both compute from the day-granular
+//!   rollup; scanning it is not the "live scan of the append-only log" the
+//!   design reserves for `--history`.
+//! - [`query_events`] pivots a slice of raw [`GainEvent`]s directly — used
+//!   by the default `token gain` read against the **current epoch only**
+//!   (the non-archived raw JSONL, i.e. traffic since the last `--reset`), so
+//!   the baseline-comparison workflow reports post-reset traffic honestly
+//!   instead of the unchanging all-time total. The since-reset window is
+//!   small, so aggregating it in memory on read is cheap.
+//!
+//! Both feed the same [`finalize`] pipeline, so a bucketed total is computed
+//! identically no matter which source produced it.
 
 use std::collections::BTreeMap;
 
@@ -17,7 +26,8 @@ use chrono::{Datelike, NaiveDate};
 use redb::Database;
 use serde::{Deserialize, Serialize};
 
-use super::rollup::{scan, RollupError, RollupKey, GAIN_DAILY};
+use super::event::GainEvent;
+use super::rollup::{day_key, scan, RollupError, RollupKey, GAIN_DAILY};
 
 /// Time-axis granularity for a pivot's `time` bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,11 +122,35 @@ fn dim_value(dim: Dim, key: &RollupKey) -> String {
     }
 }
 
-/// Run `q` against `db`'s daily rollup table.
+fn event_dim_value(dim: Dim, event: &GainEvent) -> String {
+    match dim {
+        Dim::Surface => event.surface.to_string(),
+        Dim::Transform => event.transform.clone(),
+        Dim::Level => event.level.to_string(),
+        Dim::Cache => event.cache.to_string(),
+    }
+}
+
+type Buckets = BTreeMap<(Option<String>, Option<String>), PivotTotals>;
+
+/// Turn the accumulated `(time, dim)` buckets + grand total into a sorted
+/// [`PivotResult`]. Shared by both source paths so a bucketed total is
+/// computed identically whether it came from the rollup or from raw events.
+fn finalize(buckets: Buckets, totals: PivotTotals) -> PivotResult {
+    let mut rows: Vec<PivotRow> = buckets
+        .into_iter()
+        .map(|((time, dim), totals)| PivotRow { time, dim, totals })
+        .collect();
+    rows.sort_by(|a, b| (&a.time, &a.dim).cmp(&(&b.time, &b.dim)));
+    PivotResult { rows, totals }
+}
+
+/// Pivot `db`'s cumulative daily rollup table — the **all-time** view across
+/// every epoch. The source for `token gain --all-time` and `--since`.
 pub fn query(db: &Database, q: &PivotQuery) -> Result<PivotResult, RollupError> {
     let daily_rows = scan(db, GAIN_DAILY)?;
 
-    let mut buckets: BTreeMap<(Option<String>, Option<String>), PivotTotals> = BTreeMap::new();
+    let mut buckets: Buckets = BTreeMap::new();
     let mut totals = PivotTotals::default();
 
     for (key, value) in &daily_rows {
@@ -137,13 +171,38 @@ pub fn query(db: &Database, q: &PivotQuery) -> Result<PivotResult, RollupError> 
         buckets.entry((time, dim)).or_default().add_row(&row_totals);
     }
 
-    let mut rows: Vec<PivotRow> = buckets
-        .into_iter()
-        .map(|((time, dim), totals)| PivotRow { time, dim, totals })
-        .collect();
-    rows.sort_by(|a, b| (&a.time, &a.dim).cmp(&(&b.time, &b.dim)));
+    Ok(finalize(buckets, totals))
+}
 
-    Ok(PivotResult { rows, totals })
+/// Pivot a slice of raw [`GainEvent`]s directly — the **current-epoch**
+/// source for the default `token gain` read. `events` is the caller's
+/// non-archived raw window (`JsonlGainWriter::read_all`, which excludes
+/// `archive/**`), so the result reflects only traffic since the last
+/// `--reset`. Pure (no I/O) — the caller owns reading the log.
+pub fn query_events(events: &[GainEvent], q: &PivotQuery) -> PivotResult {
+    let mut buckets: Buckets = BTreeMap::new();
+    let mut totals = PivotTotals::default();
+
+    for event in events {
+        let period = day_key(event.ts);
+        if let Some(since) = &q.since {
+            if &period < since {
+                continue;
+            }
+        }
+        let row_totals = PivotTotals {
+            bytes_before: event.bytes_before,
+            bytes_after: event.bytes_after,
+            count: 1,
+        };
+        totals.add_row(&row_totals);
+
+        let time = q.time.map(|axis| time_bucket(axis, &period));
+        let dim = q.dim.map(|d| event_dim_value(d, event));
+        buckets.entry((time, dim)).or_default().add_row(&row_totals);
+    }
+
+    finalize(buckets, totals)
 }
 
 #[cfg(test)]
@@ -299,6 +358,71 @@ mod tests {
             since: None,
         };
         let result = query(&db, &q).unwrap();
+        assert!(result.rows.is_empty());
+        assert_eq!(result.totals, PivotTotals::default());
+    }
+
+    // ── query_events (current-epoch source) ─────────────────────────────
+
+    #[test]
+    fn query_events_sums_a_raw_slice_with_no_axes() {
+        let events = [
+            event(1_783_728_000, Surface::CliSearch, "whitespace", 1000, 400),
+            event(1_783_900_800, Surface::McpQuery, "snippet", 500, 100),
+        ];
+        let result = query_events(&events, &PivotQuery::default());
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.totals.bytes_before, 1500);
+        assert_eq!(result.totals.bytes_after, 500);
+        assert_eq!(result.totals.count, 2);
+    }
+
+    #[test]
+    fn query_events_buckets_by_day_and_surface_like_the_rollup_path() {
+        // The same three events, fed through query_events (raw) and through
+        // query (rollup), must produce identical bucketed results — proving
+        // the two sources share one bucketing pipeline (finalize).
+        let events = [
+            event(1_783_728_000, Surface::CliSearch, "whitespace", 1000, 400),
+            event(1_783_900_800, Surface::McpQuery, "snippet", 500, 100),
+            event(1_785_542_400, Surface::CliSearch, "whitespace", 2000, 1000),
+        ];
+        let q = PivotQuery {
+            time: Some(TimeAxis::Day),
+            dim: Some(Dim::Surface),
+            since: None,
+        };
+        let from_events = query_events(&events, &q);
+
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("token.redb")).unwrap();
+        for e in &events {
+            update(&db, e).unwrap();
+        }
+        let from_rollup = query(&db, &q).unwrap();
+
+        assert_eq!(from_events, from_rollup);
+    }
+
+    #[test]
+    fn query_events_honors_since_filter() {
+        let events = [
+            event(1_783_728_000, Surface::CliSearch, "whitespace", 1000, 400), // 2026-07-11
+            event(1_785_542_400, Surface::CliSearch, "whitespace", 2000, 1000), // 2026-08-01
+        ];
+        let q = PivotQuery {
+            time: None,
+            dim: None,
+            since: Some("2026-08-01".to_string()),
+        };
+        let result = query_events(&events, &q);
+        assert_eq!(result.totals.count, 1);
+        assert_eq!(result.totals.bytes_before, 2000);
+    }
+
+    #[test]
+    fn query_events_on_empty_slice_is_zeroed() {
+        let result = query_events(&[], &PivotQuery::default());
         assert!(result.rows.is_empty());
         assert_eq!(result.totals, PivotTotals::default());
     }

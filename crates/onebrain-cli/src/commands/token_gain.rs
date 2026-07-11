@@ -183,9 +183,21 @@ fn tail(mut events: Vec<GainEvent>, limit: usize) -> Vec<GainEvent> {
 pub(crate) struct TokenGainData {
     #[serde(flatten)]
     pivot: PivotResult,
+    /// `true` when the reported pivot spans **all epochs** (`--all-time` /
+    /// `--since` / the `--rebuild` all-time summary); `false` when it is
+    /// scoped to the current epoch (traffic since the last `--reset`). This
+    /// is the honest scope flag consumers key off — never inferred from the
+    /// presence of `since_reset` alone.
+    all_time: bool,
     /// The boundary date of the most recent `--reset`, when one exists.
+    /// Informational for consumers; drives the human-readable scope label.
     #[serde(skip_serializing_if = "Option::is_none")]
     since_reset: Option<String>,
+    /// `true` when a current-epoch (`all_time == false`) report uses
+    /// month/year bucketing while a reset epoch exists — those buckets can't
+    /// reach the archived epoch, so the renderer nudges toward `--all-time`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    cross_epoch_buckets_hidden: bool,
     /// Populated for `--history`.
     #[serde(skip_serializing_if = "Option::is_none")]
     history: Option<Vec<GainEvent>>,
@@ -221,9 +233,13 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &TokenGainArgs)
     if args.rebuild {
         let stats =
             rollup::rebuild(&gdir, &db).context("rebuilding rollups from the raw gain log")?;
+        // The post-rebuild summary is the all-time cumulative rollup (every
+        // epoch), so it's labeled all-time.
         let data = TokenGainData {
             pivot: pivot::query(&db, &PivotQuery::default()).context("querying rebuilt rollups")?,
+            all_time: true,
             since_reset: read_reset_marker(&gdir).map(|m| day_string(m.ts)),
+            cross_epoch_buckets_hidden: false,
             history: None,
             rebuilt_events: Some(stats.events_replayed),
             archived_to: None,
@@ -250,11 +266,20 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &TokenGainArgs)
         )?;
         // Rollups are the all-time cumulative view and are NEVER wiped by a
         // reset (design §5: "keep everything" · archived epochs remain
-        // queryable via `--rebuild`, which walks `gain/archive/**` too).
+        // queryable via `--all-time` / `--rebuild`, which walk
+        // `gain/archive/**` too). The reset RESPONSE, though, reports the
+        // fresh current-epoch window — which `archive_epoch` just emptied —
+        // so the pivot honestly reads zero, matching what "counting fresh"
+        // means. (The archive-confirmation render doesn't surface totals; the
+        // empty pivot is for `--json` consumers.)
+        let current = JsonlGainWriter::new(&gdir)
+            .read_all()
+            .context("reading fresh current window after reset")?;
         let data = TokenGainData {
-            pivot: pivot::query(&db, &PivotQuery::default())
-                .context("querying rollups after reset")?,
+            pivot: pivot::query_events(&current, &PivotQuery::default()),
+            all_time: false,
             since_reset: Some(day_string(ts)),
+            cross_epoch_buckets_hidden: false,
             history: None,
             rebuilt_events: None,
             archived_to: Some(archived_to.display().to_string()),
@@ -273,12 +298,16 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &TokenGainArgs)
             .read_all()
             .context("reading raw gain log")?;
         let events = tail(filter_since(events, args.since.as_deref()), HISTORY_LIMIT);
+        // `--history` tails the current-epoch raw log (excludes archived
+        // epochs), so it's a current-epoch view.
         let data = TokenGainData {
             pivot: PivotResult {
                 rows: Vec::new(),
                 totals: PivotTotals::default(),
             },
+            all_time: false,
             since_reset: read_reset_marker(&gdir).map(|m| day_string(m.ts)),
+            cross_epoch_buckets_hidden: false,
             history: Some(events),
             rebuilt_events: None,
             archived_to: None,
@@ -293,16 +322,41 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &TokenGainArgs)
     }
 
     // Default: summary (no axes) or `--by` pivot.
+    //
+    // Source selection is the R2-blocker fix. The bare default (no `--since`,
+    // no `--all-time`) reports the CURRENT epoch — traffic since the last
+    // `--reset` — by pivoting the non-archived raw log directly, so the
+    // baseline-comparison workflow (reset → run at X → read → reset → run at
+    // Y → read → compare) shows attributable per-epoch numbers instead of the
+    // unchanging all-time cumulative total. `--all-time` and `--since` both
+    // reach every epoch via the cumulative rollup.
     let (time, dim) = parse_by(args.by.as_deref())?;
     let query = PivotQuery {
         time,
         dim,
         since: args.since.clone(),
     };
-    let result = pivot::query(&db, &query).context("querying gain rollups")?;
+    let marker = read_reset_marker(&gdir);
+    let use_current_epoch = !args.all_time && args.since.is_none();
+    let result = if use_current_epoch {
+        let events = JsonlGainWriter::new(&gdir)
+            .read_all()
+            .context("reading current-epoch gain log")?;
+        pivot::query_events(&events, &query)
+    } else {
+        pivot::query(&db, &query).context("querying gain rollups")?
+    };
+    // month/year buckets on a current-epoch report can't span the archived
+    // epoch — flag it so the report never implies a cross-epoch bucket it
+    // didn't compute.
+    let cross_epoch_buckets_hidden = use_current_epoch
+        && marker.is_some()
+        && matches!(time, Some(TimeAxis::Month) | Some(TimeAxis::Year));
     let data = TokenGainData {
         pivot: result,
-        since_reset: read_reset_marker(&gdir).map(|m| day_string(m.ts)),
+        all_time: !use_current_epoch,
+        since_reset: marker.map(|m| day_string(m.ts)),
+        cross_epoch_buckets_hidden,
         history: None,
         rebuilt_events: None,
         archived_to: None,
@@ -438,8 +492,28 @@ fn render_text(env: &Envelope<TokenGainData>) -> String {
         s.push_str(&render_summary(&data.pivot.totals));
         s
     };
-    if let Some(since_reset) = &data.since_reset {
-        out.push_str(&format!("  (since reset: {since_reset})\n"));
+    // Honest scope label — never claim a scoping the number doesn't have.
+    match (&data.since_reset, data.all_time) {
+        // Current-epoch report and a reset happened → truly since-reset.
+        (Some(date), false) => {
+            out.push_str(&format!("  (scope: since reset {date})\n"));
+        }
+        // All-time report that spans a past reset → say so, and point at the
+        // current-epoch view.
+        (Some(date), true) => {
+            out.push_str(&format!(
+                "  (scope: all-time — includes traffic before the reset at {date}; \
+                 omit --all-time for the current epoch only)\n"
+            ));
+        }
+        // No reset ever: current-epoch == all traffic. Nothing to qualify.
+        (None, _) => {}
+    }
+    if data.cross_epoch_buckets_hidden {
+        out.push_str(
+            "  Note: month/year buckets cover the current epoch only; \
+             use --all-time to include archived epochs.\n",
+        );
     }
     out.push_str(ESTIMATE_NOTE);
     out.push('\n');
@@ -593,7 +667,9 @@ mod tests {
                     rows: Vec::new(),
                     totals: PivotTotals::default(),
                 },
+                all_time: false,
                 since_reset: None,
+                cross_epoch_buckets_hidden: false,
                 history: None,
                 rebuilt_events: None,
                 archived_to: None,
@@ -613,7 +689,9 @@ mod tests {
                     rows: Vec::new(),
                     totals: PivotTotals::default(),
                 },
+                all_time: false,
                 since_reset: None,
+                cross_epoch_buckets_hidden: false,
                 history: Some(vec![sample_event(1_783_728_000)]),
                 rebuilt_events: None,
                 archived_to: None,
@@ -634,7 +712,9 @@ mod tests {
                     rows: Vec::new(),
                     totals: PivotTotals::default(),
                 },
+                all_time: false,
                 since_reset: Some("2026-07-11".to_string()),
+                cross_epoch_buckets_hidden: false,
                 history: None,
                 rebuilt_events: None,
                 archived_to: Some("/vault/.cache/token/gain/archive/1-baseline".to_string()),
@@ -655,7 +735,9 @@ mod tests {
                     rows: Vec::new(),
                     totals: PivotTotals::default(),
                 },
+                all_time: true,
                 since_reset: None,
+                cross_epoch_buckets_hidden: false,
                 history: None,
                 rebuilt_events: Some(42),
                 archived_to: None,
@@ -663,6 +745,63 @@ mod tests {
         );
         let text = render_text(&env);
         assert!(text.contains("42"), "{text}");
+    }
+
+    /// Build a default-mode `TokenGainData` for scope-label assertions.
+    fn summary_data(all_time: bool, since_reset: Option<&str>) -> TokenGainData {
+        TokenGainData {
+            pivot: PivotResult {
+                rows: Vec::new(),
+                totals: PivotTotals::default(),
+            },
+            all_time,
+            since_reset: since_reset.map(str::to_string),
+            cross_epoch_buckets_hidden: false,
+            history: None,
+            rebuilt_events: None,
+            archived_to: None,
+        }
+    }
+
+    #[test]
+    fn render_text_current_epoch_with_reset_labels_since_reset() {
+        let env = Envelope::ok("token.gain", None, summary_data(false, Some("2026-07-11")));
+        let text = render_text(&env);
+        assert!(text.contains("scope: since reset 2026-07-11"), "{text}");
+        assert!(!text.contains("all-time"), "{text}");
+    }
+
+    #[test]
+    fn render_text_all_time_over_a_reset_labels_all_time_not_since_reset() {
+        // The honesty fix: an all-time number that spans a reset must NOT
+        // claim "since reset" — that was the lie the R2 review caught.
+        let env = Envelope::ok("token.gain", None, summary_data(true, Some("2026-07-11")));
+        let text = render_text(&env);
+        assert!(text.contains("scope: all-time"), "{text}");
+        assert!(
+            !text.contains("scope: since reset"),
+            "all-time report must never claim since-reset scoping:\n{text}"
+        );
+    }
+
+    #[test]
+    fn render_text_no_reset_ever_omits_scope_label() {
+        // No reset happened → current-epoch == all traffic; nothing to qualify.
+        let env = Envelope::ok("token.gain", None, summary_data(false, None));
+        let text = render_text(&env);
+        assert!(!text.contains("scope:"), "{text}");
+    }
+
+    #[test]
+    fn render_text_cross_epoch_bucket_note_appears_only_when_flagged() {
+        let mut data = summary_data(false, Some("2026-07-11"));
+        data.cross_epoch_buckets_hidden = true;
+        let env = Envelope::ok("token.gain", None, data);
+        let text = render_text(&env);
+        assert!(
+            text.contains("month/year buckets cover the current epoch only"),
+            "{text}"
+        );
     }
 
     #[test]

@@ -68,7 +68,10 @@ impl RollupValue {
     }
 }
 
-fn day_key(ts: i64) -> String {
+/// `YYYY-MM-DD` (UTC) for a unix timestamp — the daily rollup key's period
+/// segment. `pub(crate)` so [`super::pivot::query_events`] buckets raw
+/// events on the exact same day boundary the rollup does.
+pub(crate) fn day_key(ts: i64) -> String {
     let dt = DateTime::<Utc>::from_timestamp(ts, 0).unwrap_or_else(Utc::now);
     format!("{:04}-{:02}-{:02}", dt.year(), dt.month(), dt.day())
 }

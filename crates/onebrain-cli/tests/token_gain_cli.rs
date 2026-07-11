@@ -26,6 +26,125 @@ fn write_vault(dir: &Path) {
     .unwrap();
 }
 
+/// The current-window raw gain dir for the `t-token-gain` collection under a
+/// tempdir-redirected cache: `<cache>/search/<collection>/token/gain/`.
+fn gain_dir(cache: &Path) -> std::path::PathBuf {
+    cache
+        .join("search")
+        .join("t-token-gain")
+        .join("token")
+        .join("gain")
+}
+
+/// Append one synthetic `GainEvent` JSONL line to the current-window raw log
+/// (`<gain>/2026-07.jsonl`). Direct-write seeding stands in for the live
+/// funnel traffic that Track 4 will add — the reporting surface only cares
+/// that well-formed lines exist to read.
+fn seed_event(gdir: &Path, ts: i64, before: u64, after: u64) {
+    use std::io::Write;
+    std::fs::create_dir_all(gdir).unwrap();
+    let line = format!(
+        "{{\"ts\":{ts},\"surface\":\"cli_search\",\"transform\":\"whitespace\",\
+         \"level\":\"conservative\",\"bytes_before\":{before},\"bytes_after\":{after},\
+         \"cache\":\"none\",\"session_token\":null}}\n"
+    );
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(gdir.join("2026-07.jsonl"))
+        .unwrap();
+    f.write_all(line.as_bytes()).unwrap();
+}
+
+/// The core baseline-workflow guarantee (ADR 0030): after a `--reset`, the
+/// default `token gain` read must reflect ONLY post-reset traffic, while
+/// `--all-time` still reaches everything (incl. the archived pre-reset
+/// epoch). This is the regression the R2 review caught — the default read
+/// used to pivot the full cumulative rollup and return the same all-time
+/// total after a reset, decorated with a "(since reset)" label that lied
+/// about a scoping that never happened.
+#[test]
+fn token_gain_default_after_reset_shows_only_post_reset_traffic() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write_vault(vault.path());
+    let gdir = gain_dir(cache.path());
+
+    // Pre-reset traffic: 2 events on 2026-07-11.
+    seed_event(&gdir, 1_783_728_000, 1000, 400);
+    seed_event(&gdir, 1_783_728_060, 1000, 400);
+
+    // Reset → archives the 2 pre-reset events out of the current window.
+    let reset = onebrain(vault.path(), cache.path())
+        .args(["token", "gain", "--reset", "--label", "off", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        reset.status.success(),
+        "reset stderr: {}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+
+    // Post-reset traffic: 3 events on 2026-07-13 (fresh current window).
+    seed_event(&gdir, 1_783_900_800, 500, 100);
+    seed_event(&gdir, 1_783_900_860, 500, 100);
+    seed_event(&gdir, 1_783_900_920, 500, 100);
+
+    // Populate the cumulative rollup from ALL epochs (archived + current) —
+    // this is the all-time state live traffic would maintain, and the exact
+    // state that made the buggy default read return 5 instead of 3.
+    let rebuild = onebrain(vault.path(), cache.path())
+        .args(["token", "gain", "--rebuild", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        rebuild.status.success(),
+        "rebuild stderr: {}",
+        String::from_utf8_lossy(&rebuild.stderr)
+    );
+    let rv: serde_json::Value = serde_json::from_slice(&rebuild.stdout).unwrap();
+    assert_eq!(
+        rv["data"]["rebuilt_events"], 5,
+        "rebuild must see all 5 events across both epochs"
+    );
+
+    // DEFAULT read: must reflect ONLY the 3 post-reset events.
+    let default = onebrain(vault.path(), cache.path())
+        .args(["token", "gain", "--json"])
+        .output()
+        .unwrap();
+    assert!(default.status.success());
+    let dv: serde_json::Value = serde_json::from_slice(&default.stdout).unwrap();
+    assert_eq!(
+        dv["data"]["totals"]["count"], 3,
+        "default read after --reset must be scoped to the post-reset window (3), \
+         not the all-time cumulative total (5). data: {}",
+        dv["data"]
+    );
+    assert_eq!(dv["data"]["all_time"], false);
+    assert!(
+        dv["data"]["since_reset"].is_string(),
+        "since_reset marker date must be present in default post-reset read"
+    );
+
+    // --all-time read: must reflect BOTH epochs (5).
+    let all = onebrain(vault.path(), cache.path())
+        .args(["token", "gain", "--all-time", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        all.status.success(),
+        "all-time stderr: {}",
+        String::from_utf8_lossy(&all.stderr)
+    );
+    let av: serde_json::Value = serde_json::from_slice(&all.stdout).unwrap();
+    assert_eq!(
+        av["data"]["totals"]["count"], 5,
+        "--all-time must include the archived pre-reset epoch (5)"
+    );
+    assert_eq!(av["data"]["all_time"], true);
+}
+
 #[test]
 fn token_gain_help_lists_the_verb() {
     let out = Command::new(env!("CARGO_BIN_EXE_onebrain"))

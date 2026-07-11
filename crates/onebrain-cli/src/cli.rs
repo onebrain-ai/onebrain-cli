@@ -1453,7 +1453,14 @@ pub struct TokenGainArgs {
     /// entirely for a single grand-total summary.
     #[arg(long = "by", value_name = "AXES")]
     pub by: Option<String>,
-    /// Inclusive lower bound on the window, `YYYY-MM-DD`. Omit for all-time.
+    /// Report all-time cumulative traffic across every epoch (including
+    /// archived pre-`--reset` windows). Without this, and without `--since`,
+    /// the default report is scoped to the current epoch — traffic since the
+    /// last `--reset` (or all-time when no reset has happened).
+    #[arg(long = "all-time", default_value_t = false)]
+    pub all_time: bool,
+    /// Inclusive lower bound on the window, `YYYY-MM-DD`. Queries all epochs
+    /// (like `--all-time`) filtered to on-or-after this date.
     #[arg(long = "since", value_name = "DATE")]
     pub since: Option<String>,
     /// Show the recent per-call raw log (tails the JSONL) instead of a
