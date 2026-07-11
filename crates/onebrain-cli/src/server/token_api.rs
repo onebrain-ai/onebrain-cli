@@ -488,6 +488,93 @@ mod tests {
         assert!(v.get("reference").is_none());
     }
 
+    /// Drive a `mode:"lex"` reindex through the held engine (no model load) so
+    /// a real doc becomes indexed — the seam MAJOR 4 needs to exercise the
+    /// non-`unknown_doc` verdict branches over HTTP.
+    async fn lex_reindex(router: &axum::Router) {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::post("/api/internal/reindex")
+                    .header("x-onebrain-token", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"lex"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "lex reindex should succeed");
+    }
+
+    async fn ledger_check(router: &axum::Router, body: &str) -> serde_json::Value {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::post("/api/token/ledger/check")
+                    .header("x-onebrain-token", TOKEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// MAJOR 4: end-to-end route coverage of the verdict path on an INDEXED
+    /// doc — first_send (record) → unchanged (+ reference envelope) → edit →
+    /// changed. Catches a serde-rename typo or a swapped current/sent hash that
+    /// the `unknown_doc`-only tests never touch. Uses lex-only indexing so no
+    /// embedding model is loaded.
+    #[tokio::test]
+    async fn ledger_check_verdict_path_first_send_unchanged_changed() {
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        std::fs::write(vault.path().join("a.md"), "# A\noriginal body text").unwrap();
+        let router = router_holding_cache(vault.path());
+
+        // Index a.md (lex-only) so the engine's doc_hash resolves.
+        lex_reindex(&router).await;
+
+        // 1) First send, with record:true → verdict first_send, hash recorded.
+        let v = ledger_check(
+            &router,
+            r#"{"path":"a.md","session_token":"sess-1","record":true}"#,
+        )
+        .await;
+        assert_eq!(v["verdict"], "first_send");
+        assert!(v.get("reference").is_none(), "no reference on first_send");
+
+        // 2) Repeat send of unchanged content → unchanged + reference envelope.
+        let v = ledger_check(&router, r#"{"path":"a.md","session_token":"sess-1"}"#).await;
+        assert_eq!(v["verdict"], "unchanged");
+        let r = &v["reference"];
+        assert_eq!(r["doc_path"], "a.md");
+        assert_eq!(r["sent_earlier"], true);
+        assert_eq!(r["rematerialize"], "onebrain search get a.md --force");
+        assert!(r["hash"].as_str().is_some_and(|h| !h.is_empty()));
+        assert!(
+            r["bytes_saved"].as_u64().unwrap() > 0,
+            "a real indexed body credits non-zero bytes_saved"
+        );
+
+        // 3) Edit the doc + re-index → hash changes → verdict changed.
+        std::fs::write(
+            vault.path().join("a.md"),
+            "# A\nEDITED body, different bytes",
+        )
+        .unwrap();
+        lex_reindex(&router).await;
+        let v = ledger_check(&router, r#"{"path":"a.md","session_token":"sess-1"}"#).await;
+        assert_eq!(
+            v["verdict"], "changed",
+            "an edited doc (new hash) must read as changed, not unchanged"
+        );
+        assert!(v.get("reference").is_none(), "no reference on changed");
+    }
+
     #[tokio::test]
     async fn ledger_check_unknown_doc_when_not_indexed() {
         // A real session token but a path the engine has never indexed:

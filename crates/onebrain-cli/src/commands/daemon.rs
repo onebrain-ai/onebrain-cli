@@ -1255,19 +1255,42 @@ fn addr_from(port: u16) -> std::net::SocketAddr {
 /// slack on a 30-minute TTL is irrelevant). Reading an atomic + comparing to now
 /// avoids any per-request timer churn.
 async fn idle_shutdown(state: std::sync::Arc<crate::server::AppState>, idle_secs: u64) {
-    if idle_secs == 0 {
-        std::future::pending::<()>().await;
-        return;
-    }
     use std::sync::atomic::Ordering;
     let poll = std::time::Duration::from_secs(60);
     loop {
         tokio::time::sleep(poll).await;
-        let last = state.last_activity.load(Ordering::Relaxed);
-        let now = crate::server::now_epoch_secs();
-        if should_idle_shutdown(last, now, idle_secs) {
-            return;
+        // Maintenance (MAJOR 3): the ledger's bounded prune runs HERE, on the
+        // daemon's existing periodic loop, so the per-write path can stay a
+        // throttled O(1) insert instead of an O(n) scan per delivery. Runs
+        // every tick regardless of `idle_secs` (a never-idle daemon still needs
+        // its ledger pruned).
+        run_ledger_gc(&state);
+
+        // Idle-shutdown check. `idle_secs == 0` disables shutdown (the daemon
+        // runs until SIGTERM) but the maintenance sweep above still runs.
+        if idle_secs != 0 {
+            let last = state.last_activity.load(Ordering::Relaxed);
+            let now = crate::server::now_epoch_secs();
+            if should_idle_shutdown(last, now, idle_secs) {
+                return;
+            }
         }
+    }
+}
+
+/// Prune ledger entries older than the TTL from the daemon-held token cache
+/// (MAJOR 3). Best-effort: a GC error is logged and swallowed — a failed prune
+/// must never take the daemon down or block the idle-shutdown check. No-op when
+/// the daemon holds no token cache.
+fn run_ledger_gc(state: &crate::server::AppState) {
+    let Some(cache) = state.token_cache.as_ref() else {
+        return;
+    };
+    let now = crate::server::now_epoch_secs() as i64;
+    match cache.ledger().gc(now) {
+        Ok(n) if n > 0 => tracing::debug!(pruned = n, "ledger GC pruned stale entries"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "ledger GC pass failed (non-fatal)"),
     }
 }
 

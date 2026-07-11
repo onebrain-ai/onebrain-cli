@@ -22,7 +22,9 @@ use redb::Database;
 pub mod ledger;
 pub mod memo;
 
-pub use ledger::{Ledger, LedgerEntry, LedgerVerdict, DEFAULT_LEDGER_TTL_SECS};
+pub use ledger::{
+    Ledger, LedgerEntry, LedgerVerdict, DEFAULT_LEDGER_TTL_SECS, GC_MIN_INTERVAL_SECS,
+};
 pub use memo::{Memo, MemoKey};
 
 /// Error surface for the redb-backed cache layers. Wraps redb's per-stage

@@ -64,6 +64,15 @@ const LAST_INDEXED_KEY: &str = "last_indexed_at";
 /// constantly-firing PostToolUse lex-only reindex hook changes lex results
 /// without ever embedding.
 const GENERATION_KEY: &str = "generation";
+/// Stable per-index-instance nonce (design §3a). Written ONCE when a fresh
+/// `engine.redb` is created and NEVER reset by a reindex — only a brand-new
+/// index (the `reindex --force` / cache-split-migration / `rm index/` wipe of
+/// `engine.redb`, which drops this whole header) gets a new one. The memo
+/// cache folds it into every key alongside [`GENERATION_KEY`] so a rebuilt
+/// index — whose `generation` restarts at 0→1 and would otherwise COLLIDE with
+/// stale memo entries written under the old index's generation 1 — instead
+/// lands in a fresh key space and can never serve a pre-rebuild hit.
+const INDEX_NONCE_KEY: &str = "index_nonce";
 
 const CHUNK_MAX_TOKENS: usize = 512;
 const CHUNK_OVERLAP_TOKENS: usize = 64;
@@ -706,6 +715,15 @@ impl Engine {
                 let mut header = write_txn.open_table(ENGINE_HEADER)?;
                 if header.get(ACTIVE_MODEL_KEY)?.is_none() {
                     header.insert(ACTIVE_MODEL_KEY, embed_model)?;
+                }
+                // Mint the index-instance nonce exactly once, when this
+                // `engine.redb` is first created (or after a `--force`/wipe
+                // dropped the header). Present ⟹ same index instance ⟹ keep it
+                // stable across every reopen and reindex; absent ⟹ fresh index
+                // ⟹ a new nonce so the memo cache can't reuse a prior instance's
+                // key space (design §3a / MAJOR 2).
+                if header.get(INDEX_NONCE_KEY)?.is_none() {
+                    header.insert(INDEX_NONCE_KEY, fresh_index_nonce().as_str())?;
                 }
             }
             write_txn.commit()?;
@@ -1682,10 +1700,20 @@ impl Engine {
     /// The single choke-point (design §3a / §8 risk row) that bumps the
     /// [`GENERATION_KEY`] counter by one, in ONE atomic write txn. Every
     /// reindex mode calls exactly this — full and lex-only — so no reindex
-    /// path can forget to invalidate the memo cache. Because the read+write
-    /// live in one committed transaction, a crash before commit leaves the
-    /// counter untouched (no half-bump); a crash after leaves the index and
-    /// the counter consistently advanced together.
+    /// path can forget to invalidate the memo cache.
+    ///
+    /// **Crash safety (MAJOR 1).** The counter lives in `engine.redb` (`meta`)
+    /// while the actual index content lives in tantivy + the vector store —
+    /// SEPARATE durable stores that are NOT committed together, so a crash
+    /// mid-reindex can leave them at different points. To make that safe the
+    /// callers bump BEFORE mutating the index (and again after — see the
+    /// reindex bodies): a crash then leaves `generation` already advanced while
+    /// the index is old/partial, so a memo key built with the new generation
+    /// MISSES and the result is recomputed. The reverse ordering (bump last)
+    /// would leave `generation` old against a new index — a stale hit, the one
+    /// outcome the memo layer must make impossible. Over-invalidating (a bump
+    /// with no matching index change) is always safe: it only costs a cache
+    /// miss.
     fn bump_generation(&mut self) -> Result<()> {
         let write_txn = self.meta.begin_write()?;
         {
@@ -1717,6 +1745,25 @@ impl Engine {
                 .unwrap_or(0))
         })()
         .unwrap_or(0)
+    }
+
+    /// The stable per-index-instance nonce (design §3a / MAJOR 2). Constant for
+    /// the life of one `engine.redb`; changes only when the index is created
+    /// fresh (a `--force`/wipe/`rm index/` that drops the header). The memo
+    /// cache folds this into every key alongside [`Engine::generation`] so a
+    /// rebuilt index — whose `generation` restarts at 0→1 and would collide
+    /// with stale entries stored under the old instance's generation 1 — gets a
+    /// disjoint key space instead. Empty string only if the header can't be
+    /// read (treated as "unknown instance" — a memo miss, never a false hit).
+    pub fn index_nonce(&self) -> String {
+        (|| -> Result<Option<String>> {
+            let read_txn = self.meta.begin_read()?;
+            let header = read_txn.open_table(ENGINE_HEADER)?;
+            Ok(header.get(INDEX_NONCE_KEY)?.map(|v| v.value().to_string()))
+        })()
+        .ok()
+        .flatten()
+        .unwrap_or_default()
     }
 
     /// Public content-hash accessor for `doc_path` (design §3b) — the
@@ -1904,6 +1951,11 @@ impl Engine {
     ) -> Result<ReindexStats> {
         let total = doc_paths.len();
         progress(ReindexProgress::Walked { total });
+        // MAJOR 1 (crash safety): bump BEFORE any index mutation. A crash
+        // mid-loop then leaves generation advanced against an old/partial
+        // index → a new-gen memo key misses → safe recompute. See
+        // [`Engine::bump_generation`].
+        self.bump_generation()?;
         let mut model_announced = false;
         let mut stats = ReindexStats::default();
         for (i, doc_path) in doc_paths.iter().enumerate() {
@@ -1955,8 +2007,10 @@ impl Engine {
         if mode == IndexMode::Full {
             self.record_last_indexed(now_epoch_secs())?;
         }
-        // The generation counter DOES bump on every mode (design §3a) — a
-        // lex-only reindex changes results the memo cache must invalidate.
+        // Second bump AFTER the index is fully updated: closes the
+        // concurrent-query-during-reindex gap — a search that ran mid-reindex
+        // and memoized against the partially-updated index (under the
+        // pre-loop generation) is invalidated here. Over-invalidation is safe.
         self.bump_generation()?;
         Ok(stats)
     }
@@ -2034,6 +2088,9 @@ impl Engine {
 
         let total = doc_paths.len();
         progress(ReindexProgress::Walked { total });
+        // MAJOR 1 (crash safety): bump BEFORE any index mutation — see the
+        // paths-inner counterpart and [`Engine::bump_generation`].
+        self.bump_generation()?;
         let mut model_announced = false;
         let mut stats = ReindexStats::default();
         for (i, (doc_path, abs_path)) in doc_paths.iter().zip(files.iter()).enumerate() {
@@ -2087,11 +2144,12 @@ impl Engine {
             stats.removed += 1;
         }
 
-        // The generation counter bumps on every mode (design §3a): even a
-        // lex-only reindex (the constantly-firing PostToolUse hook) changes
-        // lex results and must invalidate the memo cache. Bump BEFORE the
-        // full-only reranker fetch below so an early return on a fetch error
-        // can't skip it.
+        // Second bump AFTER the index is fully updated (post-loop, post-sweep):
+        // closes the concurrent-query-during-reindex gap (a search that
+        // memoized against the partial index under the pre-loop generation is
+        // invalidated here). Placed BEFORE the full-only reranker fetch below so
+        // an early return on a fetch error can't skip it. Over-invalidation is
+        // safe (a cache miss, never a stale hit).
         self.bump_generation()?;
 
         // Lex-only runs never touch `last_indexed_at`: see this function's
@@ -2249,6 +2307,22 @@ fn now_epoch_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Mint a fresh index-instance nonce ([`INDEX_NONCE_KEY`]). Combines
+/// wall-clock nanoseconds with a process-wide monotonic counter so that two
+/// index recreations — even back-to-back within the same nanosecond in a
+/// test — never collide: the counter disambiguates within a process, the
+/// nanos across process restarts.
+fn fresh_index_nonce() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}-{seq:x}")
 }
 
 #[cfg(test)]
@@ -4639,14 +4713,18 @@ mod tests {
         let mut e = fake_engine(cache_dir.path());
         std::fs::write(vault_dir.path().join("a.md"), "# A\nbody").unwrap();
 
+        // Each reindex bumps twice — once BEFORE the index loop (crash safety,
+        // MAJOR 1) and once AFTER (concurrent-query gap) — so we assert strict
+        // monotonic increase rather than an exact +1, which is all the memo
+        // cache relies on (that the counter CHANGES across a reindex).
         assert_eq!(e.generation(), 0);
         e.reindex_all(vault_dir.path()).unwrap();
-        assert_eq!(e.generation(), 1, "full reindex must bump generation");
+        let g1 = e.generation();
+        assert!(g1 > 0, "full reindex must advance generation, got {g1}");
         e.reindex_all(vault_dir.path()).unwrap();
-        assert_eq!(
-            e.generation(),
-            2,
-            "a second full reindex bumps again (even all-unchanged)"
+        assert!(
+            e.generation() > g1,
+            "a second full reindex advances again (even all-unchanged)"
         );
     }
 
@@ -4666,10 +4744,10 @@ mod tests {
         assert_eq!(e.generation(), 0);
         e.reindex_all_lex_only_with_progress(vault_dir.path(), &mut |_| {})
             .unwrap();
-        assert_eq!(
-            e.generation(),
-            1,
-            "lex-only reindex MUST bump generation (PostToolUse hook path)"
+        let g1 = e.generation();
+        assert!(
+            g1 > 0,
+            "lex-only reindex MUST advance generation (PostToolUse hook path), got {g1}"
         );
 
         // And `last_indexed_at` did NOT move — proving generation is a
@@ -4680,12 +4758,54 @@ mod tests {
             "lex-only must not record last_indexed_at (only generation moved)"
         );
 
-        // A second lex-only pass over an unchanged vault still bumps: the
+        // A second lex-only pass over an unchanged vault still advances: the
         // counter is a coarse "something ran" signal, and over-invalidating
         // the memo cache is safe (a miss), under-invalidating is not.
         e.reindex_all_lex_only_with_progress(vault_dir.path(), &mut |_| {})
             .unwrap();
-        assert_eq!(e.generation(), 2);
+        assert!(e.generation() > g1);
+    }
+
+    /// MAJOR 1 crash-safety ordering: generation must be bumped BEFORE the
+    /// index-mutation loop, so a reindex that ERRORS partway still leaves the
+    /// counter advanced (new-gen memo key → miss → recompute), never old
+    /// against a mutated index. Forces the paths-reindex to error via an
+    /// unreadable in-vault file (`std::fs::read` → permission denied →
+    /// propagates through the `?` in the paths loop). If the bump were AFTER
+    /// the loop the early return would skip it and generation would stay put.
+    #[test]
+    #[cfg(unix)]
+    fn generation_bumps_before_index_loop_even_when_reindex_errors() {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        // chmod 0o000 is a no-op for root, so the read wouldn't fail — skip.
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+
+        let doc = vault_dir.path().join("locked.md");
+        std::fs::write(&doc, "# Locked\nbody").unwrap();
+        std::fs::set_permissions(&doc, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let before = e.generation();
+        // The read of the unreadable file fails and propagates via `?`, so the
+        // whole reindex returns Err BEFORE reaching any post-loop bump.
+        let result = e.reindex_paths(vault_dir.path(), &["locked.md".to_string()]);
+        assert!(result.is_err(), "reindex of an unreadable file must error");
+        assert!(
+            e.generation() > before,
+            "generation must be bumped before the index loop — so it advances \
+             even when the reindex errors out (got {} <= {before})",
+            e.generation()
+        );
+
+        // Restore perms so tempdir cleanup can remove the file.
+        std::fs::set_permissions(&doc, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     #[test]
@@ -4693,17 +4813,52 @@ mod tests {
         let cache_dir = tempfile::tempdir().unwrap();
         let vault_dir = tempfile::tempdir().unwrap();
         std::fs::write(vault_dir.path().join("a.md"), "# A\nbody").unwrap();
+        let after_reindex;
         {
             let mut e = fake_engine(cache_dir.path());
             e.reindex_all(vault_dir.path()).unwrap();
-            assert_eq!(e.generation(), 1);
+            after_reindex = e.generation();
+            assert!(after_reindex > 0);
         } // drop releases the redb lock
         let e = fake_engine(cache_dir.path());
         assert_eq!(
             e.generation(),
-            1,
-            "generation is durable — survives an engine reopen"
+            after_reindex,
+            "generation is durable — survives an engine reopen unchanged"
         );
+    }
+
+    // ---- MAJOR 2: index-instance nonce ----
+
+    #[test]
+    fn index_nonce_is_set_at_creation_and_stable_across_reopen_and_reindex() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nbody").unwrap();
+
+        let nonce = {
+            let e = fake_engine(cache_dir.path());
+            let n = e.index_nonce();
+            assert!(!n.is_empty(), "a fresh index has a nonce");
+            n
+        };
+        // Reopen + reindex must NOT change the nonce — same index instance.
+        let mut e = fake_engine(cache_dir.path());
+        assert_eq!(e.index_nonce(), nonce, "nonce stable across reopen");
+        e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(e.index_nonce(), nonce, "reindex must not reset the nonce");
+    }
+
+    #[test]
+    fn a_freshly_created_index_gets_a_different_nonce() {
+        // Two independent fresh indexes (stand-in for a rebuild that dropped
+        // and recreated engine.redb) must get distinct nonces, so their memo
+        // key spaces can never overlap.
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let na = fake_engine(a.path()).index_nonce();
+        let nb = fake_engine(b.path()).index_nonce();
+        assert_ne!(na, nb, "distinct index instances must have distinct nonces");
     }
 
     #[test]
