@@ -1,6 +1,6 @@
 ---
-latest_version: 3.4.8
-released: 2026-07-10
+latest_version: 3.4.9
+released: 2026-07-11
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,16 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.9] — 2026-07-11 — Cache layout split + field fixes
+
+- **Breaking:** pinned `ONEBRAIN_TOKEN` must be ≥32 chars in `[A-Za-z0-9_-]`; violations abort serve/daemon startup (was warn-and-generate) — closes a Windows command-injection path ([#218](https://github.com/onebrain-ai/onebrain-cli/issues/218))
+- `serve --open` now works on Windows via quoted `cmd /C start` ([#218](https://github.com/onebrain-ai/onebrain-cli/issues/218))
+- Collection cache split into `models/` + `index/` with eager auto-migration (never re-downloads models); `search status` reports split sizes + layout state ([#225](https://github.com/onebrain-ai/onebrain-cli/issues/225))
+- Fresh `onebrain.yml` emits `search.exclude` (attachments + archive); `doctor --fix` backfills existing vaults ([#220](https://github.com/onebrain-ai/onebrain-cli/issues/220))
+- `session init --json` gains `recap_pending` (unrecapped session-log count) ([#219](https://github.com/onebrain-ai/onebrain-cli/issues/219))
+- doctor detects legacy qmd installs with guided cleanup — destructive actions require interactive confirmation, never run headless ([#221](https://github.com/onebrain-ai/onebrain-cli/issues/221))
+- Compile-time guard for `SYSTEM_SECTION`/`SECTIONS` drift ([#213](https://github.com/onebrain-ai/onebrain-cli/issues/213))
 
 ## [3.4.8] — 2026-07-10 — CLI-UX polish + self-documenting config
 
