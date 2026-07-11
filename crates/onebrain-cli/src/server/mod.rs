@@ -50,6 +50,7 @@ mod internal;
 mod search;
 mod r#static;
 mod token;
+mod token_api;
 mod translate;
 mod webview;
 
@@ -167,6 +168,15 @@ pub struct AppState {
     /// supplies `Some` so it is the sole redb owner and mcp/CLI clients route
     /// through it.
     pub search_engine: Option<SharedEngine>,
+    /// The `token.redb` cache (memoization + already-sent ledger, Track 3),
+    /// opened ONCE at daemon boot alongside [`AppState::search_engine`] and
+    /// held for the process lifetime — the daemon is the sole owner (design
+    /// §1). `None` when no engine is held (foreground `serve` / unit-test
+    /// router) or when the vault has no resolvable collection cache yet; the
+    /// `/api/token/*` routes then report the cache as unavailable rather than
+    /// racing a second opener. One shared handle is concurrency-safe: redb
+    /// serves concurrent readers + a single writer on one `Database`.
+    pub token_cache: Option<Arc<onebrain_token::TokenCache>>,
     /// Monotonic-ish "last request seen" marker: epoch-seconds of the most
     /// recent authenticated request, bumped by the auth middleware on every
     /// request that reaches the surface. The daemon's idle-shutdown loop reads
@@ -189,6 +199,7 @@ impl std::fmt::Debug for AppState {
             // Token elided — never print the auth credential, even in Debug.
             .field("dist_dir", &self.dist_dir)
             .field("search_engine_held", &self.search_engine.is_some())
+            .field("token_cache_held", &self.token_cache.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -245,11 +256,24 @@ pub fn build_router_with_state(cfg: ServeConfig) -> (Router, Arc<AppState>) {
         None
     };
 
+    // Open the token cache alongside the engine, under the same `hold_engine`
+    // guard so only the warm daemon owns `token.redb`. A failure to open
+    // (never-indexed vault, no collection) leaves it `None` and the token
+    // routes degrade gracefully — they never fall back to a per-request open.
+    let token_cache = if cfg.hold_engine {
+        cfg.vault_root
+            .as_deref()
+            .and_then(token_api::open_held_token_cache)
+    } else {
+        None
+    };
+
     let state = Arc::new(AppState {
         vault_root: cfg.vault_root,
         token: cfg.token,
         dist_dir: cfg.dist_dir,
         search_engine,
+        token_cache,
         last_activity: Arc::new(std::sync::atomic::AtomicU64::new(now_epoch_secs())),
         chat_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CHATS)),
     });
@@ -257,7 +281,9 @@ pub fn build_router_with_state(cfg: ServeConfig) -> (Router, Arc<AppState>) {
     // The API sub-router stays a `Router<Arc<AppState>>` (no own `.with_state`);
     // the single `.with_state(state)` at the bottom supplies state to the whole
     // tree — nested API routes AND the static fallback — exactly once.
-    let api = api::router().merge(internal::router());
+    let api = api::router()
+        .merge(internal::router())
+        .merge(token_api::router());
 
     // DoS hardening note (fix L, deferred): a `tower_http::timeout::TimeoutLayer`
     // here would cap slow/stuck requests cheaply. It needs tower-http's `timeout`

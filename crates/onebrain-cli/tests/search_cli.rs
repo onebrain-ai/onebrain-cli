@@ -1439,6 +1439,15 @@ fn pending_only_with_nothing_pending_skips_fast() {
 /// Task 4: without `ONEBRAIN_EMBED_FOREGROUND`, a gate-passing `--pending-only
 /// --json` run must detach a background child and return immediately with
 /// `detached: true` — never blocking the calling turn on model load / embed.
+///
+/// The `< 5s` bound is also the Windows regression guard for the detached
+/// spawn: on Windows a child inherits the parent's stdout pipe by default, so
+/// `Command::output()` here would block until the CHILD (re-exec + engine open)
+/// exits, not just the parent — `spawn_detached_pending_embed` clears
+/// `HANDLE_FLAG_INHERIT` on the parent's std handles to prevent that. The
+/// foreground opens NO engine and does NO redb write before detaching (the
+/// generation bump runs only inside the detached child's reindex), so this
+/// bound holds regardless of how slow the child's embed is.
 #[cfg(feature = "semantic")]
 #[test]
 fn pending_only_json_detaches() {
