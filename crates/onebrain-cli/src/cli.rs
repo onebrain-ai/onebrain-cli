@@ -1460,8 +1460,9 @@ pub struct TokenCmd {
 pub enum TokenVerb {
     /// Report token-optimization savings — summary, `--by` pivot, or `--history`.
     Gain(TokenGainArgs),
-    /// Gate a repeat vault-doc read for the PreToolUse read-hook (design
-    /// §5b). Exit 0 = allow (stdout empty). Exit 2 = deny — the already-sent
+    /// Gate a repeat vault-doc read for the PreToolUse read-hook (design §5b).
+    ///
+    /// Exit 0 = allow (stdout empty). Exit 2 = deny — the already-sent
     /// reference envelope JSON is on stdout. Fails open (exit 0) on any
     /// error, timeout, missing daemon, or unresolvable session — a read is
     /// NEVER blocked by infrastructure trouble.
