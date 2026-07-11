@@ -1068,6 +1068,7 @@ mod tests {
             checkpoint: Default::default(),
             folders: Default::default(),
             search: Default::default(),
+            stats: Default::default(),
         };
         let r = reranker_status_fields(&config, cache.path());
         assert_eq!(r.model, "onebrain-rerank-v1");
@@ -1090,6 +1091,7 @@ mod tests {
             checkpoint: Default::default(),
             folders: Default::default(),
             search: Default::default(), // reranker.enabled defaults true
+            stats: Default::default(),
         };
         let r = reranker_status_fields(&config, cache.path());
         assert_eq!(r.model, info.name);
@@ -1116,6 +1118,7 @@ mod tests {
             checkpoint: Default::default(),
             folders: Default::default(),
             search: Default::default(),
+            stats: Default::default(),
         };
         config.search.reranker.enabled = false;
         let r = reranker_status_fields(&config, cache.path());

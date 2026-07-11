@@ -6,7 +6,7 @@ v3.1 locks a singular-noun, two-level grammar — `onebrain <noun> <verb>` — s
 onebrain
 ├── init                       create / re-scaffold a vault (--yes · --force · --no-sync)
 ├── update                     self-update the binary (--check · --plan)
-├── doctor [--fix]             12 health checks (text folds the 2 migration checks into 1 row) + auto-repair recipes
+├── doctor [--fix]             13 health checks (text folds the 2 migration checks into 1 row) + auto-repair recipes
 ├── serve                      local web UI + vault JSON API (--port · --open)
 ├── mcp                        MCP stdio server — vault search tools (--vault)
 │
@@ -32,7 +32,7 @@ onebrain
 | **Notes** | `note read · list · find · search · stat · new · append · edit · move · mkdir · archive · delete · orphans · backlinks` | Structured vault-note operations — wikilink-aware moves, dated archiving, orphan/backlink graph queries. |
 | **Tasks** | `task list` | List dated vault tasks (fence-aware), filterable by due date and folder. |
 | **Web UI** | `serve` | Host the binary-embedded web UI + token-gated vault JSON API on `127.0.0.1:6789` — file explorer, reading view, search panel, agent chat; `--open` launches the browser. See [`serve.md`](serve.md). |
-| **Maintenance** | `doctor [--fix]`, `plugin update · migrate`, `schedule register` | Twelve read-only checks + `--fix` recipes (incl. per-key config-value validation with comment-preserving reset-to-default), self-update the binary + rewrite hooks + rebind launchd plists, compile the `onebrain.yml schedule:` block into OS scheduler artifacts. |
+| **Maintenance** | `doctor [--fix]`, `plugin update · migrate`, `schedule register` | Thirteen read-only checks + `--fix` recipes (incl. per-key config-value validation with comment-preserving reset-to-default), self-update the binary + rewrite hooks + rebind launchd plists, compile the `onebrain.yml schedule:` block into OS scheduler artifacts. |
 | **Diagnostics** | `vault current`, `harness detect` | Report which mechanism resolved the active vault, and which AI harness is running. |
 
 > The tree shape is **locked for v3.2+** — 200+ verbs beyond the working set above are stubbed with a stable `E_NOT_IMPLEMENTED` (exit 72) so the grammar can't drift while features land. Hidden v3.0 flat aliases (`session-init`, `qmd-reindex`, `register-hooks`, …) still dispatch, printing a one-time migration notice (silence with `ONEBRAIN_QUIET_MIGRATION=1`); they're removed no earlier than v4.

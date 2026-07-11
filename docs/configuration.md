@@ -94,7 +94,7 @@ a completeness test enforces this against the config structs.
 | `recap.min_sessions` | Unrecapped session logs required before `/recap` runs (plugin key) | `6` | integer ≥ 1 | not validated (plugin-level) |
 | `recap.min_frequency` | Sessions a topic must recur in to be promoted to memory (plugin key) | `2` | integer ≥ 1 | not validated (plugin-level) |
 | `schedule` | Scheduled skill/command entries compiled by `onebrain schedule register` | *(none)* | see `schedule register` docs | not validated |
-| `stats.*` | Doctor run timestamps, stamped by `onebrain doctor` | — | managed automatically | — |
+| `stats.*` | Doctor run timestamps, stamped by `onebrain doctor`, plus `qmd_cleanup_declined`, a flag written by `doctor --fix` when the user declines legacy-qmd cleanup | — | managed automatically | — |
 
 Validation sources: the defaults above are the Rust runtime's own default
 fns (`onebrain-core`), the embedding/reranker model registries
