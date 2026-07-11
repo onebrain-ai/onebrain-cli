@@ -1,4 +1,5 @@
 use crate::{find_config_file, CoreError, Result, VaultRoot, CONFIG_FILENAME};
+use onebrain_token::OptLevel;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -21,6 +22,11 @@ pub struct VaultConfig {
     #[serde(default)]
     pub search: SearchConfig,
 
+    /// Token-optimization ladder + cache + read-hook config (v3.4.10).
+    /// Defaults supplied by `TokenOptimizationConfig::default`.
+    #[serde(default)]
+    pub token_optimization: TokenOptimizationConfig,
+
     /// Doctor-managed housekeeping flags parsed from the config's `stats:`
     /// block. `last_doctor_run` / `last_doctor_fix` are NOT modeled here —
     /// they're pure timestamps written by a specialized comment-preserving
@@ -30,6 +36,114 @@ pub struct VaultConfig {
     /// field. Defaults supplied by `VaultStats::default`.
     #[serde(default)]
     pub stats: VaultStats,
+}
+
+/// Token-optimization config parsed from the config's `token_optimization:`
+/// block (v3.4.10 design §5). `level` reuses `onebrain_token::OptLevel`
+/// directly — its `Serialize`/`Deserialize` route through `Display`/`FromStr`
+/// (`off|conservative|balanced|aggressive`), so the wire format here and the
+/// `--opt-level` CLI flag can never drift from each other.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenOptimizationConfig {
+    /// Optimization ladder rung. Default `conservative` — the ladder's own
+    /// documented default rung (level 1); distinct from `OptLevel::default()`
+    /// (`off`), which is the crate-internal "no level resolved" safety value.
+    #[serde(default = "default_token_level")]
+    pub level: OptLevel,
+    /// `search get` / MCP `get` continuation cap, in estimated tokens.
+    /// `0` = unlimited. Default 6000.
+    #[serde(default = "default_token_get_max_tokens")]
+    pub get_max_tokens: u32,
+    /// Per-hit snippet length cap, in characters. Level-specific defaults
+    /// (150 at balanced, 120 at aggressive) override this when unset.
+    /// Default 200.
+    #[serde(default = "default_token_snippet_max_chars")]
+    pub snippet_max_chars: u32,
+    /// When to strip YAML frontmatter from `get`/`multi_get` doc bodies.
+    /// Default `auto` (strips at balanced+, per the ladder).
+    #[serde(default)]
+    pub strip_frontmatter: StripFrontmatter,
+    /// Model family hint for token estimation (`onebrain_token::ModelFamily`
+    /// resolution) and per-model pricing. `auto` sniffs `settings.json` as a
+    /// hint only. Default `auto`.
+    #[serde(default = "default_token_model")]
+    pub model: String,
+    /// Vault-read ledger-gate hook mode (design §5b). `off` = the hook
+    /// (if registered) always allows; `ledger` = repeat reads of an
+    /// already-sent doc are denied with a reference. Default `off` — the
+    /// product-wide default; ob-1 flips this to `ledger` as the field test.
+    #[serde(default)]
+    pub read_hook: ReadHookMode,
+}
+
+fn default_token_level() -> OptLevel {
+    OptLevel::Conservative
+}
+
+fn default_token_get_max_tokens() -> u32 {
+    6000
+}
+
+fn default_token_snippet_max_chars() -> u32 {
+    200
+}
+
+fn default_token_model() -> String {
+    "auto".to_string()
+}
+
+impl Default for TokenOptimizationConfig {
+    fn default() -> Self {
+        Self {
+            level: default_token_level(),
+            get_max_tokens: default_token_get_max_tokens(),
+            snippet_max_chars: default_token_snippet_max_chars(),
+            strip_frontmatter: StripFrontmatter::default(),
+            model: default_token_model(),
+            read_hook: ReadHookMode::default(),
+        }
+    }
+}
+
+/// `token_optimization.strip_frontmatter` mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StripFrontmatter {
+    /// Strip at balanced+ (the ladder's own default behavior for that rung).
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl std::fmt::Display for StripFrontmatter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            StripFrontmatter::Auto => "auto",
+            StripFrontmatter::Always => "always",
+            StripFrontmatter::Never => "never",
+        };
+        f.write_str(s)
+    }
+}
+
+/// `token_optimization.read_hook` mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadHookMode {
+    #[default]
+    Off,
+    Ledger,
+}
+
+impl std::fmt::Display for ReadHookMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ReadHookMode::Off => "off",
+            ReadHookMode::Ledger => "ledger",
+        };
+        f.write_str(s)
+    }
 }
 
 /// Doctor-managed housekeeping flags parsed read-only from the config's
@@ -554,5 +668,115 @@ mod tests {
         assert_eq!(cfg.search.default_top_k, 25);
         // Other search defaults preserved alongside the override.
         assert_eq!(cfg.search.embed_model, "multilingual-e5-small");
+    }
+
+    // ── token_optimization ──────────────────────────────────────────────
+
+    #[test]
+    fn token_optimization_absent_uses_all_defaults() {
+        let (_dir, root) = write_vault("# no token_optimization block\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.token_optimization.level, OptLevel::Conservative);
+        assert_eq!(cfg.token_optimization.get_max_tokens, 6000);
+        assert_eq!(cfg.token_optimization.snippet_max_chars, 200);
+        assert_eq!(
+            cfg.token_optimization.strip_frontmatter,
+            StripFrontmatter::Auto
+        );
+        assert_eq!(cfg.token_optimization.model, "auto");
+        assert_eq!(cfg.token_optimization.read_hook, ReadHookMode::Off);
+    }
+
+    #[test]
+    fn token_optimization_default_matches_struct_default() {
+        assert_eq!(
+            TokenOptimizationConfig::default().level,
+            OptLevel::Conservative
+        );
+        let d = TokenOptimizationConfig::default();
+        assert_eq!(d.get_max_tokens, 6000);
+        assert_eq!(d.snippet_max_chars, 200);
+        assert_eq!(d.model, "auto");
+    }
+
+    #[test]
+    fn token_optimization_level_round_trips_through_yaml() {
+        let (_dir, root) = write_vault("token_optimization:\n  level: aggressive\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.token_optimization.level, OptLevel::Aggressive);
+        // Untouched siblings keep their defaults.
+        assert_eq!(cfg.token_optimization.get_max_tokens, 6000);
+    }
+
+    #[test]
+    fn token_optimization_bad_level_string_errors() {
+        let (_dir, root) = write_vault("token_optimization:\n  level: yolo\n");
+        let err = load_vault_config(&root).unwrap_err();
+        assert!(matches!(err, CoreError::InvalidYaml(_)));
+    }
+
+    #[test]
+    fn token_optimization_partial_override_keeps_other_defaults() {
+        let (_dir, root) =
+            write_vault("token_optimization:\n  get_max_tokens: 3000\n  read_hook: ledger\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.token_optimization.get_max_tokens, 3000);
+        assert_eq!(cfg.token_optimization.read_hook, ReadHookMode::Ledger);
+        // Defaults preserved for keys not overridden.
+        assert_eq!(cfg.token_optimization.level, OptLevel::Conservative);
+        assert_eq!(cfg.token_optimization.snippet_max_chars, 200);
+        assert_eq!(
+            cfg.token_optimization.strip_frontmatter,
+            StripFrontmatter::Auto
+        );
+    }
+
+    #[test]
+    fn token_optimization_strip_frontmatter_all_variants_parse() {
+        for (yaml_value, expect) in [
+            ("auto", StripFrontmatter::Auto),
+            ("always", StripFrontmatter::Always),
+            ("never", StripFrontmatter::Never),
+        ] {
+            let (_dir, root) = write_vault(&format!(
+                "token_optimization:\n  strip_frontmatter: {yaml_value}\n"
+            ));
+            let cfg = load_vault_config(&root).unwrap();
+            assert_eq!(cfg.token_optimization.strip_frontmatter, expect);
+        }
+    }
+
+    #[test]
+    fn token_optimization_full_config_round_trips() {
+        let yaml = "token_optimization:\n  \
+                     level: balanced\n  \
+                     get_max_tokens: 4000\n  \
+                     snippet_max_chars: 150\n  \
+                     strip_frontmatter: always\n  \
+                     model: gpt4\n  \
+                     read_hook: ledger\n";
+        let (_dir, root) = write_vault(yaml);
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.token_optimization.level, OptLevel::Balanced);
+        assert_eq!(cfg.token_optimization.get_max_tokens, 4000);
+        assert_eq!(cfg.token_optimization.snippet_max_chars, 150);
+        assert_eq!(
+            cfg.token_optimization.strip_frontmatter,
+            StripFrontmatter::Always
+        );
+        assert_eq!(cfg.token_optimization.model, "gpt4");
+        assert_eq!(cfg.token_optimization.read_hook, ReadHookMode::Ledger);
+    }
+
+    #[test]
+    fn token_optimization_serializes_level_as_lowercase_string() {
+        // Guard against the level field ever drifting from OptLevel's
+        // Display/FromStr string format (`off|conservative|balanced|aggressive`).
+        let cfg = TokenOptimizationConfig {
+            level: OptLevel::Balanced,
+            ..TokenOptimizationConfig::default()
+        };
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        assert!(yaml.contains("level: balanced"), "{yaml}");
     }
 }

@@ -129,6 +129,7 @@ pub fn run(
             checkpoint: Default::default(),
             folders: Default::default(),
             search: Default::default(),
+            token_optimization: Default::default(),
             stats: Default::default(),
         }
     });
@@ -2038,6 +2039,7 @@ fn fix_folders(vault_root: &Path, json: bool) -> FixOutcome {
         checkpoint: Default::default(),
         folders: Default::default(),
         search: Default::default(),
+        token_optimization: Default::default(),
         stats: Default::default(),
     });
     let f = &config.folders;
@@ -6888,14 +6890,16 @@ mod tests {
         for doc in onebrain_fs::config_key_docs() {
             let key = doc.segments.last().unwrap();
             // Keys not present in this legacy config are never added
-            // (recap.*, stats.*, schedule, and the search reranker/top_k/
-            // exclude/embed.* keys are all absent here).
+            // (recap.*, stats.*, schedule, token_optimization.*, and the
+            // search reranker/top_k/exclude/embed.* keys are all absent
+            // here).
             if doc.segments.join(".").starts_with("search.reranker")
                 || doc.segments == ["search", "default_top_k"]
                 || doc.segments == ["search", "exclude"]
                 || doc.segments.get(1) == Some(&"embed")
                 || doc.segments.first() == Some(&"recap")
                 || doc.segments.first() == Some(&"stats")
+                || doc.segments.first() == Some(&"token_optimization")
                 || doc.segments == ["schedule"]
             {
                 assert!(
@@ -7347,6 +7351,7 @@ mod tests {
                 collection: Some(collection.to_string()),
                 ..Default::default()
             },
+            token_optimization: Default::default(),
             stats: Default::default(),
         }
     }
@@ -7508,6 +7513,7 @@ mod tests {
             checkpoint: Default::default(),
             folders: Default::default(),
             search: Default::default(),
+            token_optimization: Default::default(),
             stats: Default::default(),
         };
         let home = tempdir().unwrap();
@@ -7531,6 +7537,7 @@ mod tests {
                 collection: Some("ob-1".to_string()),
                 ..Default::default()
             },
+            token_optimization: Default::default(),
             stats: Default::default(),
         };
         let home = tempdir().unwrap();

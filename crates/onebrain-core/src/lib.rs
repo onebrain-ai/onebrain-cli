@@ -13,8 +13,8 @@ pub(crate) mod test_support;
 pub mod types;
 
 pub use config::{
-    load_vault_config, load_vault_config_at, CheckpointPolicy, RerankerConfig, VaultConfig,
-    VaultFolders, VaultStats,
+    load_vault_config, load_vault_config_at, CheckpointPolicy, ReadHookMode, RerankerConfig,
+    StripFrontmatter, TokenOptimizationConfig, VaultConfig, VaultFolders, VaultStats,
 };
 pub use error::{CoreError, Result};
 pub use path::{

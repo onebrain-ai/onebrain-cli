@@ -138,6 +138,7 @@ mod tests {
             checkpoint: Default::default(),
             folders: Default::default(),
             search: Default::default(),
+            token_optimization: Default::default(),
             stats: Default::default(),
         }
     }
