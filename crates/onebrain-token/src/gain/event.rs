@@ -19,6 +19,20 @@ pub enum Surface {
     ReadHook,
 }
 
+impl std::fmt::Display for Surface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Surface::McpQuery => "mcp_query",
+            Surface::McpGet => "mcp_get",
+            Surface::McpMultiGet => "mcp_multi_get",
+            Surface::CliSearch => "cli_search",
+            Surface::DaemonHttp => "daemon_http",
+            Surface::ReadHook => "read_hook",
+        };
+        f.write_str(s)
+    }
+}
+
 /// Which cache layer, if any, served this call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,6 +41,18 @@ pub enum CacheKind {
     MemoHit,
     LedgerRef,
     HookFailopen,
+}
+
+impl std::fmt::Display for CacheKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            CacheKind::None => "none",
+            CacheKind::MemoHit => "memo_hit",
+            CacheKind::LedgerRef => "ledger_ref",
+            CacheKind::HookFailopen => "hook_failopen",
+        };
+        f.write_str(s)
+    }
 }
 
 /// One optimized call, as appended to `token/gain/YYYY-MM.jsonl` (design
@@ -82,5 +108,33 @@ mod tests {
         assert!(json.contains("\"cache\":\"hook_failopen\""));
         assert!(json.contains("\"level\":\"off\""));
         assert!(json.contains("\"session_token\":null"));
+    }
+
+    #[test]
+    fn display_matches_serde_snake_case_for_every_surface_and_cache_kind() {
+        // rollup.rs's composite keys and the CLI renderer both format via
+        // Display — it must never drift from the wire (serde) casing.
+        for (variant, expect) in [
+            (Surface::McpQuery, "mcp_query"),
+            (Surface::McpGet, "mcp_get"),
+            (Surface::McpMultiGet, "mcp_multi_get"),
+            (Surface::CliSearch, "cli_search"),
+            (Surface::DaemonHttp, "daemon_http"),
+            (Surface::ReadHook, "read_hook"),
+        ] {
+            assert_eq!(variant.to_string(), expect);
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, format!("\"{expect}\""));
+        }
+        for (variant, expect) in [
+            (CacheKind::None, "none"),
+            (CacheKind::MemoHit, "memo_hit"),
+            (CacheKind::LedgerRef, "ledger_ref"),
+            (CacheKind::HookFailopen, "hook_failopen"),
+        ] {
+            assert_eq!(variant.to_string(), expect);
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, format!("\"{expect}\""));
+        }
     }
 }

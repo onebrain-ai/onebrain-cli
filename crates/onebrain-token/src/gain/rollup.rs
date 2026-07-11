@@ -16,7 +16,7 @@ use chrono::{DateTime, Datelike, Utc};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use super::event::{CacheKind, GainEvent, Surface};
+use super::event::GainEvent;
 use super::writer::JsonlGainWriter;
 
 /// Rollup keyed by calendar day: `YYYY-MM-DD`.
@@ -68,26 +68,6 @@ impl RollupValue {
     }
 }
 
-fn surface_str(s: Surface) -> &'static str {
-    match s {
-        Surface::McpQuery => "mcp_query",
-        Surface::McpGet => "mcp_get",
-        Surface::McpMultiGet => "mcp_multi_get",
-        Surface::CliSearch => "cli_search",
-        Surface::DaemonHttp => "daemon_http",
-        Surface::ReadHook => "read_hook",
-    }
-}
-
-fn cache_str(c: CacheKind) -> &'static str {
-    match c {
-        CacheKind::None => "none",
-        CacheKind::MemoHit => "memo_hit",
-        CacheKind::LedgerRef => "ledger_ref",
-        CacheKind::HookFailopen => "hook_failopen",
-    }
-}
-
 fn day_key(ts: i64) -> String {
     let dt = DateTime::<Utc>::from_timestamp(ts, 0).unwrap_or_else(Utc::now);
     format!("{:04}-{:02}-{:02}", dt.year(), dt.month(), dt.day())
@@ -116,10 +96,7 @@ pub struct RollupKey {
 fn composite_key(period: &str, event: &GainEvent) -> String {
     format!(
         "{period}{KEY_SEP}{}{KEY_SEP}{}{KEY_SEP}{}{KEY_SEP}{}",
-        surface_str(event.surface),
-        event.transform,
-        event.level,
-        cache_str(event.cache),
+        event.surface, event.transform, event.level, event.cache,
     )
 }
 
@@ -260,6 +237,7 @@ pub fn scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gain::event::{CacheKind, Surface};
     use crate::level::OptLevel;
     use tempfile::tempdir;
 
