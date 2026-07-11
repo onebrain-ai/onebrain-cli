@@ -47,7 +47,19 @@ use crate::commands::token_gain::parse_by;
 use onebrain_token::gain::pivot;
 #[allow(unused_imports)] // PivotResult is referenced in rustdoc intra-doc links.
 use onebrain_token::PivotResult;
-use onebrain_token::{LedgerVerdict, PivotQuery, TokenCache};
+use onebrain_token::{LedgerVerdict, PivotQuery, ReferenceEnvelope, TokenCache};
+
+/// Resolve the effective optimization level for `vault_root` from
+/// `token_optimization.level` in `onebrain.yml`, as its wire string
+/// (`off|conservative|balanced|aggressive`). Best-effort: any config-load
+/// failure falls back to the product default `conservative` — a server route
+/// must never fail just because the config couldn't be read, and conservative
+/// keeps the ledger inactive (safe) rather than emitting references.
+fn resolve_level(vault_root: &Path) -> String {
+    onebrain_core::config::load_vault_config_at(vault_root)
+        .map(|cfg| cfg.token_optimization.level.to_string())
+        .unwrap_or_else(|_| "conservative".to_string())
+}
 
 /// The `token/` sibling of `models/` + `index/` under a collection cache dir,
 /// and the `token.redb` file inside it. `CollectionLayout` scans only
@@ -181,6 +193,8 @@ async fn get_token_status(State(state): State<Arc<AppState>>) -> Result<Response
     // Holding the cache is required — this route reports on it.
     let _cache = require_token_cache(&state)?;
 
+    let level = resolve_level(&root);
+
     let cache_bytes = tokio::task::spawn_blocking(move || {
         let collection = collection_name_readonly(&root).ok()?;
         let db_path = token_db_path(&collection_cache_dir(&collection));
@@ -190,8 +204,8 @@ async fn get_token_status(State(state): State<Arc<AppState>>) -> Result<Response
     .map_err(|e| ApiError::Internal(format!("status task join: {e}")))?
     .unwrap_or(0);
 
-    // Track 4 replaces this default with `config.token_optimization.level`.
-    let level = "conservative".to_string();
+    // The resolved level (T4): `off`/`conservative` keep the ledger inactive;
+    // `balanced`/`aggressive` activate it (design §3b).
     let ledger_active = ledger_active_for_level(&level);
 
     Ok(Json(TokenStatusResponse {
@@ -219,22 +233,23 @@ struct LedgerCheckRequest {
     /// so the NEXT repeat read is caught. Default `false` (pure check).
     #[serde(default)]
     record: bool,
-}
-
-/// The reference envelope embedded in an `unchanged` verdict (design §3b) —
-/// the frozen shape Track 4/5 consume. `sent_earlier` is always `true` here.
-#[derive(Debug, Serialize, PartialEq)]
-struct ReferenceEnvelope {
-    doc_path: String,
-    hash: String,
-    sent_earlier: bool,
-    bytes_saved: u64,
-    rematerialize: String,
+    /// Hash of the EXACT bytes the caller is about to deliver (design §3b).
+    /// When present the ledger keys on THIS hash — reflecting delivered-vs-
+    /// current content — instead of the stored index hash, so a doc edited on
+    /// disk but not yet reindexed is correctly re-delivered. Absent (the
+    /// read-hook, which only has a path) → derive the hash from the engine.
+    #[serde(default)]
+    content_hash: Option<String>,
+    /// Size of those bytes, credited to `bytes_saved` on an `unchanged`
+    /// verdict when `content_hash` is supplied (avoids a second engine read).
+    #[serde(default)]
+    bytes: Option<u64>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
 struct LedgerCheckResponse {
-    /// `first_send` | `unchanged` | `changed` | `no_session` | `unknown_doc`.
+    /// `first_send` | `unchanged` | `changed` | `no_session` | `unknown_doc`
+    /// | `inactive`.
     verdict: String,
     /// Present only on `unchanged` — the reference a caller may send instead
     /// of the full body.
@@ -249,6 +264,22 @@ async fn post_ledger_check(
     if req.path.trim().is_empty() {
         return Err(ApiError::BadRequest("empty path".to_string()));
     }
+
+    // M3 — server-side level gate (design §3b): the already-sent ledger only
+    // activates at `balanced`/`aggressive`. At `off`/`conservative` the route
+    // must NEVER touch the ledger or emit a reference envelope — so a
+    // conservative vault (the default) can't hand back references. Gated here,
+    // before the cache/session checks, so it holds no matter which client
+    // (MCP get, CLI, read-hook) calls the route.
+    let level = resolve_level(require_vault_root(&state)?);
+    if !ledger_active_for_level(&level) {
+        return Ok(Json(LedgerCheckResponse {
+            verdict: "inactive".to_string(),
+            reference: None,
+        })
+        .into_response());
+    }
+
     let cache = require_token_cache(&state)?;
 
     // No session token → ledger silently inactive for this call (never guess).
@@ -264,16 +295,23 @@ async fn post_ledger_check(
     let path = req.path.clone();
     let session = req.session_token.clone();
     let record = req.record;
+    let provided_hash = req.content_hash.clone();
+    let provided_bytes = req.bytes;
 
     let response = tokio::task::spawn_blocking(move || -> Result<LedgerCheckResponse, ApiError> {
-        // Current content hash from the held engine. Unknown/unindexed doc →
-        // we cannot compare, so the ledger can't claim "unchanged".
-        let current_hash = match &engine {
-            Some(shared) => {
-                let guard = shared.lock().unwrap_or_else(|p| p.into_inner());
-                guard.doc_hash(&path)
-            }
-            None => None,
+        // Prefer the caller's delivered-content hash (reflects the exact bytes
+        // being sent — the fix for the "edited on disk, not reindexed" window).
+        // Absent (the read-hook) → derive from the engine; unknown/unindexed doc
+        // then can't be compared, so the ledger can't claim "unchanged".
+        let current_hash = match provided_hash {
+            Some(h) => Some(h),
+            None => match &engine {
+                Some(shared) => {
+                    let guard = shared.lock().unwrap_or_else(|p| p.into_inner());
+                    guard.doc_hash(&path)
+                }
+                None => None,
+            },
         };
         let Some(current_hash) = current_hash else {
             return Ok(LedgerCheckResponse {
@@ -289,26 +327,24 @@ async fn post_ledger_check(
 
         let response = match &verdict {
             LedgerVerdict::Unchanged { sent_hash } => {
-                // Credit the full avoided inline size when the body is cheaply
-                // reconstructable; best-effort (0 on any error — never fail the
-                // decision on a size estimate).
-                let bytes_saved = engine
-                    .as_ref()
-                    .and_then(|s| {
-                        let guard = s.lock().unwrap_or_else(|p| p.into_inner());
-                        guard.get(&path).ok()
+                // Credit the avoided inline size: the caller's own body size
+                // when supplied, else a best-effort engine read (0 on error —
+                // never fail the decision on a size estimate).
+                let bytes_saved = provided_bytes
+                    .or_else(|| {
+                        engine.as_ref().and_then(|s| {
+                            let guard = s.lock().unwrap_or_else(|p| p.into_inner());
+                            guard.get(&path).ok().map(|body| body.len() as u64)
+                        })
                     })
-                    .map(|body| body.len() as u64)
                     .unwrap_or(0);
                 LedgerCheckResponse {
                     verdict: "unchanged".to_string(),
-                    reference: Some(ReferenceEnvelope {
-                        doc_path: path.clone(),
-                        hash: sent_hash.clone(),
-                        sent_earlier: true,
+                    reference: Some(ReferenceEnvelope::new(
+                        path.clone(),
+                        sent_hash.clone(),
                         bytes_saved,
-                        rematerialize: format!("onebrain search get {path} --force"),
-                    }),
+                    )),
                 }
             }
             LedgerVerdict::FirstSend | LedgerVerdict::Changed => {
@@ -371,12 +407,29 @@ mod tests {
     }
 
     /// A vault with a config + an isolated cache dir; the held daemon opens
-    /// both the engine and the token cache.
+    /// both the engine and the token cache. No `token_optimization` block, so
+    /// the level resolves to the product default `conservative`.
     fn vault_and_cache() -> (tempfile::TempDir, tempfile::TempDir) {
         let vault = tempfile::tempdir().unwrap();
         std::fs::write(
             vault.path().join("onebrain.yml"),
             "search:\n  collection: token-api-test\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        (vault, cache)
+    }
+
+    /// Like [`vault_and_cache`] but pins `token_optimization.level` — the
+    /// ledger-verdict tests need `balanced` (level 2↑) so the M3 route gate
+    /// lets the check run rather than short-circuiting to `inactive`.
+    fn vault_and_cache_at_level(level: &str) -> (tempfile::TempDir, tempfile::TempDir) {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            format!(
+                "search:\n  collection: token-api-test\ntoken_optimization:\n  level: {level}\n"
+            ),
         )
         .unwrap();
         let cache = tempfile::tempdir().unwrap();
@@ -579,10 +632,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ledger_check_inactive_at_conservative_never_references() {
+        // M3: at the default `conservative` level the route gate short-circuits
+        // to `inactive` BEFORE any ledger access — a conservative vault can
+        // never hand back a reference envelope, even for an already-sent doc.
+        let (vault, cache) = vault_and_cache(); // no token_optimization → conservative
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let router = router_holding_cache(vault.path());
+
+        let v = ledger_check(&router, r#"{"path":"a.md","session_token":"sess-1"}"#).await;
+        assert_eq!(v["verdict"], "inactive");
+        assert!(v.get("reference").is_none(), "no reference at conservative");
+    }
+
+    #[tokio::test]
     async fn ledger_check_no_session_returns_no_session_verdict() {
         // Empty session token → ledger silently inactive (design §3b): the
-        // daemon never guesses a token, so the verdict is `no_session`.
-        let (vault, cache) = vault_and_cache();
+        // daemon never guesses a token, so the verdict is `no_session`. Needs a
+        // ledger-active level (balanced) to reach the session check past the M3
+        // gate.
+        let (vault, cache) = vault_and_cache_at_level("balanced");
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         let router = router_holding_cache(vault.path());
 
@@ -645,7 +714,7 @@ mod tests {
     /// embedding model is loaded.
     #[tokio::test]
     async fn ledger_check_verdict_path_first_send_unchanged_changed() {
-        let (vault, cache) = vault_and_cache();
+        let (vault, cache) = vault_and_cache_at_level("balanced");
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         std::fs::write(vault.path().join("a.md"), "# A\noriginal body text").unwrap();
         let router = router_holding_cache(vault.path());
@@ -694,8 +763,9 @@ mod tests {
     async fn ledger_check_unknown_doc_when_not_indexed() {
         // A real session token but a path the engine has never indexed:
         // doc_hash is None, so the ledger cannot claim "unchanged" — the
-        // verdict is `unknown_doc`, never a false reference.
-        let (vault, cache) = vault_and_cache();
+        // verdict is `unknown_doc`, never a false reference. Balanced so the
+        // M3 gate lets the check run.
+        let (vault, cache) = vault_and_cache_at_level("balanced");
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         let router = router_holding_cache(vault.path());
 

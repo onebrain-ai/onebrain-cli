@@ -43,8 +43,11 @@ impl Payload {
 }
 
 /// The complete, frozen honesty-signal vocabulary (design §4 / ADR 0028).
-/// Every lossy transform emits one of these — never a silent drop.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Every lossy transform emits one of these — never a silent drop. Serializable
+/// so a surface can hand the signals straight to a structured (`--output
+/// json`/MCP) client (design §4: "no silent drops, ever").
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Signal {
     /// Content was cut; `next` is the recovery cursor/instruction (a line
     /// index for pagination, or a short tag naming what was cut, e.g.

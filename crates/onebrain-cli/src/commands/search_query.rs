@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cli::SearchQueryArgs;
 #[cfg(feature = "semantic")]
@@ -24,11 +24,14 @@ use crate::commands::search_common::{
 use crate::commands::search_common::{
     map_daemon_error, rerank_settings_from_config, route_to_daemon,
 };
+use crate::commands::token_runner;
 use crate::output::{emit, Envelope, OutputMode};
+use onebrain_core::ResolvedVault;
 use onebrain_search::engine::Hit;
 use onebrain_search::lex::LexIndex;
+use onebrain_token::gain::Surface;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct HitData {
     chunk_id: String,
     doc_path: String,
@@ -71,6 +74,11 @@ struct SearchHitsData {
     /// "you forgot to reindex".
     #[serde(skip_serializing_if = "Option::is_none")]
     index_hint: Option<String>,
+    /// Honesty signals for lossy shaping applied to the hit list (snippet
+    /// cap/omission, duplicate chunks collapsed) — design §4, never a silent
+    /// drop. Empty (omitted) when nothing lossy happened.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    signals: Vec<onebrain_token::Signal>,
 }
 
 /// Why an empty result might not mean "no matching notes": an empty or
@@ -130,7 +138,15 @@ pub fn run_query(
         // only (no `vec_top_score`).
         rerank_unreranked_hint(&hits, None, engine.rerank_enabled())
     };
-    emit_hits("search.query", vault_info, hits, hint, mode)
+    emit_hits(
+        "search.query",
+        &resolved,
+        vault_info,
+        hits,
+        hint,
+        args.opt_level.as_deref(),
+        mode,
+    )
 }
 
 /// Lex-only build: hybrid degrades to keyword (BM25) ranking with a stderr
@@ -266,7 +282,15 @@ pub fn run_vsearch(
         None => index_hint_for(&engine, &resolved),
         Some(top) => rerank_unreranked_hint(&hits, Some(top.score), engine.rerank_enabled()),
     };
-    emit_hits("search.vec", vault_info, hits, hint, mode)
+    emit_hits(
+        "search.vec",
+        &resolved,
+        vault_info,
+        hits,
+        hint,
+        args.opt_level.as_deref(),
+        mode,
+    )
 }
 
 /// `onebrain search search` — lex-only (BM25) search. Deliberately does NOT
@@ -324,16 +348,15 @@ pub fn run_lex(
         .collect();
 
     // No engine here (deliberately — no embedder), so no index-state probe.
-    let envelope = Envelope::ok(
+    emit_hits_data(
         "search.lex",
-        Some(vault_info),
-        SearchHitsData {
-            hits,
-            index_hint: None,
-        },
-    );
-    emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
-    Ok(())
+        &resolved,
+        vault_info,
+        hits,
+        None,
+        args.opt_level.as_deref(),
+        mode,
+    )
 }
 
 /// Run a search through the warm daemon's `/api/vault/search` (mode `hybrid` /
@@ -421,16 +444,15 @@ fn run_query_via_daemon(
     } else {
         "search.lex"
     };
-    let envelope = Envelope::ok(
+    emit_hits_data(
         command,
-        Some(vault_info),
-        SearchHitsData {
-            hits,
-            index_hint: hint,
-        },
-    );
-    emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
-    Ok(())
+        resolved,
+        vault_info,
+        hits,
+        hint,
+        args.opt_level.as_deref(),
+        mode,
+    )
 }
 
 /// [`rerank_unreranked_hint`]'s counterpart for the daemon path, which works
@@ -571,19 +593,100 @@ fn apply_rerank_overrides(
 
 fn emit_hits(
     command: &str,
+    resolved: &ResolvedVault,
     vault_info: crate::output::VaultInfo,
     hits: Vec<Hit>,
     index_hint: Option<String>,
+    opt_level: Option<&str>,
     mode: &OutputMode,
 ) -> Result<()> {
     let hits: Vec<HitData> = hits.into_iter().map(HitData::from).collect();
+    emit_hits_data(
+        command, resolved, vault_info, hits, index_hint, opt_level, mode,
+    )
+}
+
+/// Emit a `HitData` result set, shaping it through the token funnel
+/// (`Surface::CliSearch`) FIRST when the output is structured (`--output
+/// json`/`yaml`) — the agent-facing path. Human TTY text is emitted unchanged
+/// (design §1: "human TTY output is untouched this release"), and no gain event
+/// is recorded for it. Shared by every CLI search verb so the shaping and
+/// metering land identically on the direct, lex, and daemon-routed paths.
+fn emit_hits_data(
+    command: &str,
+    resolved: &ResolvedVault,
+    vault_info: crate::output::VaultInfo,
+    hits: Vec<HitData>,
+    index_hint: Option<String>,
+    opt_level: Option<&str>,
+    mode: &OutputMode,
+) -> Result<()> {
+    let (hits, signals) = if mode.is_structured() {
+        shape_cli_hits(resolved, hits, opt_level)?
+    } else {
+        (hits, Vec::new())
+    };
     let envelope = Envelope::ok(
         command,
         Some(vault_info),
-        SearchHitsData { hits, index_hint },
+        SearchHitsData {
+            hits,
+            index_hint,
+            signals,
+        },
     );
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
+}
+
+/// Shape a CLI hit list through the funnel: map `HitData` to the canonical
+/// `doc_path`+`text` hit JSON the query transforms understand (design §1),
+/// funnel it (`CliSearch`), and map back. Records one gain event. Returns the
+/// shaped hits AND the honesty signals (design §4). Level resolves per-call
+/// `--opt-level` > config > default; a bad `--opt-level` is an error surfaced to
+/// the caller (no silent fallback).
+fn shape_cli_hits(
+    resolved: &ResolvedVault,
+    hits: Vec<HitData>,
+    opt_level: Option<&str>,
+) -> Result<(Vec<HitData>, Vec<onebrain_token::Signal>)> {
+    let cfg = onebrain_core::load_vault_config(&resolved.root)
+        .map(|c| c.token_optimization)
+        .unwrap_or_default();
+    let level = token_runner::resolve_level(opt_level, &cfg)?;
+    let ctx = token_runner::ctx_for(level, &cfg, None, false, None);
+    let canonical: Vec<serde_json::Value> = hits.iter().map(hitdata_to_canonical).collect();
+    let (shaped, signals) =
+        token_runner::shape_query_hits(resolved, Surface::CliSearch, canonical, &ctx);
+    Ok((
+        shaped.into_iter().filter_map(canonical_from).collect(),
+        signals,
+    ))
+}
+
+/// `HitData` → canonical hit JSON (`snippet`→`text`; `doc_path` already
+/// matches). Other fields ride along untouched.
+fn hitdata_to_canonical(h: &HitData) -> serde_json::Value {
+    let mut v = serde_json::to_value(h).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = v.as_object_mut() {
+        if let Some(snippet) = obj.remove("snippet") {
+            obj.insert("text".to_string(), snippet);
+        }
+    }
+    v
+}
+
+/// Canonical hit JSON → `HitData` (`text`→`snippet`, absent after `disclosure`
+/// → empty snippet, matching the required `String` field). A hit that fails to
+/// round-trip is dropped rather than corrupting the result set.
+fn canonical_from(mut v: serde_json::Value) -> Option<HitData> {
+    if let Some(obj) = v.as_object_mut() {
+        let text = obj
+            .remove("text")
+            .unwrap_or_else(|| serde_json::Value::String(String::new()));
+        obj.insert("snippet".to_string(), text);
+    }
+    serde_json::from_value::<HitData>(v).ok()
 }
 
 fn render_text(env: &Envelope<SearchHitsData>) -> String {
@@ -656,6 +759,7 @@ mod tests {
             SearchHitsData {
                 hits,
                 index_hint: None,
+                signals: Vec::new(),
             },
         )
     }
@@ -687,6 +791,7 @@ mod tests {
             SearchHitsData {
                 hits: Vec::new(),
                 index_hint: Some("index is empty — run `onebrain search reindex` first".into()),
+                signals: Vec::new(),
             },
         );
         let s = render_text(&e);
@@ -726,6 +831,7 @@ mod tests {
                     rerank_score: None,
                 }],
                 index_hint: Some("⚠️  low-confidence semantic match".into()),
+                signals: Vec::new(),
             },
         );
         let s = render_text(&e);

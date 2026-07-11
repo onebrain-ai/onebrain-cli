@@ -12,12 +12,22 @@ use serde::Serialize;
 use crate::cli::SearchGetArgs;
 use crate::commands::daemon_client::DaemonHandle;
 use crate::commands::search_common::{map_daemon_error, open_engine, route_to_daemon};
+use crate::commands::token_runner;
 use crate::output::{emit, Envelope, OutputMode};
+use onebrain_token::gain::Surface;
+use onebrain_token::{CacheKind, GainEvent, OptLevel, ReferenceEnvelope};
 
 #[derive(Debug, Serialize)]
 struct SearchGetData {
     doc_path: String,
     content: String,
+    /// Present when the already-sent ledger (design §3b, level 2↑, structured
+    /// output only) recognized a repeat, unchanged read: `content` is then
+    /// empty and this reference tells the agent how to re-materialize the full
+    /// body (`onebrain search get <path> --force`). `--force` always delivers
+    /// the full body and never populates this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference: Option<ReferenceEnvelope>,
 }
 
 /// The hint appended when a doc isn't found in the index — shared by the direct
@@ -48,19 +58,94 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchGetArgs)
     // Warm-daemon path: when a daemon already holds the engine, `Engine::get`
     // (a redb read) would clash with it → route the lookup through the daemon.
     // Only when it serves this exact vault; else fall through to a direct open.
-    let content = if let Some(handle) = route_to_daemon(&resolved) {
-        get_via_daemon(&handle, &doc_path)?
+    // Captured once so the ledger check below reuses the same backend decision.
+    let daemon = route_to_daemon(&resolved);
+    let content = if let Some(handle) = &daemon {
+        get_via_daemon(handle, &doc_path)?
     } else {
         let (engine, _resolved) = open_engine(vault_flag)?;
         engine
             .get(&doc_path)
             .map_err(|e| anyhow::anyhow!("{e}\n{NOT_INDEXED_HINT}"))?
     };
-    let data = SearchGetData { doc_path, content };
+
+    // Level (per-call `--opt-level` > config > default); a bad `--opt-level` is
+    // surfaced as an error, never silently downgraded (design contract).
+    let cfg = onebrain_core::load_vault_config(&resolved.root)
+        .map(|c| c.token_optimization)
+        .unwrap_or_default();
+    let level = token_runner::resolve_level(args.opt_level.as_deref(), &cfg)?;
+    let session = token_runner::resolve_session_token_opt();
+
+    // Already-sent ledger on the agent-facing (structured) path (design
+    // §3b/§3c/§5d): a repeat, unchanged `search get --output json` returns a
+    // reference instead of the body; `--force` bypasses the ledger and always
+    // delivers the full body (it's the reference's re-materialize target). The
+    // ledger keys on a hash of the delivered `content`, so an out-of-band edit
+    // is caught. Human TTY always gets the full body (never a reference).
+    let reference = if mode.is_structured() && !args.force && level >= OptLevel::Balanced {
+        match &daemon {
+            Some(handle) => token_runner::daemon_ledger_reference(handle, &doc_path, &content),
+            None => token_runner::direct_ledger_reference(&resolved, &doc_path, &content),
+        }
+    } else {
+        None
+    };
+
+    // Meter the structured surface (design §5d — no surface escapes metering).
+    // The ladder's doc-body transforms are MCP-only (§2a — no CLI doc-body
+    // surface this release), and the query transforms must not run on a doc body
+    // (snippet's fallback would truncate it), so a delivered body records a
+    // plain "none" event; a reference records a `ledger_ref` credit.
+    if mode.is_structured() {
+        let before = content.len() as u64;
+        let (transform, after, cache) = match &reference {
+            Some(r) => {
+                let ref_bytes = serde_json::to_string(r)
+                    .map(|s| s.len() as u64)
+                    .unwrap_or(0);
+                ("ledger_ref", ref_bytes, CacheKind::LedgerRef)
+            }
+            None => ("none", before, CacheKind::None),
+        };
+        token_runner::record_gain(
+            &resolved,
+            GainEvent {
+                ts: now_ts(),
+                surface: Surface::CliSearch,
+                transform: transform.to_string(),
+                level,
+                bytes_before: before,
+                bytes_after: after,
+                cache,
+                session_token: session.clone(),
+            },
+        );
+    }
+
+    // On a reference the body is dropped (the reference stands in for it).
+    let content = if reference.is_some() {
+        String::new()
+    } else {
+        content
+    };
+    let data = SearchGetData {
+        doc_path,
+        content,
+        reference,
+    };
 
     let envelope = Envelope::ok("search.get", Some(vault_info), data);
     emit(&envelope, mode, std::io::stdout().lock(), render_text)?;
     Ok(())
+}
+
+/// Epoch seconds for the metering gain event.
+fn now_ts() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Fetch a doc's indexed text through the warm daemon's `/api/internal/get`. A
@@ -100,7 +185,17 @@ fn normalize_doc_path(input: &str, vault_root: &std::path::Path) -> String {
 
 fn render_text(env: &Envelope<SearchGetData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
-    d.content.clone()
+    // Structured output can carry a reference (already-sent) instead of a body;
+    // in text mode render a human-readable note pointing at the force re-fetch.
+    // In practice text mode never activates the ledger (it's structured-only),
+    // but keep the renderer total.
+    match &d.reference {
+        Some(r) => format!(
+            "⤷ already sent this session (unchanged) — re-fetch the full body with:\n    {}",
+            r.rematerialize
+        ),
+        None => d.content.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -165,8 +260,25 @@ mod tests {
             SearchGetData {
                 doc_path: "a.md".into(),
                 content: "line1\nline2".into(),
+                reference: None,
             },
         );
         assert_eq!(render_text(&e), "line1\nline2");
+    }
+
+    #[test]
+    fn text_renders_reference_with_force_instruction() {
+        let e = Envelope::ok(
+            "search.get",
+            None,
+            SearchGetData {
+                doc_path: "a.md".into(),
+                content: String::new(),
+                reference: Some(ReferenceEnvelope::new("a.md", "h", 42)),
+            },
+        );
+        let s = render_text(&e);
+        assert!(s.contains("already sent"), "{s}");
+        assert!(s.contains("onebrain search get a.md --force"), "{s}");
     }
 }

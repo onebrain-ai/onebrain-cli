@@ -594,17 +594,32 @@ impl DaemonHandle {
     /// token routes answers 404. That is NOT an error — it means "this daemon
     /// can't optimize", so the client gets `Ok(None)` and skips the
     /// optimization (inlines as today). Only a live route answers `Ok(Some)`.
+    ///
+    /// `content_hash`/`bytes` carry the hash + size of the EXACT bytes the
+    /// caller is about to deliver (design §3b): when present, the daemon keys
+    /// the ledger on THIS hash instead of deriving one from the index, so a doc
+    /// edited on disk but not reindexed is correctly re-delivered. Absent (the
+    /// read-hook path, which only has a path) → the daemon derives the hash from
+    /// the engine as before.
     pub fn token_ledger_check(
         &self,
         path: &str,
+        content_hash: Option<&str>,
+        bytes: Option<u64>,
         record: bool,
     ) -> Result<Option<serde_json::Value>> {
         let session_token = resolve_session_token_opt().unwrap_or_default();
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "path": path,
             "session_token": session_token,
             "record": record,
         });
+        if let Some(h) = content_hash {
+            body["content_hash"] = serde_json::Value::String(h.to_string());
+        }
+        if let Some(b) = bytes {
+            body["bytes"] = serde_json::Value::Number(b.into());
+        }
         let payload = serde_json::to_string(&body).context("serialize ledger check body")?;
         let op = |h: &DaemonHandle| {
             let url = format!("{}/api/token/ledger/check", h.info.base_url());
