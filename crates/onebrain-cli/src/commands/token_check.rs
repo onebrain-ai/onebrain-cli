@@ -144,6 +144,19 @@ fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
+/// Serialize the reference envelope and write it (newline-terminated) to `w`,
+/// returning `false` if either step fails — a serialize error or a closed /
+/// broken sink. Extracted from [`run`] so the deny path's write-failure
+/// branch, which must fail OPEN rather than panic, is unit-testable without
+/// touching the process-global stdout. `writeln!` (unlike `println!`) surfaces
+/// the `io::Error` instead of panicking on a broken pipe.
+fn emit_reference(w: &mut impl std::io::Write, reference: &ReferenceEnvelope) -> bool {
+    serde_json::to_string(reference)
+        .ok()
+        .and_then(|json| writeln!(w, "{json}").ok())
+        .is_some()
+}
+
 /// Record the fail-open [`GainEvent`] (design §5c-5). Best-effort: when the
 /// vault/collection isn't resolvable there's nowhere to write it, and
 /// dropping it silently is the same "no sink → event dropped" contract every
@@ -196,8 +209,25 @@ pub fn run(vault_flag: Option<PathBuf>, path: &str) -> Result<i32> {
     match decide(outcome) {
         Decision::Allow => Ok(0),
         Decision::Deny(reference) => {
-            println!("{}", serde_json::to_string(&reference)?);
-            Ok(2)
+            // Deliver the reference envelope on stdout, then exit 2 (deny). A
+            // raw `println!` here would PANIC if stdout is already closed — the
+            // hook harness hung up or its own (5s) timeout fired while we were
+            // still resolving the vault — and under the release build's
+            // `panic = "abort"` that panic is a SIGABRT: an exit code outside
+            // the documented {0,2} contract, with no `hook_failopen` recorded.
+            // A gating hook must NEVER block a read on infrastructure trouble,
+            // so a stdout write failure fails OPEN, mirroring the codebase's
+            // own BrokenPipe-as-exit-0 convention (`exit.rs`).
+            if emit_reference(&mut std::io::stdout().lock(), &reference) {
+                Ok(2)
+            } else {
+                record_failopen(
+                    resolved.as_ref(),
+                    "reference_emit_error",
+                    resolve_session_token_opt(),
+                );
+                Ok(0)
+            }
         }
         Decision::FailOpen(reason) => {
             record_failopen(resolved.as_ref(), reason, resolve_session_token_opt());
@@ -217,6 +247,45 @@ mod tests {
 
     fn envelope() -> ReferenceEnvelope {
         ReferenceEnvelope::new("a.md", "deadbeef", 4096)
+    }
+
+    /// A sink that fails every write — stands in for a stdout whose reader has
+    /// already hung up (closed pipe).
+    struct BrokenSink;
+    impl std::io::Write for BrokenSink {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed",
+            ))
+        }
+    }
+
+    #[test]
+    fn emit_reference_writes_newline_terminated_json_to_a_live_sink() {
+        let mut buf = Vec::new();
+        assert!(emit_reference(&mut buf, &envelope()));
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("\"doc_path\":\"a.md\""),
+            "envelope JSON: {out}"
+        );
+        assert!(out.ends_with('\n'), "must be newline-terminated: {out:?}");
+    }
+
+    #[test]
+    fn emit_reference_on_broken_stdout_reports_failure_never_panics() {
+        // The deny path relies on this: a `false` return makes `run` fail OPEN
+        // (exit 0 + `hook_failopen`) instead of the old `println!` panicking —
+        // which under release `panic = "abort"` was a SIGABRT breaking the
+        // {0,2} contract. A broken sink must NOT panic here.
+        assert!(!emit_reference(&mut BrokenSink, &envelope()));
     }
 
     #[test]
