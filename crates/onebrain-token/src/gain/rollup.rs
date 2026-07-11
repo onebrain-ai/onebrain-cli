@@ -200,8 +200,16 @@ pub struct RebuildStats {
 /// rebuilding from a log must always produce tables identical to having
 /// applied every event incrementally as it happened (the determinism
 /// property the design requires).
+///
+/// Reads `jsonl_dir` **recursively** (via
+/// [`read_all_recursive`](JsonlGainWriter::read_all_recursive)), so an
+/// archived epoch under `jsonl_dir/archive/<ts>-<label>/` is included —
+/// rollups are the all-time cumulative view; `--reset` only changes which
+/// raw log files future writes append to, it never removes history from
+/// what a rebuild reconstructs (design §5: "archived epochs remain
+/// queryable").
 pub fn rebuild(jsonl_dir: &Path, db: &Database) -> Result<RebuildStats, RollupError> {
-    let events = JsonlGainWriter::new(jsonl_dir).read_all()?;
+    let events = JsonlGainWriter::new(jsonl_dir).read_all_recursive()?;
 
     let write_txn = db.begin_write()?;
     // `delete_table` returns `Ok(false)` (not an error) when the table
@@ -394,6 +402,48 @@ mod tests {
         let stats = rebuild(jsonl_dir.path(), &db).unwrap();
         assert_eq!(stats.events_replayed, 0);
         assert_eq!(scan(&db, GAIN_DAILY).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn rebuild_includes_archived_epochs() {
+        // A `--reset` moves the current window's raw files under
+        // `<gain_dir>/archive/<ts>-<label>/` without deleting them — rebuild
+        // must still count them (rollups are the all-time cumulative view).
+        let db_dir = tempdir().unwrap();
+        let jsonl_dir = tempdir().unwrap();
+        let db = Database::create(db_dir.path().join("token.redb")).unwrap();
+
+        let writer = JsonlGainWriter::new(jsonl_dir.path());
+        writer
+            .append(&event(
+                1_783_900_800,
+                Surface::CliSearch,
+                "whitespace",
+                100,
+                50,
+            ))
+            .unwrap();
+
+        let archived = jsonl_dir.path().join("archive").join("1700000000-baseline");
+        std::fs::create_dir_all(&archived).unwrap();
+        let archived_writer = JsonlGainWriter::new(&archived);
+        archived_writer
+            .append(&event(
+                1_700_000_000,
+                Surface::McpQuery,
+                "snippet",
+                200,
+                100,
+            ))
+            .unwrap();
+
+        let stats = rebuild(jsonl_dir.path(), &db).unwrap();
+        assert_eq!(stats.events_replayed, 2, "archived epoch must be counted");
+
+        let result =
+            crate::gain::pivot::query(&db, &crate::gain::pivot::PivotQuery::default()).unwrap();
+        assert_eq!(result.totals.count, 2);
+        assert_eq!(result.totals.bytes_before, 300);
     }
 
     #[test]
