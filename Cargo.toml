@@ -16,6 +16,7 @@ publish = false
 onebrain-core   = { path = "crates/onebrain-core" }
 onebrain-fs     = { path = "crates/onebrain-fs" }
 onebrain-cache  = { path = "crates/onebrain-cache" }
+onebrain-token  = { path = "crates/onebrain-token" }
 # `default-features = false` so the (default-ON) `semantic` feature is opted
 # into explicitly by the consumer (onebrain-cli, via its own `semantic`
 # feature). Lets `cargo build -p onebrain-cli --no-default-features` produce a

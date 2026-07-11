@@ -1,0 +1,1 @@
+Matched snippet text that aggressive-level progressive disclosure removes entirely from the query response, leaving only doc_path/score for the agent to explicitly request via get.
