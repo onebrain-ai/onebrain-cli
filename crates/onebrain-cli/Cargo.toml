@@ -110,6 +110,10 @@ nix            = { workspace = true }
 
 [dev-dependencies]
 tempfile          = { workspace = true }
+# `token discover`'s `--since-days` test back-dates a fixture transcript's
+# mtime (the filter is mtime-based, per plan 5.2 — no other reliable
+# cross-platform way to control a file's mtime from a test).
+filetime          = { workspace = true }
 assert_cmd        = { workspace = true }
 predicates        = { workspace = true }
 insta             = { workspace = true }
