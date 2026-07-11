@@ -6,7 +6,8 @@
 
 use std::collections::HashSet;
 
-use super::{Payload, Signal, Transform, TransformCtx};
+use super::{is_query_surface, Payload, Signal, Transform, TransformCtx};
+use crate::gain::Surface;
 use crate::level::OptLevel;
 
 pub struct DocDedup;
@@ -18,6 +19,10 @@ impl Transform for DocDedup {
 
     fn min_level(&self) -> OptLevel {
         OptLevel::Conservative
+    }
+
+    fn applies_to(&self, surface: Surface) -> bool {
+        is_query_surface(surface)
     }
 
     fn lossy(&self) -> bool {

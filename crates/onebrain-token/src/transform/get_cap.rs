@@ -6,6 +6,7 @@
 
 use super::{Payload, Signal, Transform, TransformCtx};
 use crate::estimate::estimate_tokens;
+use crate::gain::Surface;
 use crate::level::OptLevel;
 
 pub struct GetCap;
@@ -17,6 +18,11 @@ impl Transform for GetCap {
 
     fn min_level(&self) -> OptLevel {
         OptLevel::Conservative
+    }
+
+    fn applies_to(&self, surface: Surface) -> bool {
+        // `get` only — it has a real `path:N` continuation cursor.
+        matches!(surface, Surface::McpGet)
     }
 
     fn lossy(&self) -> bool {
@@ -43,7 +49,17 @@ impl Transform for GetCap {
                 format!("{acc}\n{line}")
             };
             if estimate_tokens(&candidate, ctx.model) > max_tokens {
-                cut_at = i;
+                if acc.is_empty() {
+                    // The very first line alone exceeds the cap: include it
+                    // anyway (small overrun) so we never deliver an empty
+                    // payload with a cursor that points at what we just
+                    // failed to deliver. The cursor advances past it (i + 1),
+                    // guaranteeing forward progress on resume.
+                    acc = candidate;
+                    cut_at = i + 1;
+                } else {
+                    cut_at = i;
+                }
                 break;
             }
             acc = candidate;
@@ -119,5 +135,33 @@ mod tests {
     fn is_categorized_lossless_at_conservative() {
         assert_eq!(GetCap.min_level(), OptLevel::Conservative);
         assert!(!GetCap.lossy());
+    }
+
+    #[test]
+    fn single_line_over_cap_still_delivers_non_empty_and_advances_cursor() {
+        // One line, no newlines, longer than the cap. The pre-fix loop broke
+        // at i==0 with acc empty → empty text + cursor "0" (non-advancing:
+        // a caller resuming at fromLine=0 loops forever). Now it includes the
+        // line and advances the cursor past it.
+        let one_long_line = "z".repeat(400);
+        let ctx = ctx_with_cap(5); // far below the line's token cost
+        assert!(estimate_tokens(&one_long_line, ctx.model) > 5);
+
+        let out = GetCap.apply(&Payload::new(one_long_line.clone()), &ctx);
+
+        assert!(
+            !out.text.is_empty(),
+            "must never deliver empty text for non-empty input"
+        );
+        let Signal::Truncated { next } = &out.signals[0] else {
+            panic!("expected a Truncated signal, got {:?}", out.signals)
+        };
+        let cursor: usize = next.parse().expect("cursor must be a line index");
+        assert!(
+            cursor >= 1,
+            "cursor must advance past the delivered line (got {cursor})"
+        );
+        // Resuming at the cursor consumes the whole 1-line input — no infinite loop.
+        assert_eq!(one_long_line.lines().skip(cursor).count(), 0);
     }
 }

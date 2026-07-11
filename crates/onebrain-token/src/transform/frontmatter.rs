@@ -2,7 +2,8 @@
 //! (tags/created/status metadata an agent rarely needs) and signals what
 //! was cut so a caller that does need it knows to re-fetch the full doc.
 
-use super::{Payload, Signal, Transform, TransformCtx};
+use super::{is_doc_surface, Payload, Signal, Transform, TransformCtx};
+use crate::gain::Surface;
 use crate::level::OptLevel;
 
 pub struct FrontmatterStrip;
@@ -14,6 +15,10 @@ impl Transform for FrontmatterStrip {
 
     fn min_level(&self) -> OptLevel {
         OptLevel::Balanced
+    }
+
+    fn applies_to(&self, surface: Surface) -> bool {
+        is_doc_surface(surface)
     }
 
     fn lossy(&self) -> bool {

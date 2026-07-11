@@ -64,7 +64,10 @@ pub fn run_funnel(
     let mut current = input.clone();
     let mut applied: Vec<&'static str> = Vec::new();
     for t in registry() {
-        if t.min_level() > ctx.level {
+        // Gated by BOTH the ladder rung (when) AND the surface (where) —
+        // design §2a. Skipping the surface check is the blocker R1+R2 found:
+        // a query-hit transform empties/truncates a doc body otherwise.
+        if t.min_level() > ctx.level || !t.applies_to(surface) {
             continue;
         }
         let next = t.apply(&current, ctx);
@@ -336,5 +339,93 @@ mod tests {
         );
         let event = &sink.events[0];
         assert!(event.bytes_after <= event.bytes_before);
+    }
+
+    /// BLOCKER enforcement (design §2a): a document-body surface (`get`,
+    /// `multi_get`) must NEVER be emptied or shrunk to a snippet-sized stub
+    /// by a query-hit transform. Before the surface gate, `disclosure`
+    /// (Aggressive) emptied the body and `never_worse` kept it (0 tokens <
+    /// original); `snippet` (Balanced+) capped a document body to 150 chars.
+    /// This asserts non-empty AND plausibly-sized output at every level for
+    /// every doc-body / query surface — the monotonic-bytes test alone
+    /// masked the empty-body bug.
+    #[test]
+    fn per_surface_output_is_non_empty_and_plausibly_sized_at_every_level() {
+        // A real document body — bigger than any snippet cap, so a wrongly
+        // applied query transform would visibly shrink or empty it.
+        let doc_body = include_str!("../tests/fixtures/get_cap/input.md");
+        let doc_len = doc_body.len();
+
+        // Doc-body surfaces: output must stay a real document, never a
+        // snippet stub (>150/120 char caps) and never empty.
+        for surface in [Surface::McpGet, Surface::McpMultiGet] {
+            for level in OptLevel::ALL {
+                let mut sink = MemoryGainSink::default();
+                let out = run_funnel(Payload::new(doc_body), &ctx(level), surface, &mut sink);
+                assert!(
+                    !out.text.is_empty(),
+                    "{surface:?} at {level} emptied the document body"
+                );
+                // A doc-body transform may cap large bodies, but must never
+                // collapse a ~1KB body to a snippet-sized stub. Floor at
+                // half the original (the get_cap fixture is well under the
+                // 4k-token cap, so nothing should truncate it here).
+                assert!(
+                    out.text.len() >= doc_len / 2,
+                    "{surface:?} at {level} shrank body to {} bytes (orig {doc_len}) — a query transform leaked onto a doc surface",
+                    out.text.len()
+                );
+            }
+        }
+
+        // Query surface: hits list stays non-empty at every level.
+        for level in OptLevel::ALL {
+            let mut sink = MemoryGainSink::default();
+            let hits = include_str!("../tests/fixtures/doc_dedup/input.json");
+            let out = run_funnel(
+                Payload::new(hits),
+                &ctx(level),
+                Surface::McpQuery,
+                &mut sink,
+            );
+            assert!(
+                !out.text.is_empty(),
+                "McpQuery at {level} emptied the hit list"
+            );
+        }
+    }
+
+    /// `head_only` must not be dead code: at Aggressive on `multi_get`, a
+    /// large body is capped by `head_only` (with a `Truncated{next:"body"}`
+    /// signal), not emptied by `disclosure`. Proves the surface gate lets
+    /// `head_only` reach the payload.
+    #[test]
+    fn head_only_runs_on_multi_get_at_aggressive() {
+        let doc_body = include_str!("../tests/fixtures/get_cap/input.md");
+        let mut over_cap = String::new();
+        while estimate_tokens(&over_cap, MODEL) < 5000 {
+            over_cap.push_str(doc_body);
+        }
+
+        let mut sink = MemoryGainSink::default();
+        let out = run_funnel(
+            Payload::new(over_cap.clone()),
+            &ctx(OptLevel::Aggressive),
+            Surface::McpMultiGet,
+            &mut sink,
+        );
+        assert!(!out.text.is_empty(), "multi_get body was emptied");
+        assert!(
+            out.text.len() < over_cap.len(),
+            "head_only should have capped the over-cap body"
+        );
+        assert!(
+            out.signals.iter().any(|s| matches!(
+                s,
+                Signal::Truncated { next } if next == "body"
+            )),
+            "expected head_only's Truncated{{next:\"body\"}} signal, got {:?}",
+            out.signals
+        );
     }
 }

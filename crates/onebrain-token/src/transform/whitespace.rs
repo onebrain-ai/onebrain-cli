@@ -1,10 +1,12 @@
 //! Lossless whitespace compaction: trims trailing line whitespace, collapses
 //! runs of blank lines to at most one, and collapses interior runs of
-//! spaces/tabs to a single space — while preserving leading indentation
-//! (markdown lists, nested content) untouched. Purely cosmetic; no prose
-//! character is removed.
+//! *spaces* to a single space — while preserving leading indentation
+//! (markdown lists, nested content), tabs (structurally significant), and
+//! everything inside fenced code blocks (``` / ~~~) untouched. Purely
+//! cosmetic; no prose character and no significant whitespace is removed.
 
-use super::{Payload, Transform, TransformCtx};
+use super::{is_doc_surface, Payload, Transform, TransformCtx};
+use crate::gain::Surface;
 use crate::level::OptLevel;
 
 pub struct Whitespace;
@@ -16,6 +18,10 @@ impl Transform for Whitespace {
 
     fn min_level(&self) -> OptLevel {
         OptLevel::Conservative
+    }
+
+    fn applies_to(&self, surface: Surface) -> bool {
+        is_doc_surface(surface)
     }
 
     fn lossy(&self) -> bool {
@@ -31,26 +37,54 @@ impl Transform for Whitespace {
 }
 
 fn compact_whitespace(text: &str) -> String {
-    let lines: Vec<String> = text.lines().map(collapse_line).collect();
-
-    let mut out_lines: Vec<String> = Vec::with_capacity(lines.len());
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut in_fence = false;
     let mut blank_run = 0u32;
-    for line in lines {
-        if line.is_empty() {
+
+    for line in text.lines() {
+        // A fenced-code delimiter (``` or ~~~) toggles fence state. The
+        // delimiter line itself is preserved verbatim (it may carry an info
+        // string like ```rust).
+        if is_fence_marker(line) {
+            in_fence = !in_fence;
+            blank_run = 0;
+            out_lines.push(line.to_string());
+            continue;
+        }
+
+        // Inside a fence: preserve every line verbatim — interior alignment
+        // (ASCII tables, TSV, terminal output) and blank lines are all
+        // significant (§4: never silently destroy structure).
+        if in_fence {
+            out_lines.push(line.to_string());
+            continue;
+        }
+
+        let collapsed = collapse_line(line);
+        if collapsed.is_empty() {
             blank_run += 1;
             if blank_run <= 1 {
-                out_lines.push(line);
+                out_lines.push(collapsed);
             }
         } else {
             blank_run = 0;
-            out_lines.push(line);
+            out_lines.push(collapsed);
         }
     }
     out_lines.join("\n")
 }
 
-/// Trims trailing whitespace and collapses interior runs of spaces/tabs to
-/// one space, while leaving leading indentation exactly as-is.
+/// True for a fenced-code-block delimiter line (``` or ~~~, after any leading
+/// indentation).
+fn is_fence_marker(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("```") || t.starts_with("~~~")
+}
+
+/// Trims trailing whitespace and collapses interior runs of *spaces* to a
+/// single space, while leaving leading indentation exactly as-is. Tabs are
+/// left untouched everywhere — they are structurally significant (TSV,
+/// alignment) and must never be collapsed or converted to a space.
 fn collapse_line(line: &str) -> String {
     let trimmed_end = line.trim_end();
     let indent_len = trimmed_end.len() - trimmed_end.trim_start().len();
@@ -59,12 +93,13 @@ fn collapse_line(line: &str) -> String {
     let mut collapsed = String::with_capacity(rest.len());
     let mut last_was_space = false;
     for ch in rest.chars() {
-        if ch == ' ' || ch == '\t' {
+        if ch == ' ' {
             if !last_was_space {
                 collapsed.push(' ');
             }
             last_was_space = true;
         } else {
+            // Tabs and every other char pass through untouched.
             collapsed.push(ch);
             last_was_space = false;
         }
@@ -129,5 +164,60 @@ mod tests {
         let once = Whitespace.apply(&Payload::new(INPUT), &TransformCtx::default());
         let twice = Whitespace.apply(&once, &TransformCtx::default());
         assert_eq!(once, twice);
+    }
+
+    const FENCED: &str = include_str!("../../tests/fixtures/whitespace/fenced.md");
+
+    #[test]
+    fn preserves_aligned_columns_and_tabs_inside_a_code_fence() {
+        let out = Whitespace
+            .apply(&Payload::new(FENCED), &TransformCtx::default())
+            .text;
+
+        // The entire fenced block must survive byte-for-byte: aligned
+        // columns (multi-space) and the tab-separated line untouched.
+        for verbatim in [
+            "col1      col2      col3",
+            "alpha     100       yes",
+            "beta      2000      no",
+            "x\ty\tz",
+        ] {
+            assert!(
+                out.contains(verbatim),
+                "fenced line was corrupted; expected {verbatim:?} in:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn still_collapses_double_spaces_outside_the_fence() {
+        let out = Whitespace
+            .apply(&Payload::new(FENCED), &TransformCtx::default())
+            .text;
+        assert!(
+            out.contains("Some prose with double spaces here."),
+            "prose OUTSIDE the fence must still collapse:\n{out}"
+        );
+        assert!(
+            out.contains("More prose after."),
+            "prose after the fence must still collapse:\n{out}"
+        );
+    }
+
+    #[test]
+    fn is_idempotent_with_a_fence() {
+        let once = Whitespace.apply(&Payload::new(FENCED), &TransformCtx::default());
+        let twice = Whitespace.apply(&once, &TransformCtx::default());
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn leaves_a_bare_tab_line_untouched_even_outside_a_fence() {
+        // Tabs are structurally significant everywhere; a TSV row outside a
+        // fence keeps its tabs (only space runs collapse).
+        let input = Payload::new("a\tb\tc\nx  y  z");
+        let out = Whitespace.apply(&input, &TransformCtx::default()).text;
+        assert!(out.contains("a\tb\tc"), "tabs must survive: {out:?}");
+        assert!(out.contains("x y z"), "space runs still collapse: {out:?}");
     }
 }

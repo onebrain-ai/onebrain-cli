@@ -2,6 +2,7 @@
 //! registry consumed by [`crate::guard::run_funnel`].
 
 use crate::estimate::ModelFamily;
+use crate::gain::Surface;
 use crate::level::OptLevel;
 
 pub mod disclosure;
@@ -117,10 +118,36 @@ pub trait Transform {
     fn name(&self) -> &'static str;
     /// The lowest ladder rung at which this transform is active.
     fn min_level(&self) -> OptLevel;
+    /// Which surfaces this transform may run on (design §2a). A transform is
+    /// gated by BOTH `min_level() <= ctx.level` AND `applies_to(surface)`:
+    /// the ladder says *when* a technique switches on, this says *where* it
+    /// may run. Default `true`; each transform overrides per the matrix so a
+    /// query-hit transform (`snippet`/`disclosure`) can never run on a `get`
+    /// document body and empty/truncate it. `ReadHook` never flows through
+    /// the funnel for shaping, so it is `false` for every shaping transform.
+    fn applies_to(&self, surface: Surface) -> bool {
+        let _ = surface;
+        true
+    }
     /// Whether this transform can discard information (vs. purely
     /// reshaping/compacting it losslessly).
     fn lossy(&self) -> bool;
     fn apply(&self, input: &Payload, ctx: &TransformCtx) -> Payload;
+}
+
+/// Query/result-set surfaces — hit lists with per-hit snippets. `json_compact`,
+/// `doc_dedup`, `snippet`, `disclosure` operate here (design §2a).
+pub(crate) fn is_query_surface(surface: Surface) -> bool {
+    matches!(
+        surface,
+        Surface::McpQuery | Surface::CliSearch | Surface::DaemonHttp
+    )
+}
+
+/// Document-body surfaces — whole-doc bodies. `whitespace`, `frontmatter`
+/// operate here; `get_cap` on `get` only, `head_only` on `multi_get` only.
+pub(crate) fn is_doc_surface(surface: Surface) -> bool {
+    matches!(surface, Surface::McpGet | Surface::McpMultiGet)
 }
 
 /// All registered transforms, in the canonical order [`crate::guard::run_funnel`]

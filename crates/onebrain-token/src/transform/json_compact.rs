@@ -2,7 +2,8 @@
 //! whitespace. Non-JSON input passes through untouched — this transform
 //! only ever touches agent-facing `--json`/MCP payload text.
 
-use super::{Payload, Transform, TransformCtx};
+use super::{is_query_surface, Payload, Transform, TransformCtx};
+use crate::gain::Surface;
 use crate::level::OptLevel;
 
 pub struct JsonCompact;
@@ -14,6 +15,10 @@ impl Transform for JsonCompact {
 
     fn min_level(&self) -> OptLevel {
         OptLevel::Conservative
+    }
+
+    fn applies_to(&self, surface: Surface) -> bool {
+        is_query_surface(surface)
     }
 
     fn lossy(&self) -> bool {

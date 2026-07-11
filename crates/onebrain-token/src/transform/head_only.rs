@@ -6,6 +6,7 @@
 
 use super::{Payload, Signal, Transform, TransformCtx};
 use crate::estimate::estimate_tokens;
+use crate::gain::Surface;
 use crate::level::OptLevel;
 
 /// Default head size when the caller supplies no explicit cap — deliberately
@@ -21,6 +22,11 @@ impl Transform for HeadOnly {
 
     fn min_level(&self) -> OptLevel {
         OptLevel::Aggressive
+    }
+
+    fn applies_to(&self, surface: Surface) -> bool {
+        // `multi_get` only — fan-out with no per-doc continuation cursor.
+        matches!(surface, Surface::McpMultiGet)
     }
 
     fn lossy(&self) -> bool {
@@ -47,6 +53,13 @@ impl Transform for HeadOnly {
                 format!("{acc}\n{line}")
             };
             if estimate_tokens(&candidate, ctx.model) > max_tokens {
+                if acc.is_empty() {
+                    // First line alone exceeds the cap: include it anyway so
+                    // a non-empty input never yields an empty head (the
+                    // recovery for multi_get is a full `get`, so a small
+                    // overrun on the head is fine).
+                    acc = candidate;
+                }
                 break;
             }
             acc = candidate;
@@ -108,5 +121,23 @@ mod tests {
     fn is_lossy_at_aggressive() {
         assert_eq!(HeadOnly.min_level(), OptLevel::Aggressive);
         assert!(HeadOnly.lossy());
+    }
+
+    #[test]
+    fn single_line_over_cap_still_delivers_non_empty() {
+        // Pre-fix, a single line longer than the cap left acc empty → empty
+        // head. Now the first line is included even if it overruns the cap.
+        let one_long_line = "z".repeat(400);
+        let ctx = TransformCtx {
+            get_max_tokens: Some(5),
+            ..TransformCtx::default()
+        };
+        assert!(estimate_tokens(&one_long_line, ctx.model) > 5);
+
+        let out = HeadOnly.apply(&Payload::new(one_long_line), &ctx);
+        assert!(
+            !out.text.is_empty(),
+            "multi_get head must never be empty for non-empty input"
+        );
     }
 }
