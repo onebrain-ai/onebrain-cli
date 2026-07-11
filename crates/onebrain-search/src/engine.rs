@@ -54,6 +54,16 @@ const ENGINE_HEADER: TableDefinition<&str, &str> = TableDefinition::new("engine_
 
 const ACTIVE_MODEL_KEY: &str = "active_model";
 const LAST_INDEXED_KEY: &str = "last_indexed_at";
+/// Monotonic index-version counter (design §3a). Bumped in a single atomic
+/// write txn at the end of EVERY reindex — full AND lex-only — so the
+/// query-result memoization cache (Track 3, `onebrain-token`) can put it in
+/// its key and be structurally immune to staleness: any reindex that could
+/// change results also changes `generation`, so a prior memo entry can never
+/// match. Unlike [`LAST_INDEXED_KEY`] (full-mode only — it means "vectors are
+/// current as of"), this MUST bump on the lex-only path too, because the
+/// constantly-firing PostToolUse lex-only reindex hook changes lex results
+/// without ever embedding.
+const GENERATION_KEY: &str = "generation";
 
 const CHUNK_MAX_TOKENS: usize = 512;
 const CHUNK_OVERLAP_TOKENS: usize = 64;
@@ -1669,6 +1679,57 @@ impl Engine {
             .and_then(|v| v.value().parse::<u64>().ok()))
     }
 
+    /// The single choke-point (design §3a / §8 risk row) that bumps the
+    /// [`GENERATION_KEY`] counter by one, in ONE atomic write txn. Every
+    /// reindex mode calls exactly this — full and lex-only — so no reindex
+    /// path can forget to invalidate the memo cache. Because the read+write
+    /// live in one committed transaction, a crash before commit leaves the
+    /// counter untouched (no half-bump); a crash after leaves the index and
+    /// the counter consistently advanced together.
+    fn bump_generation(&mut self) -> Result<()> {
+        let write_txn = self.meta.begin_write()?;
+        {
+            let mut header = write_txn.open_table(ENGINE_HEADER)?;
+            let current = header
+                .get(GENERATION_KEY)?
+                .and_then(|v| v.value().parse::<u64>().ok())
+                .unwrap_or(0);
+            let next = current.wrapping_add(1);
+            header.insert(GENERATION_KEY, next.to_string().as_str())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// The current index generation — a monotonic counter bumped once per
+    /// reindex (full or lex-only). `0` before any reindex has run (or if the
+    /// header can't be read — treated as "never indexed", the safe default
+    /// that just misses the memo cache rather than serving staleness). The
+    /// memoization cache (Track 3) folds this into every key so that a reindex
+    /// invalidates all prior entries by construction.
+    pub fn generation(&self) -> u64 {
+        (|| -> Result<u64> {
+            let read_txn = self.meta.begin_read()?;
+            let header = read_txn.open_table(ENGINE_HEADER)?;
+            Ok(header
+                .get(GENERATION_KEY)?
+                .and_then(|v| v.value().parse::<u64>().ok())
+                .unwrap_or(0))
+        })()
+        .unwrap_or(0)
+    }
+
+    /// Public content-hash accessor for `doc_path` (design §3b) — the
+    /// already-sent ledger (Track 3) needs to compare a doc's current content
+    /// hash without re-hashing large bodies. Reuses the stored hashes: the
+    /// `LEX_HASHES` entry if present, else `DOC_HASHES` (via
+    /// [`Engine::effective_lex_hash`]), so a lex-only-indexed doc resolves too.
+    /// `None` for an unknown/unindexed doc (or on any read error — the caller
+    /// then simply treats the doc as first-send, never a false "unchanged").
+    pub fn doc_hash(&self, doc_path: &str) -> Option<String> {
+        self.effective_lex_hash(doc_path).ok().flatten()
+    }
+
     /// Drop `doc_path`'s stored content hash from BOTH `DOC_HASHES` and
     /// `LEX_HASHES`. Used when a doc is swept as removed (file gone from
     /// disk) — in both `Full` and `LexOnly` reindex modes a removed doc must
@@ -1894,6 +1955,9 @@ impl Engine {
         if mode == IndexMode::Full {
             self.record_last_indexed(now_epoch_secs())?;
         }
+        // The generation counter DOES bump on every mode (design §3a) — a
+        // lex-only reindex changes results the memo cache must invalidate.
+        self.bump_generation()?;
         Ok(stats)
     }
 
@@ -2022,6 +2086,13 @@ impl Engine {
             self.drop_hash(&doc_path)?;
             stats.removed += 1;
         }
+
+        // The generation counter bumps on every mode (design §3a): even a
+        // lex-only reindex (the constantly-firing PostToolUse hook) changes
+        // lex results and must invalidate the memo cache. Bump BEFORE the
+        // full-only reranker fetch below so an early return on a fetch error
+        // can't skip it.
+        self.bump_generation()?;
 
         // Lex-only runs never touch `last_indexed_at`: see this function's
         // doc comment (and `reindex_all_lex_only_with_progress`'s) — it means
@@ -4546,5 +4617,119 @@ mod tests {
             0,
             "nothing should read as pending after migration — vectors were reused, not rebuilt"
         );
+    }
+
+    // ---- Track 3: generation counter + doc_hash accessor (design §3) ----
+
+    #[test]
+    fn generation_starts_at_zero_before_any_reindex() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let e = fake_engine(cache_dir.path());
+        assert_eq!(
+            e.generation(),
+            0,
+            "a fresh engine has never reindexed, so generation is 0"
+        );
+    }
+
+    #[test]
+    fn full_reindex_bumps_generation() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nbody").unwrap();
+
+        assert_eq!(e.generation(), 0);
+        e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(e.generation(), 1, "full reindex must bump generation");
+        e.reindex_all(vault_dir.path()).unwrap();
+        assert_eq!(
+            e.generation(),
+            2,
+            "a second full reindex bumps again (even all-unchanged)"
+        );
+    }
+
+    /// THE regression that matters (design §3a / §8 risk): the constantly-
+    /// firing PostToolUse lex-only reindex hook changes lex results but never
+    /// embeds. `last_indexed_at` is deliberately full-mode-only, so the memo
+    /// cache CANNOT key on it; `generation` must bump on the lex-only path too
+    /// or a stale memo entry survives an index change. This asserts exactly
+    /// that: a lex-only reindex advances the counter.
+    #[test]
+    fn lex_only_reindex_bumps_generation() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nbody").unwrap();
+
+        assert_eq!(e.generation(), 0);
+        e.reindex_all_lex_only_with_progress(vault_dir.path(), &mut |_| {})
+            .unwrap();
+        assert_eq!(
+            e.generation(),
+            1,
+            "lex-only reindex MUST bump generation (PostToolUse hook path)"
+        );
+
+        // And `last_indexed_at` did NOT move — proving generation is a
+        // distinct signal that tracks lex-only changes the timestamp misses.
+        assert_eq!(
+            e.stored_last_indexed().unwrap(),
+            None,
+            "lex-only must not record last_indexed_at (only generation moved)"
+        );
+
+        // A second lex-only pass over an unchanged vault still bumps: the
+        // counter is a coarse "something ran" signal, and over-invalidating
+        // the memo cache is safe (a miss), under-invalidating is not.
+        e.reindex_all_lex_only_with_progress(vault_dir.path(), &mut |_| {})
+            .unwrap();
+        assert_eq!(e.generation(), 2);
+    }
+
+    #[test]
+    fn generation_persists_across_reopen() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nbody").unwrap();
+        {
+            let mut e = fake_engine(cache_dir.path());
+            e.reindex_all(vault_dir.path()).unwrap();
+            assert_eq!(e.generation(), 1);
+        } // drop releases the redb lock
+        let e = fake_engine(cache_dir.path());
+        assert_eq!(
+            e.generation(),
+            1,
+            "generation is durable — survives an engine reopen"
+        );
+    }
+
+    #[test]
+    fn doc_hash_returns_stored_hash_for_indexed_doc_and_none_otherwise() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(cache_dir.path());
+        std::fs::write(vault_dir.path().join("a.md"), "# A\noriginal content").unwrap();
+        e.reindex_all(vault_dir.path()).unwrap();
+
+        let h1 = e.doc_hash("a.md").expect("indexed doc has a hash");
+        assert_eq!(
+            Some(h1.as_str()),
+            e.stored_hash("a.md").unwrap().as_deref(),
+            "doc_hash must expose exactly the stored content hash (no re-hash)"
+        );
+        assert!(
+            e.doc_hash("nope.md").is_none(),
+            "unknown/unindexed doc has no hash"
+        );
+
+        // Editing the doc and reindexing changes the reported hash — the
+        // property the ledger relies on to detect a doc was edited.
+        std::fs::write(vault_dir.path().join("a.md"), "# A\nedited body").unwrap();
+        e.reindex_all(vault_dir.path()).unwrap();
+        let h2 = e.doc_hash("a.md").unwrap();
+        assert_ne!(h1, h2, "an edit must change the doc_hash");
     }
 }
