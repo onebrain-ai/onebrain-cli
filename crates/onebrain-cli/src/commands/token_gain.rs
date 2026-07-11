@@ -126,7 +126,11 @@ fn parse_dim(s: &str) -> Option<Dim> {
     }
 }
 
-fn parse_by(by: Option<&str>) -> Result<(Option<TimeAxis>, Option<Dim>)> {
+/// Parse a `--by`/`?by=` value (`time,dim` in either order, either alone) into
+/// its `(time, dim)` axes. `pub(crate)` so the daemon `/api/token/gain` route
+/// reuses the EXACT same parsing as the CLI — one code path for the by-axes,
+/// no daemon/CLI drift.
+pub(crate) fn parse_by(by: Option<&str>) -> Result<(Option<TimeAxis>, Option<Dim>)> {
     let Some(by) = by else {
         return Ok((None, None));
     };

@@ -5,7 +5,7 @@
 //! lock-free HTTP clients of the one owner.
 //!
 //! ```text
-//!   GET  /api/token/gain?by=&since=&history=  → gain pivot JSON (Track 2 rollups)
+//!   GET  /api/token/gain?by=&since=&history=  → PivotResult JSON (Tier-2 rollups)
 //!   GET  /api/token/status                    → { level, ledger_active, cache_bytes }
 //!   POST /api/token/ledger/check              → { path, session_token, record? }
 //!                                               → ledger verdict (+ reference envelope)
@@ -16,19 +16,18 @@
 //! actually hold the token cache — a `serve` / unit-test router with none gets
 //! 503, never a per-request open (the daemon is the single redb owner).
 //!
-//! ## Coordination note (Track 2)
-//! `GET /api/token/gain` is a STUB in this track: it returns an empty pivot
-//! shape until Track 2 lands the `PivotResult` type + `token.redb` rollups.
-//! When Track 2 merges, this handler reads the rollups and returns the real
-//! `PivotResult` (the SAME struct the CLI `--json` and webui consume). The
-//! route existing (200, empty) — rather than 404 — is deliberate: clients
-//! feature-detect on 404 (old daemon) vs 200 (route present), and an empty
-//! pivot is a truthful "no data yet", not "route missing".
+//! `GET /api/token/gain` serves the real [`PivotResult`] from the Tier-2
+//! rollup tables in the daemon-owned `token.redb` — the SAME
+//! [`onebrain_token::gain::pivot::query`] engine the CLI `token gain` command
+//! reads, and the same by-axes parsing ([`crate::commands::token_gain::parse_by`]),
+//! so the route, the CLI `--json`, and the WebUI all agree on one code path
+//! (design §5 "one pivot engine ... serves all three consumers"). An empty
+//! pivot is a truthful "no gain data yet", never hardcoded. Version-skew
+//! contract: a daemon too old to have the route answers 404 → the client skips
+//! optimization; a present route answers 200 with the real-or-empty pivot.
 //!
-//! `GET /api/token/status`'s `level` is likewise a best-effort default
-//! (`conservative`, the product default) until Track 2's
-//! `token_optimization` config block lands and Track 4 wires per-call/config
-//! level resolution.
+//! `GET /api/token/status`'s `level` is a best-effort default (`conservative`,
+//! the product default) until Track 4 wires per-call/config level resolution.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -44,7 +43,11 @@ use serde::{Deserialize, Serialize};
 use super::api::{require_vault_root, ApiError};
 use super::AppState;
 use crate::commands::search_common::{collection_cache_dir, collection_name_readonly};
-use onebrain_token::{LedgerVerdict, TokenCache};
+use crate::commands::token_gain::parse_by;
+use onebrain_token::gain::pivot;
+#[allow(unused_imports)] // PivotResult is referenced in rustdoc intra-doc links.
+use onebrain_token::PivotResult;
+use onebrain_token::{LedgerVerdict, PivotQuery, TokenCache};
 
 /// The `token/` sibling of `models/` + `index/` under a collection cache dir,
 /// and the `token.redb` file inside it. `CollectionLayout` scans only
@@ -107,30 +110,48 @@ fn require_token_cache(state: &AppState) -> Result<Arc<TokenCache>, ApiError> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// GET /api/token/gain  (STUB — Track 2 rollups)
+// GET /api/token/gain
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct GainQuery {
+    /// `time,dim` (either order, either alone) — parsed by the shared
+    /// [`parse_by`] so the route and the CLI agree on the axes.
     by: Option<String>,
+    /// Inclusive `YYYY-MM-DD` lower bound on the pivot window.
     since: Option<String>,
+    /// Accepted for wire-compat with the CLI flags; the route serves the
+    /// Tier-2 rollup pivot (design §5), which is what the WebUI dashboard
+    /// consumes — the raw per-call log tail (`--history`) is a CLI-only view.
+    #[serde(default)]
     history: Option<bool>,
 }
 
-/// Returns the gain pivot. STUB until Track 2 (see module note): an empty
-/// pivot shape with the echoed query, so a client can distinguish "route
-/// present, no data" (200) from "route missing" (404 on an old daemon).
-async fn get_token_gain(Query(q): Query<GainQuery>) -> Response {
-    Json(serde_json::json!({
-        "rows": [],
-        "totals": serde_json::Value::Null,
-        "by": q.by,
-        "since": q.since,
-        "history": q.history.unwrap_or(false),
-        // Removed once Track 2's PivotResult + rollups land here.
-        "pending": "token gain rollups land with Track 2 (PivotResult)",
-    }))
-    .into_response()
+/// Returns the real [`PivotResult`] from the daemon-owned `token.redb` Tier-2
+/// rollups via the shared [`pivot::query`] engine. Empty pivot when there's
+/// genuinely no gain data — never hardcoded. 503 when the daemon holds no
+/// token cache; a bad `by=` value is a 400.
+async fn get_token_gain(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<GainQuery>,
+) -> Result<Response, ApiError> {
+    let _ = q.history; // accepted for wire-compat; rollup pivot is the source.
+    let cache = require_token_cache(&state)?;
+
+    let (time, dim) = parse_by(q.by.as_deref()).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let query = PivotQuery {
+        time,
+        dim,
+        since: q.since,
+    };
+
+    // The pivot is a synchronous redb scan of the rollup table — run it off the
+    // async runtime, like the other token routes.
+    let result = tokio::task::spawn_blocking(move || pivot::query(cache.database(), &query))
+        .await
+        .map_err(|e| ApiError::Internal(format!("token gain task join: {e}")))?
+        .map_err(|e| ApiError::Internal(format!("token gain pivot: {e}")))?;
+    Ok(Json(result).into_response())
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -139,9 +160,8 @@ async fn get_token_gain(Query(q): Query<GainQuery>) -> Response {
 
 #[derive(Debug, Serialize, PartialEq)]
 struct TokenStatusResponse {
-    /// Effective optimization level. Best-effort `"conservative"` (product
-    /// default) until Track 2's `token_optimization` config lands + Track 4
-    /// wires real resolution.
+    /// Effective optimization level. Best-effort `"conservative"` (the product
+    /// default) until Track 4 wires per-call/config level resolution.
     level: String,
     /// Whether the already-sent ledger is active — true at level 2↑
     /// (`balanced`/`aggressive`), matching design §3b's activation rule.
@@ -421,27 +441,122 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gain_route_returns_stub_200() {
+    async fn gain_route_empty_when_no_data() {
+        // Route present (200, not 404) so clients feature-detect correctly;
+        // a fresh token.redb with no rollups is a truthful empty pivot.
         let (vault, cache) = vault_and_cache();
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         let router = router_holding_cache(vault.path());
 
         let resp = router
             .oneshot(
-                Request::get("/api/token/gain?by=month,surface&history=true")
+                Request::get("/api/token/gain?by=surface")
                     .header("x-onebrain-token", TOKEN)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        // Route present (200, not 404) so clients feature-detect correctly.
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["rows"], serde_json::json!([]));
-        assert_eq!(v["by"], "month,surface");
-        assert!(v.get("pending").is_some(), "stub marks Track 2 pending");
+        assert_eq!(v["rows"], serde_json::json!([]), "no data → empty rows");
+        assert_eq!(v["totals"]["count"], 0);
+        assert!(v.get("pending").is_none(), "no stub marker anymore");
+    }
+
+    /// The seam proof (plan step 3.5): seed a couple of gain events into the
+    /// daemon-owned `token.redb`, roll them up, then hit the route and assert
+    /// the response carries the SEEDED pivot rows — the real
+    /// `onebrain_token::gain::pivot` engine over the real rollup tables, not a
+    /// hardcoded shape.
+    #[tokio::test]
+    async fn gain_route_serves_seeded_rollup_rows() {
+        use onebrain_token::gain::rollup;
+        use onebrain_token::{CacheKind, Database, GainEvent, OptLevel, Surface};
+
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+
+        // Seed the rollups BEFORE the daemon opens the DB (redb is single-writer
+        // — the seeding handle is dropped before the router opens it).
+        let cache_dir = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap());
+        let db_path = token_db_path(&cache_dir);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let event = |ts, surface, before, after| GainEvent {
+            ts,
+            surface,
+            transform: "whitespace".to_string(),
+            level: OptLevel::Conservative,
+            bytes_before: before,
+            bytes_after: after,
+            cache: CacheKind::None,
+            session_token: None,
+        };
+        {
+            let db = Database::create(&db_path).unwrap();
+            rollup::update(&db, &event(1_783_728_000, Surface::CliSearch, 1000, 400)).unwrap();
+            rollup::update(&db, &event(1_783_900_800, Surface::McpQuery, 500, 100)).unwrap();
+        } // drop releases the redb lock so the daemon can take it
+
+        let router = router_holding_cache(vault.path());
+        let resp = router
+            .oneshot(
+                Request::get("/api/token/gain?by=surface")
+                    .header("x-onebrain-token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // Two surfaces seeded → two pivot rows, and the grand total sums both.
+        let rows = v["rows"].as_array().expect("rows array");
+        assert_eq!(rows.len(), 2, "one row per seeded surface: {v}");
+        let surfaces: Vec<&str> = rows.iter().filter_map(|r| r["dim"].as_str()).collect();
+        assert!(surfaces.contains(&"cli_search"), "got {surfaces:?}");
+        assert!(surfaces.contains(&"mcp_query"), "got {surfaces:?}");
+        assert_eq!(v["totals"]["bytes_before"], 1500);
+        assert_eq!(v["totals"]["bytes_after"], 500);
+        assert_eq!(v["totals"]["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn gain_route_rejects_bad_by_axis() {
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let router = router_holding_cache(vault.path());
+        let resp = router
+            .oneshot(
+                Request::get("/api/token/gain?by=bogus")
+                    .header("x-onebrain-token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn gain_route_503_without_held_cache() {
+        let (vault, _cache) = vault_and_cache();
+        let cfg =
+            ServeConfig::localhost(Some(vault.path().to_path_buf()), 0, TOKEN.to_string(), None);
+        let router = build_router(cfg);
+        let resp = router
+            .oneshot(
+                Request::get("/api/token/gain")
+                    .header("x-onebrain-token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
