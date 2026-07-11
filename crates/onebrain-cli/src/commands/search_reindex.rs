@@ -275,6 +275,54 @@ fn spawn_detached_pending_embed(vault_flag: Option<&PathBuf>) -> std::io::Result
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+
+    // Windows detach hardening: nulling the child's OWN stdio isn't enough.
+    // Rust spawns Windows children with `bInheritHandles=TRUE`, so the child
+    // also inherits every OTHER inheritable handle in this process — including
+    // OUR stdout/stderr. When the parent's stdout is a pipe (e.g. a
+    // `Command::output()` capture in a test, or any caller reading our JSON),
+    // the reader only sees EOF once EVERY writer handle closes: the inherited
+    // copy in the long-lived child keeps that pipe open, so the caller blocks
+    // on the CHILD's whole run (re-exec of the big semantic binary + engine
+    // open) instead of returning the instant we detach. Unix avoids this via
+    // `O_CLOEXEC` on pipe fds; Windows has no equivalent by default, so clear
+    // the inherit flag on our std handles right before spawning. The child
+    // explicitly nulls its own stdio, so it never needs to inherit ours; the
+    // parent keeps using its handles normally (the flag only governs
+    // inheritance by children spawned afterward). This is what makes the
+    // `--pending-only` foreground return provably independent of the detached
+    // embed's duration (fixes the Windows-only `pending_only_json_detaches`
+    // >5s timeout).
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        // `SetHandleInformation(hObject, HANDLE_FLAG_INHERIT, 0)` — declared
+        // directly (no `windows-sys` dep) mirroring the crate's existing
+        // `extern "C" { fn geteuid() }` pattern in the search engine tests.
+        // `#[link(name = "kernel32")]` makes the symbol resolve explicitly
+        // rather than relying on std already pulling kernel32 into the link.
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetHandleInformation(
+                h_object: *mut core::ffi::c_void,
+                dw_mask: u32,
+                dw_flags: u32,
+            ) -> i32;
+        }
+        const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+        // Best-effort: a failure here just means we fall back to the prior
+        // (possibly-blocking) behavior — never a reason to fail the detach.
+        for h in [
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+            std::io::stdin().as_raw_handle(),
+        ] {
+            unsafe {
+                let _ = SetHandleInformation(h as *mut core::ffi::c_void, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+
     cmd.spawn()?;
     Ok(())
 }
