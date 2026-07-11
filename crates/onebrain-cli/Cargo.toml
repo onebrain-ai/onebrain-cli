@@ -15,13 +15,13 @@ path = "src/main.rs"
 onebrain-core   = { workspace = true }
 onebrain-fs     = { workspace = true }
 onebrain-cache  = { workspace = true }
+onebrain-token  = { workspace = true }
 # The workspace dep pins `default-features = false`; onebrain-cli's own
 # `semantic` feature (default ON, see [features] below) forwards to
 # `onebrain-search/semantic`. So `cargo build -p onebrain-cli --no-default-features`
 # produces a lex-only binary with no fastembed/ONNX dep — the tier used on
 # release targets with no ONNX Runtime prebuilt (see ADR 0017).
 onebrain-search = { workspace = true }
-onebrain-token  = { workspace = true }
 clap           = { workspace = true }
 clap_complete  = { workspace = true }
 serde          = { workspace = true }

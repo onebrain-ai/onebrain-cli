@@ -57,6 +57,18 @@ fn own_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Best-effort session-token resolution for ledger calls (design §3b). The
+/// token identifies which agent session a delivery belongs to so one daemon
+/// serves many sessions correctly. `None` when no token is resolvable
+/// (headless / odd host) — the caller then sends `""` and the ledger is
+/// silently inactive for that call; content inlines normally, never guessed.
+fn resolve_session_token_opt() -> Option<String> {
+    let inputs = onebrain_cache::ResolveInputs::from_env();
+    onebrain_cache::resolve_session_token(&inputs)
+        .ok()
+        .map(|t| t.to_string())
+}
+
 /// Directory holding the daemon's runtime files: `~/.onebrain/run/`.
 ///
 /// Kept in lockstep with `commands::daemon`'s private `run_dir()` (both key off
@@ -570,6 +582,90 @@ impl DaemonHandle {
                 .header("content-type", "application/json")
                 .send(payload.as_str())
         })
+    }
+
+    /// `POST /api/token/ledger/check` (Track 3, design §3b/§5b) with
+    /// `{ path, session_token, record }`. The session token is resolved HERE
+    /// (best-effort via [`resolve_session_token_opt`]) and attached so one
+    /// daemon serves many sessions correctly; an unresolvable token is sent as
+    /// `""`, which the daemon reads as "ledger inactive for this call".
+    ///
+    /// **Version-skew feature-detect (design §8):** a daemon that predates the
+    /// token routes answers 404. That is NOT an error — it means "this daemon
+    /// can't optimize", so the client gets `Ok(None)` and skips the
+    /// optimization (inlines as today). Only a live route answers `Ok(Some)`.
+    pub fn token_ledger_check(
+        &self,
+        path: &str,
+        record: bool,
+    ) -> Result<Option<serde_json::Value>> {
+        let session_token = resolve_session_token_opt().unwrap_or_default();
+        let body = serde_json::json!({
+            "path": path,
+            "session_token": session_token,
+            "record": record,
+        });
+        let payload = serde_json::to_string(&body).context("serialize ledger check body")?;
+        let op = |h: &DaemonHandle| {
+            let url = format!("{}/api/token/ledger/check", h.info.base_url());
+            h.agent
+                .post(&url)
+                .header("x-onebrain-token", &h.info.token)
+                .header("content-type", "application/json")
+                .send(payload.as_str())
+        };
+        match op(self) {
+            Ok(mut resp) => Ok(Some(read_json(&mut resp)?)),
+            // Route absent on an older daemon → skip optimization (not an error).
+            Err(ureq::Error::StatusCode(404)) => Ok(None),
+            Err(ureq::Error::StatusCode(503)) => Err(daemon_engine_busy()),
+            Err(e) => Err(anyhow::anyhow!("daemon ledger check: {e}")),
+        }
+    }
+
+    /// `GET /api/token/status` → `{ level, ledger_active, cache_bytes }`, or
+    /// `Ok(None)` when the daemon predates the token routes (404). Same
+    /// feature-detect contract as [`Self::token_ledger_check`].
+    pub fn token_status(&self) -> Result<Option<serde_json::Value>> {
+        self.token_get_feature_detected("/api/token/status")
+    }
+
+    /// `GET /api/token/gain?by=&since=&history=` → the gain pivot JSON, or
+    /// `Ok(None)` on a 404 (route absent). Query params are omitted when
+    /// `None`, mirroring [`Self::search`].
+    pub fn token_gain(
+        &self,
+        by: Option<&str>,
+        since: Option<&str>,
+        history: bool,
+    ) -> Result<Option<serde_json::Value>> {
+        let mut path = String::from("/api/token/gain?");
+        if let Some(by) = by {
+            path.push_str(&format!("by={}&", urlencode(by)));
+        }
+        if let Some(since) = since {
+            path.push_str(&format!("since={}&", urlencode(since)));
+        }
+        path.push_str(&format!("history={history}"));
+        self.token_get_feature_detected(&path)
+    }
+
+    /// Shared GET helper for the feature-detected token routes: `Ok(Some(json))`
+    /// on 2xx, `Ok(None)` on 404 (old daemon), `Err` on any other failure.
+    fn token_get_feature_detected(&self, path: &str) -> Result<Option<serde_json::Value>> {
+        let op = |h: &DaemonHandle| {
+            let url = format!("{}{}", h.info.base_url(), path);
+            h.agent
+                .get(&url)
+                .header("x-onebrain-token", &h.info.token)
+                .call()
+        };
+        match op(self) {
+            Ok(mut resp) => Ok(Some(read_json(&mut resp)?)),
+            Err(ureq::Error::StatusCode(404)) => Ok(None),
+            Err(ureq::Error::StatusCode(503)) => Err(daemon_engine_busy()),
+            Err(e) => Err(anyhow::anyhow!("daemon token GET {path}: {e}")),
+        }
     }
 
     /// `GET /api/health` → parsed JSON (`{ ok, engine_held, dist_dir }`), or
