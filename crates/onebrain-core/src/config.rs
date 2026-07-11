@@ -3,7 +3,7 @@ use onebrain_token::OptLevel;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VaultConfig {
     /// Optional qmd MCP collection name · None disables semantic search wiring.
     #[serde(default)]
