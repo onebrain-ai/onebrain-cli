@@ -7,6 +7,7 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 /// The four rungs of the optimization ladder.
@@ -16,6 +17,22 @@ pub enum OptLevel {
     Conservative,
     Balanced,
     Aggressive,
+}
+
+// Serde impls route through `Display`/`FromStr` so the wire format and the
+// CLI/config string format (`off|conservative|balanced|aggressive`) can
+// never drift from each other — one source of truth.
+impl Serialize for OptLevel {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for OptLevel {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 impl OptLevel {
