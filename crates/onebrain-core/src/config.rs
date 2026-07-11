@@ -358,46 +358,8 @@ mod tests {
         let parsed: SearchConfig = serde_yaml::from_str("exclude: []").unwrap();
         assert!(parsed.exclude.is_empty());
     }
+    use crate::test_support::EnvVarGuard;
     use tempfile::tempdir;
-
-    /// RAII env guard for these tests. onebrain-core has no shared `test_env`
-    /// like onebrain-cli's, so this mirrors that policy locally: serialize
-    /// process-env mutations on one lock and restore the prior value on drop,
-    /// instead of scattering raw `std::env::set_var`/`remove_var` (unsound
-    /// under concurrent reads) through the tests. The lock is held across the
-    /// env-dependent critical section (`find_vault_root`) below.
-    struct EnvVarGuard {
-        key: &'static str,
-        prev: Option<std::ffi::OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            // A poisoned lock only means an earlier test panicked mid-guard —
-            // its Drop already restored the env, so recover rather than panic.
-            let lock = ENV_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let prev = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self {
-                key,
-                prev,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
 
     fn write_vault(content: &str) -> (tempfile::TempDir, VaultRoot) {
         let dir = tempdir().unwrap();

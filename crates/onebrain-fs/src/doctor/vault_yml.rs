@@ -116,7 +116,11 @@ mod tests {
     /// check. Caller's deprecation warning fires at first lookup.
     #[test]
     fn legacy_vault_yml_still_loads() {
-        std::env::set_var("ONEBRAIN_QUIET_VAULT_YML_DEPRECATION", "1");
+        // Guard restores the env var on drop, including if an assertion
+        // below panics — an unguarded set/remove pair would otherwise leak
+        // it into whatever test runs concurrently.
+        let _guard =
+            crate::test_support::EnvGuard::set("ONEBRAIN_QUIET_VAULT_YML_DEPRECATION", "1");
         let d = tempdir().unwrap();
         std::fs::write(
             d.path().join("vault.yml"),
@@ -124,7 +128,6 @@ mod tests {
         )
         .unwrap();
         let r = VaultYmlCheck.run(d.path(), &cfg());
-        std::env::remove_var("ONEBRAIN_QUIET_VAULT_YML_DEPRECATION");
         assert_eq!(r.status, DoctorStatus::Ok);
         assert!(r.details.iter().any(|d| d.contains("qmd: legacy")));
     }

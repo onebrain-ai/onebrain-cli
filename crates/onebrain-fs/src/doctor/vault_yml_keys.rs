@@ -293,11 +293,14 @@ mod tests {
     /// schema check (lookup falls back via `find_config_file`).
     #[test]
     fn legacy_vault_yml_still_passes_schema_check() {
-        std::env::set_var("ONEBRAIN_QUIET_VAULT_YML_DEPRECATION", "1");
+        // Guard restores the env var on drop, including if an assertion
+        // below panics — an unguarded set/remove pair would otherwise leak
+        // it into whatever test runs concurrently.
+        let _guard =
+            crate::test_support::EnvGuard::set("ONEBRAIN_QUIET_VAULT_YML_DEPRECATION", "1");
         let d = tempdir().unwrap();
         write_legacy_yaml(d.path(), valid_schema());
         let r = VaultYmlKeysCheck.run(d.path(), &cfg());
-        std::env::remove_var("ONEBRAIN_QUIET_VAULT_YML_DEPRECATION");
         assert_eq!(r.status, DoctorStatus::Ok);
     }
 

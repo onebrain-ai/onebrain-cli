@@ -1200,39 +1200,15 @@ mod tests {
 
     // Serialize all cache tests — they share `ONEBRAIN_RELEASE_CACHE` env
     // state and would race under cargo's default parallel test runner.
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
-    /// RAII guard that restores `ONEBRAIN_RELEASE_CACHE` to its prior state
-    /// on Drop, even if `body()` panics. Panic-safety matters because cargo's
-    /// parallel runner shares the process env across tests — a leaked value
-    /// silently bleeds into every subsequent cache test.
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
+    // `EnvGuard::set` (crate::test_support) holds the lock for its lifetime
+    // and restores the prior value on Drop, even if `body()` panics —
+    // panic-safety matters because cargo's parallel runner shares the
+    // process env across tests, so a leaked value would bleed into every
+    // subsequent cache test.
     fn with_cache_path<F: FnOnce()>(body: F) {
-        // Poisoning is fine — another test panicked but the lock semantics
-        // are intact, so just ignore the poison and proceed.
-        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("latest-release.json");
-        let _env = EnvGuard {
-            key: "ONEBRAIN_RELEASE_CACHE",
-            previous: std::env::var_os("ONEBRAIN_RELEASE_CACHE"),
-        };
-        std::env::set_var("ONEBRAIN_RELEASE_CACHE", &path);
+        let _env = crate::test_support::EnvGuard::set("ONEBRAIN_RELEASE_CACHE", path.as_os_str());
         body();
         // `_env` Drop restores the previous value on the way out, even if
         // `body()` panicked.
@@ -1377,7 +1353,16 @@ mod tests {
             .unwrap();
 
             // Simulate the integration-test environment: override URL set.
-            std::env::set_var(GITHUB_ENV_OVERRIDE, "http://test.example/releases");
+            // `with_cache_path` already holds the shared env lock via its own
+            // `EnvGuard::set` call above in the call stack, so this nested
+            // mutation uses `set_within_lock` — nesting two `set()` calls on
+            // the same thread would deadlock the non-reentrant lock. The
+            // guard restores the prior value on drop, even if an assertion
+            // below panics.
+            let _guard = crate::test_support::EnvGuard::set_within_lock(
+                GITHUB_ENV_OVERRIDE,
+                "http://test.example/releases",
+            );
 
             // Hand-roll the write path that the orchestrator would have hit
             // after a "successful fetch" against the override URL. The guard
@@ -1395,8 +1380,6 @@ mod tests {
             let bytes = std::fs::read(&cache_path).unwrap();
             let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(json["tag_name"], "v-known-good");
-
-            std::env::remove_var(GITHUB_ENV_OVERRIDE);
         });
     }
 
@@ -1609,11 +1592,14 @@ mod tests {
             // Pre-condition: cache is warm and readable without the override.
             assert!(read_release_cache().is_some(), "pre-condition: warm cache");
 
-            let _guard = EnvGuard {
-                key: GITHUB_ENV_OVERRIDE,
-                previous: std::env::var_os(GITHUB_ENV_OVERRIDE),
-            };
-            std::env::set_var(GITHUB_ENV_OVERRIDE, "http://localhost:9999/fake");
+            // `with_cache_path` already holds the shared env lock via its
+            // own `EnvGuard::set` call above in the call stack, so this
+            // nested mutation uses `set_within_lock` — nesting two `set()`
+            // calls on the same thread would deadlock the non-reentrant lock.
+            let _guard = crate::test_support::EnvGuard::set_within_lock(
+                GITHUB_ENV_OVERRIDE,
+                "http://localhost:9999/fake",
+            );
             assert!(
                 read_release_cache().is_none(),
                 "warm cache must be bypassed when override URL env var is set"
