@@ -10,3 +10,9 @@ pub mod gain;
 pub mod guard;
 pub mod level;
 pub mod transform;
+
+pub use estimate::{estimate_tokens, ModelFamily};
+pub use gain::{CacheKind, GainEvent, GainSink, Surface};
+pub use guard::{never_worse, run_funnel};
+pub use level::OptLevel;
+pub use transform::{Payload, Signal, Transform, TransformCtx};
