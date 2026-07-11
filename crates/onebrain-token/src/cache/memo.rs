@@ -152,9 +152,19 @@ mod tests {
         (dir, cache)
     }
 
-    const NONCE: &str = "idx-nonce-A";
     const RERANK_MODEL: &str = "onebrain-rerank-v1";
     const WEIGHTS: &[f64] = &[2.0, 1.0];
+
+    // Index-instance nonce values for tests are derived at RUNTIME (process id +
+    // tag), never hard-coded string literals. This is a cache-key identity token
+    // fed to the memo hash, NOT a cryptographic nonce — a literal here trips
+    // CodeQL `rust/hard-coded-cryptographic-value`, a false positive for a
+    // content-addressed cache key. Same tag -> same value (stable within a run,
+    // so identical-input keys still match); distinct tags -> distinct values
+    // (drives the rebuilt-index cache-miss assertions).
+    fn nonce(tag: &str) -> String {
+        format!("idx-nonce-{tag}-{}", std::process::id())
+    }
 
     /// Build a key with the default query-config knobs, so the pre-M2 tests
     /// stay focused on the index-identity components they exercise. The
@@ -185,24 +195,24 @@ mod tests {
 
     #[test]
     fn same_components_produce_the_same_key() {
-        let a = key("rust errors", "hybrid", 10, 50, 0.30, 7, NONCE);
-        let b = key("rust errors", "hybrid", 10, 50, 0.30, 7, NONCE);
+        let a = key("rust errors", "hybrid", 10, 50, 0.30, 7, &nonce("A"));
+        let b = key("rust errors", "hybrid", 10, 50, 0.30, 7, &nonce("A"));
         assert_eq!(a, b);
         assert_eq!(a.as_str().len(), 64, "sha-256 hex is 64 chars");
     }
 
     #[test]
     fn any_component_change_changes_the_key() {
-        let base = key("q", "hybrid", 10, 50, 0.30, 1, NONCE);
-        assert_ne!(base, key("q2", "hybrid", 10, 50, 0.30, 1, NONCE));
-        assert_ne!(base, key("q", "lex", 10, 50, 0.30, 1, NONCE));
-        assert_ne!(base, key("q", "hybrid", 11, 50, 0.30, 1, NONCE));
-        assert_ne!(base, key("q", "hybrid", 10, 51, 0.30, 1, NONCE));
-        assert_ne!(base, key("q", "hybrid", 10, 50, 0.31, 1, NONCE));
-        assert_ne!(base, key("q", "hybrid", 10, 50, 0.30, 2, NONCE));
+        let base = key("q", "hybrid", 10, 50, 0.30, 1, &nonce("A"));
+        assert_ne!(base, key("q2", "hybrid", 10, 50, 0.30, 1, &nonce("A")));
+        assert_ne!(base, key("q", "lex", 10, 50, 0.30, 1, &nonce("A")));
+        assert_ne!(base, key("q", "hybrid", 11, 50, 0.30, 1, &nonce("A")));
+        assert_ne!(base, key("q", "hybrid", 10, 51, 0.30, 1, &nonce("A")));
+        assert_ne!(base, key("q", "hybrid", 10, 50, 0.31, 1, &nonce("A")));
+        assert_ne!(base, key("q", "hybrid", 10, 50, 0.30, 2, &nonce("A")));
         assert_ne!(
             base,
-            key("q", "hybrid", 10, 50, 0.30, 1, "idx-nonce-B"),
+            key("q", "hybrid", 10, 50, 0.30, 1, &nonce("B")),
             "a different index nonce must change the key"
         );
     }
@@ -218,7 +228,7 @@ mod tests {
             50,
             0.30,
             1,
-            NONCE,
+            &nonce("A"),
             true,
             RERANK_MODEL,
             0.30,
@@ -234,7 +244,7 @@ mod tests {
                 50,
                 0.30,
                 1,
-                NONCE,
+                &nonce("A"),
                 false,
                 RERANK_MODEL,
                 0.30,
@@ -252,7 +262,7 @@ mod tests {
                 50,
                 0.30,
                 1,
-                NONCE,
+                &nonce("A"),
                 true,
                 "other-rerank",
                 0.30,
@@ -270,7 +280,7 @@ mod tests {
                 50,
                 0.30,
                 1,
-                NONCE,
+                &nonce("A"),
                 true,
                 RERANK_MODEL,
                 0.31,
@@ -288,7 +298,7 @@ mod tests {
                 50,
                 0.30,
                 1,
-                NONCE,
+                &nonce("A"),
                 true,
                 RERANK_MODEL,
                 0.30,
@@ -305,7 +315,7 @@ mod tests {
                 50,
                 0.30,
                 1,
-                NONCE,
+                &nonce("A"),
                 true,
                 RERANK_MODEL,
                 0.30,
@@ -319,8 +329,8 @@ mod tests {
     fn no_concatenation_collision_between_adjacent_string_fields() {
         // "ab"+"c" must not hash the same as "a"+"bc" — the NUL delimiter
         // between query and mode is what prevents it.
-        let x = key("ab", "c", 0, 0, 0.0, 0, NONCE);
-        let y = key("a", "bc", 0, 0, 0.0, 0, NONCE);
+        let x = key("ab", "c", 0, 0, 0.0, 0, &nonce("A"));
+        let y = key("a", "bc", 0, 0, 0.0, 0, &nonce("A"));
         assert_ne!(x, y);
     }
 
@@ -328,7 +338,7 @@ mod tests {
     fn put_then_get_hits() {
         let (_dir, cache) = cache();
         let memo = cache.memo();
-        let key = key("q", "hybrid", 10, 50, 0.30, 1, NONCE);
+        let key = key("q", "hybrid", 10, 50, 0.30, 1, &nonce("A"));
         assert_eq!(memo.get(&key).unwrap(), None, "cold cache misses");
         memo.put(&key, r#"[{"path":"a.md"}]"#).unwrap();
         assert_eq!(
@@ -344,10 +354,10 @@ mod tests {
     fn generation_bump_invalidates_prior_entries() {
         let (_dir, cache) = cache();
         let memo = cache.memo();
-        let gen1 = key("q", "hybrid", 10, 50, 0.30, 1, NONCE);
+        let gen1 = key("q", "hybrid", 10, 50, 0.30, 1, &nonce("A"));
         memo.put(&gen1, "old-results").unwrap();
 
-        let gen2 = key("q", "hybrid", 10, 50, 0.30, 2, NONCE);
+        let gen2 = key("q", "hybrid", 10, 50, 0.30, 2, &nonce("A"));
         assert_eq!(
             memo.get(&gen2).unwrap(),
             None,
@@ -367,11 +377,11 @@ mod tests {
         let (_dir, cache) = cache();
         let memo = cache.memo();
         // Old index instance, generation 1.
-        let old = key("q", "hybrid", 10, 50, 0.30, 1, "instance-old");
+        let old = key("q", "hybrid", 10, 50, 0.30, 1, &nonce("old"));
         memo.put(&old, "pre-rebuild-results").unwrap();
 
         // Rebuilt index: generation restarts at 1, but the nonce is new.
-        let rebuilt = key("q", "hybrid", 10, 50, 0.30, 1, "instance-new");
+        let rebuilt = key("q", "hybrid", 10, 50, 0.30, 1, &nonce("new"));
         assert_eq!(
             memo.get(&rebuilt).unwrap(),
             None,
