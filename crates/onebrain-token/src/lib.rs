@@ -26,7 +26,7 @@ pub use gain::{
 };
 pub use guard::{never_worse, run_funnel};
 pub use level::OptLevel;
-pub use reference::ReferenceEnvelope;
+pub use reference::{content_hash, ReferenceEnvelope};
 pub use transform::{Payload, Signal, Transform, TransformCtx};
 
 // Re-exported so callers that only need to open a `token.redb` handle (the

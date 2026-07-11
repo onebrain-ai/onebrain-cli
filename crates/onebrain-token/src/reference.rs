@@ -13,7 +13,20 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::transform::Signal;
+/// SHA-256 hex of `content` — the fingerprint the already-sent ledger keys on.
+/// A surface hashes the EXACT bytes it is about to deliver (design §3b), so the
+/// ledger tracks delivered-vs-current content, not index state: a doc edited on
+/// disk but not yet reindexed hashes differently and is correctly re-delivered.
+pub fn content_hash(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(content.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
 
 /// The already-sent reference a surface may return instead of a full body.
 /// Build it with [`ReferenceEnvelope::new`] so the `rematerialize` instruction
@@ -47,17 +60,6 @@ impl ReferenceEnvelope {
             sent_earlier: true,
             bytes_saved,
             rematerialize,
-        }
-    }
-
-    /// The honesty [`Signal`] carrying this reference — for embedding in a
-    /// [`crate::Payload`] whose body was replaced by the reference.
-    pub fn as_signal(&self) -> Signal {
-        Signal::Reference {
-            doc_path: self.doc_path.clone(),
-            hash: self.hash.clone(),
-            bytes_saved: self.bytes_saved,
-            rematerialize: self.rematerialize.clone(),
         }
     }
 }
@@ -98,16 +100,9 @@ mod tests {
     }
 
     #[test]
-    fn as_signal_carries_the_same_fields() {
-        let r = ReferenceEnvelope::new("a.md", "h", 7);
-        assert_eq!(
-            r.as_signal(),
-            Signal::Reference {
-                doc_path: "a.md".into(),
-                hash: "h".into(),
-                bytes_saved: 7,
-                rematerialize: "onebrain search get a.md --force".into(),
-            }
-        );
+    fn content_hash_is_stable_and_content_sensitive() {
+        assert_eq!(content_hash("abc"), content_hash("abc"));
+        assert_ne!(content_hash("abc"), content_hash("abd"));
+        assert_eq!(content_hash("abc").len(), 64, "sha-256 hex is 64 chars");
     }
 }
