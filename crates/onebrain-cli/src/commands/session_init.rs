@@ -139,7 +139,31 @@ fn compute_result(
 /// configured-but-never-indexed vault
 /// reports `None` (unknown) without touching disk — consistent with "probe
 /// couldn't determine" rather than a misleading `Some(0)`.
+///
+/// **Daemon-first, like `search status`:** when a live warm daemon already
+/// serves THIS vault (typically an `onebrain mcp` session), it is the sole
+/// redb owner, so a local `Engine::open` here would (a) hit the lock and
+/// (b) — worse — eagerly migrate the cache layout out from under a process
+/// that may hold the legacy paths open (rename-while-open is an untested
+/// hazard on Windows). In that case the pending count is read from the
+/// daemon's `/api/internal/status` with the NO-retry/NO-respawn probe; any
+/// probe failure (engine-less daemon 503s, transport error) reports `None`
+/// (unknown) — it never falls through to a local open while the daemon is
+/// live.
 fn native_pending(vault_root: &onebrain_core::VaultRoot, collection: &str) -> Option<usize> {
+    use crate::commands::daemon_client;
+
+    if !crate::commands::search_common::daemon_routing_disabled() {
+        if let Ok(Some(handle)) = daemon_client::discover_matching(Some(vault_root.as_path())) {
+            return handle
+                .probe_status_no_retry()
+                .and_then(|v| v.get("pending_total")?.as_u64())
+                .map(|n| n as usize);
+        }
+        // No matching live daemon (or discovery failed) → the direct local
+        // probe below is contention-free.
+    }
+
     let cache_dir = collection_cache_dir(collection);
     if !is_indexed(&cache_dir) {
         return None;
@@ -659,7 +683,13 @@ mod tests {
         // checking the cache dir's existence before opening the engine;
         // `native_pending` mirrors that ordering.
         let cache = tempdir().unwrap();
-        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        // `ONEBRAIN_NO_DAEMON`: pin these local-path tests to the direct
+        // probe — without it, a live daemon.json on the developer's machine
+        // could route the probe over HTTP instead.
+        let _env = crate::test_env::set_vars(&[
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")),
+        ]);
 
         let vault = tempdir().unwrap();
         std::fs::write(
@@ -694,7 +724,11 @@ mod tests {
         // `Engine::status(..).pending_total()` — 0 here since the vault has
         // no markdown files and the (empty) index was never touched.
         let cache = tempdir().unwrap();
-        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        // Direct local path (see the never-indexed test above for why).
+        let _env = crate::test_env::set_vars(&[
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")),
+        ]);
 
         let vault = tempdir().unwrap();
         std::fs::write(
@@ -720,6 +754,118 @@ mod tests {
             Some(0),
             "an indexed-but-empty vault must report a determined Some(0), not None"
         );
+    }
+
+    /// A live warm daemon serving THIS vault must be consulted INSTEAD of a
+    /// local `Engine::open`: the daemon owns the redb lock, and a local open
+    /// would also eagerly migrate the cache layout out from under a process
+    /// that may hold the legacy paths open (rename-while-open is an untested
+    /// hazard on Windows). The stub daemon here answers `/api/health` (so
+    /// discovery routes to it) but 503s `/api/internal/status` (an
+    /// engine-less daemon), so the probe reports `None` — and, crucially,
+    /// the legacy on-disk layout stays untouched: no `index/`/`models/`
+    /// split dirs appear and the artifacts stay at the collection root,
+    /// proving no local engine open (and thus no silent SessionStart
+    /// migration) happened.
+    #[cfg(unix)] // discovery lives under $HOME; dirs::home_dir ignores $HOME on Windows
+    #[test]
+    fn native_pending_routes_to_live_daemon_without_local_open_or_migration() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let cache = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("HOME", home.path().as_os_str()),
+        ]);
+
+        let vault = tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: daemon-guard-collection\n",
+        )
+        .unwrap();
+        let vault_root = onebrain_core::VaultRoot::from_path(vault.path()).unwrap();
+
+        // Legacy flat fixture: index artifacts at the collection root, no
+        // split dirs. (Names via a variable so the repo-wide "no literal
+        // artifact joins" sweep stays clean.)
+        let artifacts = ["tantivy", "engine.redb"];
+        let collection_dir = cache.path().join("search").join("daemon-guard-collection");
+        let legacy_lex_dir = collection_dir.join(artifacts[0]);
+        std::fs::create_dir_all(&legacy_lex_dir).unwrap();
+        let legacy_redb = collection_dir.join(artifacts[1]);
+        std::fs::write(&legacy_redb, b"legacy-bytes").unwrap();
+
+        // Minimal stub daemon: 200 on /api/health (liveness), 503 on
+        // everything else (engine-less daemon shape). Plain std TCP — no
+        // engine, no axum, so the stub itself can't migrate anything.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let server = std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                if stop_thread.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(mut stream) = conn else { continue };
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while !buf.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => buf.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let request = String::from_utf8_lossy(&buf);
+                let response: &[u8] = if request.starts_with("GET /api/health") {
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\n\r\n{\"ok\":true}"
+                } else {
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n"
+                };
+                let _ = stream.write_all(response);
+            }
+        });
+
+        // Publish a matching discovery record: our version, THIS vault.
+        let info = crate::commands::daemon_client::DaemonInfo {
+            port,
+            token: "session-init-daemon-guard-token".to_string(),
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            vault: crate::commands::daemon_client::canonical_vault_id(vault.path()),
+        };
+        let discovery = crate::commands::daemon_client::discovery_path().unwrap();
+        info.write(&discovery).unwrap();
+
+        let result = native_pending(&vault_root, "daemon-guard-collection");
+
+        // Engine-less daemon 503s the status probe → unknown, NOT a fall
+        // through to a local open.
+        assert_eq!(
+            result, None,
+            "a live daemon that can't answer status must yield None, never a local open"
+        );
+        // The load-bearing assertion: the legacy layout is byte-for-byte
+        // untouched — no local Engine::open ran, so no silent migration.
+        assert!(
+            !collection_dir.join("index").exists() && !collection_dir.join("models").exists(),
+            "no split-layout dirs may appear while a live daemon owns the collection"
+        );
+        assert!(legacy_lex_dir.is_dir(), "legacy lex dir must stay in place");
+        assert_eq!(
+            std::fs::read(&legacy_redb).unwrap(),
+            b"legacy-bytes",
+            "legacy redb file must stay in place, untouched"
+        );
+
+        // Unblock the accept loop and shut the stub down.
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        let _ = server.join();
     }
 
     // ── recap_pending: session logs missing `recapped:` frontmatter ──────

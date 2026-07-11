@@ -54,5 +54,6 @@ ADRs are immutable once accepted — if a decision changes, write a new ADR that
 | [0024](0024-vector-confidence-recall-first.md) | Recall-first vector cutoff + honest confidence | accepted · superseded in part by [0025](0025-tier2-cross-encoder-reranker.md) |
 | [0025](0025-tier2-cross-encoder-reranker.md) | Tier-2 cross-encoder reranker on every search surface | accepted |
 | [0026](0026-config-self-documentation.md) | Self-documenting onebrain.yml + doctor validate/reset-to-default | accepted |
+| [0027](0027-collection-cache-layout-split.md) | Collection cache layout split (`index/` + `models/`) with eager migration | accepted |
 
 > These ADRs distill the public-facing rationale; the full design notes live in the project tracker. Numbers are stable IDs assigned at authoring time — see each ADR's **Date** for chronology.

@@ -47,17 +47,34 @@ dir (moved off the OS-purgeable cache dir in v3.4.5 —
 | Linux | `$XDG_DATA_HOME/onebrain/search/<collection>/` (fallback `~/.local/share/…`) |
 | Windows | `%APPDATA%\onebrain\search\<collection>\` |
 
-Inside a collection dir:
+Inside a collection dir, the cache is **split into two subdirectories** (v3.4.9,
+[`layout.rs::CollectionLayout`](../../crates/onebrain-search/src/layout.rs)): `index/` holds the
+search artifacts, `models/` is the hf-hub download cache base. Transient markers
+(`reindex-progress.json`) stay at the root.
 
 | Artifact | What it is | Built from | Written by |
 |---|---|---|---|
-| `tantivy/` | **Lex (BM25) index.** Schema ([`lex.rs::LexIndex::open`](../../crates/onebrain-search/src/lex.rs)): `chunk_id` (STRING, stored), `doc_path` (STRING, stored), `heading_path` (TEXT, stored), `body` (TEXT, script-aware tokenizer, freqs+positions, **not stored**). Thai/Lao/Khmer/Myanmar/CJK runs are character-bigrammed (no dictionary dep); other text gets lowercased word tokens. | Chunk texts from the chunker | `Engine::index_doc` / `remove_doc` (`LexIndex::add/delete/commit`), in both full and lex-only reindex modes |
-| `vectors/vectors.bin` | **Semantic index, data file.** Packed little-endian `f32`, row-major, fixed stride = `dims × 4` bytes; row *i* at byte offset `i × dims × 4`. Read via mmap ([`vector.rs`](../../crates/onebrain-search/src/vector.rs)). | One L2-normalized embedding per chunk (`Embed::embed_passages`) | `VectorStore::add`, called by `Engine::index_doc` (full mode) and `Engine::rebuild` |
-| `vectors/meta.redb` | **Semantic index, metadata.** redb tables: `chunk_to_row`, `row_to_chunk`, `tombstones`, `free_rows` (recyclable tombstoned slots), `header` (`dims`, append cursor). | — | `VectorStore` |
-| `engine.redb` | **Engine metadata** ([`engine.rs`](../../crates/onebrain-search/src/engine.rs)): `chunk_meta` (per-chunk `{doc_path, heading_path, chunk_index, text}` — the *only* place chunk **text** is retrievable: tantivy's `body` field is indexed but not stored, and the vector store keeps no text. Headings are also stored in tantivy, but no search path reads them from there), `doc_chunks` (doc → chunk-id list), `doc_hashes` (per-doc sha256, meaning "vectors current as of this hash"), `lex_hashes` (per-doc sha256 from a lex-only pass — see §2), `engine_header` (`active_model`, `last_indexed_at`). | Doc bytes + chunker output | `Engine` |
-| `models--<org>--<repo>/` | Downloaded ONNX embedding models (hf-hub naming via `ModelInfo::cache_dir_name`, e.g. `models--intfloat--multilingual-e5-small`). | Hugging Face download by fastembed | Lazy embedder construction (`Engine::embedder` → `embed::new`) |
-| `models--onebrain-ai--onebrain-rerank-v1/` | Downloaded Tier-2 cross-encoder reranker model (same hf-hub cache-dir convention, via `RerankerInfo::cache_dir_name`), sha256-verified once per download (`verify_sha256_once`, cached via a `.sha256-verified` marker next to the model file). | Hugging Face download by the reranker loader | Lazy reranker construction (`Engine::reranker` → `rerank::new`), or eagerly at the end of a full `reindex` when `search.reranker.enabled` and not yet downloaded ([`ReindexProgress::LoadingReranker`]) |
-| `reindex-progress.json` | Transient live marker for an in-flight reindex: `{"done":N,"total":M}`. | — | `search reindex` (RAII `LiveProgressFile`, see §4) |
+| `index/tantivy/` | **Lex (BM25) index.** Schema ([`lex.rs::LexIndex::open`](../../crates/onebrain-search/src/lex.rs)): `chunk_id` (STRING, stored), `doc_path` (STRING, stored), `heading_path` (TEXT, stored), `body` (TEXT, script-aware tokenizer, freqs+positions, **not stored**). Thai/Lao/Khmer/Myanmar/CJK runs are character-bigrammed (no dictionary dep); other text gets lowercased word tokens. | Chunk texts from the chunker | `Engine::index_doc` / `remove_doc` (`LexIndex::add/delete/commit`), in both full and lex-only reindex modes |
+| `index/vectors/vectors.bin` | **Semantic index, data file.** Packed little-endian `f32`, row-major, fixed stride = `dims × 4` bytes; row *i* at byte offset `i × dims × 4`. Read via mmap ([`vector.rs`](../../crates/onebrain-search/src/vector.rs)). | One L2-normalized embedding per chunk (`Embed::embed_passages`) | `VectorStore::add`, called by `Engine::index_doc` (full mode) and `Engine::rebuild` |
+| `index/vectors/meta.redb` | **Semantic index, metadata.** redb tables: `chunk_to_row`, `row_to_chunk`, `tombstones`, `free_rows` (recyclable tombstoned slots), `header` (`dims`, append cursor). | — | `VectorStore` |
+| `index/engine.redb` | **Engine metadata** ([`engine.rs`](../../crates/onebrain-search/src/engine.rs)): `chunk_meta` (per-chunk `{doc_path, heading_path, chunk_index, text}` — the *only* place chunk **text** is retrievable: tantivy's `body` field is indexed but not stored, and the vector store keeps no text. Headings are also stored in tantivy, but no search path reads them from there), `doc_chunks` (doc → chunk-id list), `doc_hashes` (per-doc sha256, meaning "vectors current as of this hash"), `lex_hashes` (per-doc sha256 from a lex-only pass — see §2), `engine_header` (`active_model`, `last_indexed_at`). | Doc bytes + chunker output | `Engine` |
+| `models/models--<org>--<repo>/` | Downloaded ONNX embedding models (hf-hub naming via `ModelInfo::cache_dir_name`, e.g. `models--intfloat--multilingual-e5-small`). | Hugging Face download by fastembed | Lazy embedder construction (`Engine::embedder` → `embed::new`) |
+| `models/models--onebrain-ai--onebrain-rerank-v1/` | Downloaded Tier-2 cross-encoder reranker model (same hf-hub cache-dir convention, via `RerankerInfo::cache_dir_name`), sha256-verified once per download (`verify_sha256_once`, cached via a `.sha256-verified` marker next to the model file). | Hugging Face download by the reranker loader | Lazy reranker construction (`Engine::reranker` → `rerank::new`), or eagerly at the end of a full `reindex` when `search.reranker.enabled` and not yet downloaded ([`ReindexProgress::LoadingReranker`]) |
+| `reindex-progress.json` | Transient live marker for an in-flight reindex: `{"done":N,"total":M}`. Root-level — `migrate()` leaves it alone. | — | `search reindex` (RAII `LiveProgressFile`, see §4) |
+
+**Migration from the pre-v3.4.9 flat layout** (everything directly at the collection root):
+`Engine::open` migrates **eagerly on every open** — `CollectionLayout::migrate()` renames each
+recognized root entry (`tantivy`, `vectors`, `engine.redb`, `models--*`) into its new home.
+Per-entry, idempotent, race-safe (an entry whose target already exists is skipped, so concurrent
+opens can't clobber each other), and same-volume `fs::rename` — instant, no re-embed, no data
+copy. Read-only consumers (`search status`, `doctor`, hook gates, the MCP/daemon lex paths, the
+model TUI) never migrate; they resolve **per artifact with legacy fallback**
+(`CollectionLayout::index_artifact` / `model_dir`): new location if present, else the legacy
+root. A partially migrated collection — including a split-brain model cache (one `models--*`
+moved, another still at the root) — therefore stays fully functional and is finished by the
+next `Engine::open`. Fresh downloads always target `models/`
+(`CollectionLayout::models_base`); see
+[ADR 0027](../decisions/0027-collection-cache-layout-split.md) for the tradeoffs.
 
 ### Embedding model registry
 
@@ -130,12 +147,12 @@ flowchart LR
         RR["rerank::Rerank<br/>(Tier-2 cross-encoder)"]
     end
     subgraph DISK["collection cache dir (platform data dir / onebrain / search / collection)"]
-        T[("tantivy/")]
-        VB[("vectors/vectors.bin")]
-        VM[("vectors/meta.redb")]
-        ER[("engine.redb")]
-        MD[("models--*/ (embed)")]
-        MR[("models--onebrain-ai--onebrain-rerank-v1/")]
+        T[("index/tantivy/")]
+        VB[("index/vectors/vectors.bin")]
+        VM[("index/vectors/meta.redb")]
+        ER[("index/engine.redb")]
+        MD[("models/models--*/ (embed)")]
+        MR[("models/models--…--onebrain-rerank-v1/")]
         PM[("reindex-progress.json")]
     end
     CFG --> VERBS
@@ -182,10 +199,15 @@ flowchart LR
    `search.embed_model` key **and** no `models--*` dir on disk): a TTY + text-mode run shows an
    interactive picker (choice persisted to `onebrain.yml` before indexing); non-TTY/structured
    runs silently keep the `multilingual-e5-small` default so headless runs never block.
-4. **`--force`** — wipes `tantivy/`, `vectors/`, `engine.redb` (never the downloaded models) so
-   everything re-chunks + re-embeds; rejected when combined with explicit paths.
-5. **Open engine** — `Engine::open(cache_dir, embed_model)` opens/creates the three stores.
-   The embedder is **lazy**: `open` itself never downloads a model.
+4. **`--force`** — wipes `tantivy/`, `vectors/`, `engine.redb` at **both** candidate locations
+   (split `index/…` AND legacy root — a lost migration race can leave an orphaned legacy
+   duplicate that fallback resolution would otherwise resurrect on the next open; never the
+   downloaded models) so everything re-chunks + re-embeds; rejected when combined with explicit
+   paths.
+5. **Open engine** — `Engine::open(cache_dir, embed_model)` first migrates any legacy flat
+   layout into the `index/` + `models/` split (`CollectionLayout::migrate`, idempotent +
+   race-safe — see §1), then opens/creates the three stores. The embedder is **lazy**: `open`
+   itself never downloads a model.
 6. **Live marker** — `LiveProgressFile` creates `reindex-progress.json`; every progress event
    atomically rewrites `{"done":N,"total":M}`; dropping it (any exit) removes the file.
 7. **Walk** — `walk_markdown_files`: recursively collect `*.md` only, skipping hidden dirs and
@@ -307,10 +329,11 @@ fail the calling turn.** Every gate failure or runtime error emits an ok-envelop
    the gates, the progress marker is built from the gate's already-resolved cache dir
    (`LiveProgressFile::in_cache_dir`), so no part of the hook path re-resolves via the
    persisting `collection_for`.
-2. `no-index` — `<cache_dir>/tantivy/` doesn't exist yet (the user hasn't run a first reindex).
-3. `model-not-downloaded` — the configured model's `models--*` dir is absent. Applies to *both*
-   flags (even `--lex-only`, which needs no model) so a hook can never race a foreground
-   first-run download.
+2. `no-index` — the collection's tantivy index doesn't exist at either layout location
+   (resolved via `CollectionLayout`; the user hasn't run a first reindex).
+3. `model-not-downloaded` — the configured model's `models--*` dir is absent from both layout
+   locations (per-model fallback resolution). Applies to *both* flags (even `--lex-only`, which
+   needs no model) so a hook can never race a foreground first-run download.
 4. `reindex-in-flight` — a fresh `reindex-progress.json` marker exists (§4).
 
 Additional skip reasons past the gates: `no-pending` (empty worklist), `detach-failed`,

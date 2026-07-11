@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use super::api::{require_vault_root, ApiError};
 use super::{AppState, SharedEngine};
 use crate::commands::search_common::{
-    collection_cache_dir, collection_name_readonly, models_cache_dir, rerank_settings_from_config,
+    collection_cache_dir, collection_name_readonly, rerank_settings_from_config,
 };
 use onebrain_search::engine::Engine;
 use onebrain_search::rerank::{reranker_download_status, reranker_registry};
@@ -164,9 +164,7 @@ fn spawn_reranker_warm_thread(
         let downloaded = reranker_registry()
             .iter()
             .find(|m| m.name == reranker_model)
-            .is_some_and(|info| {
-                reranker_download_status(info, &models_cache_dir(&cache_dir)).downloaded
-            });
+            .is_some_and(|info| reranker_download_status(info, &cache_dir).downloaded);
         if !downloaded {
             // No model on disk yet — nothing to warm; a reindex will fetch it.
             return;
@@ -281,13 +279,12 @@ async fn get_internal_status(State(state): State<Arc<AppState>>) -> Result<Respo
         let config = onebrain_core::load_vault_config_at(&root)?;
         let collection = collection_name_readonly(&root)?;
         let cache_dir = collection_cache_dir(&collection);
-        let models_dir = models_cache_dir(&cache_dir);
         let embed_model = config.search.embed_model.clone();
         let reranker_model = config.search.reranker.model.clone();
         let download = reranker_registry()
             .iter()
             .find(|r| r.name == reranker_model)
-            .map(|r| reranker_download_status(r, &models_dir));
+            .map(|r| reranker_download_status(r, &cache_dir));
         let reranker_downloaded = download.as_ref().is_some_and(|d| d.downloaded);
         let reranker_disk_bytes = download.and_then(|d| d.disk_size);
 

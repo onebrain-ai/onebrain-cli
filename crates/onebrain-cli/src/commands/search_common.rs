@@ -111,12 +111,13 @@ pub fn collection_cache_dir(collection: &str) -> PathBuf {
     search_cache_root().join(collection)
 }
 
-/// The hf-hub model download cache base for a collection whose root is
-/// `cache_dir`: `<cache_dir>/models` post-migration, legacy root while any
-/// `models--*` dir is still flat (per-artifact fallback, no mutation). Every
-/// read-only model probe (`model_download_status` / `reranker_download_status`)
-/// must be fed THIS path, not the raw collection root, so it looks where the
-/// engine's eager migration actually put the downloads. Pure path resolution.
+/// The hf-hub model DOWNLOAD cache base for a collection whose root is
+/// `cache_dir`: always `<cache_dir>/models` (see
+/// [`CollectionLayout::models_base`]). Feed this to download-triggering
+/// calls (`embed::new*` / `rerank::new`) so fresh downloads land in the
+/// split layout. Read-only "is this model downloaded?" probes must NOT use
+/// it — `model_download_status` / `reranker_download_status` take the
+/// collection ROOT and resolve per model with legacy fallback internally.
 pub(crate) fn models_cache_dir(cache_dir: &Path) -> PathBuf {
     CollectionLayout::new(cache_dir).models_base()
 }
@@ -289,10 +290,9 @@ pub fn embed_model_key_present(vault_root: &Path) -> bool {
 /// collection cache dir. Pure `std::fs` scan — never downloads.
 pub fn any_model_downloaded(cache_dir: &Path) -> bool {
     use onebrain_search::embed::{model_download_status, model_registry};
-    let models = models_cache_dir(cache_dir);
     model_registry()
         .iter()
-        .any(|m| model_download_status(m, &models).downloaded)
+        .any(|m| model_download_status(m, cache_dir).downloaded)
 }
 
 /// Whether the vault has *no* embedding model chosen yet: neither a
@@ -324,11 +324,10 @@ pub(crate) fn reconcile_missing_model(vault_root: &Path, cache_dir: &Path, embed
     if read_reindex_progress(cache_dir).is_some() || !embed_model_key_present(vault_root) {
         return;
     }
-    let models = models_cache_dir(cache_dir);
     let downloaded = model_registry()
         .iter()
         .find(|m| m.name == embed_model)
-        .is_some_and(|m| model_download_status(m, &models).downloaded);
+        .is_some_and(|m| model_download_status(m, cache_dir).downloaded);
     if !downloaded {
         // Surface the outcome instead of discarding it (`let _ =` hid a real
         // config mutation): a removal is announced, a failure is logged.

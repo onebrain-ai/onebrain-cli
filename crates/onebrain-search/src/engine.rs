@@ -912,7 +912,7 @@ impl Engine {
             let info = rerank::reranker_registry()
                 .iter()
                 .find(|m| m.name == self.rerank_settings.model)?;
-            if !rerank::reranker_download_status(info, &self.layout.models_base()).downloaded {
+            if !rerank::reranker_download_status(info, self.layout.root()).downloaded {
                 return None;
             }
             match rerank::new(&self.rerank_settings.model, &self.layout.models_base()) {
@@ -2007,9 +2007,7 @@ impl Engine {
             let downloaded = rerank::reranker_registry()
                 .iter()
                 .find(|m| m.name == self.rerank_settings.model)
-                .map(|info| {
-                    rerank::reranker_download_status(info, &self.layout.models_base()).downloaded
-                })
+                .map(|info| rerank::reranker_download_status(info, self.layout.root()).downloaded)
                 .unwrap_or(true);
             if should_fetch_reranker(self.rerank_settings.enabled, downloaded) {
                 progress(ReindexProgress::LoadingReranker);

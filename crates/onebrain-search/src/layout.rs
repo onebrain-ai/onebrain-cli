@@ -13,10 +13,16 @@
 //! # Design invariants
 //!
 //! - **Per-artifact fallback resolution.** Every read path
-//!   ([`CollectionLayout::models_base`], [`CollectionLayout::index_artifact`])
-//!   resolves independently: new location if present, else legacy root. A
-//!   half-migrated collection (some artifacts moved, some not) always works —
-//!   nothing needs to wait for a full migration before it can be read.
+//!   ([`CollectionLayout::model_dir`], [`CollectionLayout::index_artifact`])
+//!   resolves each artifact independently: new location if present, else
+//!   legacy root. A half-migrated collection (some artifacts moved, some
+//!   not — including a "split-brain" model cache where one `models--*` dir
+//!   moved and another is still at the root) always works — nothing needs to
+//!   wait for a full migration before it can be read.
+//!   [`CollectionLayout::models_base`] is the one deliberate exception: it is
+//!   the hf-hub DOWNLOAD base (always the new `<root>/models`), for write
+//!   paths that run after [`CollectionLayout::migrate`] — never use it to
+//!   probe whether a specific model is on disk.
 //! - **`migrate()` is per-entry, idempotent, and race-safe.** It walks the
 //!   root and `fs::rename`s each recognized entry into its new home. If the
 //!   target already exists (another process/thread migrated it first, or a
@@ -121,18 +127,45 @@ impl CollectionLayout {
         }
     }
 
-    /// The hf-hub cache base directory: `<root>/models` once migrated,
-    /// `<root>` while any `models--*` dir is still legacy. hf-hub owns the
-    /// `models--org--name` layout inside this directory.
+    /// The hf-hub DOWNLOAD cache base directory: always `<root>/models`.
+    /// hf-hub owns the `models--org--name` layout inside this directory.
+    ///
+    /// This is a **write-path** resolver for callers that run after
+    /// [`CollectionLayout::migrate`] (the engine's lazy embedder/reranker
+    /// construction, the model TUI's forced downloads), so fresh downloads
+    /// always land in the new location. It deliberately does NOT fall back to
+    /// the legacy root: a single base for ALL models cannot represent a
+    /// split-brain cache (model A still legacy at root, model B already under
+    /// `models/`) — any one choice resolves at least one model to the wrong
+    /// place. Read-only "is this model downloaded?" probes must therefore use
+    /// the per-model [`CollectionLayout::model_dir`] instead.
+    ///
+    /// Accepted tradeoff: if `migrate()` partially failed and left a model
+    /// stuck at the legacy root, a download through this base re-fetches it
+    /// into `models/` rather than reusing the stranded copy — wasteful but
+    /// correct, and self-healing (the next `migrate()` retry skips the entry
+    /// because the target now exists).
     pub fn models_base(&self) -> PathBuf {
-        let has_legacy_model = self.legacy_entries().iter().any(
-            |p| matches!(p.file_name(), Some(n) if n.to_string_lossy().starts_with("models--")),
-        );
-        if has_legacy_model {
-            self.root.clone()
-        } else {
-            self.root.join("models")
+        self.root.join("models")
+    }
+
+    /// Resolve one model's hf-hub cache dir (`models--org--name`) to wherever
+    /// it actually lives, PER MODEL: `<root>/models/<name>` if present, else
+    /// the legacy `<root>/<name>` if present, else the new location (where a
+    /// future download will put it). This is the read-probe counterpart of
+    /// [`CollectionLayout::index_artifact`] — a split-brain cache (one model
+    /// migrated, another still legacy) resolves each model correctly, which a
+    /// single shared base cannot do.
+    pub fn model_dir(&self, cache_dir_name: &str) -> PathBuf {
+        let new_path = self.root.join("models").join(cache_dir_name);
+        if new_path.exists() {
+            return new_path;
         }
+        let legacy_path = self.root.join(cache_dir_name);
+        if legacy_path.exists() {
+            return legacy_path;
+        }
+        new_path
     }
 
     /// Resolve an index artifact (`"tantivy"`, `"vectors"`, or
@@ -290,7 +323,54 @@ mod tests {
             layout.index_artifact("engine.redb"),
             dir.path().join("engine.redb")
         );
-        assert_eq!(layout.models_base(), dir.path().to_path_buf());
+        // Per-model probe follows the legacy dir; the download base is always
+        // the new location regardless of migration state.
+        assert_eq!(
+            layout.model_dir("models--org--name"),
+            dir.path().join("models--org--name")
+        );
+        assert_eq!(layout.models_base(), dir.path().join("models"));
+    }
+
+    /// The split-brain case that motivates PER-MODEL resolution: model A is
+    /// still legacy at the root while model B already moved under `models/`.
+    /// A single shared base would resolve at least one of them to the wrong
+    /// place; `model_dir` must find each where it actually lives.
+    #[test]
+    fn model_dir_resolves_split_brain_models_individually() {
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("models--org--legacy")).unwrap();
+        fs::create_dir_all(dir.path().join("models").join("models--org--migrated")).unwrap();
+        let layout = CollectionLayout::new(dir.path());
+
+        assert_eq!(layout.detect(), CacheLayoutState::Partial);
+        assert_eq!(
+            layout.model_dir("models--org--legacy"),
+            dir.path().join("models--org--legacy"),
+            "legacy model must resolve to its root location"
+        );
+        assert_eq!(
+            layout.model_dir("models--org--migrated"),
+            dir.path().join("models").join("models--org--migrated"),
+            "migrated model must resolve under models/"
+        );
+        // A model present in NEITHER location resolves to the new location
+        // (where a future download puts it).
+        assert_eq!(
+            layout.model_dir("models--org--absent"),
+            dir.path().join("models").join("models--org--absent")
+        );
+        // Consistency with models_size_bytes, which sums BOTH locations.
+        fs::write(dir.path().join("models--org--legacy").join("w"), [0u8; 3]).unwrap();
+        fs::write(
+            dir.path()
+                .join("models")
+                .join("models--org--migrated")
+                .join("w"),
+            [0u8; 4],
+        )
+        .unwrap();
+        assert_eq!(layout.models_size_bytes(), 7);
     }
 
     #[test]
