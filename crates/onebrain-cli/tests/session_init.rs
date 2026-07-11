@@ -25,6 +25,37 @@ fn session_init_emits_required_fields_in_minimal_vault_with_json() {
         .stdout(predicate::str::contains("\"decision\":").not());
 }
 
+/// #229: `onebrain session init --vault <path>` must resolve the flagged
+/// vault even when the process cwd is OUTSIDE any vault — before the fix,
+/// `session init` ignored the global `--vault` flag entirely and always
+/// walked up from cwd, so this would have emitted the "not found" block.
+#[test]
+fn session_init_honors_vault_flag_from_outside_any_vault() {
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["session", "init", "--json", "--vault"])
+        .arg(fixture("minimal_vault"))
+        .current_dir(fixture("empty_vault"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"session_token\":"))
+        .stdout(predicate::str::contains("\"decision\":").not());
+}
+
+/// Counterpart via `ONEBRAIN_VAULT` env instead of the flag.
+#[test]
+fn session_init_honors_onebrain_vault_env_from_outside_any_vault() {
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["session", "init", "--json"])
+        .env("ONEBRAIN_VAULT", fixture("minimal_vault"))
+        .current_dir(fixture("empty_vault"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"session_token\":"))
+        .stdout(predicate::str::contains("\"decision\":").not());
+}
+
 #[test]
 fn session_init_emits_block_outside_vault_with_json() {
     Command::cargo_bin("onebrain")
