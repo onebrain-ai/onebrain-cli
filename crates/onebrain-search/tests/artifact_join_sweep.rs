@@ -105,14 +105,17 @@ fn size_and_wipe_do_not_duplicate_the_artifact_list() {
 }
 
 fn check_file(path: &Path, crates_dir: &Path, offenders: &mut Vec<String>) {
-    if path.file_name().and_then(|n| n.to_str()) == Some("layout.rs") {
-        return;
-    }
     let rel = path
         .strip_prefix(crates_dir)
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/");
+    // The artifact-name list legitimately lives in exactly this file; skip it by
+    // FULL relative path, not bare filename, so a future `<other-crate>/src/
+    // layout.rs` can't silently inherit the exemption (Copilot #224 follow-up).
+    if rel == "onebrain-search/src/layout.rs" {
+        return;
+    }
     if ALLOWLIST.contains(&rel.as_str()) {
         return;
     }
