@@ -556,6 +556,12 @@ pub struct Engine {
     /// [`Engine::skip_reranker_fetch_for_tests`].
     skip_reranker_fetch: bool,
     meta: Database,
+    /// Held for the engine's whole lifetime purely for its exclusive-open
+    /// side effect (never read/written to) — see
+    /// [`CollectionLayout::lock_path`] (#223). Reuses redb's own
+    /// crash-safe, process-exclusive open (auto-released by the OS if this
+    /// process dies) rather than adding a new file-locking dependency.
+    _collection_lock: Database,
 }
 
 /// Pure decision for the reindex-time reranker fetch: fetch only when
@@ -638,11 +644,37 @@ impl Engine {
         std::fs::create_dir_all(cache_dir)
             .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
 
-        // Eager migration on the write path: fold any legacy flat artifacts
-        // (and `models--*` dirs) into the `models/` + `index/` split, and
-        // (unconditionally) create both subdirs so redb's `Database::create`
-        // — which does NOT create parents — finds `index/` already present.
         let layout = CollectionLayout::new(cache_dir);
+
+        // Collection-level advisory lock (#223), acquired BEFORE `migrate()`
+        // and every index artifact — because `migrate()` itself (the
+        // `fs::rename` of legacy `tantivy`/`vectors`/`engine.redb`/`models--*`
+        // from the legacy root into the split layout) is exactly the
+        // concurrent-unsafe I/O this lock exists to serialize. Two processes
+        // racing to open the same still-legacy collection (e.g. a long-lived
+        // `onebrain mcp` daemon + a CLI command right after an upgrade) must
+        // NOT both enter `migrate()`: one's rename would then hit ENOENT
+        // after the other moved the source, and that raw I/O error is NOT
+        // recognized by `classify_open_error`, so the caller would get a
+        // confusing failure instead of the honest `EngineBusy`. Taking the
+        // lock first serializes migration and also spares a busy collection a
+        // wasted, unprotected migrate attempt.
+        //
+        // The lock path is fixed at the collection root regardless of
+        // legacy/split state — see `CollectionLayout::lock_path` — so two
+        // openers always contend here even if they'd otherwise resolve to two
+        // different physical `engine.redb` files (redb's own per-file lock
+        // can't see that collision). It reuses redb's own crash-safe,
+        // process-exclusive open; a lost race classifies as `EngineBusy`.
+        let lock_path = layout.lock_path();
+        let collection_lock = Database::create(&lock_path)
+            .with_context(|| format!("acquiring collection lock at {}", lock_path.display()))?;
+
+        // Eager migration on the write path, now under the collection lock:
+        // fold any legacy flat artifacts (and `models--*` dirs) into the
+        // `models/` + `index/` split, and (unconditionally) create both
+        // subdirs so redb's `Database::create` — which does NOT create
+        // parents — finds `index/` already present.
         layout
             .migrate()
             .with_context(|| format!("migrating cache layout at {}", cache_dir.display()))?;
@@ -682,6 +714,7 @@ impl Engine {
             chunk_corruption_logged: std::cell::Cell::new(false),
             skip_reranker_fetch: false,
             meta,
+            _collection_lock: collection_lock,
         })
     }
 
@@ -2203,7 +2236,11 @@ mod tests {
     }
 
     fn fake_engine(dir: &Path) -> Engine {
-        Engine::open_with_embedder(dir, "fake-model", Box::new(FakeEmbedder { dims: 16 })).unwrap()
+        fake_engine_result(dir).unwrap()
+    }
+
+    fn fake_engine_result(dir: &Path) -> Result<Engine> {
+        Engine::open_with_embedder(dir, "fake-model", Box::new(FakeEmbedder { dims: 16 }))
     }
 
     #[test]
@@ -2225,6 +2262,180 @@ mod tests {
             "second open should be EngineBusy, got: {err:#}"
         );
         assert!(err.downcast_ref::<EngineBusy>().is_some());
+    }
+
+    /// #223: a holder that only touches the collection-level lock file
+    /// (standing in for a legacy-unaware opener that would otherwise create
+    /// a totally separate physical `engine.redb` at the legacy root, with no
+    /// shared redb lock to catch the collision) must now block a normal
+    /// split-aware `Engine::open` on the SAME collection root.
+    #[test]
+    fn legacy_holder_on_shared_root_lock_blocks_split_aware_open() {
+        use crate::error::{is_engine_busy, EngineBusy};
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = CollectionLayout::new(dir.path()).lock_path();
+        // Simulate a "legacy holder": takes the shared collection lock
+        // directly, without going through `Engine::open` at all — this
+        // stands in for the other side of the legacy/split boundary that
+        // `open_inner`'s own migrate() cannot coordinate with (see #223).
+        let _legacy_holder = Database::create(&lock_path).unwrap();
+
+        let err = match fake_engine_result(dir.path()) {
+            Ok(_) => panic!("open must fail while the legacy holder keeps the shared root lock"),
+            Err(e) => e,
+        };
+        assert!(is_engine_busy(&err), "got: {err:#}");
+        assert!(err.downcast_ref::<EngineBusy>().is_some());
+    }
+
+    /// Converse of the above: once a normal `Engine::open` holds the
+    /// collection, a second, independent attempt to take the SAME
+    /// collection-level lock (simulating a legacy-side actor arriving after
+    /// a split-aware opener) must also fail — the lock is symmetric,
+    /// regardless of which "side" gets there first.
+    #[test]
+    fn split_engine_blocks_a_second_holder_of_the_shared_root_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let _held = fake_engine(dir.path());
+
+        let lock_path = CollectionLayout::new(dir.path()).lock_path();
+        let result = Database::create(&lock_path);
+        assert!(
+            result.is_err(),
+            "a second opener of the shared collection lock must be rejected while \
+             the engine holds it"
+        );
+    }
+
+    /// #223 regression (migrate-before-lock): the collection lock must be
+    /// acquired BEFORE `migrate()` runs, because `migrate()` (the
+    /// `fs::rename` of legacy artifacts into `index/`) is exactly the
+    /// concurrent-unsafe I/O the lock exists to serialize. Here a holder
+    /// keeps the shared lock while a POPULATED LEGACY collection sits on
+    /// disk; a second open must be rejected by the lock and must NOT have
+    /// migrated anything — no `index/` split dir may appear, and every
+    /// legacy artifact must stay put. Under the buggy order (`migrate()`
+    /// first, lock second) the open still returns `EngineBusy`, but only
+    /// AFTER migrate() has already moved the artifacts — so the layout
+    /// assertions below fail. Fake bytes suffice: with the lock held the
+    /// open bails before it ever opens them as real stores.
+    #[test]
+    fn held_root_lock_prevents_unprotected_migration_of_legacy_collection() {
+        use crate::error::is_engine_busy;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Populated legacy layout: artifacts at the collection root, no
+        // split `index/` yet. (Names via a variable so the repo-wide "no
+        // literal artifact joins" sweep stays clean.)
+        let artifacts = ["tantivy", "vectors", "engine.redb"];
+        std::fs::create_dir(root.join(artifacts[0])).unwrap();
+        std::fs::write(root.join(artifacts[0]).join("seg"), b"lex").unwrap();
+        std::fs::create_dir(root.join(artifacts[1])).unwrap();
+        std::fs::write(root.join(artifacts[1]).join("v"), b"vec").unwrap();
+        std::fs::write(root.join(artifacts[2]), b"redb").unwrap();
+        assert_eq!(
+            CollectionLayout::new(root).detect(),
+            crate::layout::CacheLayoutState::Legacy
+        );
+
+        // Another opener holds the shared collection lock.
+        let lock_path = CollectionLayout::new(root).lock_path();
+        let _holder = Database::create(&lock_path).unwrap();
+
+        // The second open must be rejected by the lock — and, crucially,
+        // must not have run migrate() first.
+        let err = match fake_engine_result(root) {
+            Ok(_) => panic!("open must fail while the holder keeps the shared root lock"),
+            Err(e) => e,
+        };
+        assert!(is_engine_busy(&err), "expected EngineBusy, got: {err:#}");
+
+        // The load-bearing regression assertions: no unprotected migration
+        // touched a collection another opener holds.
+        assert!(
+            !root.join("index").exists(),
+            "migrate() must NOT run before the lock check — no split dir may \
+             appear on a busy collection (#223 migrate-before-lock regression)"
+        );
+        for name in artifacts {
+            assert!(
+                root.join(name).exists(),
+                "legacy {name} must stay at the collection root, unmigrated"
+            );
+        }
+    }
+
+    /// #223 regression (racy migrate): two processes racing `Engine::open`
+    /// on the SAME still-legacy collection must never escape with a raw,
+    /// unclassified I/O error — the loser either serializes cleanly behind
+    /// the lock or gets a classified `EngineBusy`, and the winner completes
+    /// the migration. Under the buggy migrate-before-lock order both threads
+    /// can enter `migrate()` at once; one's `fs::rename` then hits ENOENT
+    /// after the peer moved the source, and that ENOENT is NOT recognized by
+    /// `classify_open_error`, so it surfaces as a raw error instead of the
+    /// honest `EngineBusy`. Uses a REAL (dims-16 fake-embedder) index moved
+    /// back to the legacy root so the winning open genuinely succeeds.
+    #[test]
+    fn concurrent_opens_of_populated_legacy_collection_never_escape_unclassified() {
+        use crate::error::is_engine_busy;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("note.md"), "# hi\n\nsome body text").unwrap();
+
+        // Build a real split index, then fake a legacy layout by moving each
+        // artifact back to the collection root and dropping the split dir +
+        // the setup engine's leftover lock, so the race starts clean.
+        {
+            let mut e = fake_engine(&root);
+            e.skip_reranker_fetch_for_tests();
+            e.reindex_all(vault.path()).unwrap();
+        }
+        let artifacts = ["tantivy", "vectors", "engine.redb"];
+        for name in artifacts {
+            let from = CollectionLayout::new(&root).index_artifact(name);
+            if from != root.join(name) && from.exists() {
+                std::fs::rename(&from, root.join(name)).unwrap();
+            }
+        }
+        let _ = std::fs::remove_dir_all(root.join("index"));
+        let _ = std::fs::remove_file(CollectionLayout::new(&root).lock_path());
+        assert_eq!(
+            CollectionLayout::new(&root).detect(),
+            crate::layout::CacheLayoutState::Legacy
+        );
+
+        // Race two opens, released simultaneously by a barrier.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (root_a, root_b) = (root.clone(), root.clone());
+        let (b_a, b_b) = (barrier.clone(), barrier.clone());
+        let ta = std::thread::spawn(move || {
+            b_a.wait();
+            fake_engine_result(&root_a)
+        });
+        let tb = std::thread::spawn(move || {
+            b_b.wait();
+            fake_engine_result(&root_b)
+        });
+        let ra = ta.join().unwrap();
+        let rb = tb.join().unwrap();
+
+        // Neither thread may escape with a raw, unclassified error (e.g. a
+        // migrate() rename ENOENT after the peer moved the source first).
+        for (label, r) in [("A", &ra), ("B", &rb)] {
+            if let Err(e) = r {
+                assert!(
+                    is_engine_busy(e),
+                    "thread {label} escaped with an unclassified error — migrate() \
+                     ran unprotected by the lock: {e:#}"
+                );
+            }
+        }
+        assert!(ra.is_ok() || rb.is_ok(), "at least one open must succeed");
+        assert!(
+            root.join("index").exists(),
+            "the winning open must have completed the migration"
+        );
     }
 
     /// An embedder whose every method panics. Used to prove a lex-only

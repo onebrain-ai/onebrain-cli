@@ -39,8 +39,11 @@
 
 use std::path::{Path, PathBuf};
 
-/// The index artifact names this module knows how to relocate.
-const INDEX_ARTIFACTS: [&str; 3] = ["tantivy", "vectors", "engine.redb"];
+/// The index artifact names this module knows how to relocate. Exported so
+/// every consumer that needs to enumerate index artifacts (size accounting,
+/// `--force` wipe) shares this ONE list instead of a private duplicate that
+/// would silently miss a future 4th artifact (issue #224).
+pub const INDEX_ARTIFACTS: [&str; 3] = ["tantivy", "vectors", "engine.redb"];
 
 /// Where a collection's on-disk cache currently stands relative to the
 /// `models/` + `index/` split.
@@ -166,6 +169,24 @@ impl CollectionLayout {
             return legacy_path;
         }
         new_path
+    }
+
+    /// Path to the collection's advisory lock file — always
+    /// `<root>/.collection.lock`, regardless of migration state (#223).
+    ///
+    /// Unlike an index artifact, this path never resolves through the
+    /// legacy/split fallback: it's deliberately the SAME file whichever
+    /// layout state the collection is in, so any two openers of this
+    /// collection contend on it identically. This closes the gap where a
+    /// legacy-unaware opener and a split-aware opener can independently
+    /// create/lock two DIFFERENT physical `engine.redb` files (one at the
+    /// legacy root, one under `index/`) without redb's own per-file lock
+    /// ever seeing the collision — see [`crate::engine::Engine::open`],
+    /// which acquires this lock (via a throwaway `redb::Database`, reusing
+    /// redb's own crash-safe process-exclusive open rather than adding a new
+    /// locking dependency) before touching any index artifact.
+    pub fn lock_path(&self) -> PathBuf {
+        self.root.join(".collection.lock")
     }
 
     /// Resolve an index artifact (`"tantivy"`, `"vectors"`, or
@@ -305,6 +326,25 @@ mod tests {
             dir.path().join("index").join("tantivy")
         );
         assert_eq!(layout.models_base(), dir.path().join("models"));
+    }
+
+    /// [`CollectionLayout::lock_path`] is a FIXED collection-root path,
+    /// independent of migration state — that's the whole point (#223): it
+    /// must be the same file whether the collection currently resolves its
+    /// index artifacts to the legacy root or the split `index/` location, so
+    /// any two openers of the SAME collection contend on the same lock
+    /// regardless of which physical `engine.redb` they'd otherwise resolve
+    /// to.
+    #[test]
+    fn lock_path_is_fixed_at_collection_root_regardless_of_layout_state() {
+        let dir = tempdir().unwrap();
+        let layout = CollectionLayout::new(dir.path());
+        assert_eq!(layout.lock_path(), dir.path().join(".collection.lock"));
+
+        // Still the same path once the collection has (partially) migrated.
+        fs::create_dir_all(dir.path().join("index")).unwrap();
+        fs::write(dir.path().join("engine.redb"), b"legacy").unwrap();
+        assert_eq!(layout.lock_path(), dir.path().join(".collection.lock"));
     }
 
     #[test]

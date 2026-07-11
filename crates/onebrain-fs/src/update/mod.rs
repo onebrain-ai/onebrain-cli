@@ -1200,17 +1200,30 @@ mod tests {
 
     // Serialize all cache tests — they share `ONEBRAIN_RELEASE_CACHE` env
     // state and would race under cargo's default parallel test runner.
-    // `EnvGuard::set` (crate::test_support) holds the lock for its lifetime
-    // and restores the prior value on Drop, even if `body()` panics —
-    // panic-safety matters because cargo's parallel runner shares the
-    // process env across tests, so a leaked value would bleed into every
-    // subsequent cache test.
+    // `EnvGuard::set_vars` (crate::test_support) holds the lock for its
+    // lifetime and restores every prior value on Drop, even if `body()`
+    // panics — panic-safety matters because cargo's parallel runner shares
+    // the process env across tests, so a leaked value would bleed into
+    // every subsequent cache test.
     fn with_cache_path<F: FnOnce()>(body: F) {
+        with_cache_path_and_env(&[], body);
+    }
+
+    /// Like [`with_cache_path`], plus any extra env pairs a test needs set
+    /// for the same duration (e.g. `GITHUB_ENV_OVERRIDE`). One atomic
+    /// `set_vars` call covers both the cache-path var and the caller's
+    /// extras — no nested lock acquisition (#226; this replaced the old
+    /// `EnvGuard::set` + `set_within_lock` two-call shape, whose
+    /// only-call-under-an-outer-lock contract was comment-enforced only).
+    fn with_cache_path_and_env<F: FnOnce()>(extra: &[(&'static str, &std::ffi::OsStr)], body: F) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("latest-release.json");
-        let _env = crate::test_support::EnvGuard::set("ONEBRAIN_RELEASE_CACHE", path.as_os_str());
+        let mut pairs: Vec<(&'static str, &std::ffi::OsStr)> =
+            vec![("ONEBRAIN_RELEASE_CACHE", path.as_os_str())];
+        pairs.extend_from_slice(extra);
+        let _env = crate::test_support::EnvGuard::set_vars(&pairs);
         body();
-        // `_env` Drop restores the previous value on the way out, even if
+        // `_env` Drop restores every prior value on the way out, even if
         // `body()` panicked.
     }
 
@@ -1338,49 +1351,46 @@ mod tests {
 
     #[test]
     fn cache_skipped_when_github_url_override_is_set() {
-        with_cache_path(|| {
-            let cache_path = release_cache_path().unwrap();
-            // Pre-seed the cache with a known-good value we want preserved.
-            std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
-            std::fs::write(
-                &cache_path,
-                serde_json::to_vec(&serde_json::json!({
-                    "tag_name": "v-known-good",
-                    "published_at": null,
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-
-            // Simulate the integration-test environment: override URL set.
-            // `with_cache_path` already holds the shared env lock via its own
-            // `EnvGuard::set` call above in the call stack, so this nested
-            // mutation uses `set_within_lock` — nesting two `set()` calls on
-            // the same thread would deadlock the non-reentrant lock. The
-            // guard restores the prior value on drop, even if an assertion
-            // below panics.
-            let _guard = crate::test_support::EnvGuard::set_within_lock(
+        // Simulate the integration-test environment: override URL set for
+        // the whole body, atomically alongside the cache-path var — one
+        // `set_vars` call, no nested lock acquisition (#226).
+        with_cache_path_and_env(
+            &[(
                 GITHUB_ENV_OVERRIDE,
-                "http://test.example/releases",
-            );
+                std::ffi::OsStr::new("http://test.example/releases"),
+            )],
+            || {
+                let cache_path = release_cache_path().unwrap();
+                // Pre-seed the cache with a known-good value we want preserved.
+                std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+                std::fs::write(
+                    &cache_path,
+                    serde_json::to_vec(&serde_json::json!({
+                        "tag_name": "v-known-good",
+                        "published_at": null,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
 
-            // Hand-roll the write path that the orchestrator would have hit
-            // after a "successful fetch" against the override URL. The guard
-            // should refuse to overwrite the on-disk cache.
-            let info = ReleaseInfo {
-                version: "v-test-fixture".to_string(),
-                published_at: None,
-            };
-            // Mimic the gate the production fetcher applies.
-            if std::env::var_os(GITHUB_ENV_OVERRIDE).is_none() {
-                write_release_cache(&info).unwrap();
-            }
+                // Hand-roll the write path that the orchestrator would have hit
+                // after a "successful fetch" against the override URL. The guard
+                // should refuse to overwrite the on-disk cache.
+                let info = ReleaseInfo {
+                    version: "v-test-fixture".to_string(),
+                    published_at: None,
+                };
+                // Mimic the gate the production fetcher applies.
+                if std::env::var_os(GITHUB_ENV_OVERRIDE).is_none() {
+                    write_release_cache(&info).unwrap();
+                }
 
-            // Cache must still hold the known-good value.
-            let bytes = std::fs::read(&cache_path).unwrap();
-            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(json["tag_name"], "v-known-good");
-        });
+                // Cache must still hold the known-good value.
+                let bytes = std::fs::read(&cache_path).unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(json["tag_name"], "v-known-good");
+            },
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1583,7 +1593,20 @@ mod tests {
         // Directly tests the early-return: even with a warm valid cache file
         // on disk, read_release_cache must return None when
         // ONEBRAIN_GITHUB_RELEASES_URL is set (intent = "hit this URL now").
-        with_cache_path(|| {
+        //
+        // Needs the override added PARTWAY through (the pre-condition below
+        // must observe the cache warm and readable WITHOUT it), so this uses
+        // two sequential, independently-locked `set_vars` scopes rather than
+        // `with_cache_path` — never nested, so there's no "only call this
+        // under an outer lock" contract to get wrong (#226).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("latest-release.json");
+
+        {
+            let _env = crate::test_support::EnvGuard::set_vars(&[(
+                "ONEBRAIN_RELEASE_CACHE",
+                path.as_os_str(),
+            )]);
             let info = ReleaseInfo {
                 version: "v-warm".to_string(),
                 published_at: None,
@@ -1591,21 +1614,23 @@ mod tests {
             write_release_cache(&info).unwrap();
             // Pre-condition: cache is warm and readable without the override.
             assert!(read_release_cache().is_some(), "pre-condition: warm cache");
+        }
 
-            // `with_cache_path` already holds the shared env lock via its
-            // own `EnvGuard::set` call above in the call stack, so this
-            // nested mutation uses `set_within_lock` — nesting two `set()`
-            // calls on the same thread would deadlock the non-reentrant lock.
-            let _guard = crate::test_support::EnvGuard::set_within_lock(
+        // Second, independent scope: both vars set together atomically —
+        // the cache-path var is re-specified so it stays in effect
+        // alongside the override.
+        let _env = crate::test_support::EnvGuard::set_vars(&[
+            ("ONEBRAIN_RELEASE_CACHE", path.as_os_str()),
+            (
                 GITHUB_ENV_OVERRIDE,
-                "http://localhost:9999/fake",
-            );
-            assert!(
-                read_release_cache().is_none(),
-                "warm cache must be bypassed when override URL env var is set"
-            );
-            // EnvGuard Drop restores GITHUB_ENV_OVERRIDE on the way out.
-        });
+                std::ffi::OsStr::new("http://localhost:9999/fake"),
+            ),
+        ]);
+        assert!(
+            read_release_cache().is_none(),
+            "warm cache must be bypassed when override URL env var is set"
+        );
+        // EnvGuard Drop restores both vars on the way out.
     }
 
     // -----------------------------------------------------------------

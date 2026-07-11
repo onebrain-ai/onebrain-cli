@@ -95,7 +95,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
         // ───── Session ──────────────────────────────────────────────
         Cmd::Session(SessionCmd { verb }) => match verb {
-            SessionVerb::Init { vault_dir } => commands::session_init::run(vault_dir, &mode),
+            SessionVerb::Init { vault_dir } => {
+                commands::session_init::run(vault_dir, vault_flag.clone(), &mode)
+            }
             SessionVerb::Current => stubs::not_implemented("session current"),
             SessionVerb::List => stubs::not_implemented("session list"),
             SessionVerb::Get { .. } => stubs::not_implemented("session get"),
@@ -533,7 +535,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         // ───── Hidden v3.0 aliases — emit migration notice + dispatch ─
         Cmd::SessionInitAlias(a) => {
             migration::print_once("session-init", "session init");
-            commands::session_init::run(a.vault_dir, &mode)
+            commands::session_init::run(a.vault_dir, vault_flag.clone(), &mode)
         }
         Cmd::OrphanScanAlias(a) => {
             migration::print_once("orphan-scan", "checkpoint orphans");

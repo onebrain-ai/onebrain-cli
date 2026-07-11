@@ -329,6 +329,7 @@ fn all_checks(vault_root: &Path, config: &onebrain_core::VaultConfig) -> Vec<Doc
     results.push(config_values_check(vault_root));
     results.push(search_exclude_check(vault_root));
     results.push(native_search_check(vault_root));
+    results.push(legacy_index_stub_check(vault_root));
     results.push(qmd_leftovers_check_prod(config));
     results
 }
@@ -1024,6 +1025,177 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Legacy index stub detection + cleanup (#222)
+//
+// Task 9 (v3.4.9 #201 dry-run) demonstrated: a pre-#201 binary opening an
+// already-split collection doesn't know about the `models/` + `index/`
+// layout, so it silently creates a FRESH, EMPTY legacy `tantivy/` /
+// `vectors/` / `engine.redb` directly at the collection root — right next
+// to the real, populated copy under `index/`. `CollectionLayout`'s
+// per-artifact fallback resolution keeps reads correct even with this
+// duplicate in place, but the empty stub never gets cleaned up on its own:
+// `Engine::open`'s eager `migrate()` skips any entry whose target already
+// exists (that's the correct behaviour for a genuine partial migration —
+// never clobber the split copy), so the stub is permanent junk once
+// created. This check finds it and, on `--fix`, removes ONLY the entries
+// that are genuinely empty stubs — anything holding real bytes is reported
+// but never auto-deleted, since that could be a genuine (if confusing)
+// second copy of real data from an aborted migration.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `true` when `path` is a legacy-root index artifact with no real content:
+/// a zero-length file, or a directory with zero entries. A missing path is
+/// treated as trivially "empty" (nothing to remove) so callers can call this
+/// unconditionally after an existence check.
+fn is_empty_stub(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return true;
+    };
+    if meta.is_file() {
+        return meta.len() == 0;
+    }
+    if meta.is_dir() {
+        return std::fs::read_dir(path)
+            .map(|mut rd| rd.next().is_none())
+            .unwrap_or(true);
+    }
+    false
+}
+
+/// Doctor check (`check = "legacy-index-stub"`). Read-only: for each of
+/// [`onebrain_search::layout::INDEX_ARTIFACTS`], looks for a legacy-root
+/// copy that ALSO has a split-location (`index/<name>`) counterpart — the
+/// signature of a pre-#201 binary's stray write, or of a genuinely stuck
+/// partial migration. Names with an empty legacy copy are reported as
+/// auto-fixable; names whose legacy copy holds real bytes are reported
+/// as manual-only (never auto-deleted).
+///
+/// Deliberately narrower than "any `CacheLayoutState::Partial` collection"
+/// — a `Partial` state caused solely by an in-progress MODEL migration (no
+/// index-artifact duplicate at all) is normal and not flagged here.
+fn legacy_index_stub_check(vault_root: &Path) -> DoctorResult {
+    use crate::commands::search_common::{collection_cache_dir, collection_name_readonly};
+    use onebrain_search::layout::INDEX_ARTIFACTS;
+
+    let resolved = match crate::vault_ctx::require(Some(vault_root.to_path_buf())) {
+        Ok(r) => r,
+        Err(_) => return DoctorResult::ok("legacy-index-stub", "skipped — vault unresolvable"),
+    };
+    let collection = match collection_name_readonly(resolved.root.as_path()) {
+        Ok(c) => c,
+        Err(_) => return DoctorResult::ok("legacy-index-stub", "skipped — collection unresolved"),
+    };
+    let cache_dir = collection_cache_dir(&collection);
+
+    let mut empty_stubs = Vec::new();
+    let mut nonempty_duplicates = Vec::new();
+    for name in INDEX_ARTIFACTS {
+        let legacy_path = cache_dir.join(name);
+        let split_path = cache_dir.join("index").join(name);
+        if !legacy_path.exists() || !split_path.exists() {
+            continue; // no duplicate at both locations — nothing to flag
+        }
+        if is_empty_stub(&legacy_path) {
+            empty_stubs.push(name);
+        } else {
+            nonempty_duplicates.push(name);
+        }
+    }
+
+    if empty_stubs.is_empty() && nonempty_duplicates.is_empty() {
+        return DoctorResult::ok("legacy-index-stub", "no legacy index duplicates found");
+    }
+
+    if !nonempty_duplicates.is_empty() {
+        let names = nonempty_duplicates.join(", ");
+        return DoctorResult::warn(
+            "legacy-index-stub",
+            format!("legacy index artifact(s) with data still at collection root: {names}"),
+        )
+        .with_details(vec![
+            format!("collection: {collection}"),
+            format!("{names} will NOT be auto-removed — investigate manually before deleting"),
+        ]);
+    }
+
+    let names = empty_stubs.join(", ");
+    DoctorResult::warn(
+        "legacy-index-stub",
+        format!(
+            "empty legacy index stub(s) at collection root: {names} — left by a pre-#201 binary"
+        ),
+    )
+    .with_hint("onebrain doctor --fix")
+    .with_details(vec![format!("collection: {collection}")])
+}
+
+/// `--fix` recipe for `legacy-index-stub`: re-resolves the same duplicates
+/// the check found and removes ONLY the empty ones. A non-empty legacy
+/// duplicate always survives untouched, even when other names in the same
+/// run were safely removed — [`FixOutcome::Partial`] reports that mix
+/// honestly rather than claiming a clean `Fixed`.
+fn fix_legacy_index_stub(vault_root: &Path, _json: bool) -> FixOutcome {
+    use crate::commands::search_common::{collection_cache_dir, collection_name_readonly};
+    use onebrain_search::layout::INDEX_ARTIFACTS;
+
+    let resolved = match crate::vault_ctx::require(Some(vault_root.to_path_buf())) {
+        Ok(r) => r,
+        Err(e) => return FixOutcome::Failed(format!("could not resolve vault: {e}")),
+    };
+    let collection = match collection_name_readonly(resolved.root.as_path()) {
+        Ok(c) => c,
+        Err(e) => return FixOutcome::Failed(format!("could not resolve collection: {e}")),
+    };
+    let cache_dir = collection_cache_dir(&collection);
+
+    let mut removed = Vec::new();
+    let mut skipped_nonempty = Vec::new();
+    for name in INDEX_ARTIFACTS {
+        let legacy_path = cache_dir.join(name);
+        let split_path = cache_dir.join("index").join(name);
+        if !legacy_path.exists() || !split_path.exists() {
+            continue;
+        }
+        if !is_empty_stub(&legacy_path) {
+            skipped_nonempty.push(name);
+            continue;
+        }
+        let result = if legacy_path.is_dir() {
+            std::fs::remove_dir_all(&legacy_path)
+        } else {
+            std::fs::remove_file(&legacy_path)
+        };
+        match result {
+            Ok(()) => removed.push(name),
+            Err(e) => {
+                return FixOutcome::Partial(format!(
+                    "removed [{}] before failing on {name}: {e}",
+                    removed.join(", ")
+                ));
+            }
+        }
+    }
+
+    if !skipped_nonempty.is_empty() {
+        return FixOutcome::Partial(format!(
+            "removed empty stub(s) [{}] — left non-empty legacy artifact(s) [{}] \
+             untouched, investigate manually",
+            removed.join(", "),
+            skipped_nonempty.join(", ")
+        ));
+    }
+
+    if removed.is_empty() {
+        FixOutcome::Fixed("nothing to remove — no empty legacy stubs found".to_string())
+    } else {
+        FixOutcome::Fixed(format!(
+            "removed empty legacy stub(s): {}",
+            removed.join(", ")
+        ))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Legacy `qmd` leftover detection + guided cleanup (v3.4.9)
 //
 // Pre-v3.4 vaults used an npm-installed CLI (`@tobilu/qmd`, invoked as
@@ -1434,6 +1606,11 @@ fn attempt_fix(
         // this vault's own `folders.archive`, comment from the shared
         // `config_key_docs` table (Task 3's doc entry).
         "search-exclude" => fix_search_exclude(vault_root, json),
+        // Remove empty legacy index stubs left by a pre-#201 binary that
+        // silently recreated tantivy/vectors/engine.redb at the collection
+        // root of an already-split collection. Only truly empty duplicates
+        // are removed; a non-empty legacy copy is reported, never deleted.
+        "legacy-index-stub" => fix_legacy_index_stub(vault_root, json),
         // Strip the stale `extraKnownMarketplaces.onebrain` entry from
         // `.claude/settings.json`. Cosmetic config cleanup; no behavioral
         // change at runtime (the plugin is enabled via `enabledPlugins`).
@@ -2946,7 +3123,12 @@ const DOCTOR_SECTIONS: [(&str, &str, &[&str]); 4] = [
     (
         "📊",
         "Index & state",
-        &["orphan-checkpoints", "search", "qmd-leftovers"],
+        &[
+            "orphan-checkpoints",
+            "search",
+            "legacy-index-stub",
+            "qmd-leftovers",
+        ],
     ),
 ];
 
@@ -2968,6 +3150,7 @@ fn display_label(check: &str) -> &str {
         "claude-settings" => "claude settings",
         "orphan-checkpoints" => "checkpoints",
         "search" => "search",
+        "legacy-index-stub" => "legacy index stub",
         "qmd-leftovers" => "qmd cleanup",
         other => other,
     }
@@ -5161,6 +5344,192 @@ mod tests {
 
         // Cache lives under the guard-scoped tempdir (`cache`), which is
         // removed on drop — no manual cleanup of the real cache root needed.
+    }
+
+    // ── legacy_index_stub_check / fix_legacy_index_stub: #222 ────────────────
+
+    #[test]
+    fn legacy_index_stub_check_ok_when_no_cache_dir() {
+        // Fresh vault, never indexed — no collection cache dir at all, so
+        // there's nothing to detect. Must not create anything as a side
+        // effect (read-only check).
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let d = tempdir().unwrap();
+        let collection = "doctor-unit-stub-no-cache";
+        fs::write(
+            d.path().join("onebrain.yml"),
+            format!("search:\n  collection: {collection}\n"),
+        )
+        .unwrap();
+
+        let r = legacy_index_stub_check(d.path());
+        assert_eq!(r.check, "legacy-index-stub");
+        assert_eq!(r.status, DoctorStatus::Ok);
+    }
+
+    #[test]
+    fn legacy_index_stub_check_ok_when_fully_split_no_legacy_entries() {
+        // A collection already fully migrated (only `index/` populated, no
+        // legacy-root duplicates) must report OK — this is the common,
+        // healthy post-migration state, not something to flag.
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let d = tempdir().unwrap();
+        let collection = "doctor-unit-stub-fully-split";
+        fs::write(
+            d.path().join("onebrain.yml"),
+            format!("search:\n  collection: {collection}\n"),
+        )
+        .unwrap();
+        // Artifact name comes from a variable, not a hand-typed literal —
+        // the repo-wide "no literal artifact joins outside layout.rs" sweep
+        // (artifact_join_sweep.rs) scans this file's raw text too.
+        let name = onebrain_search::layout::INDEX_ARTIFACTS[0]; // tantivy
+        let cache_dir = crate::commands::search_common::collection_cache_dir(collection);
+        fs::create_dir_all(cache_dir.join("index").join(name)).unwrap();
+        fs::write(cache_dir.join("index").join(name).join("seg"), b"x").unwrap();
+
+        let r = legacy_index_stub_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Ok);
+    }
+
+    #[test]
+    fn legacy_index_stub_check_warns_on_empty_stub_alongside_populated_index() {
+        // The exact #222 bug: a pre-#201 binary created a fresh EMPTY
+        // legacy `tantivy/` at the collection root while the real data
+        // already lives at `index/tantivy/`. Must warn with an auto-fix
+        // hint, naming the artifact.
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let d = tempdir().unwrap();
+        let collection = "doctor-unit-stub-empty-alongside-populated";
+        fs::write(
+            d.path().join("onebrain.yml"),
+            format!("search:\n  collection: {collection}\n"),
+        )
+        .unwrap();
+        let name = onebrain_search::layout::INDEX_ARTIFACTS[0]; // "tantivy"
+        let cache_dir = crate::commands::search_common::collection_cache_dir(collection);
+        // Real data at the split location.
+        fs::create_dir_all(cache_dir.join("index").join(name)).unwrap();
+        fs::write(cache_dir.join("index").join(name).join("seg"), b"x").unwrap();
+        // Empty stub left at the legacy root by an old binary.
+        fs::create_dir_all(cache_dir.join(name)).unwrap();
+
+        let r = legacy_index_stub_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Warn);
+        assert!(r.message.contains(name), "{r:?}");
+        assert_eq!(r.hint.as_deref(), Some("onebrain doctor --fix"));
+    }
+
+    #[test]
+    fn legacy_index_stub_check_warns_report_only_for_nonempty_duplicate() {
+        // A legacy-root duplicate that actually HOLDS DATA (not an empty
+        // stub) must be reported but never offered as auto-fixable — the
+        // hint must not point at --fix, since the check itself never
+        // deletes it either.
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let d = tempdir().unwrap();
+        let collection = "doctor-unit-stub-nonempty-duplicate";
+        fs::write(
+            d.path().join("onebrain.yml"),
+            format!("search:\n  collection: {collection}\n"),
+        )
+        .unwrap();
+        let name = onebrain_search::layout::INDEX_ARTIFACTS[2]; // "engine.redb"
+        let cache_dir = crate::commands::search_common::collection_cache_dir(collection);
+        fs::create_dir_all(cache_dir.join("index")).unwrap();
+        fs::write(cache_dir.join("index").join(name), b"real").unwrap();
+        // Legacy duplicate that is NOT empty — must never be auto-deleted.
+        fs::write(cache_dir.join(name), b"some-old-bytes").unwrap();
+
+        let r = legacy_index_stub_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Warn);
+        assert!(r.message.contains(name), "{r:?}");
+        assert!(
+            r.message.contains("NOT be auto-removed")
+                || r.details.iter().any(|d| d.contains("NOT be auto-removed")),
+            "{r:?}"
+        );
+        assert_ne!(
+            r.hint.as_deref(),
+            Some("onebrain doctor --fix"),
+            "a non-empty legacy duplicate must not be offered as one-command auto-fixable: {r:?}"
+        );
+    }
+
+    #[test]
+    fn fix_legacy_index_stub_removes_empty_stub_leaves_populated_index_alone() {
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let d = tempdir().unwrap();
+        let collection = "doctor-unit-fix-stub-removes-empty";
+        fs::write(
+            d.path().join("onebrain.yml"),
+            format!("search:\n  collection: {collection}\n"),
+        )
+        .unwrap();
+        let name = onebrain_search::layout::INDEX_ARTIFACTS[1]; // "vectors"
+        let cache_dir = crate::commands::search_common::collection_cache_dir(collection);
+        fs::create_dir_all(cache_dir.join("index").join(name)).unwrap();
+        fs::write(cache_dir.join("index").join(name).join("v"), b"real").unwrap();
+        fs::create_dir_all(cache_dir.join(name)).unwrap(); // empty stub
+
+        let outcome = fix_legacy_index_stub(d.path(), false);
+        assert!(
+            matches!(outcome, FixOutcome::Fixed(_)),
+            "expected Fixed, got {outcome:?}"
+        );
+        assert!(
+            !cache_dir.join(name).exists(),
+            "empty legacy stub must be removed"
+        );
+        assert!(
+            cache_dir.join("index").join(name).join("v").exists(),
+            "populated split-location data must survive untouched"
+        );
+    }
+
+    #[test]
+    fn fix_legacy_index_stub_never_deletes_nonempty_legacy_artifact() {
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let d = tempdir().unwrap();
+        let collection = "doctor-unit-fix-stub-keeps-nonempty";
+        fs::write(
+            d.path().join("onebrain.yml"),
+            format!("search:\n  collection: {collection}\n"),
+        )
+        .unwrap();
+        let name = onebrain_search::layout::INDEX_ARTIFACTS[2]; // "engine.redb"
+        let cache_dir = crate::commands::search_common::collection_cache_dir(collection);
+        fs::create_dir_all(cache_dir.join("index")).unwrap();
+        fs::write(cache_dir.join("index").join(name), b"real").unwrap();
+        fs::write(cache_dir.join(name), b"old-real-bytes").unwrap();
+
+        let outcome = fix_legacy_index_stub(d.path(), false);
+        assert!(
+            !matches!(outcome, FixOutcome::Fixed(_)),
+            "must not report Fixed while a non-empty legacy artifact was left in place: {outcome:?}"
+        );
+        assert_eq!(
+            fs::read(cache_dir.join(name)).unwrap(),
+            b"old-real-bytes",
+            "non-empty legacy artifact must survive --fix untouched"
+        );
+    }
+
+    #[test]
+    fn legacy_index_stub_in_doctor_sections_and_display_label() {
+        assert_eq!(display_label("legacy-index-stub"), "legacy index stub");
+        assert!(
+            DOCTOR_SECTIONS
+                .iter()
+                .any(|(_, _, checks)| checks.contains(&"legacy-index-stub")),
+            "legacy-index-stub must be listed in DOCTOR_SECTIONS"
+        );
     }
 
     // ── fix_settings_hooks: success path ─────────────────────────────────────

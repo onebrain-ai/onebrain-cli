@@ -3,7 +3,7 @@ use crate::legacy_output::{serialize_for_mode, SessionInitBlock, SessionInitOutp
 use crate::output::OutputMode;
 use anyhow::{Context, Result};
 use onebrain_cache::{clean_stale_state_file, resolve_session_token, ResolveInputs};
-use onebrain_core::{find_vault_root, load_vault_config, CoreError};
+use onebrain_core::{load_vault_config, resolve_vault, CoreError, VaultResolveInputs};
 use onebrain_search::engine::Engine;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -16,13 +16,20 @@ enum SessionInitResult {
     Block(SessionInitBlock),
 }
 
-pub fn run(vault_dir: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
+pub fn run(
+    vault_dir: Option<PathBuf>,
+    vault_flag: Option<PathBuf>,
+    mode: &OutputMode,
+) -> Result<()> {
     // Bun parity: `--vault-dir <path>` overrides the cwd-based auto-detect.
+    // Kept as the walk-up STARTING POINT (soft — a directory to search
+    // upward from), distinct from the global `--vault`/`ONEBRAIN_VAULT`
+    // resolution below, which is a HARD override (must already be a vault).
     let start = match vault_dir {
         Some(dir) => dir,
         None => env::current_dir().context("read current directory")?,
     };
-    let line = build_output(&start, mode, native_pending_bounded)?;
+    let line = build_output(&start, vault_flag, mode, native_pending_bounded)?;
     println!("{line}");
     Ok(())
 }
@@ -34,20 +41,46 @@ pub fn run(vault_dir: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
 /// (never `None` at the call site — see [`compute_result`]).
 fn build_output(
     cwd: &Path,
+    vault_flag: Option<PathBuf>,
     mode: &OutputMode,
     qmd_count: impl Fn(&onebrain_core::VaultRoot, &str) -> Option<usize>,
 ) -> Result<String> {
-    Ok(format_output(&compute_result(cwd, qmd_count)?, mode))
+    Ok(format_output(
+        &compute_result(cwd, vault_flag, qmd_count)?,
+        mode,
+    ))
 }
 
 fn compute_result(
     cwd: &Path,
+    vault_flag: Option<PathBuf>,
     qmd_count: impl Fn(&onebrain_core::VaultRoot, &str) -> Option<usize>,
 ) -> Result<SessionInitResult> {
+    // Vault resolution follows the same flag > ONEBRAIN_VAULT env >
+    // cwd-walk-up chain every other vault-aware command uses
+    // (`vault_ctx::require`) — session init previously ignored both the
+    // `--vault` flag and the env var and ALWAYS walked up from `cwd`,
+    // silently discarding an explicit override (#229). `cwd` here is the
+    // walk-up starting point (either the real process cwd or the legacy
+    // `--vault-dir`, resolved by the caller); it's only consulted when
+    // neither the flag nor the env var is set.
+    //
     // Distinct block reasons for missing-vault vs malformed-yaml — the
-    // SessionStart hook routes each to a different recovery path.
-    let Some(vault_root) = find_vault_root(cwd) else {
-        return Ok(SessionInitResult::Block(SessionInitBlock::init_required()));
+    // SessionStart hook routes each to a different recovery path. A
+    // flag/env value that doesn't resolve to a real vault
+    // (`CoreError::NotAVault`) degrades to the same "not found" block a
+    // plain walk-up miss would produce — hook consumers only care "is
+    // there a vault", not why resolution failed.
+    let inputs = VaultResolveInputs {
+        flag: vault_flag,
+        env: std::env::var_os("ONEBRAIN_VAULT").map(PathBuf::from),
+        cwd: cwd.to_path_buf(),
+    };
+    let vault_root = match resolve_vault(&inputs) {
+        Ok(Some(resolved)) => resolved.root,
+        Ok(None) | Err(_) => {
+            return Ok(SessionInitResult::Block(SessionInitBlock::init_required()));
+        }
     };
 
     let config = match load_vault_config(&vault_root) {
@@ -381,7 +414,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "qmd_collection: ob-1\n").unwrap();
 
-        let line = build_output(dir.path(), &json_mode(), |_, _| Some(0)).unwrap();
+        let line = build_output(dir.path(), None, &json_mode(), |_, _| Some(0)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
 
         assert!(v.get("datetime").and_then(|d| d.as_str()).is_some());
@@ -402,7 +435,7 @@ mod tests {
     fn block_path_when_no_vault_yml_found() {
         let dir = tempdir().unwrap();
         // No vault.yml anywhere.
-        let line = build_output(dir.path(), &json_mode(), |_, _| Some(0)).unwrap();
+        let line = build_output(dir.path(), None, &json_mode(), |_, _| Some(0)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v.get("decision").and_then(|d| d.as_str()), Some("block"));
         assert_eq!(
@@ -420,7 +453,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "not: : valid\n").unwrap();
 
-        let line = build_output(dir.path(), &json_mode(), |_, _| Some(0)).unwrap();
+        let line = build_output(dir.path(), None, &json_mode(), |_, _| Some(0)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v.get("decision").and_then(|d| d.as_str()), Some("block"));
         assert_eq!(
@@ -442,7 +475,7 @@ mod tests {
         // `onebrain-vault-not-found` reason (renamed from `init-required`
         // in v3.1) and skips the `error_detail` field.
         let dir = tempdir().unwrap();
-        let line = build_output(dir.path(), &json_mode(), |_, _| Some(0)).unwrap();
+        let line = build_output(dir.path(), None, &json_mode(), |_, _| Some(0)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(
             v.get("reason").and_then(|r| r.as_str()),
@@ -454,6 +487,132 @@ mod tests {
         );
     }
 
+    // ── #229: --vault flag / ONEBRAIN_VAULT env resolution ──────────────
+
+    #[test]
+    fn vault_flag_overrides_cwd_walk_up() {
+        // `cwd` here is an isolated tempdir with no onebrain.yml anywhere in
+        // its ancestry (no vault via walk-up), while `--vault` points at a
+        // real, separate vault. Before #229 the flag was silently ignored
+        // and this resolved to a "not found" block; after the fix it must
+        // resolve to the flagged vault (proven by the injected qmd_count
+        // closure observing THAT vault's configured collection name).
+        let cwd_dir = tempdir().unwrap();
+        let flag_dir = tempdir().unwrap();
+        std::fs::write(
+            flag_dir.path().join("onebrain.yml"),
+            "search:\n  collection: flag-vault-collection\n",
+        )
+        .unwrap();
+
+        let seen = std::cell::RefCell::new(None);
+        let line = build_output(
+            cwd_dir.path(),
+            Some(flag_dir.path().to_path_buf()),
+            &json_mode(),
+            |_, collection| {
+                *seen.borrow_mut() = Some(collection.to_string());
+                Some(0)
+            },
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(
+            v.get("decision").is_none(),
+            "must resolve via --vault flag, not block; got {v:?}"
+        );
+        assert_eq!(
+            seen.borrow().as_deref(),
+            Some("flag-vault-collection"),
+            "must have queried the flagged vault's collection, not cwd's"
+        );
+    }
+
+    #[test]
+    fn onebrain_vault_env_overrides_cwd_walk_up_when_flag_absent() {
+        let cwd_dir = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        std::fs::write(
+            env_dir.path().join("onebrain.yml"),
+            "search:\n  collection: env-vault-collection\n",
+        )
+        .unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_VAULT", env_dir.path());
+
+        let seen = std::cell::RefCell::new(None);
+        let line = build_output(cwd_dir.path(), None, &json_mode(), |_, collection| {
+            *seen.borrow_mut() = Some(collection.to_string());
+            Some(0)
+        })
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(
+            v.get("decision").is_none(),
+            "must resolve via ONEBRAIN_VAULT env, not block; got {v:?}"
+        );
+        assert_eq!(seen.borrow().as_deref(), Some("env-vault-collection"));
+    }
+
+    #[test]
+    fn vault_flag_wins_over_onebrain_vault_env() {
+        let cwd_dir = tempdir().unwrap();
+        let flag_dir = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        std::fs::write(
+            flag_dir.path().join("onebrain.yml"),
+            "search:\n  collection: flag-wins-collection\n",
+        )
+        .unwrap();
+        std::fs::write(
+            env_dir.path().join("onebrain.yml"),
+            "search:\n  collection: env-loses-collection\n",
+        )
+        .unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_VAULT", env_dir.path());
+
+        let seen = std::cell::RefCell::new(None);
+        let line = build_output(
+            cwd_dir.path(),
+            Some(flag_dir.path().to_path_buf()),
+            &json_mode(),
+            |_, collection| {
+                *seen.borrow_mut() = Some(collection.to_string());
+                Some(0)
+            },
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(v.get("decision").is_none(), "got {v:?}");
+        assert_eq!(
+            seen.borrow().as_deref(),
+            Some("flag-wins-collection"),
+            "--vault must outrank ONEBRAIN_VAULT"
+        );
+    }
+
+    #[test]
+    fn vault_flag_pointing_at_non_vault_degrades_to_not_found_block() {
+        // An explicit --vault whose path has no onebrain.yml is a resolver
+        // Err (CoreError::NotAVault), not a panic or a raw process error —
+        // the hook-protocol contract still gets a clean block JSON.
+        let cwd_dir = tempdir().unwrap();
+        let not_a_vault = tempdir().unwrap();
+
+        let line = build_output(
+            cwd_dir.path(),
+            Some(not_a_vault.path().to_path_buf()),
+            &json_mode(),
+            |_, _| Some(0),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v.get("decision").and_then(|d| d.as_str()), Some("block"));
+        assert_eq!(
+            v.get("reason").and_then(|r| r.as_str()),
+            Some("onebrain-vault-not-found")
+        );
+    }
+
     #[test]
     fn collection_absent_reports_zero_without_querying_qmd() {
         // Gating guard: a vault with no `qmd_collection` reports 0 and must NOT
@@ -462,7 +621,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "# no qmd_collection\n").unwrap();
 
-        let line = build_output(dir.path(), &json_mode(), |_, _| Some(99)).unwrap();
+        let line = build_output(dir.path(), None, &json_mode(), |_, _| Some(99)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(
             v.get("search_unembedded").and_then(|n| n.as_u64()),
@@ -484,7 +643,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "qmd_collection: ob-1\n").unwrap();
 
-        let line = build_output(dir.path(), &json_mode(), |_, _| Some(7)).unwrap();
+        let line = build_output(dir.path(), None, &json_mode(), |_, _| Some(7)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(
             v.get("search_unembedded").and_then(|n| n.as_u64()),
@@ -507,7 +666,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "qmd_collection: ob-1\n").unwrap();
 
-        let line = build_output(dir.path(), &json_mode(), |_, _| None).unwrap();
+        let line = build_output(dir.path(), None, &json_mode(), |_, _| None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         let field = v
             .get("search_unembedded")
@@ -530,7 +689,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "qmd_collection: ob-1\n").unwrap();
 
-        let line = build_output(dir.path(), &text_mode(), |_, _| None).unwrap();
+        let line = build_output(dir.path(), None, &text_mode(), |_, _| None).unwrap();
         assert!(
             line.contains("search index: unknown"),
             "expected unknown marker for unavailable search index; got: {line}"
@@ -549,7 +708,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "qmd_collection: ob-1\n").unwrap();
 
-        let line = build_output(dir.path(), &text_mode(), |_, _| Some(7)).unwrap();
+        let line = build_output(dir.path(), None, &text_mode(), |_, _| Some(7)).unwrap();
         assert!(
             line.contains("search index: 7 unembedded"),
             "expected the determined count in text mode; got: {line}"
@@ -561,7 +720,7 @@ mod tests {
         // v3.1: --yaml / --output yaml flips the hook-protocol block to
         // YAML. Default stays JSON (verified above).
         let dir = tempdir().unwrap();
-        let line = build_output(dir.path(), &OutputMode::Yaml, |_, _| Some(0)).unwrap();
+        let line = build_output(dir.path(), None, &OutputMode::Yaml, |_, _| Some(0)).unwrap();
         // Parse the YAML to assert structure rather than string-matching
         // (serde_yaml's emitter formatting is implementation-defined).
         let v: serde_yaml::Value = serde_yaml::from_str(&line).unwrap();
@@ -586,7 +745,7 @@ mod tests {
     fn happy_path_emits_yaml_when_mode_is_yaml() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "qmd_collection: ob-1\n").unwrap();
-        let line = build_output(dir.path(), &OutputMode::Yaml, |_, _| Some(0)).unwrap();
+        let line = build_output(dir.path(), None, &OutputMode::Yaml, |_, _| Some(0)).unwrap();
         let v: serde_yaml::Value = serde_yaml::from_str(&line).unwrap();
         assert!(v.get("datetime").and_then(|d| d.as_str()).is_some());
         assert!(v.get("session_token").and_then(|s| s.as_str()).is_some());
@@ -603,7 +762,7 @@ mod tests {
     #[test]
     fn default_outside_vault_emits_text_not_json() {
         let dir = tempdir().unwrap();
-        let line = build_output(dir.path(), &text_mode(), |_, _| Some(0)).unwrap();
+        let line = build_output(dir.path(), None, &text_mode(), |_, _| Some(0)).unwrap();
         assert!(
             !line.trim_start().starts_with('{'),
             "default mode must NOT emit JSON braces; got: {line}"
@@ -622,7 +781,7 @@ mod tests {
     fn default_inside_vault_emits_text_success() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "qmd_collection: ob-1\n").unwrap();
-        let line = build_output(dir.path(), &text_mode(), |_, _| Some(0)).unwrap();
+        let line = build_output(dir.path(), None, &text_mode(), |_, _| Some(0)).unwrap();
         assert!(
             !line.trim_start().starts_with('{'),
             "default mode must NOT emit JSON braces; got: {line}"
@@ -638,7 +797,7 @@ mod tests {
     fn default_on_malformed_vault_emits_text() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("vault.yml"), "not: : valid\n").unwrap();
-        let line = build_output(dir.path(), &text_mode(), |_, _| Some(0)).unwrap();
+        let line = build_output(dir.path(), None, &text_mode(), |_, _| Some(0)).unwrap();
         assert!(!line.trim_start().starts_with('{'), "got: {line}");
         assert!(line.contains("malformed"), "got: {line}");
         assert!(line.contains("onebrain doctor"), "got: {line}");
@@ -648,9 +807,12 @@ mod tests {
     fn json_pretty_emits_indented_multiline() {
         let dir = tempdir().unwrap();
         // Block path is simplest — no volatile fields to assert against.
-        let line = build_output(dir.path(), &OutputMode::Json { pretty: true }, |_, _| {
-            Some(0)
-        })
+        let line = build_output(
+            dir.path(),
+            None,
+            &OutputMode::Json { pretty: true },
+            |_, _| Some(0),
+        )
         .unwrap();
         // Pretty JSON contains newlines + 2-space indent.
         assert!(
