@@ -55,5 +55,9 @@ ADRs are immutable once accepted — if a decision changes, write a new ADR that
 | [0025](0025-tier2-cross-encoder-reranker.md) | Tier-2 cross-encoder reranker on every search surface | accepted |
 | [0026](0026-config-self-documentation.md) | Self-documenting onebrain.yml + doctor validate/reset-to-default | accepted |
 | [0027](0027-collection-cache-layout-split.md) | Collection cache layout split (`index/` + `models/`) with eager migration | accepted |
+| [0028](0028-token-optimization-layer.md) | Token optimization layer: `onebrain-token` crate, level ladder, honesty contract | accepted |
+| [0029](0029-token-cache-redb.md) | Token cache on redb: memoization + already-sent ledger + generation counter | accepted |
+| [0030](0030-gain-telemetry-raw-plus-rollups.md) | Gain telemetry: raw JSONL keep-everything + precomputed rollups + epoch reset | accepted |
+| [0031](0031-vault-read-ledger-gate-hook.md) | Vault-read ledger gate hook: deny only repeat-unchanged, fail-open, default off | accepted |
 
 > These ADRs distill the public-facing rationale; the full design notes live in the project tracker. Numbers are stable IDs assigned at authoring time — see each ADR's **Date** for chronology.
