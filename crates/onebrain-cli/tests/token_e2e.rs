@@ -194,6 +194,19 @@ fn token_flow_query_get_reference_force_and_gain() {
         "note.md",
         "# Hello\nsome vault content about rust errors and retries\n",
     );
+    // A doc large enough to exceed the balanced get_cap (4000 tokens) so a get
+    // must truncate it — for the honesty-marker assertion (B2). ~800 lines of
+    // ASCII prose ≈ well over 4000 tokens.
+    let big_body: String = (0..800)
+        .map(|i| format!("line {i}: rust errors retries and more filler prose here\n"))
+        .collect();
+    write(vault.path(), "bignote.md", &format!("# Big\n{big_body}"));
+    // A doc only the CLI `search get` touches (GAP 3 ledger test).
+    write(
+        vault.path(),
+        "clinote.md",
+        "# Cli\ncontent read through the engine by the CLI get surface\n",
+    );
 
     // 1. Full reindex so the daemon's `doc_hash` resolves for the ledger check.
     // (A `--lex-only` pass is incremental — it SKIPS a vault with no index yet,
@@ -303,7 +316,53 @@ fn token_flow_query_get_reference_force_and_gain() {
         "forced get must bypass the ledger (full body, not a reference)"
     );
 
-    // Close stdin; let the server exit before reading gain.
+    // 6b. BLOCKING-1 regression: edit note.md ON DISK without reindexing, then
+    // get again. The ledger keys on a hash of the delivered (disk) bytes, so the
+    // edit must read as CHANGED → the full NEW body, never a stale "unchanged"
+    // reference. (The prior get(id 12) was forced, so it did NOT re-record; the
+    // last recorded hash is still the ORIGINAL body from id 10.)
+    write(
+        vault.path(),
+        "note.md",
+        "# Hello\nEDITED OUT OF BAND totally different bytes now\n",
+    );
+    let after_edit = call_get(
+        &mut stdin,
+        &rx,
+        13,
+        serde_json::json!({ "file": "note.md" }),
+        deadline,
+    );
+    assert!(
+        after_edit.contains("EDITED OUT OF BAND"),
+        "an out-of-band edit (no reindex) must deliver the NEW body, not a stale reference: {after_edit}"
+    );
+    assert!(
+        !after_edit.contains("sent_earlier"),
+        "edited doc must NOT come back as an already-sent reference: {after_edit}"
+    );
+
+    // 6c. BLOCKING-2: a get on a doc bigger than the balanced get_cap truncates
+    // the body — and the truncation must be DISCLOSED (design §4), not silent.
+    let big = call_get(
+        &mut stdin,
+        &rx,
+        14,
+        serde_json::json!({ "file": "bignote.md" }),
+        deadline,
+    );
+    assert!(
+        big.contains("[truncated at line"),
+        "an over-cap get must append a truncation marker with a cursor: {}",
+        &big[big.len().saturating_sub(400)..]
+    );
+    assert!(
+        big.contains("--force"),
+        "the truncation marker must tell the agent how to get the full body: {}",
+        &big[big.len().saturating_sub(400)..]
+    );
+
+    // Close stdin; let the server exit before the CLI ledger steps + gain read.
     drop(stdin);
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(30) {
@@ -313,7 +372,40 @@ fn token_flow_query_get_reference_force_and_gain() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // 7. token gain --history --json — the raw per-call events the surfaces
+    // 7. GAP-3: the CLI `search get` structured path also wires the ledger.
+    // Two `search get --output json` on the same doc in one session → the
+    // second is a reference; `--force` → the full body again.
+    let cli_get = |args: &[&str]| -> String {
+        let out = onebrain(vault.path(), cache.path(), home.path())
+            .args(["search", "get"])
+            .args(args)
+            .args(["--output", "json"])
+            .output()
+            .expect("run search get");
+        assert!(
+            out.status.success(),
+            "search get failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let cli1 = cli_get(&["clinote.md"]);
+    assert!(
+        cli1.contains("read through the engine") && !cli1.contains("sent_earlier"),
+        "first CLI search get returns the full body: {cli1}"
+    );
+    let cli2 = cli_get(&["clinote.md"]);
+    assert!(
+        cli2.contains("sent_earlier") && cli2.contains("rematerialize"),
+        "second CLI search get in the same session returns a reference: {cli2}"
+    );
+    let cli_forced = cli_get(&["clinote.md", "--force"]);
+    assert!(
+        cli_forced.contains("read through the engine") && !cli_forced.contains("sent_earlier"),
+        "CLI search get --force bypasses the ledger and returns the full body: {cli_forced}"
+    );
+
+    // 8. token gain --history --json — the raw per-call events the surfaces
     // recorded (JSONL source of truth). Must include the get surface and the
     // ledger reference hit.
     let gain = onebrain(vault.path(), cache.path(), home.path())
@@ -339,6 +431,10 @@ fn token_flow_query_get_reference_force_and_gain() {
     assert!(
         history.contains("ledger_ref"),
         "gain history should record the ledger reference hit: {history}"
+    );
+    assert!(
+        history.contains("cli_search"),
+        "gain history should record the CLI search get surface: {history}"
     );
 
     stop_daemon(cache.path(), home.path(), vault.path());
