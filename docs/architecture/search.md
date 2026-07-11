@@ -67,12 +67,18 @@ search artifacts, `models/` is the hf-hub download cache base. Transient markers
 recognized root entry (`tantivy`, `vectors`, `engine.redb`, `models--*`) into its new home.
 Per-entry, idempotent, race-safe (an entry whose target already exists is skipped, so concurrent
 opens can't clobber each other), and same-volume `fs::rename` — instant, no re-embed, no data
-copy. Read-only consumers (`search status`, `doctor`, hook gates, the MCP/daemon lex paths, the
-model TUI) never migrate; they resolve **per artifact with legacy fallback**
-(`CollectionLayout::index_artifact` / `model_dir`): new location if present, else the legacy
-root. A partially migrated collection — including a split-brain model cache (one `models--*`
-moved, another still at the root) — therefore stays fully functional and is finished by the
-next `Engine::open`. Fresh downloads always target `models/`
+copy. The **fallback resolvers** (`CollectionLayout::index_artifact` / `model_dir`) themselves
+never migrate — they only resolve **per artifact with legacy fallback**: new location if
+present, else the legacy root. But most consumers that look read-only still call `Engine::open`
+under the hood and therefore DO trigger migration on first touch: `search status`'s doc-count
+open, `doctor`'s engine probe, and `session init`'s no-daemon fallback probe (`native_pending`)
+all migrate a legacy collection the first time they touch it post-upgrade. What truly never
+migrates is the handful of paths that bypass `Engine::open` entirely — `search model list` / the
+model TUI, the hook lex gates (`search reindex --lex-only`), and the MCP/daemon lex-only query
+paths — plus the resolver functions themselves. A partially migrated collection — including a
+split-brain model cache (one `models--*` moved, another still at the root) — therefore stays
+fully functional and is finished by the next `Engine::open`. Fresh downloads always target
+`models/`
 (`CollectionLayout::models_base`); see
 [ADR 0027](../decisions/0027-collection-cache-layout-split.md) for the tradeoffs.
 
