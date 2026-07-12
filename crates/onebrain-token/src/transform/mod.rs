@@ -55,8 +55,8 @@ pub enum Signal {
     Truncated { next: String },
     /// A snippet was shortened or removed entirely.
     SnippetOmitted,
-    /// `N` near-duplicate chunks were collapsed into one.
-    ChunksCollapsed(u32),
+    /// `count` exact-duplicate chunks were collapsed into one.
+    ChunksCollapsed { count: u32 },
     /// The content already sent earlier in this session was replaced by a
     /// reference — the ledger's (Track 3) honesty envelope.
     Reference {
@@ -334,5 +334,50 @@ mod tests {
             let twice = t.apply(&once, ctx);
             assert_eq!(once, twice, "transform {:?} is not idempotent", t.name());
         }
+    }
+
+    /// Regression test for #249: every `Signal` variant must round-trip
+    /// through `serde_json` under the internally-tagged `#[serde(tag =
+    /// "kind")]` representation. `ChunksCollapsed` used to be a newtype
+    /// variant (`ChunksCollapsed(u32)`) holding a bare scalar, which serde
+    /// cannot serialize under internal tagging — `onebrain search
+    /// search/query --output json` errored with `E_INTERNAL: cannot
+    /// serialize tagged newtype variant Signal::ChunksCollapsed containing
+    /// an integer` whenever `doc_dedup` collapsed chunks. This case would
+    /// panic on `serde_json::to_string` against the old newtype shape —
+    /// every variant, including `ChunksCollapsed`, must carry named fields.
+    #[test]
+    fn every_signal_variant_round_trips_through_json() {
+        let signals = vec![
+            Signal::Truncated {
+                next: "42".to_string(),
+            },
+            Signal::SnippetOmitted,
+            Signal::ChunksCollapsed { count: 3 },
+            Signal::Reference {
+                doc_path: "a.md".to_string(),
+                hash: "deadbeef".to_string(),
+                bytes_saved: 1024,
+                rematerialize: "onebrain search get a.md --force".to_string(),
+            },
+        ];
+
+        for signal in signals {
+            let json = serde_json::to_string(&signal)
+                .unwrap_or_else(|e| panic!("failed to serialize {signal:?}: {e}"));
+            let round_tripped: Signal = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("failed to deserialize {json}: {e}"));
+            assert_eq!(signal, round_tripped, "round-trip mismatch for {json}");
+        }
+    }
+
+    /// #249: `ChunksCollapsed` must serialize as a struct variant under
+    /// internal tagging — `{"kind":"chunks_collapsed","count":3}` — not as
+    /// a bare scalar payload (which serde rejects for tagged newtype
+    /// variants).
+    #[test]
+    fn chunks_collapsed_serializes_to_tagged_struct_shape() {
+        let json = serde_json::to_string(&Signal::ChunksCollapsed { count: 3 }).unwrap();
+        assert_eq!(json, r#"{"kind":"chunks_collapsed","count":3}"#);
     }
 }

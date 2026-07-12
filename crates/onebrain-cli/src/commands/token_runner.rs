@@ -254,7 +254,9 @@ pub fn doc_signal_marker(signals: &[Signal], doc_path: &str) -> Option<String> {
                  or get the full document with `onebrain search get {doc_path} --force`]"
             )),
             Signal::SnippetOmitted => notes.push("[snippet omitted]".to_string()),
-            Signal::ChunksCollapsed(n) => notes.push(format!("[{n} duplicate chunk(s) collapsed]")),
+            Signal::ChunksCollapsed { count } => {
+                notes.push(format!("[{count} duplicate chunk(s) collapsed]"))
+            }
             Signal::Reference { .. } => {} // references are their own response
         }
     }
@@ -476,7 +478,7 @@ mod tests {
                     next: "body".into(),
                 },
                 Signal::SnippetOmitted,
-                Signal::ChunksCollapsed(3),
+                Signal::ChunksCollapsed { count: 3 },
             ],
             "a.md",
         )
