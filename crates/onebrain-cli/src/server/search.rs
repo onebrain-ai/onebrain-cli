@@ -551,8 +551,37 @@ mod tests {
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         let result_lex = run_native(dir.path(), "anything", "lex", TOP_K, None);
         let result_hybrid = run_native(dir.path(), "anything", "hybrid", TOP_K, None);
+        let result_vec = run_native(dir.path(), "anything", "vec", TOP_K, None);
         assert!(result_lex.unwrap().is_empty());
         assert!(result_hybrid.unwrap().is_empty());
+        assert!(
+            result_vec.unwrap().is_empty(),
+            "vec on a no-index vault → empty"
+        );
+    }
+
+    /// #258 Gap 3: `run_native` (per-request — the standalone `serve` path)
+    /// dispatches `mode=vec` to `run_vec` and short-circuits on an EXISTING but
+    /// empty index, download-free. Covers the per-request vec body (the no-index
+    /// case above returns at the guard before reaching `run_vec`).
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn run_native_vec_empty_index_is_download_free_empty() {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: rn-vec-empty\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let cache_dir = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap());
+        {
+            let mut lex = LexIndex::open(&index_artifact_path(&cache_dir, "tantivy")).unwrap();
+            lex.commit().unwrap();
+        }
+        let hits = run_native(vault.path(), "anything", "vec", TOP_K, None).unwrap();
+        assert!(hits.is_empty(), "empty index → no vec hits, no download");
     }
 
     #[test]
