@@ -99,6 +99,15 @@ pub struct ServeConfig {
     /// before), since a foreground `serve` is short-lived and not the canonical
     /// engine owner.
     pub hold_engine: bool,
+    /// When `true`, open the `token.redb` cache at router-build time even
+    /// without holding the engine — so a standalone `serve` (the explicit
+    /// `--port`/`--dir` escape hatch) can serve `/api/token/*` and light up the
+    /// Token-Gain dashboard (#257) instead of 503-ing. `hold_engine` already
+    /// implies opening the token cache (the daemon), so this only matters for
+    /// the engine-less standalone path. Best-effort: if `token.redb` is held by
+    /// another process the open fails and the routes degrade to "unavailable",
+    /// never a second racing opener. The unit-test router leaves it `false`.
+    pub open_token_cache: bool,
 }
 
 impl ServeConfig {
@@ -118,6 +127,7 @@ impl ServeConfig {
             port,
             token,
             hold_engine: false,
+            open_token_cache: false,
         }
     }
 
@@ -260,7 +270,7 @@ pub fn build_router_with_state(cfg: ServeConfig) -> (Router, Arc<AppState>) {
     // guard so only the warm daemon owns `token.redb`. A failure to open
     // (never-indexed vault, no collection) leaves it `None` and the token
     // routes degrade gracefully — they never fall back to a per-request open.
-    let token_cache = if cfg.hold_engine {
+    let token_cache = if cfg.hold_engine || cfg.open_token_cache {
         cfg.vault_root
             .as_deref()
             .and_then(token_api::open_held_token_cache)

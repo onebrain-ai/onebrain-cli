@@ -510,8 +510,6 @@ pub use wizard::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-    use std::rc::Rc;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
@@ -710,8 +708,6 @@ mod tests {
     fn confirm_fn_directory_no_aborts_before_creating_anything() {
         let d = tempdir().unwrap();
         let (mut opts, _stdout_buf) = test_opts(d.path());
-        // Counter to track which question we're on
-        let count = Rc::new(RefCell::new(0_u32));
         // FnMut closures with shared state — can't use Rc/RefCell with Send,
         // so use a plain Mutex<u32> + Box::new + move.
         let counter = Arc::new(Mutex::new(0_u32));
@@ -721,7 +717,6 @@ mod tests {
             *c += 1;
             false // always decline
         }));
-        let _ = count; // silence unused
 
         let r = run_init(opts).unwrap();
         assert!(r.ok);

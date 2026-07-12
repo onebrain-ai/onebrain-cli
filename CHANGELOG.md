@@ -1,5 +1,5 @@
 ---
-latest_version: 3.4.11
+latest_version: 3.4.12
 released: 2026-07-12
 ---
 
@@ -9,6 +9,16 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.12] — 2026-07-12 — Self-healing: run smooth under a running daemon
+
+Theme: no command, `serve`, or MCP call should error or fail to run because a daemon is (or isn't) holding the single-process redb lock.
+
+- `token gain` works under a running daemon: default/`--by`/`--history`/`--reset` read the lock-free JSONL raw log; `--all-time`/`--since` route through the daemon's `/api/token/gain` — even across a **version skew**, so it works right after an upgrade without restarting the daemon ([#258](https://github.com/onebrain-ai/onebrain-cli/issues/258))
+- A genuinely contended rollup open (or a daemon too old to serve the route) now reports the shared `E_ENGINE_BUSY` (exit 77) with an actionable hint, instead of a raw redb `Database already open` error at exit 1 ([#258](https://github.com/onebrain-ai/onebrain-cli/issues/258))
+- `serve` now **reuses or starts** a daemon (restarting a stale/version-mismatched one) instead of an engine-less foreground standalone — so the Token-Gain dashboard is populated rather than dark; the explicit `--port`/`--dir` standalone escape hatch now also opens its token cache ([#257](https://github.com/onebrain-ai/onebrain-cli/issues/257), [#258](https://github.com/onebrain-ai/onebrain-cli/issues/258))
+- `search vsearch` is daemon-routable: vector-only search routes through the daemon's new `/api/vault/search?mode=vec` instead of failing `E_ENGINE_BUSY` while an `onebrain mcp` session holds the engine ([#258](https://github.com/onebrain-ai/onebrain-cli/issues/258))
+- Fixes: `doctor`'s scoped-key lookup no longer panics on empty segments; remove dead test code; migrate a `chrono` `DateTime::from_timestamp` deprecation (Copilot autoreview)
 
 ## [3.4.11] — 2026-07-12 — Token-opt seam fixes
 
