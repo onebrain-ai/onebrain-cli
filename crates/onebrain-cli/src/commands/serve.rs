@@ -83,16 +83,18 @@ enum ServePlan {
     /// A live daemon already serves this vault — print its webui URL (and
     /// `--open` it); do NOT bind a second listener or open a second engine.
     OpenDaemon { url: String },
-    /// No matching daemon (or the user asked for a specific listener) — start
-    /// the foreground server exactly as before.
+    /// The user asked for a specific listener (`--port`/`--dir`/`$ONEBRAIN_BIND`),
+    /// the daemon kill switch is set, or starting a daemon failed — run the
+    /// foreground server directly.
     Standalone,
 }
 
-/// Decide between routing to an existing daemon and standalone serving.
+/// Decide between routing to a daemon and standalone serving.
 ///
-/// `daemon` is the discovery record of a live, version- AND vault-matched
-/// daemon (`daemon_client::discover_matching` already applied every guard —
-/// a mismatch arrives here as `None`). `explicit_listener` is `true` when the
+/// `daemon` is the record of the daemon `serve` reuses or just started for this
+/// vault (`daemon_client::ensure_running` — `None` only when routing is disabled,
+/// the user forced a listener, or the start failed). `explicit_listener` is
+/// `true` when the
 /// user passed `--port` or `--dir`, or set `$ONEBRAIN_BIND`: they asked for a
 /// SPECIFIC standalone listener, so a daemon never hijacks that (the
 /// standalone bind will fail loudly on a port conflict rather than silently
@@ -187,19 +189,33 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
     let resolved = crate::vault_ctx::require(args.vault_dir.clone())?;
     let vault_root = resolved.root.as_path().to_path_buf();
 
-    // Daemon-aware routing (#197): if a live daemon already serves THIS vault,
-    // don't bind a second listener (shared port, and two engine owners would
-    // collide on the redb lock) — hand the user the daemon's webui URL instead.
-    // PASSIVE discovery only (`discover_matching`): a version/vault mismatch or
-    // a dead record yields `None` and we serve standalone — `serve` never
-    // starts, stops, or restarts a daemon. `$ONEBRAIN_NO_DAEMON` (the CLI-wide
-    // routing kill switch) skips discovery entirely. Explicit listener flags —
-    // and a set `$ONEBRAIN_BIND` (a container operator NEEDS a reachable
-    // listener, not a redirect to a loopback-bound daemon) — skip it too.
+    // Daemon-aware routing (#197, self-healing since v3.4.12): `serve` reuses a
+    // running daemon for THIS vault, and — when none is running — STARTS one
+    // (or restarts a stale/version-mismatched one) via `ensure_running`, then
+    // hands the user that daemon's webui URL. This makes `serve` "always run:
+    // reuse-or-start", and the started daemon holds the engine + token cache, so
+    // the Token-Gain dashboard is populated (fixes #257 for the default path)
+    // instead of the old engine-less foreground standalone.
+    //
+    // Two engine owners would collide on redb's single-writer lock, so we never
+    // bind a second listener next to a daemon. If starting a daemon genuinely
+    // fails (e.g. the engine is still locked by an exiting process), we fall
+    // back to a standalone foreground server rather than erroring.
+    //
+    // `$ONEBRAIN_NO_DAEMON` (the CLI-wide routing kill switch) skips this
+    // entirely → standalone. Explicit listener flags — and a set
+    // `$ONEBRAIN_BIND` (a container operator NEEDS a reachable listener, not a
+    // redirect to a loopback-bound daemon) — skip it too.
     let bind_override = bind_env();
     let explicit_listener = args.port.is_some() || args.dir.is_some() || bind_override.is_some();
     let daemon_info = if wants_daemon_routing(explicit_listener) {
-        daemon_client::discover_matching(Some(&vault_root))?.map(|handle| handle.info().clone())
+        match daemon_client::ensure_running(Some(&vault_root)) {
+            Ok(handle) => Some(handle.info().clone()),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not reuse or start a daemon; serving standalone");
+                None
+            }
+        }
     } else {
         None
     };
