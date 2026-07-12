@@ -93,9 +93,9 @@ a completeness test enforces this against the config structs.
 | `search.reranker.min_candidates` | Minimum candidate pool to rerank (a floor, not a ceiling) | `10` | integer ≥ 1 | yes |
 | `search.reranker.min_score` | Score gate: hits below this calibrated 0–1 score are dropped | `0.30` (engine-calibrated; key may also be omitted) | number in `[0, 1]` | yes |
 | `token_optimization.level` | Token-optimization ladder rung — see [`token-optimization.md`](token-optimization.md) | `conservative` | `off`, `conservative`, `balanced`, `aggressive` | not validated |
-| `token_optimization.get_max_tokens` | `search get` / MCP `get` continuation cap, in estimated tokens; `0` = unlimited | `6000` | integer ≥ 0 | not validated |
-| `token_optimization.snippet_max_chars` | Per-hit query snippet length cap, in characters | `200` | integer ≥ 1 | not validated |
-| `token_optimization.strip_frontmatter` | When to strip YAML frontmatter from `get`/`multi_get` doc bodies | `auto` | `auto`, `always`, `never` | not validated · ⚠️ **v3.4.10: only `auto` is wired** — frontmatter strips at balanced+ per the ladder; `always`/`never` are accepted but not yet honored (config-wiring lands in v3.4.11) |
+| `token_optimization.get_max_tokens` | `search get` / MCP `get` continuation cap, in estimated tokens. Unset → per-level ladder (6000/4000/4000); a set value pins a fixed cap at every active level; `0` = unlimited | *unset* (per-level) | integer ≥ 0 | not validated |
+| `token_optimization.snippet_max_chars` | Per-hit query snippet length cap, in characters. Unset → per-level ladder (200/150/120); a set value pins a fixed cap at every active level | *unset* (per-level) | integer ≥ 0 | not validated |
+| `token_optimization.strip_frontmatter` | When to strip YAML frontmatter from `get`/`multi_get` doc bodies. `auto` strips at balanced+ per the ladder; `always` strips from conservative up; `never` never strips | `auto` | `auto`, `always`, `never` | not validated |
 | `token_optimization.model` | Model-family hint for token estimation calibration + pricing | `auto` | any string | not validated |
 | `token_optimization.read_hook` | Vault-read ledger-gate hook mode (plugin registers the PreToolUse hook; this key only gates the CLI's ledger check) | `off` | `off`, `ledger` | not validated |
 | `recap.min_sessions` | Unrecapped session logs required before `/recap` runs (plugin key) | `6` | integer ≥ 1 | not validated (plugin-level) |

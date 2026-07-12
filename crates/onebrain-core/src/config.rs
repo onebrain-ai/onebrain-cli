@@ -51,14 +51,18 @@ pub struct TokenOptimizationConfig {
     #[serde(default = "default_token_level")]
     pub level: OptLevel,
     /// `search get` / MCP `get` continuation cap, in estimated tokens.
-    /// `0` = unlimited. Default 6000.
-    #[serde(default = "default_token_get_max_tokens")]
-    pub get_max_tokens: u32,
-    /// Per-hit snippet length cap, in characters. Level-specific defaults
-    /// (150 at balanced, 120 at aggressive) override this when unset.
-    /// Default 200.
-    #[serde(default = "default_token_snippet_max_chars")]
-    pub snippet_max_chars: u32,
+    /// `None` (unset) → follow the per-level ladder (6000/4000/4000 at
+    /// conservative/balanced/aggressive); `Some(0)` → unlimited; `Some(n)` →
+    /// a fixed cap `n` pinned at every active level (operator override).
+    /// Default `None`.
+    #[serde(default)]
+    pub get_max_tokens: Option<u32>,
+    /// Per-hit snippet length cap, in characters. `None` (unset) → follow the
+    /// per-level ladder (200/150/120 at conservative/balanced/aggressive);
+    /// `Some(0)` → uncapped; `Some(n)` → a fixed cap `n` pinned at every
+    /// active level (operator override). Default `None`.
+    #[serde(default)]
+    pub snippet_max_chars: Option<u32>,
     /// When to strip YAML frontmatter from `get`/`multi_get` doc bodies.
     /// Default `auto` (strips at balanced+, per the ladder).
     #[serde(default)]
@@ -80,14 +84,6 @@ fn default_token_level() -> OptLevel {
     OptLevel::Conservative
 }
 
-fn default_token_get_max_tokens() -> u32 {
-    6000
-}
-
-fn default_token_snippet_max_chars() -> u32 {
-    200
-}
-
 fn default_token_model() -> String {
     "auto".to_string()
 }
@@ -96,8 +92,8 @@ impl Default for TokenOptimizationConfig {
     fn default() -> Self {
         Self {
             level: default_token_level(),
-            get_max_tokens: default_token_get_max_tokens(),
-            snippet_max_chars: default_token_snippet_max_chars(),
+            get_max_tokens: None,
+            snippet_max_chars: None,
             strip_frontmatter: StripFrontmatter::default(),
             model: default_token_model(),
             read_hook: ReadHookMode::default(),
@@ -677,8 +673,9 @@ mod tests {
         let (_dir, root) = write_vault("# no token_optimization block\n");
         let cfg = load_vault_config(&root).unwrap();
         assert_eq!(cfg.token_optimization.level, OptLevel::Conservative);
-        assert_eq!(cfg.token_optimization.get_max_tokens, 6000);
-        assert_eq!(cfg.token_optimization.snippet_max_chars, 200);
+        // Caps unset by default → None → follow the per-level ladder.
+        assert_eq!(cfg.token_optimization.get_max_tokens, None);
+        assert_eq!(cfg.token_optimization.snippet_max_chars, None);
         assert_eq!(
             cfg.token_optimization.strip_frontmatter,
             StripFrontmatter::Auto
@@ -694,8 +691,8 @@ mod tests {
             OptLevel::Conservative
         );
         let d = TokenOptimizationConfig::default();
-        assert_eq!(d.get_max_tokens, 6000);
-        assert_eq!(d.snippet_max_chars, 200);
+        assert_eq!(d.get_max_tokens, None);
+        assert_eq!(d.snippet_max_chars, None);
         assert_eq!(d.model, "auto");
     }
 
@@ -704,8 +701,8 @@ mod tests {
         let (_dir, root) = write_vault("token_optimization:\n  level: aggressive\n");
         let cfg = load_vault_config(&root).unwrap();
         assert_eq!(cfg.token_optimization.level, OptLevel::Aggressive);
-        // Untouched siblings keep their defaults.
-        assert_eq!(cfg.token_optimization.get_max_tokens, 6000);
+        // Untouched siblings keep their defaults (caps unset → None).
+        assert_eq!(cfg.token_optimization.get_max_tokens, None);
     }
 
     #[test]
@@ -720,15 +717,27 @@ mod tests {
         let (_dir, root) =
             write_vault("token_optimization:\n  get_max_tokens: 3000\n  read_hook: ledger\n");
         let cfg = load_vault_config(&root).unwrap();
-        assert_eq!(cfg.token_optimization.get_max_tokens, 3000);
+        assert_eq!(cfg.token_optimization.get_max_tokens, Some(3000));
         assert_eq!(cfg.token_optimization.read_hook, ReadHookMode::Ledger);
-        // Defaults preserved for keys not overridden.
+        // Defaults preserved for keys not overridden (snippet unset → None).
         assert_eq!(cfg.token_optimization.level, OptLevel::Conservative);
-        assert_eq!(cfg.token_optimization.snippet_max_chars, 200);
+        assert_eq!(cfg.token_optimization.snippet_max_chars, None);
         assert_eq!(
             cfg.token_optimization.strip_frontmatter,
             StripFrontmatter::Auto
         );
+    }
+
+    #[test]
+    fn token_optimization_explicit_zero_cap_parses_as_some_zero() {
+        // A value the user actually types stays a real override — `0` is
+        // `Some(0)` (unlimited), never silently reinterpreted as `None`
+        // (per-level). Only an ABSENT key is `None`.
+        let (_dir, root) =
+            write_vault("token_optimization:\n  get_max_tokens: 0\n  snippet_max_chars: 0\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.token_optimization.get_max_tokens, Some(0));
+        assert_eq!(cfg.token_optimization.snippet_max_chars, Some(0));
     }
 
     #[test]
@@ -758,8 +767,8 @@ mod tests {
         let (_dir, root) = write_vault(yaml);
         let cfg = load_vault_config(&root).unwrap();
         assert_eq!(cfg.token_optimization.level, OptLevel::Balanced);
-        assert_eq!(cfg.token_optimization.get_max_tokens, 4000);
-        assert_eq!(cfg.token_optimization.snippet_max_chars, 150);
+        assert_eq!(cfg.token_optimization.get_max_tokens, Some(4000));
+        assert_eq!(cfg.token_optimization.snippet_max_chars, Some(150));
         assert_eq!(
             cfg.token_optimization.strip_frontmatter,
             StripFrontmatter::Always

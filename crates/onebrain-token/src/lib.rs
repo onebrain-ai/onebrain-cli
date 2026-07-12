@@ -27,7 +27,7 @@ pub use gain::{
 pub use guard::{never_worse, run_funnel};
 pub use level::OptLevel;
 pub use reference::{content_hash, ReferenceEnvelope};
-pub use transform::{Payload, Signal, Transform, TransformCtx};
+pub use transform::{FrontmatterPolicy, Payload, Signal, Transform, TransformCtx};
 
 // Re-exported so callers that only need to open a `token.redb` handle (the
 // CLI's `token gain` command today; the daemon's routes in Track 3) don't

@@ -18,7 +18,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **`onebrain token check` + `token discover`** — a fail-open PreToolUse read-hook gate (200 ms budget, off by default) plus a field-test tool that scans Claude Code transcripts for repeat reads the ledger could have saved ([#242](https://github.com/onebrain-ai/onebrain-cli/issues/242))
 - Dedicated [token-optimization guide](docs/token-optimization.md) + a Token Gain dashboard in the embedded WebUI ([#243](https://github.com/onebrain-ai/onebrain-cli/issues/243))
 - **Hardening:** collection-lock acquired before migration, doctor legacy-stub detection, artifact-dedup path guard, test-support parity, `session --vault` ([#238](https://github.com/onebrain-ai/onebrain-cli/issues/238))
-- Known limitations (config-wiring, fixed in v3.4.11): the level ladder differentiates by which transforms run, but the `get`/snippet caps use the flat configured value at every level (per-level tightening not yet applied); and `strip_frontmatter: always|never` is accepted but not yet honored (`auto` — strip at balanced+ — is the live behavior). Defaults are unaffected.
+- Config wiring: unset `get_max_tokens`/`snippet_max_chars` now follow the per-level cap ladder (6000/4000/4000, 200/150/120) — a set value pins a fixed cap; `strip_frontmatter: auto|always|never` is fully honored ([#241](https://github.com/onebrain-ai/onebrain-cli/issues/241))
 
 ## [3.4.9] — 2026-07-11 — Cache layout split + field fixes
 

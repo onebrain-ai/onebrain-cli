@@ -240,17 +240,13 @@ pub fn config_key_docs() -> Vec<ConfigKeyDoc> {
         ),
         doc(
             &["token_optimization", "get_max_tokens"],
-            format!(
-                "# `get` continuation cap in estimated tokens, 0 = unlimited · default: {}",
-                tok.get_max_tokens
-            ),
+            "# `get` continuation cap in estimated tokens · unset = per-level ladder (6000/4000/4000), 0 = unlimited, N = fixed cap at every level · default: unset"
+                .to_string(),
         ),
         doc(
             &["token_optimization", "snippet_max_chars"],
-            format!(
-                "# Per-hit snippet length cap in characters · default: {}",
-                tok.snippet_max_chars
-            ),
+            "# Per-hit snippet length cap in characters · unset = per-level ladder (200/150/120), 0 = uncapped, N = fixed cap at every level · default: unset"
+                .to_string(),
         ),
         doc(
             &["token_optimization", "strip_frontmatter"],
@@ -483,9 +479,9 @@ token_optimization:
   {c_level}
   level: {level}
   {c_get_max_tokens}
-  get_max_tokens: {get_max_tokens}
+  # get_max_tokens: 6000
   {c_snippet_max_chars}
-  snippet_max_chars: {snippet_max_chars}
+  # snippet_max_chars: 200
   {c_strip_frontmatter}
   strip_frontmatter: {strip_frontmatter}
   {c_model}
@@ -499,8 +495,6 @@ token_optimization:
             c_model = c(&["token_optimization", "model"]),
             c_read_hook = c(&["token_optimization", "read_hook"]),
             level = tok.level,
-            get_max_tokens = tok.get_max_tokens,
-            snippet_max_chars = tok.snippet_max_chars,
             strip_frontmatter = tok.strip_frontmatter,
             model = tok.model,
             read_hook = tok.read_hook,
@@ -699,13 +693,18 @@ mod tests {
             parsed["token_optimization"]["level"].as_str(),
             Some(tok.level.to_string()).as_deref()
         );
-        assert_eq!(
-            parsed["token_optimization"]["get_max_tokens"].as_u64(),
-            Some(tok.get_max_tokens as u64)
+        // get_max_tokens / snippet_max_chars are emitted COMMENTED-OUT so a
+        // fresh vault follows the per-level ladder by default — they must be
+        // absent from the parsed YAML (uncommenting pins a fixed cap).
+        assert!(
+            parsed["token_optimization"].get("get_max_tokens").is_none(),
+            "get_max_tokens must stay commented (per-level default):\n{yaml}"
         );
-        assert_eq!(
-            parsed["token_optimization"]["snippet_max_chars"].as_u64(),
-            Some(tok.snippet_max_chars as u64)
+        assert!(
+            parsed["token_optimization"]
+                .get("snippet_max_chars")
+                .is_none(),
+            "snippet_max_chars must stay commented (per-level default):\n{yaml}"
         );
         assert_eq!(
             parsed["token_optimization"]["strip_frontmatter"].as_str(),
@@ -746,6 +745,30 @@ mod tests {
                 assert!(
                     yaml.contains(&format!("  {}\n", doc.comment)),
                     "collection doc comment missing:\n{yaml}"
+                );
+                continue;
+            }
+            // get_max_tokens / snippet_max_chars are emitted COMMENTED-OUT
+            // (fresh vault follows the per-level ladder). The finder below
+            // matches only ACTIVE `key:` lines, so verify the exact pairing
+            // against the `# key:` placeholder here instead.
+            if doc.segments == ["token_optimization", "get_max_tokens"]
+                || doc.segments == ["token_optimization", "snippet_max_chars"]
+            {
+                let idx = lines
+                    .iter()
+                    .position(|l| l.trim_start().starts_with(&format!("# {key}:")))
+                    .unwrap_or_else(|| {
+                        panic!("commented {key} placeholder not in template:\n{yaml}")
+                    });
+                let doc_lines: Vec<&str> = doc.comment.split('\n').collect();
+                let above: Vec<&str> = lines[idx - doc_lines.len()..idx]
+                    .iter()
+                    .map(|l| l.trim_start())
+                    .collect();
+                assert_eq!(
+                    above, doc_lines,
+                    "comment above commented {key} drifted from config_key_docs"
                 );
                 continue;
             }

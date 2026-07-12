@@ -56,23 +56,23 @@ this release ever gets removed by a lower level.
 | `balanced` | 2 | + YAML frontmatter strip (`frontmatter`) · snippet cap (`snippet`) · **already-sent ledger turns on** | **on** |
 | `aggressive` | 3 | + snippet-less query hits (`disclosure`) · `multi_get` head-only cap (`head_only`) | on |
 
-> **The `get`/snippet caps are flat overrides, not per-level values.** The
-> `onebrain-token` crate's internal `TransformCtx::for_level()` defines a
-> per-level table (get cap 6000/4000/4000 tokens, snippet 200/150/120 chars
-> for conservative/balanced/aggressive) — but every real surface (MCP, CLI,
-> daemon) builds its context through `ctx_for()`, which — at any level above
-> `off` — always applies your **configured** `token_optimization.get_max_tokens`
-> / `snippet_max_chars` (flat values, default `6000` / `200`) instead of that
-> per-level table. Verified against `crates/onebrain-cli/src/commands/token_runner.rs`
-> (`ctx_for`) and its call sites in `mcp.rs`/`search_query.rs` — none of them
-> use the crate's per-level defaults directly. In practice this means: with a
-> fresh, unedited `onebrain.yml`, the `get` cap is 6000 tokens and the
-> snippet cap is 200 chars at **every** active level, including `balanced`
-> and `aggressive` — the tighter numbers only apply once you set
-> `get_max_tokens`/`snippet_max_chars` explicitly. The same applies to
-> `head_only`'s 500-token internal default on `multi_get`: it's only reached
-> when `get_max_tokens` is genuinely unset, which never happens once a level
-> is active — set `get_max_tokens` explicitly to control it.
+> **The `get`/snippet caps tighten per level by default.** When
+> `token_optimization.get_max_tokens` / `snippet_max_chars` are left **unset**
+> (the fresh-vault default — both keys ship commented-out), each active rung
+> applies its own cap from the ladder table below, so climbing a level really
+> does compact harder:
+>
+> | Level | `get` cap (tokens) | snippet cap (chars) |
+> |---|---|---|
+> | `conservative` | 6000 | 200 |
+> | `balanced` | 4000 | 150 |
+> | `aggressive` | 4000 | 120 |
+>
+> If you **set** either key to a number, that value becomes a fixed cap
+> applied at every active level (an operator override that opts out of the
+> ladder); `0` means unlimited. This is resolved in
+> `crates/onebrain-cli/src/commands/token_runner.rs` (`ctx_for`): an unset cap
+> keeps `TransformCtx::for_level()`'s per-level value, a set cap overrides it.
 
 Set it in `onebrain.yml`:
 
@@ -443,19 +443,23 @@ token-costlier one.
 ```yaml
 token_optimization:
   level: conservative        # off | conservative | balanced | aggressive · default: conservative
-  get_max_tokens: 6000       # `get` continuation cap in estimated tokens, 0 = unlimited · default: 6000
-  snippet_max_chars: 200     # per-hit snippet length cap in characters · default: 200
+  # get_max_tokens: 6000     # unset = per-level ladder (6000/4000/4000); set to pin a fixed cap; 0 = unlimited
+  # snippet_max_chars: 200   # unset = per-level ladder (200/150/120); set to pin a fixed cap; 0 = uncapped
   strip_frontmatter: auto    # auto | always | never · default: auto
   model: auto                # model family hint for token estimation + pricing · default: auto
   read_hook: off              # off | ledger · default: off
 ```
 
+The `get_max_tokens` / `snippet_max_chars` keys ship **commented-out** so a
+fresh vault follows the per-level ladder by default — uncomment one only to
+pin a fixed cap.
+
 | Key | What it is | Default | Valid values |
 |---|---|---|---|
 | `token_optimization.level` | Optimization ladder rung (see [the ladder](#the-level-ladder) above) | `conservative` | `off`, `conservative`, `balanced`, `aggressive` |
-| `token_optimization.get_max_tokens` | `search get` / MCP `get` continuation cap, in estimated tokens. A flat cap applied at every active level (see the [caps note](#the-level-ladder) above) — not level-specific; `0` means unlimited | `6000` | integer ≥ 0 |
-| `token_optimization.snippet_max_chars` | Per-hit query snippet length cap, in characters. A flat cap applied at every active level (see the [caps note](#the-level-ladder) above) — not level-specific | `200` | integer ≥ 1 |
-| `token_optimization.strip_frontmatter` | When to strip YAML frontmatter from `get`/`multi_get` doc bodies. `auto` follows the ladder (strips at balanced+). ⚠️ **v3.4.10: only `auto` is honored** — `always`/`never` are accepted but not yet wired (a `never` at balanced+ still strips); the config-wiring fix lands in v3.4.11 (same follow-up as the flat-cap note above) | `auto` | `auto`, `always`, `never` |
+| `token_optimization.get_max_tokens` | `search get` / MCP `get` continuation cap, in estimated tokens. **Unset** → the per-level ladder (6000/4000/4000; see the [caps note](#the-level-ladder) above); a **set** value pins a fixed cap at every active level; `0` means unlimited | *unset* (per-level) | integer ≥ 0 |
+| `token_optimization.snippet_max_chars` | Per-hit query snippet length cap, in characters. **Unset** → the per-level ladder (200/150/120; see the [caps note](#the-level-ladder) above); a **set** value pins a fixed cap at every active level | *unset* (per-level) | integer ≥ 0 |
+| `token_optimization.strip_frontmatter` | When to strip YAML frontmatter from `get`/`multi_get` doc bodies. `auto` follows the ladder (strips at balanced+); `always` strips from conservative up; `never` never strips | `auto` | `auto`, `always`, `never` |
 | `token_optimization.model` | Model-family hint for token estimation calibration and pricing. `auto` sniffs a hint from `settings.json`; anything starting with `gpt`/`o1`/`o3` or containing `openai` resolves to the GPT-4-class calibration table, everything else (including `auto`) resolves to the Claude-family table | `auto` | any string |
 | `token_optimization.read_hook` | Vault-read ledger-gate hook mode (see [the hook](#the-vault-read-ledger-gate-hook) above). `off` = the hook, if the plugin registers it, always allows; `ledger` = repeat reads of an already-sent doc are denied with a reference | `off` | `off`, `ledger` |
 
