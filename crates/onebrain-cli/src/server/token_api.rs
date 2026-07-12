@@ -612,6 +612,33 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    /// #257: a standalone `serve` (`open_token_cache = true`, no held engine)
+    /// opens the token cache, so the Gain route answers 200 with an honest empty
+    /// pivot instead of 503 — the dashboard lights up on the `--port` escape
+    /// hatch, not just under the daemon.
+    #[tokio::test]
+    async fn gain_route_ok_with_open_token_cache_and_no_held_engine() {
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let mut cfg =
+            ServeConfig::localhost(Some(vault.path().to_path_buf()), 0, TOKEN.to_string(), None);
+        cfg.open_token_cache = true; // standalone serve, engine NOT held
+        let router = build_router(cfg);
+        let resp = router
+            .oneshot(
+                Request::get("/api/token/gain?by=surface")
+                    .header("x-onebrain-token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["rows"], serde_json::json!([]), "no data → empty pivot");
+    }
+
     #[tokio::test]
     async fn ledger_check_empty_path_400() {
         let (vault, cache) = vault_and_cache();

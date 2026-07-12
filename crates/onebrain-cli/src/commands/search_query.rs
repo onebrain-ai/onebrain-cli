@@ -254,21 +254,52 @@ fn rerank_unreranked_hint(
     }
 }
 
+/// Route `vsearch` through a warm daemon that holds this vault's engine, if any
+/// (#258 Gap 3). Returns `Some(result)` when it routed, `None` to fall through
+/// to the direct engine open. Semantic build only — daemon search routing
+/// (`route_to_daemon`/`run_query_via_daemon`) is compiled there; the lex-only
+/// build has no vec route, so this always returns `None`.
+#[cfg(feature = "semantic")]
+fn try_vsearch_via_daemon(
+    resolved: &onebrain_core::ResolvedVault,
+    args: &SearchQueryArgs,
+    mode: &OutputMode,
+) -> Option<Result<()>> {
+    route_to_daemon(resolved)
+        .map(|handle| run_query_via_daemon(&handle, resolved, "vec", args, mode))
+}
+
+#[cfg(not(feature = "semantic"))]
+fn try_vsearch_via_daemon(
+    _resolved: &onebrain_core::ResolvedVault,
+    _args: &SearchQueryArgs,
+    _mode: &OutputMode,
+) -> Option<Result<()>> {
+    None
+}
+
 /// `onebrain search vsearch` — vector-only semantic search. Also embeds the
 /// query text (model-download point on first use).
 ///
-/// NOT daemon-routable: the warm daemon's `/api/vault/search` exposes only
-/// `lex` + `hybrid` (no vector-only mode), so vsearch always opens the engine
-/// directly. When a daemon is holding the engine (an active `onebrain mcp`
-/// session), this therefore degrades to T1's honest `E_ENGINE_BUSY` rather than
-/// silently returning hybrid results under a different ranking — use `query`
-/// (hybrid, daemon-routable) if you need results while a session is live. A
-/// dedicated vec-only daemon endpoint is a follow-up (out of scope for 2c).
+/// Daemon-routable since v3.4.12 (#258 Gap 3): when a warm daemon holds the
+/// engine (an active `onebrain mcp` session), vsearch routes through its
+/// `/api/vault/search?mode=vec` endpoint instead of degrading to
+/// `E_ENGINE_BUSY`. Only when the daemon serves this exact vault; otherwise it
+/// opens the engine directly as before (`$ONEBRAIN_NO_DAEMON` forces direct).
 pub fn run_vsearch(
     vault_flag: Option<PathBuf>,
     mode: &OutputMode,
     args: &SearchQueryArgs,
 ) -> Result<()> {
+    // Warm-daemon path: route vector-only search through a daemon holding this
+    // vault's engine, so it works WITHOUT hitting redb's single-writer lock.
+    // Semantic-build only (daemon search routing is compiled there); the lex-only
+    // build has no vec route and falls straight to the direct open below.
+    let resolved = crate::vault_ctx::require(vault_flag.clone())?;
+    if let Some(result) = try_vsearch_via_daemon(&resolved, args, mode) {
+        return result;
+    }
+
     let (mut engine, resolved) = open_engine(vault_flag)?;
     let raw_min = apply_rerank_overrides(&mut engine, args);
     let vault_info = crate::vault_ctx::info_from(&resolved);
@@ -439,10 +470,10 @@ fn run_query_via_daemon(
         // interpretation either.
         rerank_unreranked_hint_data(&hits, rerank_enabled)
     };
-    let command = if daemon_mode == "hybrid" {
-        "search.query"
-    } else {
-        "search.lex"
+    let command = match daemon_mode {
+        "hybrid" => "search.query",
+        "vec" => "search.vec",
+        _ => "search.lex",
     };
     emit_hits_data(
         command,

@@ -253,6 +253,12 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
         // so it opens the search engine per-request as before rather than
         // holding it. Only the daemon (`daemon __run`) sets `hold_engine`.
         hold_engine: false,
+        // …but DO open the token cache so this standalone escape-hatch server
+        // (reached only via --port/--dir/$ONEBRAIN_BIND now that the default
+        // path starts a daemon) still populates the Token-Gain dashboard (#257)
+        // rather than 503-ing. Best-effort: a daemon-held token.redb → the
+        // routes degrade to "unavailable".
+        open_token_cache: true,
     };
 
     // Jupyter-style URL — the token rides in the query string so a copy-paste

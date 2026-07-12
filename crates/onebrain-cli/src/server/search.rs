@@ -122,6 +122,7 @@ pub(crate) async fn get_vault_search(
     let query = q.q.trim().to_string();
     let mode: &'static str = match q.mode.as_deref() {
         Some("hybrid") => "hybrid",
+        Some("vec") => "vec",
         _ => "lex",
     };
 
@@ -212,10 +213,13 @@ fn run_search(
     }
 
     // lex never opens redb (tantivy only), so it stays on the standalone index
-    // even with a held engine — no lock, no contention. Only hybrid reuses the
-    // held (sole redb-owning) engine.
+    // even with a held engine — no lock, no contention. hybrid AND vec reuse the
+    // held (sole redb-owning) engine so the CLI/mcp can search vector-only
+    // through the daemon instead of hitting `E_ENGINE_BUSY` (#258 Gap 3).
     if mode == "hybrid" {
         run_hybrid_held(engine, &cache_dir, root, query, top_k, min_candidates)
+    } else if mode == "vec" {
+        run_vec_held(engine, &cache_dir, root, query, top_k, min_candidates)
     } else {
         run_lex(&cache_dir, query, top_k)
     }
@@ -278,7 +282,111 @@ fn run_hybrid_held(
     run_lex(cache_dir, query, top_k)
 }
 
-/// Synchronous native search. `mode` is `"hybrid"` or `"lex"`.
+/// Vector-only search against the daemon's held engine (#258 Gap 3). Mirrors
+/// [`run_hybrid_held`] but ranks purely by embedding cosine (+ optional rerank)
+/// via `Engine::vector_search`, so `onebrain search vsearch` can route through a
+/// warm daemon instead of failing with `E_ENGINE_BUSY` while an mcp session
+/// holds the engine.
+#[cfg(feature = "semantic")]
+fn run_vec_held(
+    engine: &SharedEngine,
+    _cache_dir: &Path,
+    root: &Path,
+    query: &str,
+    top_k: usize,
+    min_candidates: Option<usize>,
+) -> anyhow::Result<Vec<SearchHit>> {
+    let mut engine = engine.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(min_candidates) = min_candidates {
+        engine.set_rerank_min_candidates(min_candidates);
+    }
+    if engine.status(root)?.doc_count == 0 {
+        return Ok(vec![]);
+    }
+    Ok(engine
+        .vector_search(query, top_k)?
+        .into_iter()
+        .filter(|h| !h.doc_path.is_empty())
+        .map(|h| SearchHit {
+            title: if h.heading_path.is_empty() {
+                title_from_path(&h.doc_path)
+            } else {
+                h.heading_path.clone()
+            },
+            path: h.doc_path,
+            score: h.score,
+            snippet: h.snippet,
+            rerank_score: h.rerank_score,
+        })
+        .collect())
+}
+
+/// Lex-only build: no embedder, so a vector-only search can't run and (unlike
+/// hybrid) has no lex analogue to degrade to — surface a clear error rather than
+/// silently returning keyword results under a `vec` label.
+#[cfg(not(feature = "semantic"))]
+fn run_vec_held(
+    _engine: &SharedEngine,
+    _cache_dir: &Path,
+    _root: &Path,
+    _query: &str,
+    _top_k: usize,
+    _min_candidates: Option<usize>,
+) -> anyhow::Result<Vec<SearchHit>> {
+    anyhow::bail!("vector-only search is unavailable in this lex-only build")
+}
+
+/// Vector-only per-request search (standalone `serve`, no held engine) — the
+/// #258 Gap 3 analogue of [`run_hybrid`]. Same empty-index guard + engine setup
+/// (exclude + rerank), ranking via `Engine::vector_search`.
+#[cfg(feature = "semantic")]
+fn run_vec(
+    cache_dir: &Path,
+    root: &Path,
+    query: &str,
+    top_k: usize,
+    min_candidates: Option<usize>,
+) -> anyhow::Result<Vec<SearchHit>> {
+    let config = onebrain_core::load_vault_config_at(root)?;
+    let mut engine = Engine::open(cache_dir, &config.search.embed_model)?;
+    engine.set_exclude_patterns(config.search.exclude.clone());
+    engine.set_rerank_settings(rerank_settings_from_config(&config.search.reranker));
+    if let Some(min_candidates) = min_candidates {
+        engine.set_rerank_min_candidates(min_candidates);
+    }
+    if engine.status(root)?.doc_count == 0 {
+        return Ok(vec![]);
+    }
+    Ok(engine
+        .vector_search(query, top_k)?
+        .into_iter()
+        .filter(|h| !h.doc_path.is_empty())
+        .map(|h| SearchHit {
+            title: if h.heading_path.is_empty() {
+                title_from_path(&h.doc_path)
+            } else {
+                h.heading_path.clone()
+            },
+            path: h.doc_path,
+            score: h.score,
+            snippet: h.snippet,
+            rerank_score: h.rerank_score,
+        })
+        .collect())
+}
+
+#[cfg(not(feature = "semantic"))]
+fn run_vec(
+    _cache_dir: &Path,
+    _root: &Path,
+    _query: &str,
+    _top_k: usize,
+    _min_candidates: Option<usize>,
+) -> anyhow::Result<Vec<SearchHit>> {
+    anyhow::bail!("vector-only search is unavailable in this lex-only build")
+}
+
+/// Synchronous native search. `mode` is `"hybrid"`, `"vec"`, or `"lex"`.
 fn run_native(
     root: &Path,
     query: &str,
@@ -298,6 +406,8 @@ fn run_native(
 
     if mode == "hybrid" {
         run_hybrid(&cache_dir, root, query, top_k, min_candidates)
+    } else if mode == "vec" {
+        run_vec(&cache_dir, root, query, top_k, min_candidates)
     } else {
         run_lex(&cache_dir, query, top_k)
     }
@@ -850,6 +960,33 @@ mod tests {
         assert!(
             hits.is_empty(),
             "empty index must yield no hits, no download"
+        );
+    }
+
+    /// #258 Gap 3: `mode="vec"` reaches `run_vec_held` (not the lex fallback) and
+    /// short-circuits on an empty index — download-free, so the daemon can serve
+    /// vector-only search for a CLI `vsearch` during an mcp session.
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn run_search_vec_held_empty_index_is_download_free_empty() {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: rs-vec-empty\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let cache_dir = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap());
+        {
+            let mut lex = LexIndex::open(&index_artifact_path(&cache_dir, "tantivy")).unwrap();
+            lex.commit().unwrap();
+        }
+        let engine = crate::server::internal::open_held_engine(vault.path()).unwrap();
+        let hits = run_search(Some(&engine), vault.path(), "anything", "vec", TOP_K, None).unwrap();
+        assert!(
+            hits.is_empty(),
+            "empty index must yield no vec hits, no download"
         );
     }
 
