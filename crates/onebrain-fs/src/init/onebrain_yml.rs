@@ -307,6 +307,57 @@ pub fn config_key_docs() -> Vec<ConfigKeyDoc> {
     ]
 }
 
+/// The `token_optimization:` block's lines exactly as the fresh template
+/// renders them — comments from [`config_key_docs`], defaults from
+/// [`TokenOptimizationConfig::default`]. Vault-independent (no per-vault
+/// parameter, unlike `search.exclude`'s resolved `archive` folder), so this
+/// ONE function is the single source [`render_onebrain_yml_for_folders`] (the
+/// fresh-init emit) and `onebrain doctor --fix`'s backfill recipe for a vault
+/// whose `onebrain.yml` predates v3.4.10 and carries no `token_optimization`
+/// block at all (`onebrain-cli`'s `fix_token_optimization`) both call — the
+/// two can never drift.
+pub fn token_optimization_block_lines() -> Vec<String> {
+    let tok = TokenOptimizationConfig::default();
+    let docs = config_key_docs();
+    let c = |segments: &[&str]| -> String {
+        docs.iter()
+            .find(|d| d.segments == segments)
+            .expect("every template key has a doc entry")
+            .comment
+            .clone()
+    };
+    format!(
+        "\
+# Token optimization ladder + cache + read-hook (see docs/token-optimization.md).
+token_optimization:
+  {c_level}
+  level: {level}
+  {c_get_max_tokens}
+  # get_max_tokens: 6000
+  {c_snippet_max_chars}
+  # snippet_max_chars: 200
+  {c_strip_frontmatter}
+  strip_frontmatter: {strip_frontmatter}
+  {c_model}
+  model: {model}
+  {c_read_hook}
+  read_hook: {read_hook}",
+        c_level = c(&["token_optimization", "level"]),
+        c_get_max_tokens = c(&["token_optimization", "get_max_tokens"]),
+        c_snippet_max_chars = c(&["token_optimization", "snippet_max_chars"]),
+        c_strip_frontmatter = c(&["token_optimization", "strip_frontmatter"]),
+        c_model = c(&["token_optimization", "model"]),
+        c_read_hook = c(&["token_optimization", "read_hook"]),
+        level = tok.level,
+        strip_frontmatter = tok.strip_frontmatter,
+        model = tok.model,
+        read_hook = tok.read_hook,
+    )
+    .lines()
+    .map(str::to_string)
+    .collect()
+}
+
 /// Build the onebrain.yml text content for the given preset. Pure function —
 /// useful for unit testing without touching the filesystem. Every per-key
 /// comment line is interpolated from [`config_key_docs`], so template and
@@ -329,7 +380,6 @@ fn render_onebrain_yml_for_folders(
     let cp = CheckpointPolicy::default();
     let sc = SearchConfig::default();
     let rr = RerankerConfig::default();
-    let tok = TokenOptimizationConfig::default();
     let docs = config_key_docs();
     let c = |segments: &[&str]| -> String {
         docs.iter()
@@ -472,33 +522,7 @@ search:
 
     blocks.push(crate::config_layout::Block {
         key: "token_optimization".to_string(),
-        lines: lines_of(format!(
-            "\
-# Token optimization ladder + cache + read-hook (see docs/token-optimization.md).
-token_optimization:
-  {c_level}
-  level: {level}
-  {c_get_max_tokens}
-  # get_max_tokens: 6000
-  {c_snippet_max_chars}
-  # snippet_max_chars: 200
-  {c_strip_frontmatter}
-  strip_frontmatter: {strip_frontmatter}
-  {c_model}
-  model: {model}
-  {c_read_hook}
-  read_hook: {read_hook}",
-            c_level = c(&["token_optimization", "level"]),
-            c_get_max_tokens = c(&["token_optimization", "get_max_tokens"]),
-            c_snippet_max_chars = c(&["token_optimization", "snippet_max_chars"]),
-            c_strip_frontmatter = c(&["token_optimization", "strip_frontmatter"]),
-            c_model = c(&["token_optimization", "model"]),
-            c_read_hook = c(&["token_optimization", "read_hook"]),
-            level = tok.level,
-            strip_frontmatter = tok.strip_frontmatter,
-            model = tok.model,
-            read_hook = tok.read_hook,
-        )),
+        lines: token_optimization_block_lines(),
     });
 
     let entries = preset.entries();

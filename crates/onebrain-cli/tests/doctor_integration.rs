@@ -1737,12 +1737,16 @@ search:
     let _ = run_doctor_fix_json(d.path(), cache.path(), home.path());
     let fixed = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
 
-    // Banners for every present section.
+    // Banners for every present section. `Token optimization` is now
+    // present too (issue #247): a legacy vault predating v3.4.10 has no
+    // `token_optimization` block at all, so `--fix` backfills it alongside
+    // the restructure.
     for title in [
         "General",
         "Vault layout",
         "Agent behavior",
         "Search",
+        "Token optimization",
         "Automation",
         "System",
     ] {
@@ -1771,10 +1775,17 @@ search:
             "checkpoint",
             "recap",
             "search",
+            "token_optimization",
             "schedule",
             "stats"
         ],
         "restructured order:\n{fixed}"
+    );
+    // token_optimization is backfilled too (issue #247), with its own
+    // documented defaults — byte-identical to what `init` emits.
+    assert!(
+        fixed.contains(&onebrain_fs::token_optimization_block_lines().join("\n")),
+        "{fixed}"
     );
     // recap keys are now documented with the verified plugin defaults.
     let lines: Vec<&str> = fixed.lines().collect();
@@ -1957,6 +1968,28 @@ fn doctor_fix_text_mode_partial_outcome_renders_distinct_glyph() {
     );
 }
 
+/// Line index of the `segments.last()` key, scoped to the entry's own
+/// top-level block (`segments[0]`) — tracks the current top-level key while
+/// scanning so a bare leaf-name match under the WRONG top-level block is
+/// never returned. Needed because `config_key_docs()` has more than one entry
+/// sharing a leaf name across different blocks (e.g. `search.reranker.model`
+/// / `token_optimization.model`).
+fn find_scoped_key_line(lines: &[&str], segments: &[&str]) -> Option<usize> {
+    let top = segments[0];
+    let key = segments.last().unwrap();
+    let key_prefix = format!("{key}:");
+    let mut current_top: Option<&str> = None;
+    for (i, l) in lines.iter().enumerate() {
+        if !l.starts_with(' ') && !l.trim().is_empty() && !l.trim_start().starts_with('#') {
+            current_top = l.split(':').next();
+        }
+        if current_top == Some(top) && l.trim_start().starts_with(&key_prefix) {
+            return Some(i);
+        }
+    }
+    None
+}
+
 /// End-to-end comment backfill for an EXISTING (legacy, uncommented) vault:
 /// plain doctor reports the undocumented keys read-only; `--fix` inserts the
 /// template's comments; the next plain doctor is clean and a second `--fix`
@@ -2010,10 +2043,13 @@ fn doctor_fix_backfills_comments_on_legacy_vault_end_to_end() {
     for doc_entry in onebrain_fs::config_key_docs() {
         let key = doc_entry.segments.last().unwrap();
         let lines: Vec<&str> = cfg.lines().collect();
-        let Some(idx) = lines
-            .iter()
-            .position(|l| l.trim_start().starts_with(&format!("{key}:")))
-        else {
+        // Scoped to the entry's own TOP-LEVEL block — a bare `starts_with`
+        // scan would find the wrong occurrence when two `config_key_docs`
+        // entries share a leaf name in different blocks (e.g.
+        // `search.reranker.model` / `token_optimization.model`, since #247)
+        // and only one member of the pair is present in this minimal
+        // fixture (no `search:` block at all).
+        let Some(idx) = find_scoped_key_line(&lines, doc_entry.segments) else {
             continue; // absent keys stay absent
         };
         assert_eq!(

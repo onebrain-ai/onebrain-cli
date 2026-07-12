@@ -34,8 +34,8 @@ mod wizard;
 
 pub use folders::{INBOX_IMPORTS_SUBDIR, STANDARD_FOLDERS};
 pub use onebrain_yml::{
-    config_key_docs, render_onebrain_yml, search_exclude_comment, ConfigKeyDoc,
-    TEMPLATE_RERANK_MIN_SCORE,
+    config_key_docs, render_onebrain_yml, search_exclude_comment, token_optimization_block_lines,
+    ConfigKeyDoc, TEMPLATE_RERANK_MIN_SCORE,
 };
 pub use presets::{ScheduleEntry, SchedulePreset};
 

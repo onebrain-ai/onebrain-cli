@@ -329,6 +329,7 @@ fn all_checks(vault_root: &Path, config: &onebrain_core::VaultConfig) -> Vec<Doc
     // here rather than living alongside the fs-layer checks.
     results.push(config_values_check(vault_root));
     results.push(search_exclude_check(vault_root));
+    results.push(token_optimization_check(vault_root));
     results.push(native_search_check(vault_root));
     results.push(legacy_index_stub_check(vault_root));
     results.push(qmd_leftovers_check_prod(config));
@@ -775,6 +776,61 @@ fn search_exclude_check(vault_root: &Path) -> DoctorResult {
         "search.exclude not set — archive folder is being indexed",
     )
     .with_hint("Run onebrain doctor --fix to insert the search.exclude block")
+}
+
+const TOKEN_OPTIMIZATION_CHECK: &str = "token-optimization";
+
+/// True when the top-level `token_optimization` key is entirely absent from
+/// the parsed config. Unparseable YAML and a non-mapping root (including the
+/// comment-only/empty `Null` shape) return `false` — those are
+/// `onebrain.yml-keys`'s territory, or simply have nothing yet to backfill
+/// against; this is a key PRESENCE gate on an otherwise-real config, mirroring
+/// `search_exclude_missing`'s convention.
+fn token_optimization_missing(text: &str) -> bool {
+    let Ok(parsed) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+        return false;
+    };
+    let Some(root) = parsed.as_mapping() else {
+        return false;
+    };
+    root.get(serde_yaml::Value::String("token_optimization".to_string()))
+        .is_none()
+}
+
+/// `token_optimization` block presence check (`check = "token-optimization"`,
+/// issue #247). A vault whose `onebrain.yml` predates v3.4.10 (or was
+/// hand-edited) carries no `token_optimization` block at all — pre-#247,
+/// `doctor --fix` never backfilled one, so the block stayed silently absent
+/// and the token-opt tunables (`level`, `strip_frontmatter`, `model`,
+/// `read_hook`) were undocumented and un-tunable on that vault, even though
+/// the runtime quietly falls back to `TokenOptimizationConfig::default()`
+/// regardless. Advisory only (`warn`, not `error`): nothing is functionally
+/// broken, the config is just missing its documentation.
+fn token_optimization_check(vault_root: &Path) -> DoctorResult {
+    use onebrain_core::find_config_file;
+    let Some(path) = find_config_file(vault_root) else {
+        return DoctorResult::ok(TOKEN_OPTIMIZATION_CHECK, "skipped — no config file");
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return DoctorResult::ok(TOKEN_OPTIMIZATION_CHECK, "skipped — config unreadable");
+    };
+    // Unparseable YAML is the `onebrain.yml-keys` check's territory — skip
+    // quietly (same convention as `search_exclude_check`) rather than
+    // reporting a misleading "token_optimization ok".
+    if serde_yaml::from_str::<serde_yaml::Value>(&text).is_err() {
+        return DoctorResult::ok(
+            TOKEN_OPTIMIZATION_CHECK,
+            "skipped — invalid YAML (see onebrain.yml-keys)",
+        );
+    }
+    if !token_optimization_missing(&text) {
+        return DoctorResult::ok(TOKEN_OPTIMIZATION_CHECK, "token_optimization ok");
+    }
+    DoctorResult::warn(
+        TOKEN_OPTIMIZATION_CHECK,
+        "token_optimization block not set — token-opt config is undocumented and un-tunable",
+    )
+    .with_hint("Run onebrain doctor --fix to insert the token_optimization block")
 }
 
 /// Map a daemon `/api/internal/status` JSON body into the
@@ -1607,6 +1663,10 @@ fn attempt_fix(
         // this vault's own `folders.archive`, comment from the shared
         // `config_key_docs` table (Task 3's doc entry).
         "search-exclude" => fix_search_exclude(vault_root, json),
+        // Backfill the whole missing `token_optimization:` block for a vault
+        // whose onebrain.yml predates v3.4.10 (issue #247) — value from the
+        // same shared source `init`'s fresh template uses.
+        "token-optimization" => fix_token_optimization(vault_root, json),
         // Remove empty legacy index stubs left by a pre-#201 binary that
         // silently recreated tantivy/vectors/engine.redb at the collection
         // root of an already-split collection. Only truly empty duplicates
@@ -1665,6 +1725,7 @@ fn planned_action(result: &DoctorResult) -> Option<&'static str> {
             "reset out-of-range values to defaults · add missing self-documentation comments · restructure layout",
         ),
         "search-exclude" => Some("insert the search.exclude block"),
+        "token-optimization" => Some("insert the token_optimization block"),
         "claude-settings" => Some("remove the stale marketplace entry"),
         "plugin-cache" => Some("remove the stale plugin cache"),
         "vault-config-migration" => Some("migrate vault.yml → onebrain.yml"),
@@ -2530,6 +2591,80 @@ fn fix_search_exclude(vault_root: &Path, json: bool) -> FixOutcome {
     FixOutcome::Fixed(format!("inserted search.exclude: [attachments, {archive}]"))
 }
 
+/// Recipe — `token-optimization` warning means a vault's `onebrain.yml`
+/// predates v3.4.10 (or was hand-edited) and carries no top-level
+/// `token_optimization` block at all (issue #247). Append the SAME commented
+/// block the fresh template scaffolds — built from the one shared source,
+/// [`onebrain_fs::token_optimization_block_lines`] (`config_key_docs`
+/// comments + `TokenOptimizationConfig::default()`), so this backfill is
+/// byte-identical to what a fresh `onebrain init` emits for the block — as a
+/// new top-level block, then run the shared
+/// [`onebrain_fs::restructure_config`] so it lands under its own "Token
+/// optimization" banner in canonical position (`config_layout::SECTIONS`
+/// already lists the key) rather than dangling at EOF. Idempotent: a second
+/// run finds [`token_optimization_missing`] already false and no-ops.
+fn fix_token_optimization(vault_root: &Path, json: bool) -> FixOutcome {
+    use onebrain_core::{find_config_file, CONFIG_FILENAME};
+    let path = find_config_file(vault_root).unwrap_or_else(|| vault_root.join(CONFIG_FILENAME));
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(CONFIG_FILENAME)
+        .to_string();
+    status_line(
+        json,
+        &format!("running: insert token_optimization in {filename}"),
+    );
+
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => return FixOutcome::Failed(format!("read {filename}: {e}")),
+    };
+    if !token_optimization_missing(&text) {
+        return FixOutcome::Fixed(format!("{filename}: token_optimization already set"));
+    }
+    // A flow-style root (`{a: 1, b: 2}`) parses as a mapping — so the gate
+    // above can fire — but appending a block-form `token_optimization:` key
+    // after it would produce unparseable YAML (a flow scalar can't be
+    // followed by block-mapping siblings). Same guard as
+    // `insert_search_exclude_block`'s header check: decline with an honest
+    // manual-edit message rather than ever corrupting the file.
+    if text.trim_start().starts_with('{') {
+        return FixOutcome::Failed(format!(
+            "{filename}: root is a flow-style mapping (e.g. inline `{{…}}`) — convert it to \
+             block form, then re-run onebrain doctor --fix (or add the token_optimization \
+             block manually)"
+        ));
+    }
+
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut updated = text.clone();
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push_str(newline);
+    }
+    updated.push_str(&onebrain_fs::token_optimization_block_lines().join(newline));
+    updated.push_str(newline);
+
+    // Move the just-appended block into canonical section position. Never
+    // declines here in practice: the flow-style root case is already ruled
+    // out above, and the read proved the file parses to a mapping with at
+    // least one OTHER addressable top-level key (that's how
+    // `token_optimization_missing` could return true for a real vault) — the
+    // remaining shapes `restructure_config` refuses (invalid YAML /
+    // non-mapping / no top-level keys) can't co-occur with that. Falls back
+    // to the un-restructured append rather than failing outright if it ever
+    // does.
+    let final_text = onebrain_fs::restructure_config(&updated).unwrap_or(updated);
+
+    if let Err(e) = onebrain_fs::backup_config_file(&path) {
+        return FixOutcome::Failed(format!("backup {filename} before write: {e}"));
+    }
+    if let Err(e) = onebrain_fs::atomic_write_text(&path, &final_text) {
+        return FixOutcome::Failed(format!("write {filename}: {e}"));
+    }
+    FixOutcome::Fixed("inserted token_optimization block (defaults, documented)".to_string())
+}
+
 /// Recipe — `claude-settings` warning means `.claude/settings.json`
 /// carries a stale `extraKnownMarketplaces.onebrain` entry from a
 /// pre-marketplace install. Remove it — the plugin is loaded via
@@ -3112,6 +3247,7 @@ const DOCTOR_SECTIONS: [(&str, &str, &[&str]); 4] = [
             "onebrain.yml-keys",
             "config-values",
             "search-exclude",
+            "token-optimization",
             "vault-config-migration",
             "legacy-qmd-collection",
         ],
@@ -3143,6 +3279,7 @@ fn display_label(check: &str) -> &str {
         "onebrain.yml-keys" => "schema",
         "config-values" => "config values",
         "search-exclude" => "search exclude",
+        "token-optimization" => "token optimization",
         "vault-config-migration" => "config migration",
         "legacy-qmd-collection" => "qmd_collection",
         "folders" => "folders",
@@ -7334,6 +7471,195 @@ mod tests {
         assert!(msg.contains("already set"), "msg: {msg}");
         let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
         assert_eq!(after, original, "untouched when not gated");
+    }
+
+    // ── token-optimization: doctor flags + --fix backfills (issue #247) ──────
+
+    /// A realistic pre-v3.4.10 vault: all the standard keys, but no
+    /// `token_optimization` block at all (the exact gap issue #247 reports).
+    const LEGACY_VAULT_NO_TOKEN_OPT: &str = "update_channel: stable\n\
+         folders:\n  \
+           inbox: 00-inbox\n  \
+           projects: 01-projects\n  \
+           areas: 02-areas\n  \
+           knowledge: 03-knowledge\n  \
+           resources: 04-resources\n  \
+           agent: 05-agent\n  \
+           archive: 06-archive\n  \
+           logs: 07-logs\n\
+         checkpoint:\n  \
+           messages: 15\n  \
+           minutes: 30\n";
+
+    #[test]
+    fn doctor_flags_missing_token_optimization_block() {
+        let d = tempdir().unwrap();
+
+        // No `token_optimization:` key at all → warn finding.
+        fs::write(d.path().join("onebrain.yml"), LEGACY_VAULT_NO_TOKEN_OPT).unwrap();
+        let r = token_optimization_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Warn, "{r:?}");
+        assert_eq!(
+            r.message,
+            "token_optimization block not set — token-opt config is undocumented and un-tunable"
+        );
+        assert!(
+            r.hint.as_deref().unwrap_or("").contains("doctor --fix"),
+            "{:?}",
+            r.hint
+        );
+
+        // Block present (even minimal) → ok, never flagged.
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "token_optimization:\n  level: conservative\n",
+        )
+        .unwrap();
+        let r = token_optimization_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
+
+        // Invalid YAML — the onebrain.yml-keys check owns that error; this
+        // check skips (never a misleading "token_optimization ok").
+        fs::write(d.path().join("onebrain.yml"), "not: : valid").unwrap();
+        let r = token_optimization_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
+        assert!(
+            r.message.contains("skipped — invalid YAML"),
+            "{}",
+            r.message
+        );
+    }
+
+    #[test]
+    fn fix_token_optimization_inserts_block_matching_init_template() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("onebrain.yml"), LEGACY_VAULT_NO_TOKEN_OPT).unwrap();
+
+        let outcome = fix_token_optimization(d.path(), false);
+        let FixOutcome::Fixed(msg) = outcome else {
+            panic!("expected Fixed, got: {outcome:?}");
+        };
+        assert!(msg.contains("token_optimization"), "msg: {msg}");
+
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+
+        // The inserted block is BYTE-IDENTICAL to what `init` emits for a
+        // fresh vault — both call the one shared source function, so this
+        // can never drift.
+        let expected_block = onebrain_fs::token_optimization_block_lines().join("\n");
+        assert!(
+            after.contains(&expected_block),
+            "inserted block must match init's own emit verbatim:\nexpected:\n{expected_block}\n\ngot:\n{after}"
+        );
+
+        // Defaults present: level / strip_frontmatter / model / read_hook
+        // active; get_max_tokens / snippet_max_chars stay commented
+        // placeholders (per-level ladder default), matching the fresh
+        // template's own contract.
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&after).unwrap();
+        let tok = onebrain_core::config::TokenOptimizationConfig::default();
+        assert_eq!(
+            parsed["token_optimization"]["level"].as_str(),
+            Some(tok.level.to_string()).as_deref()
+        );
+        assert_eq!(
+            parsed["token_optimization"]["strip_frontmatter"].as_str(),
+            Some(tok.strip_frontmatter.to_string()).as_deref()
+        );
+        assert_eq!(
+            parsed["token_optimization"]["model"].as_str(),
+            Some(tok.model.as_str())
+        );
+        assert_eq!(
+            parsed["token_optimization"]["read_hook"].as_str(),
+            Some(tok.read_hook.to_string()).as_deref()
+        );
+        assert!(parsed["token_optimization"].get("get_max_tokens").is_none());
+        assert!(parsed["token_optimization"]
+            .get("snippet_max_chars")
+            .is_none());
+
+        // Landed under its own "Token optimization" banner
+        // (`config_layout::SECTIONS`), not dangling at EOF.
+        assert!(
+            after.contains(&onebrain_fs::config_layout::section_banner(
+                "Token optimization"
+            )),
+            "{after}"
+        );
+
+        // Pre-existing content survives untouched.
+        assert!(after.contains("update_channel: stable"));
+        assert!(after.contains("inbox: 00-inbox"));
+        assert!(after.contains("messages: 15"));
+
+        // Doctor now reports clean.
+        let r = token_optimization_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
+
+        // The `config_key_docs` completeness/backfill guard: `--fix`'s
+        // separate comment-backfill pass (`config-values`) must find nothing
+        // new to add for these keys — they already carry the exact table
+        // comment from this recipe.
+        assert!(
+            onebrain_fs::config_key_docs()
+                .iter()
+                .filter(|d| d.segments.first() == Some(&"token_optimization"))
+                .all(|d| !onebrain_fs::yaml_edit::key_lacks_comment(&after, d.segments)),
+            "every emitted token_optimization key must already carry its doc comment:\n{after}"
+        );
+
+        // Idempotence: a second `--fix` run is a byte-identical no-op.
+        let outcome2 = fix_token_optimization(d.path(), false);
+        let FixOutcome::Fixed(msg2) = outcome2 else {
+            panic!("expected Fixed, got: {outcome2:?}");
+        };
+        assert!(msg2.contains("already set"), "msg: {msg2}");
+        let after2 = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after2, after, "second --fix run must be byte-identical");
+    }
+
+    #[test]
+    fn fix_token_optimization_noop_when_already_present() {
+        let d = tempdir().unwrap();
+        let original = "update_channel: stable\ntoken_optimization:\n  level: aggressive\n";
+        fs::write(d.path().join("onebrain.yml"), original).unwrap();
+        let outcome = fix_token_optimization(d.path(), false);
+        let FixOutcome::Fixed(msg) = outcome else {
+            panic!("expected Fixed, got: {outcome:?}");
+        };
+        assert!(msg.contains("already set"), "msg: {msg}");
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after, original, "untouched when already present");
+    }
+
+    #[test]
+    fn fix_token_optimization_flow_root_fails_without_corrupting_yaml() {
+        // Regression, mirroring `fix_search_exclude_flow_form_search_fails_
+        // without_corrupting_yaml`: a flow-style ROOT mapping parses fine (so
+        // the presence gate fires), but appending a block-form
+        // `token_optimization:` key after a flow scalar root would produce
+        // unparseable YAML. The recipe must refuse (honest Failed with a
+        // manual step) and leave the file byte-identical and re-parseable.
+        let d = tempdir().unwrap();
+        let flow = "{update_channel: stable, checkpoint: {messages: 15}}\n";
+        fs::write(d.path().join("onebrain.yml"), flow).unwrap();
+
+        let outcome = fix_token_optimization(d.path(), false);
+        let FixOutcome::Failed(msg) = outcome else {
+            panic!("expected Failed, got: {outcome:?}");
+        };
+        assert!(msg.contains("block form"), "actionable message: {msg}");
+
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        assert_eq!(after, flow, "declined shape must be left untouched");
+        // The file must still parse — never write (or leave) corrupt YAML.
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&after).unwrap();
+        assert_eq!(
+            parsed["update_channel"].as_str(),
+            Some("stable"),
+            "existing value must survive"
+        );
     }
 
     // ── qmd leftover detection + guided cleanup ──────────────────────────────
