@@ -1198,9 +1198,22 @@ mod tests {
                 let body = gain_body.clone();
                 let reqs = reqs_bg.clone();
                 std::thread::spawn(move || {
-                    let mut buf = [0u8; 8192];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    // Accumulate until the end of the HTTP headers (`\r\n\r\n`) so
+                    // a request split across TCP segments isn't misread from a
+                    // single partial `read` (Copilot).
+                    let mut req_bytes = Vec::with_capacity(8192);
+                    let mut chunk = [0u8; 1024];
+                    while req_bytes.len() < 8192 {
+                        let n = stream.read(&mut chunk).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        req_bytes.extend_from_slice(&chunk[..n]);
+                        if req_bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&req_bytes).to_string();
                     if req.starts_with("GET /api/health") {
                         let _ = stream.write_all(
                             b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
