@@ -8,12 +8,16 @@
 //! only difference is the shutdown trigger (Ctrl-C here, SIGTERM there). See
 //! the build-level design `2026-06-04-daemon-serve-design.md` §2–4.
 //!
-//! **Daemon-aware since v3.4.8 (#197, design §2's "step 2b"):** when a daemon
-//! is already serving THIS vault, `serve` does not bind a second listener (the
-//! two share port 6789 by design, and both would want the engine) — it prints
-//! the daemon's webui URL, honours `--open`, and exits. Explicit `--port` /
-//! `--dir` flags (or a set `$ONEBRAIN_BIND`) always mean a standalone server
-//! (see [`plan_serve`]).
+//! **Daemon-aware since v3.4.8 (#197); reuse-or-start since v3.4.12 (#258):**
+//! `serve` reuses a daemon already serving THIS vault, and — when none is
+//! running — STARTS one (restarting a stale/version-mismatched one) via
+//! [`daemon_client::ensure_running`], then prints that daemon's webui URL,
+//! honours `--open`, and exits. It never binds a second listener next to a
+//! daemon (the two share port 6789 by design, and both would want the engine),
+//! and the started daemon holds the engine + token cache so the dashboard is
+//! populated. Explicit `--port` / `--dir` flags (or a set `$ONEBRAIN_BIND`) —
+//! and `$ONEBRAIN_NO_DAEMON` — always mean a foreground standalone server (see
+//! [`plan_serve`]).
 //!
 //! **Localhost-only since v3.4.8 (#205):** the `--host` flag was REMOVED —
 //! every listener binds `127.0.0.1`, same as the daemon. Remote access goes

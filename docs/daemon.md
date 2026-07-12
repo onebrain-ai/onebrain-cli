@@ -44,7 +44,7 @@ The daemon runs the **same static surface as [`serve`](serve.md)**: with `$ONEBR
 Two ways to open it without ever reading `daemon.json` by hand:
 
 - **`onebrain daemon status`** prints the clickable `http://127.0.0.1:PORT/?token=TOKEN` as part of its dashboard (below).
-- **`onebrain serve --open`** detects a daemon already serving the current vault and opens the browser at the daemon's URL instead of binding a second listener — see [serve.md](serve.md).
+- **`onebrain serve --open`** reuses a daemon already serving the current vault — or starts one when none is running (v3.4.12) — and opens the browser at that daemon's URL instead of binding a second listener — see [serve.md](serve.md).
 
 ## `daemon status` — a real dashboard
 
@@ -79,7 +79,7 @@ When a daemon is **already running and serves the same vault**, the CLI search v
 Notes:
 - **Passive: route-only, never start or restart.** The CLI uses `daemon_client::discover_matching`, NOT the MCP path's active `discover()`/`ensure_running()`. A plain `onebrain search …` never spawns a daemon and never stops/restarts one — it routes only to a daemon that is ALREADY up (the contention an MCP session creates). This is the load-bearing difference from the MCP path, which owns the daemon's lifecycle and restarts it on a version/vault mismatch. The CLI must never disrupt a daemon serving another vault.
 - **Vault-match guard.** The machine runs one daemon on a fixed port, so a daemon started for vault A must never answer a `--vault B` request. `discover_matching` reads the daemon's canonical bound vault from `daemon.json` (`DaemonInfo.vault`, written at bind) and routes only when `vault_decision` says it matches the caller's vault AND `version_decision` matches AND the daemon passes the engine-independent `/api/health` liveness probe. On ANY mismatch it declines (direct open) and **leaves the daemon.json record untouched** — no stop, no remove.
-- **`search search` (lex)** and **`search vsearch` (vector-only)** are NOT daemon-routed: lex uses the standalone tantivy index (no redb, no contention), and the daemon exposes no vector-only search mode, so vsearch opens directly (honest `E_ENGINE_BUSY` while a session holds the engine — use `query` for results mid-session).
+- **`search search` (lex)** is NOT daemon-routed: it uses the standalone tantivy index (no redb, no contention). **`search vsearch` (vector-only)** IS daemon-routed since v3.4.12 (#258 Gap 3): it routes through the daemon's `GET /api/vault/search?mode=vec` — passively, via `route_to_daemon` like the other search verbs — so it returns results while a session holds the engine instead of an `E_ENGINE_BUSY`.
 - **A routed request stays honest when the daemon holds no engine.** During the upgrade-transition window a *pre-3.4.6* `onebrain mcp` can still own the redb lock while the new warm daemon runs; the daemon is then engine-less and its `/api/internal/*` + `/api/vault/search` routes return `503`. The CLI classifies that 503 as `E_ENGINE_BUSY` (exit 77) for `query`/`get`/`reindex` and `busy: true` for `status` — identical to the direct-open fallback — so a routed verb never leaks an internal error mid-transition. (This is unambiguous because the CLI only routes to a *vault-matched* daemon; a vault-less daemon's "no vault bound" 503 is never reached — see [ADR 0023](decisions/0023-warm-daemon-mcp-search.md) Track 3.)
 - **Kill switch.** Set `ONEBRAIN_NO_DAEMON=1` to disable all CLI daemon routing (every verb opens the engine directly, the pre-daemon behaviour).
 
@@ -142,7 +142,7 @@ Three recommended paths, in increasing order of setup:
 Notes:
 
 - Set `ONEBRAIN_TOKEN` (**≥ 32 chars**, e.g. `openssl rand -hex 16`) in the daemon's environment for a **stable, bookmarkable URL** across daemon restarts — otherwise every restart mints a fresh token and saved URLs go stale. The value must match the charset `[A-Za-z0-9_-]`; a too-short or invalid value is a hard error that prevents the daemon from starting. Unset the variable to get a generated token instead.
-- Do **not** run a standalone `serve` alongside a running daemon on the default port — they share port 6789 and the engine lock (a plain `serve` detects the daemon and routes instead of binding; forcing a second listener needs an explicit `--port`). The `serve --host` flag no longer exists (#205): the only non-loopback bind is the container-scoped `ONEBRAIN_BIND` env var, which warns loudly that it speaks plaintext HTTP (see [serve.md](serve.md#containers--self-host--onebrain_bind)).
+- Do **not** force a standalone `serve` alongside a running daemon on the default port — they share port 6789 and the engine lock (a plain `serve` reuses or starts the daemon and routes to it instead of binding; forcing a second listener needs an explicit `--port`). The `serve --host` flag no longer exists (#205): the only non-loopback bind is the container-scoped `ONEBRAIN_BIND` env var, which warns loudly that it speaks plaintext HTTP (see [serve.md](serve.md#containers--self-host--onebrain_bind)).
 
 ## Lifecycle
 

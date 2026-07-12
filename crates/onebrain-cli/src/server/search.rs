@@ -2,14 +2,16 @@
 //! `onebrain-search` engine (the SAME index the CLI `onebrain search …`
 //! verbs and the native MCP server use).
 //!
-//! Two modes:
+//! Three modes:
 //!
 //! ```text
 //!   mode=lex     → LexIndex (BM25 keyword, no model, fast as-you-type)
 //!   mode=hybrid  → Engine::query (lex + vector, one query embedding)
-//!                  (lex-only / --no-default-features builds have no
-//!                  embedder, so hybrid degrades to the same LexIndex path
-//!                  as mode=lex — see `run_hybrid` below)
+//!   mode=vec     → Engine::vector_search (vector-only, one query embedding) —
+//!                  routes `onebrain search vsearch` through a warm daemon (#258)
+//!                  (lex-only / --no-default-features builds have no embedder, so
+//!                  hybrid degrades to the same LexIndex path as mode=lex — see
+//!                  `run_hybrid` below — and vec errors, having no lex analogue)
 //! ```
 //!
 //! Read-only translator: it returns vault-relative paths the existing
@@ -45,7 +47,8 @@ use onebrain_search::lex::LexIndex;
 pub(crate) struct SearchQuery {
     /// The user's search text.
     q: String,
-    /// `lex` (BM25 keyword, the default) or `hybrid` (keyword + semantic).
+    /// `lex` (BM25 keyword, the default), `hybrid` (keyword + semantic), or
+    /// `vec` (vector-only — the `search vsearch` daemon route, #258 Gap 3).
     #[serde(default)]
     mode: Option<String>,
     /// Max hits to return. When absent, falls back to the vault's

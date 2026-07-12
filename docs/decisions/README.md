@@ -59,5 +59,6 @@ ADRs are immutable once accepted — if a decision changes, write a new ADR that
 | [0029](0029-token-cache-redb.md) | Token cache on redb: memoization + already-sent ledger + generation counter | accepted |
 | [0030](0030-gain-telemetry-raw-plus-rollups.md) | Gain telemetry: raw JSONL keep-everything + precomputed rollups + epoch reset | accepted |
 | [0031](0031-vault-read-ledger-gate-hook.md) | Vault-read ledger gate hook: deny only repeat-unchanged, fail-open, default off | accepted |
+| [0032](0032-self-healing-daemon-fallback.md) | Self-healing daemon fallback: token gain / serve / vsearch under redb contention | accepted |
 
 > These ADRs distill the public-facing rationale; the full design notes live in the project tracker. Numbers are stable IDs assigned at authoring time — see each ADR's **Date** for chronology.

@@ -570,9 +570,11 @@ fn degrade_vec_error(has_lex: bool, result: anyhow::Result<Vec<Hit>>) -> anyhow:
 }
 
 /// The daemon `mode` string for a typed sub-query. The daemon's
-/// `GET /api/vault/search` speaks only `lex` (BM25) or `hybrid` (lex + vector),
-/// so a `vec`/`hyde` sub-query maps to `hybrid` (which embeds the query and
-/// fuses with lex inside the daemon), and `lex` maps to `lex`.
+/// `GET /api/vault/search` speaks `lex` (BM25), `hybrid` (lex + vector), and —
+/// since v3.4.12 — `vec` (vector-only). The MCP `query` tool deliberately still
+/// maps a `vec`/`hyde` sub-query to `hybrid` (which embeds the query and fuses
+/// with lex inside the daemon for RRF), and `lex` to `lex`; the standalone
+/// `vec` mode is what the CLI `search vsearch` verb routes through, not this.
 fn daemon_mode_for(t: &SubQueryType) -> &'static str {
     match t {
         SubQueryType::Lex => "lex",
