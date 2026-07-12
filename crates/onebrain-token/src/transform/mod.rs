@@ -67,6 +67,23 @@ pub enum Signal {
     },
 }
 
+/// Frontmatter-strip policy carried on [`TransformCtx`], mapped from the
+/// vault's `token_optimization.strip_frontmatter` config by the surface layer
+/// (`ctx_for`). Kept crate-local so `onebrain-token` stays dependency-pure
+/// (it never imports `onebrain-core`): the config enum and this one carry the
+/// same three cases and are mapped at the boundary.
+///
+/// - `Auto` (default): defer to the ladder — strip only at `Balanced`+.
+/// - `Always`: strip at any active level (`Conservative`+).
+/// - `Never`: never strip — a true pass-through, no signal, no byte change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrontmatterPolicy {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
 /// Per-call parameters the funnel and transforms need. [`run_funnel`] takes
 /// this by reference so a caller can build defaults via
 /// [`TransformCtx::for_level`] and then mutate per-call overrides (level,
@@ -86,6 +103,11 @@ pub struct TransformCtx {
     pub get_max_tokens: Option<u32>,
     /// Max snippet length, in chars.
     pub snippet_max_chars: Option<u32>,
+    /// Whether `FrontmatterStrip` may strip YAML frontmatter, and when.
+    /// Defaults to [`FrontmatterPolicy::Auto`] (ladder-driven: strip at
+    /// `Balanced`+). `ctx_for` maps the vault's `strip_frontmatter` config
+    /// onto this so `always`/`never` are honored.
+    pub strip_frontmatter: FrontmatterPolicy,
     /// The document path this payload was sourced from, when known — used
     /// by transforms that need it for signal context (e.g. dedup identity).
     pub doc_path: Option<String>,
@@ -122,6 +144,7 @@ impl TransformCtx {
             model: ModelFamily::default(),
             get_max_tokens,
             snippet_max_chars,
+            strip_frontmatter: FrontmatterPolicy::Auto,
             doc_path: None,
             force: false,
             session_token: None,
@@ -268,7 +291,9 @@ mod tests {
             (
                 "frontmatter",
                 Payload::new(include_str!("../../tests/fixtures/frontmatter/input.md")),
-                TransformCtx::default(),
+                // Balanced so Auto policy actually strips — exercises the
+                // real cut path for idempotence, not the gated no-op.
+                TransformCtx::for_level(OptLevel::Balanced),
             ),
             (
                 "snippet",

@@ -87,6 +87,7 @@ Search the vault with typed sub-queries (`lex` = BM25 keywords, `vec` = semantic
 | `collections` | array of string | no | — | **Compatibility only, not used by the native engine.** The native index is single-collection per vault, so there's nothing to select between. |
 | `intent` | string | no | — | **Compatibility only, not used by the native engine yet.** Background context for disambiguation; native intent-aware ranking is not yet implemented. |
 | `rerank` | boolean | no | — | **Compatibility only, not used by the native engine.** Native cross-encoder reranking (`onebrain-rerank-v1`, a `bge-reranker-v2-m3`-based model — [ADR 0025](../decisions/0025-tier2-cross-encoder-reranker.md)) IS implemented, but as an engine-wide, config-driven stage (`search.reranker.enabled` in `onebrain.yml`) rather than a per-request toggle — this field stays deserialize-only and has no effect either way. `vec`/`hyde` sub-queries are reranked (or not) according to the vault's configuration; `lex` sub-queries are never reranked. |
+| `optLevel` | string | no | — (config `level`) | Per-call [token-optimization](../token-optimization.md) level override — `"off"`, `"conservative"`, `"balanced"`, or `"aggressive"` — shaping how the returned hit list is compacted (snippet trimming, disclosure). Precedence: this > `token_optimization.level` in `onebrain.yml` > default (`conservative`). An unparseable value is an error, never a silent downgrade. |
 
 **Result shape**
 
@@ -142,8 +143,10 @@ Read a file's contents by vault-relative path (typically taken straight from a `
 | `fromLine` | number | no | `1` | Start line (1-indexed). Overridden by a `:N` suffix on `file` if both are given. |
 | `maxLines` | number | no | — (whole file) | Maximum number of lines to return from `fromLine`. |
 | `lineNumbers` | boolean | no | `false` | Prefix each returned line with `"N: "`. |
+| `force` | boolean | no | `false` | Bypass the already-sent ledger **and** the size cap: always return the full body, never a reference receipt. This is the `--force` re-materialize path a reference envelope points to — use it to deliberately pull back a doc the ledger has marked as already-sent. See [token optimization](../token-optimization.md). |
+| `optLevel` | string | no | — (config `level`) | Per-call [token-optimization](../token-optimization.md) level override — `"off"`/`"conservative"`/`"balanced"`/`"aggressive"` — for this read (caps, whitespace/frontmatter compaction). Precedence: this > `token_optimization.level` > default. An unparseable value is an error, never a silent downgrade. |
 
-**Result shape**: a single text content block — the sliced file text, no wrapping JSON.
+**Result shape**: a single text content block — the sliced file text, no wrapping JSON. When the already-sent ledger (level ≥ balanced) recognizes an unchanged, previously-delivered doc, `get` instead returns a small reference envelope naming the doc + the `--force` command to re-materialize it — never a silent omission.
 
 **Example call**
 

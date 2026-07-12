@@ -22,14 +22,14 @@
 
 use std::path::PathBuf;
 
-use onebrain_core::config::TokenOptimizationConfig;
+use onebrain_core::config::{StripFrontmatter, TokenOptimizationConfig};
 use onebrain_core::path::ResolvedVault;
 use onebrain_token::{
     content_hash,
     estimate::ModelFamily,
     gain::{GainSink, JsonlGainWriter, Surface},
-    run_funnel, GainEvent, LedgerVerdict, OptLevel, Payload, ReferenceEnvelope, Signal, TokenCache,
-    TransformCtx,
+    run_funnel, FrontmatterPolicy, GainEvent, LedgerVerdict, OptLevel, Payload, ReferenceEnvelope,
+    Signal, TokenCache, TransformCtx,
 };
 
 use super::daemon_client::DaemonHandle;
@@ -88,10 +88,18 @@ pub fn model_family_for(model: &str) -> ModelFamily {
 }
 
 /// Build a [`TransformCtx`] from a resolved level + the vault's
-/// `token_optimization` config. Per-level cap defaults (design §2) are the
-/// baseline; the config's explicit `get_max_tokens`/`snippet_max_chars`
-/// override them when the level would otherwise use its own default. `force`
-/// bypasses the ledger and the size cap (design §3c).
+/// `token_optimization` config. [`TransformCtx::for_level`] supplies the
+/// per-level cap ladder (design §2) as the baseline; the config only
+/// *overrides* a cap when the operator set one explicitly:
+///
+/// - `None` (cap unset) → leave the per-level ladder value in place (the fix
+///   for gap 2a — unset caps now tighten as you climb the ladder).
+/// - `Some(0)` → unlimited (the long-standing `0 = unlimited` meaning).
+/// - `Some(n)` → a fixed cap `n` pinned at every active level.
+///
+/// `strip_frontmatter` maps the config enum onto the ctx policy so
+/// `always`/`never` are honored (the fix for gap 2b). `force` bypasses the
+/// ledger and the size cap (design §3c).
 pub fn ctx_for(
     level: OptLevel,
     cfg: &TokenOptimizationConfig,
@@ -101,16 +109,23 @@ pub fn ctx_for(
 ) -> TransformCtx {
     let mut ctx = TransformCtx::for_level(level);
     ctx.model = model_family_for(&cfg.model);
-    // The config caps are authoritative when the level actually shapes output
-    // (level > off). `get_max_tokens: 0` means "unlimited" per the config docs.
+    // Only an explicitly-set config cap overrides the per-level ladder. `0`
+    // stays "unlimited" (→ None); any other value pins a fixed cap. When the
+    // config leaves a cap unset (None), the `for_level` per-level value stands.
+    // At `off` no transform runs, so caps are inert either way.
     if level != OptLevel::Off {
-        ctx.get_max_tokens = if cfg.get_max_tokens == 0 {
-            None
-        } else {
-            Some(cfg.get_max_tokens)
-        };
-        ctx.snippet_max_chars = Some(cfg.snippet_max_chars);
+        if let Some(cap) = cfg.get_max_tokens {
+            ctx.get_max_tokens = (cap != 0).then_some(cap);
+        }
+        if let Some(cap) = cfg.snippet_max_chars {
+            ctx.snippet_max_chars = (cap != 0).then_some(cap);
+        }
     }
+    ctx.strip_frontmatter = match cfg.strip_frontmatter {
+        StripFrontmatter::Auto => FrontmatterPolicy::Auto,
+        StripFrontmatter::Always => FrontmatterPolicy::Always,
+        StripFrontmatter::Never => FrontmatterPolicy::Never,
+    };
     ctx.doc_path = doc_path;
     ctx.force = force;
     ctx.session_token = session_token;
@@ -349,8 +364,8 @@ mod tests {
     #[test]
     fn ctx_for_applies_config_caps_above_off() {
         let mut c = cfg();
-        c.get_max_tokens = 1234;
-        c.snippet_max_chars = 77;
+        c.get_max_tokens = Some(1234);
+        c.snippet_max_chars = Some(77);
         let ctx = ctx_for(OptLevel::Balanced, &c, Some("a.md".into()), true, None);
         assert_eq!(ctx.get_max_tokens, Some(1234));
         assert_eq!(ctx.snippet_max_chars, Some(77));
@@ -361,7 +376,7 @@ mod tests {
     #[test]
     fn ctx_for_get_max_tokens_zero_is_unlimited() {
         let mut c = cfg();
-        c.get_max_tokens = 0;
+        c.get_max_tokens = Some(0);
         let ctx = ctx_for(OptLevel::Conservative, &c, None, false, None);
         assert_eq!(ctx.get_max_tokens, None);
     }
@@ -371,6 +386,63 @@ mod tests {
         let ctx = ctx_for(OptLevel::Off, &cfg(), None, false, None);
         assert_eq!(ctx.get_max_tokens, None);
         assert_eq!(ctx.snippet_max_chars, None);
+    }
+
+    #[test]
+    fn ctx_for_unset_caps_follow_the_per_level_ladder() {
+        // Gap 2a fix: with the config caps unset (None), the per-level ladder
+        // stands — balanced tightens to 4000/150, aggressive to 4000/120 —
+        // instead of the old flat 6000/200 at every level.
+        let c = cfg();
+        assert_eq!(c.get_max_tokens, None, "default config caps must be unset");
+        assert_eq!(c.snippet_max_chars, None);
+
+        let balanced = ctx_for(OptLevel::Balanced, &c, None, false, None);
+        assert_eq!(balanced.get_max_tokens, Some(4000));
+        assert_eq!(balanced.snippet_max_chars, Some(150));
+
+        let aggressive = ctx_for(OptLevel::Aggressive, &c, None, false, None);
+        assert_eq!(aggressive.get_max_tokens, Some(4000));
+        assert_eq!(aggressive.snippet_max_chars, Some(120));
+
+        let conservative = ctx_for(OptLevel::Conservative, &c, None, false, None);
+        assert_eq!(conservative.get_max_tokens, Some(6000));
+        assert_eq!(conservative.snippet_max_chars, Some(200));
+    }
+
+    #[test]
+    fn ctx_for_fixed_cap_pins_the_same_value_at_every_active_level() {
+        // A set cap is an operator override: the SAME value at every active
+        // level, overriding the per-level ladder.
+        let mut c = cfg();
+        c.get_max_tokens = Some(3000);
+        for level in [
+            OptLevel::Conservative,
+            OptLevel::Balanced,
+            OptLevel::Aggressive,
+        ] {
+            let ctx = ctx_for(level, &c, None, false, None);
+            assert_eq!(
+                ctx.get_max_tokens,
+                Some(3000),
+                "fixed cap must pin at {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctx_for_maps_strip_frontmatter_policy() {
+        // Gap 2b fix: the config enum reaches the ctx policy.
+        for (cfg_val, expect) in [
+            (StripFrontmatter::Auto, FrontmatterPolicy::Auto),
+            (StripFrontmatter::Always, FrontmatterPolicy::Always),
+            (StripFrontmatter::Never, FrontmatterPolicy::Never),
+        ] {
+            let mut c = cfg();
+            c.strip_frontmatter = cfg_val;
+            let ctx = ctx_for(OptLevel::Balanced, &c, None, false, None);
+            assert_eq!(ctx.strip_frontmatter, expect);
+        }
     }
 
     #[test]

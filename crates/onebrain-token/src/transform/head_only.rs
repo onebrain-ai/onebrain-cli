@@ -9,8 +9,16 @@ use crate::estimate::estimate_tokens;
 use crate::gain::Surface;
 use crate::level::OptLevel;
 
-/// Default head size when the caller supplies no explicit cap — deliberately
-/// small since `multi_get` fans out across many docs at once.
+/// Defensive head size for a genuinely uncapped ctx (`get_max_tokens: None`) —
+/// deliberately small since `multi_get` fans out across many docs at once.
+///
+/// `head_only` runs only at `Aggressive`, where `TransformCtx::for_level`
+/// already sets `get_max_tokens = Some(4000)`. So on the normal surface path
+/// (`ctx_for` with an unset config cap) this fallback is NOT reached — the
+/// ctx cap (4000, or an operator's fixed value) is used instead. It fires
+/// only when the cap is genuinely `None`: an operator's `get_max_tokens: 0`
+/// (unlimited → still head-capped here, since `multi_get` has no continuation
+/// cursor) or a raw `TransformCtx` built without `for_level`. Kept, not dead.
 const DEFAULT_HEAD_TOKENS: u64 = 500;
 
 pub struct HeadOnly;

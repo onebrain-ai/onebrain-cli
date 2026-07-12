@@ -1,9 +1,11 @@
 //! Query-result memoization (design §3a) — lossless.
 //!
 //! Key = SHA-256 of `(normalized query, mode, top_k, min_candidates,
-//! min_score, index_generation, index_nonce)`; value = the resolved hit set
-//! (an opaque serialized string the caller owns — the crate stays ignorant of
-//! the hit shape). Two components make stale service structurally impossible:
+//! min_score, index_generation, index_nonce, reranker_enabled,
+//! reranker_model, rerank_min_score, fusion_weights)`; value = the resolved
+//! hit set (an opaque serialized string the caller owns — the crate stays
+//! ignorant of the hit shape). The index-identity components make stale
+//! service across a reindex/rebuild structurally impossible:
 //! - **`generation`** (bumped on every reindex, `onebrain-search`) invalidates
 //!   entries when the SAME index changes.
 //! - **`index_nonce`** (a stable per-index-instance id, reset only when the
