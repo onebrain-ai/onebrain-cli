@@ -64,7 +64,7 @@ impl Transform for DocDedup {
         }
 
         let mut signals = input.signals.clone();
-        signals.push(Signal::ChunksCollapsed(collapsed));
+        signals.push(Signal::ChunksCollapsed { count: collapsed });
         Payload {
             text: serde_json::to_string(&out).unwrap_or_else(|_| input.text.clone()),
             signals,
@@ -84,7 +84,7 @@ mod tests {
 
         let hits: Vec<serde_json::Value> = serde_json::from_str(&out.text).unwrap();
         assert_eq!(hits.len(), 3, "one exact-duplicate chunk should collapse");
-        assert_eq!(out.signals, vec![Signal::ChunksCollapsed(1)]);
+        assert_eq!(out.signals, vec![Signal::ChunksCollapsed { count: 1 }]);
     }
 
     #[test]

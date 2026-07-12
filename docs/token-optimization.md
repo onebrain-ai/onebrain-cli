@@ -414,7 +414,7 @@ ever silently dropped:
 |---|---|---|
 | `Truncated { next }` | `get_cap`, `head_only`, frontmatter strip | Content was cut. `next` is a real line-index cursor (resumable via `fromLine`) for a `get` cap, or the literal tag `"body"` for a `multi_get` head-only cut (no per-doc cursor exists there), or `"frontmatter"` for a stripped block. |
 | `SnippetOmitted` | `snippet`, `disclosure` | A per-hit snippet was shortened or removed entirely. |
-| `ChunksCollapsed(N)` | `doc_dedup` | `N` exact-duplicate chunks were collapsed into one — lossless (no distinct information was in the duplicates). |
+| `ChunksCollapsed { count }` | `doc_dedup` | `count` exact-duplicate chunks were collapsed into one — lossless (no distinct information was in the duplicates). |
 | `Reference { doc_path, hash, bytes_saved, rematerialize }` | the already-sent ledger | The body was replaced by a reference — see [the ledger](#already-sent-ledger-lossy-signaled-balanced-only) above. |
 
 On the MCP `get`/`multi_get` text surfaces, a signal becomes a plain-text
