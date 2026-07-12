@@ -167,7 +167,10 @@ fn non_loopback_warning(host: &IpAddr) -> String {
 /// dashboard and the standalone escape hatch.
 fn build_daemon_banner(url: &str) -> String {
     let mut out = String::new();
-    out.push_str(&section("🌐", "Daemon already serving this vault"));
+    // "serving" (not "already serving") — `serve` may have just STARTED this
+    // daemon via ensure_running, so the banner must read correctly on both the
+    // reuse and the just-started paths.
+    out.push_str(&section("🌐", "Daemon serving this vault"));
     out.push('\n');
     out.push_str(&item("URL", url));
     out.push('\n');
@@ -661,7 +664,7 @@ mod tests {
     #[test]
     fn daemon_banner_carries_url_and_hint() {
         let b = build_daemon_banner("http://127.0.0.1:6789/?token=abc");
-        assert!(b.contains("🌐  Daemon already serving this vault"), "{b:?}");
+        assert!(b.contains("🌐  Daemon serving this vault"), "{b:?}");
         assert!(
             b.contains("    URL           http://127.0.0.1:6789/?token=abc"),
             "{b:?}"
