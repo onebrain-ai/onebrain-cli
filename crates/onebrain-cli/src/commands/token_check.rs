@@ -613,7 +613,7 @@ mod tests {
                 std::thread::spawn(move || {
                     // Accumulate until the end of the HTTP headers (`\r\n\r\n`) so
                     // a request split across TCP segments isn't misread from a
-                    // single partial `read` (Copilot).
+                    // single partial `read`.
                     let mut req_bytes = Vec::with_capacity(8192);
                     let mut chunk = [0u8; 1024];
                     while req_bytes.len() < 8192 {
