@@ -134,5 +134,5 @@ tokio             = { workspace = true, features = ["rt", "macros"] }
 # sha256 before embedding (see .github/workflows/release.yml). Bump BOTH
 # fields together to ship a newer web UI.
 [package.metadata.webui]
-version = "v0.1.7"
-sha256 = "0118d75d843231578a7242d1f3b0dbb729c2d8ad8874bfc9aa3f6ec46228890a"
+version = "v0.1.8"
+sha256 = "8907f2505c5aa6c81e3c4dfe1140446e5d56ff88b302a2634bd059207e385695"
