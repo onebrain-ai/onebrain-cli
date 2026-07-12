@@ -29,8 +29,9 @@ pub use config_layout::{config_layout_matches, restructure_config, SYSTEM_MANAGE
 pub use error::{FsError, Result};
 pub use harness::{detect_harness, detect_harnesses};
 pub use init::{
-    config_key_docs, render_onebrain_yml, run_init, search_exclude_comment, ConfigKeyDoc,
-    InitOptions, InitResult, ScheduleEntry, SchedulePreset, TEMPLATE_RERANK_MIN_SCORE,
+    config_key_docs, render_onebrain_yml, run_init, search_exclude_comment,
+    token_optimization_block_lines, ConfigKeyDoc, InitOptions, InitResult, ScheduleEntry,
+    SchedulePreset, TEMPLATE_RERANK_MIN_SCORE,
 };
 pub use migrate::{run_backfill_recapped, MigrateResult};
 pub use orphan::{scan_orphans, OrphanScanResult};
