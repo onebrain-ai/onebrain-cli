@@ -68,21 +68,31 @@ impl RollupValue {
     }
 }
 
+/// UTC datetime for a unix timestamp, falling back to the Unix EPOCH (not the
+/// current time) for an out-of-range `ts`. An out-of-range value can't happen
+/// for real gain events (they carry `now_ts()` seconds), but bucketing a corrupt
+/// one under 1970 makes it obviously wrong and self-flagging, rather than
+/// silently recording it under TODAY and polluting the current period's rollup.
+fn utc_or_epoch(ts: i64) -> DateTime<Utc> {
+    DateTime::from_timestamp(ts, 0)
+        .unwrap_or_else(|| DateTime::from_timestamp(0, 0).expect("unix epoch is a valid timestamp"))
+}
+
 /// `YYYY-MM-DD` (UTC) for a unix timestamp — the daily rollup key's period
 /// segment. `pub(crate)` so [`super::pivot::query_events`] buckets raw
 /// events on the exact same day boundary the rollup does.
 pub(crate) fn day_key(ts: i64) -> String {
-    let dt = DateTime::from_timestamp(ts, 0).unwrap_or_else(Utc::now);
+    let dt = utc_or_epoch(ts);
     format!("{:04}-{:02}-{:02}", dt.year(), dt.month(), dt.day())
 }
 
 fn month_key(ts: i64) -> String {
-    let dt = DateTime::from_timestamp(ts, 0).unwrap_or_else(Utc::now);
+    let dt = utc_or_epoch(ts);
     format!("{:04}-{:02}", dt.year(), dt.month())
 }
 
 fn year_key(ts: i64) -> String {
-    let dt = DateTime::from_timestamp(ts, 0).unwrap_or_else(Utc::now);
+    let dt = utc_or_epoch(ts);
     format!("{:04}", dt.year())
 }
 
@@ -255,6 +265,16 @@ mod tests {
     use crate::gain::event::{CacheKind, Surface};
     use crate::level::OptLevel;
     use tempfile::tempdir;
+
+    #[test]
+    fn utc_or_epoch_falls_back_to_1970_not_now_for_out_of_range_ts() {
+        // An out-of-range ts (`from_timestamp` → None) must bucket under the
+        // Unix epoch (obviously wrong, self-flagging), never silently under
+        // today's date where it would pollute the current period's rollup.
+        assert_eq!(utc_or_epoch(i64::MAX).year(), 1970);
+        assert_eq!(day_key(i64::MAX), "1970-01-01");
+        assert_eq!(year_key(i64::MIN), "1970");
+    }
 
     fn event(ts: i64, surface: Surface, transform: &str, before: u64, after: u64) -> GainEvent {
         GainEvent {
