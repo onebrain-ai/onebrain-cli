@@ -7,20 +7,32 @@
 //!     session; the [`ReferenceEnvelope`] JSON (T4's frozen shape) is on
 //!     stdout so the hook can hand the agent the `--force` recovery path.
 //!
-//! **Fail-open, unconditionally.** ANY trouble getting a trustworthy verdict
-//! — no vault, no daemon, a daemon too old to have the route, a transport
-//! error, the daemon reporting no resolvable session token, or the whole
-//! round-trip exceeding a 200ms budget — exits 0 (allow) and records a
+//! **Daemon → Direct, then fail-open.** When a warm, vault-bound daemon holds
+//! the engine the check routes to it (under the 200ms budget below); when there
+//! is NO such daemon the check opens the engine + token ledger **directly**
+//! in-process ([`check_direct`], mirroring `search get`'s daemon→Direct
+//! fallback) and gates from there — so the read-hook works whether or not a
+//! daemon is running (issue #248: before, no daemon meant an unconditional
+//! `no_daemon` fail-open, i.e. the gate silently never fired without a warm
+//! daemon).
+//!
+//! **Fail-open on trouble.** ANY trouble getting a trustworthy verdict — no
+//! vault, a daemon too old to have the route, a transport error, an unopenable
+//! engine or token cache, no resolvable session token, or the daemon
+//! round-trip exceeding the 200ms budget — exits 0 (allow) and records a
 //! `hook_failopen` [`GainEvent`] (design §5c-5: "fail-open is visible in gain
-//! data, never silent") so `/doctor` can surface a dead daemon instead of
-//! silent degradation. A read is NEVER blocked by infrastructure trouble.
+//! data, never silent") so `/doctor` can surface degradation instead of it
+//! being silent. A read is NEVER blocked by infrastructure trouble.
 //!
 //! The 200ms budget is enforced by THIS command, not by the daemon client's
 //! own (much longer, 2-30s) HTTP timeouts — the daemon round-trip runs on a
 //! detached thread; the caller only waits up to [`CHECK_TIMEOUT`] on a
 //! channel and fails open the instant that elapses, regardless of what the
 //! background thread is still doing (the process exits right after `run`
-//! returns anyway, via the dispatcher's `std::process::exit`).
+//! returns anyway, via the dispatcher's `std::process::exit`). The Direct leg
+//! runs synchronously (no artificial deadline): with no daemon there is no
+//! redb-lock contention, so the engine opens promptly — and a lock genuinely
+//! held elsewhere errors at once (non-blocking flock), never hangs.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -31,7 +43,8 @@ use onebrain_core::path::ResolvedVault;
 use onebrain_token::{CacheKind, GainEvent, OptLevel, ReferenceEnvelope, Surface};
 
 use crate::commands::daemon_client::{self, DaemonHandle};
-use crate::commands::token_runner::{record_gain, resolve_session_token_opt};
+use crate::commands::search_common::{daemon_routing_disabled, open_engine};
+use crate::commands::token_runner::{record_gain, resolve_session_token_opt, token_db_path};
 
 /// Hard wall-clock budget for the whole daemon round-trip (design §5b:
 /// "decision target <200ms"). Enforced client-side — the daemon client's own
@@ -105,36 +118,154 @@ fn outcome_from_response(value: &serde_json::Value) -> CheckOutcome {
     }
 }
 
-/// Query the daemon for `path`'s ledger verdict — the part of [`run`] that
-/// touches the network, isolated so it can run on a background thread under
-/// [`CHECK_TIMEOUT`]. `vault_root` scopes daemon discovery to the SAME vault
-/// (a mismatched-vault daemon is never adopted for this check — same rule
-/// every other daemon-client caller follows).
-fn query_daemon(vault_root: &Path, path: &str) -> CheckOutcome {
+/// Result of the warm-daemon leg of [`resolve_outcome`]: either an adopted
+/// daemon produced a verdict (or a daemon-side fail-open), or there is no
+/// vault-bound daemon to route to and the caller must fall through to the
+/// in-process Direct check ([`check_direct`]).
+enum DaemonLeg {
+    /// The daemon answered — or a daemon-side error / the 200ms timeout fails
+    /// open. Authoritative: an adopted daemon holds the engine, so a Direct
+    /// open would only hit the redb lock it holds — never second-guess it.
+    Verdict(CheckOutcome),
+    /// No usable daemon — a missing discovery record, or a version/vault
+    /// mismatch, or the run dir couldn't be located. All resolved from local
+    /// files with no network, so falling through to [`check_direct`] stays fast.
+    FallThrough,
+}
+
+/// Query a warm, vault-bound daemon for `path`'s ledger verdict — the part of
+/// [`resolve_outcome`] that touches the network, isolated so it can run on a
+/// background thread under [`CHECK_TIMEOUT`]. `vault_root` scopes daemon
+/// discovery to the SAME vault (a mismatched-vault daemon is never adopted —
+/// same rule every other daemon-client caller follows); a non-match yields
+/// [`DaemonLeg::FallThrough`] so the caller opens the engine directly (the #248
+/// fix), rather than the old unconditional `no_daemon` fail-open.
+fn query_daemon_leg(vault_root: &Path, path: &str) -> DaemonLeg {
     let handle: DaemonHandle = match daemon_client::discover_matching(Some(vault_root)) {
         Ok(Some(handle)) => handle,
-        Ok(None) => return CheckOutcome::FailOpen("no_daemon"),
-        Err(_) => return CheckOutcome::FailOpen("daemon_discovery_error"),
+        // No record, or a version/vault mismatch → nothing to adopt. Fall
+        // through to the Direct in-process check.
+        Ok(None) => return DaemonLeg::FallThrough,
+        // Can't even locate the run dir → treat as "no daemon" and let the
+        // local engine (authoritative when nothing else holds it) answer.
+        Err(_) => return DaemonLeg::FallThrough,
     };
-    match handle.token_ledger_check(path, None, None, true) {
+    DaemonLeg::Verdict(match handle.token_ledger_check(path, None, None, true) {
         Ok(Some(value)) => outcome_from_response(&value),
-        // 404 — daemon predates the token routes (design §8 version skew).
+        // 404 — daemon predates the token routes (design §8 version skew). It
+        // still holds the engine, so a Direct open would only hit its lock;
+        // fail open rather than fall through.
         Ok(None) => CheckOutcome::FailOpen("daemon_version_skew"),
+        Err(_) => CheckOutcome::FailOpen("ledger_check_error"),
+    })
+}
+
+/// Run [`query_daemon_leg`] on a detached thread and wait up to
+/// [`CHECK_TIMEOUT`]. A timeout fails open (a wedged daemon holds the engine —
+/// a Direct open would only hit its lock, so we do NOT fall through); the
+/// background thread is simply abandoned (the process exits right after `run`
+/// returns anyway, taking it down with it).
+fn query_daemon_leg_with_deadline(vault_root: PathBuf, path: String) -> DaemonLeg {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(query_daemon_leg(&vault_root, &path));
+    });
+    rx.recv_timeout(CHECK_TIMEOUT)
+        .unwrap_or(DaemonLeg::Verdict(CheckOutcome::FailOpen("timeout_200ms")))
+}
+
+/// In-process (Direct-mode) ledger check — the #248 fix. When no vault-bound
+/// daemon holds the engine, `token check` used to fail open unconditionally
+/// (`no_daemon`), so the read-hook silently never gated. This opens the engine
+/// and token ledger directly and runs the SAME verdict logic the daemon's
+/// `/api/token/ledger/check` route runs (mirroring `search get`'s daemon→Direct
+/// fallback):
+///
+/// - **M3 level gate** — the ledger only activates at `balanced`/`aggressive`
+///   (`level >= OptLevel::Balanced`, the same gate `search get` applies); below
+///   that it's `Allow` (the route's `inactive` verdict).
+/// - **hash from the engine** — the read-hook has only a path, so the current
+///   content hash is [`onebrain_search::engine::Engine::doc_hash`]; an
+///   unknown/unindexed doc (`None`) is `Allow` (the route's `unknown_doc`),
+///   never a false "unchanged".
+/// - **record on first send** — `record = true` (as [`query_daemon_leg`]'s
+///   daemon call passes), so the NEXT repeat read is gated; best-effort (a
+///   record error still allows this read).
+///
+/// Fail-open, always: an unreadable config, an unopenable engine (e.g. the
+/// index is locked by another process → prompt `EngineBusy`, never a hang) or
+/// token cache, no resolvable session token, or a ledger error all resolve to a
+/// tagged `FailOpen`. A gate must never block a read on infrastructure trouble.
+fn check_direct(resolved: &ResolvedVault, path: &str) -> CheckOutcome {
+    // M3 gate: read the vault's configured optimization level. An unreadable
+    // config defaults to `off` (< balanced → ledger inactive → safe), matching
+    // the daemon route's own conservative-on-error fallback.
+    let level = onebrain_core::load_vault_config(&resolved.root)
+        .map(|c| c.token_optimization.level)
+        .unwrap_or_default();
+    if level < OptLevel::Balanced {
+        return CheckOutcome::Allow; // ledger inactive at off/conservative
+    }
+
+    // No resolvable session token → ledger inactive for this call (never guess
+    // a token — design §3b). Fails open like the daemon's `no_session` verdict.
+    let Some(session) = resolve_session_token_opt() else {
+        return CheckOutcome::FailOpen("no_session_token");
+    };
+
+    // Open the engine to derive the doc's current content hash (the read-hook
+    // supplies none). redb's exclusive flock is non-blocking, so a lock held by
+    // another process errors promptly (never hangs) → fail open.
+    let engine = match open_engine(Some(resolved.root.as_path().to_path_buf())) {
+        Ok((engine, _)) => engine,
+        Err(_) => return CheckOutcome::FailOpen("engine_open_error"),
+    };
+    let Some(current_hash) = engine.doc_hash(path) else {
+        // Unindexed / unknown doc — can't compare, so never claim "unchanged".
+        return CheckOutcome::Allow;
+    };
+
+    // Open the Direct-mode token ledger (`token.redb`) and classify the send.
+    let Some(db_path) = token_db_path(resolved) else {
+        return CheckOutcome::FailOpen("no_collection");
+    };
+    let Ok(cache) = onebrain_token::TokenCache::open(&db_path) else {
+        return CheckOutcome::FailOpen("token_cache_open_error");
+    };
+    let ledger = cache.ledger();
+    match ledger.check(&session, path, &current_hash) {
+        Ok(onebrain_token::LedgerVerdict::Unchanged { sent_hash }) => {
+            // Credit the inline body size we avoided — a best-effort engine read
+            // (0 on error, never fail the decision on a size estimate), exactly
+            // as the daemon route does when the caller supplies no `bytes`.
+            let bytes_saved = engine.get(path).map(|b| b.len() as u64).unwrap_or(0);
+            CheckOutcome::Unchanged(ReferenceEnvelope::new(path, sent_hash, bytes_saved))
+        }
+        Ok(onebrain_token::LedgerVerdict::FirstSend | onebrain_token::LedgerVerdict::Changed) => {
+            // Mark the send (record = true, as the daemon call does) so the NEXT
+            // repeat read is gated. Best-effort: a record failure still allows.
+            let _ = ledger.record(&session, path, &current_hash);
+            CheckOutcome::Allow
+        }
         Err(_) => CheckOutcome::FailOpen("ledger_check_error"),
     }
 }
 
-/// Run [`query_daemon`] on a detached thread and wait up to [`CHECK_TIMEOUT`].
-/// A timeout fails open; the background thread is simply abandoned (the
-/// process exits right after `run` returns anyway, taking it down with it).
-fn query_daemon_with_deadline(vault_root: PathBuf, path: String) -> CheckOutcome {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let outcome = query_daemon(&vault_root, &path);
-        let _ = tx.send(outcome);
-    });
-    rx.recv_timeout(CHECK_TIMEOUT)
-        .unwrap_or(CheckOutcome::FailOpen("timeout_200ms"))
+/// Resolve `path`'s ledger verdict: route to a warm, vault-bound daemon when one
+/// exists (under the 200ms network budget), else check the ledger directly
+/// in-process ([`check_direct`]). Before #248 there was no Direct leg — no
+/// daemon meant an unconditional `no_daemon` fail-open, so the read-hook never
+/// gated without a warm daemon. `ONEBRAIN_NO_DAEMON` forces the Direct leg (the
+/// operator kill-switch + deterministic tests), matching every other search
+/// surface.
+fn resolve_outcome(resolved: &ResolvedVault, path: &str) -> CheckOutcome {
+    if daemon_routing_disabled() {
+        return check_direct(resolved, path);
+    }
+    match query_daemon_leg_with_deadline(resolved.root.as_path().to_path_buf(), path.to_string()) {
+        DaemonLeg::Verdict(outcome) => outcome,
+        DaemonLeg::FallThrough => check_direct(resolved, path),
+    }
 }
 
 fn now_ts() -> i64 {
@@ -202,7 +333,7 @@ pub fn run(vault_flag: Option<PathBuf>, path: &str) -> Result<i32> {
     }
 
     let outcome = match &resolved {
-        Some(r) => query_daemon_with_deadline(r.root.as_path().to_path_buf(), path.to_string()),
+        Some(r) => resolve_outcome(r, path),
         None => CheckOutcome::FailOpen("no_vault"),
     };
 
@@ -365,8 +496,8 @@ mod tests {
             Decision::Deny(envelope())
         );
         assert_eq!(
-            decide(CheckOutcome::FailOpen("no_daemon")),
-            Decision::FailOpen("no_daemon")
+            decide(CheckOutcome::FailOpen("engine_open_error")),
+            Decision::FailOpen("engine_open_error")
         );
     }
 
@@ -417,9 +548,15 @@ mod tests {
     }
 
     #[test]
-    fn no_daemon_fails_open_and_records_event() {
-        // No daemon.json under this HOME → `discover_matching` sees nothing.
-        let (vault, cache) = test_vault();
+    fn no_daemon_at_conservative_goes_direct_and_allows_without_failopen() {
+        // #248: no daemon.json under this HOME → `discover_matching` sees
+        // nothing → the check now falls THROUGH to the in-process Direct leg (it
+        // used to fail open with `no_daemon`). At the default `conservative`
+        // level the ledger is inactive, so the Direct leg simply ALLOWS — exit 0
+        // with NO fail-open event (a legitimate business allow, not
+        // degradation). The pre-#248 code recorded a `no_daemon` hook_failopen
+        // here; that event must now be gone.
+        let (vault, cache) = test_vault(); // no token_optimization → conservative
         let _env = crate::test_env::set_vars(&[
             ("HOME", vault.path().as_os_str()),
             ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
@@ -427,10 +564,10 @@ mod tests {
         let code =
             run(Some(vault.path().to_path_buf()), "notes/a.md").expect("run should not error");
         assert_eq!(code, 0);
-        let events = gain_events(cache.path());
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].cache, CacheKind::HookFailopen);
-        assert_eq!(events[0].transform, "no_daemon");
+        assert!(
+            gain_events(cache.path()).is_empty(),
+            "an inactive-level Direct allow records no event — and never a `no_daemon` fail-open"
+        );
     }
 
     /// Writes a `daemon.json` under `home/.onebrain/run/` pointing at
@@ -456,7 +593,7 @@ mod tests {
     }
 
     /// A minimal hand-rolled HTTP/1.1 responder — good enough for the two
-    /// GET/POST routes `query_daemon` hits. Avoids pulling a mock-HTTP dev-dep
+    /// GET/POST routes `query_daemon_leg` hits. Avoids pulling a mock-HTTP dev-dep
     /// just to control response TIMING (mockito doesn't expose per-response
     /// delay), which the timeout test below needs. `ledger_body` is served
     /// (as 200 JSON) for `/api/token/ledger/check`; `ledger_status` overrides
@@ -618,5 +755,102 @@ mod tests {
         let _env = crate::test_env::set_var("HOME", empty.path());
         let code = run(Some(empty.path().to_path_buf()), "a.md").expect("run should not error");
         assert_eq!(code, 0);
+    }
+
+    // ── #248 Direct-mode (no-daemon) end-to-end across the seam ────────────
+
+    /// Like [`test_vault`] but at `balanced` — the level that activates the
+    /// already-sent ledger (design §3b M3 gate). The #248 Direct-mode e2e needs
+    /// the ledger live; a fresh collection name keeps its cache isolated.
+    #[cfg(unix)]
+    fn balanced_vault() -> (tempfile::TempDir, tempfile::TempDir) {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: token-check-e2e\ntoken_optimization:\n  level: balanced\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        (vault, cache)
+    }
+
+    /// Index `rel` (lex-only, so no embedding model loads) into `vault`'s
+    /// collection so [`onebrain_search::engine::Engine::doc_hash`] resolves,
+    /// then DROP the engine so its redb lock is released before `run` /
+    /// [`check_direct`] open their own. The Direct-mode setup for the seam e2e.
+    #[cfg(unix)]
+    fn index_doc_lex_only(vault: &Path, rel: &str, body: &str) {
+        std::fs::write(vault.join(rel), body).unwrap();
+        let (mut engine, resolved) =
+            crate::commands::search_common::open_engine(Some(vault.to_path_buf())).unwrap();
+        engine
+            .reindex_paths_lex_only_with_progress(
+                resolved.root.as_path(),
+                &[rel.to_string()],
+                &mut |_| {},
+            )
+            .unwrap();
+        // engine dropped here → redb lock released for the Direct check below.
+    }
+
+    /// **The #248 e2e — read-hook gating across the daemon→Direct seam.**
+    /// Scratch vault, NO daemon anywhere, `balanced` level, an indexed doc. The
+    /// FIRST check first-sends → allow + record (exit 0); the SECOND check of
+    /// the UNCHANGED doc must be GATED — exit 2 with a reference envelope — the
+    /// read-hook behavior v3.4.10 silently never delivered without a warm
+    /// daemon. This is precisely the path every v3.4.10 gate missed: no prior
+    /// test drove the no-daemon route end to end. RED before the Direct fallback
+    /// (both checks fail-open → exit 0); GREEN after.
+    #[cfg(unix)]
+    #[test]
+    fn direct_read_hook_gates_repeat_unchanged_read_with_no_daemon() {
+        let (vault, cache) = balanced_vault();
+        let home = tempfile::tempdir().unwrap(); // no daemon.json under here
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", home.path().as_os_str()),
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            // Force the Direct leg deterministically (belt-and-suspenders with
+            // the empty HOME) and pin a resolvable, stable session token so the
+            // ledger key is identical across both checks.
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")),
+            ("CLAUDE_CODE_SESSION_ID", std::ffi::OsStr::new("e2eSess1")),
+        ]);
+        index_doc_lex_only(vault.path(), "a.md", "# A\nbody text for the #248 seam e2e");
+
+        // 1) First read of an indexed doc → first_send → allow + record.
+        assert_eq!(
+            run(Some(vault.path().to_path_buf()), "a.md").expect("run should not error"),
+            0,
+            "first read is a first_send → allow"
+        );
+
+        // 2) Repeat read of the UNCHANGED doc → the gate fires with NO daemon.
+        assert_eq!(
+            run(Some(vault.path().to_path_buf()), "a.md").expect("run should not error"),
+            2,
+            "a no-daemon repeat read of an unchanged doc must be GATED (exit 2) — the #248 fix"
+        );
+
+        // The deny carries the frozen reference envelope. `run` writes it to
+        // stdout (proven byte-for-byte by the `emit_reference` tests); assert
+        // its CONTENTS here via the same Direct verdict the deny path produced,
+        // now that a.md is recorded in the ledger.
+        let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
+        match check_direct(&resolved, "a.md") {
+            CheckOutcome::Unchanged(env) => {
+                assert_eq!(env.doc_path, "a.md");
+                assert!(
+                    !env.hash.is_empty(),
+                    "a real indexed doc has a content hash"
+                );
+                assert!(env.sent_earlier);
+                assert!(
+                    env.bytes_saved > 0,
+                    "a real indexed body credits non-zero bytes_saved"
+                );
+                assert_eq!(env.rematerialize, "onebrain search get a.md --force");
+            }
+            other => panic!("expected an Unchanged reference envelope, got {other:?}"),
+        }
     }
 }
