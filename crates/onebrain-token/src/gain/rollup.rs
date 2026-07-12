@@ -135,20 +135,28 @@ pub fn update(db: &Database, event: &GainEvent) -> Result<(), RollupError> {
     let write_txn = db.begin_write()?;
     {
         let mut daily = write_txn.open_table(GAIN_DAILY)?;
-        let key = composite_key(&day_key(event.ts), event);
-        apply(&mut daily, &key, event)?;
-    }
-    {
         let mut monthly = write_txn.open_table(GAIN_MONTHLY)?;
-        let key = composite_key(&month_key(event.ts), event);
-        apply(&mut monthly, &key, event)?;
-    }
-    {
         let mut yearly = write_txn.open_table(GAIN_YEARLY)?;
-        let key = composite_key(&year_key(event.ts), event);
-        apply(&mut yearly, &key, event)?;
+        apply_event_to_tables(&mut daily, &mut monthly, &mut yearly, event)?;
     }
     write_txn.commit()?;
+    Ok(())
+}
+
+/// Apply one event to all three already-open period tables. Extracted so
+/// [`rebuild`] can replay every event through the SAME per-table logic inside
+/// a single write transaction (one commit for the whole log) instead of one
+/// transaction per event — an incremental [`update`] opens its own txn and
+/// commits; a bulk rebuild opens once and applies the batch.
+fn apply_event_to_tables(
+    daily: &mut redb::Table<&str, &str>,
+    monthly: &mut redb::Table<&str, &str>,
+    yearly: &mut redb::Table<&str, &str>,
+    event: &GainEvent,
+) -> Result<(), RollupError> {
+    apply(daily, &composite_key(&day_key(event.ts), event), event)?;
+    apply(monthly, &composite_key(&month_key(event.ts), event), event)?;
+    apply(yearly, &composite_key(&year_key(event.ts), event), event)?;
     Ok(())
 }
 
@@ -191,20 +199,24 @@ pub struct RebuildStats {
 pub fn rebuild(jsonl_dir: &Path, db: &Database) -> Result<RebuildStats, RollupError> {
     let events = JsonlGainWriter::new(jsonl_dir).read_all_recursive()?;
 
+    // The whole rebuild — clear the three tables and replay every event —
+    // runs in ONE write transaction: a single commit for the entire log
+    // instead of one transaction per event (the previous `for … update()`
+    // loop opened + committed N times). `delete_table` returns `Ok(false)`
+    // (not an error) when the table doesn't exist yet — safe on a brand-new db.
     let write_txn = db.begin_write()?;
-    // `delete_table` returns `Ok(false)` (not an error) when the table
-    // doesn't exist yet — safe on a brand-new database.
-    write_txn.delete_table(GAIN_DAILY)?;
-    write_txn.delete_table(GAIN_MONTHLY)?;
-    write_txn.delete_table(GAIN_YEARLY)?;
-    write_txn.open_table(GAIN_DAILY)?;
-    write_txn.open_table(GAIN_MONTHLY)?;
-    write_txn.open_table(GAIN_YEARLY)?;
-    write_txn.commit()?;
-
-    for event in &events {
-        update(db, event)?;
+    {
+        write_txn.delete_table(GAIN_DAILY)?;
+        write_txn.delete_table(GAIN_MONTHLY)?;
+        write_txn.delete_table(GAIN_YEARLY)?;
+        let mut daily = write_txn.open_table(GAIN_DAILY)?;
+        let mut monthly = write_txn.open_table(GAIN_MONTHLY)?;
+        let mut yearly = write_txn.open_table(GAIN_YEARLY)?;
+        for event in &events {
+            apply_event_to_tables(&mut daily, &mut monthly, &mut yearly, event)?;
+        }
     }
+    write_txn.commit()?;
 
     Ok(RebuildStats {
         events_replayed: events.len(),
@@ -358,8 +370,20 @@ mod tests {
         ] {
             let mut a = scan(&incremental_db, table).unwrap();
             let mut b = scan(&rebuilt_db, table).unwrap();
-            a.sort_by(|x, y| format!("{:?}", x.0).cmp(&format!("{:?}", y.0)));
-            b.sort_by(|x, y| format!("{:?}", x.0).cmp(&format!("{:?}", y.0)));
+            // Sort by the key's actual fields, not its `Debug` repr — a
+            // derived-Debug string sort is fragile (a field-order or Debug-impl
+            // change would silently reorder and let a mismatched rebuild pass).
+            let by_fields = |k: &RollupKey| {
+                (
+                    k.period.clone(),
+                    k.surface.clone(),
+                    k.transform.clone(),
+                    k.level.clone(),
+                    k.cache.clone(),
+                )
+            };
+            a.sort_by_key(|x| by_fields(&x.0));
+            b.sort_by_key(|x| by_fields(&x.0));
             assert_eq!(a, b, "rebuild must match incremental for {label}");
         }
     }
