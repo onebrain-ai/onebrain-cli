@@ -72,8 +72,11 @@ fn write_reset_marker(gdir: &Path, marker: &ResetMarker) -> Result<()> {
 }
 
 fn day_string(ts: i64) -> String {
-    let dt =
-        chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0).unwrap_or_else(chrono::Utc::now);
+    // Fall back to the Unix EPOCH (not the current time) for an out-of-range
+    // `ts`, matching `onebrain_token`'s rollup `utc_or_epoch`: a corrupt value
+    // buckets under 1970 (self-flagging) instead of silently under today.
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
     format!("{:04}-{:02}-{:02}", dt.year(), dt.month(), dt.day())
 }
 

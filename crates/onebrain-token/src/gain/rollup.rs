@@ -47,6 +47,8 @@ pub enum RollupError {
     Io(#[from] std::io::Error),
     #[error("serde error decoding a rollup value: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("malformed rollup key (external corruption?): {0}")]
+    MalformedKey(String),
 }
 
 /// Aggregated counters for one `(period, surface, transform, level,
@@ -252,7 +254,11 @@ pub fn scan(
     let mut out = Vec::new();
     for row in t.iter()? {
         let (k, v) = row?;
-        let key = parse_key(k.value()).expect("this module only ever writes well-formed keys");
+        // This module only ever writes well-formed keys, but an externally
+        // corrupted redb shouldn't crash the process — surface it as an error
+        // the caller can handle (the fn already returns `Result`).
+        let key =
+            parse_key(k.value()).ok_or_else(|| RollupError::MalformedKey(k.value().to_string()))?;
         let value: RollupValue = serde_json::from_str(v.value())?;
         out.push((key, value));
     }
@@ -274,6 +280,25 @@ mod tests {
         assert_eq!(utc_or_epoch(i64::MAX).year(), 1970);
         assert_eq!(day_key(i64::MAX), "1970-01-01");
         assert_eq!(year_key(i64::MIN), "1970");
+    }
+
+    #[test]
+    fn scan_returns_malformed_key_error_not_panic_on_corrupt_key() {
+        // An externally corrupted redb (a key that isn't a 5-segment composite)
+        // must surface as a RollupError, never a process-crashing panic.
+        let dir = tempdir().unwrap();
+        let db = Database::create(dir.path().join("token.redb")).unwrap();
+        ensure_tables(&db).unwrap();
+        {
+            let w = db.begin_write().unwrap();
+            {
+                let mut t = w.open_table(GAIN_DAILY).unwrap();
+                t.insert("corrupt-key-no-colons", "{}").unwrap();
+            }
+            w.commit().unwrap();
+        }
+        let err = scan(&db, GAIN_DAILY).unwrap_err();
+        assert!(matches!(err, RollupError::MalformedKey(_)), "got {err:?}");
     }
 
     fn event(ts: i64, surface: Surface, transform: &str, before: u64, after: u64) -> GainEvent {
