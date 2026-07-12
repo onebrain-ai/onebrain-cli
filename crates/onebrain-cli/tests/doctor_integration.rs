@@ -1975,8 +1975,8 @@ fn doctor_fix_text_mode_partial_outcome_renders_distinct_glyph() {
 /// sharing a leaf name across different blocks (e.g. `search.reranker.model`
 /// / `token_optimization.model`).
 fn find_scoped_key_line(lines: &[&str], segments: &[&str]) -> Option<usize> {
-    let top = segments[0];
-    let key = segments.last().unwrap();
+    let top = *segments.first()?;
+    let key = segments.last()?;
     let key_prefix = format!("{key}:");
     let mut current_top: Option<&str> = None;
     for (i, l) in lines.iter().enumerate() {

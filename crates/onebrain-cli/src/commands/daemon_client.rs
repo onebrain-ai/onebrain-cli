@@ -1001,6 +1001,42 @@ pub fn discover_matching(expected_vault: Option<&Path>) -> Result<Option<DaemonH
     }
 }
 
+/// Adopt a same-vault LIVE daemon REGARDLESS of its version — for read routes
+/// whose wire shape is frozen across versions (today: `GET /api/token/gain`,
+/// which returns the version-stable [`onebrain_token::PivotResult`]).
+///
+/// Unlike [`discover_matching`] (which version-rejects → `None`) this returns
+/// the handle even when the daemon's version differs from ours. Rationale: a
+/// version-skewed same-vault daemon still holds `token.redb`'s exclusive lock
+/// for its whole lifetime, so a Direct open would fail with the redb lock error
+/// — the exact upgrade-without-restart gap (#258 Gap 4). Routing the read to its
+/// stable route lets the query succeed WITHOUT restarting the daemon (that's
+/// `ensure_running`/`mcp`'s job — a read verb must never kill another session's
+/// daemon; the CLI read-verb convention). A too-old daemon whose route 404s is
+/// handled by the caller's feature-detect. A DIFFERENT-vault daemon, a corrupt
+/// record, or no record → `None` (nothing same-vault holds the lock → Direct).
+pub fn discover_same_vault_any_version(
+    expected_vault: Option<&Path>,
+) -> Result<Option<DaemonHandle>> {
+    let path = discovery_path()?;
+    let info = match DaemonInfo::read(&path) {
+        Ok(Some(info)) => info,
+        Ok(None) => return Ok(None),
+        Err(_) => {
+            let _ = DaemonInfo::remove(&path);
+            return Ok(None);
+        }
+    };
+    // Vault match still gates adoption (never touch another vault's daemon), but
+    // version is deliberately IGNORED here.
+    let expected = vault_expectation(expected_vault);
+    if vault_decision(info.vault.as_deref(), &expected) == VaultDecision::Restart {
+        return Ok(None);
+    }
+    let handle = DaemonHandle::new(info);
+    Ok(handle.is_live().then_some(handle))
+}
+
 /// Ensure a daemon is running at our version and return a connected handle.
 ///
 /// Fast path: [`discover`] returns an existing live daemon. Otherwise spawn
@@ -1682,6 +1718,58 @@ mod tests {
         // must never disturb a daemon serving another vault).
         let still = DaemonInfo::read(&path).unwrap().expect("record preserved");
         assert_eq!(still.vault, srv.info.vault, "record must be left intact");
+    }
+
+    /// #258 Gap 4: `discover_same_vault_any_version` adopts a same-vault LIVE
+    /// daemon even when its version differs from ours (the upgrade-skew case),
+    /// while `discover_matching` version-rejects the very same record. A
+    /// different vault is still declined (never disturb another vault's daemon).
+    #[cfg(unix)]
+    #[test]
+    fn discover_same_vault_any_version_adopts_across_version_skew() {
+        let vault = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("HOME", home.path().as_os_str()),
+        ]);
+        let mut srv = start_live_server(vault.path(), "dc-anyver-token-1234567890");
+        // Pin a version DIFFERENT from ours (the post-upgrade skew).
+        srv.info.version = "0.0.1-old".to_string();
+        let path = discovery_path().unwrap();
+        srv.info.write(&path).unwrap();
+
+        // Version-gated discovery rejects the skewed daemon …
+        assert!(
+            discover_matching(Some(vault.path())).unwrap().is_none(),
+            "discover_matching must version-reject the skewed daemon"
+        );
+        // … but the any-version variant adopts it (same vault, live).
+        assert!(
+            discover_same_vault_any_version(Some(vault.path()))
+                .unwrap()
+                .is_some(),
+            "any-version discovery must adopt a same-vault skewed daemon (Gap 4)"
+        );
+        // A DIFFERENT vault is still declined.
+        let other = tempdir().unwrap();
+        assert!(
+            discover_same_vault_any_version(Some(other.path()))
+                .unwrap()
+                .is_none(),
+            "must not adopt a different-vault daemon"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_same_vault_any_version_none_without_a_record() {
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_var("HOME", home.path());
+        assert!(discover_same_vault_any_version(Some(home.path()))
+            .unwrap()
+            .is_none());
     }
 
     /// HEADLINE acceptance (Track 2c): with a daemon holding the engine, a
