@@ -324,6 +324,42 @@ mod tests {
         );
     }
 
+    /// Same-key accumulation must also hold when both events collapse into one
+    /// key inside `rebuild`'s SINGLE write transaction — i.e. the second event's
+    /// `apply` must read the first event's just-written value within the same
+    /// txn (redb read-your-own-writes), not overwrite it. `update`'s per-event
+    /// txns prove this trivially; the one-txn rebuild path (F2) does not, so
+    /// assert it directly here.
+    #[test]
+    fn rebuild_accumulates_same_key_events_within_one_txn() {
+        let jsonl_dir = tempdir().unwrap();
+        let writer = JsonlGainWriter::new(jsonl_dir.path());
+        let ts = 1_783_900_800;
+        // Two events, identical dimensions + same day → one rollup key.
+        writer
+            .append(&event(ts, Surface::CliSearch, "whitespace", 1000, 400))
+            .unwrap();
+        writer
+            .append(&event(ts + 60, Surface::CliSearch, "whitespace", 500, 200))
+            .unwrap();
+
+        let db_dir = tempdir().unwrap();
+        let db = open_db(db_dir.path());
+        rebuild(jsonl_dir.path(), &db).unwrap();
+
+        let daily = scan(&db, GAIN_DAILY).unwrap();
+        assert_eq!(daily.len(), 1, "same-key events must merge into one row");
+        assert_eq!(
+            daily[0].1,
+            RollupValue {
+                bytes_before: 1500,
+                bytes_after: 600,
+                count: 2
+            },
+            "the one-txn rebuild must ACCUMULATE same-key events, not overwrite"
+        );
+    }
+
     #[test]
     fn different_dimensions_stay_separate_rows() {
         let dir = tempdir().unwrap();
