@@ -1,5 +1,5 @@
 ---
-latest_version: 3.4.10
+latest_version: 3.4.11
 released: 2026-07-12
 ---
 
@@ -9,6 +9,16 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.11] — 2026-07-12 — Token-opt seam fixes
+
+Closes the three real seams that post-ship verification of v3.4.10 surfaced — none was caught by the epic's gates because no test exercised those exact cross-component paths — plus polish.
+
+- Fix `search`/`query --output json` erroring (`E_INTERNAL`) whenever duplicate chunks collapse: `Signal::ChunksCollapsed` is now a struct variant, serializable under the internally-tagged enum ([#249](https://github.com/onebrain-ai/onebrain-cli/issues/249))
+- Embed the Token Gain WebUI dashboard in the binary — the pinned web UI was a version behind, so v3.4.10 shipped without it; bumped to v0.1.8 ([#250](https://github.com/onebrain-ai/onebrain-cli/issues/250))
+- `token check` now gates a repeat read via an in-process Direct-mode ledger check when no daemon is running, so the read-hook actually gates without a warm daemon ([#248](https://github.com/onebrain-ai/onebrain-cli/issues/248))
+- `doctor --fix` backfills a missing `token_optimization` block into an existing `onebrain.yml`, byte-identical to a fresh `init` ([#247](https://github.com/onebrain-ai/onebrain-cli/issues/247))
+- Docs: `ChunksCollapsed` is now correctly documented as exact-duplicate (not near-duplicate) chunk collapse ([#246](https://github.com/onebrain-ai/onebrain-cli/issues/246))
 
 ## [3.4.10] — 2026-07-12 — Token Optimization
 
