@@ -1,5 +1,5 @@
 ---
-latest_version: 3.4.11
+latest_version: 3.4.12
 released: 2026-07-12
 ---
 
@@ -9,6 +9,11 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.12] — 2026-07-12 — token gain works under a running daemon
+
+- Fix `token gain` (every mode) failing with `Database already open. Cannot acquire lock.` whenever an `onebrain daemon` holds `token.redb`: the default summary, `--by`, `--history` and `--reset` now read the lock-free JSONL raw log (the source of truth), and `--all-time`/`--since` route through the daemon's `/api/token/gain` endpoint ([#258](https://github.com/onebrain-ai/onebrain-cli/issues/258))
+- `--rebuild` and a genuinely contended Direct rollup open now surface an actionable "held by another onebrain process — retry after `onebrain daemon stop`" message instead of the raw redb lock error ([#258](https://github.com/onebrain-ai/onebrain-cli/issues/258))
 
 ## [3.4.11] — 2026-07-12 — Token-opt seam fixes
 

@@ -21,8 +21,13 @@ use anyhow::{Context, Result};
 use chrono::Datelike;
 use serde::{Deserialize, Serialize};
 
+use onebrain_core::path::ResolvedVault;
+
 use crate::cli::TokenGainArgs;
-use crate::commands::search_common::{collection_cache_dir, resolve_collection};
+use crate::commands::daemon_client::{self, DaemonHandle};
+use crate::commands::search_common::{
+    collection_cache_dir, daemon_routing_disabled, resolve_collection,
+};
 use crate::output::{emit, Envelope, OutputMode};
 use onebrain_token::gain::{pivot, rollup};
 use onebrain_token::{
@@ -213,6 +218,84 @@ pub(crate) struct TokenGainData {
     archived_to: Option<String>,
 }
 
+/// Open the Tier-2 rollup DB (`token.redb`) directly, for the modes that
+/// genuinely need it (`--rebuild`, and the Direct leg of `--all-time`/`--since`
+/// when no daemon holds the lock). redb is single-process, so a running
+/// `onebrain daemon` — the sole `token.redb` owner — makes this open fail with
+/// `DatabaseAlreadyOpen`. When that's the cause we replace the raw redb error
+/// with an actionable message (issue #258): the lock-free modes still work, and
+/// the rollup modes need the holder to exit. Any other open failure passes
+/// through unchanged.
+fn open_rollup_db_direct(tok_dir: &Path) -> Result<Database> {
+    std::fs::create_dir_all(tok_dir).context("creating token cache dir")?;
+    Database::create(redb_path(tok_dir))
+        .context("opening token.redb")
+        .map_err(|e| {
+            if onebrain_search::error::is_redb_lock_error(&e) {
+                e.context(
+                    "token.redb is held by another onebrain process (a running daemon \
+                     owns the rollup DB). The default summary, --by, --history and \
+                     --reset read the raw log directly and work regardless; only \
+                     --all-time, --since and --rebuild need the rollup DB — retry once \
+                     that process exits (e.g. `onebrain daemon stop`).",
+                )
+            } else {
+                e
+            }
+        })
+}
+
+/// Resolve a rollup-backed pivot (`--all-time` / `--since`). The daemon is the
+/// single owner of `token.redb`, so when a warm, vault-bound daemon holds it we
+/// route the pivot through its `GET /api/token/gain` route rather than open the
+/// redb ourselves — a Direct open would only hit the exclusive lock the daemon
+/// holds (issue #258). With no daemon there's no contention, so we open the
+/// rollup DB directly. `ONEBRAIN_NO_DAEMON` forces the Direct leg (operator
+/// kill-switch + deterministic tests), matching every other search surface.
+fn resolve_rollup_pivot(
+    resolved: &ResolvedVault,
+    tok_dir: &Path,
+    by: Option<&str>,
+    query: &PivotQuery,
+) -> Result<PivotResult> {
+    if !daemon_routing_disabled() {
+        // A matching-vault daemon holds token.redb → it is authoritative; route
+        // to it. No record / unreadable run dir → nothing holds the lock, so
+        // fall through to the Direct open below.
+        if let Ok(Some(handle)) = daemon_client::discover_matching(Some(resolved.root.as_path())) {
+            return daemon_rollup_pivot(&handle, by, query.since.as_deref());
+        }
+    }
+    let db = open_rollup_db_direct(tok_dir)?;
+    rollup::ensure_tables(&db).context("ensuring rollup tables")?;
+    pivot::query(&db, query).context("querying gain rollups")
+}
+
+/// Fetch the rollup pivot from a warm daemon's `GET /api/token/gain` and decode
+/// it into a [`PivotResult`] (the route serializes exactly that type). A 404
+/// means the daemon predates the gain route (version skew) — it still holds
+/// token.redb, so a Direct open would only hit its lock; surface an actionable
+/// message rather than the raw redb error. A transport error is likewise
+/// reported against the daemon that owns the DB.
+fn daemon_rollup_pivot(
+    handle: &DaemonHandle,
+    by: Option<&str>,
+    since: Option<&str>,
+) -> Result<PivotResult> {
+    match handle.token_gain(by, since, false) {
+        Ok(Some(json)) => serde_json::from_value::<PivotResult>(json)
+            .context("decoding the daemon's /api/token/gain pivot response"),
+        Ok(None) => anyhow::bail!(
+            "the running onebrain daemon is too old to serve `token gain` (no \
+             /api/token/gain route) and holds token.redb. Upgrade the daemon, or stop \
+             it (`onebrain daemon stop`) and retry."
+        ),
+        Err(e) => {
+            Err(e.context("the running onebrain daemon holds token.redb but the gain query failed"))
+        }
+    }
+}
+
 pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &TokenGainArgs) -> Result<()> {
     let (resolved, collection) = resolve_collection(vault_flag)?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
@@ -221,9 +304,11 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &TokenGainArgs)
     let cache_dir = collection_cache_dir(&collection);
     let tok_dir = token_dir(&cache_dir);
     let gdir = gain_dir(&tok_dir);
-    std::fs::create_dir_all(&tok_dir).context("creating token cache dir")?;
-    let db = Database::create(redb_path(&tok_dir)).context("opening token.redb")?;
-    rollup::ensure_tables(&db).context("ensuring rollup tables")?;
+    // `token.redb` (the Tier-2 rollup) is opened LAZILY, only in the branches
+    // that need it (`--rebuild`, and the Direct leg of `--all-time`/`--since`).
+    // The default summary, `--by`, `--history` and `--reset` read the lock-free
+    // JSONL raw log (the source of truth), so they work even while a daemon holds
+    // the redb lock — the #258 fix.
 
     // `--json` is a local shorthand (mirrors `doctor --json` / `update
     // --json`) — it still renders through the SAME `emit`/`Envelope`
@@ -235,6 +320,12 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &TokenGainArgs)
     };
 
     if args.rebuild {
+        // A rebuild WRITES the rollup tables, so it can't route to the daemon's
+        // read-only gain route — it needs exclusive redb access. Under a running
+        // daemon this surfaces the actionable "held by another process" message
+        // rather than the raw redb lock error.
+        let db = open_rollup_db_direct(&tok_dir)?;
+        rollup::ensure_tables(&db).context("ensuring rollup tables")?;
         let stats =
             rollup::rebuild(&gdir, &db).context("rebuilding rollups from the raw gain log")?;
         // The post-rebuild summary is the all-time cumulative rollup (every
@@ -348,7 +439,9 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &TokenGainArgs)
             .context("reading current-epoch gain log")?;
         pivot::query_events(&events, &query)
     } else {
-        pivot::query(&db, &query).context("querying gain rollups")?
+        // Rollup-backed (`--all-time` / `--since`): route to the daemon when it
+        // holds token.redb, else open Direct (the #258 fix).
+        resolve_rollup_pivot(&resolved, &tok_dir, args.by.as_deref(), &query)?
     };
     // month/year buckets on a current-epoch report can't span the archived
     // epoch — flag it so the report never implies a cross-epoch bucket it
@@ -845,5 +938,302 @@ mod tests {
     fn reset_marker_absent_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         assert!(read_reset_marker(dir.path()).is_none());
+    }
+
+    // ── #258: token gain under a daemon that holds token.redb ──────────────
+    // The daemon is the single owner of `token.redb` (redb is single-process).
+    // Before the fix, `token gain` opened the redb eagerly at the top of `run`,
+    // so EVERY mode hard-errored under a warm daemon. These prove: (a) the
+    // lock-free modes work while the lock is held, (b) the rollup modes route
+    // to the daemon, and (c) a genuine Direct lock reports an actionable message
+    // instead of the raw redb error.
+
+    use onebrain_token::PivotRow;
+    #[cfg(unix)]
+    use std::io::{Read, Write};
+    #[cfg(unix)]
+    use std::net::TcpListener;
+
+    fn default_args() -> TokenGainArgs {
+        TokenGainArgs {
+            by: None,
+            all_time: false,
+            since: None,
+            history: false,
+            json: true,
+            reset: false,
+            label: None,
+            rebuild: false,
+        }
+    }
+
+    /// A vault with a search collection + isolated cache dir — enough for
+    /// `resolve_collection` / `collection_cache_dir` to resolve `token.redb`.
+    fn gain_vault() -> (tempfile::TempDir, tempfile::TempDir) {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: token-gain-seam\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        (vault, cache)
+    }
+
+    /// The token dir + `token.redb` path for the seam collection under the
+    /// currently-set `ONEBRAIN_CACHE_DIR` (call after the env is set).
+    fn seam_tok_dir() -> PathBuf {
+        token_dir(&collection_cache_dir("token-gain-seam"))
+    }
+
+    /// Open + hold `token.redb`, standing in for the running daemon that owns
+    /// it. The returned handle keeps the exclusive lock until dropped.
+    fn hold_redb_lock(tok_dir: &Path) -> Database {
+        std::fs::create_dir_all(tok_dir).unwrap();
+        Database::create(redb_path(tok_dir)).unwrap()
+    }
+
+    /// Seed rollup rows into `token.redb`, then DROP the handle so its lock is
+    /// released before the code under test opens its own.
+    fn seed_rollup(tok_dir: &Path, evs: &[(i64, Surface, u64, u64)]) {
+        std::fs::create_dir_all(tok_dir).unwrap();
+        let db = Database::create(redb_path(tok_dir)).unwrap();
+        for (ts, surface, before, after) in evs {
+            rollup::update(
+                &db,
+                &GainEvent {
+                    ts: *ts,
+                    surface: *surface,
+                    transform: "whitespace".to_string(),
+                    level: OptLevel::Conservative,
+                    bytes_before: *before,
+                    bytes_after: *after,
+                    cache: CacheKind::None,
+                    session_token: None,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn default_summary_succeeds_while_a_holder_locks_redb() {
+        let (vault, cache) = gain_vault();
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", vault.path().as_os_str()), // no daemon.json here
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")),
+        ]);
+        let _held = hold_redb_lock(&seam_tok_dir());
+
+        // Pre-#258 this hard-errored ("Database already open. Cannot acquire
+        // lock."). Now the default summary reads the lock-free JSONL → Ok.
+        let out = run(
+            Some(vault.path().to_path_buf()),
+            &OutputMode::Json { pretty: false },
+            &default_args(),
+        );
+        assert!(
+            out.is_ok(),
+            "default `token gain` must work under a held redb lock: {out:?}"
+        );
+    }
+
+    #[test]
+    fn history_succeeds_while_a_holder_locks_redb() {
+        let (vault, cache) = gain_vault();
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", vault.path().as_os_str()),
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")),
+        ]);
+        let _held = hold_redb_lock(&seam_tok_dir());
+
+        let args = TokenGainArgs {
+            history: true,
+            ..default_args()
+        };
+        let out = run(
+            Some(vault.path().to_path_buf()),
+            &OutputMode::Json { pretty: false },
+            &args,
+        );
+        assert!(
+            out.is_ok(),
+            "`token gain --history` reads the raw log and must work under a lock: {out:?}"
+        );
+    }
+
+    #[test]
+    fn all_time_direct_under_a_lock_reports_actionable_message_not_raw_redb() {
+        let (vault, cache) = gain_vault();
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", vault.path().as_os_str()),
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")), // force the Direct leg
+        ]);
+        let tok_dir = seam_tok_dir();
+        let _held = hold_redb_lock(&tok_dir);
+
+        let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
+        let err = resolve_rollup_pivot(&resolved, &tok_dir, None, &PivotQuery::default())
+            .expect_err("a Direct rollup open against a held lock must error");
+        // The actionable message is the HEAD of the chain (what the user sees
+        // first); the raw redb cause still trails it for `-v`/logs.
+        let head = err.to_string();
+        assert!(
+            head.starts_with("token.redb is held by another onebrain process"),
+            "the actionable message must head the chain: {head}"
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("onebrain daemon stop"), "{msg}");
+    }
+
+    #[test]
+    fn all_time_direct_returns_the_seeded_rollup_when_no_daemon() {
+        let (vault, cache) = gain_vault();
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", vault.path().as_os_str()), // no daemon.json → Direct
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")),
+        ]);
+        let tok_dir = seam_tok_dir();
+        seed_rollup(
+            &tok_dir,
+            &[
+                (1_783_728_000, Surface::CliSearch, 1000, 400),
+                (1_783_900_800, Surface::McpQuery, 500, 100),
+            ],
+        );
+
+        let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
+        let pivot =
+            resolve_rollup_pivot(&resolved, &tok_dir, None, &PivotQuery::default()).unwrap();
+        assert_eq!(pivot.totals.count, 2);
+        assert_eq!(pivot.totals.bytes_before, 1500);
+        assert_eq!(pivot.totals.bytes_after, 500);
+    }
+
+    // ── daemon-routing (Complete scope): --all-time/--since via the route ──
+
+    #[cfg(unix)]
+    fn write_daemon_json(home: &Path, vault: &Path, port: u16, token: &str) {
+        let run_dir = home.join(".onebrain").join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let info = daemon_client::DaemonInfo {
+            port,
+            token: token.to_string(),
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            vault: daemon_client::canonical_vault_id(vault),
+        };
+        std::fs::write(
+            run_dir.join("daemon.json"),
+            serde_json::to_vec_pretty(&info).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A minimal HTTP/1.1 responder for the two routes `resolve_rollup_pivot`
+    /// exercises: `GET /api/health` (so daemon discovery adopts it) and `GET
+    /// /api/token/gain` (served with `gain_status`/`gain_body`).
+    #[cfg(unix)]
+    fn start_fake_gain_daemon(gain_status: u16, gain_body: String) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let body = gain_body.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    if req.starts_with("GET /api/health") {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        );
+                    } else {
+                        let status_line = match gain_status {
+                            200 => "HTTP/1.1 200 OK",
+                            404 => "HTTP/1.1 404 Not Found",
+                            _ => "HTTP/1.1 500 Internal Server Error",
+                        };
+                        let resp = format!(
+                            "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_time_routes_through_the_daemon_that_holds_the_lock() {
+        let (vault, cache) = gain_vault();
+        let body = serde_json::to_string(&PivotResult {
+            rows: vec![PivotRow {
+                time: None,
+                dim: Some("cli_search".to_string()),
+                totals: PivotTotals {
+                    bytes_before: 2000,
+                    bytes_after: 500,
+                    count: 3,
+                },
+            }],
+            totals: PivotTotals {
+                bytes_before: 2000,
+                bytes_after: 500,
+                count: 3,
+            },
+        })
+        .unwrap();
+        let port = start_fake_gain_daemon(200, body);
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", vault.path().as_os_str()),
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+        ]);
+        write_daemon_json(vault.path(), vault.path(), port, "gain-daemon-token-123");
+
+        // Hold the LOCAL redb locked: a Direct open would return the wrong data
+        // (empty) or error — so this test can pass ONLY by routing to the daemon.
+        let tok_dir = seam_tok_dir();
+        let _held = hold_redb_lock(&tok_dir);
+
+        let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
+        let pivot =
+            resolve_rollup_pivot(&resolved, &tok_dir, None, &PivotQuery::default()).unwrap();
+        assert_eq!(
+            pivot.totals.count, 3,
+            "must reflect the daemon's rollup, not the locked local db"
+        );
+        assert_eq!(pivot.rows.len(), 1);
+        assert_eq!(pivot.rows[0].dim.as_deref(), Some("cli_search"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_too_old_for_the_gain_route_is_actionable() {
+        let (vault, cache) = gain_vault();
+        let port = start_fake_gain_daemon(404, "not found".to_string());
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", vault.path().as_os_str()),
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+        ]);
+        write_daemon_json(vault.path(), vault.path(), port, "gain-daemon-token-123");
+        let tok_dir = seam_tok_dir();
+        let _held = hold_redb_lock(&tok_dir);
+
+        let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
+        let err = resolve_rollup_pivot(&resolved, &tok_dir, None, &PivotQuery::default())
+            .expect_err("a 404 gain route while the daemon holds the lock must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("too old to serve"), "{msg}");
+        assert!(msg.contains("onebrain daemon stop"), "{msg}");
     }
 }
