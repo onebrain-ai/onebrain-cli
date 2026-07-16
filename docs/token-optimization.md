@@ -144,9 +144,11 @@ call answers.
 ### Already-sent ledger (lossy, signaled, `balanced`+ only)
 
 Once the ledger is active, each session tracks `(session_token, doc_path) →
-content hash last delivered`. Deliver the same doc twice, unchanged, in the
-same session, and the second delivery becomes a small reference instead of
-the full body:
+index-identity hash last delivered` — the doc's `doc_hash` (raw indexed bytes),
+the SAME key the read-hook uses, so a `search get` / MCP `get` and a later
+read-hook `token check` of the same doc share one ledger entry. Deliver the same
+doc twice, unchanged, in the same session, and the second delivery becomes a
+small reference instead of the full body:
 
 ```bash
 $ onebrain search get 03-knowledge/topic.md --output json
@@ -165,11 +167,15 @@ $ onebrain search get 03-knowledge/topic.md --output json
  "warnings":[],"error":null}
 ```
 
-Edit the doc on disk (the hash changes) and the very next check reads as
-`changed` — fresh content, no reference, ledger re-recorded. Every reference
-carries its own recovery instruction in `rematerialize`, so an agent that
-compacted its own context away never has to guess how to get the full body
-back.
+Because the ledger keys on the doc's **index identity** (`doc_hash`), the
+invalidation trigger is a **reindex**, not a raw disk write. Reindex the doc —
+any `onebrain search reindex`, or the automatic PostToolUse reindex hook that
+fires on an agent Write/Edit — and the next check reads as `changed`: fresh
+content, no reference, ledger re-recorded. An out-of-band disk edit that hasn't
+been reindexed yet stays `unchanged` until the index catches up; the reference's
+`rematerialize` (`--force`) always re-fetches the live body regardless. Every
+reference carries that recovery instruction, so an agent that compacted its own
+context away never has to guess how to get the full body back.
 
 ### `get --force` — re-materialize
 

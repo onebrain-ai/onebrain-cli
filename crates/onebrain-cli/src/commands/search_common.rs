@@ -419,9 +419,54 @@ pub(crate) fn route_to_daemon(resolved: &ResolvedVault) -> Option<DaemonHandle> 
     }
 }
 
+/// Normalize a user-supplied doc path to the index's key form: absolute paths
+/// under `vault_root` are made vault-relative, `./` prefixes are stripped, and
+/// platform back-slashes become forward slashes. Anything else passes through
+/// unchanged. Idempotent on an already-relative key.
+///
+/// The SINGLE source of truth for path→index-key normalization, shared by every
+/// surface that keys the already-sent ledger (design §3b, #255): `search get`,
+/// MCP `get`, the read-hook `token check` (Direct leg), and the daemon
+/// `/api/token/ledger/check` route. They MUST agree byte-for-byte on the `path`
+/// component of the ledger key `(session, doc_path, hash)` — the read-hook is
+/// invoked with an ABSOLUTE path (Claude Code's Read tool always passes
+/// absolute), while `search get` records the RELATIVE path. Without one shared
+/// normalizer the two never collide and cross-surface dedup silently never
+/// fires (and `engine.doc_hash`/`engine.get` would miss the relative index key
+/// entirely on an absolute path).
+pub(crate) fn normalize_doc_path(input: &str, vault_root: &Path) -> String {
+    let p = Path::new(input);
+    let rel = p.strip_prefix(vault_root).unwrap_or(p);
+    let s = rel.to_string_lossy().replace('\\', "/");
+    s.trim_start_matches("./").to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_doc_path_strips_vault_root_and_dot_prefix() {
+        let root = Path::new("/vault/ob-1");
+        assert_eq!(
+            normalize_doc_path("/vault/ob-1/00-inbox/note.md", root),
+            "00-inbox/note.md"
+        );
+        assert_eq!(
+            normalize_doc_path("./00-inbox/note.md", root),
+            "00-inbox/note.md"
+        );
+        // Already-relative key → idempotent (unchanged).
+        assert_eq!(
+            normalize_doc_path("00-inbox/note.md", root),
+            "00-inbox/note.md"
+        );
+        // Absolute path OUTSIDE the vault passes through unchanged.
+        assert_eq!(
+            normalize_doc_path("/elsewhere/x.md", root),
+            "/elsewhere/x.md"
+        );
+    }
 
     #[test]
     fn map_daemon_error_engine_busy_becomes_core_engine_busy() {

@@ -26,7 +26,7 @@ use onebrain_token::{CacheKind, GainEvent, MemoKey, OptLevel, ReferenceEnvelope,
 
 use super::daemon_client::{self, DaemonHandle};
 use super::search_common::{
-    collection_cache_dir, collection_for, index_artifact_path, open_engine,
+    collection_cache_dir, collection_for, index_artifact_path, normalize_doc_path, open_engine,
 };
 use super::search_status::{
     status_data_for, status_data_from_daemon, DaemonStatusCounts, SearchStatusData,
@@ -1194,7 +1194,10 @@ impl McpServer {
         // windowed reads always inline.
         if !force && !windowed && level >= OptLevel::Balanced {
             let full_bytes = text.len() as u64;
-            if let Some(reference) = self.ledger_reference(path_part.clone(), text.clone()).await {
+            // Normalize to the vault-relative index key so this MCP get ledger
+            // entry shares the key with `search get` and the read-hook (#255).
+            let ledger_path = normalize_doc_path(&path_part, self.resolved.root.as_path());
+            if let Some(reference) = self.ledger_reference(ledger_path, text.clone()).await {
                 let ref_json =
                     serde_json::to_string_pretty(&reference).unwrap_or_else(|_| String::new());
                 token_runner::record_gain(

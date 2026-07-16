@@ -11,7 +11,9 @@ use serde::Serialize;
 
 use crate::cli::SearchGetArgs;
 use crate::commands::daemon_client::DaemonHandle;
-use crate::commands::search_common::{map_daemon_error, open_engine, route_to_daemon};
+use crate::commands::search_common::{
+    map_daemon_error, normalize_doc_path, open_engine, route_to_daemon,
+};
 use crate::commands::token_runner;
 use crate::output::{emit, Envelope, OutputMode};
 use onebrain_token::gain::Surface;
@@ -184,17 +186,6 @@ fn is_outside_vault(input: &str, vault_root: &std::path::Path) -> bool {
     p.is_absolute() && p.strip_prefix(vault_root).is_err()
 }
 
-/// Normalize a user-supplied doc path to the index's key form: absolute
-/// paths under the vault root are made vault-relative, `./` prefixes are
-/// stripped, and platform back-slashes become forward slashes. Anything
-/// else is passed through unchanged.
-fn normalize_doc_path(input: &str, vault_root: &std::path::Path) -> String {
-    let p = std::path::Path::new(input);
-    let rel = p.strip_prefix(vault_root).unwrap_or(p);
-    let s = rel.to_string_lossy().replace('\\', "/");
-    s.trim_start_matches("./").to_string()
-}
-
 fn render_text(env: &Envelope<SearchGetData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     // Structured output can carry a reference (already-sent) instead of a body;
@@ -213,28 +204,6 @@ fn render_text(env: &Envelope<SearchGetData>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn normalize_strips_vault_root_and_dot_prefix() {
-        let root = std::path::Path::new("/vault/ob-1");
-        assert_eq!(
-            normalize_doc_path("/vault/ob-1/00-inbox/note.md", root),
-            "00-inbox/note.md"
-        );
-        assert_eq!(
-            normalize_doc_path("./00-inbox/note.md", root),
-            "00-inbox/note.md"
-        );
-        assert_eq!(
-            normalize_doc_path("00-inbox/note.md", root),
-            "00-inbox/note.md"
-        );
-        // Absolute path OUTSIDE the vault passes through unchanged.
-        assert_eq!(
-            normalize_doc_path("/elsewhere/x.md", root),
-            "/elsewhere/x.md"
-        );
-    }
 
     #[test]
     fn is_outside_vault_detects_absolute_paths_not_under_root() {
