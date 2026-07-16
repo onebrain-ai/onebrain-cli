@@ -23,11 +23,63 @@ fn is_comment(l: &str) -> bool {
     l.trim_start().starts_with('#')
 }
 
+/// Extract the bare key token from a mapping line's key portion (everything
+/// before the first `:`), or `None` when the line has no `:` (not a
+/// `key: value` shape). `raw` must already be trimmed of leading indentation
+/// — and, for a commented line, of its leading `#`. The returned token is
+/// whitespace-trimmed and stripped of a single pair of surrounding quotes,
+/// so callers compare the REAL YAML key rather than a raw text prefix:
+/// `check_timeout_ms` matches `check_timeout_ms : 500` (a space before the
+/// colon is valid YAML) and `"check_timeout_ms": 500` / `'check_timeout_ms':
+/// 500` (quoted), but never the longer key `check_timeout_ms_extra: 1`.
+///
+/// (A colon *inside* a quoted key — `"a:b": 1` — is not handled; none of
+/// onebrain.yml's keys contain one, and this stays a line-oriented editor,
+/// not a YAML parser.)
+pub fn key_token(raw: &str) -> Option<&str> {
+    let before = raw.split_once(':')?.0.trim();
+    let unquoted = before
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| before.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(before);
+    Some(unquoted)
+}
+
+/// The bare key token of a line at the given block level: its own token when
+/// active, or the token inside its `# …` comment when `allow_commented` and
+/// the line is a comment. `None` when the line isn't a `key: value` shape
+/// (or is a comment while `allow_commented` is false).
+fn line_key_token(line: &str, allow_commented: bool) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if is_comment(line) {
+        if !allow_commented {
+            return None;
+        }
+        key_token(trimmed.trim_start_matches('#').trim_start())
+    } else {
+        key_token(trimmed)
+    }
+}
+
 /// Locate the line index of the key at `segments` by walking block-form
 /// section headers. Returns `None` when a parent is an inline mapping
 /// (`checkpoint: {messages: 0}`), the key line can't be found, or the shape
 /// is otherwise not understood — never guesses.
 fn locate(lines: &[String], segments: &[&str]) -> Option<usize> {
+    locate_impl(lines, segments, false)
+}
+
+/// [`locate`]'s implementation, parameterized by `allow_commented_key`: when
+/// `true`, the FINAL segment may also match a commented-out placeholder line
+/// (`# <key>: <value>`) at the same block level — used by
+/// [`key_or_commented_placeholder_present`] for keys the fresh template
+/// legitimately emits commented-out by default (e.g.
+/// `token_optimization.get_max_tokens`, which follows a per-level ladder
+/// unless uncommented). Parent segments always require an active,
+/// block-form header regardless of this flag — only the leaf key's match
+/// relaxes.
+fn locate_impl(lines: &[String], segments: &[&str], allow_commented_key: bool) -> Option<usize> {
     let (last, parents) = segments.split_last()?;
 
     // Window (start..end) of the current block; top level = whole file with
@@ -38,34 +90,54 @@ fn locate(lines: &[String], segments: &[&str]) -> Option<usize> {
     // The window's direct-child indent level: the SHALLOWEST non-blank,
     // non-comment line — deeper lines are grandchildren and must never
     // match a key lookup for this level (a nested `model:` must not shadow
-    // a sibling `model:`, and vice versa).
-    let child_indent = |lines: &[String], start: usize, end: usize| -> Option<usize> {
-        (start..end)
-            .filter(|&i| !is_blank(&lines[i]) && !is_comment(&lines[i]))
-            .map(|i| indent_of(&lines[i]))
-            .min()
-    };
+    // a sibling `model:`, and vice versa). When the block has NO active
+    // children (every child commented out — e.g. a user-disabled
+    // `token_optimization:` block, issue #270), fall back to the shallowest
+    // COMMENT line deeper than the parent, so the `allow_commented_key` path
+    // can still locate the commented placeholders instead of returning None
+    // for every sub-key (which would make `--fix` append fresh active
+    // duplicates under the user's commented lines).
+    let child_indent =
+        |lines: &[String], start: usize, end: usize, parent_indent: isize| -> Option<usize> {
+            (start..end)
+                .filter(|&i| !is_blank(&lines[i]) && !is_comment(&lines[i]))
+                .map(|i| indent_of(&lines[i]))
+                .min()
+                .or_else(|| {
+                    (start..end)
+                        .filter(|&i| {
+                            is_comment(&lines[i]) && (indent_of(&lines[i]) as isize) > parent_indent
+                        })
+                        .map(|i| indent_of(&lines[i]))
+                        .min()
+                })
+        };
 
     for seg in parents {
-        let header = format!("{seg}:");
-        let level = child_indent(lines, start, end)?;
+        let level = child_indent(lines, start, end, parent_indent)?;
         // The section header: first non-blank, non-comment line in the window
-        // sitting exactly at the direct-child level and starting with `seg:`.
+        // sitting exactly at the direct-child level whose KEY TOKEN is `seg`
+        // (a raw `starts_with("seg:")` would miss `seg :` / `"seg":`).
         let idx = (start..end).find(|&i| {
             let l = &lines[i];
             !is_blank(l)
                 && !is_comment(l)
                 && indent_of(l) == level
                 && (level as isize) > parent_indent
-                && l.trim_start().starts_with(&header)
+                && line_key_token(l, false) == Some(*seg)
         })?;
         // Refuse inline mappings (`seg: {…}` / `seg: null`) — only a
         // block-form header can carry the child lines we walk next. A
         // trailing `# …` comment on the header line is fine (`search:  # my
         // search config`); anything else after the colon means an inline
-        // value.
-        let after_header = lines[idx].trim_start()[header.len()..].trim_start();
-        if !(after_header.is_empty() || after_header.starts_with('#')) {
+        // value. Split on the FIRST colon (never a fixed `seg:` slice — that
+        // breaks on `seg :` / `"seg":`).
+        let after_colon = lines[idx]
+            .trim_start()
+            .split_once(':')
+            .map(|(_, a)| a.trim_start())
+            .unwrap_or("");
+        if !(after_colon.is_empty() || after_colon.starts_with('#')) {
             return None;
         }
         let header_indent = indent_of(&lines[idx]) as isize;
@@ -86,18 +158,30 @@ fn locate(lines: &[String], segments: &[&str]) -> Option<usize> {
     }
 
     // The key line inside the final window, at the direct-child level only.
-    let key_prefix = format!("{last}:");
-    let level = child_indent(lines, start, end)?;
+    let level = child_indent(lines, start, end, parent_indent)?;
     if (level as isize) <= parent_indent {
         return None;
     }
     (start..end).find(|&i| {
         let l = &lines[i];
-        !is_blank(l)
-            && !is_comment(l)
-            && indent_of(l) == level
-            && l.trim_start().starts_with(&key_prefix)
+        indent_of(l) == level && line_key_token(l, allow_commented_key) == Some(*last)
     })
+}
+
+/// True when the key at `segments` is already "documented" in `text` —
+/// either as an active (uncommented) key ([`locate`] would find it) or as a
+/// commented-out placeholder line (`# <key>: <value>`) at the same block
+/// level. Doctor's `token_optimization` sub-key backfill (issue #270) uses
+/// this instead of a plain presence check for two reasons: (1) two sub-keys
+/// (`get_max_tokens` / `snippet_max_chars`) are legitimately emitted
+/// commented-out by the fresh template — a commented placeholder there is
+/// already covered, never "missing"; (2) a user who deliberately comments
+/// out an otherwise-active key (e.g. `# check_timeout_ms: 500` to disable a
+/// tunable) is never fought — their own comment wins, mirroring
+/// [`insert_comment_above`]'s "a user's own comment always wins" rule.
+pub fn key_or_commented_placeholder_present(text: &str, segments: &[&str]) -> bool {
+    let (lines, _, _) = split(text);
+    locate_impl(&lines, segments, true).is_some()
 }
 
 /// Split `text` into lines plus its newline style and trailing-newline flag,
@@ -485,6 +569,130 @@ mod tests {
         let text = "search:\r\n  collection: c\r\n";
         let out = upsert_child(text, "search", "embed_model", "m");
         assert_eq!(out, "search:\r\n  collection: c\r\n  embed_model: m\r\n");
+    }
+
+    #[test]
+    fn key_or_commented_placeholder_present_finds_active_and_commented_forms() {
+        let text = "token_optimization:\n  level: balanced\n  # get_max_tokens: 6000\n";
+        assert!(key_or_commented_placeholder_present(
+            text,
+            &["token_optimization", "level"]
+        ));
+        assert!(key_or_commented_placeholder_present(
+            text,
+            &["token_optimization", "get_max_tokens"]
+        ));
+        assert!(!key_or_commented_placeholder_present(
+            text,
+            &["token_optimization", "check_timeout_ms"]
+        ));
+    }
+
+    #[test]
+    fn key_or_commented_placeholder_present_respects_user_comment_disabling_active_key() {
+        // A user who comments out an otherwise-active key is never fought —
+        // the commented line counts as "already documented", not missing.
+        let text = "token_optimization:\n  level: balanced\n  # check_timeout_ms: 500\n";
+        assert!(key_or_commented_placeholder_present(
+            text,
+            &["token_optimization", "check_timeout_ms"]
+        ));
+    }
+
+    #[test]
+    fn key_or_commented_placeholder_present_absent_key_is_false() {
+        assert!(!key_or_commented_placeholder_present(
+            "folders:\n  inbox: x\n",
+            &["token_optimization", "level"]
+        ));
+    }
+
+    #[test]
+    fn key_token_extracts_real_key_across_spacing_and_quotes() {
+        assert_eq!(key_token("check_timeout_ms: 200"), Some("check_timeout_ms"));
+        // Space before the colon is valid YAML.
+        assert_eq!(
+            key_token("check_timeout_ms : 200"),
+            Some("check_timeout_ms")
+        );
+        assert_eq!(
+            key_token("check_timeout_ms   :200"),
+            Some("check_timeout_ms")
+        );
+        // Quoted keys.
+        assert_eq!(
+            key_token("\"check_timeout_ms\": 200"),
+            Some("check_timeout_ms")
+        );
+        assert_eq!(
+            key_token("'check_timeout_ms' : 200"),
+            Some("check_timeout_ms")
+        );
+        // A longer key is NOT the target (raw prefix would false-match).
+        assert_eq!(
+            key_token("check_timeout_ms_extra: 1"),
+            Some("check_timeout_ms_extra")
+        );
+        // No colon → not a key line.
+        assert_eq!(key_token("- attachments"), None);
+        assert_eq!(key_token("just_text"), None);
+    }
+
+    #[test]
+    fn key_or_commented_placeholder_present_matches_spaced_and_quoted_active_keys() {
+        // BLOCKING regression (issue #270 R-review): a valid `key : value`
+        // (space before colon) or `"key": value` (quoted) must be detected as
+        // PRESENT — a raw prefix check missed these, which false-reported the
+        // key missing and drove a duplicate-key insert that corrupted the file.
+        assert!(key_or_commented_placeholder_present(
+            "token_optimization:\n  check_timeout_ms : 500\n",
+            &["token_optimization", "check_timeout_ms"]
+        ));
+        assert!(key_or_commented_placeholder_present(
+            "token_optimization:\n  \"check_timeout_ms\": 500\n",
+            &["token_optimization", "check_timeout_ms"]
+        ));
+        // The check must NOT match a different, longer key.
+        assert!(!key_or_commented_placeholder_present(
+            "token_optimization:\n  check_timeout_ms_extra: 500\n",
+            &["token_optimization", "check_timeout_ms"]
+        ));
+        // Commented placeholder with a space before the colon still counts.
+        assert!(key_or_commented_placeholder_present(
+            "token_optimization:\n  # check_timeout_ms : 500\n",
+            &["token_optimization", "check_timeout_ms"]
+        ));
+    }
+
+    #[test]
+    fn key_or_commented_placeholder_present_finds_keys_in_fully_commented_block() {
+        // Finding 2: a block whose children are ALL commented (no active
+        // sibling) must still resolve its commented placeholders — otherwise
+        // `--fix` re-adds fresh active defaults under the user's commented
+        // lines. child_indent's comment fallback covers this.
+        let text = "token_optimization:\n  # level: balanced\n  # read_hook: ledger\n";
+        assert!(key_or_commented_placeholder_present(
+            text,
+            &["token_optimization", "level"]
+        ));
+        assert!(key_or_commented_placeholder_present(
+            text,
+            &["token_optimization", "read_hook"]
+        ));
+        // A key that's genuinely absent (not even commented) stays absent.
+        assert!(!key_or_commented_placeholder_present(
+            text,
+            &["token_optimization", "check_timeout_ms"]
+        ));
+    }
+
+    #[test]
+    fn set_value_matches_spaced_key() {
+        // The key-token fix also benefits the active-key editors: a spaced
+        // key is now addressable (previously missed by the raw prefix).
+        let text = "search:\n  reranker:\n    min_score : 7.5\n";
+        let out = set_value(text, &["search", "reranker", "min_score"], "0.30").unwrap();
+        assert!(out.contains("    min_score: 0.30\n"), "{out}");
     }
 
     #[test]

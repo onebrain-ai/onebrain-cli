@@ -369,6 +369,38 @@ token_optimization:
     .collect()
 }
 
+/// One `token_optimization` sub-key's `(comment, value_line)` pair, exactly
+/// as [`token_optimization_block_lines`] renders it — `value_line` is the
+/// bare trimmed key line, either active (`"check_timeout_ms: 200"`) or, for
+/// the two keys the template legitimately leaves commented-out by default
+/// (`get_max_tokens`, `snippet_max_chars`), the commented placeholder
+/// (`"# get_max_tokens: 6000"`). `key` is the bare leaf name (last path
+/// segment, e.g. `"check_timeout_ms"` — not the dotted path).
+///
+/// Single source of truth shared with [`token_optimization_block_lines`]
+/// (derives from it, never re-formats a literal) so doctor's `--fix`
+/// sub-key backfill (`onebrain-cli`, issue #270 — insert a documented
+/// sub-key into an EXISTING `token_optimization:` block) can never drift
+/// from what a fresh template — or the #247 whole-block backfill — would
+/// have written for that same key. Returns `None` for a key not present in
+/// the block (a caller bug — every `token_optimization.*` `config_key_docs`
+/// entry is a valid input).
+pub fn token_optimization_key_lines(key: &str) -> Option<(String, String)> {
+    let lines = token_optimization_block_lines();
+    let key_prefix = format!("{key}:");
+    let commented_prefix = format!("# {key_prefix}");
+    let idx = lines.iter().position(|l| {
+        let t = l.trim_start();
+        t.starts_with(&key_prefix) || t.starts_with(&commented_prefix)
+    })?;
+    // Every `token_optimization` `config_key_docs` comment is single-line,
+    // so the line directly above the key/placeholder is always the whole
+    // comment.
+    let comment = lines.get(idx.checked_sub(1)?)?.trim_start().to_string();
+    let value_line = lines[idx].trim_start().to_string();
+    Some((comment, value_line))
+}
+
 /// Build the onebrain.yml text content for the given preset. Pure function —
 /// useful for unit testing without touching the filesystem. Every per-key
 /// comment line is interpolated from [`config_key_docs`], so template and
@@ -862,9 +894,10 @@ mod tests {
         // Completeness guard (maintainer standing requirement): every real
         // user-facing config key must have a comment + default in
         // `config_key_docs` — the table drives BOTH the init template and
-        // the doctor --fix backfill (top-level keys; nested sub-key backfill
-        // into an existing block is tracked in #270), so a key missing here
-        // ships undocumented on every surface. Enumerate the key paths from the
+        // the doctor --fix backfill (top-level keys AND nested sub-keys of an
+        // EXISTING block — see `token_optimization_key_lines` / issue #270),
+        // so a key missing here ships undocumented on every surface.
+        // Enumerate the key paths from the
         // serde config structs themselves (fully populated: every Option
         // Some, every Vec non-empty) so adding a struct field without a doc
         // entry fails THIS test with instructions.
@@ -1085,6 +1118,33 @@ mod tests {
         assert_eq!(n, 6, "Maintenance Plus should write 6 schedule entries");
         assert!(yaml.contains("command: onebrain"));
         assert!(yaml.contains("qmd-reindex"));
+    }
+
+    #[test]
+    fn token_optimization_key_lines_pairs_comment_with_active_key() {
+        let (comment, value) = token_optimization_key_lines("check_timeout_ms").unwrap();
+        assert!(comment.starts_with("# "), "{comment}");
+        assert!(comment.contains("default:"), "{comment}");
+        let tok = TokenOptimizationConfig::default();
+        assert_eq!(value, format!("check_timeout_ms: {}", tok.check_timeout_ms));
+    }
+
+    #[test]
+    fn token_optimization_key_lines_pairs_comment_with_commented_placeholder() {
+        // get_max_tokens / snippet_max_chars stay commented in the fresh
+        // template (per-level ladder default) — the pair reflects that.
+        let (comment, value) = token_optimization_key_lines("get_max_tokens").unwrap();
+        assert!(comment.contains("default: unset"), "{comment}");
+        assert_eq!(value, "# get_max_tokens: 6000");
+
+        let (comment, value) = token_optimization_key_lines("snippet_max_chars").unwrap();
+        assert!(comment.contains("default: unset"), "{comment}");
+        assert_eq!(value, "# snippet_max_chars: 200");
+    }
+
+    #[test]
+    fn token_optimization_key_lines_unknown_key_is_none() {
+        assert!(token_optimization_key_lines("nope").is_none());
     }
 
     #[test]
