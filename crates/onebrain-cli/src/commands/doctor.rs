@@ -331,6 +331,7 @@ fn all_checks(vault_root: &Path, config: &onebrain_core::VaultConfig) -> Vec<Doc
     results.push(search_exclude_check(vault_root));
     results.push(token_optimization_check(vault_root));
     results.push(read_hook_failopen_check(vault_root));
+    results.push(daemon_status_check(vault_root));
     results.push(native_search_check(vault_root));
     results.push(legacy_index_stub_check(vault_root));
     results.push(qmd_leftovers_check_prod(config));
@@ -1029,6 +1030,105 @@ fn daemon_status_counts(v: &serde_json::Value) -> Option<(Option<u64>, usize, us
 /// Native-search index check (`check = "search"`). Read-only and
 /// download-free: it resolves the collection, checks whether the on-disk index
 /// exists, and — only if it does — opens the engine (lazy embedder, so
+const DAEMON_STATUS_CHECK: &str = "daemon";
+
+/// Enumerate every per-vault daemon slot (v3.4.13, #230) and surface running
+/// daemons + flag stale/wedged ones. Machine-wide (all slots, not just this
+/// vault's), so a user with several vaults sees every warm daemon at a glance.
+///
+/// READ-ONLY: probes `/api/health` (short timeout, no retry) via
+/// [`crate::commands::daemon_client::DaemonHandle`] — it NEVER starts, stops, or
+/// restarts a daemon (ADR 0032: a read verb must not disturb another session's
+/// daemon).
+///
+/// Verdicts:
+/// - `ok`   — no daemon running, or every slot maps to a live daemon.
+/// - `warn` — a slot has a discovery record whose daemon no longer answers
+///   (crashed / hard-killed), or a lingering start lock with no live daemon (a
+///   wedged slot). Advisory; the hint points at `onebrain daemon stop --all`.
+fn daemon_status_check(_vault_root: &Path) -> DoctorResult {
+    use crate::commands::daemon_client::{self, DaemonHandle, DaemonInfo};
+
+    let slots = match daemon_client::all_slots() {
+        Ok(s) => s,
+        Err(e) => {
+            return DoctorResult::warn(
+                DAEMON_STATUS_CHECK,
+                format!("could not enumerate daemon slots: {e}"),
+            )
+        }
+    };
+    if slots.is_empty() {
+        return DoctorResult::ok(DAEMON_STATUS_CHECK, "no warm daemon running");
+    }
+
+    let mut running = Vec::new();
+    let mut stale = Vec::new();
+    for slot in &slots {
+        match DaemonInfo::read(&slot.json) {
+            Ok(Some(info)) => {
+                if DaemonHandle::new(info.clone()).probe_health().is_some() {
+                    running.push(format!(
+                        "pid {} · port {} · v{} · vault {}",
+                        info.pid,
+                        info.port,
+                        info.version,
+                        info.vault.as_deref().unwrap_or("(none — vault-less)")
+                    ));
+                } else {
+                    // Record present but the daemon doesn't answer: crashed or
+                    // hard-killed, leaving a stale slot json behind.
+                    stale.push(format!(
+                        "{} (record present, daemon not answering)",
+                        slot.json.display()
+                    ));
+                }
+            }
+            // No json (only a pid/lock left): a wedged start lock with no daemon.
+            Ok(None) if slot.lock.exists() => {
+                stale.push(format!(
+                    "{} (wedged start lock, no daemon)",
+                    slot.lock.display()
+                ));
+            }
+            Ok(None) => {}
+            Err(_) => {
+                stale.push(format!(
+                    "{} (corrupt discovery record)",
+                    slot.json.display()
+                ));
+            }
+        }
+    }
+
+    let mut details = Vec::new();
+    for r in &running {
+        details.push(format!("running: {r}"));
+    }
+    for s in &stale {
+        details.push(format!("stale: {s}"));
+    }
+
+    if stale.is_empty() {
+        let msg = match running.len() {
+            1 => "1 warm daemon running".to_string(),
+            n => format!("{n} warm daemons running"),
+        };
+        DoctorResult::ok(DAEMON_STATUS_CHECK, msg).with_details(details)
+    } else {
+        DoctorResult::warn(
+            DAEMON_STATUS_CHECK,
+            format!(
+                "{} running · {} stale/wedged daemon slot(s)",
+                running.len(),
+                stale.len()
+            ),
+        )
+        .with_hint("onebrain daemon stop --all")
+        .with_details(details)
+    }
+}
+
 /// `Engine::open` never downloads a model) and reads `Engine::status` (stored
 /// hashes + a vault re-hash, no embed). Reports the indexed doc count, pending
 /// drift, and whether the embedding model is downloaded.
@@ -5791,6 +5891,48 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_status_check_ok_when_no_daemon() {
+        // Empty HOME → no slot files → "no warm daemon running" (ok).
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_var("HOME", home.path());
+        let r = daemon_status_check(home.path());
+        assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
+        assert!(r.message.contains("no warm daemon"), "{r:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_status_check_warns_on_stale_slot() {
+        // A slot json pointing at a dead port → the daemon doesn't answer the
+        // health probe → flagged as a stale slot (warn + stop-all hint).
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_var("HOME", home.path());
+        let run_dir = home.path().join(".onebrain").join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let info = crate::commands::daemon_client::DaemonInfo {
+            port: 1, // nothing listens → probe fails
+            token: "x".repeat(20),
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            vault: None,
+        };
+        std::fs::write(
+            run_dir.join("daemon-deadbeef.json"),
+            serde_json::to_vec(&info).unwrap(),
+        )
+        .unwrap();
+        let r = daemon_status_check(home.path());
+        assert_eq!(r.status, DoctorStatus::Warn, "{r:?}");
+        assert!(r.message.contains("stale/wedged"), "{r:?}");
+        assert_eq!(
+            r.hint.as_deref(),
+            Some("onebrain daemon stop --all"),
+            "{r:?}"
+        );
     }
 
     #[test]
