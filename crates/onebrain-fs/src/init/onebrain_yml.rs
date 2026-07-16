@@ -862,8 +862,9 @@ mod tests {
         // Completeness guard (maintainer standing requirement): every real
         // user-facing config key must have a comment + default in
         // `config_key_docs` — the table drives BOTH the init template and
-        // the doctor --fix backfill, so a key missing here ships
-        // undocumented on every surface. Enumerate the key paths from the
+        // the doctor --fix backfill (top-level keys; nested sub-key backfill
+        // into an existing block is tracked in #270), so a key missing here
+        // ships undocumented on every surface. Enumerate the key paths from the
         // serde config structs themselves (fully populated: every Option
         // Some, every Vec non-empty) so adding a struct field without a doc
         // entry fails THIS test with instructions.

@@ -8,31 +8,33 @@
 //!     stdout so the hook can hand the agent the `--force` recovery path.
 //!
 //! **Daemon → Direct, then fail-open.** When a warm, vault-bound daemon holds
-//! the engine the check routes to it (under the 200ms budget below); when there
-//! is NO such daemon the check opens the engine + token ledger **directly**
-//! in-process ([`check_direct`], mirroring `search get`'s daemon→Direct
-//! fallback) and gates from there — so the read-hook works whether or not a
-//! daemon is running (issue #248: before, no daemon meant an unconditional
-//! `no_daemon` fail-open, i.e. the gate silently never fired without a warm
-//! daemon).
+//! the engine the check routes to it (under the configurable round-trip budget
+//! below); when there is NO such daemon the check opens the engine + token
+//! ledger **directly** in-process ([`check_direct`], mirroring `search get`'s
+//! daemon→Direct fallback) and gates from there — so the read-hook works
+//! whether or not a daemon is running (issue #248: before, no daemon meant an
+//! unconditional `no_daemon` fail-open, i.e. the gate silently never fired
+//! without a warm daemon).
 //!
 //! **Fail-open on trouble.** ANY trouble getting a trustworthy verdict — no
 //! vault, a daemon too old to have the route, a transport error, an unopenable
 //! engine or token cache, no resolvable session token, or the daemon
-//! round-trip exceeding the 200ms budget — exits 0 (allow) and records a
+//! round-trip exceeding its budget — exits 0 (allow) and records a
 //! `hook_failopen` [`GainEvent`] (design §5c-5: "fail-open is visible in gain
 //! data, never silent") so `/doctor` can surface degradation instead of it
 //! being silent. A read is NEVER blocked by infrastructure trouble.
 //!
-//! The 200ms budget is enforced by THIS command, not by the daemon client's
-//! own (much longer, 2-30s) HTTP timeouts — the daemon round-trip runs on a
-//! detached thread; the caller only waits up to [`CHECK_TIMEOUT`] on a
-//! channel and fails open the instant that elapses, regardless of what the
-//! background thread is still doing (the process exits right after `run`
-//! returns anyway, via the dispatcher's `std::process::exit`). The Direct leg
-//! runs synchronously (no artificial deadline): with no daemon there is no
-//! redb-lock contention, so the engine opens promptly — and a lock genuinely
-//! held elsewhere errors at once (non-blocking flock), never hangs.
+//! The round-trip budget — `token_optimization.check_timeout_ms` (default
+//! 200ms, [`DEFAULT_CHECK_TIMEOUT`]; raise it for iCloud / networked vaults) —
+//! is enforced by THIS command, not by the daemon client's own (much longer,
+//! 2-30s) HTTP timeouts — the daemon round-trip runs on a detached thread; the
+//! caller only waits up to that budget on a channel and fails open the instant
+//! it elapses, regardless of what the background thread is still doing (the
+//! process exits right after `run` returns anyway, via the dispatcher's
+//! `std::process::exit`). The Direct leg runs synchronously (no artificial
+//! deadline): with no daemon there is no redb-lock contention, so the engine
+//! opens promptly — and a lock genuinely held elsewhere errors at once
+//! (non-blocking flock), never hangs.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;

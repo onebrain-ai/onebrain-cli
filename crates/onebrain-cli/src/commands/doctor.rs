@@ -921,6 +921,15 @@ fn read_hook_failopen_check(vault_root: &Path) -> DoctorResult {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let cutoff = now - FAILOPEN_WINDOW_DAYS * 86_400;
+    // `total` counts only the read-hook events that produce a gain row — a
+    // fail-open (`HookFailopen`) or a genuine deny (`LedgerDeny`). A plain
+    // Allow / first_send records NO gain event (design §5c: only fail-opens and
+    // denies meter), so it never appears here. The ratio is therefore
+    // failopen / (failopen + genuine_deny), i.e. "of the decisions that DID
+    // something measurable, how many were degraded" — which is exactly the
+    // silent-inert signal. Consequence: the 20-sample floor is reached in
+    // fail-opens + denies, not raw reads, so a healthy first-read-heavy vault
+    // (mostly first_send allows) can take a while to accumulate a sample.
     let (mut total, mut failopen) = (0usize, 0usize);
     for e in &events {
         if e.surface == Surface::ReadHook && e.ts >= cutoff {
@@ -2729,6 +2738,13 @@ fn fix_search_exclude(vault_root: &Path, json: bool) -> FixOutcome {
 /// optimization" banner in canonical position (`config_layout::SECTIONS`
 /// already lists the key) rather than dangling at EOF. Idempotent: a second
 /// run finds [`token_optimization_missing`] already false and no-ops.
+///
+/// **Scope — top-level block only.** This backfills the WHOLE block only when
+/// it is entirely absent; it does NOT reach into an EXISTING
+/// `token_optimization:` block to add a newly-introduced nested sub-key (e.g. a
+/// vault that predates `check_timeout_ms` keeps its block untouched — serde
+/// falls back to the key's default at runtime, so nothing breaks). Nested
+/// sub-key backfill into an existing block is tracked in #270.
 fn fix_token_optimization(vault_root: &Path, json: bool) -> FixOutcome {
     use onebrain_core::{find_config_file, CONFIG_FILENAME};
     let path = find_config_file(vault_root).unwrap_or_else(|| vault_root.join(CONFIG_FILENAME));
@@ -5527,20 +5543,26 @@ mod tests {
     /// Append `total` read-hook gain events (of which `failopen` are
     /// HookFailopen, the rest LedgerDeny) at NOW into `collection`'s gain JSONL.
     fn seed_read_hook_gain(collection: &str, total: usize, failopen: usize) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        seed_read_hook_gain_at(collection, total, failopen, now);
+    }
+
+    /// Like [`seed_read_hook_gain`] but pins an explicit `ts` — lets a test seed
+    /// events OUTSIDE the [`FAILOPEN_WINDOW_DAYS`] window to prove the cutoff.
+    fn seed_read_hook_gain_at(collection: &str, total: usize, failopen: usize, ts: i64) {
         use onebrain_token::gain::JsonlGainWriter;
         use onebrain_token::{CacheKind, GainEvent, OptLevel, Surface};
         let dir = crate::commands::search_common::collection_cache_dir(collection)
             .join("token")
             .join("gain");
         let w = JsonlGainWriter::new(&dir);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
         for i in 0..total {
             let is_failopen = i < failopen;
             w.append(&GainEvent {
-                ts: now,
+                ts,
                 surface: Surface::ReadHook,
                 transform: if is_failopen {
                     "engine_busy"
@@ -5648,6 +5670,34 @@ mod tests {
         let r = read_hook_failopen_check(d.path());
         assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
         assert!(r.message.contains("not applicable"), "{r:?}");
+    }
+
+    #[test]
+    fn read_hook_failopen_check_excludes_events_outside_window() {
+        // 25 all-fail-open events — enough to warn INERT if counted — but
+        // stamped ~30 days ago, well outside the FAILOPEN_WINDOW_DAYS window.
+        // The cutoff must exclude them: total drops to 0 → quiet ok, not a warn.
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let collection = unique_collection("failopen-window");
+        let d = ledger_vault(&collection);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let old = now - (FAILOPEN_WINDOW_DAYS + 23) * 86_400;
+        seed_read_hook_gain_at(&collection, 25, 25, old);
+
+        let r = read_hook_failopen_check(d.path());
+        assert_eq!(
+            r.status,
+            DoctorStatus::Ok,
+            "out-of-window fail-opens must not warn: {r:?}"
+        );
+        assert!(
+            r.message.contains("(0 read(s)"),
+            "events older than the window must be excluded from total: {r:?}"
+        );
     }
 
     #[test]
