@@ -258,6 +258,33 @@ fn recurring_command_block(entry: &ScheduleEntry, ctx: &LaunchdContext) -> Strin
     lines.join("\n")
 }
 
+/// Escape a value for safe interpolation inside a double-quoted `/bin/sh -c
+/// "..."` argument (Finding #7). Order matters — backslash MUST go first,
+/// otherwise the backslashes just added in front of `"` / `$` / `` ` ``
+/// would themselves get doubled by a later `\` → `\\` pass:
+///
+/// 1. `\` → `\\` (escape the escape char itself)
+/// 2. `"` → `\"` (would otherwise close the quoted string early)
+/// 3. `$` → `\$` (would otherwise trigger parameter/command substitution)
+/// 4. `` ` `` → `` \` `` (would otherwise trigger command substitution)
+///
+/// Applies to values that are interpolated into the one-shot blocks' shell
+/// string but are NOT user-supplied `args:` — those are already rejected
+/// outright by `sanitize_args_for_one_shot` (see
+/// `commands/register_schedule.rs`) if they contain any of these chars.
+/// `ctx.vault_path`, `ctx.skill_cli_path`, `entry.skill`, `entry.command`,
+/// and the derived `plist_file` path are system/config-derived and were
+/// never covered by that check — a value containing `"` would break the
+/// shell string, and `$` / `` ` `` / `\` would allow injection or corrupt
+/// the command launchd actually runs.
+fn shell_escape_double_quoted(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
+}
+
 /// Build the `<ProgramArguments>` body for a one-shot skill-mode entry —
 /// wraps a self-deleting shell command for launchctl bootout + rm.
 fn one_shot_skill_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &str) -> String {
@@ -277,13 +304,13 @@ fn one_shot_skill_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &str
     };
     let shell = format!(
         "\"{}\" skill run --vault=\"{}\" --skill=\"{}\"{}; launchctl bootout gui/{}/{}; rm -f \"{}\"",
-        ctx.skill_cli_path,
-        ctx.vault_path.to_string_lossy(),
-        entry.skill.as_deref().unwrap_or(""),
+        shell_escape_double_quoted(&ctx.skill_cli_path),
+        shell_escape_double_quoted(&ctx.vault_path.to_string_lossy()),
+        shell_escape_double_quoted(entry.skill.as_deref().unwrap_or("")),
         args_flags,
         ctx.uid,
         label,
-        plist_file,
+        shell_escape_double_quoted(&plist_file),
     );
     format!(
         "        <string>/bin/sh</string>\n\
@@ -304,6 +331,13 @@ fn one_shot_command_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &s
         "{}/Library/LaunchAgents/{label}.plist",
         ctx.homedir.to_string_lossy()
     );
+    // NOTE: user-supplied `args:` list elements (`a`) are intentionally left
+    // unescaped here — `sanitize_args_for_one_shot` already rejects any
+    // value containing `"` / `$` / `` ` `` / `\` before this runs, so
+    // escaping them too would double-escape a value that's already known
+    // to be clean. `entry.command` and `ctx.vault_path` are NOT covered by
+    // that check (it only validates `args:`), so those get
+    // `shell_escape_double_quoted` below.
     let mut parts: Vec<String> = match &entry.args {
         Some(Args::List(argv)) if !argv.is_empty() => {
             argv.iter().map(|a| format!("\"{a}\"")).collect()
@@ -312,7 +346,10 @@ fn one_shot_command_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &s
     };
     if should_append_vault(entry, ctx) {
         parts.push("\"--vault\"".to_string());
-        parts.push(format!("\"{}\"", ctx.vault_path.to_string_lossy()));
+        parts.push(format!(
+            "\"{}\"",
+            shell_escape_double_quoted(&ctx.vault_path.to_string_lossy())
+        ));
     }
     let quoted_args = if parts.is_empty() {
         String::new()
@@ -321,12 +358,15 @@ fn one_shot_command_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &s
     };
     let inner = format!(
         "\"{}\"{}",
-        entry.command.as_deref().unwrap_or(""),
+        shell_escape_double_quoted(entry.command.as_deref().unwrap_or("")),
         quoted_args
     );
     let shell = format!(
         "{}; launchctl bootout gui/{}/{}; rm -f \"{}\"",
-        inner, ctx.uid, label, plist_file
+        inner,
+        ctx.uid,
+        label,
+        shell_escape_double_quoted(&plist_file)
     );
     format!(
         "        <string>/bin/sh</string>\n\
@@ -974,6 +1014,155 @@ mod tests {
         assert!(
             out.contains("&quot;--vault&quot; &quot;/tmp/My Vault/x&quot;"),
             "space-containing vault path must be quoted in the shell wrapper, out:\n{out}"
+        );
+    }
+
+    // ── Finding #7: shell escaping in one-shot `/bin/sh -c "..."` wrappers ──
+
+    /// Direct proof the escaping is correct: for a battery of strings
+    /// containing every character `shell_escape_double_quoted` handles
+    /// (backslash, double-quote, `$`, backtick — plus combinations that
+    /// would otherwise inject a subshell or corrupt the argument), wrap the
+    /// escaped output inside a double-quoted `printf` argument and run it
+    /// through a REAL `/bin/sh -c`. If escaping is correct, the shell must
+    /// hand back exactly the original, un-escaped string as a single
+    /// argument — no injected commands, no truncation, no corruption.
+    #[test]
+    fn shell_escape_double_quoted_round_trips_through_real_sh() {
+        let cases = [
+            "plain/path no specials",
+            "has a \"quote\" inside",
+            "has a $DOLLAR and $(subshell)",
+            "has a `backtick` command",
+            "has a back\\slash",
+            "combo: \"$(rm -rf /)\" `whoami` \\end",
+            "/tmp/weird\"$(id)\"vault",
+        ];
+        for raw in cases {
+            let escaped = shell_escape_double_quoted(raw);
+            let script = format!("printf '%s' \"{escaped}\"");
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .expect("/bin/sh must be available to run this test");
+            assert!(
+                out.status.success(),
+                "sh -c exited non-zero for {raw:?} · script: {script} · stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                raw,
+                "round-trip mismatch for {raw:?} · script: {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_escape_double_quoted_escapes_all_four_chars_in_order() {
+        // Backslash must be escaped FIRST — otherwise the backslashes just
+        // added in front of `"` / `$` / `` ` `` would get doubled by a
+        // later backslash pass.
+        assert_eq!(
+            shell_escape_double_quoted(r#"a\b"c$d`e"#),
+            r#"a\\b\"c\$d\`e"#
+        );
+    }
+
+    #[test]
+    fn one_shot_skill_vault_path_with_quote_and_dollar_escaped_in_wrapper() {
+        // Copilot Finding #7: `ctx.vault_path` is interpolated into the
+        // one-shot skill block's `/bin/sh -c "..."` string with NO
+        // escaping. A path containing `"` breaks out of the quoted
+        // `--vault="..."` segment; `$` allows command/parameter
+        // substitution. Real vault paths only ever contain spaces (already
+        // handled by the surrounding quotes) — this hardens the exotic-char
+        // case.
+        let e = ScheduleEntry {
+            at: Some("2026-05-13 14:30".into()),
+            skill: Some("/reminder".into()),
+            ..Default::default()
+        };
+        let vault = "/tmp/weird\"$(id)\"vault";
+        let out = generate_plist(&e, &test_ctx_with_vault(vault));
+
+        // Compute the expected escaped-then-xml-escaped fragment using the
+        // real helpers so this test can't silently drift from the emitter.
+        let shell_fragment = format!("--vault=\"{}\"", shell_escape_double_quoted(vault));
+        let expected_in_plist = xml_escape(&shell_fragment);
+        assert!(
+            out.contains(&expected_in_plist),
+            "expected escaped vault path inside the shell wrapper: {expected_in_plist:?}, \
+             out:\n{out}"
+        );
+        // Positive evidence the dollar sign was actually backslash-escaped
+        // (not just coincidentally present) — `\$(id)` (backslash directly
+        // before `$`) can only appear if escaping ran.
+        assert!(
+            out.contains("\\$(id)"),
+            "expected the `$` in the vault path to be backslash-escaped, out:\n{out}"
+        );
+    }
+
+    #[test]
+    fn one_shot_command_entry_command_with_backtick_and_quote_escaped_in_wrapper() {
+        // Same finding, `entry.command` this time (one-shot command-mode
+        // block). A command path containing a backtick or quote must not
+        // break out of the `"<command>"` segment or trigger command
+        // substitution.
+        let e = ScheduleEntry {
+            at: Some("2026-05-13 14:30".into()),
+            command: Some("/tmp/weird`whoami`\"cmd".into()),
+            args: Some(Args::List(vec!["reindex".into()])),
+            ..Default::default()
+        };
+        let out = generate_plist(&e, &test_ctx());
+
+        let expected_in_plist = xml_escape(&format!(
+            "\"{}\"",
+            shell_escape_double_quoted("/tmp/weird`whoami`\"cmd")
+        ));
+        assert!(
+            out.contains(&expected_in_plist),
+            "expected escaped command inside the shell wrapper: {expected_in_plist:?}, \
+             out:\n{out}"
+        );
+        assert!(
+            out.contains("\\`whoami\\`"),
+            "expected the backticks in the command to be backslash-escaped, out:\n{out}"
+        );
+    }
+
+    #[test]
+    fn one_shot_skill_plist_file_path_escaped_when_homedir_has_special_chars() {
+        // `plist_file` (built from `ctx.homedir` + the sanitized label) is
+        // also interpolated into the `rm -f "..."` segment of the shell
+        // wrapper. The label itself is alphanumeric/dash-only
+        // (`sanitize_label`), but `ctx.homedir` is not sanitized anywhere
+        // upstream, so it must be escaped at the point of interpolation too.
+        let e = ScheduleEntry {
+            at: Some("2026-05-13 14:30".into()),
+            skill: Some("/reminder".into()),
+            ..Default::default()
+        };
+        let ctx = LaunchdContext {
+            vault_path: PathBuf::from("/Users/test/vault"),
+            skill_cli_path: "/opt/homebrew/bin/onebrain".into(),
+            log_base_path: PathBuf::from("/Users/test/vault/07-logs/scheduler/2026/05"),
+            homedir: PathBuf::from("/tmp/weird\"$home"),
+            uid: 501,
+        };
+        let out = generate_plist(&e, &ctx);
+        let plist_file = "/tmp/weird\"$home/Library/LaunchAgents/com.onebrain.reminder.plist";
+        let expected_in_plist = xml_escape(&format!(
+            "rm -f \"{}\"",
+            shell_escape_double_quoted(plist_file)
+        ));
+        assert!(
+            out.contains(&expected_in_plist),
+            "expected escaped plist_file inside the `rm -f` segment: {expected_in_plist:?}, \
+             out:\n{out}"
         );
     }
 

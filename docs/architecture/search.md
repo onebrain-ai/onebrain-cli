@@ -315,7 +315,7 @@ stateDiagram-v2
 > [`crates/onebrain-cli/src/commands/search_reindex.rs`](../../crates/onebrain-cli/src/commands/search_reindex.rs)
 > (`run_hook_path`)
 
-`onebrain plugin update` (hook registration — `register-hooks` is its hidden legacy alias)
+`onebrain plugin install` (hook registration — `register-hooks` is its hidden legacy alias)
 installs two Claude Code hook entries — only when the vault has a search collection configured
 (`register_hooks/mod.rs` strips them otherwise). The Stop entry is registered separately from —
 and never merged with — the checkpoint Stop hook:
