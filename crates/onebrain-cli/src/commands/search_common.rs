@@ -455,25 +455,44 @@ pub(crate) fn route_to_daemon(resolved: &ResolvedVault) -> Option<DaemonHandle> 
 /// lexical result — never panics, never guesses a wrong key.
 pub(crate) fn normalize_doc_path(input: &str, vault_root: &Path) -> String {
     let p = Path::new(input);
-    match p.strip_prefix(vault_root) {
-        Ok(rel) => finish_normalize(rel),
-        Err(_) if p.is_absolute() => {
-            let canon_match = fs::canonicalize(p)
-                .ok()
-                .zip(fs::canonicalize(vault_root).ok())
-                .and_then(|(canon_input, canon_root)| {
-                    canon_input
-                        .strip_prefix(&canon_root)
-                        .map(Path::to_path_buf)
-                        .ok()
-                });
-            match canon_match {
-                Some(rel) => finish_normalize(&rel),
-                None => finish_normalize(p),
-            }
-        }
-        Err(_) => finish_normalize(p),
+    match strip_vault_prefix(p, vault_root) {
+        Some(rel) => finish_normalize(&rel),
+        None => finish_normalize(p),
     }
+}
+
+/// Strip `vault_root` from `input`, returning the vault-relative remainder, or
+/// `None` when `input` is not under the vault.
+///
+/// The SINGLE symlink-aware prefix-strip shared by every surface that must
+/// decide "is this absolute path under the vault, and if so what's its
+/// vault-relative form?" — [`normalize_doc_path`] (the ledger-key normalizer)
+/// and `search get`'s outside-vault guard. Keeping one implementation avoids a
+/// third divergent lexical-vs-canonicalize copy drifting out of sync (#268).
+///
+/// Algorithm (same fast-path/fallback shape as the ledger normalizer):
+/// 1. **Lexical `strip_prefix`** first — the hot path, no filesystem I/O when
+///    the spellings already agree.
+/// 2. On a lexical miss **and only when `input` is absolute**, `fs::canonicalize`
+///    BOTH sides (resolving symlink boundaries like macOS `/tmp` →
+///    `/private/tmp`) and retry the strip. Relative inputs are excluded:
+///    canonicalizing a relative path resolves it against the process `cwd`,
+///    which is unrelated to the vault.
+/// 3. `None` when the strip fails on both routes, or when either canonicalize
+///    errors (path doesn't exist, permissions, …) — callers stay fail-open.
+pub(crate) fn strip_vault_prefix(input: &Path, vault_root: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = input.strip_prefix(vault_root) {
+        return Some(rel.to_path_buf());
+    }
+    if !input.is_absolute() {
+        return None;
+    }
+    let canon_input = fs::canonicalize(input).ok()?;
+    let canon_root = fs::canonicalize(vault_root).ok()?;
+    canon_input
+        .strip_prefix(&canon_root)
+        .map(Path::to_path_buf)
+        .ok()
 }
 
 /// Shared tail of [`normalize_doc_path`]: forward-slash the path and trim a

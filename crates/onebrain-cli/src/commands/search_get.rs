@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::cli::SearchGetArgs;
 use crate::commands::daemon_client::DaemonHandle;
 use crate::commands::search_common::{
-    map_daemon_error, normalize_doc_path, open_engine, route_to_daemon,
+    map_daemon_error, normalize_doc_path, open_engine, route_to_daemon, strip_vault_prefix,
 };
 use crate::commands::token_runner;
 use crate::output::{emit, Envelope, OutputMode};
@@ -181,9 +181,16 @@ fn get_via_daemon(handle: &DaemonHandle, doc_path: &str) -> Result<String> {
 /// so the caller should reject it up front with a clear message rather than
 /// let the lookup miss generically. Relative inputs are always `false` here
 /// (they're resolved against the vault by `normalize_doc_path`).
+///
+/// Uses the SAME symlink-aware [`strip_vault_prefix`] the ledger normalizer
+/// uses (#268): a symlinked-but-inside absolute path (e.g. `/tmp/vault/x.md`
+/// against a canonical `/private/tmp/vault` root) canonicalizes to a match, so
+/// it is NOT rejected — this guard ran BEFORE `normalize_doc_path` with a
+/// purely-lexical strip, which used to `bail!` on exactly those paths before
+/// the fix could apply.
 fn is_outside_vault(input: &str, vault_root: &std::path::Path) -> bool {
     let p = std::path::Path::new(input);
-    p.is_absolute() && p.strip_prefix(vault_root).is_err()
+    p.is_absolute() && strip_vault_prefix(p, vault_root).is_none()
 }
 
 fn render_text(env: &Envelope<SearchGetData>) -> String {
@@ -231,6 +238,48 @@ mod tests {
         // Relative → always false here.
         assert!(!is_outside_vault("00-inbox/note.md", root));
         assert!(!is_outside_vault("./00-inbox/note.md", root));
+    }
+
+    /// #268: `is_outside_vault` runs BEFORE `normalize_doc_path` and used a
+    /// purely-lexical `strip_prefix`, so an absolute path spelled through a
+    /// symlinked component (e.g. `/tmp/vault/...` while the vault root resolves
+    /// to canonical `/private/tmp/vault`) was wrongly rejected with "path is
+    /// outside this vault" — bailing before the symlink-aware normalizer could
+    /// run. It must now canonicalize and recognize the path as INSIDE. A
+    /// genuinely-outside absolute path must still be rejected.
+    #[cfg(unix)]
+    #[test]
+    fn is_outside_vault_recognizes_symlinked_inside_path() {
+        let base = tempfile::tempdir().unwrap();
+        let real_vault = base.path().join("real-vault");
+        std::fs::create_dir_all(real_vault.join("00-inbox")).unwrap();
+        let doc = real_vault.join("00-inbox/note.md");
+        std::fs::write(&doc, "body").unwrap();
+
+        // A symlink standing in for the vault dir (the `/tmp` → `/private/tmp`
+        // split, reproduced portably with a real symlink rather than relying
+        // on the macOS-specific mapping).
+        let link_vault = base.path().join("linked-vault");
+        std::os::unix::fs::symlink(&real_vault, &link_vault).unwrap();
+
+        // The caller resolves vault_root to the canonical, symlink-free form,
+        // while the user passes the doc through the symlinked spelling.
+        let canonical_root = real_vault.canonicalize().unwrap();
+        let input_through_symlink = link_vault.join("00-inbox/note.md");
+
+        assert!(
+            !is_outside_vault(input_through_symlink.to_str().unwrap(), &canonical_root),
+            "a symlinked-but-inside absolute path must NOT be rejected as outside the vault"
+        );
+
+        // A genuinely-outside absolute path is still rejected.
+        let outside = base.path().join("elsewhere/x.md");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, "body").unwrap();
+        assert!(
+            is_outside_vault(outside.to_str().unwrap(), &canonical_root),
+            "an absolute path genuinely outside the vault must still be rejected"
+        );
     }
 
     #[test]
