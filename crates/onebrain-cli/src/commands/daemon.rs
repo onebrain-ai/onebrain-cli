@@ -769,6 +769,14 @@ fn resolve_start_vault(vault: Option<&Path>) -> Option<PathBuf> {
     if std::env::var_os("ONEBRAIN_VAULT").is_some() {
         return None;
     }
+    // Rung 3 (both explicit flag and env absent): walk up from cwd. NOTE this
+    // rung means a *vault-less* spawn intent would incidentally bind cwd's
+    // vault. It is only ever reached from a bare manual `daemon start`; the
+    // programmatic spawn path (`daemon_client::ensure_running` →
+    // `spawn_daemon_start`) always threads an already-resolved `--vault`
+    // (rung 1) for every current caller, so `ensure_running(None)`'s
+    // vault-less-spawn semantics are unaffected. A future caller reintroducing
+    // `ensure_running(None)` on a walk-uppable cwd would want to reconsider.
     let cwd = std::env::current_dir().ok()?;
     onebrain_core::find_vault_root(&cwd).map(|root| root.as_path().to_path_buf())
 }
