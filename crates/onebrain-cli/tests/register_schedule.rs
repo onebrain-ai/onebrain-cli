@@ -214,7 +214,9 @@ fn command_mode_entries_fully_identical_still_collide() {
 }
 
 /// Recurring command-mode entry produces a hook-style argv plist (no
-/// `--skill` / `--vault` / `run-skill`).
+/// `--skill` / `run-skill`) — but DOES embed `--vault` (#263 bug 1: launchd
+/// runs jobs with cwd=/, so command-mode entries need the vault path in
+/// their own argv, same as skill-mode already has).
 ///
 /// Unix-only: relies on `/bin/echo` existing.
 #[cfg(unix)]
@@ -235,7 +237,8 @@ fn command_mode_dry_run_produces_hook_style_argv() {
         .success()
         .stdout(predicate::str::contains("<string>/bin/echo</string>"))
         .stdout(predicate::str::contains("<string>hello</string>"))
-        .stdout(predicate::str::contains("<string>--skill</string>").not());
+        .stdout(predicate::str::contains("<string>--skill</string>").not())
+        .stdout(predicate::str::contains("<string>--vault</string>"));
 }
 
 /// Skill marked `schedulable: false` is rejected at register time.

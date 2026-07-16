@@ -1636,7 +1636,9 @@ pub struct LegacyVaultSyncArgs {
 pub struct LegacyRunSkillArgs {
     /// `--vault` is the v3.0 canonical long; `--vault-dir` is a sibling
     /// alias for parity. Optional so the global pre-subcommand `--vault`
-    /// can also be the source; dispatcher requires at least one.
+    /// can also be the source; when neither is given the dispatcher walks
+    /// up from cwd via `vault_ctx::require` (same chain as the modern
+    /// `skill run`), per #263 Part 2.
     #[arg(long, alias = "vault-dir")]
     pub vault: Option<PathBuf>,
     #[arg(long)]

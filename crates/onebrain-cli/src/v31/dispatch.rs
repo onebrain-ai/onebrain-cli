@@ -594,13 +594,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Cmd::RunSkillAlias(a) => {
             migration::print_once("run-skill", "skill run");
-            let v = a.vault.or(vault_flag.clone()).ok_or_else(|| {
-                anyhow::anyhow!("run-skill requires --vault <PATH> or --vault-dir <PATH>")
-            })?;
+            // #263 Part 2: resolve through the canonical chain (flag >
+            // ONEBRAIN_VAULT > walk-up from cwd) instead of requiring an
+            // explicit --vault/--vault-dir — matches the modern `skill run`
+            // arm above. Without this, a bare/relative legacy call that
+            // found no vault anywhere would fall through to
+            // `run_skill::run`'s own internal config check and surface a
+            // bare `Ok(78)` (EX_CONFIG) instead of the canonical
+            // `E_VAULT_NOT_FOUND` (exit 64).
+            let resolved = crate::vault_ctx::require(a.vault.or(vault_flag.clone()))?;
+            let vault = resolved.root.as_path().to_string_lossy();
             // Legacy alias keeps the claude default with no model override;
             // `--harness` / `--model` live on the modern `skill run`.
             let code = commands::run_skill::run(
-                &v.to_string_lossy(),
+                &vault,
                 &a.skill,
                 &a.args,
                 crate::cli::HarnessArg::Claude,

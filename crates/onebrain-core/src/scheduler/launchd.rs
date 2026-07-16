@@ -160,7 +160,15 @@ fn recurring_skill_block(entry: &ScheduleEntry, ctx: &LaunchdContext) -> String 
 
 /// Build the `<ProgramArguments>` body for a recurring command-mode entry.
 /// Each argv element becomes a `<string>` line.
-fn recurring_command_block(entry: &ScheduleEntry) -> String {
+///
+/// launchd runs every job with `cwd=/`, so a command-mode entry can't rely
+/// on cwd to find the vault the way an interactive shell invocation would.
+/// We therefore always append `--vault <ctx.vault_path>` after the user's
+/// own args — an explicit flag, preferred over setting `WorkingDirectory`
+/// (which would also change the meaning of any relative paths the user's
+/// own `args:` already assume). Mirrors `recurring_skill_block`, which
+/// already embeds `--vault` (#263 bug 1).
+fn recurring_command_block(entry: &ScheduleEntry, ctx: &LaunchdContext) -> String {
     let cmd = entry.command.as_deref().unwrap_or("");
     let mut lines: Vec<String> = vec![format!("        <string>{}</string>", xml_escape(cmd))];
     if let Some(Args::List(argv)) = &entry.args {
@@ -168,6 +176,11 @@ fn recurring_command_block(entry: &ScheduleEntry) -> String {
             lines.push(format!("        <string>{}</string>", xml_escape(a)));
         }
     }
+    lines.push("        <string>--vault</string>".to_string());
+    lines.push(format!(
+        "        <string>{}</string>",
+        xml_escape(&ctx.vault_path.to_string_lossy())
+    ));
     lines.join("\n")
 }
 
@@ -207,18 +220,24 @@ fn one_shot_skill_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &str
 }
 
 /// Build the `<ProgramArguments>` body for a one-shot command-mode entry.
+///
+/// Same `--vault` rationale as [`recurring_command_block`] (#263 bug 1):
+/// launchd's `cwd=/` means the command needs the vault path in its own argv,
+/// appended after any user-supplied args, quoted the same way.
 fn one_shot_command_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &str) -> String {
     let plist_file = format!(
         "{}/Library/LaunchAgents/{label}.plist",
         ctx.homedir.to_string_lossy()
     );
-    let quoted_args: String = match &entry.args {
+    let mut parts: Vec<String> = match &entry.args {
         Some(Args::List(argv)) if !argv.is_empty() => {
-            let parts: Vec<String> = argv.iter().map(|a| format!("\"{a}\"")).collect();
-            format!(" {}", parts.join(" "))
+            argv.iter().map(|a| format!("\"{a}\"")).collect()
         }
-        _ => String::new(),
+        _ => Vec::new(),
     };
+    parts.push("\"--vault\"".to_string());
+    parts.push(format!("\"{}\"", ctx.vault_path.to_string_lossy()));
+    let quoted_args = format!(" {}", parts.join(" "));
     let inner = format!(
         "\"{}\"{}",
         entry.command.as_deref().unwrap_or(""),
@@ -346,7 +365,7 @@ pub fn generate_plist(entry: &ScheduleEntry, ctx: &LaunchdContext) -> String {
     let program_args = match (is_one_shot(entry), is_command_mode(entry)) {
         (true, true) => one_shot_command_block(entry, ctx, &label),
         (true, false) => one_shot_skill_block(entry, ctx, &label),
-        (false, true) => recurring_command_block(entry),
+        (false, true) => recurring_command_block(entry, ctx),
         (false, false) => recurring_skill_block(entry, ctx),
     };
 
@@ -564,6 +583,12 @@ mod tests {
 
     #[test]
     fn recurring_command_emits_hook_style_program_arguments() {
+        // #263 bug 1: launchd runs jobs with cwd=/, so a command-mode entry
+        // MUST embed `--vault <path>` in its own argv — it can't rely on cwd
+        // to find the vault (skill-mode already does this; command-mode was
+        // the gap). The `--skill` / `skill run` shape stays absent — that's
+        // what makes this "hook-style" (plain `command + args[]`, matching
+        // Claude Code's hooks.json convention) rather than skill-mode.
         let e = ScheduleEntry {
             cron: Some("0 3 * * 0".into()),
             command: Some("/opt/homebrew/bin/onebrain".into()),
@@ -574,7 +599,15 @@ mod tests {
         assert!(out.contains("<string>/opt/homebrew/bin/onebrain</string>"));
         assert!(out.contains("<string>qmd-reindex</string>"));
         assert!(!out.contains("<string>--skill</string>"));
-        assert!(!out.contains("<string>--vault</string>"));
+        assert!(
+            out.contains("<string>--vault</string>"),
+            "command-mode argv must embed --vault so launchd's cwd=/ can't \
+             break vault discovery, out:\n{out}"
+        );
+        assert!(
+            out.contains("<string>/Users/test/vault</string>"),
+            "expected the ctx vault_path after --vault, out:\n{out}"
+        );
         assert!(!out.contains("<string>skill</string>\n        <string>run</string>"));
     }
 
@@ -669,7 +702,10 @@ mod tests {
     }
 
     #[test]
-    fn command_with_no_args_produces_single_element_argv() {
+    fn command_with_no_args_still_gets_vault_appended() {
+        // #263 bug 1: even with zero user-supplied args, `--vault <path>`
+        // must still be appended — the command isn't left as a bare
+        // one-element argv.
         let e = ScheduleEntry {
             cron: Some("0 3 * * 0".into()),
             command: Some("/usr/bin/true".into()),
@@ -677,6 +713,8 @@ mod tests {
         };
         let out = generate_plist(&e, &test_ctx());
         assert!(out.contains("<string>/usr/bin/true</string>"));
+        assert!(out.contains("<string>--vault</string>"));
+        assert!(out.contains("<string>/Users/test/vault</string>"));
     }
 
     #[test]

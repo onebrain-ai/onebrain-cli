@@ -561,13 +561,16 @@ fn skill_run_without_name_errors_exit_1() {
     );
 }
 
-/// `run-skill` (hidden v3.0 alias) requires an explicit `--vault`/`--vault-dir`
-/// — it does NOT walk up from cwd. With none provided (and `ONEBRAIN_VAULT`
-/// cleared) the dispatcher's `ok_or_else` guard fires before `run_skill::run`,
-/// surfacing a usage error → exit 1. Exercises the `Cmd::RunSkillAlias`
-/// missing-vault branch.
+/// `run-skill` (hidden v3.0 alias), post-#263-Part-2 hardening: with no
+/// `--vault`/`--vault-dir` flag and `ONEBRAIN_VAULT` cleared, the alias now
+/// resolves through the SAME walk-up chain as the modern `skill run` arm
+/// (`vault_ctx::require`) instead of erroring up-front via `ok_or_else`. When
+/// nothing is found anywhere above cwd, that walk-up itself fails with
+/// `CoreError::VaultNotFound` → exit 64 (E_VAULT_NOT_FOUND) — the same guard
+/// the modern arm hits — rather than the old bare "requires --vault" usage
+/// error (exit 1). Exercises the `Cmd::RunSkillAlias` missing-vault branch.
 #[test]
-fn run_skill_alias_without_vault_errors_exit_1() {
+fn run_skill_alias_without_vault_exits_64() {
     let neutral = tempdir().unwrap();
     let out = Command::cargo_bin("onebrain")
         .unwrap()
@@ -578,12 +581,43 @@ fn run_skill_alias_without_vault_errors_exit_1() {
         .unwrap();
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "run-skill without --vault should exit 1 (generic)"
+        Some(64),
+        "run-skill without --vault, and no vault anywhere above cwd, should exit 64 (E_VAULT_NOT_FOUND)"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("requires --vault"),
-        "expected a 'requires --vault' usage error on stderr. got:\n{stderr}"
+        stderr.contains("no OneBrain vault found"),
+        "expected the walk-up 'no OneBrain vault found' error on stderr. got:\n{stderr}"
+    );
+}
+
+/// Positive counterpart to the above: `run-skill` run from a directory
+/// *nested inside* a vault (not the vault root itself), with no
+/// `--vault`/`--vault-dir` flag, must resolve via walk-up and actually reach
+/// the harness-spawn body — proving the alias genuinely walks up now, rather
+/// than only ever erroring when a flag is absent. `CLAUDE_BIN=/bin/true`
+/// stands in for `claude` so the spawn succeeds deterministically (exit 0)
+/// without depending on a real harness being installed.
+#[cfg(unix)]
+#[test]
+fn run_skill_alias_resolves_vault_via_walk_up_from_nested_cwd() {
+    let vault = vault_dir();
+    let nested = vault.path().join("00-inbox").join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(&nested)
+        .env_remove("ONEBRAIN_VAULT")
+        .env("CLAUDE_BIN", "/bin/true")
+        .args(["run-skill", "--skill", "daily"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "run-skill with no --vault, invoked from a directory nested inside a \
+         vault, should walk up and succeed rather than hitting the old \
+         up-front usage error. stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
