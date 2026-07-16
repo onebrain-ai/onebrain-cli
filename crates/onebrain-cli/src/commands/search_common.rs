@@ -155,6 +155,30 @@ pub fn open_engine(vault_flag: Option<PathBuf>) -> Result<(Engine, ResolvedVault
     Ok((engine, resolved))
 }
 
+/// Open the engine for an ALREADY-RESOLVED vault, without re-resolving it via
+/// [`vault_ctx::require`]. A variant of [`open_engine`] for callers who
+/// already hold a `ResolvedVault` (e.g. because they needed it earlier in the
+/// same call for other purposes) — re-resolving would call
+/// [`vault_ctx::require`] a second time AND route back through
+/// [`collection_for`], which persists the auto-generated collection name to
+/// `onebrain.yml` a second time when the config had no `search.collection`
+/// set. This calls [`collection_for`] exactly once instead.
+///
+/// Returns the resolved vault back alongside the engine (cloned from the
+/// input) so callers can destructure it the same way [`open_engine`]'s
+/// callers do.
+pub fn open_engine_from_resolved(resolved: &ResolvedVault) -> Result<(Engine, ResolvedVault)> {
+    let config = load_vault_config(&resolved.root).context("load vault config")?;
+    let collection = collection_for(resolved)?;
+
+    let cache_dir = collection_cache_dir(&collection);
+    let mut engine = Engine::open(&cache_dir, &config.search.embed_model)
+        .map_err(|e| map_engine_open_error(e, &cache_dir))?;
+    engine.set_exclude_patterns(config.search.exclude.clone());
+    engine.set_rerank_settings(rerank_settings_from_config(&config.search.reranker));
+    Ok((engine, resolved.clone()))
+}
+
 /// Open the engine for an ALREADY-RESOLVED collection name **without any
 /// config persistence** — the doctor read path. Unlike [`open_engine`], this
 /// never calls [`collection_for`], so a vault whose index dir exists while
@@ -841,6 +865,50 @@ mod tests {
         .unwrap();
         let resolved = resolved_at(dir.path());
         assert_eq!(collection_for(&resolved).unwrap(), "legacy-name");
+    }
+
+    #[test]
+    fn open_engine_from_resolved_does_not_double_persist_collection() {
+        // Copilot round-2 finding #3: `search_get.rs`'s direct (non-daemon)
+        // path called `open_engine(vault_flag)` even though it already held
+        // a `ResolvedVault` — re-resolving the vault AND re-deriving +
+        // persisting an auto-generated `search.collection` a second time.
+        // `open_engine_from_resolved` takes the already-resolved vault and
+        // must call `collection_for` exactly once: a caller that already
+        // resolved the collection (as `search_get::run` does) must not see
+        // `onebrain.yml` written to again on open.
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "folders:\n  inbox: 00-inbox\n",
+        )
+        .unwrap();
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let resolved = resolved_at(dir.path());
+
+        // Mirrors a caller that already resolved the collection before
+        // opening the engine (as `search_get::run` does for the ledger
+        // check).
+        let expected_collection = collection_for(&resolved).unwrap();
+        let before = std::fs::read_to_string(dir.path().join("onebrain.yml")).unwrap();
+
+        let (_engine, out_resolved) = open_engine_from_resolved(&resolved).unwrap();
+        assert_eq!(out_resolved.root.as_path(), resolved.root.as_path());
+
+        // No further write happened: the file is byte-identical to right
+        // after the first (and only) `collection_for` persist.
+        let after = std::fs::read_to_string(dir.path().join("onebrain.yml")).unwrap();
+        assert_eq!(
+            after, before,
+            "open_engine_from_resolved must not persist the collection again"
+        );
+        assert_eq!(
+            after.matches("collection:").count(),
+            1,
+            "search.collection must be persisted exactly once, not duplicated: {after}"
+        );
+        assert!(after.contains(&format!("collection: {expected_collection}")));
     }
 
     #[test]

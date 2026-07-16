@@ -12,7 +12,8 @@ use serde::Serialize;
 use crate::cli::SearchGetArgs;
 use crate::commands::daemon_client::DaemonHandle;
 use crate::commands::search_common::{
-    map_daemon_error, normalize_doc_path, open_engine, route_to_daemon, strip_vault_prefix,
+    map_daemon_error, normalize_doc_path, open_engine_from_resolved, route_to_daemon,
+    strip_vault_prefix,
 };
 use crate::commands::token_runner;
 use crate::output::{emit, Envelope, OutputMode};
@@ -38,7 +39,7 @@ const NOT_INDEXED_HINT: &str = "💡  paths are vault-relative (e.g. `00-inbox/n
      if the doc is new, `onebrain search reindex` may not have indexed it yet";
 
 pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchGetArgs) -> Result<()> {
-    let resolved = crate::vault_ctx::require(vault_flag.clone())?;
+    let resolved = crate::vault_ctx::require(vault_flag)?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
 
     // An absolute path that isn't under the vault root can never be an index
@@ -69,7 +70,11 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchGetArgs)
     let (content, doc_hash) = if let Some(handle) = &daemon {
         (get_via_daemon(handle, &doc_path)?, None)
     } else {
-        let (engine, _resolved) = open_engine(vault_flag)?;
+        // `resolved` is already resolved above — use the vault we already
+        // have instead of re-resolving (which would also re-persist an
+        // auto-generated `search.collection` to `onebrain.yml` a second
+        // time).
+        let (engine, _resolved) = open_engine_from_resolved(&resolved)?;
         let content = engine
             .get(&doc_path)
             .map_err(|e| anyhow::anyhow!("{e}\n{NOT_INDEXED_HINT}"))?;
@@ -138,7 +143,12 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchGetArgs)
     }
 
     // On a reference the body is dropped (the reference stands in for it).
+    // Explicitly `drop` it here rather than letting the shadowing `let`
+    // below merely stop naming it — shadowing alone leaves the (possibly
+    // large) original `String` allocation live until the end of `run`, not
+    // freed at this point.
     let content = if reference.is_some() {
+        drop(content);
         String::new()
     } else {
         content
