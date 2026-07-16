@@ -117,6 +117,11 @@ filetime          = { workspace = true }
 assert_cmd        = { workspace = true }
 predicates        = { workspace = true }
 insta             = { workspace = true }
+# Integration tests reconstruct a daemon's per-vault slot filename
+# (`daemon-<hash>.json`, #230), which the CLI derives via `short_path_hash`
+# (sha256 of the canonical vault path, first 6 hex). Replicated here because the
+# binary-only crate exposes no lib for tests to call it directly.
+sha2              = { workspace = true }
 pretty_assertions = { workspace = true }
 tar               = { workspace = true }
 mockito           = { workspace = true }

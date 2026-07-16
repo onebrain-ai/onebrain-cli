@@ -204,23 +204,35 @@ fn spawn_mock_daemon(status_body: &'static str) -> u16 {
     port
 }
 
-/// Write a `daemon.json` discovery record under `home` pointing at `port`,
-/// bound to `vault` (canonicalized — `vault_decision` compares canonical
-/// identities) at THIS crate's version (`version_decision` requires an exact
-/// match with the spawned binary, which shares the workspace version).
+/// The per-vault slot stem (`daemon-<hash>`, #230) for a canonical vault path —
+/// a replica of the CLI's `daemon_client::slot_stem` (`short_path_hash` =
+/// sha256 of the path, first 6 hex chars). Replicated because the binary-only
+/// crate exposes no lib for the integration test to call it directly.
+#[cfg(unix)]
+fn slot_stem_for(canon_vault: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let full = format!("{:x}", Sha256::digest(canon_vault.as_bytes()));
+    format!("daemon-{}", &full[..6])
+}
+
+/// Write a discovery record into `vault`'s SLOT (`daemon-<hash>.json`, #230)
+/// under `home`, pointing at `port` and bound to the canonical `vault` at THIS
+/// crate's version (`version_decision` requires an exact match with the spawned
+/// binary, which shares the workspace version).
 #[cfg(unix)]
 fn write_daemon_record(home: &Path, vault: &Path, port: u16) {
     let run = home.join(".onebrain/run");
     std::fs::create_dir_all(&run).unwrap();
     let canon = std::fs::canonicalize(vault).unwrap();
+    let canon = canon.display().to_string();
     std::fs::write(
-        run.join("daemon.json"),
+        run.join(format!("{}.json", slot_stem_for(&canon))),
         serde_json::json!({
             "port": port,
             "token": "test-token",
             "pid": std::process::id(),
             "version": env!("CARGO_PKG_VERSION"),
-            "vault": canon.display().to_string(),
+            "vault": canon,
         })
         .to_string(),
     )
