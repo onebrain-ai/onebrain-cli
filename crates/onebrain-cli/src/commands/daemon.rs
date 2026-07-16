@@ -735,6 +735,52 @@ fn render_status_text(env: &Envelope<DaemonStatusData>) -> String {
     lines.join("\n")
 }
 
+/// Resolve the vault to convey to the detached `__run` child at `start` time
+/// (#262). Every sibling verb (`serve`, `search`, `token`, `doctor`) walks up
+/// from cwd to find a vault; bare `daemon start` didn't, because the ONLY
+/// place that ever resolved a vault was [`resolve_daemon_vault`] inside the
+/// detached child — but by the time that runs, `spawn_detached_run`'s
+/// `pre_exec` has already `chdir("/")`'d the child (a long-lived daemon must
+/// not pin whatever directory `start` happened to run from). A walk-up
+/// inside the child is therefore structurally useless; it has to happen here,
+/// in the parent, while cwd still means something.
+///
+/// Precedence, UNCHANGED from before this function existed for the first two
+/// rungs, plus one new rung inserted below them:
+/// 1. Explicit `--vault <arg>` — returned untouched (even if it isn't a real
+///    vault). Validation still happens exactly once, downstream, in the
+///    child's [`resolve_daemon_vault`] (soft-fail: warn + serve vault-less).
+///    Routing this through the stricter `vault_ctx::resolve` would hard-error
+///    on an invalid explicit path, which is NOT today's behaviour and #262
+///    explicitly says to preserve it.
+/// 2. `$ONEBRAIN_VAULT` set, arg absent — returns `None` here so no `--vault`
+///    flag is passed; the child inherits the same env and resolves it itself
+///    via [`resolve_daemon_vault`]'s existing fallback (zero change).
+/// 3. **NEW:** both absent — walk up from `$PWD` with
+///    [`onebrain_core::find_vault_root`], the same helper `serve`/`search`/
+///    `token`/`doctor` use. Found root is passed through as if it were an
+///    explicit `--vault`.
+/// 4. Nothing found (or cwd unreadable) — `None`. `daemon start` still
+///    succeeds vault-less, same as today.
+fn resolve_start_vault(vault: Option<&Path>) -> Option<PathBuf> {
+    if let Some(v) = vault {
+        return Some(v.to_path_buf());
+    }
+    if std::env::var_os("ONEBRAIN_VAULT").is_some() {
+        return None;
+    }
+    // Rung 3 (both explicit flag and env absent): walk up from cwd. NOTE this
+    // rung means a *vault-less* spawn intent would incidentally bind cwd's
+    // vault. It is only ever reached from a bare manual `daemon start`; the
+    // programmatic spawn path (`daemon_client::ensure_running` →
+    // `spawn_daemon_start`) always threads an already-resolved `--vault`
+    // (rung 1) for every current caller, so `ensure_running(None)`'s
+    // vault-less-spawn semantics are unaffected. A future caller reintroducing
+    // `ensure_running(None)` on a walk-uppable cwd would want to reconsider.
+    let cwd = std::env::current_dir().ok()?;
+    onebrain_core::find_vault_root(&cwd).map(|root| root.as_path().to_path_buf())
+}
+
 /// `onebrain daemon start` — spawn a detached `__run` child if not already
 /// running, record its PID, report.
 ///
@@ -742,7 +788,10 @@ fn render_status_text(env: &Envelope<DaemonStatusData>) -> String {
 /// caller conveys the vault the daemon should bind EXPLICITLY, rather than
 /// mutating `$ONEBRAIN_VAULT` in the parent process (which is unsound under
 /// concurrent reads and deprecated since Rust 1.81). When `None`, the child
-/// falls back to `$ONEBRAIN_VAULT` — the pre-`--vault` behaviour.
+/// falls back to `$ONEBRAIN_VAULT` — the pre-`--vault` behaviour. When BOTH
+/// are absent (the bare `daemon start` case), [`resolve_start_vault`] adds a
+/// 3rd rung — walking up from cwd — before spawning; see its doc comment
+/// for why that has to happen here in the parent (#262).
 pub fn run_start(mode: &OutputMode, vault: Option<&Path>) -> Result<()> {
     let pid_path = pid_path()?;
 
@@ -784,7 +833,9 @@ pub fn run_start(mode: &OutputMode, vault: Option<&Path>) -> Result<()> {
     }
 
     // Spawn the detached child and record its PID.
-    let pid = spawn_detached_run(&log_path()?, vault).context("spawn detached daemon process")?;
+    let effective_vault = resolve_start_vault(vault);
+    let pid = spawn_detached_run(&log_path()?, effective_vault.as_deref())
+        .context("spawn detached daemon process")?;
     write_pid(&pid_path, pid)?;
 
     // Wait — STILL HOLDING THE LOCK — until the daemon is fully up (it has
@@ -2666,6 +2717,82 @@ mod tests {
         assert_eq!(
             info.vault, expected,
             "daemon.json.vault must be the --vault path (arg carried the vault, not env)"
+        );
+        // Teardown: `_teardown` (StopDaemonOnDrop) stops the daemon on every
+        // exit path, the failing-assert ones included.
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #262: bare `daemon start` (no `--vault`, no `$ONEBRAIN_VAULT`) must
+    // walk up from cwd to find the vault, exactly like `serve`/`search`/
+    // `token`/`doctor` do. Spawned with `.current_dir()` set to a
+    // SUBDIRECTORY of the vault (not the vault root itself) to prove real
+    // walk-up rather than a lucky direct hit. `$ONEBRAIN_VAULT` is removed
+    // so the ONLY possible source of the bound vault is cwd walk-up.
+    // ─────────────────────────────────────────────────────────────────────
+    #[cfg(unix)]
+    #[test]
+    fn daemon_start_bare_walks_up_cwd_vault() {
+        use assert_cmd::cargo::cargo_bin;
+        use std::process::Command as StdCommand;
+        use std::time::{Duration, Instant};
+
+        let home = tempdir().unwrap();
+        let vault = tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: bare-walkup-it\n",
+        )
+        .unwrap();
+        let subdir = vault.path().join("00-inbox");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let bin = cargo_bin("onebrain");
+        let _teardown = StopDaemonOnDrop {
+            bin: bin.clone(),
+            envs: vec![("HOME".into(), home.path().display().to_string())],
+        };
+
+        // Start with NO --vault and NO $ONEBRAIN_VAULT, from a SUBDIRECTORY
+        // of the vault — walk-up is the only way this can resolve.
+        let start = StdCommand::new(&bin)
+            .env("HOME", home.path())
+            .env_remove("ONEBRAIN_VAULT")
+            .env("ONEBRAIN_DAEMON_PORT", "0")
+            .env("ONEBRAIN_DAEMON_IDLE_SECS", "0")
+            .current_dir(&subdir)
+            .args(["daemon", "start"])
+            .output()
+            .expect("spawn onebrain daemon start (bare)");
+        assert!(
+            start.status.success(),
+            "daemon start exited non-zero: {start:?}"
+        );
+
+        let discovery = home
+            .path()
+            .join(".onebrain")
+            .join("run")
+            .join("daemon.json");
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let info = loop {
+            if let Ok(Some(info)) = crate::commands::daemon_client::DaemonInfo::read(&discovery) {
+                break info;
+            }
+            if Instant::now() >= deadline {
+                // `_teardown` stops the daemon (if any) on this panic.
+                panic!("daemon never published daemon.json");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        // The daemon bound the vault found by walking up from cwd: daemon.json
+        // records its canonical identity (NOT null / vault-less).
+        let expected = crate::commands::daemon_client::canonical_vault_id(vault.path());
+        assert!(expected.is_some(), "test vault must canonicalize");
+        assert_eq!(
+            info.vault, expected,
+            "daemon.json.vault must be the walked-up vault root (bare start must walk up cwd)"
         );
         // Teardown: `_teardown` (StopDaemonOnDrop) stops the daemon on every
         // exit path, the failing-assert ones included.
