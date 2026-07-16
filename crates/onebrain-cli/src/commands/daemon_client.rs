@@ -595,12 +595,12 @@ impl DaemonHandle {
     /// can't optimize", so the client gets `Ok(None)` and skips the
     /// optimization (inlines as today). Only a live route answers `Ok(Some)`.
     ///
-    /// `content_hash`/`bytes` carry the hash + size of the EXACT bytes the
-    /// caller is about to deliver (design §3b): when present, the daemon keys
-    /// the ledger on THIS hash instead of deriving one from the index, so a doc
-    /// edited on disk but not reindexed is correctly re-delivered. Absent (the
-    /// read-hook path, which only has a path) → the daemon derives the hash from
-    /// the engine as before.
+    /// `bytes` carries the size of the body the caller is about to deliver, so
+    /// the daemon can credit `bytes_saved` on a reference. `content_hash` lets a
+    /// caller pin the ledger key to a specific hash; as of #255 every live caller
+    /// (the read-hook AND the `get` surfaces) sends it as `None`, so the daemon
+    /// derives the key from its own engine (`Engine::doc_hash`) — the shared
+    /// raw-file identity that lets the surfaces collide on one ledger entry.
     pub fn token_ledger_check(
         &self,
         path: &str,

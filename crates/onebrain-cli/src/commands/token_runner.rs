@@ -25,7 +25,6 @@ use std::path::PathBuf;
 use onebrain_core::config::{StripFrontmatter, TokenOptimizationConfig};
 use onebrain_core::path::ResolvedVault;
 use onebrain_token::{
-    content_hash,
     estimate::ModelFamily,
     gain::{GainSink, JsonlGainWriter, Surface},
     run_funnel, FrontmatterPolicy, GainEvent, LedgerVerdict, OptLevel, Payload, ReferenceEnvelope,
@@ -268,53 +267,73 @@ pub fn doc_signal_marker(signals: &[Signal], doc_path: &str) -> Option<String> {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Direct-mode ledger check: no daemon, so open `token.redb` in-process and run
-/// the ledger against a hash of the EXACT `content` about to be delivered
-/// (design §3b/§5d). Returns the reference envelope only on an `unchanged`
-/// verdict (records the send on first/changed). `None` on no session token, no
-/// collection, or any error → the caller inlines the full body.
+/// the ledger against the doc's raw-file identity hash (`doc_hash`, the same key
+/// the read-hook keys on — design §3b/§5d, issue #255). Returns the reference
+/// envelope only on an `unchanged` verdict (records the send on first/changed).
+/// `None` on no session token, no collection, or any error → the caller inlines
+/// the full body. `content` is still passed so `bytes_saved` credits the exact
+/// body the reference stood in for.
 ///
-/// Hashing the delivered bytes — not the index hash — is what fixes the
-/// "edited on disk, not yet reindexed" window: an out-of-band edit changes the
-/// content hash, so the ledger reads `Changed` and re-delivers the new body
-/// even though the stale index entry is unchanged.
+/// **Cross-surface unification (#255):** keying on `doc_hash` — the raw-file
+/// identity captured at index time — instead of a hash of the reconstructed/
+/// delivered body is what makes the `get` surfaces share ONE ledger entry with
+/// the read-hook `token check` (which already keys on `doc_hash`). Before this,
+/// each surface hashed a different byte-string for the same doc, so the two
+/// ledgers never collided and cross-surface dedup silently never fired.
+///
+/// **`doc_hash == None` (unindexed doc):** skip the ledger entirely and inline
+/// the full body. With no raw-file identity there is no cross-surface entry to
+/// share (the read-hook would `Allow` such a doc too), so recording under some
+/// other fallback hash would only ever match another `get`, never the read-hook
+/// — dead weight. Never unwrap; a `None` here is a clean "inline it."
 pub fn direct_ledger_reference(
     resolved: &ResolvedVault,
     doc_path: &str,
+    doc_hash: Option<&str>,
     content: &str,
 ) -> Option<ReferenceEnvelope> {
+    // No index identity → skip the ledger and inline (never a hard deny for a
+    // doc we can't fingerprint). This is the safe-failure floor: the ledger
+    // only ever gates on a genuine identity match.
+    let hash = doc_hash?;
     let session = resolve_session_token_opt()?;
     let db_path = token_db_path(resolved)?;
-    let hash = content_hash(content);
     // Per-call open: redb's non-blocking exclusive flock means two concurrent
     // tool calls can make one open silently no-op — but it FAILS SAFE (full
     // body, never a wrong answer). A shared cache handle is a v3.4.11 follow-up.
     let cache = TokenCache::open(&db_path).ok()?;
     let ledger = cache.ledger();
-    match ledger.check(&session, doc_path, &hash).ok()? {
+    match ledger.check(&session, doc_path, hash).ok()? {
         LedgerVerdict::Unchanged { sent_hash } => Some(ReferenceEnvelope::new(
             doc_path,
             sent_hash,
             content.len() as u64,
         )),
         LedgerVerdict::FirstSend | LedgerVerdict::Changed => {
-            let _ = ledger.record(&session, doc_path, &hash);
+            let _ = ledger.record(&session, doc_path, hash);
             None
         }
     }
 }
 
-/// Daemon-mode ledger check: the daemon owns `token.redb`, so POST the
-/// delivered-content hash + body size to `/api/token/ledger/check` (which
-/// enforces the M3 level gate) and read back the reference on `unchanged`.
-/// `None` on a 404 (old daemon), non-`unchanged` verdict, or any error.
+/// Daemon-mode ledger check: the daemon owns `token.redb`, so POST to
+/// `/api/token/ledger/check` (which enforces the M3 level gate) and read back
+/// the reference on `unchanged`. `None` on a 404 (old daemon), non-`unchanged`
+/// verdict, or any error.
+///
+/// **Cross-surface unification (#255):** send NO `content_hash`, so the daemon
+/// derives the key from its own engine (`Engine::doc_hash`) — the SAME raw-file
+/// identity the read-hook produces when it routes to the daemon (it also sends
+/// no hash). That shared key is what lets a `get` and a later `token check` of
+/// the same doc collide on one ledger entry. The delivered body size still
+/// rides along (`content.len()`) so `bytes_saved` credits the real body.
 pub fn daemon_ledger_reference(
     handle: &DaemonHandle,
     doc_path: &str,
     content: &str,
 ) -> Option<ReferenceEnvelope> {
-    let hash = content_hash(content);
     let value = handle
-        .token_ledger_check(doc_path, Some(&hash), Some(content.len() as u64), true)
+        .token_ledger_check(doc_path, None, Some(content.len() as u64), true)
         .ok()??;
     if value.get("verdict").and_then(|v| v.as_str()) != Some("unchanged") {
         return None;

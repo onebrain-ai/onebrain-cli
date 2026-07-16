@@ -11,7 +11,9 @@ use serde::Serialize;
 
 use crate::cli::SearchGetArgs;
 use crate::commands::daemon_client::DaemonHandle;
-use crate::commands::search_common::{map_daemon_error, open_engine, route_to_daemon};
+use crate::commands::search_common::{
+    map_daemon_error, normalize_doc_path, open_engine, route_to_daemon,
+};
 use crate::commands::token_runner;
 use crate::output::{emit, Envelope, OutputMode};
 use onebrain_token::gain::Surface;
@@ -60,13 +62,19 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchGetArgs)
     // Only when it serves this exact vault; else fall through to a direct open.
     // Captured once so the ledger check below reuses the same backend decision.
     let daemon = route_to_daemon(&resolved);
-    let content = if let Some(handle) = &daemon {
-        get_via_daemon(handle, &doc_path)?
+    // `doc_hash` is the raw-file identity the already-sent ledger keys on
+    // (issue #255) — captured from the SAME engine that serves the body so the
+    // read-hook (which keys on `doc_hash`) shares the entry. In daemon mode this
+    // process holds no engine, so `None` here means the daemon derives it.
+    let (content, doc_hash) = if let Some(handle) = &daemon {
+        (get_via_daemon(handle, &doc_path)?, None)
     } else {
         let (engine, _resolved) = open_engine(vault_flag)?;
-        engine
+        let content = engine
             .get(&doc_path)
-            .map_err(|e| anyhow::anyhow!("{e}\n{NOT_INDEXED_HINT}"))?
+            .map_err(|e| anyhow::anyhow!("{e}\n{NOT_INDEXED_HINT}"))?;
+        let doc_hash = engine.doc_hash(&doc_path);
+        (content, doc_hash)
     };
 
     // Level (per-call `--opt-level` > config > default); a bad `--opt-level` is
@@ -81,12 +89,18 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchGetArgs)
     // §3b/§3c/§5d): a repeat, unchanged `search get --output json` returns a
     // reference instead of the body; `--force` bypasses the ledger and always
     // delivers the full body (it's the reference's re-materialize target). The
-    // ledger keys on a hash of the delivered `content`, so an out-of-band edit
-    // is caught. Human TTY always gets the full body (never a reference).
+    // ledger keys on the doc's raw-file identity (`doc_hash`), unified with the
+    // read-hook so the two surfaces share one entry (#255). Human TTY always
+    // gets the full body (never a reference).
     let reference = if mode.is_structured() && !args.force && level >= OptLevel::Balanced {
         match &daemon {
             Some(handle) => token_runner::daemon_ledger_reference(handle, &doc_path, &content),
-            None => token_runner::direct_ledger_reference(&resolved, &doc_path, &content),
+            None => token_runner::direct_ledger_reference(
+                &resolved,
+                &doc_path,
+                doc_hash.as_deref(),
+                &content,
+            ),
         }
     } else {
         None
@@ -172,17 +186,6 @@ fn is_outside_vault(input: &str, vault_root: &std::path::Path) -> bool {
     p.is_absolute() && p.strip_prefix(vault_root).is_err()
 }
 
-/// Normalize a user-supplied doc path to the index's key form: absolute
-/// paths under the vault root are made vault-relative, `./` prefixes are
-/// stripped, and platform back-slashes become forward slashes. Anything
-/// else is passed through unchanged.
-fn normalize_doc_path(input: &str, vault_root: &std::path::Path) -> String {
-    let p = std::path::Path::new(input);
-    let rel = p.strip_prefix(vault_root).unwrap_or(p);
-    let s = rel.to_string_lossy().replace('\\', "/");
-    s.trim_start_matches("./").to_string()
-}
-
 fn render_text(env: &Envelope<SearchGetData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     // Structured output can carry a reference (already-sent) instead of a body;
@@ -201,28 +204,6 @@ fn render_text(env: &Envelope<SearchGetData>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn normalize_strips_vault_root_and_dot_prefix() {
-        let root = std::path::Path::new("/vault/ob-1");
-        assert_eq!(
-            normalize_doc_path("/vault/ob-1/00-inbox/note.md", root),
-            "00-inbox/note.md"
-        );
-        assert_eq!(
-            normalize_doc_path("./00-inbox/note.md", root),
-            "00-inbox/note.md"
-        );
-        assert_eq!(
-            normalize_doc_path("00-inbox/note.md", root),
-            "00-inbox/note.md"
-        );
-        // Absolute path OUTSIDE the vault passes through unchanged.
-        assert_eq!(
-            normalize_doc_path("/elsewhere/x.md", root),
-            "/elsewhere/x.md"
-        );
-    }
 
     #[test]
     fn is_outside_vault_detects_absolute_paths_not_under_root() {

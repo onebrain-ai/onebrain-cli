@@ -233,15 +233,23 @@ struct LedgerCheckRequest {
     /// so the NEXT repeat read is caught. Default `false` (pure check).
     #[serde(default)]
     record: bool,
-    /// Hash of the EXACT bytes the caller is about to deliver (design §3b).
-    /// When present the ledger keys on THIS hash — reflecting delivered-vs-
-    /// current content — instead of the stored index hash, so a doc edited on
-    /// disk but not yet reindexed is correctly re-delivered. Absent (the
-    /// read-hook, which only has a path) → derive the hash from the engine.
+    /// **Dormant escape-hatch — every live caller sends `None`.** As of #255 the
+    /// ledger keys on the doc's index identity (`Engine::doc_hash`) for the
+    /// read-hook AND both `get` surfaces, so all three share one entry. When
+    /// present, this pins the ledger key to THIS hash instead of the derived
+    /// `doc_hash`.
+    ///
+    /// ⚠️ TRAP: sending a `content_hash` re-forks the ledger key away from the
+    /// read-hook's `doc_hash` key, silently reintroducing the cross-surface
+    /// dedup gap #255 fixes — a `get` keyed on a bespoke hash will never collide
+    /// with a later `token check` keyed on `doc_hash`. Only set it if you
+    /// understand that and deliberately want per-caller (non-shared) keying.
     #[serde(default)]
     content_hash: Option<String>,
-    /// Size of those bytes, credited to `bytes_saved` on an `unchanged`
-    /// verdict when `content_hash` is supplied (avoids a second engine read).
+    /// Size of the delivered body, credited to `bytes_saved` on an `unchanged`
+    /// verdict (avoids a second engine read). Sent by the `get` surfaces
+    /// alongside `content_hash: None`; the read-hook omits it (0 → best-effort
+    /// engine read).
     #[serde(default)]
     bytes: Option<u64>,
 }
@@ -265,13 +273,15 @@ async fn post_ledger_check(
         return Err(ApiError::BadRequest("empty path".to_string()));
     }
 
+    let vault_root = require_vault_root(&state)?;
+
     // M3 — server-side level gate (design §3b): the already-sent ledger only
     // activates at `balanced`/`aggressive`. At `off`/`conservative` the route
     // must NEVER touch the ledger or emit a reference envelope — so a
     // conservative vault (the default) can't hand back references. Gated here,
     // before the cache/session checks, so it holds no matter which client
     // (MCP get, CLI, read-hook) calls the route.
-    let level = resolve_level(require_vault_root(&state)?);
+    let level = resolve_level(vault_root);
     if !ledger_active_for_level(&level) {
         return Ok(Json(LedgerCheckResponse {
             verdict: "inactive".to_string(),
@@ -279,6 +289,14 @@ async fn post_ledger_check(
         })
         .into_response());
     }
+
+    // Normalize the incoming path to the index's vault-relative key form. The
+    // read-hook's daemon leg sends an ABSOLUTE path (Claude Code's Read passes
+    // absolute), while `search get` records the RELATIVE path; the daemon is
+    // vault-bound, so normalize against its own root here — one shared
+    // normalizer with every other ledger surface, so the key `(session, path,
+    // hash)` collides across surfaces (#255). Idempotent on a relative path.
+    let path = crate::commands::search_common::normalize_doc_path(&req.path, vault_root);
 
     let cache = require_token_cache(&state)?;
 
@@ -292,18 +310,21 @@ async fn post_ledger_check(
     }
 
     let engine = state.search_engine.clone();
-    let path = req.path.clone();
     let session = req.session_token.clone();
     let record = req.record;
     let provided_hash = req.content_hash.clone();
     let provided_bytes = req.bytes;
 
     let response = tokio::task::spawn_blocking(move || -> Result<LedgerCheckResponse, ApiError> {
-        // Prefer the caller's delivered-content hash (reflects the exact bytes
-        // being sent — the fix for the "edited on disk, not reindexed" window).
-        // Absent (the read-hook) → derive from the engine; unknown/unindexed doc
-        // then can't be compared, so the ledger can't claim "unchanged".
+        // Key on the doc's index identity (`Engine::doc_hash`) — the shared key
+        // every live caller (read-hook AND both get surfaces) relies on, so a
+        // `get` and a later `token check` of the same doc collide on ONE entry
+        // (#255). An unknown/unindexed doc yields no hash, so the ledger can't
+        // claim "unchanged".
         let current_hash = match provided_hash {
+            // Dormant escape-hatch: a bespoke hash pins a per-caller key that
+            // does NOT share with the read-hook (see `LedgerCheckRequest
+            // ::content_hash`'s TRAP note). No live caller sets this.
             Some(h) => Some(h),
             None => match &engine {
                 Some(shared) => {
@@ -812,5 +833,83 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["verdict"], "unknown_doc");
+    }
+
+    /// #255 daemon-leg path normalization: record under the RELATIVE key, then
+    /// check with an ABSOLUTE path (exactly as the read-hook's daemon leg sends
+    /// it). The route must normalize it to the same relative key and read
+    /// `unchanged`. Before normalization the absolute path missed the relative
+    /// index key → `unknown_doc`, so the read-hook never gated via the daemon.
+    #[tokio::test]
+    async fn ledger_check_normalizes_absolute_path_to_relative_key() {
+        let (vault, cache) = vault_and_cache_at_level("balanced");
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        std::fs::write(
+            vault.path().join("a.md"),
+            "# A\nbody for the abs-path daemon test",
+        )
+        .unwrap();
+        let router = router_holding_cache(vault.path());
+        lex_reindex(&router).await;
+
+        // Record under the relative key.
+        let v = ledger_check(
+            &router,
+            r#"{"path":"a.md","session_token":"sess-1","record":true}"#,
+        )
+        .await;
+        assert_eq!(v["verdict"], "first_send");
+
+        // Check with the ABSOLUTE path → must normalize to "a.md" and match.
+        let abs = vault.path().join("a.md");
+        let body = serde_json::json!({
+            "path": abs.to_str().unwrap(),
+            "session_token": "sess-1",
+        })
+        .to_string();
+        let v = ledger_check(&router, &body).await;
+        assert_eq!(
+            v["verdict"], "unchanged",
+            "an absolute path must normalize to the recorded relative key and read unchanged"
+        );
+        assert_eq!(
+            v["reference"]["doc_path"], "a.md",
+            "the reference must report the normalized relative key"
+        );
+    }
+
+    /// The dormant `content_hash` escape-hatch keys the ledger on a BESPOKE hash,
+    /// NOT the doc's `doc_hash` — so a request that supplies one does NOT collide
+    /// with a `doc_hash`-keyed entry (the documented #255 trap). Guards against a
+    /// future change that would silently re-share the key. Record via the normal
+    /// `doc_hash` path, then a `content_hash`-bearing check of the SAME doc must
+    /// NOT read `unchanged`.
+    #[tokio::test]
+    async fn ledger_check_content_hash_does_not_collide_with_doc_hash_entry() {
+        let (vault, cache) = vault_and_cache_at_level("balanced");
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        std::fs::write(vault.path().join("a.md"), "# A\nbody for the trap test").unwrap();
+        let router = router_holding_cache(vault.path());
+        lex_reindex(&router).await;
+
+        // Record under the doc's `doc_hash` (no content_hash).
+        let v = ledger_check(
+            &router,
+            r#"{"path":"a.md","session_token":"sess-1","record":true}"#,
+        )
+        .await;
+        assert_eq!(v["verdict"], "first_send");
+
+        // A content_hash-bearing check keys on the BESPOKE hash → does NOT match
+        // the doc_hash entry → not `unchanged` (the documented trap).
+        let v = ledger_check(
+            &router,
+            r#"{"path":"a.md","session_token":"sess-1","content_hash":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}"#,
+        )
+        .await;
+        assert_ne!(
+            v["verdict"], "unchanged",
+            "a bespoke content_hash must NOT collide with the doc_hash-keyed entry (the #255 trap)"
+        );
     }
 }

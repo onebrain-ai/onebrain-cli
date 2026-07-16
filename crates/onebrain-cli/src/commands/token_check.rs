@@ -43,7 +43,7 @@ use onebrain_core::path::ResolvedVault;
 use onebrain_token::{CacheKind, GainEvent, OptLevel, ReferenceEnvelope, Surface};
 
 use crate::commands::daemon_client::{self, DaemonHandle};
-use crate::commands::search_common::{daemon_routing_disabled, open_engine};
+use crate::commands::search_common::{daemon_routing_disabled, normalize_doc_path, open_engine};
 use crate::commands::token_runner::{record_gain, resolve_session_token_opt, token_db_path};
 
 /// Hard wall-clock budget for the whole daemon round-trip (design §5b:
@@ -197,6 +197,16 @@ fn query_daemon_leg_with_deadline(vault_root: PathBuf, path: String) -> DaemonLe
 /// token cache, no resolvable session token, or a ledger error all resolve to a
 /// tagged `FailOpen`. A gate must never block a read on infrastructure trouble.
 fn check_direct(resolved: &ResolvedVault, path: &str) -> CheckOutcome {
+    // Normalize the incoming path to the index's vault-relative key form BEFORE
+    // any engine/ledger lookup. The read-hook is invoked with an ABSOLUTE path
+    // (Claude Code's Read tool always passes absolute), but the index and the
+    // ledger key both use the vault-RELATIVE path `search get` records. Without
+    // this, `engine.doc_hash`/`engine.get` miss the relative key (→ Allow: the
+    // gate silently never fires in production) AND the ledger key never collides
+    // across surfaces (#255). Idempotent on an already-relative path.
+    let normalized = normalize_doc_path(path, resolved.root.as_path());
+    let path = normalized.as_str();
+
     // M3 gate: read the vault's configured optimization level. An unreadable
     // config defaults to `off` (< balanced → ledger inactive → safe), matching
     // the daemon route's own conservative-on-error fallback.
@@ -865,5 +875,218 @@ mod tests {
             }
             other => panic!("expected an Unchanged reference envelope, got {other:?}"),
         }
+    }
+
+    // ── #255 cross-surface unification (get side ↔ read-hook) ──────────────
+
+    /// **The #255 cross-surface e2e — realistic path skew.** In ONE session: the
+    /// CLI `search get` records the send under the vault-RELATIVE key it
+    /// normalizes to, then the read-hook `token check` is invoked with an
+    /// ABSOLUTE path (exactly as Claude Code's Read tool passes it) and must
+    /// STILL gate (exit 2). This needs BOTH halves of the key `(session,
+    /// doc_path, hash)` to agree: the read-hook normalizes the absolute path to
+    /// the same relative key AND both surfaces key the hash on `Engine::doc_hash`.
+    ///
+    /// Two pre-#255 gaps this pins, both → a first-send Allow (exit 0):
+    /// 1. HASH skew — the get side recorded `content_hash(engine.get(path))`
+    ///    (reconstructed body, headings stripped) while `token check` keyed on
+    ///    `doc_hash` (raw file bytes) — different hashes.
+    /// 2. PATH skew — the read-hook keyed on the raw ABSOLUTE path, which misses
+    ///    the relative index key entirely (`doc_hash` → `None` → Allow) and never
+    ///    matches `search get`'s relative ledger path.
+    ///
+    /// RED before the fix (exit 0); GREEN after (shared relative key + shared
+    /// `doc_hash` → exit 2).
+    #[cfg(unix)]
+    #[test]
+    fn search_get_then_read_hook_share_one_ledger_entry() {
+        let (vault, cache) = balanced_vault();
+        let home = tempfile::tempdir().unwrap(); // no daemon.json under here
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", home.path().as_os_str()),
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")),
+            ("CLAUDE_CODE_SESSION_ID", std::ffi::OsStr::new("xSurf255")),
+        ]);
+        // A heading + body: the chunker drops the heading line from the chunk
+        // text, so the reconstructed body (`engine.get`) is provably ≠ the raw
+        // file bytes — the exact pre-#255 hash divergence this test pins.
+        index_doc_lex_only(
+            vault.path(),
+            "a.md",
+            "# A\nshared-ledger cross-surface body text",
+        );
+
+        // Build the read-hook's absolute path from the RESOLVED root (what the
+        // CLI resolves the vault to) so it is a genuine child of the same root
+        // `normalize_doc_path` strips against — mirroring the real Read tool,
+        // which passes an absolute path under the actual vault root.
+        let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
+        let abs = resolved.root.as_path().join("a.md");
+        let abs = abs.to_str().unwrap();
+
+        // Surface A — CLI `search get --output json` records the send under the
+        // relative key `a.md`, keyed on the doc's `doc_hash`.
+        crate::commands::search_get::run(
+            Some(vault.path().to_path_buf()),
+            &crate::output::OutputMode::Json { pretty: false },
+            &crate::cli::SearchGetArgs {
+                doc_path: "a.md".to_string(),
+                force: false,
+                opt_level: None,
+            },
+        )
+        .expect("search get should succeed");
+
+        // Surface B — the read-hook, invoked with the ABSOLUTE path, must
+        // normalize to the same relative key, find A's entry, and GATE the read.
+        assert_eq!(
+            run(Some(vault.path().to_path_buf()), abs).expect("run should not error"),
+            2,
+            "search get (relative) + read-hook (ABSOLUTE) of the same unchanged doc \
+             must share one ledger entry and GATE the read (exit 2) — the #255 fix"
+        );
+
+        // The deny carries the frozen reference envelope (design contract: a deny
+        // ALWAYS offers a `--force` re-materialize path). Re-derive the same
+        // Direct verdict the deny produced — passing the ABSOLUTE path again — and
+        // assert the envelope reports the NORMALIZED relative key.
+        match check_direct(&resolved, abs) {
+            CheckOutcome::Unchanged(env) => {
+                assert_eq!(
+                    env.doc_path, "a.md",
+                    "envelope must report the relative key"
+                );
+                assert!(
+                    !env.hash.is_empty(),
+                    "a real indexed doc has a content hash"
+                );
+                assert!(env.sent_earlier);
+                assert_eq!(env.rematerialize, "onebrain search get a.md --force");
+            }
+            other => panic!("expected an Unchanged reference envelope, got {other:?}"),
+        }
+    }
+
+    /// A read-hook `token check` invoked with an ABSOLUTE path must resolve the
+    /// SAME index identity as the relative key — normalization maps the absolute
+    /// Read-tool path onto the vault-relative index key. Proves the path half of
+    /// the #255 unification directly at the engine level (and that the raw
+    /// absolute path misses — the reason normalization is required).
+    #[cfg(unix)]
+    #[test]
+    fn absolute_path_resolves_same_doc_hash_as_relative_key() {
+        let (vault, cache) = balanced_vault();
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", home.path().as_os_str()),
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")),
+            ("CLAUDE_CODE_SESSION_ID", std::ffi::OsStr::new("xAbs255")),
+        ]);
+        index_doc_lex_only(vault.path(), "a.md", "# A\nbody for the abs-path test");
+
+        let (engine, resolved) =
+            crate::commands::search_common::open_engine(Some(vault.path().to_path_buf())).unwrap();
+        let root = resolved.root.as_path();
+        let abs = root.join("a.md");
+        let abs = abs.to_str().unwrap();
+
+        let rel_hash = engine.doc_hash("a.md");
+        assert!(rel_hash.is_some(), "the relative key resolves a doc_hash");
+        // Normalizing the absolute path resolves the SAME identity.
+        let normalized = normalize_doc_path(abs, root);
+        assert_eq!(
+            engine.doc_hash(&normalized),
+            rel_hash,
+            "a normalized absolute path must resolve the SAME index identity as the relative key"
+        );
+        // The RAW absolute path misses — index keys are vault-relative. This is
+        // precisely why the read-hook must normalize (#255).
+        assert!(
+            engine.doc_hash(abs).is_none(),
+            "the raw absolute path must NOT resolve — this is the miss #255 fixes"
+        );
+    }
+
+    /// `doc_hash == None` (unindexed doc) must make `direct_ledger_reference`
+    /// SKIP the ledger — inline the full body, record NOTHING, never unwrap. Proof
+    /// it recorded nothing: a subsequent read-hook check of the same doc is still
+    /// a first-send Allow (exit 0), not a gate.
+    #[cfg(unix)]
+    #[test]
+    fn direct_ledger_reference_skips_when_doc_hash_none() {
+        let (vault, cache) = balanced_vault();
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", home.path().as_os_str()),
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")),
+            ("CLAUDE_CODE_SESSION_ID", std::ffi::OsStr::new("xNone255")),
+        ]);
+        index_doc_lex_only(vault.path(), "a.md", "# A\nbody for the none-fallback test");
+        let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
+
+        // None doc_hash → skip: returns None (inline the body) without touching
+        // the ledger.
+        assert!(
+            crate::commands::token_runner::direct_ledger_reference(
+                &resolved,
+                "a.md",
+                None,
+                "body for the none-fallback test",
+            )
+            .is_none(),
+            "doc_hash=None must skip the ledger and inline, never unwrap"
+        );
+
+        // It must not have RECORDED anything: the very next read-hook check of the
+        // real, indexed doc is a fresh first-send Allow, not a gate.
+        assert_eq!(
+            run(Some(vault.path().to_path_buf()), "a.md").expect("run should not error"),
+            0,
+            "a skipped (doc_hash=None) call must record no ledger entry"
+        );
+    }
+
+    /// Safe-failure invariant (#255): when the doc's indexed content CHANGES
+    /// after a send was recorded, the read-hook must re-deliver (verdict
+    /// `Changed` → Allow, exit 0) — the ledger NEVER hard-denies content the
+    /// agent hasn't seen. Record H0, reindex the doc to a new `doc_hash` H1, then
+    /// check: H1 ≠ recorded H0 → Changed → Allow, not a stale deny.
+    #[cfg(unix)]
+    #[test]
+    fn changed_indexed_content_re_delivers_never_denies_unseen() {
+        let (vault, cache) = balanced_vault();
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", home.path().as_os_str()),
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")),
+            ("CLAUDE_CODE_SESSION_ID", std::ffi::OsStr::new("xChg255")),
+        ]);
+        index_doc_lex_only(vault.path(), "a.md", "# A\noriginal body content");
+
+        // First read-hook check records the ORIGINAL doc_hash (H0) → Allow.
+        assert_eq!(
+            run(Some(vault.path().to_path_buf()), "a.md").expect("run should not error"),
+            0,
+            "first check is a first-send Allow (records H0)"
+        );
+
+        // Reindex the doc with entirely new bytes → its doc_hash flips to H1.
+        index_doc_lex_only(
+            vault.path(),
+            "a.md",
+            "# A\nCOMPLETELY DIFFERENT body — reindexed",
+        );
+
+        // The read-hook now sees H1 ≠ recorded H0 → Changed → ALLOW (re-deliver),
+        // never a stale deny of content the agent has not been shown.
+        assert_eq!(
+            run(Some(vault.path().to_path_buf()), "a.md").expect("run should not error"),
+            0,
+            "changed indexed content must re-deliver (Changed→Allow), never deny unseen content"
+        );
     }
 }

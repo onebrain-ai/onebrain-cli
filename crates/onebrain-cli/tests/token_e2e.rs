@@ -316,11 +316,19 @@ fn token_flow_query_get_reference_force_and_gain() {
         "forced get must bypass the ledger (full body, not a reference)"
     );
 
-    // 6b. BLOCKING-1 regression: edit note.md ON DISK without reindexing, then
-    // get again. The ledger keys on a hash of the delivered (disk) bytes, so the
-    // edit must read as CHANGED → the full NEW body, never a stale "unchanged"
-    // reference. (The prior get(id 12) was forced, so it did NOT re-record; the
-    // last recorded hash is still the ORIGINAL body from id 10.)
+    // 6b. #255 index-identity keying: the already-sent ledger now keys on the
+    // doc's INDEX identity (`Engine::doc_hash`, the raw file bytes captured at
+    // index time), UNIFIED with the read-hook — not a hash of the delivered disk
+    // bytes. So an out-of-band DISK edit that is NOT reindexed leaves `doc_hash`
+    // unchanged, and a repeat whole-doc get still returns an already-sent
+    // REFERENCE; the edit is reflected only after a reindex flips the index hash.
+    // (Agent-driven edits go through the PostToolUse search-reindex hook, which
+    // DOES reindex, so this stale window only applies to truly out-of-band edits;
+    // the reference's `--force` re-materializes the live disk body regardless.)
+    // The prior get(id 12) was forced, so it did NOT re-record — the last
+    // recorded hash is still H0 from id 10, which equals the (unchanged) index
+    // hash, so the ledger reads UNCHANGED. Pre-#255 this asserted the NEW body;
+    // that split the get key from the read-hook, the bug #255 fixes.
     write(
         vault.path(),
         "note.md",
@@ -334,12 +342,13 @@ fn token_flow_query_get_reference_force_and_gain() {
         deadline,
     );
     assert!(
-        after_edit.contains("EDITED OUT OF BAND"),
-        "an out-of-band edit (no reindex) must deliver the NEW body, not a stale reference: {after_edit}"
+        after_edit.contains("sent_earlier"),
+        "an out-of-band edit without reindex leaves the index hash unchanged, so a \
+         repeat get is still an already-sent reference (index-identity keying, #255): {after_edit}"
     );
     assert!(
-        !after_edit.contains("sent_earlier"),
-        "edited doc must NOT come back as an already-sent reference: {after_edit}"
+        after_edit.contains("--force"),
+        "the reference must embed the --force re-materialize path to recover the live body: {after_edit}"
     );
 
     // 6c. BLOCKING-2: a get on a doc bigger than the balanced get_cap truncates
