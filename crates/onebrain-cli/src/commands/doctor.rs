@@ -330,6 +330,7 @@ fn all_checks(vault_root: &Path, config: &onebrain_core::VaultConfig) -> Vec<Doc
     results.push(config_values_check(vault_root));
     results.push(search_exclude_check(vault_root));
     results.push(token_optimization_check(vault_root));
+    results.push(read_hook_failopen_check(vault_root));
     results.push(native_search_check(vault_root));
     results.push(legacy_index_stub_check(vault_root));
     results.push(qmd_leftovers_check_prod(config));
@@ -831,6 +832,131 @@ fn token_optimization_check(vault_root: &Path) -> DoctorResult {
         "token_optimization block not set — token-opt config is undocumented and un-tunable",
     )
     .with_hint("Run onebrain doctor --fix to insert the token_optimization block")
+}
+
+const READ_HOOK_FAILOPEN_CHECK: &str = "read-hook-failopen";
+/// Rolling window (days) over which the read-hook fail-open rate is measured.
+const FAILOPEN_WINDOW_DAYS: i64 = 7;
+/// Minimum read-hook events in the window before the rate is trustworthy — a
+/// cold start (few reads) is not degradation, so stay silent below this.
+const FAILOPEN_MIN_SAMPLE: usize = 20;
+/// Fail-open fraction at/above which the gate is treated as silently inert.
+const FAILOPEN_WARN_RATIO: f64 = 0.95;
+
+/// Verdict of the pure read-hook fail-open classifier — separated from the
+/// filesystem read so the ratio logic is unit-testable without a vault.
+#[derive(Debug, PartialEq)]
+enum FailopenVerdict {
+    /// Enough samples and the fail-open rate is under the inert threshold.
+    Healthy,
+    /// Too few read-hook events in the window to judge (never warn on a cold
+    /// start — that's not degradation).
+    InsufficientSample,
+    /// Nearly every read fails open — the gate is registered but effectively
+    /// doing nothing (the #264 silent-inert condition the field test hit).
+    Inert { ratio: f64 },
+}
+
+/// Classify a window's read-hook counts. Pure: no I/O, no clock.
+fn classify_failopen(total: usize, failopen: usize) -> FailopenVerdict {
+    if total < FAILOPEN_MIN_SAMPLE {
+        return FailopenVerdict::InsufficientSample;
+    }
+    let ratio = failopen as f64 / total as f64;
+    if ratio >= FAILOPEN_WARN_RATIO {
+        FailopenVerdict::Inert { ratio }
+    } else {
+        FailopenVerdict::Healthy
+    }
+}
+
+/// Read-hook silent-inert detector (`check = "read-hook-failopen"`, #264
+/// sub-fix C). When the ledger gate is ENABLED (`token_optimization.read_hook:
+/// ledger`) but nearly every read-hook decision fails open over the last
+/// [`FAILOPEN_WINDOW_DAYS`] days, the gate is registered yet doing nothing —
+/// exactly the v3.4.12 field condition (25× `engine_open_error` + timeout
+/// fail-opens, ~0 savings). Reads the on-disk gain JSONL only (never the
+/// daemon), so it works regardless of daemon state. Advisory (`warn`) — nothing
+/// is broken, the optimization is just inert. Off vaults / thin samples are a
+/// quiet `ok`.
+fn read_hook_failopen_check(vault_root: &Path) -> DoctorResult {
+    use crate::commands::search_common::{collection_cache_dir, collection_name_readonly};
+    use onebrain_core::config::ReadHookMode;
+    use onebrain_core::load_vault_config;
+    use onebrain_token::gain::JsonlGainWriter;
+    use onebrain_token::{CacheKind, Surface};
+
+    // Resolve the vault read-only; an unresolvable vault/collection is the
+    // search checks' territory, so skip quietly rather than warn.
+    let resolved = match crate::vault_ctx::require(Some(vault_root.to_path_buf())) {
+        Ok(r) => r,
+        Err(_) => return DoctorResult::ok(READ_HOOK_FAILOPEN_CHECK, "skipped — vault unresolved"),
+    };
+
+    // Only meaningful when the gate is actually enabled — an off vault (the
+    // product default) has nothing to assess.
+    let enabled = load_vault_config(&resolved.root)
+        .map(|c| c.token_optimization.read_hook == ReadHookMode::Ledger)
+        .unwrap_or(false);
+    if !enabled {
+        return DoctorResult::ok(
+            READ_HOOK_FAILOPEN_CHECK,
+            "read_hook gate off — not applicable",
+        );
+    }
+
+    let collection = match collection_name_readonly(resolved.root.as_path()) {
+        Ok(c) => c,
+        Err(_) => {
+            return DoctorResult::ok(READ_HOOK_FAILOPEN_CHECK, "skipped — no collection resolved")
+        }
+    };
+    let gain_dir = collection_cache_dir(&collection).join("token").join("gain");
+    let events = JsonlGainWriter::new(&gain_dir)
+        .read_all()
+        .unwrap_or_default();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let cutoff = now - FAILOPEN_WINDOW_DAYS * 86_400;
+    let (mut total, mut failopen) = (0usize, 0usize);
+    for e in &events {
+        if e.surface == Surface::ReadHook && e.ts >= cutoff {
+            total += 1;
+            if e.cache == CacheKind::HookFailopen {
+                failopen += 1;
+            }
+        }
+    }
+
+    match classify_failopen(total, failopen) {
+        FailopenVerdict::Healthy => DoctorResult::ok(
+            READ_HOOK_FAILOPEN_CHECK,
+            format!("read-hook gate healthy — {failopen}/{total} fail-open over {FAILOPEN_WINDOW_DAYS}d"),
+        ),
+        FailopenVerdict::InsufficientSample => DoctorResult::ok(
+            READ_HOOK_FAILOPEN_CHECK,
+            format!(
+                "read-hook gate: too few samples to assess ({total} read(s) over {FAILOPEN_WINDOW_DAYS}d)"
+            ),
+        ),
+        FailopenVerdict::Inert { ratio } => DoctorResult::warn(
+            READ_HOOK_FAILOPEN_CHECK,
+            format!(
+                "read-hook gate is effectively inert — {:.0}% of reads fail open ({failopen}/{total} over {FAILOPEN_WINDOW_DAYS}d)",
+                ratio * 100.0
+            ),
+        )
+        .with_details(vec![
+            "the ledger gate is enabled but almost never produces a verdict — token savings are ~0".to_string(),
+            "common causes: the daemon is version-skewed or down, or the round-trip exceeds token_optimization.check_timeout_ms".to_string(),
+        ])
+        .with_hint(
+            "Check `onebrain daemon status` (restart a skewed daemon) and raise token_optimization.check_timeout_ms for slow/iCloud vaults",
+        ),
+    }
 }
 
 /// Map a daemon `/api/internal/status` JSON body into the
@@ -3264,6 +3390,7 @@ const DOCTOR_SECTIONS: [(&str, &str, &[&str]); 4] = [
         &[
             "orphan-checkpoints",
             "search",
+            "read-hook-failopen",
             "legacy-index-stub",
             "qmd-leftovers",
         ],
@@ -3289,6 +3416,7 @@ fn display_label(check: &str) -> &str {
         "claude-settings" => "claude settings",
         "orphan-checkpoints" => "checkpoints",
         "search" => "search",
+        "read-hook-failopen" => "read-hook gate",
         "legacy-index-stub" => "legacy index stub",
         "qmd-leftovers" => "qmd cleanup",
         other => other,
@@ -5372,6 +5500,156 @@ mod tests {
         );
     }
 
+    // ── #264 sub-fix C: read-hook silent-inert detector ────────────────────
+
+    #[test]
+    fn classify_failopen_pure_boundaries() {
+        // Below the min sample → never warn (cold start isn't degradation).
+        assert_eq!(
+            classify_failopen(FAILOPEN_MIN_SAMPLE - 1, FAILOPEN_MIN_SAMPLE - 1),
+            FailopenVerdict::InsufficientSample
+        );
+        assert_eq!(classify_failopen(0, 0), FailopenVerdict::InsufficientSample);
+        // At/above the min sample, 100% fail-open → inert.
+        assert!(matches!(
+            classify_failopen(FAILOPEN_MIN_SAMPLE, FAILOPEN_MIN_SAMPLE),
+            FailopenVerdict::Inert { .. }
+        ));
+        // Exactly the warn ratio (0.95 of 20 = 19) → inert (>= threshold).
+        assert!(matches!(
+            classify_failopen(20, 19),
+            FailopenVerdict::Inert { .. }
+        ));
+        // Just under the ratio (18/20 = 0.90) → healthy.
+        assert_eq!(classify_failopen(20, 18), FailopenVerdict::Healthy);
+    }
+
+    /// Append `total` read-hook gain events (of which `failopen` are
+    /// HookFailopen, the rest LedgerDeny) at NOW into `collection`'s gain JSONL.
+    fn seed_read_hook_gain(collection: &str, total: usize, failopen: usize) {
+        use onebrain_token::gain::JsonlGainWriter;
+        use onebrain_token::{CacheKind, GainEvent, OptLevel, Surface};
+        let dir = crate::commands::search_common::collection_cache_dir(collection)
+            .join("token")
+            .join("gain");
+        let w = JsonlGainWriter::new(&dir);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for i in 0..total {
+            let is_failopen = i < failopen;
+            w.append(&GainEvent {
+                ts: now,
+                surface: Surface::ReadHook,
+                transform: if is_failopen {
+                    "engine_busy"
+                } else {
+                    "ledger_deny"
+                }
+                .to_string(),
+                level: OptLevel::Balanced,
+                bytes_before: 100,
+                bytes_after: 10,
+                cache: if is_failopen {
+                    CacheKind::HookFailopen
+                } else {
+                    CacheKind::LedgerDeny
+                },
+                session_token: Some("s".to_string()),
+            })
+            .unwrap();
+        }
+    }
+
+    fn ledger_vault(collection: &str) -> tempfile::TempDir {
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            format!(
+                "search:\n  collection: {collection}\ntoken_optimization:\n  level: balanced\n  read_hook: ledger\n"
+            ),
+        )
+        .unwrap();
+        d
+    }
+
+    fn unique_collection(prefix: &str) -> String {
+        format!(
+            "{prefix}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    #[test]
+    fn read_hook_failopen_check_warns_when_gate_inert() {
+        // The #264 field condition: the gate is enabled but ~every read fails
+        // open → warn (silent-inert), with an actionable hint.
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let collection = unique_collection("failopen-inert");
+        let d = ledger_vault(&collection);
+        seed_read_hook_gain(&collection, 25, 25); // all fail-open
+
+        let r = read_hook_failopen_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Warn, "{r:?}");
+        assert!(r.message.contains("inert"), "{r:?}");
+        assert!(
+            r.hint.is_some(),
+            "an inert gate must offer a fix hint: {r:?}"
+        );
+    }
+
+    #[test]
+    fn read_hook_failopen_check_ok_when_gate_working() {
+        // Same enabled gate, but only 2/25 fail open (8%) → healthy, no warn.
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let collection = unique_collection("failopen-healthy");
+        let d = ledger_vault(&collection);
+        seed_read_hook_gain(&collection, 25, 2);
+
+        let r = read_hook_failopen_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
+        assert!(r.message.contains("healthy"), "{r:?}");
+    }
+
+    #[test]
+    fn read_hook_failopen_check_thin_sample_stays_quiet() {
+        // Below the min sample even at 100% fail-open → ok (cold start).
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let collection = unique_collection("failopen-thin");
+        let d = ledger_vault(&collection);
+        seed_read_hook_gain(&collection, 5, 5);
+
+        let r = read_hook_failopen_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
+        assert!(r.message.contains("too few samples"), "{r:?}");
+    }
+
+    #[test]
+    fn read_hook_failopen_check_not_applicable_when_gate_off() {
+        // read_hook default off → not applicable, even if fail-open events exist.
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let collection = unique_collection("failopen-off");
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            format!("search:\n  collection: {collection}\n"),
+        )
+        .unwrap();
+        seed_read_hook_gain(&collection, 25, 25);
+
+        let r = read_hook_failopen_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
+        assert!(r.message.contains("not applicable"), "{r:?}");
+    }
+
     #[test]
     fn native_search_check_warns_when_reranker_enabled_but_not_downloaded() {
         let cache = tempdir().unwrap();
@@ -5668,6 +5946,19 @@ mod tests {
                 .iter()
                 .any(|(_, _, checks)| checks.contains(&"legacy-index-stub")),
             "legacy-index-stub must be listed in DOCTOR_SECTIONS"
+        );
+    }
+
+    #[test]
+    fn read_hook_failopen_in_doctor_sections_and_display_label() {
+        // #264 sub-fix C: the new check must render in a section (not fall into
+        // the "Other" bucket) and carry a scannable label.
+        assert_eq!(display_label(READ_HOOK_FAILOPEN_CHECK), "read-hook gate");
+        assert!(
+            DOCTOR_SECTIONS
+                .iter()
+                .any(|(_, _, checks)| checks.contains(&READ_HOOK_FAILOPEN_CHECK)),
+            "read-hook-failopen must be listed in DOCTOR_SECTIONS"
         );
     }
 
