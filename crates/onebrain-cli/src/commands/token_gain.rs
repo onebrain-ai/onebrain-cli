@@ -1166,15 +1166,22 @@ mod tests {
     ) {
         let run_dir = home.join(".onebrain").join("run");
         std::fs::create_dir_all(&run_dir).unwrap();
+        let vault_id = daemon_client::canonical_vault_id(vault);
         let info = daemon_client::DaemonInfo {
             port,
             token: token.to_string(),
             pid: std::process::id(),
             version: version.to_string(),
-            vault: daemon_client::canonical_vault_id(vault),
+            vault: vault_id.clone(),
         };
+        // Write to the vault's SLOT (`daemon-<hash>.json`), computed from the
+        // explicit `home` so it doesn't depend on `$HOME` timing (v3.4.13, #230).
+        let stem = format!(
+            "daemon-{}",
+            onebrain_search::engine::short_path_hash(Path::new(&vault_id.unwrap()))
+        );
         std::fs::write(
-            run_dir.join("daemon.json"),
+            run_dir.join(format!("{stem}.json")),
             serde_json::to_vec_pretty(&info).unwrap(),
         )
         .unwrap();

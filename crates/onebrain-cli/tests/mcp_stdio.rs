@@ -70,7 +70,9 @@ fn stop_daemon(cache_dir: &Path, home: &Path) {
         .env("ONEBRAIN_CACHE_DIR", cache_dir)
         .env("HOME", home)
         .env("USERPROFILE", home)
-        .args(["daemon", "stop"])
+        // `--all`: the mcp server auto-started a PER-VAULT slot daemon (#230);
+        // a plain `stop` would target only the cwd's slot and miss it.
+        .args(["daemon", "stop", "--all"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

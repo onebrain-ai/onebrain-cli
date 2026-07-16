@@ -27,12 +27,19 @@
 //! guards concurrent starts, and idle-shuts-down. See
 //! `docs/decisions/0023-warm-daemon-mcp-search.md` + `docs/daemon.md`.
 //!
-//! ## Files (under `~/.onebrain/run/`)
-//! - `daemon.pid` — the running daemon's PID (one line, just the integer).
-//! - `daemon.log` — the detached child's stdout+stderr and `tracing` output.
-//! - `daemon.json` — discovery record (`port`/`token`/`pid`/`version`), written
-//!   after bind, removed on clean shutdown (see [`crate::commands::daemon_client`]).
-//! - `daemon.lock` — transient exclusive start lock (see [`acquire_start_lock`]).
+//! ## Files (under `~/.onebrain/run/`) — PER-VAULT slots (v3.4.13, #230)
+//! Every runtime file is keyed on the bound vault: `daemon-<hash>.*` for a vault
+//! (hash = `short_path_hash` of the canonical path), `daemon-none.*` for a
+//! vault-less daemon. The slot paths are resolved through the ONE shared resolver
+//! in [`crate::commands::daemon_client`] ([`daemon_client::slot_paths_for_id`]),
+//! so the daemon (writer) and clients (readers) can't drift.
+//! - `daemon-<hash>.pid` — the running daemon's PID (one line, just the integer).
+//! - `daemon-<hash>.log` — the detached child's stdout+stderr and `tracing` output.
+//! - `daemon-<hash>.json` — discovery record (`port`/`token`/`pid`/`version`/`vault`),
+//!   written after bind, removed on clean shutdown.
+//! - `daemon-<hash>.lock` — transient per-slot exclusive start lock (see
+//!   [`acquire_start_lock`]). Per-slot, so two DIFFERENT vaults starting
+//!   concurrently never serialize; same-vault concurrent starts still exclude.
 //!
 //! ## Concurrent-start guard (v3.4.6)
 //! `daemon start` takes an exclusive `O_EXCL`-create lock around the
@@ -50,6 +57,7 @@
 //!   through. A full start-time identity check (pid + process start-time in
 //!   `daemon.json`) is deferred to the v3.8 daemon refactor.
 
+use crate::commands::daemon_client::{self, DaemonInfo, SlotPaths};
 use crate::output::{emit, Envelope, OutputMode};
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -76,7 +84,7 @@ use std::path::{Path, PathBuf};
 /// Printing it to the user's own terminal is fine — the token already lives
 /// user-readable in `daemon.json` — but it must NEVER be written to tracing
 /// logs (`~/.onebrain/run/daemon.log` is long-lived).
-#[derive(Debug, Serialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 pub struct DaemonStatusData {
     pub running: bool,
     pub pid: Option<u32>,
@@ -129,6 +137,16 @@ pub struct DaemonStatusData {
     pub reranker_ready: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reranker_downloaded: Option<bool>,
+}
+
+/// `daemon status` payload — the LIST of running daemons, one per per-vault slot
+/// (v3.4.13, #230). Multiple warm daemons (one per vault) now coexist, so
+/// `daemon status` enumerates all `daemon-*` slots and reports each running one.
+/// An empty list = no daemon running. Each entry is the same [`DaemonStatusData`]
+/// dashboard the single-daemon status used to emit.
+#[derive(Debug, Serialize)]
+pub struct DaemonStatusListData {
+    pub daemons: Vec<DaemonStatusData>,
 }
 
 /// `daemon start` payload. `already_running` distinguishes a fresh spawn from
@@ -219,18 +237,24 @@ fn remove_pid(pid_path: &Path) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Path resolution — `~/.onebrain/run/{daemon.pid,daemon.log}`.
+// Slot-path resolution (v3.4.13, #230). Every runtime file lives in a per-vault
+// slot — `daemon-<hash>.{json,pid,lock,log}` — resolved through the ONE shared
+// resolver in `daemon_client` ([`daemon_client::slot_paths_for_id`] /
+// [`resolve_slot`]) so the daemon (writer) and clients (readers) can't drift.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Directory holding the daemon's runtime files: `~/.onebrain/run/`.
+/// The slot the management verbs operate on for a given `--vault`-style arg.
 ///
-/// Resolves the home directory via `dirs::home_dir` (honours `$HOME` on Unix,
-/// `%USERPROFILE%` on Windows). Errors if the home dir can't be resolved
-/// rather than silently falling back to cwd — a misplaced PID file would make
-/// `status`/`stop` find nothing.
-fn run_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("resolve home directory for daemon run dir")?;
-    Ok(home.join(".onebrain").join("run"))
+/// Resolves the bound vault EXACTLY as [`run_internal`] will ([`resolve_daemon_vault`]:
+/// a validated real vault, else vault-less), then keys the slot on its canonical
+/// id. This is why `run_start` (which pre-creates `slot.log`/`slot.pid`/`slot.lock`)
+/// and the detached `__run` child (which writes `slot.json`/`slot.pid`) always
+/// agree on the slot: both derive it from the SAME resolved-and-canonicalized
+/// bound vault.
+fn slot_for_arg(vault_arg: Option<&Path>) -> Result<SlotPaths> {
+    let bound = resolve_daemon_vault(vault_arg);
+    let vault_id = bound.as_deref().and_then(daemon_client::canonical_vault_id);
+    daemon_client::slot_paths_for_id(vault_id.as_deref())
 }
 
 /// Create the daemon run dir (`~/.onebrain/run/`) if missing, with private
@@ -260,26 +284,6 @@ fn ensure_private_run_dir(dir: &Path) -> Result<()> {
     {
         fs::create_dir_all(dir).with_context(|| format!("create daemon run dir {}", dir.display()))
     }
-}
-
-fn pid_path() -> Result<PathBuf> {
-    Ok(run_dir()?.join("daemon.pid"))
-}
-
-fn log_path() -> Result<PathBuf> {
-    Ok(run_dir()?.join("daemon.log"))
-}
-
-/// Discovery file the daemon publishes after it binds: `~/.onebrain/run/daemon.json`.
-fn discovery_path() -> Result<PathBuf> {
-    Ok(run_dir()?.join("daemon.json"))
-}
-
-/// Exclusive start-lock file: `~/.onebrain/run/daemon.lock`. Guards the
-/// check-then-spawn critical section in [`run_start`] so two concurrent
-/// `daemon start` calls can't both spawn (see [`StartGuard`]).
-fn start_lock_path() -> Result<PathBuf> {
-    Ok(run_dir()?.join("daemon.lock"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -523,26 +527,68 @@ fn remove_pid_lock_stale(lock_path: &Path) -> Result<()> {
 /// leaves its fields absent, and `status` still exits 0 (see
 /// [`DaemonStatusData`]). Probes NEVER start, stop, or restart a daemon.
 pub fn run_status(mode: &OutputMode) -> Result<()> {
-    let mut data = compute_status(&pid_path()?, is_alive);
-    if data.running {
-        let discovery = discovery_path()?;
-        if let Ok(Some(info)) = crate::commands::daemon_client::DaemonInfo::read(&discovery) {
-            let handle = crate::commands::daemon_client::DaemonHandle::new(info.clone());
+    // Enumerate every per-vault slot and report each RUNNING daemon (v3.4.13,
+    // #230). A slot whose json is present but whose daemon is dead (stale) is
+    // skipped here — status stays read-only; doctor's daemon check flags stale
+    // slots. A vault-less daemon (`daemon-none.*`) is enumerated like any other.
+    // The legacy pre-v3.4.13 machine-wide slot is checked too, so a live
+    // pre-upgrade daemon (invisible to `all_slots`) still shows up here (LOW-2)
+    // instead of the command reporting "not running" while it holds the lock.
+    let mut daemons = Vec::new();
+    let slots = daemon_client::all_slots()?
+        .into_iter()
+        .chain(std::iter::once(daemon_client::legacy_slot()?));
+    for slot in slots {
+        let mut data = compute_status(&slot.pid, is_alive);
+        if !data.running {
+            continue;
+        }
+        if let Ok(Some(info)) = DaemonInfo::read(&slot.json) {
+            let handle = daemon_client::DaemonHandle::new(info.clone());
             let health = handle.probe_health();
             let internal = handle.probe_status_no_retry();
             enrich_status(
                 &mut data,
                 &info,
-                file_mtime_secs(&discovery),
+                file_mtime_secs(&slot.json),
                 resolve_idle_secs(),
                 health.as_ref(),
                 internal.as_ref(),
             );
         }
+        daemons.push(data);
     }
-    let env = Envelope::ok("daemon.status", None, data);
-    emit(&env, mode, std::io::stdout().lock(), render_status_text)?;
+    let env = Envelope::ok("daemon.status", None, DaemonStatusListData { daemons });
+    emit(
+        &env,
+        mode,
+        std::io::stdout().lock(),
+        render_status_list_text,
+    )?;
     Ok(())
+}
+
+/// Render the multi-daemon `daemon status` report: one grouped block per running
+/// daemon (reusing [`render_status_text`] via a per-daemon envelope), or the
+/// plain "daemon not running" when the list is empty. A count header precedes
+/// the blocks when more than one daemon runs.
+fn render_status_list_text(env: &Envelope<DaemonStatusListData>) -> String {
+    let d = env.data.as_ref().expect("ok envelope always has data");
+    if d.daemons.is_empty() {
+        return "daemon not running".to_string();
+    }
+    let mut out = String::new();
+    if d.daemons.len() > 1 {
+        out.push_str(&format!("{} daemons running\n\n", d.daemons.len()));
+    }
+    for (i, daemon) in d.daemons.iter().enumerate() {
+        if i > 0 {
+            out.push_str("\n\n");
+        }
+        let one = Envelope::ok("daemon.status", None, daemon.clone());
+        out.push_str(&render_status_text(&one));
+    }
+    out
 }
 
 /// Fill the dashboard fields of `data` from the discovery record + the two
@@ -793,31 +839,37 @@ fn resolve_start_vault(vault: Option<&Path>) -> Option<PathBuf> {
 /// 3rd rung — walking up from cwd — before spawning; see its doc comment
 /// for why that has to happen here in the parent (#262).
 pub fn run_start(mode: &OutputMode, vault: Option<&Path>) -> Result<()> {
-    let pid_path = pid_path()?;
+    // Resolve the vault to convey to the child (walk-up for a bare start), then
+    // the SLOT that vault maps to. `run_start` pre-creates this slot's log/pid/
+    // lock; the detached `__run` child (spawned with the SAME `--vault`) derives
+    // the identical slot and writes its json/pid there — so they never diverge.
+    let effective_vault = resolve_start_vault(vault);
+    let slot = slot_for_arg(effective_vault.as_deref())?;
 
-    // Already-running guard: a live PID file means a no-op start.
+    // Already-running guard: a live PID file in THIS slot means a no-op start.
     if let DaemonStatusData {
         running: true,
         pid: Some(pid),
         ..
-    } = compute_status(&pid_path, is_alive)
+    } = compute_status(&slot.pid, is_alive)
     {
         return emit_already_running(mode, pid);
     }
 
-    // Take the exclusive start lock so two parallel `daemon start` calls can't
-    // both spawn (see [`acquire_start_lock`]). We won it → hold the guard across
-    // the check-then-spawn window; drop clears the lock afterwards. The reclaim
-    // decision probes the LOCK's own creator PID (`pid_exists`), not the daemon
-    // PID file — the latter isn't written yet during a fresh concurrent start.
-    let lock_path = start_lock_path()?;
-    let _guard = match acquire_start_lock(&lock_path, pid_exists)? {
+    // Take THIS SLOT's exclusive start lock so two parallel `daemon start` calls
+    // for the SAME vault can't both spawn (see [`acquire_start_lock`]). Two
+    // DIFFERENT vaults take DIFFERENT slot locks, so they never serialize — the
+    // multi-vault property. We won it → hold the guard across the check-then-spawn
+    // window. The reclaim decision probes the LOCK's own creator PID
+    // (`pid_exists`), not the daemon PID file (unwritten during a fresh start).
+    let _guard = match acquire_start_lock(&slot.lock, pid_exists)? {
         StartLock::Acquired(g) => g,
         // A concurrent starter won. Report the daemon it started as
-        // already-running (the recorded PID, or 0 if it hasn't landed yet).
+        // already-running (its real PID — polled briefly so we don't emit a
+        // misleading `pid 0` while the winner is a few ms from writing it;
+        // Copilot AI-finding #1).
         StartLock::Contended => {
-            let pid = compute_status(&pid_path, is_alive).pid.unwrap_or(0);
-            return emit_already_running(mode, pid);
+            return emit_already_running(mode, contended_winner_pid(&slot));
         }
     };
 
@@ -827,26 +879,24 @@ pub fn run_start(mode: &OutputMode, vault: Option<&Path>) -> Result<()> {
         running: true,
         pid: Some(pid),
         ..
-    } = compute_status(&pid_path, is_alive)
+    } = compute_status(&slot.pid, is_alive)
     {
         return emit_already_running(mode, pid);
     }
 
-    // Spawn the detached child and record its PID.
-    let effective_vault = resolve_start_vault(vault);
-    let pid = spawn_detached_run(&log_path()?, effective_vault.as_deref())
+    // Spawn the detached child and record its PID in this slot.
+    let pid = spawn_detached_run(&slot.log, effective_vault.as_deref())
         .context("spawn detached daemon process")?;
-    write_pid(&pid_path, pid)?;
+    write_pid(&slot.pid, pid)?;
 
-    // Wait — STILL HOLDING THE LOCK — until the daemon is fully up (it has
-    // published `daemon.json` after binding). Releasing the lock the instant we
-    // spawn would let a serialized racer take it and, seeing the child not yet
-    // bound (no daemon.json, PID not yet a confirmed session leader), spawn a
-    // SECOND daemon. Holding until the daemon advertises readiness means every
-    // later racer sees a confirmed-running daemon and backs off. Bounded so a
-    // wedged child can't hang `start` forever; on timeout we proceed (the PID
-    // file is written, and `stop`/`status` handle a partially-up child).
-    wait_until_ready(pid, &discovery_path()?, std::time::Duration::from_secs(5));
+    // Wait — STILL HOLDING THE SLOT LOCK — until the daemon is fully up (it has
+    // published its `daemon-<hash>.json` after binding). Releasing the lock the
+    // instant we spawn would let a serialized same-vault racer take it and,
+    // seeing the child not yet bound (no json, PID not yet a confirmed session
+    // leader), spawn a SECOND daemon for this slot. Holding until the daemon
+    // advertises readiness means every later racer sees a confirmed-running
+    // daemon and backs off. Bounded so a wedged child can't hang `start` forever.
+    wait_until_ready(pid, &slot.json, std::time::Duration::from_secs(5));
 
     let data = DaemonStartData {
         started: true,
@@ -856,6 +906,24 @@ pub fn run_start(mode: &OutputMode, vault: Option<&Path>) -> Result<()> {
     let env = Envelope::ok("daemon.start", None, data);
     emit(&env, mode, std::io::stdout().lock(), render_start_text)?;
     Ok(())
+}
+
+/// Poll briefly for a concurrent starter's PID to land in THIS slot's PID file,
+/// so a `Contended` start reports the winner's real PID instead of a bare `0`
+/// (Copilot AI-finding #1). The winner takes the lock, spawns, then writes the
+/// PID file, so a loser can lose the race by microseconds; a short poll (≤10 ×
+/// 25ms = 250ms) resolves the real PID in the common case. Reads the PID FILE
+/// directly (not `compute_status`) so it returns as soon as the winner writes
+/// it, before the child has finished `setsid`. Falls back to `0` only if the
+/// winner still hasn't published a PID after the wait.
+fn contended_winner_pid(slot: &SlotPaths) -> u32 {
+    for _ in 0..10 {
+        if let Some(pid) = read_pid(&slot.pid) {
+            return pid;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    read_pid(&slot.pid).unwrap_or(0)
 }
 
 /// Poll until the freshly-spawned daemon is READY — it has published its
@@ -910,62 +978,144 @@ fn render_start_text(env: &Envelope<DaemonStartData>) -> String {
     }
 }
 
-/// Remove ALL of the daemon's runtime files: the PID file, the `daemon.json`
-/// discovery record, and the `daemon.lock` start lock. Called by `run_stop` in
-/// both branches so `onebrain daemon stop` fully resets the runtime state.
+/// Remove ALL of a slot's runtime files: the PID file, the `daemon-<hash>.json`
+/// discovery record, and the `daemon-<hash>.lock` start lock. Best-effort (a
+/// missing file is fine).
 ///
-/// Clearing `daemon.lock` here is the CLI recovery for a WEDGED start lock: if a
+/// Clearing the lock here is the CLI recovery for a WEDGED start lock: if a
 /// `daemon start` is SIGKILL'd inside the check-then-spawn window it leaves the
 /// lock behind, and if the OS later recycles that PID onto an unrelated live
 /// process, `pid_exists` stays true so `acquire_start_lock` would report
 /// "already running" forever with no way out but a manual `rm`. `daemon stop`
-/// now unwedges it. Each removal is best-effort (a missing file is fine).
-fn clear_runtime_files() -> Result<()> {
-    remove_pid(&pid_path()?)?;
-    let _ = crate::commands::daemon_client::DaemonInfo::remove(&discovery_path()?);
-    let _ = remove_pid_lock_stale(&start_lock_path()?);
-    Ok(())
+/// now unwedges it.
+fn clear_slot_files(slot: &SlotPaths) {
+    let _ = remove_pid(&slot.pid);
+    let _ = DaemonInfo::remove(&slot.json);
+    let _ = remove_pid_lock_stale(&slot.lock);
 }
 
-/// `onebrain daemon stop` — SIGTERM the recorded PID, wait briefly for it to
-/// exit, then clear the PID / discovery / lock files, report.
-pub fn run_stop(mode: &OutputMode) -> Result<()> {
-    let pid_path = pid_path()?;
-
-    let data = match compute_status(&pid_path, is_alive) {
+/// SIGTERM the daemon occupying `slot` (if live), wait briefly for it to exit,
+/// then clear the slot's PID / discovery / lock files. Returns `(stopped, pid)`.
+///
+/// The slot-aware core shared by the `daemon stop` verb AND
+/// [`daemon_client`](crate::commands::daemon_client)'s version-skew restart —
+/// keeping the SIGTERM + cleanup in one place (rather than the client shelling
+/// `onebrain daemon stop`, which would target the cwd's slot, not the intended
+/// one). An error only on a failed SIGTERM (the old daemon may still hold the
+/// engine lock, so the caller needs to know).
+pub(crate) fn stop_slot(slot: &SlotPaths) -> Result<(bool, Option<u32>)> {
+    match compute_status(&slot.pid, is_alive) {
         DaemonStatusData {
             running: true,
             pid: Some(pid),
             ..
         } => {
             terminate(pid).with_context(|| format!("signal daemon pid {pid}"))?;
-            // Best-effort: the daemon's SIGTERM handler removes the PID +
-            // discovery files on its way out, but if it died uncleanly (or isn't
-            // ours — a recycled session leader could slip through) we still clear
-            // the PID, discovery, AND start-lock files so a later `start` isn't
-            // blocked by a stale PID / wedged lock and no client connects to a
-            // dead daemon via a stale `daemon.json`.
-            clear_runtime_files()?;
-            DaemonStopData {
-                stopped: true,
-                pid: Some(pid),
-            }
+            // Best-effort: the daemon's SIGTERM handler removes its own PID +
+            // discovery files, but if it died uncleanly (or isn't ours — a
+            // recycled session leader could slip through) we still clear the
+            // slot's files so a later `start` isn't blocked and no client
+            // connects to a dead daemon via a stale record.
+            clear_slot_files(slot);
+            Ok((true, Some(pid)))
         }
-        // Nothing live to stop. Clear any stale PID / discovery / lock files so
-        // the slate is clean (a hard-killed daemon, or a SIGKILL'd `start`,
-        // leaves these behind — this is the CLI recovery for a wedged lock).
+        // Nothing live to stop. Clear any stale files so the slate is clean.
         _ => {
-            clear_runtime_files()?;
-            DaemonStopData {
-                stopped: false,
-                pid: None,
+            clear_slot_files(slot);
+            Ok((false, None))
+        }
+    }
+}
+
+/// `onebrain daemon stop [--vault <path>] [--all]` — stop a per-vault daemon.
+///
+/// - `--all` → stop EVERY slot's daemon (and clear every wedged lock).
+/// - `--vault <path>` → stop that vault's slot.
+/// - neither → stop the cwd-resolved slot (walk-up like `serve`/`search`; the
+///   vault-less sentinel slot when cwd isn't inside a vault).
+pub fn run_stop(mode: &OutputMode, vault: Option<&Path>, all: bool) -> Result<()> {
+    if all {
+        return run_stop_all(mode);
+    }
+    let slot = match vault {
+        // Explicit `--vault X`: target X's slot by canonicalizing X DIRECTLY,
+        // NOT through `slot_for_arg`/`resolve_daemon_vault` (which re-validates X
+        // is still a vault). Start/stop symmetry (LOW-1): the daemon's slot was
+        // keyed on `canonical(X)` at start; if X's `onebrain.yml` has since been
+        // removed while the directory still exists, `resolve_daemon_vault` would
+        // drop X to the vault-less slot and stop the WRONG daemon. Canonicalizing
+        // X directly still finds X's slot as long as the directory exists. A
+        // MOVED/DELETED X can't canonicalize (`None`) — its slot is inherently
+        // underivable from a path that no longer maps to it, so we refuse rather
+        // than fall back to the vault-less slot (which would stop the wrong one).
+        Some(x) => match daemon_client::canonical_vault_id(x) {
+            Some(id) => daemon_client::slot_paths_for_id(Some(&id))?,
+            None => {
+                let env = Envelope::ok(
+                    "daemon.stop",
+                    None,
+                    DaemonStopData {
+                        stopped: false,
+                        pid: None,
+                    },
+                );
+                emit(&env, mode, std::io::stdout().lock(), render_stop_text)?;
+                return Ok(());
             }
+        },
+        // Default: cwd-resolved slot. `resolve_start_vault(None)` returns `None`
+        // in the `$ONEBRAIN_VAULT`-set case, and `slot_for_arg(None)` then
+        // re-resolves the env vault — so the env vault's slot is targeted, not the
+        // vault-less one.
+        None => {
+            let effective_vault = resolve_start_vault(None);
+            slot_for_arg(effective_vault.as_deref())?
         }
     };
-
-    let env = Envelope::ok("daemon.stop", None, data);
+    let (stopped, pid) = stop_slot(&slot)?;
+    let env = Envelope::ok("daemon.stop", None, DaemonStopData { stopped, pid });
     emit(&env, mode, std::io::stdout().lock(), render_stop_text)?;
     Ok(())
+}
+
+/// `daemon stop --all` — stop every per-vault daemon on the machine. Reports how
+/// many were stopped (the `pid` field carries the last one, for the text line).
+fn run_stop_all(mode: &OutputMode) -> Result<()> {
+    let mut stopped = 0usize;
+    let mut last_pid = None;
+    // Every per-vault slot, PLUS the legacy pre-v3.4.13 single slot (so an
+    // upgrade leaves nothing running). `stop_slot` on an absent slot is a
+    // harmless no-op that just clears any stale files.
+    let mut slots = daemon_client::all_slots()?;
+    slots.push(daemon_client::legacy_slot()?);
+    for slot in slots {
+        let (was_stopped, pid) = stop_slot(&slot)?;
+        if was_stopped {
+            stopped += 1;
+            last_pid = pid;
+        }
+    }
+    let env = Envelope::ok(
+        "daemon.stop",
+        None,
+        DaemonStopData {
+            stopped: stopped > 0,
+            pid: last_pid,
+        },
+    );
+    emit(&env, mode, std::io::stdout().lock(), move |e| {
+        render_stop_all_text(e, stopped)
+    })?;
+    Ok(())
+}
+
+/// Text line for `daemon stop --all`: `stopped N daemon(s)` or `no daemons running`.
+fn render_stop_all_text(_env: &Envelope<DaemonStopData>, stopped: usize) -> String {
+    match stopped {
+        0 => "no daemons running".to_string(),
+        1 => "stopped 1 daemon".to_string(),
+        n => format!("stopped {n} daemons"),
+    }
 }
 
 fn render_stop_text(env: &Envelope<DaemonStopData>) -> String {
@@ -1129,7 +1279,8 @@ fn terminate(_pid: u32) -> Result<()> {
 /// - **vault_root** — the `--vault` arg passed by `daemon start` if present,
 ///   else `$ONEBRAIN_VAULT` — but ONLY if the chosen candidate names a real
 ///   vault (see [`resolve_daemon_vault`]). Otherwise `None`.
-/// - **port** — the shared default ([`crate::commands::serve::DEFAULT_PORT`]).
+/// - **port** — an EPHEMERAL OS-assigned port ([`DAEMON_EPHEMERAL_PORT`] = `0`),
+///   published (actual value) in the slot json; `$ONEBRAIN_DAEMON_PORT` overrides.
 /// - **token** — freshly generated per process.
 /// - **dist_dir** — `$ONEBRAIN_DIST` if set, else `None`. `$ONEBRAIN_DIST` is
 ///   an OVERRIDE (webui development / the plugin launcher pinning a dist);
@@ -1155,37 +1306,33 @@ fn terminate(_pid: u32) -> Result<()> {
 /// `vault` is the `--vault` arg `daemon start` threaded through; it takes
 /// precedence over `$ONEBRAIN_VAULT` (see [`resolve_daemon_vault`]).
 pub fn run_internal(vault: Option<&Path>) -> Result<()> {
-    use crate::commands::serve::DEFAULT_PORT;
     use crate::server::{self, resolve_token, ServeConfig};
 
-    let pid_path = pid_path()?;
-    let log_path = log_path()?;
-
-    init_tracing(&log_path)?;
-
-    let pid = std::process::id();
-    write_pid(&pid_path, pid)?;
-
-    // Resolve the vault the daemon serves. The detached child has chdir'd to
-    // `/`, so walk-up from cwd is useless; rely on `$ONEBRAIN_VAULT` (the
-    // launcher's job to export).
+    // Resolve the vault the daemon serves FIRST — the slot files are keyed on it.
+    // The detached child has chdir'd to `/`, so walk-up from cwd is useless; rely
+    // on the `--vault` arg (threaded by `daemon start`) or `$ONEBRAIN_VAULT`.
     //
     // SECURITY (fix A): we NEVER fall back to a placeholder root like `/`. A
     // `/` root would let `GET /api/vault/file?path=etc/passwd` serve
-    // `/etc/passwd`. Instead we REQUIRE a real vault: the candidate dir from
-    // `$ONEBRAIN_VAULT` must actually be a vault (contain `onebrain.yml` or the
-    // legacy `vault.yml`). If it isn't — or the env var is unset — we bind
-    // `None`, and the vault handlers return 503 (the static surface + token
-    // still work, so the daemon runs and reports cleanly; it just exposes no
-    // filesystem).
+    // `/etc/passwd`. Instead we REQUIRE a real vault: the candidate dir must
+    // actually be a vault (contain `onebrain.yml` or the legacy `vault.yml`). If
+    // it isn't — or nothing is set — we bind `None`, and the vault handlers
+    // return 503 (the static surface + token still work).
     let vault_root = resolve_daemon_vault(vault);
-    // Canonical identity of the bound vault, stamped into `daemon.json` so a
-    // client that resolved a DIFFERENT vault detects the mismatch and restarts
-    // the daemon instead of silently routing through the wrong-vault engine
-    // (see `daemon_client::vault_decision`). `None` when bound vault-less.
+    // Canonical identity of the bound vault: stamped into the slot json AND used
+    // to key the slot itself (`daemon-<hash>.*`). `None` → the vault-less
+    // sentinel slot (`daemon-none.*`). `run_start` derives the SAME slot from the
+    // same `--vault`, so the child writes where the parent pre-created.
     let vault_id = vault_root
         .as_deref()
-        .and_then(crate::commands::daemon_client::canonical_vault_id);
+        .and_then(daemon_client::canonical_vault_id);
+    let slot = daemon_client::slot_paths_for_id(vault_id.as_deref())?;
+
+    init_tracing(&slot.log)?;
+
+    let pid = std::process::id();
+    write_pid(&slot.pid, pid)?;
+
     // Optional pre-built webui dist, passed by the plugin launcher.
     let dist_dir = std::env::var_os("ONEBRAIN_DIST").map(PathBuf::from);
     // Honours $ONEBRAIN_TOKEN (≥32 chars, [A-Za-z0-9_-]) for a stable token
@@ -1193,14 +1340,16 @@ pub fn run_internal(vault: Option<&Path>) -> Result<()> {
     // `resolve_token`) rather than a silent swap for a random one.
     let token = resolve_token()?;
 
-    // Port: `$ONEBRAIN_DAEMON_PORT` overrides the shared default. The override
-    // exists mainly so the lifecycle integration test can bind a free port and
-    // avoid colliding with a real daemon (or a parallel test) on 6789. `0` is
-    // honoured (OS-assigned ephemeral port) for tests that don't curl.
+    // Port: an EPHEMERAL OS-assigned port by default (v3.4.13, #230) — two
+    // per-vault daemons can't both bind a fixed port, so each takes `:0` and
+    // publishes the ACTUAL bound port in its slot json (discovery/serve/mcp/
+    // status all read the port from the slot, never assume 6789).
+    // `$ONEBRAIN_DAEMON_PORT` overrides it (tests pin a value or `0`; a pinned
+    // fixed value is a single-daemon convenience).
     let port = std::env::var("ONEBRAIN_DAEMON_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(DEFAULT_PORT);
+        .unwrap_or(DAEMON_EPHEMERAL_PORT);
 
     // Daemon always binds localhost — a persistent boot-time engine should never
     // listen on a public interface implicitly. Remote access is tunnel-only
@@ -1220,7 +1369,7 @@ pub fn run_internal(vault: Option<&Path>) -> Result<()> {
     // forever) — handy for a pinned always-on daemon.
     let idle_secs = resolve_idle_secs();
 
-    let discovery_path = discovery_path()?;
+    let discovery_path = slot.json.clone();
 
     // Own a tokio runtime for the lifetime of the daemon. `enable_all` turns on
     // the I/O + time drivers the server + signal handling need.
@@ -1252,7 +1401,7 @@ pub fn run_internal(vault: Option<&Path>) -> Result<()> {
         // listener is up. Written from the `on_bind` callback so a `0` (ephemeral)
         // port resolves to the real one clients must connect to.
         let on_bind = move |addr: std::net::SocketAddr| {
-            let info = crate::commands::daemon_client::DaemonInfo {
+            let info = DaemonInfo {
                 port: addr.port(),
                 token,
                 pid,
@@ -1260,23 +1409,28 @@ pub fn run_internal(vault: Option<&Path>) -> Result<()> {
                 vault: vault_id,
             };
             if let Err(e) = info.write(&discovery_for_bind) {
-                tracing::warn!(error = %e, "failed to write daemon.json discovery file");
+                tracing::warn!(error = %e, "failed to write slot discovery file");
             } else {
-                tracing::info!(port = addr.port(), "published daemon.json discovery file");
+                tracing::info!(port = addr.port(), "published slot discovery file");
             }
         };
 
         server::run_server_from_router(router, addr_from(port), on_bind, shutdown).await
     });
 
-    // Always clear the PID + discovery files on the way out, even if the server
-    // returned an error — stale files would block/mislead the next start.
-    tracing::info!("daemon shutting down; removing PID + discovery files");
-    remove_pid(&pid_path)?;
-    let _ = crate::commands::daemon_client::DaemonInfo::remove(&discovery_path);
-    tracing::info!("PID + discovery files removed; exit");
+    // Always clear this slot's PID + discovery files on the way out, even if the
+    // server returned an error — stale files would block/mislead the next start.
+    tracing::info!("daemon shutting down; removing slot PID + discovery files");
+    remove_pid(&slot.pid)?;
+    let _ = DaemonInfo::remove(&slot.json);
+    tracing::info!("slot PID + discovery files removed; exit");
     result
 }
+
+/// Default daemon bind port: `0` = OS-assigned ephemeral (v3.4.13, #230). Two
+/// per-vault daemons can't share a fixed port, so each binds `:0` and publishes
+/// its ACTUAL port in its slot json. `$ONEBRAIN_DAEMON_PORT` overrides it.
+const DAEMON_EPHEMERAL_PORT: u16 = 0;
 
 /// Default idle-shutdown TTL: 30 minutes with no authenticated request.
 const DEFAULT_IDLE_SECS: u64 = 30 * 60;
@@ -2165,6 +2319,99 @@ mod tests {
         assert_eq!(rich["idle_ttl_secs"], 1800);
     }
 
+    #[test]
+    fn status_list_text_empty_one_and_many() {
+        // Empty list → the plain "not running" line.
+        let empty = Envelope::ok(
+            "daemon.status",
+            None,
+            DaemonStatusListData { daemons: vec![] },
+        );
+        assert_eq!(render_status_list_text(&empty), "daemon not running");
+
+        // One daemon → a single grouped Process block, no count header.
+        let one = Envelope::ok(
+            "daemon.status",
+            None,
+            DaemonStatusListData {
+                daemons: vec![DaemonStatusData {
+                    running: true,
+                    pid: Some(11),
+                    ..Default::default()
+                }],
+            },
+        );
+        let s = render_status_list_text(&one);
+        assert!(s.contains("pid 11"), "{s}");
+        assert!(
+            !s.contains("daemons running"),
+            "no count header for one: {s}"
+        );
+
+        // Two daemons → a count header + both pids, in one report.
+        let two = Envelope::ok(
+            "daemon.status",
+            None,
+            DaemonStatusListData {
+                daemons: vec![
+                    DaemonStatusData {
+                        running: true,
+                        pid: Some(11),
+                        port: Some(40001),
+                        ..Default::default()
+                    },
+                    DaemonStatusData {
+                        running: true,
+                        pid: Some(22),
+                        port: Some(40002),
+                        ..Default::default()
+                    },
+                ],
+            },
+        );
+        let s = render_status_list_text(&two);
+        assert!(s.contains("2 daemons running"), "{s}");
+        assert!(s.contains("pid 11") && s.contains("pid 22"), "{s}");
+        assert!(s.contains("40001") && s.contains("40002"), "{s}");
+    }
+
+    #[test]
+    fn stop_all_text_pluralizes() {
+        let env = Envelope::ok(
+            "daemon.stop",
+            None,
+            DaemonStopData {
+                stopped: false,
+                pid: None,
+            },
+        );
+        assert_eq!(render_stop_all_text(&env, 0), "no daemons running");
+        assert_eq!(render_stop_all_text(&env, 1), "stopped 1 daemon");
+        assert_eq!(render_stop_all_text(&env, 3), "stopped 3 daemons");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_slot_clears_files_and_reports_not_running_when_absent() {
+        // stop_slot on an absent slot is a harmless no-op that still clears any
+        // stale files and reports (false, None).
+        let dir = tempdir().unwrap();
+        let slot = SlotPaths {
+            json: dir.path().join("daemon-x.json"),
+            pid: dir.path().join("daemon-x.pid"),
+            lock: dir.path().join("daemon-x.lock"),
+            log: dir.path().join("daemon-x.log"),
+        };
+        // Plant stale files with no live daemon.
+        fs::write(&slot.json, "{}").unwrap();
+        fs::write(&slot.lock, "999999").unwrap();
+        let (stopped, pid) = stop_slot(&slot).unwrap();
+        assert!(!stopped);
+        assert!(pid.is_none());
+        assert!(!slot.json.exists(), "stale json cleared");
+        assert!(!slot.lock.exists(), "stale lock cleared");
+    }
+
     /// RAII teardown for the real-daemon integration tests: runs
     /// `onebrain daemon stop` (with the test's own HOME/env) on drop, so a
     /// FAILED assertion between `daemon start` and the test's own `stop` never
@@ -2185,9 +2432,32 @@ mod tests {
             for (k, v) in &self.envs {
                 cmd.env(k, v);
             }
-            // Best-effort: a double stop is an idempotent no-op.
-            let _ = cmd.args(["daemon", "stop"]).output();
+            // `--all`: stop EVERY per-vault slot under this test's HOME (v3.4.13).
+            // A plain `stop` would target only the cwd's slot, missing a daemon
+            // bound to a specific test vault. Best-effort; a double stop is a
+            // no-op.
+            let _ = cmd.args(["daemon", "stop", "--all"]).output();
         }
+    }
+
+    /// Compute a slot runtime-file path under an EXPLICIT test HOME. The
+    /// integration tests set `HOME` on the CHILD process, not on this test
+    /// process, so production's `slot_paths_for_id`/`run_dir` (which read THIS
+    /// process's `$HOME`) can't be used. Mirrors production slot naming:
+    /// `daemon-<hash>` for a vault (hash of the canonical path), `daemon-none`
+    /// for vault-less.
+    #[cfg(unix)]
+    fn slot_file_under_home(home: &Path, vault: Option<&Path>, ext: &str) -> PathBuf {
+        let stem = match vault.and_then(daemon_client::canonical_vault_id) {
+            Some(id) => format!(
+                "daemon-{}",
+                onebrain_search::engine::short_path_hash(Path::new(&id))
+            ),
+            None => daemon_client::VAULTLESS_SLOT_STEM.to_string(),
+        };
+        home.join(".onebrain")
+            .join("run")
+            .join(format!("{stem}.{ext}"))
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -2371,12 +2641,9 @@ mod tests {
         // Start the daemon.
         assert!(run("start").status.success(), "daemon start failed");
 
-        // Wait for daemon.json to appear (the daemon writes it after binding).
-        let discovery = home
-            .path()
-            .join(".onebrain")
-            .join("run")
-            .join("daemon.json");
+        // Wait for the slot json to appear (the daemon writes it after binding).
+        // ONEBRAIN_VAULT is set, so the daemon binds `vault` → its slot.
+        let discovery = slot_file_under_home(home.path(), Some(vault.path()), "json");
         let deadline = Instant::now() + Duration::from_secs(8);
         let info: crate::commands::daemon_client::DaemonInfo = loop {
             if let Ok(Some(info)) = crate::commands::daemon_client::DaemonInfo::read(&discovery) {
@@ -2538,12 +2805,9 @@ mod tests {
         );
 
         // Wait for the winning daemon to publish discovery, then assert exactly
-        // one live daemon.json + one PID.
-        let discovery = home
-            .path()
-            .join(".onebrain")
-            .join("run")
-            .join("daemon.json");
+        // one live slot json + one PID. Bare `daemon start` from a non-vault cwd
+        // binds vault-less → the `daemon-none` slot.
+        let discovery = slot_file_under_home(home.path(), None, "json");
         let deadline = Instant::now() + Duration::from_secs(8);
         while !discovery.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
@@ -2596,7 +2860,9 @@ mod tests {
         };
         let run_dir = home.path().join(".onebrain").join("run");
         std::fs::create_dir_all(&run_dir).unwrap();
-        let lock = run_dir.join("daemon.lock");
+        // Bare `daemon start`/`stop` from a non-vault cwd operate on the
+        // `daemon-none` slot, so plant the wedged lock in THAT slot.
+        let lock = slot_file_under_home(home.path(), None, "lock");
 
         // Plant a wedged lock: its recorded PID is THIS test process — live, but
         // not our daemon. `pid_exists` sees it alive, so without the stop-unlink
@@ -2621,10 +2887,7 @@ mod tests {
         // `daemon stop` must clear the wedged lock (nothing live to signal, but
         // it still resets the runtime files).
         assert!(daemon("stop").status.success(), "daemon stop failed");
-        assert!(
-            !lock.exists(),
-            "daemon stop must clear the wedged daemon.lock"
-        );
+        assert!(!lock.exists(), "daemon stop must clear the wedged lock");
 
         // And now `daemon start` succeeds (no longer wedged) and comes up.
         let start = daemon("start");
@@ -2636,14 +2899,14 @@ mod tests {
         );
 
         // Confirm it really bound, then clean up.
-        let discovery = run_dir.join("daemon.json");
+        let discovery = slot_file_under_home(home.path(), None, "json");
         let deadline = Instant::now() + Duration::from_secs(8);
         while !discovery.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(
             discovery.exists(),
-            "recovered daemon never published daemon.json"
+            "recovered daemon never published its slot json"
         );
         // Teardown: `_teardown` (StopDaemonOnDrop) stops the recovered daemon
         // on EVERY exit path, panicking asserts included.
@@ -2693,11 +2956,8 @@ mod tests {
             "daemon start --vault exited non-zero: {start:?}"
         );
 
-        let discovery = home
-            .path()
-            .join(".onebrain")
-            .join("run")
-            .join("daemon.json");
+        // The daemon bound `vault` (via --vault) → its slot.
+        let discovery = slot_file_under_home(home.path(), Some(vault.path()), "json");
         let deadline = Instant::now() + Duration::from_secs(8);
         let info = loop {
             if let Ok(Some(info)) = crate::commands::daemon_client::DaemonInfo::read(&discovery) {
@@ -2705,7 +2965,7 @@ mod tests {
             }
             if Instant::now() >= deadline {
                 // `_teardown` stops the daemon (if any) on this panic.
-                panic!("daemon never published daemon.json");
+                panic!("daemon never published its slot json");
             }
             std::thread::sleep(Duration::from_millis(50));
         };
@@ -2769,11 +3029,8 @@ mod tests {
             "daemon start exited non-zero: {start:?}"
         );
 
-        let discovery = home
-            .path()
-            .join(".onebrain")
-            .join("run")
-            .join("daemon.json");
+        // The daemon walked up cwd to `vault` → its slot.
+        let discovery = slot_file_under_home(home.path(), Some(vault.path()), "json");
         let deadline = Instant::now() + Duration::from_secs(8);
         let info = loop {
             if let Ok(Some(info)) = crate::commands::daemon_client::DaemonInfo::read(&discovery) {
@@ -2781,7 +3038,7 @@ mod tests {
             }
             if Instant::now() >= deadline {
                 // `_teardown` stops the daemon (if any) on this panic.
-                panic!("daemon never published daemon.json");
+                panic!("daemon never published its slot json");
             }
             std::thread::sleep(Duration::from_millis(50));
         };
@@ -2796,5 +3053,254 @@ mod tests {
         );
         // Teardown: `_teardown` (StopDaemonOnDrop) stops the daemon on every
         // exit path, the failing-assert ones included.
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // THE deliverable-verify (#230): two per-vault daemons coexist on one
+    // machine — started CONCURRENTLY, each binds its OWN vault + ephemeral port
+    // + slot, neither stops the other (no thrash), `daemon status` lists BOTH,
+    // and `daemon stop --all` retires them. This is the multi-vault property the
+    // whole track exists for; the single-slot model got this wrong (starting B
+    // reported A "already running" and never bound B). Unix-only, download-free
+    // (distinct auto-collections, engine open needs no model). One shared HOME +
+    // CACHE tempdir so it NEVER touches the real ~/.onebrain / real daemon.
+    // ─────────────────────────────────────────────────────────────────────
+    #[cfg(unix)]
+    #[test]
+    fn two_vault_daemons_coexist_status_lists_both_and_stop_all_retires() {
+        use assert_cmd::cargo::cargo_bin;
+        use std::process::Command as StdCommand;
+        use std::time::{Duration, Instant};
+
+        let home = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let vault_a = tempdir().unwrap();
+        let vault_b = tempdir().unwrap();
+        std::fs::write(
+            vault_a.path().join("onebrain.yml"),
+            "search:\n  collection: two-vault-a\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vault_b.path().join("onebrain.yml"),
+            "search:\n  collection: two-vault-b\n",
+        )
+        .unwrap();
+
+        let bin = cargo_bin("onebrain");
+        let _teardown = StopDaemonOnDrop {
+            bin: bin.clone(),
+            envs: vec![
+                ("HOME".into(), home.path().display().to_string()),
+                (
+                    "ONEBRAIN_CACHE_DIR".into(),
+                    cache.path().display().to_string(),
+                ),
+            ],
+        };
+
+        // Start a daemon for A and for B CONCURRENTLY (two threads racing), each
+        // with an explicit `--vault`. Distinct slots take distinct start locks,
+        // so they must NOT serialize, and neither may report "already running".
+        let spawn_start = |vault: PathBuf| {
+            let bin = bin.clone();
+            let home = home.path().to_path_buf();
+            let cache = cache.path().to_path_buf();
+            std::thread::spawn(move || {
+                StdCommand::new(&bin)
+                    .env("HOME", &home)
+                    .env("ONEBRAIN_CACHE_DIR", &cache)
+                    .env_remove("ONEBRAIN_VAULT")
+                    .env("ONEBRAIN_DAEMON_PORT", "0")
+                    .env("ONEBRAIN_DAEMON_IDLE_SECS", "0")
+                    .args(["daemon", "start", "--vault"])
+                    .arg(&vault)
+                    .output()
+                    .expect("spawn daemon start")
+            })
+        };
+        let ta = spawn_start(vault_a.path().to_path_buf());
+        let tb = spawn_start(vault_b.path().to_path_buf());
+        let out_a = ta.join().unwrap();
+        let out_b = tb.join().unwrap();
+        assert!(out_a.status.success(), "start A failed: {out_a:?}");
+        assert!(out_b.status.success(), "start B failed: {out_b:?}");
+        for (label, out) in [("A", &out_a), ("B", &out_b)] {
+            let s = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                s.contains("started") && !s.contains("already running"),
+                "start {label} must be a FRESH start (not 'already running'): {s}"
+            );
+        }
+
+        // Both slots go live (health-probe each on its OWN ephemeral port).
+        let disc_a = slot_file_under_home(home.path(), Some(vault_a.path()), "json");
+        let disc_b = slot_file_under_home(home.path(), Some(vault_b.path()), "json");
+        let read_live = |disc: &Path| -> Option<crate::commands::daemon_client::DaemonInfo> {
+            let info = crate::commands::daemon_client::DaemonInfo::read(disc).ok()??;
+            let url = format!("http://127.0.0.1:{}/api/health", info.port);
+            ureq::get(&url)
+                .header("x-onebrain-token", &info.token)
+                .call()
+                .ok()?;
+            Some(info)
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (info_a, info_b) = loop {
+            if let (Some(a), Some(b)) = (read_live(&disc_a), read_live(&disc_b)) {
+                break (a, b);
+            }
+            if Instant::now() >= deadline {
+                let _ = StdCommand::new(&bin)
+                    .env("HOME", home.path())
+                    .args(["daemon", "stop", "--all"])
+                    .output();
+                panic!(
+                    "both daemons never came up (a_json={} b_json={})",
+                    disc_a.exists(),
+                    disc_b.exists()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+
+        // The core multi-vault properties: distinct slots, ports, pids, vaults.
+        assert_ne!(disc_a, disc_b, "A and B must occupy distinct slots");
+        assert_ne!(
+            info_a.port, info_b.port,
+            "each daemon binds its OWN ephemeral port (a={} b={})",
+            info_a.port, info_b.port
+        );
+        assert_ne!(info_a.pid, info_b.pid, "two distinct daemon processes");
+        assert_eq!(
+            info_a.vault,
+            crate::commands::daemon_client::canonical_vault_id(vault_a.path())
+        );
+        assert_eq!(
+            info_b.vault,
+            crate::commands::daemon_client::canonical_vault_id(vault_b.path())
+        );
+
+        // Neither stopped the other: BOTH still answer after both are up. This is
+        // the anti-thrash assertion — the passive coexistence the design demands.
+        assert!(
+            read_live(&disc_a).is_some(),
+            "A must survive B's start (no thrash)"
+        );
+        assert!(
+            read_live(&disc_b).is_some(),
+            "B must survive A's start (no thrash)"
+        );
+
+        // `daemon status` enumerates BOTH slots.
+        let status = StdCommand::new(&bin)
+            .env("HOME", home.path())
+            .env("ONEBRAIN_CACHE_DIR", cache.path())
+            .args(["daemon", "status"])
+            .output()
+            .expect("daemon status");
+        let stat = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            stat.contains("2 daemons running"),
+            "status must list both: {stat}"
+        );
+        assert!(
+            stat.contains(&info_a.port.to_string()) && stat.contains(&info_b.port.to_string()),
+            "status must show both ports: {stat}"
+        );
+
+        // `daemon stop --all` retires BOTH; their slot jsons disappear.
+        let stop = StdCommand::new(&bin)
+            .env("HOME", home.path())
+            .args(["daemon", "stop", "--all"])
+            .output()
+            .expect("daemon stop --all");
+        assert!(stop.status.success(), "stop --all failed: {stop:?}");
+        let gone = Instant::now() + Duration::from_secs(4);
+        while (disc_a.exists() || disc_b.exists()) && Instant::now() < gone {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !disc_a.exists() && !disc_b.exists(),
+            "stop --all must retire both daemons (a={} b={})",
+            disc_a.exists(),
+            disc_b.exists()
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // LOW-1 start/stop symmetry: a daemon started for vault X lives in X's slot
+    // (keyed on canonical(X)). If X's `onebrain.yml` is removed while the dir
+    // still exists, `daemon stop --vault X` must STILL target X's slot
+    // (canonicalize X directly, don't re-validate it's a vault) rather than
+    // dropping to the vault-less slot and stopping the wrong daemon. Unix-only.
+    // ─────────────────────────────────────────────────────────────────────
+    #[cfg(unix)]
+    #[test]
+    fn stop_vault_targets_slot_even_after_onebrain_yml_removed() {
+        use assert_cmd::cargo::cargo_bin;
+        use std::process::Command as StdCommand;
+        use std::time::{Duration, Instant};
+
+        let home = tempdir().unwrap();
+        let vault = tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: low1-it\n",
+        )
+        .unwrap();
+        let bin = cargo_bin("onebrain");
+        let _teardown = StopDaemonOnDrop {
+            bin: bin.clone(),
+            envs: vec![("HOME".into(), home.path().display().to_string())],
+        };
+
+        // Start a daemon bound to X.
+        let start = StdCommand::new(&bin)
+            .env("HOME", home.path())
+            .env_remove("ONEBRAIN_VAULT")
+            .env("ONEBRAIN_DAEMON_PORT", "0")
+            .env("ONEBRAIN_DAEMON_IDLE_SECS", "0")
+            .args(["daemon", "start", "--vault"])
+            .arg(vault.path())
+            .output()
+            .expect("daemon start --vault");
+        assert!(start.status.success(), "start failed: {start:?}");
+
+        let disc = slot_file_under_home(home.path(), Some(vault.path()), "json");
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !disc.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(disc.exists(), "daemon never published its slot json");
+
+        // Remove onebrain.yml: X is no longer a "valid vault", but its dir + slot
+        // remain, and canonical(X) still resolves — so stop must find X's slot.
+        std::fs::remove_file(vault.path().join("onebrain.yml")).unwrap();
+
+        let stop = StdCommand::new(&bin)
+            .env("HOME", home.path())
+            .env_remove("ONEBRAIN_VAULT")
+            .args(["daemon", "stop", "--vault"])
+            .arg(vault.path())
+            .output()
+            .expect("daemon stop --vault");
+        assert!(stop.status.success(), "stop --vault failed: {stop:?}");
+        let out = String::from_utf8_lossy(&stop.stdout);
+        assert!(
+            out.contains("stopped"),
+            "stop --vault must retire X's daemon even without onebrain.yml, got: {out}"
+        );
+
+        // X's slot json is gone → its daemon was actually stopped (not the
+        // vault-less slot).
+        let gone = Instant::now() + Duration::from_secs(3);
+        while disc.exists() && Instant::now() < gone {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !disc.exists(),
+            "stop --vault X must have retired X's slot daemon"
+        );
     }
 }

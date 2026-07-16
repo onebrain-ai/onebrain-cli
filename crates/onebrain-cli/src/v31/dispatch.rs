@@ -367,7 +367,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         },
         Cmd::Daemon(DaemonCmd { verb }) => match verb {
             DaemonVerb::Start { vault } => commands::daemon::run_start(&mode, vault.as_deref()),
-            DaemonVerb::Stop => commands::daemon::run_stop(&mode),
+            DaemonVerb::Stop { vault, all } => {
+                // Accept `--vault` either after `stop` (local) or at the global
+                // position (`onebrain --vault X daemon stop`) — fall back to the
+                // global flag so both spellings target the same vault's slot.
+                let v = vault.as_deref().or(vault_flag.as_deref());
+                commands::daemon::run_stop(&mode, v, all)
+            }
             DaemonVerb::Status => commands::daemon::run_status(&mode),
             // Hidden internal verb — the detached child's body.
             DaemonVerb::Run { vault } => commands::daemon::run_internal(vault.as_deref()),

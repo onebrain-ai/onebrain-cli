@@ -2,6 +2,7 @@
 
 - **Status:** accepted
 - **Date:** 2026-07-05
+- **Superseded in part by:** [0033](0033-per-vault-daemon-slots.md) — the "machine singleton / one vault at a time / `daemon.json` singular / fixed port / `vault_decision`+`vault_expectation` cross-vault restart" model below is history: v3.4.13 (#230) moved to **per-vault slots** (`daemon-<hash>.{json,pid,lock,log}`), ephemeral per-daemon ports, and no cross-vault stealing (each caller resolves its own slot; `vault_decision`/`vault_expectation` were removed for `resolve_slot`/`record_is_our_vault`). The warm-daemon rationale (HTTP+token transport, engine ownership) still holds.
 
 ## Context
 

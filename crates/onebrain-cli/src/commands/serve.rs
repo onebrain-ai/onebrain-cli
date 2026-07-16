@@ -8,14 +8,16 @@
 //! only difference is the shutdown trigger (Ctrl-C here, SIGTERM there). See
 //! the build-level design `2026-06-04-daemon-serve-design.md` §2–4.
 //!
-//! **Daemon-aware since v3.4.8 (#197); reuse-or-start since v3.4.12 (#258):**
-//! `serve` reuses a daemon already serving THIS vault, and — when none is
+//! **Daemon-aware since v3.4.8 (#197); reuse-or-start since v3.4.12 (#258);
+//! per-vault slots since v3.4.13 (#230):**
+//! `serve` reuses the daemon already serving THIS vault, and — when none is
 //! running — STARTS one (restarting a stale/version-mismatched one) via
-//! [`daemon_client::ensure_running`], then prints that daemon's webui URL,
-//! honours `--open`, and exits. It never binds a second listener next to a
-//! daemon (the two share port 6789 by design, and both would want the engine),
-//! and the started daemon holds the engine + token cache so the dashboard is
-//! populated. Explicit `--port` / `--dir` flags (or a set `$ONEBRAIN_BIND`) —
+//! [`daemon_client::ensure_running`], then prints THAT daemon's webui URL (read
+//! from its slot — the daemon binds an ephemeral port, never a fixed 6789),
+//! honours `--open`, and exits. It never binds a second listener next to the
+//! same vault's daemon (both would want that vault's engine). Two DIFFERENT
+//! vaults' daemons coexisting on their own ephemeral ports is now CORRECT, not a
+//! collision. Explicit `--port` / `--dir` flags (or a set `$ONEBRAIN_BIND`) —
 //! and `$ONEBRAIN_NO_DAEMON` — always mean a foreground standalone server (see
 //! [`plan_serve`]).
 //!
@@ -33,11 +35,13 @@ use crate::server::{self, resolve_token, ServeConfig};
 use anyhow::{Context, Result};
 use std::net::{IpAddr, Ipv4Addr};
 
-/// Default port for `serve` when `--port` is omitted. `6789` is memorable
-/// (the 6-7-8-9 run) and avoids the busy "round" ports — 8888 (Jupyter),
-/// 5555 (Android ADB), 6666 (IRC), 3000/5173/8080 (dev servers) — as well as
-/// 4317/4318 (OpenTelemetry OTLP gRPC/HTTP), which the previous default
-/// collided with. The daemon uses the same default (one surface, one port).
+/// Default port for a STANDALONE foreground `serve` when `--port` is omitted.
+/// `6789` is memorable (the 6-7-8-9 run) and avoids the busy "round" ports —
+/// 8888 (Jupyter), 5555 (Android ADB), 6666 (IRC), 3000/5173/8080 (dev servers)
+/// — as well as 4317/4318 (OpenTelemetry OTLP gRPC/HTTP). This is ONLY the
+/// standalone escape hatch's default: since v3.4.13 (#230) the warm daemon binds
+/// an EPHEMERAL port (multiple per-vault daemons can't share a fixed one), so the
+/// common reuse-or-start path never touches 6789.
 pub const DEFAULT_PORT: u16 = 6789;
 
 /// Format the web UI label for the serve banner: `OneBrain Web UI v0.1.1

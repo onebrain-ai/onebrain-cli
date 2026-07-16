@@ -331,6 +331,7 @@ fn all_checks(vault_root: &Path, config: &onebrain_core::VaultConfig) -> Vec<Doc
     results.push(search_exclude_check(vault_root));
     results.push(token_optimization_check(vault_root));
     results.push(read_hook_failopen_check(vault_root));
+    results.push(daemon_status_check(vault_root));
     results.push(native_search_check(vault_root));
     results.push(legacy_index_stub_check(vault_root));
     results.push(qmd_leftovers_check_prod(config));
@@ -1029,6 +1030,132 @@ fn daemon_status_counts(v: &serde_json::Value) -> Option<(Option<u64>, usize, us
 /// Native-search index check (`check = "search"`). Read-only and
 /// download-free: it resolves the collection, checks whether the on-disk index
 /// exists, and — only if it does — opens the engine (lazy embedder, so
+const DAEMON_STATUS_CHECK: &str = "daemon";
+
+/// Enumerate every per-vault daemon slot (v3.4.13, #230) and surface running
+/// daemons + flag stale/wedged ones. Machine-wide (all slots, not just this
+/// vault's), so a user with several vaults sees every warm daemon at a glance.
+///
+/// READ-ONLY: probes `/api/health` (short timeout, no retry) via
+/// [`crate::commands::daemon_client::DaemonHandle`] — it NEVER starts, stops, or
+/// restarts a daemon (ADR 0032: a read verb must not disturb another session's
+/// daemon).
+///
+/// Verdicts:
+/// - `ok`   — no daemon running, or every slot maps to a live daemon.
+/// - `warn` — a slot has a discovery record whose daemon no longer answers
+///   (crashed / hard-killed), or a lingering start lock with no live daemon (a
+///   wedged slot), OR a LIVE legacy pre-v3.4.13 daemon is still running (the
+///   upgrade window — it holds the vault's redb lock; LOW-2). Advisory; the hint
+///   points at `onebrain daemon stop --all`.
+fn daemon_status_check(_vault_root: &Path) -> DoctorResult {
+    use crate::commands::daemon_client::{self, DaemonHandle, DaemonInfo};
+
+    let slots = match daemon_client::all_slots() {
+        Ok(s) => s,
+        Err(e) => {
+            return DoctorResult::warn(
+                DAEMON_STATUS_CHECK,
+                format!("could not enumerate daemon slots: {e}"),
+            )
+        }
+    };
+
+    let mut running = Vec::new();
+    let mut stale = Vec::new();
+    let is_live = |info: &DaemonInfo| DaemonHandle::new(info.clone()).probe_health().is_some();
+    for slot in &slots {
+        match DaemonInfo::read(&slot.json) {
+            Ok(Some(info)) => {
+                if is_live(&info) {
+                    running.push(format!(
+                        "pid {} · port {} · v{} · vault {}",
+                        info.pid,
+                        info.port,
+                        info.version,
+                        info.vault.as_deref().unwrap_or("(none — vault-less)")
+                    ));
+                } else {
+                    // Record present but the daemon doesn't answer: crashed or
+                    // hard-killed, leaving a stale slot json behind.
+                    stale.push(format!(
+                        "{} (record present, daemon not answering)",
+                        slot.json.display()
+                    ));
+                }
+            }
+            // No json (only a pid/lock left): a wedged start lock with no daemon.
+            Ok(None) if slot.lock.exists() => {
+                stale.push(format!(
+                    "{} (wedged start lock, no daemon)",
+                    slot.lock.display()
+                ));
+            }
+            Ok(None) => {}
+            Err(_) => {
+                stale.push(format!(
+                    "{} (corrupt discovery record)",
+                    slot.json.display()
+                ));
+            }
+        }
+    }
+
+    // The legacy pre-v3.4.13 machine-wide daemon (`daemon.json`, no `-<hash>`) is
+    // EXCLUDED from `all_slots`, so a live one would otherwise be invisible here
+    // while it still holds the vault's redb lock. Surface it (LOW-2) so the
+    // upgrade window is visible + actionable via `daemon stop --all`.
+    let mut legacy_live = false;
+    if let Ok(legacy) = daemon_client::legacy_slot() {
+        match DaemonInfo::read(&legacy.json) {
+            Ok(Some(info)) if is_live(&info) => {
+                legacy_live = true;
+                running.push(format!(
+                    "pid {} · port {} · v{} · LEGACY pre-v3.4.13 daemon (retire with `onebrain daemon stop --all`)",
+                    info.pid, info.port, info.version
+                ));
+            }
+            // A dead legacy record is inert (new code ignores it); don't flag it.
+            _ => {}
+        }
+    }
+
+    let mut details = Vec::new();
+    for r in &running {
+        details.push(format!("running: {r}"));
+    }
+    for s in &stale {
+        details.push(format!("stale: {s}"));
+    }
+
+    if running.is_empty() && stale.is_empty() {
+        return DoctorResult::ok(DAEMON_STATUS_CHECK, "no warm daemon running");
+    }
+
+    // A live legacy daemon or any stale/wedged slot warrants a warn (+ the
+    // stop-all hint); an all-healthy per-vault fleet is ok.
+    if stale.is_empty() && !legacy_live {
+        let msg = match running.len() {
+            1 => "1 warm daemon running".to_string(),
+            n => format!("{n} warm daemons running"),
+        };
+        DoctorResult::ok(DAEMON_STATUS_CHECK, msg).with_details(details)
+    } else {
+        let msg = if legacy_live && stale.is_empty() {
+            "legacy pre-v3.4.13 daemon still running — retire it".to_string()
+        } else {
+            format!(
+                "{} running · {} stale/wedged daemon slot(s)",
+                running.len(),
+                stale.len()
+            )
+        };
+        DoctorResult::warn(DAEMON_STATUS_CHECK, msg)
+            .with_hint("onebrain daemon stop --all")
+            .with_details(details)
+    }
+}
+
 /// `Engine::open` never downloads a model) and reads `Engine::status` (stored
 /// hashes + a vault re-hash, no embed). Reports the indexed doc count, pending
 /// drift, and whether the embedding model is downloaded.
@@ -5791,6 +5918,106 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_status_check_ok_when_no_daemon() {
+        // Empty HOME → no slot files → "no warm daemon running" (ok).
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_var("HOME", home.path());
+        let r = daemon_status_check(home.path());
+        assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
+        assert!(r.message.contains("no warm daemon"), "{r:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_status_check_warns_on_stale_slot() {
+        // A slot json pointing at a dead port → the daemon doesn't answer the
+        // health probe → flagged as a stale slot (warn + stop-all hint).
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_var("HOME", home.path());
+        let run_dir = home.path().join(".onebrain").join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let info = crate::commands::daemon_client::DaemonInfo {
+            port: 1, // nothing listens → probe fails
+            token: "x".repeat(20),
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            vault: None,
+        };
+        std::fs::write(
+            run_dir.join("daemon-deadbeef.json"),
+            serde_json::to_vec(&info).unwrap(),
+        )
+        .unwrap();
+        let r = daemon_status_check(home.path());
+        assert_eq!(r.status, DoctorStatus::Warn, "{r:?}");
+        assert!(r.message.contains("stale/wedged"), "{r:?}");
+        assert_eq!(
+            r.hint.as_deref(),
+            Some("onebrain daemon stop --all"),
+            "{r:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_status_check_surfaces_live_legacy_daemon() {
+        // LOW-2: a LIVE pre-v3.4.13 machine-wide `daemon.json` (no `-<hash>`, so
+        // `all_slots` excludes it) must be surfaced during the upgrade window —
+        // it holds the vault's redb lock — with the stop-all hint, not hidden as
+        // "not running". A minimal mock answers `/api/health` 200.
+        use std::io::{Read, Write};
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_var("HOME", home.path());
+        let run_dir = home.path().join(".onebrain").join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let req = String::from_utf8_lossy(&buf);
+                let resp: &[u8] = if req.starts_with("GET /api/health") {
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\n\r\n{\"ok\":true}"
+                } else {
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n"
+                };
+                let _ = s.write_all(resp);
+            }
+        });
+
+        // Plant a LEGACY discovery record at the un-hashed `daemon.json`.
+        let info = crate::commands::daemon_client::DaemonInfo {
+            port,
+            token: "x".repeat(20),
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            vault: None,
+        };
+        std::fs::write(
+            run_dir.join("daemon.json"),
+            serde_json::to_vec(&info).unwrap(),
+        )
+        .unwrap();
+
+        let r = daemon_status_check(home.path());
+        assert_eq!(r.status, DoctorStatus::Warn, "{r:?}");
+        assert!(r.message.to_lowercase().contains("legacy"), "{r:?}");
+        assert_eq!(
+            r.hint.as_deref(),
+            Some("onebrain daemon stop --all"),
+            "{r:?}"
+        );
+        assert!(
+            r.details.iter().any(|d| d.contains("LEGACY")),
+            "details must name the legacy daemon: {r:?}"
+        );
     }
 
     #[test]
