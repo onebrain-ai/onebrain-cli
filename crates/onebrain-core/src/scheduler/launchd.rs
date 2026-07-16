@@ -268,15 +268,20 @@ fn recurring_command_block(entry: &ScheduleEntry, ctx: &LaunchdContext) -> Strin
 /// 3. `$` → `\$` (would otherwise trigger parameter/command substitution)
 /// 4. `` ` `` → `` \` `` (would otherwise trigger command substitution)
 ///
-/// Applies to values that are interpolated into the one-shot blocks' shell
-/// string but are NOT user-supplied `args:` — those are already rejected
-/// outright by `sanitize_args_for_one_shot` (see
-/// `commands/register_schedule.rs`) if they contain any of these chars.
-/// `ctx.vault_path`, `ctx.skill_cli_path`, `entry.skill`, `entry.command`,
-/// and the derived `plist_file` path are system/config-derived and were
-/// never covered by that check — a value containing `"` would break the
-/// shell string, and `$` / `` ` `` / `\` would allow injection or corrupt
-/// the command launchd actually runs.
+/// Applied to EVERY value interpolated into the one-shot blocks' shell
+/// string — system/config-derived values (`ctx.vault_path`,
+/// `ctx.skill_cli_path`, `entry.skill`, `entry.command`, the derived
+/// `plist_file`) AND user-supplied `args:` map keys/values. A value
+/// containing `"` would break the shell string; `$` / `` ` `` / `\` would
+/// allow injection or corrupt the command launchd actually runs.
+///
+/// `args:` map keys/values are ALSO rejected at register time by
+/// `sanitize_args_for_one_shot` / `validate_schedulable` (see
+/// `commands/register_schedule.rs`), which scan both keys and values — but
+/// we escape them here too as defense-in-depth, so a bypassed or future
+/// unvalidated code path still can't inject. (The register-time check
+/// originally scanned VALUES only, leaving map keys as an unguarded
+/// injection vector — this escape is the second layer that closes it.)
 fn shell_escape_double_quoted(input: &str) -> String {
     input
         .replace('\\', "\\\\")
@@ -292,11 +297,20 @@ fn one_shot_skill_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &str
         "{}/Library/LaunchAgents/{label}.plist",
         ctx.homedir.to_string_lossy()
     );
+    // BOTH key and value land inside the `/bin/sh -c "..."` wrapper's quoted
+    // `--arg="{k}={v}"` fragment, so BOTH must be shell-escaped — escaping
+    // only the value (or neither) leaves the key as an injection vector.
     let args_flags: String = match &entry.args {
         Some(Args::Map(map)) if !map.is_empty() => {
             let parts: Vec<String> = map
                 .iter()
-                .map(|(k, v)| format!("--arg=\"{k}={v}\""))
+                .map(|(k, v)| {
+                    format!(
+                        "--arg=\"{}={}\"",
+                        shell_escape_double_quoted(k),
+                        shell_escape_double_quoted(v)
+                    )
+                })
                 .collect();
             format!(" {}", parts.join(" "))
         }
@@ -1163,6 +1177,106 @@ mod tests {
             out.contains(&expected_in_plist),
             "expected escaped plist_file inside the `rm -f` segment: {expected_in_plist:?}, \
              out:\n{out}"
+        );
+    }
+
+    /// Reverse of [`xml_escape`] — recovers the raw text of a `<string>`
+    /// payload. `&amp;` LAST so an already-decoded `&` can't be re-decoded.
+    fn un_xml_escape(s: &str) -> String {
+        s.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&amp;", "&")
+    }
+
+    /// Pull the `/bin/sh -c` payload (the 3rd ProgramArguments `<string>`,
+    /// right after `-c`) out of a generated one-shot plist and un-XML-escape
+    /// it back to the raw shell command that launchd would actually run.
+    fn extract_one_shot_shell(plist: &str) -> String {
+        let marker = "<string>-c</string>";
+        let after = &plist[plist.find(marker).expect("no -c marker") + marker.len()..];
+        let start = after.find("<string>").expect("no shell <string>") + "<string>".len();
+        let rel_end = after[start..]
+            .find("</string>")
+            .expect("unterminated shell <string>");
+        un_xml_escape(&after[start..start + rel_end])
+    }
+
+    #[test]
+    fn one_shot_skill_map_key_injection_neutralized_through_real_sh() {
+        // SECURITY PoC (RED→GREEN). The live exploit used a map KEY of
+        // `x"; touch <sentinel>; echo "` to break out of the quoted
+        // `--arg="{k}={v}"` fragment inside the `/bin/sh -c "..."` wrapper
+        // and run an arbitrary command. With key-escaping in place, running
+        // the ACTUAL emitted shell string through a real `/bin/sh -c` must
+        // NOT create the sentinel — the injected `touch` stays inert text
+        // inside the quoted arg. On the pre-fix code the sentinel WAS
+        // created (test fails), proving the guard catches the bug.
+        let td = tempfile::tempdir().unwrap();
+        let sentinel = td.path().join("onebrain_poc_pwned");
+        assert!(!sentinel.exists());
+
+        let mut map = IndexMap::new();
+        map.insert(
+            format!("x\"; touch {}; echo \"", sentinel.display()),
+            "harmless".to_string(),
+        );
+        let e = ScheduleEntry {
+            at: Some("2026-05-13 14:30".into()),
+            skill: Some("/distill".into()),
+            args: Some(Args::Map(map)),
+            ..Default::default()
+        };
+        let out = generate_plist(&e, &test_ctx());
+        let shell = extract_one_shot_shell(&out);
+
+        // Run the real payload. The `onebrain` / `launchctl` commands inside
+        // it are expected to fail (binary absent / no such job) — irrelevant.
+        // We only assert the INJECTED `touch` never executes.
+        let _ = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&shell)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run /bin/sh");
+        assert!(
+            !sentinel.exists(),
+            "SHELL INJECTION: emitted one-shot payload executed the injected \
+             command. shell string was:\n{shell}"
+        );
+    }
+
+    #[test]
+    fn one_shot_command_plist_file_path_escaped_when_homedir_has_special_chars() {
+        // Structural companion to the skill-mode plist_file test: the
+        // one-shot COMMAND block also interpolates `plist_file` (derived from
+        // `ctx.homedir`) into its `rm -f "..."` segment and must escape it
+        // identically. `/usr/bin/true` is a generic command (no --vault
+        // append) so this isolates the plist_file path.
+        let e = ScheduleEntry {
+            at: Some("2026-05-13 14:30".into()),
+            command: Some("/usr/bin/true".into()),
+            ..Default::default()
+        };
+        let ctx = LaunchdContext {
+            vault_path: PathBuf::from("/Users/test/vault"),
+            skill_cli_path: "/opt/homebrew/bin/onebrain".into(),
+            log_base_path: PathBuf::from("/Users/test/vault/07-logs/scheduler/2026/05"),
+            homedir: PathBuf::from("/tmp/weird\"$home"),
+            uid: 501,
+        };
+        let out = generate_plist(&e, &ctx);
+        let label = format!("com.onebrain.{}", label_for_entry(&e));
+        let plist_file = format!("/tmp/weird\"$home/Library/LaunchAgents/{label}.plist");
+        let expected_in_plist = xml_escape(&format!(
+            "rm -f \"{}\"",
+            shell_escape_double_quoted(&plist_file)
+        ));
+        assert!(
+            out.contains(&expected_in_plist),
+            "expected escaped plist_file inside the command-mode `rm -f` segment: \
+             {expected_in_plist:?}, out:\n{out}"
         );
     }
 
