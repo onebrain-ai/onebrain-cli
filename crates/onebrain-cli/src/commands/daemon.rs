@@ -257,23 +257,6 @@ fn slot_for_arg(vault_arg: Option<&Path>) -> Result<SlotPaths> {
     daemon_client::slot_paths_for_id(vault_id.as_deref())
 }
 
-/// The pre-v3.4.13 single machine-wide slot (`daemon.{json,pid,lock,log}`).
-///
-/// BACK-COMPAT: new code never WRITES these files — a live pre-upgrade daemon
-/// keeps running (invisible to slot-based discovery) until it idles out, and its
-/// stale files are inert (the `daemon-` prefix excludes them from `all_slots()`).
-/// This lets `daemon stop --all` STOP + clear a lingering legacy daemon so a
-/// user can retire it immediately instead of waiting for the idle timeout.
-fn legacy_slot() -> Result<SlotPaths> {
-    let dir = daemon_client::run_dir()?;
-    Ok(SlotPaths {
-        json: dir.join("daemon.json"),
-        pid: dir.join("daemon.pid"),
-        lock: dir.join("daemon.lock"),
-        log: dir.join("daemon.log"),
-    })
-}
-
 /// Create the daemon run dir (`~/.onebrain/run/`) if missing, with private
 /// (0700 owner-only) permissions on Unix (fix B).
 ///
@@ -548,8 +531,14 @@ pub fn run_status(mode: &OutputMode) -> Result<()> {
     // #230). A slot whose json is present but whose daemon is dead (stale) is
     // skipped here — status stays read-only; doctor's daemon check flags stale
     // slots. A vault-less daemon (`daemon-none.*`) is enumerated like any other.
+    // The legacy pre-v3.4.13 machine-wide slot is checked too, so a live
+    // pre-upgrade daemon (invisible to `all_slots`) still shows up here (LOW-2)
+    // instead of the command reporting "not running" while it holds the lock.
     let mut daemons = Vec::new();
-    for slot in daemon_client::all_slots()? {
+    let slots = daemon_client::all_slots()?
+        .into_iter()
+        .chain(std::iter::once(daemon_client::legacy_slot()?));
+    for slot in slots {
         let mut data = compute_status(&slot.pid, is_alive);
         if !data.running {
             continue;
@@ -1048,12 +1037,41 @@ pub fn run_stop(mode: &OutputMode, vault: Option<&Path>, all: bool) -> Result<()
     if all {
         return run_stop_all(mode);
     }
-    // Default: cwd-resolved slot (or the `--vault` slot). `resolve_start_vault`
-    // returns `None` in the `$ONEBRAIN_VAULT`-set case, and `slot_for_arg(None)`
-    // then re-resolves the env vault — so the env vault's slot is targeted, not
-    // the vault-less one.
-    let effective_vault = resolve_start_vault(vault);
-    let slot = slot_for_arg(effective_vault.as_deref())?;
+    let slot = match vault {
+        // Explicit `--vault X`: target X's slot by canonicalizing X DIRECTLY,
+        // NOT through `slot_for_arg`/`resolve_daemon_vault` (which re-validates X
+        // is still a vault). Start/stop symmetry (LOW-1): the daemon's slot was
+        // keyed on `canonical(X)` at start; if X's `onebrain.yml` has since been
+        // removed while the directory still exists, `resolve_daemon_vault` would
+        // drop X to the vault-less slot and stop the WRONG daemon. Canonicalizing
+        // X directly still finds X's slot as long as the directory exists. A
+        // MOVED/DELETED X can't canonicalize (`None`) — its slot is inherently
+        // underivable from a path that no longer maps to it, so we refuse rather
+        // than fall back to the vault-less slot (which would stop the wrong one).
+        Some(x) => match daemon_client::canonical_vault_id(x) {
+            Some(id) => daemon_client::slot_paths_for_id(Some(&id))?,
+            None => {
+                let env = Envelope::ok(
+                    "daemon.stop",
+                    None,
+                    DaemonStopData {
+                        stopped: false,
+                        pid: None,
+                    },
+                );
+                emit(&env, mode, std::io::stdout().lock(), render_stop_text)?;
+                return Ok(());
+            }
+        },
+        // Default: cwd-resolved slot. `resolve_start_vault(None)` returns `None`
+        // in the `$ONEBRAIN_VAULT`-set case, and `slot_for_arg(None)` then
+        // re-resolves the env vault — so the env vault's slot is targeted, not the
+        // vault-less one.
+        None => {
+            let effective_vault = resolve_start_vault(None);
+            slot_for_arg(effective_vault.as_deref())?
+        }
+    };
     let (stopped, pid) = stop_slot(&slot)?;
     let env = Envelope::ok("daemon.stop", None, DaemonStopData { stopped, pid });
     emit(&env, mode, std::io::stdout().lock(), render_stop_text)?;
@@ -1069,7 +1087,7 @@ fn run_stop_all(mode: &OutputMode) -> Result<()> {
     // upgrade leaves nothing running). `stop_slot` on an absent slot is a
     // harmless no-op that just clears any stale files.
     let mut slots = daemon_client::all_slots()?;
-    slots.push(legacy_slot()?);
+    slots.push(daemon_client::legacy_slot()?);
     for slot in slots {
         let (was_stopped, pid) = stop_slot(&slot)?;
         if was_stopped {
@@ -3207,6 +3225,82 @@ mod tests {
             "stop --all must retire both daemons (a={} b={})",
             disc_a.exists(),
             disc_b.exists()
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // LOW-1 start/stop symmetry: a daemon started for vault X lives in X's slot
+    // (keyed on canonical(X)). If X's `onebrain.yml` is removed while the dir
+    // still exists, `daemon stop --vault X` must STILL target X's slot
+    // (canonicalize X directly, don't re-validate it's a vault) rather than
+    // dropping to the vault-less slot and stopping the wrong daemon. Unix-only.
+    // ─────────────────────────────────────────────────────────────────────
+    #[cfg(unix)]
+    #[test]
+    fn stop_vault_targets_slot_even_after_onebrain_yml_removed() {
+        use assert_cmd::cargo::cargo_bin;
+        use std::process::Command as StdCommand;
+        use std::time::{Duration, Instant};
+
+        let home = tempdir().unwrap();
+        let vault = tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: low1-it\n",
+        )
+        .unwrap();
+        let bin = cargo_bin("onebrain");
+        let _teardown = StopDaemonOnDrop {
+            bin: bin.clone(),
+            envs: vec![("HOME".into(), home.path().display().to_string())],
+        };
+
+        // Start a daemon bound to X.
+        let start = StdCommand::new(&bin)
+            .env("HOME", home.path())
+            .env_remove("ONEBRAIN_VAULT")
+            .env("ONEBRAIN_DAEMON_PORT", "0")
+            .env("ONEBRAIN_DAEMON_IDLE_SECS", "0")
+            .args(["daemon", "start", "--vault"])
+            .arg(vault.path())
+            .output()
+            .expect("daemon start --vault");
+        assert!(start.status.success(), "start failed: {start:?}");
+
+        let disc = slot_file_under_home(home.path(), Some(vault.path()), "json");
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !disc.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(disc.exists(), "daemon never published its slot json");
+
+        // Remove onebrain.yml: X is no longer a "valid vault", but its dir + slot
+        // remain, and canonical(X) still resolves — so stop must find X's slot.
+        std::fs::remove_file(vault.path().join("onebrain.yml")).unwrap();
+
+        let stop = StdCommand::new(&bin)
+            .env("HOME", home.path())
+            .env_remove("ONEBRAIN_VAULT")
+            .args(["daemon", "stop", "--vault"])
+            .arg(vault.path())
+            .output()
+            .expect("daemon stop --vault");
+        assert!(stop.status.success(), "stop --vault failed: {stop:?}");
+        let out = String::from_utf8_lossy(&stop.stdout);
+        assert!(
+            out.contains("stopped"),
+            "stop --vault must retire X's daemon even without onebrain.yml, got: {out}"
+        );
+
+        // X's slot json is gone → its daemon was actually stopped (not the
+        // vault-less slot).
+        let gone = Instant::now() + Duration::from_secs(3);
+        while disc.exists() && Instant::now() < gone {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !disc.exists(),
+            "stop --vault X must have retired X's slot daemon"
         );
     }
 }

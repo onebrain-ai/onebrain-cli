@@ -83,10 +83,11 @@ pub(super) fn router() -> Router<Arc<AppState>> {
 /// dashboard can report "placeholder" instead of a dishonest "embedded".
 ///
 /// The vault identity a CLI client vault-matches against is NOT surfaced here —
-/// it reads the daemon's canonical bound vault from `daemon.json` (`DaemonInfo.
-/// vault`, written at bind time and rung true by the liveness probe), so there
-/// is no second served-vault source to keep in sync. See #170's `vault_decision`
-/// + the passive `daemon_client::discover_matching`.
+/// since #230 each vault has its OWN slot, so a client reads the daemon's
+/// canonical bound vault from that slot's `daemon-<hash>.json` (`DaemonInfo.vault`,
+/// written at bind time and rung true by the liveness probe) and confirms it via
+/// `daemon_client::record_is_our_vault`; there is no second served-vault source
+/// to keep in sync. See the passive `daemon_client::discover_matching`.
 async fn get_health(State(state): State<Arc<AppState>>) -> Response {
     Json(serde_json::json!({
         "ok": true,

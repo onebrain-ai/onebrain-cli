@@ -242,6 +242,24 @@ pub fn all_slots() -> Result<Vec<SlotPaths>> {
         .collect())
 }
 
+/// The pre-v3.4.13 single machine-wide slot (`daemon.{json,pid,lock,log}`).
+///
+/// BACK-COMPAT: new code never WRITES these files, and [`all_slots`] deliberately
+/// EXCLUDES them (the `daemon-` prefix), so a live pre-upgrade daemon is
+/// invisible to slot discovery and idles out on its own. This resolver lets the
+/// surfaces that DO care — `daemon stop --all` (retire it now) and the `daemon
+/// status` / doctor upgrade-window checks (make it visible) — target it
+/// explicitly.
+pub fn legacy_slot() -> Result<SlotPaths> {
+    let dir = run_dir()?;
+    Ok(SlotPaths {
+        json: dir.join("daemon.json"),
+        pid: dir.join("daemon.pid"),
+        lock: dir.join("daemon.lock"),
+        log: dir.join("daemon.log"),
+    })
+}
+
 /// The daemon's discovery record, published to `daemon.json` after it binds.
 /// `port` is the ACTUAL bound port (may differ from the requested one when
 /// binding `0`); `version` is the daemon CLI's own version, used for skew
@@ -857,10 +875,11 @@ fn with_retry(
 /// **Why every routed 503 means engine-busy (not "no vault bound").** The daemon
 /// also 503s from `require_vault_root` when it is running vault-less. But this
 /// client is only reached via [`route_to_daemon`](super::search_common::route_to_daemon)
-/// → [`discover_matching`], which returns a handle ONLY for a daemon whose
-/// `daemon.json.vault` matches the caller's vault; a vault-less daemon fails
-/// `vault_decision` (`Restart`) and is never routed to (the CLI opens the engine
-/// directly instead). So a 503 on a routed request can only come from the
+/// → [`discover_matching`], which resolves THIS vault's slot and returns a handle
+/// ONLY for a daemon whose slot record is our vault (`record_is_our_vault`); a
+/// vault-less daemon lives in a DIFFERENT slot (`daemon-none`) and is never
+/// routed to (the CLI opens the engine directly instead). So a 503 on a routed
+/// request can only come from the
 /// engine-contention paths — `require_engine` on `/api/internal/*` or
 /// `map_search_failure` on `/api/vault/search` — never the no-vault guard.
 fn classify_daemon_ureq(e: ureq::Error) -> anyhow::Error {
@@ -1426,9 +1445,9 @@ mod tests {
         assert_eq!(urlencode("คำ"), "%E0%B8%84%E0%B8%B3");
     }
 
-    // Client fallback: with no daemon.json present, discover() returns None
+    // Client fallback: with no slot json present, discover() returns None
     // (no daemon), so a caller falls back to opening the engine directly. We
-    // point HOME at an empty tempdir so `discovery_path()` resolves under it and
+    // point HOME at an empty tempdir so `slot_json_path()` resolves under it and
     // finds nothing — never touching the real ~/.onebrain.
     #[cfg(unix)]
     #[test]
