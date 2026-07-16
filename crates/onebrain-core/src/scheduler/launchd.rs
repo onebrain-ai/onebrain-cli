@@ -1041,6 +1041,12 @@ mod tests {
     /// through a REAL `/bin/sh -c`. If escaping is correct, the shell must
     /// hand back exactly the original, un-escaped string as a single
     /// argument — no injected commands, no truncation, no corruption.
+    ///
+    /// `#[cfg(unix)]`: shells out to a real `/bin/sh`, which doesn't exist on
+    /// Windows. The one-shot `/bin/sh -c` wrapper this guards is itself a
+    /// unix/launchd concern; the pure-string escaping logic stays covered on
+    /// all platforms by `shell_escape_double_quoted_escapes_all_four_chars_in_order`.
+    #[cfg(unix)]
     #[test]
     fn shell_escape_double_quoted_round_trips_through_real_sh() {
         let cases = [
@@ -1182,6 +1188,11 @@ mod tests {
 
     /// Reverse of [`xml_escape`] — recovers the raw text of a `<string>`
     /// payload. `&amp;` LAST so an already-decoded `&` can't be re-decoded.
+    ///
+    /// `#[cfg(unix)]`: only feeds the `/bin/sh` round-trip test below, which
+    /// is unix-only — keeping it unguarded would be dead code (and a
+    /// `-D warnings` clippy failure) on Windows.
+    #[cfg(unix)]
     fn un_xml_escape(s: &str) -> String {
         s.replace("&lt;", "<")
             .replace("&gt;", ">")
@@ -1192,6 +1203,9 @@ mod tests {
     /// Pull the `/bin/sh -c` payload (the 3rd ProgramArguments `<string>`,
     /// right after `-c`) out of a generated one-shot plist and un-XML-escape
     /// it back to the raw shell command that launchd would actually run.
+    ///
+    /// `#[cfg(unix)]`: only used by the unix-only `/bin/sh` injection test.
+    #[cfg(unix)]
     fn extract_one_shot_shell(plist: &str) -> String {
         let marker = "<string>-c</string>";
         let after = &plist[plist.find(marker).expect("no -c marker") + marker.len()..];
@@ -1202,6 +1216,12 @@ mod tests {
         un_xml_escape(&after[start..start + rel_end])
     }
 
+    // `#[cfg(unix)]`: shells out to a real `/bin/sh`, absent on Windows. The
+    // one-shot `/bin/sh -c` wrapper it exercises is a unix/launchd construct;
+    // the key-escaping logic is also covered platform-independently by the
+    // pure-string assertions in `one_shot_skill_map_key_escaped_in_wrapper`-
+    // style checks and the register-time validator tests.
+    #[cfg(unix)]
     #[test]
     fn one_shot_skill_map_key_injection_neutralized_through_real_sh() {
         // SECURITY PoC (RED→GREEN). The live exploit used a map KEY of
