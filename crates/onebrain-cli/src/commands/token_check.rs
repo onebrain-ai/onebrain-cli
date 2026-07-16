@@ -403,6 +403,55 @@ fn record_failopen(resolved: Option<&ResolvedVault>, reason: &str, session_token
     );
 }
 
+/// Record the read-hook DENY [`GainEvent`] (#264 sub-fix B). This is the fix
+/// for the field finding that a real deny never appeared in telemetry: the deny
+/// arm returned `exit 2` with no `record_gain`, so the very savings the ledger
+/// produced were invisible in `token gain`.
+///
+/// Metered HERE — at the read-hook client — for BOTH the Direct and the
+/// warm-daemon leg, because `run` is the single place the ReadHook surface
+/// finalizes a deny. Deliberately NOT metered inside the daemon's
+/// `post_ledger_check`: that route is shared with `search get` / MCP `get`,
+/// which already meter their own `LedgerRef` deliveries, so a daemon-side meter
+/// would double-count those surfaces (and mislabel them ReadHook). Metering at
+/// the client keeps the design §5d invariant "metering never depends on the
+/// daemon" and records each read-hook deny exactly once.
+///
+/// Parallels `mcp.rs`'s `LedgerRef` recording: `bytes_before` = the original
+/// doc body avoided (the envelope's `bytes_saved`), `bytes_after` = the
+/// reference envelope actually delivered, `cache = LedgerDeny`, `surface =
+/// ReadHook`. Best-effort — no collection → no sink → dropped, like every other
+/// surface. `level` reflects the vault's configured rung (the ledger only gates
+/// at `balanced`+, so an unreadable config defaults to `balanced`).
+fn record_ledger_deny(
+    resolved: Option<&ResolvedVault>,
+    reference: &ReferenceEnvelope,
+    session_token: Option<String>,
+) {
+    let Some(resolved) = resolved else {
+        return;
+    };
+    let ref_bytes = serde_json::to_string(reference)
+        .map(|s| s.len() as u64)
+        .unwrap_or(0);
+    let level = onebrain_core::load_vault_config(&resolved.root)
+        .map(|c| c.token_optimization.level)
+        .unwrap_or(OptLevel::Balanced);
+    record_gain(
+        resolved,
+        GainEvent {
+            ts: now_ts(),
+            surface: Surface::ReadHook,
+            transform: "ledger_deny".to_string(),
+            level,
+            bytes_before: reference.bytes_saved,
+            bytes_after: ref_bytes,
+            cache: CacheKind::LedgerDeny,
+            session_token,
+        },
+    );
+}
+
 /// Entry point invoked from the dispatcher — mirrors `harness_run::run`'s
 /// contract: returns the exit code the binary should call
 /// `std::process::exit` with. `path` is the doc path the hook is about to let
@@ -440,6 +489,12 @@ pub fn run(vault_flag: Option<PathBuf>, path: &str) -> Result<i32> {
             // so a stdout write failure fails OPEN, mirroring the codebase's
             // own BrokenPipe-as-exit-0 convention (`exit.rs`).
             if emit_reference(&mut std::io::stdout().lock(), &reference) {
+                // #264 sub-fix B: the deny actually saved the doc body — record
+                // it so `token gain` surfaces the read-hook's savings (before,
+                // a deny recorded nothing and the ledger's whole point was
+                // invisible). Only after a SUCCESSFUL emit — a write failure
+                // fails open below and is metered as such, never as a deny.
+                record_ledger_deny(resolved.as_ref(), &reference, resolve_session_token_opt());
                 Ok(2)
             } else {
                 record_failopen(
@@ -932,9 +987,23 @@ mod tests {
         let code =
             run(Some(vault.path().to_path_buf()), "notes/a.md").expect("run should not error");
         assert_eq!(code, 2);
-        // Deny never records a gain event from `check` itself — the ledger
-        // route doesn't meter (only `search get`/MCP `get` deliveries do).
-        assert!(gain_events(cache.path()).is_empty());
+        // #264 sub-fix B: a deny NOW records a `LedgerDeny` gain row (before, it
+        // recorded nothing and the ledger's savings were invisible in
+        // `token gain`). `bytes_before` credits the avoided body (the envelope's
+        // `bytes_saved`); `bytes_after` is the reference envelope actually sent.
+        let events = gain_events(cache.path());
+        assert_eq!(events.len(), 1, "a deny must record exactly one gain row");
+        assert_eq!(events[0].cache, CacheKind::LedgerDeny);
+        assert_eq!(events[0].surface, Surface::ReadHook);
+        assert_eq!(events[0].transform, "ledger_deny");
+        assert_eq!(
+            events[0].bytes_before, 123,
+            "bytes_before credits the avoided doc body (envelope bytes_saved)"
+        );
+        assert!(
+            events[0].bytes_after > 0,
+            "bytes_after is the reference envelope size"
+        );
     }
 
     #[cfg(unix)]
@@ -1037,6 +1106,26 @@ mod tests {
             run(Some(vault.path().to_path_buf()), "a.md").expect("run should not error"),
             2,
             "a no-daemon repeat read of an unchanged doc must be GATED (exit 2) — the #248 fix"
+        );
+
+        // #264 sub-fix B — the DIRECT-leg deny also records a `LedgerDeny` row
+        // (a real indexed body → non-zero bytes_before). The first_send allow
+        // recorded nothing, so exactly one row exists after the deny. This vault
+        // uses the `token-check-e2e` collection (not `test_vault`'s
+        // `token-check-test`), so read that collection's gain dir directly.
+        let e2e_gain = crate::commands::search_common::collection_cache_dir("token-check-e2e")
+            .join("token")
+            .join("gain");
+        let events = JsonlGainWriter::new(&e2e_gain)
+            .read_all()
+            .unwrap_or_default();
+        assert_eq!(events.len(), 1, "only the deny records; the allow does not");
+        assert_eq!(events[0].cache, CacheKind::LedgerDeny);
+        assert_eq!(events[0].surface, Surface::ReadHook);
+        assert_eq!(events[0].level, OptLevel::Balanced);
+        assert!(
+            events[0].bytes_before > 0,
+            "a real indexed body credits non-zero bytes_before"
         );
 
         // The deny carries the frozen reference envelope. `run` writes it to

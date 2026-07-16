@@ -348,6 +348,15 @@ async fn post_ledger_check(
 
         let response = match &verdict {
             LedgerVerdict::Unchanged { sent_hash } => {
+                // #264 note — this route deliberately does NOT record a gain
+                // event, even on an `unchanged` deny. The route is a shared
+                // verdict oracle: `search get` / MCP `get` call it and meter
+                // their OWN `LedgerRef` deliveries client-side, and the
+                // read-hook (`token check`) meters its OWN `LedgerDeny` in
+                // `run`'s deny arm. Metering here would double-count every get
+                // surface (and mislabel them ReadHook). "Each surface meters
+                // itself" (design §5d) — the oracle stays metering-free.
+                //
                 // Credit the avoided inline size: the caller's own body size
                 // when supplied, else a best-effort engine read (0 on error —
                 // never fail the decision on a size estimate).
