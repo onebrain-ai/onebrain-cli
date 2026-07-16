@@ -595,20 +595,32 @@ fn run_skill_alias_without_vault_exits_64() {
 /// *nested inside* a vault (not the vault root itself), with no
 /// `--vault`/`--vault-dir` flag, must resolve via walk-up and actually reach
 /// the harness-spawn body — proving the alias genuinely walks up now, rather
-/// than only ever erroring when a flag is absent. `CLAUDE_BIN=/bin/true`
-/// stands in for `claude` so the spawn succeeds deterministically (exit 0)
-/// without depending on a real harness being installed.
+/// than only ever erroring when a flag is absent.
+///
+/// Uses a written mock `claude` script (exits 0 immediately) pointed at by
+/// `CLAUDE_BIN`, so the test is hermetic and instant. A bare `CLAUDE_BIN=/bin/true`
+/// is NOT portable: `/bin/true` doesn't exist on macOS (only `/usr/bin/true`),
+/// so the harness resolver would report it missing and fall through to a real
+/// installed `claude` — burning API tokens and taking tens of seconds.
 #[cfg(unix)]
 #[test]
 fn run_skill_alias_resolves_vault_via_walk_up_from_nested_cwd() {
+    use std::os::unix::fs::PermissionsExt;
     let vault = vault_dir();
     let nested = vault.path().join("00-inbox").join("nested");
     std::fs::create_dir_all(&nested).unwrap();
+
+    let mock = vault.path().join("mock-claude.sh");
+    std::fs::write(&mock, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut perms = std::fs::metadata(&mock).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&mock, perms).unwrap();
+
     let out = Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(&nested)
         .env_remove("ONEBRAIN_VAULT")
-        .env("CLAUDE_BIN", "/bin/true")
+        .env("CLAUDE_BIN", &mock)
         .args(["run-skill", "--skill", "daily"])
         .output()
         .unwrap();

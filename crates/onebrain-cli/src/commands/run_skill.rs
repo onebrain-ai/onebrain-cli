@@ -28,7 +28,13 @@
 //!
 //! Exit codes mirror Bun's `runSkillCommand`:
 //!
-//! - `78` (EX_CONFIG) — no OneBrain config (onebrain.yml / vault.yml) present
+//! - `78` (EX_CONFIG) — no OneBrain config (onebrain.yml / vault.yml) present.
+//!   NOTE (#263): both CLI entry points (`skill run` and the legacy
+//!   `run-skill` alias) now pre-resolve the vault via `vault_ctx::require`
+//!   before calling this function, so a missing/invalid vault surfaces as
+//!   `E_VAULT_NOT_FOUND` (exit 64) at the dispatch layer and this `78` guard
+//!   is effectively unreachable through the CLI. It's kept only as
+//!   defense-in-depth for any direct in-process caller of [`run`].
 //! - `127` — couldn't run/track the child (spawn failed, e.g. the harness
 //!   binary not on disk; or a fault while waiting on it)
 //! - `128 + signal` — child terminated by signal (Unix only)
