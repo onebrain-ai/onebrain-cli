@@ -46,11 +46,32 @@ use crate::commands::daemon_client::{self, DaemonHandle};
 use crate::commands::search_common::{daemon_routing_disabled, normalize_doc_path, open_engine};
 use crate::commands::token_runner::{record_gain, resolve_session_token_opt, token_db_path};
 
-/// Hard wall-clock budget for the whole daemon round-trip (design §5b:
-/// "decision target <200ms"). Enforced client-side — the daemon client's own
-/// timeouts (2-30s, sized for cold embeds) are all longer than this and would
-/// otherwise let a wedged daemon block the very read it's supposed to gate.
-const CHECK_TIMEOUT: Duration = Duration::from_millis(200);
+/// Default wall-clock budget for the whole daemon round-trip (design §5b:
+/// "decision target <200ms") when the vault config can't be read. Enforced
+/// client-side — the daemon client's own timeouts (2-30s, sized for cold
+/// embeds) are all longer than this and would otherwise let a wedged daemon
+/// block the very read it's supposed to gate. The operative budget is
+/// `token_optimization.check_timeout_ms` (#264, default 200) — pinned equal to
+/// this constant by a test — so iCloud / networked vaults can raise it above
+/// 200ms rather than fail open silently every time (the #264 field finding).
+const DEFAULT_CHECK_TIMEOUT: Duration =
+    Duration::from_millis(onebrain_core::config::default_check_timeout_ms() as u64);
+
+/// The daemon round-trip budget for this vault: `token_optimization
+/// .check_timeout_ms` (default 200ms). An unreadable config, or a configured
+/// `0` (which would be an instant-timeout that silently disables the gate),
+/// both fall back to [`DEFAULT_CHECK_TIMEOUT`] — a gate must never lose its
+/// budget, and never self-disable via a degenerate value.
+fn check_timeout(resolved: &ResolvedVault) -> Duration {
+    let ms = onebrain_core::load_vault_config(&resolved.root)
+        .map(|c| c.token_optimization.check_timeout_ms)
+        .unwrap_or_else(|_| onebrain_core::config::default_check_timeout_ms());
+    if ms == 0 {
+        DEFAULT_CHECK_TIMEOUT
+    } else {
+        Duration::from_millis(ms as u64)
+    }
+}
 
 /// What the daemon round-trip (or a client-side pre-check) produced. Kept
 /// separate from [`Decision`] so the exit-code/stdout mapping ([`decide`])
@@ -135,21 +156,41 @@ enum DaemonLeg {
 
 /// Query a warm, vault-bound daemon for `path`'s ledger verdict — the part of
 /// [`resolve_outcome`] that touches the network, isolated so it can run on a
-/// background thread under [`CHECK_TIMEOUT`]. `vault_root` scopes daemon
+/// background thread under the configured budget. `vault_root` scopes daemon
 /// discovery to the SAME vault (a mismatched-vault daemon is never adopted —
 /// same rule every other daemon-client caller follows); a non-match yields
 /// [`DaemonLeg::FallThrough`] so the caller opens the engine directly (the #248
 /// fix), rather than the old unconditional `no_daemon` fail-open.
+///
+/// **#264 — adopt a same-vault daemon REGARDLESS of version**
+/// ([`daemon_client::discover_same_vault_any_version`], the same route
+/// `token gain` uses for the same reason). The prior version-EXACT
+/// [`daemon_client::discover_matching`] was the root cause of the field
+/// finding: after a `brew upgrade`, the still-running same-vault daemon is
+/// version-skewed, so `discover_matching` returned `FallThrough` → the Direct
+/// leg cold-opened the engine — but the skewed daemon STILL held both
+/// `token.redb` and the engine lock, so the open collided and collapsed into
+/// the opaque `engine_open_error` (the 25× majority in `token gain --history`).
+/// Adopting the warm daemon serves the verdict from its HELD engine, lock-free
+/// (`post_ledger_check`) — no cold open, no collision. A version-skewed daemon
+/// too old to have the route 404s → `daemon_version_skew` fail-open (clean, and
+/// it self-heals once the daemon restarts at v3.4.13+); an older daemon that
+/// HAS the route but predates #255's path normalization simply misses on the
+/// absolute path → `first_send`/`unknown_doc` → Allow (also clean — the gate
+/// fires once the warm daemon is v3.4.13+ too). Either way, no engine_open_error.
 fn query_daemon_leg(vault_root: &Path, path: &str) -> DaemonLeg {
-    let handle: DaemonHandle = match daemon_client::discover_matching(Some(vault_root)) {
-        Ok(Some(handle)) => handle,
-        // No record, or a version/vault mismatch → nothing to adopt. Fall
-        // through to the Direct in-process check.
-        Ok(None) => return DaemonLeg::FallThrough,
-        // Can't even locate the run dir → treat as "no daemon" and let the
-        // local engine (authoritative when nothing else holds it) answer.
-        Err(_) => return DaemonLeg::FallThrough,
-    };
+    let handle: DaemonHandle =
+        match daemon_client::discover_same_vault_any_version(Some(vault_root)) {
+            Ok(Some(handle)) => handle,
+            // No same-vault record, a different-vault daemon, or a daemon that
+            // vanished mid-discovery (no longer holds the lock) → nothing same-vault
+            // holds `token.redb`, so falling through to the Direct in-process check
+            // is safe (self-healing, mirrors `token gain`'s #258 Gap 8 handling).
+            Ok(None) => return DaemonLeg::FallThrough,
+            // Can't even locate the run dir → treat as "no daemon" and let the
+            // local engine (authoritative when nothing else holds it) answer.
+            Err(_) => return DaemonLeg::FallThrough,
+        };
     DaemonLeg::Verdict(match handle.token_ledger_check(path, None, None, true) {
         Ok(Some(value)) => outcome_from_response(&value),
         // 404 — daemon predates the token routes (design §8 version skew). It
@@ -160,18 +201,37 @@ fn query_daemon_leg(vault_root: &Path, path: &str) -> DaemonLeg {
     })
 }
 
-/// Run [`query_daemon_leg`] on a detached thread and wait up to
-/// [`CHECK_TIMEOUT`]. A timeout fails open (a wedged daemon holds the engine —
-/// a Direct open would only hit its lock, so we do NOT fall through); the
-/// background thread is simply abandoned (the process exits right after `run`
-/// returns anyway, taking it down with it).
-fn query_daemon_leg_with_deadline(vault_root: PathBuf, path: String) -> DaemonLeg {
+/// Run [`query_daemon_leg`] on a detached thread and wait up to `budget`
+/// (`token_optimization.check_timeout_ms`, #264). A timeout fails open (a
+/// wedged daemon holds the engine — a Direct open would only hit its lock, so
+/// we do NOT fall through); the background thread is simply abandoned (the
+/// process exits right after `run` returns anyway, taking it down with it).
+fn query_daemon_leg_with_deadline(
+    vault_root: PathBuf,
+    path: String,
+    budget: Duration,
+) -> DaemonLeg {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(query_daemon_leg(&vault_root, &path));
     });
-    rx.recv_timeout(CHECK_TIMEOUT)
-        .unwrap_or(DaemonLeg::Verdict(CheckOutcome::FailOpen("timeout_200ms")))
+    rx.recv_timeout(budget)
+        .unwrap_or(DaemonLeg::Verdict(CheckOutcome::FailOpen("daemon_timeout")))
+}
+
+/// True when an `open_engine` failure is the redb-lock-held-elsewhere case
+/// (`EngineBusy`, exit-77 territory), as opposed to a genuine cold/slow open
+/// failure. `search_common::map_engine_open_error` re-wraps a redb lock
+/// collision as [`onebrain_core::CoreError::EngineBusy`] (dropping the original
+/// typed `onebrain_search::EngineBusy` head), so the primary check is on
+/// `CoreError`; the raw search-layer predicate is kept as a belt-and-suspenders
+/// for any path that surfaces the untyped-mapped variant. Lets `check_direct`
+/// record `engine_busy` vs `engine_open_error` distinctly (#264 A#5).
+fn is_engine_busy_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| {
+        c.downcast_ref::<onebrain_core::CoreError>()
+            .is_some_and(|e| matches!(e, onebrain_core::CoreError::EngineBusy(_)))
+    }) || onebrain_search::error::is_engine_busy(err)
 }
 
 /// In-process (Direct-mode) ledger check — the #248 fix. When no vault-bound
@@ -226,9 +286,24 @@ fn check_direct(resolved: &ResolvedVault, path: &str) -> CheckOutcome {
     // Open the engine to derive the doc's current content hash (the read-hook
     // supplies none). redb's exclusive flock is non-blocking, so a lock held by
     // another process errors promptly (never hangs) → fail open.
+    //
+    // #264 — classify the open failure instead of collapsing every cause into
+    // one opaque `engine_open_error` (v3.4.12's 25× majority). A redb lock held
+    // elsewhere (`open_engine` maps it to `CoreError::EngineBusy`) is recorded
+    // as the distinct `engine_busy` reason; a genuine cold/slow open keeps
+    // `engine_open_error`. With the warm-daemon route now adopting a same-vault
+    // daemon regardless of version, a held lock should almost never reach the
+    // Direct leg anymore — so a future `engine_busy` spike self-diagnoses as a
+    // discovery-race rather than hiding as generic open failure.
     let engine = match open_engine(Some(resolved.root.as_path().to_path_buf())) {
         Ok((engine, _)) => engine,
-        Err(_) => return CheckOutcome::FailOpen("engine_open_error"),
+        Err(e) => {
+            return CheckOutcome::FailOpen(if is_engine_busy_error(&e) {
+                "engine_busy"
+            } else {
+                "engine_open_error"
+            });
+        }
     };
     let Some(current_hash) = engine.doc_hash(path) else {
         // Unindexed / unknown doc — can't compare, so never claim "unchanged".
@@ -272,7 +347,12 @@ fn resolve_outcome(resolved: &ResolvedVault, path: &str) -> CheckOutcome {
     if daemon_routing_disabled() {
         return check_direct(resolved, path);
     }
-    match query_daemon_leg_with_deadline(resolved.root.as_path().to_path_buf(), path.to_string()) {
+    let budget = check_timeout(resolved);
+    match query_daemon_leg_with_deadline(
+        resolved.root.as_path().to_path_buf(),
+        path.to_string(),
+        budget,
+    ) {
         DaemonLeg::Verdict(outcome) => outcome,
         DaemonLeg::FallThrough => check_direct(resolved, path),
     }
@@ -511,6 +591,60 @@ mod tests {
         );
     }
 
+    // ── #264 A#4/A#5: configurable budget + open-failure classification ────
+
+    #[test]
+    fn default_check_timeout_pins_the_config_default() {
+        // The read-hook's fallback `Duration` must never drift from the config's
+        // documented default — both derive from `default_check_timeout_ms`.
+        assert_eq!(
+            DEFAULT_CHECK_TIMEOUT,
+            Duration::from_millis(onebrain_core::config::default_check_timeout_ms() as u64)
+        );
+        assert_eq!(DEFAULT_CHECK_TIMEOUT, Duration::from_millis(200));
+    }
+
+    fn vault_with_timeout(yaml: &str) -> (tempfile::TempDir, ResolvedVault) {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("onebrain.yml"), yaml).unwrap();
+        let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
+        (vault, resolved)
+    }
+
+    #[test]
+    fn check_timeout_reads_configured_budget() {
+        // #264: iCloud/network vaults raise the budget past 200ms.
+        let (_v, resolved) = vault_with_timeout(
+            "search:\n  collection: t\ntoken_optimization:\n  check_timeout_ms: 750\n",
+        );
+        assert_eq!(check_timeout(&resolved), Duration::from_millis(750));
+    }
+
+    #[test]
+    fn check_timeout_defaults_when_absent() {
+        let (_v, resolved) = vault_with_timeout("search:\n  collection: t\n");
+        assert_eq!(check_timeout(&resolved), DEFAULT_CHECK_TIMEOUT);
+    }
+
+    #[test]
+    fn check_timeout_zero_falls_back_to_default_never_instant() {
+        // A degenerate `0` would recv_timeout(0) → instant fail-open every call,
+        // silently disabling the gate. Fall back to the default instead.
+        let (_v, resolved) = vault_with_timeout(
+            "search:\n  collection: t\ntoken_optimization:\n  check_timeout_ms: 0\n",
+        );
+        assert_eq!(check_timeout(&resolved), DEFAULT_CHECK_TIMEOUT);
+    }
+
+    #[test]
+    fn is_engine_busy_error_distinguishes_lock_from_cold_open() {
+        let busy: anyhow::Error =
+            anyhow::Error::new(onebrain_core::CoreError::EngineBusy("locked".to_string()));
+        assert!(is_engine_busy_error(&busy));
+        let cold = anyhow::anyhow!("opening search engine at /x: no such file");
+        assert!(!is_engine_busy_error(&cold));
+    }
+
     // ── `run` end-to-end: every fail-open branch, each asserting the
     //    `hook_failopen` gain event lands (plan 5.1) ────────────────────────
 
@@ -586,13 +720,27 @@ mod tests {
     /// but skipped here since the test doesn't need the private perms path).
     #[cfg(unix)]
     fn write_daemon_json(home: &Path, vault: &Path, port: u16, token: &str) {
+        write_daemon_json_versioned(home, vault, port, token, env!("CARGO_PKG_VERSION"));
+    }
+
+    /// Like [`write_daemon_json`] but pins an arbitrary `version` — lets a test
+    /// stand up a VERSION-SKEWED same-vault daemon record (the post-`brew
+    /// upgrade` field condition #264 fixes).
+    #[cfg(unix)]
+    fn write_daemon_json_versioned(
+        home: &Path,
+        vault: &Path,
+        port: u16,
+        token: &str,
+        version: &str,
+    ) {
         let run_dir = home.join(".onebrain").join("run");
         std::fs::create_dir_all(&run_dir).unwrap();
         let info = daemon_client::DaemonInfo {
             port,
             token: token.to_string(),
             pid: std::process::id(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: version.to_string(),
             vault: daemon_client::canonical_vault_id(vault),
         };
         std::fs::write(
@@ -703,6 +851,43 @@ mod tests {
         assert_eq!(events[0].transform, "no_session_token");
     }
 
+    /// **#264 sub-fix A — the warm-daemon route adopts a same-vault daemon
+    /// REGARDLESS of version.** A version-SKEWED (post-`brew upgrade`) same-vault
+    /// daemon record answers `unchanged`; the read-hook must ROUTE to it and
+    /// GATE (exit 2), NOT version-reject it and cold-open the engine. Under the
+    /// prior `discover_matching` (version-exact) this skewed daemon was rejected
+    /// → FallThrough → `check_direct` at conservative → Allow (exit 0): the RED
+    /// state, and precisely why v3.4.12 collided on the held lock into
+    /// `engine_open_error`. GREEN after switching to
+    /// `discover_same_vault_any_version`.
+    #[cfg(unix)]
+    #[test]
+    fn warm_same_vault_daemon_gates_even_across_version_skew() {
+        let (vault, cache) = test_vault(); // conservative client config
+        let body = r#"{"verdict":"unchanged","reference":{"doc_path":"notes/a.md","hash":"deadbeef","sent_earlier":true,"bytes_saved":6352,"rematerialize":"onebrain search get notes/a.md --force"}}"#;
+        let port = start_fake_daemon(200, body, Duration::ZERO);
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", vault.path().as_os_str()),
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+        ]);
+        // A version DIFFERENT from ours — the post-upgrade skew condition.
+        write_daemon_json_versioned(
+            vault.path(),
+            vault.path(),
+            port,
+            "daemon-check-token-123",
+            "0.0.1-old",
+        );
+
+        let code =
+            run(Some(vault.path().to_path_buf()), "notes/a.md").expect("run should not error");
+        assert_eq!(
+            code, 2,
+            "a warm same-vault daemon must be adopted across version skew and GATE the read \
+             (exit 2) via its held engine — never version-rejected into a colliding cold open"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn timeout_fails_open_fast_and_records_event() {
@@ -729,7 +914,7 @@ mod tests {
         let events = gain_events(cache.path());
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].cache, CacheKind::HookFailopen);
-        assert_eq!(events[0].transform, "timeout_200ms");
+        assert_eq!(events[0].transform, "daemon_timeout");
     }
 
     #[cfg(unix)]
