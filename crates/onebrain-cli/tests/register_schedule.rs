@@ -213,8 +213,10 @@ fn command_mode_entries_fully_identical_still_collide() {
         .stderr(predicate::str::contains("normalize to the same plist path"));
 }
 
-/// Recurring command-mode entry produces a hook-style argv plist (no
-/// `--skill` / `--vault` / `run-skill`).
+/// Recurring command-mode entry for a GENERIC binary produces a hook-style
+/// argv plist (no `--skill` / `run-skill`) and — #263 R2 — must NOT get a
+/// `--vault` appended. `/bin/echo` stands in for any non-onebrain command
+/// (rsync, etc.): appending `--vault` there would break the job.
 ///
 /// Unix-only: relies on `/bin/echo` existing.
 #[cfg(unix)]
@@ -235,7 +237,40 @@ fn command_mode_dry_run_produces_hook_style_argv() {
         .success()
         .stdout(predicate::str::contains("<string>/bin/echo</string>"))
         .stdout(predicate::str::contains("<string>hello</string>"))
-        .stdout(predicate::str::contains("<string>--skill</string>").not());
+        .stdout(predicate::str::contains("<string>--skill</string>").not())
+        .stdout(predicate::str::contains("<string>--vault</string>").not());
+}
+
+/// Recurring command-mode entry whose command IS the onebrain binary DOES
+/// get `--vault <vault_path>` appended (#263 bug 1): launchd runs jobs with
+/// cwd=/, so onebrain needs the vault path in its own argv. We point
+/// `command:` at the built onebrain test binary by absolute path — the
+/// register path resolves it (it exists) and its basename `onebrain` is
+/// detected as the onebrain binary.
+#[cfg(unix)]
+#[test]
+fn command_mode_onebrain_dry_run_embeds_vault() {
+    let v = tempdir().unwrap();
+    let onebrain_bin = assert_cmd::cargo::cargo_bin("onebrain");
+    let onebrain_str = onebrain_bin.to_str().unwrap();
+    std::fs::write(
+        v.path().join("vault.yml"),
+        format!(
+            "schedule:\n  - cron: \"0 3 * * 0\"\n    command: {onebrain_str}\n    \
+             args:\n      - search\n      - reindex\n"
+        ),
+    )
+    .unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<string>search</string>"))
+        .stdout(predicate::str::contains("<string>reindex</string>"))
+        .stdout(predicate::str::contains("<string>--vault</string>"));
 }
 
 /// Skill marked `schedulable: false` is rejected at register time.

@@ -1,6 +1,12 @@
 //! Launchd plist emitter. Mirrors Bun `src/lib/scheduler/launchd.ts`
-//! byte-for-byte — every newline and indent space must match for the
-//! Layer-4 parity test against the Bun v2.3.3 binary.
+//! byte-for-byte for **skill-mode** plists — every newline and indent space
+//! must match for the Layer-4 parity test against the Bun v2.3.3 binary.
+//!
+//! **Command-mode is a deliberate divergence from Bun (#263):** onebrain
+//! command-mode entries now append `--vault <path>` to their argv (launchd
+//! runs jobs with `cwd=/`, so the binary can't otherwise find the vault).
+//! Bun v2.3.3 never emitted this, so the byte-parity claim above is scoped
+//! to skill-mode; command-mode output intentionally differs.
 //!
 //! Implementation is **string templating, not `quick-xml`.** A round-trip
 //! through `quick-xml` would re-format whitespace, breaking the byte
@@ -158,15 +164,96 @@ fn recurring_skill_block(entry: &ScheduleEntry, ctx: &LaunchdContext) -> String 
     out
 }
 
+/// Strip a trailing `.exe` (Windows) from a filename and return the bare
+/// stem. `onebrain.exe` → `onebrain`; `rsync` → `rsync`.
+fn strip_exe(name: &str) -> &str {
+    name.strip_suffix(".exe").unwrap_or(name)
+}
+
+/// The basename of a path/command string, with any `.exe` suffix stripped.
+/// Returns `None` when the path has no final component.
+fn command_basename(cmd: &str) -> Option<&str> {
+    Path::new(cmd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(strip_exe)
+}
+
+/// True when a command-mode entry's `command` resolves to the onebrain
+/// binary itself — the ONLY case where appending `--vault` is meaningful.
+///
+/// Command-mode explicitly supports generic binaries (`command: rsync,
+/// args: [-av, /vault, /backup]` is a documented preset). Appending
+/// `--vault <path>` to `rsync` would produce `rsync … --vault <path>`,
+/// which rsync rejects as an unknown flag — the scheduled job would fail
+/// on every fire (#263 R2 regression). So we gate the append on the
+/// command actually being onebrain.
+///
+/// Detection is by basename so both the bare `onebrain` and an absolute
+/// `/opt/homebrew/bin/onebrain` spelling match (the register path rewrites
+/// command to an absolute path before this runs), plus a Windows
+/// `onebrain.exe`. We also match when the command's basename equals
+/// `ctx.skill_cli_path`'s basename — the exact binary launchd would exec
+/// for skill-mode — so a renamed/aliased install still resolves.
+fn command_is_onebrain(cmd: &str, ctx: &LaunchdContext) -> bool {
+    let Some(cmd_base) = command_basename(cmd) else {
+        return false;
+    };
+    if cmd_base == "onebrain" {
+        return true;
+    }
+    command_basename(&ctx.skill_cli_path).is_some_and(|cli_base| cli_base == cmd_base)
+}
+
+/// True when the entry's command-mode `args:` already carry an explicit
+/// vault flag — `--vault`, `--vault-dir`, or their `=`-joined forms. When
+/// present we must NOT append our own `--vault`: respect the user's
+/// explicit choice and avoid a double-flag clobber (#263 R2 finding).
+fn args_have_explicit_vault(entry: &ScheduleEntry) -> bool {
+    match &entry.args {
+        Some(Args::List(argv)) => argv.iter().any(|a| {
+            a == "--vault"
+                || a == "--vault-dir"
+                || a.starts_with("--vault=")
+                || a.starts_with("--vault-dir=")
+        }),
+        _ => false,
+    }
+}
+
+/// Whether `--vault <ctx.vault_path>` should be appended to a command-mode
+/// entry's argv: only when the command is onebrain (a generic binary would
+/// choke on the flag) AND the user hasn't already supplied a vault flag.
+fn should_append_vault(entry: &ScheduleEntry, ctx: &LaunchdContext) -> bool {
+    command_is_onebrain(entry.command.as_deref().unwrap_or(""), ctx)
+        && !args_have_explicit_vault(entry)
+}
+
 /// Build the `<ProgramArguments>` body for a recurring command-mode entry.
 /// Each argv element becomes a `<string>` line.
-fn recurring_command_block(entry: &ScheduleEntry) -> String {
+///
+/// launchd runs every job with `cwd=/`, so an onebrain command-mode entry
+/// can't rely on cwd to find the vault the way an interactive shell
+/// invocation would. When the command is onebrain (see [`should_append_vault`])
+/// we append `--vault <ctx.vault_path>` after the user's own args — an
+/// explicit flag, preferred over setting `WorkingDirectory` (which would
+/// also change the meaning of any relative paths the user's `args:` already
+/// assume). Generic commands (rsync, etc.) get their argv UNCHANGED.
+/// Mirrors `recurring_skill_block`, which already embeds `--vault` (#263 bug 1).
+fn recurring_command_block(entry: &ScheduleEntry, ctx: &LaunchdContext) -> String {
     let cmd = entry.command.as_deref().unwrap_or("");
     let mut lines: Vec<String> = vec![format!("        <string>{}</string>", xml_escape(cmd))];
     if let Some(Args::List(argv)) = &entry.args {
         for a in argv {
             lines.push(format!("        <string>{}</string>", xml_escape(a)));
         }
+    }
+    if should_append_vault(entry, ctx) {
+        lines.push("        <string>--vault</string>".to_string());
+        lines.push(format!(
+            "        <string>{}</string>",
+            xml_escape(&ctx.vault_path.to_string_lossy())
+        ));
     }
     lines.join("\n")
 }
@@ -207,17 +294,30 @@ fn one_shot_skill_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &str
 }
 
 /// Build the `<ProgramArguments>` body for a one-shot command-mode entry.
+///
+/// Same `--vault` rationale and gating as [`recurring_command_block`]
+/// (#263 bug 1 + R2): launchd's `cwd=/` means an onebrain command needs the
+/// vault path in its own argv, appended after any user-supplied args and
+/// quoted the same way. A generic command (rsync, etc.) is left untouched.
 fn one_shot_command_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &str) -> String {
     let plist_file = format!(
         "{}/Library/LaunchAgents/{label}.plist",
         ctx.homedir.to_string_lossy()
     );
-    let quoted_args: String = match &entry.args {
+    let mut parts: Vec<String> = match &entry.args {
         Some(Args::List(argv)) if !argv.is_empty() => {
-            let parts: Vec<String> = argv.iter().map(|a| format!("\"{a}\"")).collect();
-            format!(" {}", parts.join(" "))
+            argv.iter().map(|a| format!("\"{a}\"")).collect()
         }
-        _ => String::new(),
+        _ => Vec::new(),
+    };
+    if should_append_vault(entry, ctx) {
+        parts.push("\"--vault\"".to_string());
+        parts.push(format!("\"{}\"", ctx.vault_path.to_string_lossy()));
+    }
+    let quoted_args = if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", parts.join(" "))
     };
     let inner = format!(
         "\"{}\"{}",
@@ -346,7 +446,7 @@ pub fn generate_plist(entry: &ScheduleEntry, ctx: &LaunchdContext) -> String {
     let program_args = match (is_one_shot(entry), is_command_mode(entry)) {
         (true, true) => one_shot_command_block(entry, ctx, &label),
         (true, false) => one_shot_skill_block(entry, ctx, &label),
-        (false, true) => recurring_command_block(entry),
+        (false, true) => recurring_command_block(entry, ctx),
         (false, false) => recurring_skill_block(entry, ctx),
     };
 
@@ -387,8 +487,14 @@ mod tests {
     use indexmap::IndexMap;
 
     fn test_ctx() -> LaunchdContext {
+        test_ctx_with_vault("/Users/test/vault")
+    }
+
+    /// Same as [`test_ctx`] but with an arbitrary vault path — used to
+    /// exercise paths containing spaces (#263 motivating scenario).
+    fn test_ctx_with_vault(vault: &str) -> LaunchdContext {
         LaunchdContext {
-            vault_path: PathBuf::from("/Users/test/vault"),
+            vault_path: PathBuf::from(vault),
             skill_cli_path: "/opt/homebrew/bin/onebrain".into(),
             log_base_path: PathBuf::from("/Users/test/vault/07-logs/scheduler/2026/05"),
             homedir: PathBuf::from("/Users/test"),
@@ -564,6 +670,12 @@ mod tests {
 
     #[test]
     fn recurring_command_emits_hook_style_program_arguments() {
+        // #263 bug 1: launchd runs jobs with cwd=/, so a command-mode entry
+        // MUST embed `--vault <path>` in its own argv — it can't rely on cwd
+        // to find the vault (skill-mode already does this; command-mode was
+        // the gap). The `--skill` / `skill run` shape stays absent — that's
+        // what makes this "hook-style" (plain `command + args[]`, matching
+        // Claude Code's hooks.json convention) rather than skill-mode.
         let e = ScheduleEntry {
             cron: Some("0 3 * * 0".into()),
             command: Some("/opt/homebrew/bin/onebrain".into()),
@@ -574,7 +686,15 @@ mod tests {
         assert!(out.contains("<string>/opt/homebrew/bin/onebrain</string>"));
         assert!(out.contains("<string>qmd-reindex</string>"));
         assert!(!out.contains("<string>--skill</string>"));
-        assert!(!out.contains("<string>--vault</string>"));
+        assert!(
+            out.contains("<string>--vault</string>"),
+            "command-mode argv must embed --vault so launchd's cwd=/ can't \
+             break vault discovery, out:\n{out}"
+        );
+        assert!(
+            out.contains("<string>/Users/test/vault</string>"),
+            "expected the ctx vault_path after --vault, out:\n{out}"
+        );
         assert!(!out.contains("<string>skill</string>\n        <string>run</string>"));
     }
 
@@ -666,10 +786,80 @@ mod tests {
         assert!(out.contains("&quot;/opt/homebrew/bin/onebrain&quot; &quot;qmd-reindex&quot;"));
         assert!(out.contains("launchctl bootout gui/501/com.onebrain.onebrain-qmd-reindex"));
         assert!(out.contains("rm -f"));
+        // #263: onebrain one-shot command embeds --vault too (quoted).
+        assert!(
+            out.contains("&quot;--vault&quot; &quot;/Users/test/vault&quot;"),
+            "onebrain one-shot argv must carry a quoted --vault, out:\n{out}"
+        );
+    }
+
+    // ── #263 R2: --vault appended for onebrain ONLY, never generic binaries ──
+
+    #[test]
+    fn onebrain_recurring_command_with_no_args_gets_vault_appended() {
+        // #263: an onebrain command with zero user-supplied args still gets
+        // `--vault <path>` appended (it's not left a bare one-element argv).
+        let e = ScheduleEntry {
+            cron: Some("0 3 * * 0".into()),
+            command: Some("/opt/homebrew/bin/onebrain".into()),
+            ..Default::default()
+        };
+        let out = generate_plist(&e, &test_ctx());
+        assert!(out.contains("<string>/opt/homebrew/bin/onebrain</string>"));
+        assert!(out.contains("<string>--vault</string>"));
+        assert!(out.contains("<string>/Users/test/vault</string>"));
     }
 
     #[test]
-    fn command_with_no_args_produces_single_element_argv() {
+    fn onebrain_bare_and_exe_command_names_detected() {
+        // Detection is basename-based: bare `onebrain` and an `onebrain.exe`
+        // (Windows binary name) both count as the onebrain binary → --vault
+        // appended. Uses a forward-slash path for the `.exe` case so the
+        // test is host-agnostic (std::path only splits on `\` on Windows).
+        for cmd in ["onebrain", "/opt/homebrew/bin/onebrain.exe"] {
+            let e = ScheduleEntry {
+                cron: Some("0 3 * * 0".into()),
+                command: Some(cmd.into()),
+                args: Some(Args::List(vec!["search".into(), "reindex".into()])),
+                ..Default::default()
+            };
+            let out = generate_plist(&e, &test_ctx());
+            assert!(
+                out.contains("<string>--vault</string>"),
+                "expected --vault for onebrain command `{cmd}`, out:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn recurring_generic_command_gets_no_vault() {
+        // #263 R2 REGRESSION GUARD: command-mode supports generic binaries
+        // (the documented `command: rsync, args: [-av, /vault, /backup]`
+        // preset). Appending `--vault` there would make rsync fail on an
+        // unknown flag every fire. A non-onebrain command must be UNCHANGED.
+        let e = ScheduleEntry {
+            cron: Some("0 5 * * *".into()),
+            command: Some("/usr/bin/rsync".into()),
+            args: Some(Args::List(vec![
+                "-av".into(),
+                "/vault".into(),
+                "/backup".into(),
+            ])),
+            ..Default::default()
+        };
+        let out = generate_plist(&e, &test_ctx());
+        assert!(out.contains("<string>/usr/bin/rsync</string>"));
+        assert!(out.contains("<string>-av</string>"));
+        assert!(
+            !out.contains("<string>--vault</string>"),
+            "generic rsync command must NOT get --vault appended, out:\n{out}"
+        );
+    }
+
+    #[test]
+    fn recurring_generic_command_with_no_args_gets_no_vault() {
+        // A generic no-args command stays a bare one-element argv — no
+        // spurious --vault, and no empty trailing string.
         let e = ScheduleEntry {
             cron: Some("0 3 * * 0".into()),
             command: Some("/usr/bin/true".into()),
@@ -677,19 +867,114 @@ mod tests {
         };
         let out = generate_plist(&e, &test_ctx());
         assert!(out.contains("<string>/usr/bin/true</string>"));
+        assert!(!out.contains("<string>--vault</string>"));
     }
 
     #[test]
-    fn command_with_non_onebrain_binary_works() {
+    fn one_shot_generic_command_gets_no_vault() {
+        // #263 R2 REGRESSION GUARD, one-shot variant: a generic one-shot
+        // command must not get --vault injected into its shell wrapper. Use
+        // `/src /dst` (not `/vault /backup`) as the paths so the assertion
+        // isn't confused by a `--vault` substring in the sanitized label
+        // discriminator — we assert on the precise quoted flag form the
+        // appended argv would take.
         let e = ScheduleEntry {
-            cron: Some("0 5 * * *".into()),
+            at: Some("2026-05-13 14:30".into()),
             command: Some("/usr/bin/rsync".into()),
             args: Some(Args::List(vec!["-av".into(), "/src".into(), "/dst".into()])),
             ..Default::default()
         };
         let out = generate_plist(&e, &test_ctx());
-        assert!(out.contains("<string>/usr/bin/rsync</string>"));
-        assert!(out.contains("<string>-av</string>"));
+        assert!(out.contains("&quot;/usr/bin/rsync&quot;"));
+        assert!(
+            !out.contains("&quot;--vault&quot;"),
+            "generic one-shot rsync command must NOT get --vault, out:\n{out}"
+        );
+    }
+
+    #[test]
+    fn onebrain_recurring_command_with_explicit_vault_arg_not_doubled() {
+        // #263 R2: respect a user's explicit --vault in args — don't append
+        // a second one.
+        let e = ScheduleEntry {
+            cron: Some("0 3 * * 0".into()),
+            command: Some("onebrain".into()),
+            args: Some(Args::List(vec![
+                "search".into(),
+                "reindex".into(),
+                "--vault".into(),
+                "/other/vault".into(),
+            ])),
+            ..Default::default()
+        };
+        let out = generate_plist(&e, &test_ctx());
+        assert_eq!(
+            out.matches("<string>--vault</string>").count(),
+            1,
+            "exactly one --vault (the user's), no appended duplicate, out:\n{out}"
+        );
+        // The appended ctx vault path must NOT be present — only the user's.
+        assert!(!out.contains("<string>/Users/test/vault</string>"));
+        assert!(out.contains("<string>/other/vault</string>"));
+    }
+
+    #[test]
+    fn onebrain_command_with_explicit_vault_equals_form_not_doubled() {
+        // The `--vault=<x>` and `--vault-dir` spellings are also honored.
+        for arg in ["--vault=/other", "--vault-dir=/other", "--vault-dir"] {
+            let e = ScheduleEntry {
+                cron: Some("0 3 * * 0".into()),
+                command: Some("onebrain".into()),
+                args: Some(Args::List(vec!["reindex".into(), arg.into()])),
+                ..Default::default()
+            };
+            let out = generate_plist(&e, &test_ctx());
+            assert!(
+                !out.contains("<string>/Users/test/vault</string>"),
+                "explicit vault flag `{arg}` should suppress the appended \
+                 ctx vault, out:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn onebrain_recurring_command_vault_path_with_space_round_trips() {
+        // #263 motivating scenario: a vault path containing a space must
+        // round-trip. In recurring (hook-style) argv each element is its own
+        // `<string>`, so the space needs no shell quoting — it lives intact
+        // inside one `<string>` element.
+        let e = ScheduleEntry {
+            cron: Some("0 3 * * 0".into()),
+            command: Some("onebrain".into()),
+            args: Some(Args::List(vec!["reindex".into()])),
+            ..Default::default()
+        };
+        let out = generate_plist(&e, &test_ctx_with_vault("/tmp/My Vault/x"));
+        assert!(out.contains("<string>--vault</string>"));
+        assert!(
+            out.contains("<string>/tmp/My Vault/x</string>"),
+            "space-containing vault path must be one intact <string>, out:\n{out}"
+        );
+    }
+
+    #[test]
+    fn onebrain_one_shot_command_vault_path_with_space_round_trips() {
+        // One-shot wraps argv in a `/bin/sh -c` string, so a space in the
+        // vault path must be shell-quoted (double-quoted) to survive as a
+        // single argument.
+        let e = ScheduleEntry {
+            at: Some("2026-05-13 14:30".into()),
+            command: Some("onebrain".into()),
+            args: Some(Args::List(vec!["reindex".into()])),
+            ..Default::default()
+        };
+        let out = generate_plist(&e, &test_ctx_with_vault("/tmp/My Vault/x"));
+        // xml_escape turns the surrounding double-quotes into &quot; — the
+        // space stays literal inside them.
+        assert!(
+            out.contains("&quot;--vault&quot; &quot;/tmp/My Vault/x&quot;"),
+            "space-containing vault path must be quoted in the shell wrapper, out:\n{out}"
+        );
     }
 
     #[test]

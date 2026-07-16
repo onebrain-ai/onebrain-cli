@@ -1228,8 +1228,9 @@ fn all_hidden_aliases_dispatch_and_warn() {
     // Coverage table — each entry pairs the alias name with the minimal
     // valid argv. Exit code expectations vary per command (some are
     // hook-protocol exit-0-on-block; vault-sync exits 1 on a bad fixture;
-    // run-skill exits 78 on missing vault.yml) — we don't assert a
-    // specific code, only that the migration arm fired.
+    // run-skill exits 64 on a --vault dir without config since the #263
+    // alias hardening) — we don't assert a specific code, only that the
+    // migration arm fired.
     let cases: &[(&str, &[&str], Option<i32>)] = &[
         // (alias name, extra-args, optional expected exit code)
         ("session-init", &[], None),
@@ -1243,9 +1244,11 @@ fn all_hidden_aliases_dispatch_and_warn() {
         ("register-schedule", &["--dry-run"], None),
         // migrate: handler always exits 0 (internal-command contract).
         ("migrate", &["unknown-migration"], Some(0)),
-        // run-skill: exits 78 when vault.yml is absent. We give a vault
-        // dir without vault.yml so we hit the 78 path quickly.
-        ("run-skill", &["--skill", "noop"], Some(78)),
+        // run-skill: since the #263 alias hardening it resolves the vault via
+        // `vault_ctx::require` (like the modern `skill run` arm), so a --vault
+        // dir without a config is NotAVault → exit 64 (E_VAULT_NOT_FOUND),
+        // not the old bare 78 from run_skill::run's internal guard.
+        ("run-skill", &["--skill", "noop"], Some(64)),
         // vault-sync: pointed at a missing fixture path → exit 1.
         ("vault-sync", &[], Some(1)),
     ];

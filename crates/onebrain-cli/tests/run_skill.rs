@@ -40,8 +40,16 @@ echo "$PWD" >> "$ARGV_LOG.cwd"
 exit "${MOCK_EXIT:-0}"
 "#;
 
+/// #263 Part 2: `run-skill` now resolves its `--vault` value through
+/// `vault_ctx::require` (same chain as the modern `skill run` arm) BEFORE
+/// ever calling `commands::run_skill::run`. An explicit `--vault` pointing at
+/// a path with no `onebrain.yml`/`vault.yml` therefore now fails as
+/// `CoreError::NotAVault` at the dispatch layer → exit 64
+/// (E_VAULT_NOT_FOUND), rather than falling through to `run_skill::run`'s own
+/// internal config check (which used to be the only guard, returning a bare
+/// `Ok(78)`).
 #[test]
-fn missing_config_exits_78() {
+fn missing_config_exits_64() {
     let d = tempdir().unwrap();
     let bogus = d.path().join("does-not-exist");
     Command::cargo_bin("onebrain")
@@ -56,8 +64,8 @@ fn missing_config_exits_78() {
         .env("CLAUDE_BIN", "/bin/true")
         .assert()
         .failure()
-        .code(78)
-        .stderr(predicate::str::contains("Vault not found"));
+        .code(64)
+        .stderr(predicate::str::contains("not a valid vault root"));
 }
 
 #[cfg(unix)]
