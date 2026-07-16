@@ -795,13 +795,14 @@ impl McpServer {
             .map_err(|e| ErrorData::invalid_params(e.to_string(), None))
     }
 
-    /// Check the already-sent ledger for `doc_path`, hashing the EXACT `content`
-    /// about to be delivered (design §3b/§5d) so an out-of-band edit is caught.
-    /// Returns the reference envelope only on `unchanged`; every other outcome
-    /// (first send, changed, inactive, no session, 404 old daemon, any error)
-    /// yields `None` → the caller inlines. Level gate applied by the caller
-    /// (Direct) / the daemon route (Daemon). Runs the blocking cache/HTTP work
-    /// off the async runtime.
+    /// Check the already-sent ledger for `doc_path`, keyed on the doc's raw-file
+    /// identity (`Engine::doc_hash`, unified with the read-hook — design §3b/§5d,
+    /// issue #255). Returns the reference envelope only on `unchanged`; every
+    /// other outcome (first send, changed, inactive, no session, 404 old daemon,
+    /// unindexed doc, any error) yields `None` → the caller inlines. Level gate
+    /// applied by the caller (Direct) / the daemon route (Daemon). `content` is
+    /// the delivered body; it still supplies `bytes_saved`. Runs the blocking
+    /// cache/HTTP work off the async runtime.
     async fn ledger_reference(
         &self,
         doc_path: String,
@@ -809,6 +810,8 @@ impl McpServer {
     ) -> Option<ReferenceEnvelope> {
         let resolved = self.resolved.clone();
         match &self.backend {
+            // Daemon route derives `doc_hash` from its own engine (we send no
+            // content hash), matching the read-hook's daemon leg exactly.
             Backend::Daemon(handle) => {
                 let handle = handle.clone();
                 tokio::task::spawn_blocking(move || {
@@ -818,12 +821,27 @@ impl McpServer {
                 .ok()
                 .flatten()
             }
-            Backend::Direct(_) => tokio::task::spawn_blocking(move || {
-                token_runner::direct_ledger_reference(&resolved, &doc_path, &content)
-            })
-            .await
-            .ok()
-            .flatten(),
+            // Direct: look up `doc_hash` from the locally-held engine (a cheap
+            // hash-table read) and key the ledger on it. `None` (unindexed doc)
+            // makes `direct_ledger_reference` skip the ledger and inline.
+            Backend::Direct(engine) => {
+                let engine = engine.clone();
+                tokio::task::spawn_blocking(move || {
+                    let doc_hash = {
+                        let guard = engine.lock().unwrap_or_else(|p| p.into_inner());
+                        guard.doc_hash(&doc_path)
+                    };
+                    token_runner::direct_ledger_reference(
+                        &resolved,
+                        &doc_path,
+                        doc_hash.as_deref(),
+                        &content,
+                    )
+                })
+                .await
+                .ok()
+                .flatten()
+            }
         }
     }
 
@@ -1171,8 +1189,9 @@ impl McpServer {
         // WHOLE-doc read comes back as a reference the agent can re-materialize
         // with `--force`, not the full body again. Works in both backends
         // (daemon route or in-process `token.redb`, design §5d). The ledger keys
-        // on a hash of the disk body (`text`) about to be delivered, so an
-        // out-of-band edit is caught. `force` and windowed reads always inline.
+        // on the doc's raw-file identity (`Engine::doc_hash`), unified with the
+        // read-hook so the two surfaces share one entry (#255). `force` and
+        // windowed reads always inline.
         if !force && !windowed && level >= OptLevel::Balanced {
             let full_bytes = text.len() as u64;
             if let Some(reference) = self.ledger_reference(path_part.clone(), text.clone()).await {

@@ -60,13 +60,19 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchGetArgs)
     // Only when it serves this exact vault; else fall through to a direct open.
     // Captured once so the ledger check below reuses the same backend decision.
     let daemon = route_to_daemon(&resolved);
-    let content = if let Some(handle) = &daemon {
-        get_via_daemon(handle, &doc_path)?
+    // `doc_hash` is the raw-file identity the already-sent ledger keys on
+    // (issue #255) — captured from the SAME engine that serves the body so the
+    // read-hook (which keys on `doc_hash`) shares the entry. In daemon mode this
+    // process holds no engine, so `None` here means the daemon derives it.
+    let (content, doc_hash) = if let Some(handle) = &daemon {
+        (get_via_daemon(handle, &doc_path)?, None)
     } else {
         let (engine, _resolved) = open_engine(vault_flag)?;
-        engine
+        let content = engine
             .get(&doc_path)
-            .map_err(|e| anyhow::anyhow!("{e}\n{NOT_INDEXED_HINT}"))?
+            .map_err(|e| anyhow::anyhow!("{e}\n{NOT_INDEXED_HINT}"))?;
+        let doc_hash = engine.doc_hash(&doc_path);
+        (content, doc_hash)
     };
 
     // Level (per-call `--opt-level` > config > default); a bad `--opt-level` is
@@ -81,12 +87,18 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchGetArgs)
     // §3b/§3c/§5d): a repeat, unchanged `search get --output json` returns a
     // reference instead of the body; `--force` bypasses the ledger and always
     // delivers the full body (it's the reference's re-materialize target). The
-    // ledger keys on a hash of the delivered `content`, so an out-of-band edit
-    // is caught. Human TTY always gets the full body (never a reference).
+    // ledger keys on the doc's raw-file identity (`doc_hash`), unified with the
+    // read-hook so the two surfaces share one entry (#255). Human TTY always
+    // gets the full body (never a reference).
     let reference = if mode.is_structured() && !args.force && level >= OptLevel::Balanced {
         match &daemon {
             Some(handle) => token_runner::daemon_ledger_reference(handle, &doc_path, &content),
-            None => token_runner::direct_ledger_reference(&resolved, &doc_path, &content),
+            None => token_runner::direct_ledger_reference(
+                &resolved,
+                &doc_path,
+                doc_hash.as_deref(),
+                &content,
+            ),
         }
     } else {
         None

@@ -866,4 +866,157 @@ mod tests {
             other => panic!("expected an Unchanged reference envelope, got {other:?}"),
         }
     }
+
+    // ── #255 cross-surface unification (get side ↔ read-hook) ──────────────
+
+    /// **The #255 cross-surface e2e.** In ONE session: the CLI `search get`
+    /// surface records the send, then the read-hook `token check` of the SAME
+    /// unchanged doc must GATE (exit 2). This only works if both surfaces key the
+    /// already-sent ledger on the SAME hash — the doc's raw-file identity
+    /// (`Engine::doc_hash`). Before #255 the get side recorded
+    /// `content_hash(engine.get(path))` (the reconstructed body — headings
+    /// stripped, chunks re-joined) while `token check` keyed on `doc_hash` (the
+    /// raw file bytes), so the two ledgers never collided and this repeat check
+    /// fell through to a first-send Allow (exit 0). RED before the unification
+    /// (both surfaces disagree → exit 0); GREEN after (shared key → exit 2).
+    #[cfg(unix)]
+    #[test]
+    fn search_get_then_read_hook_share_one_ledger_entry() {
+        let (vault, cache) = balanced_vault();
+        let home = tempfile::tempdir().unwrap(); // no daemon.json under here
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", home.path().as_os_str()),
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")),
+            ("CLAUDE_CODE_SESSION_ID", std::ffi::OsStr::new("xSurf255")),
+        ]);
+        // A heading + body: the chunker drops the heading line from the chunk
+        // text, so the reconstructed body (`engine.get`) is provably ≠ the raw
+        // file bytes — the exact pre-#255 hash divergence this test pins.
+        index_doc_lex_only(
+            vault.path(),
+            "a.md",
+            "# A\nshared-ledger cross-surface body text",
+        );
+
+        // Surface A — CLI `search get --output json` records the send keyed on
+        // the doc's `doc_hash`. First send returns the full body + records.
+        crate::commands::search_get::run(
+            Some(vault.path().to_path_buf()),
+            &crate::output::OutputMode::Json { pretty: false },
+            &crate::cli::SearchGetArgs {
+                doc_path: "a.md".to_string(),
+                force: false,
+                opt_level: None,
+            },
+        )
+        .expect("search get should succeed");
+
+        // Surface B — the read-hook `token check` of the SAME unchanged doc must
+        // find A's entry (shared `doc_hash` key) and GATE the read.
+        assert_eq!(
+            run(Some(vault.path().to_path_buf()), "a.md").expect("run should not error"),
+            2,
+            "search get + token check of the same unchanged doc must share one \
+             ledger entry and GATE the read (exit 2) — the #255 cross-surface fix"
+        );
+
+        // The deny carries the frozen reference envelope (design contract: a deny
+        // ALWAYS offers a `--force` re-materialize path). Re-derive the same
+        // Direct verdict the deny produced and assert the envelope contents.
+        let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
+        match check_direct(&resolved, "a.md") {
+            CheckOutcome::Unchanged(env) => {
+                assert_eq!(env.doc_path, "a.md");
+                assert!(
+                    !env.hash.is_empty(),
+                    "a real indexed doc has a content hash"
+                );
+                assert!(env.sent_earlier);
+                assert_eq!(env.rematerialize, "onebrain search get a.md --force");
+            }
+            other => panic!("expected an Unchanged reference envelope, got {other:?}"),
+        }
+    }
+
+    /// `doc_hash == None` (unindexed doc) must make `direct_ledger_reference`
+    /// SKIP the ledger — inline the full body, record NOTHING, never unwrap. Proof
+    /// it recorded nothing: a subsequent read-hook check of the same doc is still
+    /// a first-send Allow (exit 0), not a gate.
+    #[cfg(unix)]
+    #[test]
+    fn direct_ledger_reference_skips_when_doc_hash_none() {
+        let (vault, cache) = balanced_vault();
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", home.path().as_os_str()),
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")),
+            ("CLAUDE_CODE_SESSION_ID", std::ffi::OsStr::new("xNone255")),
+        ]);
+        index_doc_lex_only(vault.path(), "a.md", "# A\nbody for the none-fallback test");
+        let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
+
+        // None doc_hash → skip: returns None (inline the body) without touching
+        // the ledger.
+        assert!(
+            crate::commands::token_runner::direct_ledger_reference(
+                &resolved,
+                "a.md",
+                None,
+                "body for the none-fallback test",
+            )
+            .is_none(),
+            "doc_hash=None must skip the ledger and inline, never unwrap"
+        );
+
+        // It must not have RECORDED anything: the very next read-hook check of the
+        // real, indexed doc is a fresh first-send Allow, not a gate.
+        assert_eq!(
+            run(Some(vault.path().to_path_buf()), "a.md").expect("run should not error"),
+            0,
+            "a skipped (doc_hash=None) call must record no ledger entry"
+        );
+    }
+
+    /// Safe-failure invariant (#255): when the doc's indexed content CHANGES
+    /// after a send was recorded, the read-hook must re-deliver (verdict
+    /// `Changed` → Allow, exit 0) — the ledger NEVER hard-denies content the
+    /// agent hasn't seen. Record H0, reindex the doc to a new `doc_hash` H1, then
+    /// check: H1 ≠ recorded H0 → Changed → Allow, not a stale deny.
+    #[cfg(unix)]
+    #[test]
+    fn changed_indexed_content_re_delivers_never_denies_unseen() {
+        let (vault, cache) = balanced_vault();
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", home.path().as_os_str()),
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")),
+            ("CLAUDE_CODE_SESSION_ID", std::ffi::OsStr::new("xChg255")),
+        ]);
+        index_doc_lex_only(vault.path(), "a.md", "# A\noriginal body content");
+
+        // First read-hook check records the ORIGINAL doc_hash (H0) → Allow.
+        assert_eq!(
+            run(Some(vault.path().to_path_buf()), "a.md").expect("run should not error"),
+            0,
+            "first check is a first-send Allow (records H0)"
+        );
+
+        // Reindex the doc with entirely new bytes → its doc_hash flips to H1.
+        index_doc_lex_only(
+            vault.path(),
+            "a.md",
+            "# A\nCOMPLETELY DIFFERENT body — reindexed",
+        );
+
+        // The read-hook now sees H1 ≠ recorded H0 → Changed → ALLOW (re-deliver),
+        // never a stale deny of content the agent has not been shown.
+        assert_eq!(
+            run(Some(vault.path().to_path_buf()), "a.md").expect("run should not error"),
+            0,
+            "changed indexed content must re-deliver (Changed→Allow), never deny unseen content"
+        );
+    }
 }
