@@ -372,10 +372,14 @@ pub fn upsert_child(text: &str, parent: &str, key: &str, value: &str) -> String 
     }
 
     let (mut lines, newline, ends_with_newline) = split(text);
-    let header = format!("{parent}:");
-    let parent_idx = lines
-        .iter()
-        .position(|l| indent_of(l) == 0 && !is_comment(l) && l.trim_start().starts_with(&header));
+    // Match the parent's KEY TOKEN, not a raw `starts_with("{parent}:")`
+    // prefix — the same bug already fixed for `locate`/`key_token` elsewhere
+    // in this module: a parent key with a space before the colon (`search
+    // :`) or a quoted key (`"search":`) would otherwise be missed, falling
+    // through to `append_block` and creating a DUPLICATE top-level block.
+    let parent_idx = lines.iter().position(|l| {
+        indent_of(l) == 0 && !is_comment(l) && line_key_token(l, false) == Some(parent)
+    });
 
     let Some(pidx) = parent_idx else {
         // No `parent:` line at all → append a fresh block.
@@ -384,7 +388,13 @@ pub fn upsert_child(text: &str, parent: &str, key: &str, value: &str) -> String 
 
     // Only `parent:` (optionally with a trailing `# comment`) is a block we
     // can extend; anything else after the colon is an inline/scalar value.
-    let after = lines[pidx].trim_start()[header.len()..].trim_start();
+    // Split on the FIRST colon (never a fixed `"{parent}:"` slice — that
+    // breaks on `parent :` / `"parent":`, same as `locate_impl`).
+    let after = lines[pidx]
+        .trim_start()
+        .split_once(':')
+        .map(|(_, a)| a.trim_start())
+        .unwrap_or("");
     if !(after.is_empty() || after.starts_with('#')) {
         lines.splice(
             pidx..pidx + 1,
@@ -452,6 +462,32 @@ mod tests {
         )
         .is_none());
         assert!(set_value("a: 1\n", &[], "x").is_none());
+    }
+
+    #[test]
+    fn key_lacks_comment_true_when_key_is_first_line() {
+        // idx == 0: no line sits above the key at all, so it trivially
+        // "lacks a comment" — doctor's `--fix` must insert one, not skip it.
+        let text = "a: 1\nb: 2\n";
+        assert!(key_lacks_comment(text, &["a"]));
+    }
+
+    #[test]
+    fn key_lacks_comment_true_when_previous_line_is_not_a_comment() {
+        let text = "a: 1\nb: 2\n";
+        assert!(key_lacks_comment(text, &["b"]));
+    }
+
+    #[test]
+    fn key_lacks_comment_false_when_comment_directly_above() {
+        let text = "# doc for a\na: 1\nb: 2\n";
+        assert!(!key_lacks_comment(text, &["a"]));
+    }
+
+    #[test]
+    fn key_lacks_comment_false_when_key_not_found() {
+        let text = "a: 1\nb: 2\n";
+        assert!(!key_lacks_comment(text, &["nope"]));
     }
 
     #[test]
@@ -562,6 +598,41 @@ mod tests {
             upsert_child("", "search", "collection", "c"),
             "search:\n  collection: c\n"
         );
+    }
+
+    #[test]
+    fn upsert_child_finds_spaced_and_quoted_parent_key_no_duplicate() {
+        // BLOCKING regression (Copilot round-2 finding #1): a raw
+        // `starts_with(&header)` prefix check (header = "{parent}:") misses a
+        // parent key with a space before the colon (`search :`) or a quoted
+        // key (`"search":`) — the SAME bug already fixed elsewhere in this
+        // module via `key_token` (see the `key_or_commented_placeholder_present`
+        // spaced/quoted regression tests above). Missing the parent falls
+        // through to `append_block`, which appends a SECOND top-level
+        // `search:` block — a duplicate key that corrupts the config. This
+        // must FAIL on the old `starts_with` code and PASS once `upsert_child`
+        // matches on `line_key_token` like the rest of the module.
+        let spaced = "search :\n  collection: c\nfolders:\n  inbox: x\n";
+        let out = upsert_child(spaced, "search", "embed_model", "m");
+        assert_eq!(
+            out.matches("search").count(),
+            1,
+            "must not create a duplicate `search` block: {out}"
+        );
+        assert!(out.contains("embed_model: m"), "{out}");
+        assert!(out.contains("collection: c"), "{out}");
+        serde_yaml::from_str::<serde_yaml::Value>(&out).expect("result must parse as valid YAML");
+
+        let quoted = "\"search\":\n  collection: c\nfolders:\n  inbox: x\n";
+        let out = upsert_child(quoted, "search", "embed_model", "m");
+        assert_eq!(
+            out.matches("search").count(),
+            1,
+            "must not create a duplicate `search` block: {out}"
+        );
+        assert!(out.contains("embed_model: m"), "{out}");
+        assert!(out.contains("collection: c"), "{out}");
+        serde_yaml::from_str::<serde_yaml::Value>(&out).expect("result must parse as valid YAML");
     }
 
     #[test]
