@@ -41,6 +41,12 @@ pub enum CacheKind {
     MemoHit,
     LedgerRef,
     HookFailopen,
+    /// The read-hook ledger gate DENIED a repeat, unchanged whole-doc read —
+    /// the agent got a reference envelope instead of the body (design §5b,
+    /// #264). Distinct from `LedgerRef` (a `get`/MCP delivery that returned a
+    /// reference) so the deny funnel is separately visible in `token gain`; the
+    /// gap #264 closes was that a real deny never appeared in telemetry at all.
+    LedgerDeny,
 }
 
 impl std::fmt::Display for CacheKind {
@@ -50,6 +56,7 @@ impl std::fmt::Display for CacheKind {
             CacheKind::MemoHit => "memo_hit",
             CacheKind::LedgerRef => "ledger_ref",
             CacheKind::HookFailopen => "hook_failopen",
+            CacheKind::LedgerDeny => "ledger_deny",
         };
         f.write_str(s)
     }
@@ -131,6 +138,7 @@ mod tests {
             (CacheKind::MemoHit, "memo_hit"),
             (CacheKind::LedgerRef, "ledger_ref"),
             (CacheKind::HookFailopen, "hook_failopen"),
+            (CacheKind::LedgerDeny, "ledger_deny"),
         ] {
             assert_eq!(variant.to_string(), expect);
             let json = serde_json::to_string(&variant).unwrap();

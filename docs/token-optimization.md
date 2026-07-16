@@ -243,7 +243,10 @@ Note: byte counts are exact; per-model token figures are an estimate — see `do
 
 `surface` values are `mcp_query | mcp_get | mcp_multi_get | cli_search |
 daemon_http | read_hook`; `cache` values are `none | memo_hit | ledger_ref |
-hook_failopen`.
+hook_failopen | ledger_deny`. A `ledger_deny` row is a read-hook `token check`
+DENY — a repeat unchanged read served as a reference instead of the body
+(surface `read_hook`); the saved body shows in `bytes_before`, the reference
+sent in `bytes_after`. Break it out with `onebrain token gain --by cache`.
 
 ### `--history` — the raw per-call tail
 
@@ -343,8 +346,9 @@ session.**
 - **Fail-open, always.** Any trouble getting a trustworthy verdict — no
   vault, no daemon, a daemon too old to have the route (version skew), a
   transport error, an unresolvable session token, or the whole round-trip
-  exceeding a client-enforced **200ms** budget — resolves to **exit 0
-  (allow)**. A read is never blocked by infrastructure trouble. Every
+  exceeding the client-enforced budget (`token_optimization.check_timeout_ms`,
+  default **200ms** — raise it for iCloud / networked vaults) — resolves to
+  **exit 0 (allow)**. A read is never blocked by infrastructure trouble. Every
   fail-open records a `hook_failopen` gain event (visible in `token gain
   --by cache`) so `onebrain doctor` can surface a dead daemon instead of the
   hook silently degrading.
@@ -378,9 +382,12 @@ $ echo $?
 The 0/2 exit protocol is frozen: **0 = allow, 2 = deny.** Nothing else is
 ever returned — an unrecognized future verdict, a malformed daemon response,
 or any other surprise resolves to allow (fail-open), never to a guessed
-deny. The whole round-trip is budgeted at 200ms client-side, independent of
-the daemon client's own (much longer) HTTP timeouts, so a wedged daemon
-can't stall the read it's supposed to be gating.
+deny. The whole round-trip is budgeted client-side by
+`token_optimization.check_timeout_ms` (default 200ms; raise it for iCloud /
+networked vaults), independent of the daemon client's own (much longer) HTTP
+timeouts, so a wedged daemon can't stall the read it's supposed to be gating.
+A deny is metered as a `ledger_deny` gain event (surface `read_hook`), so the
+savings the gate produces are visible in `onebrain token gain --by cache`.
 
 ## `token discover` — measuring what the hook would have caught
 
@@ -454,6 +461,7 @@ token_optimization:
   strip_frontmatter: auto    # auto | always | never · default: auto
   model: auto                # model family hint for token estimation + pricing · default: auto
   read_hook: off              # off | ledger · default: off
+  check_timeout_ms: 200      # read-hook warm-daemon round-trip budget in ms · default: 200
 ```
 
 The `get_max_tokens` / `snippet_max_chars` keys ship **commented-out** so a
@@ -468,6 +476,7 @@ pin a fixed cap.
 | `token_optimization.strip_frontmatter` | When to strip YAML frontmatter from `get`/`multi_get` doc bodies. `auto` follows the ladder (strips at balanced+); `always` strips from conservative up; `never` never strips | `auto` | `auto`, `always`, `never` |
 | `token_optimization.model` | Model-family hint for token estimation calibration and pricing. `auto` sniffs a hint from `settings.json`; anything starting with `gpt`/`o1`/`o3` or containing `openai` resolves to the GPT-4-class calibration table, everything else (including `auto`) resolves to the Claude-family table | `auto` | any string |
 | `token_optimization.read_hook` | Vault-read ledger-gate hook mode (see [the hook](#the-vault-read-ledger-gate-hook) above). `off` = the hook, if the plugin registers it, always allows; `ledger` = repeat reads of an already-sent doc are denied with a reference | `off` | `off`, `ledger` |
+| `token_optimization.check_timeout_ms` | Client-side wall-clock budget, in milliseconds, for the read-hook's warm-daemon ledger round-trip (see [the hook](#the-vault-read-ledger-gate-hook) above). The gate fails open the instant this elapses, so a slow/wedged daemon never blocks the `Read`. Raise it for iCloud / networked vaults whose round-trip exceeds 200ms | `200` | integer ≥ 1 |
 
 `onebrain init` scaffolds this whole block, fully commented, into every
 fresh `onebrain.yml` — token optimization is a headline feature, not an

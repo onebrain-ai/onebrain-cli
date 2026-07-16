@@ -78,6 +78,16 @@ pub struct TokenOptimizationConfig {
     /// product-wide default; ob-1 flips this to `ledger` as the field test.
     #[serde(default)]
     pub read_hook: ReadHookMode,
+    /// Client-side wall-clock budget, in milliseconds, for the read-hook's
+    /// warm-daemon ledger round-trip (`onebrain token check`, design §5b).
+    /// The gate fails open the instant this elapses, so a wedged or slow
+    /// daemon can never block the `Read` it guards. Default 200ms — raise it
+    /// for iCloud / networked vaults whose warm-daemon round-trip legitimately
+    /// exceeds 200ms (the #264 field finding: a too-tight budget fails open
+    /// silently, so the gate never fires). `0` is treated as the default by
+    /// the read-hook (never an instant-timeout that would disable the gate).
+    #[serde(default = "default_check_timeout_ms")]
+    pub check_timeout_ms: u32,
 }
 
 fn default_token_level() -> OptLevel {
@@ -86,6 +96,12 @@ fn default_token_level() -> OptLevel {
 
 fn default_token_model() -> String {
     "auto".to_string()
+}
+
+/// Read-hook warm-daemon round-trip budget default (ms). `const fn` so the
+/// read-hook's own fallback `Duration` constant can derive from it (no drift).
+pub const fn default_check_timeout_ms() -> u32 {
+    200
 }
 
 impl Default for TokenOptimizationConfig {
@@ -97,6 +113,7 @@ impl Default for TokenOptimizationConfig {
             strip_frontmatter: StripFrontmatter::default(),
             model: default_token_model(),
             read_hook: ReadHookMode::default(),
+            check_timeout_ms: default_check_timeout_ms(),
         }
     }
 }
@@ -682,6 +699,8 @@ mod tests {
         );
         assert_eq!(cfg.token_optimization.model, "auto");
         assert_eq!(cfg.token_optimization.read_hook, ReadHookMode::Off);
+        // #264: the read-hook round-trip budget defaults to 200ms.
+        assert_eq!(cfg.token_optimization.check_timeout_ms, 200);
     }
 
     #[test]
@@ -694,6 +713,18 @@ mod tests {
         assert_eq!(d.get_max_tokens, None);
         assert_eq!(d.snippet_max_chars, None);
         assert_eq!(d.model, "auto");
+        assert_eq!(d.check_timeout_ms, 200);
+    }
+
+    #[test]
+    fn token_optimization_check_timeout_ms_round_trips_through_yaml() {
+        // #264: an iCloud/network vault raises the budget past the 200ms default.
+        let (_dir, root) = write_vault("token_optimization:\n  check_timeout_ms: 500\n");
+        let cfg = load_vault_config(&root).unwrap();
+        assert_eq!(cfg.token_optimization.check_timeout_ms, 500);
+        // Untouched siblings keep their defaults.
+        assert_eq!(cfg.token_optimization.level, OptLevel::Conservative);
+        assert_eq!(cfg.token_optimization.read_hook, ReadHookMode::Off);
     }
 
     #[test]

@@ -264,6 +264,13 @@ pub fn config_key_docs() -> Vec<ConfigKeyDoc> {
             &["token_optimization", "read_hook"],
             "# Vault-read ledger-gate hook: off | ledger · default: off".to_string(),
         ),
+        doc(
+            &["token_optimization", "check_timeout_ms"],
+            format!(
+                "# Read-hook warm-daemon ledger round-trip budget in ms · gate fails open past it (raise for iCloud/network vaults) · default: {}",
+                tok.check_timeout_ms
+            ),
+        ),
         // Plugin-level recap thresholds (`/recap` skill). Not part of
         // VaultConfig — the CLI never emits a recap block in the fresh
         // template (absent = the plugin uses its own defaults, so the two
@@ -341,17 +348,21 @@ token_optimization:
   {c_model}
   model: {model}
   {c_read_hook}
-  read_hook: {read_hook}",
+  read_hook: {read_hook}
+  {c_check_timeout_ms}
+  check_timeout_ms: {check_timeout_ms}",
         c_level = c(&["token_optimization", "level"]),
         c_get_max_tokens = c(&["token_optimization", "get_max_tokens"]),
         c_snippet_max_chars = c(&["token_optimization", "snippet_max_chars"]),
         c_strip_frontmatter = c(&["token_optimization", "strip_frontmatter"]),
         c_model = c(&["token_optimization", "model"]),
         c_read_hook = c(&["token_optimization", "read_hook"]),
+        c_check_timeout_ms = c(&["token_optimization", "check_timeout_ms"]),
         level = tok.level,
         strip_frontmatter = tok.strip_frontmatter,
         model = tok.model,
         read_hook = tok.read_hook,
+        check_timeout_ms = tok.check_timeout_ms,
     )
     .lines()
     .map(str::to_string)
@@ -851,8 +862,9 @@ mod tests {
         // Completeness guard (maintainer standing requirement): every real
         // user-facing config key must have a comment + default in
         // `config_key_docs` — the table drives BOTH the init template and
-        // the doctor --fix backfill, so a key missing here ships
-        // undocumented on every surface. Enumerate the key paths from the
+        // the doctor --fix backfill (top-level keys; nested sub-key backfill
+        // into an existing block is tracked in #270), so a key missing here
+        // ships undocumented on every surface. Enumerate the key paths from the
         // serde config structs themselves (fully populated: every Option
         // Some, every Vec non-empty) so adding a struct field without a doc
         // entry fails THIS test with instructions.
