@@ -367,7 +367,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         },
         Cmd::Daemon(DaemonCmd { verb }) => match verb {
             DaemonVerb::Start { vault } => commands::daemon::run_start(&mode, vault.as_deref()),
-            DaemonVerb::Stop => commands::daemon::run_stop(&mode),
+            DaemonVerb::Stop { vault, all } => {
+                commands::daemon::run_stop(&mode, vault.as_deref(), all)
+            }
             DaemonVerb::Status => commands::daemon::run_status(&mode),
             // Hidden internal verb — the detached child's body.
             DaemonVerb::Run { vault } => commands::daemon::run_internal(vault.as_deref()),

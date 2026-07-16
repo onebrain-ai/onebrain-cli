@@ -7,33 +7,35 @@
 //! module is that reusable client — the mcp + CLI tracks call it; nothing here
 //! opens an engine itself.
 //!
-//! ## Discovery file — `~/.onebrain/run/daemon.json`
-//! The daemon writes `{ port, token, pid, version, vault }` after it binds (see
-//! [`DaemonInfo::write`]); a clean shutdown removes it. Clients read it,
-//! liveness-probe the daemon, and connect. A stale file (daemon dead, or a
-//! version/vault mismatch) is cleaned up / triggers a restart rather than
-//! trusted — except the PASSIVE CLI path ([`discover_matching`]), which on a
-//! mismatch routes direct and LEAVES the record intact (never restarts a daemon
-//! serving another vault).
+//! ## Per-vault slots — `~/.onebrain/run/daemon-<hash>.json` (v3.4.13, #230)
+//! Each vault has its OWN daemon slot, keyed on `short_path_hash(canonical vault
+//! path)` — the SAME primitive that keys per-vault search-collection cache dirs —
+//! so multi-vault warm daemons coexist without thrashing. A vault-less daemon
+//! uses the `daemon-none.*` sentinel slot. A caller resolves ITS slot with
+//! [`resolve_slot`] and reads only that vault's `daemon-<hash>.json`
+//! (`{ port, token, pid, version, vault }`), so there is NO cross-vault
+//! comparison and NO stealing of another vault's daemon. The daemon binds an
+//! EPHEMERAL port and publishes the actual one in its slot json.
 //!
 //! ## Entry points
-//! - [`discover`] — ACTIVE: read + liveness-probe an already-running daemon,
-//!   RESTARTING it on a version/vault mismatch (the MCP path owns the daemon's
-//!   lifecycle); else `None` (and clean up a stale discovery file).
-//! - [`discover_matching`] — PASSIVE (the CLI-search path): return a handle only
-//!   for a live daemon matching BOTH version and the caller's vault; on ANY
-//!   mismatch route direct (`None`) WITHOUT stopping/restarting — never disrupt
-//!   a daemon serving another vault.
-//! - [`ensure_running`] — [`discover`], else spawn `daemon __run` detached and
-//!   poll until it's live; handles the start race (someone else won → connect).
+//! - [`resolve_slot`] / [`slot_paths_for_id`] — the ONE shared slot-path resolver
+//!   used by both the daemon (writer) and clients (readers).
+//! - [`discover`] — ACTIVE (MCP/serve): read + liveness-probe THIS vault's slot,
+//!   RESTARTING it only on a same-slot VERSION skew (never stops another vault's
+//!   daemon — they live in different slots); else `None`.
+//! - [`discover_matching`] — PASSIVE (CLI-search): return a handle only for a
+//!   live, our-version daemon in this vault's slot; on any mismatch route direct
+//!   (`None`) WITHOUT stopping/restarting.
+//! - [`ensure_running`] — [`discover`], else spawn `daemon start --vault` for
+//!   this slot and poll until it's live; handles the same-slot start race.
 //! - [`DaemonHandle::search`] / [`reindex`](DaemonHandle::reindex) /
 //!   [`status`](DaemonHandle::status) / [`get`](DaemonHandle::get) — typed HTTP
 //!   calls carrying the token.
 //!
 //! ## Version skew
 //! A daemon from an older/newer CLI may speak a different wire shape, so
-//! [`discover`] treats a `version` mismatch as "must restart": it stops the old
-//! daemon and (via [`ensure_running`]) starts one at our version before use.
+//! [`discover`] treats a same-slot `version` mismatch as "must restart": it stops
+//! that slot's daemon and (via [`ensure_running`]) starts one at our version.
 //!
 //! ## Dead-code allow
 //! This is a REUSABLE client library: the daemon side (this PR) only calls
@@ -69,25 +71,175 @@ fn resolve_session_token_opt() -> Option<String> {
         .map(|t| t.to_string())
 }
 
-/// Directory holding the daemon's runtime files: `~/.onebrain/run/`.
+/// Directory holding every daemon slot's runtime files: `~/.onebrain/run/`.
 ///
-/// Kept in lockstep with `commands::daemon`'s private `run_dir()` (both key off
-/// `dirs::home_dir`), so the client reads the same `daemon.json` the daemon
-/// writes. Honours `$HOME` on Unix / `%USERPROFILE%` on Windows.
-fn run_dir() -> Result<PathBuf> {
+/// The SINGLE source of truth for the run dir (v3.4.13): `commands::daemon` no
+/// longer keeps its own `run_dir()` — it resolves slot paths through
+/// [`resolve_slot`] / [`slot_paths_for_id`] here, so the two can't drift.
+/// Honours `$HOME` on Unix / `%USERPROFILE%` on Windows.
+pub(crate) fn run_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("resolve home directory for daemon run dir")?;
     Ok(home.join(".onebrain").join("run"))
 }
 
-/// Path to the discovery file: `~/.onebrain/run/daemon.json`.
-pub fn discovery_path() -> Result<PathBuf> {
-    Ok(run_dir()?.join("daemon.json"))
+// ─────────────────────────────────────────────────────────────────────────
+// Per-vault daemon slots (v3.4.13, #230).
+//
+// A daemon's four runtime files used to be machine-wide singletons
+// (`daemon.{json,pid,lock,log}`), binding the whole machine to ONE vault. Two
+// vaults' sessions thrashed: the MCP `discover` path stopped the other vault's
+// daemon on a vault mismatch, then respawned — ping-pong. Now each vault gets
+// its OWN slot keyed on `short_path_hash(canonical vault path)` — the SAME
+// primitive that already keys per-vault search-collection cache dirs
+// (`search_common::generate_collection_name`) — so multi-vault warm daemons
+// coexist, each on its own ephemeral port + slot files. A vault-LESS daemon
+// gets a stable sentinel slot (`daemon-none.*`).
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Filename stem shared by a vault-less daemon's slot files (`daemon-none.*`).
+pub const VAULTLESS_SLOT_STEM: &str = "daemon-none";
+
+/// The filename stem for a slot's runtime files: `daemon-<hash>` for a vault
+/// (hash = [`short_path_hash`](onebrain_search::engine::short_path_hash) of the
+/// canonical vault path), or `daemon-none` for the vault-less sentinel. Reuses
+/// the collection-cache hash so a vault maps to one stable slot.
+fn slot_stem(vault_id: Option<&str>) -> String {
+    match vault_id {
+        Some(id) => format!(
+            "daemon-{}",
+            onebrain_search::engine::short_path_hash(Path::new(id))
+        ),
+        None => VAULTLESS_SLOT_STEM.to_string(),
+    }
 }
 
-/// Path to the daemon log — surfaced in the `ensure_running` timeout error so
-/// the operator knows where to look.
-fn log_path() -> Result<PathBuf> {
-    Ok(run_dir()?.join("daemon.log"))
+/// The four runtime files for one daemon slot under `~/.onebrain/run/`. Both the
+/// daemon (which WRITES them) and clients (which READ them) resolve these
+/// through the same helpers so the names can never drift apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotPaths {
+    /// `daemon-<hash>.json` — discovery record (port/token/pid/version/vault).
+    pub json: PathBuf,
+    /// `daemon-<hash>.pid` — the running daemon's PID.
+    pub pid: PathBuf,
+    /// `daemon-<hash>.lock` — the per-slot exclusive start lock.
+    pub lock: PathBuf,
+    /// `daemon-<hash>.log` — the detached daemon's stdout+stderr + tracing.
+    pub log: PathBuf,
+}
+
+/// Build the slot paths for an ALREADY-CANONICAL vault id (or `None` for the
+/// vault-less sentinel). The DAEMON side calls this directly — it has resolved +
+/// canonicalized its bound vault, so it needs no re-canonicalization.
+pub fn slot_paths_for_id(vault_id: Option<&str>) -> Result<SlotPaths> {
+    let dir = run_dir()?;
+    let stem = slot_stem(vault_id);
+    Ok(SlotPaths {
+        json: dir.join(format!("{stem}.json")),
+        pid: dir.join(format!("{stem}.pid")),
+        lock: dir.join(format!("{stem}.lock")),
+        log: dir.join(format!("{stem}.log")),
+    })
+}
+
+/// The slot a CALLER should read/write for `expected_vault`.
+///
+/// - `Slot` — a concrete slot to use (the vault-less sentinel when
+///   `expected_vault` is `None`, else the vault's hash slot).
+/// - `Unresolvable` — the caller HAS a vault but it wouldn't canonicalize (the
+///   directory vanished / a transient stat error). No trustworthy slot exists,
+///   so callers treat it conservatively — never adopt or start a daemon they
+///   can't key. This preserves the pre-slot "Unresolvable is conservative"
+///   safety (the old `VaultExpectation::Unresolvable`).
+#[derive(Debug)]
+pub enum SlotResolve {
+    /// A concrete slot plus the canonical vault id it was keyed on (`None` for
+    /// the vault-less sentinel), which the daemon stamps into `daemon.json` and
+    /// discovery uses as a defensive same-vault check.
+    Slot {
+        paths: SlotPaths,
+        vault_id: Option<String>,
+    },
+    /// The caller's vault couldn't be canonicalized — no slot.
+    Unresolvable,
+}
+
+/// Resolve the slot for a caller's `expected_vault`: `None` → the vault-less
+/// sentinel slot; `Some(p)` that canonicalizes → the vault's hash slot; `Some(p)`
+/// that won't canonicalize → [`SlotResolve::Unresolvable`].
+pub fn resolve_slot(expected_vault: Option<&Path>) -> Result<SlotResolve> {
+    match expected_vault {
+        None => Ok(SlotResolve::Slot {
+            paths: slot_paths_for_id(None)?,
+            vault_id: None,
+        }),
+        Some(p) => match canonical_vault_id(p) {
+            Some(id) => {
+                let paths = slot_paths_for_id(Some(&id))?;
+                Ok(SlotResolve::Slot {
+                    paths,
+                    vault_id: Some(id),
+                })
+            }
+            None => Ok(SlotResolve::Unresolvable),
+        },
+    }
+}
+
+/// Convenience: the discovery (`daemon-<hash>.json`) path for a caller's vault,
+/// or `None` when the vault won't canonicalize. Thin wrapper over
+/// [`resolve_slot`] used by call sites (and tests) that only need the json path.
+pub fn slot_json_path(expected_vault: Option<&Path>) -> Result<Option<PathBuf>> {
+    Ok(match resolve_slot(expected_vault)? {
+        SlotResolve::Slot { paths, .. } => Some(paths.json),
+        SlotResolve::Unresolvable => None,
+    })
+}
+
+/// If `name` is one of a slot's runtime files (`daemon-<stem>.{json,pid,lock,log}`),
+/// return the stem `daemon-<stem>` — the SlotPaths key. Deliberately EXCLUDES a
+/// legacy machine-wide `daemon.json` (no `-<hash>`) and the `daemon-<stem>.json.tmp`
+/// atomic-write sibling (it ends in `.tmp`, not a known ext).
+fn slot_stem_of(name: &str) -> Option<&str> {
+    if !name.starts_with("daemon-") {
+        return None;
+    }
+    for ext in [".json", ".pid", ".lock", ".log"] {
+        if let Some(stem) = name.strip_suffix(ext) {
+            return Some(stem);
+        }
+    }
+    None
+}
+
+/// Enumerate every daemon slot present on disk as [`SlotPaths`], by scanning
+/// `~/.onebrain/run/` for `daemon-<stem>.{json,pid,lock,log}` files and grouping
+/// by stem. Used by `daemon status` (list every daemon), `daemon stop --all`
+/// (stop every daemon + clear wedged locks), and doctor's daemon check. A
+/// missing run dir yields an empty list (no daemon has ever run).
+pub fn all_slots() -> Result<Vec<SlotPaths>> {
+    let dir = run_dir()?;
+    let mut stems = std::collections::BTreeSet::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("read run dir {}", dir.display())),
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if let Some(stem) = slot_stem_of(&name.to_string_lossy()) {
+            stems.insert(stem.to_string());
+        }
+    }
+    Ok(stems
+        .into_iter()
+        .map(|stem| SlotPaths {
+            json: dir.join(format!("{stem}.json")),
+            pid: dir.join(format!("{stem}.pid")),
+            lock: dir.join(format!("{stem}.lock")),
+            log: dir.join(format!("{stem}.log")),
+        })
+        .collect())
 }
 
 /// The daemon's discovery record, published to `daemon.json` after it binds.
@@ -109,23 +261,21 @@ pub struct DaemonInfo {
     pub version: String,
     /// The CANONICAL path of the vault this daemon bound at boot, or `None` if
     /// it bound vault-less (`$ONEBRAIN_VAULT` unset/invalid — see
-    /// `daemon::resolve_daemon_vault`). The daemon is a MACHINE SINGLETON keyed
-    /// on `daemon.json`, so a client that resolved a DIFFERENT vault must not
-    /// silently reuse this daemon's engine — [`vault_decision`] compares this to
-    /// the caller's vault and triggers a restart on mismatch, exactly like a
-    /// version skew. Absent in `daemon.json` written by a pre-vault-field CLI →
-    /// deserializes to `None` (treated as "unknown vault" → restart when a
-    /// caller expects a specific one), so an old daemon is never trusted to be
-    /// serving the right vault.
+    /// `daemon::resolve_daemon_vault`). Since v3.4.13 each vault has its OWN slot
+    /// keyed on this path's hash, so a client reads the RIGHT slot by
+    /// construction; `record_is_our_vault` still compares this defensively (guards
+    /// a hash collision or a stale record from a moved vault). Absent in a legacy
+    /// `daemon.json` → deserializes to `None` (the vault-less sentinel record).
     #[serde(default)]
     pub vault: Option<String>,
 }
 
-/// Canonical identity string for a vault path — the value stored in
-/// `daemon.json.vault` and compared by [`vault_decision`]. Canonicalizing both
-/// the daemon's bound vault and the caller's resolved vault means a symlinked,
-/// `..`-laden, or trailing-slash path variant of the SAME vault compares equal
-/// (no spurious restart), while genuinely different vaults compare unequal.
+/// Canonical identity string for a vault path — the value stored in a slot's
+/// `daemon-<hash>.json` `vault` field AND (via `short_path_hash`) the key the
+/// slot itself is named on. Canonicalizing both the daemon's bound vault and the
+/// caller's resolved vault means a symlinked, `..`-laden, or trailing-slash path
+/// variant of the SAME vault maps to the SAME slot (no spurious second daemon),
+/// while genuinely different vaults get different slots.
 /// Returns `None` when the path can't be canonicalized (e.g. it no longer
 /// exists) — callers treat an uncanonicalizable expected vault as "unknown", so
 /// they don't force a restart on a transient stat failure.
@@ -260,85 +410,14 @@ pub fn version_decision(daemon_version: &str, own: &str) -> VersionDecision {
     }
 }
 
-/// Decide what a client should do given a discovered daemon's bound vault vs the
-/// vault the caller resolved. Pure (no I/O) so the policy is unit-testable.
-///
-/// The daemon is a machine singleton keyed on `daemon.json`, so if it's serving
-/// vault A and the caller resolved vault B, routing B's `query`/`status` through
-/// A's engine would return WRONG-VAULT results with no error. This maps that to
-/// a restart, exactly like a version skew — making the v3.4.6 model explicit:
-/// **one vault at a time per machine; switching vaults restarts the daemon.**
-/// (Multiple concurrent per-vault daemons are deferred to the v3.8 daemon
-/// refactor.)
-#[derive(Debug, PartialEq, Eq)]
-pub enum VaultDecision {
-    /// The daemon's bound vault matches the caller's (or the caller expressed no
-    /// vault expectation) — use the running daemon as-is.
-    Use,
-    /// The daemon is bound to a DIFFERENT vault (or bound vault-less while the
-    /// caller expects one, or its record predates the vault field) — restart it
-    /// for the caller's vault.
-    Restart,
-}
-
-/// What vault a caller expects a daemon to be serving — the input to
-/// [`vault_decision`]. Distinguishing the three cases is a safety property: an
-/// [`Unresolvable`](VaultExpectation::Unresolvable) expected vault (the caller
-/// HAS a vault, but it wouldn't canonicalize — e.g. the directory vanished
-/// mid-operation) must NOT collapse into [`Any`](VaultExpectation::Any), or the
-/// caller would silently REUSE/route to a possibly-wrong-vault daemon it can't
-/// verify (a narrow wrong-vault TOCTOU). It is instead treated conservatively
-/// as a mismatch.
-#[derive(Debug, PartialEq, Eq)]
-pub enum VaultExpectation {
-    /// The caller expressed NO vault expectation (`expected_vault == None`) — it
-    /// doesn't care which vault the daemon serves. Never a mismatch.
-    Any,
-    /// The caller HAS a vault that canonicalized to this id — match against it.
-    Vault(String),
-    /// The caller HAS a vault, but it wouldn't canonicalize (canonicalize failed
-    /// — the dir vanished / a transient stat error). Conservatively a mismatch:
-    /// the caller can't verify a daemon serves the right vault, so it must not
-    /// adopt one.
-    Unresolvable,
-}
-
-/// Turn a caller's expected vault path into a [`VaultExpectation`], preserving
-/// the "has a vault but it wouldn't canonicalize" case rather than flattening it
-/// to "no expectation". This is the seam that closes the wrong-vault TOCTOU:
-/// callers previously did `expected_vault.and_then(canonical_vault_id)`, which
-/// mapped BOTH `None` (no vault) AND `Some(uncanonicalizable)` to `None`, and
-/// `vault_decision(_, None)` said `Use` — so a caller whose vault vanished
-/// mid-op would reuse whatever daemon was up.
-pub fn vault_expectation(expected_vault: Option<&Path>) -> VaultExpectation {
-    match expected_vault {
-        None => VaultExpectation::Any,
-        Some(p) => match canonical_vault_id(p) {
-            Some(id) => VaultExpectation::Vault(id),
-            None => VaultExpectation::Unresolvable,
-        },
-    }
-}
-
-/// Compare a discovered daemon's bound vault (`daemon.json.vault`, already
-/// canonicalized at write time) against the caller's [`VaultExpectation`].
-///
-/// - `Any` → the caller doesn't care which vault (never restarts).
-/// - `Vault(v)` and the daemon's `vault == Some(v)` → `Use`.
-/// - `Vault(_)` with any other daemon vault — different vault, daemon bound
-///   vault-less, or an old record with no vault field (`daemon_vault == None`) —
-///   → `Restart`. An old daemon is thus never trusted to be serving the right
-///   vault.
-/// - `Unresolvable` → `Restart`. The caller HAS a vault it can't canonicalize,
-///   so it can't confirm any daemon serves the right one — treat conservatively
-///   as a mismatch rather than adopt a possibly-wrong-vault daemon.
-pub fn vault_decision(daemon_vault: Option<&str>, expected: &VaultExpectation) -> VaultDecision {
-    match expected {
-        VaultExpectation::Any => VaultDecision::Use,
-        VaultExpectation::Vault(want) if daemon_vault == Some(want.as_str()) => VaultDecision::Use,
-        VaultExpectation::Vault(_) | VaultExpectation::Unresolvable => VaultDecision::Restart,
-    }
-}
+// NOTE (v3.4.13, #230): the pre-slot cross-vault decision machinery
+// (`VaultDecision` / `VaultExpectation` / `vault_decision` / `vault_expectation`)
+// was REMOVED. It compared a machine-wide daemon's bound vault against the
+// caller's — a comparison the per-vault slot model makes unnecessary, because
+// each caller now resolves ITS OWN slot ([`resolve_slot`]) and reads only that
+// vault's `daemon-<hash>.json`. The "Unresolvable is conservative" safety it
+// carried now lives in [`SlotResolve::Unresolvable`]; the residual same-vault
+// sanity check lives in `record_is_our_vault`.
 
 /// Why the client is still waiting for a daemon — used to turn `ensure_running`'s
 /// opaque timeout into an actionable message. Pure classification (no I/O) so it
@@ -858,61 +937,63 @@ fn urlencode(s: &str) -> String {
 
 /// Discover an already-running daemon serving `expected_vault`, or `None`.
 ///
-/// Reads `daemon.json`; if present and live AND at our version AND bound to the
-/// caller's `expected_vault`, returns a handle. A stale record (parse error,
-/// dead daemon) is cleaned up and yields `None`. A version OR vault mismatch
-/// stops the old daemon, cleans the record, and yields `None` so a caller's
-/// [`ensure_running`] starts a fresh one (see [`version_decision`] /
-/// [`vault_decision`]).
+/// Reads THIS vault's slot (`daemon-<hash>.json`, resolved from `expected_vault`
+/// — never a cross-vault comparison, since the slot IS the vault). If present,
+/// live, and at our version, returns a handle. A stale record (parse error, dead
+/// daemon) is cleaned up → `None`. A VERSION skew on our own slot stops that
+/// slot's daemon (same vault, wrong version) and clears its record → `None`, so
+/// a caller's [`ensure_running`] starts a fresh one for the SAME slot.
 ///
-/// `expected_vault` is the caller's resolved vault path (`None` = "any vault,
-/// don't check" — e.g. a diagnostic that just wants to reach whatever daemon is
-/// up). It is canonicalized here and compared against the daemon's stored
-/// canonical vault.
+/// This is the ACTIVE lifecycle owner (MCP/serve path). Unlike pre-v3.4.13 it
+/// **never stops another vault's daemon**: two vaults now live in two slots, so
+/// there is no other-vault daemon in ours to displace.
+///
+/// `expected_vault` is the caller's resolved vault path (`None` = the vault-less
+/// sentinel slot). An `expected_vault` that won't canonicalize
+/// ([`SlotResolve::Unresolvable`]) yields `None` without touching anything — the
+/// caller's `ensure_running` then bails with a clear message.
 pub fn discover(expected_vault: Option<&Path>) -> Result<Option<DaemonHandle>> {
-    let path = discovery_path()?;
-    let info = match DaemonInfo::read(&path) {
+    let (slot, vault_id) = match resolve_slot(expected_vault)? {
+        SlotResolve::Slot { paths, vault_id } => (paths, vault_id),
+        SlotResolve::Unresolvable => return Ok(None),
+    };
+    let info = match DaemonInfo::read(&slot.json) {
         Ok(Some(info)) => info,
-        // No file → no daemon. A corrupt file → clean it and treat as none.
+        // No file → no daemon in this slot. A corrupt file → clean it.
         Ok(None) => return Ok(None),
         Err(_) => {
-            let _ = DaemonInfo::remove(&path);
+            let _ = DaemonInfo::remove(&slot.json);
             return Ok(None);
         }
     };
 
-    // A version OR vault mismatch both mean "this running daemon can't serve
-    // us": restart it. Compute the vault decision from the caller's expectation
-    // (which preserves the "has a vault but it wouldn't canonicalize" case as a
-    // conservative mismatch) vs the daemon's stored canonical vault.
-    let expected = vault_expectation(expected_vault);
-    let version_mismatch =
-        version_decision(&info.version, own_version()) == VersionDecision::Restart;
-    let vault_mismatch = vault_decision(info.vault.as_deref(), &expected) == VaultDecision::Restart;
-    if version_mismatch || vault_mismatch {
-        if vault_mismatch && !version_mismatch {
-            tracing::info!(
-                daemon_vault = ?info.vault,
-                expected_vault = ?expected,
-                "daemon bound to a different vault; restarting daemon for the caller's vault"
-            );
-        } else {
-            tracing::info!(
-                daemon_version = %info.version,
-                own_version = own_version(),
-                "daemon version skew; restarting daemon"
-            );
-        }
-        // Stop the mismatched daemon, then clear its record. A stop FAILURE is
-        // material — the old daemon may still hold the redb lock, so the
-        // subsequent start would fail. Capture it: warn now, and (via the
-        // caller's `ensure_running`) it surfaces as an "engine still locked"
-        // start failure rather than being silently dropped.
-        if let Err(e) = stop_daemon() {
-            tracing::warn!(error = %e, "failed to stop mismatched daemon; \
+    // Defensive same-vault check. The slot path already encodes the vault, so
+    // this normally passes; it only trips on a hash collision or a stale record
+    // for a moved vault. In that case the record is NOT ours — route direct and
+    // leave it alone (never stop another vault's daemon).
+    if !record_is_our_vault(&info, vault_id.as_deref()) {
+        tracing::debug!(
+            daemon_vault = ?info.vault, expected_vault = ?vault_id,
+            "slot record vault mismatch (collision/stale); not adopting, not stopping"
+        );
+        return Ok(None);
+    }
+
+    // Same vault, our slot. A VERSION skew means the wire shape may differ →
+    // restart THIS slot's daemon (stop the old-version one, clear its record).
+    if version_decision(&info.version, own_version()) == VersionDecision::Restart {
+        tracing::info!(
+            daemon_version = %info.version, own_version = own_version(),
+            "daemon version skew on this vault's slot; restarting it"
+        );
+        // A stop FAILURE is material — the old daemon may still hold the redb
+        // lock, so the subsequent start would fail. Warn now; it then surfaces
+        // via `ensure_running` as an "engine still locked" start failure.
+        if let Err(e) = stop_slot(&slot) {
+            tracing::warn!(error = %e, "failed to stop version-skewed daemon; \
                 a fresh start may fail while it still holds the engine lock");
         }
-        let _ = DaemonInfo::remove(&path);
+        let _ = DaemonInfo::remove(&slot.json);
         return Ok(None);
     }
 
@@ -921,9 +1002,18 @@ pub fn discover(expected_vault: Option<&Path>) -> Result<Option<DaemonHandle>> {
         Ok(Some(handle))
     } else {
         // Stale record: daemon named in the file is gone. Clean up.
-        let _ = DaemonInfo::remove(&path);
+        let _ = DaemonInfo::remove(&slot.json);
         Ok(None)
     }
+}
+
+/// Defensive check that a slot record actually belongs to the vault we resolved
+/// the slot for. Normally true by construction (the slot path is keyed on the
+/// vault hash); guards a hash collision or a stale record left by a moved vault.
+/// The vault-less sentinel slot (`expected == None`) requires a vault-less
+/// record (`info.vault == None`).
+fn record_is_our_vault(info: &DaemonInfo, expected: Option<&str>) -> bool {
+    info.vault.as_deref() == expected
 }
 
 /// PASSIVE discovery for the CLI search verbs — return a handle ONLY when a
@@ -938,12 +1028,12 @@ pub fn discover(expected_vault: Option<&Path>) -> Result<Option<DaemonHandle>> {
 /// (a live MCP session), so on ANY mismatch it simply declines to route
 /// (`Ok(None)`) and the caller opens the engine directly.
 ///
-/// Decisions (all from `daemon.json`, no HTTP until the vault/version check
-/// passes):
+/// Decisions (all from this vault's slot `daemon-<hash>.json`, no HTTP until the
+/// version check passes):
 /// - version mismatch (`version_decision == Restart`) → `Ok(None)`, record
-///   LEFT INTACT (a foreign daemon; not ours to reclaim).
-/// - vault mismatch (`vault_decision == Restart` — wrong vault, vault-less
-///   daemon while we expect one, or a pre-vault-field record) → `Ok(None)`,
+///   LEFT INTACT (a same-vault daemon at another version; not ours to restart —
+///   the CLI is passive).
+/// - the slot record's vault doesn't match ours (collision/stale) → `Ok(None)`,
 ///   record LEFT INTACT.
 /// - match, but the daemon fails the `/api/health` liveness probe (via
 ///   [`DaemonHandle::is_live`] — the engine-INDEPENDENT route, so a
@@ -952,28 +1042,26 @@ pub fn discover(expected_vault: Option<&Path>) -> Result<Option<DaemonHandle>> {
 ///   returned.
 /// - match + live → `Ok(Some(handle))`.
 ///
-/// `expected_vault = None` means "any vault" and skips the vault check (kept for
-/// signature symmetry; the CLI always passes `Some`).
+/// `expected_vault = None` reads the vault-less sentinel slot; an unresolvable
+/// vault yields `Ok(None)` (route direct, don't adopt an unverifiable daemon).
 pub fn discover_matching(expected_vault: Option<&Path>) -> Result<Option<DaemonHandle>> {
-    let path = discovery_path()?;
-    let info = match DaemonInfo::read(&path) {
+    let (slot, vault_id) = match resolve_slot(expected_vault)? {
+        SlotResolve::Slot { paths, vault_id } => (paths, vault_id),
+        SlotResolve::Unresolvable => return Ok(None),
+    };
+    let info = match DaemonInfo::read(&slot.json) {
         Ok(Some(info)) => info,
         Ok(None) => return Ok(None),
-        // A corrupt record isn't tied to any specific vault, so cleaning it is
-        // safe and matches `discover`'s handling.
+        // A corrupt record for our own slot is safe to clean (matches `discover`).
         Err(_) => {
-            let _ = DaemonInfo::remove(&path);
+            let _ = DaemonInfo::remove(&slot.json);
             return Ok(None);
         }
     };
 
-    // Version or vault mismatch → decline to route, WITHOUT touching the record.
-    // A mismatched daemon may be a live MCP session on another vault; the CLI
-    // must never stop/restart/remove it. An expected vault that won't
-    // canonicalize is treated as a mismatch here too (via `vault_expectation`):
-    // the CLI can't verify the daemon serves the right vault, so it routes
-    // direct rather than adopt a possibly-wrong-vault daemon.
-    let expected = vault_expectation(expected_vault);
+    // A version mismatch, or a slot record that isn't our vault (collision/stale),
+    // → decline to route, WITHOUT touching the record. The CLI is passive: it
+    // must never stop/restart/remove a daemon it isn't sure is exclusively ours.
     if version_decision(&info.version, own_version()) == VersionDecision::Restart {
         tracing::debug!(
             daemon_version = %info.version, own_version = own_version(),
@@ -981,10 +1069,10 @@ pub fn discover_matching(expected_vault: Option<&Path>) -> Result<Option<DaemonH
         );
         return Ok(None);
     }
-    if vault_decision(info.vault.as_deref(), &expected) == VaultDecision::Restart {
+    if !record_is_our_vault(&info, vault_id.as_deref()) {
         tracing::debug!(
-            daemon_vault = ?info.vault, expected_vault = ?expected,
-            "daemon bound to a different vault; CLI routes direct (no restart)"
+            daemon_vault = ?info.vault, expected_vault = ?vault_id,
+            "slot record vault mismatch; CLI routes direct (no restart)"
         );
         return Ok(None);
     }
@@ -996,7 +1084,7 @@ pub fn discover_matching(expected_vault: Option<&Path>) -> Result<Option<DaemonH
     } else {
         // A dead SAME-vault record is genuinely stale (it's ours to reclaim);
         // clean it so the next lookup doesn't re-probe a corpse.
-        let _ = DaemonInfo::remove(&path);
+        let _ = DaemonInfo::remove(&slot.json);
         Ok(None)
     }
 }
@@ -1018,32 +1106,39 @@ pub fn discover_matching(expected_vault: Option<&Path>) -> Result<Option<DaemonH
 pub fn discover_same_vault_any_version(
     expected_vault: Option<&Path>,
 ) -> Result<Option<DaemonHandle>> {
-    let path = discovery_path()?;
-    let info = match DaemonInfo::read(&path) {
+    let (slot, vault_id) = match resolve_slot(expected_vault)? {
+        SlotResolve::Slot { paths, vault_id } => (paths, vault_id),
+        SlotResolve::Unresolvable => return Ok(None),
+    };
+    let info = match DaemonInfo::read(&slot.json) {
         Ok(Some(info)) => info,
         Ok(None) => return Ok(None),
         Err(_) => {
-            let _ = DaemonInfo::remove(&path);
+            let _ = DaemonInfo::remove(&slot.json);
             return Ok(None);
         }
     };
     // Vault match still gates adoption (never touch another vault's daemon), but
-    // version is deliberately IGNORED here.
-    let expected = vault_expectation(expected_vault);
-    if vault_decision(info.vault.as_deref(), &expected) == VaultDecision::Restart {
+    // version is deliberately IGNORED here. The slot is keyed on the vault, so
+    // the defensive check normally passes — it only guards a collision/stale
+    // record.
+    if !record_is_our_vault(&info, vault_id.as_deref()) {
         return Ok(None);
     }
     let handle = DaemonHandle::new(info);
     Ok(handle.is_live().then_some(handle))
 }
 
-/// Ensure a daemon is running at our version and return a connected handle.
+/// Ensure a daemon is running at our version for `expected_vault`'s slot and
+/// return a connected handle.
 ///
-/// Fast path: [`discover`] returns an existing live daemon. Otherwise spawn
-/// `onebrain daemon start` (detached; the existing self-respawn path) and poll
-/// for `daemon.json` + liveness up to [`START_TIMEOUT`]. The start race is
-/// handled implicitly: if a concurrent starter won, its `daemon.json` appears
-/// and we connect to it — we don't require that *we* spawned the winner.
+/// Fast path: [`discover`] returns an existing live daemon in this vault's slot.
+/// Otherwise spawn `onebrain daemon start --vault <path>` (detached; the
+/// self-respawn path) and poll this vault's slot json for our-version + live up
+/// to [`START_TIMEOUT`]. The start race is handled implicitly: a concurrent
+/// starter for THIS slot publishes the same `daemon-<hash>.json` and we connect
+/// to it — a DIFFERENT vault's starter writes a DIFFERENT slot, so it can't
+/// satisfy us.
 pub fn ensure_running(expected_vault: Option<&Path>) -> Result<DaemonHandle> {
     if let Some(handle) = discover(expected_vault)? {
         return Ok(handle);
@@ -1051,40 +1146,33 @@ pub fn ensure_running(expected_vault: Option<&Path>) -> Result<DaemonHandle> {
 
     // If the caller HAS a vault but it won't canonicalize (dir vanished
     // mid-op), refuse rather than spawn a daemon we couldn't verify — a
-    // `--vault <vanished-path>` daemon would bind vault-less and we'd never
-    // adopt it anyway (the poll below requires a vault MATCH). Bail early with a
-    // clear message instead of spinning to the start timeout.
-    let expected = vault_expectation(expected_vault);
-    if expected == VaultExpectation::Unresolvable {
-        anyhow::bail!(
+    // `--vault <vanished-path>` daemon would bind vault-less into a DIFFERENT
+    // slot and we'd never adopt it. Bail early with a clear message instead of
+    // spinning to the start timeout.
+    let (slot, vault_id) = match resolve_slot(expected_vault)? {
+        SlotResolve::Slot { paths, vault_id } => (paths, vault_id),
+        SlotResolve::Unresolvable => anyhow::bail!(
             "cannot start a daemon: the expected vault could not be resolved \
              (canonicalize failed — did the directory move or get removed?)"
-        );
-    }
+        ),
+    };
 
     // Pass the resolved vault through `daemon start --vault` so the spawned
-    // daemon binds it EXPLICITLY (no `$ONEBRAIN_VAULT` mutation).
+    // daemon binds it EXPLICITLY (no `$ONEBRAIN_VAULT` mutation) and lands in
+    // this slot.
     spawn_daemon_start(expected_vault).context("spawn daemon start")?;
 
-    let path = discovery_path()?;
     let deadline = Instant::now() + START_TIMEOUT;
     // Remember the last-observed discovery record so a timeout can say WHY.
     let mut last_read: Option<DaemonInfo> = None;
     loop {
-        // A daemon.json at our version + our vault + live probe → connected.
-        // The vault check matters even here: a concurrent starter for a
-        // DIFFERENT vault could win the race and publish first, and connecting
-        // to it would silently serve the wrong vault. `spawn_daemon_start` now
-        // passes `--vault`, so the daemon WE spawn binds our vault; requiring
-        // the match just refuses to adopt a wrong-vault winner (we keep polling
-        // until the deadline instead).
-        if let Ok(read) = DaemonInfo::read(&path) {
+        // This slot's json at our version + our vault + live probe → connected.
+        if let Ok(read) = DaemonInfo::read(&slot.json) {
             last_read = read.clone();
             if let Some(info) = read {
                 let version_ok =
                     version_decision(&info.version, own_version()) == VersionDecision::Use;
-                let vault_ok =
-                    vault_decision(info.vault.as_deref(), &expected) == VaultDecision::Use;
+                let vault_ok = record_is_our_vault(&info, vault_id.as_deref());
                 if version_ok && vault_ok {
                     let handle = DaemonHandle::new(info);
                     if handle.is_live() {
@@ -1094,12 +1182,10 @@ pub fn ensure_running(expected_vault: Option<&Path>) -> Result<DaemonHandle> {
             }
         }
         if Instant::now() >= deadline {
-            // Classify the last state + point at the log, instead of one opaque
-            // "did not become ready" line.
+            // Classify the last state + point at THIS slot's log, instead of one
+            // opaque "did not become ready" line.
             let state = classify_last_state(&last_read, own_version());
-            let log = log_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "~/.onebrain/run/daemon.log".to_string());
+            let log = slot.log.display().to_string();
             anyhow::bail!(
                 "daemon did not become ready within {}s; last state: {}. See {log}",
                 START_TIMEOUT.as_secs(),
@@ -1137,22 +1223,16 @@ fn spawn_daemon_start(expected_vault: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// Stop a running daemon via `onebrain daemon stop` (SIGTERM + PID cleanup).
-/// Used by the version-skew restart path. Returns an error on a non-zero exit
-/// so the caller can react (the old daemon may still hold the engine lock).
-fn stop_daemon() -> Result<()> {
-    let exe = std::env::current_exe().context("resolve current executable")?;
-    let status = std::process::Command::new(exe)
-        .args(["daemon", "stop"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .context("run `onebrain daemon stop`")?;
-    if !status.success() {
-        anyhow::bail!("`onebrain daemon stop` exited with {status}");
-    }
-    Ok(())
+/// Stop the daemon occupying a specific SLOT (SIGTERM + PID/discovery/lock
+/// cleanup), IN-PROCESS. Used by [`discover`]'s version-skew restart path.
+///
+/// In-process (via [`crate::commands::daemon::stop_slot`]) rather than shelling
+/// `onebrain daemon stop`: the target is THIS vault's slot, and shelling out
+/// would resolve the cwd's slot instead — the wrong one. Returns an error only
+/// if the SIGTERM itself failed (the old daemon may still hold the engine lock,
+/// so the caller warns); a "nothing to stop" is a clean `Ok`.
+fn stop_slot(slot: &SlotPaths) -> Result<()> {
+    crate::commands::daemon::stop_slot(slot).map(|_| ())
 }
 
 #[cfg(test)]
@@ -1236,99 +1316,107 @@ mod tests {
         assert_eq!(version_decision("3.5.0", "3.4.6"), VersionDecision::Restart);
     }
 
-    // ── vault_decision: the wrong-vault-daemon restart policy (C1) ─────────
+    // ── per-vault slot resolution (v3.4.13, #230) ─────────────────────────
     #[test]
-    fn vault_decision_no_expectation_always_uses() {
-        // A caller with no vault expectation never forces a restart.
-        assert_eq!(
-            vault_decision(Some("/vaults/a"), &VaultExpectation::Any),
-            VaultDecision::Use
+    fn slot_stem_keys_on_vault_hash_and_none_sentinel() {
+        // A vault id maps to `daemon-<short_path_hash>`, matching the collection
+        // cache key; `None` → the stable vault-less sentinel.
+        let id = "/vaults/a";
+        let expected = format!(
+            "daemon-{}",
+            onebrain_search::engine::short_path_hash(Path::new(id))
         );
-        assert_eq!(
-            vault_decision(None, &VaultExpectation::Any),
-            VaultDecision::Use
-        );
+        assert_eq!(slot_stem(Some(id)), expected);
+        assert_eq!(slot_stem(None), VAULTLESS_SLOT_STEM);
+        // Distinct vaults → distinct slots (the whole point — no thrash).
+        assert_ne!(slot_stem(Some("/vaults/a")), slot_stem(Some("/vaults/b")));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn vault_decision_same_vault_uses() {
-        assert_eq!(
-            vault_decision(
-                Some("/vaults/a"),
-                &VaultExpectation::Vault("/vaults/a".into())
-            ),
-            VaultDecision::Use
-        );
-    }
+    fn resolve_slot_maps_none_vault_and_unresolvable() {
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_var("HOME", home.path());
 
-    #[test]
-    fn vault_decision_different_vault_restarts() {
-        // Daemon on A, caller wants B → restart (the core wrong-vault guard).
-        assert_eq!(
-            vault_decision(
-                Some("/vaults/a"),
-                &VaultExpectation::Vault("/vaults/b".into())
-            ),
-            VaultDecision::Restart
-        );
-    }
-
-    #[test]
-    fn vault_decision_vaultless_or_old_record_restarts_when_vault_expected() {
-        // Daemon bound vault-less, OR an old daemon.json with no vault field
-        // (deserializes to None) → restart when a caller expects a vault. An
-        // old daemon is never trusted to be serving the right vault.
-        assert_eq!(
-            vault_decision(None, &VaultExpectation::Vault("/vaults/b".into())),
-            VaultDecision::Restart
-        );
-    }
-
-    // ── vault_decision + vault_expectation: the uncanonicalizable-expected-vault
-    // hardening (the narrow wrong-vault TOCTOU). A caller that HAS a vault which
-    // won't canonicalize must be a MISMATCH, not silently "no expectation".
-    #[test]
-    fn vault_decision_unresolvable_expected_restarts_even_against_matching_daemon() {
-        // Even if a daemon is up on `/vaults/a`, an Unresolvable expectation
-        // can't confirm it — treat as a mismatch (don't adopt it).
-        assert_eq!(
-            vault_decision(Some("/vaults/a"), &VaultExpectation::Unresolvable),
-            VaultDecision::Restart
-        );
-        assert_eq!(
-            vault_decision(None, &VaultExpectation::Unresolvable),
-            VaultDecision::Restart
-        );
-    }
-
-    #[test]
-    fn vault_expectation_none_is_any() {
-        assert_eq!(vault_expectation(None), VaultExpectation::Any);
-    }
-
-    #[test]
-    fn vault_expectation_real_dir_canonicalizes_to_vault() {
-        // An existing directory canonicalizes → `Vault(id)` matching the daemon
-        // record a co-located daemon would write for the same path.
-        let dir = tempdir().unwrap();
-        match vault_expectation(Some(dir.path())) {
-            VaultExpectation::Vault(id) => {
-                assert_eq!(Some(id), canonical_vault_id(dir.path()));
+        // None → the vault-less sentinel slot; all four files share the stem.
+        match resolve_slot(None).unwrap() {
+            SlotResolve::Slot { paths, vault_id } => {
+                assert_eq!(vault_id, None);
+                assert!(paths
+                    .json
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(VAULTLESS_SLOT_STEM));
+                assert_eq!(paths.json.with_extension("pid"), paths.pid);
             }
-            other => panic!("expected Vault(_), got {other:?}"),
+            SlotResolve::Unresolvable => panic!("None must resolve to the sentinel slot"),
         }
+
+        // A real dir → a concrete vault-keyed slot carrying its canonical id.
+        let vault = tempdir().unwrap();
+        match resolve_slot(Some(vault.path())).unwrap() {
+            SlotResolve::Slot { vault_id, .. } => {
+                assert_eq!(vault_id, canonical_vault_id(vault.path()));
+            }
+            SlotResolve::Unresolvable => panic!("a real dir must resolve to a slot"),
+        }
+
+        // A vanished dir → Unresolvable (the conservative case the old
+        // `VaultExpectation::Unresolvable` carried).
+        let gone = vault.path().join("does-not-exist");
+        assert!(matches!(
+            resolve_slot(Some(&gone)).unwrap(),
+            SlotResolve::Unresolvable
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_slots_enumerates_hash_slots_and_skips_legacy() {
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_var("HOME", home.path());
+        let dir = run_dir().unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        // Two per-vault slots + a legacy machine-wide daemon.json (must be
+        // skipped) + a .json.tmp atomic-write sibling (must be skipped).
+        std::fs::write(dir.join("daemon-aaaaaa.json"), "{}").unwrap();
+        std::fs::write(dir.join("daemon-bbbbbb.pid"), "1").unwrap();
+        std::fs::write(dir.join("daemon.json"), "{}").unwrap();
+        std::fs::write(dir.join("daemon-cccccc.json.tmp"), "{}").unwrap();
+
+        let slots = all_slots().unwrap();
+        let stems: Vec<String> = slots
+            .iter()
+            .map(|s| s.json.file_stem().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(stems.contains(&"daemon-aaaaaa".to_string()));
+        assert!(stems.contains(&"daemon-bbbbbb".to_string()));
+        assert!(
+            !stems.iter().any(|s| s == "daemon"),
+            "legacy daemon.json must be skipped: {stems:?}"
+        );
+        assert!(
+            !stems.iter().any(|s| s.contains("cccccc")),
+            ".json.tmp sibling must be skipped: {stems:?}"
+        );
     }
 
     #[test]
-    fn vault_expectation_missing_dir_is_unresolvable() {
-        // A path that can't be canonicalized (never existed / vanished mid-op)
-        // → `Unresolvable`, NOT `Any` — this is the TOCTOU the hardening closes.
-        let dir = tempdir().unwrap();
-        let gone = dir.path().join("does-not-exist");
-        assert_eq!(
-            vault_expectation(Some(&gone)),
-            VaultExpectation::Unresolvable
-        );
+    fn record_is_our_vault_matches_and_rejects() {
+        let ours = DaemonInfo {
+            vault: Some("/vaults/a".to_string()),
+            ..sample("3.4.6")
+        };
+        assert!(record_is_our_vault(&ours, Some("/vaults/a")));
+        assert!(!record_is_our_vault(&ours, Some("/vaults/b")));
+        // Vault-less sentinel slot: only a vault-less record belongs to it.
+        let vaultless = DaemonInfo {
+            vault: None,
+            ..sample("3.4.6")
+        };
+        assert!(record_is_our_vault(&vaultless, None));
+        assert!(!record_is_our_vault(&ours, None));
     }
 
     #[test]
@@ -1701,20 +1789,22 @@ mod tests {
             ("HOME", home.path().as_os_str()),
         ]);
         let srv = start_live_server(vault.path(), "dc-live-token-1234567890");
-        let path = discovery_path().unwrap();
+        // Write the record into THIS vault's slot (`daemon-<hash>.json`).
+        let path = slot_json_path(Some(vault.path())).unwrap().unwrap();
         srv.info.write(&path).unwrap();
 
         // Same vault → routes (Some, live).
         let matched = discover_matching(Some(vault.path())).unwrap();
         assert!(matched.is_some(), "same-vault daemon should route");
 
-        // A DIFFERENT vault → declines (None, direct open) …
+        // A DIFFERENT vault → declines (None, direct open): the CLI resolves the
+        // OTHER vault's slot, which has no record …
         let other = tempdir().unwrap();
         assert!(
             discover_matching(Some(other.path())).unwrap().is_none(),
             "wrong-vault daemon must NOT route"
         );
-        // … and the daemon.json record is UNTOUCHED (no stop/remove — the CLI
+        // … and this vault's slot record is UNTOUCHED (no stop/remove — the CLI
         // must never disturb a daemon serving another vault).
         let still = DaemonInfo::read(&path).unwrap().expect("record preserved");
         assert_eq!(still.vault, srv.info.vault, "record must be left intact");
@@ -1737,7 +1827,7 @@ mod tests {
         let mut srv = start_live_server(vault.path(), "dc-anyver-token-1234567890");
         // Pin a version DIFFERENT from ours (the post-upgrade skew).
         srv.info.version = "0.0.1-old".to_string();
-        let path = discovery_path().unwrap();
+        let path = slot_json_path(Some(vault.path())).unwrap().unwrap();
         srv.info.write(&path).unwrap();
 
         // Version-gated discovery rejects the skewed daemon …
@@ -1930,29 +2020,22 @@ mod tests {
         ]);
         let srv = start_live_server(vault.path(), "dc-live-token-1234567890");
 
-        let path = discovery_path().unwrap();
+        let path = slot_json_path(Some(vault.path())).unwrap().unwrap();
         srv.info.write(&path).unwrap();
 
-        // Discover with the SAME vault the server bound → vault check passes.
+        // Discover with the SAME vault the server bound → reads its slot.
         let found = discover(Some(vault.path())).unwrap();
         assert!(found.is_some(), "discover should find the live server");
         let v = found.unwrap().status().unwrap();
         assert!(v["doc_count"].is_number());
     }
 
-    // C1: a daemon bound to vault A must NOT be adopted by a client resolving a
-    // DIFFERENT vault B — `discover(Some(B))` refuses it (restarts instead), so
-    // B's queries never silently route through A's engine.
-    //
-    // We assert the REFUSAL at the fast-path level with a live server bound to A
-    // and `daemon.json` stamped with A. To avoid the `stop_daemon` subprocess
-    // spawn on the mismatch path (which, under `cargo test`, would re-exec the
-    // test binary — the same reason `ensure_running`'s spawn is a documented
-    // coverage residual), we test the REUSE side directly: a same-vault client
-    // (A) adopts it, and a cross-vault client's decision is `Restart`. The
-    // actual respawn is the version-skew-equivalent OS shell (see
-    // docs/coverage.md). The pure `vault_decision`/`version_decision` policy and
-    // the wire round-trips below pin the logic without a spawn.
+    // #230: a daemon bound to vault A lives in A's slot; a client resolving a
+    // DIFFERENT vault B reads B's (empty) slot and never even sees A — so it
+    // routes direct WITHOUT touching A's daemon (no cross-vault stop/thrash).
+    // We use a live server bound to A: a same-vault client (A) adopts it; a
+    // cross-vault client (B) resolves an empty slot → `None`; and A's slot record
+    // is left INTACT (the CLI/MCP never disturbs another vault's daemon).
     #[cfg(unix)]
     #[test]
     fn discover_reuses_only_when_vault_matches() {
@@ -1964,51 +2047,46 @@ mod tests {
             ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
             ("HOME", home.path().as_os_str()),
         ]);
-        // Live server bound to vault A, and a daemon.json stamped with A.
+        // Live server bound to vault A, and a record in A's slot.
         let srv = start_live_server(vault_a.path(), "dc-live-token-1234567890");
-        srv.info.write(&discovery_path().unwrap()).unwrap();
+        let a_slot = slot_json_path(Some(vault_a.path())).unwrap().unwrap();
+        srv.info.write(&a_slot).unwrap();
         let a_id = canonical_vault_id(vault_a.path());
-        assert_eq!(srv.info.vault, a_id, "daemon.json must record vault A");
+        assert_eq!(srv.info.vault, a_id, "slot record must record vault A");
 
         // Same-vault client (A) → the daemon is REUSED (fast path, no restart).
         let found = discover(Some(vault_a.path())).unwrap();
         assert!(found.is_some(), "a same-vault client must reuse the daemon");
         assert_eq!(found.unwrap().info().vault, a_id);
 
-        // Cross-vault client (B) → the DECISION is Restart (the refusal), which
-        // is what triggers `discover` to stop + respawn for B. Asserting the
-        // pure decision keeps this spawn-free; the live restart is OS shell.
-        assert_eq!(
-            vault_decision(
-                srv.info.vault.as_deref(),
-                &vault_expectation(Some(vault_b.path()))
-            ),
-            VaultDecision::Restart,
-            "a daemon bound to A must be refused (restarted) for vault B"
+        // Cross-vault client (B) → reads B's empty slot → `None` (route direct),
+        // and A's slot record is UNTOUCHED (never disturb another vault).
+        assert!(
+            discover(Some(vault_b.path())).unwrap().is_none(),
+            "a client for vault B must not adopt vault A's daemon"
         );
+        let still = DaemonInfo::read(&a_slot)
+            .unwrap()
+            .expect("A's record preserved");
+        assert_eq!(still.vault, a_id, "vault A's slot must be left intact");
     }
 
     // Back-compat: a daemon.json written by a pre-vault-field CLI has no `vault`
-    // key; it must deserialize with `vault: None` (serde default), so an old
-    // daemon reads as "unknown vault" and a vault-expecting caller restarts it.
+    // key; it must still deserialize with `vault: None` (serde default). Such a
+    // record only "belongs to" the vault-less sentinel slot, never a vault slot.
     #[test]
     fn old_daemon_json_without_vault_field_deserializes_to_none() {
         let body = r#"{"port":6789,"token":"tok-abcdefghijklmnop","pid":42,"version":"3.4.5"}"#;
         let info: DaemonInfo = serde_json::from_str(body).unwrap();
         assert_eq!(info.vault, None);
-        assert_eq!(
-            vault_decision(
-                info.vault.as_deref(),
-                &VaultExpectation::Vault("/vaults/b".into())
-            ),
-            VaultDecision::Restart
-        );
+        // A vault-expecting slot would reject this record (not our vault).
+        assert!(!record_is_our_vault(&info, Some("/vaults/b")));
     }
 
     #[cfg(unix)]
     #[test]
     fn ensure_running_fast_path_returns_discovered_daemon() {
-        // With a live server + a matching daemon.json, ensure_running must take
+        // With a live server + a matching slot record, ensure_running must take
         // the fast path (discover succeeds) and NOT spawn anything.
         let vault = tempdir().unwrap();
         let cache = tempdir().unwrap();
@@ -2018,7 +2096,9 @@ mod tests {
             ("HOME", home.path().as_os_str()),
         ]);
         let srv = start_live_server(vault.path(), "dc-live-token-1234567890");
-        srv.info.write(&discovery_path().unwrap()).unwrap();
+        srv.info
+            .write(&slot_json_path(Some(vault.path())).unwrap().unwrap())
+            .unwrap();
 
         let handle = ensure_running(Some(vault.path())).expect("fast path should connect");
         assert_eq!(handle.info().port, srv.info.port);
@@ -2027,11 +2107,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn discover_removes_stale_record_for_dead_server() {
-        // A daemon.json pointing at a port nothing listens on → discover cleans
-        // it up and returns None (stale record, no live daemon).
+        // A vault-less slot record pointing at a port nothing listens on →
+        // discover cleans it up and returns None (stale record, no live daemon).
         let home = tempdir().unwrap();
         let _env = crate::test_env::set_var("HOME", home.path());
-        let path = discovery_path().unwrap();
+        let path = slot_json_path(None).unwrap().unwrap();
         DaemonInfo {
             port: 1, // unused — connection refused
             token: "x".repeat(20),

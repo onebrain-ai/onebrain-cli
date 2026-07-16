@@ -1362,10 +1362,12 @@ pub fn run(vault_flag: Option<PathBuf>) -> Result<()> {
 
     // Primary path: route through the warm daemon so the MCP server holds NO
     // redb lock and multiple concurrent MCP sessions coexist. `ensure_running`
-    // auto-starts the daemon (the sole engine owner) if it isn't up yet, and —
-    // passed our resolved vault — RESTARTS a daemon bound to a DIFFERENT vault so
-    // `query`/`status` never silently route through the wrong vault's engine
-    // (one vault at a time per machine; switching vaults restarts the daemon).
+    // auto-starts THIS vault's slot daemon (the sole engine owner for this vault)
+    // if it isn't up yet. Since v3.4.13 (#230) each vault has its OWN slot, so a
+    // daemon for a DIFFERENT vault is simply left alone (a different slot) —
+    // multiple per-vault warm daemons coexist, and this session only ever
+    // starts/reuses/restarts ITS OWN vault's slot. `query`/`status` therefore
+    // never route through the wrong vault's engine.
     //
     // Fallback: if the daemon genuinely can't start (e.g. spawn failed), open
     // the engine directly so a lone session still works — today's behaviour.

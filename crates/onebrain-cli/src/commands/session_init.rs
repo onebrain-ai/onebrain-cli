@@ -1000,7 +1000,9 @@ mod tests {
             version: env!("CARGO_PKG_VERSION").to_string(),
             vault: crate::commands::daemon_client::canonical_vault_id(vault.path()),
         };
-        let discovery = crate::commands::daemon_client::discovery_path().unwrap();
+        let discovery = crate::commands::daemon_client::slot_json_path(Some(vault.path()))
+            .unwrap()
+            .unwrap();
         info.write(&discovery).unwrap();
 
         let result = native_pending(&vault_root, "daemon-guard-collection");

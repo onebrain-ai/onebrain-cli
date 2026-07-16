@@ -1091,9 +1091,11 @@ mod tests {
             ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("")),
         ]);
 
-        // A daemon.json bound to vault A (port 1 = connection refused; never
-        // probed here — the vault check short-circuits first).
-        let path = crate::commands::daemon_client::discovery_path().unwrap();
+        // A daemon record in vault A's SLOT (port 1 = connection refused; never
+        // probed here — the CLI resolves vault B's slot, which doesn't exist).
+        let path = crate::commands::daemon_client::slot_json_path(Some(vault_a.path()))
+            .unwrap()
+            .unwrap();
         DaemonInfo {
             port: 1,
             token: "x".repeat(20),

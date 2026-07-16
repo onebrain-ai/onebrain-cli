@@ -431,9 +431,20 @@ pub enum DaemonVerb {
         #[arg(long)]
         vault: Option<PathBuf>,
     },
-    /// Stop the running daemon (SIGTERM + PID-file cleanup).
-    Stop,
-    /// Report whether the daemon is running, and its PID.
+    /// Stop a per-vault daemon (SIGTERM + slot-file cleanup). Defaults to the
+    /// cwd-resolved vault's slot; `--vault` targets a specific vault, `--all`
+    /// stops every running daemon.
+    Stop {
+        /// Vault whose daemon to stop. Default: the cwd-resolved vault's slot
+        /// (the vault-less daemon when cwd isn't inside a vault).
+        #[arg(long)]
+        vault: Option<PathBuf>,
+        /// Stop EVERY running daemon on the machine (all per-vault slots).
+        #[arg(long)]
+        all: bool,
+    },
+    /// Report every running daemon (one per per-vault slot): PID, port, vault,
+    /// and version.
     Status,
     /// Internal: the detached daemon body. Spawned by `daemon start`; not for
     /// direct use. Runs the HTTP surface until SIGTERM.
