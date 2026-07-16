@@ -28,6 +28,19 @@ fn is_comment(l: &str) -> bool {
 /// (`checkpoint: {messages: 0}`), the key line can't be found, or the shape
 /// is otherwise not understood — never guesses.
 fn locate(lines: &[String], segments: &[&str]) -> Option<usize> {
+    locate_impl(lines, segments, false)
+}
+
+/// [`locate`]'s implementation, parameterized by `allow_commented_key`: when
+/// `true`, the FINAL segment may also match a commented-out placeholder line
+/// (`# <key>: <value>`) at the same block level — used by
+/// [`key_or_commented_placeholder_present`] for keys the fresh template
+/// legitimately emits commented-out by default (e.g.
+/// `token_optimization.get_max_tokens`, which follows a per-level ladder
+/// unless uncommented). Parent segments always require an active,
+/// block-form header regardless of this flag — only the leaf key's match
+/// relaxes.
+fn locate_impl(lines: &[String], segments: &[&str], allow_commented_key: bool) -> Option<usize> {
     let (last, parents) = segments.split_last()?;
 
     // Window (start..end) of the current block; top level = whole file with
@@ -87,17 +100,39 @@ fn locate(lines: &[String], segments: &[&str]) -> Option<usize> {
 
     // The key line inside the final window, at the direct-child level only.
     let key_prefix = format!("{last}:");
+    let commented_key_prefix = format!("# {key_prefix}");
     let level = child_indent(lines, start, end)?;
     if (level as isize) <= parent_indent {
         return None;
     }
     (start..end).find(|&i| {
         let l = &lines[i];
-        !is_blank(l)
-            && !is_comment(l)
-            && indent_of(l) == level
-            && l.trim_start().starts_with(&key_prefix)
+        if is_blank(l) || indent_of(l) != level {
+            return false;
+        }
+        let trimmed = l.trim_start();
+        if is_comment(l) {
+            allow_commented_key && trimmed.starts_with(&commented_key_prefix)
+        } else {
+            trimmed.starts_with(&key_prefix)
+        }
     })
+}
+
+/// True when the key at `segments` is already "documented" in `text` —
+/// either as an active (uncommented) key ([`locate`] would find it) or as a
+/// commented-out placeholder line (`# <key>: <value>`) at the same block
+/// level. Doctor's `token_optimization` sub-key backfill (issue #270) uses
+/// this instead of a plain presence check for two reasons: (1) two sub-keys
+/// (`get_max_tokens` / `snippet_max_chars`) are legitimately emitted
+/// commented-out by the fresh template — a commented placeholder there is
+/// already covered, never "missing"; (2) a user who deliberately comments
+/// out an otherwise-active key (e.g. `# check_timeout_ms: 500` to disable a
+/// tunable) is never fought — their own comment wins, mirroring
+/// [`insert_comment_above`]'s "a user's own comment always wins" rule.
+pub fn key_or_commented_placeholder_present(text: &str, segments: &[&str]) -> bool {
+    let (lines, _, _) = split(text);
+    locate_impl(&lines, segments, true).is_some()
 }
 
 /// Split `text` into lines plus its newline style and trailing-newline flag,
@@ -485,6 +520,42 @@ mod tests {
         let text = "search:\r\n  collection: c\r\n";
         let out = upsert_child(text, "search", "embed_model", "m");
         assert_eq!(out, "search:\r\n  collection: c\r\n  embed_model: m\r\n");
+    }
+
+    #[test]
+    fn key_or_commented_placeholder_present_finds_active_and_commented_forms() {
+        let text = "token_optimization:\n  level: balanced\n  # get_max_tokens: 6000\n";
+        assert!(key_or_commented_placeholder_present(
+            text,
+            &["token_optimization", "level"]
+        ));
+        assert!(key_or_commented_placeholder_present(
+            text,
+            &["token_optimization", "get_max_tokens"]
+        ));
+        assert!(!key_or_commented_placeholder_present(
+            text,
+            &["token_optimization", "check_timeout_ms"]
+        ));
+    }
+
+    #[test]
+    fn key_or_commented_placeholder_present_respects_user_comment_disabling_active_key() {
+        // A user who comments out an otherwise-active key is never fought —
+        // the commented line counts as "already documented", not missing.
+        let text = "token_optimization:\n  level: balanced\n  # check_timeout_ms: 500\n";
+        assert!(key_or_commented_placeholder_present(
+            text,
+            &["token_optimization", "check_timeout_ms"]
+        ));
+    }
+
+    #[test]
+    fn key_or_commented_placeholder_present_absent_key_is_false() {
+        assert!(!key_or_commented_placeholder_present(
+            "folders:\n  inbox: x\n",
+            &["token_optimization", "level"]
+        ));
     }
 
     #[test]
