@@ -2802,14 +2802,29 @@ fn insert_token_optimization_sub_keys(
     let ends_with_newline = text.ends_with('\n');
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
 
+    // Match the header by KEY TOKEN, not a raw `starts_with("token_optimization:")`
+    // — a valid `token_optimization :` (spaced) or `"token_optimization":`
+    // (quoted) header must resolve to the same block the presence check
+    // (`locate_impl`) found, or the two disagree. Split the inline-check on
+    // the first colon for the same reason.
     let header_idx = lines.iter().position(|l| {
-        indent_of(l) == 0 && !is_comment(l) && l.trim_start().starts_with("token_optimization:")
+        indent_of(l) == 0
+            && !is_comment(l)
+            && onebrain_fs::yaml_edit::key_token(l.trim_start()) == Some("token_optimization")
     })?;
-    let after_header = lines[header_idx].trim_start()["token_optimization:".len()..].trim_start();
-    if !(after_header.is_empty() || after_header.starts_with('#')) {
+    let after_colon = lines[header_idx]
+        .trim_start()
+        .split_once(':')
+        .map(|(_, a)| a.trim_start())
+        .unwrap_or("");
+    if !(after_colon.is_empty() || after_colon.starts_with('#')) {
         return None;
     }
 
+    // The insertion anchor is the block's LAST child line (active or comment),
+    // so a missing sub-key lands after the block's existing content — even a
+    // fully-commented block (child_indent falls back to two spaces, matching
+    // the canonical indent).
     let mut last_child = header_idx;
     let mut child_indent: Option<usize> = None;
     let mut j = header_idx + 1;
@@ -2950,6 +2965,20 @@ fn fix_token_optimization(vault_root: &Path, json: bool) -> FixOutcome {
              doctor --fix (or add the missing sub-key(s) manually)"
         ));
     };
+
+    // Defense-in-depth (issue #270 R-review): the splice above must never
+    // produce a file that no longer parses. The key-token presence check
+    // (`key_or_commented_placeholder_present`) already prevents the one known
+    // corruption path (a spaced/quoted existing key false-reported missing →
+    // duplicate key), but PARSE the result before writing as a hard safety
+    // net — abort with the file byte-identical rather than ever writing YAML
+    // that `serde_yaml` (or the runtime loader) would reject.
+    if serde_yaml::from_str::<serde_yaml::Value>(&updated).is_err() {
+        return FixOutcome::Failed(format!(
+            "{filename}: token_optimization sub-key backfill would produce invalid YAML — \
+             aborted, file left unchanged (please add the missing sub-key(s) manually)"
+        ));
+    }
 
     if let Err(e) = onebrain_fs::backup_config_file(&path) {
         return FixOutcome::Failed(format!("backup {filename} before write: {e}"));
@@ -8330,6 +8359,107 @@ mod tests {
             "every token_optimization sub-key must be documented after --fix:\n{after}"
         );
 
+        let r = token_optimization_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
+    }
+
+    #[test]
+    fn fix_token_optimization_noop_on_spaced_and_quoted_sub_keys_no_duplicate() {
+        // BLOCKING regression (issue #270 R-review): a valid `check_timeout_ms
+        // : 500` (space before colon) or `"strip_frontmatter": always`
+        // (quoted) key must be recognised as PRESENT. A raw-prefix presence
+        // check missed them → the key was false-reported missing → the splice
+        // inserted a SECOND `check_timeout_ms: 200` → the file grew a DUPLICATE
+        // key → `serde_yaml` fails to parse it on the next load. `--fix` must
+        // NEVER corrupt a valid onebrain.yml.
+        //
+        // Fully-populate the block from the shared source, then rewrite two of
+        // its lines into the tricky (but valid) spaced / quoted forms. `--fix`
+        // must be a NO-OP: no duplicate, and the file still parses.
+        let d = tempdir().unwrap();
+        let mut block_lines = onebrain_fs::token_optimization_block_lines();
+        for line in block_lines.iter_mut() {
+            if line.trim_start().starts_with("check_timeout_ms:") {
+                *line = "  check_timeout_ms : 200".to_string();
+            } else if line.trim_start().starts_with("strip_frontmatter:") {
+                *line = "  \"strip_frontmatter\": auto".to_string();
+            }
+        }
+        let original = format!("update_channel: stable\n{}\n", block_lines.join("\n"));
+        // Sanity: the pre-fix file already parses and has one of each key.
+        serde_yaml::from_str::<serde_yaml::Value>(&original).unwrap();
+        fs::write(d.path().join("onebrain.yml"), &original).unwrap();
+
+        let outcome = fix_token_optimization(d.path(), false);
+        let FixOutcome::Fixed(msg) = outcome else {
+            panic!("expected Fixed, got: {outcome:?}");
+        };
+        assert!(msg.contains("already set"), "must be a no-op: {msg}");
+
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        // No duplicate key inserted → still exactly one occurrence each.
+        assert_eq!(
+            after.matches("check_timeout_ms").count(),
+            1,
+            "spaced key must not be duplicated:\n{after}"
+        );
+        assert_eq!(
+            after.matches("strip_frontmatter").count(),
+            1,
+            "quoted key must not be duplicated:\n{after}"
+        );
+        // The file MUST still parse — the corruption this test guards against.
+        serde_yaml::from_str::<serde_yaml::Value>(&after)
+            .unwrap_or_else(|e| panic!("--fix corrupted the YAML ({e}):\n{after}"));
+        assert_eq!(after, original, "no-op must be byte-identical");
+    }
+
+    #[test]
+    fn fix_token_optimization_all_commented_block_does_not_double_backfill() {
+        // Finding 2 (R-review): a `token_optimization:` block whose children
+        // are ALL commented (user deliberately disabled them) must NOT gain
+        // fresh ACTIVE duplicates of those commented keys. The commented
+        // level/read_hook are respected; only genuinely-absent keys are added.
+        let d = tempdir().unwrap();
+        let original =
+            "token_optimization:\n  # level: aggressive\n  # read_hook: ledger\n".to_string();
+        fs::write(d.path().join("onebrain.yml"), &original).unwrap();
+
+        let outcome = fix_token_optimization(d.path(), false);
+        let FixOutcome::Fixed(msg) = outcome else {
+            panic!("expected Fixed, got: {outcome:?}");
+        };
+        // check_timeout_ms (and the other genuinely-absent keys) backfilled…
+        assert!(msg.contains("check_timeout_ms"), "msg: {msg}");
+        // …but NOT the commented level / read_hook.
+        assert!(
+            !msg.contains("level"),
+            "commented level must be respected: {msg}"
+        );
+        assert!(
+            !msg.contains("read_hook"),
+            "commented read_hook must be respected: {msg}"
+        );
+
+        let after = fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
+        // The user's commented lines survive untouched.
+        assert!(after.contains("# level: aggressive"), "{after}");
+        assert!(after.contains("# read_hook: ledger"), "{after}");
+        // No ACTIVE level: / read_hook: line was added.
+        assert_eq!(
+            after
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with('#') && (t.starts_with("level:") || t.starts_with("read_hook:"))
+                })
+                .count(),
+            0,
+            "must not add active duplicates of commented keys:\n{after}"
+        );
+        // File still parses; doctor now clean (all sub-keys present, some
+        // commented, some active).
+        serde_yaml::from_str::<serde_yaml::Value>(&after).unwrap();
         let r = token_optimization_check(d.path());
         assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
     }
