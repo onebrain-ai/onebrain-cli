@@ -565,7 +565,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             )
         }
         Cmd::RegisterHooksAlias(a) => {
-            migration::print_once("register-hooks", "plugin update");
+            migration::print_once("register-hooks", "plugin install");
             // Honour either the per-command `--vault-dir` (legacy spelling)
             // OR the global `--vault` (v3.1 spelling). Either lands in the
             // same place semantically.

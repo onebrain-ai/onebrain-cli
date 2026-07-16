@@ -30,10 +30,10 @@ pub enum SchedulerError {
     #[error("Skill {0} does not declare schedulable: true in frontmatter")]
     SkillSchedulableMissing(String),
 
-    #[error("Arg \"{key}\" value must not contain shell-special chars (\", $, `, \\): {value}")]
+    #[error("Arg \"{key}\"=\"{value}\" must not contain shell-special chars (\", $, `, \\) in its key or value")]
     ShellSpecialInArg { key: String, value: String },
 
-    #[error("Arg value must not contain shell-special chars (\", $, `, \\): {0}")]
+    #[error("Arg key or value must not contain shell-special chars (\", $, `, \\): {0}")]
     ShellSpecialInOneShotArg(String),
 
     #[error("Command not found at absolute path: {0}. Check the path in onebrain.yml — launchd will silently fail at run time if the binary is missing.")]

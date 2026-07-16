@@ -1231,29 +1231,46 @@ fn all_hidden_aliases_dispatch_and_warn() {
     // run-skill exits 64 on a --vault dir without config since the #263
     // alias hardening) — we don't assert a specific code, only that the
     // migration arm fired.
-    let cases: &[(&str, &[&str], Option<i32>)] = &[
-        // (alias name, extra-args, optional expected exit code)
-        ("session-init", &[], None),
-        ("orphan-scan", &[".", "tokABC"], None),
-        ("qmd-reindex", &[], None),
+    //
+    // `expected_new_path` is the TRUE modern-command target the alias
+    // dispatches to (verified against the `Cmd::*Alias` arm's handler call
+    // in `dispatch.rs`, NOT copied from `migration::print_once`'s literal —
+    // that literal can itself be wrong, as `register-hooks` proved: it
+    // dispatched to `commands::register_hooks::run` — the same handler
+    // `PluginVerb::Install` uses — but advertised "plugin update" instead of
+    // the correct "plugin install"). Asserting this string closes the test
+    // gap that let that bug ship.
+    let cases: &[(&str, &[&str], Option<i32>, &str)] = &[
+        // (alias name, extra-args, optional expected exit code, expected new path)
+        ("session-init", &[], None, "session init"),
+        ("orphan-scan", &[".", "tokABC"], None, "checkpoint orphans"),
+        ("qmd-reindex", &[], None, "search reindex"),
         // register-hooks: vault-required, but `--vault` lets us point at a
-        // tempdir. With --dry-run + an empty vault, exit 0.
-        ("register-hooks", &["--dry-run"], None),
+        // tempdir. With --dry-run + an empty vault, exit 0. Dispatches to
+        // `commands::register_hooks::run` — the same handler as `plugin
+        // install` — so the true new path is "plugin install", not "plugin
+        // update" (a distinct command that drives vault-sync + hook rewrite).
+        ("register-hooks", &["--dry-run"], None, "plugin install"),
         // register-schedule: vault.yml has no `schedule:` block so it
         // prints "Nothing to register" + exits 0.
-        ("register-schedule", &["--dry-run"], None),
+        (
+            "register-schedule",
+            &["--dry-run"],
+            None,
+            "schedule register",
+        ),
         // migrate: handler always exits 0 (internal-command contract).
-        ("migrate", &["unknown-migration"], Some(0)),
+        ("migrate", &["unknown-migration"], Some(0), "plugin migrate"),
         // run-skill: since the #263 alias hardening it resolves the vault via
         // `vault_ctx::require` (like the modern `skill run` arm), so a --vault
         // dir without a config is NotAVault → exit 64 (E_VAULT_NOT_FOUND),
         // not the old bare 78 from run_skill::run's internal guard.
-        ("run-skill", &["--skill", "noop"], Some(64)),
+        ("run-skill", &["--skill", "noop"], Some(64), "skill run"),
         // vault-sync: pointed at a missing fixture path → exit 1.
-        ("vault-sync", &[], Some(1)),
+        ("vault-sync", &[], Some(1), "vault sync"),
     ];
 
-    for (alias, extra, want_exit) in cases.iter() {
+    for (alias, extra, want_exit, expected_new_path) in cases.iter() {
         let vault = make_alias_vault();
         let home = tempdir().unwrap();
         let cache = home.path().join("cache");
@@ -1288,7 +1305,7 @@ fn all_hidden_aliases_dispatch_and_warn() {
                 .env_remove("ONEBRAIN_QUIET_MIGRATION")
                 .output()
                 .unwrap();
-            assert_alias_warned(alias, &out, *want_exit);
+            assert_alias_warned(alias, &out, *want_exit, expected_new_path);
             // Keep the fresh tempdir alive past assertions.
             drop(fresh);
             continue;
@@ -1312,7 +1329,7 @@ fn all_hidden_aliases_dispatch_and_warn() {
             );
         }
         let out = cmd.output().unwrap();
-        assert_alias_warned(alias, &out, *want_exit);
+        assert_alias_warned(alias, &out, *want_exit, expected_new_path);
 
         // Subsequent invocation: same HOME + cache, so state file is
         // sticky → notice MUST stay silent.
@@ -1336,11 +1353,28 @@ fn all_hidden_aliases_dispatch_and_warn() {
     }
 }
 
-fn assert_alias_warned(alias: &str, out: &std::process::Output, want_exit: Option<i32>) {
+/// Asserts the migration notice fired for `alias` AND that it advertised the
+/// correct new-path (`expected_new_path`) — not just that *some* notice was
+/// printed. The old assertion (old-name-only) is exactly how the
+/// `register-hooks` → "plugin update" mismap (#5) slipped through: the
+/// notice fired, `alias` appeared in stderr, and the test was green even
+/// though the advertised replacement command was wrong. See
+/// `Cmd::RegisterHooksAlias` in `dispatch.rs` for the real target.
+fn assert_alias_warned(
+    alias: &str,
+    out: &std::process::Output,
+    want_exit: Option<i32>,
+    expected_new_path: &str,
+) {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("v3.1") && stderr.contains(alias),
         "alias `{alias}` did NOT emit migration notice · stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains(expected_new_path),
+        "alias `{alias}` migration notice did NOT advertise the correct new \
+         path `{expected_new_path}` · stderr: {stderr:?}"
     );
     if let Some(code) = want_exit {
         assert_eq!(

@@ -235,18 +235,28 @@ fn read_vault_config(vault: &Path) -> Result<ScheduleConfig> {
     Ok(cfg)
 }
 
-/// Reject shell-special chars in any arg value for one-shot entries —
-/// these get embedded inside a `sh -c "..."` wrapper, so unsanitized values
-/// would allow shell injection.
+/// Reject shell-special chars in any arg token for one-shot entries — these
+/// get embedded inside a `sh -c "..."` wrapper, so unsanitized tokens would
+/// allow shell injection.
+///
+/// **Map KEYS are checked as well as values.** Skill-mode one-shot entries
+/// emit each map pair as a `--arg="{k}={v}"` fragment inside the shell
+/// string (see `one_shot_skill_block`), so a malicious KEY (e.g.
+/// `x"; touch /tmp/pwned; echo "`) breaks out of the quoted fragment exactly
+/// like a malicious value would. Earlier this scanned `m.values()` only,
+/// leaving keys as an unguarded injection vector.
 fn sanitize_args_for_one_shot(entry: &ScheduleEntry) -> Result<()> {
-    let values: Vec<&str> = match &entry.args {
+    let tokens: Vec<&str> = match &entry.args {
         Some(Args::List(v)) => v.iter().map(String::as_str).collect(),
-        Some(Args::Map(m)) => m.values().map(String::as_str).collect(),
+        Some(Args::Map(m)) => m
+            .iter()
+            .flat_map(|(k, v)| [k.as_str(), v.as_str()])
+            .collect(),
         None => return Ok(()),
     };
-    for v in values {
-        if has_shell_special(v) {
-            return Err(anyhow!(SchedulerError::ShellSpecialInOneShotArg(v.into())));
+    for t in tokens {
+        if has_shell_special(t) {
+            return Err(anyhow!(SchedulerError::ShellSpecialInOneShotArg(t.into())));
         }
     }
     Ok(())
@@ -308,11 +318,14 @@ fn validate_schedulable(vault: &Path, entry: &ScheduleEntry) -> Result<()> {
         )));
     }
 
-    // Reject shell-special chars in recurring skill-mode args. One-shot
-    // entries are validated upstream by `sanitize_args_for_one_shot`.
+    // Reject shell-special chars in recurring skill-mode args — in the KEY
+    // as well as the value. One-shot entries are validated upstream by
+    // `sanitize_args_for_one_shot` (which also checks keys). Checking the key
+    // here keeps skill-mode consistent and defends any future code path that
+    // interpolates a recurring entry's map key into a shell context.
     if let Some(Args::Map(m)) = &entry.args {
         for (k, v) in m {
-            if has_shell_special(v) {
+            if has_shell_special(k) || has_shell_special(v) {
                 return Err(anyhow!(SchedulerError::ShellSpecialInArg {
                     key: k.clone(),
                     value: v.clone(),
@@ -898,6 +911,26 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_args_for_one_shot_rejects_shell_special_in_map_key() {
+        // Security regression (CVE): a one-shot skill map KEY with
+        // shell-special chars is an injection vector because
+        // `one_shot_skill_block` emits `--arg="{k}={v}"` inside a
+        // `/bin/sh -c "..."` wrapper. The exact live PoC input that broke
+        // out and executed `touch /tmp/onebrain_poc_pwned` must now be
+        // REJECTED at register time. Previously this scanned values only and
+        // passed the entry through.
+        use onebrain_core::scheduler::ScheduleEntry;
+        let entry: ScheduleEntry = serde_yaml::from_str(
+            "at: \"2026-05-13 14:30\"\nskill: /distill\nargs:\n  \
+             \"x\\\"; touch /tmp/onebrain_poc_pwned; echo \\\"\": harmless\n",
+        )
+        .unwrap();
+        let err = sanitize_args_for_one_shot(&entry)
+            .expect_err("map key with shell-special chars must be rejected");
+        assert!(err.to_string().contains("shell-special"), "got: {err}");
+    }
+
+    #[test]
     fn sanitize_args_for_one_shot_accepts_no_args() {
         use onebrain_core::scheduler::ScheduleEntry;
         let entry = ScheduleEntry {
@@ -1182,6 +1215,22 @@ mod tests {
         // Build via YAML to avoid direct indexmap dependency.
         let entry: ScheduleEntry = serde_yaml::from_str(
             "cron: \"0 9 * * *\"\nskill: /distill\nargs:\n  topic: \"$(evil)\"\n",
+        )
+        .unwrap();
+        let err = validate_schedulable(dir.path(), &entry).unwrap_err();
+        assert!(err.to_string().contains("shell-special"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_schedulable_rejects_shell_special_in_recurring_arg_key() {
+        // Companion to the value check above: a map KEY with shell-special
+        // chars must also be rejected (was previously unchecked — only
+        // values were scanned).
+        use onebrain_core::scheduler::ScheduleEntry;
+        let dir = tempfile::tempdir().unwrap();
+        write_skill_file(dir.path(), "distill", "schedulable: true");
+        let entry: ScheduleEntry = serde_yaml::from_str(
+            "cron: \"0 9 * * *\"\nskill: /distill\nargs:\n  \"bad`key\": safe-value\n",
         )
         .unwrap();
         let err = validate_schedulable(dir.path(), &entry).unwrap_err();
