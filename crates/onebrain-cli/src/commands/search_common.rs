@@ -21,6 +21,7 @@
 //!   machine, and
 //! - **visible + editable** in `onebrain.yml` afterwards.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -434,9 +435,69 @@ pub(crate) fn route_to_daemon(resolved: &ResolvedVault) -> Option<DaemonHandle> 
 /// normalizer the two never collide and cross-surface dedup silently never
 /// fires (and `engine.doc_hash`/`engine.get` would miss the relative index key
 /// entirely on an absolute path).
+///
+/// ## Symlink boundaries (#268, R3 follow-up to #255)
+///
+/// The lexical `strip_prefix` above is a byte-for-byte comparison — it has no
+/// notion of symlinks. When the incoming absolute path and `vault_root` were
+/// resolved via different routes that disagree across a symlinked path
+/// component (macOS `/tmp` → `/private/tmp`, `/var` → `/private/var`, or a
+/// user-symlinked vault), the lexical strip fails even though the two paths
+/// point at the same file, and the ledger key falls back to the raw absolute
+/// path — silently failing the read-hook gate OPEN.
+///
+/// To stay fast on the overwhelmingly common case (spellings already agree),
+/// canonicalization is only attempted as a fallback, and only when `input` is
+/// absolute — canonicalizing a relative path would resolve it against the
+/// process `cwd`, which has nothing to do with the vault and would produce a
+/// wrong key. If canonicalization errors (path doesn't exist, permissions,
+/// …) or the canonical strip also fails, this falls back to the original
+/// lexical result — never panics, never guesses a wrong key.
 pub(crate) fn normalize_doc_path(input: &str, vault_root: &Path) -> String {
     let p = Path::new(input);
-    let rel = p.strip_prefix(vault_root).unwrap_or(p);
+    match strip_vault_prefix(p, vault_root) {
+        Some(rel) => finish_normalize(&rel),
+        None => finish_normalize(p),
+    }
+}
+
+/// Strip `vault_root` from `input`, returning the vault-relative remainder, or
+/// `None` when `input` is not under the vault.
+///
+/// The SINGLE symlink-aware prefix-strip shared by every surface that must
+/// decide "is this absolute path under the vault, and if so what's its
+/// vault-relative form?" — [`normalize_doc_path`] (the ledger-key normalizer)
+/// and `search get`'s outside-vault guard. Keeping one implementation avoids a
+/// third divergent lexical-vs-canonicalize copy drifting out of sync (#268).
+///
+/// Algorithm (same fast-path/fallback shape as the ledger normalizer):
+/// 1. **Lexical `strip_prefix`** first — the hot path, no filesystem I/O when
+///    the spellings already agree.
+/// 2. On a lexical miss **and only when `input` is absolute**, `fs::canonicalize`
+///    BOTH sides (resolving symlink boundaries like macOS `/tmp` →
+///    `/private/tmp`) and retry the strip. Relative inputs are excluded:
+///    canonicalizing a relative path resolves it against the process `cwd`,
+///    which is unrelated to the vault.
+/// 3. `None` when the strip fails on both routes, or when either canonicalize
+///    errors (path doesn't exist, permissions, …) — callers stay fail-open.
+pub(crate) fn strip_vault_prefix(input: &Path, vault_root: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = input.strip_prefix(vault_root) {
+        return Some(rel.to_path_buf());
+    }
+    if !input.is_absolute() {
+        return None;
+    }
+    let canon_input = fs::canonicalize(input).ok()?;
+    let canon_root = fs::canonicalize(vault_root).ok()?;
+    canon_input
+        .strip_prefix(&canon_root)
+        .map(Path::to_path_buf)
+        .ok()
+}
+
+/// Shared tail of [`normalize_doc_path`]: forward-slash the path and trim a
+/// leading `./`.
+fn finish_normalize(rel: &Path) -> String {
     let s = rel.to_string_lossy().replace('\\', "/");
     s.trim_start_matches("./").to_string()
 }
@@ -466,6 +527,114 @@ mod tests {
             normalize_doc_path("/elsewhere/x.md", root),
             "/elsewhere/x.md"
         );
+    }
+
+    /// #268 (R3 follow-up to #255): the lexical `strip_prefix` in
+    /// `normalize_doc_path` fails silently when the incoming absolute path and
+    /// `vault_root` disagree across a SYMLINKED path component — e.g. macOS
+    /// `/tmp` → `/private/tmp`, `/var` → `/private/var`, or a user-symlinked
+    /// vault. On failure it falls back to `unwrap_or(p)`, returning the raw
+    /// absolute path instead of the relative index key, which makes the
+    /// already-sent ledger (#255) miss and the read-hook gate fail OPEN.
+    ///
+    /// Build a real symlink in a tempdir (not relying on the exact `/tmp` ↔
+    /// `/private/tmp` mapping, which is macOS-specific and not guaranteed
+    /// stable), then normalize the "through-the-symlink" spelling of a doc
+    /// path against the canonical vault_root. Before the fix this returns the
+    /// raw absolute (unrelativized) path; after the fix it must return the
+    /// relative key.
+    #[cfg(unix)]
+    #[test]
+    fn normalize_doc_path_resolves_symlinked_vault_root() {
+        let base = tempfile::tempdir().unwrap();
+        let real_vault = base.path().join("real-vault");
+        std::fs::create_dir_all(real_vault.join("00-inbox")).unwrap();
+        let doc = real_vault.join("00-inbox/note.md");
+        std::fs::write(&doc, "body").unwrap();
+
+        let link_vault = base.path().join("linked-vault");
+        std::os::unix::fs::symlink(&real_vault, &link_vault).unwrap();
+
+        // The read-hook receives the path exactly as Claude Code's Read tool
+        // saw it — through the symlinked spelling — while `vault_root` was
+        // resolved (elsewhere) to the canonical, symlink-free spelling. This
+        // mirrors the real-world `/tmp` vs `/private/tmp` split confirmed in
+        // #255 R3.
+        let input_through_symlink = link_vault.join("00-inbox/note.md");
+        let canonical_root = real_vault.canonicalize().unwrap();
+
+        assert_eq!(
+            normalize_doc_path(input_through_symlink.to_str().unwrap(), &canonical_root),
+            "00-inbox/note.md",
+            "a symlinked-path input must still normalize to the relative index key, \
+             not fall open to the raw absolute path"
+        );
+    }
+
+    /// A relative `input` must never be canonicalized against `cwd` — only
+    /// ABSOLUTE inputs are eligible for the symlink-resolution fallback.
+    /// Canonicalizing a relative path implicitly resolves it against the
+    /// process's current working directory, which has nothing to do with the
+    /// vault and would silently produce a wrong key. A relative input that
+    /// already fails the lexical strip (it's not absolute, so it trivially
+    /// isn't a child of the absolute `vault_root`) must short-circuit straight
+    /// to the existing passthrough behavior.
+    #[test]
+    fn normalize_doc_path_relative_input_is_idempotent_never_canonicalized() {
+        let root = Path::new("/vault/ob-1");
+        assert_eq!(
+            normalize_doc_path("00-inbox/note.md", root),
+            "00-inbox/note.md"
+        );
+        assert_eq!(
+            normalize_doc_path("./00-inbox/note.md", root),
+            "00-inbox/note.md"
+        );
+    }
+
+    /// An absolute path that is genuinely outside the vault (no symlink
+    /// involved, canonicalize succeeds on both sides, but the canonical strip
+    /// still fails) must stay fail-open: return the input unchanged, never
+    /// panic.
+    #[cfg(unix)]
+    #[test]
+    fn normalize_doc_path_outside_vault_stays_fail_open() {
+        let base = tempfile::tempdir().unwrap();
+        let vault_root = base.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        let outside_dir = base.path().join("elsewhere");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside_file = outside_dir.join("x.md");
+        std::fs::write(&outside_file, "body").unwrap();
+
+        let result = normalize_doc_path(outside_file.to_str().unwrap(), &vault_root);
+        assert_eq!(
+            result,
+            outside_file.to_str().unwrap(),
+            "a genuinely-outside-vault absolute path must pass through unchanged, fail-open"
+        );
+    }
+
+    /// A `vault_root` (or input) that does not exist on disk must not panic —
+    /// `fs::canonicalize` errors out, and the function must fall back to the
+    /// lexical (non-canonicalized) result.
+    #[test]
+    fn normalize_doc_path_nonexistent_paths_stay_fail_open_no_panic() {
+        let root = Path::new("/vault/ob-1-does-not-exist-268");
+        // Neither the input file nor vault_root exist on disk: canonicalize
+        // fails on both, so this must fall back to the lexical passthrough
+        // (unchanged) rather than panicking.
+        assert_eq!(
+            normalize_doc_path("/vault/ob-1-does-not-exist-268/00-inbox/note.md", root),
+            "00-inbox/note.md",
+            "lexical strip already succeeds here (no symlink involved), so the \
+             canonicalize fallback path is never reached"
+        );
+        // Now force the lexical strip to fail too, by using a vault_root that
+        // shares no prefix at all, and confirm no panic / safe passthrough.
+        let other_root = Path::new("/some/other/nonexistent/root-268");
+        let input = "/vault/ob-1-does-not-exist-268/00-inbox/note.md";
+        assert_eq!(normalize_doc_path(input, other_root), input);
     }
 
     #[test]
