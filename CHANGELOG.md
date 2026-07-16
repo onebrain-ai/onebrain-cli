@@ -1,6 +1,6 @@
 ---
-latest_version: 3.4.12
-released: 2026-07-12
+latest_version: 3.4.13
+released: 2026-07-16
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,20 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.13] — 2026-07-16 — Ledger works in production + multi-vault daemons
+
+Theme: make the token-optimization read-hook ledger actually gate in production (it shipped enabled-but-inert), and let one machine run a warm daemon per vault instead of one that thrashes across vaults.
+
+- Unify the already-sent ledger key on `doc_hash` + the **vault-relative, canonicalized** path across `search get` / MCP `get` / the read-hook — so cross-surface dedup fires and `token check` gates on the absolute paths the read-hook receives, including vaults under a symlinked path (`/tmp`→`/private/tmp`) ([#255](https://github.com/onebrain-ai/onebrain-cli/issues/255), [#268](https://github.com/onebrain-ai/onebrain-cli/issues/268))
+- `token check` routes to a warm same-vault daemon even across a version skew — ending the cold-open lock collision that made the gate fail open 100% of the time in the field; the round-trip budget is configurable (`token_optimization.check_timeout_ms`, default 200) for iCloud/networked vaults, a successful deny is metered (`ledger_deny`) in `token gain`, and `doctor` flags a read-hook that fails open ~always ([#264](https://github.com/onebrain-ai/onebrain-cli/issues/264))
+- **Per-vault daemon slots** — each vault gets its own warm daemon (`daemon-<hash>.*` on an ephemeral port) instead of one machine-wide daemon that thrashes when two vaults are active; `daemon status` enumerates all, `daemon stop` gains `--vault`/`--all`, and `doctor` surfaces running daemons plus a lingering pre-upgrade one ([#230](https://github.com/onebrain-ai/onebrain-cli/issues/230))
+- `onebrain daemon start` walks up from cwd to bind the vault like every sibling verb, instead of spawning a vault-less daemon ([#262](https://github.com/onebrain-ai/onebrain-cli/issues/262))
+- Scheduler command-mode launchd plists embed `--vault` for onebrain jobs (generic binaries untouched), fixing scheduled jobs that exited 78; the legacy `run-skill` alias now walk-up-resolves ([#263](https://github.com/onebrain-ai/onebrain-cli/issues/263))
+- `doctor --fix` backfills a documented `token_optimization` sub-key missing from an existing block — parse-guarded, handles spaced/quoted keys ([#270](https://github.com/onebrain-ai/onebrain-cli/issues/270))
+- Hardening (Copilot findings): the `register-hooks` migration notice points at the correct command (`plugin install`); one-shot launchd `/bin/sh -c` wrappers shell-escape every interpolated value and reject shell-special chars in `args` keys — closing a demonstrated command-injection
+
+**Breaking:** `onebrain daemon status --json` now returns `{"daemons": [...]}` (a list) instead of a single object, reflecting the multi-daemon model. Upgrading: run `onebrain daemon stop --all` once after upgrading to retire a lingering pre-v3.4.13 machine-wide daemon.
 
 ## [3.4.12] — 2026-07-12 — Self-healing: run smooth under a running daemon
 
