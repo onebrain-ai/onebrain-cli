@@ -46,11 +46,13 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &SearchGetArgs)
     // key (keys are vault-relative), so `Engine::get` would just miss with a
     // generic "not indexed" hint. Catch it up front with a precise message.
     if is_outside_vault(&args.doc_path, resolved.root.as_path()) {
-        anyhow::bail!(
-            "❌  path is outside this vault: {}\n💡  `search get` takes vault-relative \
-             paths of indexed `.md` notes (e.g. `00-inbox/note.md`)",
-            args.doc_path
-        );
+        // `HintedError` (R3, #279): the ✗/💡 dressing is text-mode-only —
+        // structured error envelopes get the single-line plain text.
+        return Err(anyhow::Error::new(crate::output::HintedError::new(
+            format!("path is outside this vault: {}", args.doc_path),
+            "`search get` takes vault-relative paths of indexed `.md` notes \
+             (e.g. `00-inbox/note.md`)",
+        )));
     }
 
     // Index keys are vault-relative (forward-slash) paths; accept an
