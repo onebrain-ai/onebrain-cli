@@ -40,9 +40,48 @@ pub fn resolve(flag: Option<PathBuf>) -> Result<Option<ResolvedVault>> {
 
 /// Resolve a vault, failing with E_VAULT_NOT_FOUND (exit 64) if no vault is
 /// found. Used by plugin_update and vault-required stub commands.
+///
+/// #288: `require_vault`'s walk-up dead end (`CoreError::VaultNotFound`) is
+/// EVERY verb's most common failure — and, before this fix, the one text-mode
+/// error that rendered as a bare `Error: {e:#}` with no 💡 remedy (a literal
+/// miss of #279's "no dead-end errors" contract, since this is the resolver
+/// almost every command hits first). Dress it in a [`crate::output::
+/// HintedError`] via `.context(..)` ON TOP of the original error — never a
+/// rebuilt `anyhow::anyhow!` — so `CoreError::VaultNotFound` stays in the
+/// chain and `exit::exit_code_for`'s downcast walk still finds it (exit 64
+/// survives), the SAME technique `serve::contract_bind_error` uses to keep a
+/// wrapped `io::Error::PermissionDenied` mapping to exit 66. `plain` is the
+/// error's own `Display` verbatim — this KEEPS the test-pinned "no OneBrain
+/// vault found by walking up from ..." substring
+/// (`dispatch_coverage.rs::run_skill_alias_without_vault...`) — only the
+/// missing hint is added.
+///
+/// `CoreError::NotAVault` (an explicit `--vault`/`$ONEBRAIN_VAULT` pointing
+/// at a non-vault path) is dressed too (#290 R1-5): a different failure
+/// shape — the user already named a path, so the remedy is "check that
+/// path", not "run inside a vault" — hence its own hint. Also exit 64
+/// (`E_VAULT_NOT_FOUND`, `exit.rs`), preserved the same way.
 pub fn require(flag: Option<PathBuf>) -> Result<ResolvedVault> {
     let inputs = snapshot_inputs(flag)?;
-    Ok(require_vault(&inputs)?)
+    require_vault(&inputs).map_err(dress_vault_not_found)
+}
+
+/// The dressing helper for [`require`]'s error path — split out so it's
+/// testable against a hand-built `CoreError` rather than depending on the
+/// live process cwd/env (which `require` snapshots via [`snapshot_inputs`]).
+fn dress_vault_not_found(core_err: onebrain_core::CoreError) -> anyhow::Error {
+    let hint = match &core_err {
+        onebrain_core::CoreError::VaultNotFound { .. } => {
+            "run inside a vault, or pass `--vault <path>` (`onebrain init` creates one)"
+        }
+        onebrain_core::CoreError::NotAVault { .. } => {
+            "check the path points at a vault root (the folder containing `onebrain.yml`)"
+        }
+        _ => return core_err.into(),
+    };
+    let plain = core_err.to_string();
+    let err: anyhow::Error = core_err.into();
+    err.context(crate::output::HintedError::new(plain, hint))
 }
 
 /// Hook-protocol commands (`session init`, `checkpoint *`, `qmd reindex`).
@@ -130,6 +169,81 @@ mod tests {
             result.is_err(),
             "expected Err(NotAVault) when flag path has no onebrain.yml"
         );
+    }
+
+    // ---- require / dress_vault_not_found ----
+
+    #[test]
+    fn dress_vault_not_found_adds_hint_and_keeps_exit_64() {
+        // #288: the walk-up dead end must gain a 💡 hint without losing exit 64.
+        let core_err = onebrain_core::CoreError::VaultNotFound {
+            cwd: PathBuf::from("/no/vault/anywhere"),
+        };
+        let err = dress_vault_not_found(core_err);
+
+        let hinted = err
+            .downcast_ref::<crate::output::HintedError>()
+            .expect("VaultNotFound must carry the HintedError dressing");
+        // The test-pinned substring (dispatch_coverage.rs greps stderr for
+        // this) must survive verbatim inside `plain`.
+        assert!(
+            hinted
+                .plain
+                .contains("no OneBrain vault found by walking up from"),
+            "plain must keep the pinned walk-up substring, got: {}",
+            hinted.plain
+        );
+        assert!(hinted.plain.contains("/no/vault/anywhere"));
+        assert!(!hinted.hint.is_empty());
+        assert!(hinted.hint.contains("--vault"));
+
+        // The original CoreError::VaultNotFound must still be reachable so
+        // the exit-code walk keeps mapping this to 64, not the generic 1.
+        assert_eq!(crate::exit::exit_code_for(&err), 64);
+    }
+
+    #[test]
+    fn dress_not_a_vault_adds_its_own_hint_and_keeps_exit_64() {
+        // #290 R1-5: an explicit --vault pointing at a non-vault path is a
+        // DIFFERENT failure shape (the user already named a path), so it
+        // gets its OWN "check the path" hint — not the walk-up's "run
+        // inside a vault" remedy.
+        let core_err = onebrain_core::CoreError::NotAVault {
+            path: PathBuf::from("/bogus"),
+        };
+        let err = dress_vault_not_found(core_err);
+        let hinted = err
+            .downcast_ref::<crate::output::HintedError>()
+            .expect("NotAVault must carry the HintedError dressing");
+        // plain = the error's own Display, verbatim.
+        assert!(
+            hinted.plain.contains("path is not a valid vault root"),
+            "plain must keep NotAVault's Display text, got: {}",
+            hinted.plain
+        );
+        assert!(hinted.plain.contains("/bogus"));
+        assert!(hinted.hint.contains("onebrain.yml"));
+        // NotAVault maps to EXIT_VAULT_NOT_FOUND (64) in exit.rs — the
+        // dressing must not change that.
+        assert_eq!(crate::exit::exit_code_for(&err), 64);
+    }
+
+    #[test]
+    fn require_outside_vault_surfaces_the_dressed_error() {
+        // End-to-end through `require` itself (not just the helper): a clean
+        // cwd with no `--vault`/env still produces the HintedError-dressed,
+        // exit-64 error.
+        let no_vault_cwd = tempdir().unwrap();
+        let inputs = VaultResolveInputs {
+            flag: None,
+            env: None,
+            cwd: no_vault_cwd.path().to_path_buf(),
+        };
+        let err = require_vault(&inputs)
+            .map_err(dress_vault_not_found)
+            .unwrap_err();
+        assert!(err.downcast_ref::<crate::output::HintedError>().is_some());
+        assert_eq!(crate::exit::exit_code_for(&err), 64);
     }
 
     // ---- info_from ----

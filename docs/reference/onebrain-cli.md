@@ -84,7 +84,7 @@ CLI-side wiring for `onebrain_core::resolve_vault` — snapshots `--vault` flag 
 **Key functions**
 - `snapshot_inputs(flag) -> Result<VaultResolveInputs>` — builds the resolver input from live env+cwd.
 - `resolve(flag) -> Result<Option<ResolvedVault>>` — vault-free/informational, never errors.
-- `require(flag) -> Result<ResolvedVault>` — vault-required, errors `E_VAULT_NOT_FOUND` (exit 64).
+- `require(flag) -> Result<ResolvedVault>` — vault-required, errors `E_VAULT_NOT_FOUND` (exit 64). Dresses the error in the ✗/💡 `HintedError` contract via `dress_vault_not_found` (#288): the walk-up `VaultNotFound` gets a "run inside a vault / pass `--vault`" hint, and `NotAVault` (an explicit path that isn't a vault root) gets its own "check the path" hint — exit 64 preserved in both (the original `CoreError` stays in the chain under the `.context(..)` wrapper).
 - `resolve_for_hook` / `info_from` / `print_vault_not_found_help` — reserved for v3.2+ hook-protocol and vault-required handlers (dead-code-allowed in v3.1).
 **Connections** — calls: `onebrain_core::{resolve_vault, require_vault}`; called by: `stubs::not_implemented_vault_required`, `plugin_update`, `vault_current`, `doctor`.
 

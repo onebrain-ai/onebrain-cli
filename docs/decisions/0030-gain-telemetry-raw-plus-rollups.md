@@ -52,3 +52,7 @@ Corrections, shipped in #283:
   a `since` nor an `all_time` key is a pre-3.4.14 CLI's `--all-time` and is
   served all-epoch; the webui always sends `?by=&since=` (keys present, empty
   = unset) and gets the current epoch.
+- A malformed non-empty `since` **value** (as opposed to key presence, which
+  the rules above govern) is rejected since v3.4.14: CLI exit 70
+  (`E_INVALID_DATE`) / route HTTP 400 — strict zero-padded `YYYY-MM-DD` only
+  (#287).

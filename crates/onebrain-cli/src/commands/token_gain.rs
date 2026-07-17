@@ -182,6 +182,60 @@ pub(crate) fn parse_by(by: Option<&str>) -> Result<(Option<TimeAxis>, Option<Dim
     Ok((time, dim))
 }
 
+/// Strict `YYYY-MM-DD` shape check: exactly 4-2-2 ASCII digits joined by two
+/// literal `-`s. `chrono::NaiveDate::parse_from_str(_, "%Y-%m-%d")` alone is
+/// NOT enough — chrono's `%m`/`%d` specifiers are lenient on width when
+/// PARSING (they require zero-padding only when FORMATTING), so `"2026-1-1"`
+/// parses clean as 2026-01-01. That's the exact #287 bug: the resulting date
+/// compares correctly in-memory but the caller only ever sees a valid
+/// `NaiveDate`, never a rejection — the value later fails to line up with the
+/// zero-padded `YYYY-MM-DD` keys the gain log buckets by, so `--since 2026-1-1`
+/// silently reports zero instead of erroring. Checking the literal width
+/// FIRST closes that gap; `NaiveDate::parse_from_str` below still does the
+/// calendar-validity check (rejects `2026-13-01`, `2026-02-30`, etc).
+fn is_strict_since_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[0..4].iter().all(u8::is_ascii_digit)
+        && b[4] == b'-'
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[7] == b'-'
+        && b[8..10].iter().all(u8::is_ascii_digit)
+        && chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
+}
+
+/// Validate a `--since` / `?since=` value. `None` or `""` (the "unset" guard
+/// both the CLI and the daemon route apply BEFORE calling this — see [`run`]
+/// and `server::token_api::get_token_gain`) short-circuit `Ok(())` — an empty
+/// value is a deliberate no-op, never a malformed date. Anything else must be
+/// a strict `YYYY-MM-DD` per [`is_strict_since_date`].
+///
+/// The error carries `CoreError::InvalidDate` so `exit::exit_code_for` maps
+/// it to exit 70 (`EXIT_INVALID_DATE`) — until #287, that code existed but
+/// was unreachable. `HintedError` rides on top via `.context(..)` (never a
+/// rebuilt `anyhow!`), the SAME technique [`parse_by`] uses above and
+/// `serve::contract_bind_error` uses for the PermissionDenied-66 case: the
+/// original `CoreError` stays in the chain so the exit-code walk still finds
+/// it, while `HintedError`'s `Display` (→ the JSON envelope's
+/// `error.message`) stays the single-line, glyph-free `plain` text. The
+/// daemon route reuses this AS-IS (`e.to_string()` → its 400 body), mirroring
+/// the existing `?by=bogus` 400 path — one validator, one message, for both
+/// the CLI arg-parse error and the wire-level check.
+pub(crate) fn validate_since(since: Option<&str>) -> Result<()> {
+    let Some(since) = since else { return Ok(()) };
+    if since.is_empty() || is_strict_since_date(since) {
+        return Ok(());
+    }
+    Err(
+        anyhow::Error::new(onebrain_core::CoreError::InvalidDate(since.to_string())).context(
+            crate::output::HintedError::new(
+                format!("--since must be a date in YYYY-MM-DD form (got {since:?})"),
+                "example: `--since 2026-07-01`",
+            ),
+        ),
+    )
+}
+
 /// Recent-log cap for `--history` — "recent per-call log" (design §5), not
 /// an unbounded raw-log dump. Oldest-first order is preserved; only the tail
 /// is kept.
@@ -240,20 +294,43 @@ pub(crate) struct TokenGainData {
     archived_to: Option<String>,
 }
 
+/// What+why for the rollup-lock EngineBusy error — single-line, no remedy.
+/// This is what `CoreError::EngineBusy`'s own Display carries AND
+/// `HintedError::plain` mirrors, so text mode's `✗ {plain}` and a JSON
+/// consumer's `error.message` say the exact same (glyph-free) thing.
+const ROLLUP_LOCK_WHAT: &str =
+    "token.redb is held by another onebrain process (a running daemon owns the rollup DB)";
+
+/// The actionable remedy — #288: previously baked into the SAME string as
+/// [`ROLLUP_LOCK_WHAT`] and carried entirely inside `CoreError::EngineBusy`,
+/// so it rode into the JSON envelope's `error.message` (remedy text where a
+/// consumer expects only "what failed") and text mode showed a bare
+/// `Error: search engine busy: ...` with no 💡 dressing — a miss of #279's
+/// "no dead-end errors" contract. Wording is fact-corrected (#258/#281: only
+/// `--rebuild` still touches `token.redb`; every read mode is JSONL-backed).
+const ROLLUP_LOCK_REMEDY: &str =
+    "every read mode (the default summary, `--by`, `--history`, `--all-time`, `--since`, and \
+     `--reset`) reads the lock-free raw log and works regardless; only `--rebuild` needs the \
+     rollup DB — retry once that process exits (e.g. `onebrain daemon stop`)";
+
 /// The actionable, exit-77 error for a genuinely contended `token.redb`. Typed
 /// as [`onebrain_core::CoreError::EngineBusy`] so it maps to `E_ENGINE_BUSY` /
 /// exit 77 — the SAME transient-lock code `search query`/`vsearch`/`get` use
 /// (`search_common::map_engine_open_error`), instead of a plain exit-1 generic
-/// error that scripts can't tell apart from a real failure.
-fn rollup_busy_error(detail: &str) -> anyhow::Error {
-    anyhow::Error::new(onebrain_core::CoreError::EngineBusy(detail.to_string()))
+/// error that scripts can't tell apart from a real failure. `HintedError`
+/// rides on top via `.context(..)` — never a rebuilt `anyhow::anyhow!` — so
+/// the original `CoreError::EngineBusy` stays in the chain and
+/// `exit::exit_code_for`'s downcast walk still finds it (exit 77 survives),
+/// the same technique `vault_ctx::dress_vault_not_found` uses for exit 64.
+fn rollup_busy_error() -> anyhow::Error {
+    anyhow::Error::new(onebrain_core::CoreError::EngineBusy(
+        ROLLUP_LOCK_WHAT.to_string(),
+    ))
+    .context(crate::output::HintedError::new(
+        ROLLUP_LOCK_WHAT,
+        ROLLUP_LOCK_REMEDY,
+    ))
 }
-
-const ROLLUP_LOCK_HINT: &str =
-    "token.redb is held by another onebrain process (a running daemon owns the rollup DB). \
-     Every read mode (the default summary, --by, --history, --all-time, --since and --reset) \
-     reads the lock-free raw log and works regardless; only --rebuild needs the rollup DB — \
-     retry once that process exits (e.g. `onebrain daemon stop`).";
 
 /// Open the Tier-2 rollup DB (`token.redb`) directly, for the ONE mode that
 /// still needs it: `--rebuild` (every read mode is JSONL-backed since #281).
@@ -268,7 +345,7 @@ fn open_rollup_db_direct(tok_dir: &Path) -> Result<Database> {
         .context("opening token.redb")
         .map_err(|e| {
             if onebrain_search::error::is_redb_lock_error(&e) {
-                rollup_busy_error(ROLLUP_LOCK_HINT)
+                rollup_busy_error()
             } else {
                 e
             }
@@ -342,6 +419,11 @@ fn daemon_all_epoch_pivot(
 }
 
 pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &TokenGainArgs) -> Result<()> {
+    // #287: validate BEFORE any I/O — every branch below that reads `args.since`
+    // (the default/`--all-time` pivot AND `--history`'s `filter_since`) must see
+    // a value that's either unset or a real `YYYY-MM-DD`, never a string that
+    // silently fails to match the log's zero-padded date keys.
+    validate_since(args.since.as_deref())?;
     let (resolved, collection) = resolve_collection(vault_flag)?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
     let collection = collection.context("no search collection resolved for this vault")?;
@@ -761,6 +843,97 @@ mod tests {
     fn filter_since_unparseable_date_returns_everything() {
         let events = vec![sample_event(1_783_728_000)];
         assert_eq!(filter_since(events, Some("not-a-date")).len(), 1);
+    }
+
+    // ── #287: --since / ?since= strict-format validation ───────────────────
+
+    #[test]
+    fn is_strict_since_date_accepts_zero_padded_date() {
+        assert!(is_strict_since_date("2026-07-01"));
+    }
+
+    #[test]
+    fn is_strict_since_date_rejects_non_zero_padded_month_and_day() {
+        // The exact #287 live-proven case: chrono's own parser accepts this
+        // (lenient on width) and silently produces 2026-01-01, which is why
+        // validation can't rely on `NaiveDate::parse_from_str` alone.
+        assert!(!is_strict_since_date("2026-1-1"));
+    }
+
+    #[test]
+    fn is_strict_since_date_rejects_garbage() {
+        assert!(!is_strict_since_date("notadate"));
+    }
+
+    #[test]
+    fn is_strict_since_date_rejects_out_of_range_calendar_date() {
+        assert!(!is_strict_since_date("2026-13-01"));
+        assert!(!is_strict_since_date("2026-02-30"));
+    }
+
+    #[test]
+    fn validate_since_accepts_none() {
+        assert!(validate_since(None).is_ok());
+    }
+
+    #[test]
+    fn validate_since_accepts_empty_string_as_unset() {
+        // The `--since ""` = unset guard (mirrors the daemon route's
+        // key-present-but-empty semantics) must stay a no-op here — the
+        // caller applies its own `.filter(|s| !s.is_empty())` before/after,
+        // but the validator itself must never reject "".
+        assert!(validate_since(Some("")).is_ok());
+    }
+
+    #[test]
+    fn validate_since_accepts_valid_date() {
+        assert!(validate_since(Some("2026-07-01")).is_ok());
+    }
+
+    #[test]
+    fn validate_since_rejects_non_zero_padded_date_with_invalid_date_exit_code() {
+        let err = validate_since(Some("2026-1-1")).unwrap_err();
+        // The dressed HintedError's Display (plain) is what both the JSON
+        // envelope and the daemon route's 400 body see.
+        let hinted = err
+            .downcast_ref::<crate::output::HintedError>()
+            .expect("must carry the HintedError dressing");
+        assert!(hinted.plain.contains("--since"));
+        assert!(hinted.plain.contains("2026-1-1"));
+        assert!(!hinted.hint.is_empty());
+        // The ORIGINAL CoreError::InvalidDate must survive in the chain so
+        // `exit::exit_code_for` still maps it to 70 — same technique as
+        // `contract_bind_error`'s PermissionDenied-66 preservation.
+        assert_eq!(crate::exit::exit_code_for(&err), 70);
+    }
+
+    #[test]
+    fn validate_since_rejects_garbage_with_invalid_date_exit_code() {
+        let err = validate_since(Some("notadate")).unwrap_err();
+        assert_eq!(crate::exit::exit_code_for(&err), 70);
+    }
+
+    // ── #288: rollup-lock EngineBusy — HintedError dressing, exit 77 ───────
+
+    #[test]
+    fn rollup_busy_error_is_dressed_and_keeps_exit_77() {
+        let err = rollup_busy_error();
+        let hinted = err
+            .downcast_ref::<crate::output::HintedError>()
+            .expect("must carry the HintedError dressing");
+        // plain = what+why only, no remedy.
+        assert_eq!(hinted.plain, ROLLUP_LOCK_WHAT);
+        assert!(hinted.plain.contains("token.redb"));
+        assert!(!hinted.plain.contains("onebrain daemon stop"));
+        // hint = the actionable remedy.
+        assert_eq!(hinted.hint, ROLLUP_LOCK_REMEDY);
+        assert!(hinted.hint.contains("onebrain daemon stop"));
+        // The JSON envelope's error.message (top-level Display) must be the
+        // plain line only — never the remedy leaking into it.
+        assert_eq!(err.to_string(), ROLLUP_LOCK_WHAT);
+        // The original CoreError::EngineBusy must survive in the chain so
+        // the exit-code walk still maps this to 77.
+        assert_eq!(crate::exit::exit_code_for(&err), 77);
     }
 
     #[test]

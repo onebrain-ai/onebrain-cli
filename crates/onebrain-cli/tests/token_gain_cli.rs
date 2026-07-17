@@ -296,6 +296,31 @@ fn token_gain_by_rejects_unrecognized_axis() {
     assert!(stderr.contains("bogus"), "{stderr}");
 }
 
+/// #287 end-to-end: a non-zero-padded `--since` must exit 70
+/// (`E_INVALID_DATE`) at the process level — before the fix it exited 0 with
+/// silently-zero results. The `2026-1-1` value is the exact live-proven case
+/// (chrono parses it leniently; only the strict-width validator rejects it).
+#[test]
+fn token_gain_since_non_zero_padded_exits_70() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    write_vault(vault.path());
+
+    let out = onebrain(vault.path(), cache.path())
+        .args(["token", "gain", "--since", "2026-1-1"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(70),
+        "malformed --since must exit 70 (E_INVALID_DATE); stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("YYYY-MM-DD"), "{stderr}");
+    assert!(stderr.contains("2026-1-1"), "{stderr}");
+}
+
 #[test]
 fn token_gain_by_pivot_json_on_fresh_vault_has_no_rows() {
     let vault = tempdir().unwrap();
