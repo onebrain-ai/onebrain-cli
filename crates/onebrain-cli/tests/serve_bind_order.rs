@@ -58,8 +58,8 @@ fn serve_bind_failure_prints_no_success_banner_before_the_error() {
         .args(["serve", "--port", &port.to_string()])
         .output()
         .expect("spawn onebrain binary");
-
-    drop(occupied);
+    // `occupied` stays bound until end of scope — the port must be held for
+    // the entire subprocess run so the child's bind reliably fails.
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -115,13 +115,10 @@ impl Drop for KillOnDrop {
 /// if the `on_bind` banner print were deleted entirely.
 #[test]
 fn serve_successful_bind_prints_the_banner() {
-    // Learn a free port the same way `server/tests.rs` does: bind an
-    // ephemeral probe, read the port, drop it, and let `serve` re-bind it
-    // (reliable on 127.0.0.1 for a localhost test).
-    let probe = TcpListener::bind("127.0.0.1:0").expect("bind a probe port");
-    let port = probe.local_addr().unwrap().port();
-    drop(probe);
-
+    // Use `--port 0` so the KERNEL assigns a free port at bind time — no
+    // probe/drop/rebind TOCTOU race with other processes. The banner must
+    // then carry the ACTUAL bound port (not the literal `0`), which this
+    // test parses back out of the printed URL.
     let vault = minimal_vault();
 
     // `serve` blocks on Ctrl-C after a successful bind, so `.output()` would
@@ -133,7 +130,7 @@ fn serve_successful_bind_prints_the_banner() {
         .current_dir(vault.path())
         .env_remove("ONEBRAIN_VAULT")
         .env("ONEBRAIN_NO_DAEMON", "1")
-        .args(["serve", "--port", &port.to_string()])
+        .args(["serve", "--port", "0"])
         .stdout(stdout_file)
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -158,15 +155,29 @@ fn serve_successful_bind_prints_the_banner() {
         std::thread::sleep(Duration::from_millis(25));
     };
 
-    // The full banner: section header, token-bearing URL on the bound port,
-    // and the stop hint (already matched by the loop above).
+    // The full banner: section header, token-bearing URL carrying the REAL
+    // kernel-assigned port, and the stop hint (already matched by the loop).
     assert!(
         stdout.contains("Serving"),
         "banner header must appear after a successful bind: {stdout}"
     );
+    let url_line = stdout
+        .lines()
+        .find(|l| l.contains("http://127.0.0.1:"))
+        .unwrap_or_else(|| panic!("token-bearing URL must appear: {stdout}"));
+    let bound_port: u16 = url_line
+        .split("http://127.0.0.1:")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("URL must carry a parseable port: {url_line}"));
+    assert_ne!(
+        bound_port, 0,
+        "banner must print the ACTUAL bound port, not the requested `0`: {url_line}"
+    );
     assert!(
-        stdout.contains(&format!("http://127.0.0.1:{port}/?token=")),
-        "token-bearing URL for the bound port must appear: {stdout}"
+        url_line.contains("/?token="),
+        "URL must carry the auth token: {url_line}"
     );
 
     // Terminate the still-serving child (also covered by KillOnDrop on the

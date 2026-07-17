@@ -272,12 +272,9 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
         open_token_cache: true,
     };
 
-    // Jupyter-style URL — the token rides in the query string so a copy-paste
-    // (or the `--open` browser launch) authenticates the SPA on first load.
-    // Printed to stdout (not just the tracing log) so the user sees it
-    // immediately in the foreground console. The framed, emoji-prefixed banner
-    // mirrors OneBrain's session-greeting look (a `────` rule + fields).
-    let url = format!("http://{host}:{port}/?token={token}");
+    // The token-bearing URL is built inside `on_bind` from the listener's
+    // ACTUAL bound address (see below) — with `--port 0` the kernel assigns
+    // the port, so a URL built here from the requested value would be wrong.
     // The 🎨 line reports the web UI source and, when the dist exposes a
     // `version.json` (onebrain-webui ≥ 0.1.1), the live UI version + release date
     // inline as `OneBrain Web UI vX.Y.Z (YYYY-MM-DD)` — read from the `--dir`
@@ -328,7 +325,12 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
         // + auth token + "Ctrl-C to stop") from inside `on_bind`, instead of
         // before this call, is what fixes #278: a failed bind now surfaces
         // only the bind error, never a banner that implies the server came up.
-        let on_bind = move |_bound: std::net::SocketAddr| {
+        let on_bind = move |bound: std::net::SocketAddr| {
+            // The URL must carry the ACTUAL bound port from the listener, not
+            // the requested one — with `--port 0` the kernel assigns the port,
+            // and a banner built from the request would print `:0` (an
+            // unusable URL). `bound` is the listener's real local_addr.
+            let url = format!("http://{host}:{port}/?token={token}", port = bound.port());
             // Grouped-convention banner (matches `search status` / `doctor`): a
             // `🌐  Serving` section header, then indented `Label  value` rows, a
             // blank line, and the stop hint.

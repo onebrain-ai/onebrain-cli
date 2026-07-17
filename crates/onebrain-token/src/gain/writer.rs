@@ -31,7 +31,11 @@ impl JsonlGainWriter {
     }
 
     fn file_for_ts(&self, ts: i64) -> PathBuf {
-        let dt = DateTime::<Utc>::from_timestamp(ts, 0).unwrap_or_else(Utc::now);
+        // Out-of-range `ts` falls back to the Unix epoch, mirroring
+        // `rollup::utc_or_epoch`: a corrupt timestamp lands in an obviously
+        // wrong, self-flagging `1970-01.jsonl` instead of silently polluting
+        // the current month's live file.
+        let dt = DateTime::<Utc>::from_timestamp(ts, 0).unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
         self.dir
             .join(format!("{:04}-{:02}.jsonl", dt.year(), dt.month()))
     }
