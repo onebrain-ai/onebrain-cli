@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use super::api::{require_vault_root, ApiError};
 use super::AppState;
 use crate::commands::search_common::{collection_cache_dir, collection_name_readonly};
-use crate::commands::token_gain::parse_by;
+use crate::commands::token_gain::{parse_by, validate_since};
 use onebrain_token::gain::pivot;
 use onebrain_token::{
     JsonlGainWriter, LedgerVerdict, PivotQuery, PivotResult, ReferenceEnvelope, TokenCache,
@@ -210,6 +210,12 @@ async fn get_token_gain(
     let since = raw_since.filter(|s| !s.is_empty());
     let by = q.by.filter(|s| !s.is_empty());
 
+    // #287: a non-empty `?since=` must be a strict `YYYY-MM-DD` — mirrors the
+    // `?by=bogus` 400 path immediately below (same `HintedError::to_string()`
+    // → plain single-line body pattern), reusing the CLI's OWN validator so
+    // the route and `onebrain token gain --since` can never drift on what
+    // counts as a valid date.
+    validate_since(since.as_deref()).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let (time, dim) = parse_by(by.as_deref()).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     // Mirror the CLI's `use_current_epoch = !all_time && since.is_none()`.
     let use_current_epoch = !all_time && since.is_none();

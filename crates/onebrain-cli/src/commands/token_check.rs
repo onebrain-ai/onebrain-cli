@@ -719,6 +719,34 @@ mod tests {
         (vault, cache)
     }
 
+    /// Like [`test_vault`] but with `token_optimization.check_timeout_ms` set
+    /// to `ms` — the SAME config key `check_timeout_reads_configured_budget`
+    /// exercises (#264), reused here as a test-hardening knob (#289) rather
+    /// than a product default. `query_daemon_leg_with_deadline`'s 200ms
+    /// default budget is sized for the real p99 (a warm loopback round-trip),
+    /// not for a CI runner under contention — the fake daemon's socket
+    /// accept/spawn/write can occasionally lose that race on a slow
+    /// macos-latest runner even with zero injected delay, flipping the
+    /// recorded fail-open reason from `no_session_token` to
+    /// `daemon_timeout`/`ledger_check_error` (seen once on afc98be's push
+    /// run). Raising the budget here removes the race without loosening the
+    /// test's assertion on the SPECIFIC reason — which stays load-bearing:
+    /// it's the only thing distinguishing "the gate correctly saw no session
+    /// token" from "infrastructure broke" in the deny-telemetry `/doctor`
+    /// reads from (design §5c-5).
+    fn test_vault_with_check_timeout_ms(ms: u32) -> (tempfile::TempDir, tempfile::TempDir) {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            format!(
+                "search:\n  collection: token-check-test\ntoken_optimization:\n  check_timeout_ms: {ms}\n"
+            ),
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        (vault, cache)
+    }
+
     fn gain_events(cache: &Path) -> Vec<GainEvent> {
         // `ONEBRAIN_CACHE_DIR` overrides `search_cache_root()`'s PARENT
         // (`default_state_dir()`); the actual collection cache dir is
@@ -898,7 +926,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn no_session_response_fails_open_and_records_event() {
-        let (vault, cache) = test_vault();
+        // #289: a generous 5s budget (vs. the 200ms product default) so a
+        // slow CI runner's scheduling jitter can never race the fake
+        // daemon's socket round-trip into a spurious `daemon_timeout` /
+        // `ledger_check_error` — see `test_vault_with_check_timeout_ms`'s
+        // doc comment. The fake daemon still answers almost instantly
+        // (`Duration::ZERO` injected delay below), so this doesn't make the
+        // test itself slow; it only raises the ceiling.
+        let (vault, cache) = test_vault_with_check_timeout_ms(5000);
         let port = start_fake_daemon(200, r#"{"verdict":"no_session"}"#, Duration::ZERO);
         let _env = crate::test_env::set_vars(&[
             ("HOME", vault.path().as_os_str()),
