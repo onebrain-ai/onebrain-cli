@@ -909,13 +909,19 @@ pub fn run_start(mode: &OutputMode, vault: Option<&Path>) -> Result<()> {
     // `started: true`, matching the pre-existing bounded-wait tradeoff.
     if let ReadyOutcome::Died = wait_until_ready(pid, &slot.json, std::time::Duration::from_secs(5))
     {
-        anyhow::bail!(
-            "✗ Daemon did not start — it exited before it finished binding its HTTP listener \
-             (pid {pid} is gone)\n\
-             💡 check `{}` for the real cause (often another process already using the port); \
-             run `onebrain daemon status`, then retry `onebrain daemon start`",
-            slot.log.display()
-        );
+        // `HintedError`, not a glyph-carrying bail: the ✗/💡 dressing is
+        // text-mode-only, while `--json` error envelopes get the plain line.
+        return Err(anyhow::Error::new(crate::output::HintedError::new(
+            format!(
+                "daemon did not start — it exited before it finished binding its HTTP \
+                 listener (pid {pid} is gone)"
+            ),
+            format!(
+                "check `{}` for the real cause (often another process already using the \
+                 port); run `onebrain daemon status`, then retry `onebrain daemon start`",
+                slot.log.display()
+            ),
+        )));
     }
 
     let data = DaemonStartData {
@@ -1307,7 +1313,11 @@ fn spawn_detached_run(log_path: &Path, vault: Option<&Path>) -> Result<u32> {
 /// Non-Unix stub — the detached-spawn path is Unix-only for now.
 #[cfg(not(unix))]
 fn spawn_detached_run(_log_path: &Path, _vault: Option<&Path>) -> Result<u32> {
-    anyhow::bail!("daemon is not yet supported on this platform")
+    Err(anyhow::Error::new(crate::output::HintedError::new(
+        "the daemon is not yet supported on this platform (it currently requires macOS or Linux)",
+        "everything else still works without it — search and serve open the vault index \
+         directly when no daemon is running",
+    )))
 }
 
 /// Send SIGTERM to `pid`, then poll briefly for it to exit (best-effort).
@@ -1321,7 +1331,9 @@ fn terminate(pid: u32) -> Result<()> {
     // ESRCH here means it already exited between status + now — that's fine.
     if let Err(e) = kill(target, Signal::SIGTERM) {
         if e != nix::errno::Errno::ESRCH {
-            return Err(anyhow::anyhow!("SIGTERM pid {pid}: {e}"));
+            return Err(anyhow::anyhow!(
+                "couldn't signal the daemon to stop (SIGTERM to pid {pid} failed: {e})"
+            ));
         }
     }
 
@@ -1341,7 +1353,11 @@ fn terminate(pid: u32) -> Result<()> {
 
 #[cfg(not(unix))]
 fn terminate(_pid: u32) -> Result<()> {
-    anyhow::bail!("daemon is not yet supported on this platform")
+    Err(anyhow::Error::new(crate::output::HintedError::new(
+        "the daemon is not yet supported on this platform (it currently requires macOS or Linux)",
+        "everything else still works without it — search and serve open the vault index \
+         directly when no daemon is running",
+    )))
 }
 
 // ─────────────────────────────────────────────────────────────────────────

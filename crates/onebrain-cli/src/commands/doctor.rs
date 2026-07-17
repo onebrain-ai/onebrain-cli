@@ -3562,7 +3562,9 @@ fn stamp_doctor_run(vault_root: &Path, fix: bool, quiet: bool) {
         Err(e) => {
             if !quiet {
                 eprintln!(
-                    "⚠ Could not record today's run in {} — {e} (the checks above are unaffected)",
+                    "⚠ Could not record today's run in {} — {e} (the checks above are unaffected)\n\
+                     💡 check that {} is readable — otherwise no action needed",
+                    path.display(),
                     path.display()
                 );
             }
@@ -3589,7 +3591,9 @@ fn stamp_doctor_run(vault_root: &Path, fix: bool, quiet: bool) {
             if let Err(e) = onebrain_fs::atomic_write_text(&path, &final_text) {
                 if !quiet {
                     eprintln!(
-                        "⚠ Could not record today's run in {} — {e} (the checks above are unaffected)",
+                        "⚠ Could not record today's run in {} — {e} (the checks above are unaffected)\n\
+                         💡 check that {} is writable — otherwise no action needed",
+                        path.display(),
                         path.display()
                     );
                 }
@@ -3647,14 +3651,18 @@ fn decline_qmd_cleanup(vault_root: &Path) {
     if let Err(e) = onebrain_fs::backup_config_file(&path) {
         eprintln!(
             "⚠ Could not save your qmd-cleanup choice — backing up {} first failed: {e} \
-             (doctor will ask again next run)",
+             (doctor will ask again next run)\n\
+             💡 check that {}'s folder is writable — otherwise no action needed",
+            path.display(),
             path.display()
         );
         return;
     }
     if let Err(e) = onebrain_fs::atomic_write_text(&path, &updated) {
         eprintln!(
-            "⚠ Could not save your qmd-cleanup choice to {} — {e} (doctor will ask again next run)",
+            "⚠ Could not save your qmd-cleanup choice to {} — {e} (doctor will ask again next run)\n\
+             💡 check that {} is writable — otherwise no action needed",
+            path.display(),
             path.display()
         );
     }

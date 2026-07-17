@@ -93,13 +93,16 @@ pub(crate) fn split_frontmatter(text: &str) -> Result<(SkillFrontmatter, String)
 pub(crate) fn load_skill(vault: &Path, name: &str) -> Result<Result<ParsedSkill, i32>> {
     let name = normalize_name(name);
     if name.is_empty() {
-        eprintln!("skill: name must not be empty");
+        eprintln!(
+            "✗ Skill name must not be empty\n\
+             💡 pass a skill name, e.g. `onebrain skill info daily`"
+        );
         return Ok(Err(64));
     }
     if find_config_file(vault).is_none() {
         eprintln!(
             "✗ Vault not found at {} (no onebrain.yml present)\n\
-             💡 run this from inside a vault, or pass --vault <path> pointing at one",
+             💡 run this from inside a vault, or pass `--vault <path>` pointing at one",
             vault.display()
         );
         return Ok(Err(78));

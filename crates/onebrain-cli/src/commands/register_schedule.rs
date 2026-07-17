@@ -426,8 +426,9 @@ fn resolve_logs_folder(vault: &Path) -> String {
         raw
     } else {
         eprintln!(
-            "register-schedule: refusing unsafe folders.logs value '{raw}' (must be a relative \
-             path with no `..` segments) — falling back to '07-logs'"
+            "⚠ Ignoring unsafe folders.logs value '{raw}' — it must be a relative path with no \
+             `..` segments; using '07-logs' for the scheduler logs instead\n\
+             💡 fix `folders.logs` in onebrain.yml to a safe relative path"
         );
         "07-logs".to_string()
     }
@@ -594,8 +595,10 @@ fn cleanup_stale_legacy_plist(
         Err(e) => {
             if !quiet {
                 eprintln!(
-                    "warning: could not remove stale legacy plist {}: {e} — it may keep firing \
-                     until manually removed",
+                    "⚠ Could not remove stale legacy plist {} — {e}; it may keep firing until \
+                     removed\n\
+                     💡 delete {} manually",
+                    legacy_target.display(),
                     legacy_target.display()
                 );
             }

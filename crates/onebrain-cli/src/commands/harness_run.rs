@@ -61,7 +61,7 @@ pub fn run(
         if find_config_file(dir).is_none() {
             eprintln!(
                 "✗ Vault not found at {} (no onebrain.yml present)\n\
-                 💡 run this from inside a vault, pass --vault <path> pointing at one, or use \
+                 💡 run this from inside a vault, pass `--vault <path>` pointing at one, or use \
                  `--mode ad-hoc` if you don't need vault context",
                 dir.display()
             );
@@ -105,7 +105,7 @@ pub fn run(
     if let Some(warning) = &resolution.warning {
         // `warning`'s own text is kept stable (Bun-parity, see
         // `resolve_bin`'s doc comment) — only the wrapping hint is new.
-        eprintln!("⚠ {warning}\n💡 fix or unset the env var above to silence this.");
+        eprintln!("⚠ {warning}\n💡 fix or unset the env var above to silence this");
     }
 
     let context_str = context_dir.map(|p| p.to_string_lossy().into_owned());

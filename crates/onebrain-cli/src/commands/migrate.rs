@@ -17,9 +17,12 @@ pub fn run(name: &str, cutoff: Option<&str>, vault: Option<&str>) -> Result<()> 
     let vault_root = match vault_root {
         Some(p) => p,
         None => {
+            // Canonical "Vault not found" lead (matches skill run / harness
+            // run / skill inspect); "not inside a vault" stays verbatim —
+            // migrate_integration.rs greps for it.
             eprintln!(
-                "✗ migrate: not inside a vault (no onebrain.yml or vault.yml found)\n\
-                 💡 run this from inside a vault, or pass --vault <path> pointing at one"
+                "✗ Vault not found — not inside a vault (no onebrain.yml or vault.yml found)\n\
+                 💡 run this from inside a vault, or pass `--vault <path>` pointing at one"
             );
             return Ok(());
         }

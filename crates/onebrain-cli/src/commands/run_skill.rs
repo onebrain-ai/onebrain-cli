@@ -62,7 +62,7 @@ pub fn run(
     if find_config_file(&vault_path).is_none() {
         eprintln!(
             "✗ Vault not found at {vault} (no onebrain.yml present)\n\
-             💡 run this from inside a vault, or pass --vault <path> pointing at one"
+             💡 run this from inside a vault, or pass `--vault <path>` pointing at one"
         );
         return Ok(78); // EX_CONFIG (sysexits.h)
     }
@@ -80,7 +80,7 @@ pub fn run(
     if let Some(warning) = &resolution.warning {
         // `warning`'s own text is kept stable (Bun-parity, see
         // `resolve_bin`'s doc comment) — only the wrapping hint is new.
-        eprintln!("⚠ {warning}\n💡 fix or unset the env var above to silence this.");
+        eprintln!("⚠ {warning}\n💡 fix or unset the env var above to silence this");
     }
 
     // Skills always run with-context: --add-dir / --include-directories the vault.
@@ -233,7 +233,7 @@ pub(crate) fn spawn_harness(
                 eprintln!(
                     "✗ Failed to spawn {label} ({}): {e}\n\
                      💡 make sure `{label}` is installed and on PATH (check with `which {label}`), \
-                     or set {bin_env_var} to its full path",
+                     or set `{bin_env_var}` to its full path",
                     bin.display()
                 );
                 Ok(127)
@@ -284,7 +284,7 @@ pub(crate) fn spawn_harness(
             eprintln!(
                 "✗ Failed to spawn {label} ({}): {e}\n\
                  💡 make sure `{label}` is installed and on PATH (check with `which {label}`), \
-                 or set {bin_env_var} to its full path",
+                 or set `{bin_env_var}` to its full path",
                 bin.display()
             );
             return Ok(127);

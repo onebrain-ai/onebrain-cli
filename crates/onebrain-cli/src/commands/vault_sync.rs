@@ -3,7 +3,7 @@
 //! vault. Mirrors Bun's `vaultSyncCommand`: exit 1 on `!result.ok`, otherwise 0.
 
 use crate::safety::refuse_dangerous_vault_path;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use onebrain_core::find_vault_root;
 use onebrain_fs::{run_vault_sync, VaultSyncOptions};
 use std::env;
@@ -62,8 +62,18 @@ fn run_with(
         Some(p) => p,
         None => {
             let cwd = env::current_dir().context("read current directory")?;
+            // `HintedError`: text mode gets the ✗/💡 dressing from
+            // `main::render_error`; structured error envelopes get the plain
+            // line only. "not inside a vault" stays verbatim — it's the
+            // canonical walk-up-failure detail (and grep target).
             find_vault_root(&cwd)
-                .ok_or_else(|| anyhow!("not inside a vault (no onebrain.yml or vault.yml found)"))?
+                .ok_or_else(|| {
+                    anyhow::Error::new(crate::output::HintedError::new(
+                        "Vault not found — not inside a vault (no onebrain.yml or vault.yml found)",
+                        "run this from inside a vault, or pass the vault path: \
+                         `onebrain vault sync <vault-root>`",
+                    ))
+                })?
                 .as_path()
                 .to_path_buf()
         }
@@ -100,7 +110,7 @@ fn run_with(
         if let Some(err) = result.error.as_ref() {
             eprintln!(
                 "✗ vault-sync: failed: {err}\n\
-                 💡 check your network connection, then retry `onebrain vault-sync`; run \
+                 💡 check your network connection, then retry `onebrain vault sync`; run \
                  `onebrain doctor` afterward if you're unsure whether the sync partially applied"
             );
         } else {
@@ -108,7 +118,7 @@ fn run_with(
             // generic hint so schedulers/CI can see something happened.
             eprintln!(
                 "✗ vault-sync: failed (no error detail captured)\n\
-                 💡 retry `onebrain vault-sync`; if it keeps failing, run `onebrain doctor` to \
+                 💡 retry `onebrain vault sync`; if it keeps failing, run `onebrain doctor` to \
                  check the vault's overall health"
             );
         }

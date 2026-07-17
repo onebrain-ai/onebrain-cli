@@ -145,26 +145,38 @@ pub(crate) fn parse_by(by: Option<&str>) -> Result<(Option<TimeAxis>, Option<Dim
     let mut time = None;
     let mut dim = None;
     for part in by.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        // Contract errors ride a `HintedError`, never a literal-glyph bail:
+        // Display = the plain line only, so the JSON error envelope and the
+        // daemon's `/api/token/gain` reuse (`e.to_string()` → BadRequest
+        // body) stay single-line and glyph-free; the ✗/💡 dressing is added
+        // by `main::render_error` in text mode. `{part:?}` (Debug) keeps
+        // escaping fidelity for weird input.
         if let Some(t) = parse_time_axis(part) {
             if time.replace(t).is_some() {
-                anyhow::bail!(
-                    "✗ --by takes only one time axis (multiple time axes given: also saw \"{part}\")\n\
-                     💡 use exactly one of day, week, month, or year — e.g. `--by month,surface`"
-                );
+                return Err(anyhow::Error::new(crate::output::HintedError::new(
+                    format!(
+                        "--by takes only one time axis (multiple time axes given: saw a second {part:?})"
+                    ),
+                    "use exactly one of day, week, month, or year — e.g. `--by month,surface`",
+                )));
             }
         } else if let Some(d) = parse_dim(part) {
             if dim.replace(d).is_some() {
-                anyhow::bail!(
-                    "✗ --by takes only one dimension (multiple dimensions given: also saw \"{part}\")\n\
-                     💡 use exactly one of surface, transform, level, or cache — e.g. `--by month,surface`"
-                );
+                return Err(anyhow::Error::new(crate::output::HintedError::new(
+                    format!(
+                        "--by takes only one dimension (multiple dimensions given: saw a second {part:?})"
+                    ),
+                    "use exactly one of surface, transform, level, or cache — e.g. `--by month,surface`",
+                )));
             }
         } else {
-            anyhow::bail!(
-                "✗ --by doesn't recognize \"{part}\" — expected a time axis (day, week, month, \
-                 year) or a dimension (surface, transform, level, cache)\n\
-                 💡 combine at most one of each, e.g. `--by month,surface`"
-            );
+            return Err(anyhow::Error::new(crate::output::HintedError::new(
+                format!(
+                    "--by doesn't recognize {part:?} — expected a time axis (day, week, month, \
+                     year) or a dimension (surface, transform, level, cache)"
+                ),
+                "combine at most one of each, e.g. `--by month,surface`",
+            )));
         }
     }
     Ok((time, dim))

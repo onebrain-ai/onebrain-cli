@@ -363,7 +363,8 @@ pub(crate) fn reconcile_missing_model(vault_root: &Path, cache_dir: &Path, embed
             Ok(false) => {}
             Err(e) => eprintln!(
                 "⚠ Could not clear the stale search.embed_model setting — {e:#} (harmless; the \
-                 reindex still ran normally; if this repeats, check that onebrain.yml is writable)"
+                 reindex isn't affected)\n\
+                 💡 if this repeats, check that onebrain.yml is writable"
             ),
         }
     }

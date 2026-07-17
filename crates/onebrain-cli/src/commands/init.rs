@@ -99,7 +99,7 @@ fn real_confirm_fn() -> ConfirmFn {
             debug_assert!(false, "unhandled init prompt: {question}");
             eprintln!(
                 "✗ Internal error — an init prompt wasn't recognized, so it was answered \"no\": {question}\n\
-                 💡 this is a OneBrain bug, not something you did — please report it (include the line above)."
+                 💡 this is a OneBrain bug, not something you did — please report it (include the line above)"
             );
             false
         }

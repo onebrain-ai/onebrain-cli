@@ -137,11 +137,20 @@ fn fetch_translation_from(
     // unreachable" (selection text is never logged), so without this the real
     // cause — DNS, TLS, timeout, HTTP status — is lost for debugging.
     let mut resp = agent.get(&url).call().map_err(|e| {
-        eprintln!("translate: request failed: {e}");
+        eprintln!(
+            "⚠ Translation request failed — {e} (the web UI shows \"translate service \
+             unreachable\")\n\
+             💡 check network access to translate.googleapis.com, then retry from the web UI"
+        );
         "translate service unreachable".to_string()
     })?;
     let body = resp.body_mut().read_to_string().map_err(|e| {
-        eprintln!("translate: reading response body failed: {e}");
+        eprintln!(
+            "⚠ Translation response could not be read — {e} (the web UI shows \"translate \
+             service unreachable\")\n\
+             💡 retry from the web UI; if it repeats, check network access to \
+             translate.googleapis.com"
+        );
         "translate service unreachable".to_string()
     })?;
     parse_gtx(&body)
