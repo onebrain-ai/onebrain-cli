@@ -1,6 +1,6 @@
 ---
 latest_version: 3.4.13
-released: 2026-07-16
+released: 2026-07-17
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -10,7 +10,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
-## [3.4.13] — 2026-07-16 — Ledger works in production + multi-vault daemons
+## [3.4.13] — 2026-07-17 — Ledger works in production + multi-vault daemons
 
 Theme: make the token-optimization read-hook ledger actually gate in production (it shipped enabled-but-inert), and let one machine run a warm daemon per vault instead of one that thrashes across vaults.
 
