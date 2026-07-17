@@ -303,33 +303,8 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
         },
         None => "placeholder page (this binary has no bundled web UI)".to_string(),
     };
-    // Grouped-convention banner (matches `search status` / `doctor`): a
-    // `🌐  Serving` section header, then indented `Label  value` rows, a blank
-    // line, and the stop hint.
-    print!(
-        "{}",
-        build_banner(
-            &url,
-            &resolved.root.as_path().display().to_string(),
-            &ui_line
-        )
-    );
-
-    // Binding beyond loopback exposes the server on the network over PLAIN
-    // HTTP — the token + vault content would travel unencrypted. Only
-    // `$ONEBRAIN_BIND` can get here (#205: no `--host` flag anymore), so the
-    // warning guards the env path. Warn loudly and point at the safe way to
-    // do it (a TLS tunnel/proxy in front).
-    if !host.is_loopback() {
-        eprint!("{}", non_loopback_warning(&host));
-    }
-
-    if args.open {
-        // Best-effort: a failed browser launch must not stop the server.
-        if let Err(e) = open_browser(&url) {
-            eprintln!("warning: could not open browser: {e}");
-        }
-    }
+    let vault_display = resolved.root.as_path().display().to_string();
+    let open_flag = args.open;
 
     // Build a tokio runtime + block on the server, shutting down on Ctrl-C.
     // `serve` is a one-shot foreground process, so it's fine to own the runtime
@@ -346,7 +321,36 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!("Ctrl-C received; shutting down serve");
         };
-        server::run_server(cfg, shutdown).await
+        // `run_server_with`'s `on_bind` callback only fires AFTER the listener
+        // has bound successfully (see `server::run_server_from_router`) — a
+        // bind failure (e.g. the port is already in use) returns `Err` from
+        // this call WITHOUT ever invoking `on_bind`. Printing the banner (URL
+        // + auth token + "Ctrl-C to stop") from inside `on_bind`, instead of
+        // before this call, is what fixes #278: a failed bind now surfaces
+        // only the bind error, never a banner that implies the server came up.
+        let on_bind = move |_bound: std::net::SocketAddr| {
+            // Grouped-convention banner (matches `search status` / `doctor`): a
+            // `🌐  Serving` section header, then indented `Label  value` rows, a
+            // blank line, and the stop hint.
+            print!("{}", build_banner(&url, &vault_display, &ui_line));
+
+            // Binding beyond loopback exposes the server on the network over
+            // PLAIN HTTP — the token + vault content would travel unencrypted.
+            // Only `$ONEBRAIN_BIND` can get here (#205: no `--host` flag
+            // anymore), so the warning guards the env path. Warn loudly and
+            // point at the safe way to do it (a TLS tunnel/proxy in front).
+            if !host.is_loopback() {
+                eprint!("{}", non_loopback_warning(&host));
+            }
+
+            if open_flag {
+                // Best-effort: a failed browser launch must not stop the server.
+                if let Err(e) = open_browser(&url) {
+                    eprintln!("warning: could not open browser: {e}");
+                }
+            }
+        };
+        server::run_server_with(cfg, shutdown, on_bind).await
     })?;
 
     Ok(())

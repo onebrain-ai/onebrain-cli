@@ -888,7 +888,7 @@ async fn create_and_delete_folder() {
 // Full bind + serve + graceful-shutdown integration (fix E).
 //
 // Unlike every test above (which drives the in-memory `Router` via `oneshot`),
-// this exercises the REAL `run_server` path: it binds an ephemeral TCP port,
+// this exercises the REAL `run_server_with` path: it binds an ephemeral TCP port,
 // fires genuine HTTP/1.1 requests over a `tokio::net::TcpStream`, and then
 // asserts that resolving the shutdown future drains the server and returns
 // `Ok(())`. This is the only coverage of the socket bind + graceful drain.
@@ -912,10 +912,10 @@ async fn run_server_binds_serves_and_shuts_down_cleanly() {
     fs::write(root.join("onebrain.yml"), "qmd_collection: itest-vault\n").unwrap();
 
     // Bind an ephemeral port ourselves to learn the real address, then hand the
-    // bound port to `ServeConfig` (run_server re-binds it; on 127.0.0.1 the OS
-    // reassigns the same free port reliably for a localhost test). To avoid any
-    // re-bind race we instead read the port from our probe listener, drop it,
-    // and let run_server bind it.
+    // bound port to `ServeConfig` (run_server_with re-binds it; on 127.0.0.1 the
+    // OS reassigns the same free port reliably for a localhost test). To avoid
+    // any re-bind race we instead read the port from our probe listener, drop
+    // it, and let run_server_with bind it.
     let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = probe.local_addr().unwrap().port();
     drop(probe);
@@ -936,8 +936,12 @@ async fn run_server_binds_serves_and_shuts_down_cleanly() {
         }
     };
 
-    // Spawn the real server on a task.
-    let server = tokio::spawn(async move { run_server(cfg, shutdown).await });
+    // Spawn the real server on a task. `run_server_with` + a no-op `on_bind` is
+    // the direct replacement for the removed `run_server` wrapper (#278 folded
+    // the "print nothing" no-op into every caller so `on_bind` — fired only
+    // after a successful bind — is the sole place that does success-implying
+    // output).
+    let server = tokio::spawn(async move { run_server_with(cfg, shutdown, |_| {}).await });
 
     // Wait until the port actually accepts a connection (bind is async).
     let addr = format!("127.0.0.1:{port}");
@@ -963,7 +967,7 @@ async fn run_server_binds_serves_and_shuts_down_cleanly() {
         .expect("server task panicked");
     assert!(
         joined.is_ok(),
-        "run_server should return Ok(()) on graceful shutdown, got: {joined:?}"
+        "run_server_with should return Ok(()) on graceful shutdown, got: {joined:?}"
     );
 
     // ── tiny raw-TCP HTTP/1.1 helpers (no reqwest/hyper dev-dep) ──

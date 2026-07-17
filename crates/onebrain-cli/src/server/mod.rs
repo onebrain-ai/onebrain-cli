@@ -22,9 +22,11 @@
 //!   [`AppState::search_engine`] for the process lifetime (the sole redb owner;
 //!   `serve` opens per-request). This also lights up the token-gated
 //!   `/api/internal/*` reindex + status routes.
-//! - **Entry point** — `serve` calls [`run_server`]; the daemon uses
-//!   [`build_router_with_state`] + [`run_server_from_router`] so it can read
-//!   `last_activity` for idle-shutdown and publish `daemon.json` on bind.
+//! - **Entry point** — `serve` calls [`run_server_with`] (its `on_bind`
+//!   callback prints the startup banner only once the listener is actually
+//!   up — see #278); the daemon uses [`build_router_with_state`] +
+//!   [`run_server_from_router`] so it can read `last_activity` for
+//!   idle-shutdown and publish `daemon.json` on bind.
 //!
 //! Factoring the router into [`build_router`] (which never touches a socket)
 //! keeps every handler unit-testable via `tower::ServiceExt::oneshot`.
@@ -69,7 +71,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Everything [`run_server`] / [`build_router`] need to stand up the surface.
+/// Everything [`run_server_with`] / [`build_router`] need to stand up the surface.
 ///
 /// Cheap to clone-by-`Arc`: the router shares one [`AppState`] across handlers,
 /// so this struct is consumed once at build time.
@@ -321,7 +323,20 @@ pub fn build_router_with_state(cfg: ServeConfig) -> (Router, Arc<AppState>) {
     (router, state)
 }
 
-/// Bind `cfg.host:cfg.port` and serve until `shutdown` resolves.
+/// Bind `cfg.host:cfg.port` and serve until `shutdown` resolves, calling
+/// `on_bind` with the ACTUAL bound [`SocketAddr`] once the listener is up —
+/// and only then. A bind failure (e.g. the port is already in use) returns
+/// `Err` WITHOUT ever calling `on_bind`, so a caller that does its
+/// success-implying output (a startup banner, a discovery-file write, ...)
+/// from inside `on_bind` never reports success before the listener is
+/// actually up (#278).
+///
+/// The daemon uses `on_bind` to publish its discovery file
+/// (`~/.onebrain/run/daemon.json`) with the real port — which matters when it
+/// binds port `0` (OS-assigned) so a client can still find it. `serve` uses it
+/// to print its startup banner (URL, vault, web UI, the "Ctrl-C to stop"
+/// hint). Tests that don't care about the bound address pass a no-op
+/// (`|_| {}`).
 ///
 /// The `shutdown` future is the caller's graceful-stop signal (Ctrl-C for
 /// `serve`, SIGTERM for the daemon). When it resolves, axum stops accepting new
@@ -334,18 +349,6 @@ pub fn build_router_with_state(cfg: ServeConfig) -> (Router, Arc<AppState>) {
 /// to any local process that can read the log. The foreground `serve` command
 /// prints the full token-bearing URL to its OWN stdout (a transient console the
 /// user is already looking at) — that's fine and stays in `serve.rs`.
-pub async fn run_server(
-    cfg: ServeConfig,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) -> anyhow::Result<()> {
-    run_server_with(cfg, shutdown, |_| {}).await
-}
-
-/// [`run_server`] plus an `on_bind` callback fired with the ACTUAL bound
-/// [`SocketAddr`] once the listener is up (before serving). The daemon uses it
-/// to publish its discovery file (`~/.onebrain/run/daemon.json`) with the real
-/// port — which matters when it binds port `0` (OS-assigned) so a client can
-/// still find it. `serve` and the tests use the no-op [`run_server`].
 pub async fn run_server_with(
     cfg: ServeConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
