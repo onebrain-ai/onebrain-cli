@@ -742,13 +742,15 @@ impl DaemonHandle {
         self.token_get_feature_detected("/api/token/status")
     }
 
-    /// `GET /api/token/gain?by=&since=&history=` → the gain pivot JSON, or
-    /// `Ok(None)` on a 404 (route absent). Query params are omitted when
-    /// `None`, mirroring [`Self::search`].
+    /// `GET /api/token/gain?by=&since=&all_time=&history=` → the gain pivot JSON,
+    /// or `Ok(None)` on a 404 (route absent). Query params are omitted when
+    /// `None`, mirroring [`Self::search`]. `all_time` selects the all-epoch
+    /// (archived-inclusive) JSONL scope, matching `token gain --all-time`.
     pub fn token_gain(
         &self,
         by: Option<&str>,
         since: Option<&str>,
+        all_time: bool,
         history: bool,
     ) -> Result<Option<serde_json::Value>> {
         let mut path = String::from("/api/token/gain?");
@@ -758,7 +760,7 @@ impl DaemonHandle {
         if let Some(since) = since {
             path.push_str(&format!("since={}&", urlencode(since)));
         }
-        path.push_str(&format!("history={history}"));
+        path.push_str(&format!("all_time={all_time}&history={history}"));
         self.token_get_feature_detected(&path)
     }
 

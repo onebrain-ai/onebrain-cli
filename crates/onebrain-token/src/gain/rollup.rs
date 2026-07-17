@@ -1,14 +1,15 @@
-//! Tier-2 precomputed rollups (design 0030 §5): redb tables in `token.redb`,
-//! keyed by `(period, surface, transform, level, cache_kind)`, updated
-//! incrementally from raw [`GainEvent`]s in the SAME write batch the Tier-1
-//! JSONL append happens in (daemon-side, later tracks). Every read (CLI
-//! summary/pivot + the Web API) serves from these tables at constant time
-//! regardless of how large the raw log has grown — only `--history` tails
-//! the raw JSONL directly.
+//! **Legacy** Tier-2 precomputed rollups (design 0030 §5, superseded by #281):
+//! redb tables in `token.redb`, keyed by `(period, surface, transform, level,
+//! cache_kind)`. The design's incremental daemon-side population never
+//! shipped — since v3.4.12 (#258) recording goes to the lock-free Tier-1
+//! JSONL only, so nothing populates these tables automatically, and since
+//! #281 every read (CLI summary/pivot/`--all-time`/`--since` + the daemon
+//! route + the WebUI) serves from the raw JSONL instead. The tables' only
+//! remaining user is `token gain --rebuild` ([`rebuild`] + the post-rebuild
+//! summary); they are pending removal in a follow-up.
 //!
 //! [`rebuild`] reconstructs the tables from scratch by replaying the raw
-//! log through the same [`update`] path an incremental write uses, so the
-//! two can never disagree (the determinism the design calls out).
+//! log through the same [`update`] path an incremental write would use.
 
 use std::path::Path;
 

@@ -1,21 +1,20 @@
 //! One pivot engine (design 0030 §5), shared by every gain-data consumer:
-//! the CLI's `token gain` summary/pivot/`--json`, the later `/api/token/gain`
+//! the CLI's `token gain` summary/pivot/`--json`, the `/api/token/gain`
 //! daemon route, and the WebUI dashboard. All three render the exact same
 //! [`PivotResult`] — "one pivot engine ... serves all three consumers," not
 //! three re-derivations of the same aggregation logic.
 //!
-//! Two sources, one bucketing pipeline:
-//! - [`query`] pivots the cumulative [`GAIN_DAILY`] rollup table — the
-//!   **all-time** view across every epoch (archived + current). `week`
-//!   buckets and `--since` windows both compute from the day-granular
-//!   rollup; scanning it is not the "live scan of the append-only log" the
-//!   design reserves for `--history`.
-//! - [`query_events`] pivots a slice of raw [`GainEvent`]s directly — used
-//!   by the default `token gain` read against the **current epoch only**
-//!   (the non-archived raw JSONL, i.e. traffic since the last `--reset`), so
-//!   the baseline-comparison workflow reports post-reset traffic honestly
-//!   instead of the unchanging all-time total. The since-reset window is
-//!   small, so aggregating it in memory on read is cheap.
+//! Since #281 every read is JSONL-first:
+//! - [`query_events`] pivots a slice of raw [`GainEvent`]s directly — the
+//!   engine behind EVERY read: the default `token gain` (current epoch = the
+//!   non-archived raw JSONL, i.e. traffic since the last `--reset`, so the
+//!   baseline-comparison workflow reports post-reset traffic honestly),
+//!   `--all-time`/`--since` (all epochs = the recursive JSONL walk including
+//!   `archive/**`), and the daemon route the WebUI consumes. Pure (no I/O) —
+//!   the caller owns reading the log.
+//! - [`query`] pivots the legacy cumulative [`GAIN_DAILY`] rollup table. Its
+//!   only remaining caller is `token gain --rebuild`'s post-rebuild summary;
+//!   it is pending removal together with the rollup tables.
 //!
 //! Both feed the same [`finalize`] pipeline, so a bucketed total is computed
 //! identically no matter which source produced it.
@@ -145,8 +144,11 @@ fn finalize(buckets: Buckets, totals: PivotTotals) -> PivotResult {
     PivotResult { rows, totals }
 }
 
-/// Pivot `db`'s cumulative daily rollup table — the **all-time** view across
-/// every epoch. The source for `token gain --all-time` and `--since`.
+/// Pivot `db`'s legacy cumulative daily rollup table. Since #281 the only
+/// remaining caller is `token gain --rebuild`'s post-rebuild summary — every
+/// other read (CLI default, `--all-time`/`--since`, the daemon route) goes
+/// through [`query_events`] over the raw JSONL. Pending removal together with
+/// the rollup tables.
 pub fn query(db: &Database, q: &PivotQuery) -> Result<PivotResult, RollupError> {
     let daily_rows = scan(db, GAIN_DAILY)?;
 
@@ -174,11 +176,13 @@ pub fn query(db: &Database, q: &PivotQuery) -> Result<PivotResult, RollupError> 
     Ok(finalize(buckets, totals))
 }
 
-/// Pivot a slice of raw [`GainEvent`]s directly — the **current-epoch**
-/// source for the default `token gain` read. `events` is the caller's
-/// non-archived raw window (`JsonlGainWriter::read_all`, which excludes
-/// `archive/**`), so the result reflects only traffic since the last
-/// `--reset`. Pure (no I/O) — the caller owns reading the log.
+/// Pivot a slice of raw [`GainEvent`]s directly — since #281 the engine behind
+/// EVERY gain read. The caller picks the scope by picking the slice: the
+/// default `token gain` and the WebUI dashboard pass the non-archived raw
+/// window (`JsonlGainWriter::read_all`, current epoch = traffic since the last
+/// `--reset`); `--all-time`/`--since` and the daemon's all-epoch calls pass the
+/// recursive walk (`JsonlGainWriter::read_all_recursive`, `archive/**`
+/// included). Pure (no I/O) — the caller owns reading the log.
 pub fn query_events(events: &[GainEvent], q: &PivotQuery) -> PivotResult {
     let mut buckets: Buckets = BTreeMap::new();
     let mut totals = PivotTotals::default();

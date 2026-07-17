@@ -1,6 +1,6 @@
 # 0030 — Gain telemetry: raw JSONL keep-everything + precomputed rollups + epoch reset
 
-- **Status:** accepted
+- **Status:** accepted · updated by #283 (reads are JSONL-first; rollups = `--rebuild`-only)
 - **Date:** 2026-07-11
 
 ## Context
@@ -21,3 +21,34 @@
 - Every question is answerable forever (raw is never discarded), yet report latency is flat forever (reads never touch raw) — the cost is double-write bookkeeping and the drift check, both cheap and self-healing via `--rebuild`.
 - Baseline experiments become a first-class workflow instead of a data sacrifice.
 - Storage grows unbounded by design (~2–5 MB/month heavy use, plain text) — accepted per the keep-everything requirement; archives compress well if it ever matters.
+
+## Update — #281/#283 (v3.4.14): reads are JSONL-first; rollups are legacy
+
+The "all reads serve from rollups" decision above never became true in practice:
+the incremental daemon-side rollup write ("same write batch as the raw append")
+was not built, and v3.4.12 (#258, ADR 0032) moved recording + the default CLI
+reads to the lock-free JSONL to survive daemon lock contention. That left the
+rollup DB permanently empty on any fresh cache — `--rebuild` (its only writer)
+cannot run while a daemon holds `token.redb` — so the daemon's
+`GET /api/token/gain` (the WebUI dashboard) and `--all-time`/`--since` reported
+zeroes forever (#281, the same failure class as #257).
+
+Corrections, shipped in #283:
+
+- **Every read serves from the raw JSONL** through the one `query_events` pivot
+  engine: the CLI default (current epoch, `read_all`), `--all-time`/`--since`
+  (all epochs, `read_all_recursive` including `gain/archive/**`), and the
+  daemon route the WebUI consumes. Daemon-routed and Direct answers agree
+  because they read the same files; a routing failure (404/transport) falls
+  through to the lock-free Direct read, eliminating the `E_ENGINE_BUSY`
+  catch-22 on all-epoch reads.
+- **Rollups are legacy:** `GAIN_DAILY`/`GAIN_MONTHLY`/`GAIN_YEARLY` and
+  `pivot::query` have exactly one remaining user — `token gain --rebuild` —
+  pending removal in a follow-up.
+- **The flat-read-latency property is traded away** for truthfulness: gain
+  reads now walk the JSONL per request, so read cost grows with history length
+  until log compaction or read caching lands (follow-up).
+- The route keeps a **legacy-bare compatibility rule**: a request with neither
+  a `since` nor an `all_time` key is a pre-3.4.14 CLI's `--all-time` and is
+  served all-epoch; the webui always sends `?by=&since=` (keys present, empty
+  = unset) and gets the current epoch.

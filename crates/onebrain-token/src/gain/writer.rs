@@ -82,7 +82,15 @@ impl JsonlGainWriter {
 
 fn read_events_from_files(files: &[PathBuf], out: &mut Vec<GainEvent>) -> io::Result<()> {
     for path in files {
-        let file = fs::File::open(path)?;
+        let file = match fs::File::open(path) {
+            Ok(f) => f,
+            // TOCTOU (#283): `token gain --reset` renames monthly files into
+            // `archive/` between the directory listing and this open. A file
+            // that vanished mid-walk contributes zero events — never fail a
+            // concurrent read (e.g. a live dashboard poll) over it.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
         for line in io::BufReader::new(file).lines() {
             let line = line?;
             if line.trim().is_empty() {
@@ -263,5 +271,33 @@ mod tests {
         let missing = dir.path().join("does-not-exist");
         let writer = JsonlGainWriter::new(missing);
         assert_eq!(writer.read_all_recursive().unwrap(), Vec::new());
+    }
+
+    /// TOCTOU (#283): `token gain --reset` renames monthly files into
+    /// `archive/` between a reader's directory listing and its `File::open`.
+    /// A file that vanished mid-walk must contribute zero events, not fail the
+    /// whole read (a live dashboard polling during a reset would 500).
+    #[test]
+    fn read_tolerates_a_file_renamed_away_mid_walk() {
+        let dir = tempdir().unwrap();
+        let writer = JsonlGainWriter::new(dir.path());
+        // Two months → two files.
+        writer.append(&sample_event(1_781_000_000)).unwrap(); // 2026-06
+        writer.append(&sample_event(1_783_800_000)).unwrap(); // 2026-07
+
+        // Snapshot the listing, THEN delete one file — exactly the race window.
+        let mut files: Vec<PathBuf> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        files.sort();
+        assert_eq!(files.len(), 2);
+        fs::remove_file(&files[0]).unwrap();
+
+        let mut out = Vec::new();
+        read_events_from_files(&files, &mut out)
+            .expect("a file renamed away mid-walk must not fail the read");
+        assert_eq!(out.len(), 1, "the surviving file's events are still read");
     }
 }

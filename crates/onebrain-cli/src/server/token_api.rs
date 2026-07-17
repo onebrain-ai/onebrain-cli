@@ -5,7 +5,7 @@
 //! lock-free HTTP clients of the one owner.
 //!
 //! ```text
-//!   GET  /api/token/gain?by=&since=&history=  → PivotResult JSON (Tier-2 rollups)
+//!   GET  /api/token/gain?by=&since=&all_time=&history=  → PivotResult JSON (gain JSONL)
 //!   GET  /api/token/status                    → { level, ledger_active, cache_bytes }
 //!   POST /api/token/ledger/check              → { path, session_token, record? }
 //!                                               → ledger verdict (+ reference envelope)
@@ -16,15 +16,26 @@
 //! actually hold the token cache — a `serve` / unit-test router with none gets
 //! 503, never a per-request open (the daemon is the single redb owner).
 //!
-//! `GET /api/token/gain` serves the real [`PivotResult`] from the Tier-2
-//! rollup tables in the daemon-owned `token.redb` — the SAME
-//! [`onebrain_token::gain::pivot::query`] engine the CLI `token gain` command
-//! reads, and the same by-axes parsing ([`crate::commands::token_gain::parse_by`]),
-//! so the route, the CLI `--json`, and the WebUI all agree on one code path
-//! (design §5 "one pivot engine ... serves all three consumers"). An empty
-//! pivot is a truthful "no gain data yet", never hardcoded. Version-skew
+//! `GET /api/token/gain` serves the real [`PivotResult`] from the lock-free
+//! **gain JSONL** raw log (Tier-1 source of truth, ADR 0030) — the SAME reader
+//! the CLI `token gain` command uses ([`onebrain_token::JsonlGainWriter`] +
+//! [`onebrain_token::gain::pivot::query_events`]) and the same by-axes parsing
+//! ([`crate::commands::token_gain::parse_by`]), so the route, the CLI `--json`,
+//! and the WebUI all agree on one code path (design §5 "one pivot engine ...
+//! serves all three consumers"). The WebUI call (`?by=&since=`, keys present,
+//! empty = unset) reports the CURRENT epoch (non-archived JSONL); an explicit
+//! `all_time` or a `since` window spans every epoch (archived too), mirroring
+//! the CLI's epoch scoping exactly (#281). A request with neither `since` nor
+//! `all_time` keys is a pre-3.4.14 client's `--all-time` — served all-epoch for
+//! compatibility (the legacy-bare rule, see [`get_token_gain`]).
+//! An empty pivot is a truthful "no gain data yet", never hardcoded. Version-skew
 //! contract: a daemon too old to have the route answers 404 → the client skips
 //! optimization; a present route answers 200 with the real-or-empty pivot.
+//!
+//! The Tier-2 rollup DB (`token.redb`) is no longer read here — since v3.4.12
+//! (#258) nothing populates it automatically, so it read empty and the dashboard
+//! went dark (#281). It is now legacy, with `token gain --rebuild` as its only
+//! remaining reader/writer, pending removal in a follow-up.
 //!
 //! `GET /api/token/status`'s `level` reflects the vault's resolved
 //! `token_optimization.level` (`resolve_level`, Track 4 / M3).
@@ -45,9 +56,9 @@ use super::AppState;
 use crate::commands::search_common::{collection_cache_dir, collection_name_readonly};
 use crate::commands::token_gain::parse_by;
 use onebrain_token::gain::pivot;
-#[allow(unused_imports)] // PivotResult is referenced in rustdoc intra-doc links.
-use onebrain_token::PivotResult;
-use onebrain_token::{LedgerVerdict, PivotQuery, ReferenceEnvelope, TokenCache};
+use onebrain_token::{
+    JsonlGainWriter, LedgerVerdict, PivotQuery, PivotResult, ReferenceEnvelope, TokenCache,
+};
 
 /// Resolve the effective optimization level for `vault_root` from
 /// `token_optimization.level` in `onebrain.yml`, as its wire string
@@ -67,6 +78,14 @@ fn resolve_level(vault_root: &Path) -> String {
 /// (design §1).
 fn token_db_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join("token").join("token.redb")
+}
+
+/// The `token/gain/` raw-log directory — sibling of `token.redb` under a
+/// collection cache dir, holding the monthly `YYYY-MM.jsonl` files (and the
+/// `archive/<ts>-<label>/` epoch dirs). This is the same layout
+/// [`crate::commands::token_gain`] reads, so the route and the CLI agree.
+fn token_gain_dir(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("token").join("gain")
 }
 
 /// Open (creating dir + file) the daemon-owned token cache for `vault_root`.
@@ -128,41 +147,92 @@ fn require_token_cache(state: &AppState) -> Result<Arc<TokenCache>, ApiError> {
 #[derive(Debug, Deserialize)]
 struct GainQuery {
     /// `time,dim` (either order, either alone) — parsed by the shared
-    /// [`parse_by`] so the route and the CLI agree on the axes.
+    /// [`parse_by`] so the route and the CLI agree on the axes. The webui
+    /// always sends the key (possibly empty = unset).
     by: Option<String>,
-    /// Inclusive `YYYY-MM-DD` lower bound on the pivot window.
+    /// Inclusive `YYYY-MM-DD` lower bound on the pivot window. Key presence
+    /// matters (see [`get_token_gain`]): the webui always sends the key
+    /// (possibly empty = unset); a pre-3.4.14 CLI omits it for `--all-time`.
     since: Option<String>,
+    /// When `true`, span EVERY epoch (archived JSONL too), mirroring the CLI's
+    /// `--all-time`. When ABSENT (not just false), the `since` key's presence
+    /// decides between the webui current-epoch default and the legacy-bare
+    /// all-time rule — see [`get_token_gain`].
+    #[serde(default)]
+    all_time: Option<bool>,
     /// Accepted for wire-compat with the CLI flags; the route serves the
-    /// Tier-2 rollup pivot (design §5), which is what the WebUI dashboard
+    /// aggregated pivot (design §5), which is what the WebUI dashboard
     /// consumes — the raw per-call log tail (`--history`) is a CLI-only view.
     #[serde(default)]
     history: Option<bool>,
 }
 
-/// Returns the real [`PivotResult`] from the daemon-owned `token.redb` Tier-2
-/// rollups via the shared [`pivot::query`] engine. Empty pivot when there's
-/// genuinely no gain data — never hardcoded. 503 when the daemon holds no
-/// token cache; a bad `by=` value is a 400.
+/// Returns the real [`PivotResult`] from the daemon-owned gain JSONL raw log
+/// via the shared [`pivot::query_events`] engine — the SAME reader the CLI
+/// `token gain` uses. Empty pivot when there's genuinely no gain data — never
+/// hardcoded. 503 when the daemon holds no token cache; a bad `by=` value is a
+/// 400.
+///
+/// ## Param semantics (#283, hub-adjudicated)
+///
+/// Two client generations share this route and must both keep their meaning:
+///
+/// - The **webui** always sends `?by=&since=` with the keys PRESENT (possibly
+///   empty values). An empty value means "unset" — the overview/tab calls are
+///   current-epoch reads.
+/// - A **pre-3.4.14 CLI** (`--all-time`/`--since` routed here) never sends a
+///   `since` key for `--all-time`, and the old route served all data. So a
+///   request with NEITHER a `since` key NOR an `all_time` key is a pre-3.4.14
+///   client's `--all-time` — served all-epoch for compatibility (the
+///   legacy-bare rule).
+/// - The **3.4.14+ CLI** always sends an explicit `all_time=`, which wins.
+///
+/// Epoch scoping then mirrors [`crate::commands::token_gain::run`] exactly:
+/// current epoch = non-archived JSONL; `all_time`/`since` span every epoch
+/// (archived too), so a daemon-routed read and a direct CLI read agree (#281).
 async fn get_token_gain(
     State(state): State<Arc<AppState>>,
     Query(q): Query<GainQuery>,
 ) -> Result<Response, ApiError> {
-    let _ = q.history; // accepted for wire-compat; rollup pivot is the source.
-    let cache = require_token_cache(&state)?;
+    let _ = q.history; // accepted for wire-compat; the JSONL raw log is the source.
+                       // Still require the daemon to be the token owner (503 otherwise) — the same
+                       // contract as before, even though the read now hits the lock-free JSONL
+                       // rather than the redb the cache guards.
+    let _cache = require_token_cache(&state)?;
+    let root = require_vault_root(&state)?.to_path_buf();
 
-    let (time, dim) = parse_by(q.by.as_deref()).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let query = PivotQuery {
-        time,
-        dim,
-        since: q.since,
-    };
+    // The locked param mechanism (see the doc above). `raw_since` distinguishes
+    // key-present-but-empty (webui, Some("")) from key-absent (legacy CLI,
+    // None): a request with neither `since` nor `all_time` keys is a
+    // pre-3.4.14 client's --all-time — served all-epoch for compatibility.
+    let raw_since = q.since;
+    let all_time = q.all_time.unwrap_or(raw_since.is_none());
+    let since = raw_since.filter(|s| !s.is_empty());
+    let by = q.by.filter(|s| !s.is_empty());
 
-    // The pivot is a synchronous redb scan of the rollup table — run it off the
-    // async runtime, like the other token routes.
-    let result = tokio::task::spawn_blocking(move || pivot::query(cache.database(), &query))
-        .await
-        .map_err(|e| ApiError::Internal(format!("token gain task join: {e}")))?
-        .map_err(|e| ApiError::Internal(format!("token gain pivot: {e}")))?;
+    let (time, dim) = parse_by(by.as_deref()).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    // Mirror the CLI's `use_current_epoch = !all_time && since.is_none()`.
+    let use_current_epoch = !all_time && since.is_none();
+    let query = PivotQuery { time, dim, since };
+
+    // Reading the JSONL files is blocking I/O — run it off the async runtime,
+    // like the other token routes.
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<PivotResult> {
+        let collection = collection_name_readonly(&root)?;
+        let gdir = token_gain_dir(&collection_cache_dir(&collection));
+        let writer = JsonlGainWriter::new(&gdir);
+        // Current epoch = non-archived log (`read_all`); all-time / since span
+        // archived epochs too (`read_all_recursive`) — same split as the CLI.
+        let events = if use_current_epoch {
+            writer.read_all()?
+        } else {
+            writer.read_all_recursive()?
+        };
+        Ok(pivot::query_events(&events, &query))
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("token gain task join: {e}")))?
+    .map_err(|e| ApiError::Internal(format!("token gain read: {e}")))?;
     Ok(Json(result).into_response())
 }
 
@@ -548,25 +618,15 @@ mod tests {
         assert!(v.get("pending").is_none(), "no stub marker anymore");
     }
 
-    /// The seam proof (plan step 3.5): seed a couple of gain events into the
-    /// daemon-owned `token.redb`, roll them up, then hit the route and assert
-    /// the response carries the SEEDED pivot rows — the real
-    /// `onebrain_token::gain::pivot` engine over the real rollup tables, not a
-    /// hardcoded shape.
-    #[tokio::test]
-    async fn gain_route_serves_seeded_rollup_rows() {
-        use onebrain_token::gain::rollup;
-        use onebrain_token::{CacheKind, Database, GainEvent, OptLevel, Surface};
-
-        let (vault, cache) = vault_and_cache();
-        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
-
-        // Seed the rollups BEFORE the daemon opens the DB (redb is single-writer
-        // — the seeding handle is dropped before the router opens it).
-        let cache_dir = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap());
-        let db_path = token_db_path(&cache_dir);
-        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-        let event = |ts, surface, before, after| GainEvent {
+    /// A gain event for the JSONL-seeding tests below.
+    fn gain_event(
+        ts: i64,
+        surface: onebrain_token::Surface,
+        before: u64,
+        after: u64,
+    ) -> onebrain_token::GainEvent {
+        use onebrain_token::{CacheKind, GainEvent, OptLevel};
+        GainEvent {
             ts,
             surface,
             transform: "whitespace".to_string(),
@@ -575,12 +635,29 @@ mod tests {
             bytes_after: after,
             cache: CacheKind::None,
             session_token: None,
-        };
-        {
-            let db = Database::create(&db_path).unwrap();
-            rollup::update(&db, &event(1_783_728_000, Surface::CliSearch, 1000, 400)).unwrap();
-            rollup::update(&db, &event(1_783_900_800, Surface::McpQuery, 500, 100)).unwrap();
-        } // drop releases the redb lock so the daemon can take it
+        }
+    }
+
+    /// The seam proof (#281): seed a couple of gain events into the daemon-owned
+    /// gain JSONL raw log, then hit the route and assert the response carries the
+    /// SEEDED pivot rows — the real `onebrain_token::gain::pivot::query_events`
+    /// engine over the real JSONL files (the same reader the CLI uses), not a
+    /// hardcoded shape and not the never-populated rollup DB.
+    #[tokio::test]
+    async fn gain_route_serves_seeded_jsonl_rows() {
+        use onebrain_token::Surface;
+
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+
+        let cache_dir = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap());
+        let writer = JsonlGainWriter::new(token_gain_dir(&cache_dir));
+        writer
+            .append(&gain_event(1_783_728_000, Surface::CliSearch, 1000, 400))
+            .unwrap();
+        writer
+            .append(&gain_event(1_783_900_800, Surface::McpQuery, 500, 100))
+            .unwrap();
 
         let router = router_holding_cache(vault.path());
         let resp = router
@@ -605,6 +682,236 @@ mod tests {
         assert_eq!(v["totals"]["bytes_before"], 1500);
         assert_eq!(v["totals"]["bytes_after"], 500);
         assert_eq!(v["totals"]["count"], 2);
+    }
+
+    // ── #283 R1 param truth table ───────────────────────────────────────────
+    // The webui ALWAYS sends `?by=&since=` with the keys PRESENT (possibly
+    // empty values); a pre-3.4.14 CLI never sends a `since` key for --all-time
+    // and expects the old route's all-data semantics. Each test below is one
+    // row of the adjudicated truth table.
+
+    /// Seed a scope-distinguishing fixture: one current-epoch event
+    /// (2026-07-13, mcp_query, 500→100) plus two archived events (2023-11-14
+    /// cli_search 1000→400 · 2026-07-05 cli_search 2000→800). Every scope has a
+    /// distinct total: current epoch = 1 call / 500 · all epochs = 3 / 3500 ·
+    /// since 2026-07-01 over all epochs = 2 / 2500.
+    fn seed_epoch_fixture(vault: &Path) {
+        use onebrain_token::Surface;
+        let cache_dir = collection_cache_dir(&collection_name_readonly(vault).unwrap());
+        let gdir = token_gain_dir(&cache_dir);
+        JsonlGainWriter::new(&gdir)
+            .append(&gain_event(1_783_900_800, Surface::McpQuery, 500, 100))
+            .unwrap();
+        let archive = JsonlGainWriter::new(gdir.join("archive").join("1-baseline"));
+        archive
+            .append(&gain_event(1_700_000_000, Surface::CliSearch, 1000, 400))
+            .unwrap();
+        archive
+            .append(&gain_event(1_783_209_600, Surface::CliSearch, 2000, 800))
+            .unwrap();
+    }
+
+    /// GET `/api/token/gain{query}` → 200 + parsed JSON body.
+    async fn gain_hit(router: &axum::Router, query: &str) -> serde_json::Value {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/token/gain{query}"))
+                    .header("x-onebrain-token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "query {query:?}");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Truth-table row: webui overview `?by=&since=` (keys present, values
+    /// empty) → current epoch. Empty values must read as "unset", never as a
+    /// real `since` filter or an all-epoch trigger.
+    #[tokio::test]
+    async fn gain_route_webui_overview_empty_keys_is_current_epoch() {
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        seed_epoch_fixture(vault.path());
+        let router = router_holding_cache(vault.path());
+
+        let v = gain_hit(&router, "?by=&since=").await;
+        assert_eq!(v["totals"]["count"], 1, "current epoch only: {v}");
+        assert_eq!(v["totals"]["bytes_before"], 500);
+    }
+
+    /// Truth-table row: webui tab `?by=surface&since=` → current epoch,
+    /// pivoted by surface.
+    #[tokio::test]
+    async fn gain_route_webui_tab_empty_since_is_current_epoch_pivoted() {
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        seed_epoch_fixture(vault.path());
+        let router = router_holding_cache(vault.path());
+
+        let v = gain_hit(&router, "?by=surface&since=").await;
+        assert_eq!(v["totals"]["count"], 1, "current epoch only: {v}");
+        let rows = v["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "one current-epoch surface: {v}");
+        assert_eq!(rows[0]["dim"], "mcp_query");
+    }
+
+    /// Truth-table row: a pre-3.4.14 CLI's `--all-time` sends NEITHER a `since`
+    /// key NOR an `all_time` key — the legacy-bare rule serves it all-epoch for
+    /// compatibility with the old route's all-data semantics.
+    #[tokio::test]
+    async fn gain_route_legacy_bare_call_is_all_time() {
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        seed_epoch_fixture(vault.path());
+        let router = router_holding_cache(vault.path());
+
+        let v = gain_hit(&router, "").await;
+        assert_eq!(
+            v["totals"]["count"], 3,
+            "legacy bare call = all epochs: {v}"
+        );
+        assert_eq!(v["totals"]["bytes_before"], 3500);
+    }
+
+    /// Truth-table row: a pre-3.4.14 CLI's `--all-time --by day` sends `?by=day`
+    /// only — still the legacy-bare rule (no `since`/`all_time` keys), all-epoch,
+    /// pivoted.
+    #[tokio::test]
+    async fn gain_route_legacy_all_time_with_by_is_all_epoch_pivoted() {
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        seed_epoch_fixture(vault.path());
+        let router = router_holding_cache(vault.path());
+
+        let v = gain_hit(&router, "?by=day").await;
+        assert_eq!(v["totals"]["count"], 3, "all epochs: {v}");
+        let rows = v["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "three distinct days across epochs: {v}");
+        assert!(rows.iter().all(|r| r["time"].is_string()));
+    }
+
+    /// Truth-table row: a pre-3.4.14 CLI's `--since 2026-07-01` sends
+    /// `?since=2026-07-01` — all epochs, date-filtered (archived 2026-07-05 +
+    /// current 2026-07-13 survive; archived 2023-11-14 does not).
+    #[tokio::test]
+    async fn gain_route_legacy_since_filters_all_epochs() {
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        seed_epoch_fixture(vault.path());
+        let router = router_holding_cache(vault.path());
+
+        let v = gain_hit(&router, "?since=2026-07-01").await;
+        assert_eq!(v["totals"]["count"], 2, "since filters all epochs: {v}");
+        assert_eq!(v["totals"]["bytes_before"], 2500);
+    }
+
+    /// Truth-table row: the 3.4.14+ CLI's explicit `?all_time=true` → all epochs.
+    #[tokio::test]
+    async fn gain_route_explicit_all_time_true_is_all_epochs() {
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        seed_epoch_fixture(vault.path());
+        let router = router_holding_cache(vault.path());
+
+        let v = gain_hit(&router, "?all_time=true").await;
+        assert_eq!(
+            v["totals"]["count"], 3,
+            "explicit all_time = all epochs: {v}"
+        );
+        assert_eq!(v["totals"]["bytes_before"], 3500);
+    }
+
+    /// Truth-table row: `?all_time=false&since=2026-07-01` (the 3.4.14+ CLI's
+    /// `--since`) → all epochs, date-filtered — same answer as the legacy
+    /// `?since=` form.
+    #[tokio::test]
+    async fn gain_route_all_time_false_with_since_filters_all_epochs() {
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        seed_epoch_fixture(vault.path());
+        let router = router_holding_cache(vault.path());
+
+        let v = gain_hit(&router, "?all_time=false&since=2026-07-01").await;
+        assert_eq!(v["totals"]["count"], 2, "since filters all epochs: {v}");
+        assert_eq!(v["totals"]["bytes_before"], 2500);
+    }
+
+    /// Equivalence (#281): for EVERY `by=<dim>` the WebUI dashboard sends
+    /// (surface, transform, level, cache — the four `--by` dims), the daemon
+    /// route and the CLI's own JSONL reader (`JsonlGainWriter::read_all` +
+    /// `pivot::query_events`) produce the byte-identical `PivotResult` on the
+    /// same seeded log. One code path, so the dashboard tabs and `onebrain token
+    /// gain --by <dim>` can never disagree. Also covers the bare (no-`by`)
+    /// summary call.
+    #[tokio::test]
+    async fn gain_route_matches_the_cli_jsonl_reader_for_every_dim() {
+        use onebrain_token::Surface;
+
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let cache_dir = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap());
+        let gdir = token_gain_dir(&cache_dir);
+        let writer = JsonlGainWriter::new(&gdir);
+        writer
+            .append(&gain_event(1_783_728_000, Surface::CliSearch, 1000, 400))
+            .unwrap();
+        writer
+            .append(&gain_event(1_783_900_800, Surface::McpQuery, 500, 100))
+            .unwrap();
+
+        let events = writer.read_all().unwrap();
+        let router = router_holding_cache(vault.path());
+
+        // None = the bare summary call; the four dims are exactly what the CLI
+        // `--by` accepts and the dashboard renders as tabs.
+        for by in [
+            None,
+            Some("surface"),
+            Some("transform"),
+            Some("level"),
+            Some("cache"),
+        ] {
+            // What the CLI's JSONL reader computes, independently.
+            let (time, dim) = parse_by(by).unwrap();
+            let expected = pivot::query_events(
+                &events,
+                &PivotQuery {
+                    time,
+                    dim,
+                    since: None,
+                },
+            );
+
+            // The webui wire form: `by` and `since` keys always present (empty
+            // = unset) — the current-epoch scope, matching the CLI default read
+            // computed above.
+            let path = match by {
+                Some(d) => format!("/api/token/gain?by={d}&since="),
+                None => "/api/token/gain?by=&since=".to_string(),
+            };
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::get(&path)
+                        .header("x-onebrain-token", TOKEN)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "by={by:?}");
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let from_route: PivotResult = serde_json::from_slice(&bytes).unwrap();
+
+            assert_eq!(
+                from_route, expected,
+                "the daemon route must match the CLI's JSONL reader exactly for by={by:?}"
+            );
+        }
     }
 
     #[tokio::test]

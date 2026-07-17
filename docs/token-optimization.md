@@ -215,9 +215,19 @@ Note: byte counts are exact; per-model token figures are an estimate — see `do
 With no flags, the report is scoped to the **current epoch** — traffic since
 the last `--reset` (or everything, if you've never reset). Pass `--all-time`
 to sum every epoch including anything archived by a past `--reset`, or
-`--since YYYY-MM-DD` for a custom lower bound (both of those read the
-precomputed Tier-2 rollups instead of the epoch's raw log, so they stay fast
-regardless of history length).
+`--since YYYY-MM-DD` for a custom lower bound.
+
+Every read mode — the default summary, `--by`, `--history`, `--all-time`, and
+`--since` — reads the lock-free JSONL raw log (the source of truth), so the
+WebUI dashboard (which calls the daemon's `GET /api/token/gain`) and the CLI
+always agree, and neither depends on a warm daemon to be populated (#281). The
+Tier-2 rollup DB (`token.redb`) is now **legacy**: since v3.4.12 nothing
+populates it automatically, and `--rebuild` is its only remaining reader/writer,
+pending removal in a follow-up.
+
+Note that each gain read walks the JSONL per request (and the archived epochs
+too for `--all-time`/`--since`), so read cost grows with history length until
+log compaction or read caching lands (planned follow-up).
 
 ### `--by <time>[,<dim>]` — pivots
 
@@ -285,8 +295,9 @@ $ onebrain token gain
 $ onebrain token gain --all-time --by level
 ```
 
-An archived epoch is never lost — `--all-time` and `--since` both reach it
-through the cumulative rollup, and `--rebuild` (below) walks it too.
+An archived epoch is never lost — `--all-time` and `--since` both reach it by
+walking the archived JSONL (`read_all_recursive`), and `--rebuild` (below) walks
+it too.
 
 ### `--rebuild` — rollup recovery
 

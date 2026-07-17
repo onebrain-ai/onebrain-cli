@@ -81,15 +81,6 @@ impl TokenCache {
     pub fn ledger(&self) -> Ledger<'_> {
         Ledger::new(&self.db)
     }
-
-    /// The underlying `token.redb` handle — for the shared gain pivot engine
-    /// ([`crate::gain::pivot::query`]), which reads the Tier-2 rollup tables
-    /// this same DB owns. Exposed so the daemon's `/api/token/gain` route and
-    /// the CLI `token gain` command run the ONE pivot engine over the ONE
-    /// store, instead of re-deriving the aggregation.
-    pub fn database(&self) -> &Database {
-        &self.db
-    }
 }
 
 #[cfg(test)]

@@ -232,13 +232,13 @@ fn rollup_busy_error(detail: &str) -> anyhow::Error {
 
 const ROLLUP_LOCK_HINT: &str =
     "token.redb is held by another onebrain process (a running daemon owns the rollup DB). \
-     The default summary, --by, --history and --reset read the raw log directly and work \
-     regardless; only --all-time, --since and --rebuild need the rollup DB — retry once that \
-     process exits (e.g. `onebrain daemon stop`).";
+     Every read mode (the default summary, --by, --history, --all-time, --since and --reset) \
+     reads the lock-free raw log and works regardless; only --rebuild needs the rollup DB — \
+     retry once that process exits (e.g. `onebrain daemon stop`).";
 
-/// Open the Tier-2 rollup DB (`token.redb`) directly, for the modes that
-/// genuinely need it (`--rebuild`, and the Direct leg of `--all-time`/`--since`
-/// when no daemon holds the lock). redb is single-process, so a running
+/// Open the Tier-2 rollup DB (`token.redb`) directly, for the ONE mode that
+/// still needs it: `--rebuild` (every read mode is JSONL-backed since #281).
+/// redb is single-process, so a running
 /// `onebrain daemon` — the sole `token.redb` owner — makes this open fail with
 /// `DatabaseAlreadyOpen`. When that's the cause we surface the actionable,
 /// exit-77 [`rollup_busy_error`] (issue #258); any other open failure passes
@@ -256,71 +256,69 @@ fn open_rollup_db_direct(tok_dir: &Path) -> Result<Database> {
         })
 }
 
-/// Resolve a rollup-backed pivot (`--all-time` / `--since`). The daemon is the
-/// single owner of `token.redb`, so when a same-vault daemon holds it we route
-/// the pivot through its `GET /api/token/gain` route rather than open the redb
-/// ourselves — a Direct open would only hit the exclusive lock (issue #258).
+/// Resolve an all-epoch pivot (`--all-time` / `--since`), reading the lock-free
+/// gain JSONL raw log — every epoch, archived included ([`JsonlGainWriter::
+/// read_all_recursive`]) — the SAME source of truth the default summary reads.
+/// The Tier-2 rollup DB is no longer consulted: since #258 nothing populates it
+/// automatically, so it read empty and `--all-time`/`--since` (and the dashboard)
+/// were dark (#281). `--rebuild` remains its only reader/writer.
 ///
-/// Routing adopts the daemon REGARDLESS of version
-/// ([`daemon_client::discover_same_vault_any_version`]), because the gain route
-/// returns the version-stable [`PivotResult`]: this closes the
-/// upgrade-without-restart gap (#258 Gap 4) where a still-running old daemon
-/// holds the lock. With no same-vault daemon there's no contention, so we open
-/// Direct. `ONEBRAIN_NO_DAEMON` forces the Direct leg (operator kill-switch +
-/// deterministic tests), matching every other search surface.
-fn resolve_rollup_pivot(
+/// When a same-vault daemon is up we still route through its `GET /api/token/gain`
+/// route (it reads the same JSONL, so the answers agree), adopting it REGARDLESS
+/// of version ([`daemon_client::discover_same_vault_any_version`]) since the route
+/// returns the version-stable [`PivotResult`]. A 404 (route absent) or a transport
+/// error simply falls through to the Direct JSONL read — lock-free, so it always
+/// works (no more `E_ENGINE_BUSY` catch-22). `ONEBRAIN_NO_DAEMON` forces the
+/// Direct leg (operator kill-switch + deterministic tests).
+fn resolve_all_epoch_pivot(
     resolved: &ResolvedVault,
     tok_dir: &Path,
     by: Option<&str>,
+    all_time: bool,
     query: &PivotQuery,
 ) -> Result<PivotResult> {
     if !daemon_routing_disabled() {
         if let Ok(Some(handle)) =
             daemon_client::discover_same_vault_any_version(Some(resolved.root.as_path()))
         {
-            // `None` = the daemon vanished mid-call (transport error) → it no
-            // longer holds the lock, so fall THROUGH to a now-safe Direct open
-            // (self-healing, #258 Gap 8). `Some` = a real pivot; `Err` = a
-            // too-old daemon that still holds the lock (actionable) or a decode
-            // failure.
-            if let Some(pivot) = daemon_rollup_pivot(&handle, by, query.since.as_deref())? {
+            // `Some(pivot)` = the daemon answered. `None` = route absent (404) or
+            // the daemon vanished (transport error); either way its JSONL is the
+            // same lock-free files we can read ourselves, so fall THROUGH to Direct.
+            if let Some(pivot) =
+                daemon_all_epoch_pivot(&handle, by, query.since.as_deref(), all_time)?
+            {
                 return Ok(pivot);
             }
         }
     }
-    let db = open_rollup_db_direct(tok_dir)?;
-    rollup::ensure_tables(&db).context("ensuring rollup tables")?;
-    pivot::query(&db, query).context("querying gain rollups")
+    let events = JsonlGainWriter::new(gain_dir(tok_dir))
+        .read_all_recursive()
+        .context("reading the gain log (all epochs) for --all-time/--since")?;
+    Ok(pivot::query_events(&events, query))
 }
 
-/// Fetch the rollup pivot from a same-vault daemon's `GET /api/token/gain`.
+/// Fetch the all-epoch pivot from a same-vault daemon's `GET /api/token/gain`.
 ///
 /// - `Ok(Some(pivot))` — the route answered; decode the version-stable
 ///   [`PivotResult`] (a decode failure is a hard `Err`, never a silent Direct
 ///   fallback that could mask a real wire break).
-/// - `Ok(None)` — a TRANSPORT error: the daemon died between discovery and this
-///   call, so it no longer holds the lock; the caller falls through to a Direct
-///   open (self-healing, #258 Gap 8).
-/// - `Err(EngineBusy)` — a 404: the daemon is too old to serve the route but
-///   still holds the lock, so Direct would fail too; surface the actionable
-///   exit-77 error rather than the raw redb error.
-fn daemon_rollup_pivot(
+/// - `Ok(None)` — the route is absent (404) or the call failed (transport /
+///   status error). The gain JSONL is lock-free, so the caller falls through to
+///   a Direct read that reads the exact same files and always works (#281) —
+///   no more "daemon too old holds the lock" catch-22.
+fn daemon_all_epoch_pivot(
     handle: &DaemonHandle,
     by: Option<&str>,
     since: Option<&str>,
+    all_time: bool,
 ) -> Result<Option<PivotResult>> {
-    match handle.token_gain(by, since, false) {
+    match handle.token_gain(by, since, all_time, false) {
         Ok(Some(json)) => serde_json::from_value::<PivotResult>(json)
             .map(Some)
             .context("decoding the daemon's /api/token/gain pivot response"),
-        Ok(None) => Err(rollup_busy_error(
-            "the running onebrain daemon is too old to serve `token gain` (no \
-             /api/token/gain route) and holds token.redb — restart it \
-             (`onebrain daemon stop`) to pick up this version, then retry.",
-        )),
-        // Transport failure: the daemon is gone, so it released the lock. Signal
-        // a fall-through to Direct rather than erroring.
-        Err(_) => Ok(None),
+        // 404 (old daemon) or any transport/status error: fall through to the
+        // lock-free Direct JSONL read.
+        Ok(None) | Err(_) => Ok(None),
     }
 }
 
@@ -332,11 +330,11 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &TokenGainArgs)
     let cache_dir = collection_cache_dir(&collection);
     let tok_dir = token_dir(&cache_dir);
     let gdir = gain_dir(&tok_dir);
-    // `token.redb` (the Tier-2 rollup) is opened LAZILY, only in the branches
-    // that need it (`--rebuild`, and the Direct leg of `--all-time`/`--since`).
-    // The default summary, `--by`, `--history` and `--reset` read the lock-free
-    // JSONL raw log (the source of truth), so they work even while a daemon holds
-    // the redb lock — the #258 fix.
+    // `token.redb` (the legacy Tier-2 rollup) is opened LAZILY, only by
+    // `--rebuild` — the sole remaining branch that needs it. EVERY read mode
+    // (default summary, `--by`, `--history`, `--all-time`, `--since`, `--reset`)
+    // reads the lock-free JSONL raw log (the source of truth), so reads work
+    // even while a daemon holds the redb lock — the #258 fix, completed by #281.
 
     // `--json` is a local shorthand (mirrors `doctor --json` / `update
     // --json`) — it still renders through the SAME `emit`/`Envelope`
@@ -452,24 +450,35 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &TokenGainArgs)
     // baseline-comparison workflow (reset → run at X → read → reset → run at
     // Y → read → compare) shows attributable per-epoch numbers instead of the
     // unchanging all-time cumulative total. `--all-time` and `--since` both
-    // reach every epoch via the cumulative rollup.
+    // reach every epoch by also walking the archived JSONL
+    // (`read_all_recursive`, #281).
     let (time, dim) = parse_by(args.by.as_deref())?;
+    // Mirror the daemon route's empty-value guard: `--since ""` means unset,
+    // never a real (vacuous) filter that silently flips the epoch scope.
+    let since = args.since.clone().filter(|s| !s.is_empty());
     let query = PivotQuery {
         time,
         dim,
-        since: args.since.clone(),
+        since: since.clone(),
     };
     let marker = read_reset_marker(&gdir);
-    let use_current_epoch = !args.all_time && args.since.is_none();
+    let use_current_epoch = !args.all_time && since.is_none();
     let result = if use_current_epoch {
         let events = JsonlGainWriter::new(&gdir)
             .read_all()
             .context("reading current-epoch gain log")?;
         pivot::query_events(&events, &query)
     } else {
-        // Rollup-backed (`--all-time` / `--since`): route to the daemon when it
-        // holds token.redb, else open Direct (the #258 fix).
-        resolve_rollup_pivot(&resolved, &tok_dir, args.by.as_deref(), &query)?
+        // All-epoch (`--all-time` / `--since`): read the lock-free JSONL raw log
+        // (all epochs), routing through a same-vault daemon when one is up (it
+        // reads the same JSONL, so the answers agree) else Direct (#281).
+        resolve_all_epoch_pivot(
+            &resolved,
+            &tok_dir,
+            args.by.as_deref(),
+            args.all_time,
+            &query,
+        )?
     };
     // month/year buckets on a current-epoch report can't span the archived
     // epoch — flag it so the report never implies a cross-epoch bucket it
@@ -1021,15 +1030,14 @@ mod tests {
         Database::create(redb_path(tok_dir)).unwrap()
     }
 
-    /// Seed rollup rows into `token.redb`, then DROP the handle so its lock is
-    /// released before the code under test opens its own.
-    fn seed_rollup(tok_dir: &Path, evs: &[(i64, Surface, u64, u64)]) {
-        std::fs::create_dir_all(tok_dir).unwrap();
-        let db = Database::create(redb_path(tok_dir)).unwrap();
+    /// Seed raw events into the gain JSONL log under `tok_dir` — the lock-free
+    /// source `--all-time`/`--since` now read (#281). Writes into the current
+    /// epoch (non-archived) so both `read_all` and `read_all_recursive` see them.
+    fn seed_jsonl(tok_dir: &Path, evs: &[(i64, Surface, u64, u64)]) {
+        let writer = JsonlGainWriter::new(gain_dir(tok_dir));
         for (ts, surface, before, after) in evs {
-            rollup::update(
-                &db,
-                &GainEvent {
+            writer
+                .append(&GainEvent {
                     ts: *ts,
                     surface: *surface,
                     transform: "whitespace".to_string(),
@@ -1038,9 +1046,8 @@ mod tests {
                     bytes_after: *after,
                     cache: CacheKind::None,
                     session_token: None,
-                },
-            )
-            .unwrap();
+                })
+                .unwrap();
         }
     }
 
@@ -1092,8 +1099,12 @@ mod tests {
         );
     }
 
+    /// #281: the Direct leg (no daemon) reads the lock-free gain JSONL — a held
+    /// redb lock no longer blocks it, because the rollup DB is no longer the
+    /// source. Proves the catch-22 is gone: `--all-time` works while a holder
+    /// keeps token.redb locked.
     #[test]
-    fn all_time_direct_under_a_lock_reports_actionable_message_not_raw_redb() {
+    fn all_time_direct_reads_jsonl_even_while_a_holder_locks_redb() {
         let (vault, cache) = gain_vault();
         let _env = crate::test_env::set_vars(&[
             ("HOME", vault.path().as_os_str()),
@@ -1101,28 +1112,19 @@ mod tests {
             ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")), // force the Direct leg
         ]);
         let tok_dir = seam_tok_dir();
-        let _held = hold_redb_lock(&tok_dir);
+        seed_jsonl(&tok_dir, &[(1_783_728_000, Surface::CliSearch, 1000, 400)]);
+        let _held = hold_redb_lock(&tok_dir); // held, but the JSONL read ignores it
 
         let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
-        let err = resolve_rollup_pivot(&resolved, &tok_dir, None, &PivotQuery::default())
-            .expect_err("a Direct rollup open against a held lock must error");
-        // Typed as CoreError::EngineBusy → E_ENGINE_BUSY / exit 77, the SAME
-        // transient-lock code every sibling search surface uses (not a raw redb
-        // error at generic exit 1).
-        let core = err
-            .downcast_ref::<onebrain_core::CoreError>()
-            .expect("the lock error must be a typed CoreError, not a plain anyhow error");
-        assert_eq!(core.error_code(), "E_ENGINE_BUSY", "must map to exit 77");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("token.redb is held by another onebrain process"),
-            "actionable hint present: {msg}"
-        );
-        assert!(msg.contains("onebrain daemon stop"), "{msg}");
+        let pivot =
+            resolve_all_epoch_pivot(&resolved, &tok_dir, None, true, &PivotQuery::default())
+                .expect("the lock-free JSONL read must succeed under a held redb lock");
+        assert_eq!(pivot.totals.count, 1);
+        assert_eq!(pivot.totals.bytes_before, 1000);
     }
 
     #[test]
-    fn all_time_direct_returns_the_seeded_rollup_when_no_daemon() {
+    fn all_time_direct_returns_the_seeded_jsonl_when_no_daemon() {
         let (vault, cache) = gain_vault();
         let _env = crate::test_env::set_vars(&[
             ("HOME", vault.path().as_os_str()), // no daemon.json → Direct
@@ -1130,7 +1132,7 @@ mod tests {
             ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")),
         ]);
         let tok_dir = seam_tok_dir();
-        seed_rollup(
+        seed_jsonl(
             &tok_dir,
             &[
                 (1_783_728_000, Surface::CliSearch, 1000, 400),
@@ -1140,10 +1142,50 @@ mod tests {
 
         let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
         let pivot =
-            resolve_rollup_pivot(&resolved, &tok_dir, None, &PivotQuery::default()).unwrap();
+            resolve_all_epoch_pivot(&resolved, &tok_dir, None, true, &PivotQuery::default())
+                .unwrap();
         assert_eq!(pivot.totals.count, 2);
         assert_eq!(pivot.totals.bytes_before, 1500);
         assert_eq!(pivot.totals.bytes_after, 500);
+    }
+
+    /// #281: `read_all_recursive` on the Direct leg reaches archived epochs, so
+    /// `--all-time` includes events archived by `--reset` — parity with the old
+    /// cumulative rollup's all-epoch scope.
+    #[test]
+    fn all_time_direct_includes_archived_epochs() {
+        let (vault, cache) = gain_vault();
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", vault.path().as_os_str()),
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")),
+        ]);
+        let tok_dir = seam_tok_dir();
+        // One current-epoch event + one archived event.
+        seed_jsonl(&tok_dir, &[(1_783_900_800, Surface::McpQuery, 500, 100)]);
+        let archive = gain_dir(&tok_dir).join("archive").join("1-baseline");
+        JsonlGainWriter::new(&archive)
+            .append(&GainEvent {
+                ts: 1_700_000_000,
+                surface: Surface::CliSearch,
+                transform: "whitespace".to_string(),
+                level: OptLevel::Conservative,
+                bytes_before: 1000,
+                bytes_after: 400,
+                cache: CacheKind::None,
+                session_token: None,
+            })
+            .unwrap();
+
+        let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
+        let pivot =
+            resolve_all_epoch_pivot(&resolved, &tok_dir, None, true, &PivotQuery::default())
+                .unwrap();
+        assert_eq!(
+            pivot.totals.count, 2,
+            "all-time must include the archived epoch"
+        );
+        assert_eq!(pivot.totals.bytes_before, 1500);
     }
 
     // ── daemon-routing (Complete scope): --all-time/--since via the route ──
@@ -1189,10 +1231,10 @@ mod tests {
 
     type CapturedReqs = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
-    /// A minimal HTTP/1.1 responder for the two routes `resolve_rollup_pivot`
+    /// A minimal HTTP/1.1 responder for the two routes `resolve_all_epoch_pivot`
     /// exercises: `GET /api/health` (so daemon discovery adopts it) and `GET
     /// /api/token/gain`. It records each non-health request's first line (so a
-    /// test can assert `by=`/`since=` forwarding) and serves `gain_body` with
+    /// test can assert `by=`/`since=`/`all_time=` forwarding) and serves `gain_body` with
     /// `gain_status` — EXCEPT `gain_status == 0`, which drops the connection
     /// with no response, simulating a daemon that died mid-call (a transport
     /// error → Gap 8 Direct-fallback).
@@ -1279,7 +1321,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn all_time_routes_through_the_daemon_that_holds_the_lock() {
+    fn all_time_routes_to_the_daemon_when_local_jsonl_is_empty() {
         let (vault, cache) = gain_vault();
         let (port, _reqs) = start_fake_gain_daemon(200, pivot_body(3));
         let _env = crate::test_env::set_vars(&[
@@ -1288,27 +1330,26 @@ mod tests {
         ]);
         write_daemon_json(vault.path(), vault.path(), port, "gain-daemon-token-123");
 
-        // Hold the LOCAL redb locked: a Direct open would return the wrong data
-        // (empty) or error — so this test can pass ONLY by routing to the daemon.
+        // Leave the LOCAL JSONL empty: a Direct read would return count=0, so
+        // this test can pass ONLY by routing to the daemon (count=3).
         let tok_dir = seam_tok_dir();
-        let _held = hold_redb_lock(&tok_dir);
 
         let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
         let pivot =
-            resolve_rollup_pivot(&resolved, &tok_dir, None, &PivotQuery::default()).unwrap();
+            resolve_all_epoch_pivot(&resolved, &tok_dir, None, true, &PivotQuery::default())
+                .unwrap();
         assert_eq!(
             pivot.totals.count, 3,
-            "must reflect the daemon's rollup, not the locked local db"
+            "must reflect the daemon's answer, not the empty local JSONL"
         );
         assert_eq!(pivot.rows.len(), 1);
         assert_eq!(pivot.rows[0].dim.as_deref(), Some("cli_search"));
     }
 
-    /// #258 Gap 4: after a CLI upgrade the still-running OLD daemon holds
-    /// token.redb. `discover_matching` would version-reject it → Direct-open →
-    /// lock error. Routing must adopt the version-skewed same-vault daemon
-    /// anyway (its gain route + PivotResult are version-stable). The local redb
-    /// is held locked so the ONLY way to succeed is routing.
+    /// #258 Gap 4: after a CLI upgrade the still-running OLD daemon is up.
+    /// Routing must adopt the version-skewed same-vault daemon anyway (its gain
+    /// route + PivotResult are version-stable). The local JSONL is left empty so
+    /// the ONLY way to reach count=7 is routing to the daemon.
     #[cfg(unix)]
     #[test]
     fn all_time_routes_to_a_version_mismatched_same_vault_daemon() {
@@ -1321,20 +1362,20 @@ mod tests {
         // A daemon at a DIFFERENT version than ours (the upgrade-skew case).
         write_daemon_json_versioned(vault.path(), vault.path(), port, "tok", "0.0.1-old");
         let tok_dir = seam_tok_dir();
-        let _held = hold_redb_lock(&tok_dir);
 
         let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
         let pivot =
-            resolve_rollup_pivot(&resolved, &tok_dir, None, &PivotQuery::default()).unwrap();
+            resolve_all_epoch_pivot(&resolved, &tok_dir, None, true, &PivotQuery::default())
+                .unwrap();
         assert_eq!(
             pivot.totals.count, 7,
-            "must route to the version-skewed same-vault daemon (Gap 4), not Direct-open the locked db"
+            "must route to the version-skewed same-vault daemon (Gap 4), not read the empty local JSONL"
         );
     }
 
-    /// #258 Gap 8: the daemon dies between discovery and the gain call → a
-    /// transport error. It no longer holds the lock, so the read must fall
-    /// through to a now-safe Direct open (self-healing), NOT surface an error.
+    /// #258 Gap 8 / #281: the daemon dies between discovery and the gain call →
+    /// a transport error. The read must fall through to the Direct JSONL read
+    /// (self-healing), NOT surface an error.
     #[cfg(unix)]
     #[test]
     fn daemon_gone_mid_call_falls_back_to_direct() {
@@ -1346,23 +1387,24 @@ mod tests {
         ]);
         write_daemon_json(vault.path(), vault.path(), port, "tok");
         let tok_dir = seam_tok_dir();
-        // No lock held (the daemon "died"); seed the local rollup Direct will read.
-        seed_rollup(&tok_dir, &[(1_783_728_000, Surface::CliSearch, 1000, 400)]);
+        // Seed the local JSONL the Direct fallback will read.
+        seed_jsonl(&tok_dir, &[(1_783_728_000, Surface::CliSearch, 1000, 400)]);
 
         let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
         let pivot =
-            resolve_rollup_pivot(&resolved, &tok_dir, None, &PivotQuery::default()).unwrap();
+            resolve_all_epoch_pivot(&resolved, &tok_dir, None, true, &PivotQuery::default())
+                .unwrap();
         assert_eq!(
             pivot.totals.count, 1,
-            "a transport error must fall back to a now-unlocked Direct open (Gap 8)"
+            "a transport error must fall back to the Direct JSONL read (Gap 8)"
         );
     }
 
-    /// R3: prove `by`/`since` are actually forwarded onto the daemon route URL
-    /// (the fake daemon records the request line).
+    /// R3: prove `by`/`since`/`all_time` are actually forwarded onto the daemon
+    /// route URL (the fake daemon records the request line).
     #[cfg(unix)]
     #[test]
-    fn by_and_since_are_forwarded_to_the_daemon_route() {
+    fn by_since_and_all_time_are_forwarded_to_the_daemon_route() {
         let (vault, cache) = gain_vault();
         let empty = serde_json::to_string(&PivotResult {
             rows: vec![],
@@ -1376,7 +1418,6 @@ mod tests {
         ]);
         write_daemon_json(vault.path(), vault.path(), port, "tok");
         let tok_dir = seam_tok_dir();
-        let _held = hold_redb_lock(&tok_dir);
 
         let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
         let query = PivotQuery {
@@ -1384,7 +1425,8 @@ mod tests {
             dim: None,
             since: Some("2026-01-01".to_string()),
         };
-        let _ = resolve_rollup_pivot(&resolved, &tok_dir, Some("surface"), &query).unwrap();
+        let _ =
+            resolve_all_epoch_pivot(&resolved, &tok_dir, Some("surface"), true, &query).unwrap();
 
         let captured = reqs.lock().unwrap().clone();
         assert!(
@@ -1395,11 +1437,19 @@ mod tests {
             captured.iter().any(|r| r.contains("by=surface")),
             "by must be forwarded: {captured:?}"
         );
+        assert!(
+            captured.iter().any(|r| r.contains("all_time=true")),
+            "all_time must be forwarded: {captured:?}"
+        );
     }
 
+    /// #281: a daemon too old to serve the gain route answers 404. Because the
+    /// JSONL is lock-free, the read falls through to the Direct JSONL read (which
+    /// reads the same files) rather than erroring — the old `E_ENGINE_BUSY`
+    /// catch-22 is gone.
     #[cfg(unix)]
     #[test]
-    fn daemon_too_old_for_the_gain_route_is_actionable() {
+    fn daemon_too_old_for_the_gain_route_falls_back_to_direct() {
         let (vault, cache) = gain_vault();
         let (port, _reqs) = start_fake_gain_daemon(404, "not found".to_string());
         let _env = crate::test_env::set_vars(&[
@@ -1408,21 +1458,17 @@ mod tests {
         ]);
         write_daemon_json(vault.path(), vault.path(), port, "gain-daemon-token-123");
         let tok_dir = seam_tok_dir();
-        let _held = hold_redb_lock(&tok_dir);
+        // Seed the local JSONL the Direct fallback reads after the 404.
+        seed_jsonl(&tok_dir, &[(1_783_728_000, Surface::CliSearch, 1000, 400)]);
 
         let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
-        let err = resolve_rollup_pivot(&resolved, &tok_dir, None, &PivotQuery::default())
-            .expect_err("a 404 gain route while the daemon holds the lock must error");
-        // Typed EngineBusy (exit 77), actionable, and points at the fix.
+        let pivot =
+            resolve_all_epoch_pivot(&resolved, &tok_dir, None, true, &PivotQuery::default())
+                .expect("a 404 gain route must fall through to the lock-free Direct JSONL read");
         assert_eq!(
-            err.downcast_ref::<onebrain_core::CoreError>()
-                .expect("typed CoreError")
-                .error_code(),
-            "E_ENGINE_BUSY"
+            pivot.totals.count, 1,
+            "a 404 must fall back to the Direct JSONL read, not error"
         );
-        let msg = format!("{err:#}");
-        assert!(msg.contains("too old to serve"), "{msg}");
-        assert!(msg.contains("onebrain daemon stop"), "{msg}");
     }
 
     /// R3: `--rebuild` is a redb WRITE that can't route to the read-only daemon
