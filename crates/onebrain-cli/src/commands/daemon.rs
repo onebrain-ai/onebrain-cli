@@ -896,7 +896,24 @@ pub fn run_start(mode: &OutputMode, vault: Option<&Path>) -> Result<()> {
     // leader), spawn a SECOND daemon for this slot. Holding until the daemon
     // advertises readiness means every later racer sees a confirmed-running
     // daemon and backs off. Bounded so a wedged child can't hang `start` forever.
-    wait_until_ready(pid, &slot.json, std::time::Duration::from_secs(5));
+    //
+    // #278 daemon-startup audit: `__run`'s bind-then-announce ordering was
+    // already correct (its `on_bind` callback writes `daemon.json` only after a
+    // successful bind — see `run_internal`). But THIS caller had the same
+    // "success-implying output before the operation succeeds" anti-pattern one
+    // layer up: it used to report `started: true` unconditionally, even when
+    // `ReadyOutcome::Died` meant the child had already exited (bind failure or
+    // early crash) — the parent would print "daemon started" for a daemon that
+    // was, at that moment, provably not running. A `TimedOut` outcome (child
+    // still alive, just slow to bind within the 5s window) stays best-effort
+    // `started: true`, matching the pre-existing bounded-wait tradeoff.
+    if let ReadyOutcome::Died = wait_until_ready(pid, &slot.json, std::time::Duration::from_secs(5))
+    {
+        anyhow::bail!(
+            "daemon process (pid {pid}) exited before it finished binding its HTTP listener; \
+             check the daemon log for the underlying error"
+        );
+    }
 
     let data = DaemonStartData {
         started: true,
@@ -926,33 +943,86 @@ fn contended_winner_pid(slot: &SlotPaths) -> u32 {
     read_pid(&slot.pid).unwrap_or(0)
 }
 
+/// Outcome of [`wait_until_ready`]: whether the caller may trust that the
+/// daemon actually came up, or must NOT report success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadyOutcome {
+    /// Confirmed: `discovery` exists and `pid` is a live session leader.
+    Ready,
+    /// The child exited before publishing `discovery` (e.g. a bind failure) —
+    /// a caller must NOT report this as a successful start.
+    Died,
+    /// Still alive at the deadline but never confirmed readiness — best-effort
+    /// (see the caller's comment on why this stays a soft "probably fine").
+    TimedOut,
+}
+
 /// Poll until the freshly-spawned daemon is READY — it has published its
 /// `discovery` file (`daemon.json`, written after it binds) AND `pid` is a live
 /// session leader — or `timeout` elapses (best-effort). Called by `run_start`
 /// while STILL holding the start lock, so a serialized concurrent starter always
 /// observes a fully-up daemon and backs off instead of spawning a second one.
 ///
-/// If the child dies early (`!is_alive`), stop waiting immediately — there's no
-/// point holding the lock for a daemon that already failed; the caller reports
-/// the (now-dead) start and a later `start` can retry cleanly.
-fn wait_until_ready(pid: u32, discovery: &Path, timeout: std::time::Duration) {
+/// If the child dies early ([`child_has_exited`]), stop waiting immediately and
+/// report [`ReadyOutcome::Died`] — there's no point holding the lock for a
+/// daemon that already failed, and the caller must not claim it started.
+fn wait_until_ready(pid: u32, discovery: &Path, timeout: std::time::Duration) -> ReadyOutcome {
     let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
+    loop {
         if is_alive(pid) && discovery.exists() {
-            return;
+            return ReadyOutcome::Ready;
         }
         // Child forked but exited before binding → don't spin the full timeout.
-        if !bare_pid_or_session_alive(pid) {
-            return;
+        if child_has_exited(pid) {
+            return ReadyOutcome::Died;
+        }
+        if std::time::Instant::now() >= deadline {
+            return ReadyOutcome::TimedOut;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
 
-/// `true` while the child process still exists at all (bare `pid_exists`) — used
-/// by [`wait_until_ready`] to bail early if the child died before binding,
-/// rather than the stricter session-leader [`is_alive`] (which is only true
-/// AFTER setsid, so it can't distinguish "not yet setsid" from "dead").
+/// `true` when `pid` — the direct child [`spawn_detached_run`] just forked in
+/// THIS `run_start` call — has already exited.
+///
+/// Uses a non-blocking `waitpid(pid, WNOHANG)` REAP rather than the
+/// `kill(pid, 0)` liveness probe [`is_alive`]/[`pid_exists`] rely on: a
+/// process that exits before its parent reaps it becomes a ZOMBIE, and a
+/// zombie's pid slot stays valid for `kill()` — signaling a zombie still
+/// succeeds — so `kill(pid, 0)` alone cannot distinguish "exited, awaiting
+/// reap" from "genuinely still running". `waitpid` is the only call that can
+/// tell the difference, and reaping here (this process is the direct parent,
+/// so it's entitled to) also means a bind-failure death never leaks a zombie
+/// for `run_start`'s own short remaining lifetime (#278 audit finding: without
+/// this, a dead-on-arrival daemon child would appear "alive" to `kill(pid, 0)`
+/// for the ENTIRE [`wait_until_ready`] window, since nothing ever reaped it —
+/// masking a confirmable bind failure as `ReadyOutcome::TimedOut`, which
+/// `run_start` treats as best-effort success).
+///
+/// `Err` from `waitpid` (e.g. `ECHILD` — not literally our child, which only
+/// happens in tests that pass an arbitrary pid) falls back to the plain
+/// existence probe: a pid that doesn't exist at all is definitely dead.
+#[cfg(unix)]
+fn child_has_exited(pid: u32) -> bool {
+    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+    use nix::unistd::Pid;
+    match waitpid(Pid::from_raw(pid as i32), Some(WaitPidFlag::WNOHANG)) {
+        Ok(WaitStatus::StillAlive) => false,
+        Ok(_) => true, // Exited / Signaled / etc. — reaped, confirmed dead.
+        Err(_) => !bare_pid_or_session_alive(pid),
+    }
+}
+
+/// Non-Unix stub — the daemon isn't supported yet (see [`is_alive`]).
+#[cfg(not(unix))]
+fn child_has_exited(_pid: u32) -> bool {
+    false
+}
+
+/// `true` while the child process still exists at all (bare `pid_exists`) —
+/// the fallback existence probe [`child_has_exited`] uses when `waitpid`
+/// itself can't answer (e.g. `pid` isn't literally our child).
 fn bare_pid_or_session_alive(pid: u32) -> bool {
     pid_exists(pid)
 }
@@ -1544,7 +1614,8 @@ fn resolve_daemon_vault(arg: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// A future that resolves when SIGTERM is received — the daemon's graceful-
-/// shutdown trigger, handed to `server::run_server`'s `with_graceful_shutdown`.
+/// shutdown trigger, handed to `server::run_server_from_router`'s
+/// `with_graceful_shutdown`.
 ///
 /// Uses tokio's async signal handling (a self-pipe under the hood) rather than
 /// the old `sigaction` + `AtomicBool` park loop: it composes cleanly as a
@@ -1900,16 +1971,38 @@ mod tests {
     #[test]
     fn wait_until_ready_bails_early_when_child_is_dead() {
         // A pid that doesn't exist → wait_until_ready returns fast (no full
-        // timeout) via the `!bare_pid_or_session_alive` early-out.
+        // timeout) via the `!bare_pid_or_session_alive` early-out, reporting
+        // `Died` so the caller (run_start) knows NOT to claim success (#278).
         let dir = tempdir().unwrap();
         let never = dir.path().join("never.json");
         let start = std::time::Instant::now();
-        wait_until_ready(0x7FFF_FFF0, &never, std::time::Duration::from_secs(30));
+        let outcome = wait_until_ready(0x7FFF_FFF0, &never, std::time::Duration::from_secs(30));
+        assert_eq!(outcome, ReadyOutcome::Died);
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
             "should bail early for a dead child, took {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn wait_until_ready_times_out_when_alive_but_never_confirmed() {
+        // Our OWN pid stays alive (`pid_exists` true) for the whole call — it's
+        // not a session leader in the test harness, so `is_alive` never fires —
+        // and the discovery file never appears → TimedOut (best-effort; the
+        // caller still reports `started: true` for this outcome, unlike
+        // `Died`). The `Ready` outcome (a REAL setsid'd session leader
+        // publishing its discovery file) is exercised end-to-end by
+        // `daemon_lifecycle_start_status_stop` below, which drives the actual
+        // `daemon start` → success path against a genuine detached daemon.
+        let dir = tempdir().unwrap();
+        let never = dir.path().join("never.json");
+        let outcome = wait_until_ready(
+            std::process::id(),
+            &never,
+            std::time::Duration::from_millis(50),
+        );
+        assert_eq!(outcome, ReadyOutcome::TimedOut);
     }
 
     #[test]
@@ -2556,6 +2649,56 @@ mod tests {
         assert!(
             run("status").contains("not running"),
             "expected post-stop status to report not running"
+        );
+    }
+
+    /// #278 daemon-startup audit: `daemon start` must NOT report "daemon
+    /// started" when the detached `__run` child dies before it finishes
+    /// binding its HTTP listener. Pins `ONEBRAIN_DAEMON_PORT` to a port we
+    /// occupy ourselves (rather than the usual `0` ephemeral port), so the
+    /// child's `TcpListener::bind` fails immediately, the child process exits,
+    /// and `wait_until_ready` observes `ReadyOutcome::Died` — `run_start` must
+    /// then bail with an error instead of emitting the success envelope.
+    #[cfg(unix)]
+    #[test]
+    fn daemon_start_bind_failure_reports_error_not_started() {
+        use assert_cmd::Command;
+        use std::net::TcpListener;
+
+        let home = tempdir().unwrap();
+        let _teardown = StopDaemonOnDrop {
+            bin: assert_cmd::cargo::cargo_bin("onebrain"),
+            envs: vec![("HOME".into(), home.path().display().to_string())],
+        };
+
+        // Occupy a port ourselves so the detached child's bind fails. Held
+        // open for the whole `daemon start` call below.
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = occupied.local_addr().unwrap().port();
+
+        let out = Command::cargo_bin("onebrain")
+            .unwrap()
+            .env("HOME", home.path())
+            .env("ONEBRAIN_DAEMON_PORT", port.to_string())
+            .args(["daemon", "start"])
+            .output()
+            .expect("spawn onebrain binary");
+
+        drop(occupied);
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "daemon start against an occupied port must fail; stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            !stdout.contains("daemon started"),
+            "must not report success when the child died before binding: stdout={stdout}"
+        );
+        assert!(
+            stderr.contains("exited before it finished binding"),
+            "must surface the confirmed-death error: stderr={stderr}"
         );
     }
 
