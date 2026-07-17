@@ -24,6 +24,7 @@ User guides for the tool, plus design & internals docs for people reading the so
 | [`reference/`](reference/) | Navigate the source file-by-file: every module's purpose, its key types/functions, and how it connects to the rest. A code/API reference — start here when you want to follow the calls. |
 | [`decisions/`](decisions/) | Understand *why* a choice was made (Rust over Bun, direct-GitHub self-update, the canonical `Envelope`, …). One Architecture Decision Record (ADR) per choice. |
 | [`rust-patterns.md`](rust-patterns.md) | Learn the idiomatic Rust this codebase uses — trait objects, compile-time target detection, error enums, atomic file swaps — each anchored to a real file. |
+| [`output-style.md`](output-style.md) | See the contract every failure/warning message follows (`✗ what: why` + `💡 hint`), what's frozen (envelope shape, error/exit codes) vs. improvable (message wording), and the checklist for adding new output. |
 
 ## Who this is for
 

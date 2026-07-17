@@ -291,7 +291,7 @@ pub(crate) fn status_data(
                 match engine.status(resolved.root.as_path()) {
                     Ok(s) => StatusProbe::Ok(s),
                     Err(e) => {
-                        eprintln!("search status: {e:#}");
+                        eprintln!("⚠ Could not read the search index status — {e:#}");
                         StatusProbe::Error {
                             message: short_error(&e),
                         }
@@ -302,7 +302,7 @@ pub(crate) fn status_data(
                 StatusProbe::Unknown { busy: true }
             }
             Err(e) => {
-                eprintln!("search status: {e:#}");
+                eprintln!("⚠ Could not open the search index — {e:#}");
                 StatusProbe::Error {
                     message: short_error(&e),
                 }
@@ -401,7 +401,7 @@ fn probe_via_daemon(handle: &crate::commands::daemon_client::DaemonHandle) -> St
         Ok(v) => probe_from_daemon_status(&v),
         Err(e) if onebrain_search::error::is_engine_busy(&e) => StatusProbe::Unknown { busy: true },
         Err(e) => {
-            eprintln!("search status (daemon): {e:#}");
+            eprintln!("⚠ Could not read the search index status from the daemon — {e:#}");
             StatusProbe::Error {
                 message: short_error(&e),
             }
@@ -432,7 +432,8 @@ fn probe_from_daemon_status(v: &serde_json::Value) -> StatusProbe {
 
 /// One-line, size-bounded rendering of an error's full `anyhow` chain, for the
 /// status text line and the `W_STATUS_UNREADABLE` warning. The complete chain
-/// still goes to stderr via `eprintln!("search status: {e:#}")`.
+/// still goes to stderr as an `⚠ Could not read/open the search index …`
+/// line (see the `StatusProbe::Error` arms above).
 fn short_error(err: &anyhow::Error) -> String {
     const MAX: usize = 160;
     let full = format!("{err:#}").replace('\n', " ");

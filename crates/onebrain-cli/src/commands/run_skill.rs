@@ -60,7 +60,10 @@ pub fn run(
 ) -> Result<i32> {
     let vault_path = PathBuf::from(vault);
     if find_config_file(&vault_path).is_none() {
-        eprintln!("Vault not found at {vault} (no onebrain.yml present)");
+        eprintln!(
+            "✗ Vault not found at {vault} (no onebrain.yml present)\n\
+             💡 run this from inside a vault, or pass `--vault <path>` pointing at one"
+        );
         return Ok(78); // EX_CONFIG (sysexits.h)
     }
 
@@ -75,7 +78,9 @@ pub fn run(
         HarnessArg::Gemini => resolve_gemini_bin(None, env_lookup, path_exists, home.as_deref()),
     };
     if let Some(warning) = &resolution.warning {
-        eprintln!("{warning}");
+        // `warning`'s own text is kept stable (Bun-parity, see
+        // `resolve_bin`'s doc comment) — only the wrapping hint is new.
+        eprintln!("⚠ {warning}\n💡 fix or unset the env var above to silence this");
     }
 
     // Skills always run with-context: --add-dir / --include-directories the vault.
@@ -184,6 +189,10 @@ pub(crate) fn spawn_harness(
 ) -> Result<i32> {
     use std::io::IsTerminal;
     let label = harness.as_str();
+    let bin_env_var = match harness {
+        HarnessArg::Claude => "CLAUDE_BIN",
+        HarnessArg::Gemini => "GEMINI_BIN",
+    };
     // No `env` override beyond ONEBRAIN_HEADLESS: child inherits parent env so
     // PATH/HOME survive. stdout/stderr stay inherited so the harness's output
     // (and colour) reach the terminal verbatim; stdin is forced to null so
@@ -221,7 +230,12 @@ pub(crate) fn spawn_harness(
         return match command.status() {
             Ok(s) => Ok(translate_exit(&s)),
             Err(e) => {
-                eprintln!("Failed to spawn {label} ({}): {e}", bin.display());
+                eprintln!(
+                    "✗ Failed to spawn {label} ({}): {e}\n\
+                     💡 make sure `{label}` is installed and on PATH (check with `which {label}`), \
+                     or set `{bin_env_var}` to its full path",
+                    bin.display()
+                );
                 Ok(127)
             }
         };
@@ -267,7 +281,12 @@ pub(crate) fn spawn_harness(
         Ok(c) => c,
         Err(e) => {
             spinner.finish_and_clear();
-            eprintln!("Failed to spawn {label} ({}): {e}", bin.display());
+            eprintln!(
+                "✗ Failed to spawn {label} ({}): {e}\n\
+                 💡 make sure `{label}` is installed and on PATH (check with `which {label}`), \
+                 or set `{bin_env_var}` to its full path",
+                bin.display()
+            );
             return Ok(127);
         }
     };
@@ -304,7 +323,11 @@ pub(crate) fn spawn_harness(
             // than 1. kill+wait reaps the child so it doesn't keep running
             // (and burning API tokens) after we return.
             spinner.finish_and_clear();
-            eprintln!("waiting on {label} failed: {e}");
+            eprintln!(
+                "✗ Lost track of {label} while it was running: {e}\n\
+                 💡 this is an OS/process fault, not a skill problem — rerun `onebrain skill run`; \
+                 if it persists, check system resource limits (open files/processes)"
+            );
             let _ = child.kill();
             let _ = child.wait();
             return Ok(127);

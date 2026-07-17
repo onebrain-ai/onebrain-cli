@@ -65,8 +65,11 @@ pub fn run_vault_sync(vault_root: &Path, opts: VaultSyncOptions) -> VaultSyncRes
         Ok(d) => d,
         Err(e) => {
             result.error = Some(format!("create temp dir: {e}"));
+            // "vault-sync: download failed" stays verbatim — the CLI
+            // integration tests grep stderr for it.
             eprintln!(
-                "vault-sync: download failed: {}",
+                "✗ vault-sync: download failed: {}\n\
+                 💡 check free disk space and that the system temp folder is writable",
                 result.error.as_ref().unwrap()
             );
             return result;
@@ -79,7 +82,12 @@ pub fn run_vault_sync(vault_root: &Path, opts: VaultSyncOptions) -> VaultSyncRes
         Ok(p) => p,
         Err(msg) => {
             progress.stop("download failed");
-            eprintln!("vault-sync: download failed: {msg}");
+            // "vault-sync: download failed" stays verbatim (test grep target).
+            eprintln!(
+                "✗ vault-sync: download failed: {msg}\n\
+                 💡 nothing in the vault was changed — check your network connection, then \
+                 retry `onebrain vault sync`"
+            );
             result.error = Some(msg);
             return result;
         }
@@ -103,7 +111,11 @@ pub fn run_vault_sync(vault_root: &Path, opts: VaultSyncOptions) -> VaultSyncRes
         (Ok(p), Ok(g)) => (p.0 + g.0, p.1 + g.1),
         (Err(e), _) | (_, Err(e)) => {
             progress.stop("plugin sync failed");
-            eprintln!("vault-sync: plugin sync failed: {e}");
+            eprintln!(
+                "✗ vault-sync: plugin sync failed: {e}\n\
+                 💡 the plugin files may be partially updated — retry `onebrain vault sync`; \
+                 run `onebrain doctor` if it keeps failing"
+            );
             result.error = Some(e.to_string());
             return result;
         }
@@ -124,7 +136,11 @@ pub fn run_vault_sync(vault_root: &Path, opts: VaultSyncOptions) -> VaultSyncRes
         Ok(n) => n,
         Err(e) => {
             progress.stop("harness merge failed");
-            eprintln!("vault-sync: harness merge failed: {e}");
+            eprintln!(
+                "✗ vault-sync: harness merge failed: {e}\n\
+                 💡 check that CLAUDE.md / GEMINI.md at the vault root are writable, then \
+                 retry `onebrain vault sync`"
+            );
             result.error = Some(e.to_string());
             return result;
         }
@@ -141,7 +157,10 @@ pub fn run_vault_sync(vault_root: &Path, opts: VaultSyncOptions) -> VaultSyncRes
 
     // ── Step 6 · onebrain.yml update ─────────────────────────────────────────
     if let Err(e) = update_vault_yml(vault_root, &update_channel) {
-        eprintln!("vault-sync: onebrain.yml update failed: {e}");
+        eprintln!(
+            "✗ vault-sync: onebrain.yml update failed: {e}\n\
+             💡 check that onebrain.yml is writable, then retry `onebrain vault sync`"
+        );
         result.error = Some(e.to_string());
         return result;
     }
@@ -164,7 +183,11 @@ pub fn run_vault_sync(vault_root: &Path, opts: VaultSyncOptions) -> VaultSyncRes
                 }
             }
             Err(e) => {
-                eprintln!("vault-sync: pin warning: {e}");
+                eprintln!(
+                    "⚠ vault-sync: pin warning: {e} (non-fatal — the sync itself succeeded)\n\
+                     💡 no action needed; Claude Code keeps using its current plugin copy \
+                     until the next successful pin"
+                );
                 result.pin_skipped = true;
                 progress.stop("pin skipped (error — non-fatal)");
             }

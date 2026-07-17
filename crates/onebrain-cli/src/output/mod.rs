@@ -11,11 +11,15 @@
 pub mod boxed;
 pub mod dispatcher;
 pub mod envelope;
+pub mod hinted;
 pub mod layout;
 pub mod mode;
 pub mod progress;
 
 pub use dispatcher::emit;
+// `HintedError` — top-level-bail carrier for the ✗/💡 output-style contract
+// (text-mode dressing without leaking glyphs into the JSON error envelope).
+pub use hinted::HintedError;
 // Shared grouped-status layout primitives — `section` / `item` build the
 // house-style header + indented rows used by `search status`, `search
 // reindex`, `serve`, and any other status-like text output.

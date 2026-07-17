@@ -337,11 +337,13 @@ pub fn run_lex(
     let vault_info = crate::vault_ctx::info_from(&resolved);
 
     let Some(collection) = collection else {
-        anyhow::bail!(
-            "❌ no search collection configured\n\
-             💡  set `search.collection` in onebrain.yml (or run `onebrain init`), \
-             then run `onebrain search reindex`"
-        );
+        // `HintedError` (R3, #279): the ✗/💡 dressing is text-mode-only —
+        // structured error envelopes get the single-line plain text.
+        return Err(anyhow::Error::new(crate::output::HintedError::new(
+            "no search collection configured",
+            "set `search.collection` in onebrain.yml (or run `onebrain init`), \
+             then run `onebrain search reindex`",
+        )));
     };
     let cache_dir = collection_cache_dir(&collection);
     let lex = LexIndex::open(&index_artifact_path(&cache_dir, "tantivy"))

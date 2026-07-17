@@ -398,14 +398,17 @@ fn resolve_query_results(
         Some(Ok(hits)) if !hits.is_empty() => Some(hits),
         Some(Ok(_)) => {
             eprintln!(
-                "onebrain mcp: query-tool rerank resolved 0 of {} candidates — falling back to fused order",
+                "⚠ Reranking matched none of the {} candidates — falling back to the plain fused \
+                 order\n\
+                 💡 automatic — no action needed unless every query hits this",
                 survivors.len()
             );
             None
         }
         Some(Err(e)) => {
             eprintln!(
-                "onebrain mcp: query-tool rerank failed — falling back to fused order: {e:#}"
+                "⚠ Reranking failed — falling back to the plain fused order: {e:#}\n\
+                 💡 if this repeats, run `onebrain search status` to check the reranker model"
             );
             None
         }
@@ -555,14 +558,29 @@ fn lex_subquery(resolved: &ResolvedVault, text: &str, top_k: usize) -> anyhow::R
 /// (vector-only has no lex analogue, so it errors instead of degrading).
 ///
 /// Split out of the tool body so the degradation branch is unit-testable
-/// without a running engine. Note: guarding on the exact `SEMANTIC_UNAVAILABLE`
-/// string would be dead code in the shipped (semantic-on) build, where that
-/// string never occurs — hence the `has_lex`-only guard here.
+/// without a running engine. Note: the *degradation decision* keys only on
+/// `has_lex` (guarding it on the exact `SEMANTIC_UNAVAILABLE` string would be
+/// dead code in the shipped semantic-on build); the marker is consulted only
+/// to pick an honest hint — in a lex-only build "run `onebrain search
+/// reindex`" would be false advice (no reindex can add embeddings there).
 fn degrade_vec_error(has_lex: bool, result: anyhow::Result<Vec<Hit>>) -> anyhow::Result<Vec<Hit>> {
     match result {
         Ok(hits) => Ok(hits),
         Err(e) if has_lex => {
-            eprintln!("onebrain mcp: vec/hyde sub-query degraded to lex (skipping): {e:#}");
+            let detail = format!("{e:#}");
+            if detail.contains(onebrain_search::engine::SEMANTIC_UNAVAILABLE) {
+                eprintln!(
+                    "⚠ Semantic search fell back to keyword-only — this build has no semantic \
+                     search support (no ONNX runtime for this platform)\n\
+                     💡 keyword results still work; a platform build with semantic support is \
+                     needed for vector search"
+                );
+            } else {
+                eprintln!(
+                    "⚠ Semantic search fell back to keyword-only — {detail}\n\
+                     💡 run `onebrain search reindex` to restore embeddings"
+                );
+            }
             Ok(Vec::new())
         }
         Err(e) => Err(e),

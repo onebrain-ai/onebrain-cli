@@ -235,7 +235,7 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
         if args.open {
             // Best-effort, same as the standalone path below.
             if let Err(e) = open_browser(&url) {
-                eprintln!("warning: could not open browser: {e}");
+                eprintln!("⚠ Could not open your browser automatically — {e}\n💡 open the URL above manually");
             }
         }
         return Ok(());
@@ -346,14 +346,43 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
             if open_flag {
                 // Best-effort: a failed browser launch must not stop the server.
                 if let Err(e) = open_browser(&url) {
-                    eprintln!("warning: could not open browser: {e}");
+                    eprintln!("⚠ Could not open your browser automatically — {e}\n💡 open the URL above manually");
                 }
             }
         };
         server::run_server_with(cfg, shutdown, on_bind).await
-    })?;
+    })
+    .map_err(contract_bind_error)?;
 
     Ok(())
+}
+
+/// Dress a standalone-bind failure in contract style: what happened, and a
+/// concrete next step. Recognised by the stable `"bind HTTP listener"`
+/// context `server::run_server_from_router` attaches right before the TCP
+/// bind (#278) — every other error `run`'s `block_on` can return (a
+/// mid-flight HTTP fault, a runtime build failure, ...) passes through
+/// unchanged, since those already carry their own explanation and this
+/// serve-specific hint wouldn't fit them.
+///
+/// The dressing rides a [`crate::output::HintedError`] attached via
+/// `.context(..)` ON TOP of the original error, never a rebuilt
+/// `anyhow::anyhow!` — the underlying `std::io::Error` must stay in the
+/// chain so `exit::exit_code_for` keeps its specific mapping (e.g. a
+/// permission-denied bind → exit 66, not the generic 1), and so the glyphs
+/// never reach the structured error envelope (`HintedError`'s Display is the
+/// plain line only).
+fn contract_bind_error(e: anyhow::Error) -> anyhow::Error {
+    let detail = format!("{e:#}");
+    if !detail.contains("bind HTTP listener") {
+        return e;
+    }
+    e.context(crate::output::HintedError::new(
+        format!("Could not start the server — {detail}"),
+        "something else is already using that address — pick a different port with \
+         `--port <N>`, or drop `--port`/`--dir` (and `$ONEBRAIN_BIND`) so `onebrain serve` \
+         reuses or starts the per-vault daemon instead",
+    ))
 }
 
 /// Open `url` in the platform default browser (best-effort).
@@ -422,7 +451,14 @@ fn open_browser(url: &str) -> Result<()> {
     #[cfg(not(any(unix, windows)))]
     {
         let _ = url;
-        anyhow::bail!("--open is not supported on this platform yet")
+        // Glyph-free on purpose: every caller catches this Err and embeds it
+        // in its own `⚠ Could not open your browser automatically — {e}` +
+        // `💡 open the URL above manually` wrapper — glyphs here would nest
+        // inside that line.
+        anyhow::bail!(
+            "opening a browser isn't supported on this platform yet \
+             (only macOS, Linux, and Windows are)"
+        )
     }
 }
 
@@ -458,6 +494,46 @@ fn windows_start_cmdline(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CRITICAL 2 (#279 review): the contract dressing must sit ON TOP of the
+    /// original bind error, not replace it — a permission-denied bind keeps
+    /// its specific exit code (66, `EXIT_FS_ERROR`) instead of collapsing to
+    /// the generic 1. A privileged-port bind isn't reliably testable in CI
+    /// (macOS allows unprivileged low-port binds), so simulate the io::Error
+    /// kind directly.
+    #[test]
+    fn contract_bind_error_preserves_permission_denied_exit_66() {
+        let io = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let original = anyhow::Error::from(io).context("bind HTTP listener on 127.0.0.1:80");
+        let dressed = contract_bind_error(original);
+        assert_eq!(
+            crate::exit::exit_code_for(&dressed),
+            crate::exit::EXIT_FS_ERROR,
+            "io::Error must survive in the chain for exit-code mapping"
+        );
+        // And the dressing rides a HintedError whose Display (→ the JSON
+        // error envelope's message) is single-line and glyph-free.
+        let hinted = dressed
+            .downcast_ref::<crate::output::HintedError>()
+            .expect("bind failure must carry the HintedError dressing");
+        assert!(hinted.plain.contains("bind HTTP listener"), "{hinted:?}");
+        assert!(
+            !hinted.plain.contains('✗')
+                && !hinted.plain.contains('💡')
+                && !hinted.plain.contains('\n'),
+            "plain must be single-line and glyph-free: {hinted:?}"
+        );
+    }
+
+    /// Non-bind errors pass through `contract_bind_error` untouched — the
+    /// serve-specific hint would be wrong for them.
+    #[test]
+    fn contract_bind_error_passes_other_errors_through() {
+        let e = anyhow::anyhow!("some mid-flight HTTP fault");
+        let out = contract_bind_error(e);
+        assert!(out.downcast_ref::<crate::output::HintedError>().is_none());
+        assert_eq!(out.to_string(), "some mid-flight HTTP fault");
+    }
 
     #[test]
     fn ui_label_with_and_without_date() {

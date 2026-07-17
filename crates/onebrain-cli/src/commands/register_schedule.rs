@@ -426,8 +426,9 @@ fn resolve_logs_folder(vault: &Path) -> String {
         raw
     } else {
         eprintln!(
-            "register-schedule: refusing unsafe folders.logs value '{raw}' (must be a relative \
-             path with no `..` segments) — falling back to '07-logs'"
+            "⚠ Ignoring unsafe folders.logs value '{raw}' — it must be a relative path with no \
+             `..` segments; using '07-logs' for the scheduler logs instead\n\
+             💡 fix `folders.logs` in onebrain.yml to a safe relative path"
         );
         "07-logs".to_string()
     }
@@ -594,8 +595,10 @@ fn cleanup_stale_legacy_plist(
         Err(e) => {
             if !quiet {
                 eprintln!(
-                    "warning: could not remove stale legacy plist {}: {e} — it may keep firing \
-                     until manually removed",
+                    "⚠ Could not remove stale legacy plist {} — {e}; it may keep firing until \
+                     removed\n\
+                     💡 delete {} manually",
+                    legacy_target.display(),
                     legacy_target.display()
                 );
             }
@@ -729,7 +732,12 @@ fn test_run(vault: &Path, skill: &str) -> Result<()> {
         .with_context(|| format!("spawn `{exe} run-skill` for test invocation"))?;
     if !status.success() {
         let code = status.code().unwrap_or(-1);
-        eprintln!("--test: skill `{skill_name}` exited with code {code}");
+        eprintln!(
+            "✗ --test: skill `{skill_name}` exited with code {code} (see its output above)\n\
+             💡 rerun it directly with `onebrain skill run --vault {} --skill {skill_name}` to debug \
+             outside the scheduler",
+            vault.display()
+        );
         return Err(anyhow!("test invocation of `{skill_name}` failed"));
     }
     println!("--test: completed successfully");

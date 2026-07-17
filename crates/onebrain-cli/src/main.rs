@@ -112,8 +112,12 @@ fn main() {
 /// Render an error in a way that matches the requested output mode.
 ///
 /// Text mode (default human) writes the v3.0-style `Error: <msg>` line to
-/// stderr — keeps the human-readable path unchanged. Structured modes
-/// (`--json` / `--yaml`) build a canonical envelope
+/// stderr — keeps the human-readable path unchanged — EXCEPT when the error
+/// carries a [`output::HintedError`] (#279 output-style contract): then the
+/// ✗/💡 dressing renders here (`✗ {plain}` + `💡 {hint}`), and structured
+/// modes below stay glyph-free because `error_code_and_message` uses the
+/// top-level Display, which `HintedError` defines as `plain` only. Structured
+/// modes (`--json` / `--yaml`) build a canonical envelope
 /// (`ok: false`, `error: {code, message}`) and emit it on stdout so machine
 /// consumers always see one well-formed JSON document per invocation.
 ///
@@ -129,7 +133,14 @@ fn main() {
 /// propagate the exit code unchanged.
 fn render_error(e: &anyhow::Error, mode: &OutputMode) {
     if !mode.is_structured() {
-        eprintln!("Error: {e:#}");
+        // `plain` already embeds the what/why (including any wrapped cause
+        // the site chose to inline), so no `{e:#}` chain dump here — the
+        // underlying source stays in the chain for `exit_code_for` only.
+        if let Some(h) = e.downcast_ref::<output::HintedError>() {
+            eprintln!("✗ {}\n💡 {}", h.plain, h.hint);
+        } else {
+            eprintln!("Error: {e:#}");
+        }
         return;
     }
 

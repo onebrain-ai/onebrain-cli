@@ -93,12 +93,16 @@ pub(crate) fn split_frontmatter(text: &str) -> Result<(SkillFrontmatter, String)
 pub(crate) fn load_skill(vault: &Path, name: &str) -> Result<Result<ParsedSkill, i32>> {
     let name = normalize_name(name);
     if name.is_empty() {
-        eprintln!("skill: name must not be empty");
+        eprintln!(
+            "✗ Skill name must not be empty\n\
+             💡 pass a skill name, e.g. `onebrain skill info daily`"
+        );
         return Ok(Err(64));
     }
     if find_config_file(vault).is_none() {
         eprintln!(
-            "Vault not found at {} (no onebrain.yml present)",
+            "✗ Vault not found at {} (no onebrain.yml present)\n\
+             💡 run this from inside a vault, or pass `--vault <path>` pointing at one",
             vault.display()
         );
         return Ok(Err(78));
@@ -107,18 +111,31 @@ pub(crate) fn load_skill(vault: &Path, name: &str) -> Result<Result<ParsedSkill,
     let bytes = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("skill: no SKILL.md at {}", path.display());
+            eprintln!(
+                "✗ No skill named \"{name}\" — no SKILL.md at {}\n\
+                 💡 check the name — available skills live under \
+                 .claude/plugins/onebrain/skills/ in the vault",
+                path.display()
+            );
             return Ok(Err(66));
         }
         Err(e) => {
-            eprintln!("skill: reading {}: {e}", path.display());
+            eprintln!(
+                "✗ Could not read {} — {e}\n\
+                 💡 check the file's permissions",
+                path.display()
+            );
             return Ok(Err(66));
         }
     };
     let (mut frontmatter, body) = match split_frontmatter(&bytes) {
         Ok(parts) => parts,
         Err(e) => {
-            eprintln!("skill {name}: {e}");
+            eprintln!(
+                "✗ Skill \"{name}\"'s SKILL.md has malformed frontmatter — {e}\n\
+                 💡 fix the YAML between the `---` markers at the top of {}",
+                path.display()
+            );
             return Ok(Err(65));
         }
     };
