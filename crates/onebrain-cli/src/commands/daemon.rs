@@ -1000,17 +1000,24 @@ fn wait_until_ready(pid: u32, discovery: &Path, timeout: std::time::Duration) ->
 /// masking a confirmable bind failure as `ReadyOutcome::TimedOut`, which
 /// `run_start` treats as best-effort success).
 ///
-/// `Err` from `waitpid` (e.g. `ECHILD` — not literally our child, which only
-/// happens in tests that pass an arbitrary pid) falls back to the plain
+/// `EINTR` (interrupted by a signal before `waitpid` could answer) is retried
+/// inline rather than punted to the caller's next 25ms poll tick — at the
+/// deadline edge that punt could turn a confirmable death into a spurious
+/// `TimedOut`. Any other `Err` (e.g. `ECHILD` — not literally our child, which
+/// only happens in tests that pass an arbitrary pid) falls back to the plain
 /// existence probe: a pid that doesn't exist at all is definitely dead.
 #[cfg(unix)]
 fn child_has_exited(pid: u32) -> bool {
+    use nix::errno::Errno;
     use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
     use nix::unistd::Pid;
-    match waitpid(Pid::from_raw(pid as i32), Some(WaitPidFlag::WNOHANG)) {
-        Ok(WaitStatus::StillAlive) => false,
-        Ok(_) => true, // Exited / Signaled / etc. — reaped, confirmed dead.
-        Err(_) => !bare_pid_or_session_alive(pid),
+    loop {
+        match waitpid(Pid::from_raw(pid as i32), Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => return false,
+            Ok(_) => return true, // Exited / Signaled / etc. — reaped, confirmed dead.
+            Err(Errno::EINTR) => continue,
+            Err(_) => return !bare_pid_or_session_alive(pid),
+        }
     }
 }
 

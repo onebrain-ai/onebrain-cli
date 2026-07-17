@@ -11,17 +11,32 @@
 //! `crates/onebrain-cli/src/commands/serve.rs` and
 //! `crates/onebrain-cli/src/server/mod.rs`).
 //!
-//! This test occupies a port itself (a real ephemeral `TcpListener` we bind
-//! and hold for the duration of the assertion), then runs `onebrain serve
-//! --port <that port>` against it. `--port` forces the standalone bind path
-//! (skips daemon routing entirely — see `wants_daemon_routing` in
-//! `serve.rs`), so the subprocess returns promptly with the bind error
-//! instead of blocking on Ctrl-C.
+//! Two tests pin the ordering from both sides:
+//! - The NEGATIVE half occupies a port itself (a real ephemeral `TcpListener`
+//!   held for the duration of the assertion), runs `onebrain serve --port
+//!   <that port>` against it, and asserts NO banner/URL/token appears —
+//!   only the bind error.
+//! - The POSITIVE half runs `onebrain serve --port <free port>` for real and
+//!   asserts the banner DOES appear after a successful bind — without it, the
+//!   negative half would still pass if the `on_bind` banner print were
+//!   deleted entirely.
+//!
+//! In both, `--port` forces the standalone bind path (skips daemon routing
+//! entirely — see `wants_daemon_routing` in `serve.rs`).
 
 use assert_cmd::Command;
 use std::fs;
 use std::net::TcpListener;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
+
+/// Create a minimal vault — `serve` is vault-required and resolves it before
+/// anything else, so this just needs to exist.
+fn minimal_vault() -> tempfile::TempDir {
+    let vault = tempdir().unwrap();
+    fs::write(vault.path().join("onebrain.yml"), "method: onebrain\n").unwrap();
+    vault
+}
 
 #[test]
 fn serve_bind_failure_prints_no_success_banner_before_the_error() {
@@ -30,10 +45,7 @@ fn serve_bind_failure_prints_no_success_banner_before_the_error() {
     let occupied = TcpListener::bind("127.0.0.1:0").expect("bind a probe port");
     let port = occupied.local_addr().unwrap().port();
 
-    // Minimal vault — `serve` is vault-required and resolves it before
-    // anything else, so this just needs to exist.
-    let vault = tempdir().unwrap();
-    fs::write(vault.path().join("onebrain.yml"), "method: onebrain\n").unwrap();
+    let vault = minimal_vault();
 
     let out = Command::cargo_bin("onebrain")
         .unwrap()
@@ -82,4 +94,83 @@ fn serve_bind_failure_prints_no_success_banner_before_the_error() {
         stderr.contains("bind HTTP listener"),
         "must surface the bind error: stderr={stderr}"
     );
+}
+
+/// RAII kill for the long-running `serve` subprocess: a failed assertion
+/// between spawn and the test's own kill must never leak a listener that
+/// blocks on Ctrl-C forever (mirrors `StopDaemonOnDrop` in the daemon tests).
+/// A double kill (Drop after the happy path already killed) is a no-op error.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The POSITIVE half of the #278 ordering contract: after a SUCCESSFUL bind,
+/// the banner (with the stop hint and the token-bearing URL) must appear on
+/// stdout. Without this test, the negative assertions above would still pass
+/// if the `on_bind` banner print were deleted entirely.
+#[test]
+fn serve_successful_bind_prints_the_banner() {
+    // Learn a free port the same way `server/tests.rs` does: bind an
+    // ephemeral probe, read the port, drop it, and let `serve` re-bind it
+    // (reliable on 127.0.0.1 for a localhost test).
+    let probe = TcpListener::bind("127.0.0.1:0").expect("bind a probe port");
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let vault = minimal_vault();
+
+    // `serve` blocks on Ctrl-C after a successful bind, so `.output()` would
+    // hang — spawn instead, with stdout captured to a file we can poll while
+    // the child runs.
+    let stdout_path = vault.path().join("serve-stdout.log");
+    let stdout_file = fs::File::create(&stdout_path).unwrap();
+    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("onebrain"))
+        .current_dir(vault.path())
+        .env_remove("ONEBRAIN_VAULT")
+        .env("ONEBRAIN_NO_DAEMON", "1")
+        .args(["serve", "--port", &port.to_string()])
+        .stdout(stdout_file)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn onebrain binary");
+    let mut child = KillOnDrop(child);
+
+    // Bounded poll (≤5s, well under the 10s budget): the banner prints from
+    // `on_bind`, i.e. as soon as the listener is up.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let stdout = loop {
+        let s = fs::read_to_string(&stdout_path).unwrap_or_default();
+        if s.contains("Ctrl-C to stop") {
+            break s;
+        }
+        if let Some(status) = child.0.try_wait().expect("probe serve child") {
+            panic!("serve exited early ({status}) instead of serving: stdout={s}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "banner never appeared within 5s of a successful bind: stdout={s}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    // The full banner: section header, token-bearing URL on the bound port,
+    // and the stop hint (already matched by the loop above).
+    assert!(
+        stdout.contains("Serving"),
+        "banner header must appear after a successful bind: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("http://127.0.0.1:{port}/?token=")),
+        "token-bearing URL for the bound port must appear: {stdout}"
+    );
+
+    // Terminate the still-serving child (also covered by KillOnDrop on the
+    // panic paths above).
+    child.0.kill().expect("kill serve child");
+    child.0.wait().expect("reap serve child");
 }

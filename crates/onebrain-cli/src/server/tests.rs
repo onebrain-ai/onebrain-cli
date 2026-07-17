@@ -967,7 +967,7 @@ async fn run_server_binds_serves_and_shuts_down_cleanly() {
         .expect("server task panicked");
     assert!(
         joined.is_ok(),
-        "run_server should return Ok(()) on graceful shutdown, got: {joined:?}"
+        "run_server_with should return Ok(()) on graceful shutdown, got: {joined:?}"
     );
 
     // ── tiny raw-TCP HTTP/1.1 helpers (no reqwest/hyper dev-dep) ──
