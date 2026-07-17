@@ -910,8 +910,11 @@ pub fn run_start(mode: &OutputMode, vault: Option<&Path>) -> Result<()> {
     if let ReadyOutcome::Died = wait_until_ready(pid, &slot.json, std::time::Duration::from_secs(5))
     {
         anyhow::bail!(
-            "daemon process (pid {pid}) exited before it finished binding its HTTP listener; \
-             check the daemon log for the underlying error"
+            "✗ Daemon did not start — it exited before it finished binding its HTTP listener \
+             (pid {pid} is gone)\n\
+             💡 check `{}` for the real cause (often another process already using the port); \
+             run `onebrain daemon status`, then retry `onebrain daemon start`",
+            slot.log.display()
         );
     }
 
@@ -1049,7 +1052,11 @@ fn emit_already_running(mode: &OutputMode, pid: u32) -> Result<()> {
 fn render_start_text(env: &Envelope<DaemonStartData>) -> String {
     let d = env.data.as_ref().expect("ok envelope always has data");
     if d.already_running {
-        format!("daemon already running (pid {})", d.pid)
+        format!(
+            "daemon already running (pid {}) — this vault is already served\n\
+             💡 run `onebrain daemon stop --vault .` first if you want to restart it",
+            d.pid
+        )
     } else {
         format!("daemon started (pid {})", d.pid)
     }

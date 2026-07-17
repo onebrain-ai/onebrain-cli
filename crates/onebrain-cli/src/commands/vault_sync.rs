@@ -98,11 +98,19 @@ fn run_with(
 
     if !result.ok {
         if let Some(err) = result.error.as_ref() {
-            eprintln!("vault-sync: failed: {err}");
+            eprintln!(
+                "✗ vault-sync: failed: {err}\n\
+                 💡 check your network connection, then retry `onebrain vault-sync`; run \
+                 `onebrain doctor` afterward if you're unsure whether the sync partially applied"
+            );
         } else {
             // No structured error captured — still surface non-zero with a
             // generic hint so schedulers/CI can see something happened.
-            eprintln!("vault-sync: failed (no error detail captured)");
+            eprintln!(
+                "✗ vault-sync: failed (no error detail captured)\n\
+                 💡 retry `onebrain vault-sync`; if it keeps failing, run `onebrain doctor` to \
+                 check the vault's overall health"
+            );
         }
         return Ok(1);
     }

@@ -398,14 +398,16 @@ fn resolve_query_results(
         Some(Ok(hits)) if !hits.is_empty() => Some(hits),
         Some(Ok(_)) => {
             eprintln!(
-                "onebrain mcp: query-tool rerank resolved 0 of {} candidates — falling back to fused order",
+                "⚠ Reranking matched none of the {} candidates — falling back to the plain fused \
+                 order (automatic; no action needed unless every query hits this)",
                 survivors.len()
             );
             None
         }
         Some(Err(e)) => {
             eprintln!(
-                "onebrain mcp: query-tool rerank failed — falling back to fused order: {e:#}"
+                "⚠ Reranking failed — falling back to the plain fused order: {e:#}\n\
+                 💡 if this repeats, run `onebrain search status` to check the reranker model"
             );
             None
         }
@@ -562,7 +564,10 @@ fn degrade_vec_error(has_lex: bool, result: anyhow::Result<Vec<Hit>>) -> anyhow:
     match result {
         Ok(hits) => Ok(hits),
         Err(e) if has_lex => {
-            eprintln!("onebrain mcp: vec/hyde sub-query degraded to lex (skipping): {e:#}");
+            eprintln!(
+                "⚠ Semantic search fell back to keyword-only — {e:#}\n\
+                 💡 run `onebrain search reindex` to restore embeddings"
+            );
             Ok(Vec::new())
         }
         Err(e) => Err(e),

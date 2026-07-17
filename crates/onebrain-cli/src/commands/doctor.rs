@@ -123,7 +123,10 @@ pub fn run(
     // Best-effort config load — on error, fall back to defaults so doctor can
     // still report what it sees (matches Bun behavior: stderr warning + defaults).
     let config = load_vault_config(&vault_root).unwrap_or_else(|err| {
-        eprintln!("doctor: config load warning: {err}");
+        eprintln!(
+            "⚠ Could not read onebrain.yml — {err}: showing defaults for the checks below\n\
+             💡 fix the YAML syntax error above in onebrain.yml, then rerun `onebrain doctor`"
+        );
         onebrain_core::VaultConfig {
             qmd_collection: None,
             checkpoint: Default::default(),
@@ -3559,7 +3562,7 @@ fn stamp_doctor_run(vault_root: &Path, fix: bool, quiet: bool) {
         Err(e) => {
             if !quiet {
                 eprintln!(
-                    "doctor: could not read {} to stamp last_doctor_run: {e}",
+                    "⚠ Could not record today's run in {} — {e} (the checks above are unaffected)",
                     path.display()
                 );
             }
@@ -3585,7 +3588,10 @@ fn stamp_doctor_run(vault_root: &Path, fix: bool, quiet: bool) {
             };
             if let Err(e) = onebrain_fs::atomic_write_text(&path, &final_text) {
                 if !quiet {
-                    eprintln!("doctor: could not update last_doctor_run: {e}");
+                    eprintln!(
+                        "⚠ Could not record today's run in {} — {e} (the checks above are unaffected)",
+                        path.display()
+                    );
                 }
             }
         }
@@ -3594,13 +3600,17 @@ fn stamp_doctor_run(vault_root: &Path, fix: bool, quiet: bool) {
         // never-advancing timestamp doesn't look like a silent bug.
         None if !quiet && config_has_inline_stats(&text) => {
             eprintln!(
-                "doctor: `stats` in {} is an inline mapping; last_doctor_run not stamped — convert it to a block to enable stamping",
+                "⚠ Run not recorded — {}'s `stats:` block is written as an inline mapping (`{{…}}`)\n\
+                 💡 convert `stats:` in {} to block YAML form to enable run-timestamp tracking",
+                path.display(),
                 path.display()
             );
         }
         None if !quiet && text.trim_start().starts_with('{') => {
             eprintln!(
-                "doctor: {} has a flow-style (`{{…}}`) root; last_doctor_run not stamped — convert it to block form to enable stamping",
+                "⚠ Run not recorded — {} has a flow-style (`{{…}}`) root\n\
+                 💡 convert {} to block YAML form to enable run-timestamp tracking",
+                path.display(),
                 path.display()
             );
         }
@@ -3636,13 +3646,17 @@ fn decline_qmd_cleanup(vault_root: &Path) {
     }
     if let Err(e) = onebrain_fs::backup_config_file(&path) {
         eprintln!(
-            "doctor: could not back up {} before recording qmd cleanup decline: {e}",
+            "⚠ Could not save your qmd-cleanup choice — backing up {} first failed: {e} \
+             (doctor will ask again next run)",
             path.display()
         );
         return;
     }
     if let Err(e) = onebrain_fs::atomic_write_text(&path, &updated) {
-        eprintln!("doctor: could not record qmd cleanup decline: {e}");
+        eprintln!(
+            "⚠ Could not save your qmd-cleanup choice to {} — {e} (doctor will ask again next run)",
+            path.display()
+        );
     }
 }
 

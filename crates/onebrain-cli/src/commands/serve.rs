@@ -235,7 +235,7 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
         if args.open {
             // Best-effort, same as the standalone path below.
             if let Err(e) = open_browser(&url) {
-                eprintln!("warning: could not open browser: {e}");
+                eprintln!("⚠ Could not open your browser automatically — {e}\n💡 open the URL above manually.");
             }
         }
         return Ok(());
@@ -346,14 +346,35 @@ pub fn run(args: &ServeArgs, _mode: &OutputMode) -> Result<()> {
             if open_flag {
                 // Best-effort: a failed browser launch must not stop the server.
                 if let Err(e) = open_browser(&url) {
-                    eprintln!("warning: could not open browser: {e}");
+                    eprintln!("⚠ Could not open your browser automatically — {e}\n💡 open the URL above manually.");
                 }
             }
         };
         server::run_server_with(cfg, shutdown, on_bind).await
-    })?;
+    })
+    .map_err(contract_bind_error)?;
 
     Ok(())
+}
+
+/// Rewrite a standalone-bind failure into contract style: what happened, and
+/// a concrete next step. Recognised by the stable `"bind HTTP listener"`
+/// context `server::run_server_from_router` attaches right before the TCP
+/// bind (#278) — every other error `run`'s `block_on` can return (a
+/// mid-flight HTTP fault, a runtime build failure, ...) passes through
+/// unchanged, since those already carry their own explanation and this
+/// serve-specific hint wouldn't fit them.
+fn contract_bind_error(e: anyhow::Error) -> anyhow::Error {
+    let detail = format!("{e:#}");
+    if !detail.contains("bind HTTP listener") {
+        return e;
+    }
+    anyhow::anyhow!(
+        "✗ Could not start the server — {detail}\n\
+         💡 something else is already using that address — pick a different port with \
+         `--port <N>`, or drop --port/--dir (and $ONEBRAIN_BIND) so `onebrain serve` reuses \
+         or starts the per-vault daemon instead"
+    )
 }
 
 /// Open `url` in the platform default browser (best-effort).
@@ -422,7 +443,11 @@ fn open_browser(url: &str) -> Result<()> {
     #[cfg(not(any(unix, windows)))]
     {
         let _ = url;
-        anyhow::bail!("--open is not supported on this platform yet")
+        anyhow::bail!(
+            "✗ Can't open a browser automatically — this platform isn't one of the ones \
+             OneBrain knows how to launch a browser on (macOS/Linux/Windows)\n\
+             💡 copy the URL above into your browser."
+        )
     }
 }
 

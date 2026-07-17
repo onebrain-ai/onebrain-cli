@@ -729,7 +729,12 @@ fn test_run(vault: &Path, skill: &str) -> Result<()> {
         .with_context(|| format!("spawn `{exe} run-skill` for test invocation"))?;
     if !status.success() {
         let code = status.code().unwrap_or(-1);
-        eprintln!("--test: skill `{skill_name}` exited with code {code}");
+        eprintln!(
+            "✗ --test: skill `{skill_name}` exited with code {code} (see its output above)\n\
+             💡 rerun it directly with `onebrain skill run --vault {} --skill {skill_name}` to debug \
+             outside the scheduler",
+            vault.display()
+        );
         return Err(anyhow!("test invocation of `{skill_name}` failed"));
     }
     println!("--test: completed successfully");

@@ -17,7 +17,10 @@ pub fn run(name: &str, cutoff: Option<&str>, vault: Option<&str>) -> Result<()> 
     let vault_root = match vault_root {
         Some(p) => p,
         None => {
-            eprintln!("migrate: not inside a vault (no onebrain.yml or vault.yml found)");
+            eprintln!(
+                "✗ migrate: not inside a vault (no onebrain.yml or vault.yml found)\n\
+                 💡 run this from inside a vault, or pass --vault <path> pointing at one"
+            );
             return Ok(());
         }
     };
@@ -25,7 +28,10 @@ pub fn run(name: &str, cutoff: Option<&str>, vault: Option<&str>) -> Result<()> 
     let config = match load_vault_config_at(&vault_root) {
         Ok(c) => c,
         Err(err) => {
-            eprintln!("migrate: config load failed: {err}");
+            eprintln!(
+                "✗ migrate: couldn't load onebrain.yml — {err}\n\
+                 💡 fix the YAML syntax error above in onebrain.yml, then rerun this migration"
+            );
             return Ok(());
         }
     };
@@ -53,9 +59,18 @@ fn dispatch<W: Write>(
         "backfill-recapped" => {
             let today = chrono::Utc::now().date_naive().to_string();
             let result = run_backfill_recapped(logs_folder, cutoff, &today, |msg| {
-                // Mirror Bun: each warning is its own stderr line.
+                // Mirror Bun: each warning is its own stderr line. Wording stays
+                // stable (Bun-parity) — the aggregate hint below is the one new
+                // contract-shaped addition, printed once rather than per file.
                 eprintln!("{msg}");
             });
+            if result.skipped > 0 {
+                eprintln!(
+                    "💡 {} file(s) were skipped — see the messages above; a malformed \
+                     frontmatter block usually just needs valid YAML between the `---` markers",
+                    result.skipped
+                );
+            }
             writeln!(
                 out,
                 "backfilled: {} files, skipped: {}",
@@ -64,7 +79,10 @@ fn dispatch<W: Write>(
             .context("write stdout")?;
         }
         _ => {
-            eprintln!("migrate: unknown migration '{name}'");
+            eprintln!(
+                "✗ migrate: unknown migration '{name}'\n\
+                 💡 the only migration currently available is `backfill-recapped`"
+            );
         }
     }
     Ok(())

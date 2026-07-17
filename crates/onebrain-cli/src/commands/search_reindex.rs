@@ -327,6 +327,19 @@ fn spawn_detached_pending_embed(vault_flag: Option<&PathBuf>) -> std::io::Result
     Ok(())
 }
 
+/// Format a fail-open hook-path reindex error in contract style: what
+/// happened, the underlying cause, and a hint. Every caller here always
+/// degrades to a skip envelope right after printing this (still exit 0) —
+/// the parenthetical makes that explicit so a user tailing a hook's stderr
+/// doesn't mistake a skip for a hard failure.
+fn hook_reindex_error(what: &str, e: impl std::fmt::Display) -> String {
+    format!(
+        "✗ Search reindex failed — {what}: {e:#}\n\
+         💡 run `onebrain search status` to check the index, or `onebrain search reindex --force` \
+         to rebuild it (this was an automatic background reindex — nothing else was affected)"
+    )
+}
+
 /// Emit the skip envelope for `reason` and return `Ok(())` — the hook-path
 /// contract's single exit point for every gate failure / run error.
 /// `vault_info` is `None` when the vault itself couldn't be resolved (gate
@@ -373,7 +386,7 @@ fn run_hook_path(
     let resolved = match crate::vault_ctx::require(vault_flag.clone()) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("onebrain search reindex (hook path): {e:#}");
+            eprintln!("{}", hook_reindex_error("couldn't resolve the vault", &e));
             return emit_skip(mode, None, "no-collection");
         }
     };
@@ -381,7 +394,10 @@ fn run_hook_path(
     let collection = match collection_name_readonly(resolved.root.as_path()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("onebrain search reindex (hook path): {e:#}");
+            eprintln!(
+                "{}",
+                hook_reindex_error("couldn't resolve the search collection", &e)
+            );
             return emit_skip(mode, Some(vault_info), "no-collection");
         }
     };
@@ -446,7 +462,12 @@ fn run_hook_path(
         return match spawn_detached_pending_embed(vault_flag.as_ref()) {
             Ok(()) => emit_detached(mode, vault_info),
             Err(e) => {
-                eprintln!("onebrain search reindex --pending-only: failed to detach: {e:#}");
+                eprintln!(
+                    "✗ Search reindex failed — couldn't start the background embed process: {e:#}\n\
+                     💡 run `onebrain search reindex --pending-only` directly to embed in the \
+                     foreground instead (this was an automatic background reindex — nothing else \
+                     was affected)"
+                );
                 emit_skip(mode, Some(vault_info), "detach-failed")
             }
         };
@@ -518,7 +539,10 @@ fn run_hook_via_daemon(
     let resp = match handle.reindex(daemon_mode, &[]) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("onebrain search reindex (hook path, daemon): {e:#}");
+            eprintln!(
+                "{}",
+                hook_reindex_error("the warm daemon's reindex call failed", &e)
+            );
             return emit_skip(mode, Some(vault_info), "daemon-error");
         }
     };
@@ -560,7 +584,7 @@ fn run_lex_only(
     let config = match onebrain_core::load_vault_config(&resolved.root) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("onebrain search reindex --lex-only: {e:#}");
+            eprintln!("{}", hook_reindex_error("couldn't load onebrain.yml", &e));
             return emit_skip(mode, Some(vault_info), "no-collection");
         }
     };
@@ -568,7 +592,10 @@ fn run_lex_only(
         match onebrain_search::engine::Engine::open(cache_dir, &config.search.embed_model) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("onebrain search reindex --lex-only: {e:#}");
+                eprintln!(
+                    "{}",
+                    hook_reindex_error("couldn't open the search index", &e)
+                );
                 return emit_skip(mode, Some(vault_info), engine_open_skip_reason(&e));
             }
         };
@@ -604,7 +631,7 @@ fn run_lex_only(
     let stats = match result {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("onebrain search reindex --lex-only: {e:#}");
+            eprintln!("{}", hook_reindex_error("the keyword pass failed", &e));
             return emit_skip(mode, Some(vault_info), "error");
         }
     };
@@ -645,7 +672,7 @@ fn run_pending_only(
     let config = match onebrain_core::load_vault_config(&resolved.root) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("onebrain search reindex --pending-only: {e:#}");
+            eprintln!("{}", hook_reindex_error("couldn't load onebrain.yml", &e));
             return emit_skip(mode, Some(vault_info), "no-collection");
         }
     };
@@ -653,7 +680,10 @@ fn run_pending_only(
         match onebrain_search::engine::Engine::open(cache_dir, &config.search.embed_model) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("onebrain search reindex --pending-only: {e:#}");
+                eprintln!(
+                    "{}",
+                    hook_reindex_error("couldn't open the search index", &e)
+                );
                 return emit_skip(mode, Some(vault_info), engine_open_skip_reason(&e));
             }
         };
@@ -664,7 +694,10 @@ fn run_pending_only(
     let pending = match engine.pending_vector_paths(resolved.root.as_path()) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("onebrain search reindex --pending-only: {e:#}");
+            eprintln!(
+                "{}",
+                hook_reindex_error("couldn't check for pending docs", &e)
+            );
             return emit_skip(mode, Some(vault_info), "error");
         }
     };
@@ -692,7 +725,7 @@ fn run_pending_only(
     let stats = match result {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("onebrain search reindex --pending-only: {e:#}");
+            eprintln!("{}", hook_reindex_error("the embed pass failed", &e));
             return emit_skip(mode, Some(vault_info), "error");
         }
     };

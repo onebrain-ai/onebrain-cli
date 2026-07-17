@@ -147,16 +147,23 @@ pub(crate) fn parse_by(by: Option<&str>) -> Result<(Option<TimeAxis>, Option<Dim
     for part in by.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         if let Some(t) = parse_time_axis(part) {
             if time.replace(t).is_some() {
-                anyhow::bail!("--by: multiple time axes given (saw a second {part:?})");
+                anyhow::bail!(
+                    "✗ --by takes only one time axis (multiple time axes given: also saw \"{part}\")\n\
+                     💡 use exactly one of day, week, month, or year — e.g. `--by month,surface`"
+                );
             }
         } else if let Some(d) = parse_dim(part) {
             if dim.replace(d).is_some() {
-                anyhow::bail!("--by: multiple dimensions given (saw a second {part:?})");
+                anyhow::bail!(
+                    "✗ --by takes only one dimension (multiple dimensions given: also saw \"{part}\")\n\
+                     💡 use exactly one of surface, transform, level, or cache — e.g. `--by month,surface`"
+                );
             }
         } else {
             anyhow::bail!(
-                "--by: unrecognized axis {part:?} — time: day|week|month|year, \
-                 dim: surface|transform|level|cache"
+                "✗ --by doesn't recognize \"{part}\" — expected a time axis (day, week, month, \
+                 year) or a dimension (surface, transform, level, cache)\n\
+                 💡 combine at most one of each, e.g. `--by month,surface`"
             );
         }
     }
