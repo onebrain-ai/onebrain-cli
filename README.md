@@ -53,7 +53,7 @@ From zero to a working OneBrain vault in three steps:
 ```bash
 # 1. Verify the install
 onebrain --version
-# → onebrain 3.4.12
+# → onebrain 3.4.13
 
 # 2. Scaffold a vault and let init pull the OneBrain plugin
 mkdir my-vault && cd my-vault
@@ -117,7 +117,7 @@ Interactive commands print human-readable text; every command also speaks struct
 - [x] **v3.1** — Consistency standard: locked `<noun> <verb>` command tree · canonical `Envelope` output · `vault.yml → onebrain.yml`.
 - [x] **v3.2** — `note` resource group · grouped `doctor` UX · `skill run`/`harness run` for headless skills.
 - [x] **v3.3** — Daemon foundation: `onebrain serve` — embedded web UI over a token-gated vault JSON API.
-- [ ] **v3.4** — **Native Search + Warm Daemon** *(in progress — completes the foundation)*: native Rust search replaces qmd (native engine + `onebrain search` verbs · native MCP server · 0 node/python deps, v3.4.5), plus a minimal **warm daemon** that owns the engine for mcp + search so the CLI works during a live session and multiple sessions coexist (v3.4.6), plus a Tier-2 cross-encoder reranker (`onebrain-rerank-v1`) for calibrated result relevance (v3.4.7) ([milestone](https://github.com/onebrain-ai/onebrain-cli/milestone/4)).
+- [x] **v3.4** — **Native Search + Warm Daemon** *(complete, v3.4.0–v3.4.13)*: native Rust search replaces qmd (native engine + `onebrain search` verbs · native MCP server · 0 node/python deps, v3.4.5), a **warm daemon** that owns the engine so mcp + CLI coexist across live sessions (v3.4.6) — per-vault daemon slots since v3.4.13, a Tier-2 cross-encoder reranker (`onebrain-rerank-v1`) for calibrated result relevance (v3.4.7), self-documenting `onebrain.yml` + doctor validation (v3.4.8), and the **token-optimization layer** — transform ladder, already-sent ledger with a production-gating read-hook, and `onebrain token gain` telemetry (v3.4.10–v3.4.13) ([milestone](https://github.com/onebrain-ai/onebrain-cli/milestone/4)).
 
 ### 🖥️ Phase 1 · Product surfaces — replace Obsidian (v3.5–v3.6)
 - [ ] **v3.5** — **"Desktop + Deeplinks"**: `onebrain desktop` native app + deeplinks + standalone webui file access (`link`/`token`/`desktop` verbs, vault_id, tickets) — the agent hands you a clickable, section-precise webui URL for any vault file; completely replaces Obsidian.
