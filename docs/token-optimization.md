@@ -215,7 +215,9 @@ Note: byte counts are exact; per-model token figures are an estimate — see `do
 With no flags, the report is scoped to the **current epoch** — traffic since
 the last `--reset` (or everything, if you've never reset). Pass `--all-time`
 to sum every epoch including anything archived by a past `--reset`, or
-`--since YYYY-MM-DD` for a custom lower bound.
+`--since YYYY-MM-DD` for a custom lower bound. The `YYYY-MM-DD` format is
+enforced (strict zero-padding): a malformed date errors (exit 70 on the CLI,
+HTTP 400 on the route) instead of silently reporting zero results (#287).
 
 Every read mode — the default summary, `--by`, `--history`, `--all-time`, and
 `--since` — reads the lock-free JSONL raw log (the source of truth), so the

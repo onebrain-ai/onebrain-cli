@@ -19,8 +19,8 @@ Theme: complete the v3.4 line — every failure message says what happened, why,
 - **Token-Gain dashboard reads the lock-free gain JSONL** — the daemon `/api/token/gain` (and `--all-time`/`--since`) no longer serve the never-auto-populated rollup DB, so the WebUI shows real numbers without a manual rebuild; a bare pre-3.4.14 client request still gets the legacy all-time view ([#281](https://github.com/onebrain-ai/onebrain-cli/issues/281))
 - A gain read that races a `--reset` archive rename no longer errors (vanished file = zero events, not a 500)
 - Corrupt gain timestamps bucket under the self-flagging `1970-01.jsonl` (epoch fallback), never the current month's live log
-- `--since` / `?since=` now validate strict `YYYY-MM-DD` — a malformed or non-zero-padded date (e.g. `--since 2026-1-1`) errors (exit 70 / `E_INVALID_DATE`, route 400) instead of silently matching nothing ([#287](https://github.com/onebrain-ai/onebrain-cli/issues/287))
-- The two remaining bare `Error:` dead ends get the ✗/💡 dressing — the vault-not-found walk-up (every verb's most common failure) and `token gain --rebuild`'s EngineBusy remedy (now split into what/why + hint); exit codes 64/77 unchanged ([#288](https://github.com/onebrain-ai/onebrain-cli/issues/288))
+- **Breaking:** `--since` / `?since=` now validate strict `YYYY-MM-DD` — a malformed date errors (exit 70 / `E_INVALID_DATE`, route 400) instead of silently matching nothing; scripts passing non-zero-padded dates like `2026-1-1` must use `2026-01-01` (previously these silently returned zero results) ([#287](https://github.com/onebrain-ai/onebrain-cli/issues/287))
+- The remaining bare `Error:` dead ends get the ✗/💡 dressing — the vault-not-found walk-up and not-a-vault-root failures (every verb's most common errors) and `token gain --rebuild`'s EngineBusy remedy (now split into what/why + hint); exit codes 64/77 unchanged ([#288](https://github.com/onebrain-ai/onebrain-cli/issues/288))
 
 ## [3.4.13] — 2026-07-17 — Ledger works in production + multi-vault daemons
 

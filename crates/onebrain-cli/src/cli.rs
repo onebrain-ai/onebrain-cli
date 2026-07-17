@@ -1497,13 +1497,14 @@ pub struct TokenGainArgs {
     /// last `--reset` (or all-time when no reset has happened).
     #[arg(long = "all-time", default_value_t = false)]
     pub all_time: bool,
-    /// Inclusive lower bound on the window, `YYYY-MM-DD`. Queries all epochs
-    /// (like `--all-time`) filtered to on-or-after this date. Validated
-    /// post-parse (not via clap's own `value_parser`, so a bad value reaches
-    /// the dispatcher and maps to exit 70 / `E_INVALID_DATE` — a clap-native
-    /// parse rejection always exits 2, see `commands::token_gain::validate_since`);
-    /// a non-zero-padded or otherwise malformed value errors rather than
-    /// silently matching nothing (#287).
+    /// Inclusive lower bound on the window, YYYY-MM-DD. Queries all epochs
+    /// (like `--all-time`) filtered to on-or-after this date; invalid or
+    /// non-zero-padded dates error (exit 70).
+    // Validated post-parse (`commands::token_gain::validate_since`), not via
+    // clap's own `value_parser`: a clap-native parse rejection always exits 2
+    // (main.rs calls `err.exit()` before the dispatcher runs), while #287
+    // requires exit 70 / E_INVALID_DATE — which only the dispatcher's
+    // CoreError chain-walk can produce.
     #[arg(long = "since", value_name = "DATE")]
     pub since: Option<String>,
     /// Show the recent per-call raw log (tails the JSONL) instead of a

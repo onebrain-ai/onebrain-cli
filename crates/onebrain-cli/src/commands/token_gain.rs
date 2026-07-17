@@ -229,8 +229,8 @@ pub(crate) fn validate_since(since: Option<&str>) -> Result<()> {
     Err(
         anyhow::Error::new(onebrain_core::CoreError::InvalidDate(since.to_string())).context(
             crate::output::HintedError::new(
-                format!("「--since」 must be a date in YYYY-MM-DD form (got {since:?})"),
-                "example: --since 2026-07-01",
+                format!("--since must be a date in YYYY-MM-DD form (got {since:?})"),
+                "example: `--since 2026-07-01`",
             ),
         ),
     )
@@ -309,9 +309,9 @@ const ROLLUP_LOCK_WHAT: &str =
 /// "no dead-end errors" contract. Wording is fact-corrected (#258/#281: only
 /// `--rebuild` still touches `token.redb`; every read mode is JSONL-backed).
 const ROLLUP_LOCK_REMEDY: &str =
-    "every read mode (the default summary, --by, --history, --all-time, --since, and --reset) \
-     reads the lock-free raw log and works regardless; only --rebuild needs the rollup DB — \
-     retry once that process exits (e.g. `onebrain daemon stop`)";
+    "every read mode (the default summary, `--by`, `--history`, `--all-time`, `--since`, and \
+     `--reset`) reads the lock-free raw log and works regardless; only `--rebuild` needs the \
+     rollup DB — retry once that process exits (e.g. `onebrain daemon stop`)";
 
 /// The actionable, exit-77 error for a genuinely contended `token.redb`. Typed
 /// as [`onebrain_core::CoreError::EngineBusy`] so it maps to `E_ENGINE_BUSY` /

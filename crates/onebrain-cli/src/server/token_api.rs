@@ -937,6 +937,34 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// #287: a non-empty malformed `?since=` (garbage or non-zero-padded) is
+    /// a 400 — mirrors [`gain_route_rejects_bad_by_axis`] via the shared
+    /// `validate_since`. An empty `?since=` stays "unset" (the truth-table
+    /// rows above), never a 400.
+    #[tokio::test]
+    async fn gain_route_rejects_bad_since() {
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let router = router_holding_cache(vault.path());
+        for bad in ["notadate", "2026-1-1"] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::get(format!("/api/token/gain?since={bad}"))
+                        .header("x-onebrain-token", TOKEN)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "?since={bad} must 400"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn gain_route_503_without_held_cache() {
         let (vault, _cache) = vault_and_cache();

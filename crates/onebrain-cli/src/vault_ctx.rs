@@ -57,9 +57,10 @@ pub fn resolve(flag: Option<PathBuf>) -> Result<Option<ResolvedVault>> {
 /// missing hint is added.
 ///
 /// `CoreError::NotAVault` (an explicit `--vault`/`$ONEBRAIN_VAULT` pointing
-/// at a non-vault path) is deliberately left undressed here: that's a
-/// different failure shape (the user already named a path; the fix is "check
-/// that path", not "run inside a vault"), out of #288's scope.
+/// at a non-vault path) is dressed too (#290 R1-5): a different failure
+/// shape — the user already named a path, so the remedy is "check that
+/// path", not "run inside a vault" — hence its own hint. Also exit 64
+/// (`E_VAULT_NOT_FOUND`, `exit.rs`), preserved the same way.
 pub fn require(flag: Option<PathBuf>) -> Result<ResolvedVault> {
     let inputs = snapshot_inputs(flag)?;
     require_vault(&inputs).map_err(dress_vault_not_found)
@@ -69,17 +70,18 @@ pub fn require(flag: Option<PathBuf>) -> Result<ResolvedVault> {
 /// testable against a hand-built `CoreError` rather than depending on the
 /// live process cwd/env (which `require` snapshots via [`snapshot_inputs`]).
 fn dress_vault_not_found(core_err: onebrain_core::CoreError) -> anyhow::Error {
-    let is_vault_not_found = matches!(core_err, onebrain_core::CoreError::VaultNotFound { .. });
+    let hint = match &core_err {
+        onebrain_core::CoreError::VaultNotFound { .. } => {
+            "run inside a vault, or pass `--vault <path>` (`onebrain init` creates one)"
+        }
+        onebrain_core::CoreError::NotAVault { .. } => {
+            "check the path points at a vault root (the folder containing `onebrain.yml`)"
+        }
+        _ => return core_err.into(),
+    };
     let plain = core_err.to_string();
     let err: anyhow::Error = core_err.into();
-    if is_vault_not_found {
-        err.context(crate::output::HintedError::new(
-            plain,
-            "run inside a vault, or pass --vault <path> (onebrain init creates one)",
-        ))
-    } else {
-        err
-    }
+    err.context(crate::output::HintedError::new(plain, hint))
 }
 
 /// Hook-protocol commands (`session init`, `checkpoint *`, `qmd reindex`).
@@ -201,15 +203,28 @@ mod tests {
     }
 
     #[test]
-    fn dress_vault_not_found_leaves_not_a_vault_undressed() {
-        // An explicit --vault pointing at a non-vault path is a DIFFERENT
-        // failure shape (NotAVault, not VaultNotFound) — #288 scopes the
-        // dressing to the walk-up dead end only, so this must stay plain.
+    fn dress_not_a_vault_adds_its_own_hint_and_keeps_exit_64() {
+        // #290 R1-5: an explicit --vault pointing at a non-vault path is a
+        // DIFFERENT failure shape (the user already named a path), so it
+        // gets its OWN "check the path" hint — not the walk-up's "run
+        // inside a vault" remedy.
         let core_err = onebrain_core::CoreError::NotAVault {
             path: PathBuf::from("/bogus"),
         };
         let err = dress_vault_not_found(core_err);
-        assert!(err.downcast_ref::<crate::output::HintedError>().is_none());
+        let hinted = err
+            .downcast_ref::<crate::output::HintedError>()
+            .expect("NotAVault must carry the HintedError dressing");
+        // plain = the error's own Display, verbatim.
+        assert!(
+            hinted.plain.contains("path is not a valid vault root"),
+            "plain must keep NotAVault's Display text, got: {}",
+            hinted.plain
+        );
+        assert!(hinted.plain.contains("/bogus"));
+        assert!(hinted.hint.contains("onebrain.yml"));
+        // NotAVault maps to EXIT_VAULT_NOT_FOUND (64) in exit.rs — the
+        // dressing must not change that.
         assert_eq!(crate::exit::exit_code_for(&err), 64);
     }
 
