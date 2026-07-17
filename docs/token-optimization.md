@@ -225,6 +225,10 @@ Tier-2 rollup DB (`token.redb`) is now **legacy**: since v3.4.12 nothing
 populates it automatically, and `--rebuild` is its only remaining reader/writer,
 pending removal in a follow-up.
 
+Note that each gain read walks the JSONL per request (and the archived epochs
+too for `--all-time`/`--since`), so read cost grows with history length until
+log compaction or read caching lands (planned follow-up).
+
 ### `--by <time>[,<dim>]` — pivots
 
 Time axis (`day|week|month|year`) and dimension (`surface|transform|level|cache`)

@@ -1,6 +1,9 @@
-//! Gain telemetry: [`event::GainEvent`] plus the append-only JSONL writer,
-//! the Tier-2 [`rollup`] redb tables, and the [`pivot`] engine that reads
-//! from them.
+//! Gain telemetry: [`event::GainEvent`] plus the append-only JSONL writer —
+//! the lock-free source of truth EVERY read serves from (#281) — and the
+//! [`pivot`] engine that aggregates raw events. The Tier-2 [`rollup`] redb
+//! tables are legacy: nothing populates them automatically since v3.4.12
+//! (#258), and `token gain --rebuild` is their only remaining reader/writer,
+//! pending removal in a follow-up.
 
 pub mod event;
 pub mod pivot;

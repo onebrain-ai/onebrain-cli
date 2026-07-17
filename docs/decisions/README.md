@@ -57,7 +57,7 @@ ADRs are immutable once accepted — if a decision changes, write a new ADR that
 | [0027](0027-collection-cache-layout-split.md) | Collection cache layout split (`index/` + `models/`) with eager migration | accepted |
 | [0028](0028-token-optimization-layer.md) | Token optimization layer: `onebrain-token` crate, level ladder, honesty contract | accepted |
 | [0029](0029-token-cache-redb.md) | Token cache on redb: memoization + already-sent ledger + generation counter | accepted |
-| [0030](0030-gain-telemetry-raw-plus-rollups.md) | Gain telemetry: raw JSONL keep-everything + precomputed rollups + epoch reset | accepted |
+| [0030](0030-gain-telemetry-raw-plus-rollups.md) | Gain telemetry: raw JSONL keep-everything + precomputed rollups + epoch reset | accepted · updated by #283 (reads JSONL-first; rollups `--rebuild`-only) |
 | [0031](0031-vault-read-ledger-gate-hook.md) | Vault-read ledger gate hook: deny only repeat-unchanged, fail-open, default off | accepted |
 | [0032](0032-self-healing-daemon-fallback.md) | Self-healing daemon fallback: token gain / serve / vsearch under redb contention | accepted |
 | [0033](0033-per-vault-daemon-slots.md) | Per-vault daemon slots: multi-vault warm daemons on one machine (ephemeral ports, no-steal) | accepted |

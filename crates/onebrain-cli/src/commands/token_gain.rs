@@ -232,13 +232,13 @@ fn rollup_busy_error(detail: &str) -> anyhow::Error {
 
 const ROLLUP_LOCK_HINT: &str =
     "token.redb is held by another onebrain process (a running daemon owns the rollup DB). \
-     The default summary, --by, --history and --reset read the raw log directly and work \
-     regardless; only --all-time, --since and --rebuild need the rollup DB — retry once that \
-     process exits (e.g. `onebrain daemon stop`).";
+     Every read mode (the default summary, --by, --history, --all-time, --since and --reset) \
+     reads the lock-free raw log and works regardless; only --rebuild needs the rollup DB — \
+     retry once that process exits (e.g. `onebrain daemon stop`).";
 
-/// Open the Tier-2 rollup DB (`token.redb`) directly, for the modes that
-/// genuinely need it (`--rebuild`, and the Direct leg of `--all-time`/`--since`
-/// when no daemon holds the lock). redb is single-process, so a running
+/// Open the Tier-2 rollup DB (`token.redb`) directly, for the ONE mode that
+/// still needs it: `--rebuild` (every read mode is JSONL-backed since #281).
+/// redb is single-process, so a running
 /// `onebrain daemon` — the sole `token.redb` owner — makes this open fail with
 /// `DatabaseAlreadyOpen`. When that's the cause we surface the actionable,
 /// exit-77 [`rollup_busy_error`] (issue #258); any other open failure passes
@@ -330,11 +330,11 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &TokenGainArgs)
     let cache_dir = collection_cache_dir(&collection);
     let tok_dir = token_dir(&cache_dir);
     let gdir = gain_dir(&tok_dir);
-    // `token.redb` (the Tier-2 rollup) is opened LAZILY, only in the branches
-    // that need it (`--rebuild`, and the Direct leg of `--all-time`/`--since`).
-    // The default summary, `--by`, `--history` and `--reset` read the lock-free
-    // JSONL raw log (the source of truth), so they work even while a daemon holds
-    // the redb lock — the #258 fix.
+    // `token.redb` (the legacy Tier-2 rollup) is opened LAZILY, only by
+    // `--rebuild` — the sole remaining branch that needs it. EVERY read mode
+    // (default summary, `--by`, `--history`, `--all-time`, `--since`, `--reset`)
+    // reads the lock-free JSONL raw log (the source of truth), so reads work
+    // even while a daemon holds the redb lock — the #258 fix, completed by #281.
 
     // `--json` is a local shorthand (mirrors `doctor --json` / `update
     // --json`) — it still renders through the SAME `emit`/`Envelope`
@@ -450,15 +450,19 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode, args: &TokenGainArgs)
     // baseline-comparison workflow (reset → run at X → read → reset → run at
     // Y → read → compare) shows attributable per-epoch numbers instead of the
     // unchanging all-time cumulative total. `--all-time` and `--since` both
-    // reach every epoch via the cumulative rollup.
+    // reach every epoch by also walking the archived JSONL
+    // (`read_all_recursive`, #281).
     let (time, dim) = parse_by(args.by.as_deref())?;
+    // Mirror the daemon route's empty-value guard: `--since ""` means unset,
+    // never a real (vacuous) filter that silently flips the epoch scope.
+    let since = args.since.clone().filter(|s| !s.is_empty());
     let query = PivotQuery {
         time,
         dim,
-        since: args.since.clone(),
+        since: since.clone(),
     };
     let marker = read_reset_marker(&gdir);
-    let use_current_epoch = !args.all_time && args.since.is_none();
+    let use_current_epoch = !args.all_time && since.is_none();
     let result = if use_current_epoch {
         let events = JsonlGainWriter::new(&gdir)
             .read_all()
@@ -1227,10 +1231,10 @@ mod tests {
 
     type CapturedReqs = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
-    /// A minimal HTTP/1.1 responder for the two routes `resolve_rollup_pivot`
+    /// A minimal HTTP/1.1 responder for the two routes `resolve_all_epoch_pivot`
     /// exercises: `GET /api/health` (so daemon discovery adopts it) and `GET
     /// /api/token/gain`. It records each non-health request's first line (so a
-    /// test can assert `by=`/`since=` forwarding) and serves `gain_body` with
+    /// test can assert `by=`/`since=`/`all_time=` forwarding) and serves `gain_body` with
     /// `gain_status` — EXCEPT `gain_status == 0`, which drops the connection
     /// with no response, simulating a daemon that died mid-call (a transport
     /// error → Gap 8 Direct-fallback).
@@ -1317,7 +1321,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn all_time_routes_through_the_daemon_that_holds_the_lock() {
+    fn all_time_routes_to_the_daemon_when_local_jsonl_is_empty() {
         let (vault, cache) = gain_vault();
         let (port, _reqs) = start_fake_gain_daemon(200, pivot_body(3));
         let _env = crate::test_env::set_vars(&[
@@ -1396,11 +1400,11 @@ mod tests {
         );
     }
 
-    /// R3: prove `by`/`since` are actually forwarded onto the daemon route URL
-    /// (the fake daemon records the request line).
+    /// R3: prove `by`/`since`/`all_time` are actually forwarded onto the daemon
+    /// route URL (the fake daemon records the request line).
     #[cfg(unix)]
     #[test]
-    fn by_and_since_are_forwarded_to_the_daemon_route() {
+    fn by_since_and_all_time_are_forwarded_to_the_daemon_route() {
         let (vault, cache) = gain_vault();
         let empty = serde_json::to_string(&PivotResult {
             rows: vec![],

@@ -5,7 +5,7 @@
 //! lock-free HTTP clients of the one owner.
 //!
 //! ```text
-//!   GET  /api/token/gain?by=&since=&history=  → PivotResult JSON (Tier-2 rollups)
+//!   GET  /api/token/gain?by=&since=&all_time=&history=  → PivotResult JSON (gain JSONL)
 //!   GET  /api/token/status                    → { level, ledger_active, cache_bytes }
 //!   POST /api/token/ledger/check              → { path, session_token, record? }
 //!                                               → ledger verdict (+ reference envelope)
@@ -22,9 +22,12 @@
 //! [`onebrain_token::gain::pivot::query_events`]) and the same by-axes parsing
 //! ([`crate::commands::token_gain::parse_by`]), so the route, the CLI `--json`,
 //! and the WebUI all agree on one code path (design §5 "one pivot engine ...
-//! serves all three consumers"). The default/WebUI call reports the CURRENT
-//! epoch (non-archived JSONL); an explicit `all_time` or a `since` window spans
-//! every epoch (archived too), mirroring the CLI's epoch scoping exactly (#281).
+//! serves all three consumers"). The WebUI call (`?by=&since=`, keys present,
+//! empty = unset) reports the CURRENT epoch (non-archived JSONL); an explicit
+//! `all_time` or a `since` window spans every epoch (archived too), mirroring
+//! the CLI's epoch scoping exactly (#281). A request with neither `since` nor
+//! `all_time` keys is a pre-3.4.14 client's `--all-time` — served all-epoch for
+//! compatibility (the legacy-bare rule, see [`get_token_gain`]).
 //! An empty pivot is a truthful "no gain data yet", never hardcoded. Version-skew
 //! contract: a daemon too old to have the route answers 404 → the client skips
 //! optimization; a present route answers 200 with the real-or-empty pivot.
@@ -144,13 +147,17 @@ fn require_token_cache(state: &AppState) -> Result<Arc<TokenCache>, ApiError> {
 #[derive(Debug, Deserialize)]
 struct GainQuery {
     /// `time,dim` (either order, either alone) — parsed by the shared
-    /// [`parse_by`] so the route and the CLI agree on the axes.
+    /// [`parse_by`] so the route and the CLI agree on the axes. The webui
+    /// always sends the key (possibly empty = unset).
     by: Option<String>,
-    /// Inclusive `YYYY-MM-DD` lower bound on the pivot window.
+    /// Inclusive `YYYY-MM-DD` lower bound on the pivot window. Key presence
+    /// matters (see [`get_token_gain`]): the webui always sends the key
+    /// (possibly empty = unset); a pre-3.4.14 CLI omits it for `--all-time`.
     since: Option<String>,
     /// When `true`, span EVERY epoch (archived JSONL too), mirroring the CLI's
-    /// `--all-time`. Absent/false → the current epoch only (traffic since the
-    /// last `--reset`), matching the CLI default and the WebUI dashboard.
+    /// `--all-time`. When ABSENT (not just false), the `since` key's presence
+    /// decides between the webui current-epoch default and the legacy-bare
+    /// all-time rule — see [`get_token_gain`].
     #[serde(default)]
     all_time: Option<bool>,
     /// Accepted for wire-compat with the CLI flags; the route serves the
@@ -166,11 +173,23 @@ struct GainQuery {
 /// hardcoded. 503 when the daemon holds no token cache; a bad `by=` value is a
 /// 400.
 ///
-/// Epoch scoping mirrors [`crate::commands::token_gain::run`] exactly: the
-/// default (and the WebUI dashboard, which sends neither `all_time` nor
-/// `since`) reports the current epoch (non-archived JSONL); an explicit
-/// `all_time` or a `since` window spans every epoch (archived too), so a
-/// daemon-routed `--all-time`/`--since` and a direct CLI read agree (#281).
+/// ## Param semantics (#283, hub-adjudicated)
+///
+/// Two client generations share this route and must both keep their meaning:
+///
+/// - The **webui** always sends `?by=&since=` with the keys PRESENT (possibly
+///   empty values). An empty value means "unset" — the overview/tab calls are
+///   current-epoch reads.
+/// - A **pre-3.4.14 CLI** (`--all-time`/`--since` routed here) never sends a
+///   `since` key for `--all-time`, and the old route served all data. So a
+///   request with NEITHER a `since` key NOR an `all_time` key is a pre-3.4.14
+///   client's `--all-time` — served all-epoch for compatibility (the
+///   legacy-bare rule).
+/// - The **3.4.14+ CLI** always sends an explicit `all_time=`, which wins.
+///
+/// Epoch scoping then mirrors [`crate::commands::token_gain::run`] exactly:
+/// current epoch = non-archived JSONL; `all_time`/`since` span every epoch
+/// (archived too), so a daemon-routed read and a direct CLI read agree (#281).
 async fn get_token_gain(
     State(state): State<Arc<AppState>>,
     Query(q): Query<GainQuery>,
@@ -182,15 +201,19 @@ async fn get_token_gain(
     let _cache = require_token_cache(&state)?;
     let root = require_vault_root(&state)?.to_path_buf();
 
-    let (time, dim) = parse_by(q.by.as_deref()).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    // The locked param mechanism (see the doc above). `raw_since` distinguishes
+    // key-present-but-empty (webui, Some("")) from key-absent (legacy CLI,
+    // None): a request with neither `since` nor `all_time` keys is a
+    // pre-3.4.14 client's --all-time — served all-epoch for compatibility.
+    let raw_since = q.since;
+    let all_time = q.all_time.unwrap_or(raw_since.is_none());
+    let since = raw_since.filter(|s| !s.is_empty());
+    let by = q.by.filter(|s| !s.is_empty());
+
+    let (time, dim) = parse_by(by.as_deref()).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     // Mirror the CLI's `use_current_epoch = !all_time && since.is_none()`.
-    let all_time = q.all_time.unwrap_or(false);
-    let use_current_epoch = !all_time && q.since.is_none();
-    let query = PivotQuery {
-        time,
-        dim,
-        since: q.since,
-    };
+    let use_current_epoch = !all_time && since.is_none();
+    let query = PivotQuery { time, dim, since };
 
     // Reading the JSONL files is blocking I/O — run it off the async runtime,
     // like the other token routes.
@@ -661,62 +684,160 @@ mod tests {
         assert_eq!(v["totals"]["count"], 2);
     }
 
-    /// #281 epoch scoping: the default call (no `all_time`, no `since` — exactly
-    /// what the WebUI dashboard sends) reports the CURRENT epoch only, excluding
-    /// archived JSONL; `all_time=true` spans the archive too. Proves the route
-    /// mirrors the CLI's `read_all` vs `read_all_recursive` split.
-    #[tokio::test]
-    async fn gain_route_current_epoch_excludes_archive_all_time_includes_it() {
+    // ── #283 R1 param truth table ───────────────────────────────────────────
+    // The webui ALWAYS sends `?by=&since=` with the keys PRESENT (possibly
+    // empty values); a pre-3.4.14 CLI never sends a `since` key for --all-time
+    // and expects the old route's all-data semantics. Each test below is one
+    // row of the adjudicated truth table.
+
+    /// Seed a scope-distinguishing fixture: one current-epoch event
+    /// (2026-07-13, mcp_query, 500→100) plus two archived events (2023-11-14
+    /// cli_search 1000→400 · 2026-07-05 cli_search 2000→800). Every scope has a
+    /// distinct total: current epoch = 1 call / 500 · all epochs = 3 / 3500 ·
+    /// since 2026-07-01 over all epochs = 2 / 2500.
+    fn seed_epoch_fixture(vault: &Path) {
         use onebrain_token::Surface;
-
-        let (vault, cache) = vault_and_cache();
-        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
-        let cache_dir = collection_cache_dir(&collection_name_readonly(vault.path()).unwrap());
+        let cache_dir = collection_cache_dir(&collection_name_readonly(vault).unwrap());
         let gdir = token_gain_dir(&cache_dir);
-
-        // One current-epoch event + one archived event.
         JsonlGainWriter::new(&gdir)
             .append(&gain_event(1_783_900_800, Surface::McpQuery, 500, 100))
             .unwrap();
-        JsonlGainWriter::new(gdir.join("archive").join("1-baseline"))
+        let archive = JsonlGainWriter::new(gdir.join("archive").join("1-baseline"));
+        archive
             .append(&gain_event(1_700_000_000, Surface::CliSearch, 1000, 400))
             .unwrap();
+        archive
+            .append(&gain_event(1_783_209_600, Surface::CliSearch, 2000, 800))
+            .unwrap();
+    }
 
+    /// GET `/api/token/gain{query}` → 200 + parsed JSON body.
+    async fn gain_hit(router: &axum::Router, query: &str) -> serde_json::Value {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/token/gain{query}"))
+                    .header("x-onebrain-token", TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "query {query:?}");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Truth-table row: webui overview `?by=&since=` (keys present, values
+    /// empty) → current epoch. Empty values must read as "unset", never as a
+    /// real `since` filter or an all-epoch trigger.
+    #[tokio::test]
+    async fn gain_route_webui_overview_empty_keys_is_current_epoch() {
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        seed_epoch_fixture(vault.path());
         let router = router_holding_cache(vault.path());
-        let hit = |q: &str| {
-            let router = router.clone();
-            let path = format!("/api/token/gain{q}");
-            async move {
-                let resp = router
-                    .oneshot(
-                        Request::get(&path)
-                            .header("x-onebrain-token", TOKEN)
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(resp.status(), StatusCode::OK);
-                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
-            }
-        };
 
-        // Default (dashboard) → current epoch only: the one non-archived event.
-        let cur = hit("").await;
-        assert_eq!(
-            cur["totals"]["count"], 1,
-            "current epoch excludes archive: {cur}"
-        );
-        assert_eq!(cur["totals"]["bytes_before"], 500);
+        let v = gain_hit(&router, "?by=&since=").await;
+        assert_eq!(v["totals"]["count"], 1, "current epoch only: {v}");
+        assert_eq!(v["totals"]["bytes_before"], 500);
+    }
 
-        // all_time=true → both events (current + archived).
-        let all = hit("?all_time=true").await;
+    /// Truth-table row: webui tab `?by=surface&since=` → current epoch,
+    /// pivoted by surface.
+    #[tokio::test]
+    async fn gain_route_webui_tab_empty_since_is_current_epoch_pivoted() {
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        seed_epoch_fixture(vault.path());
+        let router = router_holding_cache(vault.path());
+
+        let v = gain_hit(&router, "?by=surface&since=").await;
+        assert_eq!(v["totals"]["count"], 1, "current epoch only: {v}");
+        let rows = v["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "one current-epoch surface: {v}");
+        assert_eq!(rows[0]["dim"], "mcp_query");
+    }
+
+    /// Truth-table row: a pre-3.4.14 CLI's `--all-time` sends NEITHER a `since`
+    /// key NOR an `all_time` key — the legacy-bare rule serves it all-epoch for
+    /// compatibility with the old route's all-data semantics.
+    #[tokio::test]
+    async fn gain_route_legacy_bare_call_is_all_time() {
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        seed_epoch_fixture(vault.path());
+        let router = router_holding_cache(vault.path());
+
+        let v = gain_hit(&router, "").await;
         assert_eq!(
-            all["totals"]["count"], 2,
-            "all-time includes archive: {all}"
+            v["totals"]["count"], 3,
+            "legacy bare call = all epochs: {v}"
         );
-        assert_eq!(all["totals"]["bytes_before"], 1500);
+        assert_eq!(v["totals"]["bytes_before"], 3500);
+    }
+
+    /// Truth-table row: a pre-3.4.14 CLI's `--all-time --by day` sends `?by=day`
+    /// only — still the legacy-bare rule (no `since`/`all_time` keys), all-epoch,
+    /// pivoted.
+    #[tokio::test]
+    async fn gain_route_legacy_all_time_with_by_is_all_epoch_pivoted() {
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        seed_epoch_fixture(vault.path());
+        let router = router_holding_cache(vault.path());
+
+        let v = gain_hit(&router, "?by=day").await;
+        assert_eq!(v["totals"]["count"], 3, "all epochs: {v}");
+        let rows = v["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "three distinct days across epochs: {v}");
+        assert!(rows.iter().all(|r| r["time"].is_string()));
+    }
+
+    /// Truth-table row: a pre-3.4.14 CLI's `--since 2026-07-01` sends
+    /// `?since=2026-07-01` — all epochs, date-filtered (archived 2026-07-05 +
+    /// current 2026-07-13 survive; archived 2023-11-14 does not).
+    #[tokio::test]
+    async fn gain_route_legacy_since_filters_all_epochs() {
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        seed_epoch_fixture(vault.path());
+        let router = router_holding_cache(vault.path());
+
+        let v = gain_hit(&router, "?since=2026-07-01").await;
+        assert_eq!(v["totals"]["count"], 2, "since filters all epochs: {v}");
+        assert_eq!(v["totals"]["bytes_before"], 2500);
+    }
+
+    /// Truth-table row: the 3.4.14+ CLI's explicit `?all_time=true` → all epochs.
+    #[tokio::test]
+    async fn gain_route_explicit_all_time_true_is_all_epochs() {
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        seed_epoch_fixture(vault.path());
+        let router = router_holding_cache(vault.path());
+
+        let v = gain_hit(&router, "?all_time=true").await;
+        assert_eq!(
+            v["totals"]["count"], 3,
+            "explicit all_time = all epochs: {v}"
+        );
+        assert_eq!(v["totals"]["bytes_before"], 3500);
+    }
+
+    /// Truth-table row: `?all_time=false&since=2026-07-01` (the 3.4.14+ CLI's
+    /// `--since`) → all epochs, date-filtered — same answer as the legacy
+    /// `?since=` form.
+    #[tokio::test]
+    async fn gain_route_all_time_false_with_since_filters_all_epochs() {
+        let (vault, cache) = vault_and_cache();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        seed_epoch_fixture(vault.path());
+        let router = router_holding_cache(vault.path());
+
+        let v = gain_hit(&router, "?all_time=false&since=2026-07-01").await;
+        assert_eq!(v["totals"]["count"], 2, "since filters all epochs: {v}");
+        assert_eq!(v["totals"]["bytes_before"], 2500);
     }
 
     /// Equivalence (#281): for EVERY `by=<dim>` the WebUI dashboard sends
@@ -765,9 +886,12 @@ mod tests {
                 },
             );
 
+            // The webui wire form: `by` and `since` keys always present (empty
+            // = unset) — the current-epoch scope, matching the CLI default read
+            // computed above.
             let path = match by {
-                Some(d) => format!("/api/token/gain?by={d}"),
-                None => "/api/token/gain".to_string(),
+                Some(d) => format!("/api/token/gain?by={d}&since="),
+                None => "/api/token/gain?by=&since=".to_string(),
             };
             let resp = router
                 .clone()
