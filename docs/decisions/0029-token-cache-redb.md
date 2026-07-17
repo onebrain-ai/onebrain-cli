@@ -1,6 +1,6 @@
 # 0029 — Token cache on redb: memoization + already-sent ledger + generation counter
 
-- **Status:** accepted
+- **Status:** accepted · updated by [#283](https://github.com/onebrain-ai/onebrain-cli/pull/283): gain reads are JSONL-first since v3.4.14 — the rollup-read rationale in §(d) applies only to the `--rebuild` leg
 - **Date:** 2026-07-11
 
 ## Context

@@ -1,5 +1,5 @@
 ---
-latest_version: 3.4.13
+latest_version: 3.4.14
 released: 2026-07-17
 ---
 
@@ -9,6 +9,16 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.14] — 2026-07-17 — Human-readable CLI + gain dashboard truth
+
+Theme: complete the v3.4 line — every failure message says what happened, why, and what to do next; the Token-Gain dashboard tells the truth. Companion plugin release 3.4.0 ships the search cascade + grep-gate hook.
+
+- **Bind before banner**: `serve` prints its banner only after the listener actually binds — a failed bind shows only the error, never a URL+token; the URL now carries the **actual bound port** (so `--port 0` prints a clickable address). `daemon start` detects a child that died before binding (waitpid, not a zombie-fooled probe) and says so fast instead of claiming success ([#278](https://github.com/onebrain-ai/onebrain-cli/issues/278))
+- **Output style contract** across every command: failures read `✗ what — why` + `💡 next step` (docs/output-style.md); JSON envelopes stay single-line and glyph-free via a typed hint mechanism, error codes and exit codes unchanged (PermissionDenied binds still exit 66) ([#279](https://github.com/onebrain-ai/onebrain-cli/issues/279))
+- **Token-Gain dashboard reads the lock-free gain JSONL** — the daemon `/api/token/gain` (and `--all-time`/`--since`) no longer serve the never-auto-populated rollup DB, so the WebUI shows real numbers without a manual rebuild; a bare pre-3.4.14 client request still gets the legacy all-time view ([#281](https://github.com/onebrain-ai/onebrain-cli/issues/281))
+- A gain read that races a `--reset` archive rename no longer errors (vanished file = zero events, not a 500)
+- Corrupt gain timestamps bucket under the self-flagging `1970-01.jsonl` (epoch fallback), never the current month's live log
 
 ## [3.4.13] — 2026-07-17 — Ledger works in production + multi-vault daemons
 
