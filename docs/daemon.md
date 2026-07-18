@@ -164,6 +164,16 @@ Before v3.4.13 a single machine-wide `daemon.json` daemon held the vault's redb 
 - **Make it visible:** `onebrain daemon status` and `onebrain doctor` both surface a live legacy daemon (with the retire hint) rather than reporting "not running".
 - **Retire it now:** `onebrain daemon stop --all` stops every per-vault slot **and** the legacy daemon, ending the window immediately. A dead legacy record is inert and ignored (no action needed).
 
+## Automatic retire on same-family upgrade (v3.4.15, #291)
+
+A same-family binary upgrade (e.g. `3.4.13 → 3.4.14`) has the same hazard in a subtler form: a still-running warm daemon of the OLD version is re-adopted by the next `daemon start`/`serve`/`mcp` (discovery adopts a same-vault daemon regardless of version), so it keeps serving the **old wire shape** — e.g. a superseded `token gain` route leaves the WebUI dashboard dark — until it idles out (~30 min). Unlike the pre-v3.4.13 legacy case there's no lock collision, just stale routes, so it previously slipped the manual "stop --all after upgrading" net. v3.4.15 automates the refresh:
+
+- **`onebrain update`** — after a real self-update passes the validate gate, retires **all** warm daemons machine-wide (they respawn at the new version on next use). Reported as `↻ retired {n} warm daemon(s)`.
+- **`onebrain plugin update`** — retires this vault's warm daemon **only when its version is skewed** from the CLI's (the `brew upgrade` + `plugin update` flow); a matching-version daemon is left warm (no cold-start penalty).
+- **`onebrain doctor`** — the safety net when a user `brew upgrade`s directly and runs neither: it **warns** on a live version-skewed daemon (naming both versions) with the `onebrain daemon stop --all` hint. Diagnostic only — doctor never stops a daemon.
+
+So the manual `daemon stop --all` after an in-place upgrade is now a fallback, not a required step — `update`/`plugin update` handle the common paths and `doctor` flags whatever slips through.
+
 ## Lifecycle
 
 - **Idle-shutdown TTL** — after `$ONEBRAIN_DAEMON_IDLE_SECS` (default **30 min**) with no authenticated request, the daemon exits, dropping the engine and releasing the redb lock. Set `0` to disable (run forever — e.g. a pinned always-on daemon).

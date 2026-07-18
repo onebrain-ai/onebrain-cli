@@ -934,10 +934,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn daemon_predates_token_routes_fails_open_and_records_event() {
-        // #289: in-process seam — inject the version-skew (404, route-missing)
-        // verdict directly instead of a real socket, so a slow CI runner can't
-        // race the round-trip into a spurious `daemon_timeout`. The full
-        // verdict (fail-open reason + gain event) is still asserted.
+        // #289: deterministic leg→verdict mapping (in-process seam) — a
+        // `daemon_version_skew` fail-open leg → exit 0 + a `daemon_version_skew`
+        // HookFailopen event. The socket-driven 404→skew branch (a real daemon
+        // too old to have the token route) is covered end-to-end by
+        // `query_daemon_leg_404_fails_open_with_skew_reason` below; here the leg
+        // is injected so a slow CI runner can't race it into `daemon_timeout`.
         let (vault, cache) = test_vault();
         let _env = crate::test_env::set_vars(&[
             ("HOME", vault.path().as_os_str()),
@@ -982,22 +984,17 @@ mod tests {
         assert_eq!(events[0].transform, "no_session_token");
     }
 
-    /// **#264 sub-fix A — the warm-daemon route adopts a same-vault daemon
-    /// REGARDLESS of version.** A version-SKEWED (post-`brew upgrade`) same-vault
-    /// daemon record answers `unchanged`; the read-hook must ROUTE to it and
-    /// GATE (exit 2), NOT version-reject it and cold-open the engine. Under the
-    /// prior `discover_matching` (version-exact) this skewed daemon was rejected
-    /// → FallThrough → `check_direct` at conservative → Allow (exit 0): the RED
-    /// state, and precisely why v3.4.12 collided on the held lock into
-    /// `engine_open_error`. GREEN after switching to
-    /// `discover_same_vault_any_version`.
+    /// Deterministic verdict→exit-code mapping (in-process seam): an `Unchanged`
+    /// daemon leg → Deny → exit 2. This pins ONLY the leg→exit-code contract; it
+    /// does NOT exercise discovery/adoption (the leg is injected, no socket). The
+    /// socket-driven #264 adoption path — a version-skewed same-vault daemon
+    /// adopted via `discover_same_vault_any_version` and gating end-to-end — is
+    /// the job of `query_daemon_leg_adopts_skewed_daemon_and_gates` below.
+    /// Injecting the leg means a CI scheduling race can never flip this exit-2
+    /// assertion into a spurious fail-open.
     #[cfg(unix)]
     #[test]
-    fn warm_same_vault_daemon_gates_even_across_version_skew() {
-        // #289: the warm same-vault daemon (adopted across version skew, #264)
-        // answers `unchanged` → the read GATES (exit 2). Inject that verdict
-        // in-process so the exit-2 assertion can't be flipped to a fail-open
-        // exit 0 by a CI scheduling race on the socket round-trip.
+    fn unchanged_leg_gates_with_exit_2() {
         let (vault, cache) = test_vault();
         let _env = crate::test_env::set_vars(&[
             ("HOME", vault.path().as_os_str()),
@@ -1008,10 +1005,7 @@ mod tests {
 
         let code =
             run(Some(vault.path().to_path_buf()), "notes/a.md").expect("run should not error");
-        assert_eq!(
-            code, 2,
-            "a warm same-vault daemon's `unchanged` verdict must GATE the read (exit 2)"
-        );
+        assert_eq!(code, 2, "an `Unchanged` leg must GATE the read (exit 2)");
     }
 
     #[cfg(unix)]
@@ -1041,6 +1035,94 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].cache, CacheKind::HookFailopen);
         assert_eq!(events[0].transform, "daemon_timeout");
+    }
+
+    // ── Real-socket integration coverage of `query_daemon_leg` (#289) ──────
+    // The in-process seam above deflakes the leg→verdict MAPPING but bypasses
+    // the socket, so these drive `query_daemon_leg` END-TO-END — discovery +
+    // adoption + the real HTTP response→verdict path — the coverage the seam
+    // tests deliberately skip. They use a GENEROUS FIXED 30s budget (NOT the
+    // 200ms/5s config default): robust by construction, since a localhost
+    // round-trip is ~ms and `run` returns the instant the response arrives
+    // (never waiting the budget), so even a pathologically degraded runner
+    // finishes well under 30s — the property the old tight 5s lacked.
+
+    /// A `test_vault` with a generous fixed 30s daemon budget for the real-socket
+    /// integration tests below. See the block comment above for why 30s is
+    /// non-flaky where the removed `test_vault_with_check_timeout_ms(5000)` was
+    /// not.
+    #[cfg(unix)]
+    fn test_vault_generous_budget() -> (tempfile::TempDir, tempfile::TempDir) {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: token-check-test\ntoken_optimization:\n  check_timeout_ms: 30000\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        (vault, cache)
+    }
+
+    /// **#264 regression guard (real socket).** A version-SKEWED same-vault
+    /// daemon answering `unchanged` must be ADOPTED via
+    /// `discover_same_vault_any_version` and GATE the read (exit 2). Drives
+    /// `query_daemon_leg` end-to-end (discovery → adopt → 200-body → verdict).
+    /// A revert to the version-EXACT `discover_matching` (the exact #264 bug)
+    /// would REJECT the skewed daemon → FallThrough → `check_direct` at the
+    /// default (inactive) level → Allow (exit 0), failing this assertion — so
+    /// this is THE guard that must survive such a revert. Collapses coverage of
+    /// both the discovery adoption AND the 200-unchanged→deny mapping.
+    #[cfg(unix)]
+    #[test]
+    fn query_daemon_leg_adopts_skewed_daemon_and_gates() {
+        let (vault, cache) = test_vault_generous_budget();
+        let body = r#"{"verdict":"unchanged","reference":{"doc_path":"notes/a.md","hash":"deadbeef","sent_earlier":true,"bytes_saved":4096,"rematerialize":"onebrain search get notes/a.md --force"}}"#;
+        let port = start_fake_daemon(200, body, Duration::ZERO);
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", vault.path().as_os_str()),
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+        ]);
+        // A version DIFFERENT from ours — the post-`brew upgrade` skew. Only
+        // `discover_same_vault_any_version` adopts it; `discover_matching` won't.
+        write_daemon_json_versioned(
+            vault.path(),
+            vault.path(),
+            port,
+            "daemon-check-token-123",
+            "0.0.1-old",
+        );
+
+        let code =
+            run(Some(vault.path().to_path_buf()), "notes/a.md").expect("run should not error");
+        assert_eq!(
+            code, 2,
+            "a skewed same-vault daemon must be adopted (discover_same_vault_any_version) \
+             and GATE (exit 2) — a discover_matching revert would Allow (exit 0)"
+        );
+    }
+
+    /// Real-socket sibling of `daemon_predates_token_routes_fails_open…`: a
+    /// same-vault daemon that 404s the token route (predates it) drives
+    /// `query_daemon_leg` through discovery + adoption to the `Ok(None)` →
+    /// `FailOpen("daemon_version_skew")` branch end-to-end (exit 0 + event).
+    #[cfg(unix)]
+    #[test]
+    fn query_daemon_leg_404_fails_open_with_skew_reason() {
+        let (vault, cache) = test_vault_generous_budget();
+        let port = start_fake_daemon(404, "not found", Duration::ZERO);
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", vault.path().as_os_str()),
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+        ]);
+        write_daemon_json(vault.path(), vault.path(), port, "daemon-check-token-123");
+
+        let code =
+            run(Some(vault.path().to_path_buf()), "notes/a.md").expect("run should not error");
+        assert_eq!(code, 0);
+        let events = gain_events(cache.path());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].cache, CacheKind::HookFailopen);
+        assert_eq!(events[0].transform, "daemon_version_skew");
     }
 
     #[cfg(unix)]

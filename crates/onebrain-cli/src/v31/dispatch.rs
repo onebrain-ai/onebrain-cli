@@ -852,12 +852,13 @@ fn render_plugin_update_inner<W: std::io::Write>(
             writeln!(writer, " ↻ {hint}")?;
         }
     }
-    // #291: surface the retired stale warm daemon so the user knows the dark
+    // #291: surface the retired warm daemon so the user knows the dark
     // dashboard has been refreshed. The respawned daemon comes up at our
-    // version (`own_version`) on the next call.
+    // version (`own_version`) on the next call. "warm daemon" matches the
+    // `onebrain update` wording (`retired {n} warm daemon(s)`) for parity.
     if f.daemon_retired {
         let own = crate::commands::daemon_client::own_version();
-        let msg = format!("retired stale daemon — respawns at v{own} on next use");
+        let msg = format!("retired warm daemon — respawns at v{own} on next use");
         if color {
             writeln!(writer, " {dim}↻ {msg}{reset}")?;
         } else {
@@ -1251,6 +1252,86 @@ mod tests {
         assert!(
             !out.contains("vault sync       :"),
             "legacy colon-aligned table leaked:\n{out}"
+        );
+    }
+
+    #[test]
+    fn plugin_update_daemon_retired_renders_in_text_and_json() {
+        // #291 (R2-#1): when step 5 retired a skewed warm daemon, BOTH surfaces
+        // must show it — the framed text report gets the `↻ retired warm daemon`
+        // glyph line naming our version, and the JSON envelope gains a
+        // `daemon_retired: true` field. Mirrors the partial-failure surfacing.
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 1,
+            plists_rewritten: false,
+            plists_count: Some(0),
+            version_before: None,
+            version_after: None,
+            partial_failure: None,
+            warnings: Vec::new(),
+            daemon_retired: true,
+        };
+        let own = crate::commands::daemon_client::own_version();
+
+        // Text surface — the glyph line renders with our version.
+        let mut text_buf = Vec::new();
+        emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut text_buf).unwrap();
+        let text = String::from_utf8(text_buf).unwrap();
+        assert!(
+            text.contains("↻ retired warm daemon"),
+            "retire glyph line missing:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("respawns at v{own}")),
+            "retire line must name our version:\n{text}"
+        );
+
+        // JSON surface — the field appears and is true.
+        let mut json_buf = Vec::new();
+        let json_mode = OutputMode::Json { pretty: false };
+        emit_plugin_update_summary_to(&report, &json_mode, &mut json_buf).unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&json_buf).unwrap();
+        assert_eq!(
+            env["data"]["daemon_retired"],
+            serde_json::json!(true),
+            "JSON envelope must carry daemon_retired: true:\n{env}"
+        );
+    }
+
+    #[test]
+    fn plugin_update_daemon_not_retired_omits_json_field() {
+        // The additive-shape guard: with no retire, `daemon_retired` is skipped
+        // from the JSON (via `skip_serializing_if`) so a normal plugin update's
+        // envelope shape is unchanged, and the text report shows no retire line.
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 1,
+            plists_rewritten: false,
+            plists_count: Some(0),
+            version_before: None,
+            version_after: None,
+            partial_failure: None,
+            warnings: Vec::new(),
+            daemon_retired: false,
+        };
+        let mut json_buf = Vec::new();
+        let json_mode = OutputMode::Json { pretty: false };
+        emit_plugin_update_summary_to(&report, &json_mode, &mut json_buf).unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&json_buf).unwrap();
+        assert!(
+            env["data"].get("daemon_retired").is_none(),
+            "daemon_retired must be omitted when false:\n{env}"
+        );
+
+        let mut text_buf = Vec::new();
+        emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut text_buf).unwrap();
+        let text = String::from_utf8(text_buf).unwrap();
+        assert!(
+            !text.contains("retired warm daemon"),
+            "no retire line when nothing was retired:\n{text}"
         );
     }
 
