@@ -51,7 +51,7 @@ pub fn run(check: bool, fresh: bool, json: bool, plan: bool, mode: &OutputMode) 
     let want_structured = json || plan || mode.is_structured();
     let want_tty = !want_structured && std::io::stdout().is_terminal();
 
-    let opts = if want_structured {
+    let mut opts = if want_structured {
         // Suppress the orchestrator's plain-text log lines — structured
         // mode produces exactly one document on stdout.
         UpdateOptions {
@@ -70,6 +70,20 @@ pub fn run(check: bool, fresh: bool, json: bool, plan: bool, mode: &OutputMode) 
             ..Default::default()
         }
     };
+
+    // #291: after a real upgrade, the just-swapped binary means every running
+    // warm daemon now serves the OLD wire shape until it idles out. Retire them
+    // all so the next `daemon start`/`serve`/`mcp` respawns at the new version.
+    // Only wired on the real-install path — `run_update` also guards it (never
+    // fires on `--check`/plan/no-op/failure), so a dry run never touches
+    // daemons even though the closure is present.
+    if !dry_run {
+        opts.post_update_fn = Some(Box::new(|| {
+            crate::commands::daemon::stop_all_slots()
+                .map(|(n, _)| n)
+                .map_err(|e| e.to_string())
+        }));
+    }
 
     let result = run_update(opts);
 
@@ -283,6 +297,15 @@ fn build_json_document(
             .unwrap()
             .insert("error".to_string(), serde_json::Value::String(err.clone()));
     }
+    // #291: how many warm daemons the post-upgrade retire stopped. Absent on
+    // dry-run / no-op / failure (the closure never ran → `daemons_retired` is
+    // `None`), present as a number only after a real upgrade.
+    if let Some(n) = result.daemons_retired {
+        doc.as_object_mut().unwrap().insert(
+            "daemons_retired".to_string(),
+            serde_json::Value::Number(n.into()),
+        );
+    }
     if plan && update_available_bool {
         let tag = if latest.starts_with('v') {
             latest.to_string()
@@ -368,6 +391,7 @@ mod tests {
             latest_version: Some(latest.to_string()),
             error: None,
             latest_published_at: None,
+            daemons_retired: None,
         }
     }
 
@@ -426,6 +450,7 @@ mod tests {
             latest_version: None,
             error: Some("Fetch failed: network".into()),
             latest_published_at: None,
+            daemons_retired: None,
         };
         let doc = build_json_document(&r, false);
         assert_eq!(doc["ok"], false);
@@ -451,5 +476,24 @@ mod tests {
         let r = result("3.0.0-alpha.7", "3.0.0-alpha.8", true);
         let doc = build_json_document(&r, false);
         assert!(doc.get("released_at").is_none());
+    }
+
+    #[test]
+    fn json_doc_emits_daemons_retired_when_present() {
+        // #291: after a real upgrade the post-update closure reports how many
+        // warm daemons it retired → surfaced as a JSON number.
+        let mut r = result("3.4.14", "3.4.15", true);
+        r.daemons_retired = Some(2);
+        let doc = build_json_document(&r, false);
+        assert_eq!(doc["daemons_retired"], 2);
+    }
+
+    #[test]
+    fn json_doc_omits_daemons_retired_when_absent() {
+        // Dry-run / no-op / failure never runs the retire closure → field absent
+        // (distinct from `Some(0)`, which would mean "ran, nothing to stop").
+        let r = result("3.4.15", "3.4.15", true);
+        let doc = build_json_document(&r, false);
+        assert!(doc.get("daemons_retired").is_none());
     }
 }

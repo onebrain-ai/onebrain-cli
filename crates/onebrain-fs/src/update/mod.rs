@@ -51,6 +51,12 @@ pub struct UpdateResult {
     /// the upstream payload included it. Used by `onebrain update --json`
     /// to expose `released_at` in the document.
     pub latest_published_at: Option<DateTime<Utc>>,
+    /// Count of warm daemons retired by `post_update_fn` after a real upgrade
+    /// (#291). `None` when the closure was never called (`--check`, already
+    /// up-to-date, install/validate failure) or was not injected; `Some(0)`
+    /// when it ran but nothing was running. Surfaced as `daemons_retired` in
+    /// `onebrain update --json`.
+    pub daemons_retired: Option<usize>,
 }
 
 /// Release info parsed from the GitHub `releases/latest` payload.
@@ -68,6 +74,13 @@ pub type InstallFn = Box<dyn Fn(&str) -> Result<(), UpdateError> + Send + Sync>;
 /// can confirm the `onebrain` on PATH actually reports it; returns `Err(reason)`
 /// with a specific, user-actionable failure message.
 pub type ValidateFn = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+/// Runs AFTER a real upgrade passes the validate gate — retires now-stale warm
+/// daemons so the next call respawns at the freshly-installed version (#291).
+/// Returns the count retired. `onebrain-fs` can't reach the CLI's daemon code,
+/// so the CLI injects this the same way it injects `install_fn`/`validate_fn`.
+/// An `Err` here must NOT fail the already-succeeded update — it is absorbed
+/// and logged, never propagated.
+pub type PostUpdateFn = Box<dyn Fn() -> Result<usize, String> + Send + Sync>;
 pub type CurrentVersionFn = Box<dyn Fn() -> CurrentVersion + Send + Sync>;
 type LineSink = Box<dyn FnMut(&str) + Send>;
 
@@ -91,6 +104,10 @@ pub struct UpdateOptions {
     pub fetch_fn: Option<FetchFn>,
     pub install_fn: Option<InstallFn>,
     pub validate_fn: Option<ValidateFn>,
+    /// Called once, ONLY after a real upgrade clears the validate gate (#291).
+    /// The CLI wires this to retire machine-wide warm daemons. Never called on
+    /// `--check`, already-up-to-date, or any failure branch.
+    pub post_update_fn: Option<PostUpdateFn>,
     pub current_version_fn: Option<CurrentVersionFn>,
     /// Optional output sink (line-oriented, plain text). Defaults to stdout
     /// when `None`. Stderr lines (errors) always go to stderr regardless.
@@ -755,6 +772,39 @@ pub fn run_update(mut opts: UpdateOptions) -> UpdateResult {
         return result;
     }
 
+    // Post-upgrade — retire now-stale warm daemons (#291). The binary just
+    // changed, so any running daemon serves the OLD wire shape until it idles
+    // out. We reach here ONLY on the real-upgrade path (`--check` /
+    // already-up-to-date / install / validate all returned earlier), so the
+    // closure only fires after an actual version bump. A retire failure must
+    // NOT undo the successful update — absorb + log, never propagate.
+    if let Some(retire) = opts.post_update_fn.as_ref() {
+        match retire() {
+            Ok(n) => {
+                result.daemons_retired = Some(n);
+                if n > 0 {
+                    let tag = if release.version.starts_with('v') {
+                        release.version.clone()
+                    } else {
+                        format!("v{}", release.version)
+                    };
+                    write_stdout(
+                        &mut opts,
+                        &format!(
+                            "↻ retired {n} warm daemon(s) — they respawn at {tag} on next use"
+                        ),
+                    );
+                }
+            }
+            Err(e) => {
+                write_stderr(
+                    &mut opts,
+                    &format!("update: warm-daemon retire skipped: {e}"),
+                );
+            }
+        }
+    }
+
     write_stdout(
         &mut opts,
         "done: to sync the plugin run /update (in Claude) or `onebrain plugin update`",
@@ -1090,6 +1140,132 @@ mod tests {
         let result = run_update(opts);
         assert!(result.ok);
         assert_eq!(seen.lock().unwrap().as_deref(), Some("v2.0.0"));
+    }
+
+    /// Build `UpdateOptions` whose `post_update_fn` records how many times it
+    /// was called (incrementing a shared counter) and reports 2 daemons
+    /// retired. Mirrors the closure-injection style of
+    /// `gate_passes_just_installed_version_to_validator`.
+    fn post_update_counting(calls: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> PostUpdateFn {
+        Box::new(move || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(2)
+        })
+    }
+
+    #[test]
+    fn post_update_fn_runs_on_real_upgrade_path() {
+        // #291: after a real fetch→install→validate upgrade, the injected
+        // daemon-retire closure fires exactly once and its count lands on the
+        // result.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let opts = UpdateOptions {
+            fetch_fn: Some(mock_fetch("v2.0.0")),
+            install_fn: Some(Box::new(|_| Ok(()))),
+            validate_fn: Some(Box::new(|_| Ok(()))),
+            post_update_fn: Some(post_update_counting(calls.clone())),
+            current_version_fn: Some(current("v1.10.18")),
+            stdout_lines: Some(Box::new(|_| {})),
+            stderr_lines: Some(Box::new(|_| {})),
+            ..Default::default()
+        };
+        let result = run_update(opts);
+        assert!(result.ok);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(result.daemons_retired, Some(2));
+    }
+
+    #[test]
+    fn post_update_fn_not_called_on_check() {
+        // `--check` is a dry run — it must never retire daemons.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let opts = UpdateOptions {
+            check: true,
+            fetch_fn: Some(mock_fetch("v2.0.0")),
+            post_update_fn: Some(post_update_counting(calls.clone())),
+            current_version_fn: Some(current("v1.10.18")),
+            stdout_lines: Some(Box::new(|_| {})),
+            ..Default::default()
+        };
+        let result = run_update(opts);
+        assert!(result.ok);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(result.daemons_retired, None);
+    }
+
+    #[test]
+    fn post_update_fn_not_called_when_already_up_to_date() {
+        // current >= latest — no install happens, so nothing to retire.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let opts = UpdateOptions {
+            fetch_fn: Some(mock_fetch("v2.0.0")),
+            post_update_fn: Some(post_update_counting(calls.clone())),
+            current_version_fn: Some(current("v2.0.0")),
+            stdout_lines: Some(Box::new(|_| {})),
+            ..Default::default()
+        };
+        let result = run_update(opts);
+        assert!(result.ok);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(result.daemons_retired, None);
+    }
+
+    #[test]
+    fn post_update_fn_not_called_on_install_failure() {
+        // Install failed → the gate returns before the retire step.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let opts = UpdateOptions {
+            fetch_fn: Some(mock_fetch("v2.0.0")),
+            install_fn: Some(Box::new(|_| Err(UpdateError::Install("boom".into())))),
+            post_update_fn: Some(post_update_counting(calls.clone())),
+            current_version_fn: Some(current("v1.10.18")),
+            stdout_lines: Some(Box::new(|_| {})),
+            stderr_lines: Some(Box::new(|_| {})),
+            ..Default::default()
+        };
+        let result = run_update(opts);
+        assert!(!result.ok);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(result.daemons_retired, None);
+    }
+
+    #[test]
+    fn post_update_fn_not_called_on_validate_failure() {
+        // Validate gate failed → retire must not run.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let opts = UpdateOptions {
+            fetch_fn: Some(mock_fetch("v2.0.0")),
+            install_fn: Some(Box::new(|_| Ok(()))),
+            validate_fn: Some(Box::new(|_| Err("stale on PATH".into()))),
+            post_update_fn: Some(post_update_counting(calls.clone())),
+            current_version_fn: Some(current("v1.10.18")),
+            stdout_lines: Some(Box::new(|_| {})),
+            stderr_lines: Some(Box::new(|_| {})),
+            ..Default::default()
+        };
+        let result = run_update(opts);
+        assert!(!result.ok);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(result.daemons_retired, None);
+    }
+
+    #[test]
+    fn post_update_fn_error_does_not_fail_a_successful_upgrade() {
+        // A retire failure is absorbed — the update already succeeded.
+        let opts = UpdateOptions {
+            fetch_fn: Some(mock_fetch("v2.0.0")),
+            install_fn: Some(Box::new(|_| Ok(()))),
+            validate_fn: Some(Box::new(|_| Ok(()))),
+            post_update_fn: Some(Box::new(|| Err("could not reach run dir".into()))),
+            current_version_fn: Some(current("v1.10.18")),
+            stdout_lines: Some(Box::new(|_| {})),
+            stderr_lines: Some(Box::new(|_| {})),
+            ..Default::default()
+        };
+        let result = run_update(opts);
+        assert!(result.ok, "retire failure must not fail the update");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.daemons_retired, None);
     }
 
     #[test]

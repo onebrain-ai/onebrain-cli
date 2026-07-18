@@ -703,6 +703,7 @@ pub(crate) fn render_plugin_update_animated_to<W: std::io::Write>(
         version_after: report.version_after.as_deref(),
         dry_run: report.dry_run,
         partial_failure: report.partial_failure.as_deref(),
+        daemon_retired: report.daemon_retired,
     };
     render_plugin_update_inner(writer, &fields, mode, false, step_delay_override)
 }
@@ -723,6 +724,8 @@ struct PluginUpdateFields<'a> {
     version_after: Option<&'a str>,
     dry_run: bool,
     partial_failure: Option<&'a str>,
+    /// #291: a live version-skewed warm daemon was retired this run.
+    daemon_retired: bool,
 }
 
 /// Shared body for both `plugin update` text surfaces (v3.2.18 · unifies the
@@ -847,6 +850,18 @@ fn render_plugin_update_inner<W: std::io::Write>(
             writeln!(writer, " {dim}↻ {hint}{reset}")?;
         } else {
             writeln!(writer, " ↻ {hint}")?;
+        }
+    }
+    // #291: surface the retired stale warm daemon so the user knows the dark
+    // dashboard has been refreshed. The respawned daemon comes up at our
+    // version (`own_version`) on the next call.
+    if f.daemon_retired {
+        let own = crate::commands::daemon_client::own_version();
+        let msg = format!("retired stale daemon — respawns at v{own} on next use");
+        if color {
+            writeln!(writer, " {dim}↻ {msg}{reset}")?;
+        } else {
+            writeln!(writer, " ↻ {msg}")?;
         }
     }
     writeln!(writer, "{dim}{rule}{reset}")?;
@@ -989,6 +1004,16 @@ struct PluginUpdateData<'a> {
     note: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     partial_failure: Option<&'a str>,
+    /// #291: `true` only when a live version-skewed warm daemon was retired.
+    /// Skipped when `false` so the JSON envelope shape stays additive (a
+    /// normal plugin update gains no new field).
+    #[serde(skip_serializing_if = "is_false")]
+    daemon_retired: bool,
+}
+
+/// serde `skip_serializing_if` predicate — omit a `false` bool from the JSON.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Same as [`emit_plugin_update_summary`] but with an injectable writer for
@@ -1020,6 +1045,7 @@ pub(crate) fn emit_plugin_update_summary_to<W: std::io::Write>(
             None
         },
         partial_failure: report.partial_failure.as_deref(),
+        daemon_retired: report.daemon_retired,
     };
 
     let mut env = if let Some(reason) = report.partial_failure.as_deref() {
@@ -1088,6 +1114,7 @@ fn render_plugin_update_text(
         version_after: d.version_after,
         dry_run: d.dry_run,
         partial_failure: d.partial_failure,
+        daemon_retired: d.daemon_retired,
     };
     // Static text mode: `force_static = true` — no spinner for `plugin
     // update`; the operation is fast (single HTTP fetch + a few file writes)
@@ -1134,6 +1161,7 @@ mod tests {
             version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mode = OutputMode::Json { pretty: false };
         let err = emit_plugin_update_summary_to(&report, &mode, BrokenPipeWriter)
@@ -1194,6 +1222,7 @@ mod tests {
             version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
@@ -1237,6 +1266,7 @@ mod tests {
             version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
@@ -1268,6 +1298,7 @@ mod tests {
             version_after: None,
             partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
@@ -1308,6 +1339,7 @@ mod tests {
                 "schedule re-register failed\nlaunchctl exit 1\nplist syntax error".to_string(),
             ),
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
@@ -1340,6 +1372,7 @@ mod tests {
             version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
@@ -1376,6 +1409,7 @@ mod tests {
             version_after: Some("3.1.4".to_string()),
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
@@ -1406,6 +1440,7 @@ mod tests {
             version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
@@ -1440,6 +1475,7 @@ mod tests {
             version_after: None,
             partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let color_mode = OutputMode::Text {
             color: true,
@@ -1487,6 +1523,7 @@ mod tests {
             version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         render_plugin_update_animated_to(
@@ -1543,6 +1580,7 @@ mod tests {
             version_after: None,
             partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         render_plugin_update_animated_to(
@@ -1579,6 +1617,7 @@ mod tests {
             version_after: Some("3.1.4".to_string()),
             partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
@@ -1605,6 +1644,7 @@ mod tests {
             version_after: Some("3.1.4".to_string()),
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         render_plugin_update_animated_to(
@@ -1636,6 +1676,7 @@ mod tests {
             version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         let mode = OutputMode::Json { pretty: false };
@@ -1725,6 +1766,7 @@ mod tests {
             version_after: None,
             partial_failure: Some("launchctl exit 1".to_string()),
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         let mode = OutputMode::Json { pretty: false };
@@ -1762,6 +1804,7 @@ mod tests {
             version_after: Some("3.1.4".to_string()),
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         let mode = OutputMode::Json { pretty: false };
@@ -1787,6 +1830,7 @@ mod tests {
             version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         let mode = OutputMode::Json { pretty: false };
@@ -1819,6 +1863,7 @@ mod tests {
                 code: "W_MALFORMED_HOOK_ENTRY".to_string(),
                 message: "unexpected hook shape at index 2".to_string(),
             }],
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         let mode = OutputMode::Json { pretty: false };

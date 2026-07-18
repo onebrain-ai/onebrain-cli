@@ -1052,7 +1052,9 @@ const DAEMON_STATUS_CHECK: &str = "daemon";
 ///   upgrade window — it holds the vault's redb lock; LOW-2). Advisory; the hint
 ///   points at `onebrain daemon stop --all`.
 fn daemon_status_check(_vault_root: &Path) -> DoctorResult {
-    use crate::commands::daemon_client::{self, DaemonHandle, DaemonInfo};
+    use crate::commands::daemon_client::{
+        self, own_version, version_decision, DaemonHandle, DaemonInfo, VersionDecision,
+    };
 
     let slots = match daemon_client::all_slots() {
         Ok(s) => s,
@@ -1066,6 +1068,13 @@ fn daemon_status_check(_vault_root: &Path) -> DoctorResult {
 
     let mut running = Vec::new();
     let mut stale = Vec::new();
+    // #291: LIVE daemons whose stamped version differs from ours. A version-
+    // skewed daemon keeps serving the OLD wire shape (e.g. #281's empty gain
+    // route → dark dashboard) until it idles out or is restarted. doctor is
+    // diagnostic — it NEVER stops anything — but it warns with both versions +
+    // the `daemon stop --all` hint (the safety net for a user who `brew
+    // upgrade`d directly and never ran `onebrain update` / `plugin update`).
+    let mut skewed = Vec::new();
     let is_live = |info: &DaemonInfo| DaemonHandle::new(info.clone()).probe_health().is_some();
     for slot in &slots {
         match DaemonInfo::read(&slot.json) {
@@ -1078,6 +1087,14 @@ fn daemon_status_check(_vault_root: &Path) -> DoctorResult {
                         info.version,
                         info.vault.as_deref().unwrap_or("(none — vault-less)")
                     ));
+                    if version_decision(&info.version, own_version()) == VersionDecision::Restart {
+                        skewed.push(format!(
+                            "daemon v{} != CLI v{} · vault {}",
+                            info.version,
+                            own_version(),
+                            info.vault.as_deref().unwrap_or("(none — vault-less)")
+                        ));
+                    }
                 } else {
                     // Record present but the daemon doesn't answer: crashed or
                     // hard-killed, leaving a stale slot json behind.
@@ -1127,6 +1144,9 @@ fn daemon_status_check(_vault_root: &Path) -> DoctorResult {
     for r in &running {
         details.push(format!("running: {r}"));
     }
+    for sk in &skewed {
+        details.push(format!("version-skew: {sk}"));
+    }
     for s in &stale {
         details.push(format!("stale: {s}"));
     }
@@ -1135,16 +1155,27 @@ fn daemon_status_check(_vault_root: &Path) -> DoctorResult {
         return DoctorResult::ok(DAEMON_STATUS_CHECK, "no warm daemon running");
     }
 
-    // A live legacy daemon or any stale/wedged slot warrants a warn (+ the
-    // stop-all hint); an all-healthy per-vault fleet is ok.
-    if stale.is_empty() && !legacy_live {
+    // A live legacy daemon, a version-skewed live daemon (#291), or any
+    // stale/wedged slot warrants a warn (+ the stop-all hint); an all-healthy,
+    // all-current per-vault fleet is ok.
+    if stale.is_empty() && !legacy_live && skewed.is_empty() {
         let msg = match running.len() {
             1 => "1 warm daemon running".to_string(),
             n => format!("{n} warm daemons running"),
         };
         DoctorResult::ok(DAEMON_STATUS_CHECK, msg).with_details(details)
     } else {
-        let msg = if legacy_live && stale.is_empty() {
+        // Version-skew takes primacy in the message (it names both versions);
+        // a live legacy daemon and stale/wedged slots are the other warn causes.
+        let msg = if !skewed.is_empty() {
+            match skewed.len() {
+                1 => format!("version-skewed daemon running: {}", skewed[0]),
+                n => format!(
+                    "{n} version-skewed daemons running (CLI v{})",
+                    own_version()
+                ),
+            }
+        } else if legacy_live && stale.is_empty() {
             "legacy pre-v3.4.13 daemon still running — retire it".to_string()
         } else {
             format!(
@@ -6039,6 +6070,72 @@ mod tests {
         assert!(
             r.details.iter().any(|d| d.contains("LEGACY")),
             "details must name the legacy daemon: {r:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_status_check_warns_on_version_skew() {
+        // #291: a LIVE per-vault daemon whose stamped version differs from ours
+        // (the post-`brew upgrade` window) must warn — naming BOTH versions —
+        // with the `daemon stop --all` hint. doctor never stops it (diagnostic
+        // only); it just surfaces the skew so the user can refresh a dark
+        // dashboard. A minimal mock answers `/api/health` 200 so the daemon
+        // reads as live.
+        use std::io::{Read, Write};
+        let home = tempdir().unwrap();
+        let _env = crate::test_env::set_var("HOME", home.path());
+        let run_dir = home.path().join(".onebrain").join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                let req = String::from_utf8_lossy(&buf);
+                let resp: &[u8] = if req.starts_with("GET /api/health") {
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\n\r\n{\"ok\":true}"
+                } else {
+                    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n"
+                };
+                let _ = s.write_all(resp);
+            }
+        });
+
+        // A per-vault slot record stamped with an OLD version (≠ our
+        // CARGO_PKG_VERSION) → skew.
+        let info = crate::commands::daemon_client::DaemonInfo {
+            port,
+            token: "x".repeat(20),
+            pid: std::process::id(),
+            version: "0.0.1".to_string(),
+            vault: None,
+        };
+        std::fs::write(
+            run_dir.join("daemon-deadbeef.json"),
+            serde_json::to_vec(&info).unwrap(),
+        )
+        .unwrap();
+
+        let r = daemon_status_check(home.path());
+        assert_eq!(r.status, DoctorStatus::Warn, "{r:?}");
+        assert!(
+            r.message.contains("skew"),
+            "message must flag the version skew: {r:?}"
+        );
+        // Both versions must appear so the user knows what to refresh.
+        assert!(r.message.contains("0.0.1"), "old version in message: {r:?}");
+        assert!(
+            r.message.contains(env!("CARGO_PKG_VERSION")),
+            "our version in message: {r:?}"
+        );
+        assert_eq!(
+            r.hint.as_deref(),
+            Some("onebrain daemon stop --all"),
+            "{r:?}"
         );
     }
 

@@ -6,6 +6,10 @@
 //! v3.1 split: `onebrain update` now means "self-update the CLI binary",
 //! while `onebrain plugin update` is the plugin-side workflow.
 
+use crate::commands::daemon::stop_slot;
+use crate::commands::daemon_client::{
+    self, own_version, version_decision, DaemonInfo, SlotResolve, VersionDecision,
+};
 use crate::v31::hook_rewriter::{self, RewriteWarning};
 use anyhow::{Context, Result};
 use onebrain_fs::read_plugin_version;
@@ -52,6 +56,11 @@ pub struct PluginUpdateReport {
     /// always populated these, but they used to be dropped on the floor
     /// before reaching the user.
     pub warnings: Vec<RewriteWarning>,
+    /// v3.4.15 (#291): `true` when step 5 stopped a LIVE version-skewed warm
+    /// daemon for this vault (the user `brew upgrade`d then ran `plugin
+    /// update`). `false` on the common path where the running daemon already
+    /// matches our version, or none was running.
+    pub daemon_retired: bool,
 }
 
 /// Run the v3.1 plugin update workflow.
@@ -162,7 +171,44 @@ pub fn run(
         }
     }
 
+    // 5. Retire a version-skewed warm daemon for this vault (#291). A plugin
+    //    update doesn't change the CLI binary, but the user may have
+    //    `brew upgrade`d separately then run `plugin update` — the exact flow
+    //    that hit #291. A stale-version daemon keeps serving the OLD wire shape
+    //    (e.g. the empty gain route) until it idles out, so retire it now; the
+    //    next call respawns one at our version. CONDITIONAL: a no-op when the
+    //    running daemon already matches our version (no cold-start penalty on a
+    //    normal plugin update). Partial-failure convention — the helper never
+    //    surfaces an error: steps 2–4 already mutated disk, so a retire hiccup
+    //    is absorbed, not surfaced as a failed update.
+    if !dry_run {
+        report.daemon_retired = retire_skewed_daemon(resolved.root.as_path());
+    }
+
     Ok(report)
+}
+
+/// Step-5 core (#291): stop a LIVE version-skewed warm daemon for `vault_root`,
+/// returning `true` when one was actually retired. Returns `false` — never an
+/// error — when the running daemon already matches our version, none is
+/// running, or any of the slot / record lookups fail (partial-failure
+/// convention: a plugin update that already mutated disk must not fail on a
+/// best-effort daemon cleanup).
+fn retire_skewed_daemon(vault_root: &std::path::Path) -> bool {
+    let Ok(SlotResolve::Slot { paths, .. }) = daemon_client::resolve_slot(Some(vault_root)) else {
+        return false;
+    };
+    let Ok(Some(info)) = DaemonInfo::read(&paths.json) else {
+        return false;
+    };
+    // CONDITIONAL: matching version → leave the warm daemon alone.
+    if version_decision(&info.version, own_version()) != VersionDecision::Restart {
+        return false;
+    }
+    // `stop_slot` returns `(stopped, _)`; `stopped` is true only when a LIVE
+    // daemon was signalled. A stale on-disk record is just cleared — not a
+    // retire.
+    matches!(stop_slot(&paths), Ok((true, _)))
 }
 
 #[cfg(test)]
@@ -184,6 +230,7 @@ mod tests {
         assert!(!r.dry_run);
         assert!(r.partial_failure.is_none());
         assert!(r.warnings.is_empty());
+        assert!(!r.daemon_retired);
     }
 
     #[test]
@@ -201,6 +248,7 @@ mod tests {
             version_after: None,
             partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         assert_eq!(r.hooks_rewritten, 3);
         assert!(r.vault_synced);
@@ -281,5 +329,96 @@ mod tests {
             "expected one rewriter warning to plumb through to the report"
         );
         assert_eq!(report.warnings[0].code, "W_MALFORMED_HOOK_ENTRY");
+    }
+
+    // ── #291: step-5 warm-daemon retire (`retire_skewed_daemon`) ──────────
+    // Unix-only: isolates the daemon run dir via `$HOME`, which
+    // `dirs::home_dir()` honours only on Unix (the repo-wide convention for
+    // HOME-based daemon tests). A real short-lived child process stands in for
+    // the running daemon so `stop_slot`'s liveness probe + SIGTERM exercise
+    // for real.
+
+    /// Spawn a long-lived child to stand in for a running daemon. Killed +
+    /// reaped by the caller's cleanup. `process_group(0)` puts it in its OWN
+    /// process group (pgid == pid) so `daemon::is_alive`'s group-leader check
+    /// (the real daemon runs under `setsid()`) treats it as a live daemon.
+    #[cfg(unix)]
+    fn spawn_fake_daemon_process() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn `sleep` as a fake live daemon")
+    }
+
+    /// Plant a per-vault daemon slot (`daemon-<hash>.json` + `.pid`) under
+    /// `$HOME/.onebrain/run/` for `vault`, stamped `version` and pointing at
+    /// `pid` — the record `retire_skewed_daemon` reads.
+    #[cfg(unix)]
+    fn plant_slot(vault: &std::path::Path, version: &str, pid: u32) {
+        let SlotResolve::Slot { paths, .. } = daemon_client::resolve_slot(Some(vault)).unwrap()
+        else {
+            panic!("vault slot must resolve for a real tempdir");
+        };
+        let info = DaemonInfo {
+            port: 1, // retire never probes health — pid liveness is what matters
+            token: "x".repeat(20),
+            pid,
+            version: version.to_string(),
+            vault: daemon_client::canonical_vault_id(vault),
+        };
+        info.write(&paths.json).unwrap(); // also creates the 0700 run dir
+        std::fs::write(&paths.pid, format!("{pid}\n")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retire_skewed_daemon_stops_live_skewed_daemon() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_var("HOME", home.path());
+        let vault = tempfile::tempdir().unwrap();
+        let mut child = spawn_fake_daemon_process();
+        // A version DIFFERENT from ours — the post-`brew upgrade` skew.
+        plant_slot(vault.path(), "0.0.1", child.id());
+
+        assert!(
+            retire_skewed_daemon(vault.path()),
+            "a live version-skewed daemon must be retired (flag true)"
+        );
+
+        // `stop_slot` SIGTERM'd the child — reap it to avoid a lingering zombie.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retire_skewed_daemon_leaves_matching_version_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_var("HOME", home.path());
+        let vault = tempfile::tempdir().unwrap();
+        let mut child = spawn_fake_daemon_process();
+        // SAME version as ours → conditional no-op, daemon left running.
+        plant_slot(vault.path(), env!("CARGO_PKG_VERSION"), child.id());
+
+        assert!(
+            !retire_skewed_daemon(vault.path()),
+            "a version-matching daemon must be left running (flag false)"
+        );
+
+        // The daemon was NOT stopped — it's still our child; clean it up.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retire_skewed_daemon_false_when_no_record() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_var("HOME", home.path());
+        let vault = tempfile::tempdir().unwrap();
+        // No slot json planted → nothing running → nothing retired.
+        assert!(!retire_skewed_daemon(vault.path()));
     }
 }

@@ -203,6 +203,48 @@ fn query_daemon_leg(vault_root: &Path, path: &str) -> DaemonLeg {
     })
 }
 
+// Test-only in-process transport seam (#289). Fake-daemon tests used to stand
+// up a real localhost `TcpListener` and drive `run()` through the socket +
+// deadline thread below; on a degraded CI runner the loopback round-trip could
+// lose the race to the check budget, flipping the recorded verdict from the
+// asserted reason (e.g. `no_session_token`) to `daemon_timeout` — a pure
+// infrastructure flake, not a logic bug. Growing the 200ms→5s budget (v3.4.14)
+// didn't hold (the runner blew even 5s). This seam lets a test inject the
+// daemon leg's result DIRECTLY, so a slow runner can be slow but can NEVER time
+// out an in-process call — the whole flake class is eliminated while the full
+// verdict (exit code + gain event) is still asserted deterministically.
+//
+// Production is untouched: the seam is `#[cfg(test)]`, so
+// `query_daemon_leg_with_deadline` compiles to the identical real-HTTP path in
+// release builds. The socket-backed `timeout_fails_open_fast_and_records_event`
+// test deliberately does NOT set the override — it exercises the real budget.
+#[cfg(test)]
+thread_local! {
+    static DAEMON_LEG_OVERRIDE: std::cell::RefCell<Option<DaemonLeg>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install a one-shot daemon-leg override on the current thread and return an
+/// RAII guard that clears it on drop (so a panicking test can't leak the
+/// override onto a reused pool thread). Consumed by the next
+/// `query_daemon_leg_with_deadline` call via `take()`.
+#[cfg(test)]
+#[must_use]
+fn override_daemon_leg(leg: DaemonLeg) -> DaemonLegGuard {
+    DAEMON_LEG_OVERRIDE.with(|c| *c.borrow_mut() = Some(leg));
+    DaemonLegGuard
+}
+
+#[cfg(test)]
+struct DaemonLegGuard;
+
+#[cfg(test)]
+impl Drop for DaemonLegGuard {
+    fn drop(&mut self) {
+        DAEMON_LEG_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    }
+}
+
 /// Run [`query_daemon_leg`] on a detached thread and wait up to `budget`
 /// (`token_optimization.check_timeout_ms`, #264). A timeout fails open (a
 /// wedged daemon holds the engine — a Direct open would only hit its lock, so
@@ -213,6 +255,12 @@ fn query_daemon_leg_with_deadline(
     path: String,
     budget: Duration,
 ) -> DaemonLeg {
+    // #289: a test-injected verdict short-circuits the socket + deadline thread
+    // entirely (in-process → no timing race). No-op in production (`cfg(test)`).
+    #[cfg(test)]
+    if let Some(leg) = DAEMON_LEG_OVERRIDE.with(|c| c.borrow_mut().take()) {
+        return leg;
+    }
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(query_daemon_leg(&vault_root, &path));
@@ -719,39 +767,13 @@ mod tests {
         (vault, cache)
     }
 
-    /// Like [`test_vault`] but with `token_optimization.check_timeout_ms` set
-    /// to `ms` — the SAME config key `check_timeout_reads_configured_budget`
-    /// exercises (#264), reused here as a test-hardening knob (#289) rather
-    /// than a product default. `query_daemon_leg_with_deadline`'s 200ms
-    /// default budget is sized for the real p99 (a warm loopback round-trip),
-    /// not for a CI runner under contention — the fake daemon's socket
-    /// accept/spawn/write can occasionally lose that race on a slow
-    /// macos-latest runner even with zero injected delay, flipping the
-    /// recorded fail-open reason from `no_session_token` to
-    /// `daemon_timeout`/`ledger_check_error` (seen once on afc98be's push
-    /// run). Raising the budget here removes the race without loosening the
-    /// test's assertion on the SPECIFIC reason — which stays load-bearing:
-    /// it's the only thing distinguishing "the gate correctly saw no session
-    /// token" from "infrastructure broke" in the deny-telemetry `/doctor`
-    /// reads from (design §5c-5).
-    ///
-    /// Every fake-daemon test whose assertion is about the VERDICT (a
-    /// specific reason, an exit code, an event count) uses this — only
-    /// `timeout_fails_open_fast_and_records_event`, which tests the budget
-    /// itself, keeps the 200ms default.
-    #[cfg(unix)]
-    fn test_vault_with_check_timeout_ms(ms: u32) -> (tempfile::TempDir, tempfile::TempDir) {
-        let vault = tempfile::tempdir().unwrap();
-        std::fs::write(
-            vault.path().join("onebrain.yml"),
-            format!(
-                "search:\n  collection: token-check-test\ntoken_optimization:\n  check_timeout_ms: {ms}\n"
-            ),
-        )
-        .unwrap();
-        let cache = tempfile::tempdir().unwrap();
-        (vault, cache)
-    }
+    // #289 (v3.4.15): the version-skew / verdict / event / exit-code assertions
+    // that used to need a raised `check_timeout_ms` budget now inject the daemon
+    // leg in-process (see `override_daemon_leg`), so there is no socket to race
+    // and no budget to raise — the `test_vault_with_check_timeout_ms` helper the
+    // budget-bump (v3.4.14) added is gone. Only
+    // `timeout_fails_open_fast_and_records_event` still drives a real socket, on
+    // the product-default 200ms budget, because it tests the budget itself.
 
     fn gain_events(cache: &Path) -> Vec<GainEvent> {
         // `ONEBRAIN_CACHE_DIR` overrides `search_cache_root()`'s PARENT
@@ -912,15 +934,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn daemon_predates_token_routes_fails_open_and_records_event() {
-        // 5s budget (#289): the assert is on the SPECIFIC skew reason — a CI
-        // scheduling race must never flip it to `daemon_timeout`.
-        let (vault, cache) = test_vault_with_check_timeout_ms(5000);
-        let port = start_fake_daemon(404, "not found", Duration::ZERO);
+        // #289: in-process seam — inject the version-skew (404, route-missing)
+        // verdict directly instead of a real socket, so a slow CI runner can't
+        // race the round-trip into a spurious `daemon_timeout`. The full
+        // verdict (fail-open reason + gain event) is still asserted.
+        let (vault, cache) = test_vault();
         let _env = crate::test_env::set_vars(&[
             ("HOME", vault.path().as_os_str()),
             ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
         ]);
-        write_daemon_json(vault.path(), vault.path(), port, "daemon-check-token-123");
+        let _leg = override_daemon_leg(DaemonLeg::Verdict(CheckOutcome::FailOpen(
+            "daemon_version_skew",
+        )));
 
         let code =
             run(Some(vault.path().to_path_buf()), "notes/a.md").expect("run should not error");
@@ -934,20 +959,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn no_session_response_fails_open_and_records_event() {
-        // #289: a generous 5s budget (vs. the 200ms product default) so a
-        // slow CI runner's scheduling jitter can never race the fake
-        // daemon's socket round-trip into a spurious `daemon_timeout` /
-        // `ledger_check_error` — see `test_vault_with_check_timeout_ms`'s
-        // doc comment. The fake daemon still answers almost instantly
-        // (`Duration::ZERO` injected delay below), so this doesn't make the
-        // test itself slow; it only raises the ceiling.
-        let (vault, cache) = test_vault_with_check_timeout_ms(5000);
-        let port = start_fake_daemon(200, r#"{"verdict":"no_session"}"#, Duration::ZERO);
+        // #289: the daemon's `no_session` verdict maps to a `no_session_token`
+        // fail-open. Inject it in-process (the response→outcome mapping itself
+        // is covered by `no_session_verdict_fails_open`), so the run()
+        // pipeline's exit code + gain event are asserted with zero socket
+        // timing — a slow CI runner can never flip this to `daemon_timeout`.
+        let (vault, cache) = test_vault();
         let _env = crate::test_env::set_vars(&[
             ("HOME", vault.path().as_os_str()),
             ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
         ]);
-        write_daemon_json(vault.path(), vault.path(), port, "daemon-check-token-123");
+        let _leg = override_daemon_leg(DaemonLeg::Verdict(CheckOutcome::FailOpen(
+            "no_session_token",
+        )));
 
         let code =
             run(Some(vault.path().to_path_buf()), "notes/a.md").expect("run should not error");
@@ -970,31 +994,23 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn warm_same_vault_daemon_gates_even_across_version_skew() {
-        // 5s budget (#289): the assert is exit 2 (deny) — a CI scheduling
-        // race must never time the round-trip out into a fail-open exit 0.
-        // (Still a conservative-level client config; only the budget differs.)
-        let (vault, cache) = test_vault_with_check_timeout_ms(5000);
-        let body = r#"{"verdict":"unchanged","reference":{"doc_path":"notes/a.md","hash":"deadbeef","sent_earlier":true,"bytes_saved":6352,"rematerialize":"onebrain search get notes/a.md --force"}}"#;
-        let port = start_fake_daemon(200, body, Duration::ZERO);
+        // #289: the warm same-vault daemon (adopted across version skew, #264)
+        // answers `unchanged` → the read GATES (exit 2). Inject that verdict
+        // in-process so the exit-2 assertion can't be flipped to a fail-open
+        // exit 0 by a CI scheduling race on the socket round-trip.
+        let (vault, cache) = test_vault();
         let _env = crate::test_env::set_vars(&[
             ("HOME", vault.path().as_os_str()),
             ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
         ]);
-        // A version DIFFERENT from ours — the post-upgrade skew condition.
-        write_daemon_json_versioned(
-            vault.path(),
-            vault.path(),
-            port,
-            "daemon-check-token-123",
-            "0.0.1-old",
-        );
+        let reference = ReferenceEnvelope::new("notes/a.md", "deadbeef", 6352);
+        let _leg = override_daemon_leg(DaemonLeg::Verdict(CheckOutcome::Unchanged(reference)));
 
         let code =
             run(Some(vault.path().to_path_buf()), "notes/a.md").expect("run should not error");
         assert_eq!(
             code, 2,
-            "a warm same-vault daemon must be adopted across version skew and GATE the read \
-             (exit 2) via its held engine — never version-rejected into a colliding cold open"
+            "a warm same-vault daemon's `unchanged` verdict must GATE the read (exit 2)"
         );
     }
 
@@ -1030,17 +1046,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unchanged_verdict_denies_with_reference_json_on_stdout() {
-        // 5s budget (#289): the assert is exit 2 + the LedgerDeny row — a CI
-        // scheduling race must never time out into fail-open (exit 0 + a
-        // HookFailopen row instead).
-        let (vault, cache) = test_vault_with_check_timeout_ms(5000);
-        let body = r#"{"verdict":"unchanged","reference":{"doc_path":"notes/a.md","hash":"deadbeef","sent_earlier":true,"bytes_saved":123,"rematerialize":"onebrain search get notes/a.md --force"}}"#;
-        let port = start_fake_daemon(200, body, Duration::ZERO);
+        // #289: inject the `unchanged` deny verdict in-process so the exit-2 +
+        // LedgerDeny assertions can't be flipped to a fail-open (exit 0 +
+        // HookFailopen) by a CI scheduling race on the socket round-trip.
+        let (vault, cache) = test_vault();
         let _env = crate::test_env::set_vars(&[
             ("HOME", vault.path().as_os_str()),
             ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
         ]);
-        write_daemon_json(vault.path(), vault.path(), port, "daemon-check-token-123");
+        // `bytes_saved = 123` — the avoided doc body the deny credits below.
+        let reference = ReferenceEnvelope::new("notes/a.md", "deadbeef", 123);
+        let _leg = override_daemon_leg(DaemonLeg::Verdict(CheckOutcome::Unchanged(reference)));
 
         let code =
             run(Some(vault.path().to_path_buf()), "notes/a.md").expect("run should not error");
@@ -1067,15 +1083,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn allow_verdict_produces_no_gain_event() {
-        // 5s budget (#289): the assert is "NO gain event" — a CI scheduling
-        // race must never time out into a fail-open that records one.
-        let (vault, cache) = test_vault_with_check_timeout_ms(5000);
-        let port = start_fake_daemon(200, r#"{"verdict":"first_send"}"#, Duration::ZERO);
+        // #289: inject an `Allow` verdict in-process so the "NO gain event"
+        // assertion can't be flipped by a CI scheduling race timing the socket
+        // round-trip out into a fail-open (which WOULD record an event).
+        let (vault, cache) = test_vault();
         let _env = crate::test_env::set_vars(&[
             ("HOME", vault.path().as_os_str()),
             ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
         ]);
-        write_daemon_json(vault.path(), vault.path(), port, "daemon-check-token-123");
+        let _leg = override_daemon_leg(DaemonLeg::Verdict(CheckOutcome::Allow));
 
         let code =
             run(Some(vault.path().to_path_buf()), "notes/a.md").expect("run should not error");
