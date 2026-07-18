@@ -54,8 +54,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// The CLI's own version — the daemon stamps it into `daemon.json`, and a
-/// client compares against it to detect version skew.
-fn own_version() -> &'static str {
+/// client compares against it to detect version skew. `pub(crate)` so the
+/// `plugin update` (#291) and `doctor` version-skew checks reuse the SAME
+/// source of truth rather than re-reading `CARGO_PKG_VERSION` independently.
+pub(crate) fn own_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 

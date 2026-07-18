@@ -703,6 +703,7 @@ pub(crate) fn render_plugin_update_animated_to<W: std::io::Write>(
         version_after: report.version_after.as_deref(),
         dry_run: report.dry_run,
         partial_failure: report.partial_failure.as_deref(),
+        daemon_retired: report.daemon_retired,
     };
     render_plugin_update_inner(writer, &fields, mode, false, step_delay_override)
 }
@@ -723,6 +724,8 @@ struct PluginUpdateFields<'a> {
     version_after: Option<&'a str>,
     dry_run: bool,
     partial_failure: Option<&'a str>,
+    /// #291: a live version-skewed warm daemon was retired this run.
+    daemon_retired: bool,
 }
 
 /// Shared body for both `plugin update` text surfaces (v3.2.18 · unifies the
@@ -847,6 +850,19 @@ fn render_plugin_update_inner<W: std::io::Write>(
             writeln!(writer, " {dim}↻ {hint}{reset}")?;
         } else {
             writeln!(writer, " ↻ {hint}")?;
+        }
+    }
+    // #291: surface the retired warm daemon so the user knows the dark
+    // dashboard has been refreshed. The respawned daemon comes up at our
+    // version (`own_version`) on the next call. "warm daemon" matches the
+    // `onebrain update` wording (`retired {n} warm daemon(s)`) for parity.
+    if f.daemon_retired {
+        let own = crate::commands::daemon_client::own_version();
+        let msg = format!("retired warm daemon — respawns at v{own} on next use");
+        if color {
+            writeln!(writer, " {dim}↻ {msg}{reset}")?;
+        } else {
+            writeln!(writer, " ↻ {msg}")?;
         }
     }
     writeln!(writer, "{dim}{rule}{reset}")?;
@@ -989,6 +1005,16 @@ struct PluginUpdateData<'a> {
     note: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     partial_failure: Option<&'a str>,
+    /// #291: `true` only when a live version-skewed warm daemon was retired.
+    /// Skipped when `false` so the JSON envelope shape stays additive (a
+    /// normal plugin update gains no new field).
+    #[serde(skip_serializing_if = "is_false")]
+    daemon_retired: bool,
+}
+
+/// serde `skip_serializing_if` predicate — omit a `false` bool from the JSON.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Same as [`emit_plugin_update_summary`] but with an injectable writer for
@@ -1020,6 +1046,7 @@ pub(crate) fn emit_plugin_update_summary_to<W: std::io::Write>(
             None
         },
         partial_failure: report.partial_failure.as_deref(),
+        daemon_retired: report.daemon_retired,
     };
 
     let mut env = if let Some(reason) = report.partial_failure.as_deref() {
@@ -1088,6 +1115,7 @@ fn render_plugin_update_text(
         version_after: d.version_after,
         dry_run: d.dry_run,
         partial_failure: d.partial_failure,
+        daemon_retired: d.daemon_retired,
     };
     // Static text mode: `force_static = true` — no spinner for `plugin
     // update`; the operation is fast (single HTTP fetch + a few file writes)
@@ -1134,6 +1162,7 @@ mod tests {
             version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mode = OutputMode::Json { pretty: false };
         let err = emit_plugin_update_summary_to(&report, &mode, BrokenPipeWriter)
@@ -1194,6 +1223,7 @@ mod tests {
             version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
@@ -1226,6 +1256,86 @@ mod tests {
     }
 
     #[test]
+    fn plugin_update_daemon_retired_renders_in_text_and_json() {
+        // #291 (R2-#1): when step 5 retired a skewed warm daemon, BOTH surfaces
+        // must show it — the framed text report gets the `↻ retired warm daemon`
+        // glyph line naming our version, and the JSON envelope gains a
+        // `daemon_retired: true` field. Mirrors the partial-failure surfacing.
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 1,
+            plists_rewritten: false,
+            plists_count: Some(0),
+            version_before: None,
+            version_after: None,
+            partial_failure: None,
+            warnings: Vec::new(),
+            daemon_retired: true,
+        };
+        let own = crate::commands::daemon_client::own_version();
+
+        // Text surface — the glyph line renders with our version.
+        let mut text_buf = Vec::new();
+        emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut text_buf).unwrap();
+        let text = String::from_utf8(text_buf).unwrap();
+        assert!(
+            text.contains("↻ retired warm daemon"),
+            "retire glyph line missing:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("respawns at v{own}")),
+            "retire line must name our version:\n{text}"
+        );
+
+        // JSON surface — the field appears and is true.
+        let mut json_buf = Vec::new();
+        let json_mode = OutputMode::Json { pretty: false };
+        emit_plugin_update_summary_to(&report, &json_mode, &mut json_buf).unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&json_buf).unwrap();
+        assert_eq!(
+            env["data"]["daemon_retired"],
+            serde_json::json!(true),
+            "JSON envelope must carry daemon_retired: true:\n{env}"
+        );
+    }
+
+    #[test]
+    fn plugin_update_daemon_not_retired_omits_json_field() {
+        // The additive-shape guard: with no retire, `daemon_retired` is skipped
+        // from the JSON (via `skip_serializing_if`) so a normal plugin update's
+        // envelope shape is unchanged, and the text report shows no retire line.
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 1,
+            plists_rewritten: false,
+            plists_count: Some(0),
+            version_before: None,
+            version_after: None,
+            partial_failure: None,
+            warnings: Vec::new(),
+            daemon_retired: false,
+        };
+        let mut json_buf = Vec::new();
+        let json_mode = OutputMode::Json { pretty: false };
+        emit_plugin_update_summary_to(&report, &json_mode, &mut json_buf).unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&json_buf).unwrap();
+        assert!(
+            env["data"].get("daemon_retired").is_none(),
+            "daemon_retired must be omitted when false:\n{env}"
+        );
+
+        let mut text_buf = Vec::new();
+        emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut text_buf).unwrap();
+        let text = String::from_utf8(text_buf).unwrap();
+        assert!(
+            !text.contains("retired warm daemon"),
+            "no retire line when nothing was retired:\n{text}"
+        );
+    }
+
+    #[test]
     fn plugin_update_text_dry_run_renders_dry_run_section_header_and_verdict() {
         let report = plugin_update::PluginUpdateReport {
             dry_run: true,
@@ -1237,6 +1347,7 @@ mod tests {
             version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
@@ -1268,6 +1379,7 @@ mod tests {
             version_after: None,
             partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
@@ -1308,6 +1420,7 @@ mod tests {
                 "schedule re-register failed\nlaunchctl exit 1\nplist syntax error".to_string(),
             ),
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
@@ -1340,6 +1453,7 @@ mod tests {
             version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
@@ -1376,6 +1490,7 @@ mod tests {
             version_after: Some("3.1.4".to_string()),
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
@@ -1406,6 +1521,7 @@ mod tests {
             version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
@@ -1440,6 +1556,7 @@ mod tests {
             version_after: None,
             partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let color_mode = OutputMode::Text {
             color: true,
@@ -1487,6 +1604,7 @@ mod tests {
             version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         render_plugin_update_animated_to(
@@ -1543,6 +1661,7 @@ mod tests {
             version_after: None,
             partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         render_plugin_update_animated_to(
@@ -1579,6 +1698,7 @@ mod tests {
             version_after: Some("3.1.4".to_string()),
             partial_failure: Some("schedule re-register failed: launchctl exit 1".to_string()),
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         emit_plugin_update_summary_to(&report, &text_mode_mono(), &mut buf).unwrap();
@@ -1605,6 +1725,7 @@ mod tests {
             version_after: Some("3.1.4".to_string()),
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         render_plugin_update_animated_to(
@@ -1636,6 +1757,7 @@ mod tests {
             version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         let mode = OutputMode::Json { pretty: false };
@@ -1725,6 +1847,7 @@ mod tests {
             version_after: None,
             partial_failure: Some("launchctl exit 1".to_string()),
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         let mode = OutputMode::Json { pretty: false };
@@ -1762,6 +1885,7 @@ mod tests {
             version_after: Some("3.1.4".to_string()),
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         let mode = OutputMode::Json { pretty: false };
@@ -1787,6 +1911,7 @@ mod tests {
             version_after: None,
             partial_failure: None,
             warnings: Vec::new(),
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         let mode = OutputMode::Json { pretty: false };
@@ -1819,6 +1944,7 @@ mod tests {
                 code: "W_MALFORMED_HOOK_ENTRY".to_string(),
                 message: "unexpected hook shape at index 2".to_string(),
             }],
+            daemon_retired: false,
         };
         let mut buf = Vec::new();
         let mode = OutputMode::Json { pretty: false };

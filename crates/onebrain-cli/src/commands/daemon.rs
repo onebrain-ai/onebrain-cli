@@ -1168,14 +1168,15 @@ pub fn run_stop(mode: &OutputMode, vault: Option<&Path>, all: bool) -> Result<()
     Ok(())
 }
 
-/// `daemon stop --all` — stop every per-vault daemon on the machine. Reports how
-/// many were stopped (the `pid` field carries the last one, for the text line).
-fn run_stop_all(mode: &OutputMode) -> Result<()> {
+/// Stop EVERY daemon slot on the machine — every per-vault slot PLUS the legacy
+/// pre-v3.4.13 single slot — returning `(count_stopped, last_pid)`. The shared
+/// core behind `daemon stop --all` AND the post-upgrade warm-daemon retire
+/// (#291, `onebrain update`): the binary just changed, so every running daemon
+/// is now stale. `stop_slot` on an absent slot is a harmless no-op that just
+/// clears any stale files.
+pub(crate) fn stop_all_slots() -> Result<(usize, Option<u32>)> {
     let mut stopped = 0usize;
     let mut last_pid = None;
-    // Every per-vault slot, PLUS the legacy pre-v3.4.13 single slot (so an
-    // upgrade leaves nothing running). `stop_slot` on an absent slot is a
-    // harmless no-op that just clears any stale files.
     let mut slots = daemon_client::all_slots()?;
     slots.push(daemon_client::legacy_slot()?);
     for slot in slots {
@@ -1185,6 +1186,13 @@ fn run_stop_all(mode: &OutputMode) -> Result<()> {
             last_pid = pid;
         }
     }
+    Ok((stopped, last_pid))
+}
+
+/// `daemon stop --all` — stop every per-vault daemon on the machine. Reports how
+/// many were stopped (the `pid` field carries the last one, for the text line).
+fn run_stop_all(mode: &OutputMode) -> Result<()> {
+    let (stopped, last_pid) = stop_all_slots()?;
     let env = Envelope::ok(
         "daemon.stop",
         None,
