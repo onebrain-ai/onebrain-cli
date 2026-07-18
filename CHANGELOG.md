@@ -1,6 +1,6 @@
 ---
-latest_version: 3.4.14
-released: 2026-07-17
+latest_version: 3.4.15
+released: 2026-07-18
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,15 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.15] — 2026-07-18 — Retire the stale warm daemon on upgrade
+
+Theme: close the v3.4 line — after a binary upgrade, a warm daemon of the OLD version no longer serves stale routes (the v3.4.14 gain-dashboard-dark class), and the fake-daemon tests are deterministic for real.
+
+- `onebrain update` retires every warm daemon after a successful upgrade (they respawn at the new version on next use), and `onebrain plugin update` retires a version-skewed daemon for its vault — so the WebUI/mcp never keep serving an old binary's routes ([#291](https://github.com/onebrain-ai/onebrain-cli/issues/291))
+- `onebrain doctor` now warns when a running daemon's version differs from the CLI, with the `onebrain daemon stop --all` hint — the safety net for an in-place `brew upgrade` ([#291](https://github.com/onebrain-ai/onebrain-cli/issues/291))
+- Fake-daemon token-check tests are deterministic: verdict→exit-code mapping runs in-process (no socket timing), while the daemon-adoption/#264 regression + HTTP-branch coverage runs on a generous fixed budget — no more slow-CI-runner flakes ([#289](https://github.com/onebrain-ai/onebrain-cli/issues/289))
+- CI guard asserts the README Quickstart `onebrain --version` example matches the workspace version, so it can never ship stale again
 
 ## [3.4.14] — 2026-07-17 — Human-readable CLI + gain dashboard truth
 
