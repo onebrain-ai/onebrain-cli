@@ -1,6 +1,6 @@
 ---
-latest_version: 3.4.15
-released: 2026-07-18
+latest_version: 3.4.16
+released: 2026-07-20
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,17 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.16] — 2026-07-20 — Search recall: headings become searchable, the rerank gate stops deleting hits
+
+Theme: two defects that were removing correct answers from every search, and the schema migration the first one forces.
+
+- `heading_path` is now searched, not just stored — and it shares the script-aware tokenizer with `body`, so **Thai and CJK headings can match at all** for the first time. Heading-shaped recall doubles (hit@10 0.300 → 0.600 on a real 782-doc vault) with no loss on body-term queries ([#294](https://github.com/onebrain-ai/onebrain-cli/issues/294))
+- **Breaking (index):** that tokenizer change alters the tantivy schema, so an index built by ≤3.4.15 is migrated on first use — rebuilt from stored chunk metadata, no files re-read and nothing re-embedded (1.2 s for 6271 chunks, then 8 ms). Crash-safe: an interrupted migration is detected and finished on the next open, and a rebuild that would erase the only surviving copy refuses instead. **Downgrading afterwards requires `onebrain search reindex --force`** ([ADR 0034](docs/decisions/0034-heading-search-schema-selfheal-rerank-gate-decouple.md))
+- `search.reranker.min_score` defaults to `0.0`: the reranker now **reorders** instead of deleting rows, restoring hits it was silently dropping (heading-shaped hit@10 0.233 → 0.500, body-term 0.500 → 0.733). The confidence bands are unchanged at 0.30/0.60 — the gate asks whether to delete a row, the band asks how much to trust it ([#295](https://github.com/onebrain-ai/onebrain-cli/issues/295))
+- Vaults initialized on v3.4.7–v3.4.15 have `min_score: 0.30` written into their own `onebrain.yml` and keep the old behaviour; `onebrain doctor` now flags it as a **superseded default** and `--fix` resets it
+- `onebrain doctor` gains a `lex-index` check for a keyword index that is empty, duplicated or orphaned relative to its stored metadata — states that previously reported as healthy while search returned nothing; `--fix` repairs the first two from metadata
+- `doctor --fix --json` no longer runs a repair for checks that have none, so a warm daemon no longer produces a spurious failure and exit 1
 
 ## [3.4.15] — 2026-07-18 — Retire the stale warm daemon on upgrade
 
