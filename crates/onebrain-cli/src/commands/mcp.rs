@@ -18,7 +18,6 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt
 
 use onebrain_core::path::ResolvedVault;
 use onebrain_search::engine::{Engine, Hit};
-use onebrain_search::lex::LexIndex;
 
 use onebrain_core::config::{TokenOptimizationConfig, VaultConfig};
 use onebrain_token::gain::Surface;
@@ -27,6 +26,7 @@ use onebrain_token::{CacheKind, GainEvent, MemoKey, OptLevel, ReferenceEnvelope,
 use super::daemon_client::{self, DaemonHandle};
 use super::search_common::{
     collection_cache_dir, collection_for, index_artifact_path, normalize_doc_path, open_engine,
+    open_lex_migrating,
 };
 use super::search_status::{
     status_data_for, status_data_from_daemon, DaemonStatusCounts, SearchStatusData,
@@ -523,7 +523,7 @@ fn no_index_note() -> String {
 fn lex_subquery(resolved: &ResolvedVault, text: &str, top_k: usize) -> anyhow::Result<Vec<Hit>> {
     let collection = collection_for(resolved)?;
     let cache_dir = collection_cache_dir(&collection);
-    let lex = LexIndex::open(&index_artifact_path(&cache_dir, "tantivy"))
+    let lex = open_lex_migrating(&cache_dir, resolved)
         .with_context(|| format!("opening lex index at {}", cache_dir.display()))?;
     let raw_hits = lex.search(text, top_k)?;
     Ok(raw_hits

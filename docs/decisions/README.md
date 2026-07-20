@@ -52,7 +52,7 @@ ADRs are immutable once accepted — if a decision changes, write a new ADR that
 | [0022](0022-honest-search-lock-errors.md) | Honest search lock & status errors (`E_ENGINE_BUSY`, exit 77) | accepted |
 | [0023](0023-warm-daemon-mcp-search.md) | Warm daemon owns the search engine for mcp + CLI search | accepted |
 | [0024](0024-vector-confidence-recall-first.md) | Recall-first vector cutoff + honest confidence | accepted · superseded in part by [0025](0025-tier2-cross-encoder-reranker.md) |
-| [0025](0025-tier2-cross-encoder-reranker.md) | Tier-2 cross-encoder reranker on every search surface | accepted |
+| [0025](0025-tier2-cross-encoder-reranker.md) | Tier-2 cross-encoder reranker on every search surface | accepted · superseded in part by [0034](0034-heading-search-schema-selfheal-rerank-gate-decouple.md) |
 | [0026](0026-config-self-documentation.md) | Self-documenting onebrain.yml + doctor validate/reset-to-default | accepted |
 | [0027](0027-collection-cache-layout-split.md) | Collection cache layout split (`index/` + `models/`) with eager migration | accepted |
 | [0028](0028-token-optimization-layer.md) | Token optimization layer: `onebrain-token` crate, level ladder, honesty contract | accepted |
@@ -61,5 +61,6 @@ ADRs are immutable once accepted — if a decision changes, write a new ADR that
 | [0031](0031-vault-read-ledger-gate-hook.md) | Vault-read ledger gate hook: deny only repeat-unchanged, fail-open, default off | accepted |
 | [0032](0032-self-healing-daemon-fallback.md) | Self-healing daemon fallback: token gain / serve / vsearch under redb contention | accepted |
 | [0033](0033-per-vault-daemon-slots.md) | Per-vault daemon slots: multi-vault warm daemons on one machine (ephemeral ports, no-steal) | accepted |
+| [0034](0034-heading-search-schema-selfheal-rerank-gate-decouple.md) | Heading search enables the lex schema; self-heal over a hard error; rerank gate decoupled from the confidence band | accepted |
 
 > These ADRs distill the public-facing rationale; the full design notes live in the project tracker. Numbers are stable IDs assigned at authoring time — see each ADR's **Date** for chronology.

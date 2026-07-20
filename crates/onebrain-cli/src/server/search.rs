@@ -37,9 +37,11 @@ use super::{AppState, SharedEngine};
 use crate::commands::search_common::rerank_settings_from_config;
 use crate::commands::search_common::{
     collection_cache_dir, collection_name_readonly, index_artifact_path,
+    open_lex_migrating_with_collection,
 };
 #[cfg(feature = "semantic")]
 use onebrain_search::engine::Engine;
+#[cfg(test)]
 use onebrain_search::lex::LexIndex;
 
 /// Query string for `GET /api/vault/search`.
@@ -187,7 +189,8 @@ fn map_search_failure(e: anyhow::Error) -> ApiError {
 /// Synchronous search dispatcher, aware of an optionally-held persistent
 /// engine (the warm-daemon path). Runs entirely inside `spawn_blocking`.
 ///
-/// - **lex** always uses the standalone [`LexIndex`] (tantivy only — it never
+/// - **lex** always uses the standalone [`onebrain_search::lex::LexIndex`]
+///   (tantivy only — it never
 ///   opens redb, so it can't clash with a held engine, and needs no lock).
 /// - **hybrid** with a held engine reuses that engine under its mutex (the
 ///   ONLY redb opener in the daemon); without one it falls back to
@@ -224,7 +227,7 @@ fn run_search(
     } else if mode == "vec" {
         run_vec_held(engine, &cache_dir, root, query, top_k, min_candidates)
     } else {
-        run_lex(&cache_dir, query, top_k)
+        run_lex(root, &cache_dir, &collection, query, top_k)
     }
 }
 
@@ -271,18 +274,24 @@ fn run_hybrid_held(
 
 /// Lex-only build: a held engine can't do vector search (no embedder), so
 /// hybrid degrades to keyword ranking. `cache_dir` is re-derived by the caller;
-/// route straight to [`run_lex`] via the standalone index. `root`/`engine` are
-/// unused here — the held engine offers nothing a lex-only build can use.
+/// route straight to [`run_lex`] via the standalone index. `engine` is unused
+/// here — the held engine offers nothing a lex-only build can use.
 #[cfg(not(feature = "semantic"))]
 fn run_hybrid_held(
     _engine: &SharedEngine,
     cache_dir: &Path,
-    _root: &Path,
+    root: &Path,
     query: &str,
     top_k: usize,
     _min_candidates: Option<usize>,
 ) -> anyhow::Result<Vec<SearchHit>> {
-    run_lex(cache_dir, query, top_k)
+    run_lex(
+        root,
+        cache_dir,
+        &collection_name_readonly(root)?,
+        query,
+        top_k,
+    )
 }
 
 /// Vector-only search against the daemon's held engine (#258 Gap 3). Mirrors
@@ -412,7 +421,7 @@ fn run_native(
     } else if mode == "vec" {
         run_vec(&cache_dir, root, query, top_k, min_candidates)
     } else {
-        run_lex(&cache_dir, query, top_k)
+        run_lex(root, &cache_dir, &collection, query, top_k)
     }
 }
 
@@ -420,8 +429,34 @@ fn run_native(
 /// `LexIndex::search` returns bare `(chunk_id, score)`; `chunk_id` prefixes
 /// the doc path (`<doc_path>#N`), so surface that as the path + title, with
 /// no snippet (the snippet lives in engine metadata this path never opens).
-fn run_lex(cache_dir: &Path, query: &str, top_k: usize) -> anyhow::Result<Vec<SearchHit>> {
-    let lex = LexIndex::open(&index_artifact_path(cache_dir, "tantivy"))?;
+///
+/// The THIRD read-only lex fast path (alongside `commands::search_query::run_lex`
+/// and `commands::mcp::lex_subquery`), and therefore the third that must go
+/// through the migrating open: a v3.4.16 binary meeting a ≤3.4.15 tantivy
+/// schema gets `is_schema_mismatch` back from a plain `LexIndex::open`, which
+/// this route rendered as a hard **HTTP 500** — a user who upgrades and opens
+/// the web UI hit it on every keystroke until some other command migrated for
+/// them (standalone `serve` holds no engine, and `run_search` routes
+/// `mode=lex` here even when a daemon does hold one).
+///
+/// Uses the NON-persisting [`open_lex_migrating_with_collection`], not
+/// `open_lex_migrating`: this route resolves its collection through
+/// `collection_name_readonly` precisely so a vault with no `search.collection`
+/// key is never rewritten (the persist path re-serializes the whole
+/// `onebrain.yml` through serde and strips the template's comments). The
+/// self-heal must not smuggle that write back in.
+fn run_lex(
+    root: &Path,
+    cache_dir: &Path,
+    collection: &str,
+    query: &str,
+    top_k: usize,
+) -> anyhow::Result<Vec<SearchHit>> {
+    // `vault_ctx::require` on the already-known root: the migrating open needs
+    // a `ResolvedVault` for the healing `Engine::open`, which only READS config
+    // (`search.embed_model` / `search.exclude` / the reranker block).
+    let resolved = crate::vault_ctx::require(Some(root.to_path_buf()))?;
+    let lex = open_lex_migrating_with_collection(cache_dir, &resolved, collection)?;
     let raw = lex.search(query, top_k)?;
     Ok(raw
         .into_iter()
@@ -504,17 +539,22 @@ fn run_hybrid(
 
 /// Lex-only build: hybrid degrades to keyword (BM25) ranking via [`run_lex`]
 /// rather than calling `Engine::query`, which has no embedder to fall back
-/// on in this build and would error instead of degrading. `root` is unused
-/// here (only needed to load `search.embed_model` for the real engine).
+/// on in this build and would error instead of degrading.
 #[cfg(not(feature = "semantic"))]
 fn run_hybrid(
     cache_dir: &Path,
-    _root: &Path,
+    root: &Path,
     query: &str,
     top_k: usize,
     _min_candidates: Option<usize>,
 ) -> anyhow::Result<Vec<SearchHit>> {
-    run_lex(cache_dir, query, top_k)
+    run_lex(
+        root,
+        cache_dir,
+        &collection_name_readonly(root)?,
+        query,
+        top_k,
+    )
 }
 
 /// File stem of a slash-separated vault path (`a/b/note.md` → `note`), used
@@ -590,6 +630,7 @@ mod tests {
     #[test]
     fn run_lex_returns_hits_from_a_prebuilt_index() {
         use onebrain_search::chunk::Chunk;
+        let vault = lex_test_vault("rl-hits");
         let cache = tempfile::tempdir().unwrap();
         let tantivy_dir = index_artifact_path(cache.path(), "tantivy");
         {
@@ -604,7 +645,7 @@ mod tests {
             .unwrap();
             lex.commit().unwrap();
         }
-        let hits = run_lex(cache.path(), "quick fox", TOP_K).unwrap();
+        let hits = run_lex(vault.path(), cache.path(), "rl-hits", "quick fox", TOP_K).unwrap();
         assert_eq!(hits.len(), 1, "hits: {hits:?}");
         assert_eq!(hits[0].path, "notes/alpha.md");
         assert_eq!(hits[0].title, "alpha");
@@ -618,6 +659,7 @@ mod tests {
         // Task 4: `top_k` is no longer hardcoded to `TOP_K` — a smaller
         // caller-supplied value must actually truncate the result set.
         use onebrain_search::chunk::Chunk;
+        let vault = lex_test_vault("rl-topk");
         let cache = tempfile::tempdir().unwrap();
         let tantivy_dir = index_artifact_path(cache.path(), "tantivy");
         {
@@ -634,8 +676,115 @@ mod tests {
             }
             lex.commit().unwrap();
         }
-        let hits = run_lex(cache.path(), "quick fox", 2).unwrap();
+        let hits = run_lex(vault.path(), cache.path(), "rl-topk", "quick fox", 2).unwrap();
         assert_eq!(hits.len(), 2, "top_k=2 must cap the result set: {hits:?}");
+    }
+
+    // ── stale-schema self-heal on the server lex path (B2, v3.4.16) ────────
+    //
+    // `GET /api/vault/search?mode=lex` was the THIRD read-only lex fast path
+    // and the one that got missed: a v3.4.16 binary meeting a ≤3.4.15 tantivy
+    // schema got `is_schema_mismatch` from a plain `LexIndex::open`, which this
+    // route rendered as a hard HTTP 500 on every keystroke. Standalone `serve`
+    // holds no engine, and `run_search` routes `mode=lex` here even when a
+    // daemon does — so nothing else migrated for the user.
+
+    #[test]
+    fn run_native_lex_self_heals_a_stale_schema_without_touching_config() {
+        // A vault with NO `search.collection` key — the shape that makes the
+        // persist-vs-read-only choice observable. If the self-heal routed
+        // through `open_lex_migrating` (→ `collection_for`), the generated name
+        // would be written back through a whole-file serde re-serialization,
+        // destroying the commented template. Asserted byte-for-byte below.
+        let vault = tempfile::tempdir().unwrap();
+        let config_path = vault.path().join("onebrain.yml");
+        let config_text = "# ── search ──────────\nsearch:\n  # keep me\n  default_top_k: 10\n";
+        std::fs::write(&config_path, config_text).unwrap();
+        std::fs::write(
+            vault.path().join("note.md"),
+            "# Errors Handling\nzebra quokka narwhal error text\n",
+        )
+        .unwrap();
+
+        let cache = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
+        let collection = collection_name_readonly(vault.path()).unwrap();
+        let cache_dir = collection_cache_dir(&collection);
+
+        // Populate chunk_meta + a CURRENT-schema lex index. `--lex-only` never
+        // touches the embedder, so this needs no model download. Opened
+        // through the read-only helper so the SETUP itself can't be what
+        // rewrites the config.
+        {
+            let mut engine =
+                crate::commands::search_common::open_engine_with_collection(&resolved, &collection)
+                    .unwrap();
+            engine
+                .reindex_all_lex_only_with_progress(vault.path(), &mut |_| {})
+                .unwrap();
+        } // dropped: releases the collection lock before the healing reopen.
+
+        let config_before = std::fs::read(&config_path).unwrap();
+
+        // Downgrade the tantivy dir to a FOREIGN schema — the on-disk shape a
+        // vault indexed by a ≤3.4.15 build presents to a v3.4.16 binary.
+        let tantivy_dir = index_artifact_path(&cache_dir, "tantivy");
+        std::fs::remove_dir_all(&tantivy_dir).unwrap();
+        std::fs::create_dir_all(&tantivy_dir).unwrap();
+        {
+            let mut sb = tantivy::schema::Schema::builder();
+            sb.add_text_field("something_else", tantivy::schema::TEXT);
+            tantivy::Index::builder()
+                .schema(sb.build())
+                .open_or_create(tantivy::directory::MmapDirectory::open(&tantivy_dir).unwrap())
+                .unwrap();
+        }
+        // Sanity: the plain open the route USED to do genuinely fails here, so
+        // a green result below can only come from the self-heal.
+        let plain = LexIndex::open(&tantivy_dir);
+        assert!(
+            plain
+                .as_ref()
+                .err()
+                .is_some_and(onebrain_search::lex::is_schema_mismatch),
+            "setup must produce a real schema mismatch, got {:?}",
+            plain.map(|_| "ok"),
+        );
+
+        // The exact standalone-`serve` dispatch: no held engine, mode=lex.
+        let hits = run_native(vault.path(), "error", "lex", TOP_K, None)
+            .expect("the server lex path must self-heal, not 500");
+        assert!(
+            hits.iter().any(|h| h.path == "note.md"),
+            "self-healed index must serve the indexed chunk back: {hits:?}"
+        );
+
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            config_before,
+            "the server lex self-heal must NOT persist a collection name — \
+             onebrain.yml has to be byte-identical"
+        );
+        assert_eq!(
+            String::from_utf8(config_before).unwrap(),
+            config_text,
+            "and it must still be the original commented template"
+        );
+    }
+
+    /// Minimal on-disk vault (just an `onebrain.yml` naming `collection`) so
+    /// `run_lex`'s `vault_ctx::require` resolves. `run_lex` takes the cache dir
+    /// separately, so the collection name here only has to match what the
+    /// caller passes.
+    fn lex_test_vault(collection: &str) -> tempfile::TempDir {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            format!("search:\n  collection: {collection}\n"),
+        )
+        .unwrap();
+        vault
     }
 
     // ── top_k / min_candidates params (v3.4.7 Track E) ─────────────────────

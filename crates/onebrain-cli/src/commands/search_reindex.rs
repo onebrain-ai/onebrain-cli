@@ -786,6 +786,13 @@ impl Drop for LiveProgressFile {
 /// root (`migrate()` skips an entry whose target already exists); wiping only
 /// the resolved copy would let a later `Engine::open` resurrect the stale
 /// legacy one via fallback resolution — a wiped index must stay wiped.
+///
+/// The lex rebuild marker (a SIBLING of the tantivy dir, so `remove_dir_all`
+/// on the dir itself cannot touch it) is cleared at both candidate locations
+/// too. Leaving it behind was benign but dishonest: the next `Engine::open`
+/// would see a pending rebuild over an empty `chunk_meta`, announce
+/// "rebuilding 0 chunk(s)", and clear the marker itself. A `--force` wipe
+/// means "nothing of the old index survives" — including its bookkeeping.
 fn wipe_index_files(vault_flag: Option<PathBuf>) -> Result<()> {
     let resolved = crate::vault_ctx::require(vault_flag)?;
     let collection = collection_for(&resolved)?;
@@ -809,6 +816,12 @@ fn wipe_index_files(vault_flag: Option<PathBuf>) -> Result<()> {
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+    for tantivy_dir in [
+        index_dir.join(onebrain_search::layout::LEX_ARTIFACT),
+        cache_dir.join(onebrain_search::layout::LEX_ARTIFACT),
+    ] {
+        onebrain_search::lex::clear_rebuild_marker(&tantivy_dir)?;
     }
     Ok(())
 }
@@ -1191,6 +1204,47 @@ mod tests {
             );
         }
         assert!(model.is_dir(), "model cache must survive the wipe");
+    }
+
+    /// The lex rebuild marker is a SIBLING of the tantivy dir, so removing the
+    /// named artifacts leaves it behind. A `--force` wipe must clear it too —
+    /// otherwise the next `Engine::open` announces a rebuild of 0 chunks over
+    /// an empty `chunk_meta`, which is harmless but plainly untrue.
+    #[test]
+    fn wipe_index_files_clears_the_lex_rebuild_marker() {
+        let cache = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: wipe-marker-collection\n",
+        )
+        .unwrap();
+
+        let collection_dir = cache.path().join("search").join("wipe-marker-collection");
+        // Both candidate locations: split `index/tantivy` and legacy root.
+        let lex = onebrain_search::layout::LEX_ARTIFACT;
+        let split = collection_dir.join("index").join(lex);
+        let legacy = collection_dir.join(lex);
+        for tantivy_dir in [&split, &legacy] {
+            std::fs::create_dir_all(tantivy_dir).unwrap();
+            std::fs::write(
+                onebrain_search::lex::rebuild_marker_path(tantivy_dir),
+                b"pending\n",
+            )
+            .unwrap();
+            assert!(onebrain_search::lex::rebuild_pending(tantivy_dir));
+        }
+
+        wipe_index_files(Some(vault.path().to_path_buf())).unwrap();
+
+        for tantivy_dir in [&split, &legacy] {
+            assert!(
+                !onebrain_search::lex::rebuild_pending(tantivy_dir),
+                "the rebuild marker at {} must not survive a --force wipe",
+                onebrain_search::lex::rebuild_marker_path(tantivy_dir).display()
+            );
+        }
     }
 
     #[test]

@@ -336,6 +336,7 @@ fn all_checks(vault_root: &Path, config: &onebrain_core::VaultConfig) -> Vec<Doc
     results.push(read_hook_failopen_check(vault_root));
     results.push(daemon_status_check(vault_root));
     results.push(native_search_check(vault_root));
+    results.push(lex_index_check(vault_root));
     results.push(legacy_index_stub_check(vault_root));
     results.push(qmd_leftovers_check_prod(config));
     results
@@ -361,6 +362,12 @@ struct ConfigFinding {
     /// True for `search.embed_model` — resetting it invalidates existing
     /// vectors, so the fix footer must tell the user to reindex.
     reindex_required: bool,
+    /// True when the value is perfectly VALID but is a superseded default that
+    /// a newer release moved away from (v3.4.16's
+    /// `search.reranker.min_score: 0.30`). Reset like any other resettable
+    /// finding, but counted and worded separately: calling an in-range value
+    /// "invalid" would be a lie.
+    superseded: bool,
 }
 
 impl ConfigFinding {
@@ -378,6 +385,33 @@ impl ConfigFinding {
             )
         }
     }
+}
+
+/// The `search.reranker.min_score` value that v3.4.7–v3.4.15 scaffolded into
+/// every freshly-initialized vault's own `onebrain.yml` (ADR 0026 writes the
+/// key ACTIVE, not commented out). v3.4.16 moved the engine default to `0.0`
+/// — reorder-only instead of filtering — but a present config value wins over
+/// the engine default, so those vaults silently keep the old gate.
+const SUPERSEDED_RERANK_MIN_SCORE: f64 = 0.30;
+
+/// True when a `search.reranker.min_score` YAML scalar is EXACTLY the
+/// superseded [`SUPERSEDED_RERANK_MIN_SCORE`] default, and that value is no
+/// longer the current default.
+///
+/// Two deliberate narrowings:
+/// - The equality is on the exact superseded value (within an f64 epsilon, so
+///   `0.30` and `0.3` both match — they are the same number). A user who
+///   deliberately chose some other gate (`0.5`, `0.25`) is left alone: this
+///   flags a stale scaffold, not an opinion.
+/// - It self-disables if the template default ever returns to `0.30` — then
+///   the value is no longer superseded and there is nothing to report.
+fn is_superseded_rerank_min_score(v: &serde_yaml::Value) -> bool {
+    let current_default: Option<f64> = onebrain_fs::TEMPLATE_RERANK_MIN_SCORE.parse().ok();
+    if current_default.is_some_and(|d| (d - SUPERSEDED_RERANK_MIN_SCORE).abs() < f64::EPSILON) {
+        return false;
+    }
+    v.as_f64()
+        .is_some_and(|f| (f - SUPERSEDED_RERANK_MIN_SCORE).abs() < f64::EPSILON)
 }
 
 /// Best-effort display of a YAML scalar for finding messages.
@@ -438,6 +472,7 @@ fn collect_config_findings(text: &str) -> Option<Vec<ConfigFinding>> {
                 default_repr: DEFAULT_UPDATE_CHANNEL.to_string(),
                 resettable: true,
                 reindex_required: false,
+                superseded: false,
             });
         }
     }
@@ -458,6 +493,7 @@ fn collect_config_findings(text: &str) -> Option<Vec<ConfigFinding>> {
                         default_repr: default.to_string(),
                         resettable: true,
                         reindex_required: false,
+                        superseded: false,
                     });
                 }
             }
@@ -490,6 +526,7 @@ fn collect_config_findings(text: &str) -> Option<Vec<ConfigFinding>> {
                         default_repr: String::new(),
                         resettable: false,
                         reindex_required: false,
+                        superseded: false,
                     });
                 }
             }
@@ -514,6 +551,7 @@ fn collect_config_findings(text: &str) -> Option<Vec<ConfigFinding>> {
                     default_repr: String::new(),
                     resettable: false,
                     reindex_required: false,
+                    superseded: false,
                 });
             }
         }
@@ -532,6 +570,7 @@ fn collect_config_findings(text: &str) -> Option<Vec<ConfigFinding>> {
                     default_repr: sc.embed_model.clone(),
                     resettable: true,
                     reindex_required: true,
+                    superseded: false,
                 });
             }
         }
@@ -547,6 +586,7 @@ fn collect_config_findings(text: &str) -> Option<Vec<ConfigFinding>> {
                     default_repr: sc.default_top_k.to_string(),
                     resettable: true,
                     reindex_required: false,
+                    superseded: false,
                 });
             }
         }
@@ -564,6 +604,7 @@ fn collect_config_findings(text: &str) -> Option<Vec<ConfigFinding>> {
                         default_repr: rd.enabled.to_string(),
                         resettable: true,
                         reindex_required: false,
+                        superseded: false,
                     });
                 }
             }
@@ -581,6 +622,7 @@ fn collect_config_findings(text: &str) -> Option<Vec<ConfigFinding>> {
                         default_repr: rd.model.clone(),
                         resettable: true,
                         reindex_required: false,
+                        superseded: false,
                     });
                 }
             }
@@ -595,6 +637,7 @@ fn collect_config_findings(text: &str) -> Option<Vec<ConfigFinding>> {
                         default_repr: rd.min_candidates.to_string(),
                         resettable: true,
                         reindex_required: false,
+                        superseded: false,
                     });
                 }
             }
@@ -614,6 +657,31 @@ fn collect_config_findings(text: &str) -> Option<Vec<ConfigFinding>> {
                         default_repr: onebrain_fs::TEMPLATE_RERANK_MIN_SCORE.to_string(),
                         resettable: true,
                         reindex_required: false,
+                        superseded: false,
+                    });
+                } else if is_superseded_rerank_min_score(&v) {
+                    // In range, but STILL the superseded v3.4.7 default. ADR
+                    // 0026 scaffolds `min_score` uncommented, so every vault
+                    // initialized on v3.4.7–v3.4.15 carries a literal `0.30`
+                    // in its own onebrain.yml — and a present value beats
+                    // `DEFAULT_RERANK_MIN_SCORE` in
+                    // `search_common::rerank_settings_from_config`. Those
+                    // vaults therefore keep the old hard gate after upgrading
+                    // to v3.4.16 and get none of the fix, with nothing to tell
+                    // them (the bounds check above is happy with 0.30).
+                    findings.push(ConfigFinding {
+                        dotted: "search.reranker.min_score".to_string(),
+                        segments: vec!["search", "reranker", "min_score"],
+                        problem: format!(
+                            "is {} — the superseded v3.4.7 default: it DROPS every hit scoring \
+                             below it instead of merely ranking them, roughly halving \
+                             heading-shaped hit@10 (see ADR 0034)",
+                            display_yaml_value(&v)
+                        ),
+                        default_repr: onebrain_fs::TEMPLATE_RERANK_MIN_SCORE.to_string(),
+                        resettable: true,
+                        reindex_required: false,
+                        superseded: true,
                     });
                 }
             }
@@ -665,8 +733,16 @@ fn config_values_check(vault_root: &Path) -> DoctorResult {
     }
     let mut message_parts: Vec<String> = Vec::new();
     let mut details: Vec<String> = findings.iter().map(ConfigFinding::detail_line).collect();
-    if !findings.is_empty() {
-        message_parts.push(format!("{} invalid value(s)", findings.len()));
+    // Superseded-default findings are counted apart from out-of-range ones:
+    // `0.30` IS a legal min_score, so folding it into "invalid value(s)" would
+    // misreport a valid config as broken.
+    let superseded_count = findings.iter().filter(|f| f.superseded).count();
+    let invalid_count = findings.len() - superseded_count;
+    if invalid_count > 0 {
+        message_parts.push(format!("{invalid_count} invalid value(s)"));
+    }
+    if superseded_count > 0 {
+        message_parts.push(format!("{superseded_count} superseded default(s)"));
     }
     if !undocumented.is_empty() {
         message_parts.push(format!("{} undocumented key(s)", undocumented.len()));
@@ -682,12 +758,14 @@ fn config_values_check(vault_root: &Path) -> DoctorResult {
             "config layout differs from template — doctor --fix will restructure (reorder sections, add banners; values and comments preserved)".to_string(),
         );
     }
-    let any_resettable = findings.iter().any(|f| f.resettable);
-    // Any of the three repair actions warrants a `--fix` hint; compose it from
+    // Any of the repair actions warrants a `--fix` hint; compose it from
     // whichever apply so the message never over-promises.
     let mut actions: Vec<&str> = Vec::new();
-    if any_resettable {
+    if findings.iter().any(|f| f.resettable && !f.superseded) {
         actions.push("reset out-of-range tunables to their defaults");
+    }
+    if findings.iter().any(|f| f.resettable && f.superseded) {
+        actions.push("reset superseded defaults to their current values");
     }
     if !undocumented.is_empty() {
         actions.push("add the missing self-documentation comments");
@@ -1420,6 +1498,203 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Dead keyword-index detection (B1, v3.4.16)
+//
+// The v3.4.16 tantivy schema change means an older index can't be opened, so
+// `LexIndex::open_or_reset` wipes it and `Engine::open` repopulates it from
+// redb's `chunk_meta`. If that rebuild is interrupted (Ctrl-C on what looks
+// like a hung command) the collection is left holding every chunk in redb and
+// ZERO documents in tantivy — and nothing else notices: `search status` counts
+// docs from redb and cheerfully reports "up to date", while `reindex` skips
+// every doc because `lex_hashes` says they're current. Keyword search returns
+// nothing, forever, with no error anywhere.
+//
+// `Engine::lex_health()` is the cheap probe for exactly that state (one redb
+// `table.len()` + one tantivy `num_docs()`, no scan).
+// ─────────────────────────────────────────────────────────────────────────
+
+const LEX_INDEX_CHECK: &str = "lex-index";
+
+/// Doctor check (`check = "lex-index"`) — is the keyword index actually alive?
+///
+/// Read-only, and deliberately independent of [`native_search_check`]: that one
+/// answers "is there an index and is it current", which is precisely the
+/// question that reports healthy while BM25 is dead.
+///
+/// Every resolution failure degrades to `ok("skipped — …")` rather than a
+/// warn: a vault with no config, no collection, or no index on disk is not
+/// broken, and `native_search_check` already owns those messages. A busy engine
+/// (an `onebrain mcp` session holding the redb lock) is likewise skipped, not
+/// warned — doctor is read-only and must never look like breakage because a
+/// daemon is running.
+///
+/// NOTE the deliberate ordering effect: opening the engine here is itself the
+/// repair for the *marker-backed* case — `Engine::open` retries a pending
+/// rebuild automatically. So the state this check can still report as dead is
+/// the residual one where the rebuild marker is gone (external tmp reaper,
+/// manual cleanup) and nothing will ever retry on its own. That is exactly the
+/// case that needs a human-visible finding.
+fn lex_index_check(vault_root: &Path) -> DoctorResult {
+    use crate::commands::search_common::{
+        collection_cache_dir, collection_name_readonly, is_indexed, open_engine_with_collection,
+    };
+
+    let skip = |msg: String| DoctorResult::ok(LEX_INDEX_CHECK, format!("skipped — {msg}"));
+
+    let Ok(resolved) = crate::vault_ctx::require(Some(vault_root.to_path_buf())) else {
+        return skip("vault unresolved".to_string());
+    };
+    // Read-only collection resolution, same reason as `native_search_check`:
+    // doctor must never rewrite `onebrain.yml` as a side effect.
+    let Ok(collection) = collection_name_readonly(resolved.root.as_path()) else {
+        return skip("collection unresolved".to_string());
+    };
+    let cache_dir = collection_cache_dir(&collection);
+    if !is_indexed(&cache_dir) {
+        return skip("no index on disk".to_string());
+    }
+
+    let engine = match open_engine_with_collection(&resolved, &collection) {
+        Ok(engine) => engine,
+        Err(e) => {
+            // Busy (a daemon owns the lock) is a normal, transient condition —
+            // never a finding. Anything else is already reported by the
+            // `search` check's "engine unavailable" arm, so stay quiet here
+            // rather than double-reporting the same failure.
+            return skip(format!("engine unavailable: {e}"));
+        }
+    };
+    let health = match engine.lex_health() {
+        Ok(h) => h,
+        Err(e) => return skip(format!("health probe failed: {e}")),
+    };
+    let details = vec![
+        format!("collection: {collection}"),
+        format!("lex_docs: {}", health.lex_docs),
+        format!("chunk_meta: {}", health.chunk_meta),
+        format!("rebuild_pending: {}", health.rebuild_pending),
+    ];
+
+    if health.is_dead() {
+        return DoctorResult::error(
+            LEX_INDEX_CHECK,
+            format!(
+                "keyword index is EMPTY while the collection holds {} chunk(s) — every keyword \
+                 search silently returns nothing (interrupted schema migration)",
+                health.chunk_meta
+            ),
+        )
+        .with_hint("onebrain doctor --fix (rebuilds the keyword index from stored metadata; or `onebrain search reindex --force`)")
+        .with_details(details);
+    }
+    if health.has_excess_docs() {
+        // Warn, not error: keyword search still answers — it just answers
+        // WORSE, because duplicate/orphan documents skew BM25's document
+        // frequencies and average field length. See
+        // `LexHealth::has_excess_docs` for why this direction has no benign
+        // explanation.
+        return DoctorResult::warn(
+            LEX_INDEX_CHECK,
+            format!(
+                "keyword index holds {} doc(s) but the collection has only {} chunk(s) — the \
+                 surplus are duplicates or orphans, and they degrade keyword ranking",
+                health.lex_docs, health.chunk_meta
+            ),
+        )
+        .with_hint("onebrain doctor --fix (rebuilds the keyword index from stored metadata; or `onebrain search reindex --force`)")
+        .with_details(details);
+    }
+    if health.rebuild_pending {
+        // `Engine::open` above already retried the rebuild, so a marker that
+        // survives means the retry itself keeps failing.
+        return DoctorResult::warn(
+            LEX_INDEX_CHECK,
+            "keyword-index rebuild is still marked pending after a retry — the rebuild is failing"
+                .to_string(),
+        )
+        .with_hint("onebrain search reindex --force")
+        .with_details(details);
+    }
+    DoctorResult::ok(
+        LEX_INDEX_CHECK,
+        format!("{} keyword doc(s) · healthy", health.lex_docs),
+    )
+    .with_details(details)
+}
+
+/// Recipe — `lex-index` finding means the keyword index is empty, holds MORE
+/// docs than there are chunks (duplicates/orphans), or its rebuild is stuck,
+/// while redb still holds every chunk. One rebuild repairs all three: the
+/// repopulate clears before re-adding, so it is idempotent on any start state.
+///
+/// Auto-fixable, and deliberately so rather than only advising `search reindex
+/// --force`: [`Engine::repopulate_lex_from_meta`][repop] reads NO vault files,
+/// loads NO embedding model, and writes only the tantivy index — vectors,
+/// `doc_hashes` and `lex_hashes` are untouched, because the content itself
+/// never changed. It is strictly a subset of what `reindex --force` would do,
+/// with none of the cost (a `--force` re-embeds the whole vault) and none of
+/// the risk (nothing else is dropped). Corrupt individual chunks are skipped,
+/// not fatal, and the rebuild marker is cleared only after the commit — so an
+/// interrupted `--fix` is simply re-runnable.
+///
+/// The hint still names `onebrain search reindex --force` as the manual
+/// fallback for the case this recipe can't cover: `chunk_meta` itself being
+/// empty or unreadable.
+///
+/// [repop]: onebrain_search::engine::Engine::repopulate_lex_from_meta
+fn fix_lex_index(vault_root: &Path, json: bool) -> FixOutcome {
+    use crate::commands::search_common::{
+        collection_cache_dir, collection_name_readonly, is_indexed, open_engine_with_collection,
+    };
+    status_line(json, "running: rebuild keyword index from stored metadata");
+
+    let resolved = match crate::vault_ctx::require(Some(vault_root.to_path_buf())) {
+        Ok(r) => r,
+        Err(e) => return FixOutcome::Failed(format!("could not resolve vault: {e}")),
+    };
+    let collection = match collection_name_readonly(resolved.root.as_path()) {
+        Ok(c) => c,
+        Err(e) => return FixOutcome::Failed(format!("could not resolve collection: {e}")),
+    };
+    if !is_indexed(&collection_cache_dir(&collection)) {
+        return FixOutcome::Manual(
+            "no index on disk — run `onebrain search reindex` to build one".to_string(),
+        );
+    }
+    let mut engine = match open_engine_with_collection(&resolved, &collection) {
+        Ok(e) => e,
+        Err(e) => return FixOutcome::Failed(format!("open engine for {collection}: {e}")),
+    };
+    // Re-probe rather than trusting the check's message: the plain-doctor
+    // `Engine::open` may already have healed a marker-backed rebuild between
+    // the report and this recipe.
+    match engine.lex_health() {
+        Ok(h) if h.is_healthy() => {
+            return FixOutcome::Fixed(format!(
+                "keyword index already healthy — {} doc(s)",
+                h.lex_docs
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => return FixOutcome::Failed(format!("lex health probe: {e}")),
+    }
+    match engine.repopulate_lex_from_meta() {
+        Ok(0) => FixOutcome::Manual(
+            "nothing to rebuild from — stored chunk metadata is empty; run \
+             `onebrain search reindex --force`"
+                .to_string(),
+        ),
+        Ok(n) => FixOutcome::Fixed(format!(
+            "rebuilt the keyword index from stored metadata — {n} chunk(s) restored \
+             (no files re-read, nothing re-embedded)"
+        )),
+        Err(e) => FixOutcome::Failed(format!(
+            "rebuild keyword index: {e} — run `onebrain search reindex --force`"
+        )),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Legacy index stub detection + cleanup (#222)
 //
 // Task 9 (v3.4.9 #201 dry-run) demonstrated: a pre-#201 binary opening an
@@ -2011,6 +2286,10 @@ fn attempt_fix(
         // root of an already-split collection. Only truly empty duplicates
         // are removed; a non-empty legacy copy is reported, never deleted.
         "legacy-index-stub" => fix_legacy_index_stub(vault_root, json),
+        // Rebuild an emptied keyword index from redb's stored chunk metadata
+        // (no vault files re-read, no model loaded, vectors untouched) — the
+        // interrupted-schema-migration state `lex_index_check` catches.
+        LEX_INDEX_CHECK => fix_lex_index(vault_root, json),
         // Strip the stale `extraKnownMarketplaces.onebrain` entry from
         // `.claude/settings.json`. Cosmetic config cleanup; no behavioral
         // change at runtime (the plugin is enabled via `enabledPlugins`).
@@ -2065,6 +2344,7 @@ fn planned_action(result: &DoctorResult) -> Option<&'static str> {
         ),
         "search-exclude" => Some("insert the search.exclude block"),
         "token-optimization" => Some("insert the token_optimization block / missing sub-key(s)"),
+        "lex-index" => Some("rebuild the keyword index from stored chunk metadata"),
         "claude-settings" => Some("remove the stale marketplace entry"),
         "plugin-cache" => Some("remove the stale plugin cache"),
         "vault-config-migration" => Some("migrate vault.yml → onebrain.yml"),
@@ -7438,7 +7718,7 @@ mod tests {
         let text = "update_channel: stable\n\
                     checkpoint:\n  messages: 15\n  minutes: 30\n\
                     search:\n  default_top_k: 10\n  embed_model: multilingual-e5-small\n  \
-                    reranker:\n    enabled: true\n    model: onebrain-rerank-v1\n    min_candidates: 10\n    min_score: 0.30\n";
+                    reranker:\n    enabled: true\n    model: onebrain-rerank-v1\n    min_candidates: 10\n    min_score: 0.0\n";
         let findings = collect_config_findings(text).unwrap();
         assert!(findings.is_empty(), "{findings:?}");
     }
@@ -7508,8 +7788,24 @@ mod tests {
         assert_eq!(by("search.default_top_k"), "10");
         assert_eq!(by("search.embed_model"), "multilingual-e5-small");
         assert_eq!(by("search.reranker.model"), "onebrain-rerank-v1");
-        assert_eq!(by("search.reranker.min_score"), "0.30");
+        assert_eq!(by("search.reranker.min_score"), "0.0");
         assert_eq!(by("update_channel"), "stable");
+        // Nothing here is a superseded default — every finding above is a
+        // genuinely out-of-range value.
+        assert!(!findings.iter().any(|f| f.superseded), "{dotted:?}");
+        // The one rule the fixture above CANNOT express (a value can't be both
+        // out of range and the superseded in-range default) — kept in this
+        // completeness test so "every rule fires" stays literally true.
+        let superseded =
+            collect_config_findings("search:\n  reranker:\n    min_score: 0.30\n").unwrap();
+        assert_eq!(
+            superseded
+                .iter()
+                .filter(|f| f.superseded)
+                .map(|f| f.dotted.as_str())
+                .collect::<Vec<_>>(),
+            vec!["search.reranker.min_score"],
+        );
     }
 
     #[test]
@@ -7523,6 +7819,349 @@ mod tests {
         assert_eq!(collect_config_findings(bad).unwrap().len(), 1);
         let bad = "search:\n  reranker:\n    min_score: not-a-number\n";
         assert_eq!(collect_config_findings(bad).unwrap().len(), 1);
+    }
+
+    // ── superseded `search.reranker.min_score: 0.30` (C2, v3.4.16) ─────────
+    //
+    // ADR 0026 scaffolds `min_score` ACTIVE, so every vault initialized on
+    // v3.4.7–v3.4.15 pins `0.30` in its own onebrain.yml — and a present value
+    // beats `DEFAULT_RERANK_MIN_SCORE`. Without a finding those vaults keep the
+    // old hard filter after upgrading and get none of the v3.4.16 rerank fix,
+    // silently: the bounds check above is perfectly happy with 0.30.
+
+    #[test]
+    fn collect_config_findings_flags_the_superseded_min_score_default() {
+        for form in ["0.30", "0.3"] {
+            let text = format!("search:\n  reranker:\n    min_score: {form}\n");
+            let findings = collect_config_findings(&text).unwrap();
+            assert_eq!(findings.len(), 1, "{form}: {findings:?}");
+            let f = &findings[0];
+            assert_eq!(f.dotted, "search.reranker.min_score");
+            assert!(f.superseded, "{form}: must be flagged as superseded");
+            assert!(f.resettable, "{form}: --fix must be able to reset it");
+            assert!(!f.reindex_required);
+            // The message must explain the BEHAVIOUR change, not just the
+            // number — a user who only sees "0.30 → 0.0" learns nothing.
+            assert!(
+                f.problem.contains("superseded") && f.problem.contains("DROPS"),
+                "{form}: {}",
+                f.problem
+            );
+            // Reset target is the current template/engine default.
+            assert_eq!(f.default_repr, onebrain_fs::TEMPLATE_RERANK_MIN_SCORE);
+        }
+    }
+
+    #[test]
+    fn collect_config_findings_leaves_a_deliberate_min_score_alone() {
+        // A user who chose their own gate is expressing an opinion, not
+        // carrying a stale scaffold. Only the exact superseded value is
+        // flagged; an absent key is never flagged at all (serde falls back to
+        // the current default, which is the fixed behaviour already).
+        for text in [
+            "search:\n  reranker:\n    min_score: 0.5\n",
+            "search:\n  reranker:\n    min_score: 0.25\n",
+            "search:\n  reranker:\n    min_score: 0.31\n",
+            "search:\n  reranker:\n    min_candidates: 10\n",
+            "search:\n  default_top_k: 10\n",
+        ] {
+            assert!(
+                collect_config_findings(text).unwrap().is_empty(),
+                "must not flag: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_values_check_reports_superseded_apart_from_invalid() {
+        // `0.30` IS a legal min_score — counting it as an "invalid value"
+        // would misreport a valid config as broken.
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "search:\n  reranker:\n    # min_score comment\n    min_score: 0.30\n",
+        )
+        .unwrap();
+        let r = config_values_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Warn);
+        assert!(
+            r.message.contains("1 superseded default(s)"),
+            "message: {}",
+            r.message
+        );
+        assert!(
+            !r.message.contains("invalid value"),
+            "an in-range value must not be called invalid: {}",
+            r.message
+        );
+        assert!(
+            r.details
+                .iter()
+                .any(|l| l.contains("search.reranker.min_score") && l.contains("superseded")),
+            "{:?}",
+            r.details
+        );
+        assert!(
+            r.hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("reset superseded defaults"),
+            "{:?}",
+            r.hint
+        );
+    }
+
+    #[test]
+    fn fix_config_values_resets_the_superseded_min_score() {
+        let d = tempdir().unwrap();
+        let path = d.path().join("onebrain.yml");
+        fs::write(
+            &path,
+            "search:\n  reranker:\n    # keep this comment\n    min_score: 0.30\n",
+        )
+        .unwrap();
+        let outcome = fix_config_values(d.path(), true);
+        assert!(
+            matches!(outcome, FixOutcome::Fixed(_)),
+            "expected Fixed, got {outcome:?}"
+        );
+        let after = fs::read_to_string(&path).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&after).unwrap();
+        let got = parsed["search"]["reranker"]["min_score"].as_f64().unwrap();
+        let want: f64 = onebrain_fs::TEMPLATE_RERANK_MIN_SCORE.parse().unwrap();
+        assert!(
+            (got - want).abs() < f64::EPSILON,
+            "min_score must be reset to the current default, got {got}: {after}"
+        );
+        assert!(
+            after.contains("# keep this comment"),
+            "the reset must preserve user comments: {after}"
+        );
+        // Idempotent: a second pass finds nothing left to reset.
+        assert!(
+            collect_config_findings(&after).unwrap().is_empty(),
+            "{after}"
+        );
+    }
+
+    // ── dead keyword index (B1, v3.4.16) ──────────────────────────────────
+    //
+    // An interrupted schema migration leaves redb holding every chunk and
+    // tantivy holding none. Nothing else notices: `search status` counts docs
+    // from redb and says "up to date", `reindex` skips every doc because
+    // `lex_hashes` says they're current, and keyword search just returns
+    // nothing, forever.
+
+    /// Build a real, lex-only-indexed collection for `vault`, then return its
+    /// (collection, cache_dir, tantivy_dir). The `ONEBRAIN_CACHE_DIR` guard is
+    /// the caller's to hold.
+    fn indexed_collection(vault: &Path) -> (String, PathBuf, PathBuf) {
+        use crate::commands::search_common::{
+            collection_cache_dir, collection_name_readonly, index_artifact_path,
+            open_engine_with_collection,
+        };
+        let resolved = crate::vault_ctx::require(Some(vault.to_path_buf())).unwrap();
+        let collection = collection_name_readonly(vault).unwrap();
+        let cache_dir = collection_cache_dir(&collection);
+        {
+            // Lex-only: populates redb's `chunk_meta` + the tantivy index
+            // without ever loading the embedding model (no download).
+            let mut engine = open_engine_with_collection(&resolved, &collection).unwrap();
+            engine
+                .reindex_all_lex_only_with_progress(vault, &mut |_| {})
+                .unwrap();
+        }
+        let tantivy_dir = index_artifact_path(&cache_dir, "tantivy");
+        (collection, cache_dir, tantivy_dir)
+    }
+
+    /// The B1 dead state: a VALID, current-schema, but EMPTY tantivy index
+    /// beside a fully-populated `chunk_meta`, with no rebuild marker left to
+    /// make `Engine::open` retry on its own. Exactly what a Ctrl-C during the
+    /// v3.4.16 migration leaves behind once the marker is gone.
+    fn empty_the_lex_index(tantivy_dir: &Path) {
+        use onebrain_search::lex::LexIndex;
+        fs::remove_dir_all(tantivy_dir).unwrap();
+        let mut lex = LexIndex::open(tantivy_dir).unwrap();
+        lex.commit().unwrap();
+    }
+
+    /// The B-A1 over-populated state: extra committed documents beside an
+    /// otherwise intact index — what a rebuild appended onto a non-empty index
+    /// produced, and what a crash between `remove_doc`'s redb commit and its
+    /// lex commit leaves behind. Returns how many surplus docs were added.
+    fn over_populate_the_lex_index(tantivy_dir: &Path) -> usize {
+        use onebrain_search::chunk::Chunk;
+        use onebrain_search::lex::LexIndex;
+        let mut lex = LexIndex::open(tantivy_dir).unwrap();
+        for id in 0..3 {
+            lex.add(&Chunk {
+                chunk_id: format!("ghost.md#{id}"),
+                doc_path: "ghost.md".to_string(),
+                heading_path: "Ghost".to_string(),
+                chunk_index: id,
+                text: "zebra quokka narwhal error text".to_string(),
+            })
+            .unwrap();
+        }
+        lex.commit().unwrap();
+        3
+    }
+
+    fn lex_check_vault() -> (tempfile::TempDir, tempfile::TempDir) {
+        let vault = tempdir().unwrap();
+        fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: lexhealth\n",
+        )
+        .unwrap();
+        fs::write(
+            vault.path().join("note.md"),
+            "# Errors Handling\nzebra quokka narwhal error text\n",
+        )
+        .unwrap();
+        let cache = tempdir().unwrap();
+        (vault, cache)
+    }
+
+    #[test]
+    fn lex_index_check_reports_a_dead_keyword_index() {
+        let (vault, cache) = lex_check_vault();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let (_collection, _cache_dir, tantivy_dir) = indexed_collection(vault.path());
+
+        // Healthy first — the check must not cry wolf on a good index.
+        let healthy = lex_index_check(vault.path());
+        assert_eq!(healthy.status, DoctorStatus::Ok, "{}", healthy.message);
+        assert!(healthy.message.contains("healthy"), "{}", healthy.message);
+
+        empty_the_lex_index(&tantivy_dir);
+
+        let r = lex_index_check(vault.path());
+        assert_eq!(r.status, DoctorStatus::Error, "{}", r.message);
+        assert!(
+            r.message.contains("keyword index is EMPTY"),
+            "{}",
+            r.message
+        );
+        assert!(
+            r.details.iter().any(|d| d == "lex_docs: 0"),
+            "{:?}",
+            r.details
+        );
+        assert!(
+            r.details
+                .iter()
+                .any(|d| d.starts_with("chunk_meta: ") && d != "chunk_meta: 0"),
+            "{:?}",
+            r.details
+        );
+        // The recovery must be named, and must be reachable.
+        assert!(
+            r.hint.as_deref().unwrap_or("").contains("reindex --force"),
+            "{:?}",
+            r.hint
+        );
+        assert!(planned_action(&r).is_some(), "--fix must offer a repair");
+    }
+
+    #[test]
+    fn fix_lex_index_rebuilds_from_stored_metadata() {
+        let (vault, cache) = lex_check_vault();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let (_collection, _cache_dir, tantivy_dir) = indexed_collection(vault.path());
+        empty_the_lex_index(&tantivy_dir);
+        assert_eq!(lex_index_check(vault.path()).status, DoctorStatus::Error);
+
+        // The note itself is deleted first: the repair must come from redb's
+        // stored chunk metadata alone, never from re-reading the vault.
+        fs::remove_file(vault.path().join("note.md")).unwrap();
+
+        let outcome = fix_lex_index(vault.path(), true);
+        match &outcome {
+            FixOutcome::Fixed(m) => assert!(m.contains("chunk(s) restored"), "{m}"),
+            other => panic!("expected Fixed, got {other:?}"),
+        }
+        let after = lex_index_check(vault.path());
+        assert_eq!(after.status, DoctorStatus::Ok, "{}", after.message);
+
+        // Idempotent: a second --fix on a healthy index is a no-op, not a
+        // second rebuild.
+        match fix_lex_index(vault.path(), true) {
+            FixOutcome::Fixed(m) => assert!(m.contains("already healthy"), "{m}"),
+            other => panic!("expected an already-healthy Fixed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lex_index_check_reports_an_over_populated_keyword_index() {
+        // Audit concern 1: `lex_docs` well above `chunk_meta` used to report
+        // as "N keyword doc(s) · healthy" — the only state the check knew was
+        // an EMPTY index. Duplicates/orphans still answer queries, just worse
+        // (corrupt BM25 corpus statistics), so this is a warn, not an error.
+        let (vault, cache) = lex_check_vault();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let (_collection, _cache_dir, tantivy_dir) = indexed_collection(vault.path());
+        assert_eq!(lex_index_check(vault.path()).status, DoctorStatus::Ok);
+
+        let surplus = over_populate_the_lex_index(&tantivy_dir);
+        assert!(surplus > 0);
+
+        let r = lex_index_check(vault.path());
+        assert_eq!(r.status, DoctorStatus::Warn, "{}", r.message);
+        assert!(
+            r.message.contains("degrade keyword ranking"),
+            "{}",
+            r.message
+        );
+        assert!(planned_action(&r).is_some(), "--fix must offer a repair");
+    }
+
+    #[test]
+    fn fix_lex_index_repairs_an_over_populated_index() {
+        // The repair must bring `lex_docs` back to `chunk_meta` exactly — the
+        // repopulate clears before re-adding, so it is idempotent on any start
+        // state, not only on an empty index.
+        let (vault, cache) = lex_check_vault();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let (_collection, _cache_dir, tantivy_dir) = indexed_collection(vault.path());
+        over_populate_the_lex_index(&tantivy_dir);
+        assert_eq!(lex_index_check(vault.path()).status, DoctorStatus::Warn);
+
+        match fix_lex_index(vault.path(), true) {
+            FixOutcome::Fixed(m) => assert!(m.contains("chunk(s) restored"), "{m}"),
+            other => panic!("expected Fixed, got {other:?}"),
+        }
+        let after = lex_index_check(vault.path());
+        assert_eq!(after.status, DoctorStatus::Ok, "{}", after.message);
+        let docs = after
+            .details
+            .iter()
+            .find_map(|d| d.strip_prefix("lex_docs: "))
+            .unwrap()
+            .to_string();
+        assert!(
+            after.details.contains(&format!("chunk_meta: {docs}")),
+            "lex_docs must match chunk_meta after the repair: {:?}",
+            after.details
+        );
+    }
+
+    #[test]
+    fn lex_index_check_skips_quietly_without_an_index() {
+        // A fresh vault (or one whose collection can't be resolved) is not
+        // broken — `native_search_check` owns those messages, so this check
+        // must stay silent rather than double-report.
+        let (vault, cache) = lex_check_vault();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let r = lex_index_check(vault.path());
+        assert_eq!(r.status, DoctorStatus::Ok, "{}", r.message);
+        assert!(r.message.contains("skipped"), "{}", r.message);
+
+        let bare = tempdir().unwrap();
+        let r = lex_index_check(bare.path());
+        assert_eq!(r.status, DoctorStatus::Ok, "{}", r.message);
+        assert!(r.message.contains("skipped"), "{}", r.message);
     }
 
     #[test]

@@ -132,6 +132,19 @@ mockito           = { workspace = true }
 tower             = { workspace = true, features = ["util"] }
 http-body-util    = "0.1"
 tokio             = { workspace = true, features = ["rt", "macros"] }
+# `open_lex_migrating`'s self-heal unit test builds a foreign-schema tantivy
+# index by hand (mirrors onebrain-search's own
+# `reopen_after_lex_schema_change_repopulates_from_meta` engine test) to
+# simulate a pre-upgrade index on disk — this crate otherwise never touches
+# tantivy directly (it's onebrain-search's dependency). Same version +
+# feature set as onebrain-search's Cargo.toml so it unifies with the copy
+# already pulled in transitively; adds no new crate to the dependency graph.
+tantivy           = { version = "0.26", default-features = false, features = [
+    "mmap",
+    "lz4-compression",
+    "stopwords",
+    "stemmer",
+] }
 
 # The prebuilt web UI release this binary embeds. The release workflow's
 # `webui` job downloads `onebrain-webui-<version>-dist.tar.gz` from

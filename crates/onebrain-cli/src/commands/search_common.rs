@@ -29,6 +29,7 @@ use onebrain_core::{
     load_vault_config, load_vault_config_at, RerankerConfig, ResolvedVault, VaultRoot,
 };
 use onebrain_search::engine::{short_path_hash, Engine, RerankSettings, DEFAULT_RERANK_MIN_SCORE};
+use onebrain_search::lex::LexIndex;
 use onebrain_search::CollectionLayout;
 
 use crate::vault_ctx;
@@ -132,6 +133,160 @@ pub(crate) fn models_cache_dir(cache_dir: &Path) -> PathBuf {
 /// `migrate()`).
 pub(crate) fn index_artifact_path(cache_dir: &Path, name: &str) -> PathBuf {
     CollectionLayout::new(cache_dir).index_artifact(name)
+}
+
+/// Open a collection's lex index for the read-only fast paths (`search
+/// search`, the MCP lex sub-query) that deliberately bypass redb and the
+/// embedder.
+///
+/// Those paths cannot self-heal a stale tantivy schema on their own: refilling
+/// an emptied lex index needs the chunk text, which lives in the engine's redb.
+/// So on — and only on — a schema mismatch, this opens the engine once
+/// (`Engine::open` wipes and repopulates the lex index, touching no vault files
+/// and loading no model), drops it to release the collection lock, and retries.
+/// Migration therefore stays invisible on every surface instead of only the
+/// engine-backed ones. Any other error propagates untouched.
+///
+/// Uses [`open_engine_from_resolved`] for the healing open, so a vault with no
+/// `search.collection` gets the generated name PERSISTED to `onebrain.yml` —
+/// acceptable on these two CLI surfaces, which already resolve their collection
+/// through the persisting [`collection_for`]. Surfaces that must not rewrite
+/// config (the webui `GET /api/vault/search`) use
+/// [`open_lex_migrating_with_collection`] instead.
+pub(crate) fn open_lex_migrating(cache_dir: &Path, resolved: &ResolvedVault) -> Result<LexIndex> {
+    open_lex_migrating_inner(cache_dir, &mut || {
+        // The engine is dropped at the end of this closure, releasing the
+        // collection lock before the retried `LexIndex::open`.
+        open_engine_from_resolved(resolved).map(|_| ())
+    })
+}
+
+/// Non-persisting twin of [`open_lex_migrating`] for read-only surfaces that
+/// already resolved their collection through [`collection_name_readonly`] — the
+/// webui `GET /api/vault/search` lex path (`server::search::run_lex`).
+///
+/// Same self-heal, but the healing open goes through
+/// [`open_engine_with_collection`] rather than [`open_engine_from_resolved`],
+/// so a vault whose index dir exists while `search.collection` is absent is NOT
+/// silently rewritten: `collection_for`'s persist re-serializes the whole
+/// `onebrain.yml` through serde and strips the commented template's comments.
+/// Exactly the reasoning behind `open_engine_with_collection` itself — the
+/// migration must be invisible on this surface in BOTH directions (it heals the
+/// index without touching the config).
+pub(crate) fn open_lex_migrating_with_collection(
+    cache_dir: &Path,
+    resolved: &ResolvedVault,
+    collection: &str,
+) -> Result<LexIndex> {
+    open_lex_migrating_inner(cache_dir, &mut || {
+        open_engine_with_collection(resolved, collection).map(|_| ())
+    })
+}
+
+/// How many times the self-heal attempts the engine open before giving up, and
+/// the backoff before each retry. The migration takes redb's single-process
+/// collection lock, so N processes racing the first post-upgrade search (the
+/// agent's MCP lex sub-queries alongside the PostToolUse reindex hook) leave
+/// N-1 losers staring at `E_ENGINE_BUSY` (exit 77) for what is a purely
+/// transient, self-resolving condition.
+///
+/// Bounded and small on purpose: one wait per entry below, so the worst case
+/// adds ~200 ms to one already-degraded request and NEVER loops unbounded. A
+/// still-busy engine after that is surfaced honestly as `E_ENGINE_BUSY`, and
+/// any non-busy failure is surfaced immediately, unretried.
+const LEX_MIGRATE_RETRY_BACKOFF: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(50),
+    std::time::Duration::from_millis(150),
+];
+
+/// Total engine-open attempts: one per backoff entry, plus the final attempt
+/// that has no wait left after it. Derived so the two can never drift.
+const LEX_MIGRATE_OPEN_ATTEMPTS: usize = LEX_MIGRATE_RETRY_BACKOFF.len() + 1;
+
+/// Shared body of the two migrating opens. `heal` opens (and immediately
+/// drops) the engine — `Engine::open` is what performs the wipe + repopulate,
+/// and dropping it releases the collection lock. The caller's choice of
+/// persisting / non-persisting engine open is the ONLY difference between the
+/// two public wrappers; taking it as a closure also lets the retry policy be
+/// unit-tested deterministically.
+fn open_lex_migrating_inner(
+    cache_dir: &Path,
+    heal: &mut dyn FnMut() -> Result<()>,
+) -> Result<LexIndex> {
+    let tantivy_dir = index_artifact_path(cache_dir, "tantivy");
+    match LexIndex::open(&tantivy_dir) {
+        // B-R1: a plain open SUCCEEDS on the leftovers of an INTERRUPTED
+        // migration — `open_or_reset` recreates the wiped dir immediately, so
+        // what a crash leaves behind has a *current, matching* schema and is
+        // simply EMPTY. No error path can tell that apart from a healthy
+        // index; only the rebuild marker can, and only `Engine::open` acts on
+        // it. So the read-only fast paths must consult it themselves, or a
+        // Ctrl-C'd rebuild leaves keyword search silently returning zero hits
+        // (`ok: true`, exit 0) until some unrelated engine-opening command
+        // happens to run.
+        Ok(lex) if onebrain_search::lex::rebuild_pending(&tantivy_dir) => {
+            // Release the read handle before the healing engine open.
+            drop(lex);
+            heal_with_retry(&tantivy_dir, heal)
+        }
+        Ok(lex) => Ok(lex),
+        Err(err) if onebrain_search::lex::is_schema_mismatch(&err) => {
+            heal_with_retry(&tantivy_dir, heal)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Run the healing engine open (which wipes + repopulates the lex index from
+/// redb `chunk_meta`), retrying a transiently busy collection lock, then hand
+/// back the freshly opened lex index. Shared by both routes into the heal: a
+/// stale schema, and a rebuild left pending by an interrupted migration.
+fn heal_with_retry(tantivy_dir: &Path, heal: &mut dyn FnMut() -> Result<()>) -> Result<LexIndex> {
+    for attempt in 0..LEX_MIGRATE_OPEN_ATTEMPTS {
+        match heal() {
+            Ok(()) => return LexIndex::open(tantivy_dir),
+            // Lost the race for the collection lock. Whoever won it is
+            // very likely performing this exact migration, so back off
+            // and retry rather than surfacing a transient
+            // `E_ENGINE_BUSY` on the first post-upgrade query.
+            Err(e) if is_engine_busy_error(&e) => {
+                let Some(backoff) = LEX_MIGRATE_RETRY_BACKOFF.get(attempt) else {
+                    return Err(e);
+                };
+                std::thread::sleep(*backoff);
+                // Cheap win first: if the winner already committed the
+                // migration, the plain open now succeeds and we never need the
+                // engine (or its lock) at all. Gated on the marker being GONE —
+                // a race winner that died mid-rebuild leaves an index that
+                // opens perfectly well and is perfectly empty, so accepting it
+                // here would reintroduce B-R1 through the back door.
+                if !onebrain_search::lex::rebuild_pending(tantivy_dir) {
+                    if let Ok(lex) = LexIndex::open(tantivy_dir) {
+                        return Ok(lex);
+                    }
+                }
+            }
+            // A genuine failure (corrupt redb, IO error, …) is never
+            // retried and never swallowed.
+            Err(e) => return Err(e),
+        }
+    }
+    // Unreachable: the loop body either returns or exhausts the backoff
+    // table and returns the busy error. Kept total and honest.
+    LexIndex::open(tantivy_dir)
+}
+
+/// True when `err` is the collection-lock contention that surfaces as
+/// `E_ENGINE_BUSY` / exit 77, whichever of the two classifications it carries:
+/// the typed [`onebrain_search::error::EngineBusy`] straight off `Engine::open`,
+/// or the [`onebrain_core::CoreError::EngineBusy`] that
+/// [`map_engine_open_error`] re-wraps it into (dropping the original typed head
+/// from the chain, which is why one check alone is not enough).
+pub(crate) fn is_engine_busy_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| {
+        c.downcast_ref::<onebrain_core::CoreError>()
+            .is_some_and(|e| matches!(e, onebrain_core::CoreError::EngineBusy(_)))
+    }) || onebrain_search::error::is_engine_busy(err)
 }
 
 /// Resolve the vault and open the engine rooted at its collection's cache
@@ -1190,6 +1345,466 @@ mod tests {
             still.vault,
             canonical_vault_id(vault_a.path()),
             "CLI must not disturb a daemon serving another vault"
+        );
+    }
+
+    // ── `open_lex_migrating` self-heal (issue #296) ─────────────────────────
+    //
+    // `open_lex_migrating` is the CLI-layer seam that lets the two read-only
+    // lex fast paths (`search search` / the MCP lex sub-query) migrate a
+    // stale-schema tantivy index without ever going through `Engine::index_doc`
+    // themselves. It was previously proven only by a manual real-vault smoke
+    // test; these pin its three branches with unit tests.
+
+    use onebrain_search::chunk::Chunk;
+
+    #[test]
+    fn open_lex_migrating_repopulates_from_meta_on_schema_mismatch() {
+        // Real-world scenario: a vault indexed by an older OneBrain build has a
+        // tantivy dir under the pre-v3.4.16 schema. The lex fast path cannot
+        // self-heal alone (no chunk text to refill from), so it must open the
+        // engine once — which self-heals from redb's `chunk_meta` — and hand
+        // back a WHOLE, searchable lex index, proven here by an actual search
+        // hit rather than merely a successful `Ok(..)`.
+        let vault = tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: heal-296\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vault.path().join("note.md"),
+            "# Errors Handling\nzebra quokka narwhal error text\n",
+        )
+        .unwrap();
+
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let resolved = resolved_at(vault.path());
+        let collection = collection_for(&resolved).unwrap();
+        let cache_dir = collection_cache_dir(&collection);
+
+        // Populate chunk_meta + a CURRENT-schema lex index via a lex-only
+        // reindex. This never touches the embedder (no network / model
+        // download) — the same mechanism the CLI's `search reindex --lex-only`
+        // uses, and exactly why it was chosen for this test's setup.
+        {
+            let (mut engine, _) = open_engine_from_resolved(&resolved).unwrap();
+            engine
+                .reindex_all_lex_only_with_progress(vault.path(), &mut |_| {})
+                .unwrap();
+        } // dropped here: releases the collection lock before the healing reopen.
+
+        let tantivy_dir = index_artifact_path(&cache_dir, "tantivy");
+
+        // Replace the current-schema tantivy dir with a FOREIGN-schema index —
+        // simulating a vault upgraded from an older OneBrain build, exactly as
+        // `onebrain_search::engine`'s
+        // `reopen_after_lex_schema_change_repopulates_from_meta` test does.
+        std::fs::remove_dir_all(&tantivy_dir).unwrap();
+        std::fs::create_dir_all(&tantivy_dir).unwrap();
+        {
+            let mut sb = tantivy::schema::Schema::builder();
+            sb.add_text_field("something_else", tantivy::schema::TEXT);
+            tantivy::Index::builder()
+                .schema(sb.build())
+                .open_or_create(tantivy::directory::MmapDirectory::open(&tantivy_dir).unwrap())
+                .unwrap();
+        }
+
+        let lex = open_lex_migrating(&cache_dir, &resolved)
+            .expect("must self-heal, not hard-fail, on a schema mismatch");
+        let hits = lex.search("error", 5).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "lex index must be repopulated from chunk_meta after the self-heal"
+        );
+        assert!(
+            hits[0].0.starts_with("note.md#"),
+            "expected the indexed chunk back, got {:?}",
+            hits[0]
+        );
+    }
+
+    #[test]
+    fn open_lex_migrating_current_schema_leaves_engine_unopened() {
+        // A tantivy dir already on the CURRENT schema must be handed back
+        // as-is: existing contents preserved, and — critically — the engine
+        // must never be opened (no wipe, no repopulate, no redb/lock file
+        // created). The setup builds the tantivy index directly through
+        // `LexIndex`'s own public API, with no `Engine`/chunk_meta involved at
+        // all, so any engine-artifact appearing afterward can only have come
+        // from `open_lex_migrating` itself.
+        let vault = tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: untouched-296\n",
+        )
+        .unwrap();
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let resolved = resolved_at(vault.path());
+        let cache_dir = collection_cache_dir("untouched-296");
+        let tantivy_dir = index_artifact_path(&cache_dir, "tantivy");
+
+        {
+            let mut ix = LexIndex::open(&tantivy_dir).unwrap();
+            ix.add(&Chunk {
+                chunk_id: "note.md#0".into(),
+                doc_path: "note.md".into(),
+                heading_path: String::new(),
+                chunk_index: 0,
+                text: "error handling in rust".into(),
+            })
+            .unwrap();
+            ix.commit().unwrap();
+        }
+
+        let lex = open_lex_migrating(&cache_dir, &resolved).unwrap();
+        let hits = lex.search("error", 5).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "existing content must be preserved untouched"
+        );
+        assert_eq!(hits[0].0, "note.md#0");
+
+        assert!(
+            !cache_dir.join(".collection.lock").exists(),
+            "a current-schema index must never trigger an engine open"
+        );
+        assert!(
+            !index_artifact_path(&cache_dir, "engine.redb").exists(),
+            "no redb metadata db should be created for a healthy index"
+        );
+        assert!(
+            !index_artifact_path(&cache_dir, "vectors").exists(),
+            "no vector store should be created for a healthy index"
+        );
+    }
+
+    #[test]
+    fn open_lex_migrating_heals_an_index_left_pending_by_an_interrupted_rebuild() {
+        // B-R1 (BLOCKER, v3.4.16 re-audit): SIGKILL a migrating `search
+        // search` and what is left on disk is an EMPTY tantivy dir with a
+        // CURRENT, matching schema — `open_or_reset` recreates it immediately
+        // after the wipe. So `LexIndex::open` SUCCEEDS, the schema-mismatch
+        // branch is never taken, and the fast path handed back an empty index:
+        // `ok: true`, 0 hits, exit 0, no stderr, marker still on disk — on
+        // every subsequent call, until some unrelated engine-opening command
+        // happened to run. Only the rebuild marker distinguishes this state
+        // from a healthy index, so the fast path must consult it itself.
+        let vault = tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: pending-br1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vault.path().join("note.md"),
+            "# Errors Handling\nzebra quokka narwhal error text\n",
+        )
+        .unwrap();
+
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let resolved = resolved_at(vault.path());
+        let collection = collection_for(&resolved).unwrap();
+        let cache_dir = collection_cache_dir(&collection);
+
+        // Populate chunk_meta + a current-schema lex index (lex-only: no
+        // embedder, no model download).
+        {
+            let (mut engine, _) = open_engine_from_resolved(&resolved).unwrap();
+            engine
+                .reindex_all_lex_only_with_progress(vault.path(), &mut |_| {})
+                .unwrap();
+        }
+
+        // Reproduce the crash: marker written, dir wiped, dir recreated empty
+        // under the CURRENT schema — then the process dies before the commit.
+        let tantivy_dir = index_artifact_path(&cache_dir, "tantivy");
+        let marker = onebrain_search::lex::rebuild_marker_path(&tantivy_dir);
+        std::fs::write(&marker, b"rebuild pending\n").unwrap();
+        std::fs::remove_dir_all(&tantivy_dir).unwrap();
+        drop(LexIndex::open(&tantivy_dir).unwrap());
+
+        // Confirm the trap is real: a plain open reports no error and no docs.
+        assert_eq!(
+            LexIndex::open(&tantivy_dir).unwrap().num_docs().unwrap(),
+            0,
+            "the post-crash index must open cleanly AND be empty"
+        );
+        assert!(onebrain_search::lex::rebuild_pending(&tantivy_dir));
+
+        let lex = open_lex_migrating(&cache_dir, &resolved)
+            .expect("a pending rebuild must be healed, not handed back empty");
+        let hits = lex.search("error", 5).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "the fast path must rebuild from chunk_meta when a rebuild is pending"
+        );
+        assert!(hits[0].0.starts_with("note.md#"), "{:?}", hits[0]);
+        assert!(
+            !onebrain_search::lex::rebuild_pending(&tantivy_dir),
+            "a completed heal must clear the marker"
+        );
+    }
+
+    #[test]
+    fn open_lex_migrating_markerless_empty_index_leaves_engine_unopened() {
+        // The guard must key on the MARKER, not on emptiness: a fresh vault
+        // (or one where everything is excluded) has a legitimately empty
+        // current-schema index and must still open with no engine, no lock,
+        // no redb — otherwise every such search pays a full engine open.
+        let vault = tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: emptyok-br1\n",
+        )
+        .unwrap();
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let resolved = resolved_at(vault.path());
+        let cache_dir = collection_cache_dir("emptyok-br1");
+        let tantivy_dir = index_artifact_path(&cache_dir, "tantivy");
+        drop(LexIndex::open(&tantivy_dir).unwrap());
+        assert!(!onebrain_search::lex::rebuild_pending(&tantivy_dir));
+
+        let lex = open_lex_migrating(&cache_dir, &resolved).unwrap();
+        assert_eq!(lex.num_docs().unwrap(), 0);
+        assert!(
+            !cache_dir.join(".collection.lock").exists(),
+            "a markerless empty index must never trigger an engine open"
+        );
+        assert!(!index_artifact_path(&cache_dir, "engine.redb").exists());
+        assert!(!index_artifact_path(&cache_dir, "vectors").exists());
+    }
+
+    #[test]
+    fn open_lex_migrating_propagates_non_schema_errors_without_wiping() {
+        // A non-schema failure (I/O, permissions, corruption) must propagate
+        // untouched — a wipe/self-heal is only the right response to a
+        // genuine schema mismatch. Force a plain I/O error portably (no
+        // chmod/root dependency, unlike this repo's permission-based tests
+        // elsewhere): put a REGULAR FILE where the tantivy directory belongs,
+        // so `LexIndex::open`'s `fs::create_dir_all` fails outright before it
+        // ever gets to opening an index — this can never be misclassified as
+        // `TantivyError::SchemaError`.
+        let vault = tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: badpath-296\n",
+        )
+        .unwrap();
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let resolved = resolved_at(vault.path());
+        let cache_dir = collection_cache_dir("badpath-296");
+        let tantivy_dir = index_artifact_path(&cache_dir, "tantivy");
+        std::fs::create_dir_all(tantivy_dir.parent().unwrap()).unwrap();
+        std::fs::write(&tantivy_dir, b"not a directory").unwrap();
+
+        // `LexIndex` isn't `Debug` (mirrors `Engine`), so unwrap the error via
+        // `match` rather than `expect_err`.
+        let err = match open_lex_migrating(&cache_dir, &resolved) {
+            Ok(_) => panic!("a file where a directory belongs must error, not silently wipe"),
+            Err(e) => e,
+        };
+        // Not misclassified as the self-heal trigger.
+        assert!(
+            !onebrain_search::lex::is_schema_mismatch(&err),
+            "a plain I/O error must not be classified as a schema mismatch: {err:#}"
+        );
+
+        // Nothing was wiped: the file is still exactly what was written.
+        assert!(
+            tantivy_dir.is_file(),
+            "must not have been replaced by a directory"
+        );
+        assert_eq!(std::fs::read(&tantivy_dir).unwrap(), b"not a directory");
+
+        // The engine must never have been opened either (no wipe path taken
+        // means no self-heal attempt).
+        assert!(!cache_dir.join(".collection.lock").exists());
+    }
+
+    // ── busy-retry inside the self-heal (C3, v3.4.16) ──────────────────────
+    //
+    // The healing `Engine::open` takes redb's single-process collection lock.
+    // Six concurrent `search search` calls on a freshly-upgraded index gave 1
+    // success and 5 × `E_ENGINE_BUSY` (exit 77) — a transient, self-resolving
+    // condition surfaced as a hard failure, and reachable in normal use (the
+    // agent fires MCP lex sub-queries alongside the PostToolUse reindex hook).
+    //
+    // Driving `open_lex_migrating_inner`'s injected heal closure directly makes
+    // the retry policy deterministic; the two public wrappers differ only in
+    // WHICH engine open they pass in (proven by their own tests above and by
+    // `server::search`'s byte-identical-config test).
+
+    /// A stale-schema tantivy dir at `<cache>/tantivy`, plus the cache dir —
+    /// enough to drive `open_lex_migrating_inner` down its self-heal branch.
+    fn stale_schema_cache_dir() -> (tempfile::TempDir, PathBuf) {
+        let cache = tempdir().unwrap();
+        let tantivy_dir = index_artifact_path(cache.path(), "tantivy");
+        std::fs::create_dir_all(&tantivy_dir).unwrap();
+        let mut sb = tantivy::schema::Schema::builder();
+        sb.add_text_field("something_else", tantivy::schema::TEXT);
+        tantivy::Index::builder()
+            .schema(sb.build())
+            .open_or_create(tantivy::directory::MmapDirectory::open(&tantivy_dir).unwrap())
+            .unwrap();
+        let dir = cache.path().to_path_buf();
+        (cache, dir)
+    }
+
+    /// Stand in for what the race winner does: replace the foreign-schema
+    /// index with a current-schema one holding a single searchable chunk.
+    fn write_current_schema_index(cache_dir: &Path) {
+        let tantivy_dir = index_artifact_path(cache_dir, "tantivy");
+        std::fs::remove_dir_all(&tantivy_dir).unwrap();
+        let mut ix = LexIndex::open(&tantivy_dir).unwrap();
+        ix.add(&Chunk {
+            chunk_id: "note.md#0".into(),
+            doc_path: "note.md".into(),
+            heading_path: String::new(),
+            chunk_index: 0,
+            text: "error handling in rust".into(),
+        })
+        .unwrap();
+        ix.commit().unwrap();
+    }
+
+    #[test]
+    fn open_lex_migrating_retries_a_busy_engine_instead_of_failing() {
+        // Attempt 1 loses the collection lock (typed `EngineBusy` — what
+        // `Engine::open` itself returns); attempt 2 loses it again, this time
+        // as the `CoreError::EngineBusy` that `map_engine_open_error` re-wraps
+        // it into (both classifications must be retried); attempt 3 wins and
+        // migrates. Without the retry the very first busy would have surfaced
+        // as exit 77.
+        let (_cache, cache_dir) = stale_schema_cache_dir();
+        let mut calls = 0usize;
+        let lex = open_lex_migrating_inner(&cache_dir, &mut || {
+            calls += 1;
+            match calls {
+                1 => Err(anyhow::Error::new(onebrain_search::error::EngineBusy)),
+                2 => Err(anyhow::Error::new(onebrain_core::CoreError::EngineBusy(
+                    "index locked by another process".into(),
+                ))),
+                _ => {
+                    write_current_schema_index(&cache_dir);
+                    Ok(())
+                }
+            }
+        })
+        .expect("a transiently busy engine must be retried, not surfaced as E_ENGINE_BUSY");
+        assert_eq!(calls, 3, "both busy classifications must be retried");
+        assert_eq!(lex.search("error", 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn open_lex_migrating_takes_the_cheap_win_when_the_race_winner_migrated() {
+        // The common real shape: another process won the lock and is doing the
+        // very same migration. Once it commits, the plain `LexIndex::open`
+        // succeeds — so the retry must re-check that FIRST and never need the
+        // engine (or its lock) at all.
+        let (_cache, cache_dir) = stale_schema_cache_dir();
+        let mut calls = 0usize;
+        let lex = open_lex_migrating_inner(&cache_dir, &mut || {
+            calls += 1;
+            // The winner commits its migration while we back off.
+            write_current_schema_index(&cache_dir);
+            Err(anyhow::Error::new(onebrain_search::error::EngineBusy))
+        })
+        .expect("a migration completed by the race winner must be picked up");
+        assert_eq!(calls, 1, "the cheap re-open must win before a second try");
+        assert_eq!(lex.search("error", 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn open_lex_migrating_rejects_a_cheap_win_the_race_winner_never_finished() {
+        // The cheap-win probe's dark twin (B-R1): the process that won the
+        // lock wiped the index and then DIED. Its leftovers open perfectly —
+        // current schema, zero docs — so an unguarded `if let Ok(lex) =
+        // LexIndex::open(..)` would accept an empty index and report success.
+        // The marker is the only thing that says otherwise, so the probe must
+        // require it to be gone.
+        let (_cache, cache_dir) = stale_schema_cache_dir();
+        let tantivy_dir = index_artifact_path(&cache_dir, "tantivy");
+        let marker = onebrain_search::lex::rebuild_marker_path(&tantivy_dir);
+        let mut calls = 0usize;
+        let lex = open_lex_migrating_inner(&cache_dir, &mut || {
+            calls += 1;
+            match calls {
+                1 => {
+                    // The winner wiped to a current-schema EMPTY index, wrote
+                    // its marker, and then crashed before repopulating.
+                    std::fs::write(&marker, b"rebuild pending\n").unwrap();
+                    std::fs::remove_dir_all(&tantivy_dir).unwrap();
+                    drop(LexIndex::open(&tantivy_dir).unwrap());
+                    Err(anyhow::Error::new(onebrain_search::error::EngineBusy))
+                }
+                _ => {
+                    // We get the lock next and complete the rebuild properly.
+                    write_current_schema_index(&cache_dir);
+                    std::fs::remove_file(&marker).unwrap();
+                    Ok(())
+                }
+            }
+        })
+        .expect("an abandoned rebuild must be finished, not accepted as a win");
+        assert_eq!(
+            calls, 2,
+            "the cheap-win probe must refuse an index whose rebuild is still pending"
+        );
+        assert_eq!(
+            lex.search("error", 5).unwrap().len(),
+            1,
+            "the returned index must be the REBUILT one, not the abandoned empty one"
+        );
+    }
+
+    #[test]
+    fn open_lex_migrating_gives_up_on_a_persistently_busy_engine() {
+        // Bounded: a genuinely stuck lock is surfaced honestly as busy after a
+        // small, fixed number of tries — never an unbounded loop.
+        let (_cache, cache_dir) = stale_schema_cache_dir();
+        let mut calls = 0usize;
+        let err = match open_lex_migrating_inner(&cache_dir, &mut || {
+            calls += 1;
+            Err(anyhow::Error::new(onebrain_search::error::EngineBusy))
+        }) {
+            Ok(_) => panic!("a permanently busy engine must not report success"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            calls, LEX_MIGRATE_OPEN_ATTEMPTS,
+            "the retry must be bounded"
+        );
+        assert!(
+            is_engine_busy_error(&err),
+            "the honest busy classification must survive the retries: {err:#}"
+        );
+    }
+
+    #[test]
+    fn open_lex_migrating_never_retries_a_genuine_failure() {
+        // Corrupt redb, IO error, permission denied — not transient, so
+        // retrying only wastes the user's time and hides the cause.
+        let (_cache, cache_dir) = stale_schema_cache_dir();
+        let mut calls = 0usize;
+        let err = match open_lex_migrating_inner(&cache_dir, &mut || {
+            calls += 1;
+            Err(anyhow::anyhow!("engine.redb is corrupt"))
+        }) {
+            Ok(_) => panic!("a genuine failure must not be swallowed"),
+            Err(e) => e,
+        };
+        assert_eq!(calls, 1, "a non-busy failure must be surfaced immediately");
+        assert!(
+            format!("{err:#}").contains("engine.redb is corrupt"),
+            "{err:#}"
         );
     }
 }

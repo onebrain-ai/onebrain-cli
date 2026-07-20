@@ -43,7 +43,14 @@ use std::path::{Path, PathBuf};
 /// every consumer that needs to enumerate index artifacts (size accounting,
 /// `--force` wipe) shares this ONE list instead of a private duplicate that
 /// would silently miss a future 4th artifact (issue #224).
-pub const INDEX_ARTIFACTS: [&str; 3] = ["tantivy", "vectors", "engine.redb"];
+pub const INDEX_ARTIFACTS: [&str; 3] = [LEX_ARTIFACT, "vectors", "engine.redb"];
+
+/// The keyword (BM25) index artifact — the one artifact that carries a
+/// crash-safety SIDECAR next to it ([`crate::lex::rebuild_marker_path`]), and
+/// so the one callers outside this module occasionally need by name. Exported
+/// so they can say `LEX_ARTIFACT` instead of hand-joining the literal, which
+/// the `artifact_join_sweep` guard test forbids (ADR 0027).
+pub const LEX_ARTIFACT: &str = "tantivy";
 
 /// Where a collection's on-disk cache currently stands relative to the
 /// `models/` + `index/` split.

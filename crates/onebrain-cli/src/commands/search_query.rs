@@ -18,7 +18,7 @@ use crate::cli::SearchQueryArgs;
 #[cfg(feature = "semantic")]
 use crate::commands::daemon_client::DaemonHandle;
 use crate::commands::search_common::{
-    collection_cache_dir, index_artifact_path, open_engine, resolve_collection,
+    collection_cache_dir, open_engine, open_lex_migrating, resolve_collection,
 };
 #[cfg(feature = "semantic")]
 use crate::commands::search_common::{
@@ -28,7 +28,6 @@ use crate::commands::token_runner;
 use crate::output::{emit, Envelope, OutputMode};
 use onebrain_core::ResolvedVault;
 use onebrain_search::engine::Hit;
-use onebrain_search::lex::LexIndex;
 use onebrain_token::gain::Surface;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -199,16 +198,24 @@ fn vec_confidence_hint(top_score: f64) -> Option<String> {
 /// pairs once the reranker model is live in production; treat the thresholds
 /// as placeholders, not tuned values.
 ///
-/// The low band edge IS the engine's own rerank gate default — a hit this
-/// weak only survives via the never-empty floor, so `RERANK_NO_MATCH_BAND`
-/// references [`onebrain_search::engine::DEFAULT_RERANK_MIN_SCORE`] directly
-/// rather than duplicating its value as a literal (they must never drift
-/// apart). `0.60` (`RERANK_POSSIBLE_BAND`) has no such counterpart yet — it
-/// stays a standalone provisional tunable pending Track C.
+/// The low band edge USED TO alias the engine's rerank gate default, on the
+/// reasoning that a hit scoring below the gate only survived via the
+/// never-empty floor — so the two "must never drift apart". v3.4.16 separated
+/// them, because they answer different questions:
 ///
-/// `< DEFAULT_RERANK_MIN_SCORE` → "no strong match"; `DEFAULT_RERANK_MIN_SCORE..0.60`
-/// → "possible match"; `> 0.60` → confident, no label.
-const RERANK_NO_MATCH_BAND: f32 = onebrain_search::engine::DEFAULT_RERANK_MIN_SCORE;
+/// - `DEFAULT_RERANK_MIN_SCORE` — *should this row be deleted?* Now `0.0`: never.
+/// - `RERANK_NO_MATCH_BAND` — *how much should the reader trust this row?*
+///   Still `0.30`, the v3.4.7 calibration boundary (non-matches measured
+///   0.003–0.066, genuine matches 0.73–0.99) and the same number the search
+///   cascade tells the agent to judge on.
+///
+/// Keeping the alias would have collapsed the "no strong match" band to
+/// nothing the moment the gate stopped filtering, relabelling every weak hit
+/// as a "possible match" — deleting the honesty signal instead of the rows.
+///
+/// `< 0.30` → "no strong match"; `0.30..=0.60` → "possible match";
+/// `> 0.60` → confident, no label.
+const RERANK_NO_MATCH_BAND: f32 = 0.30;
 const RERANK_POSSIBLE_BAND: f32 = 0.60;
 
 /// Confidence label for one reranked hit's `rerank_score`, or `None` when the
@@ -346,7 +353,7 @@ pub fn run_lex(
         )));
     };
     let cache_dir = collection_cache_dir(&collection);
-    let lex = LexIndex::open(&index_artifact_path(&cache_dir, "tantivy"))
+    let lex = open_lex_migrating(&cache_dir, &resolved)
         .with_context(|| format!("opening lex index at {}", cache_dir.display()))?;
 
     let mut raw_hits = lex.search_with_heading(&args.text, args.top_k)?;

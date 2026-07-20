@@ -91,7 +91,7 @@ a completeness test enforces this against the config structs.
 | `search.reranker.enabled` | Tier-2 cross-encoder rerank stage on/off | `true` | `true`, `false` | yes |
 | `search.reranker.model` | Reranker model (see `onebrain search model list`) | `onebrain-rerank-v1` | reranker-registry name | yes |
 | `search.reranker.min_candidates` | Minimum candidate pool to rerank (a floor, not a ceiling) | `10` | integer ≥ 1 | yes |
-| `search.reranker.min_score` | Score gate: hits below this calibrated 0–1 score are dropped | `0.30` (engine-calibrated; key may also be omitted) | number in `[0, 1]` | yes |
+| `search.reranker.min_score` | Score gate: hits below this calibrated 0–1 score are dropped | `0.0` (engine-calibrated — drops nothing by default as of v3.4.16, [ADR 0034](decisions/0034-heading-search-schema-selfheal-rerank-gate-decouple.md); key may also be omitted) — vaults initialized on v3.4.7–v3.4.15 have `0.30` written out explicitly, flagged as **superseded** by `doctor` (a legal value, but no longer the recommended default) | number in `[0, 1]` | yes |
 | `token_optimization.level` | Token-optimization ladder rung — see [`token-optimization.md`](token-optimization.md) | `conservative` | `off`, `conservative`, `balanced`, `aggressive` | not validated |
 | `token_optimization.get_max_tokens` | `search get` / MCP `get` continuation cap, in estimated tokens. Unset → per-level ladder (6000/4000/4000); a set value pins a fixed cap at every active level; `0` = unlimited | *unset* (per-level) | integer ≥ 0 | not validated |
 | `token_optimization.snippet_max_chars` | Per-hit query snippet length cap, in characters. Unset → per-level ladder (200/150/120); a set value pins a fixed cap at every active level | *unset* (per-level) | integer ≥ 0 | not validated |
@@ -154,3 +154,8 @@ row in the text view — the JSON keeps them separate), and closes with a boxed
 and deduplicated `💡 command → outcome` next-actions. When a warm daemon
 (`onebrain mcp`) is holding the search index, the search check reads its
 doc/pending counts from the daemon instead of reporting the index as locked.
+
+**Index & state checks** include:
+
+- **search** — Is there an index, and is it current? Checks collection name, presence on disk, total doc count, pending/unembedded count.
+- **lex-index** — Is the keyword (tantivy BM25) index actually alive? Detects the silent failure mode where an interrupted schema migration (v3.4.16 upgrade) leaves the tantivy index empty while the chunk metadata table still holds chunks — every keyword search would return nothing. Read-only check; resolution failures (no collection, no index on disk, daemon busy) degrade to `ok/"skipped"` rather than false-positive warnings. When found: `error` "keyword index is EMPTY while collection holds N chunk(s)" + hint pointing at `doctor --fix` (preferred; fast, rebuilds from stored metadata only) or `search reindex --force`. When rebuild is marked pending but still failing: `warn` "keyword-index rebuild still pending after retry" + hint pointing at `search reindex --force`.
