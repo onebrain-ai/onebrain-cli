@@ -9,6 +9,23 @@ use std::fs;
 use std::time::Duration;
 use tempfile::tempdir;
 
+/// The binary, with its search-cache root pinned to a throwaway tempdir.
+///
+/// Mandatory for any test that names a collection and then runs the binary:
+/// several commands OPEN a collection that already exists under the resolved
+/// cache root, and opening is not read-only. One test below writes
+/// `qmd_collection: test-collection-fixture`, and every `init` run resolves a
+/// collection name (generated from the vault path when the config names none)
+/// against that root. Applied to every invocation in this file — the hazard is
+/// the missing isolation, not the individual name. It also keeps `init` runs
+/// from seeding stray per-tempdir collection dirs in the real cache root.
+/// Enforced by `tests/cache_isolation_sweep.rs`.
+fn onebrain_cmd(cache: &tempfile::TempDir) -> Command {
+    let mut cmd = Command::cargo_bin("onebrain").unwrap();
+    cmd.env("ONEBRAIN_CACHE_DIR", cache.path());
+    cmd
+}
+
 /// Cross-crate drift guard: the `min_score` value the onebrain.yml template
 /// scaffolds (`onebrain-fs`, which cannot depend on `onebrain-search`) must
 /// equal the engine's calibrated default gate.
@@ -30,8 +47,8 @@ fn template_min_score_matches_engine_default() {
 #[test]
 fn cli_yes_fresh_vault_writes_files_and_emits_header() {
     let d = tempdir().unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    let cache = tempdir().unwrap();
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -67,10 +84,10 @@ fn cli_yes_fresh_vault_writes_files_and_emits_header() {
 #[test]
 fn cli_yes_existing_onebrain_yml_returns_non_zero() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     fs::write(d.path().join("onebrain.yml"), "old: value\n").unwrap();
 
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -90,10 +107,10 @@ fn cli_yes_existing_onebrain_yml_returns_non_zero() {
 #[test]
 fn cli_yes_existing_legacy_vault_yml_returns_non_zero() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     fs::write(d.path().join("vault.yml"), "old: legacy\n").unwrap();
 
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -111,8 +128,8 @@ fn cli_yes_existing_legacy_vault_yml_returns_non_zero() {
 #[test]
 fn cli_yes_creates_schedule_block_with_essentials_entries() {
     let d = tempdir().unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    let cache = tempdir().unwrap();
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -127,8 +144,8 @@ fn cli_yes_creates_schedule_block_with_essentials_entries() {
 #[test]
 fn cli_yes_emits_essentials_preset_line() {
     let d = tempdir().unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    let cache = tempdir().unwrap();
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -139,14 +156,13 @@ fn cli_yes_emits_essentials_preset_line() {
 #[test]
 fn cli_yes_run_twice_second_fails_without_force() {
     let d = tempdir().unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    let cache = tempdir().unwrap();
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
         .success();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -160,8 +176,8 @@ fn cli_yes_run_twice_second_fails_without_force() {
 #[test]
 fn cli_yes_populates_claude_settings_json_with_stop_hook() {
     let d = tempdir().unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    let cache = tempdir().unwrap();
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -189,10 +205,10 @@ fn cli_yes_populates_claude_settings_json_with_stop_hook() {
 #[test]
 fn cli_yes_force_preserves_existing_onebrain_yml() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     let original = "qmd_collection: test-collection-fixture\nold: value\n";
     fs::write(d.path().join("onebrain.yml"), original).unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--force", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -214,8 +230,8 @@ fn cli_yes_force_preserves_existing_onebrain_yml() {
 #[test]
 fn init_creates_marketplace_json_at_vault_root() {
     let d = tempdir().unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    let cache = tempdir().unwrap();
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -240,8 +256,8 @@ fn init_creates_marketplace_json_at_vault_root() {
 #[test]
 fn init_adds_enabled_plugins_to_settings() {
     let d = tempdir().unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    let cache = tempdir().unwrap();
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -269,8 +285,8 @@ fn init_adds_enabled_plugins_to_settings() {
 #[test]
 fn init_is_idempotent_marketplace_json_not_overwritten() {
     let d = tempdir().unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    let cache = tempdir().unwrap();
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -286,8 +302,7 @@ fn init_is_idempotent_marketplace_json_not_overwritten() {
     fs::write(&path, &text).unwrap();
 
     // Re-init with --force (existing onebrain.yml guard requires it)
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--force", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -311,6 +326,7 @@ fn init_is_idempotent_marketplace_json_not_overwritten() {
 #[test]
 fn init_preserves_existing_settings_keys() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     fs::create_dir_all(d.path().join(".claude")).unwrap();
     let settings_path = d.path().join(".claude").join("settings.json");
     let custom = serde_json::json!({
@@ -324,8 +340,7 @@ fn init_preserves_existing_settings_keys() {
     )
     .unwrap();
 
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--force", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -351,8 +366,8 @@ fn init_preserves_existing_settings_keys() {
 #[test]
 fn init_skips_when_already_enabled() {
     let d = tempdir().unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    let cache = tempdir().unwrap();
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -360,8 +375,7 @@ fn init_skips_when_already_enabled() {
         .stdout(predicate::str::contains("plugin: enabled"));
 
     // Run again with --force; key already true → "ok (already enabled)"
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--force", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -382,12 +396,12 @@ fn init_skips_when_already_enabled() {
 #[test]
 fn init_fails_on_malformed_settings_json() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     fs::create_dir_all(d.path().join(".claude")).unwrap();
     let settings_path = d.path().join(".claude").join("settings.json");
     fs::write(&settings_path, "{not valid json").unwrap();
 
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--force", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -405,10 +419,10 @@ fn init_fails_on_malformed_settings_json() {
 #[test]
 fn init_target_directory_via_vault_flag() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     let target = d.path().join("nested-vault");
     fs::create_dir_all(&target).unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args([
             "--vault",
             target.to_str().unwrap(),
@@ -430,8 +444,8 @@ fn init_target_directory_via_vault_flag() {
 #[test]
 fn init_rejects_vault_dir_flag() {
     let d = tempdir().unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    let cache = tempdir().unwrap();
+    onebrain_cmd(&cache)
         .args([
             "init",
             "--yes",
@@ -451,8 +465,8 @@ fn init_rejects_vault_dir_flag() {
 #[test]
 fn init_empty_dir_succeeds_silently() {
     let d = tempdir().unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    let cache = tempdir().unwrap();
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -465,10 +479,10 @@ fn init_empty_dir_succeeds_silently() {
 #[test]
 fn init_nonexistent_dir_creates_and_succeeds() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     let target = d.path().join("brand-new").join("nested");
     assert!(!target.exists());
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args([
             "--vault",
             target.to_str().unwrap(),
@@ -489,9 +503,9 @@ fn init_nonexistent_dir_creates_and_succeeds() {
 #[test]
 fn init_nonempty_dir_yes_without_force_errors_with_exit_75() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     fs::write(d.path().join("README.md"), "hi").unwrap();
-    let out = Command::cargo_bin("onebrain")
-        .unwrap()
+    let out = onebrain_cmd(&cache)
         .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -513,10 +527,10 @@ fn init_nonempty_dir_yes_without_force_errors_with_exit_75() {
 #[test]
 fn init_nonempty_dir_force_flag_proceeds() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     fs::write(d.path().join("README.md"), "hi").unwrap();
     fs::create_dir_all(d.path().join("src")).unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--force", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -534,9 +548,9 @@ fn init_nonempty_dir_force_flag_proceeds() {
 #[test]
 fn init_json_mode_nonempty_errors_without_prompt() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     fs::write(d.path().join("file.txt"), "x").unwrap();
-    let assert = Command::cargo_bin("onebrain")
-        .unwrap()
+    let assert = onebrain_cmd(&cache)
         .args(["init", "--yes", "--no-sync", "--json"])
         .current_dir(d.path())
         .assert()
@@ -559,9 +573,9 @@ fn init_json_mode_nonempty_errors_without_prompt() {
 #[test]
 fn init_json_mode_nonempty_with_force_succeeds() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     fs::write(d.path().join("file.txt"), "x").unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--force", "--no-sync", "--json"])
         .current_dir(d.path())
         .assert()
@@ -575,9 +589,9 @@ fn init_json_mode_nonempty_with_force_succeeds() {
 #[test]
 fn init_dotfile_only_dir_still_triggers_safety_check() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     fs::write(d.path().join(".DS_Store"), "").unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -591,13 +605,13 @@ fn init_dotfile_only_dir_still_triggers_safety_check() {
 #[test]
 fn init_existing_onebrain_yml_skips_safety_check() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     fs::write(d.path().join("onebrain.yml"), "old: value\n").unwrap();
     // Also drop a sibling file so the dir is clearly "non-empty" — proves
     // the safety check defers to the existing guard when a config file is
     // present, regardless of other entries.
     fs::write(d.path().join("README.md"), "hi").unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["init", "--yes", "--no-sync"])
         .current_dir(d.path())
         .assert()
@@ -616,9 +630,9 @@ fn init_existing_onebrain_yml_skips_safety_check() {
 #[test]
 fn init_nonempty_closed_stdin_does_not_hang() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     fs::write(d.path().join("README.md"), "hi").unwrap();
-    let assert = Command::cargo_bin("onebrain")
-        .unwrap()
+    let assert = onebrain_cmd(&cache)
         .args(["init", "--no-sync"])
         .current_dir(d.path())
         .write_stdin("")

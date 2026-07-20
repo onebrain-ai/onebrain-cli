@@ -2,6 +2,14 @@
 
 Status: accepted (v3.4.6) — **superseded in part by [ADR 0025](0025-tier2-cross-encoder-reranker.md)** (v3.4.7): the Tier-2 cross-encoder reranker is now the real precision gate for every reranked hit. `vec_confidence_hint`'s bi-encoder cosine heuristic (below) is **not removed** — it remains the fallback confidence signal for the narrow case where a hit genuinely has no `rerank_score` to band on (reranker disabled, not downloaded, or a lex-only build). `keep_top_cluster` (the recall-first vector cutoff itself) is unaffected — reranking runs on top of it, not instead of it.
 
+> **Superseded in part by [ADR 0034](0034-heading-search-schema-selfheal-rerank-gate-decouple.md)
+> (v3.4.16).** The sentence above — "the Tier-2 cross-encoder reranker is now the real precision
+> gate for every reranked hit" — described the reranker while `DEFAULT_RERANK_MIN_SCORE` was
+> `0.30`. It is now `0.0`: by default the reranker **reorders and bands** hits but drops none, so
+> it is no longer a precision *gate* unless the user raises `search.reranker.min_score`. Nothing
+> else in this ADR changes — `keep_top_cluster` and the `vec_confidence_hint` fallback role
+> described below both still hold. See 0034 for why the gate was decoupled from ranking.
+
 ## Context
 
 Native vector search dropped hits below a per-model absolute cosine floor

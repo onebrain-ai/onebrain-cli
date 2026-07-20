@@ -10,6 +10,22 @@ use std::fs;
 use std::path::Path;
 use tempfile::tempdir;
 
+/// The binary, with its search-cache root pinned to a throwaway tempdir.
+///
+/// Mandatory for any test that names a collection and then runs the binary:
+/// several commands OPEN a collection that already exists under the resolved
+/// cache root, and opening is not read-only. `write_vault` below writes a
+/// caller-supplied `qmd_collection`, so an unisolated run would reach the
+/// developer's real index the moment that name happened to exist. Applied to
+/// every invocation in this file, not just the collection-naming one — the
+/// hazard is the missing isolation, not the individual name. Enforced by
+/// `tests/cache_isolation_sweep.rs`.
+fn onebrain_cmd(cache: &tempfile::TempDir) -> Command {
+    let mut cmd = Command::cargo_bin("onebrain").unwrap();
+    cmd.env("ONEBRAIN_CACHE_DIR", cache.path());
+    cmd
+}
+
 fn write_vault(dir: &Path, claude_dir: bool, qmd_collection: Option<&str>) {
     if claude_dir {
         fs::create_dir_all(dir.join(".claude")).unwrap();
@@ -29,9 +45,9 @@ fn read_settings(dir: &Path) -> Value {
 #[test]
 fn cli_fresh_vault_writes_settings() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     write_vault(d.path(), true, None);
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["register-hooks", "--vault", d.path().to_str().unwrap()])
         .assert()
         .success()
@@ -47,16 +63,15 @@ fn cli_fresh_vault_writes_settings() {
 #[test]
 fn cli_existing_canonical_idempotent() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     write_vault(d.path(), true, None);
     // First run installs.
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["register-hooks", "--vault", d.path().to_str().unwrap()])
         .assert()
         .success();
     // Second run is idempotent.
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["register-hooks", "--vault", d.path().to_str().unwrap()])
         .assert()
         .success()
@@ -67,6 +82,7 @@ fn cli_existing_canonical_idempotent() {
 #[test]
 fn cli_foreign_hooks_preserved() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     write_vault(d.path(), true, None);
     // Pre-seed with a user UserPromptSubmit hook that should survive.
     fs::write(
@@ -85,8 +101,7 @@ fn cli_foreign_hooks_preserved() {
         .unwrap(),
     )
     .unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["register-hooks", "--vault", d.path().to_str().unwrap()])
         .assert()
         .success();
@@ -101,9 +116,9 @@ fn cli_foreign_hooks_preserved() {
 #[test]
 fn cli_dry_run_does_not_write() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     write_vault(d.path(), true, None);
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args([
             "register-hooks",
             "--vault",
@@ -121,16 +136,15 @@ fn cli_dry_run_does_not_write() {
 #[test]
 fn cli_remove_strips_state() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     write_vault(d.path(), true, None);
     // Install first.
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["register-hooks", "--vault", d.path().to_str().unwrap()])
         .assert()
         .success();
     // Now strip.
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args([
             "register-hooks",
             "--vault",
@@ -158,9 +172,9 @@ fn cli_no_claude_dir_falls_into_direct_mode() {
     // gemini-style message). Either way the test's invariant — no
     // settings.json written — still holds.
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     write_vault(d.path(), false, None);
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["register-hooks", "--vault", d.path().to_str().unwrap()])
         .assert()
         .success()
@@ -171,9 +185,9 @@ fn cli_no_claude_dir_falls_into_direct_mode() {
 #[test]
 fn cli_qmd_collection_set_adds_post_tool_use() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     write_vault(d.path(), true, Some("ob-1-test"));
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args(["register-hooks", "--vault", d.path().to_str().unwrap()])
         .assert()
         .success()
@@ -187,9 +201,9 @@ fn cli_qmd_collection_set_adds_post_tool_use() {
 #[test]
 fn cli_vault_dir_alias_resolves_to_vault() {
     let d = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     write_vault(d.path(), true, None);
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    onebrain_cmd(&cache)
         .args([
             "register-hooks",
             "--vault-dir",

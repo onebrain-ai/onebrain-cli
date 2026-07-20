@@ -192,7 +192,7 @@ The public surface other crates (chiefly `onebrain-cli`) reach for first:
 - **Engine** — `engine::Engine` (`open`, `set_exclude_patterns`, `index_doc`, `remove_doc`, `query`, `vector_search`, `get`, `status`, `reindex_all[_with_progress]`, `reindex_paths[_with_progress]`, `rebuild[_with_progress]`, `active_model_matches`, `set_rerank_settings`, `rerank_enabled`, `rerank_active`), `engine::{Hit, IndexStatus, ReindexStats, ReindexProgress, RerankSettings, DEFAULT_RERANK_MIN_SCORE}`, `engine::short_path_hash`
 - **Model registry** — `embed::{model_registry, ModelInfo, is_supported_model, model_dims, model_download_status, ModelDownloadStatus, dir_size_bytes}`, `embed::{new, new_quiet, Embedder, Embed}`
 - **Reranker registry** — `rerank::{reranker_registry, RerankerInfo, is_supported_reranker, reranker_download_status}`, `rerank::{new, Reranker, Rerank}`
-- **Building blocks** (rarely used directly) — `chunk::{chunk_markdown, Chunk}`, `lex::{LexIndex, open_or_reset, is_schema_mismatch}`, `vector::VectorStore`, `hybrid::rrf_fuse`
+- **Building blocks** (rarely used directly) — `chunk::{chunk_markdown, Chunk}`, `lex::{LexIndex, is_schema_mismatch, rebuild_pending, clear_rebuild_marker, rebuild_marker_path}` — note `open_or_reset` is an associated fn on `LexIndex`, not a `lex::` free item, while the three rebuild-marker fns are free items that `onebrain-cli`'s `search_reindex.rs` drives directly — `vector::VectorStore`, `hybrid::rrf_fuse`
 
 ## MCP server
 

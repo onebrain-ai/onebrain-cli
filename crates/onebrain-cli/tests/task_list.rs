@@ -13,6 +13,13 @@ fn write(root: &std::path::Path, rel: &str, body: &str) {
 #[test]
 fn task_list_json_excludes_fenced_and_respects_due_by() {
     let dir = tempdir().unwrap();
+    // Search-cache isolation, mandatory for any test that names a collection
+    // and then runs the binary: several commands OPEN a collection that already
+    // exists under the resolved cache root, and opening is not read-only. Named
+    // `t` here, so without this the child reaches the developer's real index the
+    // moment a collection called `t` exists. Enforced by
+    // `tests/cache_isolation_sweep.rs`.
+    let cache = tempdir().unwrap();
     let root = dir.path();
     write(root, "onebrain.yml", "qmd_collection: t\n");
     write(
@@ -24,6 +31,7 @@ fn task_list_json_excludes_fenced_and_respects_due_by() {
     );
 
     let out = Command::new(env!("CARGO_BIN_EXE_onebrain"))
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
         .args([
             "--vault",
             root.to_str().unwrap(),

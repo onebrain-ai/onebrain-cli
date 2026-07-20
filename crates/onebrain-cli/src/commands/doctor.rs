@@ -1521,6 +1521,15 @@ const LEX_INDEX_CHECK: &str = "lex-index";
 /// would immediately re-hit the same failed open.
 const LEX_INDEX_UNVERIFIED: &str = "could not verify the keyword index";
 
+/// Message prefix of the other `lex-index` finding that is NOT auto-fixable:
+/// the ORPHANED state, where `chunk_meta` — the only source a rebuild could
+/// read — is itself gone. [`fix_lex_index`] already refuses this one at
+/// runtime (`repopulate_lex_from_meta` returns `Ok(0)` → `FixOutcome::Manual`),
+/// so offering it in the `--fix` plan promises a repair that cannot happen and
+/// hides the `--force` reindex that is the actual remedy. Shared by the check
+/// and by [`planned_action`] so the two can't drift.
+const LEX_INDEX_ORPHANED: &str = "stored chunk metadata is EMPTY";
+
 /// Doctor check (`check = "lex-index"`) — is the keyword index actually alive?
 ///
 /// Touches no vault files, but NOT inert: opening the engine is itself the
@@ -1634,7 +1643,7 @@ fn lex_index_check(vault_root: &Path) -> DoctorResult {
         return DoctorResult::error(
             LEX_INDEX_CHECK,
             format!(
-                "stored chunk metadata is EMPTY while the keyword index still holds {} doc(s) — \
+                "{LEX_INDEX_ORPHANED} while the keyword index still holds {} doc(s) — \
                  every one is an orphan, and the metadata a rebuild would read is gone (an \
                  interrupted index wipe, or a partial restore)",
                 health.lex_docs
@@ -1703,7 +1712,11 @@ fn lex_index_check(vault_root: &Path) -> DoctorResult {
 /// ([`LexHealth::is_orphaned`][orphan] — the check above reports it as an
 /// error), the repopulate REFUSES outright rather than clearing the last copy
 /// of the data, and returns 0 — which lands on the `Ok(0)` arm below and tells
-/// the user exactly that.
+/// the user exactly that. Since that refusal is knowable from the check's own
+/// message, [`planned_action`] no longer routes the orphaned state here at all
+/// — it goes straight to the manual list, which prints the `--force` hint in
+/// full. The `Ok(0)` arm stays as the belt-and-braces path for the states that
+/// ARE planned here but lose their metadata between the report and the fix.
 ///
 /// [orphan]: onebrain_search::engine::LexHealth::is_orphaned
 ///
@@ -2410,15 +2423,22 @@ fn planned_action(result: &DoctorResult) -> Option<&'static str> {
         ),
         "search-exclude" => Some("insert the search.exclude block"),
         "token-optimization" => Some("insert the token_optimization block / missing sub-key(s)"),
-        // Every lex-index finding is repaired by the same rebuild — EXCEPT the
-        // "could not verify" one, which reports that the engine could not be
-        // opened at all. Planning a repair there would run `fix_lex_index`,
-        // whose first act is the very `Engine::open` that just failed: a
-        // guaranteed `✗` in the fix summary and a non-zero exit, on a check
-        // that found nothing wrong. Same `hint`-driven precedent as
-        // `qmd-leftovers` below.
-        "lex-index" => (!result.message.starts_with(LEX_INDEX_UNVERIFIED))
-            .then_some("rebuild the keyword index from stored chunk metadata"),
+        // Every lex-index finding is repaired by the same rebuild — EXCEPT two,
+        // both of which `fix_lex_index` would only short-circuit on anyway:
+        //  - "could not verify": the engine could not be opened at all.
+        //    Planning a repair would run `fix_lex_index`, whose first act is
+        //    the very `Engine::open` that just failed — a guaranteed `✗` in the
+        //    fix summary and a non-zero exit, on a check that found nothing
+        //    wrong.
+        //  - ORPHANED: `chunk_meta` is empty, so `repopulate_lex_from_meta`
+        //    deliberately refuses (`Ok(0)` → `Manual`) rather than clearing the
+        //    last surviving copy. Listing it as auto-fixable promised a repair
+        //    that never happens AND buried the real remedy (`search reindex
+        //    --force`) — routing it to the manual list prints that hint in full.
+        // Same `hint`-driven precedent as `qmd-leftovers` below.
+        "lex-index" => (!result.message.starts_with(LEX_INDEX_UNVERIFIED)
+            && !result.message.starts_with(LEX_INDEX_ORPHANED))
+        .then_some("rebuild the keyword index from stored chunk metadata"),
         "claude-settings" => Some("remove the stale marketplace entry"),
         "plugin-cache" => Some("remove the stale plugin cache"),
         "vault-config-migration" => Some("migrate vault.yml → onebrain.yml"),
@@ -4127,6 +4147,8 @@ const DOCTOR_SECTIONS: [(&str, &str, &[&str]); 4] = [
         &[
             "orphan-checkpoints",
             "search",
+            "lex-index",
+            "daemon",
             "read-hook-failopen",
             "legacy-index-stub",
             "qmd-leftovers",
@@ -4153,6 +4175,8 @@ fn display_label(check: &str) -> &str {
         "claude-settings" => "claude settings",
         "orphan-checkpoints" => "checkpoints",
         "search" => "search",
+        "lex-index" => "keyword index",
+        "daemon" => "daemon",
         "read-hook-failopen" => "read-hook gate",
         "legacy-index-stub" => "legacy index stub",
         "qmd-leftovers" => "qmd cleanup",
@@ -4408,6 +4432,19 @@ fn action_from_result(r: &DoctorResult) -> (String, String) {
         return ("/wrapup".to_string(), format!("merge {n} checkpoint(s)"));
     }
     if hint.contains("search reindex") {
+        // `--force` is a DIFFERENT command, not a decoration: a plain reindex
+        // skips every doc whose hash is unchanged, so it cannot repair an index
+        // whose contents disagree with the stored metadata. Collapsing both to
+        // "onebrain search reindex" told the reader to run the one command that
+        // provably won't help. Keep the flag when the hint carries it — and let
+        // the two stay distinct dedup keys in `summary_action_lines`, so a run
+        // that surfaces both prints both.
+        if hint.contains("search reindex --force") {
+            return (
+                "onebrain search reindex --force".to_string(),
+                "rebuild the keyword index and its metadata from the vault".to_string(),
+            );
+        }
         let outcome = match pending_count(&r.message) {
             Some(n) => format!("embed {n} pending doc(s)"),
             None => "reindex the search index".to_string(),
@@ -10005,6 +10042,72 @@ mod tests {
                 .any(|(_, _, checks)| checks.contains(&"qmd-leftovers")),
             "qmd-leftovers must be assigned to a section, not fall through to Other"
         );
+    }
+
+    // ── S1: every shipped check has a section + a human label ───────────────
+
+    #[test]
+    fn lex_index_and_daemon_have_a_section_and_a_display_label() {
+        assert_eq!(display_label(LEX_INDEX_CHECK), "keyword index");
+        assert_eq!(display_label(DAEMON_STATUS_CHECK), "daemon");
+        for name in [LEX_INDEX_CHECK, DAEMON_STATUS_CHECK] {
+            assert!(
+                DOCTOR_SECTIONS
+                    .iter()
+                    .any(|(_, _, checks)| checks.contains(&name)),
+                "'{name}' must be assigned to a section, not fall through to Other"
+            );
+        }
+    }
+
+    // ── S2: `--force` survives the summary-box rendering ────────────────────
+
+    fn orphaned_lex_result() -> DoctorResult {
+        DoctorResult::error(
+            LEX_INDEX_CHECK,
+            format!("{LEX_INDEX_ORPHANED} while the keyword index still holds 9 doc(s)"),
+        )
+        .with_hint(
+            "onebrain search reindex --force (rebuilds the keyword index AND the stored \
+             metadata from the vault; `doctor --fix` cannot repair this one)",
+        )
+    }
+
+    #[test]
+    fn orphaned_lex_index_is_not_offered_as_an_automated_fix() {
+        // `fix_lex_index` can only return Manual here — the plan must say so.
+        assert!(
+            planned_action(&orphaned_lex_result()).is_none(),
+            "orphaned lex-index has no rebuild source, so no automated fix"
+        );
+        // …but the other lex-index findings stay auto-fixable.
+        let dead = DoctorResult::error(
+            LEX_INDEX_CHECK,
+            "keyword index is EMPTY while the collection holds 9 chunk(s)",
+        );
+        assert!(planned_action(&dead).is_some(), "dead index is repairable");
+    }
+
+    #[test]
+    fn summary_action_preserves_force_and_dedups_it_apart_from_plain_reindex() {
+        let results = vec![
+            DoctorResult::warn("search", "721 indexed · 6 pending")
+                .with_hint("onebrain search reindex"),
+            orphaned_lex_result(),
+        ];
+        let cmds: Vec<String> = summary_action_lines(&results)
+            .into_iter()
+            .map(|(cmd, _)| cmd)
+            .collect();
+        assert!(
+            cmds.iter().any(|c| c == "onebrain search reindex --force"),
+            "the --force hint must keep its flag: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c == "onebrain search reindex"),
+            "the plain-reindex hint must still render: {cmds:?}"
+        );
+        assert_eq!(cmds.len(), 2, "no extra lines, no dedup collapse: {cmds:?}");
     }
 
     #[test]
