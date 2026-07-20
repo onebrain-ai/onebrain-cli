@@ -3691,16 +3691,7 @@ mod tests {
         };
 
         // Replace with an index carrying a DIFFERENT schema.
-        std::fs::remove_dir_all(&tantivy_dir).unwrap();
-        std::fs::create_dir_all(&tantivy_dir).unwrap();
-        {
-            let mut sb = tantivy::schema::Schema::builder();
-            sb.add_text_field("something_else", tantivy::schema::TEXT);
-            tantivy::Index::builder()
-                .schema(sb.build())
-                .open_or_create(tantivy::directory::MmapDirectory::open(&tantivy_dir).unwrap())
-                .unwrap();
-        }
+        plant_foreign_schema(&tantivy_dir);
 
         // Reopening succeeds and the lex index is whole again.
         let e = fake_engine(dir.path());
@@ -3720,6 +3711,21 @@ mod tests {
         assert!(e.lex_health().unwrap().is_healthy());
     }
 
+    /// Wipe `tantivy_dir` and recreate it holding an index whose schema shares
+    /// no field with ours, so the next `LexIndex::open_or_reset` sees the
+    /// typed `SchemaError` a pre-v3.4.16 index produces and takes the wipe +
+    /// repopulate branch. The stand-in for "an index from the old schema".
+    fn plant_foreign_schema(tantivy_dir: &Path) {
+        std::fs::remove_dir_all(tantivy_dir).unwrap();
+        std::fs::create_dir_all(tantivy_dir).unwrap();
+        let mut sb = tantivy::schema::Schema::builder();
+        sb.add_text_field("something_else", tantivy::schema::TEXT);
+        tantivy::Index::builder()
+            .schema(sb.build())
+            .open_or_create(tantivy::directory::MmapDirectory::open(tantivy_dir).unwrap())
+            .unwrap();
+    }
+
     /// Reproduce the on-disk state a migration interrupted between the wipe
     /// and the repopulate's commit leaves behind: the tantivy dir wiped and
     /// recreated EMPTY under the CURRENT schema (so the next open reports no
@@ -3733,16 +3739,7 @@ mod tests {
         let tantivy_dir = CollectionLayout::new(cache_dir).index_artifact("tantivy");
         // Foreign schema ⇒ `open_or_reset` takes the wipe branch, exactly as
         // an upgraded vault does.
-        std::fs::remove_dir_all(&tantivy_dir).unwrap();
-        std::fs::create_dir_all(&tantivy_dir).unwrap();
-        {
-            let mut sb = tantivy::schema::Schema::builder();
-            sb.add_text_field("something_else", tantivy::schema::TEXT);
-            tantivy::Index::builder()
-                .schema(sb.build())
-                .open_or_create(tantivy::directory::MmapDirectory::open(&tantivy_dir).unwrap())
-                .unwrap();
-        }
+        plant_foreign_schema(&tantivy_dir);
         let (_lex, was_reset) = LexIndex::open_or_reset(&tantivy_dir).unwrap();
         assert!(was_reset);
         // ...and here the process dies. No repopulate, no marker clear.

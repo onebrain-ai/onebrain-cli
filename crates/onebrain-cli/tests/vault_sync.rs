@@ -390,6 +390,11 @@ fn default_init_with_inline_sync_keeps_template_comments() {
         .current_dir(&vault)
         .env("ONEBRAIN_VAULT_SYNC_FIXTURE", &tarball_path)
         .env("ONEBRAIN_INSTALLED_PLUGINS_PATH", &isolated)
+        // The only `collection:` in this test is the template's COMMENTED
+        // placeholder, so nothing resolves to a real name — this is the
+        // cache-isolation sweep's documented false-positive shape, resolved
+        // the same safe way as a true one.
+        .env("ONEBRAIN_CACHE_DIR", dir.path().join("cache"))
         .output()
         .unwrap();
     assert!(

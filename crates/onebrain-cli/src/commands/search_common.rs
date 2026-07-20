@@ -1457,16 +1457,7 @@ mod tests {
         // simulating a vault upgraded from an older OneBrain build, exactly as
         // `onebrain_search::engine`'s
         // `reopen_after_lex_schema_change_repopulates_from_meta` test does.
-        std::fs::remove_dir_all(&tantivy_dir).unwrap();
-        std::fs::create_dir_all(&tantivy_dir).unwrap();
-        {
-            let mut sb = tantivy::schema::Schema::builder();
-            sb.add_text_field("something_else", tantivy::schema::TEXT);
-            tantivy::Index::builder()
-                .schema(sb.build())
-                .open_or_create(tantivy::directory::MmapDirectory::open(&tantivy_dir).unwrap())
-                .unwrap();
-        }
+        plant_foreign_schema(&tantivy_dir);
 
         let lex = open_lex_migrating(&cache_dir, &resolved)
             .expect("must self-heal, not hard-fail, on a schema mismatch");
@@ -1698,18 +1689,29 @@ mod tests {
     // WHICH engine open they pass in (proven by their own tests above and by
     // `server::search`'s byte-identical-config test).
 
+    /// (Re)create `tantivy_dir` holding an index whose schema shares no field
+    /// with ours, so the next open sees the typed `SchemaError` a pre-v3.4.16
+    /// index produces. The stand-in for "a vault upgraded from an older
+    /// OneBrain build" — same shape as `onebrain_search::engine`'s own test
+    /// helper (the two crates are separate test targets, so the duplication
+    /// across them is unavoidable).
+    fn plant_foreign_schema(tantivy_dir: &Path) {
+        let _ = std::fs::remove_dir_all(tantivy_dir);
+        std::fs::create_dir_all(tantivy_dir).unwrap();
+        let mut sb = tantivy::schema::Schema::builder();
+        sb.add_text_field("something_else", tantivy::schema::TEXT);
+        tantivy::Index::builder()
+            .schema(sb.build())
+            .open_or_create(tantivy::directory::MmapDirectory::open(tantivy_dir).unwrap())
+            .unwrap();
+    }
+
     /// A stale-schema tantivy dir at `<cache>/tantivy`, plus the cache dir —
     /// enough to drive `open_lex_migrating_inner` down its self-heal branch.
     fn stale_schema_cache_dir() -> (tempfile::TempDir, PathBuf) {
         let cache = tempdir().unwrap();
         let tantivy_dir = index_artifact_path(cache.path(), "tantivy");
-        std::fs::create_dir_all(&tantivy_dir).unwrap();
-        let mut sb = tantivy::schema::Schema::builder();
-        sb.add_text_field("something_else", tantivy::schema::TEXT);
-        tantivy::Index::builder()
-            .schema(sb.build())
-            .open_or_create(tantivy::directory::MmapDirectory::open(&tantivy_dir).unwrap())
-            .unwrap();
+        plant_foreign_schema(&tantivy_dir);
         let dir = cache.path().to_path_buf();
         (cache, dir)
     }

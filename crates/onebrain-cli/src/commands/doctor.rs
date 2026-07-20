@@ -166,8 +166,26 @@ pub fn run(
             .collect();
         if want_structured {
             // Machine path (the `/doctor` skill drives `--fix --json`): no
-            // prompt, run every recipe, capture outcomes for the `fix[]` array.
+            // prompt, run the auto-fixable recipes, capture outcomes for the
+            // `fix[]` array.
             if !issues.is_empty() {
+                // `planned_action` gates this path exactly as it gates the
+                // text path below — a check with no automated recipe is
+                // reported as `manual`, never run. Without the gate, a state
+                // whose recipe deliberately refuses (or whose engine could not
+                // be opened at all — `lex-index` "could not verify" under a
+                // warm daemon, the NORMAL configuration) became a guaranteed
+                // `failed` entry plus exit 1 on the JSON path only, while
+                // `--fix --yes` on the same vault exited 0. See
+                // `planned_action`'s own comment.
+                //
+                // The `manual` message mirrors the text path's manual list —
+                // the check's own hint verbatim — rather than
+                // `manual_message`, whose circular-hint stripping would bury
+                // remedies that legitimately mention `doctor --fix` (the
+                // orphaned `lex-index` hint says `doctor --fix` CANNOT repair
+                // it and names `search reindex --force` instead).
+                //
                 // No prompt was (or could be) shown on this path, so no
                 // recipe ever receives `interactive_confirmed = true` here.
                 let outcomes: Vec<(String, FixOutcome)> = issues
@@ -175,7 +193,7 @@ pub fn run(
                     .map(|r| {
                         (
                             r.check.clone(),
-                            attempt_fix(r, vault_root.as_path(), true, false),
+                            structured_fix_outcome(r, vault_root.as_path()),
                         )
                     })
                     .collect();
@@ -2401,6 +2419,38 @@ fn attempt_fix(
         // short-circuits to Manual before touching the filesystem at all.
         "qmd-leftovers" => fix_qmd_leftovers(result, interactive_confirmed),
         _ => FixOutcome::Manual(manual_message(result)),
+    }
+}
+
+/// One issue's outcome on the structured `--fix --json` path — the machine
+/// counterpart of the text path's auto/manual split, gated by the SAME
+/// [`planned_action`] classifier so the two paths cannot disagree about what
+/// is auto-fixable.
+///
+/// A check with no automated recipe is reported as `manual` and its recipe is
+/// never invoked. Running it anyway is how `lex-index` "could not verify"
+/// (engine held by a daemon — the normal OneBrain configuration) turned into a
+/// `failed` entry and exit 1 on `--fix --json`, while `--fix --yes` on the very
+/// same vault printed "Nothing to auto-fix" and exited 0.
+///
+/// The `manual` message is the check's own `hint` verbatim, exactly as the text
+/// path's manual list prints it — deliberately NOT [`manual_message`], whose
+/// circular-hint stripping would discard remedies that legitimately mention
+/// `doctor --fix` (the orphaned `lex-index` hint says `doctor --fix` *cannot*
+/// repair it, and names `search reindex --force` instead).
+fn structured_fix_outcome(result: &DoctorResult, vault_root: &Path) -> FixOutcome {
+    if planned_action(result).is_some() {
+        // No prompt is possible on this path, so `interactive_confirmed` is
+        // never true here.
+        attempt_fix(result, vault_root, true, false)
+    } else {
+        FixOutcome::Manual(
+            result
+                .hint
+                .as_deref()
+                .unwrap_or(result.message.as_str())
+                .to_string(),
+        )
     }
 }
 
@@ -8374,6 +8424,65 @@ mod tests {
         // And it goes back to a real verdict once the holder is gone — the
         // warn is about the LOCK, not a permanent state.
         drop(held);
+        assert_eq!(lex_index_check(vault.path()).status, DoctorStatus::Ok);
+    }
+
+    #[test]
+    fn structured_fix_reports_a_held_engine_as_manual_not_failed() {
+        // Regression: `planned_action` gated the TEXT `--fix` path only, so
+        // `--fix --json` (what the `/doctor` vault skill drives) mapped
+        // `attempt_fix` over EVERY warn — including this one, whose recipe's
+        // first act is the `Engine::open` that just failed. Live result before
+        // the gate: `--fix --yes` → exit 0 "Nothing to auto-fix", while
+        // `--fix --json` on the same vault → exit 1 with
+        // `lex-index | failed | "open engine …: search engine busy"`.
+        //
+        // A held engine is the NORMAL configuration (any running daemon), so
+        // that was a guaranteed spurious failure on every `/doctor` run.
+        let (vault, cache) = lex_check_vault();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let (collection, _cache_dir, _tantivy_dir) = indexed_collection(vault.path());
+
+        let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
+        let held =
+            crate::commands::search_common::open_engine_with_collection(&resolved, &collection)
+                .expect("fixture must be able to hold the engine");
+
+        let r = lex_index_check(vault.path());
+        assert!(r.message.contains("could not verify"), "{}", r.message);
+
+        match structured_fix_outcome(&r, vault.path()) {
+            FixOutcome::Manual(m) => {
+                // The hint verbatim — the way out, not a stripped placeholder.
+                assert!(
+                    m.contains("daemon"),
+                    "manual message names the way out: {m}"
+                );
+            }
+            other => panic!(
+                "a check with no automated recipe must be reported as manual on the JSON path, \
+                 got {other:?}"
+            ),
+        }
+        drop(held);
+    }
+
+    #[test]
+    fn structured_fix_still_runs_recipes_for_auto_fixable_checks() {
+        // Guard the other direction: the `planned_action` gate must not turn
+        // the JSON path into a no-op. A genuinely broken (emptied) keyword
+        // index IS auto-fixable, so it must still be rebuilt here.
+        let (vault, cache) = lex_check_vault();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let (_collection, _cache_dir, tantivy_dir) = indexed_collection(vault.path());
+        empty_the_lex_index(&tantivy_dir);
+
+        let r = lex_index_check(vault.path());
+        assert_eq!(r.status, DoctorStatus::Error, "{}", r.message);
+        match structured_fix_outcome(&r, vault.path()) {
+            FixOutcome::Fixed(m) => assert!(m.contains("chunk(s) restored"), "{m}"),
+            other => panic!("expected the recipe to run and rebuild, got {other:?}"),
+        }
         assert_eq!(lex_index_check(vault.path()).status, DoctorStatus::Ok);
     }
 

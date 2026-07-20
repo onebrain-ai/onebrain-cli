@@ -39,7 +39,9 @@ The alternative to self-healing was a hard error on open, pointing the user at `
 
 So the schema break self-heals instead: `LexIndex::open_or_reset` catches specifically a **typed** schema mismatch (`tantivy::TantivyError::SchemaError`, matched via `is_schema_mismatch` — never a raw I/O or permission error, which propagate untouched) and wipes + recreates the tantivy index at the new schema. `Engine::open` then calls `repopulate_lex_from_meta`, which walks every `chunk_meta` row and re-adds each chunk to the freshly emptied lex index — no vault file is re-read, no chunker runs, no embedder is constructed, and the vector store and `doc_hashes`/`lex_hashes` are untouched, because the underlying content never changed.
 
-The read-only lex fast paths that intentionally bypass `Engine::open` and redb entirely (`search search`, the MCP `lex` sub-query) can't self-heal on their own — refilling the lex index needs `chunk_meta`, which only the engine can reach. They route through a new seam, `open_lex_migrating`: on a plain open they behave exactly as before; on a schema mismatch they open the engine once (which self-heals via `open_or_reset` + `repopulate_lex_from_meta`), drop it to release the collection lock, and retry the plain open. Migration is therefore invisible on every surface, not only the engine-backed ones.
+The read-only lex fast paths that intentionally bypass `Engine::open` and redb entirely (`search search`, the MCP `lex` sub-query, and the web UI's `mode=lex`) can't self-heal on their own — refilling the lex index needs `chunk_meta`, which only the engine can reach. They route through a new seam, `open_lex_migrating`: on a plain open they behave exactly as before; on a schema mismatch they open the engine once (which self-heals via `open_or_reset` + `repopulate_lex_from_meta`), drop it to release the collection lock, and retry the plain open. Migration is therefore invisible on every surface, not only the engine-backed ones.
+
+> **Amendment (v3.4.16, same release).** This paragraph originally named **two** fast paths. There are **three**: the web UI's `server::search::run_lex` is the third, and it takes the **non-persisting twin** `open_lex_migrating_with_collection` rather than `open_lex_migrating`. That route resolves its collection through `collection_name_readonly` precisely so a vault with no `search.collection` key is never rewritten — the persisting variant re-serializes the whole `onebrain.yml` through serde and strips the template's comments — so the self-heal must not smuggle that write back in. The decision above is unchanged; only the enumeration was incomplete.
 
 Measured on the real 782-doc vault: **1.26 s** for the full self-heal on first call after upgrade, **8 ms** on every call after (the schema now matches, so `open_or_reset` takes the fast path). A migrated index scores identically to one built fresh at the new schema — the repopulation reconstructs the exact same lex documents `reindex_all` would have produced, just without the chunking/embedding work.
 
@@ -48,6 +50,17 @@ This follows the same shape as [ADR 0027](0027-collection-cache-layout-split.md)
 ### Crash safety during migration
 
 A migration interrupted mid-flight (process killed between wiping the old tantivy index and finishing repopulation) must not leave a collection permanently broken. That guarantee — an interrupted migration is detected and retried on the next open, rather than being mistaken for "already migrated" or silently left half-populated — is being added concurrently in this release and is described here only by its observable behavior, not its implementation: callers can rely on a killed migration self-correcting on the next `Engine::open`, with no manual recovery step.
+
+> **Amendment (v3.4.16, same release) — one state is deliberately excluded from that guarantee.**
+> Self-correction rebuilds the lex index *from `chunk_meta`*, so it only works while `chunk_meta`
+> still holds the content. When `chunk_meta` is **empty** and the lex index is populated (an
+> interrupted index *wipe*, or a partial restore — not an interrupted schema migration),
+> `repopulate_lex_from_meta` refuses rather than clearing the last surviving copy: it returns
+> `Ok(0)`, the rebuild marker is kept **on purpose**, and `doctor` routes that finding out of the
+> `--fix` plan and into the manual list. Recovery there is `onebrain search reindex --force`,
+> which rebuilds both the keyword index and the stored metadata from the vault — the one manual
+> step this section's "no manual recovery step" does not cover. Everything else in this section
+> stands: a migration killed with `chunk_meta` intact still self-corrects on the next open.
 
 ### Downgrade is NOT supported
 

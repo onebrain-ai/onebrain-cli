@@ -535,13 +535,18 @@ impl LexIndex {
         Ok(())
     }
 
-    /// BM25 search over the `body` field. `query` is segmented with the
-    /// same script-aware routine used at index time and turned into a
-    /// `Should`-combined [`BooleanQuery`] of per-term [`TermQuery`]s
-    /// (deliberately bypassing tantivy's `QueryParser`, which pre-tokenizes
-    /// as English and would mis-tokenize no-space scripts). Returns
-    /// `(chunk_id, score)`
-    /// pairs, highest score first.
+    /// BM25 search over the `body` **and** `heading_path` fields (v3.4.16): via
+    /// the shared `search_docs` → [`Self::build_query`], every query unit emits
+    /// a `body` term plus a `heading_path` term boosted by `HEADING_BOOST`.
+    /// This is the entry point the MCP `lex` sub-query and the web UI's
+    /// `mode=lex` route call, so heading matching is live there too — not only
+    /// on [`Self::search_with_heading`].
+    ///
+    /// `query` is segmented with the same script-aware routine used at index
+    /// time and turned into a `Should`-combined [`BooleanQuery`] of per-term
+    /// [`TermQuery`]s (deliberately bypassing tantivy's `QueryParser`, which
+    /// pre-tokenizes as English and would mis-tokenize no-space scripts).
+    /// Returns `(chunk_id, score)` pairs, highest score first.
     pub fn search(&self, query: &str, top_k: usize) -> Result<Vec<(String, f32)>> {
         self.search_docs(query, top_k, |searcher, doc_address| {
             let retrieved: tantivy::TantivyDocument = searcher.doc(doc_address)?;

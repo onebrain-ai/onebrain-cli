@@ -457,11 +457,17 @@ fn doctor_fix_json_reports_legacy_qmd_collection_outcome() {
     let cfg = vault.path().join("vault.yml");
     let existing = std::fs::read_to_string(&cfg).unwrap();
     std::fs::write(&cfg, format!("qmd_collection: ob-json\n{existing}")).unwrap();
+    // A literal collection name plus an unisolated spawn is exactly the hazard
+    // `cache_isolation_sweep` exists for: `doctor` opens the engine, and
+    // `Engine::open` migrates (or wipes-and-repopulates) whatever collection of
+    // that name it finds under the process-wide cache root.
+    let cache = tempdir().unwrap();
 
     let assert = Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(vault.path())
         .env("PATH", "/usr/bin:/bin")
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
         .args(["doctor", "--fix", "--json"])
         .assert()
         .success();
@@ -690,11 +696,15 @@ fn doctor_fix_migrates_legacy_qmd_collection() {
     let cfg = d.path().join("vault.yml");
     let existing = std::fs::read_to_string(&cfg).unwrap();
     std::fs::write(&cfg, format!("qmd_collection: ob-legacy\n{existing}")).unwrap();
+    // See `doctor_fix_json_reports_legacy_qmd_collection_outcome` — a named
+    // collection must never resolve against the developer's real cache root.
+    let cache = tempdir().unwrap();
 
     let assert = Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(d.path())
         .env("PATH", "/usr/bin:/bin")
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
         .args(["doctor", "--fix"])
         .assert()
         .success();

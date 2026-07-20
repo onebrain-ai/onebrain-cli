@@ -90,11 +90,23 @@ catches specifically that typed mismatch (`lex::is_schema_mismatch`, matched on
 `tantivy::TantivyError::SchemaError` — never on I/O or permission errors) and wipes + recreates
 the tantivy index; `Engine::open` then repopulates it from `engine.redb`'s `chunk_meta` table
 (`repopulate_lex_from_meta`) — no vault file is re-read, no chunker or embedder runs, and
-`vectors/` + `doc_hashes`/`lex_hashes` are untouched. The read-only lex fast paths that bypass
-`Engine::open` (`search search`, MCP's `lex` sub-query) route through `open_lex_migrating`
-instead, which opens the engine once to trigger the same self-heal on a mismatch, then retries —
-so migration is invisible on every surface. Measured on a real 782-doc vault: 1.26 s on the first
-post-upgrade call, 8 ms after. **Downgrading the CLI below v3.4.16 against a migrated collection
+`vectors/` + `doc_hashes`/`lex_hashes` are untouched. The **three** read-only lex fast paths that
+bypass `Engine::open` all route through a migrating open instead, which opens the engine once to
+trigger the same self-heal on a mismatch, then retries — so migration is invisible on every
+surface:
+
+| Read-only lex fast path | Seam |
+|---|---|
+| `search search` (`commands::search_query::run_lex`) | `open_lex_migrating` |
+| MCP `lex` sub-query (`commands::mcp::lex_subquery`) | `open_lex_migrating` |
+| web UI `mode=lex` (`server::search::run_lex`) | `open_lex_migrating_with_collection` |
+
+The web UI takes the **non-persisting twin** deliberately: it resolves its collection through
+`collection_name_readonly` so a vault with no `search.collection` key is never rewritten (the
+persisting variant re-serializes the whole `onebrain.yml` through serde and strips the template's
+comments). The self-heal must not smuggle that write back in.
+
+Measured on a real 782-doc vault: 1.26 s on the first post-upgrade call, 8 ms after. **Downgrading the CLI below v3.4.16 against a migrated collection
 is not supported** — see ADR 0034's Downgrade section for the exact failure modes per verb.
 
 ### Embedding model registry

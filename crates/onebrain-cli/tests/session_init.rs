@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::PathBuf;
+use tempfile::tempdir;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -10,11 +11,21 @@ fn fixture(name: &str) -> PathBuf {
 
 // v3.1: default mode is text · hook callers pass `--json` for the
 // structured envelope. The tests below cover both contracts.
+//
+// Every spawn against the `minimal_vault` fixture pins `ONEBRAIN_CACHE_DIR`:
+// that fixture's checked-in `vault.yml` carries `qmd_collection: ob-1`, and
+// `session init` probes the index for the resolved collection — `Engine::open`
+// migrates the layout it finds, so an unisolated run reaches (and rewrites)
+// a same-named collection in the developer's real cache root. The collection
+// name lives outside `.rs`, which is why `tests/cache_isolation_sweep.rs`
+// scans the fixture configs too.
 
 #[test]
 fn session_init_emits_required_fields_in_minimal_vault_with_json() {
+    let cache = tempdir().unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
         .args(["session-init", "--json"])
         .current_dir(fixture("minimal_vault"))
         .assert()
@@ -31,8 +42,10 @@ fn session_init_emits_required_fields_in_minimal_vault_with_json() {
 /// walked up from cwd, so this would have emitted the "not found" block.
 #[test]
 fn session_init_honors_vault_flag_from_outside_any_vault() {
+    let cache = tempdir().unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
         .args(["session", "init", "--json", "--vault"])
         .arg(fixture("minimal_vault"))
         .current_dir(fixture("empty_vault"))
@@ -45,8 +58,10 @@ fn session_init_honors_vault_flag_from_outside_any_vault() {
 /// Counterpart via `ONEBRAIN_VAULT` env instead of the flag.
 #[test]
 fn session_init_honors_onebrain_vault_env_from_outside_any_vault() {
+    let cache = tempdir().unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
         .args(["session", "init", "--json"])
         .env("ONEBRAIN_VAULT", fixture("minimal_vault"))
         .current_dir(fixture("empty_vault"))
@@ -105,8 +120,10 @@ fn default_outside_vault_emits_text_not_json() {
 
 #[test]
 fn default_inside_vault_emits_text_session_ready() {
+    let cache = tempdir().unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
         .arg("session-init")
         .current_dir(fixture("minimal_vault"))
         .assert()
