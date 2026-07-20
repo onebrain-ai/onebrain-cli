@@ -127,6 +127,12 @@ pub fn is_schema_mismatch(err: &anyhow::Error) -> bool {
 /// `search reindex --force` removes the three NAMED index artifacts rather
 /// than the `index/` dir, so it clears this file explicitly (see the CLI's
 /// `wipe_index_files`) — a forced wipe leaves no bookkeeping behind either.
+///
+/// `pub` for the tests rather than for production callers: production code
+/// goes through [`rebuild_pending`] / [`clear_rebuild_marker`] and never needs
+/// the path itself, but the B1 / B-A1 / D2 regression tests must PLANT and
+/// inspect the marker to reconstruct the crash states they pin. Keep it
+/// exported.
 pub fn rebuild_marker_path(dir: &Path) -> PathBuf {
     let name = dir
         .file_name()

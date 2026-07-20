@@ -199,10 +199,6 @@ const LEX_MIGRATE_RETRY_BACKOFF: [std::time::Duration; 2] = [
     std::time::Duration::from_millis(150),
 ];
 
-/// Total engine-open attempts: one per backoff entry, plus the final attempt
-/// that has no wait left after it. Derived so the two can never drift.
-const LEX_MIGRATE_OPEN_ATTEMPTS: usize = LEX_MIGRATE_RETRY_BACKOFF.len() + 1;
-
 /// Shared body of the two migrating opens. `heal` opens (and immediately
 /// drops) the engine — `Engine::open` is what performs the wipe + repopulate,
 /// and dropping it releases the collection lock. The caller's choice of
@@ -241,8 +237,14 @@ fn open_lex_migrating_inner(
 /// redb `chunk_meta`), retrying a transiently busy collection lock, then hand
 /// back the freshly opened lex index. Shared by both routes into the heal: a
 /// stale schema, and a rebuild left pending by an interrupted migration.
+///
+/// The bound is the backoff table itself: every iteration either returns or
+/// consumes one entry, and an exhausted table returns the busy error. So the
+/// loop attempts `heal` at most `LEX_MIGRATE_RETRY_BACKOFF.len() + 1` times and
+/// cannot fall out of the bottom — no unreachable tail to keep honest.
 fn heal_with_retry(tantivy_dir: &Path, heal: &mut dyn FnMut() -> Result<()>) -> Result<LexIndex> {
-    for attempt in 0..LEX_MIGRATE_OPEN_ATTEMPTS {
+    let mut backoffs = LEX_MIGRATE_RETRY_BACKOFF.iter();
+    loop {
         match heal() {
             Ok(()) => return LexIndex::open(tantivy_dir),
             // Lost the race for the collection lock. Whoever won it is
@@ -250,7 +252,7 @@ fn heal_with_retry(tantivy_dir: &Path, heal: &mut dyn FnMut() -> Result<()>) -> 
             // and retry rather than surfacing a transient
             // `E_ENGINE_BUSY` on the first post-upgrade query.
             Err(e) if is_engine_busy_error(&e) => {
-                let Some(backoff) = LEX_MIGRATE_RETRY_BACKOFF.get(attempt) else {
+                let Some(backoff) = backoffs.next() else {
                     return Err(e);
                 };
                 std::thread::sleep(*backoff);
@@ -271,9 +273,6 @@ fn heal_with_retry(tantivy_dir: &Path, heal: &mut dyn FnMut() -> Result<()>) -> 
             Err(e) => return Err(e),
         }
     }
-    // Unreachable: the loop body either returns or exhausts the backoff
-    // table and returns the busy error. Kept total and honest.
-    LexIndex::open(tantivy_dir)
 }
 
 /// True when `err` is the collection-lock contention that surfaces as
@@ -688,6 +687,15 @@ fn finish_normalize(rel: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Total engine-open attempts the retry policy allows: one per backoff
+    /// entry, plus the final attempt that has no wait left after it.
+    ///
+    /// Test-only, and derived from the same table the production loop consumes
+    /// so the two can never drift. `heal_with_retry` does not read a count at
+    /// all — exhausting [`LEX_MIGRATE_RETRY_BACKOFF`] IS its bound — so
+    /// restating the policy here is what pins it.
+    const LEX_MIGRATE_OPEN_ATTEMPTS: usize = LEX_MIGRATE_RETRY_BACKOFF.len() + 1;
 
     #[test]
     fn normalize_doc_path_strips_vault_root_and_dot_prefix() {

@@ -1587,6 +1587,36 @@ fn lex_index_check(vault_root: &Path) -> DoctorResult {
         .with_hint("onebrain doctor --fix (rebuilds the keyword index from stored metadata; or `onebrain search reindex --force`)")
         .with_details(details);
     }
+    if health.is_orphaned() {
+        // Error, not warn — three reasons, each stronger than the plain
+        // excess-docs case below:
+        //  1. Nothing here is recoverable from stored metadata. `chunk_meta`
+        //     IS the recovery source, and it is gone. `doctor --fix` cannot
+        //     repair it, and `Engine::repopulate_lex_from_meta` deliberately
+        //     REFUSES rather than clearing the last surviving copy.
+        //  2. It never self-heals. The rebuild marker is deliberately left in
+        //     place, so every later open re-reaches the same refusal.
+        //  3. The results are wrong, not merely worse. Every remaining keyword
+        //     document is an orphan: the engine-backed paths drop them all in
+        //     `resolve_hits` (hybrid search returns nothing), while the three
+        //     read-only lex fast paths never open redb and hand them back as
+        //     hits pointing at documents the collection no longer indexes.
+        return DoctorResult::error(
+            LEX_INDEX_CHECK,
+            format!(
+                "stored chunk metadata is EMPTY while the keyword index still holds {} doc(s) — \
+                 every one is an orphan, and the metadata a rebuild would read is gone (an \
+                 interrupted index wipe, or a partial restore)",
+                health.lex_docs
+            ),
+        )
+        .with_hint(
+            "onebrain search reindex --force (rebuilds the keyword index AND the stored metadata \
+             from the vault; `doctor --fix` cannot repair this one — there is nothing left to \
+             rebuild from)",
+        )
+        .with_details(details);
+    }
     if health.has_excess_docs() {
         // Warn, not error: keyword search still answers — it just answers
         // WORSE, because duplicate/orphan documents skew BM25's document
@@ -1639,7 +1669,13 @@ fn lex_index_check(vault_root: &Path) -> DoctorResult {
 ///
 /// The hint still names `onebrain search reindex --force` as the manual
 /// fallback for the case this recipe can't cover: `chunk_meta` itself being
-/// empty or unreadable.
+/// empty or unreadable. When it is empty AND the keyword index is populated
+/// ([`LexHealth::is_orphaned`][orphan] — the check above reports it as an
+/// error), the repopulate REFUSES outright rather than clearing the last copy
+/// of the data, and returns 0 — which lands on the `Ok(0)` arm below and tells
+/// the user exactly that.
+///
+/// [orphan]: onebrain_search::engine::LexHealth::is_orphaned
 ///
 /// [repop]: onebrain_search::engine::Engine::repopulate_lex_from_meta
 fn fix_lex_index(vault_root: &Path, json: bool) -> FixOutcome {
@@ -8115,6 +8151,81 @@ mod tests {
             r.message
         );
         assert!(planned_action(&r).is_some(), "--fix must offer a repair");
+    }
+
+    #[test]
+    fn lex_index_check_reports_an_orphaned_keyword_index() {
+        // D2 (BLOCKER): `chunk_meta` gone while the keyword index survives —
+        // reachable because `wipe_index_files` deletes `engine.redb` before
+        // `tantivy/`, so an interruption between the two lands exactly here.
+        // The repopulate used to CLEAR on this state (nothing to restore, the
+        // only copy destroyed) and then clear the marker, after which
+        // `is_dead()` — which requires `chunk_meta > 0` — reported HEALTHY.
+        use crate::commands::search_common::{collection_cache_dir, index_artifact_path};
+        let (vault, cache) = lex_check_vault();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let (collection, _cache_dir, tantivy_dir) = indexed_collection(vault.path());
+        assert_eq!(lex_index_check(vault.path()).status, DoctorStatus::Ok);
+        let docs_before = onebrain_search::lex::LexIndex::open(&tantivy_dir)
+            .unwrap()
+            .num_docs()
+            .unwrap();
+        assert!(docs_before > 0, "fixture must have a populated lex index");
+
+        // Interrupted wipe: redb gone, tantivy still there, marker planted by
+        // whatever rebuild was in flight.
+        fs::remove_file(index_artifact_path(
+            &collection_cache_dir(&collection),
+            "engine.redb",
+        ))
+        .unwrap();
+        let marker = onebrain_search::lex::rebuild_marker_path(&tantivy_dir);
+        fs::write(&marker, b"rebuild pending\n").unwrap();
+
+        // This opens the engine, which is where the refusal happens.
+        let r = lex_index_check(vault.path());
+        assert_eq!(r.status, DoctorStatus::Error, "{}", r.message);
+        assert!(
+            r.message.contains("stored chunk metadata is EMPTY"),
+            "{}",
+            r.message
+        );
+        assert!(r.details.contains(&"chunk_meta: 0".to_string()), "{r:?}");
+        assert!(
+            r.details.contains(&format!("lex_docs: {docs_before}")),
+            "the index must be reported INTACT, not cleared: {r:?}"
+        );
+        assert_eq!(
+            onebrain_search::lex::LexIndex::open(&tantivy_dir)
+                .unwrap()
+                .num_docs()
+                .unwrap(),
+            docs_before,
+            "opening the engine must not have destroyed the last surviving copy"
+        );
+        assert!(
+            marker.exists(),
+            "a refused rebuild is not a resolved one — the marker must stay"
+        );
+        // `doctor --fix` must not claim it can repair this: the metadata a
+        // rebuild would read is precisely what is gone.
+        assert!(
+            r.hint.as_deref().unwrap_or("").contains("reindex --force"),
+            "{:?}",
+            r.hint
+        );
+        match fix_lex_index(vault.path(), true) {
+            FixOutcome::Manual(m) => assert!(m.contains("reindex --force"), "{m}"),
+            other => panic!("expected Manual, got {other:?}"),
+        }
+        assert_eq!(
+            onebrain_search::lex::LexIndex::open(&tantivy_dir)
+                .unwrap()
+                .num_docs()
+                .unwrap(),
+            docs_before,
+            "--fix must not destroy it either"
+        );
     }
 
     #[test]
