@@ -1515,18 +1515,25 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
 
 const LEX_INDEX_CHECK: &str = "lex-index";
 
+/// Message prefix of the one `lex-index` finding that is NOT auto-fixable: the
+/// engine could not be opened, so nothing about the index is known. Shared by
+/// the check and by [`planned_action`], which must not offer a rebuild that
+/// would immediately re-hit the same failed open.
+const LEX_INDEX_UNVERIFIED: &str = "could not verify the keyword index";
+
 /// Doctor check (`check = "lex-index"`) — is the keyword index actually alive?
 ///
-/// Read-only, and deliberately independent of [`native_search_check`]: that one
-/// answers "is there an index and is it current", which is precisely the
-/// question that reports healthy while BM25 is dead.
+/// Touches no vault files, but NOT inert: opening the engine is itself the
+/// self-heal (see the NOTE below), so this check can wipe and rebuild the
+/// tantivy index from redb's stored metadata. Deliberately independent of
+/// [`native_search_check`]: that one answers "is there an index and is it
+/// current", which is precisely the question that reports healthy while BM25 is
+/// dead.
 ///
 /// Every resolution failure degrades to `ok("skipped — …")` rather than a
 /// warn: a vault with no config, no collection, or no index on disk is not
 /// broken, and `native_search_check` already owns those messages. A busy engine
-/// (an `onebrain mcp` session holding the redb lock) is likewise skipped, not
-/// warned — doctor is read-only and must never look like breakage because a
-/// daemon is running.
+/// is the one exception — see the arm itself.
 ///
 /// NOTE the deliberate ordering effect: opening the engine here is itself the
 /// repair for the *marker-backed* case — `Engine::open` retries a pending
@@ -1556,11 +1563,34 @@ fn lex_index_check(vault_root: &Path) -> DoctorResult {
 
     let engine = match open_engine_with_collection(&resolved, &collection) {
         Ok(engine) => engine,
+        // A daemon (`onebrain mcp`, `onebrain serve`) holds the collection lock
+        // for its whole lifetime, so this is the NORMAL configuration, not an
+        // exotic one — and it is the configuration in which this check is the
+        // only thing that can see `is_dead` / `is_orphaned` / `has_excess_docs`
+        // at all. Rendering that as an ok-styled "skipped" told the user their
+        // keyword index was fine while it was empty and every search returned
+        // nothing. Report the honest thing instead: not checked.
+        //
+        // Warn, not error: nothing is known to be broken. And deliberately NOT
+        // routed through the daemon like `native_search_check` — a lex-health
+        // endpoint is a real feature, not a patch-release fix.
+        Err(e) if crate::commands::search_common::is_engine_busy_error(&e) => {
+            return DoctorResult::warn(
+                LEX_INDEX_CHECK,
+                format!(
+                    "{LEX_INDEX_UNVERIFIED} — a running onebrain process holds the search engine"
+                ),
+            )
+            .with_hint("stop the daemon (`onebrain daemon stop`) and re-run `onebrain doctor`")
+            .with_details(vec![
+                format!("collection: {collection}"),
+                format!("engine: {e}"),
+            ]);
+        }
         Err(e) => {
-            // Busy (a daemon owns the lock) is a normal, transient condition —
-            // never a finding. Anything else is already reported by the
-            // `search` check's "engine unavailable" arm, so stay quiet here
-            // rather than double-reporting the same failure.
+            // Anything else is already reported by the `search` check's "engine
+            // unavailable" arm, so stay quiet here rather than double-reporting
+            // the same failure.
             return skip(format!("engine unavailable: {e}"));
         }
     };
@@ -2380,7 +2410,15 @@ fn planned_action(result: &DoctorResult) -> Option<&'static str> {
         ),
         "search-exclude" => Some("insert the search.exclude block"),
         "token-optimization" => Some("insert the token_optimization block / missing sub-key(s)"),
-        "lex-index" => Some("rebuild the keyword index from stored chunk metadata"),
+        // Every lex-index finding is repaired by the same rebuild — EXCEPT the
+        // "could not verify" one, which reports that the engine could not be
+        // opened at all. Planning a repair there would run `fix_lex_index`,
+        // whose first act is the very `Engine::open` that just failed: a
+        // guaranteed `✗` in the fix summary and a non-zero exit, on a check
+        // that found nothing wrong. Same `hint`-driven precedent as
+        // `qmd-leftovers` below.
+        "lex-index" => (!result.message.starts_with(LEX_INDEX_UNVERIFIED))
+            .then_some("rebuild the keyword index from stored chunk metadata"),
         "claude-settings" => Some("remove the stale marketplace entry"),
         "plugin-cache" => Some("remove the stale plugin cache"),
         "vault-config-migration" => Some("migrate vault.yml → onebrain.yml"),
@@ -8256,6 +8294,96 @@ mod tests {
             "lex_docs must match chunk_meta after the repair: {:?}",
             after.details
         );
+    }
+
+    #[test]
+    fn lex_index_check_warns_instead_of_pretending_ok_when_the_engine_is_held() {
+        // The busy arm used to `skip(...)`, which renders as OK. A daemon
+        // (`onebrain mcp` / `onebrain serve`) holds the collection lock for its
+        // whole lifetime, so in the NORMAL OneBrain configuration the only
+        // check that can see a dead / orphaned / over-populated keyword index
+        // was inert AND reported everything fine. "Could not check" must not
+        // look like "checked and fine".
+        //
+        // `Engine::open` reports busy for any other live handle on the
+        // collection INCLUDING one in this process, so holding it here
+        // reproduces the daemon exactly.
+        let (vault, cache) = lex_check_vault();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let (collection, _cache_dir, _tantivy_dir) = indexed_collection(vault.path());
+        assert_eq!(lex_index_check(vault.path()).status, DoctorStatus::Ok);
+
+        let resolved = crate::vault_ctx::require(Some(vault.path().to_path_buf())).unwrap();
+        let held =
+            crate::commands::search_common::open_engine_with_collection(&resolved, &collection)
+                .expect("fixture must be able to hold the engine");
+
+        let r = lex_index_check(vault.path());
+        assert_eq!(r.status, DoctorStatus::Warn, "{}", r.message);
+        assert!(r.message.contains("could not verify"), "{}", r.message);
+        assert!(
+            r.hint.as_deref().unwrap_or("").contains("daemon"),
+            "the warn must name the way out: {:?}",
+            r.hint
+        );
+        // And it must NOT be offered to `--fix`: the repair's first act is the
+        // very `Engine::open` that just failed, so planning it turns a check
+        // that found nothing wrong into a failed fix and a non-zero exit.
+        assert!(
+            planned_action(&r).is_none(),
+            "an unverifiable index must not be offered as auto-fixable"
+        );
+
+        // And it goes back to a real verdict once the holder is gone — the
+        // warn is about the LOCK, not a permanent state.
+        drop(held);
+        assert_eq!(lex_index_check(vault.path()).status, DoctorStatus::Ok);
+    }
+
+    #[test]
+    fn lex_index_check_warns_when_the_rebuild_marker_survives_the_retry() {
+        // The fourth arm, and the only one that had no test. Reachable exactly
+        // as `engine::tests::a_post_commit_marker_clear_failure_does_not_fail_
+        // the_open` shows: the rebuild COMMITS, the post-commit marker removal
+        // fails (read-only `index/`, exotic FS), the open warns and carries on
+        // — so counts match, nothing is dead, and the marker is still there.
+        // Same portable stand-in for "unremovable": a NON-EMPTY DIRECTORY where
+        // the marker file belongs, which `remove_file` can never delete.
+        let (vault, cache) = lex_check_vault();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        let (_collection, _cache_dir, tantivy_dir) = indexed_collection(vault.path());
+        assert_eq!(lex_index_check(vault.path()).status, DoctorStatus::Ok);
+
+        let marker = onebrain_search::lex::rebuild_marker_path(&tantivy_dir);
+        fs::create_dir_all(marker.join("occupied")).unwrap();
+        assert!(onebrain_search::lex::rebuild_pending(&tantivy_dir));
+        assert!(
+            onebrain_search::lex::clear_rebuild_marker(&tantivy_dir).is_err(),
+            "the marker must be genuinely unremovable or this test proves nothing"
+        );
+
+        let r = lex_index_check(vault.path());
+        assert_eq!(r.status, DoctorStatus::Warn, "{}", r.message);
+        assert!(r.message.contains("still marked pending"), "{}", r.message);
+        assert!(
+            r.details.contains(&"rebuild_pending: true".to_string()),
+            "{r:?}"
+        );
+        // It must be THIS arm, not the dead/orphaned/excess ones: the rebuild
+        // itself succeeded, so the counts agree.
+        let docs = r
+            .details
+            .iter()
+            .find_map(|d| d.strip_prefix("lex_docs: "))
+            .unwrap()
+            .to_string();
+        assert_ne!(docs, "0", "the index must be populated: {:?}", r.details);
+        assert!(
+            r.details.contains(&format!("chunk_meta: {docs}")),
+            "counts must agree: {:?}",
+            r.details
+        );
+        assert_eq!(r.hint.as_deref(), Some("onebrain search reindex --force"));
     }
 
     #[test]

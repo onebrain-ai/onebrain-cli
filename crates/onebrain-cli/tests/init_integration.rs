@@ -189,7 +189,7 @@ fn cli_yes_populates_claude_settings_json_with_stop_hook() {
 #[test]
 fn cli_yes_force_preserves_existing_onebrain_yml() {
     let d = tempdir().unwrap();
-    let original = "qmd_collection: ob-1-441565\nold: value\n";
+    let original = "qmd_collection: test-collection-fixture\nold: value\n";
     fs::write(d.path().join("onebrain.yml"), original).unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()

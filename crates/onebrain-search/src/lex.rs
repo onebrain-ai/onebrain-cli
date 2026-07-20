@@ -940,6 +940,41 @@ mod tests {
     }
 
     #[test]
+    fn a_heading_match_adds_score_on_top_of_an_identical_body_match() {
+        // The guard on the DOWNWARD direction, and the one this whole release
+        // rests on. Every other heading test asserts RETRIEVAL, and a
+        // zero-weight `BoostQuery` still MATCHES — so `HEADING_BOOST = 0.0`
+        // left all of them green while delivering exactly none of the recall
+        // win. Only 10.0 was guarded (by `body_match_outranks_heading_only_
+        // match`), i.e. the direction nobody would drift into.
+        //
+        // Two chunks with BYTE-IDENTICAL bodies, so their body subquery scores
+        // are equal by construction and the heading is the ONLY difference.
+        // At boost 0.0 the two scores are exactly equal and the strict `>`
+        // below fails.
+        let dir = tempfile::tempdir().unwrap();
+        let mut ix = LexIndex::open(dir.path()).unwrap();
+        let body = "the reranker scores candidates";
+        let mut both = chunk("d1#0", body);
+        both.heading_path = "Reranker".into();
+        ix.add(&both).unwrap();
+        ix.add(&chunk("d2#0", body)).unwrap();
+        ix.commit().unwrap();
+
+        let hits = ix.search("reranker", 5).unwrap();
+        assert_eq!(hits.len(), 2);
+        let score = |id: &str| hits.iter().find(|h| h.0 == id).unwrap().1;
+        assert!(
+            score("d1#0") > score("d2#0"),
+            "a heading match must ADD score over the same body match — heading boost is inert \
+             (got d1={}, d2={})",
+            score("d1#0"),
+            score("d2#0")
+        );
+        assert_eq!(hits[0].0, "d1#0", "and must therefore rank first");
+    }
+
+    #[test]
     fn search_with_heading_returns_stored_heading_path() {
         // Bug E (v3.4.6): heading_path is a STORED tantivy field, so the
         // lex-only verb can recover it without opening redb.

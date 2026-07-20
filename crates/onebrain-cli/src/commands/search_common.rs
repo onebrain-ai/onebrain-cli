@@ -173,13 +173,19 @@ pub(crate) fn open_lex_migrating(cache_dir: &Path, resolved: &ResolvedVault) -> 
 /// Exactly the reasoning behind `open_engine_with_collection` itself — the
 /// migration must be invisible on this surface in BOTH directions (it heals the
 /// index without touching the config).
+///
+/// Takes the vault ROOT rather than a `ResolvedVault` so the resolution (a
+/// config read + parse) happens INSIDE the heal closure — i.e. only on the rare
+/// migration, never on the common as-you-type request this path exists to serve
+/// fast.
 pub(crate) fn open_lex_migrating_with_collection(
     cache_dir: &Path,
-    resolved: &ResolvedVault,
+    vault_root: &Path,
     collection: &str,
 ) -> Result<LexIndex> {
     open_lex_migrating_inner(cache_dir, &mut || {
-        open_engine_with_collection(resolved, collection).map(|_| ())
+        let resolved = crate::vault_ctx::require(Some(vault_root.to_path_buf()))?;
+        open_engine_with_collection(&resolved, collection).map(|_| ())
     })
 }
 
@@ -219,8 +225,9 @@ fn open_lex_migrating_inner(
         // it. So the read-only fast paths must consult it themselves, or a
         // Ctrl-C'd rebuild leaves keyword search silently returning zero hits
         // (`ok: true`, exit 0) until some unrelated engine-opening command
-        // happens to run.
-        Ok(lex) if onebrain_search::lex::rebuild_pending(&tantivy_dir) => {
+        // happens to run. See [`is_abandoned_rebuild`] for why the marker
+        // ALONE is not the condition.
+        Ok(lex) if is_abandoned_rebuild(&tantivy_dir, &lex) => {
             // Release the read handle before the healing engine open.
             drop(lex);
             heal_with_retry(&tantivy_dir, heal)
@@ -231,6 +238,43 @@ fn open_lex_migrating_inner(
         }
         Err(err) => Err(err),
     }
+}
+
+/// True for the ONE state a rebuild marker makes unservable: the index opens
+/// cleanly under the current schema, a rebuild is still marked pending, and the
+/// index is EMPTY. That is B-R1 — an interrupted wipe+repopulate, whose
+/// leftovers are indistinguishable from a healthy index except for the marker,
+/// and which really must be healed before anything is served.
+///
+/// A marker over a NON-EMPTY index is a different animal entirely, and healing
+/// it is at best pointless and at worst a hard failure:
+///
+///  * **D2** (`chunk_meta` empty, lex populated) — `repopulate_lex_from_meta`
+///    REFUSES rather than erase the last surviving copy, and deliberately
+///    leaves the marker in place. The marker is therefore PERMANENT by design,
+///    so healing can only ever repeat the same refusal.
+///  * **A post-commit marker-clear failure** (read-only `index/`, exotic FS) —
+///    the rebuild already committed; only the bookkeeping removal failed.
+///  * **A crash before the repopulate's single commit** — the previous index
+///    survives byte-for-byte, so keyword search still answers (possibly with
+///    duplicates, which `doctor`'s `lex-index` check reports and `--fix`
+///    repairs).
+///
+/// Gating on the marker alone made all three fail CLOSED. `Engine::open`
+/// returns `EngineBusy` for any other live handle on the collection —
+/// *including one in the same process* — and `server::search::run_lex` runs
+/// INSIDE the daemon, which already holds `state.search_engine`. So a
+/// permanently-pending marker turned every `mode=lex` request into a guaranteed
+/// busy error after ~200 ms of pointless backoff, on exactly the states where
+/// the lex index is the last readable copy of the data. Serving a degraded
+/// index beats refusing a readable one.
+///
+/// A `num_docs()` that itself fails is treated as "not the B-R1 state": the
+/// index is then broken in a way a repopulate cannot be trusted to fix, and the
+/// error surfaces honestly on the search that follows instead of being turned
+/// into a wipe.
+fn is_abandoned_rebuild(tantivy_dir: &Path, lex: &LexIndex) -> bool {
+    onebrain_search::lex::rebuild_pending(tantivy_dir) && matches!(lex.num_docs(), Ok(0))
 }
 
 /// Run the healing engine open (which wipes + repopulates the lex index from
@@ -258,12 +302,16 @@ fn heal_with_retry(tantivy_dir: &Path, heal: &mut dyn FnMut() -> Result<()>) -> 
                 std::thread::sleep(*backoff);
                 // Cheap win first: if the winner already committed the
                 // migration, the plain open now succeeds and we never need the
-                // engine (or its lock) at all. Gated on the marker being GONE —
-                // a race winner that died mid-rebuild leaves an index that
-                // opens perfectly well and is perfectly empty, so accepting it
-                // here would reintroduce B-R1 through the back door.
-                if !onebrain_search::lex::rebuild_pending(tantivy_dir) {
-                    if let Ok(lex) = LexIndex::open(tantivy_dir) {
+                // engine (or its lock) at all. Refused only for the ONE state
+                // that would reintroduce B-R1 through the back door — a race
+                // winner that died mid-rebuild, leaving an index that opens
+                // perfectly well and is perfectly empty. Same predicate as the
+                // fast path above, for the same reason: a marker over a
+                // POPULATED index (a D2 refusal the winner just hit) is
+                // permanent, so rejecting the win here would only march us into
+                // the busy error it exists to avoid.
+                if let Ok(lex) = LexIndex::open(tantivy_dir) {
+                    if !is_abandoned_rebuild(tantivy_dir, &lex) {
                         return Ok(lex);
                     }
                 }
@@ -1774,11 +1822,76 @@ mod tests {
     }
 
     #[test]
+    fn open_lex_migrating_serves_a_populated_index_whose_rebuild_marker_is_permanent() {
+        // B-R1's fix, over-applied: gating the heal on the MARKER ALONE made
+        // every read-only lex surface fail closed on states where the marker is
+        // permanent BY DESIGN and the lex index is the last readable copy — D2
+        // (`repopulate` refuses and deliberately keeps the marker) and a
+        // post-commit marker-clear failure. `Engine::open` reports `EngineBusy`
+        // for a live handle IN THE SAME PROCESS, and `server::search::run_lex`
+        // runs inside the daemon that already holds one, so "heal" there was a
+        // guaranteed 3-attempt, ~200 ms march to HTTP 503 with nothing
+        // contending. A readable index must be served.
+        let cache = tempdir().unwrap();
+        let cache_dir = cache.path().to_path_buf();
+        let tantivy_dir = index_artifact_path(&cache_dir, "tantivy");
+        std::fs::create_dir_all(&tantivy_dir).unwrap();
+        write_current_schema_index(&cache_dir);
+        let marker = onebrain_search::lex::rebuild_marker_path(&tantivy_dir);
+        std::fs::write(&marker, b"rebuild pending\n").unwrap();
+        assert!(onebrain_search::lex::rebuild_pending(&tantivy_dir));
+
+        let mut calls = 0usize;
+        let lex = open_lex_migrating_inner(&cache_dir, &mut || {
+            calls += 1;
+            Ok(())
+        })
+        .expect("a populated index must be served, not refused");
+        assert_eq!(
+            calls, 0,
+            "a marker over a NON-EMPTY index must never trigger the engine open"
+        );
+        assert_eq!(
+            lex.search("error", 5).unwrap().len(),
+            1,
+            "the readable index must actually answer"
+        );
+        assert!(
+            marker.exists(),
+            "this path must not resolve the marker — doctor still has to report it"
+        );
+    }
+
+    #[test]
+    fn open_lex_migrating_takes_a_cheap_win_whose_marker_is_permanent() {
+        // Same reasoning one layer down: if the race winner lands in the
+        // permanently-pending state while we back off, rejecting its populated
+        // index only marches us into the busy error the retry exists to avoid.
+        // Only an EMPTY index + marker (the abandoned rebuild) is refused —
+        // that case is `open_lex_migrating_rejects_a_cheap_win_the_race_winner_never_finished`.
+        let (_cache, cache_dir) = stale_schema_cache_dir();
+        let tantivy_dir = index_artifact_path(&cache_dir, "tantivy");
+        let marker = onebrain_search::lex::rebuild_marker_path(&tantivy_dir);
+        let mut calls = 0usize;
+        let lex = open_lex_migrating_inner(&cache_dir, &mut || {
+            calls += 1;
+            // The winner migrated and committed, but its marker survives.
+            write_current_schema_index(&cache_dir);
+            std::fs::write(&marker, b"rebuild pending\n").unwrap();
+            Err(anyhow::Error::new(onebrain_search::error::EngineBusy))
+        })
+        .expect("a populated index committed by the race winner must be picked up");
+        assert_eq!(calls, 1, "the cheap re-open must win before a second try");
+        assert_eq!(lex.search("error", 5).unwrap().len(), 1);
+    }
+
+    #[test]
     fn open_lex_migrating_gives_up_on_a_persistently_busy_engine() {
         // Bounded: a genuinely stuck lock is surfaced honestly as busy after a
         // small, fixed number of tries — never an unbounded loop.
         let (_cache, cache_dir) = stale_schema_cache_dir();
         let mut calls = 0usize;
+        let started = std::time::Instant::now();
         let err = match open_lex_migrating_inner(&cache_dir, &mut || {
             calls += 1;
             Err(anyhow::Error::new(onebrain_search::error::EngineBusy))
@@ -1786,9 +1899,20 @@ mod tests {
             Ok(_) => panic!("a permanently busy engine must not report success"),
             Err(e) => e,
         };
+        let elapsed = started.elapsed();
         assert_eq!(
             calls, LEX_MIGRATE_OPEN_ATTEMPTS,
             "the retry must be bounded"
+        );
+        // `LEX_MIGRATE_OPEN_ATTEMPTS` is DERIVED from the same table the loop
+        // consumes, so the assertion above holds for any table — including one
+        // that sleeps for ten seconds. Pin the actual budget too: the cost of a
+        // busy give-up is what the user waits through, and it is the reason the
+        // table is "bounded and small on purpose".
+        assert_eq!(calls, 3, "two backoffs plus the first attempt");
+        assert!(
+            elapsed < std::time::Duration::from_millis(1500),
+            "the whole give-up must stay well under a second of sleeping, got {elapsed:?}"
         );
         assert!(
             is_engine_busy_error(&err),

@@ -623,12 +623,15 @@ mod tests {
 
     #[test]
     fn search_config_defaults() {
-        let (_dir, root) = write_vault("qmd_collection: ob-1-441565\n");
+        let (_dir, root) = write_vault("qmd_collection: test-collection-fixture\n");
         let cfg = load_vault_config(&root).unwrap();
         assert_eq!(cfg.search.embed_model, "multilingual-e5-small");
         assert!(cfg.search.embed.auto);
         assert_eq!(cfg.search.embed.threshold, 10);
-        assert_eq!(cfg.search.collection.as_deref(), Some("ob-1-441565"));
+        assert_eq!(
+            cfg.search.collection.as_deref(),
+            Some("test-collection-fixture")
+        );
     }
 
     #[test]

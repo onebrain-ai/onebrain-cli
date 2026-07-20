@@ -218,8 +218,14 @@ fn run_search(
         return Ok(vec![]);
     }
 
-    // lex never opens redb (tantivy only), so it stays on the standalone index
-    // even with a held engine — no lock, no contention. hybrid AND vec reuse the
+    // lex opens no redb in the steady state (tantivy only), so it stays on the
+    // standalone index even with a held engine — no lock, no contention. The
+    // ONE exception is the self-heal in `open_lex_migrating_with_collection`,
+    // which opens the engine and therefore CANNOT succeed against this daemon's
+    // own held handle; it is deliberately narrowed to the single state that
+    // genuinely cannot be served (schema mismatch, or an abandoned rebuild that
+    // left the index empty) so a readable index is never refused over a lock
+    // this process holds. hybrid AND vec reuse the
     // held (sole redb-owning) engine so the CLI/mcp can search vector-only
     // through the daemon instead of hitting `E_ENGINE_BUSY` (#258 Gap 3).
     if mode == "hybrid" {
@@ -452,11 +458,13 @@ fn run_lex(
     query: &str,
     top_k: usize,
 ) -> anyhow::Result<Vec<SearchHit>> {
-    // `vault_ctx::require` on the already-known root: the migrating open needs
-    // a `ResolvedVault` for the healing `Engine::open`, which only READS config
-    // (`search.embed_model` / `search.exclude` / the reranker block).
-    let resolved = crate::vault_ctx::require(Some(root.to_path_buf()))?;
-    let lex = open_lex_migrating_with_collection(cache_dir, &resolved, collection)?;
+    // The root is passed through, NOT resolved here: only the healing
+    // `Engine::open` needs a `ResolvedVault` (to READ `search.embed_model` /
+    // `search.exclude` / the reranker block), and
+    // `open_lex_migrating_with_collection` resolves it lazily inside the heal.
+    // This is the as-you-type path — it must not pay a config read + parse per
+    // keystroke for a migration that happens once.
+    let lex = open_lex_migrating_with_collection(cache_dir, root, collection)?;
     let raw = lex.search(query, top_k)?;
     Ok(raw
         .into_iter()
