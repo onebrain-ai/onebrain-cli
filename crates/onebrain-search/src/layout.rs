@@ -43,7 +43,20 @@ use std::path::{Path, PathBuf};
 /// every consumer that needs to enumerate index artifacts (size accounting,
 /// `--force` wipe) shares this ONE list instead of a private duplicate that
 /// would silently miss a future 4th artifact (issue #224).
-pub const INDEX_ARTIFACTS: [&str; 3] = ["tantivy", "vectors", "engine.redb"];
+pub const INDEX_ARTIFACTS: [&str; 3] = [LEX_ARTIFACT, "vectors", "engine.redb"];
+
+/// The keyword (BM25) index artifact — the one artifact that carries a
+/// crash-safety SIDECAR next to it ([`crate::lex::rebuild_marker_path`]).
+///
+/// Named rather than inlined for ONE load-bearing caller: the **wipe path**,
+/// which must clear that marker under both the split and the legacy layouts
+/// and so needs the artifact by name in a layout-agnostic form. Everywhere
+/// else `index_artifact("tantivy")` through the layout is equally correct and
+/// equally satisfies the `artifact_join_sweep` guard (ADR 0027) — what that
+/// guard forbids is hand-joining the literal onto a path, not naming it in a
+/// layout call. Three `engine.rs` sites still pass the literal for that
+/// reason; they are not violations.
+pub const LEX_ARTIFACT: &str = "tantivy";
 
 /// Where a collection's on-disk cache currently stands relative to the
 /// `models/` + `index/` split.

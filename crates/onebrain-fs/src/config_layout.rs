@@ -409,7 +409,7 @@ schedule:
 - cron: 0 9 * * *
   skill: /daily
 search:
-  collection: ob-1-441565
+  collection: test-collection-fixture
   embed_model: multilingual-e5-base
 ";
         let out = restructure_config(text).unwrap();
@@ -426,7 +426,7 @@ search:
             ]
         );
         // Values + user comment survived.
-        assert!(out.contains("collection: ob-1-441565"));
+        assert!(out.contains("collection: test-collection-fixture"));
         assert!(out.contains("# Raw braindumps and quick captures · default: 00-inbox"));
         assert!(out.contains("  min_sessions: 6"));
         // Banners inserted, stats marked system-managed and last.

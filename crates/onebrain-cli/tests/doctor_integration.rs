@@ -457,11 +457,17 @@ fn doctor_fix_json_reports_legacy_qmd_collection_outcome() {
     let cfg = vault.path().join("vault.yml");
     let existing = std::fs::read_to_string(&cfg).unwrap();
     std::fs::write(&cfg, format!("qmd_collection: ob-json\n{existing}")).unwrap();
+    // A literal collection name plus an unisolated spawn is exactly the hazard
+    // `cache_isolation_sweep` exists for: `doctor` opens the engine, and
+    // `Engine::open` migrates (or wipes-and-repopulates) whatever collection of
+    // that name it finds under the process-wide cache root.
+    let cache = tempdir().unwrap();
 
     let assert = Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(vault.path())
         .env("PATH", "/usr/bin:/bin")
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
         .args(["doctor", "--fix", "--json"])
         .assert()
         .success();
@@ -690,11 +696,15 @@ fn doctor_fix_migrates_legacy_qmd_collection() {
     let cfg = d.path().join("vault.yml");
     let existing = std::fs::read_to_string(&cfg).unwrap();
     std::fs::write(&cfg, format!("qmd_collection: ob-legacy\n{existing}")).unwrap();
+    // See `doctor_fix_json_reports_legacy_qmd_collection_outcome` — a named
+    // collection must never resolve against the developer's real cache root.
+    let cache = tempdir().unwrap();
 
     let assert = Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(d.path())
         .env("PATH", "/usr/bin:/bin")
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
         .args(["doctor", "--fix"])
         .assert()
         .success();
@@ -1175,7 +1185,7 @@ fn doctor_fix_preserves_custom_keys_and_backs_up() {
         vault.path().join("vault.yml"),
         "# hand-tuned by me — keep this header\n\
          custom_key: keepme  # my note on the custom key\n\
-         qmd_collection: ob-1-441565\n\
+         qmd_collection: test-collection-fixture\n\
          folders:\n  \
            # inbox is sacred\n  \
            inbox: 00-inbox\n  \
@@ -1189,9 +1199,18 @@ fn doctor_fix_preserves_custom_keys_and_backs_up() {
     )
     .unwrap();
     let elsewhere = tempdir().unwrap();
+    // `ONEBRAIN_CACHE_DIR` (the convention every other doctor test here
+    // follows, and the one this test alone was missing): the fixture's
+    // `qmd_collection` names a REAL collection, so without the override the
+    // checks resolved it to the developer's actual `~/…/onebrain/search/<name>`
+    // — and `doctor` OPENS the engine there, which on a v3.4.16 binary wipes
+    // and rebuilds that collection's tantivy index (the schema migration). A
+    // config-comment test must never reach outside its tempdir.
+    let cache = tempdir().unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(elsewhere.path())
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
         .env("PATH", "/usr/bin:/bin") // scrub qmd so the probe degrades
         .args(["doctor", "--fix", "--vault"])
         .arg(vault.path())
@@ -1206,7 +1225,7 @@ fn doctor_fix_preserves_custom_keys_and_backs_up() {
         "legacy qmd_collection must be removed by --fix · got:\n{after}"
     );
     assert!(
-        after.contains("collection: ob-1-441565"),
+        after.contains("collection: test-collection-fixture"),
         "qmd_collection value must be migrated to search.collection · got:\n{after}"
     );
     assert!(

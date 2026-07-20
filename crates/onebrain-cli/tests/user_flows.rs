@@ -9,6 +9,22 @@ use assert_cmd::Command;
 use std::fs;
 use tempfile::tempdir;
 
+/// The binary, with its search-cache root pinned to a throwaway tempdir.
+///
+/// Mandatory for any test that names a collection and then runs the binary:
+/// several commands OPEN a collection that already exists under the resolved
+/// cache root, and opening is not read-only. Two flows below write
+/// `qmd_collection: ob-1` / `x`, so an unisolated run would reach the
+/// developer's real index the moment such a collection existed. Applied to
+/// every invocation in this file, not just those two — the hazard is the
+/// missing isolation, not the individual name. Enforced by
+/// `tests/cache_isolation_sweep.rs`.
+fn onebrain_cmd(cache: &tempfile::TempDir) -> Command {
+    let mut cmd = Command::cargo_bin("onebrain").unwrap();
+    cmd.env("ONEBRAIN_CACHE_DIR", cache.path());
+    cmd
+}
+
 /// Flow 1 · brand-new user. No vault. Runs the binary in a random dir.
 ///
 /// Expected:
@@ -20,10 +36,10 @@ use tempfile::tempdir;
 #[test]
 fn flow_new_user_no_vault() {
     let dir = tempdir().unwrap();
+    let cache = tempdir().unwrap();
 
     // Help must always work.
-    let help = Command::cargo_bin("onebrain")
-        .unwrap()
+    let help = onebrain_cmd(&cache)
         .args(["--help"])
         .current_dir(dir.path())
         .output()
@@ -36,8 +52,7 @@ fn flow_new_user_no_vault() {
     );
 
     // Default `session init` → text, not JSON.
-    let init = Command::cargo_bin("onebrain")
-        .unwrap()
+    let init = onebrain_cmd(&cache)
         .args(["session", "init"])
         .current_dir(dir.path())
         .env("NO_COLOR", "1")
@@ -60,8 +75,7 @@ fn flow_new_user_no_vault() {
     );
 
     // --json still gives the structured envelope.
-    let init_json = Command::cargo_bin("onebrain")
-        .unwrap()
+    let init_json = onebrain_cmd(&cache)
         .args(["session", "init", "--json"])
         .current_dir(dir.path())
         .output()
@@ -82,11 +96,11 @@ fn flow_new_user_no_vault() {
 #[test]
 fn flow_established_user_inside_vault() {
     let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     fs::write(vault.path().join("vault.yml"), "qmd_collection: ob-1\n").unwrap();
 
     // Interactive text.
-    let init = Command::cargo_bin("onebrain")
-        .unwrap()
+    let init = onebrain_cmd(&cache)
         .args(["session", "init"])
         .current_dir(vault.path())
         .env("NO_COLOR", "1")
@@ -104,8 +118,7 @@ fn flow_established_user_inside_vault() {
     );
 
     // --json envelope.
-    let init_json = Command::cargo_bin("onebrain")
-        .unwrap()
+    let init_json = onebrain_cmd(&cache)
         .args(["session", "init", "--json"])
         .current_dir(vault.path())
         .output()
@@ -149,12 +162,12 @@ fn flow_established_user_inside_vault() {
 #[test]
 fn flow_hook_consumer_parses_session_init_json() {
     let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     fs::write(vault.path().join("vault.yml"), "qmd_collection: x\n").unwrap();
 
     // Run with the same shape the hook's argv writes after `plugin update`
     // has run: ["session", "init", "--json"].
-    let out = Command::cargo_bin("onebrain")
-        .unwrap()
+    let out = onebrain_cmd(&cache)
         .args(["session", "init", "--json"])
         .current_dir(vault.path())
         .output()
@@ -188,11 +201,11 @@ fn flow_hook_consumer_parses_session_init_json() {
 #[test]
 fn flow_error_recovery_malformed_vault_yml() {
     let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
     fs::write(vault.path().join("vault.yml"), "not: : valid yaml\n").unwrap();
 
     // Default mode — actionable text.
-    let init = Command::cargo_bin("onebrain")
-        .unwrap()
+    let init = onebrain_cmd(&cache)
         .args(["session", "init"])
         .current_dir(vault.path())
         .env("NO_COLOR", "1")
@@ -214,8 +227,7 @@ fn flow_error_recovery_malformed_vault_yml() {
     );
 
     // --json: distinct reason for the SessionStart consumer.
-    let init_json = Command::cargo_bin("onebrain")
-        .unwrap()
+    let init_json = onebrain_cmd(&cache)
         .args(["session", "init", "--json"])
         .current_dir(vault.path())
         .output()

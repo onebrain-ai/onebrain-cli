@@ -18,7 +18,6 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt
 
 use onebrain_core::path::ResolvedVault;
 use onebrain_search::engine::{Engine, Hit};
-use onebrain_search::lex::LexIndex;
 
 use onebrain_core::config::{TokenOptimizationConfig, VaultConfig};
 use onebrain_token::gain::Surface;
@@ -27,6 +26,7 @@ use onebrain_token::{CacheKind, GainEvent, MemoKey, OptLevel, ReferenceEnvelope,
 use super::daemon_client::{self, DaemonHandle};
 use super::search_common::{
     collection_cache_dir, collection_for, index_artifact_path, normalize_doc_path, open_engine,
+    open_lex_migrating,
 };
 use super::search_status::{
     status_data_for, status_data_from_daemon, DaemonStatusCounts, SearchStatusData,
@@ -506,6 +506,43 @@ fn fusion_weights(n: usize) -> Vec<f64> {
     (0..n).map(|i| if i == 0 { 2.0 } else { 1.0 }).collect()
 }
 
+/// Build the `query` memo key from the index identity plus every
+/// result-determining knob (see [`MemoKey::new`]).
+///
+/// Extracted from `query` for ONE reason: the unset-`min_score` fallback. It
+/// was spelled as the literal `0.30` while every other resolution of the same
+/// field goes through [`DEFAULT_RERANK_MIN_SCORE`] — which v3.4.16 changed to
+/// `0.0`. A vault leaving `min_score` unset (effective gate 0.0) and one pinning
+/// it to `0.30` therefore hashed to the SAME key, and switching between them
+/// served the other's cached hits: exactly the under-invalidation class the key
+/// exists to prevent. The fallback must resolve through the constant, and a
+/// free function is what lets a test pin that.
+fn query_memo_key(
+    q_norm: &str,
+    limit: usize,
+    min_score: f32,
+    generation: u64,
+    index_nonce: &str,
+    reranker: &onebrain_core::config::RerankerConfig,
+    weights: &[f64],
+) -> MemoKey {
+    MemoKey::new(
+        q_norm,
+        "mcp",
+        limit,
+        reranker.min_candidates,
+        min_score,
+        generation,
+        index_nonce,
+        reranker.enabled,
+        &reranker.model,
+        reranker
+            .min_score
+            .unwrap_or(onebrain_search::engine::DEFAULT_RERANK_MIN_SCORE),
+        weights,
+    )
+}
+
 /// Agent-facing note returned by `query` when the vault has no index yet, so
 /// the caller degrades to filesystem search instead of treating it as an error.
 fn no_index_note() -> String {
@@ -523,7 +560,7 @@ fn no_index_note() -> String {
 fn lex_subquery(resolved: &ResolvedVault, text: &str, top_k: usize) -> anyhow::Result<Vec<Hit>> {
     let collection = collection_for(resolved)?;
     let cache_dir = collection_cache_dir(&collection);
-    let lex = LexIndex::open(&index_artifact_path(&cache_dir, "tantivy"))
+    let lex = open_lex_migrating(&cache_dir, resolved)
         .with_context(|| format!("opening lex index at {}", cache_dir.display()))?;
     let raw_hits = lex.search(text, top_k)?;
     Ok(raw_hits
@@ -946,18 +983,13 @@ impl McpServer {
             let (generation, index_nonce) = self
                 .with_engine(|e| Ok((e.generation(), e.index_nonce())))
                 .await?;
-            let r = &vault_cfg.search.reranker;
-            Some(MemoKey::new(
+            Some(query_memo_key(
                 &q_norm,
-                "mcp",
                 limit,
-                r.min_candidates,
                 min_score as f32,
                 generation,
                 &index_nonce,
-                r.enabled,
-                &r.model,
-                r.min_score.unwrap_or(0.30),
+                &vault_cfg.search.reranker,
                 &weights,
             ))
         } else {
@@ -1444,6 +1476,53 @@ mod tests {
             snippet: String::new(),
             rerank_score: None,
         }
+    }
+
+    #[test]
+    fn memo_key_separates_an_unset_rerank_gate_from_a_pinned_one() {
+        // The `min_score: None` fallback used to be the literal `0.30` here
+        // while `DEFAULT_RERANK_MIN_SCORE` moved to `0.0` in v3.4.16. That made
+        // "unset" (gate 0.0 — nothing dropped) and "pinned to 0.30" (half the
+        // reranked block dropped) hash IDENTICALLY, so flipping the config
+        // served the other's cached hits from a memo that believes it folds
+        // "every result-determining knob".
+        use onebrain_core::config::RerankerConfig;
+        let unset = RerankerConfig {
+            min_score: None,
+            ..Default::default()
+        };
+        let pinned = RerankerConfig {
+            min_score: Some(0.30),
+            ..Default::default()
+        };
+        // The pinned value must be one the default does NOT equal, or the test
+        // proves nothing.
+        assert_ne!(
+            onebrain_search::engine::DEFAULT_RERANK_MIN_SCORE,
+            0.30,
+            "fixture must differ from the default gate"
+        );
+        let key = |r: &RerankerConfig| {
+            query_memo_key("q", 10, 0.0, 1, "nonce", r, &[2.0, 1.0])
+                .as_str()
+                .to_string()
+        };
+        assert_ne!(
+            key(&unset),
+            key(&pinned),
+            "two configs with DIFFERENT effective rerank gates must not share a memo key"
+        );
+        // And the fallback really is the constant, not some third value: a
+        // config pinned TO the default must key identically to an unset one.
+        let pinned_to_default = RerankerConfig {
+            min_score: Some(onebrain_search::engine::DEFAULT_RERANK_MIN_SCORE),
+            ..Default::default()
+        };
+        assert_eq!(
+            key(&unset),
+            key(&pinned_to_default),
+            "unset must resolve through DEFAULT_RERANK_MIN_SCORE"
+        );
     }
 
     // ── Token-surface shaping helpers (Track 4) ────────────────────────────

@@ -651,7 +651,7 @@ mod tests {
         // `qmd_collection`. Re-init preserves the config verbatim; missing keys
         // are repaired separately by `doctor --fix`.
         let d = tempdir().unwrap();
-        let original = "qmd_collection: ob-1-441565\nold: value\n";
+        let original = "qmd_collection: test-collection-fixture\nold: value\n";
         std::fs::write(d.path().join("onebrain.yml"), original).unwrap();
         let (mut opts, _stdout_buf) = test_opts(d.path());
         opts.force = true;

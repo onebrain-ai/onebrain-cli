@@ -456,11 +456,16 @@ fn vault_current_reports_not_detected_when_no_vault() {
 fn session_init_alias_dispatches_to_session_init() {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("vault.yml"), "qmd_collection: x\n").unwrap();
+    // `session init` probes the index for the named collection, and
+    // `Engine::open` is not read-only — pin the cache root so a developer who
+    // happens to own a collection called `x` keeps it.
+    let cache = tempdir().unwrap();
 
     // v3.1: pass --json to assert parity on the structured envelope.
     let out_alias = Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(dir.path())
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
         .args(["session-init", "--json"])
         .assert()
         .success();
@@ -469,6 +474,7 @@ fn session_init_alias_dispatches_to_session_init() {
     let out_new = Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(dir.path())
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
         .args(["session", "init", "--json"])
         .assert()
         .success();
@@ -903,9 +909,13 @@ fn hook_protocol_session_init_keeps_stderr_clean() {
     // bytes — even if a developer accidentally turns colour on in CI.
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("vault.yml"), "qmd_collection: x\n").unwrap();
+    // See `session_init_alias_dispatches_to_session_init` — a named collection
+    // must never resolve against the developer's real cache root.
+    let cache = tempdir().unwrap();
     let out = Command::cargo_bin("onebrain")
         .unwrap()
         .current_dir(dir.path())
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
         .args(["session", "init"])
         .assert()
         .success();

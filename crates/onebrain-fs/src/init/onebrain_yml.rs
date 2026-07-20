@@ -43,7 +43,7 @@ pub fn search_exclude_comment(archive: &str) -> String {
 /// — this crate cannot depend on `onebrain-search` (the init scaffold must
 /// stay lightweight), so the value is mirrored here and pinned to the engine
 /// constant by a cross-crate test in `onebrain-cli` (`init` command tests).
-pub const TEMPLATE_RERANK_MIN_SCORE: &str = "0.30";
+pub const TEMPLATE_RERANK_MIN_SCORE: &str = "0.0";
 
 /// One template-known config key: its path segments and the exact
 /// self-documentation comment line the fresh template writes directly above
@@ -184,7 +184,7 @@ pub fn config_key_docs() -> Vec<ConfigKeyDoc> {
         doc(
             &["search", "reranker", "min_score"],
             format!(
-                "# Score gate: hits below this calibrated 0-1 score are dropped · default: {TEMPLATE_RERANK_MIN_SCORE}"
+                "# Score gate: hits below this calibrated 0-1 score are dropped · 0 = rerank orders results but drops nothing · default: {TEMPLATE_RERANK_MIN_SCORE}"
             ),
         ),
         // `search.exclude` IS emitted by the fresh template (v3.4.9+): the

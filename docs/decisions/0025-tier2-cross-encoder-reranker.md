@@ -2,6 +2,13 @@
 
 Status: accepted (v3.4.7)
 
+> **Superseded in part by [ADR 0034](0034-heading-search-schema-selfheal-rerank-gate-decouple.md)
+> (v3.4.16).** `DEFAULT_RERANK_MIN_SCORE` changed from `0.30` (below, and in the Calibration
+> section) to `0.0` — the gate no longer drops hits by default — and the CLI's "no strong match"
+> confidence band was split into its own constant so it no longer aliases the gate value. This
+> ADR's record of the original 0.30 calibration and reasoning is left as-is below; see 0034 for
+> why it changed and what stayed the same.
+
 ## Context
 
 [ADR 0024](0024-vector-confidence-recall-first.md) retired the per-model absolute

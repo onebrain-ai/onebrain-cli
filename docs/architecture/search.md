@@ -54,10 +54,10 @@ search artifacts, `models/` is the hf-hub download cache base. Transient markers
 
 | Artifact | What it is | Built from | Written by |
 |---|---|---|---|
-| `index/tantivy/` | **Lex (BM25) index.** Schema ([`lex.rs::LexIndex::open`](../../crates/onebrain-search/src/lex.rs)): `chunk_id` (STRING, stored), `doc_path` (STRING, stored), `heading_path` (TEXT, stored), `body` (TEXT, script-aware tokenizer, freqs+positions, **not stored**). Thai/Lao/Khmer/Myanmar/CJK runs are character-bigrammed (no dictionary dep); other text gets lowercased word tokens. | Chunk texts from the chunker | `Engine::index_doc` / `remove_doc` (`LexIndex::add/delete/commit`), in both full and lex-only reindex modes |
+| `index/tantivy/` | **Lex (BM25) index.** Schema ([`lex.rs::LexIndex::open`](../../crates/onebrain-search/src/lex.rs)): `chunk_id` (STRING, stored), `doc_path` (STRING, stored), `heading_path` (TEXT, **script-aware tokenizer**, stored), `body` (TEXT, script-aware tokenizer, freqs+positions, **not stored**). `heading_path` and `body` share the same tokenizer (v3.4.16 — [ADR 0034](../decisions/0034-heading-search-schema-selfheal-rerank-gate-decouple.md)) so Thai/CJK headings tokenize the same way their body text does. Thai/Lao/Khmer/Myanmar/CJK runs are character-bigrammed (no dictionary dep); other text gets lowercased word tokens. A pre-3.4.16 index's `heading_path` field predates the script-aware tokenizer and is schema-incompatible — see the self-heal note below the table. | Chunk texts from the chunker | `Engine::index_doc` / `remove_doc` (`LexIndex::add/delete/commit`), in both full and lex-only reindex modes |
 | `index/vectors/vectors.bin` | **Semantic index, data file.** Packed little-endian `f32`, row-major, fixed stride = `dims × 4` bytes; row *i* at byte offset `i × dims × 4`. Read via mmap ([`vector.rs`](../../crates/onebrain-search/src/vector.rs)). | One L2-normalized embedding per chunk (`Embed::embed_passages`) | `VectorStore::add`, called by `Engine::index_doc` (full mode) and `Engine::rebuild` |
 | `index/vectors/meta.redb` | **Semantic index, metadata.** redb tables: `chunk_to_row`, `row_to_chunk`, `tombstones`, `free_rows` (recyclable tombstoned slots), `header` (`dims`, append cursor). | — | `VectorStore` |
-| `index/engine.redb` | **Engine metadata** ([`engine.rs`](../../crates/onebrain-search/src/engine.rs)): `chunk_meta` (per-chunk `{doc_path, heading_path, chunk_index, text}` — the *only* place chunk **text** is retrievable: tantivy's `body` field is indexed but not stored, and the vector store keeps no text. Headings are also stored in tantivy, but no search path reads them from there), `doc_chunks` (doc → chunk-id list), `doc_hashes` (per-doc sha256, meaning "vectors current as of this hash"), `lex_hashes` (per-doc sha256 from a lex-only pass — see §2), `engine_header` (`active_model`, `last_indexed_at`). | Doc bytes + chunker output | `Engine` |
+| `index/engine.redb` | **Engine metadata** ([`engine.rs`](../../crates/onebrain-search/src/engine.rs)): `chunk_meta` (per-chunk `{doc_path, heading_path, chunk_index, text}` — the *only* place chunk **text** is retrievable: tantivy's `body` field is indexed but not stored, and the vector store keeps no text. Headings are also stored in tantivy and, as of v3.4.16, are queried from there too — see [ADR 0034](../decisions/0034-heading-search-schema-selfheal-rerank-gate-decouple.md) — but `chunk_meta` remains the only source for a *snippet's* heading/text), `doc_chunks` (doc → chunk-id list), `doc_hashes` (per-doc sha256, meaning "vectors current as of this hash"), `lex_hashes` (per-doc sha256 from a lex-only pass — see §2), `engine_header` (`active_model`, `last_indexed_at`). | Doc bytes + chunker output | `Engine` |
 | `models/models--<org>--<repo>/` | Downloaded ONNX embedding models (hf-hub naming via `ModelInfo::cache_dir_name`, e.g. `models--intfloat--multilingual-e5-small`). | Hugging Face download by fastembed | Lazy embedder construction (`Engine::embedder` → `embed::new`) |
 | `models/models--onebrain-ai--onebrain-rerank-v1/` | Downloaded Tier-2 cross-encoder reranker model (same hf-hub cache-dir convention, via `RerankerInfo::cache_dir_name`), sha256-verified once per download (`verify_sha256_once`, cached via a `.sha256-verified` marker next to the model file). | Hugging Face download by the reranker loader | Lazy reranker construction (`Engine::reranker` → `rerank::new`), or eagerly at the end of a full `reindex` when `search.reranker.enabled` and not yet downloaded ([`ReindexProgress::LoadingReranker`]) |
 | `reindex-progress.json` | Transient live marker for an in-flight reindex: `{"done":N,"total":M}`. Root-level — `migrate()` leaves it alone. | — | `search reindex` (RAII `LiveProgressFile`, see §4) |
@@ -81,6 +81,33 @@ fully functional and is finished by the next `Engine::open`. Fresh downloads alw
 `models/`
 (`CollectionLayout::models_base`); see
 [ADR 0027](../decisions/0027-collection-cache-layout-split.md) for the tradeoffs.
+
+**Lex schema self-heal (v3.4.16)** — a separate, narrower migration from the layout one above:
+giving `heading_path` the script-aware tokenizer ([ADR 0034](../decisions/0034-heading-search-schema-selfheal-rerank-gate-decouple.md))
+changed the tantivy schema, so a pre-3.4.16 `tantivy/` index fails to open
+(`Schema error: 'An index exists but the schema does not match.'`). `LexIndex::open_or_reset`
+catches specifically that typed mismatch (`lex::is_schema_mismatch`, matched on
+`tantivy::TantivyError::SchemaError` — never on I/O or permission errors) and wipes + recreates
+the tantivy index; `Engine::open` then repopulates it from `engine.redb`'s `chunk_meta` table
+(`repopulate_lex_from_meta`) — no vault file is re-read, no chunker or embedder runs, and
+`vectors/` + `doc_hashes`/`lex_hashes` are untouched. The **three** read-only lex fast paths that
+bypass `Engine::open` all route through a migrating open instead, which opens the engine once to
+trigger the same self-heal on a mismatch, then retries — so migration is invisible on every
+surface:
+
+| Read-only lex fast path | Seam |
+|---|---|
+| `search search` (`commands::search_query::run_lex`) | `open_lex_migrating` |
+| MCP `lex` sub-query (`commands::mcp::lex_subquery`) | `open_lex_migrating` |
+| web UI `mode=lex` (`server::search::run_lex`) | `open_lex_migrating_with_collection` |
+
+The web UI takes the **non-persisting twin** deliberately: it resolves its collection through
+`collection_name_readonly` so a vault with no `search.collection` key is never rewritten (the
+persisting variant re-serializes the whole `onebrain.yml` through serde and strips the template's
+comments). The self-heal must not smuggle that write back in.
+
+Measured on a real 782-doc vault: 1.26 s on the first post-upgrade call, 8 ms after. **Downgrading the CLI below v3.4.16 against a migrated collection
+is not supported** — see ADR 0034's Downgrade section for the exact failure modes per verb.
 
 ### Embedding model registry
 
@@ -108,9 +135,12 @@ confidence-floor part of [ADR 0013](../decisions/0013-retrieval-semantics-confid
 A calibrated cross-encoder reranker — the **Tier-2 rerank stage** — now runs on
 top of this cutoff: both `query` (hybrid) and `vsearch` (vector-only) fuse/fetch
 a wide candidate block, cross-encode the head of that block against the query
-text, sort by the reranker's calibrated 0–1 score, and gate low scorers out —
-subject to a never-empty floor (`RERANK_NO_MATCH_KEEP` = 3) that keeps the
-invariant above alive one layer up. The default reranker is
+text, and sort by the reranker's calibrated 0–1 score. By default
+(`search.reranker.min_score = 0.0`, [ADR 0034](../decisions/0034-heading-search-schema-selfheal-rerank-gate-decouple.md),
+v3.4.16) the stage only reorders — it drops nothing; raising `min_score` above
+0 opts into gating low scorers out, subject to a never-empty floor
+(`RERANK_NO_MATCH_KEEP` = 3) that keeps the invariant above alive one layer
+up. The default reranker is
 `onebrain-rerank-v1` (a `bge-reranker-v2-m3`-based int8 cross-encoder,
 multilingual incl. Thai, ~570 MB). Skip-not-fail throughout: no reranker
 configured, not downloaded, a lex-only build, or a runtime error all fall back
@@ -130,7 +160,7 @@ fails, and never returns fewer results, because reranking didn't work. See
 | `search.reranker.enabled` | Master switch for the Tier-2 cross-encoder rerank stage | `true` (default-on) |
 | `search.reranker.model` | Reranker registry name (see [`rerank::reranker_registry`](../reference/onebrain-search.md)) | `onebrain-rerank-v1` |
 | `search.reranker.min_candidates` | Minimum fused/retrieved candidate pool cross-encoded per query — a FLOOR, not a ceiling. The engine actually reranks `max(min_candidates, top_k)`, auto-raised so every returned result is always reranked; this value only matters when it exceeds `top_k` (a wider pool than the return size improves quality). Overridable per-query via the CLI's `--min-candidates` / the webui API's `min_candidates` param. | `10` (calibrated) |
-| `search.reranker.min_score` | Gate: reranked hits below this calibrated 0–1 score are dropped (never-empty floor still applies). Because the gate removes low-confidence hits, `query`/`vsearch` can **return fewer than `top_k`** results on a weak-match query — quality-adaptive by design (and, when nothing clears the gate, `RERANK_NO_MATCH_KEEP = 3` survive, labelled "no strong match"). The CLI `--min-score` flag overrides this gate per-query **when reranking is active** (so it filters the calibrated `rerank_score`, the confidence number a user can reason about); when reranking is off (disabled / model absent / pure-lex `search`), `--min-score` filters the raw retrieval score instead. | `None` → engine's `DEFAULT_RERANK_MIN_SCORE = 0.30` |
+| `search.reranker.min_score` | Gate: reranked hits below this calibrated 0–1 score are dropped (never-empty floor still applies). At the default of `0.0` the gate drops nothing — every hit clears it — so `query`/`vsearch` normally return the caller's full requested `top_k`, reordered by the reranker rather than filtered by it ([ADR 0034](../decisions/0034-heading-search-schema-selfheal-rerank-gate-decouple.md), v3.4.16 — supersedes the v3.4.7 default of `0.30`, which was calibrated on question-shaped queries and silently dropped ~half of correct keyword/heading-shaped hits). Raising this above `0.0` is an explicit opt-in to hard filtering; on a weak-match query it can then **return fewer than `top_k`** results (and, when nothing clears the gate, `RERANK_NO_MATCH_KEEP = 3` survive, labelled "no strong match" via the separate, no-longer-aliased `RERANK_NO_MATCH_BAND = 0.30`). The CLI `--min-score` flag overrides this gate per-query **when reranking is active** (so it filters the calibrated `rerank_score`, the confidence number a user can reason about); when reranking is off (disabled / model absent / pure-lex `search`), `--min-score` filters the raw retrieval score instead. | `None` → engine's `DEFAULT_RERANK_MIN_SCORE = 0.0` |
 | `search.default_top_k` | Vault-level default result count (`top_k`) for a surface that doesn't specify one explicitly (e.g. the webui API's `top_k` param when omitted). Always overridable per-query (CLI `--top-k` / API param). | `10` |
 | `qmd_collection` (legacy, top-level) | v3.3-era collection key. Still read as fallback by `load_vault_config`; `onebrain doctor --fix` migrates it to `search.collection` and removes it ([ADR 0016](../decisions/0016-qmd-collection-config-migration.md)). | — |
 
@@ -389,10 +419,14 @@ a model download can only happen on paths that actually embed:
 | `onebrain.yml` | read; **may persist** an auto-generated `search.collection` on first run (§4) |
 
 Flow: resolve collection → open `LexIndex` directly (deliberately *not* `Engine::open`, so no
-embedder ever exists) → BM25 search (raw tantivy scores; `--min-score` filters on them) →
-results carry `chunk_id` + a `doc_path` parsed from the chunk-id prefix (`<doc_path>#N`);
-`heading_path`/`snippet` are left empty rather than guessed, because chunk text lives only in
-`engine.redb`, which this verb never opens.
+embedder ever exists) → BM25 search over both `body` and (boosted) `heading_path`
+(`LexIndex::search_with_heading`, [ADR 0034](../decisions/0034-heading-search-schema-selfheal-rerank-gate-decouple.md);
+raw tantivy scores, `--min-score` filters on them) → results carry `chunk_id` + a `doc_path`
+parsed from the chunk-id prefix (`<doc_path>#N`) + `heading_path` (a STORED tantivy field,
+populated without opening the engine's redb metadata — v3.4.6 bug E). `snippet` stays empty:
+chunk text lives only in `engine.redb`'s `chunk_meta`, and the `body` field is indexed but NOT
+stored in tantivy, so a snippet here would need a further schema change this verb never opens
+redb to make.
 
 ```mermaid
 flowchart LR
@@ -414,12 +448,14 @@ flowchart LR
 Flow: open engine → embed the query (`embed_query`, model's query prefix) → vector store scan →
 keep the top cluster (`keep_top_cluster`, within 0.02 of the best score), fetched at
 `max(top_k, min_candidates)` so the rerank stage has a full pool to work with → **Tier-2 rerank
-stage** (`apply_rerank`, [ADR 0025](../decisions/0025-tier2-cross-encoder-reranker.md)):
+stage** (`apply_rerank`, [ADR 0025](../decisions/0025-tier2-cross-encoder-reranker.md),
+gate/band split by [ADR 0034](../decisions/0034-heading-search-schema-selfheal-rerank-gate-decouple.md)):
 cross-encode the reranked pool — `max(min_candidates, top_k)` entries, a FLOOR of
 `min_candidates` auto-raised to cover `top_k` so every returned result is always reranked —
-against the query text, sort by calibrated score, gate at `min_score` (never-empty floor keeps
-the top 3 on total rejection), append the unreranked fused tail (dropped by the final truncation
-to `top_k` — it never appears in the returned set) → resolve chunk ids to `Hit`s (doc path,
+against the query text, sort by calibrated score, gate at `min_score` (default `0.0` — drops
+nothing; never-empty floor `RERANK_NO_MATCH_KEEP = 3` only matters once `min_score` is raised
+above 0 and every candidate falls below it), append the unreranked fused tail (dropped by the
+final truncation to `top_k` — it never appears in the returned set) → resolve chunk ids to `Hit`s (doc path,
 heading path, 200-char snippet, `rerank_score`) from `chunk_meta`. Skip-not-fail: no reranker
 configured/downloaded, a lex-only build, or a runtime rerank error all fall back to the plain
 vector order with `rerank_score: None` on every hit — the CLI then surfaces an explicit
@@ -454,8 +490,10 @@ ties broken by chunk id for determinism). The fuse width is `max(--top-k, search
 [ADR 0025](../decisions/0025-tier2-cross-encoder-reranker.md)) always sees a full reranked pool:
 cross-encode `max(min_candidates, top_k)` entries (`min_candidates` is a FLOOR, auto-raised to
 cover `top_k` — every returned result is always reranked) against the query text, sort by
-calibrated score, gate at `min_score` (never-empty floor), append the unreranked fused tail
-(dropped by the truncation below — it never appears in the returned set), truncate to `--top-k`,
+calibrated score, gate at `min_score` (default `0.0` — drops nothing; see
+[ADR 0034](../decisions/0034-heading-search-schema-selfheal-rerank-gate-decouple.md) — the
+never-empty floor only matters once `min_score` is raised above 0), append the unreranked fused
+tail (dropped by the truncation below — it never appears in the returned set), truncate to `--top-k`,
 resolve via `chunk_meta`. `--min-score` filters on the fused RRF score — a **separate** knob from
 the rerank gate (`search.reranker.min_score`), which operates on the cross-encoder's calibrated
 score instead. In a **lex-only build**, hybrid degrades to `run_lex` with a one-line stderr notice

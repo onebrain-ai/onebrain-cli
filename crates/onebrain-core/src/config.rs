@@ -290,7 +290,12 @@ pub struct RerankerConfig {
     #[serde(default = "default_reranker_min_candidates")]
     pub min_candidates: usize,
     /// Minimum reranker score threshold. `None` uses the engine's calibrated
-    /// default (`DEFAULT_RERANK_MIN_SCORE` = 0.30, measured on real ob-1).
+    /// default (`DEFAULT_RERANK_MIN_SCORE` = 0.0 as of v3.4.16 — the gate
+    /// drops nothing by default; raising this re-enables hard filtering as
+    /// an explicit opt-in. Was 0.30 (v3.4.7), measured on real ob-1; that
+    /// value cut heading- and keyword-shaped hit@10 roughly in half on the
+    /// same vault, so it moved to a reorder-only default — see
+    /// `docs/decisions/0034-heading-search-schema-selfheal-rerank-gate-decouple.md`).
     #[serde(default)]
     pub min_score: Option<f32>,
 }
@@ -618,12 +623,15 @@ mod tests {
 
     #[test]
     fn search_config_defaults() {
-        let (_dir, root) = write_vault("qmd_collection: ob-1-441565\n");
+        let (_dir, root) = write_vault("qmd_collection: test-collection-fixture\n");
         let cfg = load_vault_config(&root).unwrap();
         assert_eq!(cfg.search.embed_model, "multilingual-e5-small");
         assert!(cfg.search.embed.auto);
         assert_eq!(cfg.search.embed.threshold, 10);
-        assert_eq!(cfg.search.collection.as_deref(), Some("ob-1-441565"));
+        assert_eq!(
+            cfg.search.collection.as_deref(),
+            Some("test-collection-fixture")
+        );
     }
 
     #[test]

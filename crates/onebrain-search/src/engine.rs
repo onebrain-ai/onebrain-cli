@@ -28,15 +28,15 @@ use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::chunk::chunk_markdown;
+use crate::chunk::{chunk_markdown, Chunk};
 use crate::embed::{self, Embed};
 use crate::hybrid::rrf_fuse;
 use crate::layout::CollectionLayout;
-use crate::lex::LexIndex;
+use crate::lex::{self, LexIndex};
 use crate::rerank::{self, Rerank};
 use crate::vector::VectorStore;
 
@@ -93,13 +93,33 @@ const SNIPPET_MAX_CHARS: usize = 200;
 /// the Tier-2 rerank stage.
 const RERANK_NO_MATCH_KEEP: usize = 3;
 
-/// Default rerank-score gate. PROVISIONAL — like the retired `vec_floor`,
-/// any unmeasured constant is a guess: the v3.4.7 Track C calibration run on
-/// real vault content (golden set from the 2026-07-06 floor investigation)
-/// replaces this value. Unlike `vec_floor`, a bad value here cannot silence
-/// results: total rejection keeps the top [`RERANK_NO_MATCH_KEEP`] hits and
-/// the CLI labels weak results instead of hiding them.
-pub const DEFAULT_RERANK_MIN_SCORE: f32 = 0.30;
+/// Default rerank-score gate — **0.0, i.e. rank-only, drop nothing**.
+///
+/// v3.4.7 shipped 0.30, calibrated on question-shaped queries where genuine
+/// matches scored 0.73-0.99 and non-matches 0.003-0.066. That calibration held
+/// for the query shape it was measured on and missed the one it wasn't:
+/// keyword and fragment queries -- exactly what the agent's `lex` sub-queries
+/// and a `heading_path` lookup produce -- score inside the gated band even
+/// when they are correct.
+///
+/// Measured 2026-07-19 on a real 782-doc vault, 60 probes: the 0.30 gate cut
+/// heading-shaped hit@10 from 0.500 to 0.233 and body-term hit@10 from 0.733
+/// to 0.500 -- **half the correct answers removed**. The previous doc comment
+/// claimed a bad value here "cannot silence results" because
+/// [`RERANK_NO_MATCH_KEEP`] backstops total rejection; the damage came from
+/// PARTIAL rejection, which nothing backstopped, since `candidates` and
+/// `top_k` are both 10 and so no fused tail remains to backfill with.
+///
+/// At 0.0 the cross-encoder still does its real job -- it REORDERS, putting
+/// strong matches on top -- and every hit carries its `rerank_score`, which is
+/// what the search cascade instructs the agent to judge confidence on
+/// (`<0.30` no strong match, `0.30-0.60` possible, `>=0.60` confident). The
+/// engine no longer repeats that judgement by deleting rows.
+///
+/// Raising `search.reranker.min_score` above 0.0 re-enables hard filtering as
+/// an explicit opt-in, with [`RERANK_NO_MATCH_KEEP`] still guarding total
+/// rejection.
+pub const DEFAULT_RERANK_MIN_SCORE: f32 = 0.0;
 
 /// Error message returned by embedder-backed operations (`query`,
 /// `vector_search`, model switch, and the lazy embedder) in a lex-only build
@@ -107,6 +127,109 @@ pub const DEFAULT_RERANK_MIN_SCORE: f32 = 0.30;
 /// Runtime prebuilt. See docs/decisions/0017-platform-tiered-semantic-search.md.
 pub const SEMANTIC_UNAVAILABLE: &str =
     "semantic search isn't available in this build (no ONNX runtime for this platform)";
+
+/// How often (in chunks) `Engine::open`'s own stderr reporting prints a line
+/// while repopulating a wiped lex index. Every chunk is far too chatty on a
+/// 6k-chunk vault; the `(0, total)` announcement and the final line always
+/// print regardless.
+const REPOPULATE_PROGRESS_EVERY: usize = 500;
+
+/// Cheap consistency snapshot of the keyword (tantivy) index against the
+/// stored chunk metadata — see [`Engine::lex_health`].
+///
+/// Exists because a half-finished schema migration can leave a lex index that
+/// is EMPTY while every other signal reports a healthy collection: `status`
+/// counts docs from redb, and `reindex` skips every doc because `lex_hashes`
+/// says it is current. Comparing the two counts is the only cheap way to see
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LexHealth {
+    /// Committed, non-deleted documents in the tantivy index (one per chunk).
+    pub lex_docs: u64,
+    /// Rows in redb's `chunk_meta` — the authoritative chunk count.
+    pub chunk_meta: u64,
+    /// True when a lex rebuild was started but never confirmed complete (the
+    /// marker file from [`crate::lex::open_or_reset`][LexIndex::open_or_reset]
+    /// is still on disk). `Engine::open` retries the rebuild whenever this is
+    /// set, so seeing it from a CLI means the rebuild is failing repeatedly.
+    pub rebuild_pending: bool,
+}
+
+impl LexHealth {
+    /// True for the failure this type exists to catch: the collection holds
+    /// chunks but the keyword index has none, so every BM25 query returns
+    /// nothing while the collection looks fully indexed. Recovery is
+    /// `onebrain search reindex --force`.
+    ///
+    /// Deliberately NOT `lex_docs == chunk_meta`: tantivy counts only
+    /// committed, non-deleted docs, so a benign skew (an in-flight writer, a
+    /// chunk skipped as corrupt) would otherwise be reported as breakage.
+    pub fn is_dead(&self) -> bool {
+        self.chunk_meta > 0 && self.lex_docs == 0
+    }
+
+    /// True for the opposite skew: the keyword index holds MORE documents than
+    /// there are chunks. Unlike a shortfall, this direction is never benign.
+    ///
+    /// [`Self::is_dead`]'s rationale for not simply comparing `!=` covers only
+    /// skew DOWNWARD — tantivy counts committed, non-deleted docs, so an
+    /// in-flight writer or a chunk skipped as corrupt legitimately leaves
+    /// `lex_docs < chunk_meta`. Nothing legitimate produces the reverse: extra
+    /// committed documents are either duplicates of chunks that are also
+    /// present (a rebuild appended onto a non-empty index — the bug
+    /// [`Engine::repopulate_lex_from_meta`]'s unconditional clear now
+    /// prevents) or orphans of chunks already gone from redb (a crash between
+    /// `remove_doc`'s redb commit and its lex commit). Both are real damage:
+    /// duplicates corrupt BM25 document frequencies and average field length
+    /// so relevance decays, and orphans mislead: the engine-backed paths drop
+    /// them in [`Engine::resolve_hits`], but the three read-only lex fast
+    /// paths never open redb at all and so return them as hits pointing at
+    /// documents the collection no longer indexes (see
+    /// [`Engine::repopulate_lex_from_meta`] for the full list).
+    ///
+    /// Deliberately a separate predicate rather than a widening of
+    /// [`Self::is_dead`]: dead means "keyword search returns nothing", which
+    /// is an error; this means "keyword search returns worse results", which
+    /// is a warning. Both are repaired by the same rebuild.
+    pub fn has_excess_docs(&self) -> bool {
+        self.lex_docs > self.chunk_meta
+    }
+
+    /// True for the one shape of [`Self::has_excess_docs`] that a rebuild from
+    /// `chunk_meta` cannot repair, because there is nothing left to rebuild
+    /// FROM: redb holds zero chunks while the keyword index still holds
+    /// documents. Every one of those documents is an orphan.
+    ///
+    /// Reachable without any crash of the lex index itself:
+    /// `search_reindex::wipe_index_files` deletes the artifacts in
+    /// `INDEX_ARTIFACTS` order, so an interruption between removing
+    /// `engine.redb` and removing `tantivy/` lands exactly here; so does a
+    /// partial restore from backup, or a tmp reaper that ate only the redb
+    /// file.
+    ///
+    /// The distinction earns its own predicate because it changes the ADVICE,
+    /// not just the wording: the ordinary excess-docs finding is auto-fixable
+    /// by `doctor --fix` (repopulate from `chunk_meta`), while this one is not
+    /// — [`Engine::repopulate_lex_from_meta`] deliberately REFUSES here rather
+    /// than clearing the only surviving copy of the data. The only honest
+    /// recovery is `onebrain search reindex --force`, which rebuilds both
+    /// sides from the vault.
+    ///
+    /// Not folded into [`Self::is_healthy`]: it is a strict subset of
+    /// [`Self::has_excess_docs`] (`chunk_meta == 0 && lex_docs > 0` implies
+    /// `lex_docs > chunk_meta`), so `is_healthy` already rejects it. It exists
+    /// purely so callers can tell the two apart when reporting.
+    pub fn is_orphaned(&self) -> bool {
+        self.chunk_meta == 0 && self.lex_docs > 0
+    }
+
+    /// True when nothing is wrong: not [`Self::is_dead`], not
+    /// [`Self::has_excess_docs`] (which subsumes [`Self::is_orphaned`]), and
+    /// no rebuild left pending.
+    pub fn is_healthy(&self) -> bool {
+        !self.is_dead() && !self.has_excess_docs() && !self.rebuild_pending
+    }
+}
 
 /// Live progress events emitted during a reindex so a caller (the CLI) can
 /// render a progress bar without the engine knowing anything about terminals.
@@ -698,8 +821,6 @@ impl Engine {
             .migrate()
             .with_context(|| format!("migrating cache layout at {}", cache_dir.display()))?;
 
-        let lex = LexIndex::open(&layout.index_artifact("tantivy"))?;
-
         let vec = VectorStore::open(&layout.index_artifact("vectors"), dims)?;
 
         let meta_path = layout.index_artifact("engine.redb");
@@ -729,7 +850,30 @@ impl Engine {
             write_txn.commit()?;
         }
 
-        Ok(Engine {
+        // A tantivy schema change (e.g. giving `heading_path` the script-aware
+        // tokenizer so it can be queried) makes an older vault's index
+        // un-openable. Rather than failing the whole engine on upgrade, wipe
+        // and repopulate from redb — which holds every chunk's text.
+        //
+        // ORDERING (B1): this is deliberately the LAST thing `open` does, after
+        // the vector store and redb have opened successfully. The wipe is the
+        // only destructive step here, and everything before it can fail for
+        // ordinary reasons (a locked/corrupt redb, a vectors dir we can't
+        // read). Wiping first meant such a failure returned an `Err` from a
+        // point where the lex index was already gone but nothing had recorded
+        // that fact — a dead index with no crash to explain it. Doing it last
+        // means a failure on either of those lines leaves the old lex index
+        // fully intact. The marker below covers the window that ordering
+        // cannot: an actual crash/Ctrl-C between the wipe and the commit.
+        let tantivy_dir = layout.index_artifact("tantivy");
+        let (lex, lex_was_reset) = LexIndex::open_or_reset(&tantivy_dir)?;
+        // Crash-safe, and the authority: the marker outlives the process, the
+        // in-memory flag does not. `||` rather than the marker alone so a
+        // brand-new reset still repopulates even if the marker file vanished
+        // underneath us (external cleanup, aggressive tmp reaper).
+        let needs_repopulate = lex_was_reset || lex::rebuild_pending(&tantivy_dir);
+
+        let mut engine = Engine {
             lex,
             vec,
             exclude_patterns: Vec::new(),
@@ -743,6 +887,215 @@ impl Engine {
             skip_reranker_fetch: false,
             meta,
             _collection_lock: collection_lock,
+        };
+        if needs_repopulate {
+            // C6: a silent multi-minute rebuild looks hung, and a user who
+            // Ctrl-Cs a rebuild they think is stuck is exactly what creates
+            // the B1 state. Announce it, then tick. stderr only, so JSON on
+            // stdout stays clean. `Engine::open` has no progress callback to
+            // plumb through, so this is the crate's own reporting; callers
+            // that want structured progress call
+            // [`Engine::repopulate_lex_from_meta_with_progress`] directly.
+            engine.repopulate_lex_from_meta_with_progress(&mut |done, total| {
+                if done == 0 {
+                    eprintln!(
+                        "onebrain-search: keyword index schema changed — rebuilding {total} \
+                         chunk(s) from stored metadata (no files re-read, nothing re-embedded)"
+                    );
+                } else if done == total || done % REPOPULATE_PROGRESS_EVERY == 0 {
+                    eprintln!("onebrain-search: rebuilding keyword index {done}/{total}");
+                }
+            })?;
+        }
+        Ok(engine)
+    }
+
+    /// Rebuild the lex index from stored chunk metadata: clear it, then re-add
+    /// every stored chunk.
+    ///
+    /// **Idempotent by construction, on ANY starting state** — empty or fully
+    /// populated. It used to assume it ran only after
+    /// [`LexIndex::open_or_reset`] had wiped a stale-schema index, and that
+    /// assumption was wrong the moment the rebuild became *marker*-driven:
+    /// when only the marker triggers the rebuild the schema MATCHES, so
+    /// `open_or_reset` wipes nothing and returns a fully populated index. With
+    /// [`LexIndex::add`] never replacing, the rebuild was then appended on top
+    /// of the existing documents and doubled the index — every repeat doubling
+    /// again, silently, while `lex_health` still reported "healthy" (it only
+    /// flagged an EMPTY index). Duplicate documents also corrupt BM25 document
+    /// frequencies and average field length, so relevance decays with each
+    /// repeat. Hence the unconditional [`LexIndex::clear`] first.
+    ///
+    /// `chunk_meta` already holds each chunk's `doc_path`, `heading_path`,
+    /// `chunk_index` and `text`, so the rebuild touches no vault files and —
+    /// crucially — never loads the embedding model: vectors and
+    /// `doc_hashes`/`lex_hashes` are untouched and stay valid, since the
+    /// content itself did not change.
+    ///
+    /// Returns the number of chunks restored. On return, the index holds
+    /// exactly that many documents — no leftovers from before.
+    ///
+    /// **One exception, and only one (D2): `chunk_meta` EMPTY while the lex
+    /// index is POPULATED.** There the clear would destroy the last searchable
+    /// copy of the data and restore nothing, so this function refuses: it
+    /// clears nothing, rebuilds nothing, leaves the rebuild marker in place
+    /// (the state stays visible instead of being silently "resolved"), warns
+    /// on stderr, and returns `Ok(0)`. `doctor`'s `lex-index` check reports it
+    /// via [`LexHealth::is_orphaned`]; `search reindex --force` is the only
+    /// recovery.
+    ///
+    /// The refusal is NOT conditional on "did `open_or_reset` wipe?" — that
+    /// framing is what let the marker-only rebuild double a populated index.
+    /// It is conditional purely on there being nothing to restore and
+    /// something to lose.
+    ///
+    /// Note what the refusal is NOT justified by. Orphaned lex documents — a
+    /// `chunk_id` with no `chunk_meta` row — are dropped by
+    /// [`Engine::resolve_hits`], but the three read-only lex fast paths never
+    /// reach it: `commands/search_query.rs::run_lex`,
+    /// `commands/mcp.rs::lex_subquery` and `server/search.rs::run_lex` all
+    /// open `LexIndex` directly, build their hits from tantivy's STORED fields
+    /// and derive `doc_path` by splitting `chunk_id` on `#`, never opening
+    /// redb. On those surfaces orphans DO surface as hits, pointing at
+    /// documents the collection no longer indexes. That is a pre-existing
+    /// limitation (its usual source is a crash between `remove_doc`'s redb
+    /// commit and its lex commit), it is out of scope here, and it is a reason
+    /// the D2 state must be reported rather than quietly cleared.
+    ///
+    /// `Ok(0)` conflates "refused" with "restored nothing from an empty
+    /// `chunk_meta` over an already-empty index". Deliberate: both mean "this
+    /// rebuild cannot help you", both point at the same `reindex --force`, and
+    /// the only caller that reads the count (`doctor --fix`) renders exactly
+    /// that.
+    pub fn repopulate_lex_from_meta(&mut self) -> Result<usize> {
+        self.repopulate_lex_from_meta_with_progress(&mut |_, _| {})
+    }
+
+    /// Like [`Engine::repopulate_lex_from_meta`] but reports progress as
+    /// `(done, total)` chunk counts: once as `(0, total)` before the first
+    /// chunk is added, then after every chunk. On a large vault this rebuild
+    /// takes long enough to look hung, and a user who interrupts it is exactly
+    /// what produces the half-migrated state the marker exists to repair — so
+    /// silence here is a correctness hazard, not only a UX one.
+    ///
+    /// Skip-not-fail on corruption: a `chunk_meta` value that no longer
+    /// deserializes is logged (rate-limited, same convention as
+    /// [`Engine::chunk_texts`]) and skipped, never propagated. Propagating
+    /// aborted `Engine::open` itself — *after* the wipe — so one bad record
+    /// made the collection permanently unopenable; losing one chunk from the
+    /// keyword index is strictly better, and `reindex --force` restores it.
+    ///
+    /// The rebuild marker is cleared only after [`LexIndex::commit`] returns,
+    /// so an interruption anywhere before that leaves the marker in place and
+    /// the next `Engine::open` simply tries again.
+    ///
+    /// **Why the clear + adds + single commit is crash-safe.**
+    /// [`LexIndex::clear`] writes nothing to disk — it only empties tantivy's
+    /// in-memory segment registers (see its docs) — so the ONE `commit` below
+    /// is the only durable step, and it publishes exactly the documents added
+    /// in this call. A crash before it leaves the previous index byte-for-byte
+    /// intact (duplicated or not) *and* the marker still on disk, so the next
+    /// `Engine::open` re-runs this whole function and clears again. There is
+    /// no intermediate commit and therefore no window in which the index is
+    /// observably empty or half-rebuilt.
+    pub fn repopulate_lex_from_meta_with_progress(
+        &mut self,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<usize> {
+        let read_txn = self.meta.begin_read()?;
+        let chunk_meta = read_txn.open_table(CHUNK_META)?;
+        let total = chunk_meta.len()? as usize;
+        // D2 GUARD, before the destructive step: nothing to restore, something
+        // to lose. `wipe_index_files` deletes `engine.redb` before `tantivy/`,
+        // so an interruption between the two lands here; so does a partial
+        // restore or a tmp reaper. Clearing now would leave BOTH sides empty
+        // and — because `is_dead()` requires `chunk_meta > 0` — a `doctor` that
+        // reports healthy. Refuse, keep the marker (so the state stays
+        // visible), and let `Engine::open` succeed. See this function's docs.
+        let live_lex_docs = if total == 0 { self.lex.num_docs()? } else { 0 };
+        if total == 0 && live_lex_docs > 0 {
+            eprintln!(
+                "onebrain-search: refusing to rebuild the keyword index — stored chunk metadata \
+                 is EMPTY while the keyword index still holds {} document(s). Rebuilding would \
+                 erase the only remaining copy and restore nothing. The index is left untouched; \
+                 run `onebrain search reindex --force` to rebuild both from the vault.",
+                live_lex_docs
+            );
+            return Ok(0);
+        }
+        // Now the clear, unconditionally: `add` appends, so anything already in
+        // the index would otherwise survive alongside the freshly added copies.
+        // Deliberately not conditional on "did open_or_reset wipe?" — the
+        // marker-only rebuild path reaches here over a POPULATED index, and
+        // this function is also called straight from `doctor --fix`.
+        self.lex.clear()?;
+        progress(0, total);
+        let mut restored = 0usize;
+        let mut skipped = 0usize;
+        for entry in chunk_meta.iter()? {
+            let (key, value) = entry?;
+            let chunk_id = key.value().to_string();
+            let record: ChunkMeta = match serde_json::from_str(value.value()) {
+                Ok(record) => record,
+                Err(e) => {
+                    skipped += 1;
+                    if !self.chunk_corruption_logged.get() {
+                        self.chunk_corruption_logged.set(true);
+                        eprintln!(
+                            "onebrain-search: chunk meta for {chunk_id} is corrupt ({e}) — \
+                             skipped while rebuilding the keyword index; a `reindex --force` \
+                             rebuilds it (further corrupt-chunk warnings on this engine will \
+                             not be logged)"
+                        );
+                    }
+                    progress(restored + skipped, total);
+                    continue;
+                }
+            };
+            self.lex.add(&Chunk {
+                chunk_id,
+                doc_path: record.doc_path,
+                heading_path: record.heading_path,
+                chunk_index: record.chunk_index,
+                text: record.text,
+            })?;
+            restored += 1;
+            progress(restored + skipped, total);
+        }
+        drop(chunk_meta);
+        drop(read_txn);
+        self.lex.commit()?;
+        // The rebuild SUCCEEDED — the commit above is the durable part. A
+        // failure to remove the bookkeeping marker afterwards must not turn
+        // that success into an `Err`: `Engine::open` propagates this, and the
+        // next open would see matching schema + pending marker → same rebuild
+        // → same failure, making the collection permanently unopenable on a
+        // read-only `index/`. Warn loudly (never silently swallow) and carry
+        // on; the only cost of a lingering marker is a redundant rebuild.
+        if let Err(e) = lex::clear_rebuild_marker(&self.layout.index_artifact("tantivy")) {
+            eprintln!(
+                "onebrain-search: keyword index rebuilt successfully ({restored} chunk(s)), but \
+                 the rebuild marker could not be cleared ({e:#}) — the next open will redo this \
+                 rebuild. Fix the permissions on the collection's index dir, or remove the \
+                 marker file by hand."
+            );
+        }
+        Ok(restored)
+    }
+
+    /// Cheap consistency probe over the keyword index, for `doctor` / `status`.
+    ///
+    /// Two counts and a flag, no query and no full scan: tantivy's committed
+    /// doc count, redb's `chunk_meta` row count, and whether a lex rebuild is
+    /// still marked pending. See [`LexHealth::is_dead`] for the state this
+    /// exists to catch.
+    pub fn lex_health(&self) -> Result<LexHealth> {
+        let read_txn = self.meta.begin_read()?;
+        let chunk_meta = read_txn.open_table(CHUNK_META)?;
+        Ok(LexHealth {
+            lex_docs: self.lex.num_docs()?,
+            chunk_meta: chunk_meta.len()?,
+            rebuild_pending: lex::rebuild_pending(&self.layout.index_artifact("tantivy")),
         })
     }
 
@@ -3320,6 +3673,603 @@ mod tests {
     }
 
     #[test]
+    fn reopen_after_lex_schema_change_repopulates_from_meta() {
+        // Upgrade path: a vault indexed by an older build has a tantivy index
+        // whose schema no longer matches. Reopening must self-heal — wipe the
+        // lex index and refill it from redb's chunk_meta — WITHOUT re-reading
+        // vault files or re-embedding. Simulated by replacing the tantivy dir
+        // with a foreign-schema index between two opens.
+        let dir = tempfile::tempdir().unwrap();
+        let tantivy_dir = {
+            let mut e = fake_engine(dir.path());
+            e.index_doc("rust.md", "# Rust\nerror handling and memory safety")
+                .unwrap();
+            e.index_doc("cook.md", "# Cooking\npasta recipe with tomato")
+                .unwrap();
+            assert!(!e.lex.search("error", 5).unwrap().is_empty());
+            e.layout.index_artifact("tantivy")
+        };
+
+        // Replace with an index carrying a DIFFERENT schema.
+        plant_foreign_schema(&tantivy_dir);
+
+        // Reopening succeeds and the lex index is whole again.
+        let e = fake_engine(dir.path());
+        let hits = e.lex.search("error", 5).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "lex index must be repopulated from chunk_meta after a schema reset"
+        );
+        assert!(hits[0].0.starts_with("rust.md#"));
+        assert!(!e.lex.search("pasta", 5).unwrap().is_empty());
+        // The doc's stored text is untouched — nothing was re-read or re-embedded.
+        assert!(e.get("rust.md").unwrap().contains("memory safety"));
+        // A completed rebuild clears its own marker, so the next open is a
+        // plain open.
+        assert!(!lex::rebuild_pending(&tantivy_dir));
+        assert!(e.lex_health().unwrap().is_healthy());
+    }
+
+    /// Wipe `tantivy_dir` and recreate it holding an index whose schema shares
+    /// no field with ours, so the next `LexIndex::open_or_reset` sees the
+    /// typed `SchemaError` a pre-v3.4.16 index produces and takes the wipe +
+    /// repopulate branch. The stand-in for "an index from the old schema".
+    fn plant_foreign_schema(tantivy_dir: &Path) {
+        std::fs::remove_dir_all(tantivy_dir).unwrap();
+        std::fs::create_dir_all(tantivy_dir).unwrap();
+        let mut sb = tantivy::schema::Schema::builder();
+        sb.add_text_field("something_else", tantivy::schema::TEXT);
+        tantivy::Index::builder()
+            .schema(sb.build())
+            .open_or_create(tantivy::directory::MmapDirectory::open(tantivy_dir).unwrap())
+            .unwrap();
+    }
+
+    /// Reproduce the on-disk state a migration interrupted between the wipe
+    /// and the repopulate's commit leaves behind: the tantivy dir wiped and
+    /// recreated EMPTY under the CURRENT schema (so the next open reports no
+    /// mismatch and no reset), while redb still holds every chunk. Returns the
+    /// tantivy dir.
+    ///
+    /// Faithful to the real crash: it goes through `LexIndex::open_or_reset`
+    /// itself — including the marker write — and then simply never
+    /// repopulates, which is precisely what a Ctrl-C during the rebuild does.
+    fn simulate_interrupted_lex_migration(cache_dir: &Path) -> PathBuf {
+        let tantivy_dir = CollectionLayout::new(cache_dir).index_artifact("tantivy");
+        // Foreign schema ⇒ `open_or_reset` takes the wipe branch, exactly as
+        // an upgraded vault does.
+        plant_foreign_schema(&tantivy_dir);
+        let (_lex, was_reset) = LexIndex::open_or_reset(&tantivy_dir).unwrap();
+        assert!(was_reset);
+        // ...and here the process dies. No repopulate, no marker clear.
+        tantivy_dir
+    }
+
+    #[test]
+    fn interrupted_lex_migration_is_healed_on_the_next_open() {
+        // B1 (BLOCKER): the wipe is recorded on disk, not just in memory. The
+        // post-crash directory has a MATCHING schema, so `open_or_reset`
+        // reports `was_reset == false` — if that flag were the only trigger,
+        // the lex index would stay empty forever: queries return 0 hits with
+        // exit 0, `status` reports every doc indexed, and `reindex` (even a
+        // full one) skips every doc because `lex_hashes` says it is current.
+        // Only `reindex --force` would recover it. The marker is what makes
+        // the next plain open heal it.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut e = fake_engine(dir.path());
+            e.index_doc("rust.md", "# Rust\nerror handling and memory safety")
+                .unwrap();
+            e.index_doc("cook.md", "# Cooking\npasta recipe with tomato")
+                .unwrap();
+        }
+
+        let tantivy_dir = simulate_interrupted_lex_migration(dir.path());
+        assert!(
+            lex::rebuild_pending(&tantivy_dir),
+            "the interrupted migration must have left its marker behind"
+        );
+        // Confirm the trap is real: nothing else on disk says anything is
+        // wrong — the schema now matches, so a reopen sees no reset at all.
+        {
+            let (probe, was_reset) = LexIndex::open_or_reset(&tantivy_dir).unwrap();
+            assert!(!was_reset, "post-crash schema matches — no reset reported");
+            assert_eq!(probe.num_docs().unwrap(), 0, "and the index is empty");
+        }
+
+        // The next ordinary open heals it, with no --force and no reindex.
+        let e = fake_engine(dir.path());
+        assert!(
+            !e.lex.search("error", 5).unwrap().is_empty(),
+            "an interrupted migration must be repaired by the next open"
+        );
+        assert!(!e.lex.search("pasta", 5).unwrap().is_empty());
+        assert!(
+            !lex::rebuild_pending(&tantivy_dir),
+            "a completed rebuild must clear its marker"
+        );
+        let health = e.lex_health().unwrap();
+        assert!(health.is_healthy(), "unexpectedly unhealthy: {health:?}");
+        assert_eq!(health.lex_docs, health.chunk_meta);
+    }
+
+    /// Plant a rebuild marker WITHOUT touching the index — the state a failed
+    /// marker-clear leaves behind (the clear warns and carries on, by design):
+    /// pending marker over a fully populated, current-schema index.
+    fn plant_rebuild_marker(tantivy_dir: &Path) {
+        std::fs::write(lex::rebuild_marker_path(tantivy_dir), "onebrain: test\n").unwrap();
+        assert!(lex::rebuild_pending(tantivy_dir));
+    }
+
+    #[test]
+    fn a_marker_rebuild_over_a_populated_index_does_not_duplicate_it() {
+        // B-A1 (BLOCKER): the rebuild is marker-driven, but the repopulate
+        // used to assume it ran over an EMPTY index (`LexIndex::add` never
+        // replaces). When the MARKER ALONE triggers it the schema still
+        // matches, so `open_or_reset` wipes nothing and returns the fully
+        // populated index — and the rebuild was appended on top, doubling
+        // every chunk. Nothing noticed: `lex_health` only flagged an EMPTY
+        // index, so doctor reported "healthy" over a doubled index whose BM25
+        // statistics (document frequency, average field length) are corrupt.
+        let dir = tempfile::tempdir().unwrap();
+        let (tantivy_dir, before) = {
+            let mut e = fake_engine(dir.path());
+            e.index_doc("rust.md", "# Rust\nerror handling and memory safety")
+                .unwrap();
+            e.index_doc("cook.md", "# Cooking\npasta recipe with tomato")
+                .unwrap();
+            let h = e.lex_health().unwrap();
+            assert!(h.is_healthy() && h.lex_docs > 0);
+            (e.layout.index_artifact("tantivy"), h)
+        };
+
+        // Precondition of the bug: marker present, index NOT empty, schema
+        // current (so `open_or_reset` reports no reset and wipes nothing).
+        plant_rebuild_marker(&tantivy_dir);
+        {
+            let (probe, was_reset) = LexIndex::open_or_reset(&tantivy_dir).unwrap();
+            assert!(!was_reset, "schema matches — no wipe happens on this path");
+            assert_eq!(
+                probe.num_docs().unwrap(),
+                before.lex_docs,
+                "the index must still be POPULATED when the rebuild is triggered"
+            );
+        }
+
+        let e = fake_engine(dir.path());
+        let after = e.lex_health().unwrap();
+        assert_eq!(
+            after.lex_docs, after.chunk_meta,
+            "a marker-triggered rebuild must REPLACE, not append: {after:?}"
+        );
+        assert_eq!(after.lex_docs, before.lex_docs, "{after:?}");
+        assert!(after.is_healthy(), "{after:?}");
+        assert!(!lex::rebuild_pending(&tantivy_dir));
+        // Still searchable, exactly once per chunk.
+        assert_eq!(e.lex.search("error", 10).unwrap().len(), 1);
+        assert_eq!(e.lex.search("pasta", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn repeated_opens_with_a_surviving_marker_do_not_grow_the_index() {
+        // The compounding form of B-A1, and the reason it is not self-
+        // limiting: when the post-rebuild marker clear FAILS (read-only
+        // `index/`) the open warns and carries on by design, so the marker
+        // survives and EVERY subsequent open rebuilds again — observed as
+        // 6271 → 43897 docs over seven opens on the real binary, with hit
+        // counts decaying 5 → 4 → 3 as the duplicate documents wrecked BM25's
+        // corpus statistics. The count must now be stable instead.
+        let dir = tempfile::tempdir().unwrap();
+        let tantivy_dir = {
+            let mut e = fake_engine(dir.path());
+            e.index_doc("rust.md", "# Rust\nerror handling and memory safety")
+                .unwrap();
+            e.index_doc("cook.md", "# Cooking\npasta recipe with tomato")
+                .unwrap();
+            e.layout.index_artifact("tantivy")
+        };
+        // An unremovable marker (a non-empty DIRECTORY at the marker path)
+        // reproduces the surviving-marker path portably: `clear_rebuild_marker`
+        // fails on every open, so every open re-runs the rebuild.
+        std::fs::create_dir_all(lex::rebuild_marker_path(&tantivy_dir).join("occupied")).unwrap();
+        assert!(lex::clear_rebuild_marker(&tantivy_dir).is_err());
+
+        let mut counts = Vec::new();
+        for _ in 0..3 {
+            let e = fake_engine(dir.path());
+            let h = e.lex_health().unwrap();
+            assert!(
+                h.rebuild_pending,
+                "the marker must survive, or this test proves nothing: {h:?}"
+            );
+            assert_eq!(h.lex_docs, h.chunk_meta, "{h:?}");
+            assert_eq!(e.lex.search("error", 10).unwrap().len(), 1, "{h:?}");
+            counts.push(h.lex_docs);
+        }
+        assert!(
+            counts.windows(2).all(|w| w[0] == w[1]),
+            "repeated rebuilds must not grow the index: {counts:?}"
+        );
+    }
+
+    /// Empty `chunk_meta` and nothing else — the redb side of the state
+    /// `wipe_index_files` leaves when it is interrupted after removing
+    /// `engine.redb` but before removing `tantivy/` (`INDEX_ARTIFACTS`
+    /// order), and equally what a partial restore-from-backup leaves.
+    fn empty_chunk_meta(e: &Engine) {
+        let keys: Vec<String> = {
+            let read_txn = e.meta.begin_read().unwrap();
+            let table = read_txn.open_table(CHUNK_META).unwrap();
+            table
+                .iter()
+                .unwrap()
+                .map(|entry| entry.unwrap().0.value().to_string())
+                .collect()
+        };
+        assert!(!keys.is_empty(), "nothing to empty — fixture is vacuous");
+        let write_txn = e.meta.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(CHUNK_META).unwrap();
+            for key in &keys {
+                table.remove(key.as_str()).unwrap();
+            }
+        }
+        write_txn.commit().unwrap();
+    }
+
+    #[test]
+    fn a_marker_rebuild_refuses_to_clear_an_index_it_cannot_restore() {
+        // D2 (BLOCKER): the fix for B-A1 made the repopulate's `clear`
+        // unconditional, which is right — except in the ONE state where there
+        // is nothing to restore and something to lose. Marker present,
+        // `chunk_meta` EMPTY, lex POPULATED: the clear destroyed the only
+        // surviving copy of the data, cleared the marker, and left `doctor`
+        // reporting HEALTHY, because `is_dead()` requires `chunk_meta > 0`.
+        let dir = tempfile::tempdir().unwrap();
+        let (tantivy_dir, before) = {
+            let mut e = fake_engine(dir.path());
+            e.index_doc("rust.md", "# Rust\nerror handling and memory safety")
+                .unwrap();
+            e.index_doc("cook.md", "# Cooking\npasta recipe with tomato")
+                .unwrap();
+            empty_chunk_meta(&e);
+            let h = e.lex_health().unwrap();
+            assert_eq!(h.chunk_meta, 0, "precondition: no metadata to restore FROM");
+            assert!(h.lex_docs > 0, "precondition: something to lose");
+            (e.layout.index_artifact("tantivy"), h.lex_docs)
+        };
+        plant_rebuild_marker(&tantivy_dir);
+
+        // `Engine::open` must SUCCEED — a refusal is not a failure.
+        let e = fake_engine(dir.path());
+        let after = e.lex_health().unwrap();
+        assert_eq!(
+            after.lex_docs, before,
+            "the keyword index must be left byte-for-byte alone: {after:?}"
+        );
+        assert_eq!(
+            e.lex.search("error", 10).unwrap().len(),
+            1,
+            "and still be searchable"
+        );
+        assert_eq!(e.lex.search("pasta", 10).unwrap().len(), 1);
+        assert!(
+            lex::rebuild_pending(&tantivy_dir),
+            "the marker must SURVIVE — a refused rebuild is not a resolved one, and clearing it \
+             would hide the state from the next open: {after:?}"
+        );
+        // And the state is reportable: `is_dead` cannot see it (it requires
+        // `chunk_meta > 0`), which is exactly why `is_orphaned` exists.
+        assert!(after.is_orphaned(), "{after:?}");
+        assert!(!after.is_dead(), "{after:?}");
+        assert!(!after.is_healthy(), "{after:?}");
+
+        // Idempotent: a second open refuses again, identically.
+        drop(e);
+        let e = fake_engine(dir.path());
+        let again = e.lex_health().unwrap();
+        assert_eq!(again.lex_docs, before, "{again:?}");
+        assert!(lex::rebuild_pending(&tantivy_dir), "{again:?}");
+    }
+
+    #[test]
+    fn repopulate_still_rebuilds_when_chunk_meta_has_rows_to_restore() {
+        // The D2 guard's blast radius, pinned from the other side: it must fire
+        // ONLY on an empty `chunk_meta`. With rows present the repopulate is
+        // unchanged — it still clears first, so a populated index is REPLACED
+        // and not appended to (the B-A1 duplication fix), and the marker is
+        // still cleared on success.
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        e.index_doc("rust.md", "# Rust\nerror handling and memory safety")
+            .unwrap();
+        let baseline = e.lex_health().unwrap();
+        assert!(baseline.chunk_meta > 0 && baseline.lex_docs > 0);
+
+        let restored = e.repopulate_lex_from_meta().unwrap();
+        let after = e.lex_health().unwrap();
+        assert_eq!(
+            restored as u64, baseline.chunk_meta,
+            "every stored chunk must be restored, not refused: {after:?}"
+        );
+        assert_eq!(
+            after.lex_docs, baseline.lex_docs,
+            "replaced, not appended: {after:?}"
+        );
+        assert!(after.is_healthy(), "{after:?}");
+        assert_eq!(e.lex.search("error", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn lex_health_flags_an_index_holding_more_docs_than_chunks() {
+        // Audit concern 1: `chunk_meta 6271 / lex_docs 12542` used to report
+        // as "healthy" because only an EMPTY index counted as broken. Skew
+        // UPWARD has no benign explanation (see `has_excess_docs`).
+        let over = LexHealth {
+            lex_docs: 12542,
+            chunk_meta: 6271,
+            rebuild_pending: false,
+        };
+        assert!(over.has_excess_docs());
+        assert!(!over.is_dead(), "not dead — search still answers, worse");
+        assert!(!over.is_healthy(), "a doubled index is not healthy");
+
+        // Matching counts, and the benign DOWNWARD skew (a corrupt chunk
+        // skipped by the rebuild), stay healthy — no crying wolf.
+        for (lex_docs, chunk_meta) in [(6271, 6271), (6270, 6271), (0, 0)] {
+            let h = LexHealth {
+                lex_docs,
+                chunk_meta,
+                rebuild_pending: false,
+            };
+            assert!(!h.has_excess_docs(), "{h:?}");
+            assert!(h.is_healthy(), "{h:?}");
+            assert!(!h.is_orphaned(), "{h:?}");
+        }
+    }
+
+    #[test]
+    fn lex_health_separates_orphaned_from_ordinary_excess_docs() {
+        // D2: the two differ in the ADVICE, so doctor must tell them apart.
+        // Orphaned = `chunk_meta` gone entirely: nothing to rebuild FROM, so
+        // `doctor --fix` cannot repair it and only `reindex --force` can.
+        let orphaned = LexHealth {
+            lex_docs: 6271,
+            chunk_meta: 0,
+            rebuild_pending: true,
+        };
+        assert!(orphaned.is_orphaned());
+        assert!(
+            orphaned.has_excess_docs(),
+            "orphaned is a strict subset of excess, which is why is_healthy already rejects it"
+        );
+        assert!(
+            !orphaned.is_dead(),
+            "is_dead needs chunk_meta > 0 — the whole reason this predicate exists"
+        );
+        assert!(!orphaned.is_healthy());
+
+        // Ordinary excess (duplicates over a live collection) is NOT orphaned:
+        // `chunk_meta` still holds every chunk, so the rebuild works.
+        let duplicated = LexHealth {
+            lex_docs: 12542,
+            chunk_meta: 6271,
+            rebuild_pending: false,
+        };
+        assert!(duplicated.has_excess_docs());
+        assert!(!duplicated.is_orphaned());
+
+        // Both sides empty is a fresh/emptied index, not damage.
+        let empty = LexHealth {
+            lex_docs: 0,
+            chunk_meta: 0,
+            rebuild_pending: false,
+        };
+        assert!(!empty.is_orphaned());
+        assert!(empty.is_healthy());
+    }
+
+    #[test]
+    fn repopulate_replaces_an_over_populated_index() {
+        // The repair half: whatever produced the surplus (duplicates from an
+        // old build, or orphan lex docs left by a crash between `remove_doc`'s
+        // redb commit and its lex commit), one repopulate restores
+        // `lex_docs == chunk_meta`. This is what makes `doctor --fix` able to
+        // repair the state above.
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        e.index_doc("rust.md", "# Rust\nerror handling and memory safety")
+            .unwrap();
+        let baseline = e.lex_health().unwrap();
+
+        // Duplicate every chunk, plus an orphan with no chunk_meta row.
+        for id in 0..2 {
+            e.lex
+                .add(&Chunk {
+                    chunk_id: format!("ghost.md#{id}"),
+                    doc_path: "ghost.md".to_string(),
+                    heading_path: "Ghost".to_string(),
+                    chunk_index: id,
+                    text: "error handling and memory safety".to_string(),
+                })
+                .unwrap();
+        }
+        e.lex.commit().unwrap();
+        let broken = e.lex_health().unwrap();
+        assert!(broken.has_excess_docs(), "{broken:?}");
+
+        let restored = e.repopulate_lex_from_meta().unwrap();
+        let after = e.lex_health().unwrap();
+        assert_eq!(after.lex_docs, after.chunk_meta, "{after:?}");
+        assert_eq!(after.lex_docs as usize, restored, "{after:?}");
+        assert_eq!(after.lex_docs, baseline.lex_docs, "{after:?}");
+        assert!(after.is_healthy(), "{after:?}");
+        assert!(
+            e.lex.search("ghost", 10).unwrap().is_empty(),
+            "the orphan documents must be gone"
+        );
+        assert_eq!(e.lex.search("error", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_post_commit_marker_clear_failure_does_not_fail_the_open() {
+        // B-R1 companion: the rebuild's durable part is the lex COMMIT. If
+        // removing the bookkeeping marker afterwards fails (read-only
+        // `index/`, exotic FS), propagating that error aborted `Engine::open`
+        // — and the next open would see matching schema + pending marker →
+        // same rebuild → same failure, i.e. a collection permanently
+        // unopenable through a purely cosmetic problem. It must warn and
+        // carry on instead.
+        //
+        // The unremovable marker is a non-empty DIRECTORY at the marker path:
+        // `remove_file` on it fails with something that is emphatically not
+        // `NotFound` (the one kind already treated as success), portably, with
+        // no chmod/root dependency.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut e = fake_engine(dir.path());
+            e.index_doc("rust.md", "# Rust\nerror handling and memory safety")
+                .unwrap();
+        }
+        let tantivy_dir = simulate_interrupted_lex_migration(dir.path());
+        let marker = lex::rebuild_marker_path(&tantivy_dir);
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir_all(marker.join("occupied")).unwrap();
+        assert!(
+            lex::rebuild_pending(&tantivy_dir),
+            "the unremovable stand-in must still read as a pending rebuild"
+        );
+        // Prove the clear really cannot succeed — otherwise this test would
+        // pass for the wrong reason.
+        assert!(
+            lex::clear_rebuild_marker(&tantivy_dir).is_err(),
+            "the marker must be genuinely unremovable for this test to mean anything"
+        );
+
+        // The open must still succeed AND the rebuild must still have run.
+        let e = fake_engine(dir.path());
+        assert!(
+            !e.lex.search("error", 5).unwrap().is_empty(),
+            "the rebuild itself must have committed despite the clear failing"
+        );
+        assert_eq!(e.lex_health().unwrap().lex_docs, 1);
+    }
+
+    #[test]
+    fn lex_health_reports_the_interrupted_migration_state() {
+        // The CLI-facing probe (doctor / status) must be able to SEE the dead
+        // state, not just repair it — a user whose index died before this fix
+        // shipped needs to be told, and a rebuild that keeps failing must not
+        // stay invisible. Checked against a live half-migrated collection: the
+        // lex index is empty while chunk_meta is full.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut e = fake_engine(dir.path());
+            e.index_doc("rust.md", "# Rust\nerror handling and memory safety")
+                .unwrap();
+            let healthy = e.lex_health().unwrap();
+            assert!(healthy.is_healthy());
+            assert!(!healthy.is_dead());
+            assert!(healthy.chunk_meta > 0);
+        }
+        let tantivy_dir = simulate_interrupted_lex_migration(dir.path());
+
+        // Read the crippled state WITHOUT opening an Engine (which would heal
+        // it): the two counts an Engine::lex_health would report.
+        let lex_docs = LexIndex::open(&tantivy_dir).unwrap().num_docs().unwrap();
+        let dead = LexHealth {
+            lex_docs,
+            chunk_meta: 1,
+            rebuild_pending: lex::rebuild_pending(&tantivy_dir),
+        };
+        assert_eq!(dead.lex_docs, 0);
+        assert!(
+            dead.is_dead(),
+            "empty lex + populated meta is the dead state"
+        );
+        assert!(dead.rebuild_pending);
+        assert!(!dead.is_healthy());
+
+        // An empty collection is NOT dead — no chunks means no missing chunks.
+        let empty = LexHealth {
+            lex_docs: 0,
+            chunk_meta: 0,
+            rebuild_pending: false,
+        };
+        assert!(!empty.is_dead());
+        assert!(empty.is_healthy());
+    }
+
+    #[test]
+    fn repopulate_skips_a_corrupt_chunk_meta_record() {
+        // B1 part 3: `serde_json::from_str(..)?` inside the repopulate aborted
+        // `Engine::open` itself — and it runs AFTER the wipe, so a single
+        // unparseable row made the whole collection permanently unopenable and
+        // its lex index permanently empty. Skip-not-fail, same convention as
+        // `chunk_texts`: drop the bad chunk, keep the good ones, keep going.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut e = fake_engine(dir.path());
+            e.index_doc("rust.md", "# Rust\nerror handling and memory safety")
+                .unwrap();
+            e.index_doc("cook.md", "# Cooking\npasta recipe with tomato")
+                .unwrap();
+            // Genuinely malformed: not JSON at all, under a plausible key.
+            let write_txn = e.meta.begin_write().unwrap();
+            {
+                let mut t = write_txn.open_table(CHUNK_META).unwrap();
+                t.insert("broken.md#0", "{not json at all").unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let tantivy_dir = simulate_interrupted_lex_migration(dir.path());
+
+        // Opening must SUCCEED despite the corrupt row.
+        let e = fake_engine(dir.path());
+        assert!(!lex::rebuild_pending(&tantivy_dir));
+        // Both good docs survived the rebuild.
+        assert!(!e.lex.search("error", 5).unwrap().is_empty());
+        assert!(!e.lex.search("pasta", 5).unwrap().is_empty());
+        // The corrupt one is simply absent — one fewer lex doc than rows.
+        let health = e.lex_health().unwrap();
+        assert_eq!(
+            health.lex_docs + 1,
+            health.chunk_meta,
+            "exactly the corrupt row should be missing: {health:?}"
+        );
+        assert!(!health.is_dead());
+    }
+
+    #[test]
+    fn repopulate_reports_progress() {
+        // C6: a silent multi-minute rebuild reads as hung, and interrupting it
+        // is what creates the state above. Progress must start at (0, total) —
+        // before the first chunk — and reach (total, total).
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        e.index_doc("rust.md", "# Rust\nerror handling and memory safety")
+            .unwrap();
+        e.index_doc("cook.md", "# Cooking\npasta recipe with tomato")
+            .unwrap();
+
+        let mut seen: Vec<(usize, usize)> = Vec::new();
+        let restored = e
+            .repopulate_lex_from_meta_with_progress(&mut |done, total| seen.push((done, total)))
+            .unwrap();
+        let total = restored;
+        assert!(total >= 2);
+        assert_eq!(
+            seen.first().copied(),
+            Some((0, total)),
+            "must announce the total before the first chunk: {seen:?}"
+        );
+        assert_eq!(seen.last().copied(), Some((total, total)));
+        assert_eq!(seen.len(), total + 1, "one tick per chunk plus the opener");
+    }
+
+    #[test]
     fn active_model_matches_detects_change() {
         // No network needed: `open` never downloads a model, it only
         // records the requested model name in engine_header.
@@ -4047,6 +4997,24 @@ mod tests {
         }
     }
 
+    /// Like [`MarkerReranker`] but with scores straddling the SHIPPED gate,
+    /// using the bands the v3.4.7 calibration actually measured on real vault
+    /// content: genuine matches 0.73–0.99, non-matches 0.003–0.066.
+    /// `MarkerReranker`'s 0.4 "weak" score clears the 0.30 default, so it
+    /// cannot exercise gate behavior at default settings at all.
+    struct StraddlingReranker {
+        marker: &'static str,
+    }
+
+    impl Rerank for StraddlingReranker {
+        fn rerank(&self, _query: &str, passages: &[String]) -> Result<Vec<f32>> {
+            Ok(passages
+                .iter()
+                .map(|p| if p.contains(self.marker) { 0.9 } else { 0.05 })
+                .collect())
+        }
+    }
+
     /// Records how many passages it was asked to cross-encode (total across
     /// calls), and scores them all high so none is gated out. Used to assert
     /// `rerank_paths` bounds the number of chunks it reranks.
@@ -4333,6 +5301,51 @@ mod tests {
         assert_eq!(hits.len(), 2, "gate-dropped candidates must not reappear");
         assert!(hits.iter().all(|h| h.doc_path.starts_with("m")));
         assert!(hits.iter().all(|h| h.rerank_score == Some(0.9)));
+    }
+
+    #[test]
+    fn default_gate_demotes_weak_candidates_instead_of_dropping_them() {
+        // Measured 2026-07-19 on a real 782-doc vault: the shipped 0.30 gate
+        // removed HALF the correct answers (heading-shaped probes hit@10
+        // 0.500 → 0.233; body-term probes 0.733 → 0.500). Partial rejection —
+        // not the total rejection `RERANK_NO_MATCH_KEEP` guards — was the
+        // recall killer, because `candidates` and `top_k` are both 10, leaving
+        // no fused tail to backfill with.
+        //
+        // The default therefore no longer truncates. The block is already
+        // sorted by cross-encoder score, so weak candidates simply rank BELOW
+        // strong ones and every hit still carries `rerank_score` — which is
+        // what the search cascade tells the agent to judge confidence on.
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        e.index_doc("m1.md", "note zulumark alpha").unwrap();
+        e.index_doc("m2.md", "note zulumark beta").unwrap();
+        for i in 0..3 {
+            e.index_doc(&format!("u{i}.md"), &format!("note gamma{i}"))
+                .unwrap();
+        }
+        // No set_rerank_settings call: this pins the SHIPPED default.
+        e.set_reranker_for_tests(Box::new(StraddlingReranker { marker: "zulumark" }));
+        let hits = e.query("note", 10).unwrap();
+
+        assert_eq!(
+            hits.len(),
+            5,
+            "weak candidates must survive as demoted hits"
+        );
+        assert!(
+            hits[0].doc_path.starts_with('m') && hits[1].doc_path.starts_with('m'),
+            "strong matches must still rank first, got {:?}",
+            hits.iter().map(|h| &h.doc_path).collect::<Vec<_>>()
+        );
+        assert!(
+            hits[2..].iter().all(|h| h.doc_path.starts_with('u')),
+            "weak matches must be demoted below strong ones"
+        );
+        assert!(
+            hits.iter().all(|h| h.rerank_score.is_some()),
+            "every hit keeps its score so the agent can judge confidence"
+        );
     }
 
     #[test]

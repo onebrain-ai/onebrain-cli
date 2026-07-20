@@ -37,12 +37,12 @@
 //! jieba for Chinese, lindera for Japanese, ...) once the dictionary assets
 //! are vendored.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tantivy::collector::TopDocs;
 use tantivy::directory::MmapDirectory;
-use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
+use tantivy::query::{BooleanQuery, BoostQuery, Occur, Query, TermQuery};
 use tantivy::schema::{Field, IndexRecordOption, Schema, Value, STORED, STRING, TEXT};
 use tantivy::tokenizer::{
     LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer, TokenStream, Tokenizer,
@@ -52,10 +52,119 @@ use tantivy::{doc, Index, IndexWriter, Term};
 use crate::chunk::Chunk;
 
 /// Name under which the script-aware analyzer is registered on the index's
-/// [`tantivy::tokenizer::TokenizerManager`]. Used for both the `body`
-/// field's schema-declared tokenizer and query-time segmentation, so
-/// index-time and query-time tokenization always match.
+/// [`tantivy::tokenizer::TokenizerManager`]. Used for the `body` and
+/// `heading_path` fields' schema-declared tokenizer and for query-time
+/// segmentation, so index-time and query-time tokenization always match.
 const SCRIPT_AWARE_TOKENIZER: &str = "script_aware";
+
+/// Weight applied to `heading_path` term matches relative to `body` matches.
+///
+/// Below 1.0 on purpose. A chunk's `heading_path` repeats across EVERY chunk
+/// under that section, so an over-weighted heading match floods the top-k with
+/// every sibling chunk of a section whose title happens to contain the query
+/// term — a real hazard in a vault where hundreds of session logs share
+/// boilerplate headings ("Key Decisions", "Action Items").
+///
+/// Calibrated on a real 782-doc vault, not guessed. Two 30-query probe sets:
+/// **A** = queries taken from a heading occurring in exactly ONE file (gold =
+/// that file); **C** = distinctive body-term queries that never touch headings
+/// (regression guard). BM25-only, top-10:
+///
+/// | boost | A hit@10 | A MRR | C hit@10 | C MRR  |
+/// |-------|----------|-------|----------|--------|
+/// | 0.00  | 0.300    | 0.185 | 0.800    | 0.5667 |
+/// | 0.15  | 0.500    | 0.277 | 0.800    | 0.5486 |
+/// | 0.25  | 0.567    | 0.318 | 0.800    | 0.5486 |
+/// | 0.35  | 0.600    | 0.428 | 0.800    | 0.5469 |
+/// | 0.50  | 0.700    | 0.490 | 0.767    | 0.5122 |
+/// | 0.75  | 0.733    | 0.631 | 0.700    | 0.4770 |
+///
+/// 0.35 is the knee: it doubles heading-query hit@10 and lifts their MRR ~2.3×
+/// while leaving the body-query set's hit@10 untouched (its MRR moves −3.5%,
+/// inside the noise of a 30-query sample). Past 0.35 the body set starts
+/// losing hits outright.
+const HEADING_BOOST: f32 = 0.35;
+
+/// The distinguishing fragment of tantivy's schema-mismatch message
+/// (`index/index.rs`: "An index exists but the schema does not match.").
+/// Only the stable middle of the sentence is matched, so upstream
+/// capitalization or punctuation edits don't break recognition.
+const SCHEMA_MISMATCH_MARKER: &str = "schema does not match";
+
+/// True when `err` is tantivy's "an index exists but the schema does not
+/// match" — i.e. the on-disk index was written by a build whose schema differs
+/// from this one.
+///
+/// Typed-first: the [`tantivy::TantivyError::SchemaError`] variant is the
+/// primary gate, so an unrelated error type can never be mistaken for a
+/// mismatch. The message is then checked as a SECOND, narrowing condition
+/// (C4). Within tantivy 0.26.1 the schema-mismatch site is the only reachable
+/// `SchemaError` producer on [`LexIndex::open`]'s call graph, so the variant
+/// alone is correct *today* — but this predicate authorizes a destructive
+/// `remove_dir_all`, and a future tantivy adding a `SchemaError` anywhere else
+/// on that path (a bad field option, an unknown tokenizer) would silently turn
+/// into a wipe. Requiring both keeps the guarantee no wider than the intent;
+/// a wording change upstream degrades to a loud hard failure, never to a
+/// spurious wipe.
+pub fn is_schema_mismatch(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<tantivy::TantivyError>(),
+        Some(tantivy::TantivyError::SchemaError(msg)) if msg.contains(SCHEMA_MISMATCH_MARKER)
+    )
+}
+
+/// Path of the crash-safe "this lex index was wiped and still needs
+/// repopulating" marker for the tantivy directory `dir`.
+///
+/// Deliberately a SIBLING of `dir`, not a file inside it: [`LexIndex::open_or_reset`]
+/// wipes `dir` with `remove_dir_all`, so anything stored inside would be
+/// destroyed by the very operation it is meant to record. For the normal
+/// layout (`<collection>/index/tantivy`) the marker lands at
+/// `<collection>/index/.tantivy.rebuild-pending` — inside the collection, so
+/// it travels with a copied/moved collection.
+///
+/// Being a sibling also means nothing that deletes `dir` deletes the marker:
+/// `search reindex --force` removes the three NAMED index artifacts rather
+/// than the `index/` dir, so it clears this file explicitly (see the CLI's
+/// `wipe_index_files`) — a forced wipe leaves no bookkeeping behind either.
+///
+/// `pub` for the tests rather than for production callers: production code
+/// goes through [`rebuild_pending`] / [`clear_rebuild_marker`] and never needs
+/// the path itself, but the B1 / B-A1 / D2 regression tests must PLANT and
+/// inspect the marker to reconstruct the crash states they pin. Keep it
+/// exported.
+pub fn rebuild_marker_path(dir: &Path) -> PathBuf {
+    let name = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tantivy".to_string());
+    dir.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".{name}.rebuild-pending"))
+}
+
+/// True when a previous run wiped this lex index but has not yet finished
+/// repopulating it. The engine must repopulate on the next open whenever this
+/// is true — the in-memory `was_reset` flag from [`LexIndex::open_or_reset`]
+/// does NOT survive a crash, and the post-wipe directory has a *matching*
+/// schema, so a later open would otherwise see a healthy-looking EMPTY index
+/// and never rebuild it.
+pub fn rebuild_pending(dir: &Path) -> bool {
+    rebuild_marker_path(dir).exists()
+}
+
+/// Remove the rebuild marker written by [`LexIndex::open_or_reset`]. Call
+/// only AFTER the repopulate has been committed. Absent marker = success
+/// (idempotent).
+pub fn clear_rebuild_marker(dir: &Path) -> Result<()> {
+    let path = rebuild_marker_path(dir);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e)
+            .context(format!("clearing lex rebuild marker {}", path.display()))),
+    }
+}
 
 /// Unicode blocks for scripts that don't use spaces between words. Each
 /// tuple is an inclusive `(start, end)` character range.
@@ -264,13 +373,18 @@ impl LexIndex {
         let mut schema_builder = Schema::builder();
         let chunk_id = schema_builder.add_text_field("chunk_id", STRING | STORED);
         let doc_path = schema_builder.add_text_field("doc_path", STRING | STORED);
-        let heading_path = schema_builder.add_text_field("heading_path", TEXT | STORED);
-        let body_options = TEXT.set_indexing_options(
+        // `heading_path` and `body` MUST share the script-aware tokenizer: a
+        // plain `TEXT` field would use tantivy's default English analyzer, so
+        // Thai headings would segment differently from Thai bodies and only
+        // English heading terms would ever match.
+        let script_aware_options = TEXT.set_indexing_options(
             tantivy::schema::TextFieldIndexing::default()
                 .set_tokenizer(SCRIPT_AWARE_TOKENIZER)
                 .set_index_option(IndexRecordOption::WithFreqsAndPositions),
         );
-        let body = schema_builder.add_text_field("body", body_options);
+        let heading_path =
+            schema_builder.add_text_field("heading_path", script_aware_options.clone() | STORED);
+        let body = schema_builder.add_text_field("body", script_aware_options);
         let schema = schema_builder.build();
 
         let mmap_directory = MmapDirectory::open(dir)?;
@@ -291,6 +405,63 @@ impl LexIndex {
         })
     }
 
+    /// Like [`Self::open`], but self-heals a schema mismatch instead of
+    /// failing: when `dir` holds an index built by an older OneBrain whose
+    /// tantivy schema differs from the current one, the directory is wiped and
+    /// recreated empty. Returns `(index, was_reset)` — a `true` flag tells the
+    /// caller the lex index is now EMPTY and must be repopulated (the engine
+    /// does this from its redb `chunk_meta`, so no files are re-read and
+    /// nothing is re-embedded).
+    ///
+    /// Only a genuine schema mismatch triggers the reset. Any other error (I/O,
+    /// permissions, corruption) propagates untouched — a wipe must never be the
+    /// response to a problem we haven't identified.
+    ///
+    /// **Crash safety.** `was_reset` lives only in memory, so on its own it is
+    /// lost if the process dies between the wipe and the repopulate's commit —
+    /// and the post-wipe directory has a *current* schema, so the next open
+    /// succeeds with `was_reset == false` over a permanently EMPTY index (0
+    /// hits, while `status` still reports every doc indexed and `reindex`
+    /// skips everything because the hashes say "current"). To close that
+    /// window a marker file is written at [`rebuild_marker_path`] — a sibling
+    /// of `dir`, so the `remove_dir_all` cannot destroy it — BEFORE the wipe.
+    /// The engine repopulates whenever [`rebuild_pending`] is true, regardless
+    /// of `was_reset`, and calls [`clear_rebuild_marker`] only after the
+    /// repopulate has committed. Marker creation failing aborts before any
+    /// destruction: better to refuse the migration than to perform an
+    /// unrecorded wipe.
+    pub fn open_or_reset(dir: &Path) -> Result<(Self, bool)> {
+        match Self::open(dir) {
+            Ok(index) => Ok((index, false)),
+            Err(err) if is_schema_mismatch(&err) => {
+                let marker = rebuild_marker_path(dir);
+                if let Some(parent) = marker.parent() {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("creating dir for lex rebuild marker {}", marker.display())
+                    })?;
+                }
+                std::fs::write(
+                    &marker,
+                    "onebrain: the keyword (tantivy) index was wiped for a schema migration and \
+                     must be repopulated from redb chunk_meta. Removed automatically once the \
+                     rebuild commits; if it lingers, run `onebrain search reindex --force`.\n",
+                )
+                .with_context(|| format!("writing lex rebuild marker {}", marker.display()))?;
+                std::fs::remove_dir_all(dir)?;
+                Ok((Self::open(dir)?, true))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Number of committed, non-deleted documents in the index — one per
+    /// indexed chunk. Cheap: reads the segment metas via a reader, no query.
+    /// Used by [`crate::engine::Engine::lex_health`] to detect an index that
+    /// is empty while `chunk_meta` still holds chunks.
+    pub fn num_docs(&self) -> Result<u64> {
+        Ok(self.index.reader()?.searcher().num_docs())
+    }
+
     /// Return the [`IndexWriter`], creating it on first call. This is where
     /// tantivy's exclusive writer lock is acquired — deferred out of
     /// [`Self::open`] so read-only opens stay lock-free (see struct docs).
@@ -302,9 +473,35 @@ impl LexIndex {
         Ok(self.writer.as_mut().expect("writer just initialized"))
     }
 
+    /// Empty the index: drop every committed document, and discard anything
+    /// added on this writer but not yet committed.
+    ///
+    /// Exists because [`Self::add`] never replaces — a caller that re-adds
+    /// every chunk (the engine's rebuild-from-`chunk_meta`) over an index that
+    /// is NOT already empty silently doubles it, and duplicate documents
+    /// corrupt BM25's document frequencies and average field length, so
+    /// relevance degrades with every repeat.
+    ///
+    /// **Crash safety.** Takes effect only once [`Self::commit`] runs:
+    /// tantivy's `delete_all_documents` clears the in-memory segment registers
+    /// (committed *and* uncommitted) and reverts the opstamp — it writes
+    /// nothing, deletes no segment file, and leaves `meta.json` on disk
+    /// untouched. So a `clear()` → `add()`× → `commit()` sequence swaps the
+    /// whole content in ONE durable step: a crash anywhere before the commit
+    /// leaves the previous index exactly as it was, and there is no observable
+    /// half-cleared state.
+    ///
+    /// Because it also discards uncommitted adds, call it FIRST — before the
+    /// adds it is meant to precede — never in the middle of a batch.
+    pub fn clear(&mut self) -> Result<()> {
+        self.writer_mut()?.delete_all_documents()?;
+        Ok(())
+    }
+
     /// Add a chunk as a new document. Does not delete any prior document
     /// with the same `chunk_id` — call [`Self::delete`] first if
-    /// re-indexing an updated chunk.
+    /// re-indexing an updated chunk, or [`Self::clear`] first when re-adding
+    /// everything.
     pub fn add(&mut self, chunk: &Chunk) -> Result<()> {
         let chunk_id = self.chunk_id;
         let doc_path = self.doc_path;
@@ -338,13 +535,18 @@ impl LexIndex {
         Ok(())
     }
 
-    /// BM25 search over the `body` field. `query` is segmented with the
-    /// same script-aware routine used at index time and turned into a
-    /// `Should`-combined [`BooleanQuery`] of per-term [`TermQuery`]s
-    /// (deliberately bypassing tantivy's `QueryParser`, which pre-tokenizes
-    /// as English and would mis-tokenize no-space scripts). Returns
-    /// `(chunk_id, score)`
-    /// pairs, highest score first.
+    /// BM25 search over the `body` **and** `heading_path` fields (v3.4.16): via
+    /// the shared `search_docs` → [`Self::build_query`], every query unit emits
+    /// a `body` term plus a `heading_path` term boosted by `HEADING_BOOST`.
+    /// This is the entry point the MCP `lex` sub-query and the web UI's
+    /// `mode=lex` route call, so heading matching is live there too — not only
+    /// on [`Self::search_with_heading`].
+    ///
+    /// `query` is segmented with the same script-aware routine used at index
+    /// time and turned into a `Should`-combined [`BooleanQuery`] of per-term
+    /// [`TermQuery`]s (deliberately bypassing tantivy's `QueryParser`, which
+    /// pre-tokenizes as English and would mis-tokenize no-space scripts).
+    /// Returns `(chunk_id, score)` pairs, highest score first.
     pub fn search(&self, query: &str, top_k: usize) -> Result<Vec<(String, f32)>> {
         self.search_docs(query, top_k, |searcher, doc_address| {
             let retrieved: tantivy::TantivyDocument = searcher.doc(doc_address)?;
@@ -371,6 +573,12 @@ impl LexIndex {
         // is the vector side's job. Multi-word Thai should be spaced
         // (`สุขภาพ การออกกำลังกาย` = OR of two runs). Real fix: nlpo3
         // dictionary segmentation (tracked follow-up).
+        //
+        // Every unit is built TWICE — once against `body`, once against
+        // `heading_path` at [`HEADING_BOOST`] — and both are `Should`, so a
+        // chunk matching in either field is retrievable and one matching in
+        // both scores higher. The two fields share a tokenizer, so the same
+        // segmentation applies to each.
         let mut units: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         for (start, end, is_script) in split_script_runs(query) {
             let run = &query[start..end];
@@ -380,25 +588,37 @@ impl LexIndex {
                     continue;
                 }
                 let n = grams.len();
-                let subs: Vec<(Occur, Box<dyn Query>)> = grams
-                    .into_iter()
-                    .map(|(text, _, _)| {
-                        let term = Term::from_field_text(self.body, &text);
-                        let tq: Box<dyn Query> =
-                            Box::new(TermQuery::new(term, IndexRecordOption::Basic));
-                        (Occur::Should, tq)
-                    })
-                    .collect();
+                let run_query = |field: Field| -> Box<dyn Query> {
+                    let subs: Vec<(Occur, Box<dyn Query>)> = grams
+                        .iter()
+                        .map(|(text, _, _)| {
+                            let term = Term::from_field_text(field, text);
+                            let tq: Box<dyn Query> =
+                                Box::new(TermQuery::new(term, IndexRecordOption::Basic));
+                            (Occur::Should, tq)
+                        })
+                        .collect();
+                    Box::new(BooleanQuery::with_minimum_required_clauses(subs, n))
+                };
+                units.push((Occur::Should, run_query(self.body)));
                 units.push((
                     Occur::Should,
-                    Box::new(BooleanQuery::with_minimum_required_clauses(subs, n)),
+                    Box::new(BoostQuery::new(run_query(self.heading_path), HEADING_BOOST)),
                 ));
             } else {
                 for (text, _, _) in other_tokens(run, start) {
-                    let term = Term::from_field_text(self.body, &text);
-                    let tq: Box<dyn Query> =
-                        Box::new(TermQuery::new(term, IndexRecordOption::Basic));
-                    units.push((Occur::Should, tq));
+                    let term_query = |field: Field| -> Box<dyn Query> {
+                        let term = Term::from_field_text(field, &text);
+                        Box::new(TermQuery::new(term, IndexRecordOption::Basic))
+                    };
+                    units.push((Occur::Should, term_query(self.body)));
+                    units.push((
+                        Occur::Should,
+                        Box::new(BoostQuery::new(
+                            term_query(self.heading_path),
+                            HEADING_BOOST,
+                        )),
+                    ));
                 }
             }
         }
@@ -499,6 +719,264 @@ mod tests {
         ix.add(&chunk("d2#0", "cooking pasta recipe")).unwrap();
         ix.commit().unwrap();
         assert_eq!(ix.search("error", 1).unwrap()[0].0, "d1#0");
+    }
+
+    /// Build a tantivy index with the PRE-change schema (`heading_path` as
+    /// plain `TEXT`, i.e. the default English tokenizer) so the migration path
+    /// can be exercised against what shipped vaults actually have on disk.
+    fn create_legacy_index(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut sb = Schema::builder();
+        sb.add_text_field("chunk_id", STRING | STORED);
+        sb.add_text_field("doc_path", STRING | STORED);
+        sb.add_text_field("heading_path", TEXT | STORED);
+        let body_options = TEXT.set_indexing_options(
+            tantivy::schema::TextFieldIndexing::default()
+                .set_tokenizer(SCRIPT_AWARE_TOKENIZER)
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        );
+        sb.add_text_field("body", body_options);
+        let index = Index::builder()
+            .schema(sb.build())
+            .open_or_create(MmapDirectory::open(dir).unwrap())
+            .unwrap();
+        index
+            .tokenizers()
+            .register(SCRIPT_AWARE_TOKENIZER, ScriptAwareTokenizer);
+        // Force segment files onto disk so the reopen sees a real index.
+        let mut w: IndexWriter = index.writer(50_000_000).unwrap();
+        w.commit().unwrap();
+    }
+
+    #[test]
+    fn opening_a_legacy_schema_index_is_handled_not_silently_wrong() {
+        // A shipped vault's tantivy dir was built with `heading_path` under the
+        // default English tokenizer. Reopening it with the new schema must NOT
+        // silently succeed and serve mis-tokenized heading hits — either it
+        // errors loudly (caller migrates) or it rebuilds. This test pins
+        // whichever behavior we actually get so a migration can be designed
+        // against it rather than guessed.
+        let dir = tempfile::tempdir().unwrap();
+        create_legacy_index(dir.path());
+
+        let opened = LexIndex::open(dir.path());
+        let err = opened
+            .err()
+            .expect("legacy-schema index must not open silently under the new schema");
+        assert!(
+            is_schema_mismatch(&err),
+            "expected a typed schema mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn open_or_reset_self_heals_a_legacy_schema_index() {
+        // The migration path: a vault upgraded from a build with the old schema
+        // must not hard-fail. `open_or_reset` wipes and recreates, reporting
+        // `was_reset` so the engine knows to repopulate from redb.
+        // The tantivy dir is a SUBDIR of the tempdir so the sibling rebuild
+        // marker lands inside the tempdir too (and is cleaned up with it).
+        let tmp = tempfile::tempdir().unwrap();
+        // Name is arbitrary — the marker is derived from whatever the lex dir
+        // is called (the real one comes from `CollectionLayout`).
+        let dir = tmp.path().join("lex-index");
+        std::fs::create_dir_all(&dir).unwrap();
+        create_legacy_index(&dir);
+
+        let (mut ix, was_reset) = LexIndex::open_or_reset(&dir).unwrap();
+        assert!(was_reset, "legacy schema must be reported as reset");
+
+        // The recreated index is empty but fully usable under the new schema.
+        assert!(ix.search("anything", 5).unwrap().is_empty());
+        let mut c = chunk("d1#0", "body text");
+        c.heading_path = "ข้อเสีย".into();
+        ix.add(&c).unwrap();
+        ix.commit().unwrap();
+        assert_eq!(ix.search("ข้อเสีย", 5).unwrap()[0].0, "d1#0");
+    }
+
+    #[test]
+    fn open_or_reset_leaves_a_current_schema_index_untouched() {
+        // Self-heal must be surgical: an index that opens cleanly keeps its
+        // documents and reports `was_reset == false`.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut ix = LexIndex::open(dir.path()).unwrap();
+            ix.add(&chunk("d1#0", "error handling in rust")).unwrap();
+            ix.commit().unwrap();
+        }
+        let (ix, was_reset) = LexIndex::open_or_reset(dir.path()).unwrap();
+        assert!(!was_reset);
+        assert_eq!(ix.search("error", 5).unwrap()[0].0, "d1#0");
+        assert!(
+            !rebuild_pending(dir.path()),
+            "an untouched index must not be marked for rebuild"
+        );
+    }
+
+    #[test]
+    fn open_or_reset_records_the_rebuild_before_wiping() {
+        // B1: `was_reset` is in-memory only. If the process dies between the
+        // wipe and the repopulate's commit, the directory left behind has a
+        // MATCHING schema, so the next open reports `was_reset == false` over
+        // a permanently empty index. The marker is what survives that crash —
+        // so it must exist on disk the moment `open_or_reset` returns, before
+        // anyone has repopulated anything.
+        let tmp = tempfile::tempdir().unwrap();
+        // Name is arbitrary — the marker is derived from whatever the lex dir
+        // is called (the real one comes from `CollectionLayout`).
+        let dir = tmp.path().join("lex-index");
+        std::fs::create_dir_all(&dir).unwrap();
+        create_legacy_index(&dir);
+
+        let (_ix, was_reset) = LexIndex::open_or_reset(&dir).unwrap();
+        assert!(was_reset);
+        assert!(
+            rebuild_pending(&dir),
+            "a wiped index must be marked rebuild-pending at {}",
+            rebuild_marker_path(&dir).display()
+        );
+
+        // It must live OUTSIDE the wiped directory, or the wipe would have
+        // taken it with it — and inside the parent, so it travels with the
+        // collection.
+        let marker = rebuild_marker_path(&dir);
+        assert!(
+            !marker.starts_with(&dir),
+            "marker must not be inside {dir:?}"
+        );
+        assert_eq!(marker.parent().unwrap(), tmp.path());
+
+        // A second open sees a schema that now MATCHES: `was_reset` is false,
+        // which is exactly why the engine must consult the marker instead.
+        let (_ix2, was_reset2) = LexIndex::open_or_reset(&dir).unwrap();
+        assert!(!was_reset2, "post-wipe schema matches, so no second reset");
+        assert!(
+            rebuild_pending(&dir),
+            "the pending rebuild must survive a reopen that reports was_reset == false"
+        );
+
+        clear_rebuild_marker(&dir).unwrap();
+        assert!(!rebuild_pending(&dir));
+        // Idempotent: clearing an already-clear marker is not an error.
+        clear_rebuild_marker(&dir).unwrap();
+    }
+
+    #[test]
+    fn schema_mismatch_predicate_ignores_unrelated_schema_errors() {
+        // C4: the predicate authorizes `remove_dir_all`, so it must be no
+        // wider than its guarantee. Today tantivy's only reachable
+        // `SchemaError` on `LexIndex::open`'s path is the mismatch one — but a
+        // future release adding another (bad field option, unknown tokenizer)
+        // must NOT be answered with a wipe.
+        let unrelated: anyhow::Error =
+            tantivy::TantivyError::SchemaError("field 'body' is not indexed".to_string()).into();
+        assert!(
+            !is_schema_mismatch(&unrelated),
+            "an unrelated SchemaError must never authorize a wipe"
+        );
+
+        let mismatch: anyhow::Error = tantivy::TantivyError::SchemaError(
+            "An index exists but the schema does not match.".to_string(),
+        )
+        .into();
+        assert!(is_schema_mismatch(&mismatch));
+
+        // Still typed-first: a non-tantivy error carrying the same words is
+        // not a mismatch.
+        let impostor = anyhow::anyhow!("An index exists but the schema does not match.");
+        assert!(!is_schema_mismatch(&impostor));
+    }
+
+    #[test]
+    fn heading_path_is_searchable() {
+        // heading_path carries the section context ("A > B > C"). A query whose
+        // terms appear ONLY in the heading must still retrieve the chunk —
+        // before this, every TermQuery targeted `body` alone, so the field was
+        // indexed but never queried.
+        let dir = tempfile::tempdir().unwrap();
+        let mut ix = LexIndex::open(dir.path()).unwrap();
+        let mut c = chunk("d1#0", "costs 41x more to build");
+        c.heading_path = "GraphRAG > Drawbacks".into();
+        ix.add(&c).unwrap();
+        ix.add(&chunk("d2#0", "unrelated pasta recipe")).unwrap();
+        ix.commit().unwrap();
+
+        let hits = ix.search("drawbacks", 5).unwrap();
+        assert_eq!(hits.len(), 1, "heading-only term must retrieve the chunk");
+        assert_eq!(hits[0].0, "d1#0");
+    }
+
+    #[test]
+    fn heading_path_is_script_aware_tokenized() {
+        // The field was declared plain `TEXT`, i.e. the default ENGLISH
+        // tokenizer, while `body` uses the script-aware one. Thai headings were
+        // therefore mis-tokenized. Both fields must segment identically or a
+        // bilingual vault gets heading matches only in English.
+        let dir = tempfile::tempdir().unwrap();
+        let mut ix = LexIndex::open(dir.path()).unwrap();
+        let mut c = chunk("d1#0", "some body text");
+        c.heading_path = "ข้อเสีย > ต้นทุน".into();
+        ix.add(&c).unwrap();
+        ix.commit().unwrap();
+
+        let hits = ix.search("ข้อเสีย", 5).unwrap();
+        assert_eq!(hits.len(), 1, "Thai heading term must retrieve the chunk");
+        assert_eq!(hits[0].0, "d1#0");
+    }
+
+    #[test]
+    fn body_match_outranks_heading_only_match() {
+        // Heading hits are boosted BELOW body hits: a heading match repeats
+        // across every chunk under that section, so it must not outrank a chunk
+        // that genuinely discusses the term in its text.
+        let dir = tempfile::tempdir().unwrap();
+        let mut ix = LexIndex::open(dir.path()).unwrap();
+        let mut heading_only = chunk("d1#0", "completely unrelated filler text");
+        heading_only.heading_path = "Reranker".into();
+        ix.add(&heading_only).unwrap();
+        ix.add(&chunk("d2#0", "the reranker scores candidates"))
+            .unwrap();
+        ix.commit().unwrap();
+
+        let hits = ix.search("reranker", 5).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, "d2#0", "body match must rank first");
+    }
+
+    #[test]
+    fn a_heading_match_adds_score_on_top_of_an_identical_body_match() {
+        // The guard on the DOWNWARD direction, and the one this whole release
+        // rests on. Every other heading test asserts RETRIEVAL, and a
+        // zero-weight `BoostQuery` still MATCHES — so `HEADING_BOOST = 0.0`
+        // left all of them green while delivering exactly none of the recall
+        // win. Only 10.0 was guarded (by `body_match_outranks_heading_only_
+        // match`), i.e. the direction nobody would drift into.
+        //
+        // Two chunks with BYTE-IDENTICAL bodies, so their body subquery scores
+        // are equal by construction and the heading is the ONLY difference.
+        // At boost 0.0 the two scores are exactly equal and the strict `>`
+        // below fails.
+        let dir = tempfile::tempdir().unwrap();
+        let mut ix = LexIndex::open(dir.path()).unwrap();
+        let body = "the reranker scores candidates";
+        let mut both = chunk("d1#0", body);
+        both.heading_path = "Reranker".into();
+        ix.add(&both).unwrap();
+        ix.add(&chunk("d2#0", body)).unwrap();
+        ix.commit().unwrap();
+
+        let hits = ix.search("reranker", 5).unwrap();
+        assert_eq!(hits.len(), 2);
+        let score = |id: &str| hits.iter().find(|h| h.0 == id).unwrap().1;
+        assert!(
+            score("d1#0") > score("d2#0"),
+            "a heading match must ADD score over the same body match — heading boost is inert \
+             (got d1={}, d2={})",
+            score("d1#0"),
+            score("d2#0")
+        );
+        assert_eq!(hits[0].0, "d1#0", "and must therefore rank first");
     }
 
     #[test]

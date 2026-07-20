@@ -173,8 +173,13 @@ fn register_hooks_merge_legacy_snapshot() {
         .unwrap(),
     )
     .unwrap();
+    // The vault names a collection (`foo`), so the spawn must not resolve it
+    // against the developer's real search-cache root — see
+    // `tests/cache_isolation_sweep.rs`.
+    let cache = tempdir().unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
         .args(["register-hooks", "--vault", d.path().to_str().unwrap()])
         .assert()
         .success();

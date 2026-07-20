@@ -277,12 +277,12 @@ fn query_daemon_leg_with_deadline(
 /// `CoreError`; the raw search-layer predicate is kept as a belt-and-suspenders
 /// for any path that surfaces the untyped-mapped variant. Lets `check_direct`
 /// record `engine_busy` vs `engine_open_error` distinctly (#264 A#5).
-fn is_engine_busy_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|c| {
-        c.downcast_ref::<onebrain_core::CoreError>()
-            .is_some_and(|e| matches!(e, onebrain_core::CoreError::EngineBusy(_)))
-    }) || onebrain_search::error::is_engine_busy(err)
-}
+///
+/// Single definition, in `search_common`, since v3.4.16: the lex self-heal's
+/// busy-retry (`open_lex_migrating_inner`) needs the same
+/// both-classifications predicate, and two copies would drift the moment
+/// either wrapper changes.
+use crate::commands::search_common::is_engine_busy_error;
 
 /// In-process (Direct-mode) ledger check — the #248 fix. When no vault-bound
 /// daemon holds the engine, `token check` used to fail open unconditionally

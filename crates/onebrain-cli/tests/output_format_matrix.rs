@@ -215,6 +215,13 @@ fn output_format_matrix_hook_protocol_block_shape_consistent_across_modes() {
 
 fn run(c: &Cmd<'_>, format_flags: &[&str]) -> String {
     let dir = tempdir().unwrap();
+    // Search-cache isolation, mandatory for any test that names a collection
+    // and then runs the binary: several commands OPEN a collection that already
+    // exists under the resolved cache root, and opening is not read-only.
+    // `write_vault_yml` names it `x`, so without this the child reaches the
+    // developer's real index the moment a collection called `x` exists.
+    // Enforced by `tests/cache_isolation_sweep.rs`.
+    let cache = tempdir().unwrap();
     (c.cwd_setup)(dir.path());
 
     let mut all_args: Vec<&str> = c.args.to_vec();
@@ -224,6 +231,7 @@ fn run(c: &Cmd<'_>, format_flags: &[&str]) -> String {
         .unwrap()
         .args(&all_args)
         .current_dir(dir.path())
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
         // Force non-TTY → pure text, no color. Mirrors what hook consumers
         // see when running this from a subprocess pipe.
         .env_remove("CLICOLOR_FORCE")

@@ -390,6 +390,11 @@ fn default_init_with_inline_sync_keeps_template_comments() {
         .current_dir(&vault)
         .env("ONEBRAIN_VAULT_SYNC_FIXTURE", &tarball_path)
         .env("ONEBRAIN_INSTALLED_PLUGINS_PATH", &isolated)
+        // The only `collection:` in this test is the template's COMMENTED
+        // placeholder, so nothing resolves to a real name — this is the
+        // cache-isolation sweep's documented false-positive shape, resolved
+        // the same safe way as a true one.
+        .env("ONEBRAIN_CACHE_DIR", dir.path().join("cache"))
         .output()
         .unwrap();
     assert!(
@@ -410,9 +415,19 @@ fn default_init_with_inline_sync_keeps_template_comments() {
         cfg.contains("# collection:"),
         "commented collection placeholder must survive:\n{cfg}"
     );
+    // Guards that the template's min_score reaches disk VERBATIM rather than
+    // round-tripping through a float serializer (which once turned `0.30` into
+    // `0.3`). Asserted against the constant, not a literal, so the guard
+    // re-arms by itself if the default ever returns to a trailing-zero decimal.
+    // NOTE: while the default is `0.0` the re-serialization teeth are dormant —
+    // `0.0` survives a round-trip unchanged — but the verbatim-emission path is
+    // still exercised.
     assert!(
-        cfg.contains("min_score: 0.30"),
-        "min_score must stay verbatim (not re-serialized to 0.3):\n{cfg}"
+        cfg.contains(&format!(
+            "min_score: {}",
+            onebrain_fs::TEMPLATE_RERANK_MIN_SCORE
+        )),
+        "min_score must stay verbatim (not re-serialized):\n{cfg}"
     );
     assert!(cfg.contains("update_channel: stable"), "{cfg}");
     // Section banners survive end-to-end on disk (comment_lines counts them,
