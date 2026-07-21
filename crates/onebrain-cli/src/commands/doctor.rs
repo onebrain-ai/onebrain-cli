@@ -1691,9 +1691,35 @@ fn lex_index_check(vault_root: &Path) -> DoctorResult {
         .with_hint("onebrain doctor --fix (rebuilds the keyword index from stored metadata; or `onebrain search reindex --force`)")
         .with_details(details);
     }
+    if health.is_underpopulated() {
+        // Issue #298: a shortfall (`lex_docs < chunk_meta`) alone can be a
+        // benign in-flight writer or a corrupt chunk skipped by the last
+        // rebuild — nothing here measures that skew's real distribution, so
+        // a bare shortfall stays silent (falls through to `ok` below) rather
+        // than guessing at a ratio threshold. Paired with `rebuild_pending`
+        // it stops being a guess: the rebuild that would have closed the gap
+        // is stuck, which is the same "exact signal, not an estimate" the
+        // `is_orphaned` / `has_excess_docs` split already relies on.
+        return DoctorResult::warn(
+            LEX_INDEX_CHECK,
+            format!(
+                "keyword index holds {} of {} chunk(s) and a rebuild is still marked pending — \
+                 a shortfall alone can be benign skew, but paired with a stuck rebuild the index \
+                 is genuinely incomplete: roughly {} chunk(s) are missing from keyword search",
+                health.lex_docs,
+                health.chunk_meta,
+                health.chunk_meta - health.lex_docs
+            ),
+        )
+        .with_hint("onebrain search reindex --force")
+        .with_details(details);
+    }
     if health.rebuild_pending {
         // `Engine::open` above already retried the rebuild, so a marker that
-        // survives means the retry itself keeps failing.
+        // survives means the retry itself keeps failing. `is_underpopulated`
+        // above already claimed the shortfall case; this is what's left:
+        // counts matching (or, in principle, excess — already handled above)
+        // with the marker still stuck.
         return DoctorResult::warn(
             LEX_INDEX_CHECK,
             "keyword-index rebuild is still marked pending after a retry — the rebuild is failing"
@@ -8169,6 +8195,18 @@ mod tests {
         3
     }
 
+    /// The issue #298 shortfall state: a real chunk removed from the keyword
+    /// index directly, while `chunk_meta` (redb) — populated the normal way,
+    /// through `indexed_collection` — keeps every row. Unlike
+    /// `empty_the_lex_index`, this leaves the index PARTIALLY populated, so
+    /// `0 < lex_docs < chunk_meta`.
+    fn underpopulate_the_lex_index(tantivy_dir: &Path, chunk_id: &str) {
+        use onebrain_search::lex::LexIndex;
+        let mut lex = LexIndex::open(tantivy_dir).unwrap();
+        lex.delete(chunk_id).unwrap();
+        lex.commit().unwrap();
+    }
+
     fn lex_check_vault() -> (tempfile::TempDir, tempfile::TempDir) {
         let vault = tempdir().unwrap();
         fs::write(
@@ -8252,6 +8290,47 @@ mod tests {
             FixOutcome::Fixed(m) => assert!(m.contains("already healthy"), "{m}"),
             other => panic!("expected an already-healthy Fixed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lex_index_check_stays_silent_on_a_shortfall_with_no_stuck_rebuild() {
+        // Issue #298, the "must NOT flag" half: `lex_docs < chunk_meta` alone
+        // — no `rebuild_pending` marker — can be a benign in-flight writer or
+        // a corrupt chunk the last rebuild already skipped. Nothing here
+        // measures that skew's real distribution, so it must fall through to
+        // the same plain `ok` a fully-populated index gets, not a new warn.
+        let (vault, cache) = lex_check_vault();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        fs::write(
+            vault.path().join("note2.md"),
+            "# Second\nplatypus wombat coyote fixture text\n",
+        )
+        .unwrap();
+        let (_collection, _cache_dir, tantivy_dir) = indexed_collection(vault.path());
+        assert_eq!(lex_index_check(vault.path()).status, DoctorStatus::Ok);
+
+        // Drop one real chunk straight from the keyword index — `chunk_meta`
+        // (redb) is untouched, so this is a genuine shortfall, not damage.
+        underpopulate_the_lex_index(&tantivy_dir, "note2.md#0");
+        assert!(
+            !onebrain_search::lex::rebuild_pending(&tantivy_dir),
+            "no marker must be involved in this shape"
+        );
+
+        let r = lex_index_check(vault.path());
+        assert_eq!(
+            r.status,
+            DoctorStatus::Ok,
+            "a bare shortfall must stay silent: {}",
+            r.message
+        );
+        // The raw counts are still visible in `details` for anyone reading
+        // closely — just not promoted to a warning.
+        assert!(
+            r.details.iter().any(|d| d == "rebuild_pending: false"),
+            "{:?}",
+            r.details
+        );
     }
 
     #[test]

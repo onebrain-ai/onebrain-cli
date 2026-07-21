@@ -229,6 +229,44 @@ impl LexHealth {
     pub fn is_healthy(&self) -> bool {
         !self.is_dead() && !self.has_excess_docs() && !self.rebuild_pending
     }
+
+    /// True for the gap none of the predicates above cover, gated on the one
+    /// exact signal that turns "maybe fine" into "known broken": a shortfall
+    /// (`0 < lex_docs < chunk_meta`) **while a rebuild is still marked
+    /// pending**. [`Self::is_dead`] fires only at exactly zero;
+    /// [`Self::has_excess_docs`] only above `chunk_meta`. A shortfall
+    /// anywhere between used to read as healthy no matter its cause — a
+    /// collection holding 4 000 of 6 679 chunks reported identically to a
+    /// complete one (issue #298).
+    ///
+    /// Deliberately NOT `lex_docs < chunk_meta` alone, and deliberately not a
+    /// ratio threshold: the same reasoning that keeps [`Self::is_dead`] off
+    /// `lex_docs != chunk_meta` applies here — tantivy counts only
+    /// committed, non-deleted docs, so a benign skew (an in-flight writer, a
+    /// chunk skipped as corrupt) legitimately produces a small, harmless
+    /// shortfall on its own. Nothing in this repo measures that skew's real
+    /// distribution, so drawing a ratio line (`< 0.9 *`, or any other
+    /// constant) would ship a warning with an unknown false-positive rate on
+    /// a check users are already calibrated to trust.
+    ///
+    /// `rebuild_pending` is not an estimate — it is [`crate::lex`]'s own
+    /// on-disk marker that a rebuild was started and never confirmed
+    /// complete. Paired with a shortfall it means the rebuild that would
+    /// have closed the gap is stuck: this combination has no benign
+    /// explanation, the same way [`Self::has_excess_docs`] doesn't. A
+    /// shortfall with `rebuild_pending == false` stays silent here — it is
+    /// exactly the shape that may be an in-flight writer or a skipped
+    /// corrupt chunk, and nothing in this type can tell those apart from
+    /// real damage without a threshold.
+    ///
+    /// Not folded into [`Self::is_healthy`] as a widening of `is_dead`: like
+    /// [`Self::is_orphaned`], it earns its own predicate because the ADVICE
+    /// differs — see `doctor::lex_index_check`, which reports it as its own
+    /// warn (`onebrain search reindex --force`) rather than merging it into
+    /// the generic "rebuild still pending" message.
+    pub fn is_underpopulated(&self) -> bool {
+        self.rebuild_pending && self.lex_docs > 0 && self.lex_docs < self.chunk_meta
+    }
 }
 
 /// Live progress events emitted during a reindex so a caller (the CLI) can
@@ -4202,6 +4240,93 @@ mod tests {
     }
 
     #[test]
+    fn lex_health_flags_underpopulation_only_when_a_rebuild_is_stuck() {
+        // Issue #298: a shortfall (0 < lex_docs < chunk_meta) sat in the one
+        // gap `is_dead` (needs exactly 0) and `has_excess_docs` (needs `>`)
+        // don't cover — a collection holding 4 000 of 6 679 chunks used to
+        // report identical to a complete one. Fires only when paired with
+        // `rebuild_pending`, the one exact (non-estimated) signal available.
+        let stuck = LexHealth {
+            lex_docs: 4000,
+            chunk_meta: 6679,
+            rebuild_pending: true,
+        };
+        assert!(stuck.is_underpopulated(), "{stuck:?}");
+        assert!(!stuck.is_healthy(), "{stuck:?}");
+        assert!(!stuck.is_dead(), "{stuck:?}");
+        assert!(!stuck.has_excess_docs(), "{stuck:?}");
+
+        // The half that gets skipped: shapes that must NOT fire.
+        //
+        // A benign small skew alone — no rebuild marked pending — is exactly
+        // the shape this predicate is deliberately silent on: an in-flight
+        // writer or a corrupt chunk skipped by the last rebuild, with no
+        // measured false-positive rate to hang a threshold on.
+        let benign_skew = LexHealth {
+            lex_docs: 6270,
+            chunk_meta: 6271,
+            rebuild_pending: false,
+        };
+        assert!(
+            !benign_skew.is_underpopulated(),
+            "shortfall alone, no stuck rebuild, must stay silent: {benign_skew:?}"
+        );
+        assert!(benign_skew.is_healthy(), "{benign_skew:?}");
+
+        // A healthy, fully-populated index — pending or not — has no
+        // shortfall to report.
+        for rebuild_pending in [false, true] {
+            let healthy = LexHealth {
+                lex_docs: 6679,
+                chunk_meta: 6679,
+                rebuild_pending,
+            };
+            assert!(
+                !healthy.is_underpopulated(),
+                "matching counts are not a shortfall: {healthy:?}"
+            );
+        }
+
+        // Legitimately empty (nothing indexed yet) is not underpopulation —
+        // there are zero chunks to be short of.
+        let empty = LexHealth {
+            lex_docs: 0,
+            chunk_meta: 0,
+            rebuild_pending: true,
+        };
+        assert!(
+            !empty.is_underpopulated(),
+            "an empty collection has no chunks to be short of: {empty:?}"
+        );
+
+        // `is_dead` (lex_docs == 0, chunk_meta > 0) already owns this shape
+        // as its own error — `is_underpopulated` must not double-fire on it.
+        let dead = LexHealth {
+            lex_docs: 0,
+            chunk_meta: 6679,
+            rebuild_pending: true,
+        };
+        assert!(dead.is_dead(), "{dead:?}");
+        assert!(
+            !dead.is_underpopulated(),
+            "is_dead already owns the zero-docs case: {dead:?}"
+        );
+
+        // Excess docs, even with a stuck rebuild, is `has_excess_docs`'s
+        // territory, not a shortfall.
+        let excess = LexHealth {
+            lex_docs: 9000,
+            chunk_meta: 6679,
+            rebuild_pending: true,
+        };
+        assert!(excess.has_excess_docs(), "{excess:?}");
+        assert!(
+            !excess.is_underpopulated(),
+            "excess docs is not a shortfall: {excess:?}"
+        );
+    }
+
+    #[test]
     fn repopulate_skips_a_corrupt_chunk_meta_record() {
         // B1 part 3: `serde_json::from_str(..)?` inside the repopulate aborted
         // `Engine::open` itself — and it runs AFTER the wipe, so a single
@@ -4240,6 +4365,62 @@ mod tests {
             "exactly the corrupt row should be missing: {health:?}"
         );
         assert!(!health.is_dead());
+    }
+
+    #[test]
+    fn engine_open_can_produce_a_genuinely_underpopulated_index() {
+        // Proves `is_underpopulated` is reachable through the real repair
+        // path, not just a hand-built `LexHealth` — combining two failure
+        // modes already proven independently elsewhere in this file: a
+        // rebuild that skips a corrupt `chunk_meta` row (same technique as
+        // `repopulate_skips_a_corrupt_chunk_meta_record`, leaving `lex_docs <
+        // chunk_meta`) whose marker ALSO can't clear (same unremovable-
+        // directory stand-in as
+        // `a_post_commit_marker_clear_failure_does_not_fail_the_open`). Both
+        // land on disk at once: a genuine shortfall next to a stuck marker —
+        // exactly the combination issue #298's fix warns on.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut e = fake_engine(dir.path());
+            e.index_doc("rust.md", "# Rust\nerror handling and memory safety")
+                .unwrap();
+            e.index_doc("cook.md", "# Cooking\npasta recipe with tomato")
+                .unwrap();
+            // Genuinely malformed: not JSON at all, under a plausible key.
+            let write_txn = e.meta.begin_write().unwrap();
+            {
+                let mut t = write_txn.open_table(CHUNK_META).unwrap();
+                t.insert("broken.md#0", "{not json at all").unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        let tantivy_dir = simulate_interrupted_lex_migration(dir.path());
+        let marker = lex::rebuild_marker_path(&tantivy_dir);
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir_all(marker.join("occupied")).unwrap();
+        assert!(
+            lex::clear_rebuild_marker(&tantivy_dir).is_err(),
+            "the marker must be genuinely unremovable or this test proves nothing"
+        );
+
+        // The open must still succeed: skip-not-fail on the corrupt row, warn
+        // (not error) on the unremovable marker.
+        let e = fake_engine(dir.path());
+        let health = e.lex_health().unwrap();
+        assert!(health.rebuild_pending, "{health:?}");
+        assert_eq!(
+            health.lex_docs + 1,
+            health.chunk_meta,
+            "exactly the corrupt row should be missing: {health:?}"
+        );
+        assert!(!health.is_dead(), "{health:?}");
+        assert!(!health.has_excess_docs(), "{health:?}");
+        assert!(
+            health.is_underpopulated(),
+            "a real shortfall plus a stuck marker must flag: {health:?}"
+        );
+        assert!(!health.is_healthy(), "{health:?}");
     }
 
     #[test]
