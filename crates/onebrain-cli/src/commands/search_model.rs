@@ -20,7 +20,7 @@ use serde::Serialize;
 
 use crate::cli::{ModelSortCol, SearchModelListArgs, SearchModelRemoveArgs, SearchModelSetArgs};
 use crate::commands::search_common::{
-    collection_cache_dir, collection_for, format_size, open_engine,
+    collection_cache_dir, collection_for, collection_name_readonly, format_size, open_engine,
 };
 use crate::output::{emit, Envelope, OutputMode};
 use onebrain_core::load_vault_config;
@@ -109,6 +109,17 @@ struct ModelListData {
 /// per-model download status (`downloaded` / `disk_bytes`) computed by a pure
 /// `std::fs` scan of the collection cache dir. Optional `--sort <col>`
 /// reorders the rows.
+///
+/// The collection is resolved READ-ONLY. Until v3.4.17 this called the
+/// persisting [`collection_for`], contradicting the "never writes anything"
+/// contract above: on a vault with no `search.collection`, merely LISTING
+/// models auto-generated `<dir>-<hash>` and wrote it into `onebrain.yml`,
+/// round-tripping the whole file through serde — which strips the comments
+/// out of a commented template. `run_bare`'s non-TTY branch routes here, so
+/// the write fired for every agent, hook and CI invocation of bare `onebrain
+/// search model`, not just the explicit `list` subcommand. Nothing here needs
+/// the name persisted: it is used only to locate the cache dir for a size
+/// scan, and `collection_name_readonly` returns the identical name.
 pub fn run_list(
     vault_flag: Option<PathBuf>,
     mode: &OutputMode,
@@ -117,7 +128,8 @@ pub fn run_list(
     let resolved = crate::vault_ctx::require(vault_flag)?;
     let vault_info = crate::vault_ctx::info_from(&resolved);
     let config = load_vault_config(&resolved.root).context("load vault config")?;
-    let collection = collection_for(&resolved).context("resolve collection")?;
+    let collection =
+        collection_name_readonly(resolved.root.as_path()).context("resolve collection")?;
     let cache_dir = collection_cache_dir(&collection);
 
     let mut models: Vec<ModelListEntry> = model_registry()
