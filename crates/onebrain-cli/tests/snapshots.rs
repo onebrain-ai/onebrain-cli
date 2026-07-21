@@ -1,3 +1,5 @@
+mod support;
+
 use assert_cmd::Command;
 use insta::{assert_json_snapshot, assert_snapshot};
 use serde_json::Value;
@@ -139,6 +141,7 @@ fn register_hooks_fresh_install_snapshot() {
     fs::write(d.path().join("vault.yml"), "method: onebrain\n").unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-hooks", "--vault", d.path().to_str().unwrap()])
         .assert()
         .success();
@@ -238,6 +241,7 @@ fn vault_sync_happy_path_stdout_snapshot() {
 
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .arg("vault-sync")
         .current_dir(&vault)
         .env(

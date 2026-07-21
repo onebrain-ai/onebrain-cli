@@ -2,6 +2,8 @@
 //! CLI binary against a mock `claude` shell script, asserts argv + exit
 //! codes match Bun behavior. No real `claude` binary required.
 
+mod support;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
@@ -54,6 +56,7 @@ fn missing_config_exits_64() {
     let bogus = d.path().join("does-not-exist");
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "run-skill",
             "--vault",
@@ -83,6 +86,7 @@ fn happy_path_passes_canonical_argv_and_cwd() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "run-skill",
             "--vault",
@@ -132,6 +136,7 @@ fn args_are_appended_as_key_value_tokens() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "run-skill",
             "--vault",
@@ -169,6 +174,7 @@ fn child_exit_code_is_propagated() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "run-skill",
             "--vault",
@@ -195,6 +201,7 @@ fn sigterm_maps_to_143() {
     let mock = write_mock_claude(d.path(), "#!/bin/bash\nkill -TERM $$\nsleep 5\nexit 0\n");
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "run-skill",
             "--vault",
@@ -227,6 +234,7 @@ fn spawn_failure_maps_to_127() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "run-skill",
             "--vault",
@@ -249,6 +257,7 @@ fn empty_skill_returns_error() {
     write_minimal_vault(&vault);
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "run-skill",
             "--vault",
@@ -270,6 +279,7 @@ fn malformed_arg_returns_error() {
     write_minimal_vault(&vault);
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "run-skill",
             "--vault",
@@ -300,6 +310,7 @@ fn argv_snapshot_canonical_invocation() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "run-skill",
             "--vault",
@@ -344,6 +355,7 @@ fn claude_bin_env_missing_emits_warning() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "run-skill",
             "--vault",
@@ -391,6 +403,7 @@ fn gemini_harness_passes_include_directories_and_yolo() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         // `skill run` accepts `--harness`; the legacy `run-skill` does not.
         .args([
             "skill",
@@ -455,6 +468,7 @@ fn gemini_harness_propagates_non_zero_exit() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "skill",
             "run",
@@ -485,6 +499,7 @@ fn gemini_harness_spawn_failure_maps_to_127() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "skill",
             "run",
@@ -513,6 +528,7 @@ fn gemini_harness_appends_model_flag() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "skill",
             "run",
@@ -563,6 +579,7 @@ fn non_interactive_path_propagates_child_stdout() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "run-skill",
             "--vault",
@@ -590,6 +607,7 @@ fn non_interactive_path_child_stderr_reaches_stderr() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "run-skill",
             "--vault",
@@ -620,6 +638,7 @@ fn headless_env_var_is_set_on_child() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "run-skill",
             "--vault",
@@ -653,6 +672,7 @@ fn onebrain_bindir_is_prepended_to_child_path() {
     // it gets added back rather than merely surviving inheritance.
     let assert = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "run-skill",
             "--vault",
@@ -694,6 +714,7 @@ fn skill_run_passes_json_flag_to_claude() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "skill",
             "run",
@@ -730,6 +751,7 @@ fn skill_run_passes_model_to_claude() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "skill",
             "run",

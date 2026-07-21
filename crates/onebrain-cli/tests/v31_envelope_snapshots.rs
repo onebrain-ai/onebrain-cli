@@ -16,6 +16,8 @@
 //! must update the snapshots intentionally (`cargo insta review`) and CI
 //! will surface the drift before merge.
 
+mod support;
+
 use assert_cmd::Command;
 use insta::assert_json_snapshot;
 use serde_json::Value;
@@ -251,6 +253,7 @@ fn checkpoint_stop_envelope_when_threshold_hit() {
 
     let output = assert_cmd::Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "checkpoint",
             "stop",

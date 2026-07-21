@@ -116,6 +116,25 @@ pub(super) fn open_held_token_cache(vault_root: &Path) -> Option<Arc<TokenCache>
 fn try_open_held_token_cache(vault_root: &Path) -> anyhow::Result<TokenCache> {
     let collection = collection_name_readonly(vault_root)?;
     let cache_dir = collection_cache_dir(&collection);
+    // The daemon opens `token.redb` INSIDE an existing collection; it never
+    // brings a collection into existence (#300). Before this guard, every
+    // `onebrain serve` boot ran `create_dir_all(<cache_root>/<collection>/token)`
+    // unconditionally — so a `serve` against a throwaway tempdir vault
+    // materialized a permanent `<cache_root>/.tmpXXXXXX-<hash>/token/` in the
+    // developer's real search-cache root. Two per workspace test run; 125 dirs
+    // / 124 MB had accumulated when the leak was found.
+    //
+    // Bailing here is not a new failure mode — it is the one this function's
+    // caller already documents: a never-indexed vault leaves the held cache
+    // `None` and `/api/token/*` reports 503 "daemon holds no token cache". The
+    // only change is that the never-indexed case now takes that branch instead
+    // of quietly creating the collection to avoid it.
+    anyhow::ensure!(
+        cache_dir.is_dir(),
+        "collection {collection} has no cache dir at {} — vault not indexed yet, \
+         so there is no collection to hold a token cache for",
+        cache_dir.display()
+    );
     let db_path = token_db_path(&cache_dir);
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -515,6 +534,11 @@ mod tests {
     /// A vault with a config + an isolated cache dir; the held daemon opens
     /// both the engine and the token cache. No `token_optimization` block, so
     /// the level resolves to the product default `conservative`.
+    ///
+    /// The collection's cache dir is created because these tests model an
+    /// INDEXED vault: since #300 the daemon opens `token.redb` inside an
+    /// existing collection and refuses to mint one (see
+    /// [`try_open_held_token_cache`]).
     fn vault_and_cache() -> (tempfile::TempDir, tempfile::TempDir) {
         let vault = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -523,6 +547,7 @@ mod tests {
         )
         .unwrap();
         let cache = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cache.path().join("search").join("token-api-test")).unwrap();
         (vault, cache)
     }
 
@@ -539,6 +564,7 @@ mod tests {
         )
         .unwrap();
         let cache = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cache.path().join("search").join("token-api-test")).unwrap();
         (vault, cache)
     }
 
@@ -553,6 +579,33 @@ mod tests {
         let (vault, cache) = vault_and_cache();
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         assert!(open_held_token_cache(vault.path()).is_some());
+    }
+
+    /// #300: a configured vault that has never been indexed has no collection
+    /// cache dir, and the daemon must NOT create one just to hold a token
+    /// cache. It degrades to `None` — the same graceful path the routes already
+    /// document as 503 "daemon holds no token cache" — and, critically, leaves
+    /// the cache root completely untouched.
+    #[test]
+    fn open_held_token_cache_none_when_collection_never_indexed_and_creates_nothing() {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: never-indexed-test\n",
+        )
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+
+        assert!(open_held_token_cache(vault.path()).is_none());
+        assert!(
+            !cache.path().join("search").exists(),
+            "the daemon must not create anything under the cache root for a \
+             never-indexed vault; found {:?}",
+            std::fs::read_dir(cache.path().join("search"))
+                .map(|rd| rd.flatten().map(|e| e.path()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        );
     }
 
     #[tokio::test]

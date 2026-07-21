@@ -24,6 +24,8 @@
 //! In both, `--port` forces the standalone bind path (skips daemon routing
 //! entirely — see `wants_daemon_routing` in `serve.rs`).
 
+mod support;
+
 use assert_cmd::Command;
 use std::fs;
 use std::net::TcpListener;
@@ -49,6 +51,7 @@ fn serve_bind_failure_prints_no_success_banner_before_the_error() {
 
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(vault.path())
         .env_remove("ONEBRAIN_VAULT")
         // `serve --port` always means standalone (never a daemon route), so
@@ -127,6 +130,7 @@ fn serve_successful_bind_prints_the_banner() {
     let stdout_path = vault.path().join("serve-stdout.log");
     let stdout_file = fs::File::create(&stdout_path).unwrap();
     let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("onebrain"))
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(vault.path())
         .env_remove("ONEBRAIN_VAULT")
         .env("ONEBRAIN_NO_DAEMON", "1")

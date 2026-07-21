@@ -6,6 +6,8 @@
 //! the default fetch hook reads instead of hitting GitHub. Pin-step isolation
 //! comes from `ONEBRAIN_INSTALLED_PLUGINS_PATH` and the cache-dir override.
 
+mod support;
+
 use assert_cmd::Command;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -84,6 +86,7 @@ fn run_sync(
     let isolated = vault.join(".isolated-installed_plugins.json");
 
     let mut cmd = Command::cargo_bin("onebrain").unwrap();
+    cmd.env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root());
     cmd.arg("vault-sync")
         .current_dir(vault)
         .env(
@@ -161,6 +164,7 @@ fn download_failure_exits_non_zero() {
     let isolated = vault.join(".isolated-installed_plugins.json");
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .arg("vault-sync")
         .current_dir(&vault)
         .env(
@@ -192,6 +196,7 @@ fn missing_fixture_path_exits_one_with_stderr_message() {
     let isolated = vault.join(".isolated-installed_plugins.json");
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .arg("vault-sync")
         .current_dir(&vault)
         .env("ONEBRAIN_VAULT_SYNC_FIXTURE", "/this/does/not/exist.tar.gz")
@@ -249,6 +254,7 @@ fn branch_flag_overrides_update_channel() {
 
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .arg("vault-sync")
         .arg("--branch")
         .arg("next")
@@ -282,6 +288,7 @@ fn branch_flag_requires_value() {
 
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .arg("vault-sync")
         .arg("--branch") // no value
         .current_dir(&vault)

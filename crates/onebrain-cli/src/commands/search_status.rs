@@ -17,8 +17,8 @@ use onebrain_core::path::ResolvedVault;
 use serde::Serialize;
 
 use crate::commands::search_common::{
-    collection_cache_dir, collection_for, format_size, index_size_bytes, read_reindex_progress,
-    resolve_collection, ReindexLiveProgress,
+    collection_cache_dir, collection_name_readonly, format_size, index_size_bytes,
+    read_reindex_progress, resolve_collection, ReindexLiveProgress,
 };
 use crate::output::{emit, item, section, Envelope, OutputMode};
 use onebrain_core::load_vault_config;
@@ -456,7 +456,12 @@ pub(crate) fn status_data_for(
     engine: &Engine,
     resolved: &ResolvedVault,
 ) -> Result<SearchStatusData> {
-    let collection = collection_for(resolved)?;
+    // Read-only resolution (#300): this is the MCP `status` tool's data
+    // builder — an agent-facing read must not rewrite `onebrain.yml`. The
+    // caller's engine open already resolved (and, if unset, persisted) the
+    // name, so this call was a redundant second write either way; the resolver
+    // returns the identical string without one.
+    let collection = collection_name_readonly(resolved.root.as_path())?;
     let config = load_vault_config(&resolved.root)?;
 
     let (cache_dir, model_size_bytes, model_downloaded_at, index_size_bytes) = {
@@ -552,7 +557,11 @@ pub(crate) fn status_data_from_daemon(
     resolved: &ResolvedVault,
     counts: DaemonStatusCounts,
 ) -> Result<SearchStatusData> {
-    let collection = collection_for(resolved)?;
+    // Read-only resolution (#300). This path opens NO engine — it is pure fs
+    // reads behind the MCP `status` tool in daemon mode, so persisting a
+    // generated `search.collection` here would be a config write with no
+    // index-establishing act behind it at all.
+    let collection = collection_name_readonly(resolved.root.as_path())?;
     let config = load_vault_config(&resolved.root)?;
 
     let dir = collection_cache_dir(&collection);

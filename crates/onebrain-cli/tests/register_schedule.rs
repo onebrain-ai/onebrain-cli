@@ -6,6 +6,8 @@
 //! the real LaunchAgents directory is untouched. `dirs::home_dir()` reads
 //! `$HOME` on Unix, which is the standard isolation pattern.
 
+mod support;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::Path;
@@ -31,6 +33,7 @@ fn dry_run_emits_plist_to_stdout() {
     let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n");
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -47,6 +50,7 @@ fn one_shot_dry_run_emits_year_field_and_self_delete_wrapper() {
     let v = write_skill_vault("schedule:\n  - at: \"2026-05-13 14:30\"\n    skill: /daily\n");
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -64,6 +68,7 @@ fn status_lists_entries_with_cron_tag() {
     let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n");
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--status"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -89,6 +94,7 @@ fn remove_deletes_plists_from_launch_agents() {
     // First write the plist (no --dry-run).
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule"])
         .current_dir(v.path())
         .env("HOME", home.path())
@@ -102,6 +108,7 @@ fn remove_deletes_plists_from_launch_agents() {
     // Now remove it.
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--remove"])
         .current_dir(v.path())
         .env("HOME", home.path())
@@ -121,6 +128,7 @@ fn resume_clears_paused_marker_file() {
     std::fs::write(&marker, "paused at 2026-05-19\n").unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--resume", "/daily"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -153,6 +161,7 @@ fn skill_and_command_with_same_basename_no_longer_collide() {
     .unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -179,6 +188,7 @@ fn command_mode_entries_same_binary_different_args_no_collision() {
     .unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -205,6 +215,7 @@ fn command_mode_entries_fully_identical_still_collide() {
     .unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -230,6 +241,7 @@ fn command_mode_dry_run_produces_hook_style_argv() {
     .unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -263,6 +275,7 @@ fn command_mode_onebrain_dry_run_embeds_vault() {
     .unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -285,6 +298,7 @@ fn unschedulable_skill_rejected() {
     .unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -321,6 +335,7 @@ fn stale_legacy_plist_removed_on_reregister() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule"])
         .current_dir(v.path())
         .env("HOME", home.path())
@@ -352,6 +367,7 @@ fn one_shot_command_rejects_shell_special_chars() {
     .unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -373,6 +389,7 @@ fn refresh_emits_notice_line() {
     write_skill(v.path(), "daily", "name: daily\nschedulable: true");
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--refresh", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -393,6 +410,7 @@ fn status_shows_once_tag_for_at_entries() {
     write_skill(v.path(), "daily", "name: daily\nschedulable: true");
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--status"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -413,6 +431,7 @@ fn status_shows_skill_args_in_parens() {
     write_skill(v.path(), "distill", "name: distill\nschedulable: true");
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--status"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -436,6 +455,7 @@ fn status_shows_cmd_label_for_command_mode_entry() {
     .unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--status"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -458,6 +478,7 @@ fn status_shows_cmd_with_args() {
     .unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--status"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -478,6 +499,7 @@ fn resume_when_not_paused_prints_not_paused() {
     // No marker file created — skill is not paused.
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--resume", "/daily"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -493,6 +515,7 @@ fn empty_schedule_block_exits_cleanly() {
     std::fs::write(v.path().join("onebrain.yml"), "# no schedule key\n").unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -513,6 +536,7 @@ fn invalid_cron_produces_error() {
     .unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -539,6 +563,7 @@ fn schedulable_with_args_missing_required_arg_fails() {
     .unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -561,6 +586,7 @@ fn skill_no_schedulable_key_fails() {
     .unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -581,6 +607,7 @@ fn skill_mode_args_with_shell_special_rejected() {
     .unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -601,6 +628,7 @@ fn test_run_missing_skill_fails_with_message() {
     write_skill(v.path(), "daily", "name: daily\nschedulable: true");
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--test", "/nonexistent"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -625,6 +653,7 @@ fn remove_when_no_plists_exits_cleanly() {
     // No plist was ever written → remove should be a no-op exit 0.
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--remove"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -648,6 +677,7 @@ fn registration_writes_plist_file() {
     let home = tempdir().unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule"])
         .current_dir(v.path())
         .env("HOME", home.path())
@@ -678,6 +708,7 @@ fn status_marks_installed_and_uninstalled() {
     // Before registration → uninstalled (✗)
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--status"])
         .current_dir(v.path())
         .env("HOME", home.path())
@@ -688,6 +719,7 @@ fn status_marks_installed_and_uninstalled() {
     // Register it
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule"])
         .current_dir(v.path())
         .env("HOME", home.path())
@@ -697,6 +729,7 @@ fn status_marks_installed_and_uninstalled() {
     // After registration → installed (✓)
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--status"])
         .current_dir(v.path())
         .env("HOME", home.path())
@@ -714,6 +747,7 @@ fn step_cron_dry_run_emits_array_form_calendar_interval() {
     let v = write_skill_vault("schedule:\n  - cron: \"0 */6 * * *\"\n    skill: /daily\n");
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -733,6 +767,7 @@ fn list_cron_dry_run_succeeds() {
     let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * 1,3,5\"\n    skill: /daily\n");
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -747,6 +782,7 @@ fn range_cron_dry_run_succeeds() {
     let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * 1-5\"\n    skill: /daily\n");
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -763,6 +799,7 @@ fn plain_cron_dry_run_still_emits_single_dict_form() {
     let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n");
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
@@ -782,6 +819,7 @@ fn pathological_cron_expansion_rejected() {
     let v = write_skill_vault("schedule:\n  - cron: \"*/1 */1 * * *\"\n    skill: /daily\n");
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())

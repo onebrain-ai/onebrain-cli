@@ -32,7 +32,7 @@ use onebrain_token::{
 };
 
 use super::daemon_client::DaemonHandle;
-use super::search_common::{collection_cache_dir, collection_for};
+use super::search_common::{collection_cache_dir, collection_name_readonly};
 
 /// Best-effort session-token resolution for the ledger (design §3b) — the same
 /// resolution the daemon client uses. `None` when no token is resolvable
@@ -46,13 +46,47 @@ pub fn resolve_session_token_opt() -> Option<String> {
 }
 
 /// `<collection_cache>/token/token.redb` for the Direct-mode memo + ledger (the
-/// daemon owns this file in daemon mode). Creates the parent dir. `None` when
-/// the collection can't be resolved.
+/// daemon owns this file in daemon mode). **Pure path resolution: creates
+/// nothing, writes nothing.** `None` when the collection can't be resolved.
+///
+/// Two deliberate properties, both of them the defect in issue #300:
+///
+/// 1. The collection resolves through the NON-persisting
+///    [`collection_name_readonly`], not `collection_for`. A read tool
+///    (`memo_get`, a ledger probe) must never rewrite the user's
+///    `onebrain.yml`: `collection_for` auto-generates `<dir>-<hash>` and
+///    persists it, re-serializing the whole config through serde and stripping
+///    a commented template's comments. The server side already resolves
+///    read-only everywhere (`server/token_api.rs`) — this follows it.
+/// 2. It does NOT create the directory. Creation is gated on the CALLER's
+///    intent via [`token_db_path_for_write`] rather than deferred into the
+///    first `TokenCache` write, because `TokenCache::open` creates the redb
+///    file itself and needs its parent to exist; pushing the `mkdir` down into
+///    the token crate would buy nothing. Gating at the call site is what makes
+///    the read paths provably side-effect-free — `onebrain serve` reached this
+///    function at startup with no engine open and materialized
+///    `<cache_root>/<generated>/token/` in the developer's REAL cache root on
+///    every test-suite run (125 leaked dirs / 124 MB before the fix).
 pub fn token_db_path(resolved: &ResolvedVault) -> Option<PathBuf> {
-    let collection = collection_for(resolved).ok()?;
-    let dir = collection_cache_dir(&collection).join("token");
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir.join("token.redb"))
+    let collection = collection_name_readonly(resolved.root.as_path()).ok()?;
+    Some(
+        collection_cache_dir(&collection)
+            .join("token")
+            .join("token.redb"),
+    )
+}
+
+/// [`token_db_path`] for callers that are about to WRITE (a memo put, a ledger
+/// record): the same path, with the parent dir created first because
+/// `TokenCache::open` creates the redb file and needs it. `None` when the
+/// collection can't be resolved or the dir can't be created.
+///
+/// Every caller must genuinely intend a write — the point of the split is that
+/// a pure read never materializes a cache dir.
+pub fn token_db_path_for_write(resolved: &ResolvedVault) -> Option<PathBuf> {
+    let path = token_db_path(resolved)?;
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    Some(path)
 }
 
 /// Resolve the effective optimization level with the design precedence:
@@ -134,8 +168,14 @@ pub fn ctx_for(
 /// `<collection_cache>/token/gain/` for this vault, or `None` when the
 /// collection can't be resolved (no search configured) — in which case there's
 /// nothing to meter against and the surface simply skips gain recording.
+///
+/// Resolves read-only for the same reason as [`token_db_path`] (#300): metering
+/// is a side channel and must not rewrite `onebrain.yml`. The directory itself
+/// is still created lazily by `JsonlGainWriter` on its first actual append
+/// (`gain/writer.rs` `create_dir_all`), so a vault that never records a gain
+/// event never gets a dir — no `mkdir` belongs here.
 pub fn gain_dir(resolved: &ResolvedVault) -> Option<PathBuf> {
-    let collection = collection_for(resolved).ok()?;
+    let collection = collection_name_readonly(resolved.root.as_path()).ok()?;
     Some(collection_cache_dir(&collection).join("token").join("gain"))
 }
 
@@ -297,7 +337,9 @@ pub fn direct_ledger_reference(
     // only ever gates on a genuine identity match.
     let hash = doc_hash?;
     let session = resolve_session_token_opt()?;
-    let db_path = token_db_path(resolved)?;
+    // Write path: this records a ledger entry on FirstSend/Changed, so it may
+    // legitimately create the collection's `token/` dir (#300).
+    let db_path = token_db_path_for_write(resolved)?;
     // Per-call open: redb's non-blocking exclusive flock means two concurrent
     // tool calls can make one open silently no-op — but it FAILS SAFE (full
     // body, never a wrong answer). A shared cache handle is a v3.4.11 follow-up.

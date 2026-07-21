@@ -19,6 +19,8 @@
 //! library) is too invasive · instead each test uses `--check` to short
 //! circuit before install.
 
+mod support;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 
@@ -55,6 +57,7 @@ fn update_check_prints_latest_version_from_mocked_github() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["update", "--check"])
         .env(TAG_URL_ENV, &url)
         .assert()
@@ -75,6 +78,7 @@ fn update_check_exits_1_when_github_returns_503() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["update", "--check"])
         .env(TAG_URL_ENV, &url)
         .assert()
@@ -89,6 +93,7 @@ fn update_check_exits_1_when_payload_missing_tag_name() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["update", "--check"])
         .env(TAG_URL_ENV, &url)
         .assert()
@@ -109,6 +114,7 @@ fn update_check_is_idempotent_no_side_effects() {
     for _ in 0..2 {
         Command::cargo_bin("onebrain")
             .unwrap()
+            .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
             .args(["update", "--check"])
             .env(TAG_URL_ENV, &url)
             .assert()
@@ -121,6 +127,7 @@ fn update_check_is_idempotent_no_side_effects() {
 fn update_help_includes_check_flag() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["update", "--help"])
         .assert()
         .success()
@@ -132,6 +139,7 @@ fn update_network_unreachable_exits_1() {
     // 127.0.0.1:1 is reserved · TCP connect will fail fast.
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["update", "--check"])
         .env(
             TAG_URL_ENV,
@@ -152,6 +160,7 @@ fn update_network_unreachable_exits_1() {
 fn real_binary_version_output_passes_update_validator() {
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .arg("--version")
         .output()
         .unwrap();

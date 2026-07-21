@@ -2,10 +2,13 @@
 //! must fail with a helpful "use `onebrain search …`" message, not a bare
 //! clap "unrecognized subcommand", and not a panic.
 
+mod support;
+
 use std::process::Command;
 
 fn run(args: &[&str]) -> (bool, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_onebrain"))
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(args)
         .output()
         .unwrap();

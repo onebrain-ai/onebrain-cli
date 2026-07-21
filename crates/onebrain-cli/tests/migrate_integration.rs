@@ -2,6 +2,8 @@
 //! CLI end-to-end against synthetic vaults in tempdirs. Mirrors the
 //! corresponding `migrate.test.ts` (Bun) scenarios.
 
+mod support;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
@@ -31,6 +33,7 @@ fn migrate_empty_logs_outputs_zero_summary() {
     write_minimal_vault(d.path());
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(d.path())
         .args(["migrate", "backfill-recapped"])
         .assert()
@@ -46,6 +49,7 @@ fn migrate_accepts_positional_cutoff_date() {
     write_minimal_vault(d.path());
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(d.path())
         .args(["migrate", "backfill-recapped", "2026-01-01"])
         .assert()
@@ -62,6 +66,7 @@ fn migrate_rejects_both_positional_and_flag_cutoff() {
     write_minimal_vault(d.path());
     let assert = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(d.path())
         .args([
             "migrate",
@@ -96,6 +101,7 @@ fn migrate_backfills_session_log_missing_recapped() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(d.path())
         .args(["migrate", "backfill-recapped"])
         .assert()
@@ -112,6 +118,7 @@ fn migrate_unknown_name_warns_exits_0() {
     write_minimal_vault(d.path());
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(d.path())
         .args(["migrate", "not-a-real-migration"])
         .assert()
@@ -125,6 +132,7 @@ fn migrate_missing_vault_yml_warns_exits_0() {
     let d = tempdir().unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(d.path())
         .args(["migrate", "backfill-recapped"])
         .assert()
@@ -152,6 +160,7 @@ fn migrate_cutoff_flag_respected() {
 
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(d.path())
         .args(["migrate", "backfill-recapped", "--cutoff", "2026-04-22"])
         .assert()
@@ -178,6 +187,7 @@ fn migrate_vault_flag_overrides_cwd() {
     let elsewhere = tempdir().unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(elsewhere.path())
         .args([
             "migrate",

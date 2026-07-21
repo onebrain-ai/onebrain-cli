@@ -1,3 +1,5 @@
+mod support;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::PathBuf;
@@ -12,6 +14,7 @@ fn fixture(name: &str) -> PathBuf {
 fn reset_emits_no_stdout() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["checkpoint", "reset"])
         .current_dir(fixture("empty_vault"))
         .assert()
@@ -29,6 +32,7 @@ fn unknown_mode_is_rejected_by_clap_in_v31() {
     // standard.
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["checkpoint", "xyzbadmode"])
         .current_dir(fixture("empty_vault"))
         .assert()
@@ -41,6 +45,7 @@ fn unknown_mode_is_rejected_by_clap_in_v31() {
 fn stop_with_fresh_state_emits_no_stdout() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["checkpoint", "stop"])
         .current_dir(fixture("empty_vault"))
         .assert()

@@ -46,7 +46,9 @@ use onebrain_token::{CacheKind, GainEvent, OptLevel, ReferenceEnvelope, Surface}
 
 use crate::commands::daemon_client::{self, DaemonHandle};
 use crate::commands::search_common::{daemon_routing_disabled, normalize_doc_path, open_engine};
-use crate::commands::token_runner::{record_gain, resolve_session_token_opt, token_db_path};
+use crate::commands::token_runner::{
+    record_gain, resolve_session_token_opt, token_db_path_for_write,
+};
 
 /// Default wall-clock budget for the whole daemon round-trip (design §5b:
 /// "decision target <200ms") when the vault config can't be read. Enforced
@@ -361,7 +363,9 @@ fn check_direct(resolved: &ResolvedVault, path: &str) -> CheckOutcome {
     };
 
     // Open the Direct-mode token ledger (`token.redb`) and classify the send.
-    let Some(db_path) = token_db_path(resolved) else {
+    // Write variant: the classify records the send on FirstSend/Changed, so the
+    // collection's `token/` dir may legitimately be created here (#300).
+    let Some(db_path) = token_db_path_for_write(resolved) else {
         return CheckOutcome::FailOpen("no_collection");
     };
     let Ok(cache) = onebrain_token::TokenCache::open(&db_path) else {

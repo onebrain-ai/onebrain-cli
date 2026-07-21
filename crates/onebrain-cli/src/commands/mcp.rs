@@ -25,8 +25,8 @@ use onebrain_token::{CacheKind, GainEvent, MemoKey, OptLevel, ReferenceEnvelope,
 
 use super::daemon_client::{self, DaemonHandle};
 use super::search_common::{
-    collection_cache_dir, collection_for, index_artifact_path, normalize_doc_path, open_engine,
-    open_lex_migrating,
+    collection_cache_dir, collection_name_readonly, index_artifact_path, normalize_doc_path,
+    open_engine, open_lex_migrating_with_collection,
 };
 use super::search_status::{
     status_data_for, status_data_from_daemon, DaemonStatusCounts, SearchStatusData,
@@ -558,9 +558,18 @@ fn no_index_note() -> String {
 /// same as `run_lex`'s output (see its comment on why: that metadata lives in
 /// the engine's redb, which this path deliberately never opens).
 fn lex_subquery(resolved: &ResolvedVault, text: &str, top_k: usize) -> anyhow::Result<Vec<Hit>> {
-    let collection = collection_for(resolved)?;
+    // Read-only resolution (#298 item 4 / #300): an MCP `query` is a read tool
+    // and must not rewrite the user's `onebrain.yml`. The persisting
+    // `collection_for` auto-generates `<dir>-<hash>`, writes it to config, and
+    // strips a commented template's comments on the way through serde. The
+    // heal path moves to the non-persisting twin for the same reason. Fixing
+    // this alone was not enough: the SAME request also resolves a collection in
+    // `memo_get`/`memo_put` (`token_runner::token_db_path`) and in `query`
+    // below, so all three moved together.
+    let root = resolved.root.as_path();
+    let collection = collection_name_readonly(root)?;
     let cache_dir = collection_cache_dir(&collection);
-    let lex = open_lex_migrating(&cache_dir, resolved)
+    let lex = open_lex_migrating_with_collection(&cache_dir, root, &collection)
         .with_context(|| format!("opening lex index at {}", cache_dir.display()))?;
     let raw_hits = lex.search(text, top_k)?;
     Ok(raw_hits
@@ -830,7 +839,7 @@ impl McpServer {
     /// Store `results` under `key` (Direct mode). Best-effort — a write failure
     /// is swallowed so a cache hiccup never fails a live query.
     fn memo_put(&self, key: &MemoKey, results: &str) {
-        if let Some(path) = token_runner::token_db_path(&self.resolved) {
+        if let Some(path) = token_runner::token_db_path_for_write(&self.resolved) {
             if let Ok(cache) = TokenCache::open(&path) {
                 let _ = cache.memo().put(key, results);
             }
@@ -956,7 +965,9 @@ impl McpServer {
         // candidates against.
         let primary_query = params.searches[0].query.clone();
 
-        let collection = collection_for(&self.resolved).map_err(internal)?;
+        // Read-only resolution — see `lex_subquery` (#300).
+        let collection =
+            collection_name_readonly(self.resolved.root.as_path()).map_err(internal)?;
         let cache_dir = collection_cache_dir(&collection);
         if !tantivy_index_present(&cache_dir) {
             return Ok(Json(QueryOut {
