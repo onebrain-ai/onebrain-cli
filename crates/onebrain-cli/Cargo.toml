@@ -145,6 +145,15 @@ tantivy           = { version = "0.26", default-features = false, features = [
     "stopwords",
     "stemmer",
 ] }
+# The doctor `lex-index` underpopulated-state test plants a corrupt row
+# directly in a collection's `engine.redb` `chunk_meta` table — the state a
+# rebuild can only skip, never restore — which requires opening that table
+# by hand. `onebrain_search`'s `CHUNK_META` const is crate-private, but redb
+# identifies tables purely by name + key/value type, so a locally-defined
+# `TableDefinition<&str, &str>` of the same name IS the same on-disk table.
+# Same version as onebrain-search's Cargo.toml so it unifies with the copy
+# already pulled in transitively; adds no new crate to the dependency graph.
+redb              = "4.1"
 
 # The prebuilt web UI release this binary embeds. The release workflow's
 # `webui` job downloads `onebrain-webui-<version>-dist.tar.gz` from

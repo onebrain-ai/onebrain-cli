@@ -264,6 +264,23 @@ impl LexHealth {
     /// differs — see `doctor::lex_index_check`, which reports it as its own
     /// warn (`onebrain search reindex --force`) rather than merging it into
     /// the generic "rebuild still pending" message.
+    ///
+    /// **Coverage — what this DOES and does NOT close out of issue #298.**
+    /// This predicate WARNS only on a shortfall paired with a stuck rebuild
+    /// marker. It deliberately does NOT warn on a bare shortfall with no
+    /// marker — including issue #298's own motivating example, an index
+    /// holding ~4 000 of 6 679 chunks: `doctor::lex_index_check` still
+    /// reports that shape as `ok`, because any engine open (including
+    /// `doctor`'s own) repopulates the marker-driven cases and clears the
+    /// marker, so the state that would need one never reaches a `doctor`
+    /// run with the marker still set. That gap is not silent, though — the
+    /// check ALSO carries the raw shortfall as a labelled `details` line
+    /// (`shortfall: N chunk(s) present in metadata but not in keyword
+    /// search`) on every run where `lex_docs < chunk_meta` holds, `warn` or
+    /// `ok` alike, per issue #298's own option 1 ("report the shortfall as a
+    /// detail line, never as warn/error"). A reader who only checks `status`
+    /// on a bare shortfall will still see `ok`; the number is there for
+    /// anyone who reads `details`.
     pub fn is_underpopulated(&self) -> bool {
         self.rebuild_pending && self.lex_docs > 0 && self.lex_docs < self.chunk_meta
     }
