@@ -1533,34 +1533,138 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
 
 const LEX_INDEX_CHECK: &str = "lex-index";
 
-/// Message prefix of the one `lex-index` finding that is NOT auto-fixable: the
-/// engine could not be opened, so nothing about the index is known. Shared by
-/// the check and by [`planned_action`], which must not offer a rebuild that
-/// would immediately re-hit the same failed open.
+/// Message fragment naming the state where the engine could not be opened, so
+/// nothing about the index is known. Prose only — the arm's identity is
+/// [`LexIndexFinding::Unverified`].
 const LEX_INDEX_UNVERIFIED: &str = "could not verify the keyword index";
 
-/// Message prefix of the other `lex-index` finding that is NOT auto-fixable:
-/// the ORPHANED state, where `chunk_meta` — the only source a rebuild could
-/// read — is itself gone. [`fix_lex_index`] already refuses this one at
-/// runtime (`repopulate_lex_from_meta` returns `Ok(0)` → `FixOutcome::Manual`),
-/// so offering it in the `--fix` plan promises a repair that cannot happen and
-/// hides the `--force` reindex that is the actual remedy. Shared by the check
-/// and by [`planned_action`] so the two can't drift.
+/// Message fragment naming the ORPHANED state, where `chunk_meta` — the only
+/// source a rebuild could read — is itself gone. Prose only — the arm's
+/// identity is [`LexIndexFinding::Orphaned`].
 const LEX_INDEX_ORPHANED: &str = "stored chunk metadata is EMPTY";
 
-/// Message prefix of the third `lex-index` finding that is NOT auto-fixable:
-/// the underpopulated state (issue #298 — [`onebrain_search::engine::LexHealth::is_underpopulated`]).
-/// Unlike the plain excess-docs / dead-index findings, this one needs BOTH a
-/// corrupt `chunk_meta` row (a rebuild alone cannot restore it — only
-/// `search reindex --force` re-reads the vault) AND a rebuild marker whose
-/// clear keeps failing (a permissions problem, not a content one). Offering
-/// it to `--fix` would run [`fix_lex_index`], which repopulates from the same
-/// `chunk_meta`, skips the same corrupt row, fails to clear the same marker
-/// — and still returns `FixOutcome::Fixed("… chunk(s) restored")`, reporting
-/// success while the state is byte-for-byte unchanged and the next `doctor`
-/// re-reports the identical warn. Shared by the check and by
-/// [`planned_action`] so the two can't drift.
+/// Message fragment naming the underpopulated state (issue #298 —
+/// [`onebrain_search::engine::LexHealth::is_underpopulated`]). Prose only —
+/// the arm's identity is [`LexIndexFinding::Underpopulated`].
 const LEX_INDEX_UNDERPOPULATED: &str = "keyword index is UNDERPOPULATED";
+
+// ── lex-index finding identity ────────────────────────────────────────────
+//
+// `lex_index_check` returns EIGHT different findings under a single check
+// name. They used to be told apart by their prose: `planned_action` decided
+// auto-fixability with `message.starts_with(LEX_INDEX_*)` and the tests
+// decided which arm had fired with `message.contains("…")`. Two different
+// string operations over the same UX surface, and every arm added weakened
+// the discrimination of the arms below it — the v3.4.17 underpopulated arm
+// both CONTAINS the older stuck-marker arm's identifying phrase ("still
+// marked pending") and carries its exact hint, so the stuck-marker test
+// passed for either arm, and moving a state between the two arms moved it
+// silently in or out of the `--fix` plan with every doctor test still green.
+//
+// The fix is to give each finding a stable identity that is not its prose,
+// and make every consumer key on that. The macro below is what makes it
+// hold: it defines the variants, their wire codes and the code→variant
+// lookup from ONE list, so a new arm cannot be added with a code that no
+// consumer knows about. `auto_fixable` is a separate exhaustive `match`, so
+// a new variant fails to COMPILE until it is explicitly classified as
+// fixable or not — it can never inherit a neighbour's routing by accident.
+//
+// Scope: only `lex-index` is converted. Every other doctor check still
+// classifies on message text in `planned_action`; converting the whole
+// registry is a separate change.
+macro_rules! lex_index_findings {
+    ($($(#[$meta:meta])* $variant:ident => $code:literal),+ $(,)?) => {
+        /// Which of `lex_index_check`'s findings fired. Carried on the
+        /// [`DoctorResult`] as [`DoctorResult::code`].
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum LexIndexFinding {
+            $($(#[$meta])* $variant,)+
+        }
+
+        impl LexIndexFinding {
+            /// The stable wire code stamped onto the result.
+            const fn code(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $code,)+
+                }
+            }
+
+            /// Recover the finding from a [`DoctorResult::code`]. `None` for a
+            /// result that carries no code, or one from another check.
+            fn from_code(code: &str) -> Option<Self> {
+                match code {
+                    $($code => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+
+            #[cfg(test)]
+            const ALL: &'static [Self] = &[$(Self::$variant,)+];
+        }
+    };
+}
+
+lex_index_findings! {
+    /// Vault, collection or index missing, or the health probe failed —
+    /// nothing to report. `ok`.
+    Skipped => "lex-index/skipped",
+    /// A live handle (usually a daemon) holds the collection lock, so the
+    /// index could not be inspected at all. `warn`.
+    Unverified => "lex-index/unverified",
+    /// Keyword index EMPTY while `chunk_meta` holds every chunk. `error`.
+    Dead => "lex-index/dead",
+    /// `chunk_meta` empty while the keyword index still holds docs — every
+    /// one an orphan, and the rebuild source is gone. `error`.
+    Orphaned => "lex-index/orphaned",
+    /// More keyword docs than chunks: duplicates/orphans skewing BM25.
+    /// `warn`.
+    ExcessDocs => "lex-index/excess-docs",
+    /// Genuine shortfall that survived the auto-repopulate, paired with a
+    /// stuck rebuild marker (issue #298). `warn`.
+    Underpopulated => "lex-index/underpopulated",
+    /// Counts agree but the rebuild marker survived the retry — the rebuild
+    /// itself keeps failing. `warn`.
+    RebuildStuck => "lex-index/rebuild-stuck",
+    /// Counts agree, no marker. `ok`.
+    Healthy => "lex-index/healthy",
+}
+
+impl LexIndexFinding {
+    /// Can `doctor --fix` actually repair this finding? The single source of
+    /// truth for [`planned_action`]'s `lex-index` arm.
+    ///
+    /// Exhaustive on purpose: a new finding must be classified here or the
+    /// crate does not compile.
+    ///
+    /// The four `false` arms, and why a rebuild cannot help them:
+    ///  - `Unverified`: the engine could not be opened at all. Planning a
+    ///    repair would run [`fix_lex_index`], whose first act is the very
+    ///    `Engine::open` that just failed — a guaranteed `✗` in the fix
+    ///    summary and a non-zero exit, on a check that found nothing wrong.
+    ///  - `Orphaned`: `chunk_meta` is empty, so `repopulate_lex_from_meta`
+    ///    deliberately refuses (`Ok(0)` → `Manual`) rather than clearing the
+    ///    last surviving copy. Listing it as auto-fixable promised a repair
+    ///    that never happens AND buried the real remedy (`search reindex
+    ///    --force`); routing it to the manual list prints that hint in full.
+    ///  - `Underpopulated`: needs BOTH a corrupt `chunk_meta` row (which a
+    ///    rebuild can only skip, never restore) AND a rebuild marker whose
+    ///    clear keeps failing (a permissions problem `fix_lex_index` cannot
+    ///    touch). A planned repair would re-run the exact same doomed rebuild
+    ///    and report `FixOutcome::Fixed`, hiding that the state never changed.
+    ///  - `Skipped` / `Healthy`: not issues at all. Unreachable in practice —
+    ///    every `planned_action` caller filters on `is_issue` first — but
+    ///    classified explicitly rather than left to a catch-all.
+    const fn auto_fixable(self) -> bool {
+        match self {
+            Self::Dead | Self::ExcessDocs | Self::RebuildStuck => true,
+            Self::Unverified
+            | Self::Orphaned
+            | Self::Underpopulated
+            | Self::Skipped
+            | Self::Healthy => false,
+        }
+    }
+}
 
 /// Doctor check (`check = "lex-index"`) — is the keyword index actually alive?
 ///
@@ -1587,7 +1691,10 @@ fn lex_index_check(vault_root: &Path) -> DoctorResult {
         collection_cache_dir, collection_name_readonly, is_indexed, open_engine_with_collection,
     };
 
-    let skip = |msg: String| DoctorResult::ok(LEX_INDEX_CHECK, format!("skipped — {msg}"));
+    let skip = |msg: String| {
+        DoctorResult::ok(LEX_INDEX_CHECK, format!("skipped — {msg}"))
+            .with_code(LexIndexFinding::Skipped.code())
+    };
 
     let Ok(resolved) = crate::vault_ctx::require(Some(vault_root.to_path_buf())) else {
         return skip("vault unresolved".to_string());
@@ -1626,7 +1733,8 @@ fn lex_index_check(vault_root: &Path) -> DoctorResult {
             .with_details(vec![
                 format!("collection: {collection}"),
                 format!("engine: {e}"),
-            ]);
+            ])
+            .with_code(LexIndexFinding::Unverified.code());
         }
         Err(e) => {
             // Anything else is already reported by the `search` check's "engine
@@ -1671,7 +1779,8 @@ fn lex_index_check(vault_root: &Path) -> DoctorResult {
             ),
         )
         .with_hint("onebrain doctor --fix (rebuilds the keyword index from stored metadata; or `onebrain search reindex --force`)")
-        .with_details(details);
+        .with_details(details)
+        .with_code(LexIndexFinding::Dead.code());
     }
     if health.is_orphaned() {
         // Error, not warn — three reasons, each stronger than the plain
@@ -1701,7 +1810,8 @@ fn lex_index_check(vault_root: &Path) -> DoctorResult {
              from the vault; `doctor --fix` cannot repair this one — there is nothing left to \
              rebuild from)",
         )
-        .with_details(details);
+        .with_details(details)
+        .with_code(LexIndexFinding::Orphaned.code());
     }
     if health.has_excess_docs() {
         // Warn, not error: keyword search still answers — it just answers
@@ -1718,7 +1828,8 @@ fn lex_index_check(vault_root: &Path) -> DoctorResult {
             ),
         )
         .with_hint("onebrain doctor --fix (rebuilds the keyword index from stored metadata; or `onebrain search reindex --force`)")
-        .with_details(details);
+        .with_details(details)
+        .with_code(LexIndexFinding::ExcessDocs.code());
     }
     if health.is_underpopulated() {
         // Issue #298: a shortfall (`lex_docs < chunk_meta`) alone can be a
@@ -1742,7 +1853,8 @@ fn lex_index_check(vault_root: &Path) -> DoctorResult {
             ),
         )
         .with_hint("onebrain search reindex --force")
-        .with_details(details);
+        .with_details(details)
+        .with_code(LexIndexFinding::Underpopulated.code());
     }
     if health.rebuild_pending {
         // `Engine::open` above already retried the rebuild, so a marker that
@@ -1756,13 +1868,15 @@ fn lex_index_check(vault_root: &Path) -> DoctorResult {
                 .to_string(),
         )
         .with_hint("onebrain search reindex --force")
-        .with_details(details);
+        .with_details(details)
+        .with_code(LexIndexFinding::RebuildStuck.code());
     }
     DoctorResult::ok(
         LEX_INDEX_CHECK,
         format!("{} keyword doc(s) · healthy", health.lex_docs),
     )
     .with_details(details)
+    .with_code(LexIndexFinding::Healthy.code())
 }
 
 /// Recipe — `lex-index` finding means the keyword index is empty, holds MORE
@@ -2529,30 +2643,22 @@ fn planned_action(result: &DoctorResult) -> Option<&'static str> {
         ),
         "search-exclude" => Some("insert the search.exclude block"),
         "token-optimization" => Some("insert the token_optimization block / missing sub-key(s)"),
-        // Every lex-index finding is repaired by the same rebuild — EXCEPT
-        // three, none of which `fix_lex_index` can actually resolve:
-        //  - "could not verify": the engine could not be opened at all.
-        //    Planning a repair would run `fix_lex_index`, whose first act is
-        //    the very `Engine::open` that just failed — a guaranteed `✗` in the
-        //    fix summary and a non-zero exit, on a check that found nothing
-        //    wrong.
-        //  - ORPHANED: `chunk_meta` is empty, so `repopulate_lex_from_meta`
-        //    deliberately refuses (`Ok(0)` → `Manual`) rather than clearing the
-        //    last surviving copy. Listing it as auto-fixable promised a repair
-        //    that never happens AND buried the real remedy (`search reindex
-        //    --force`) — routing it to the manual list prints that hint in full.
-        //  - UNDERPOPULATED: needs BOTH a corrupt `chunk_meta` row (which a
-        //    rebuild can only skip, never restore) AND a rebuild marker whose
-        //    clear keeps failing (a permissions problem `fix_lex_index` cannot
-        //    touch). Planning a repair here would re-run the exact same
-        //    doomed rebuild and report `FixOutcome::Fixed`, hiding that the
-        //    state never changed and burying the real remedy (`search
-        //    reindex --force`) the same way ORPHANED's would.
-        // Same `hint`-driven precedent as `qmd-leftovers` below.
-        "lex-index" => (!result.message.starts_with(LEX_INDEX_UNVERIFIED)
-            && !result.message.starts_with(LEX_INDEX_ORPHANED)
-            && !result.message.starts_with(LEX_INDEX_UNDERPOPULATED))
-        .then_some("rebuild the keyword index from stored chunk metadata"),
+        // Keyed on the finding IDENTITY (`result.code`), never on the message
+        // text: the arms share phrases and hints with each other, so any
+        // prefix/substring test over the prose silently mis-routes as soon as
+        // an arm is added or reworded. `LexIndexFinding::auto_fixable` is the
+        // single source of truth and is an exhaustive `match`, so a new
+        // finding must be classified there before this compiles.
+        //
+        // A `lex-index` result with no (or an unknown) code is NOT offered to
+        // `--fix`: every arm of `lex_index_check` stamps one, so a missing
+        // code means a result this function does not understand, and the safe
+        // reading of "I do not know what this is" is "do not promise a repair".
+        LEX_INDEX_CHECK => result
+            .code
+            .and_then(LexIndexFinding::from_code)
+            .is_some_and(LexIndexFinding::auto_fixable)
+            .then_some("rebuild the keyword index from stored chunk metadata"),
         "claude-settings" => Some("remove the stale marketplace entry"),
         "plugin-cache" => Some("remove the stale plugin cache"),
         "vault-config-migration" => Some("migrate vault.yml → onebrain.yml"),
@@ -8263,6 +8369,15 @@ mod tests {
     /// directly — `onebrain_search::engine::CHUNK_META` is crate-private, so
     /// this redefines the same table by name (redb keys tables on name +
     /// value type, not on which crate declared the `TableDefinition`).
+    ///
+    /// Corrupts [`LEX_FIXTURE_CORRUPT_CHUNKS`] rows, not one, and the callers
+    /// index [`LEX_FIXTURE_LEX_DOCS`] real notes: the resulting numbers are
+    /// pairwise DISTINCT (`lex_docs` 4, `chunk_meta` 7, shortfall 3), so the
+    /// two numbers a user acts on — the `shortfall:` detail line and the
+    /// "roughly N chunk(s)" text — are genuinely pinned. The old 1-note / 1
+    /// -corrupt-row fixture made `chunk_meta - lex_docs == 1 == lex_docs`, so
+    /// swapping the subtraction for `health.lex_docs` at either message site
+    /// left every test green.
     fn genuinely_underpopulate_with_a_stuck_marker(cache_dir: &Path, tantivy_dir: &Path) {
         use crate::commands::search_common::index_artifact_path;
 
@@ -8275,7 +8390,11 @@ mod tests {
             let mut table = write_txn.open_table(CHUNK_META).unwrap();
             // Genuinely malformed: not JSON at all, under a plausible key —
             // same technique as `engine::tests::repopulate_skips_a_corrupt_chunk_meta_record`.
-            table.insert("broken.md#0", "{not json at all").unwrap();
+            for i in 0..LEX_FIXTURE_CORRUPT_CHUNKS {
+                table
+                    .insert(format!("broken{i}.md#0").as_str(), "{not json at all")
+                    .unwrap();
+            }
         }
         write_txn.commit().unwrap();
         drop(db);
@@ -8286,6 +8405,45 @@ mod tests {
             onebrain_search::lex::clear_rebuild_marker(tantivy_dir).is_err(),
             "the marker must be genuinely unremovable or this helper proves nothing"
         );
+    }
+
+    /// Assert WHICH `lex_index_check` arm fired, by its stable identity.
+    ///
+    /// Never assert an arm by `message.contains(...)`: the arms share phrases
+    /// and hints (the underpopulated message literally contains the
+    /// stuck-marker arm's "still marked pending", and carries its exact
+    /// hint), so a substring test pins the wrong arm as soon as one is added
+    /// or reworded — which is precisely how the stuck-marker test used to
+    /// pass for the underpopulated arm. Message text is still asserted in
+    /// these tests, but only for the NUMBERS a user acts on.
+    #[track_caller]
+    fn assert_lex_finding(r: &DoctorResult, want: LexIndexFinding) {
+        assert_eq!(
+            r.code.and_then(LexIndexFinding::from_code),
+            Some(want),
+            "expected the {want:?} arm, got code {:?} / message {:?}",
+            r.code,
+            r.message
+        );
+    }
+
+    #[test]
+    fn lex_index_finding_codes_round_trip_and_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for f in LexIndexFinding::ALL {
+            assert!(
+                f.code().starts_with("lex-index/"),
+                "{f:?} code must be namespaced: {}",
+                f.code()
+            );
+            assert!(seen.insert(f.code()), "duplicate code: {}", f.code());
+            assert_eq!(
+                LexIndexFinding::from_code(f.code()),
+                Some(*f),
+                "{f:?} does not round-trip"
+            );
+        }
+        assert_eq!(LexIndexFinding::from_code("lex-index/nope"), None);
     }
 
     fn lex_check_vault() -> (tempfile::TempDir, tempfile::TempDir) {
@@ -8304,6 +8462,33 @@ mod tests {
         (vault, cache)
     }
 
+    /// How many real, indexable notes the underpopulated fixture holds — one
+    /// chunk each, so this is also `lex_docs` after the auto-repopulate.
+    const LEX_FIXTURE_LEX_DOCS: u64 = 4;
+    /// How many corrupt `chunk_meta` rows the underpopulated fixture plants.
+    /// This is the shortfall: a rebuild can only skip them.
+    const LEX_FIXTURE_CORRUPT_CHUNKS: u64 = 3;
+    /// `chunk_meta` after the fixture: real rows + corrupt rows.
+    const LEX_FIXTURE_CHUNK_META: u64 = LEX_FIXTURE_LEX_DOCS + LEX_FIXTURE_CORRUPT_CHUNKS;
+
+    /// Bring `lex_check_vault`'s single note up to [`LEX_FIXTURE_LEX_DOCS`]
+    /// notes. Call BEFORE `indexed_collection`. Deliberately asymmetric with
+    /// [`LEX_FIXTURE_CORRUPT_CHUNKS`]: 4 / 7 / 3 are pairwise distinct and
+    /// none of them is 1, so no message site can substitute one count for
+    /// another (or drop the subtraction) and stay green.
+    fn grow_lex_check_vault(vault: &Path) {
+        const _: () = assert!(LEX_FIXTURE_CORRUPT_CHUNKS != LEX_FIXTURE_LEX_DOCS);
+        const _: () = assert!(LEX_FIXTURE_CORRUPT_CHUNKS != LEX_FIXTURE_CHUNK_META);
+        const _: () = assert!(LEX_FIXTURE_CORRUPT_CHUNKS != 1);
+        for i in 1..LEX_FIXTURE_LEX_DOCS {
+            fs::write(
+                vault.join(format!("note{i}.md")),
+                format!("# Fixture {i}\nplatypus wombat coyote fixture text {i}\n"),
+            )
+            .unwrap();
+        }
+    }
+
     #[test]
     fn lex_index_check_reports_a_dead_keyword_index() {
         let (vault, cache) = lex_check_vault();
@@ -8313,17 +8498,13 @@ mod tests {
         // Healthy first — the check must not cry wolf on a good index.
         let healthy = lex_index_check(vault.path());
         assert_eq!(healthy.status, DoctorStatus::Ok, "{}", healthy.message);
-        assert!(healthy.message.contains("healthy"), "{}", healthy.message);
+        assert_lex_finding(&healthy, LexIndexFinding::Healthy);
 
         empty_the_lex_index(&tantivy_dir);
 
         let r = lex_index_check(vault.path());
         assert_eq!(r.status, DoctorStatus::Error, "{}", r.message);
-        assert!(
-            r.message.contains("keyword index is EMPTY"),
-            "{}",
-            r.message
-        );
+        assert_lex_finding(&r, LexIndexFinding::Dead);
         assert!(
             r.details.iter().any(|d| d == "lex_docs: 0"),
             "{:?}",
@@ -8364,6 +8545,7 @@ mod tests {
         }
         let after = lex_index_check(vault.path());
         assert_eq!(after.status, DoctorStatus::Ok, "{}", after.message);
+        assert_lex_finding(&after, LexIndexFinding::Healthy);
 
         // Idempotent: a second --fix on a healthy index is a no-op, not a
         // second rebuild.
@@ -8382,17 +8564,19 @@ mod tests {
         // the same plain `ok` a fully-populated index gets, not a new warn.
         let (vault, cache) = lex_check_vault();
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
-        fs::write(
-            vault.path().join("note2.md"),
-            "# Second\nplatypus wombat coyote fixture text\n",
-        )
-        .unwrap();
+        grow_lex_check_vault(vault.path());
         let (_collection, _cache_dir, tantivy_dir) = indexed_collection(vault.path());
         assert_eq!(lex_index_check(vault.path()).status, DoctorStatus::Ok);
 
-        // Drop one real chunk straight from the keyword index — `chunk_meta`
+        // Drop real chunks straight from the keyword index — `chunk_meta`
         // (redb) is untouched, so this is a genuine shortfall, not damage.
-        underpopulate_the_lex_index(&tantivy_dir, "note2.md#0");
+        // Drop LEX_FIXTURE_CORRUPT_CHUNKS of the LEX_FIXTURE_LEX_DOCS notes,
+        // so the surviving counts (1 / 4 / shortfall 3) are again pairwise
+        // distinct and none is 1 except `lex_docs` itself — the `shortfall:`
+        // line cannot be satisfied by printing either raw count.
+        for i in 1..=LEX_FIXTURE_CORRUPT_CHUNKS {
+            underpopulate_the_lex_index(&tantivy_dir, &format!("note{i}.md#0"));
+        }
         assert!(
             !onebrain_search::lex::rebuild_pending(&tantivy_dir),
             "no marker must be involved in this shape"
@@ -8405,6 +8589,7 @@ mod tests {
             "a bare shortfall must stay silent: {}",
             r.message
         );
+        assert_lex_finding(&r, LexIndexFinding::Healthy);
         // The raw counts are still visible in `details` for anyone reading
         // closely — just not promoted to a warning.
         assert!(
@@ -8417,9 +8602,17 @@ mod tests {
         // `ok` — the numbers were always present unlabelled, this just spells
         // out the gap between them.
         assert!(
-            r.details.contains(
-                &"shortfall: 1 chunk(s) present in metadata but not in keyword search".to_string()
-            ),
+            r.details.contains(&format!(
+                "shortfall: {LEX_FIXTURE_CORRUPT_CHUNKS} chunk(s) present in metadata but not in \
+                 keyword search"
+            )),
+            "{:?}",
+            r.details
+        );
+        assert!(
+            r.details.contains(&"lex_docs: 1".to_string())
+                && r.details
+                    .contains(&format!("chunk_meta: {LEX_FIXTURE_LEX_DOCS}")),
             "{:?}",
             r.details
         );
@@ -8436,6 +8629,7 @@ mod tests {
         // can never clear (a permissions problem, not a content one).
         let (vault, cache) = lex_check_vault();
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        grow_lex_check_vault(vault.path());
         let (_collection, cache_dir, tantivy_dir) = indexed_collection(vault.path());
         assert_eq!(lex_index_check(vault.path()).status, DoctorStatus::Ok);
 
@@ -8443,41 +8637,37 @@ mod tests {
 
         let r = lex_index_check(vault.path());
         assert_eq!(r.status, DoctorStatus::Warn, "{}", r.message);
-        assert!(
-            r.message.contains(LEX_INDEX_UNDERPOPULATED),
-            "{}",
-            r.message
-        );
+        assert_lex_finding(&r, LexIndexFinding::Underpopulated);
 
-        let lex_docs: u64 = r
-            .details
-            .iter()
-            .find_map(|d| d.strip_prefix("lex_docs: "))
-            .and_then(|n| n.parse().ok())
-            .unwrap();
-        let chunk_meta: u64 = r
-            .details
-            .iter()
-            .find_map(|d| d.strip_prefix("chunk_meta: "))
-            .and_then(|n| n.parse().ok())
-            .unwrap();
-        assert_eq!(
-            chunk_meta - lex_docs,
-            1,
-            "exactly the corrupt row should be missing: {:?}",
+        // The fixture's three counts are pairwise distinct (4 / 7 / 3) and
+        // none is 1, so the assertions below cannot be satisfied by
+        // substituting one for another — the old 1-note fixture had
+        // `chunk_meta - lex_docs == 1 == lex_docs`, which left both message
+        // sites free to print `health.lex_docs` instead of the shortfall.
+        assert!(
+            r.details
+                .contains(&format!("lex_docs: {LEX_FIXTURE_LEX_DOCS}")),
+            "{:?}",
             r.details
         );
-        // The message names BOTH counts and the right arithmetic.
         assert!(
-            r.message
-                .contains(&format!("holds {lex_docs} of {chunk_meta} chunk(s)")),
+            r.details
+                .contains(&format!("chunk_meta: {LEX_FIXTURE_CHUNK_META}")),
+            "{:?}",
+            r.details
+        );
+        // The message names BOTH counts and the right arithmetic — as exact
+        // numbers, not as an expression re-derived from the same details.
+        assert!(
+            r.message.contains(&format!(
+                "holds {LEX_FIXTURE_LEX_DOCS} of {LEX_FIXTURE_CHUNK_META} chunk(s)"
+            )),
             "{}",
             r.message
         );
         assert!(
             r.message.contains(&format!(
-                "roughly {} chunk(s) are missing",
-                chunk_meta - lex_docs
+                "roughly {LEX_FIXTURE_CORRUPT_CHUNKS} chunk(s) are missing"
             )),
             "{}",
             r.message
@@ -8485,13 +8675,26 @@ mod tests {
         // The Fix 3 shortfall detail line fires here too, alongside the warn.
         assert!(
             r.details.contains(&format!(
-                "shortfall: {} chunk(s) present in metadata but not in keyword search",
-                chunk_meta - lex_docs
+                "shortfall: {LEX_FIXTURE_CORRUPT_CHUNKS} chunk(s) present in metadata but not in \
+                 keyword search"
             )),
             "{:?}",
             r.details
         );
         assert_eq!(r.hint.as_deref(), Some("onebrain search reindex --force"));
+
+        // Golden: the rendered text is a UX contract, frozen verbatim. The
+        // arm's IDENTITY is asserted above (`assert_lex_finding`) — this is
+        // the separate promise that the words and numbers a user reads do not
+        // drift silently. Verified byte-identical against the pre-restructure
+        // build on this same fixture.
+        assert_eq!(
+            r.message,
+            "keyword index is UNDERPOPULATED — holds 4 of 7 chunk(s) and a rebuild is still \
+             marked pending — a shortfall alone can be benign skew, but paired with a stuck \
+             rebuild the index is genuinely incomplete: roughly 3 chunk(s) are missing from \
+             keyword search"
+        );
     }
 
     #[test]
@@ -8504,6 +8707,7 @@ mod tests {
         // / `structured_fix_reports_a_held_engine_as_manual_not_failed`.
         let (vault, cache) = lex_check_vault();
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        grow_lex_check_vault(vault.path());
         let (_collection, cache_dir, tantivy_dir) = indexed_collection(vault.path());
         assert_eq!(lex_index_check(vault.path()).status, DoctorStatus::Ok);
 
@@ -8511,6 +8715,7 @@ mod tests {
 
         let r = lex_index_check(vault.path());
         assert_eq!(r.status, DoctorStatus::Warn, "{}", r.message);
+        assert_lex_finding(&r, LexIndexFinding::Underpopulated);
         assert!(
             planned_action(&r).is_none(),
             "the underpopulated state must not be offered as auto-fixable: {r:?}"
@@ -8539,11 +8744,7 @@ mod tests {
 
         let r = lex_index_check(vault.path());
         assert_eq!(r.status, DoctorStatus::Warn, "{}", r.message);
-        assert!(
-            r.message.contains("degrade keyword ranking"),
-            "{}",
-            r.message
-        );
+        assert_lex_finding(&r, LexIndexFinding::ExcessDocs);
         assert!(planned_action(&r).is_some(), "--fix must offer a repair");
     }
 
@@ -8579,11 +8780,7 @@ mod tests {
         // This opens the engine, which is where the refusal happens.
         let r = lex_index_check(vault.path());
         assert_eq!(r.status, DoctorStatus::Error, "{}", r.message);
-        assert!(
-            r.message.contains("stored chunk metadata is EMPTY"),
-            "{}",
-            r.message
-        );
+        assert_lex_finding(&r, LexIndexFinding::Orphaned);
         assert!(r.details.contains(&"chunk_meta: 0".to_string()), "{r:?}");
         assert!(
             r.details.contains(&format!("lex_docs: {docs_before}")),
@@ -8676,7 +8873,7 @@ mod tests {
 
         let r = lex_index_check(vault.path());
         assert_eq!(r.status, DoctorStatus::Warn, "{}", r.message);
-        assert!(r.message.contains("could not verify"), "{}", r.message);
+        assert_lex_finding(&r, LexIndexFinding::Unverified);
         assert!(
             r.hint.as_deref().unwrap_or("").contains("daemon"),
             "the warn must name the way out: {:?}",
@@ -8718,7 +8915,7 @@ mod tests {
                 .expect("fixture must be able to hold the engine");
 
         let r = lex_index_check(vault.path());
-        assert!(r.message.contains("could not verify"), "{}", r.message);
+        assert_lex_finding(&r, LexIndexFinding::Unverified);
 
         match structured_fix_outcome(&r, vault.path()) {
             FixOutcome::Manual(m) => {
@@ -8748,6 +8945,7 @@ mod tests {
 
         let r = lex_index_check(vault.path());
         assert_eq!(r.status, DoctorStatus::Error, "{}", r.message);
+        assert_lex_finding(&r, LexIndexFinding::Dead);
         match structured_fix_outcome(&r, vault.path()) {
             FixOutcome::Fixed(m) => assert!(m.contains("chunk(s) restored"), "{m}"),
             other => panic!("expected the recipe to run and rebuild, got {other:?}"),
@@ -8779,7 +8977,10 @@ mod tests {
 
         let r = lex_index_check(vault.path());
         assert_eq!(r.status, DoctorStatus::Warn, "{}", r.message);
-        assert!(r.message.contains("still marked pending"), "{}", r.message);
+        // Identity, not prose: the underpopulated arm's message ALSO contains
+        // "still marked pending" and carries this arm's exact hint, so the
+        // substring check this replaces passed for either arm.
+        assert_lex_finding(&r, LexIndexFinding::RebuildStuck);
         assert!(
             r.details.contains(&"rebuild_pending: true".to_string()),
             "{r:?}"
@@ -8799,6 +9000,13 @@ mod tests {
             r.details
         );
         assert_eq!(r.hint.as_deref(), Some("onebrain search reindex --force"));
+
+        // Golden, same contract as the underpopulated arm's: verified
+        // byte-identical against the pre-restructure build.
+        assert_eq!(
+            r.message,
+            "keyword-index rebuild is still marked pending after a retry — the rebuild is failing"
+        );
     }
 
     #[test]
@@ -8810,12 +9018,12 @@ mod tests {
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         let r = lex_index_check(vault.path());
         assert_eq!(r.status, DoctorStatus::Ok, "{}", r.message);
-        assert!(r.message.contains("skipped"), "{}", r.message);
+        assert_lex_finding(&r, LexIndexFinding::Skipped);
 
         let bare = tempdir().unwrap();
         let r = lex_index_check(bare.path());
         assert_eq!(r.status, DoctorStatus::Ok, "{}", r.message);
-        assert!(r.message.contains("skipped"), "{}", r.message);
+        assert_lex_finding(&r, LexIndexFinding::Skipped);
     }
 
     #[test]
@@ -10445,6 +10653,7 @@ mod tests {
             LEX_INDEX_CHECK,
             format!("{LEX_INDEX_ORPHANED} while the keyword index still holds 9 doc(s)"),
         )
+        .with_code(LexIndexFinding::Orphaned.code())
         .with_hint(
             "onebrain search reindex --force (rebuilds the keyword index AND the stored \
              metadata from the vault; `doctor --fix` cannot repair this one)",
@@ -10462,7 +10671,8 @@ mod tests {
         let dead = DoctorResult::error(
             LEX_INDEX_CHECK,
             "keyword index is EMPTY while the collection holds 9 chunk(s)",
-        );
+        )
+        .with_code(LexIndexFinding::Dead.code());
         assert!(planned_action(&dead).is_some(), "dead index is repairable");
     }
 
