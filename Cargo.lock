@@ -2112,6 +2112,7 @@ dependencies = [
  "predicates",
  "pretty_assertions",
  "ratatui",
+ "redb",
  "rmcp",
  "rust-embed",
  "schemars",
