@@ -1,6 +1,6 @@
 ---
-latest_version: 3.4.16
-released: 2026-07-20
+latest_version: 3.4.17
+released: 2026-07-22
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,15 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.17] — 2026-07-22 — Search-index health: stop writing on read paths, flag a stuck-rebuild shortfall
+
+Theme: read paths that quietly wrote to disk or the user's config, and a doctor blind spot where a half-built keyword index reported healthy.
+
+- Pure read paths no longer persist a generated collection name into `onebrain.yml`: `onebrain search model list`, the MCP token/status routes, and the daemon's token-cache open all resolve the collection read-only now, so a listing or status command can't rewrite (and strip the comments from) your config ([#300](https://github.com/onebrain-ai/onebrain-cli/issues/300))
+- The daemon no longer creates an empty collection cache dir at boot for a never-indexed vault — it reports "no token cache" (503) instead of materializing one, which is also what had been leaking stray dirs into the cache root during the test suite ([#300](https://github.com/onebrain-ai/onebrain-cli/issues/300))
+- `onebrain doctor` now flags a keyword index that holds fewer chunks than its metadata **when a rebuild is also stuck pending** — the genuinely-incomplete case — and always prints a `shortfall: N chunk(s)` detail line when the counts differ, so a partial index no longer reads as healthy ([#298](https://github.com/onebrain-ai/onebrain-cli/issues/298))
+- Test-suite isolation is enforced at the source: a static guard now fails CI if any test that spawns the binary doesn't pin its cache root, closing the class of leak behind #300 rather than the one instance
 
 ## [3.4.16] — 2026-07-20 — Search recall: headings become searchable, the rerank gate stops deleting hits
 
