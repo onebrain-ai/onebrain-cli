@@ -17,6 +17,8 @@
 //! (append/new/archive/move) can't pollute the read-verb fixtures and tests
 //! stay independent + parallel-safe.
 
+mod support;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
@@ -110,6 +112,7 @@ plain trailing line\n",
 /// as JSON. `--vault` and `--json` are appended automatically.
 fn run_note_json(vault: &Path, args: &[&str]) -> Value {
     let mut cmd = Command::cargo_bin("onebrain").unwrap();
+    cmd.env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root());
     cmd.args(args).arg("--vault").arg(vault).arg("--json");
     let output = cmd.output().expect("spawn failed");
     assert!(
@@ -707,6 +710,7 @@ fn verb_without_vault_exits_64() {
     let empty = tempdir().unwrap(); // no onebrain.yml
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["note", "list", "--vault"])
         .arg(empty.path())
         .arg("--json")
@@ -724,6 +728,7 @@ fn search_invalid_regex_exits_71() {
     let vault = build_fixture_vault();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["note", "search", "(", "--mode", "regex", "--vault"])
         .arg(vault.path())
         .arg("--json")
@@ -738,6 +743,7 @@ fn find_invalid_glob_exits_71() {
     let vault = build_fixture_vault();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["note", "find", "[", "--vault"])
         .arg(vault.path())
         .arg("--json")

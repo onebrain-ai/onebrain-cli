@@ -412,6 +412,13 @@ pub fn run(vault_flag: Option<PathBuf>) -> Result<()> {
     let resolved = crate::vault_ctx::require(vault_flag)?;
     let config = load_vault_config(&resolved.root).context("load vault config")?;
     let current = config.search.embed_model.clone();
+    // Deliberately the PERSISTING resolver, unlike its sibling
+    // `search_model::run_list` (moved to `collection_name_readonly` in
+    // v3.4.17): this is `run_bare`'s TTY branch, an interactive surface that
+    // already rewrites `onebrain.yml` on its normal paths — switching the
+    // model persists `search.embed_model`, and `reconcile_missing_model` just
+    // below writes too. The read-only rule exists to stop surfaces that claim
+    // to write nothing from writing; it is not a blanket ban on writing.
     let collection = collection_for(&resolved).context("resolve collection")?;
     let cache_dir = collection_cache_dir(&collection);
 

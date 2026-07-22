@@ -2543,6 +2543,49 @@ mod tests {
         assert!(!slot.lock.exists(), "stale lock cleared");
     }
 
+    /// Search-cache isolation for every spawn of the real binary in this
+    /// module — the `src/` counterpart of `tests/support::scratch_cache_root`,
+    /// enforced by `tests/cache_isolation_sweep.rs`.
+    ///
+    /// It does TWO things, and doing both in one call is the point:
+    ///
+    /// 1. `ONEBRAIN_CACHE_DIR` — `migration::default_state_dir` returns it
+    ///    before consulting `dirs::data_dir()`, so it is dispositive on every
+    ///    platform. Without it these tests reach the developer's real
+    ///    `~/Library/Application Support/onebrain/search/`, and `daemon start`
+    ///    is the worst offender in the crate: the detached `__run` child holds
+    ///    the engine (`hold_engine = true` → `server::internal::
+    ///    try_open_held_engine` → `Engine::open`), which materializes a whole
+    ///    collection directory (`index/` + `models/`) there — not the
+    ///    `token/`-only stub that issue #300 was about.
+    /// 2. `XDG_DATA_HOME` removal — redirecting `HOME` alone does NOT redirect
+    ///    `dirs::data_dir()` on Linux, which reads `$XDG_DATA_HOME` first. A
+    ///    developer or CI runner with that variable set would still land
+    ///    outside the tempdir on any path where (1) is missed.
+    ///
+    /// Bundling them means no call site can get the pair half-right, which is
+    /// what happened when each of the 12 spawn sites here spelled its own env
+    /// out: 7 of the 9 test functions pinned neither.
+    #[cfg(unix)]
+    trait IsolateCacheRoot {
+        fn isolate_cache_root(&mut self, cache: &Path) -> &mut Self;
+    }
+    #[cfg(unix)]
+    macro_rules! impl_isolate_cache_root {
+        ($t:ty) => {
+            impl IsolateCacheRoot for $t {
+                fn isolate_cache_root(&mut self, cache: &Path) -> &mut Self {
+                    self.env("ONEBRAIN_CACHE_DIR", cache)
+                        .env_remove("XDG_DATA_HOME")
+                }
+            }
+        };
+    }
+    #[cfg(unix)]
+    impl_isolate_cache_root!(std::process::Command);
+    #[cfg(unix)]
+    impl_isolate_cache_root!(assert_cmd::Command);
+
     /// RAII teardown for the real-daemon integration tests: runs
     /// `onebrain daemon stop` (with the test's own HOME/env) on drop, so a
     /// FAILED assertion between `daemon start` and the test's own `stop` never
@@ -2557,9 +2600,36 @@ mod tests {
         envs: Vec<(String, String)>,
     }
     #[cfg(unix)]
+    impl StopDaemonOnDrop {
+        /// The only constructor: HOME and the isolated cache root are baked in
+        /// so a teardown spawn can never be the one unisolated invocation left
+        /// in a test. `ONEBRAIN_DAEMON_PORT=0` keeps any daemon this spawns off
+        /// the fixed default port. Extra env goes on via [`Self::with_env`].
+        fn new(home: &Path, cache: &Path) -> Self {
+            Self {
+                bin: assert_cmd::cargo::cargo_bin("onebrain"),
+                envs: vec![
+                    ("HOME".into(), home.display().to_string()),
+                    ("ONEBRAIN_CACHE_DIR".into(), cache.display().to_string()),
+                    ("ONEBRAIN_DAEMON_PORT".into(), "0".into()),
+                ],
+            }
+        }
+
+        fn with_env(mut self, key: &str, value: impl std::fmt::Display) -> Self {
+            self.envs.push((key.to_string(), value.to_string()));
+            self
+        }
+    }
+    #[cfg(unix)]
     impl Drop for StopDaemonOnDrop {
         fn drop(&mut self) {
             let mut cmd = std::process::Command::new(&self.bin);
+            // Belt-and-braces to match `isolate_cache_root`: `envs` always
+            // carries `ONEBRAIN_CACHE_DIR` (see `new`), which is dispositive,
+            // but an inherited `$XDG_DATA_HOME` must not be the thing standing
+            // between this spawn and the developer's real data dir.
+            cmd.env_remove("XDG_DATA_HOME");
             for (k, v) in &self.envs {
                 cmd.env(k, v);
             }
@@ -2609,13 +2679,8 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let home = tempdir().unwrap();
-        let _teardown = StopDaemonOnDrop {
-            bin: assert_cmd::cargo::cargo_bin("onebrain"),
-            envs: vec![
-                ("HOME".into(), home.path().display().to_string()),
-                ("ONEBRAIN_DAEMON_PORT".into(), "0".into()),
-            ],
-        };
+        let cache = tempdir().unwrap();
+        let _teardown = StopDaemonOnDrop::new(home.path(), cache.path());
 
         // Small helper: run `onebrain daemon <verb>` with HOME overridden,
         // returning combined stdout as a String. We assert success separately.
@@ -2629,6 +2694,7 @@ mod tests {
             let out = Command::cargo_bin("onebrain")
                 .unwrap()
                 .env("HOME", home.path())
+                .isolate_cache_root(cache.path())
                 .env("ONEBRAIN_DAEMON_PORT", "0")
                 .args(["daemon", verb])
                 .output()
@@ -2704,10 +2770,8 @@ mod tests {
         use std::net::TcpListener;
 
         let home = tempdir().unwrap();
-        let _teardown = StopDaemonOnDrop {
-            bin: assert_cmd::cargo::cargo_bin("onebrain"),
-            envs: vec![("HOME".into(), home.path().display().to_string())],
-        };
+        let cache = tempdir().unwrap();
+        let _teardown = StopDaemonOnDrop::new(home.path(), cache.path());
 
         // Occupy a port ourselves so the detached child's bind fails. Held
         // open for the whole `daemon start` call below.
@@ -2717,6 +2781,7 @@ mod tests {
         let out = Command::cargo_bin("onebrain")
             .unwrap()
             .env("HOME", home.path())
+            .isolate_cache_root(cache.path())
             .env("ONEBRAIN_DAEMON_PORT", port.to_string())
             .args(["daemon", "start"])
             .output()
@@ -2796,11 +2861,13 @@ mod tests {
             lex.commit().unwrap();
         }
 
-        // Env shared by every `onebrain` invocation below.
+        // Env shared by every `onebrain` invocation below. The cache root is
+        // NOT in this list — `isolate_cache_root` applies it (plus the
+        // `XDG_DATA_HOME` removal) so this test cannot drift out of isolation
+        // by someone editing the vec.
         let envs: Vec<(&str, String)> = vec![
             ("HOME", home.path().display().to_string()),
             ("ONEBRAIN_VAULT", vault.path().display().to_string()),
-            ("ONEBRAIN_CACHE_DIR", cache.path().display().to_string()),
             ("ONEBRAIN_DAEMON_PORT", "0".to_string()),
             ("ONEBRAIN_DAEMON_IDLE_SECS", "0".to_string()),
         ];
@@ -2809,15 +2876,12 @@ mod tests {
             for (k, v) in &envs {
                 cmd.env(k, v);
             }
+            cmd.isolate_cache_root(cache.path());
             cmd.args(["daemon", verb]).output().expect("spawn onebrain")
         };
-        let _teardown = StopDaemonOnDrop {
-            bin: assert_cmd::cargo::cargo_bin("onebrain"),
-            envs: envs
-                .iter()
-                .map(|(k, v)| ((*k).to_string(), v.clone()))
-                .collect(),
-        };
+        let _teardown = StopDaemonOnDrop::new(home.path(), cache.path())
+            .with_env("ONEBRAIN_VAULT", vault.path().display())
+            .with_env("ONEBRAIN_DAEMON_IDLE_SECS", "0");
 
         // Start the daemon.
         assert!(run("start").status.success(), "daemon start failed");
@@ -2932,12 +2996,11 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let home = tempdir().unwrap();
+        let cache = tempdir().unwrap();
         let home_path = home.path().to_path_buf();
+        let cache_path = cache.path().to_path_buf();
         let bin = cargo_bin("onebrain");
-        let _teardown = StopDaemonOnDrop {
-            bin: bin.clone(),
-            envs: vec![("HOME".into(), home_path.display().to_string())],
-        };
+        let _teardown = StopDaemonOnDrop::new(home.path(), cache.path());
 
         // Spawn N threads that each run `onebrain daemon start` as close to
         // simultaneously as possible, collecting each invocation's stdout.
@@ -2946,9 +3009,11 @@ mod tests {
         for _ in 0..N {
             let bin = bin.clone();
             let home_path = home_path.clone();
+            let cache_path = cache_path.clone();
             handles.push(std::thread::spawn(move || {
                 let out = StdCommand::new(&bin)
                     .env("HOME", &home_path)
+                    .isolate_cache_root(&cache_path)
                     .env("ONEBRAIN_DAEMON_PORT", "0")
                     .env("ONEBRAIN_DAEMON_IDLE_SECS", "0")
                     .args(["daemon", "start"])
@@ -3034,11 +3099,9 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let home = tempdir().unwrap();
+        let cache = tempdir().unwrap();
         let bin = cargo_bin("onebrain");
-        let _teardown = StopDaemonOnDrop {
-            bin: bin.clone(),
-            envs: vec![("HOME".into(), home.path().display().to_string())],
-        };
+        let _teardown = StopDaemonOnDrop::new(home.path(), cache.path());
         let run_dir = home.path().join(".onebrain").join("run");
         std::fs::create_dir_all(&run_dir).unwrap();
         // Bare `daemon start`/`stop` from a non-vault cwd operate on the
@@ -3058,6 +3121,7 @@ mod tests {
         let daemon = |verb: &str| -> std::process::Output {
             StdCommand::new(&bin)
                 .env("HOME", home.path())
+                .isolate_cache_root(cache.path())
                 .env("ONEBRAIN_DAEMON_PORT", "0")
                 .env("ONEBRAIN_DAEMON_IDLE_SECS", "0")
                 .args(["daemon", verb])
@@ -3115,16 +3179,15 @@ mod tests {
             "search:\n  collection: vault-arg-it\n",
         )
         .unwrap();
+        let cache = tempdir().unwrap();
         let bin = cargo_bin("onebrain");
-        let _teardown = StopDaemonOnDrop {
-            bin: bin.clone(),
-            envs: vec![("HOME".into(), home.path().display().to_string())],
-        };
+        let _teardown = StopDaemonOnDrop::new(home.path(), cache.path());
 
         // Start WITH --vault and WITHOUT $ONEBRAIN_VAULT (env_remove makes the
         // arg the only possible source of the bound vault).
         let start = StdCommand::new(&bin)
             .env("HOME", home.path())
+            .isolate_cache_root(cache.path())
             .env_remove("ONEBRAIN_VAULT")
             .env("ONEBRAIN_DAEMON_PORT", "0")
             .env("ONEBRAIN_DAEMON_IDLE_SECS", "0")
@@ -3188,16 +3251,15 @@ mod tests {
         let subdir = vault.path().join("00-inbox");
         std::fs::create_dir_all(&subdir).unwrap();
 
+        let cache = tempdir().unwrap();
         let bin = cargo_bin("onebrain");
-        let _teardown = StopDaemonOnDrop {
-            bin: bin.clone(),
-            envs: vec![("HOME".into(), home.path().display().to_string())],
-        };
+        let _teardown = StopDaemonOnDrop::new(home.path(), cache.path());
 
         // Start with NO --vault and NO $ONEBRAIN_VAULT, from a SUBDIRECTORY
         // of the vault — walk-up is the only way this can resolve.
         let start = StdCommand::new(&bin)
             .env("HOME", home.path())
+            .isolate_cache_root(cache.path())
             .env_remove("ONEBRAIN_VAULT")
             .env("ONEBRAIN_DAEMON_PORT", "0")
             .env("ONEBRAIN_DAEMON_IDLE_SECS", "0")
@@ -3269,16 +3331,7 @@ mod tests {
         .unwrap();
 
         let bin = cargo_bin("onebrain");
-        let _teardown = StopDaemonOnDrop {
-            bin: bin.clone(),
-            envs: vec![
-                ("HOME".into(), home.path().display().to_string()),
-                (
-                    "ONEBRAIN_CACHE_DIR".into(),
-                    cache.path().display().to_string(),
-                ),
-            ],
-        };
+        let _teardown = StopDaemonOnDrop::new(home.path(), cache.path());
 
         // Start a daemon for A and for B CONCURRENTLY (two threads racing), each
         // with an explicit `--vault`. Distinct slots take distinct start locks,
@@ -3290,7 +3343,7 @@ mod tests {
             std::thread::spawn(move || {
                 StdCommand::new(&bin)
                     .env("HOME", &home)
-                    .env("ONEBRAIN_CACHE_DIR", &cache)
+                    .isolate_cache_root(&cache)
                     .env_remove("ONEBRAIN_VAULT")
                     .env("ONEBRAIN_DAEMON_PORT", "0")
                     .env("ONEBRAIN_DAEMON_IDLE_SECS", "0")
@@ -3334,6 +3387,7 @@ mod tests {
             if Instant::now() >= deadline {
                 let _ = StdCommand::new(&bin)
                     .env("HOME", home.path())
+                    .isolate_cache_root(cache.path())
                     .args(["daemon", "stop", "--all"])
                     .output();
                 panic!(
@@ -3376,7 +3430,7 @@ mod tests {
         // `daemon status` enumerates BOTH slots.
         let status = StdCommand::new(&bin)
             .env("HOME", home.path())
-            .env("ONEBRAIN_CACHE_DIR", cache.path())
+            .isolate_cache_root(cache.path())
             .args(["daemon", "status"])
             .output()
             .expect("daemon status");
@@ -3393,6 +3447,7 @@ mod tests {
         // `daemon stop --all` retires BOTH; their slot jsons disappear.
         let stop = StdCommand::new(&bin)
             .env("HOME", home.path())
+            .isolate_cache_root(cache.path())
             .args(["daemon", "stop", "--all"])
             .output()
             .expect("daemon stop --all");
@@ -3430,15 +3485,14 @@ mod tests {
             "search:\n  collection: low1-it\n",
         )
         .unwrap();
+        let cache = tempdir().unwrap();
         let bin = cargo_bin("onebrain");
-        let _teardown = StopDaemonOnDrop {
-            bin: bin.clone(),
-            envs: vec![("HOME".into(), home.path().display().to_string())],
-        };
+        let _teardown = StopDaemonOnDrop::new(home.path(), cache.path());
 
         // Start a daemon bound to X.
         let start = StdCommand::new(&bin)
             .env("HOME", home.path())
+            .isolate_cache_root(cache.path())
             .env_remove("ONEBRAIN_VAULT")
             .env("ONEBRAIN_DAEMON_PORT", "0")
             .env("ONEBRAIN_DAEMON_IDLE_SECS", "0")
@@ -3461,6 +3515,7 @@ mod tests {
 
         let stop = StdCommand::new(&bin)
             .env("HOME", home.path())
+            .isolate_cache_root(cache.path())
             .env_remove("ONEBRAIN_VAULT")
             .args(["daemon", "stop", "--vault"])
             .arg(vault.path())

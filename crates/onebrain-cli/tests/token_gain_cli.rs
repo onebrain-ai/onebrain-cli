@@ -5,6 +5,8 @@
 //! reporting/administration surface against a fresh, empty token.redb + raw
 //! log, which is the honest default state: zeroed totals, empty history.
 
+mod support;
+
 use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
@@ -148,6 +150,7 @@ fn token_gain_default_after_reset_shows_only_post_reset_traffic() {
 #[test]
 fn token_gain_help_lists_the_verb() {
     let out = Command::new(env!("CARGO_BIN_EXE_onebrain"))
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["token", "--help"])
         .output()
         .unwrap();

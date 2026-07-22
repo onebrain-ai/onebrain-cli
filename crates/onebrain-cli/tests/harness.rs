@@ -1,3 +1,5 @@
+mod support;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::PathBuf;
@@ -12,6 +14,7 @@ fn fixture(name: &str) -> PathBuf {
 fn empty_dir_emits_direct_json() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["harness", "detect", "--json"])
         .current_dir(fixture("empty"))
         .env_remove("ONEBRAIN_HARNESS")
@@ -24,6 +27,7 @@ fn empty_dir_emits_direct_json() {
 fn claude_dir_emits_claude_json() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["harness", "detect", "--json"])
         .current_dir(fixture("with_claude"))
         .env_remove("ONEBRAIN_HARNESS")
@@ -36,6 +40,7 @@ fn claude_dir_emits_claude_json() {
 fn both_dirs_emit_claude_first_json() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["harness", "detect", "--json"])
         .current_dir(fixture("with_both"))
         .env_remove("ONEBRAIN_HARNESS")
@@ -53,6 +58,7 @@ fn both_dirs_emit_claude_first_json() {
 fn default_mode_is_text_not_json() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["harness", "detect"])
         .current_dir(fixture("empty"))
         .env_remove("ONEBRAIN_HARNESS")
@@ -67,6 +73,7 @@ fn default_mode_is_text_not_json() {
 fn yaml_mode_emits_yaml_not_json() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["harness", "detect", "--yaml"])
         .current_dir(fixture("with_claude"))
         .env_remove("ONEBRAIN_HARNESS")
@@ -80,6 +87,7 @@ fn yaml_mode_emits_yaml_not_json() {
 fn pretty_json_is_indented_multiline() {
     let assert = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["harness", "detect", "--json", "--pretty"])
         .current_dir(fixture("with_claude"))
         .env_remove("ONEBRAIN_HARNESS")

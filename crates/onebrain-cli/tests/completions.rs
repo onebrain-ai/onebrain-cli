@@ -1,3 +1,5 @@
+mod support;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 
@@ -5,6 +7,7 @@ use predicates::prelude::*;
 fn completions_zsh_emits_compdef_marker() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["completions", "zsh"])
         .assert()
         .success()
@@ -15,6 +18,7 @@ fn completions_zsh_emits_compdef_marker() {
 fn completions_bash_emits_function_marker() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["completions", "bash"])
         .assert()
         .success()
@@ -25,6 +29,7 @@ fn completions_bash_emits_function_marker() {
 fn completions_fish_emits_complete_marker() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["completions", "fish"])
         .assert()
         .success()
@@ -35,6 +40,7 @@ fn completions_fish_emits_complete_marker() {
 fn completions_rejects_unknown_shell() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["completions", "tcsh"])
         .assert()
         .failure();
@@ -45,6 +51,7 @@ fn init_yes_does_not_print_completions_hint() {
     let tmp = tempfile::tempdir().unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["init", "--yes", "--no-sync"])
         .current_dir(tmp.path())
         .assert()
@@ -56,6 +63,7 @@ fn completions_for(shell: &str) -> String {
     String::from_utf8(
         Command::cargo_bin("onebrain")
             .unwrap()
+            .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
             .args(["completions", shell])
             .output()
             .unwrap()

@@ -11,6 +11,8 @@
 //!     - Inside a vault  → exit 72.
 //!     - Outside any vault → exit 64 (E_VAULT_NOT_FOUND).
 
+mod support;
+
 use assert_cmd::Command;
 use std::fs;
 use tempfile::tempdir;
@@ -33,6 +35,7 @@ fn vault_dir() -> tempfile::TempDir {
 fn exit_in(cwd: &std::path::Path, args: &[&str]) -> i32 {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(cwd)
         .env_remove("ONEBRAIN_VAULT")
         .args(args)
@@ -217,6 +220,7 @@ fn stub_error_message_contains_verb_path() {
     // Non-vault-gated stub (avatar start).
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(vault.path())
         .env_remove("ONEBRAIN_VAULT")
         .args(["avatar", "start"])
@@ -236,6 +240,7 @@ fn stub_error_message_contains_verb_path() {
     // Vault-required stub (task add) inside vault.
     let out2 = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(vault.path())
         .env_remove("ONEBRAIN_VAULT")
         .args(["task", "add", "buy milk"])
@@ -265,6 +270,7 @@ fn completions_arm_exits_0_with_output() {
     for shell in ["bash", "zsh", "fish"] {
         let out = Command::cargo_bin("onebrain")
             .unwrap()
+            .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
             .args(["completions", shell])
             .output()
             .unwrap();
@@ -325,6 +331,7 @@ fn schedule_list_exits_0_and_prints_schedule_inside_vault() {
     .unwrap();
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(vault.path())
         .env_remove("ONEBRAIN_VAULT")
         .args(["schedule", "list"])
@@ -359,6 +366,7 @@ fn schedule_list_exits_0_and_prints_schedule_inside_vault() {
 fn daemon_status_exits_0_with_no_running_daemon() {
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .env_remove("ONEBRAIN_VAULT")
         .args(["daemon", "status"])
         .output()
@@ -384,6 +392,7 @@ fn daemon_status_exits_0_with_no_running_daemon() {
 fn daemon_stop_graceful_when_not_running() {
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .env_remove("ONEBRAIN_VAULT")
         .args(["daemon", "stop"])
         .output()
@@ -448,6 +457,7 @@ fn plugin_migrate_unknown_migration_exits_0() {
     let vault = vault_dir();
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(vault.path())
         .env_remove("ONEBRAIN_VAULT")
         .args([
@@ -544,6 +554,7 @@ fn skill_run_without_name_errors_exit_1() {
     let neutral = tempdir().unwrap();
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(neutral.path())
         .env_remove("ONEBRAIN_VAULT")
         .args(["skill", "run"])
@@ -574,6 +585,7 @@ fn run_skill_alias_without_vault_exits_64() {
     let neutral = tempdir().unwrap();
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(neutral.path())
         .env_remove("ONEBRAIN_VAULT")
         .args(["run-skill", "--skill", "daily"])
@@ -618,6 +630,7 @@ fn run_skill_alias_resolves_vault_via_walk_up_from_nested_cwd() {
 
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(&nested)
         .env_remove("ONEBRAIN_VAULT")
         .env("CLAUDE_BIN", &mock)

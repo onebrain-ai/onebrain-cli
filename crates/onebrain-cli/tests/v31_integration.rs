@@ -17,6 +17,8 @@
 //! - Migration notice fires once per command per process (sticky via state
 //!   file across processes)
 
+mod support;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
@@ -34,6 +36,7 @@ fn root_help_shows_3_root_verbs_and_visible_groups() {
     // and `hidden_stub_still_dispatches`); they're just hidden from help.
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .arg("--help")
         .assert()
         .success();
@@ -83,6 +86,7 @@ fn root_help_renders_compact_with_wrapped_defaults() {
     // loudly.
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .arg("--help")
         .assert()
         .success();
@@ -115,6 +119,7 @@ fn root_help_renders_compact_with_wrapped_defaults() {
 fn root_help_hides_v30_aliases() {
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .arg("--help")
         .assert()
         .success();
@@ -157,6 +162,7 @@ fn top_level_help_hides_stub_groups() {
     // the visible list to the hidden/stub list below.
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .arg("--help")
         .assert()
         .success();
@@ -221,6 +227,7 @@ fn hidden_stub_still_dispatches() {
     // `not implemented: <group> <verb>` error message.
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["avatar", "pair"])
         .assert()
         .failure()
@@ -245,6 +252,7 @@ fn top_level_help_is_production_grade() {
     // `about` descriptions, and commands appear in domain-clustered order.
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .arg("--help")
         .assert()
         .success();
@@ -369,6 +377,7 @@ fn help_no_longer_has_about_line() {
     // body will once again carry two stacked brand lines.
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .env_remove("NO_COLOR")
         .env_remove("CI")
         .env("TERM", "xterm-256color")
@@ -395,6 +404,7 @@ fn vault_current_reports_walk_up_source() {
 
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(dir.path())
         .args(["vault", "current", "--json"])
         .assert()
@@ -417,6 +427,7 @@ fn vault_current_reports_flag_source_when_explicit() {
 
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         // Run from a totally different directory so walk-up can't accidentally
         // match. Tempdir for cwd has no vault.yml.
         .current_dir(tempdir().unwrap().path())
@@ -441,6 +452,7 @@ fn vault_current_reports_not_detected_when_no_vault() {
 
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(no_vault.path())
         .args(["vault", "current", "--json"])
         // vault current is informational, NOT vault-required, so exit 0.
@@ -498,6 +510,7 @@ fn session_init_emits_block_json_outside_vault() {
 
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(no_vault.path())
         // v3.1: machine consumers must opt into JSON explicitly.
         .args(["session", "init", "--json"])
@@ -517,6 +530,7 @@ fn session_init_yaml_flag_emits_yaml_block_outside_vault() {
     let no_vault = tempdir().unwrap();
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(no_vault.path())
         .args(["session", "init", "--yaml"])
         .assert()
@@ -547,6 +561,7 @@ fn session_init_output_yaml_alias_works() {
     let no_vault = tempdir().unwrap();
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(no_vault.path())
         .args(["session", "init", "--output", "yaml"])
         .assert()
@@ -569,6 +584,7 @@ fn orphan_scan_alias_dispatches_to_checkpoint_orphans() {
     // v3.1: explicit --json so the schema check below holds.
     let out_alias = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(dir.path())
         .args(["orphan-scan", "07-logs", "tokABC", "--json"])
         .assert()
@@ -577,6 +593,7 @@ fn orphan_scan_alias_dispatches_to_checkpoint_orphans() {
 
     let out_new = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(dir.path())
         .args(["checkpoint", "orphans", "07-logs", "tokABC", "--json"])
         .assert()
@@ -606,6 +623,7 @@ fn vault_required_stub_returns_64_outside_vault_or_72_inside() {
     make_vault(dir.path());
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(dir.path())
         .env_remove("ONEBRAIN_VAULT")
         .args(["task", "add", "my task"])
@@ -619,6 +637,7 @@ fn vault_required_stub_returns_64_outside_vault_or_72_inside() {
     let no_vault = tempdir().unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(no_vault.path())
         .env_remove("ONEBRAIN_VAULT")
         .args(["task", "add", "my task"])
@@ -635,6 +654,7 @@ fn plugin_update_outside_vault_exits_64_not_101() {
     let no_vault = tempdir().unwrap();
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(no_vault.path())
         .env_remove("ONEBRAIN_VAULT")
         .args(["plugin", "update", "--dry-run"])
@@ -670,6 +690,9 @@ fn plugin_update_broken_pipe_does_not_silently_succeed() {
     // Use bash to pipe through `head -c 0` which closes stdout immediately.
     let onebrain_bin = assert_cmd::cargo::cargo_bin("onebrain");
     let status = std::process::Command::new("bash")
+        // The binary is spawned indirectly (through bash), so the isolation
+        // rides on bash's environment and is inherited by the child.
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .arg("-c")
         .arg(format!(
             "{} --vault {} plugin update --dry-run | head -c 0",
@@ -693,6 +716,7 @@ fn json_error_path_emits_canonical_envelope_on_stdout() {
 
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         // Use --vault pointing at a non-vault path so we hit NotAVault
         // (deterministic; doesn't depend on cwd or env).
         .args([
@@ -735,6 +759,7 @@ fn text_error_path_keeps_legacy_stderr_format() {
 
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "--vault",
             bogus.path().to_str().unwrap(),
@@ -800,6 +825,7 @@ fn json_envelope_shape_is_canonical_for_vault_current() {
 
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(dir.path())
         .args(["vault", "current", "--json"])
         .assert()
@@ -823,6 +849,7 @@ fn yaml_output_matches_envelope_keys() {
 
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(dir.path())
         .args(["vault", "current", "--yaml"])
         .assert()
@@ -841,6 +868,7 @@ fn harness_flat_invocation_now_shows_help() {
     // help-on-missing-subcommand exit is non-zero, hence `failure()`.
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["harness"])
         .assert()
         .failure();
@@ -850,6 +878,7 @@ fn harness_flat_invocation_now_shows_help() {
 fn harness_detect_explicit_works() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["harness", "detect"])
         .assert()
         .success();
@@ -869,6 +898,7 @@ fn json_output_never_contains_banner_on_stdout() {
     make_vault(dir.path());
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(dir.path())
         .args(["vault", "current", "--json"])
         .assert()
@@ -892,6 +922,7 @@ fn piped_text_output_never_emits_banner_on_stdout() {
     make_vault(dir.path());
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(dir.path())
         .args(["vault", "current"])
         .assert()
@@ -1044,6 +1075,7 @@ fn plugin_update_partial_failure_emits_partial_envelope() {
 
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["plugin", "update", "--json"])
         .current_dir(vault)
         .env("HOME", home.path())
@@ -1151,6 +1183,7 @@ fn root_update_does_not_rewrite_hooks_or_plists() {
     // fetch failure) — we only care about the on-disk side-effect.
     let _ = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(vault)
         .env("HOME", home.path())
         .args(["update", "--check", "--json"])
@@ -1454,6 +1487,7 @@ fn vault_flag_accepted_post_subcommand() {
 
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(other.path())
         .env_remove("ONEBRAIN_VAULT")
         .args([
@@ -1480,6 +1514,7 @@ fn vault_env_overridden_by_flag() {
 
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(tempdir().unwrap().path())
         .env("ONEBRAIN_VAULT", bad.path())
         .args([
@@ -1510,6 +1545,7 @@ fn vault_env_only_when_no_flag() {
 
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(elsewhere.path())
         .env("ONEBRAIN_VAULT", dir.path())
         .args(["vault", "current", "--json"])
@@ -1546,6 +1582,7 @@ const BRAND_MARK: &str = "Your AI Thinking Partner";
 fn help_top_level_emits_banner_to_stderr_when_pretty() {
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .env_remove("NO_COLOR")
         .env_remove("CI")
         .env("TERM", "xterm-256color")
@@ -1574,6 +1611,7 @@ fn help_top_level_emits_banner_to_stderr_when_pretty() {
 fn help_subcommand_emits_banner() {
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .env_remove("NO_COLOR")
         .env_remove("CI")
         .env("TERM", "xterm-256color")
@@ -1592,6 +1630,7 @@ fn help_subcommand_emits_banner() {
 fn help_verb_emits_banner() {
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .env_remove("NO_COLOR")
         .env_remove("CI")
         .env("TERM", "xterm-256color")
@@ -1610,6 +1649,7 @@ fn help_verb_emits_banner() {
 fn help_with_json_flag_no_banner() {
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .env_remove("NO_COLOR")
         .env_remove("CI")
         .env("TERM", "xterm-256color")
@@ -1628,6 +1668,7 @@ fn help_with_json_flag_no_banner() {
 fn help_with_quiet_flag_no_banner() {
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .env_remove("NO_COLOR")
         .env_remove("CI")
         .env("TERM", "xterm-256color")
@@ -1648,6 +1689,7 @@ fn version_no_banner() {
     // banner must NOT prepend a brand line above the bare version string.
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .env_remove("NO_COLOR")
         .env_remove("CI")
         .env("TERM", "xterm-256color")
@@ -1672,6 +1714,7 @@ fn help_no_color_env_no_banner() {
     // a pipe in assert_cmd.
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .env("NO_COLOR", "1")
         .env_remove("CI")
         .env("TERM", "xterm-256color")
@@ -1694,6 +1737,7 @@ fn group_dash_help_emits_banner() {
     // group level (was the path covering `plugin help` before the rename).
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .env_remove("NO_COLOR")
         .env_remove("CI")
         .env("TERM", "xterm-256color")
@@ -1724,6 +1768,7 @@ fn bare_group_emits_banner_above_help() {
     // the pre-parse path is later broadened to match this argv shape too.
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .env_remove("NO_COLOR")
         .env_remove("CI")
         .env("TERM", "xterm-256color")
@@ -1754,6 +1799,7 @@ fn legacy_help_keyword_emits_no_banner() {
     // the contract through the full clap → main → banner pipeline.
     let out = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .env_remove("NO_COLOR")
         .env_remove("CI")
         .env("TERM", "xterm-256color")

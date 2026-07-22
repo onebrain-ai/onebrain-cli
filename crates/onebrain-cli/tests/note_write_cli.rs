@@ -1,6 +1,8 @@
 //! Integration tests for `note edit`, `note delete`, and `note mkdir`.
 //! Drives the real compiled `onebrain` binary via `assert_cmd`.
 
+mod support;
+
 use assert_cmd::Command;
 use tempfile::tempdir;
 
@@ -23,6 +25,7 @@ fn note_edit_overwrites_body() {
     std::fs::write(root.join("a.md"), "old").unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "note",
             "edit",
@@ -45,6 +48,7 @@ fn note_edit_creates_when_missing() {
     let root = dir.path();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "note",
             "edit",
@@ -68,6 +72,7 @@ fn note_delete_moves_to_trash() {
     std::fs::write(root.join("a.md"), "x").unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["note", "delete", "a.md", "--vault", root.to_str().unwrap()])
         .assert()
         .success();
@@ -81,6 +86,7 @@ fn note_mkdir_creates_folder() {
     let root = dir.path();
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args([
             "note",
             "mkdir",

@@ -1,3 +1,5 @@
+mod support;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::PathBuf;
@@ -16,6 +18,7 @@ fn fixture(name: &str) -> PathBuf {
 fn empty_logs_emits_zero_with_json_flag() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["orphan-scan", ".", "abc12345", "--json"])
         .current_dir(fixture("empty_logs"))
         .assert()
@@ -28,6 +31,7 @@ fn current_session_token_filters_self_with_json_flag() {
     // When `session_token == currtok`, the lone checkpoint must be skipped.
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["orphan-scan", ".", "currtok", "--json"])
         .current_dir(fixture("current_token_only"))
         .assert()
@@ -39,6 +43,7 @@ fn current_session_token_filters_self_with_json_flag() {
 fn manual_session_log_skips_date_with_json_flag() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["orphan-scan", ".", "abc12345", "--json"])
         .current_dir(fixture("manual_log_skip"))
         .assert()
@@ -52,6 +57,7 @@ fn manual_session_log_skips_date_with_json_flag() {
 fn default_emits_text_not_json() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["orphan-scan", ".", "abc12345"])
         .current_dir(fixture("empty_logs"))
         .assert()

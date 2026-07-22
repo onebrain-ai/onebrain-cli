@@ -1,3 +1,5 @@
+mod support;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::PathBuf;
@@ -75,6 +77,7 @@ fn session_init_honors_onebrain_vault_env_from_outside_any_vault() {
 fn session_init_emits_block_outside_vault_with_json() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["session-init", "--json"])
         .current_dir(fixture("empty_vault"))
         .assert()
@@ -93,6 +96,7 @@ fn session_init_emits_block_outside_vault_with_json() {
 fn session_init_emits_block_on_malformed_vault_yml_with_json() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["session-init", "--json"])
         .current_dir(fixture("malformed_vault"))
         .assert()
@@ -110,6 +114,7 @@ fn session_init_emits_block_on_malformed_vault_yml_with_json() {
 fn default_outside_vault_emits_text_not_json() {
     Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .arg("session-init")
         .current_dir(fixture("empty_vault"))
         .assert()
@@ -136,6 +141,7 @@ fn default_inside_vault_emits_text_session_ready() {
 fn json_pretty_emits_indented_multiline() {
     let output = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["session-init", "--json", "--pretty"])
         .current_dir(fixture("empty_vault"))
         .output()
@@ -154,6 +160,7 @@ fn json_pretty_emits_indented_multiline() {
 fn yaml_flag_emits_yaml() {
     let output = Command::cargo_bin("onebrain")
         .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["session-init", "--yaml"])
         .current_dir(fixture("empty_vault"))
         .output()
