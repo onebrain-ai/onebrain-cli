@@ -91,7 +91,7 @@ fn managed_uninstall_removes_plugin_and_marker() {
     fs::create_dir_all(vault.path().join(".codex")).unwrap();
     fs::write(
         vault.path().join(".codex/onebrain-plugin.json"),
-        r#"{"managed":true}"#,
+        r#"{"managed":true,"plugin":"onebrain@onebrain"}"#,
     )
     .unwrap();
 
@@ -125,7 +125,7 @@ fn managed_uninstall_dry_run_preserves_marker_and_global_state() {
     let home = tempdir().unwrap();
     fs::create_dir_all(vault.path().join(".codex")).unwrap();
     let marker = vault.path().join(".codex/onebrain-plugin.json");
-    fs::write(&marker, r#"{"managed":true}"#).unwrap();
+    fs::write(&marker, r#"{"managed":true,"plugin":"onebrain@onebrain"}"#).unwrap();
 
     Command::cargo_bin("onebrain")
         .unwrap()

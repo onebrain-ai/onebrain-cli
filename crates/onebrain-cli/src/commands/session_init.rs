@@ -3,7 +3,9 @@ use crate::legacy_output::{serialize_for_mode, SessionInitBlock, SessionInitOutp
 use crate::output::OutputMode;
 use anyhow::{Context, Result};
 use onebrain_cache::{clean_stale_state_file, resolve_session_token, ResolveInputs};
-use onebrain_core::{load_vault_config, resolve_vault, CoreError, VaultResolveInputs};
+use onebrain_core::{
+    load_vault_config, resolve_vault, CoreError, SessionToken, VaultResolveInputs,
+};
 use onebrain_search::engine::Engine;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -19,6 +21,7 @@ enum SessionInitResult {
 pub fn run(
     vault_dir: Option<PathBuf>,
     vault_flag: Option<PathBuf>,
+    session_token: Option<&str>,
     mode: &OutputMode,
 ) -> Result<()> {
     // Bun parity: `--vault-dir <path>` overrides the cwd-based auto-detect.
@@ -29,7 +32,13 @@ pub fn run(
         Some(dir) => dir,
         None => env::current_dir().context("read current directory")?,
     };
-    let line = build_output(&start, vault_flag, mode, native_pending_bounded)?;
+    let line = build_output_with_token(
+        &start,
+        vault_flag,
+        session_token,
+        mode,
+        native_pending_bounded,
+    )?;
     println!("{line}");
     Ok(())
 }
@@ -39,14 +48,25 @@ pub fn run(
 /// index). It is only invoked on the happy path when the vault actually has a
 /// search collection configured; `collection` is that already-resolved name
 /// (never `None` at the call site — see [`compute_result`]).
+#[cfg(test)]
 fn build_output(
     cwd: &Path,
     vault_flag: Option<PathBuf>,
     mode: &OutputMode,
     qmd_count: impl Fn(&onebrain_core::VaultRoot, &str) -> Option<usize>,
 ) -> Result<String> {
+    build_output_with_token(cwd, vault_flag, None, mode, qmd_count)
+}
+
+fn build_output_with_token(
+    cwd: &Path,
+    vault_flag: Option<PathBuf>,
+    session_token: Option<&str>,
+    mode: &OutputMode,
+    qmd_count: impl Fn(&onebrain_core::VaultRoot, &str) -> Option<usize>,
+) -> Result<String> {
     Ok(format_output(
-        &compute_result(cwd, vault_flag, qmd_count)?,
+        &compute_result(cwd, vault_flag, session_token, qmd_count)?,
         mode,
     ))
 }
@@ -54,6 +74,7 @@ fn build_output(
 fn compute_result(
     cwd: &Path,
     vault_flag: Option<PathBuf>,
+    session_token: Option<&str>,
     qmd_count: impl Fn(&onebrain_core::VaultRoot, &str) -> Option<usize>,
 ) -> Result<SessionInitResult> {
     // Vault resolution follows the same flag > ONEBRAIN_VAULT env >
@@ -102,8 +123,14 @@ fn compute_result(
     // Approximate the process start time before any subprocess work.
     let process_start = SystemTime::now();
 
-    let inputs = ResolveInputs::from_env();
-    let token = resolve_session_token(&inputs).context("resolve session token")?;
+    let token = match session_token {
+        Some(raw) => SessionToken::sanitize(raw)
+            .context("session token override must contain at least one alphanumeric character")?,
+        None => {
+            let inputs = ResolveInputs::from_env();
+            resolve_session_token(&inputs).context("resolve session token")?
+        }
+    };
 
     // Best-effort cleanup of an orphaned state file from a prior process —
     // mirrors Bun `cleanStaleStateFile`. Failures emit a stderr warning only;

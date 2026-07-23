@@ -174,19 +174,20 @@ pub fn run(
     // Refresh Codex only for vaults whose explicit managed-install marker is
     // present. A refresh failure is partial: vault sync has already succeeded
     // and must not be rolled back.
-    if report.partial_failure.is_none() {
-        match crate::commands::codex_plugin::refresh_if_managed(&vault_root, dry_run) {
-            Ok(Some(code)) if code != 0 => {
-                report.partial_failure = Some(format!(
-                    "managed Codex plugin refresh exited with code {code}"
-                ));
-            }
-            Err(error) => {
-                report.partial_failure =
-                    Some(format!("managed Codex plugin refresh failed: {error:#}"));
-            }
-            _ => {}
+    match crate::commands::codex_plugin::refresh_if_managed(&vault_root, dry_run) {
+        Ok(Some(code)) if code != 0 => {
+            append_partial_failure(
+                &mut report,
+                format!("managed Codex plugin refresh exited with code {code}"),
+            );
         }
+        Err(error) => {
+            append_partial_failure(
+                &mut report,
+                format!("managed Codex plugin refresh failed: {error:#}"),
+            );
+        }
+        _ => {}
     }
 
     // 5. Retire a version-skewed warm daemon for this vault (#291). A plugin
@@ -204,6 +205,16 @@ pub fn run(
     }
 
     Ok(report)
+}
+
+fn append_partial_failure(report: &mut PluginUpdateReport, failure: String) {
+    match &mut report.partial_failure {
+        Some(existing) => {
+            existing.push_str("; ");
+            existing.push_str(&failure);
+        }
+        None => report.partial_failure = Some(failure),
+    }
 }
 
 /// Step-5 core (#291): stop a LIVE version-skewed warm daemon for `vault_root`,
@@ -272,6 +283,19 @@ mod tests {
         assert!(r.vault_synced);
         assert!(!r.plists_rewritten);
         assert!(r.partial_failure.as_deref().unwrap().contains("launchctl"));
+    }
+
+    #[test]
+    fn partial_failures_are_aggregated() {
+        let mut report = PluginUpdateReport {
+            partial_failure: Some("schedule failed".to_string()),
+            ..Default::default()
+        };
+        append_partial_failure(&mut report, "Codex refresh failed".to_string());
+        assert_eq!(
+            report.partial_failure.as_deref(),
+            Some("schedule failed; Codex refresh failed")
+        );
     }
 
     #[test]

@@ -100,7 +100,7 @@ pub fn run(
 
 pub(crate) fn add_managed_hook_trust(harness: HarnessArg, vault: &Path, argv: &mut Vec<String>) {
     if harness == HarnessArg::Codex
-        && vault.join(".codex/onebrain-plugin.json").is_file()
+        && crate::commands::codex_plugin::has_managed_marker(vault)
         && argv.first().is_some_and(|arg| arg == "exec")
     {
         argv.insert(1, "--dangerously-bypass-hook-trust".to_string());
@@ -684,7 +684,11 @@ mod tests {
     fn managed_codex_marker_adds_hook_trust_bypass() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".codex")).unwrap();
-        std::fs::write(dir.path().join(".codex/onebrain-plugin.json"), "{}").unwrap();
+        std::fs::write(
+            dir.path().join(".codex/onebrain-plugin.json"),
+            r#"{"managed":true,"plugin":"onebrain@onebrain"}"#,
+        )
+        .unwrap();
         let mut argv = vec!["exec".to_string(), "prompt".to_string()];
         add_managed_hook_trust(HarnessArg::Codex, dir.path(), &mut argv);
         assert_eq!(argv[1], "--dangerously-bypass-hook-trust");

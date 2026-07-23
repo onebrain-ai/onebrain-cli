@@ -8,8 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const RETRY: &str = "codex plugin marketplace add <VAULT> && codex plugin add onebrain@onebrain";
-const REFRESH_RETRY: &str =
-    "codex plugin remove onebrain@onebrain && codex plugin add onebrain@onebrain";
+const REFRESH_RETRY: &str = "codex plugin add onebrain@onebrain";
 const REMOVE_RETRY: &str = "codex plugin remove onebrain@onebrain";
 
 pub fn install(vault: &Path, dry_run: bool) -> Result<i32> {
@@ -88,7 +87,7 @@ pub fn refresh_if_managed(vault: &Path, dry_run: bool) -> Result<Option<i32>> {
 
 pub fn uninstall(vault: &Path, dry_run: bool) -> Result<i32> {
     let marker = vault.join(".codex/onebrain-plugin.json");
-    if !marker.is_file() {
+    if !has_managed_marker(vault) {
         println!("plugin uninstall: codex · no managed installation");
         return Ok(0);
     }
@@ -123,33 +122,42 @@ pub fn uninstall(vault: &Path, dry_run: bool) -> Result<i32> {
 }
 
 fn refresh_if_managed_with_bin(vault: &Path, dry_run: bool, codex: &Path) -> Result<Option<i32>> {
-    if !vault.join(".codex/onebrain-plugin.json").is_file() {
+    if !has_managed_marker(vault) {
         return Ok(None);
     }
     if dry_run {
         return Ok(Some(0));
     }
 
-    for args in [
-        &["plugin", "remove", "onebrain@onebrain"][..],
-        &["plugin", "add", "onebrain@onebrain"][..],
-    ] {
-        let status = match Command::new(codex).args(args).status() {
-            Ok(status) => status,
-            Err(error) => {
-                eprintln!(
-                    "plugin update: failed to spawn {}\nretry: {REFRESH_RETRY}",
-                    codex.display()
-                );
-                return Err(error).with_context(|| format!("failed to spawn {}", codex.display()));
-            }
-        };
-        if !status.success() {
-            eprintln!("plugin update: managed Codex refresh failed\nretry: {REFRESH_RETRY}");
-            return Ok(Some(status.code().unwrap_or(1)));
+    let status = match Command::new(codex)
+        .args(["plugin", "add", "onebrain@onebrain"])
+        .status()
+    {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!(
+                "plugin update: failed to spawn {}\nretry: {REFRESH_RETRY}",
+                codex.display()
+            );
+            return Err(error).with_context(|| format!("failed to spawn {}", codex.display()));
         }
+    };
+    if !status.success() {
+        eprintln!("plugin update: managed Codex refresh failed\nretry: {REFRESH_RETRY}");
+        return Ok(Some(status.code().unwrap_or(1)));
     }
     Ok(Some(0))
+}
+
+pub(crate) fn has_managed_marker(vault: &Path) -> bool {
+    let path = vault.join(".codex/onebrain-plugin.json");
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .is_some_and(|value| {
+            value.get("managed").and_then(|v| v.as_bool()) == Some(true)
+                && value.get("plugin").and_then(|v| v.as_str()) == Some("onebrain@onebrain")
+        })
 }
 
 fn codex_home() -> Result<PathBuf> {
@@ -232,7 +240,7 @@ fn write_marker(vault: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_feature_flags, refresh_if_managed_with_bin};
+    use super::{has_managed_marker, merge_feature_flags, refresh_if_managed_with_bin};
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -257,14 +265,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn marker_requires_managed_true_and_expected_plugin() {
+        let vault = tempfile::tempdir().unwrap();
+        fs::create_dir_all(vault.path().join(".codex")).unwrap();
+        let marker = vault.path().join(".codex/onebrain-plugin.json");
+        for invalid in [
+            "{}",
+            r#"{"managed":false,"plugin":"onebrain@onebrain"}"#,
+            r#"{"managed":true,"plugin":"other@onebrain"}"#,
+            "not json",
+        ] {
+            fs::write(&marker, invalid).unwrap();
+            assert!(!has_managed_marker(vault.path()));
+        }
+        fs::write(marker, r#"{"managed":true,"plugin":"onebrain@onebrain"}"#).unwrap();
+        assert!(has_managed_marker(vault.path()));
+    }
+
     #[cfg(unix)]
     #[test]
-    fn managed_refresh_removes_then_readds_plugin() {
+    fn managed_refresh_readds_plugin_in_place() {
         let vault = tempfile::tempdir().unwrap();
         fs::create_dir_all(vault.path().join(".codex")).unwrap();
         fs::write(
             vault.path().join(".codex/onebrain-plugin.json"),
-            r#"{"managed":true}"#,
+            r#"{"managed":true,"plugin":"onebrain@onebrain"}"#,
         )
         .unwrap();
         let bin = vault.path().join("codex");
@@ -282,7 +308,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(log).unwrap(),
-            "plugin remove onebrain@onebrain\nplugin add onebrain@onebrain\n"
+            "plugin add onebrain@onebrain\n"
         );
     }
 }
