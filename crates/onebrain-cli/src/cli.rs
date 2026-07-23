@@ -559,7 +559,7 @@ pub enum GatewayVerb {
 
 #[derive(Args, Debug)]
 #[command(
-    about = "Detect or run an AI harness (claude / gemini)",
+    about = "Detect or run an AI harness (claude / gemini / codex)",
     subcommand_required = true,
     arg_required_else_help = true,
     disable_help_subcommand = true
@@ -570,9 +570,9 @@ pub struct HarnessCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum HarnessVerb {
-    /// Detect the active harness (Claude Code / Gemini / direct).
+    /// Detect the active harness (Claude Code / Gemini / Codex / direct).
     Detect,
-    /// Run a prompt through claude or gemini headlessly. Omit <PROMPT> to read from stdin (`cat note.md | …`).
+    /// Run a prompt through Claude, Gemini, or Codex headlessly. Omit <PROMPT> to read from stdin (`cat note.md | …`).
     Run {
         /// Vault root override · also accepts global `--vault`, and walks up from cwd when omitted.
         /// Ignored when `--mode ad-hoc`.
@@ -595,11 +595,11 @@ pub enum HarnessVerb {
             default_value_t = HarnessArg::Claude,
             hide_default_value = true,
             hide_possible_values = true,
-            help = "AI runtime to run the prompt through\n[default: claude, possible values: claude, gemini]"
+            help = "AI runtime to run the prompt through\n[default: claude, possible values: claude, gemini, codex]"
         )]
         harness: HarnessArg,
-        /// Model passed through to the harness (`claude --model <m>` /
-        /// `gemini -m <m>`). Omit to use the harness default.
+        /// Model passed through to the harness (`claude --model <m>`,
+        /// `gemini -m <m>`, or `codex exec --model <m>`).
         #[arg(long, value_name = "MODEL")]
         model: Option<String>,
     },
@@ -608,10 +608,9 @@ pub enum HarnessVerb {
 /// Whether `onebrain harness run` loads OneBrain's vault context before
 /// invoking the harness, or runs the prompt ad-hoc with no project context.
 ///
-/// `WithContext` (default) passes `--add-dir <vault>` (claude) /
-/// `--include-directories <vault>` (gemini) and sets `cwd = <vault>` so the
-/// harness loads OneBrain's CLAUDE.md / INSTRUCTIONS.md / GEMINI.md; requires
-/// a vault (exit 78 if missing).
+/// `WithContext` (default) passes the harness-specific vault flag and sets
+/// `cwd = <vault>` so the harness loads OneBrain's project instructions;
+/// requires a vault (exit 78 if missing).
 ///
 /// `AdHoc` skips the context-dir flag and forces `cwd = $TMPDIR` so claude /
 /// gemini can't auto-walk-up from a vault subdir and silently re-load
@@ -1187,10 +1186,22 @@ pub enum PluginVerb {
         /// Override branch (defaults to onebrain.yml `update_channel`).
         #[arg(long)]
         branch: Option<String>,
+        /// Harness to install the plugin for.
+        #[arg(long, value_enum, default_value_t = HarnessArg::Claude)]
+        harness: HarnessArg,
+        /// Report actions without changing harness-global state.
+        #[arg(long)]
+        dry_run: bool,
     },
-    /// Uninstall plugin (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Uninstall,
+    /// Remove an explicitly managed harness plugin installation.
+    Uninstall {
+        /// Harness whose managed plugin should be removed.
+        #[arg(long, value_enum, default_value_t = HarnessArg::Claude)]
+        harness: HarnessArg,
+        /// Report actions without changing harness-global state.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Pull plugin from GitHub · rewrite hooks · rebind launchd plists.
     Update {
         /// Optional vault root override.
@@ -1313,11 +1324,14 @@ pub struct SessionCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum SessionVerb {
-    /// Print session metadata as JSON (called by Claude Code's SessionStart hook · users can invoke manually).
+    /// Print session metadata as JSON (called by harness SessionStart hooks).
     Init {
         /// Vault root directory · defaults to auto-detect from cwd.
         #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
         vault_dir: Option<PathBuf>,
+        /// Preserve a hook-derived session token while collecting other startup metadata.
+        #[arg(long, value_name = "TOKEN", hide = true)]
+        session_token: Option<String>,
     },
     /// Print the active session token (not yet implemented · v3.x roadmap).
     #[command(hide = true)]
@@ -1349,6 +1363,7 @@ pub enum HarnessArg {
     #[default]
     Claude,
     Gemini,
+    Codex,
 }
 
 impl HarnessArg {
@@ -1357,6 +1372,7 @@ impl HarnessArg {
         match self {
             HarnessArg::Claude => "claude",
             HarnessArg::Gemini => "gemini",
+            HarnessArg::Codex => "codex",
         }
     }
 }
@@ -1387,7 +1403,7 @@ pub enum SkillVerb {
             default_value_t = HarnessArg::Claude,
             hide_default_value = true,
             hide_possible_values = true,
-            help = "AI runtime to run the skill through\n[default: claude, possible values: claude, gemini]"
+            help = "AI runtime to run the skill through\n[default: claude, possible values: claude, gemini, codex]"
         )]
         harness: HarnessArg,
         /// Model passed through to the harness. Omit to use the harness default. A faster model speeds up headless runs.
@@ -1775,7 +1791,7 @@ mod tests {
         let cli = Cli::try_parse_from(["onebrain", "session", "init"]).unwrap();
         match cli.command {
             Cmd::Session(SessionCmd {
-                verb: SessionVerb::Init { vault_dir },
+                verb: SessionVerb::Init { vault_dir, .. },
             }) => assert!(vault_dir.is_none()),
             _ => panic!("expected Session/Init"),
         }
@@ -1889,6 +1905,19 @@ mod tests {
             }
             _ => panic!("expected skill run"),
         }
+    }
+
+    #[test]
+    fn skill_run_help_advertises_codex_harness() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("skill")
+            .unwrap()
+            .find_subcommand_mut("run")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("claude, gemini, codex"));
     }
 
     #[test]

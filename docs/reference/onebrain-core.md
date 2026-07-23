@@ -21,7 +21,7 @@ src/
 └── types/
     ├── mod.rs          Re-exports DoctorResult/DoctorStatus, Harness, SessionToken
     ├── doctor.rs       DoctorResult + DoctorStatus (diagnostic check result model)
-    ├── harness.rs      Harness enum (Claude/Gemini/Direct AI runtime identifier)
+    ├── harness.rs      Harness enum (Claude/Gemini/Codex/Direct AI runtime identifier)
     └── session.rs      SessionToken (alphanumeric session-unique id with sanitizers)
 ```
 

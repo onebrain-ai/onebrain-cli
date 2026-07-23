@@ -38,6 +38,52 @@ fn session_init_emits_required_fields_in_minimal_vault_with_json() {
         .stdout(predicate::str::contains("\"decision\":").not());
 }
 
+#[test]
+fn codex_chats_with_same_prefix_receive_distinct_session_tokens() {
+    let cache = tempdir().unwrap();
+    let run = |session_id: &str| {
+        let output = Command::cargo_bin("onebrain")
+            .unwrap()
+            .env("ONEBRAIN_CACHE_DIR", cache.path())
+            .env("CODEX_SESSION_ID", session_id)
+            .args(["session-init", "--json"])
+            .current_dir(fixture("minimal_vault"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        value["session_token"].as_str().unwrap().to_owned()
+    };
+
+    let first = run("same-prefix-chat-a");
+    let second = run("same-prefix-chat-b");
+    assert_ne!(first, second);
+    assert_eq!(first.len(), 16);
+    assert_eq!(second.len(), 16);
+}
+
+#[test]
+fn explicit_hook_token_survives_startup_metadata_collection() {
+    let cache = tempdir().unwrap();
+    let output = Command::cargo_bin("onebrain")
+        .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .env("CODEX_SESSION_ID", "a-different-chat-id")
+        .args([
+            "session",
+            "init",
+            "--json",
+            "--session-token",
+            "0123456789abcdef",
+        ])
+        .current_dir(fixture("minimal_vault"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["session_token"], "0123456789abcdef");
+}
+
 /// #229: `onebrain session init --vault <path>` must resolve the flagged
 /// vault even when the process cwd is OUTSIDE any vault — before the fix,
 /// `session init` ignored the global `--vault` flag entirely and always

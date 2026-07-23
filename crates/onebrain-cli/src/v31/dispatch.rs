@@ -95,9 +95,15 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
         // ───── Session ──────────────────────────────────────────────
         Cmd::Session(SessionCmd { verb }) => match verb {
-            SessionVerb::Init { vault_dir } => {
-                commands::session_init::run(vault_dir, vault_flag.clone(), &mode)
-            }
+            SessionVerb::Init {
+                vault_dir,
+                session_token,
+            } => commands::session_init::run(
+                vault_dir,
+                vault_flag.clone(),
+                session_token.as_deref(),
+                &mode,
+            ),
             SessionVerb::Current => stubs::not_implemented("session current"),
             SessionVerb::List => stubs::not_implemented("session list"),
             SessionVerb::Get { .. } => stubs::not_implemented("session get"),
@@ -156,15 +162,32 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
         // ───── Plugin ───────────────────────────────────────────────
         Cmd::Plugin(PluginCmd { verb }) => match verb {
-            PluginVerb::Install { vault_dir, .. } => {
+            PluginVerb::Install {
+                vault_dir,
+                harness,
+                dry_run,
+                ..
+            } => {
                 // v3.0 `register-hooks` + `vault-sync` together. For v3.1 we
                 // expose this as a hidden verb under `plugin install`; full
                 // first-install flow runs through `onebrain init`.
                 let v = vault_dir.or(vault_flag.clone());
-                let code = commands::register_hooks::run(v, false, false)?;
+                let code = if harness == HarnessArg::Codex {
+                    let resolved = crate::vault_ctx::require(v)?;
+                    commands::codex_plugin::install(resolved.root.as_path(), dry_run)?
+                } else {
+                    commands::register_hooks::run(v, dry_run, false)?
+                };
                 std::process::exit(code);
             }
-            PluginVerb::Uninstall => stubs::not_implemented("plugin uninstall"),
+            PluginVerb::Uninstall { harness, dry_run } => {
+                if harness == HarnessArg::Codex {
+                    let resolved = crate::vault_ctx::require(vault_flag.clone())?;
+                    let code = commands::codex_plugin::uninstall(resolved.root.as_path(), dry_run)?;
+                    std::process::exit(code);
+                }
+                stubs::not_implemented("plugin uninstall")
+            }
             PluginVerb::Update {
                 vault_dir,
                 branch,
@@ -551,7 +574,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         // ───── Hidden v3.0 aliases — emit migration notice + dispatch ─
         Cmd::SessionInitAlias(a) => {
             migration::print_once("session-init", "session init");
-            commands::session_init::run(a.vault_dir, vault_flag.clone(), &mode)
+            commands::session_init::run(a.vault_dir, vault_flag.clone(), None, &mode)
         }
         Cmd::OrphanScanAlias(a) => {
             migration::print_once("orphan-scan", "checkpoint orphans");

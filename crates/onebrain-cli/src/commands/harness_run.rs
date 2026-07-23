@@ -23,10 +23,10 @@
 //! gemini`.
 
 use crate::cli::HarnessArg;
-use crate::commands::run_skill::{harness_argv, spawn_harness};
+use crate::commands::run_skill::{add_managed_hook_trust, harness_argv, spawn_harness};
 use anyhow::{anyhow, Result};
 use onebrain_core::find_config_file;
-use onebrain_fs::{resolve_claude_bin, resolve_gemini_bin};
+use onebrain_fs::{resolve_claude_bin, resolve_codex_bin, resolve_gemini_bin};
 use std::io::Read;
 use std::path::Path;
 
@@ -101,6 +101,7 @@ pub fn run(
     let resolution = match harness {
         HarnessArg::Claude => resolve_claude_bin(None, env_lookup, path_exists, home.as_deref()),
         HarnessArg::Gemini => resolve_gemini_bin(None, env_lookup, path_exists, home.as_deref()),
+        HarnessArg::Codex => resolve_codex_bin(None, env_lookup, path_exists, home.as_deref()),
     };
     if let Some(warning) = &resolution.warning {
         // `warning`'s own text is kept stable (Bun-parity, see
@@ -109,13 +110,16 @@ pub fn run(
     }
 
     let context_str = context_dir.map(|p| p.to_string_lossy().into_owned());
-    let argv = harness_argv(
+    let mut argv = harness_argv(
         harness,
         &resolved_prompt,
         context_str.as_deref(),
         model,
         want_json,
     );
+    if let Some(dir) = context_dir {
+        add_managed_hook_trust(harness, dir, &mut argv);
+    }
     spawn_harness(&resolution.path, &argv, cwd, harness, "the prompt")
 }
 

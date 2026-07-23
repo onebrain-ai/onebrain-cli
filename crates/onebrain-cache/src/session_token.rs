@@ -1,19 +1,21 @@
-//! Session token resolution. Layer 0 (`CLAUDE_CODE_SESSION_ID`) is OneBrain's
-//! own addition; layers 1–8 mirror Bun v2.3.3 `resolveSessionToken`.
+//! Session token resolution. Harness-provided chat identities take priority;
+//! the remaining layers mirror Bun v2.3.3 `resolveSessionToken`.
 //!
 //! Layer order:
-//!   0. CLAUDE_CODE_SESSION_ID (Claude Code's per-session UUID · set by the
+//!   0. CODEX_SESSION_ID (Codex hook `session_id` · hashed from the complete
+//!      value so chats with a shared UUID prefix cannot collide)
+//!   1. CLAUDE_CODE_SESSION_ID (Claude Code's per-session UUID · set by the
 //!      binary regardless of host — terminal, Obsidian, Claude Desktop, IDE,
 //!      agent-teams — and unique per session even when one terminal hosts
 //!      several · strip-then-truncate to 8 chars)
-//!   1. WT_SESSION       (Windows Terminal · strip-then-truncate to 8 chars)
-//!   2. TMUX_PANE        (tmux pane id   · strip-then-truncate to 8 chars)
-//!   3. TERM_SESSION_ID  (macOS Terminal · strip-then-truncate to 8 chars)
-//!   4. findClaudeAncestorPid walk-up (Unix · 12 hops · returns claude PID · no cache)
-//!   5. Day-scoped cache file ($TMPDIR/onebrain-day-YYYYMMDD.token · read-only)
-//!   6. process.ppid (numeric · write to cache · return)
-//!   7. PowerShell parent PID (Windows · 3000ms timeout · write to cache · return)
-//!   8. Random 5-digit numeric [10000, 99999] · write to cache · return
+//!   2. WT_SESSION       (Windows Terminal · strip-then-truncate to 8 chars)
+//!   3. TMUX_PANE        (tmux pane id   · strip-then-truncate to 8 chars)
+//!   4. TERM_SESSION_ID  (macOS Terminal · strip-then-truncate to 8 chars)
+//!   5. findClaudeAncestorPid walk-up (Unix · 12 hops · returns claude PID · no cache)
+//!   6. Day-scoped cache file ($TMPDIR/onebrain-day-YYYYMMDD.token · read-only)
+//!   7. process.ppid (numeric · write to cache · return)
+//!   8. PowerShell parent PID (Windows · 3000ms timeout · write to cache · return)
+//!   9. Random 5-digit numeric [10000, 99999] · write to cache · return
 //!
 //! Layers 1–3 are terminal-scoped: they collide when one terminal hosts
 //! several sessions (Claude Code agent-teams). Layer 0 is session-scoped, so it
@@ -23,6 +25,7 @@
 use crate::{CacheError, Result};
 use chrono::Local;
 use onebrain_core::SessionToken;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// Result of looking up a process: parent PID + command basename.
@@ -46,6 +49,8 @@ pub type ProcLookup = std::sync::Arc<dyn Fn(u32) -> Option<ProcInfo> + Send + Sy
 /// manually to bypass the global env, OS process tree, and `$TMPDIR`.
 #[derive(Clone, Default)]
 pub struct ResolveInputs {
+    /// Codex hook/thread session identity. Highest priority when present.
+    pub codex_session_id: Option<String>,
     /// `$CLAUDE_CODE_SESSION_ID` — Claude Code's per-session UUID. Highest
     /// priority: set by the binary on every host and unique per session even
     /// when one terminal hosts several (agent-teams), where the terminal-scoped
@@ -66,6 +71,7 @@ pub struct ResolveInputs {
 impl std::fmt::Debug for ResolveInputs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResolveInputs")
+            .field("codex_session_id", &self.codex_session_id)
             .field("claude_code_session_id", &self.claude_code_session_id)
             .field("wt_session", &self.wt_session)
             .field("tmux_pane", &self.tmux_pane)
@@ -82,6 +88,9 @@ impl ResolveInputs {
     /// Snapshot the real env + process state. Production callers should use this.
     pub fn from_env() -> Self {
         Self {
+            codex_session_id: std::env::var("CODEX_SESSION_ID")
+                .ok()
+                .or_else(|| std::env::var("CODEX_THREAD_ID").ok()),
             claude_code_session_id: std::env::var("CLAUDE_CODE_SESSION_ID").ok(),
             wt_session: std::env::var("WT_SESSION").ok(),
             tmux_pane: std::env::var("TMUX_PANE").ok(),
@@ -236,9 +245,17 @@ where
     None
 }
 
-/// Resolve the session token. Layer 0 (`CLAUDE_CODE_SESSION_ID`) is checked
-/// first; layers 1–8 mirror Bun v2.3.3's chain. See module docs for the order.
+/// Resolve the session token. Harness chat identities are checked first; the
+/// remaining layers mirror Bun v2.3.3's chain. See module docs for the order.
 pub fn resolve_session_token(inputs: &ResolveInputs) -> Result<SessionToken> {
+    if let Some(raw) = &inputs.codex_session_id {
+        if !raw.is_empty() {
+            let digest = Sha256::digest(raw.as_bytes());
+            return Ok(SessionToken::from_clean(
+                format!("{digest:x}")[..16].to_string(),
+            ));
+        }
+    }
     // 0. CLAUDE_CODE_SESSION_ID — Claude Code's own per-session UUID. Set by the
     //    binary regardless of host (terminal, Obsidian, Claude Desktop, IDE,
     //    agent-teams) and unique per session, so it stays stable across PID
@@ -572,6 +589,23 @@ mod tests {
         };
         let token = resolve_session_token(&inputs).unwrap();
         assert_eq!(token.as_str(), "abc123");
+    }
+
+    #[test]
+    fn distinct_codex_session_ids_produce_distinct_tokens() {
+        let first = resolve_session_token(&ResolveInputs {
+            codex_session_id: Some("same-prefix-1111-2222".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let second = resolve_session_token(&ResolveInputs {
+            codex_session_id: Some("same-prefix-9999-8888".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first.as_str().len(), 16);
+        assert_eq!(second.as_str().len(), 16);
     }
 
     // ---- findClaudeAncestorPid ----

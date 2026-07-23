@@ -57,6 +57,12 @@ pub fn validate_entry(entry: &ScheduleEntry) -> Result<(), SchedulerError> {
         });
     }
 
+    if has_command && entry.harness.is_some() {
+        return Err(SchedulerError::InvalidEntry {
+            reason: "`harness` is valid only for skill-mode entries".into(),
+        });
+    }
+
     if let Some(args) = &entry.args {
         match args {
             Args::List(_) if has_skill => {
@@ -230,5 +236,13 @@ mod tests {
         e.args = Some(Args::Map(map));
         let err = validate_entry(&e).unwrap_err();
         assert!(err.to_string().contains("command-mode"));
+    }
+
+    #[test]
+    fn validate_rejects_harness_on_command_mode() {
+        let mut e = cmd_cron();
+        e.harness = Some(crate::Harness::Codex);
+        let err = validate_entry(&e).unwrap_err();
+        assert!(err.to_string().contains("harness"));
     }
 }

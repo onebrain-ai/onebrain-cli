@@ -126,6 +126,53 @@ fn happy_path_passes_canonical_argv_and_cwd() {
 
 #[cfg(unix)]
 #[test]
+fn codex_harness_passes_exec_flags_and_dollar_prompt() {
+    let d = tempdir().unwrap();
+    let vault = d.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    write_minimal_vault(&vault);
+    let mock = write_mock_claude(d.path(), ARGV_LOG_SCRIPT);
+    let argv_log = d.path().join("codex-argv.log");
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
+        .args([
+            "--vault",
+            vault.to_str().unwrap(),
+            "skill",
+            "run",
+            "daily",
+            "--harness",
+            "codex",
+        ])
+        .env("CODEX_BIN", &mock)
+        .env("ARGV_LOG", &argv_log)
+        .assert()
+        .success();
+
+    let lines: Vec<String> = fs::read_to_string(argv_log)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            "exec",
+            "--sandbox",
+            "workspace-write",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "-C",
+            vault.to_str().unwrap(),
+            "$onebrain:daily",
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn args_are_appended_as_key_value_tokens() {
     let d = tempdir().unwrap();
     let vault = d.path().join("vault");
@@ -665,7 +712,10 @@ fn onebrain_bindir_is_prepended_to_child_path() {
     let vault = d.path().join("vault");
     fs::create_dir_all(&vault).unwrap();
     write_minimal_vault(&vault);
-    let mock = write_mock_claude(d.path(), "#!/bin/bash\nprintf '%s' \"$PATH\"\nexit 0\n");
+    let mock = write_mock_claude(
+        d.path(),
+        "#!/bin/bash\nprintf '%s\\n%s' \"$PATH\" \"$ONEBRAIN_BIN\"\nexit 0\n",
+    );
 
     // Emulate launchd's minimal PATH on the parent · only `/usr/bin:/bin`,
     // deliberately excluding the test binary's own directory so we can prove
@@ -688,7 +738,10 @@ fn onebrain_bindir_is_prepended_to_child_path() {
     let onebrain_bin = assert_cmd::cargo::cargo_bin("onebrain");
     let bindir = onebrain_bin.parent().unwrap();
     let output = assert.get_output();
-    let child_path = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let child_path = lines.next().unwrap_or_default();
+    let child_onebrain_bin = lines.next().unwrap_or_default();
     assert!(
         child_path.starts_with(bindir.to_str().unwrap()),
         "expected child PATH to start with the onebrain bindir {}: got {child_path}",
@@ -698,6 +751,7 @@ fn onebrain_bindir_is_prepended_to_child_path() {
         child_path.contains("/usr/bin:/bin") || child_path.ends_with("/usr/bin:/bin"),
         "expected the original minimal PATH to still be present: got {child_path}"
     );
+    assert_eq!(Path::new(child_onebrain_bin), onebrain_bin);
 }
 
 #[cfg(unix)]

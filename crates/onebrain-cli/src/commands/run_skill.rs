@@ -44,7 +44,10 @@
 use crate::cli::HarnessArg;
 use anyhow::{anyhow, Context, Result};
 use onebrain_core::find_config_file;
-use onebrain_fs::{build_prompt, resolve_claude_bin, resolve_gemini_bin};
+use onebrain_core::Harness;
+use onebrain_fs::{
+    build_prompt_for_harness, resolve_claude_bin, resolve_codex_bin, resolve_gemini_bin,
+};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -68,7 +71,12 @@ pub fn run(
     }
 
     let pairs = parse_args(args)?;
-    let prompt = build_prompt(skill, &pairs).map_err(|e| anyhow!(e))?;
+    let core_harness = match harness {
+        HarnessArg::Claude => Harness::Claude,
+        HarnessArg::Gemini => Harness::Gemini,
+        HarnessArg::Codex => Harness::Codex,
+    };
+    let prompt = build_prompt_for_harness(skill, &pairs, core_harness).map_err(|e| anyhow!(e))?;
 
     let env_lookup = |k: &str| std::env::var(k).ok();
     let path_exists = |p: &Path| p.exists();
@@ -76,6 +84,7 @@ pub fn run(
     let resolution = match harness {
         HarnessArg::Claude => resolve_claude_bin(None, env_lookup, path_exists, home.as_deref()),
         HarnessArg::Gemini => resolve_gemini_bin(None, env_lookup, path_exists, home.as_deref()),
+        HarnessArg::Codex => resolve_codex_bin(None, env_lookup, path_exists, home.as_deref()),
     };
     if let Some(warning) = &resolution.warning {
         // `warning`'s own text is kept stable (Bun-parity, see
@@ -84,8 +93,18 @@ pub fn run(
     }
 
     // Skills always run with-context: --add-dir / --include-directories the vault.
-    let argv = harness_argv(harness, &prompt, Some(vault), model, want_json);
+    let mut argv = harness_argv(harness, &prompt, Some(vault), model, want_json);
+    add_managed_hook_trust(harness, &vault_path, &mut argv);
     spawn_harness(&resolution.path, &argv, &vault_path, harness, "the skill")
+}
+
+pub(crate) fn add_managed_hook_trust(harness: HarnessArg, vault: &Path, argv: &mut Vec<String>) {
+    if harness == HarnessArg::Codex
+        && crate::commands::codex_plugin::has_managed_installation(vault)
+        && argv.first().is_some_and(|arg| arg == "exec")
+    {
+        argv.insert(1, "--dangerously-bypass-hook-trust".to_string());
+    }
 }
 
 /// Build the argv (after the binary name) for the chosen harness. Pure so the
@@ -105,6 +124,28 @@ pub(crate) fn harness_argv(
     model: Option<&str>,
     want_json: bool,
 ) -> Vec<String> {
+    if harness == HarnessArg::Codex {
+        let mut argv = vec![
+            "exec".to_string(),
+            "--sandbox".to_string(),
+            "workspace-write".to_string(),
+            "--skip-git-repo-check".to_string(),
+            "--ephemeral".to_string(),
+        ];
+        if let Some(dir) = context_dir {
+            argv.push("-C".to_string());
+            argv.push(dir.to_string());
+        }
+        if let Some(m) = model {
+            argv.push("--model".to_string());
+            argv.push(m.to_string());
+        }
+        if want_json {
+            argv.push("--json".to_string());
+        }
+        argv.push(prompt.to_string());
+        return argv;
+    }
     let mut argv = vec!["-p".to_string(), prompt.to_string()];
     match harness {
         HarnessArg::Claude => {
@@ -140,6 +181,7 @@ pub(crate) fn harness_argv(
                 argv.push("json".to_string());
             }
         }
+        HarnessArg::Codex => unreachable!("handled above"),
     }
     argv
 }
@@ -192,6 +234,7 @@ pub(crate) fn spawn_harness(
     let bin_env_var = match harness {
         HarnessArg::Claude => "CLAUDE_BIN",
         HarnessArg::Gemini => "GEMINI_BIN",
+        HarnessArg::Codex => "CODEX_BIN",
     };
     // No `env` override beyond ONEBRAIN_HEADLESS: child inherits parent env so
     // PATH/HOME survive. stdout/stderr stay inherited so the harness's output
@@ -213,13 +256,14 @@ pub(crate) fn spawn_harness(
     // with exit 78 (#124). Prepend our own binary's directory to the child's
     // PATH so nested `onebrain` calls resolve. Safe for interactive runs too
     // (the user's PATH already has it, so this is a no-op there).
-    if let Some(exe_dir) = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
-    {
-        if let Some(dir) = exe_dir.to_str() {
-            let existing = std::env::var("PATH").unwrap_or_default();
-            command.env("PATH", child_path_with_exe_dir(dir, &existing));
+    if let Ok(current_exe) = std::env::current_exe() {
+        command.env("ONEBRAIN_BIN", &current_exe);
+        let exe_dir = current_exe.parent().map(Path::to_path_buf);
+        if let Some(exe_dir) = exe_dir {
+            if let Some(dir) = exe_dir.to_str() {
+                let existing = std::env::var("PATH").unwrap_or_default();
+                command.env("PATH", child_path_with_exe_dir(dir, &existing));
+            }
         }
     }
 
@@ -264,7 +308,7 @@ pub(crate) fn spawn_harness(
 
     let approval_note = match harness {
         HarnessArg::Gemini => " (auto-approving tools)",
-        HarnessArg::Claude => "",
+        HarnessArg::Claude | HarnessArg::Codex => "",
     };
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
@@ -609,6 +653,46 @@ mod tests {
                 "gemini-2.5-flash"
             ]
         );
+    }
+
+    #[test]
+    fn harness_argv_codex_uses_exec_workspace_and_ephemeral() {
+        assert_eq!(
+            harness_argv(
+                HarnessArg::Codex,
+                "$onebrain:daily",
+                Some("/vault"),
+                Some("gpt-5"),
+                true
+            ),
+            vec![
+                "exec",
+                "--sandbox",
+                "workspace-write",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "-C",
+                "/vault",
+                "--model",
+                "gpt-5",
+                "--json",
+                "$onebrain:daily"
+            ]
+        );
+    }
+
+    #[test]
+    fn vault_local_codex_marker_alone_does_not_add_hook_trust_bypass() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".codex")).unwrap();
+        std::fs::write(
+            dir.path().join(".codex/onebrain-plugin.json"),
+            r#"{"managed":true,"plugin":"onebrain@onebrain"}"#,
+        )
+        .unwrap();
+        let mut argv = vec!["exec".to_string(), "prompt".to_string()];
+        add_managed_hook_trust(HarnessArg::Codex, dir.path(), &mut argv);
+        assert_eq!(argv, ["exec", "prompt"]);
     }
 
     /// Exercises the spawn path + exit-code translation with the harness stubbed

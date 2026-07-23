@@ -1,8 +1,9 @@
 //! Pure helpers backing `onebrain run-skill` · prompt construction and
-//! `claude` binary resolution. All side effects (process spawn, env var
+//! harness binary resolution. All side effects (process spawn, env var
 //! reads, stderr writes) live in the CLI handler so this module stays
 //! deterministic and trivially testable.
 
+use onebrain_core::Harness;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -15,8 +16,9 @@ pub enum RunSkillError {
     EmptySkill,
 }
 
-/// Result of resolving a harness binary (`claude` / `gemini`). `warning` is
-/// non-empty when the binary's env override (`CLAUDE_BIN` / `GEMINI_BIN`) was
+/// Result of resolving a harness binary (`claude` / `gemini` / `codex`). `warning` is
+/// non-empty when the binary's env override (`CLAUDE_BIN` / `GEMINI_BIN` /
+/// `CODEX_BIN`) was
 /// set but pointed to a missing path — the handler logs it to stderr.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessBinResolution {
@@ -37,6 +39,14 @@ pub struct HarnessBinResolution {
 /// CLI handler controls insertion order — `clap`'s `Vec<String>` of
 /// `key=value` tokens is already ordered, so this works out cleanly.
 pub fn build_prompt(skill: &str, args: &[(String, String)]) -> Result<String, RunSkillError> {
+    build_prompt_for_harness(skill, args, Harness::Claude)
+}
+
+pub fn build_prompt_for_harness(
+    skill: &str,
+    args: &[(String, String)],
+    harness: Harness,
+) -> Result<String, RunSkillError> {
     let bare = skill.strip_prefix('/').unwrap_or(skill);
     if bare.is_empty() {
         return Err(RunSkillError::EmptySkill);
@@ -46,12 +56,15 @@ pub fn build_prompt(skill: &str, args: &[(String, String)]) -> Result<String, Ru
     } else {
         format!("onebrain:{bare}")
     };
-    let slash = format!("/{namespaced}");
+    let invocation = match harness {
+        Harness::Codex => format!("${namespaced}"),
+        _ => format!("/{namespaced}"),
+    };
     if args.is_empty() {
-        return Ok(slash);
+        return Ok(invocation);
     }
     let tokens: Vec<String> = args.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    Ok(format!("{slash} {}", tokens.join(" ")))
+    Ok(format!("{invocation} {}", tokens.join(" ")))
 }
 
 /// Resolve which `claude` binary to invoke. Thin wrapper over [`resolve_bin`]
@@ -84,6 +97,22 @@ pub fn resolve_gemini_bin(
     resolve_bin(
         "gemini",
         "GEMINI_BIN",
+        override_path,
+        env_lookup,
+        path_exists,
+        home,
+    )
+}
+
+pub fn resolve_codex_bin(
+    override_path: Option<&Path>,
+    env_lookup: impl Fn(&str) -> Option<String>,
+    path_exists: impl Fn(&Path) -> bool,
+    home: Option<&str>,
+) -> HarnessBinResolution {
+    resolve_bin(
+        "codex",
+        "CODEX_BIN",
         override_path,
         env_lookup,
         path_exists,
@@ -223,7 +252,27 @@ mod tests {
         assert_eq!(build_prompt("", &[]), Err(RunSkillError::EmptySkill));
     }
 
+    #[test]
+    fn build_codex_prompt_uses_dollar_skill_syntax() {
+        let args = vec![pair("topic", "this-week")];
+        assert_eq!(
+            build_prompt_for_harness("daily", &args, onebrain_core::Harness::Codex).unwrap(),
+            "$onebrain:daily topic=this-week"
+        );
+    }
+
     // ---- resolve_claude_bin ----
+
+    #[test]
+    fn resolve_codex_bin_honors_codex_bin() {
+        let result = resolve_codex_bin(
+            None,
+            |k| (k == "CODEX_BIN").then(|| "/custom/codex".to_string()),
+            |p| p == Path::new("/custom/codex"),
+            None,
+        );
+        assert_eq!(result.path, PathBuf::from("/custom/codex"));
+    }
 
     #[test]
     fn resolve_claude_bin_uses_explicit_override_unconditionally() {

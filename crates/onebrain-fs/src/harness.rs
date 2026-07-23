@@ -10,9 +10,10 @@ use std::path::Path;
 /// 1. `ONEBRAIN_HARNESS` env var override (single value · returned as a 1-element Vec)
 ///    - `claude` or `claude-code` → `[Claude]`
 ///    - `gemini` → `[Gemini]`
+///    - `codex` → `[Codex]`
 ///    - `direct` → `[Direct]`
 ///    - Any other value → stderr warning + fall through to dir detection
-/// 2. `.claude/` and `.gemini/` directory presence (independent · both possible)
+/// 2. `.claude/`, `.gemini/`, and `.codex/` directory presence (independent)
 /// 3. Fallback `[Direct]`
 ///
 /// Always returns at least one harness.
@@ -30,6 +31,7 @@ pub(crate) fn detect_harnesses_with_env(
         match value.as_str() {
             "claude" | "claude-code" => return vec![Harness::Claude],
             "gemini" => return vec![Harness::Gemini],
+            "codex" => return vec![Harness::Codex],
             "direct" => return vec![Harness::Direct],
             other => {
                 let _ = writeln!(
@@ -46,6 +48,9 @@ pub(crate) fn detect_harnesses_with_env(
     }
     if vault_root.join(".gemini").exists() {
         detected.push(Harness::Gemini);
+    }
+    if vault_root.join(".codex").exists() {
+        detected.push(Harness::Codex);
     }
 
     if detected.is_empty() {
@@ -104,6 +109,16 @@ mod tests {
     }
 
     #[test]
+    fn only_codex_dir_returns_codex() {
+        let dir = tempdir().unwrap();
+        mk_dir(dir.path(), ".codex");
+        assert_eq!(
+            detect_harnesses_with_env(dir.path(), None),
+            vec![Harness::Codex]
+        );
+    }
+
+    #[test]
     fn neither_dir_returns_direct() {
         let dir = tempdir().unwrap();
         assert_eq!(
@@ -134,6 +149,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let result = detect_harnesses_with_env(dir.path(), Some("gemini".to_string()));
         assert_eq!(result, vec![Harness::Gemini]);
+    }
+
+    #[test]
+    fn env_codex_returns_codex() {
+        let dir = tempdir().unwrap();
+        let result = detect_harnesses_with_env(dir.path(), Some("codex".to_string()));
+        assert_eq!(result, vec![Harness::Codex]);
     }
 
     #[test]
