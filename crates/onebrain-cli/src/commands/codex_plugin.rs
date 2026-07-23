@@ -51,7 +51,7 @@ pub fn install(vault: &Path, dry_run: bool) -> Result<i32> {
     }
 
     let was_managed = has_managed_installation(vault);
-    let plugin_preexisting = plugin_is_installed(&codex).unwrap_or(true);
+    let plugin_presence = plugin_presence(&codex);
     let config_backup = merge_codex_config()?;
     if !was_managed {
         if let Err(error) = write_receipt(vault, "pending") {
@@ -69,7 +69,14 @@ pub fn install(vault: &Path, dry_run: bool) -> Result<i32> {
     {
         Ok(status) => status,
         Err(error) => {
-            rollback_before_plugin_add(vault, &config_backup, was_managed);
+            if let Err(rollback_error) =
+                rollback_before_plugin_add(vault, &config_backup, was_managed)
+            {
+                return Err(error).context(format!(
+                    "failed to spawn {}; rollback also failed: {rollback_error}",
+                    codex.display()
+                ));
+            }
             eprintln!(
                 "plugin install: failed to spawn {}\nretry: {}",
                 codex.display(),
@@ -79,7 +86,13 @@ pub fn install(vault: &Path, dry_run: bool) -> Result<i32> {
         }
     };
     if !add.success() {
-        rollback_before_plugin_add(vault, &config_backup, was_managed);
+        if let Err(rollback_error) = rollback_before_plugin_add(vault, &config_backup, was_managed)
+        {
+            return Err(rollback_error).context(format!(
+                "Codex plugin add exited {}; rollback was incomplete\nretry: {REMOVE_RETRY}",
+                add.code().unwrap_or(1)
+            ));
+        }
         eprintln!(
             "plugin install: Codex plugin add failed\nretry: {}",
             retry_command(vault)
@@ -88,13 +101,8 @@ pub fn install(vault: &Path, dry_run: bool) -> Result<i32> {
     }
 
     if let Err(error) = write_marker(vault).and_then(|_| write_receipt(vault, "installed")) {
-        let rollback = rollback_after_plugin_add(
-            vault,
-            &codex,
-            &config_backup,
-            was_managed,
-            plugin_preexisting,
-        );
+        let rollback =
+            rollback_after_plugin_add(vault, &codex, &config_backup, was_managed, plugin_presence);
         return match rollback {
             Ok(()) => Err(error).context(format!(
                 "failed to finalize managed Codex installation; rolled back\nretry: {}",
@@ -456,13 +464,30 @@ fn restore_config(backup: &ConfigBackup) -> Result<()> {
     Ok(())
 }
 
-fn rollback_before_plugin_add(vault: &Path, config_backup: &ConfigBackup, was_managed: bool) {
+fn rollback_before_plugin_add(
+    vault: &Path,
+    config_backup: &ConfigBackup,
+    was_managed: bool,
+) -> Result<()> {
+    let mut cleanup_error = None;
     if !was_managed {
         if let Ok(receipt) = receipt_path(vault) {
-            let _ = fs::remove_file(receipt);
+            if let Err(error) = remove_if_exists(&receipt) {
+                cleanup_error = Some(error.context("remove pending Codex receipt"));
+            }
         }
     }
-    let _ = restore_config(config_backup);
+    if let Err(error) = restore_config(config_backup) {
+        cleanup_error = Some(error.context("restore Codex config after failed plugin add"));
+    }
+    cleanup_error.map_or(Ok(()), Err)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PluginPresence {
+    Present,
+    Absent,
+    Unknown,
 }
 
 fn rollback_after_plugin_add(
@@ -470,10 +495,10 @@ fn rollback_after_plugin_add(
     codex: &Path,
     config_backup: &ConfigBackup,
     was_managed: bool,
-    plugin_preexisting: bool,
+    plugin_presence: PluginPresence,
 ) -> Result<()> {
     let mut cleanup_error = None;
-    if !was_managed && !plugin_preexisting {
+    if !was_managed && plugin_presence == PluginPresence::Absent {
         match Command::new(codex)
             .args(["plugin", "remove", "onebrain@onebrain"])
             .status()
@@ -489,13 +514,13 @@ fn rollback_after_plugin_add(
         }
     }
     if cleanup_error.is_none() {
-        if !was_managed {
+        if !was_managed && plugin_presence != PluginPresence::Unknown {
             if let Ok(receipt) = receipt_path(vault) {
                 let _ = fs::remove_file(receipt);
             }
+            let _ = fs::remove_file(vault.join(".codex/onebrain-plugin.json"));
         }
-        let _ = fs::remove_file(vault.join(".codex/onebrain-plugin.json"));
-    } else if !was_managed {
+    } else if !was_managed || plugin_presence == PluginPresence::Unknown {
         // Preserve an uninstall authorization record for the stranded plugin.
         write_receipt(vault, "pending")?;
     }
@@ -506,15 +531,18 @@ fn rollback_after_plugin_add(
     Ok(())
 }
 
-fn plugin_is_installed(codex: &Path) -> Result<bool> {
-    let output = Command::new(codex)
-        .args(["plugin", "list"])
-        .output()
-        .with_context(|| format!("failed to inspect plugins with {}", codex.display()))?;
+fn plugin_presence(codex: &Path) -> PluginPresence {
+    let Ok(output) = Command::new(codex).args(["plugin", "list"]).output() else {
+        return PluginPresence::Unknown;
+    };
     if !output.status.success() {
-        return Err(anyhow!("`codex plugin list` failed"));
+        return PluginPresence::Unknown;
     }
-    Ok(String::from_utf8_lossy(&output.stdout).contains("onebrain@onebrain"))
+    if String::from_utf8_lossy(&output.stdout).contains("onebrain@onebrain") {
+        PluginPresence::Present
+    } else {
+        PluginPresence::Absent
+    }
 }
 
 fn remove_if_exists(path: &Path) -> Result<()> {

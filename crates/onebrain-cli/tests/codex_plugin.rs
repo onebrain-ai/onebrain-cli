@@ -474,3 +474,96 @@ fn finalize_failure_never_removes_preexisting_manual_plugin() {
 
     assert!(!fs::read_to_string(log).unwrap().contains("plugin remove"));
 }
+
+#[cfg(unix)]
+#[test]
+fn unknown_plugin_prestate_retains_pending_receipt_on_finalize_failure() {
+    let vault = vault();
+    let home = tempdir().unwrap();
+    let bin = home.path().join("codex");
+    let log = home.path().join("argv.log");
+    fs::write(
+        &bin,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CODEX_ARGV_LOG\"\ncase \"$*\" in\n  \"plugin list\") exit 9 ;;\nesac\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(vault.path().join(".codex"), "blocks marker directory").unwrap();
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
+        .env("CODEX_BIN", &bin)
+        .env("CODEX_HOME", home.path())
+        .env("CODEX_ARGV_LOG", &log)
+        .args([
+            "--vault",
+            vault.path().to_str().unwrap(),
+            "plugin",
+            "install",
+            "--harness",
+            "codex",
+        ])
+        .assert()
+        .failure();
+
+    let receipt = fs::read_dir(home.path().join("onebrain-managed"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(receipt).unwrap()).unwrap()
+            ["state"],
+        "pending"
+    );
+    assert!(!fs::read_to_string(log).unwrap().contains("plugin remove"));
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_managed_reinstall_preserves_installed_marker_and_receipt() {
+    let vault = vault();
+    let home = tempdir().unwrap();
+    let bin = home.path().join("codex");
+    fs::write(
+        &bin,
+        "#!/bin/sh\ncase \"$*\" in\n  \"plugin list\") printf '%s\\n' 'onebrain@onebrain installed' ;;\nesac\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    let install = || {
+        Command::cargo_bin("onebrain")
+            .unwrap()
+            .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
+            .env("CODEX_BIN", &bin)
+            .env("CODEX_HOME", home.path())
+            .args([
+                "--vault",
+                vault.path().to_str().unwrap(),
+                "plugin",
+                "install",
+                "--harness",
+                "codex",
+            ])
+            .assert()
+    };
+    install().success();
+    let marker = vault.path().join(".codex/onebrain-plugin.json");
+    let receipt = fs::read_dir(home.path().join("onebrain-managed"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let marker_before = fs::read(&marker).unwrap();
+    let receipt_before = fs::read(&receipt).unwrap();
+
+    fs::set_permissions(marker.parent().unwrap(), fs::Permissions::from_mode(0o500)).unwrap();
+    install().failure();
+    fs::set_permissions(marker.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(fs::read(marker).unwrap(), marker_before);
+    assert_eq!(fs::read(receipt).unwrap(), receipt_before);
+}
