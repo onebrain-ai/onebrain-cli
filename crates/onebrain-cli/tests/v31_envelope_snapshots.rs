@@ -269,10 +269,10 @@ fn checkpoint_stop_envelope_when_threshold_hit() {
         .env("TMP", tmpdir.path())
         .env("TEMP", tmpdir.path())
         .env("WT_SESSION", token)
-        // Clear CLAUDE_CODE_SESSION_ID (layer 0, above WT_SESSION) so this test
-        // is hermetic — otherwise it inherits the host session's UUID when run
-        // under Claude Code and ignores the pinned WT_SESSION token. Also clear
-        // the lower-priority terminal vars for good measure.
+        // Clear hook-provided IDs above WT_SESSION so this test is hermetic
+        // under both Codex and Claude.
+        .env_remove("CODEX_SESSION_ID")
+        .env_remove("CODEX_THREAD_ID")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env("TMUX_PANE", "")
         .env_remove("TERM_SESSION_ID")

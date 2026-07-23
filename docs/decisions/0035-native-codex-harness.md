@@ -16,10 +16,14 @@ Codex skills use `$onebrain:<skill>` and execute with `codex exec`,
 
 Plugin management is explicit opt-in. `onebrain plugin install --harness codex`
 registers the vault marketplace, runs `codex plugin add onebrain@onebrain`,
-enables only `features.hooks` and `features.multi_agent`, and writes the
-vault-local `.codex/onebrain-plugin.json` marker atomically. Dry-run changes no
-Codex-global state. Later update automation may touch Codex only when this
-marker exists.
+enables only `features.hooks` and `features.multi_agent`, and writes two
+matching records atomically: the vault-local `.codex/onebrain-plugin.json`
+marker and a receipt under `CODEX_HOME/onebrain-managed/` bound to the vault's
+canonical path. A repository can carry a forged local marker, so later update
+automation and unattended hook-trust bypass require both records and an
+`installed` receipt. A pending receipt authorizes uninstall cleanup only.
+Installation failures remove partial plugin state and restore the previous
+Codex config. Dry-run changes no Codex-global state.
 
 Codex 0.145 names the installation verb `plugin add`, not `plugin install`;
 retry output uses the executable command rather than mirroring OneBrain's verb.

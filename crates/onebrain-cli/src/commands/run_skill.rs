@@ -100,7 +100,7 @@ pub fn run(
 
 pub(crate) fn add_managed_hook_trust(harness: HarnessArg, vault: &Path, argv: &mut Vec<String>) {
     if harness == HarnessArg::Codex
-        && crate::commands::codex_plugin::has_managed_marker(vault)
+        && crate::commands::codex_plugin::has_managed_installation(vault)
         && argv.first().is_some_and(|arg| arg == "exec")
     {
         argv.insert(1, "--dangerously-bypass-hook-trust".to_string());
@@ -681,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_codex_marker_adds_hook_trust_bypass() {
+    fn vault_local_codex_marker_alone_does_not_add_hook_trust_bypass() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".codex")).unwrap();
         std::fs::write(
@@ -691,7 +691,7 @@ mod tests {
         .unwrap();
         let mut argv = vec!["exec".to_string(), "prompt".to_string()];
         add_managed_hook_trust(HarnessArg::Codex, dir.path(), &mut argv);
-        assert_eq!(argv[1], "--dangerously-bypass-hook-trust");
+        assert_eq!(argv, ["exec", "prompt"]);
     }
 
     /// Exercises the spawn path + exit-code translation with the harness stubbed
