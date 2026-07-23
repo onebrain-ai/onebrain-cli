@@ -7,6 +7,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
 
+#[cfg(unix)]
 fn vault() -> tempfile::TempDir {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("onebrain.yml"), "folders: {}\n").unwrap();
