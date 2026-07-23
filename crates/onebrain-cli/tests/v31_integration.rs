@@ -282,7 +282,7 @@ fn top_level_help_is_production_grade() {
         "Vault operations (sync · current)",
         "Session lifecycle (init)",
         "Auto-save management (stop · reset · orphans)",
-        "Detect or run an AI harness (claude / gemini)",
+        "Detect or run an AI harness (claude / gemini / codex)",
         "Plugin lifecycle + hook rewriter",
         "launchd schedule management",
         "Skill invocation",

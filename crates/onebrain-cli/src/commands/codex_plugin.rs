@@ -572,13 +572,16 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::retry_command;
     use super::{
         has_managed_installation_in, has_managed_marker, merge_feature_flags, receipt_path_at,
-        refresh_if_managed_with_bin, retry_command,
+        refresh_if_managed_with_bin,
     };
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     use std::path::Path;
 
     #[test]
