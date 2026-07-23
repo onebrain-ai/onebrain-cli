@@ -256,13 +256,14 @@ pub(crate) fn spawn_harness(
     // with exit 78 (#124). Prepend our own binary's directory to the child's
     // PATH so nested `onebrain` calls resolve. Safe for interactive runs too
     // (the user's PATH already has it, so this is a no-op there).
-    if let Some(exe_dir) = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
-    {
-        if let Some(dir) = exe_dir.to_str() {
-            let existing = std::env::var("PATH").unwrap_or_default();
-            command.env("PATH", child_path_with_exe_dir(dir, &existing));
+    if let Ok(current_exe) = std::env::current_exe() {
+        command.env("ONEBRAIN_BIN", &current_exe);
+        let exe_dir = current_exe.parent().map(Path::to_path_buf);
+        if let Some(exe_dir) = exe_dir {
+            if let Some(dir) = exe_dir.to_str() {
+                let existing = std::env::var("PATH").unwrap_or_default();
+                command.env("PATH", child_path_with_exe_dir(dir, &existing));
+            }
         }
     }
 
