@@ -1403,7 +1403,7 @@ pub enum SkillVerb {
             default_value_t = HarnessArg::Claude,
             hide_default_value = true,
             hide_possible_values = true,
-            help = "AI runtime to run the skill through\n[default: claude, possible values: claude, gemini]"
+            help = "AI runtime to run the skill through\n[default: claude, possible values: claude, gemini, codex]"
         )]
         harness: HarnessArg,
         /// Model passed through to the harness. Omit to use the harness default. A faster model speeds up headless runs.
@@ -1905,6 +1905,19 @@ mod tests {
             }
             _ => panic!("expected skill run"),
         }
+    }
+
+    #[test]
+    fn skill_run_help_advertises_codex_harness() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("skill")
+            .unwrap()
+            .find_subcommand_mut("run")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("claude, gemini, codex"));
     }
 
     #[test]
