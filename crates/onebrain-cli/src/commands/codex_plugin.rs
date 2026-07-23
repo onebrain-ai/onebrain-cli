@@ -51,9 +51,16 @@ pub fn install(vault: &Path, dry_run: bool) -> Result<i32> {
     }
 
     let was_managed = has_managed_installation(vault);
+    let plugin_preexisting = plugin_is_installed(&codex).unwrap_or(true);
     let config_backup = merge_codex_config()?;
     if !was_managed {
-        write_receipt(vault, "pending")?;
+        if let Err(error) = write_receipt(vault, "pending") {
+            restore_config(&config_backup)?;
+            return Err(error).context(format!(
+                "failed to record pending managed Codex installation\nretry: {}",
+                retry_command(vault)
+            ));
+        }
     }
 
     let add = match Command::new(&codex)
@@ -62,7 +69,7 @@ pub fn install(vault: &Path, dry_run: bool) -> Result<i32> {
     {
         Ok(status) => status,
         Err(error) => {
-            rollback_install(vault, &codex, Some(&config_backup), was_managed);
+            rollback_before_plugin_add(vault, &config_backup, was_managed);
             eprintln!(
                 "plugin install: failed to spawn {}\nretry: {}",
                 codex.display(),
@@ -72,7 +79,7 @@ pub fn install(vault: &Path, dry_run: bool) -> Result<i32> {
         }
     };
     if !add.success() {
-        rollback_install(vault, &codex, Some(&config_backup), was_managed);
+        rollback_before_plugin_add(vault, &config_backup, was_managed);
         eprintln!(
             "plugin install: Codex plugin add failed\nretry: {}",
             retry_command(vault)
@@ -81,11 +88,23 @@ pub fn install(vault: &Path, dry_run: bool) -> Result<i32> {
     }
 
     if let Err(error) = write_marker(vault).and_then(|_| write_receipt(vault, "installed")) {
-        rollback_install(vault, &codex, Some(&config_backup), was_managed);
-        return Err(error).context(format!(
-            "failed to finalize managed Codex installation; rolled back\nretry: {}",
-            retry_command(vault)
-        ));
+        let rollback = rollback_after_plugin_add(
+            vault,
+            &codex,
+            &config_backup,
+            was_managed,
+            plugin_preexisting,
+        );
+        return match rollback {
+            Ok(()) => Err(error).context(format!(
+                "failed to finalize managed Codex installation; rolled back\nretry: {}",
+                retry_command(vault)
+            )),
+            Err(rollback_error) => Err(error).context(format!(
+                "failed to finalize managed Codex installation; plugin cleanup also failed: \
+                 {rollback_error}\nretry: {REMOVE_RETRY}"
+            )),
+        };
     }
     println!("plugin install: codex · installed onebrain@onebrain");
     Ok(0)
@@ -268,6 +287,7 @@ fn write_receipt(vault: &Path, state: &str) -> Result<()> {
 struct ConfigBackup {
     path: PathBuf,
     existed: bool,
+    permissions: Option<fs::Permissions>,
 }
 
 fn merge_codex_config() -> Result<ConfigBackup> {
@@ -278,19 +298,23 @@ fn merge_codex_config() -> Result<ConfigBackup> {
         Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
     };
     let text = merge_feature_flags(original.as_deref().unwrap_or_default());
+    let permissions = fs::metadata(&path)
+        .ok()
+        .map(|metadata| metadata.permissions());
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let backup = path.with_extension("toml.onebrain.bak");
     if let Some(original) = &original {
-        fs::write(&backup, original)?;
+        replace_file_with_permissions(&backup, original.as_bytes(), permissions.clone())?;
     } else {
         remove_if_exists(&backup)?;
     }
-    replace_file(&path, text.as_bytes())?;
+    replace_file_with_permissions(&path, text.as_bytes(), permissions.clone())?;
     Ok(ConfigBackup {
         path,
         existed: original.is_some(),
+        permissions,
     })
 }
 
@@ -350,54 +374,147 @@ fn write_marker(vault: &Path) -> Result<()> {
 }
 
 fn write_json_atomic(path: &Path, value: &serde_json::Value) -> Result<()> {
-    replace_file(path, &serde_json::to_vec_pretty(value)?)
+    let permissions = fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    replace_file_with_permissions(path, &serde_json::to_vec_pretty(value)?, permissions)
 }
 
-fn replace_file(path: &Path, contents: &[u8]) -> Result<()> {
+fn replace_file_with_permissions(
+    path: &Path,
+    contents: &[u8],
+    permissions: Option<fs::Permissions>,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("onebrain.tmp");
     fs::write(&tmp, contents)?;
-    #[cfg(windows)]
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    fs::rename(&tmp, path).inspect_err(|_| {
+    secure_file_permissions(&tmp, permissions)?;
+    replace_path(&tmp, path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })?;
     Ok(())
+}
+
+fn secure_file_permissions(path: &Path, permissions: Option<fs::Permissions>) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = permissions.unwrap_or_else(|| fs::Permissions::from_mode(0o600));
+        fs::set_permissions(path, permissions)?;
+    }
+    #[cfg(not(unix))]
+    if let Some(permissions) = permissions {
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_path(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_path(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+    }
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn restore_config(backup: &ConfigBackup) -> Result<()> {
     let backup_path = backup.path.with_extension("toml.onebrain.bak");
     if backup.existed {
         let contents = fs::read(&backup_path)?;
-        replace_file(&backup.path, &contents)?;
+        replace_file_with_permissions(&backup.path, &contents, backup.permissions.clone())?;
     } else {
         remove_if_exists(&backup.path)?;
     }
     Ok(())
 }
 
-fn rollback_install(
-    vault: &Path,
-    codex: &Path,
-    config_backup: Option<&ConfigBackup>,
-    was_managed: bool,
-) {
+fn rollback_before_plugin_add(vault: &Path, config_backup: &ConfigBackup, was_managed: bool) {
     if !was_managed {
-        let _ = Command::new(codex)
-            .args(["plugin", "remove", "onebrain@onebrain"])
-            .status();
-        let _ = fs::remove_file(vault.join(".codex/onebrain-plugin.json"));
         if let Ok(receipt) = receipt_path(vault) {
             let _ = fs::remove_file(receipt);
         }
     }
-    if let Some(backup) = config_backup {
-        let _ = restore_config(backup);
+    let _ = restore_config(config_backup);
+}
+
+fn rollback_after_plugin_add(
+    vault: &Path,
+    codex: &Path,
+    config_backup: &ConfigBackup,
+    was_managed: bool,
+    plugin_preexisting: bool,
+) -> Result<()> {
+    let mut cleanup_error = None;
+    if !was_managed && !plugin_preexisting {
+        match Command::new(codex)
+            .args(["plugin", "remove", "onebrain@onebrain"])
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                cleanup_error = Some(anyhow!(
+                    "`{REMOVE_RETRY}` exited {}",
+                    status.code().unwrap_or(1)
+                ));
+            }
+            Err(error) => cleanup_error = Some(error.into()),
+        }
     }
+    if cleanup_error.is_none() {
+        if !was_managed {
+            if let Ok(receipt) = receipt_path(vault) {
+                let _ = fs::remove_file(receipt);
+            }
+        }
+        let _ = fs::remove_file(vault.join(".codex/onebrain-plugin.json"));
+    } else if !was_managed {
+        // Preserve an uninstall authorization record for the stranded plugin.
+        write_receipt(vault, "pending")?;
+    }
+    restore_config(config_backup)?;
+    if let Some(error) = cleanup_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn plugin_is_installed(codex: &Path) -> Result<bool> {
+    let output = Command::new(codex)
+        .args(["plugin", "list"])
+        .output()
+        .with_context(|| format!("failed to inspect plugins with {}", codex.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!("`codex plugin list` failed"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).contains("onebrain@onebrain"))
 }
 
 fn remove_if_exists(path: &Path) -> Result<()> {

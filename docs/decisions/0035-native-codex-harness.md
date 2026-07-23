@@ -23,7 +23,12 @@ canonical path. A repository can carry a forged local marker, so later update
 automation and unattended hook-trust bypass require both records and an
 `installed` receipt. A pending receipt authorizes uninstall cleanup only.
 Installation failures remove partial plugin state and restore the previous
-Codex config. Dry-run changes no Codex-global state.
+Codex config. Config rewrites preserve its existing permissions (new managed
+files are owner-only on Unix), and Windows replacement uses the native
+replace-existing primitive rather than deleting the destination first. A
+failed compensating plugin removal retains a pending receipt so explicit
+uninstall can finish cleanup without authorizing hook-trust bypass. Dry-run
+changes no Codex-global state.
 
 Codex 0.145 names the installation verb `plugin add`, not `plugin install`;
 retry output uses the executable command rather than mirroring OneBrain's verb.
