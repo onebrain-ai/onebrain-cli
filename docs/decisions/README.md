@@ -62,5 +62,6 @@ ADRs are immutable once accepted — if a decision changes, write a new ADR that
 | [0032](0032-self-healing-daemon-fallback.md) | Self-healing daemon fallback: token gain / serve / vsearch under redb contention | accepted |
 | [0033](0033-per-vault-daemon-slots.md) | Per-vault daemon slots: multi-vault warm daemons on one machine (ephemeral ports, no-steal) | accepted |
 | [0034](0034-heading-search-schema-selfheal-rerank-gate-decouple.md) | Heading search enables the lex schema; self-heal over a hard error; rerank gate decoupled from the confidence band | accepted |
+| [0035](0035-native-codex-harness.md) | Native Codex harness, managed plugin opt-in, and chat-scoped session identity | accepted |
 
 > These ADRs distill the public-facing rationale; the full design notes live in the project tracker. Numbers are stable IDs assigned at authoring time — see each ADR's **Date** for chronology.

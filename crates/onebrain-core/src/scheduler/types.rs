@@ -10,6 +10,7 @@
 //! lets a single YAML file drive both — `validate_entry` later catches
 //! mismatches.
 
+use crate::Harness;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -52,9 +53,18 @@ pub struct ScheduleEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<Harness>,
+
     /// Args (map for skill mode · list for command mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<Args>,
+}
+
+impl ScheduleEntry {
+    pub fn effective_harness(&self) -> Harness {
+        self.harness.unwrap_or(Harness::Claude)
+    }
 }
 
 /// Top-level `vault.yml` shape (only the `schedule:` block is parsed here).
@@ -132,6 +142,17 @@ mod tests {
         assert_eq!(cfg.schedule.len(), 1);
         assert_eq!(cfg.schedule[0].cron.as_deref(), Some("0 9 * * *"));
         assert_eq!(cfg.schedule[0].skill.as_deref(), Some("/daily"));
+    }
+
+    #[test]
+    fn schedule_harness_round_trips_and_defaults_to_claude() {
+        let yaml = "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n    harness: codex\n";
+        let cfg: ScheduleConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.schedule[0].harness, Some(Harness::Codex));
+        let legacy: ScheduleConfig =
+            serde_yaml::from_str("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n")
+                .unwrap();
+        assert_eq!(legacy.schedule[0].effective_harness(), Harness::Claude);
     }
 
     #[test]

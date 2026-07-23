@@ -126,6 +126,53 @@ fn happy_path_passes_canonical_argv_and_cwd() {
 
 #[cfg(unix)]
 #[test]
+fn codex_harness_passes_exec_flags_and_dollar_prompt() {
+    let d = tempdir().unwrap();
+    let vault = d.path().join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    write_minimal_vault(&vault);
+    let mock = write_mock_claude(d.path(), ARGV_LOG_SCRIPT);
+    let argv_log = d.path().join("codex-argv.log");
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
+        .args([
+            "--vault",
+            vault.to_str().unwrap(),
+            "skill",
+            "run",
+            "daily",
+            "--harness",
+            "codex",
+        ])
+        .env("CODEX_BIN", &mock)
+        .env("ARGV_LOG", &argv_log)
+        .assert()
+        .success();
+
+    let lines: Vec<String> = fs::read_to_string(argv_log)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            "exec",
+            "--sandbox",
+            "workspace-write",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "-C",
+            vault.to_str().unwrap(),
+            "$onebrain:daily",
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn args_are_appended_as_key_value_tokens() {
     let d = tempdir().unwrap();
     let vault = d.path().join("vault");

@@ -17,6 +17,8 @@ expression: out
         <string>/Users/test/vault</string>
         <string>--skill</string>
         <string>/daily</string>
+        <string>--harness</string>
+        <string>claude</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>

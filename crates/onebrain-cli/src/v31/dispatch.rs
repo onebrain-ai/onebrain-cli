@@ -156,15 +156,32 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
         // ───── Plugin ───────────────────────────────────────────────
         Cmd::Plugin(PluginCmd { verb }) => match verb {
-            PluginVerb::Install { vault_dir, .. } => {
+            PluginVerb::Install {
+                vault_dir,
+                harness,
+                dry_run,
+                ..
+            } => {
                 // v3.0 `register-hooks` + `vault-sync` together. For v3.1 we
                 // expose this as a hidden verb under `plugin install`; full
                 // first-install flow runs through `onebrain init`.
                 let v = vault_dir.or(vault_flag.clone());
-                let code = commands::register_hooks::run(v, false, false)?;
+                let code = if harness == HarnessArg::Codex {
+                    let resolved = crate::vault_ctx::require(v)?;
+                    commands::codex_plugin::install(resolved.root.as_path(), dry_run)?
+                } else {
+                    commands::register_hooks::run(v, dry_run, false)?
+                };
                 std::process::exit(code);
             }
-            PluginVerb::Uninstall => stubs::not_implemented("plugin uninstall"),
+            PluginVerb::Uninstall { harness, dry_run } => {
+                if harness == HarnessArg::Codex {
+                    let resolved = crate::vault_ctx::require(vault_flag.clone())?;
+                    let code = commands::codex_plugin::uninstall(resolved.root.as_path(), dry_run)?;
+                    std::process::exit(code);
+                }
+                stubs::not_implemented("plugin uninstall")
+            }
             PluginVerb::Update {
                 vault_dir,
                 branch,

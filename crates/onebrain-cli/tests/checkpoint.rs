@@ -3,6 +3,7 @@ mod support;
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::PathBuf;
+use tempfile::tempdir;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -51,4 +52,49 @@ fn stop_with_fresh_state_emits_no_stdout() {
         .assert()
         .success()
         .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn codex_stop_state_is_isolated_per_chat_session_id() {
+    let cache = tempdir().unwrap();
+    let state = tempdir().unwrap();
+    let vault = fixture("empty_vault");
+    let token_for = |session_id: &str| {
+        let output = Command::cargo_bin("onebrain")
+            .unwrap()
+            .env("ONEBRAIN_CACHE_DIR", cache.path())
+            .env("TMPDIR", state.path())
+            .env("CODEX_SESSION_ID", session_id)
+            .args(["session", "init", "--json"])
+            .current_dir(&vault)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        value["session_token"].as_str().unwrap().to_owned()
+    };
+
+    let first = token_for("same-prefix-chat-a");
+    let second = token_for("same-prefix-chat-b");
+    for session_id in ["same-prefix-chat-a", "same-prefix-chat-b"] {
+        Command::cargo_bin("onebrain")
+            .unwrap()
+            .env("ONEBRAIN_CACHE_DIR", cache.path())
+            .env("TMPDIR", state.path())
+            .env("CODEX_SESSION_ID", session_id)
+            .args(["checkpoint", "stop"])
+            .current_dir(&vault)
+            .assert()
+            .success();
+    }
+
+    assert_ne!(first, second);
+    assert!(state
+        .path()
+        .join(format!("onebrain-{first}.state"))
+        .is_file());
+    assert!(state
+        .path()
+        .join(format!("onebrain-{second}.state"))
+        .is_file());
 }

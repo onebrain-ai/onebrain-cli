@@ -153,6 +153,9 @@ fn recurring_skill_block(entry: &ScheduleEntry, ctx: &LaunchdContext) -> String 
         xml_escape(&ctx.vault_path.to_string_lossy()),
         xml_escape(entry.skill.as_deref().unwrap_or("")),
     );
+    out.push_str("\n        <string>--harness</string>\n        <string>");
+    out.push_str(entry.effective_harness().as_str());
+    out.push_str("</string>");
     if let Some(Args::Map(map)) = &entry.args {
         for (k, v) in map.iter() {
             out.push('\n');
@@ -300,7 +303,7 @@ fn one_shot_skill_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &str
     // BOTH key and value land inside the `/bin/sh -c "..."` wrapper's quoted
     // `--arg="{k}={v}"` fragment, so BOTH must be shell-escaped — escaping
     // only the value (or neither) leaves the key as an injection vector.
-    let args_flags: String = match &entry.args {
+    let mut args_flags: String = match &entry.args {
         Some(Args::Map(map)) if !map.is_empty() => {
             let parts: Vec<String> = map
                 .iter()
@@ -316,6 +319,10 @@ fn one_shot_skill_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &str
         }
         _ => String::new(),
     };
+    args_flags.push_str(&format!(
+        " --harness=\"{}\"",
+        entry.effective_harness().as_str()
+    ));
     let shell = format!(
         "\"{}\" skill run --vault=\"{}\" --skill=\"{}\"{}; launchctl bootout gui/{}/{}; rm -f \"{}\"",
         shell_escape_double_quoted(&ctx.skill_cli_path),
@@ -651,6 +658,14 @@ mod tests {
             out.contains("<string>topic=this-week</string>"),
             "out:\n{out}"
         );
+    }
+
+    #[test]
+    fn recurring_codex_skill_forwards_harness() {
+        let mut entry = skill_entry("/daily", "0 9 * * *");
+        entry.harness = Some(crate::Harness::Codex);
+        let out = generate_plist(&entry, &test_ctx());
+        assert!(out.contains("<string>--harness</string>\n        <string>codex</string>"));
     }
 
     #[test]

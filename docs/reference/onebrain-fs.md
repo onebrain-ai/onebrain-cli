@@ -10,7 +10,7 @@ src/
 ├── backup.rs             Timestamped config backups (.onebrain-backups/) — hard precondition before any config overwrite
 ├── error.rs              FsError enum (Io + #[from] CoreError) + crate Result alias
 ├── frontmatter.rs        parse_frontmatter — CRLF-aware YAML-mapping frontmatter extractor (crate-private)
-├── harness.rs            detect_harnesses / detect_harness — Claude/Gemini/Direct runtime detection
+├── harness.rs            detect_harnesses / detect_harness — Claude/Gemini/Codex/Direct runtime detection
 ├── migrate.rs            run_backfill_recapped — idempotent session-log `recapped:` backfill migration
 ├── orphan.rs             scan_orphans — unmerged-checkpoint scan with Active-Session Guard
 ├── run_skill.rs          build_prompt + resolve_claude_bin/resolve_gemini_bin — pure helpers for `onebrain skill run`

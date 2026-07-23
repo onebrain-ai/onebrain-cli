@@ -570,9 +570,9 @@ pub struct HarnessCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum HarnessVerb {
-    /// Detect the active harness (Claude Code / Gemini / direct).
+    /// Detect the active harness (Claude Code / Gemini / Codex / direct).
     Detect,
-    /// Run a prompt through claude or gemini headlessly. Omit <PROMPT> to read from stdin (`cat note.md | …`).
+    /// Run a prompt through Claude, Gemini, or Codex headlessly. Omit <PROMPT> to read from stdin (`cat note.md | …`).
     Run {
         /// Vault root override · also accepts global `--vault`, and walks up from cwd when omitted.
         /// Ignored when `--mode ad-hoc`.
@@ -1187,10 +1187,22 @@ pub enum PluginVerb {
         /// Override branch (defaults to onebrain.yml `update_channel`).
         #[arg(long)]
         branch: Option<String>,
+        /// Harness to install the plugin for.
+        #[arg(long, value_enum, default_value_t = HarnessArg::Claude)]
+        harness: HarnessArg,
+        /// Report actions without changing harness-global state.
+        #[arg(long)]
+        dry_run: bool,
     },
-    /// Uninstall plugin (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Uninstall,
+    /// Remove an explicitly managed harness plugin installation.
+    Uninstall {
+        /// Harness whose managed plugin should be removed.
+        #[arg(long, value_enum, default_value_t = HarnessArg::Claude)]
+        harness: HarnessArg,
+        /// Report actions without changing harness-global state.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Pull plugin from GitHub · rewrite hooks · rebind launchd plists.
     Update {
         /// Optional vault root override.
@@ -1349,6 +1361,7 @@ pub enum HarnessArg {
     #[default]
     Claude,
     Gemini,
+    Codex,
 }
 
 impl HarnessArg {
@@ -1357,6 +1370,7 @@ impl HarnessArg {
         match self {
             HarnessArg::Claude => "claude",
             HarnessArg::Gemini => "gemini",
+            HarnessArg::Codex => "codex",
         }
     }
 }

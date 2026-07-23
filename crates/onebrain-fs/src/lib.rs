@@ -36,7 +36,8 @@ pub use init::{
 pub use migrate::{run_backfill_recapped, MigrateResult};
 pub use orphan::{scan_orphans, OrphanScanResult};
 pub use run_skill::{
-    build_prompt, resolve_claude_bin, resolve_gemini_bin, HarnessBinResolution, RunSkillError,
+    build_prompt, build_prompt_for_harness, resolve_claude_bin, resolve_codex_bin,
+    resolve_gemini_bin, HarnessBinResolution, RunSkillError,
 };
 pub use update::{run_update, UpdateOptions, UpdateResult};
 pub use vault_sync::{

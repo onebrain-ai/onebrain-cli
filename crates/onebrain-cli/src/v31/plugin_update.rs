@@ -150,7 +150,7 @@ pub fn run(
     //    the direct `onebrain schedule register` surface, not embedded.
     if !dry_run {
         match crate::commands::register_schedule::run_embedded(
-            Some(vault_root),
+            Some(vault_root.clone()),
             /* dry_run */ false,
             /* refresh */ true,
         ) {
@@ -168,6 +168,24 @@ pub fn run(
                     "schedule re-register failed after hook rewrite: {e:#}"
                 ));
             }
+        }
+    }
+
+    // Refresh Codex only for vaults whose explicit managed-install marker is
+    // present. A refresh failure is partial: vault sync has already succeeded
+    // and must not be rolled back.
+    if report.partial_failure.is_none() {
+        match crate::commands::codex_plugin::refresh_if_managed(&vault_root, dry_run) {
+            Ok(Some(code)) if code != 0 => {
+                report.partial_failure = Some(format!(
+                    "managed Codex plugin refresh exited with code {code}"
+                ));
+            }
+            Err(error) => {
+                report.partial_failure =
+                    Some(format!("managed Codex plugin refresh failed: {error:#}"));
+            }
+            _ => {}
         }
     }
 

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub enum Harness {
     Claude,
     Gemini,
+    Codex,
     Direct,
 }
 
@@ -16,6 +17,7 @@ impl Harness {
         match self {
             Harness::Claude => "claude",
             Harness::Gemini => "gemini",
+            Harness::Codex => "codex",
             Harness::Direct => "direct",
         }
     }
@@ -29,6 +31,7 @@ mod tests {
     fn as_str_lowercase() {
         assert_eq!(Harness::Claude.as_str(), "claude");
         assert_eq!(Harness::Gemini.as_str(), "gemini");
+        assert_eq!(Harness::Codex.as_str(), "codex");
         assert_eq!(Harness::Direct.as_str(), "direct");
     }
 }

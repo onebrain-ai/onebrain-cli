@@ -1,6 +1,6 @@
 ---
-latest_version: 3.4.17
-released: 2026-07-22
+latest_version: 3.4.18
+released: 2026-07-23
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,12 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.18] — 2026-07-23 — Native Codex harness and managed plugin opt-in
+
+- Add `codex` to harness detection, skill execution, ad-hoc harness runs, and per-entry scheduling.
+- Invoke Codex through `codex exec` with workspace-write, ephemeral sessions, vault cwd, model, and JSON forwarding.
+- Add explicit managed Codex plugin installation with an atomic vault marker and additive feature configuration.
 
 ## [3.4.17] — 2026-07-22 — Search-index health: stop writing on read paths, flag a stuck-rebuild shortfall
 
