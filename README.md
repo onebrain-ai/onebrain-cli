@@ -53,7 +53,7 @@ From zero to a working OneBrain vault in three steps:
 ```bash
 # 1. Verify the install
 onebrain --version
-# → onebrain 3.4.18
+# → onebrain 3.4.19
 
 # 2. Scaffold a vault and let init pull the OneBrain plugin
 mkdir my-vault && cd my-vault
