@@ -341,8 +341,178 @@ fn is_alive(pid: u32) -> bool {
     }
 }
 
-/// Non-Unix stub: the daemon isn't supported yet, so nothing is ever "alive".
-#[cfg(not(unix))]
+/// Win32 process probes, declared directly rather than via a `windows-sys`
+/// dependency — the same house pattern as the `SetHandleInformation` block in
+/// `commands::search_reindex` and the `extern "C" { fn geteuid() }` in the
+/// search engine's tests. `#[link(name = "kernel32")]` makes the symbols
+/// resolve explicitly instead of relying on std having already pulled kernel32
+/// into the link.
+#[cfg(windows)]
+mod win_proc {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(
+            dw_desired_access: u32,
+            b_inherit_handle: i32,
+            dw_process_id: u32,
+        ) -> *mut core::ffi::c_void;
+        fn GetExitCodeProcess(h_process: *mut core::ffi::c_void, lp_exit_code: *mut u32) -> i32;
+        fn QueryFullProcessImageNameW(
+            h_process: *mut core::ffi::c_void,
+            dw_flags: u32,
+            lp_exe_name: *mut u16,
+            lpdw_size: *mut u32,
+        ) -> i32;
+        fn TerminateProcess(h_process: *mut core::ffi::c_void, u_exit_code: u32) -> i32;
+        fn CloseHandle(h_object: *mut core::ffi::c_void) -> i32;
+    }
+
+    /// Enough to ask "does it exist / has it exited / what is it" without
+    /// requesting any right that a process owned by another integrity level
+    /// would refuse. Deliberately NOT `PROCESS_QUERY_INFORMATION`, which fails
+    /// on processes we could still legitimately observe.
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    /// `GetExitCodeProcess` reports this while the process is still running.
+    const STILL_ACTIVE: u32 = 259;
+
+    /// RAII wrapper so every early return closes the handle. Leaking process
+    /// handles from a liveness probe called on a poll loop would be a slow
+    /// resource leak in the daemon itself.
+    struct Handle(*mut core::ffi::c_void);
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    fn open(pid: u32) -> Option<Handle> {
+        // SAFETY: a plain FFI call with no pointer arguments; a failure is
+        // reported as a null handle, which we map to `None`.
+        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        (!h.is_null()).then_some(Handle(h))
+    }
+
+    /// True when a process with this pid currently exists AND has not exited.
+    ///
+    /// A handle alone is not enough: Windows keeps the handle valid after the
+    /// process exits (that is how exit codes stay readable), so an
+    /// `OpenProcess` success on a just-exited pid would read as alive.
+    ///
+    /// The classic `STILL_ACTIVE` caveat applies — a process that exits with
+    /// code 259 is indistinguishable from a running one here. Accepted rather
+    /// than worked around: our daemon exits 0 on every graceful path and 1 via
+    /// [`kill`], so it cannot produce 259. The alternative,
+    /// `WaitForSingleObject`, has no such ambiguity but needs `SYNCHRONIZE`
+    /// access on top of the query right, which is likelier to be refused —
+    /// trading a hypothetical wrong answer for a real one.
+    pub(super) fn exists(pid: u32) -> bool {
+        let Some(h) = open(pid) else {
+            return false;
+        };
+        let mut code: u32 = 0;
+        // SAFETY: `h.0` is a live handle from `OpenProcess`; `code` is a valid
+        // out-param for the duration of the call.
+        let ok = unsafe { GetExitCodeProcess(h.0, &mut code) } != 0;
+        ok && code == STILL_ACTIVE
+    }
+
+    /// Full path of the running process's image, when it can be read.
+    fn image_path(pid: u32) -> Option<std::path::PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+        let h = open(pid)?;
+        // Heap, not stack. The Windows extended-path ceiling is 32,767 UTF-16
+        // units, so an array here would put 64 KB on the stack of whatever
+        // thread happens to call this — including tokio workers, which this is
+        // reachable from via the liveness probes. A one-off allocation on a
+        // path that runs seconds apart is not worth that risk.
+        let mut buf = vec![0u16; 32_768];
+        let mut len = buf.len() as u32;
+        // SAFETY: `buf`/`len` are a matched buffer + capacity pair; the call
+        // writes at most `len` UTF-16 units and updates `len` to what it wrote.
+        let ok = unsafe { QueryFullProcessImageNameW(h.0, 0, buf.as_mut_ptr(), &mut len) } != 0;
+        ok.then(|| std::ffi::OsString::from_wide(&buf[..len as usize]).into())
+    }
+
+    /// Right needed to hard-kill. Requested separately from the probe rights so
+    /// the common liveness path never asks for termination privileges.
+    const PROCESS_TERMINATE: u32 = 0x0001;
+
+    /// Hard-kill `pid`. The escalation path only — Windows offers no graceful
+    /// equivalent of SIGTERM for a process with no console, so the cooperative
+    /// stop is the marker file and this is what happens when it is ignored.
+    /// Returns false when the process couldn't be opened or killed (already
+    /// gone, or not ours to kill).
+    pub(super) fn kill(pid: u32) -> bool {
+        // SAFETY: plain FFI; a failed open yields null, which we reject before
+        // dereferencing anything.
+        let h = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if h.is_null() {
+            return false;
+        }
+        let handle = Handle(h);
+        // SAFETY: `handle.0` came from a successful `OpenProcess` above and is
+        // closed by `Handle`'s `Drop`. Exit code 1 marks a non-graceful stop.
+        unsafe { TerminateProcess(handle.0, 1) != 0 }
+    }
+
+    /// True when `pid` is live AND running an executable with the same FILE
+    /// NAME as ours.
+    ///
+    /// This is the Windows stand-in for the Unix probe's session-leader check.
+    /// Both answer the same question — "is this pid actually OUR daemon?" — and
+    /// both exist for the same reason: pids get recycled, so bare existence
+    /// would let an unrelated process inherit a stale slot file's identity and
+    /// make `daemon start` believe a daemon is already running.
+    ///
+    /// FILE NAME, deliberately, not the full path. Comparing full paths looks
+    /// stricter but fails in the one case that matters most: `daemon_client`'s
+    /// version-skew restart exists precisely to stop a daemon left over from a
+    /// PREVIOUS install, and an upgrade can move the binary (a new npm global
+    /// prefix, a different brew cellar path). Full-path equality would report
+    /// that still-running, still-lock-holding daemon as dead, so nothing would
+    /// stop it — reintroducing the orphaned-lock-holder failure this whole
+    /// change is about. The Unix session-leader check has no such blind spot;
+    /// it never looks at the image at all.
+    ///
+    /// Residual gap, accepted: a recycled pid landing on a DIFFERENT onebrain
+    /// process (an `onebrain mcp` server, say) would pass this check. That
+    /// needs an exact pid collision within the same install, and the slot files
+    /// corroborate identity separately, so the trade is worth it — a false
+    /// "alive" costs a refused start with a clear message, a false "dead" costs
+    /// a silent double-owner of the index.
+    pub(super) fn is_self_image(pid: u32) -> bool {
+        if !exists(pid) {
+            return false;
+        }
+        match (image_path(pid), std::env::current_exe()) {
+            (Some(theirs), Ok(ours)) => {
+                // Windows paths are case-insensitive; compare accordingly.
+                match (theirs.file_name(), ours.file_name()) {
+                    (Some(t), Some(o)) => t.eq_ignore_ascii_case(o),
+                    _ => true,
+                }
+            }
+            // Couldn't read one of the paths — fall back to bare existence
+            // rather than declaring a live daemon dead and spawning a second
+            // one against the same index.
+            _ => true,
+        }
+    }
+}
+
+/// Windows liveness probe — the counterpart to the Unix `kill(pid, 0)` +
+/// session-leader check above. See [`win_proc::is_self_image`] for why identity
+/// (not just existence) is part of the answer.
+#[cfg(windows)]
+fn is_alive(pid: u32) -> bool {
+    win_proc::is_self_image(pid)
+}
+
+/// Non-Unix, non-Windows stub: no probe wired, so nothing is ever "alive".
+#[cfg(not(any(unix, windows)))]
 fn is_alive(_pid: u32) -> bool {
     false
 }
@@ -481,10 +651,19 @@ fn pid_exists(pid: u32) -> bool {
     }
 }
 
-#[cfg(not(unix))]
+/// Windows twin of the Unix `kill(pid, 0)` probe. Bare existence ONLY — no
+/// identity check — because this answers "is the lock's creator still around?",
+/// and that creator is the `daemon start` process, not the detached daemon, so
+/// it must not be gated on running our own image the way [`is_alive`] is.
+#[cfg(windows)]
+fn pid_exists(pid: u32) -> bool {
+    win_proc::exists(pid)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn pid_exists(_pid: u32) -> bool {
-    // Non-unix: no cheap raw probe wired yet; assume live so we never reclaim a
-    // lock we can't verify is stale (conservative — matches `LockOwner::Unknown`).
+    // No cheap raw probe wired here; assume live so we never reclaim a lock we
+    // can't verify is stale (conservative — matches `LockOwner::Unknown`).
     true
 }
 
@@ -1030,8 +1209,21 @@ fn child_has_exited(pid: u32) -> bool {
     }
 }
 
-/// Non-Unix stub — the daemon isn't supported yet (see [`is_alive`]).
-#[cfg(not(unix))]
+/// Windows twin of the `waitpid(WNOHANG)` probe. There is no reaping to do —
+/// Windows keeps a process's exit code readable through any open handle rather
+/// than through a parent-only wait — so `GetExitCodeProcess` answers directly,
+/// and it answers for any pid we can open, not just our own children. That
+/// makes this strictly simpler than the Unix path, with no need for the
+/// `bare_pid_or_session_alive` fallback that covers `waitpid`'s "not my child"
+/// error.
+#[cfg(windows)]
+fn child_has_exited(pid: u32) -> bool {
+    !win_proc::exists(pid)
+}
+
+/// Stub for platforms with neither probe wired — never claims a child exited,
+/// so callers wait rather than act on an answer we don't have.
+#[cfg(not(any(unix, windows)))]
 fn child_has_exited(_pid: u32) -> bool {
     false
 }
@@ -1039,6 +1231,11 @@ fn child_has_exited(_pid: u32) -> bool {
 /// `true` while the child process still exists at all (bare `pid_exists`) —
 /// the fallback existence probe [`child_has_exited`] uses when `waitpid`
 /// itself can't answer (e.g. `pid` isn't literally our child).
+///
+/// Unix-only: it exists solely to paper over `waitpid`'s "not my child" error,
+/// and Windows has no such gap — `GetExitCodeProcess` answers for any pid we
+/// can open, so the Windows `child_has_exited` needs no fallback at all.
+#[cfg(unix)]
 fn bare_pid_or_session_alive(pid: u32) -> bool {
     pid_exists(pid)
 }
@@ -1082,6 +1279,27 @@ fn clear_slot_files(slot: &SlotPaths) {
     let _ = remove_pid(&slot.pid);
     let _ = DaemonInfo::remove(&slot.json);
     let _ = remove_pid_lock_stale(&slot.lock);
+    // A `.stop` left behind (daemon killed before it could observe the marker)
+    // would make the NEXT daemon exit the moment it starts. Clearing it here
+    // means every path that tidies a slot also disarms the marker.
+    let _ = fs::remove_file(stop_marker_path(slot));
+}
+
+/// `daemon-<hash>.stop` — the cooperative stop marker, alongside the slot's
+/// other files.
+///
+/// This is the Windows stand-in for SIGTERM, and it exists because Windows has
+/// no signal to send: `GenerateConsoleCtrlEvent` needs a console the detached
+/// daemon deliberately does not have, and `TerminateProcess` is a hard kill
+/// with no chance to unwind — which for this daemon means dropping the engine
+/// without releasing redb's collection lock cleanly.
+///
+/// So `daemon stop` creates this file and the daemon polls for it, giving the
+/// same three-step shape as the Unix path: ask nicely, wait, escalate. Derived
+/// from `slot.pid` rather than added to [`SlotPaths`] to keep the marker an
+/// implementation detail of this module.
+fn stop_marker_path(slot: &SlotPaths) -> PathBuf {
+    slot.pid.with_extension("stop")
 }
 
 /// SIGTERM the daemon occupying `slot` (if live), wait briefly for it to exit,
@@ -1100,7 +1318,7 @@ pub(crate) fn stop_slot(slot: &SlotPaths) -> Result<(bool, Option<u32>)> {
             pid: Some(pid),
             ..
         } => {
-            terminate(pid).with_context(|| format!("signal daemon pid {pid}"))?;
+            terminate(pid, slot).with_context(|| format!("signal daemon pid {pid}"))?;
             // Best-effort: the daemon's SIGTERM handler removes its own PID +
             // discovery files, but if it died uncleanly (or isn't ours — a
             // recycled session leader could slip through) we still clear the
@@ -1318,8 +1536,111 @@ fn spawn_detached_run(log_path: &Path, vault: Option<&Path>) -> Result<u32> {
     Ok(child.id())
 }
 
-/// Non-Unix stub — the detached-spawn path is Unix-only for now.
-#[cfg(not(unix))]
+/// Windows counterpart of the Unix detached spawn above.
+///
+/// The two platform primitives map like this:
+///  - `setsid()` → `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`. The first
+///    gives the child no console at all (so it never inherits ours and never
+///    flashes one of its own); the second puts it in its own process group, so
+///    a Ctrl-C in the terminal that ran `daemon start` is not delivered to the
+///    daemon.
+///  - `chdir("/")` → `current_dir(<system drive root>)`. Same purpose: a
+///    long-lived daemon must not pin whatever directory `daemon start` happened
+///    to run from, which on Windows would hold a lock preventing that directory
+///    from being renamed or removed.
+///
+/// Log permissions have no `.mode(0o600)` equivalent here. The log lives under
+/// the user's own profile, which is already ACL'd to that user by default, so
+/// the Unix path's explicit tightening has no Windows action to mirror.
+#[cfg(windows)]
+fn spawn_detached_run(log_path: &Path, vault: Option<&Path>) -> Result<u32> {
+    use std::fs::OpenOptions;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    /// No console for the child, and don't let it inherit ours.
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    /// Own process group — shields the daemon from the parent terminal's Ctrl-C.
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+    if let Some(parent) = log_path.parent() {
+        ensure_private_run_dir(parent)?;
+    }
+
+    let exe = std::env::current_exe().context("resolve current executable path")?;
+
+    // Append so restarts accumulate history rather than truncating the log.
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("open daemon log {}", log_path.display()))?;
+    let log_err = log
+        .try_clone()
+        .context("clone daemon log handle for stderr")?;
+
+    // Don't pin the caller's cwd — see the doc comment. `SystemDrive` is
+    // normally `C:`; the trailing separator makes it a root path rather than
+    // the "current directory on drive C" that a bare `C:` means to Windows.
+    let root = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+
+    let mut cmd = Command::new(exe);
+    cmd.arg("daemon")
+        .arg("__run")
+        .current_dir(format!("{root}\\"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    if let Some(v) = vault {
+        cmd.arg("--vault").arg(v);
+    }
+
+    // Rust spawns Windows children with `bInheritHandles=TRUE`, so the child
+    // inherits every inheritable handle in this process — including OUR
+    // stdout/stderr. When `daemon start`'s stdout is a pipe (its own `--json`
+    // envelope being captured, or any caller reading it), the reader only sees
+    // EOF once EVERY writer handle closes — and the daemon is long-lived by
+    // definition, so that inherited copy would hold the pipe open for the
+    // daemon's entire life and hang the caller. Unix avoids this with
+    // `O_CLOEXEC`; Windows needs the inherit flag cleared explicitly. The child
+    // is given its own stdio above, so it never needs ours.
+    //
+    // Twin of the identical block in `commands::search_reindex`, which is where
+    // this was first proven (it fixed a Windows-only >5s hang there). Worth
+    // hoisting into one shared helper if a third caller ever needs it.
+    {
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetHandleInformation(
+                h_object: *mut core::ffi::c_void,
+                dw_mask: u32,
+                dw_flags: u32,
+            ) -> i32;
+        }
+        const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+        // Best-effort: a failure here only costs us the hang this prevents —
+        // never a reason to fail the spawn.
+        for h in [
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+            std::io::stdin().as_raw_handle(),
+        ] {
+            // SAFETY: plain FFI on a std handle we own; the call only clears an
+            // inheritance flag and cannot invalidate the handle.
+            unsafe {
+                let _ = SetHandleInformation(h as *mut core::ffi::c_void, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+
+    let child = cmd.spawn().context("spawn detached daemon child")?;
+    Ok(child.id())
+}
+
+/// Stub for platforms with neither spawn path wired.
+#[cfg(not(any(unix, windows)))]
 fn spawn_detached_run(_log_path: &Path, _vault: Option<&Path>) -> Result<u32> {
     Err(anyhow::Error::new(crate::output::HintedError::new(
         "the daemon is not yet supported on this platform (it currently requires macOS or Linux)",
@@ -1329,8 +1650,12 @@ fn spawn_detached_run(_log_path: &Path, _vault: Option<&Path>) -> Result<u32> {
 }
 
 /// Send SIGTERM to `pid`, then poll briefly for it to exit (best-effort).
+///
+/// `_slot` is unused here — Unix signals the process directly. It is in the
+/// signature because the Windows twin has no signal to send and must reach the
+/// daemon through its slot's stop marker instead.
 #[cfg(unix)]
-fn terminate(pid: u32) -> Result<()> {
+fn terminate(pid: u32, _slot: &SlotPaths) -> Result<()> {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
     use std::time::{Duration, Instant};
@@ -1359,8 +1684,55 @@ fn terminate(pid: u32) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn terminate(_pid: u32) -> Result<()> {
+/// Windows stop: drop the marker, wait, escalate.
+///
+/// Deliberately the same three steps and the same ~2s budget as the Unix path,
+/// so `daemon stop` behaves identically from the outside. The difference is
+/// only in how "please stop" is delivered — see [`stop_marker_path`].
+///
+/// The escalation is what the Unix comment says a SIGKILL escalation would be
+/// for: unlike a missed signal, a missed marker means the daemon's poll loop
+/// isn't running (wedged, or mid-blocking-call), and leaving it alive would
+/// hold the collection lock indefinitely with its slot files already cleared.
+#[cfg(windows)]
+fn terminate(pid: u32, slot: &SlotPaths) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    let marker = stop_marker_path(slot);
+    if let Some(parent) = marker.parent() {
+        ensure_private_run_dir(parent)?;
+    }
+    fs::write(&marker, format!("{pid}\n"))
+        .with_context(|| format!("write daemon stop marker {}", marker.display()))?;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut stopped = false;
+    while Instant::now() < deadline {
+        if !is_alive(pid) {
+            stopped = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    if !stopped && is_alive(pid) {
+        // Ignored the marker for the whole budget. Kill it rather than leave a
+        // lock-holding orphan behind.
+        tracing::warn!(pid, "daemon ignored the stop marker; terminating");
+        win_proc::kill(pid);
+    }
+
+    // The daemon removes this itself on a clean stop; remove it here too so an
+    // escalated kill can't leave a marker that would stop the next daemon
+    // instantly. `clear_slot_files` repeats this — both paths are best-effort
+    // and idempotent.
+    let _ = fs::remove_file(&marker);
+    Ok(())
+}
+
+/// Stub for platforms with neither a signal nor a marker loop wired.
+#[cfg(not(any(unix, windows)))]
+fn terminate(_pid: u32, _slot: &SlotPaths) -> Result<()> {
     Err(anyhow::Error::new(crate::output::HintedError::new(
         "the daemon is not yet supported on this platform (it currently requires macOS or Linux)",
         "everything else still works without it — search and serve open the vault index \
@@ -1438,6 +1810,16 @@ pub fn run_internal(vault: Option<&Path>) -> Result<()> {
 
     init_tracing(&slot.log)?;
 
+    // Disarm any stop marker left by a previous daemon in this slot before we
+    // start watching for one. A daemon that was hard-killed (escalation, power
+    // loss) never got to remove its own marker, and inheriting it would make
+    // this fresh daemon shut down within a quarter second of starting — a
+    // start/stop loop with no visible cause. Every path that clears a slot also
+    // clears the marker; this is the last of them, and the one that matters if
+    // the process died without running any of the others.
+    let stop_marker = stop_marker_path(&slot);
+    let _ = fs::remove_file(&stop_marker);
+
     let pid = std::process::id();
     write_pid(&slot.pid, pid)?;
 
@@ -1478,6 +1860,7 @@ pub fn run_internal(vault: Option<&Path>) -> Result<()> {
     let idle_secs = resolve_idle_secs();
 
     let discovery_path = slot.json.clone();
+    let pid_path = slot.pid.clone();
 
     // Own a tokio runtime for the lifetime of the daemon. `enable_all` turns on
     // the I/O + time drivers the server + signal handling need.
@@ -1495,13 +1878,16 @@ pub fn run_internal(vault: Option<&Path>) -> Result<()> {
         // Compose the shutdown trigger: SIGTERM OR idle-timeout.
         let idle_state = state.clone();
         let shutdown = async move {
-            let sigterm = sigterm_future();
+            let sigterm = sigterm_future(stop_marker);
             tokio::pin!(sigterm);
             let idle = idle_shutdown(idle_state, idle_secs);
             tokio::pin!(idle);
+            let deregistered = deregistered_shutdown(pid_path, pid);
+            tokio::pin!(deregistered);
             tokio::select! {
                 _ = &mut sigterm => tracing::info!("shutdown: SIGTERM"),
                 _ = &mut idle => tracing::info!("shutdown: idle timeout"),
+                _ = &mut deregistered => tracing::info!("shutdown: slot deregistered"),
             }
         };
 
@@ -1659,8 +2045,75 @@ fn resolve_daemon_vault(arg: Option<&Path>) -> Option<PathBuf> {
 /// the old `sigaction` + `AtomicBool` park loop: it composes cleanly as a
 /// `Future` the server can race against its accept loop, and tokio installs the
 /// handler in an async-signal-safe way.
+/// Resolve once our slot registration is gone — the daemon's lease has lapsed,
+/// so shut down.
+///
+/// The slot's `.pid` file is what every stop path enumerates
+/// ([`daemon_client::all_slots`] reads the run dir; nothing anywhere discovers
+/// daemons by scanning processes). So a daemon whose slot files were removed
+/// while it lived is UNREACHABLE: `daemon stop --all` prints "no daemons
+/// running" while this process is alive and still holding redb's collection
+/// lock, and the user gets "no daemons running" and "the index is locked by
+/// another process" at the same time with no command that resolves it. See #308.
+///
+/// Losing the registration means nobody can reach us, so there is no upside to
+/// holding the lock. Exiting makes the orphan state self-healing and needs no
+/// per-OS process enumeration — one `stat` per tick, identical everywhere.
+///
+/// Cross-platform on purpose: the gap is in file-based discovery, which has no
+/// `#[cfg]` on it. Windows merely reached the state first, because until the
+/// daemon port it could not spawn a daemon at all.
+///
+/// Tolerates [`DEREGISTERED_MISSES`] consecutive misses before acting: a single
+/// transient `stat` failure (or the brief window where a stop path rewrites the
+/// file) must never take down a healthy daemon.
+/// Production cadence: slow on purpose — a safety net, not a hot path, and the
+/// state it catches is rare.
+const DEREGISTERED_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Consecutive misses before we believe it — ~15s of continuous absence.
+const DEREGISTERED_MISSES: u32 = 3;
+
+async fn deregistered_shutdown(pid_path: PathBuf, pid: u32) {
+    deregistered_shutdown_every(pid_path, pid, DEREGISTERED_POLL, DEREGISTERED_MISSES).await
+}
+
+/// Cadence-injected core, so the policy can be tested in milliseconds instead
+/// of the ~15s the production constants would cost. Same seam as
+/// [`compute_status`]'s injected liveness probe.
+async fn deregistered_shutdown_every(
+    pid_path: PathBuf,
+    pid: u32,
+    poll: std::time::Duration,
+    misses_before_exit: u32,
+) {
+    let mut misses = 0u32;
+    loop {
+        // Sleep FIRST: at startup `write_pid` has already run, but sleeping
+        // first also keeps this immune to any future reordering there.
+        tokio::time::sleep(poll).await;
+
+        if read_pid(&pid_path) == Some(pid) {
+            misses = 0;
+            continue;
+        }
+
+        misses += 1;
+        if misses >= misses_before_exit {
+            tracing::warn!(
+                pid,
+                path = %pid_path.display(),
+                "slot registration gone; shutting down so the collection lock isn't orphaned"
+            );
+            return;
+        }
+    }
+}
+
+/// `_stop_marker` is unused here — Unix is signalled directly. It is in the
+/// signature because the Windows twin has no signal to wait on and watches the
+/// marker file instead.
 #[cfg(unix)]
-async fn sigterm_future() {
+async fn sigterm_future(_stop_marker: PathBuf) {
     use tokio::signal::unix::{signal, SignalKind};
     match signal(SignalKind::terminate()) {
         Ok(mut term) => {
@@ -1676,10 +2129,36 @@ async fn sigterm_future() {
     }
 }
 
-/// Non-Unix: no SIGTERM. The daemon is Unix-only for now, so this never runs in
-/// production; it exists so the async server fn type-checks on Windows.
-#[cfg(not(unix))]
-async fn sigterm_future() {
+/// Windows: watch for the stop marker `daemon stop` drops into our slot.
+///
+/// Polling rather than a filesystem watcher on purpose. The wait is measured in
+/// seconds and happens once per daemon lifetime, so a ¼-second tick costs
+/// nothing measurable, while `ReadDirectoryChangesW` would add a watcher, its
+/// own failure modes, and a dependency — for a signal that arrives at most once.
+///
+/// ¼ second is well inside `terminate`'s 2s budget, so a responsive daemon
+/// always stops cooperatively and never reaches the hard-kill escalation.
+#[cfg(windows)]
+async fn sigterm_future(stop_marker: PathBuf) {
+    use std::time::Duration;
+    loop {
+        if stop_marker.exists() {
+            tracing::info!(marker = %stop_marker.display(), "stop marker seen; shutting down daemon");
+            // Remove it as part of stopping: the marker means "stop", not
+            // "stay stopped", and a leftover would make the next daemon exit
+            // immediately. `terminate` and `clear_slot_files` also remove it —
+            // all three are best-effort and idempotent.
+            let _ = std::fs::remove_file(&stop_marker);
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Stub for platforms with neither mechanism — never resolves, so the server
+/// runs until its idle timeout. Exists so the async server fn type-checks.
+#[cfg(not(any(unix, windows)))]
+async fn sigterm_future(_stop_marker: PathBuf) {
     std::future::pending::<()>().await
 }
 
@@ -1777,6 +2256,135 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    // ── Stop marker + deregistration (#307 Windows stop, #308 orphan slots) ──
+    //
+    // Deliberately NOT `#[cfg(unix)]`. The daemon's existing lifecycle tests are
+    // Unix-gated because they isolate discovery via `$HOME`, which
+    // `dirs::home_dir()` only honours there — but none of the behaviour below
+    // needs a real HOME, a real process, or a spawn. These are the cross-platform
+    // core: the marker's path derivation, its cleanup, and the deregistration
+    // decision. Windows would otherwise ship the whole daemon port with no
+    // automated coverage at all.
+
+    fn slot_in(dir: &Path) -> SlotPaths {
+        SlotPaths {
+            json: dir.join("daemon-abc123.json"),
+            pid: dir.join("daemon-abc123.pid"),
+            lock: dir.join("daemon-abc123.lock"),
+            log: dir.join("daemon-abc123.log"),
+        }
+    }
+
+    #[test]
+    fn stop_marker_sits_beside_the_slot_and_replaces_only_the_extension() {
+        let dir = tempdir().unwrap();
+        let slot = slot_in(dir.path());
+        let marker = stop_marker_path(&slot);
+        assert_eq!(marker.file_name().unwrap(), "daemon-abc123.stop");
+        assert_eq!(
+            marker.parent(),
+            slot.pid.parent(),
+            "marker must live in the same run dir the stop path looks in"
+        );
+    }
+
+    #[test]
+    fn clearing_a_slot_also_disarms_its_stop_marker() {
+        // A marker outliving its slot would stop the NEXT daemon a quarter
+        // second after it starts — a start/stop loop with no visible cause.
+        let dir = tempdir().unwrap();
+        let slot = slot_in(dir.path());
+        let marker = stop_marker_path(&slot);
+        write_pid(&slot.pid, 4242).unwrap();
+        fs::write(&marker, "4242\n").unwrap();
+
+        clear_slot_files(&slot);
+
+        assert!(!marker.exists(), "stop marker survived clear_slot_files");
+        assert!(!slot.pid.exists());
+    }
+
+    /// Fast stand-in for [`DEREGISTERED_POLL`]. Real time, but 5ms of it —
+    /// `tokio::time::advance` would need tokio's `test-util` feature, and a
+    /// cadence parameter is a smaller change than a new dependency feature.
+    const TEST_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+    #[tokio::test]
+    async fn deregistered_shutdown_resolves_once_the_pid_file_is_gone() {
+        let dir = tempdir().unwrap();
+        let slot = slot_in(dir.path());
+        write_pid(&slot.pid, 4242).unwrap();
+
+        let watcher = tokio::spawn(deregistered_shutdown_every(
+            slot.pid.clone(),
+            4242,
+            TEST_POLL,
+            3,
+        ));
+
+        // Registration intact: must not resolve, however many polls elapse.
+        tokio::time::sleep(TEST_POLL * 20).await;
+        assert!(!watcher.is_finished(), "exited while still registered");
+
+        fs::remove_file(&slot.pid).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), watcher)
+            .await
+            .expect("did not shut down after the registration vanished")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn deregistered_shutdown_survives_a_transient_miss() {
+        // One unreadable poll must not take down a healthy daemon — the miss
+        // counter resets as soon as the registration reads back.
+        let dir = tempdir().unwrap();
+        let slot = slot_in(dir.path());
+        write_pid(&slot.pid, 4242).unwrap();
+
+        // A high miss threshold plus a restored file: even if the removal
+        // window covers several polls, the counter must reset and never reach
+        // the bound.
+        let watcher = tokio::spawn(deregistered_shutdown_every(
+            slot.pid.clone(),
+            4242,
+            TEST_POLL,
+            50,
+        ));
+
+        fs::remove_file(&slot.pid).unwrap();
+        tokio::time::sleep(TEST_POLL * 2).await;
+        write_pid(&slot.pid, 4242).unwrap();
+        tokio::time::sleep(TEST_POLL * 60).await;
+
+        assert!(
+            !watcher.is_finished(),
+            "a transient miss shut the daemon down"
+        );
+        watcher.abort();
+    }
+
+    #[tokio::test]
+    async fn deregistered_shutdown_resolves_when_another_daemon_claims_the_slot() {
+        // Someone else's pid in our slot means we are no longer the registered
+        // owner, so we must not keep holding the collection lock.
+        let dir = tempdir().unwrap();
+        let slot = slot_in(dir.path());
+        write_pid(&slot.pid, 4242).unwrap();
+
+        let watcher = tokio::spawn(deregistered_shutdown_every(
+            slot.pid.clone(),
+            4242,
+            TEST_POLL,
+            3,
+        ));
+
+        write_pid(&slot.pid, 9999).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), watcher)
+            .await
+            .expect("did not shut down after another daemon claimed the slot")
+            .unwrap();
     }
 
     #[test]

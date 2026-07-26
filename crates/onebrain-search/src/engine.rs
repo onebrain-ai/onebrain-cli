@@ -1645,9 +1645,32 @@ impl Engine {
             let mut doc_chunks = write_txn.open_table(DOC_CHUNKS)?;
             doc_chunks.remove(doc_path)?;
         }
-        write_txn.commit()?;
 
+        // Commit ORDER MATTERS, and it is the opposite of `index_doc`'s.
+        //
+        // The two stores cannot be committed atomically, so one of them wins on
+        // a crash in between. Pick the direction whose surviving state is still
+        // repairable:
+        //
+        //   lex first (here): crash before the redb commit rolls the redb txn
+        //   back, so `chunk_meta` AND the `doc_chunks` row survive. The doc is
+        //   still tracked, `remove_doc` can simply be re-run (the lex delete is
+        //   idempotent), and no lex doc outlives its `chunk_meta` — so the
+        //   lex-only fast paths cannot surface it as a hit.
+        //
+        //   redb first (the old order): the same crash left the lex delete
+        //   uncommitted while removing the very `doc_chunks` row `remove_doc`
+        //   keys off — orphaning those lex docs permanently, with nothing able
+        //   to delete them again. They then surface as hits on the three
+        //   lex-only fast paths, pointing at documents the vault no longer
+        //   indexes. See #297.
+        //
+        // `index_doc` keeps the reverse order for the same reason read the
+        // other way: there, committing lex first would publish lex docs whose
+        // `chunk_meta` does not exist yet — orphan hits by construction.
         self.lex.commit()?;
+
+        write_txn.commit()?;
 
         Ok(())
     }

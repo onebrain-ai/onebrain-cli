@@ -1,6 +1,6 @@
 ---
-latest_version: 3.4.18
-released: 2026-07-23
+latest_version: 3.4.19
+released: 2026-07-26
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,14 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.19] — 2026-07-26 — The daemon runs on Windows, so the MCP server stops holding the index lock
+
+- `onebrain daemon` now works on Windows: process probes via `OpenProcess`/`GetExitCodeProcess`, detached spawn via `DETACHED_PROCESS`, and a `daemon-<hash>.stop` marker standing in for SIGTERM — same ask/wait/escalate shape as Unix, no new dependency ([#307](https://github.com/onebrain-ai/onebrain-cli/issues/307))
+- Windows sessions therefore reach `Backend::Daemon` instead of falling back to the engine-owning path, so the MCP server holds no collection lock and `search reindex` succeeds while an editor is open — previously it was `exit 77` every time, and the Stop hook's `--pending-only` catch-up reported `detached: true` while doing nothing ([#307](https://github.com/onebrain-ai/onebrain-cli/issues/307))
+- A daemon whose slot files are removed while it runs now shuts itself down rather than holding the collection lock unreachably — `daemon stop --all` enumerates registrations, not processes, so it could not see one on any platform ([#308](https://github.com/onebrain-ai/onebrain-cli/issues/308))
+- `Engine::remove_doc` commits the keyword index before redb, so a crash mid-remove leaves a repairable state instead of permanently orphaning lex docs that then surface as hits on the lex-only fast paths ([#297](https://github.com/onebrain-ai/onebrain-cli/issues/297))
+- `onebrain search status` reports `unknown (locked)` instead of the factually wrong `never` when the index cannot be read, and `doctor`'s lex-index hint now names the process actually holding the lock rather than a daemon that may not exist ([#307](https://github.com/onebrain-ai/onebrain-cli/issues/307))
 
 ## [3.4.18] — 2026-07-23 — Native Codex harness and managed plugin opt-in
 
