@@ -1729,7 +1729,18 @@ fn lex_index_check(vault_root: &Path) -> DoctorResult {
                     "{LEX_INDEX_UNVERIFIED} — a running onebrain process holds the search engine"
                 ),
             )
-            .with_hint("stop the daemon (`onebrain daemon stop`) and re-run `onebrain doctor`")
+            // The old hint named only the daemon, which misdirects on the most
+            // common holder and is impossible to act on where the daemon does
+            // not exist. `onebrain mcp` — the plugin's MCP server, alive for as
+            // long as the editor session — holds this lock far more often than
+            // a warm daemon does, and on Windows `daemon start` is a
+            // `#[cfg(not(unix))]` stub, so "stop the daemon" is advice the user
+            // cannot follow at all. Name the real holders, commonest first.
+            .with_hint(
+                "close whatever holds the engine — usually an editor session running \
+                 `onebrain mcp`, otherwise a warm daemon (`onebrain daemon stop`) — then \
+                 re-run `onebrain doctor`",
+            )
             .with_details(vec![
                 format!("collection: {collection}"),
                 format!("engine: {e}"),

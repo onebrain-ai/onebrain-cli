@@ -836,6 +836,17 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
     }
     match d.last_indexed_at.and_then(format_local) {
         Some(when) => lines.push(item("Last indexed", &when)),
+        // `last_indexed_at` is `None` for two very different reasons, and they
+        // must not render the same way. A genuinely never-indexed collection is
+        // "never". A collection we simply COULDN'T READ — the engine was busy
+        // (another process holds the collection lock) or the status read failed
+        // — is unknown, and printing "never" there is a factual claim we have no
+        // basis for. On a healthy vault whose index was rebuilt minutes earlier
+        // it reads as data loss, sitting right above a multi-megabyte `Size`.
+        // Mirrors how `Docs` already renders unknown vs a real `0`. See #307.
+        None if d.status_error.is_some() || d.busy => {
+            lines.push(item("Last indexed", "unknown (locked)"))
+        }
         None => lines.push(item("Last indexed", "never")),
     }
     if let Some(r) = &d.reindexing {
