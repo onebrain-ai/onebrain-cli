@@ -400,6 +400,14 @@ mod win_proc {
     /// A handle alone is not enough: Windows keeps the handle valid after the
     /// process exits (that is how exit codes stay readable), so an
     /// `OpenProcess` success on a just-exited pid would read as alive.
+    ///
+    /// The classic `STILL_ACTIVE` caveat applies — a process that exits with
+    /// code 259 is indistinguishable from a running one here. Accepted rather
+    /// than worked around: our daemon exits 0 on every graceful path and 1 via
+    /// [`kill`], so it cannot produce 259. The alternative,
+    /// `WaitForSingleObject`, has no such ambiguity but needs `SYNCHRONIZE`
+    /// access on top of the query right, which is likelier to be refused —
+    /// trading a hypothetical wrong answer for a real one.
     pub(super) fn exists(pid: u32) -> bool {
         let Some(h) = open(pid) else {
             return false;
@@ -415,7 +423,12 @@ mod win_proc {
     fn image_path(pid: u32) -> Option<std::path::PathBuf> {
         use std::os::windows::ffi::OsStringExt;
         let h = open(pid)?;
-        let mut buf = [0u16; 32_768]; // MAX_PATH is not the real ceiling here.
+        // Heap, not stack. The Windows extended-path ceiling is 32,767 UTF-16
+        // units, so an array here would put 64 KB on the stack of whatever
+        // thread happens to call this — including tokio workers, which this is
+        // reachable from via the liveness probes. A one-off allocation on a
+        // path that runs seconds apart is not worth that risk.
+        let mut buf = vec![0u16; 32_768];
         let mut len = buf.len() as u32;
         // SAFETY: `buf`/`len` are a matched buffer + capacity pair; the call
         // writes at most `len` UTF-16 units and updates `len` to what it wrote.
@@ -2054,20 +2067,30 @@ fn resolve_daemon_vault(arg: Option<&Path>) -> Option<PathBuf> {
 /// Tolerates [`DEREGISTERED_MISSES`] consecutive misses before acting: a single
 /// transient `stat` failure (or the brief window where a stop path rewrites the
 /// file) must never take down a healthy daemon.
+/// Production cadence: slow on purpose — a safety net, not a hot path, and the
+/// state it catches is rare.
+const DEREGISTERED_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Consecutive misses before we believe it — ~15s of continuous absence.
+const DEREGISTERED_MISSES: u32 = 3;
+
 async fn deregistered_shutdown(pid_path: PathBuf, pid: u32) {
-    use std::time::Duration;
+    deregistered_shutdown_every(pid_path, pid, DEREGISTERED_POLL, DEREGISTERED_MISSES).await
+}
 
-    /// Slow on purpose — this is a safety net, not a hot path, and the state it
-    /// catches is rare.
-    const POLL: Duration = Duration::from_secs(5);
-    /// ~15s of continuous absence before we believe it.
-    const DEREGISTERED_MISSES: u32 = 3;
-
+/// Cadence-injected core, so the policy can be tested in milliseconds instead
+/// of the ~15s the production constants would cost. Same seam as
+/// [`compute_status`]'s injected liveness probe.
+async fn deregistered_shutdown_every(
+    pid_path: PathBuf,
+    pid: u32,
+    poll: std::time::Duration,
+    misses_before_exit: u32,
+) {
     let mut misses = 0u32;
     loop {
         // Sleep FIRST: at startup `write_pid` has already run, but sleeping
         // first also keeps this immune to any future reordering there.
-        tokio::time::sleep(POLL).await;
+        tokio::time::sleep(poll).await;
 
         if read_pid(&pid_path) == Some(pid) {
             misses = 0;
@@ -2075,7 +2098,7 @@ async fn deregistered_shutdown(pid_path: PathBuf, pid: u32) {
         }
 
         misses += 1;
-        if misses >= DEREGISTERED_MISSES {
+        if misses >= misses_before_exit {
             tracing::warn!(
                 pid,
                 path = %pid_path.display(),
@@ -2233,6 +2256,135 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    // ── Stop marker + deregistration (#307 Windows stop, #308 orphan slots) ──
+    //
+    // Deliberately NOT `#[cfg(unix)]`. The daemon's existing lifecycle tests are
+    // Unix-gated because they isolate discovery via `$HOME`, which
+    // `dirs::home_dir()` only honours there — but none of the behaviour below
+    // needs a real HOME, a real process, or a spawn. These are the cross-platform
+    // core: the marker's path derivation, its cleanup, and the deregistration
+    // decision. Windows would otherwise ship the whole daemon port with no
+    // automated coverage at all.
+
+    fn slot_in(dir: &Path) -> SlotPaths {
+        SlotPaths {
+            json: dir.join("daemon-abc123.json"),
+            pid: dir.join("daemon-abc123.pid"),
+            lock: dir.join("daemon-abc123.lock"),
+            log: dir.join("daemon-abc123.log"),
+        }
+    }
+
+    #[test]
+    fn stop_marker_sits_beside_the_slot_and_replaces_only_the_extension() {
+        let dir = tempdir().unwrap();
+        let slot = slot_in(dir.path());
+        let marker = stop_marker_path(&slot);
+        assert_eq!(marker.file_name().unwrap(), "daemon-abc123.stop");
+        assert_eq!(
+            marker.parent(),
+            slot.pid.parent(),
+            "marker must live in the same run dir the stop path looks in"
+        );
+    }
+
+    #[test]
+    fn clearing_a_slot_also_disarms_its_stop_marker() {
+        // A marker outliving its slot would stop the NEXT daemon a quarter
+        // second after it starts — a start/stop loop with no visible cause.
+        let dir = tempdir().unwrap();
+        let slot = slot_in(dir.path());
+        let marker = stop_marker_path(&slot);
+        write_pid(&slot.pid, 4242).unwrap();
+        fs::write(&marker, "4242\n").unwrap();
+
+        clear_slot_files(&slot);
+
+        assert!(!marker.exists(), "stop marker survived clear_slot_files");
+        assert!(!slot.pid.exists());
+    }
+
+    /// Fast stand-in for [`DEREGISTERED_POLL`]. Real time, but 5ms of it —
+    /// `tokio::time::advance` would need tokio's `test-util` feature, and a
+    /// cadence parameter is a smaller change than a new dependency feature.
+    const TEST_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+    #[tokio::test]
+    async fn deregistered_shutdown_resolves_once_the_pid_file_is_gone() {
+        let dir = tempdir().unwrap();
+        let slot = slot_in(dir.path());
+        write_pid(&slot.pid, 4242).unwrap();
+
+        let watcher = tokio::spawn(deregistered_shutdown_every(
+            slot.pid.clone(),
+            4242,
+            TEST_POLL,
+            3,
+        ));
+
+        // Registration intact: must not resolve, however many polls elapse.
+        tokio::time::sleep(TEST_POLL * 20).await;
+        assert!(!watcher.is_finished(), "exited while still registered");
+
+        fs::remove_file(&slot.pid).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), watcher)
+            .await
+            .expect("did not shut down after the registration vanished")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn deregistered_shutdown_survives_a_transient_miss() {
+        // One unreadable poll must not take down a healthy daemon — the miss
+        // counter resets as soon as the registration reads back.
+        let dir = tempdir().unwrap();
+        let slot = slot_in(dir.path());
+        write_pid(&slot.pid, 4242).unwrap();
+
+        // A high miss threshold plus a restored file: even if the removal
+        // window covers several polls, the counter must reset and never reach
+        // the bound.
+        let watcher = tokio::spawn(deregistered_shutdown_every(
+            slot.pid.clone(),
+            4242,
+            TEST_POLL,
+            50,
+        ));
+
+        fs::remove_file(&slot.pid).unwrap();
+        tokio::time::sleep(TEST_POLL * 2).await;
+        write_pid(&slot.pid, 4242).unwrap();
+        tokio::time::sleep(TEST_POLL * 60).await;
+
+        assert!(
+            !watcher.is_finished(),
+            "a transient miss shut the daemon down"
+        );
+        watcher.abort();
+    }
+
+    #[tokio::test]
+    async fn deregistered_shutdown_resolves_when_another_daemon_claims_the_slot() {
+        // Someone else's pid in our slot means we are no longer the registered
+        // owner, so we must not keep holding the collection lock.
+        let dir = tempdir().unwrap();
+        let slot = slot_in(dir.path());
+        write_pid(&slot.pid, 4242).unwrap();
+
+        let watcher = tokio::spawn(deregistered_shutdown_every(
+            slot.pid.clone(),
+            4242,
+            TEST_POLL,
+            3,
+        ));
+
+        write_pid(&slot.pid, 9999).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), watcher)
+            .await
+            .expect("did not shut down after another daemon claimed the slot")
+            .unwrap();
     }
 
     #[test]
