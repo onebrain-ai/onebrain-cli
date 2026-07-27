@@ -2,10 +2,15 @@
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>onebrain scheduler corpus</Description></RegistrationInfo>
   <Triggers>
-    <!-- BISECT. Round 4 caught that "49 is rejected" was an INFERENCE from
-         an error position, never a measurement: only 48, 96 and 288 were
-         ever run. The proven bound was 48 <= limit < 96, and the whole
-         decision-5 exception rests on 72 being over it. Settle it. -->
+    <!-- 49 triggers. MEASURED 2026-07-27 (run 30293414621):
+           "The task XML contains too many nodes of the same type. (57,7)"
+         So the limit is exactly 48, and this pins it from the far side.
+
+         Until this file existed the "49 is rejected" claim was an INFERENCE
+         from an error position in the 96-trigger case — only 48, 96 and 288
+         had ever been run. The inference happened to be right; it had been
+         written into a spec, a plan, a doc comment and a corpus file as
+         "MEASURED" while being nothing of the kind. -->
     <CalendarTrigger><StartBoundary>2000-01-01T00:00:00</StartBoundary><Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>
     <CalendarTrigger><StartBoundary>2000-01-01T00:05:00</StartBoundary><Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>
     <CalendarTrigger><StartBoundary>2000-01-01T00:10:00</StartBoundary><Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>
