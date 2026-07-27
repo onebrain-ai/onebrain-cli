@@ -6,8 +6,13 @@
 Description=OneBrain scheduled skill (daily)
 
 [Service]
+# ExecStart points at /bin/echo, not the real onebrain path: measured
+# 2026-07-27, `systemd-analyze verify` resolves ExecStart= against the
+# CHECKING machine's filesystem and fails if the binary is absent. The
+# corpus validates unit shape, not what happens to be installed on a
+# runner, so the path is substituted while the argv shape is preserved.
 Type=oneshot
-ExecStart=/usr/local/bin/onebrain skill run --vault /home/u/vault --skill /daily --harness claude
+ExecStart=/bin/echo onebrain skill run --vault /home/u/vault --skill /daily --harness claude
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 StandardOutput=append:/home/u/.local/state/onebrain/log/onebrain-daily.stdout
 StandardError=append:/home/u/.local/state/onebrain/log/onebrain-daily.stderr

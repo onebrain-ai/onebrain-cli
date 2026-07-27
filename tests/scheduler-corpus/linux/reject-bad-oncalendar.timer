@@ -1,0 +1,13 @@
+# Canary — proves the checker actually rejects something. An unknown DIRECTIVE
+# is only warned about ("Unknown key name ... ignoring", exit 0), so the canary
+# has to be an invalid VALUE in a directive systemd genuinely parses.
+# OnCalendar= is the right choice: it is exactly what the Linux backend
+# generates, so this case guards the real translation surface.
+[Unit]
+Description=OneBrain corpus canary
+
+[Timer]
+OnCalendar=every second tuesday of never
+
+[Install]
+WantedBy=timers.target
