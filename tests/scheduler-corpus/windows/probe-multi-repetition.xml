@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>onebrain scheduler corpus</Description></RegistrationInfo>
+  <Triggers>
+    <!-- `0,5,10 * * * *` as THREE repeating triggers rather than 72 explicit
+         ones. If this is accepted, the 72-trigger figure was a property of
+         our own TriggerTiming type (one start time), not of Windows, and
+         the decision-5 exception is unnecessary. Also probes an all-day
+         P1D Duration, which Task 7d needs. -->
+    <CalendarTrigger><StartBoundary>2000-01-01T00:00:00</StartBoundary><Enabled>true</Enabled><Repetition><Interval>PT1H</Interval><Duration>P1D</Duration></Repetition><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>
+    <CalendarTrigger><StartBoundary>2000-01-01T00:05:00</StartBoundary><Enabled>true</Enabled><Repetition><Interval>PT1H</Interval><Duration>P1D</Duration></Repetition><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>
+    <CalendarTrigger><StartBoundary>2000-01-01T00:10:00</StartBoundary><Enabled>true</Enabled><Repetition><Interval>PT1H</Interval><Duration>P1D</Duration></Repetition><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>__USER__</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <Enabled>true</Enabled>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+  </Settings>
+  <Actions Context="Author">
+    <Exec><Command>cmd.exe</Command><Arguments>/c exit 0</Arguments></Exec>
+  </Actions>
+</Task>

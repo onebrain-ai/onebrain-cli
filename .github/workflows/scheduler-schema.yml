@@ -50,7 +50,23 @@ jobs:
 
           Get-ChildItem "$corpus/*.xml" | Sort-Object Name | ForEach-Object {
             $name = $_.BaseName
-            $mustAccept = $name.StartsWith('accept-')
+            # `probe-` reports what the OS does and asserts nothing — for
+            # bisecting an unknown limit, where the answer IS the output.
+            # Any other unrecognised prefix is an error: without this arm a
+            # typo'd `acept-foo.xml` was silently treated as a reject-case and
+            # passed when Task Scheduler refused it.
+            $kind = switch -Wildcard ($name) {
+              'accept-*' { 'accept' }
+              'reject-*' { 'reject' }
+              'probe-*'  { 'probe'  }
+              default    { 'BADNAME' }
+            }
+            if ($kind -eq 'BADNAME') {
+              Write-Host ("{0,-44} FAIL :: needs an accept-/reject-/probe- prefix" -f $name)
+              $failures += "$name :: unrecognised prefix"
+              return
+            }
+            $mustAccept = ($kind -eq 'accept')
             $tn = "\OneBrainCorpus\$name"
 
             # UTF-16 is what Task Scheduler expects; the corpus keeps the
@@ -61,12 +77,21 @@ jobs:
 
             $out = & schtasks /Create /XML $path /TN $tn /F 2>&1
             $accepted = ($LASTEXITCODE -eq 0)
-            $verdict = if ($accepted -eq $mustAccept) { 'ok' } else { 'FAIL' }
-            Write-Host ("{0,-44} expect={1,-6} got={2,-6} {3}" -f `
-              $name, $(if ($mustAccept) {'accept'} else {'reject'}), `
-              $(if ($accepted) {'accept'} else {'reject'}), $verdict)
-            if ($verdict -eq 'FAIL') {
-              $failures += "$name :: $(($out -join ' ').Trim())"
+            if ($kind -eq 'probe') {
+              # Report only. The rejection REASON matters as much as the verdict
+              # — "too many nodes of the same type" and "invalid value" are very
+              # different answers, and an earlier probe was misread because only
+              # the exit status was captured.
+              Write-Host ("{0,-44} PROBE got={1,-6} :: {2}" -f `
+                $name, $(if ($accepted) {'accept'} else {'reject'}), (($out -join ' ').Trim()))
+            } else {
+              $verdict = if ($accepted -eq $mustAccept) { 'ok' } else { 'FAIL' }
+              Write-Host ("{0,-44} expect={1,-6} got={2,-6} {3}" -f `
+                $name, $(if ($mustAccept) {'accept'} else {'reject'}), `
+                $(if ($accepted) {'accept'} else {'reject'}), $verdict)
+              if ($verdict -eq 'FAIL') {
+                $failures += "$name :: $(($out -join ' ').Trim())"
+              }
             }
 
             if ($accepted) {
