@@ -2,9 +2,13 @@
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>onebrain scheduler corpus</Description></RegistrationInfo>
   <Triggers>
-    <!-- Trigger-count probe. `0 */2 * * *` needs 12; `*/5 * * * *`
-         would need 288. The cap the renderer enforces has to come from
-         the real limit, not a guess. -->
+    <!-- 288 triggers — what `*/5 * * * *` needs if each time becomes its
+         own trigger. Rejected, and that is the whole argument for
+         <Repetition>: a REGULAR interval collapses to ONE trigger, so the
+         48-trigger ceiling is never approached. Emitting one trigger per
+         time would have made `*/5 * * * *` unschedulable on Windows while
+         macOS accepts it today (cron_parse.rs:498) — a capability
+         regression, for nothing. -->
     <CalendarTrigger><StartBoundary>2000-01-01T00:00:00</StartBoundary><Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>
     <CalendarTrigger><StartBoundary>2000-01-01T00:05:00</StartBoundary><Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>
     <CalendarTrigger><StartBoundary>2000-01-01T00:10:00</StartBoundary><Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>

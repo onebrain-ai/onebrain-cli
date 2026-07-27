@@ -2,9 +2,10 @@
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>onebrain scheduler corpus</Description></RegistrationInfo>
   <Triggers>
-    <!-- Trigger-count probe. `0 */2 * * *` needs 12; `*/5 * * * *`
-         would need 288. The cap the renderer enforces has to come from
-         the real limit, not a guess. -->
+    <!-- 96 triggers — over the measured limit of 48, and rejected.
+         Kept as a reject- case so the boundary is pinned from both sides;
+         an accept here would mean the limit rose and the cap is now too
+         conservative. -->
     <CalendarTrigger><StartBoundary>2000-01-01T00:00:00</StartBoundary><Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>
     <CalendarTrigger><StartBoundary>2000-01-01T00:05:00</StartBoundary><Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>
     <CalendarTrigger><StartBoundary>2000-01-01T00:10:00</StartBoundary><Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>
