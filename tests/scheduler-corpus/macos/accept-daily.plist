@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/echo</string>
+        <string>onebrain</string>
+        <string>corpus</string>
+    </array>
+    <!-- cron `0 9 * * *`.
+         Day, Month and Weekday are OMITTED. The whole design assumes an
+         omitted key means "every" — cron_parse.rs:316 (`combinations()`) maps
+         an empty field to vec![None] and relies on exactly this. If launchd
+         disagrees, every recurring schedule is silently wrong, and it is the
+         same class of defect as the Windows <Months> bug. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>9</integer>
+        <key>Minute</key><integer>0</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

@@ -101,6 +101,80 @@ jobs:
           # this the step fails while reporting that every case passed.
           exit 0
 
+  macos-launchd-roundtrip:
+    name: launchd round-trip
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Round-trip the corpus through launchd
+        # NOT plain `shell: bash` — the default carries -e, and every reject-
+        # case is non-zero by design.
+        shell: bash --noprofile --norc {0}
+        run: |
+          set -uo pipefail
+          corpus=tests/scheduler-corpus/macos
+          work="$RUNNER_TEMP/corpus"; mkdir -p "$work"
+          uid=$(id -u)
+          failures=0
+
+          # Bootstrapping into the real gui/<uid> domain is safe HERE and only
+          # here: a throwaway runner has no user schedules to clobber. The same
+          # thing on a developer's Mac would boot out their real jobs, which is
+          # why the equivalent unit tests are #[ignore]d.
+          for f in "$corpus"/*.plist; do
+            name=$(basename "$f" .plist)
+            case "$name" in
+              accept-*) expect=accept ;;
+              reject-*) expect=reject ;;
+              *) echo "corpus file with no accept-/reject- prefix: $name"; failures=$((failures+1)); continue ;;
+            esac
+
+            label="onebrain-corpus-$name-$$"
+            sed "s|__LABEL__|$label|" "$f" > "$work/$label.plist"
+
+            # Syntax first: plutil is cheap and its message is far clearer than
+            # launchd's when a document is simply malformed.
+            if ! plutil -lint "$work/$label.plist" >/dev/null 2>&1; then
+              got=reject
+            else
+              launchctl bootout "gui/$uid/$label" >/dev/null 2>&1
+              if launchctl bootstrap "gui/$uid" "$work/$label.plist" >/dev/null 2>&1; then
+                got=accept
+              else
+                got=reject
+              fi
+            fi
+
+            verdict=$([ "$got" = "$expect" ] && echo ok || echo FAIL)
+            printf '%-40s expect=%-6s got=%-6s %s\n' "$name" "$expect" "$got" "$verdict"
+            [ "$verdict" = FAIL ] && failures=$((failures+1))
+
+            if [ "$got" = accept ]; then
+              # Pin the INTERPRETATION, not just that it loaded. launchd prints
+              # the calendar interval back, which is the closest thing it has to
+              # the Windows query output.
+              expectFile="$corpus/$name.expect"
+              if [ -f "$expectFile" ]; then
+                pattern=$(cat "$expectFile")
+                printed=$(launchctl print "gui/$uid/$label" 2>&1)
+                if echo "$printed" | grep -qE "$pattern"; then
+                  echo "    interpretation ok :: /$pattern/"
+                else
+                  echo "    interpretation FAIL :: /$pattern/ did not match"
+                  failures=$((failures+1))
+                  echo "$printed" | grep -iE 'calendar|weekday|day|hour|minute' | sed 's/^/      /' | head -12
+                fi
+              fi
+              launchctl bootout "gui/$uid/$label" >/dev/null 2>&1
+            fi
+          done
+
+          if [ "$failures" -gt 0 ]; then
+            echo; echo "$failures case(s) failed"; exit 1
+          fi
+          echo; echo "all cases behaved as pinned"
+
   linux-unit-verify:
     name: systemd unit verify
     runs-on: ubuntu-latest
