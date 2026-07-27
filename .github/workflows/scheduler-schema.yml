@@ -26,6 +26,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Both jobs only check out the repo and run local tools — nothing writes to the
+# repository, and nothing needs an API token. Matches ci.yml.
+permissions:
+  contents: read
+
 jobs:
   windows-roundtrip:
     name: Task Scheduler round-trip
