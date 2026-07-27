@@ -1,0 +1,9 @@
+# Proves the checker actually catches things — a corpus whose negative cases
+# never fail is indistinguishable from a checker that does nothing.
+[Unit]
+Description=OneBrain corpus canary
+
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+ThisDirectiveDoesNotExist=whatever

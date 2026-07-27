@@ -1,0 +1,12 @@
+# No Persistent=true: a fire missed while the machine was asleep is NOT caught
+# up. launchd's StartCalendarInterval DOES catch up, so this is a deliberate
+# cross-platform divergence and must stay documented, not discovered.
+[Unit]
+Description=OneBrain scheduled skill timer (daily)
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

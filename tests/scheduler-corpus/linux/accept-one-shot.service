@@ -1,0 +1,15 @@
+# One-shot `at:` entry that removes itself.
+# --no-block is MANDATORY: ExecStopPost runs while systemd is stopping this
+# unit, so a blocking `systemctl` call waits on the manager's job queue while
+# the manager waits for ExecStopPost to exit. That is a deadlock, and the unit
+# hangs instead of cleaning up.
+[Unit]
+Description=OneBrain one-shot skill
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/onebrain skill run --vault /home/u/vault --skill /daily --harness claude
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+StandardOutput=append:/home/u/.local/state/onebrain/log/onebrain-oneshot.stdout
+StandardError=append:/home/u/.local/state/onebrain/log/onebrain-oneshot.stderr
+ExecStopPost=/usr/bin/systemctl --user --no-block disable onebrain-oneshot.timer

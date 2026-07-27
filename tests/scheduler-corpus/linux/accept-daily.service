@@ -1,0 +1,13 @@
+# Baseline recurring skill unit. Paired with accept-daily.timer.
+# StandardOutput=append: is how a systemd job writes to a FILE — output would
+# otherwise go to the journal. Measured constraint: append: fails the unit if
+# the directory is missing, so install() must create it first (see #315).
+[Unit]
+Description=OneBrain scheduled skill (daily)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/onebrain skill run --vault /home/u/vault --skill /daily --harness claude
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+StandardOutput=append:/home/u/.local/state/onebrain/log/onebrain-daily.stdout
+StandardError=append:/home/u/.local/state/onebrain/log/onebrain-daily.stderr

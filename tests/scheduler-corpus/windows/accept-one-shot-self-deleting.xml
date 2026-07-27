@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>onebrain scheduler corpus</Description></RegistrationInfo>
+  <Triggers>
+    <!-- A one-shot `at:` entry that removes itself after firing.
+         THREE things must all be right or the task accumulates forever:
+           1. <EndBoundary>   — a trigger with no end boundary NEVER expires,
+                                and Task Scheduler deletes a task only after
+                                ALL its triggers have expired.
+           2. <DeleteExpiredTaskAfter> must sit under <Settings>, not the trigger.
+           3. the duration is measured FROM the EndBoundary, not from the fire.
+         Measured 2026-07-27: with EndBoundary = start + 60s and PT1M, the task
+         disappeared ~180s after registration (register -> +60s fire -> +60s
+         expire -> +60s delete). That number sets the CI poll ceiling. -->
+    <TimeTrigger>
+      <StartBoundary>2030-01-01T09:00:00</StartBoundary>
+      <EndBoundary>2030-01-01T09:01:00</EndBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>__USER__</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <Enabled>true</Enabled>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DeleteExpiredTaskAfter>PT1M</DeleteExpiredTaskAfter>
+  </Settings>
+  <Actions Context="Author">
+    <Exec><Command>cmd.exe</Command><Arguments>/c exit 0</Arguments></Exec>
+  </Actions>
+</Task>
