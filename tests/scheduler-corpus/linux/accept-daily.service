@@ -1,18 +1,22 @@
 # Baseline recurring skill unit. Paired with accept-daily.timer.
-# StandardOutput=append: is how a systemd job writes to a FILE — output would
-# otherwise go to the journal. Measured constraint: append: fails the unit if
-# the directory is missing, so install() must create it first (see #315).
+#
+# NO StandardOutput=append: and NO Environment=PATH=. Both were pinned here
+# earlier and both belong to designs the epic dropped:
+#   - the PATH-in-artifact track was cut once run_skill.rs:252-268 was found
+#     to already do it (v3.4.4, #124);
+#   - file logging was cut once it was found that only launchd has a redirect
+#     primitive. Linux output goes to the JOURNAL, and "did it fail?" is
+#     answered by the exit-code record, not by a log file.
+# A corpus that pins an abandoned design teaches the next reader the wrong
+# thing with full CI authority behind it.
+#
+# ExecStart points at /bin/echo, not the real onebrain path: measured
+# 2026-07-27, `systemd-analyze verify` resolves ExecStart= against the
+# CHECKING machine's filesystem and fails if the binary is absent. The corpus
+# validates unit shape, not what a runner happens to have installed.
 [Unit]
 Description=OneBrain scheduled skill (daily)
 
 [Service]
-# ExecStart points at /bin/echo, not the real onebrain path: measured
-# 2026-07-27, `systemd-analyze verify` resolves ExecStart= against the
-# CHECKING machine's filesystem and fails if the binary is absent. The
-# corpus validates unit shape, not what happens to be installed on a
-# runner, so the path is substituted while the argv shape is preserved.
 Type=oneshot
 ExecStart=/bin/echo onebrain skill run --vault /home/u/vault --skill /daily --harness claude
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
-StandardOutput=append:/home/u/.local/state/onebrain/log/onebrain-daily.stdout
-StandardError=append:/home/u/.local/state/onebrain/log/onebrain-daily.stderr

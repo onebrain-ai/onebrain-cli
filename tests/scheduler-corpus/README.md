@@ -45,9 +45,9 @@ reading documentation.
 | `reject-calendar-without-start-boundary.xml` | `<StartBoundary>` is required and is where time-of-day lives. Pinned so a renderer regression that drops it fails here rather than shipping a task that never runs. |
 | `accept-repetition-every-minute.xml` | `<Repetition><Interval>PT1M</Interval>` is the only form for a wildcard minute (`* 9 * * *`); no `ScheduleBy*` subtree expresses it. |
 | `accept-one-shot-self-deleting.xml` | `<EndBoundary>` + `<DeleteExpiredTaskAfter>` under `<Settings>`. Measured: the task disappears ~180 s after registration with a 60 s `EndBoundary` and `PT1M` (the duration runs from the **EndBoundary**, not the fire). Without `EndBoundary` the trigger never expires and the task is **never** deleted. |
-| `accept-daily.service` / `.timer` | The baseline recurring pair, including `StandardOutput=append:` — how a systemd job writes to a file rather than the journal — and `Persistent=false`, which means a fire missed while asleep is **not** caught up (launchd *does* catch up; a deliberate divergence). |
-| `accept-one-shot.service` | `ExecStopPost=` self-removal with **`--no-block`**. Blocking here deadlocks: `systemctl` waits on the manager's job queue while the manager waits for `ExecStopPost` to exit. |
-| `reject-unknown-directive.service` | A canary. A corpus whose negative cases never fail is indistinguishable from a checker that does nothing. |
+| `accept-daily.service` / `.timer` | The baseline recurring pair. Deliberately carries **no** `StandardOutput=append:` and **no** `Environment=PATH=` — both belong to designs the epic dropped, and a corpus that pins an abandoned design misleads with CI authority behind it. Linux output goes to the journal. `Persistent=false` means a fire missed while asleep is **not** caught up, where launchd *does* — a deliberate divergence. |
+| `accept-one-shot.service` | `ExecStopPost=` self-removal. Needs **three** operations, so it is `/bin/sh -c`: `disable --now` (without `--now` the timer stays loaded and fires again), `rm` both units, `daemon-reload`. **`--no-block`** on the systemctl calls is mandatory — blocking deadlocks against the manager's job queue. Fires on *every* stop, including a failed start. |
+| `reject-bad-oncalendar.timer` | A canary. An unknown *directive* is only warned about (`"Unknown key name … ignoring"`, exit 0), so the canary must be an invalid **value** in a directive systemd genuinely parses. `OnCalendar=` is what the Linux backend generates, so this guards the real surface. |
 
 ## Adding a case
 
