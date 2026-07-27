@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>onebrain scheduler corpus</Description></RegistrationInfo>
+  <Triggers>
+    <!-- cron `0 17 * 3 5` — Fridays in March.
+         ScheduleByWeek CANNOT carry <Months> (see reject-weekly-with-months),
+         so the obvious mapping fails. ScheduleByMonthDayOfWeek is the fourth
+         CalendarTrigger subtree and carries Weeks + DaysOfWeek + Months
+         together. If it holds, month+weekday needs no rejection rule at all
+         and macOS loses no capability.
+         <Weeks> lists ALL weeks, which is how "every Friday in March" — as
+         opposed to "the second Friday" — is expressed. -->
+    <CalendarTrigger>
+      <StartBoundary>2000-01-01T17:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByMonthDayOfWeek>
+        <Weeks><Week>1</Week><Week>2</Week><Week>3</Week><Week>4</Week><Week>Last</Week></Weeks>
+        <DaysOfWeek><Friday /></DaysOfWeek>
+        <Months><March /></Months>
+      </ScheduleByMonthDayOfWeek>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>__USER__</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <Enabled>true</Enabled>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+  </Settings>
+  <Actions Context="Author">
+    <Exec><Command>cmd.exe</Command><Arguments>/c exit 0</Arguments></Exec>
+  </Actions>
+</Task>
