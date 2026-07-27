@@ -15,7 +15,13 @@
          omitted key means "every" — cron_parse.rs:316 (`combinations()`) maps
          an empty field to vec![None] and relies on exactly this. If launchd
          disagrees, every recurring schedule is silently wrong, and it is the
-         same class of defect as the Windows <Months> bug. -->
+         same class of defect as the Windows <Months> bug.
+
+         VERIFIED 2026-07-27 on macos-latest: launchd stores exactly the keys
+         given and adds none. `launchctl print` reports only "Minute" and
+         "Hour" for this document. The assumption holds — and note it is the
+         OPPOSITE of Task Scheduler, which silently fills in "Every month" when
+         <Months> is omitted. Two schedulers, two defaults, one shared design. -->
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key><integer>9</integer>
