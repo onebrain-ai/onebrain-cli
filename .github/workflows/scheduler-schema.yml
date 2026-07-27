@@ -90,6 +90,11 @@ jobs:
             exit 1
           }
           Write-Host "`nall cases behaved as pinned"
+          # Explicit, and load-bearing: GitHub appends `exit $LASTEXITCODE` to
+          # every pwsh step. The last external command here is the `schtasks`
+          # call for a reject- case, which is SUPPOSED to be non-zero — without
+          # this the step fails while reporting that every case passed.
+          exit 0
 
   linux-unit-verify:
     name: systemd unit verify
@@ -98,7 +103,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Verify the corpus with systemd-analyze
-        shell: bash
+        # NOT plain `shell: bash` — GitHub's default adds `-e`, which kills the
+        # script at the first non-zero `systemd-analyze verify`. Every reject-
+        # case is non-zero BY DESIGN, so `-e` makes the corpus's own negative
+        # cases abort the run before a single one is evaluated.
+        shell: bash --noprofile --norc {0}
         run: |
           set -uo pipefail
           corpus=tests/scheduler-corpus/linux
