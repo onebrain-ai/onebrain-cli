@@ -69,7 +69,7 @@ fn at_re() -> &'static Regex {
 /// [`CronFieldSet::combinations`]).
 ///
 /// Checking the combination cap here (rather than only at plist-emission
-/// time) means `cron_fields_to_launchd_expanded` + `.combinations()` can
+/// time) means `cron_fields_expanded` + `.combinations()` can
 /// never panic/error downstream on an already-validated cron string —
 /// [`crate::scheduler::launchd::calendar_block`] relies on this.
 pub fn validate_cron(cron: &str) -> Result<(), SchedulerError> {
@@ -128,9 +128,9 @@ pub fn validate_cron(cron: &str) -> Result<(), SchedulerError> {
     if fields[2] != "*" && fields[4] != "*" {
         return Err(SchedulerError::InvalidCron {
             cron: cron.to_string(),
-            reason: "restricting both day-of-month and day-of-week is not supported by the \
-                     launchd backend; use separate `schedule:` entries (which no longer \
-                     collide as of this release)"
+            reason: "restricting both day-of-month and day-of-week is not supported; \
+                     use separate `schedule:` entries (one day-restricted, one \
+                     weekday-restricted)"
                 .to_string(),
         });
     }
@@ -181,7 +181,7 @@ fn normalize_weekday_seven(values: &mut Vec<u32>) {
 ///
 /// Used by both [`validate_cron`] (to surface semantic errors AND build
 /// the `CronFieldSet` needed to check the combination cap) and
-/// [`cron_fields_to_launchd_expanded`] (same expansion, post-validation).
+/// [`cron_fields_expanded`] (same expansion, post-validation).
 fn expand_field_or_wildcard(field: &str, range: FieldRange) -> Result<Vec<u32>, String> {
     if field == "*" {
         return Ok(Vec::new());
@@ -254,9 +254,9 @@ pub struct CronFields {
 
 /// Expanded launchd `StartCalendarInterval` field set — one concrete
 /// value set per field (empty = wildcard, matches every value). This is
-/// the general form; [`cron_fields_to_launchd`] collapses it to
+/// the general form; [`cron_fields`] collapses it to
 /// [`CronFields`] when every field has 0 or 1 values (the common case),
-/// and [`cron_fields_to_launchd_expanded`] exposes the full expansion for
+/// and [`cron_fields_expanded`] exposes the full expansion for
 /// the array-form plist emitter.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CronFieldSet {
@@ -373,16 +373,16 @@ impl CronFieldSet {
 /// Panics if `cron` did not pass [`validate_cron`], OR if the expression
 /// expands to more than one combination (multi-value fields) — callers
 /// that might receive step/list/range cron strings should use
-/// [`cron_fields_to_launchd_expanded`] instead and check
+/// [`cron_fields_expanded`] instead and check
 /// [`CronFieldSet::is_single_combination`] (or just always call the
 /// expanded form and branch on combination count, which is what
 /// [`crate::scheduler::launchd::calendar_block`] does).
-pub fn cron_fields_to_launchd(cron: &str) -> CronFields {
-    let set = cron_fields_to_launchd_expanded(cron);
+pub fn cron_fields(cron: &str) -> CronFields {
+    let set = cron_fields_expanded(cron);
     assert!(
         set.is_single_combination(),
-        "cron_fields_to_launchd called on a multi-combination cron string \
-         (use cron_fields_to_launchd_expanded instead): {cron}"
+        "cron_fields called on a multi-combination cron string \
+         (use cron_fields_expanded instead): {cron}"
     );
     set.to_single()
 }
@@ -393,12 +393,12 @@ pub fn cron_fields_to_launchd(cron: &str) -> CronFields {
 /// Panics if `cron` did not pass [`validate_cron`] — the caller is
 /// responsible for ordering. Bun's contract is identical (docstring
 /// "Assumes `cron` already passed `validateCron`.").
-pub fn cron_fields_to_launchd_expanded(cron: &str) -> CronFieldSet {
+pub fn cron_fields_expanded(cron: &str) -> CronFieldSet {
     let f: Vec<&str> = cron.split_whitespace().collect();
     assert_eq!(
         f.len(),
         5,
-        "cron_fields_to_launchd_expanded called on unvalidated input"
+        "cron_fields_expanded called on unvalidated input"
     );
     let expand = |s: &str, range: FieldRange| -> Vec<u32> {
         expand_field_or_wildcard(s, range).expect("validate_cron failed to gate")
@@ -469,10 +469,10 @@ pub struct AtFields {
 /// Convert a validated one-shot timestamp to [`AtFields`].
 ///
 /// Panics if `at` did not pass [`validate_at`].
-pub fn at_to_launchd(at: &str) -> AtFields {
+pub fn at_fields(at: &str) -> AtFields {
     let caps = at_re()
         .captures(at)
-        .unwrap_or_else(|| panic!("at_to_launchd called with unvalidated input: {at}"));
+        .unwrap_or_else(|| panic!("at_fields called with unvalidated input: {at}"));
     AtFields {
         year: caps[1].parse().unwrap(),
         month: caps[2].parse().unwrap(),
@@ -587,13 +587,13 @@ mod tests {
 
     #[test]
     fn expanded_weekday_seven_normalizes_to_zero() {
-        let set = cron_fields_to_launchd_expanded("0 9 * * 7");
+        let set = cron_fields_expanded("0 9 * * 7");
         assert_eq!(set.weekday, vec![0]);
     }
 
     #[test]
     fn expanded_weekday_zero_and_seven_dedupe_to_single_zero() {
-        let set = cron_fields_to_launchd_expanded("0 9 * * 0,7");
+        let set = cron_fields_expanded("0 9 * * 0,7");
         assert_eq!(set.weekday, vec![0]);
     }
 
@@ -605,9 +605,9 @@ mod tests {
     }
 
     #[test]
-    fn cron_fields_to_launchd_weekday_seven_collapses_to_single_dict_zero() {
+    fn cron_fields_weekday_seven_collapses_to_single_dict_zero() {
         // 0,7 dedupes to exactly one value → single-combination form.
-        let f = cron_fields_to_launchd("0 9 * * 0,7");
+        let f = cron_fields("0 9 * * 0,7");
         assert_eq!(f.weekday, Some(0));
     }
 
@@ -662,11 +662,11 @@ mod tests {
         assert!(e.to_string().contains("exceeding the cap"));
     }
 
-    // ── cron_fields_to_launchd: single-combination form ───────────────────────
+    // ── cron_fields: single-combination form ───────────────────────
 
     #[test]
-    fn cron_fields_to_launchd_daily_9am() {
-        let f = cron_fields_to_launchd("0 9 * * *");
+    fn cron_fields_daily_9am() {
+        let f = cron_fields("0 9 * * *");
         assert_eq!(f.minute, Some(0));
         assert_eq!(f.hour, Some(9));
         assert!(f.day.is_none());
@@ -675,18 +675,18 @@ mod tests {
     }
 
     #[test]
-    fn cron_fields_to_launchd_sunday_noon() {
-        let f = cron_fields_to_launchd("0 12 * * 0");
+    fn cron_fields_sunday_noon() {
+        let f = cron_fields("0 12 * * 0");
         assert_eq!(f.minute, Some(0));
         assert_eq!(f.hour, Some(12));
         assert_eq!(f.weekday, Some(0));
     }
 
-    // ── cron_fields_to_launchd_expanded: multi-value form ──────────────────────
+    // ── cron_fields_expanded: multi-value form ──────────────────────
 
     #[test]
     fn expanded_step_produces_every_nth_value() {
-        let set = cron_fields_to_launchd_expanded("0 */2 * * *");
+        let set = cron_fields_expanded("0 */2 * * *");
         assert_eq!(set.hour, vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]);
         assert_eq!(set.minute, vec![0]);
         assert!(set.day.is_empty());
@@ -694,31 +694,31 @@ mod tests {
 
     #[test]
     fn expanded_list_produces_exact_values() {
-        let set = cron_fields_to_launchd_expanded("0 9 * * 1,3,5");
+        let set = cron_fields_expanded("0 9 * * 1,3,5");
         assert_eq!(set.weekday, vec![1, 3, 5]);
     }
 
     #[test]
     fn expanded_range_produces_inclusive_values() {
-        let set = cron_fields_to_launchd_expanded("0 9 * * 1-5");
+        let set = cron_fields_expanded("0 9 * * 1-5");
         assert_eq!(set.weekday, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]
     fn expanded_range_with_step() {
-        let set = cron_fields_to_launchd_expanded("0 9 1-10/3 * *");
+        let set = cron_fields_expanded("0 9 1-10/3 * *");
         assert_eq!(set.day, vec![1, 4, 7, 10]);
     }
 
     #[test]
     fn expanded_dedupes_overlapping_list_items() {
-        let set = cron_fields_to_launchd_expanded("0 9 * * 1,1-3,2");
+        let set = cron_fields_expanded("0 9 * * 1,1-3,2");
         assert_eq!(set.weekday, vec![1, 2, 3]);
     }
 
     #[test]
     fn expanded_wildcard_field_is_empty_vec() {
-        let set = cron_fields_to_launchd_expanded("0 9 * * *");
+        let set = cron_fields_expanded("0 9 * * *");
         assert!(set.day.is_empty());
         assert!(set.month.is_empty());
         assert!(set.weekday.is_empty());
@@ -728,7 +728,7 @@ mod tests {
 
     #[test]
     fn combinations_single_value_fields_yields_one_combination() {
-        let set = cron_fields_to_launchd_expanded("0 9 * * *");
+        let set = cron_fields_expanded("0 9 * * *");
         let combos = set.combinations().unwrap();
         assert_eq!(combos.len(), 1);
         assert_eq!(combos[0].minute, Some(0));
@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn combinations_step_hour_yields_twelve_combinations() {
-        let set = cron_fields_to_launchd_expanded("0 */2 * * *");
+        let set = cron_fields_expanded("0 */2 * * *");
         let combos = set.combinations().unwrap();
         assert_eq!(combos.len(), 12);
         let hours: Vec<u32> = combos.iter().map(|c| c.hour.unwrap()).collect();
@@ -748,7 +748,7 @@ mod tests {
 
     #[test]
     fn combinations_list_weekday_yields_three_combinations() {
-        let set = cron_fields_to_launchd_expanded("0 9 * * 1,3,5");
+        let set = cron_fields_expanded("0 9 * * 1,3,5");
         let combos = set.combinations().unwrap();
         assert_eq!(combos.len(), 3);
     }
@@ -756,7 +756,7 @@ mod tests {
     #[test]
     fn combinations_two_multi_value_fields_multiply() {
         // hour has 2 values (*/12 → 0,12), weekday has 3 (1,3,5) → 6 combos.
-        let set = cron_fields_to_launchd_expanded("0 */12 * * 1,3,5");
+        let set = cron_fields_expanded("0 */12 * * 1,3,5");
         let combos = set.combinations().unwrap();
         assert_eq!(combos.len(), 6);
     }
@@ -768,7 +768,7 @@ mod tests {
         // is NOT multi-valued (wildcard fields stay as the `None`
         // sentinel, never enumerated), so it must use an explicit
         // every-value step to force real enumeration here.
-        let set = cron_fields_to_launchd_expanded("*/1 */1 * * *");
+        let set = cron_fields_expanded("*/1 */1 * * *");
         let err = set.combinations().unwrap_err();
         assert!(err.contains("exceeding the cap"), "got: {err}");
     }
@@ -806,23 +806,23 @@ mod tests {
 
     #[test]
     fn is_single_combination_true_for_all_wildcards_and_singles() {
-        let set = cron_fields_to_launchd_expanded("0 9 * * *");
+        let set = cron_fields_expanded("0 9 * * *");
         assert!(set.is_single_combination());
     }
 
     #[test]
     fn is_single_combination_false_when_any_field_multi_valued() {
-        let set = cron_fields_to_launchd_expanded("0 */2 * * *");
+        let set = cron_fields_expanded("0 */2 * * *");
         assert!(!set.is_single_combination());
     }
 
     #[test]
     #[should_panic(expected = "multi-combination")]
-    fn cron_fields_to_launchd_panics_on_multi_combination_input() {
-        let _ = cron_fields_to_launchd("0 */2 * * *");
+    fn cron_fields_panics_on_multi_combination_input() {
+        let _ = cron_fields("0 */2 * * *");
     }
 
-    // ── validate_at / at_to_launchd — unchanged behavior ───────────────────────
+    // ── validate_at / at_fields — unchanged behavior ───────────────────────
 
     #[test]
     fn validate_at_accepts_valid_timestamp() {
@@ -863,8 +863,8 @@ mod tests {
     }
 
     #[test]
-    fn at_to_launchd_2026_05_13_1430() {
-        let f = at_to_launchd("2026-05-13 14:30");
+    fn at_fields_2026_05_13_1430() {
+        let f = at_fields("2026-05-13 14:30");
         assert_eq!(
             f,
             AtFields {

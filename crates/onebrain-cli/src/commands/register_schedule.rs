@@ -1299,7 +1299,8 @@ mod tests {
         ];
         let err = detect_collisions(&entries, &ctx).unwrap_err();
         assert!(
-            err.to_string().contains("normalize to the same plist path"),
+            err.to_string()
+                .contains("normalize to the same schedule artifact"),
             "got: {err}"
         );
     }
@@ -1337,7 +1338,7 @@ mod tests {
         let err = detect_collisions(&entries, &ctx).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("normalize to the same plist path"),
+            msg.contains("normalize to the same schedule artifact"),
             "got: {msg}"
         );
         assert!(

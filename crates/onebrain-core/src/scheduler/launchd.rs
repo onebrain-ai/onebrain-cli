@@ -10,12 +10,13 @@
 //!
 //! Implementation is **string templating, not `quick-xml`.** A round-trip
 //! through `quick-xml` would re-format whitespace, breaking the byte
-//! contract. The escape helper [`xml_escape`] mirrors Bun's exact
-//! `.replace(/&/g, '&amp;')...` chain.
+//! contract. XML escaping lives in [`crate::scheduler::xml`], shared with
+//! the other renderers.
 
-use crate::scheduler::cron_parse::{at_to_launchd, cron_fields_to_launchd_expanded, CronFields};
+use crate::scheduler::cron_parse::{at_fields, cron_fields_expanded, CronFields};
 use crate::scheduler::entry::{is_command_mode, is_one_shot};
 use crate::scheduler::types::{Args, ScheduleEntry};
+use crate::scheduler::xml::escape as xml_escape;
 use std::path::{Path, PathBuf};
 
 /// Context required to emit a single plist — paths, the CLI binary path
@@ -35,18 +36,6 @@ pub struct LaunchdContext {
 
     /// User's effective UID (drives `launchctl bootout gui/<uid>/<label>`).
     pub uid: u32,
-}
-
-/// Escape XML-sensitive chars in attribute and text-content positions.
-///
-/// Mirrors Bun's chain `.replace(/&/, '&amp;').replace(/</, '&lt;')
-/// .replace(/>/, '&gt;').replace(/"/, '&quot;')`. Order matters — `&` first
-/// so the literal ampersand in `&amp;` is not double-escaped.
-pub fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 /// Derive the launchd label suffix from an entry.
@@ -449,7 +438,7 @@ fn indent_lines(body: &str, indent: &str) -> String {
 /// its Year/Month/Day/Hour/Minute are always fully concrete).
 fn calendar_block(entry: &ScheduleEntry) -> String {
     if is_one_shot(entry) {
-        let f = at_to_launchd(entry.at.as_deref().unwrap());
+        let f = at_fields(entry.at.as_deref().unwrap());
         let body = format!(
             "        <key>Year</key>\n\
              \x20       <integer>{}</integer>\n\
@@ -465,7 +454,7 @@ fn calendar_block(entry: &ScheduleEntry) -> String {
         );
         format!("    <key>StartCalendarInterval</key>\n    <dict>\n{body}\n    </dict>")
     } else {
-        let set = cron_fields_to_launchd_expanded(entry.cron.as_deref().unwrap());
+        let set = cron_fields_expanded(entry.cron.as_deref().unwrap());
         let combos = set
             .combinations()
             .expect("validate_cron failed to gate the StartCalendarInterval combination cap");
