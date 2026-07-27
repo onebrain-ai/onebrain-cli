@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/echo</string>
+        <string>onebrain</string>
+        <string>corpus</string>
+    </array>
+    <!-- Canary. A corpus whose negative cases never fail is indistinguishable
+         from a checker that does nothing. Unterminated <dict>. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>9</integer>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

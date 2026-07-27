@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/echo</string>
+        <string>onebrain</string>
+        <string>corpus</string>
+    </array>
+    <!-- cron `0 9 1 * *`. Day restricted, Month omitted.
+         The Windows analogue of this document silently became "every month".
+         launchd has no Months key at all, so Day-without-Month is the ONLY
+         way to say it — this case pins that the omission is safe here even
+         though the same shape is a bug on Windows. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>9</integer>
+        <key>Minute</key><integer>0</integer>
+        <key>Day</key><integer>1</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

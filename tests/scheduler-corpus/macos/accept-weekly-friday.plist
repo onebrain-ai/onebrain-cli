@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/echo</string>
+        <string>onebrain</string>
+        <string>corpus</string>
+    </array>
+    <!-- cron `0 17 * * 5`. launchd Weekday: 0 and 7 both mean Sunday, so 5 is
+         Friday on both sides. Pinned because an off-by-one here is a
+         wrong-day-forever bug that nothing else would catch. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>17</integer>
+        <key>Minute</key><integer>0</integer>
+        <key>Weekday</key><integer>5</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

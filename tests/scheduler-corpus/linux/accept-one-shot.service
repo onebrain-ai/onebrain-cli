@@ -1,0 +1,20 @@
+# One-shot `at:` entry that removes itself.
+# --no-block is MANDATORY: ExecStopPost runs while systemd is stopping this
+# unit, so a blocking `systemctl` call waits on the manager's job queue while
+# the manager waits for ExecStopPost to exit. That is a deadlock, and the unit
+# hangs instead of cleaning up.
+[Unit]
+Description=OneBrain one-shot skill
+
+[Service]
+# ExecStart points at /bin/echo, not the real onebrain path: measured
+# 2026-07-27, `systemd-analyze verify` resolves ExecStart= against the
+# CHECKING machine's filesystem and fails if the binary is absent. The
+# corpus validates unit shape, not what happens to be installed on a
+# runner, so the path is substituted while the argv shape is preserved.
+Type=oneshot
+ExecStart=/bin/echo onebrain skill run --vault /home/u/vault --skill /daily --harness claude
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+StandardOutput=append:/home/u/.local/state/onebrain/log/onebrain-oneshot.stdout
+StandardError=append:/home/u/.local/state/onebrain/log/onebrain-oneshot.stderr
+ExecStopPost=/usr/bin/systemctl --user --no-block disable onebrain-oneshot.timer

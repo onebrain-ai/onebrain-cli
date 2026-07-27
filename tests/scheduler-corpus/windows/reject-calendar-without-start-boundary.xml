@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>onebrain scheduler corpus</Description></RegistrationInfo>
+  <Triggers>
+    <!-- <StartBoundary> is required and is where time-of-day lives.
+         Pinned so a renderer regression that drops it fails loudly here
+         rather than producing a task that never runs. -->
+    <CalendarTrigger>
+      <Enabled>true</Enabled>
+      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>__USER__</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <Enabled>true</Enabled>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+
+  </Settings>
+  <Actions Context="Author">
+    <Exec><Command>cmd.exe</Command><Arguments>/c exit 0</Arguments></Exec>
+  </Actions>
+</Task>
