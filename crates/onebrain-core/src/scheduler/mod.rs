@@ -7,6 +7,7 @@
 //! Modules mirror the Bun layout one-to-one so future cross-implementation
 //! changes can be traced by filename:
 //!
+//! - [`backend`] — the impure install/remove/query seam, cfg-selected per OS
 //! - [`context`] — `SchedulerContext`, the inputs every backend renderer takes
 //! - [`types`] — `ScheduleEntry`, `ScheduleConfig`, `SkillFrontmatter`, `Args`
 //! - [`cron_parse`] — `validate_cron`, `validate_at`, expansion to calendar fields
@@ -16,6 +17,7 @@
 //! - [`log_paths`] — runtime stdout/stderr log path builder
 //! - [`error`] — `SchedulerError` (matched error strings for parity tests)
 
+pub mod backend;
 pub mod context;
 pub mod cron_parse;
 pub mod entry;
@@ -25,6 +27,10 @@ pub mod log_paths;
 pub mod types;
 pub mod xml;
 
+#[cfg(test)]
+pub mod test_support;
+
+pub use backend::{artifact_key, describe, install, is_installed, remove, InstallState};
 pub use context::SchedulerContext;
 pub use cron_parse::{
     at_fields, cron_fields, cron_fields_expanded, validate_at, validate_cron, AtFields,

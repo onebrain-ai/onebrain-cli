@@ -14,8 +14,9 @@
 //! environment, run collision detection, then write (or `--dry-run` print).
 
 use anyhow::{anyhow, Context, Result};
+use onebrain_core::scheduler::backend;
 use onebrain_core::scheduler::{
-    self, generate_plist, is_command_mode, is_one_shot, is_skill_mode, label_for_entry, plist_path,
+    self, generate_plist, is_command_mode, is_one_shot, is_skill_mode, label_for_entry,
     validate_at, validate_cron, validate_entry, Args, ScheduleConfig, ScheduleEntry,
     SchedulerContext, SchedulerError, SkillFrontmatter,
 };
@@ -147,22 +148,13 @@ fn run_with(
 
     for entry in &resolved {
         let plist = generate_plist(entry, &ctx);
-        let target = plist_path(&label_for_entry(entry), &ctx.homedir);
+        let target = backend::artifact_key(entry, &ctx);
         if dry_run {
             if !quiet {
                 println!("---  {}  ---", target.display());
                 println!("{plist}");
             }
             continue;
-        }
-        // Best-effort: create LaunchAgents dir if missing. launchd refuses to
-        // load from a non-existent path, but the parent should exist on any
-        // macOS install — failure here implies a misconfigured HOME or an
-        // unusual sandbox, so surface the error rather than swallow it.
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("create LaunchAgents directory at {}", parent.display())
-            })?;
         }
         // #116 bug 2 introduced an args/cron discriminator into command-mode
         // labels, so a command entry registered before this release has a
@@ -171,10 +163,12 @@ fn run_with(
         // plist so a `--refresh` doesn't leave both the old and new jobs
         // firing. Best-effort: never blocks registration on failure.
         cleanup_stale_legacy_plist(entry, &target, &ctx, quiet);
-        std::fs::write(&target, &plist)
-            .with_context(|| format!("write plist to {}", target.display()))?;
+        // The backend owns directory creation + artifact write (Task 3 seam);
+        // activation with the OS itself lands in Task 4 (#312).
+        let written = backend::install(entry, &ctx)
+            .with_context(|| format!("install schedule artifact {}", target.display()))?;
         if !quiet {
-            println!("\u{2713} Wrote {}", target.display());
+            println!("\u{2713} Wrote {}", written.display());
         }
     }
 
@@ -182,7 +176,7 @@ fn run_with(
         println!("\nRegistered {} schedule entries.", entries.len());
         println!("Use launchctl to load (or restart launchd):");
         for entry in &resolved {
-            let target = plist_path(&label_for_entry(entry), &ctx.homedir);
+            let target = backend::artifact_key(entry, &ctx);
             println!("  launchctl load {}", target.display());
         }
     }
@@ -485,7 +479,7 @@ fn current_uid() -> u32 {
 fn detect_collisions(resolved: &[ScheduleEntry], ctx: &SchedulerContext) -> Result<()> {
     let mut seen: HashMap<PathBuf, ScheduleEntry> = HashMap::new();
     for entry in resolved {
-        let target = plist_path(&label_for_entry(entry), &ctx.homedir);
+        let target = backend::artifact_key(entry, ctx);
         if let Some(existing) = seen.get(&target) {
             let existing_label = if is_command_mode(existing) {
                 format!("command:{}", existing.command.as_deref().unwrap_or(""))
@@ -617,12 +611,12 @@ fn cleanup_stale_legacy_plist(
 
 fn remove_all(vault: &Path) -> Result<()> {
     let config = read_vault_config(vault)?;
-    let homedir = dirs::home_dir().ok_or_else(|| anyhow!("could not resolve home directory"))?;
+    let ctx = build_scheduler_context(vault)?;
     for entry in &config.schedule {
-        let target = plist_path(&label_for_entry(entry), &homedir);
-        if target.exists() {
-            std::fs::remove_file(&target)
-                .with_context(|| format!("remove {}", target.display()))?;
+        let target = backend::artifact_key(entry, &ctx);
+        if backend::remove(&label_for_entry(entry), &ctx)
+            .with_context(|| format!("remove {}", target.display()))?
+        {
             println!("\u{2713} Removed {}", target.display());
         }
     }
@@ -632,14 +626,14 @@ fn remove_all(vault: &Path) -> Result<()> {
 fn print_status(vault: &Path) -> Result<()> {
     let config = read_vault_config(vault)?;
     let entries = &config.schedule;
-    let homedir = dirs::home_dir().ok_or_else(|| anyhow!("could not resolve home directory"))?;
+    let ctx = build_scheduler_context(vault)?;
     println!("Registered schedules: {}", entries.len());
     for entry in entries {
-        let target = plist_path(&label_for_entry(entry), &homedir);
-        let installed = if target.exists() {
-            "\u{2713}"
-        } else {
-            "\u{2717}"
+        // Inactive renders as installed for now — Task 4 makes the distinction
+        // real (artifact present but launchd not running it, #312).
+        let installed = match backend::is_installed(&label_for_entry(entry), &ctx)? {
+            backend::InstallState::Active | backend::InstallState::Inactive => "\u{2713}",
+            backend::InstallState::Absent => "\u{2717}",
         };
         let when = entry.at.as_deref().or(entry.cron.as_deref()).unwrap_or("?");
         let tag = if entry.at.is_some() {
