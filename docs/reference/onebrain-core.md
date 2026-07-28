@@ -99,9 +99,9 @@ Cron + at-string validation and conversion to launchd `StartCalendarInterval` fi
 
 **Key functions**
 - `validate_cron(cron: &str) -> Result<(), SchedulerError>` — enforce 5 fields, each `*`/integer/step/list/range within bounds; reason strings for invalid syntax.
-- `cron_fields_to_launchd(cron: &str) -> CronFields` — convert a *validated* single-value cron string; **panics** on unvalidated input. Multi-value fields go through the expander (a set of value-combinations, one launchd dict each).
+- `cron_fields(cron: &str) -> CronFields` — convert a *validated* single-value cron string; **panics** on unvalidated input. Multi-value fields go through the expander (a set of value-combinations, one calendar entry each).
 - `validate_at(at: &str) -> Result<(), SchedulerError>` — validate `YYYY-MM-DD HH:MM` form + month/day/hour/minute ranges.
-- `at_to_launchd(at: &str) -> AtFields` — convert a *validated* at-string; **panics** on unvalidated input.
+- `at_fields(at: &str) -> AtFields` — convert a *validated* at-string; **panics** on unvalidated input.
 
 **Connections** — uses `regex` (`OnceLock`-cached); produces `SchedulerError::{InvalidCron, InvalidAt}`. Called by: `launchd::calendar_block` and onebrain-cli schedule registration (validates before emit).
 **Tests** — `#[cfg(test)]` covers accepted/rejected cron syntax (step/range/list/field-count/chars), at-format + out-of-range fields, and conversion round-trips.
@@ -117,19 +117,32 @@ Schedule-entry mode classifiers and a structural shape validator (no field-forma
 **Connections** — reads `types::{Args, ScheduleEntry}`; produces `SchedulerError::InvalidEntry`. Called by: `launchd` (mode classifiers steer block selection) and onebrain-cli schedule loader (`validate_entry` surfaces friendly errors).
 **Tests** — `#[cfg(test)]` covers each classifier and every `validate_entry` rejection/acceptance path.
 
+### `src/scheduler/context.rs`
+`SchedulerContext` — the emit inputs every backend renderer takes: `vault_path`, `skill_cli_path`, `log_base_path`, `homedir`, `uid`. Formerly `launchd::LaunchdContext`; renamed because the Windows and Linux backends take the same inputs, so the type cannot keep a platform in its name.
+
+`uid` is deliberately **not** `cfg`-gated: the launchd one-shot blocks read it and `generate_plist` dispatches to them unconditionally, and that rendering must compile everywhere so its snapshot tests run on any dev machine. Gating it would break the build on two of three CI legs.
+
+**Connections** — no dependencies. Used by: `launchd` (all renderers), onebrain-cli schedule registration.
+
+### `src/scheduler/xml.rs`
+XML escaping shared by every renderer that emits XML. Extracted from `launchd.rs` so a scheduler-neutral layer does not import from a platform-specific one.
+**Key functions**
+- `escape(s) -> String` — `&`-first escape chain (avoids double-escaping `&amp;`); re-exported at the scheduler root as `xml_escape`.
+
+**Connections** — no dependencies. Called by: `launchd` (plist templating).
+**Tests** — `#[cfg(test)]` covers each sensitive character, the ampersand-first ordering, and an already-escaped entity.
+
 ### `src/scheduler/launchd.rs`
 launchd `.plist` emitter — **string templating, not quick-xml**, to guarantee byte-for-byte parity with Bun v2.3.3 (Layer-4 parity test).
-**Key types**
-- `LaunchdContext` — emit inputs: `vault_path`, `skill_cli_path`, `log_base_path`, `homedir`, `uid`.
+**Key types** — takes [`SchedulerContext`](#srcschedulercontextrs) (formerly `LaunchdContext`, moved to its own module for the cross-platform seam).
 
 **Key functions**
 - `generate_plist(entry, ctx) -> String` — full plist; dispatches on `(is_one_shot, is_command_mode)` to one of four `<ProgramArguments>` blocks (recurring/one-shot × skill/command).
 - `label_for_entry(entry) -> String` — derive label suffix (command basename, or skill with leading `/` stripped; non-`[a-zA-Z0-9-]` → `-`).
 - `plist_path(skill_or_label, homedir) -> PathBuf` — `~/Library/LaunchAgents/com.onebrain.<label>.plist`; accepts `/daily` or `daily`.
-- `xml_escape(s) -> String` — `&`-first escape chain mirroring Bun (avoids double-escaping `&amp;`).
 - (private block builders: `recurring_skill_block`, `recurring_command_block`, `one_shot_skill_block`, `one_shot_command_block`, `calendar_block`, `sanitize_label`.)
 
-**Connections** — calls: `cron_parse::{at_to_launchd, cron_fields_to_launchd}`, `entry::{is_command_mode, is_one_shot}`, `types::{Args, ScheduleEntry}`. Called by: onebrain-cli schedule registration (writes the emitted string to disk + `launchctl`).
+**Connections** — calls: `cron_parse::{at_fields, cron_fields_expanded}`, `entry::{is_command_mode, is_one_shot}`, `types::{Args, ScheduleEntry}`, `xml::escape`. Called by: onebrain-cli schedule registration (writes the emitted string to disk + `launchctl`).
 **Tests** — large `#[cfg(test)]` block plus an `insta` snapshot (`generate_plist_snapshot_recurring_skill`) asserting label, calendar fields, escaping, self-delete shell wrapper, and command/skill argv parity.
 
 ### `src/scheduler/log_paths.rs`

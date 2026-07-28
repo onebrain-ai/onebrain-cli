@@ -36,16 +36,16 @@ pub enum SchedulerError {
     #[error("Arg key or value must not contain shell-special chars (\", $, `, \\): {0}")]
     ShellSpecialInOneShotArg(String),
 
-    #[error("Command not found at absolute path: {0}. Check the path in onebrain.yml — launchd will silently fail at run time if the binary is missing.")]
+    #[error("Command not found at absolute path: {0}. Check the path in onebrain.yml — the scheduler will silently fail at run time if the binary is missing.")]
     CommandNotFoundAbsolute(String),
 
     #[error("Command not found at relative path: {orig} (resolved: {resolved})")]
     CommandNotFoundRelative { orig: String, resolved: String },
 
-    #[error("Command \"{0}\" not found in PATH. Use an absolute path in onebrain.yml (launchd's PATH is restricted to /usr/bin:/bin:/usr/sbin:/sbin and won't find {0}).")]
+    #[error("Command \"{0}\" not found in PATH. Use an absolute path in onebrain.yml — a scheduled job runs with a minimal environment that will not find {0}.")]
     CommandNotFoundInPath(String),
 
-    #[error("Conflict: {new} and {existing} normalize to the same plist path {path}")]
+    #[error("Conflict: {new} and {existing} normalize to the same schedule artifact {path}")]
     Conflict {
         new: String,
         existing: String,

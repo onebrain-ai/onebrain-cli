@@ -10,14 +10,15 @@
 //! - `--dry-run` → print plists to stdout instead of writing
 //!
 //! When none of the above branches fire we walk the `schedule:` list,
-//! validate each entry, build a [`LaunchdContext`] from the current process
+//! validate each entry, build a [`SchedulerContext`] from the current process
 //! environment, run collision detection, then write (or `--dry-run` print).
 
 use anyhow::{anyhow, Context, Result};
+use onebrain_core::scheduler::backend;
 use onebrain_core::scheduler::{
-    self, generate_plist, is_command_mode, is_one_shot, is_skill_mode, label_for_entry, plist_path,
-    validate_at, validate_cron, validate_entry, Args, LaunchdContext, ScheduleConfig,
-    ScheduleEntry, SchedulerError, SkillFrontmatter,
+    self, generate_plist, is_command_mode, is_one_shot, is_skill_mode, label_for_entry,
+    validate_at, validate_cron, validate_entry, Args, ScheduleConfig, ScheduleEntry,
+    SchedulerContext, SchedulerError, SkillFrontmatter,
 };
 use std::collections::HashMap;
 use std::env;
@@ -142,27 +143,18 @@ fn run_with(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let ctx = build_launchd_context(&vault)?;
+    let ctx = build_scheduler_context(&vault)?;
     detect_collisions(&resolved, &ctx)?;
 
     for entry in &resolved {
         let plist = generate_plist(entry, &ctx);
-        let target = plist_path(&label_for_entry(entry), &ctx.homedir);
+        let target = backend::artifact_key(entry, &ctx);
         if dry_run {
             if !quiet {
                 println!("---  {}  ---", target.display());
                 println!("{plist}");
             }
             continue;
-        }
-        // Best-effort: create LaunchAgents dir if missing. launchd refuses to
-        // load from a non-existent path, but the parent should exist on any
-        // macOS install — failure here implies a misconfigured HOME or an
-        // unusual sandbox, so surface the error rather than swallow it.
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("create LaunchAgents directory at {}", parent.display())
-            })?;
         }
         // #116 bug 2 introduced an args/cron discriminator into command-mode
         // labels, so a command entry registered before this release has a
@@ -171,10 +163,12 @@ fn run_with(
         // plist so a `--refresh` doesn't leave both the old and new jobs
         // firing. Best-effort: never blocks registration on failure.
         cleanup_stale_legacy_plist(entry, &target, &ctx, quiet);
-        std::fs::write(&target, &plist)
-            .with_context(|| format!("write plist to {}", target.display()))?;
+        // The backend owns directory creation + artifact write (Task 3 seam);
+        // activation with the OS itself lands in Task 4 (#312).
+        let written = backend::install(entry, &ctx)
+            .with_context(|| format!("install schedule artifact {}", target.display()))?;
         if !quiet {
-            println!("\u{2713} Wrote {}", target.display());
+            println!("\u{2713} Wrote {}", written.display());
         }
     }
 
@@ -182,7 +176,7 @@ fn run_with(
         println!("\nRegistered {} schedule entries.", entries.len());
         println!("Use launchctl to load (or restart launchd):");
         for entry in &resolved {
-            let target = plist_path(&label_for_entry(entry), &ctx.homedir);
+            let target = backend::artifact_key(entry, &ctx);
             println!("  launchctl load {}", target.display());
         }
     }
@@ -391,13 +385,13 @@ fn normalize_path(p: &Path) -> PathBuf {
     out
 }
 
-fn build_launchd_context(vault: &Path) -> Result<LaunchdContext> {
+fn build_scheduler_context(vault: &Path) -> Result<SchedulerContext> {
     let skill_cli_path = env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| "onebrain".to_string());
     let homedir = dirs::home_dir().ok_or_else(|| anyhow!("could not resolve home directory"))?;
-    Ok(LaunchdContext {
+    Ok(SchedulerContext {
         vault_path: vault.to_path_buf(),
         skill_cli_path,
         log_base_path: vault.join(resolve_logs_folder(vault)).join("scheduler"),
@@ -465,18 +459,27 @@ fn current_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// Windows has no `getuid`, and `libc` is a `cfg(unix)` dependency here, so
+/// there is nothing to call. The value is never used on Windows either: `uid`
+/// only reaches `launchctl bootout gui/<uid>/…` and the launchd one-shot
+/// wrapper, neither of which runs off macOS.
+///
+/// Kept rather than deleted because `SchedulerContext::uid` is deliberately
+/// not `cfg`-gated — the launchd renderer must compile on every platform so
+/// its snapshot tests run anywhere — so *something* has to fill the field.
+/// 501 is Bun's original `process.getuid?.() ?? 501` fallback, retained for
+/// continuity.
 #[cfg(not(unix))]
 fn current_uid() -> u32 {
-    // Mirror Bun's `process.getuid?.() ?? 501` Windows fallback.
     501
 }
 
 /// Two entries normalizing to the same plist path conflict. We label them
 /// with their `skill:` or `command:` discriminator for the error message.
-fn detect_collisions(resolved: &[ScheduleEntry], ctx: &LaunchdContext) -> Result<()> {
+fn detect_collisions(resolved: &[ScheduleEntry], ctx: &SchedulerContext) -> Result<()> {
     let mut seen: HashMap<PathBuf, ScheduleEntry> = HashMap::new();
     for entry in resolved {
-        let target = plist_path(&label_for_entry(entry), &ctx.homedir);
+        let target = backend::artifact_key(entry, ctx);
         if let Some(existing) = seen.get(&target) {
             let existing_label = if is_command_mode(existing) {
                 format!("command:{}", existing.command.as_deref().unwrap_or(""))
@@ -558,7 +561,7 @@ fn sanitize_label_for_migration(raw: &str) -> String {
 fn cleanup_stale_legacy_plist(
     entry: &ScheduleEntry,
     new_target: &Path,
-    ctx: &LaunchdContext,
+    ctx: &SchedulerContext,
     quiet: bool,
 ) {
     let Some(legacy_label_safe) = legacy_command_label(entry) else {
@@ -608,12 +611,12 @@ fn cleanup_stale_legacy_plist(
 
 fn remove_all(vault: &Path) -> Result<()> {
     let config = read_vault_config(vault)?;
-    let homedir = dirs::home_dir().ok_or_else(|| anyhow!("could not resolve home directory"))?;
+    let ctx = build_scheduler_context(vault)?;
     for entry in &config.schedule {
-        let target = plist_path(&label_for_entry(entry), &homedir);
-        if target.exists() {
-            std::fs::remove_file(&target)
-                .with_context(|| format!("remove {}", target.display()))?;
+        let target = backend::artifact_key(entry, &ctx);
+        if backend::remove(&label_for_entry(entry), &ctx)
+            .with_context(|| format!("remove {}", target.display()))?
+        {
             println!("\u{2713} Removed {}", target.display());
         }
     }
@@ -623,14 +626,14 @@ fn remove_all(vault: &Path) -> Result<()> {
 fn print_status(vault: &Path) -> Result<()> {
     let config = read_vault_config(vault)?;
     let entries = &config.schedule;
-    let homedir = dirs::home_dir().ok_or_else(|| anyhow!("could not resolve home directory"))?;
+    let ctx = build_scheduler_context(vault)?;
     println!("Registered schedules: {}", entries.len());
     for entry in entries {
-        let target = plist_path(&label_for_entry(entry), &homedir);
-        let installed = if target.exists() {
-            "\u{2713}"
-        } else {
-            "\u{2717}"
+        // Inactive renders as installed for now — Task 4 makes the distinction
+        // real (artifact present but launchd not running it, #312).
+        let installed = match backend::is_installed(&label_for_entry(entry), &ctx)? {
+            backend::InstallState::Active | backend::InstallState::Inactive => "\u{2713}",
+            backend::InstallState::Absent => "\u{2717}",
         };
         let when = entry.at.as_deref().or(entry.cron.as_deref()).unwrap_or("?");
         let tag = if entry.at.is_some() {
@@ -1249,9 +1252,9 @@ mod tests {
 
     #[test]
     fn detect_collisions_ok_when_no_duplicates() {
-        use onebrain_core::scheduler::{LaunchdContext, ScheduleEntry};
+        use onebrain_core::scheduler::{ScheduleEntry, SchedulerContext};
         let dir = tempfile::tempdir().unwrap();
-        let ctx = LaunchdContext {
+        let ctx = SchedulerContext {
             vault_path: dir.path().to_path_buf(),
             skill_cli_path: "onebrain".to_string(),
             log_base_path: dir.path().join("logs"),
@@ -1275,9 +1278,9 @@ mod tests {
 
     #[test]
     fn detect_collisions_errors_on_duplicate_plist_path() {
-        use onebrain_core::scheduler::{LaunchdContext, ScheduleEntry};
+        use onebrain_core::scheduler::{ScheduleEntry, SchedulerContext};
         let dir = tempfile::tempdir().unwrap();
-        let ctx = LaunchdContext {
+        let ctx = SchedulerContext {
             vault_path: dir.path().to_path_buf(),
             skill_cli_path: "onebrain".to_string(),
             log_base_path: dir.path().join("logs"),
@@ -1299,7 +1302,8 @@ mod tests {
         ];
         let err = detect_collisions(&entries, &ctx).unwrap_err();
         assert!(
-            err.to_string().contains("normalize to the same plist path"),
+            err.to_string()
+                .contains("normalize to the same schedule artifact"),
             "got: {err}"
         );
     }
@@ -1313,9 +1317,9 @@ mod tests {
         // only splits labels when args or cron actually differ). Exercises
         // the `is_command_mode(existing/entry)` arms that format
         // `"command:..."` labels in the error message.
-        use onebrain_core::scheduler::{LaunchdContext, ScheduleEntry};
+        use onebrain_core::scheduler::{ScheduleEntry, SchedulerContext};
         let dir = tempfile::tempdir().unwrap();
-        let ctx = LaunchdContext {
+        let ctx = SchedulerContext {
             vault_path: dir.path().to_path_buf(),
             skill_cli_path: "onebrain".to_string(),
             log_base_path: dir.path().join("logs"),
@@ -1337,7 +1341,7 @@ mod tests {
         let err = detect_collisions(&entries, &ctx).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("normalize to the same plist path"),
+            msg.contains("normalize to the same schedule artifact"),
             "got: {msg}"
         );
         assert!(
@@ -1351,9 +1355,9 @@ mod tests {
         // #116 bug 2 regression: two `command:` entries sharing a binary
         // basename but with DIFFERENT args must land on distinct plist
         // paths — no false-positive collision.
-        use onebrain_core::scheduler::{LaunchdContext, ScheduleEntry};
+        use onebrain_core::scheduler::{ScheduleEntry, SchedulerContext};
         let dir = tempfile::tempdir().unwrap();
-        let ctx = LaunchdContext {
+        let ctx = SchedulerContext {
             vault_path: dir.path().to_path_buf(),
             skill_cli_path: "onebrain".to_string(),
             log_base_path: dir.path().join("logs"),
@@ -1649,14 +1653,14 @@ mod tests {
 
     #[test]
     fn cleanup_stale_legacy_plist_removes_file_when_labels_differ() {
-        use onebrain_core::scheduler::{Args, LaunchdContext, ScheduleEntry};
+        use onebrain_core::scheduler::{Args, ScheduleEntry, SchedulerContext};
         let dir = tempfile::tempdir().unwrap();
         let agents_dir = dir.path().join("Library/LaunchAgents");
         std::fs::create_dir_all(&agents_dir).unwrap();
         let legacy = agents_dir.join("com.onebrain.echo.plist");
         std::fs::write(&legacy, "stale").unwrap();
 
-        let ctx = LaunchdContext {
+        let ctx = SchedulerContext {
             vault_path: dir.path().to_path_buf(),
             skill_cli_path: "onebrain".to_string(),
             log_base_path: dir.path().join("logs"),
@@ -1679,14 +1683,14 @@ mod tests {
     fn cleanup_stale_legacy_plist_noop_when_new_target_equals_legacy() {
         // No discriminator (no args, no distinguishing cron collision risk in
         // this synthetic case) → new label == legacy label → nothing to clean.
-        use onebrain_core::scheduler::{LaunchdContext, ScheduleEntry};
+        use onebrain_core::scheduler::{ScheduleEntry, SchedulerContext};
         let dir = tempfile::tempdir().unwrap();
         let agents_dir = dir.path().join("Library/LaunchAgents");
         std::fs::create_dir_all(&agents_dir).unwrap();
         let legacy = agents_dir.join("com.onebrain.true.plist");
         std::fs::write(&legacy, "not actually stale").unwrap();
 
-        let ctx = LaunchdContext {
+        let ctx = SchedulerContext {
             vault_path: dir.path().to_path_buf(),
             skill_cli_path: "onebrain".to_string(),
             log_base_path: dir.path().join("logs"),
@@ -1712,11 +1716,11 @@ mod tests {
 
     #[test]
     fn cleanup_stale_legacy_plist_noop_when_no_legacy_file_present() {
-        use onebrain_core::scheduler::{Args, LaunchdContext, ScheduleEntry};
+        use onebrain_core::scheduler::{Args, ScheduleEntry, SchedulerContext};
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("Library/LaunchAgents")).unwrap();
 
-        let ctx = LaunchdContext {
+        let ctx = SchedulerContext {
             vault_path: dir.path().to_path_buf(),
             skill_cli_path: "onebrain".to_string(),
             log_base_path: dir.path().join("logs"),
