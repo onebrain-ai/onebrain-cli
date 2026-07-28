@@ -528,7 +528,7 @@ mod tests {
         SchedulerContext {
             vault_path: PathBuf::from(vault),
             skill_cli_path: "/opt/homebrew/bin/onebrain".into(),
-            log_base_path: PathBuf::from("/Users/test/vault/07-logs/scheduler/2026/05"),
+            log_base_path: PathBuf::from("/Users/test/Library/Logs/onebrain"),
             homedir: PathBuf::from("/Users/test"),
             uid: 501,
         }
@@ -1155,7 +1155,7 @@ mod tests {
         let ctx = SchedulerContext {
             vault_path: PathBuf::from("/Users/test/vault"),
             skill_cli_path: "/opt/homebrew/bin/onebrain".into(),
-            log_base_path: PathBuf::from("/Users/test/vault/07-logs/scheduler/2026/05"),
+            log_base_path: PathBuf::from("/Users/test/Library/Logs/onebrain"),
             homedir: PathBuf::from("/tmp/weird\"$home"),
             uid: 501,
         };
@@ -1268,7 +1268,7 @@ mod tests {
         let ctx = SchedulerContext {
             vault_path: PathBuf::from("/Users/test/vault"),
             skill_cli_path: "/opt/homebrew/bin/onebrain".into(),
-            log_base_path: PathBuf::from("/Users/test/vault/07-logs/scheduler/2026/05"),
+            log_base_path: PathBuf::from("/Users/test/Library/Logs/onebrain"),
             homedir: PathBuf::from("/tmp/weird\"$home"),
             uid: 501,
         };
