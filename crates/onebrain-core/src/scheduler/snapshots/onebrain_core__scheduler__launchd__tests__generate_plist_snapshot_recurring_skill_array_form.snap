@@ -48,9 +48,9 @@ expression: out
         </dict>
     </array>
     <key>StandardOutPath</key>
-    <string>/Users/test/vault/07-logs/scheduler/2026/05/onebrain-daily.stdout</string>
+    <string>/Users/test/Library/Logs/onebrain/onebrain-daily.stdout</string>
     <key>StandardErrorPath</key>
-    <string>/Users/test/vault/07-logs/scheduler/2026/05/onebrain-daily.stderr</string>
+    <string>/Users/test/Library/Logs/onebrain/onebrain-daily.stderr</string>
     <key>RunAtLoad</key>
     <false/>
 </dict>

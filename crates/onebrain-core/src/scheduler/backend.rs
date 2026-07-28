@@ -156,8 +156,21 @@ mod imp {
     }
 }
 
+/// Create the scheduler log directory before any artifact references it.
+///
+/// launchd opens `StandardOutPath`/`StandardErrorPath` **before exec** and
+/// does not create parent directories. The machine-local default
+/// (`~/Library/Logs/onebrain`) does not exist on a fresh install, so skipping
+/// this ships EX_CONFIG-78-with-no-output — a byte-for-byte re-creation of
+/// the #315 headline bug (round 4, BL-2: "the cheapest way to sink the
+/// release").
+pub fn ensure_log_dir(ctx: &SchedulerContext) -> std::io::Result<()> {
+    std::fs::create_dir_all(&ctx.log_base_path)
+}
+
 /// Shared by both arms while the placeholder exists; Task 6/7c specialise.
 fn write_plist(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Result<PathBuf, SchedulerError> {
+    ensure_log_dir(ctx)?;
     let label = crate::scheduler::launchd::label_for_entry(entry);
     let target = plist_path(&label, &ctx.homedir);
     if let Some(parent) = target.parent() {
@@ -214,6 +227,31 @@ mod tests {
             !remove("seam-roundtrip", &ctx).unwrap(),
             "second remove is a no-op"
         );
+    }
+
+    #[test]
+    fn the_log_directory_is_created_before_the_artifact_is_written() {
+        let home = tempfile::tempdir().unwrap();
+        let ctx = test_support::ctx_in(home.path());
+        assert!(!ctx.log_base_path.exists(), "fixture must start without it");
+
+        ensure_log_dir(&ctx).unwrap();
+
+        assert!(
+            ctx.log_base_path.is_dir(),
+            "launchd opens the log paths before exec — a missing dir is exit 78 with no output"
+        );
+    }
+
+    #[test]
+    fn install_creates_the_log_directory_as_part_of_writing() {
+        // Filesystem-only in Task 3's placeholder arms — safe everywhere.
+        // The OS-touching round-trip lives in Task 4's #[ignore]d tests.
+        let home = tempfile::tempdir().unwrap();
+        let ctx = test_support::ctx_in(home.path());
+        install(&test_support::entry_labelled("logdir-probe"), &ctx).unwrap();
+        assert!(ctx.log_base_path.is_dir());
+        let _ = remove("logdir-probe", &ctx);
     }
 
     #[test]

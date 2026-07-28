@@ -146,6 +146,16 @@ fn run_with(
     let ctx = build_scheduler_context(&vault)?;
     detect_collisions(&resolved, &ctx)?;
 
+    // One-line migration note (#315): fixed without the user reading the issue.
+    let legacy = legacy_in_vault_log_dir(&vault);
+    if !dry_run && !quiet && legacy.exists() {
+        println!(
+            "\u{2139} scheduler logs now write to {} (previously {}; old files left in place)",
+            ctx.log_base_path.display(),
+            legacy.display()
+        );
+    }
+
     for entry in &resolved {
         let plist = generate_plist(entry, &ctx);
         let target = backend::artifact_key(entry, &ctx);
@@ -391,13 +401,26 @@ fn build_scheduler_context(vault: &Path) -> Result<SchedulerContext> {
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| "onebrain".to_string());
     let homedir = dirs::home_dir().ok_or_else(|| anyhow!("could not resolve home directory"))?;
+    // #315: job logs are machine-local operational output, not vault content.
+    // On a synced vault (iCloud) the old in-vault files eventually became
+    // unopenable-for-append, and launchd opens the log paths BEFORE exec — so
+    // every job died at setup with EX_CONFIG and wrote nothing anywhere.
+    let log_base_path =
+        onebrain_core::scheduler::default_log_dir(&homedir, &|k| std::env::var(k).ok());
     Ok(SchedulerContext {
         vault_path: vault.to_path_buf(),
         skill_cli_path,
-        log_base_path: vault.join(resolve_logs_folder(vault)).join("scheduler"),
+        log_base_path,
         homedir,
         uid: current_uid(),
     })
+}
+
+/// The pre-#315 in-vault scheduler log dir, kept only to detect and announce
+/// the migration on `register`. Old files are left in place — deleting user
+/// data is not this function's call.
+fn legacy_in_vault_log_dir(vault: &Path) -> PathBuf {
+    vault.join(resolve_logs_folder(vault)).join("scheduler")
 }
 
 /// Resolve the vault's logs folder from `vault.yml::folders.logs`. Falls back
