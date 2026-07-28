@@ -55,6 +55,18 @@ pub enum SchedulerError {
     #[error("cron \"{cron}\" needs {needed} Task Scheduler triggers; the limit is 48 (measured — 49 is rejected with 'too many nodes of the same type'). Split it into separate `schedule:` entries.")]
     TooManyTriggers { cron: String, needed: usize },
 
+    #[error("scheduler backend command failed: {command} ({status})\n{stderr}")]
+    BackendCommand {
+        /// The command line that was run, for the user to reproduce.
+        command: String,
+        /// The exit status, pre-rendered (`ExitStatus` has no stable Display
+        /// across platforms and thiserror needs Display fields).
+        status: String,
+        /// Captured stderr, verbatim. Never swallowed — a silent fallback is
+        /// the failure mode this release exists to remove.
+        stderr: String,
+    },
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 

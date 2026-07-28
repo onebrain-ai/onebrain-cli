@@ -46,7 +46,7 @@ pub fn run(
 /// plugin update`, which wraps `register_schedule` as one step inside its
 /// framed report — the bare per-plist `✓ Wrote ...` lines and the trailing
 /// "Use launchctl to load …" hint would otherwise leak through the parent
-/// frame, and the parent needs the count to distinguish "no schedule
+/// frame (pre-#312 it also suppressed the now-deleted "Use launchctl to\n/// load" hint), and the parent needs the count to distinguish "no schedule
 /// entries · skipped" from "N plists refreshed".
 ///
 /// Other paths (`status`, `remove`, `test`, `resume`, real `register` from
@@ -183,12 +183,13 @@ fn run_with(
     }
 
     if !quiet {
-        println!("\nRegistered {} schedule entries.", entries.len());
-        println!("Use launchctl to load (or restart launchd):");
-        for entry in &resolved {
-            let target = backend::artifact_key(entry, &ctx);
-            println!("  launchctl load {}", target.display());
-        }
+        // No "Use launchctl to load" epilogue: install() now boots the job
+        // out and back in itself (#312), so the instruction would be false.
+        println!(
+            "\nRegistered and activated {} schedule entries with {}.",
+            entries.len(),
+            backend::describe()
+        );
     }
     Ok(entries.len())
 }
@@ -635,9 +636,16 @@ fn cleanup_stale_legacy_plist(
 fn remove_all(vault: &Path) -> Result<()> {
     let config = read_vault_config(vault)?;
     let ctx = build_scheduler_context(vault)?;
+    remove_entries(&config, &ctx)
+}
+
+/// Split from [`remove_all`] so unit tests inject a tempdir-rooted context
+/// instead of inheriting the real home — the seam a real-plist deletion
+/// escaped through once.
+fn remove_entries(config: &ScheduleConfig, ctx: &SchedulerContext) -> Result<()> {
     for entry in &config.schedule {
-        let target = backend::artifact_key(entry, &ctx);
-        if backend::remove(&label_for_entry(entry), &ctx)
+        let target = backend::artifact_key(entry, ctx);
+        if backend::remove(&label_for_entry(entry), ctx)
             .with_context(|| format!("remove {}", target.display()))?
         {
             println!("\u{2713} Removed {}", target.display());
@@ -648,14 +656,20 @@ fn remove_all(vault: &Path) -> Result<()> {
 
 fn print_status(vault: &Path) -> Result<()> {
     let config = read_vault_config(vault)?;
-    let entries = &config.schedule;
     let ctx = build_scheduler_context(vault)?;
+    print_status_with(&config, &ctx)
+}
+
+/// See [`remove_entries`] — same injection seam, same reason.
+fn print_status_with(config: &ScheduleConfig, ctx: &SchedulerContext) -> Result<()> {
+    let entries = &config.schedule;
     println!("Registered schedules: {}", entries.len());
     for entry in entries {
-        // Inactive renders as installed for now — Task 4 makes the distinction
-        // real (artifact present but launchd not running it, #312).
-        let installed = match backend::is_installed(&label_for_entry(entry), &ctx)? {
-            backend::InstallState::Active | backend::InstallState::Inactive => "\u{2713}",
+        let installed = match backend::is_installed(&label_for_entry(entry), ctx)? {
+            backend::InstallState::Active => "\u{2713}",
+            // The state the old file-existence check could not see (#312):
+            // artifact on disk, OS not running it.
+            backend::InstallState::Inactive => "\u{26a0}",
             backend::InstallState::Absent => "\u{2717}",
         };
         let when = entry.at.as_deref().or(entry.cron.as_deref()).unwrap_or("?");
@@ -1579,24 +1593,30 @@ mod tests {
     // ── remove_all: plist-not-on-disk branch ──────────────────────────────────
 
     #[test]
-    fn run_remove_when_plist_not_on_disk_is_noop() {
-        // Exercises the `if target.exists()` false branch in remove_all:
-        // plist absent → silently skip, return Ok(()).
+    fn remove_entries_when_plist_not_on_disk_is_noop() {
+        // Exercises the `if target.exists()` false branch: plist absent →
+        // silently skip, return Ok(()).
+        //
+        // Goes through `remove_entries` with an injected tempdir context —
+        // NEVER through `run()`. The `run()` version of this test built its
+        // context from the real home and, once #312 made remove() operate on
+        // launchd for real, it booted out and DELETED the operator's actual
+        // /daily plist while reporting green. Its "not on disk" premise was
+        // only true of a world where nothing was registered.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("onebrain.yml"),
-            "schedule:\n- cron: \"0 9 * * *\"\n  skill: /daily\n",
+        let home = tempfile::tempdir().unwrap();
+        let config: ScheduleConfig = serde_yaml::from_str(
+            "schedule:\n- cron: \"0 9 * * *\"\n  skill: /unit-remove-noop-probe\n",
         )
         .unwrap();
-        let result = run(
-            Some(dir.path().to_path_buf()),
-            false,
-            true,
-            false,
-            None,
-            false,
-            None,
-        );
+        let ctx = SchedulerContext {
+            vault_path: dir.path().to_path_buf(),
+            skill_cli_path: "/usr/local/bin/onebrain".to_string(),
+            log_base_path: home.path().join("logs"),
+            homedir: home.path().to_path_buf(),
+            uid: current_uid(),
+        };
+        let result = remove_entries(&config, &ctx);
         assert!(result.is_ok(), "remove with no plist on disk: {result:?}");
     }
 
