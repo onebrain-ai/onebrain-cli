@@ -117,6 +117,13 @@ Schedule-entry mode classifiers and a structural shape validator (no field-forma
 **Connections** — reads `types::{Args, ScheduleEntry}`; produces `SchedulerError::InvalidEntry`. Called by: `launchd` (mode classifiers steer block selection) and onebrain-cli schedule loader (`validate_entry` surfaces friendly errors).
 **Tests** — `#[cfg(test)]` covers each classifier and every `validate_entry` rejection/acceptance path.
 
+### `src/scheduler/context.rs`
+`SchedulerContext` — the emit inputs every backend renderer takes: `vault_path`, `skill_cli_path`, `log_base_path`, `homedir`, `uid`. Formerly `launchd::LaunchdContext`; renamed because the Windows and Linux backends take the same inputs, so the type cannot keep a platform in its name.
+
+`uid` is deliberately **not** `cfg`-gated: the launchd one-shot blocks read it and `generate_plist` dispatches to them unconditionally, and that rendering must compile everywhere so its snapshot tests run on any dev machine. Gating it would break the build on two of three CI legs.
+
+**Connections** — no dependencies. Used by: `launchd` (all renderers), onebrain-cli schedule registration.
+
 ### `src/scheduler/xml.rs`
 XML escaping shared by every renderer that emits XML. Extracted from `launchd.rs` so a scheduler-neutral layer does not import from a platform-specific one.
 **Key functions**
@@ -127,8 +134,7 @@ XML escaping shared by every renderer that emits XML. Extracted from `launchd.rs
 
 ### `src/scheduler/launchd.rs`
 launchd `.plist` emitter — **string templating, not quick-xml**, to guarantee byte-for-byte parity with Bun v2.3.3 (Layer-4 parity test).
-**Key types**
-- `LaunchdContext` — emit inputs: `vault_path`, `skill_cli_path`, `log_base_path`, `homedir`, `uid`.
+**Key types** — takes [`SchedulerContext`](#srcschedulercontextrs) (formerly `LaunchdContext`, moved to its own module for the cross-platform seam).
 
 **Key functions**
 - `generate_plist(entry, ctx) -> String` — full plist; dispatches on `(is_one_shot, is_command_mode)` to one of four `<ProgramArguments>` blocks (recurring/one-shot × skill/command).

@@ -7,6 +7,7 @@
 //! Modules mirror the Bun layout one-to-one so future cross-implementation
 //! changes can be traced by filename:
 //!
+//! - [`context`] — `SchedulerContext`, the inputs every backend renderer takes
 //! - [`types`] — `ScheduleEntry`, `ScheduleConfig`, `SkillFrontmatter`, `Args`
 //! - [`cron_parse`] — `validate_cron`, `validate_at`, expansion to calendar fields
 //! - [`entry`] — `is_*` classifiers + `validate_entry` shape check
@@ -15,6 +16,7 @@
 //! - [`log_paths`] — runtime stdout/stderr log path builder
 //! - [`error`] — `SchedulerError` (matched error strings for parity tests)
 
+pub mod context;
 pub mod cron_parse;
 pub mod entry;
 pub mod error;
@@ -23,13 +25,14 @@ pub mod log_paths;
 pub mod types;
 pub mod xml;
 
+pub use context::SchedulerContext;
 pub use cron_parse::{
     at_fields, cron_fields, cron_fields_expanded, validate_at, validate_cron, AtFields,
     CronFieldSet, CronFields,
 };
 pub use entry::{is_command_mode, is_one_shot, is_skill_mode, validate_entry};
 pub use error::SchedulerError;
-pub use launchd::{generate_plist, label_for_entry, plist_path, LaunchdContext};
+pub use launchd::{generate_plist, label_for_entry, plist_path};
 pub use log_paths::scheduler_log_path;
 pub use types::{Args, ScheduleConfig, ScheduleEntry, SkillFrontmatter};
 pub use xml::escape as xml_escape;

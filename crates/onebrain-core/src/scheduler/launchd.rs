@@ -13,30 +13,12 @@
 //! contract. XML escaping lives in [`crate::scheduler::xml`], shared with
 //! the other renderers.
 
+use crate::scheduler::context::SchedulerContext;
 use crate::scheduler::cron_parse::{at_fields, cron_fields_expanded, CronFields};
 use crate::scheduler::entry::{is_command_mode, is_one_shot};
 use crate::scheduler::types::{Args, ScheduleEntry};
 use crate::scheduler::xml::escape as xml_escape;
 use std::path::{Path, PathBuf};
-
-/// Context required to emit a single plist — paths, the CLI binary path
-/// that launchd should exec, and the user's UID for `launchctl bootout`.
-pub struct LaunchdContext {
-    /// Absolute path to the vault root (passed as `--vault` in skill-mode plists).
-    pub vault_path: PathBuf,
-
-    /// Absolute path to the `onebrain` binary launchd should exec.
-    pub skill_cli_path: String,
-
-    /// Absolute path to `07-logs/scheduler` (or vault-yml-overridden equivalent).
-    pub log_base_path: PathBuf,
-
-    /// User homedir (drives `~/Library/LaunchAgents/<label>.plist`).
-    pub homedir: PathBuf,
-
-    /// User's effective UID (drives `launchctl bootout gui/<uid>/<label>`).
-    pub uid: u32,
-}
 
 /// Derive the launchd label suffix from an entry.
 ///
@@ -129,7 +111,7 @@ pub fn plist_path(skill_or_label: &str, homedir: &Path) -> PathBuf {
 }
 
 /// Build the `<ProgramArguments>` body for a recurring skill-mode entry.
-fn recurring_skill_block(entry: &ScheduleEntry, ctx: &LaunchdContext) -> String {
+fn recurring_skill_block(entry: &ScheduleEntry, ctx: &SchedulerContext) -> String {
     let mut out = format!(
         "        <string>{}</string>\n\
          \x20       <string>skill</string>\n\
@@ -187,7 +169,7 @@ fn command_basename(cmd: &str) -> Option<&str> {
 /// `onebrain.exe`. We also match when the command's basename equals
 /// `ctx.skill_cli_path`'s basename — the exact binary launchd would exec
 /// for skill-mode — so a renamed/aliased install still resolves.
-fn command_is_onebrain(cmd: &str, ctx: &LaunchdContext) -> bool {
+fn command_is_onebrain(cmd: &str, ctx: &SchedulerContext) -> bool {
     let Some(cmd_base) = command_basename(cmd) else {
         return false;
     };
@@ -216,7 +198,7 @@ fn args_have_explicit_vault(entry: &ScheduleEntry) -> bool {
 /// Whether `--vault <ctx.vault_path>` should be appended to a command-mode
 /// entry's argv: only when the command is onebrain (a generic binary would
 /// choke on the flag) AND the user hasn't already supplied a vault flag.
-fn should_append_vault(entry: &ScheduleEntry, ctx: &LaunchdContext) -> bool {
+fn should_append_vault(entry: &ScheduleEntry, ctx: &SchedulerContext) -> bool {
     command_is_onebrain(entry.command.as_deref().unwrap_or(""), ctx)
         && !args_have_explicit_vault(entry)
 }
@@ -232,7 +214,7 @@ fn should_append_vault(entry: &ScheduleEntry, ctx: &LaunchdContext) -> bool {
 /// also change the meaning of any relative paths the user's `args:` already
 /// assume). Generic commands (rsync, etc.) get their argv UNCHANGED.
 /// Mirrors `recurring_skill_block`, which already embeds `--vault` (#263 bug 1).
-fn recurring_command_block(entry: &ScheduleEntry, ctx: &LaunchdContext) -> String {
+fn recurring_command_block(entry: &ScheduleEntry, ctx: &SchedulerContext) -> String {
     let cmd = entry.command.as_deref().unwrap_or("");
     let mut lines: Vec<String> = vec![format!("        <string>{}</string>", xml_escape(cmd))];
     if let Some(Args::List(argv)) = &entry.args {
@@ -284,7 +266,7 @@ fn shell_escape_double_quoted(input: &str) -> String {
 
 /// Build the `<ProgramArguments>` body for a one-shot skill-mode entry —
 /// wraps a self-deleting shell command for launchctl bootout + rm.
-fn one_shot_skill_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &str) -> String {
+fn one_shot_skill_block(entry: &ScheduleEntry, ctx: &SchedulerContext, label: &str) -> String {
     let plist_file = format!(
         "{}/Library/LaunchAgents/{label}.plist",
         ctx.homedir.to_string_lossy()
@@ -336,7 +318,7 @@ fn one_shot_skill_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &str
 /// (#263 bug 1 + R2): launchd's `cwd=/` means an onebrain command needs the
 /// vault path in its own argv, appended after any user-supplied args and
 /// quoted the same way. A generic command (rsync, etc.) is left untouched.
-fn one_shot_command_block(entry: &ScheduleEntry, ctx: &LaunchdContext, label: &str) -> String {
+fn one_shot_command_block(entry: &ScheduleEntry, ctx: &SchedulerContext, label: &str) -> String {
     let plist_file = format!(
         "{}/Library/LaunchAgents/{label}.plist",
         ctx.homedir.to_string_lossy()
@@ -488,7 +470,7 @@ fn calendar_block(entry: &ScheduleEntry) -> String {
 
 /// Emit a complete launchd plist for the given entry. Byte parity with Bun
 /// is mandatory — adjust whitespace only with the parity test running.
-pub fn generate_plist(entry: &ScheduleEntry, ctx: &LaunchdContext) -> String {
+pub fn generate_plist(entry: &ScheduleEntry, ctx: &SchedulerContext) -> String {
     let label_safe = label_for_entry(entry);
     let label = format!("com.onebrain.{label_safe}");
 
@@ -536,14 +518,14 @@ mod tests {
     use super::*;
     use indexmap::IndexMap;
 
-    fn test_ctx() -> LaunchdContext {
+    fn test_ctx() -> SchedulerContext {
         test_ctx_with_vault("/Users/test/vault")
     }
 
     /// Same as [`test_ctx`] but with an arbitrary vault path — used to
     /// exercise paths containing spaces (#263 motivating scenario).
-    fn test_ctx_with_vault(vault: &str) -> LaunchdContext {
-        LaunchdContext {
+    fn test_ctx_with_vault(vault: &str) -> SchedulerContext {
+        SchedulerContext {
             vault_path: PathBuf::from(vault),
             skill_cli_path: "/opt/homebrew/bin/onebrain".into(),
             log_base_path: PathBuf::from("/Users/test/vault/07-logs/scheduler/2026/05"),
@@ -1170,7 +1152,7 @@ mod tests {
             skill: Some("/reminder".into()),
             ..Default::default()
         };
-        let ctx = LaunchdContext {
+        let ctx = SchedulerContext {
             vault_path: PathBuf::from("/Users/test/vault"),
             skill_cli_path: "/opt/homebrew/bin/onebrain".into(),
             log_base_path: PathBuf::from("/Users/test/vault/07-logs/scheduler/2026/05"),
@@ -1283,7 +1265,7 @@ mod tests {
             command: Some("/usr/bin/true".into()),
             ..Default::default()
         };
-        let ctx = LaunchdContext {
+        let ctx = SchedulerContext {
             vault_path: PathBuf::from("/Users/test/vault"),
             skill_cli_path: "/opt/homebrew/bin/onebrain".into(),
             log_base_path: PathBuf::from("/Users/test/vault/07-logs/scheduler/2026/05"),
