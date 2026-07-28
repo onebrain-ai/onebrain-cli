@@ -221,7 +221,7 @@ fn command_mode_entries_fully_identical_still_collide() {
         .env("HOME", v.path())
         .assert()
         .failure()
-        .stderr(predicate::str::contains("normalize to the same plist path"));
+        .stderr(predicate::str::contains("normalize to the same schedule artifact"));
 }
 
 /// Recurring command-mode entry for a GENERIC binary produces a hook-style
