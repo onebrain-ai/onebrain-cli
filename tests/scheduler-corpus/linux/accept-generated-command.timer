@@ -1,5 +1,5 @@
 [Unit]
-Description=OneBrain scheduled entry timer (onebrain-search-reindex)
+Description=OneBrain scheduled entry timer (echo-search-reindex)
 
 [Timer]
 OnCalendar=Sun *-*-* 03:00:00

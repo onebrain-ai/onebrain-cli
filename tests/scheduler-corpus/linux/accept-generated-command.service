@@ -1,6 +1,6 @@
 [Unit]
-Description=OneBrain scheduled entry (onebrain-search-reindex)
+Description=OneBrain scheduled entry (echo-search-reindex)
 
 [Service]
 Type=oneshot
-ExecStart=onebrain search reindex --vault /v/ob-1
+ExecStart=/bin/echo search reindex --vault /v/ob-1
