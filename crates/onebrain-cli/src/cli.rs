@@ -1202,7 +1202,7 @@ pub enum PluginVerb {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Pull plugin from GitHub · rewrite hooks · rebind launchd plists.
+    /// Pull plugin from GitHub · rewrite hooks · rebind OS scheduler artifacts.
     Update {
         /// Optional vault root override.
         #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
@@ -1237,7 +1237,10 @@ pub enum PluginVerb {
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
-#[command(about = "launchd schedule management", disable_help_subcommand = true)]
+#[command(
+    about = "OS schedule management (launchd · Task Scheduler · systemd user timers)",
+    disable_help_subcommand = true
+)]
 pub struct ScheduleCmd {
     #[command(subcommand)]
     pub verb: ScheduleVerb,
@@ -1252,18 +1255,18 @@ pub enum ScheduleVerb {
     /// Remove a scheduled skill (not yet implemented · v3.x roadmap · edit `onebrain.yml` directly meanwhile).
     #[command(hide = true)]
     Remove { skill: String },
-    /// Re-write launchd plists from `onebrain.yml` (or legacy `vault.yml`) schedule block · called by `plugin update`.
+    /// Compile the `onebrain.yml` (or legacy `vault.yml`) schedule block into OS scheduler artifacts (launchd plists · Scheduled Tasks · systemd user units) and activate them · called by `plugin update`.
     Register {
         /// Vault root override · also accepts global `--vault`; walks up from cwd when omitted.
         #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
         vault_dir: Option<PathBuf>,
-        /// Print the plists that would be written without touching disk.
+        /// Print the scheduler artifacts that would be written, without touching disk or the OS scheduler.
         #[arg(long)]
         dry_run: bool,
-        /// Remove all plists for entries currently in onebrain.yml.
+        /// Deactivate and remove the scheduler artifacts for entries currently in onebrain.yml.
         #[arg(long)]
         remove: bool,
-        /// Re-emit plists with the current vault path (logs a notice).
+        /// Re-emit scheduler artifacts with the current vault path (logs a notice).
         #[arg(long)]
         refresh: bool,
         /// Clear the .paused marker for the given skill.

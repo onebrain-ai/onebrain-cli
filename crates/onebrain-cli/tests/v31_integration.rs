@@ -284,7 +284,7 @@ fn top_level_help_is_production_grade() {
         "Auto-save management (stop · reset · orphans)",
         "Detect or run an AI harness (claude / gemini / codex)",
         "Plugin lifecycle + hook rewriter",
-        "launchd schedule management",
+        "OS schedule management (launchd \u{b7} Task Scheduler \u{b7} systemd user timers)",
         "Skill invocation",
     ] {
         assert!(
