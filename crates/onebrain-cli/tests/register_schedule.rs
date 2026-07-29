@@ -210,8 +210,8 @@ fn command_mode_entries_same_binary_different_args_no_collision() {
         .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
-        .stdout(predicate::str::contains("com.onebrain.echo-hello"))
-        .stdout(predicate::str::contains("com.onebrain.echo-world"));
+        .stdout(predicate::str::contains("---  echo-hello  ---"))
+        .stdout(predicate::str::contains("---  echo-world  ---"));
 }
 
 /// Two `command:` entries with IDENTICAL command + args + cron are a
