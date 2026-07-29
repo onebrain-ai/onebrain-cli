@@ -432,7 +432,10 @@ fn one_shot_boundaries(at: &str) -> (String, String) {
 /// (`ExecAction` admits only Command/Arguments/WorkingDirectory), any shell
 /// wrapper, any password (`LogonType=InteractiveToken`, verified to fire on
 /// hosted runners).
-pub fn generate_task_xml(entry: &ScheduleEntry, ctx: &SchedulerContext) -> String {
+pub fn generate_task_xml(
+    entry: &ScheduleEntry,
+    ctx: &SchedulerContext,
+) -> Result<String, SchedulerError> {
     let mut triggers = String::new();
     let mut expired_settings = String::new();
 
@@ -444,10 +447,14 @@ pub fn generate_task_xml(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Strin
         expired_settings =
             "    <DeleteExpiredTaskAfter>PT1M</DeleteExpiredTaskAfter>\n".to_string();
     } else {
-        // Shape/timing errors surface at validation or registration; by
-        // rendering time the cron is known translatable.
-        let shape = trigger_shape(entry).expect("validated cron has a trigger shape");
-        let timing = trigger_timing(entry).expect("validated cron has a trigger timing");
+        // The shared cross-platform validator caps combinations at 1000 (the
+        // launchd array shape) but the 48-trigger Task Scheduler cap is
+        // enforced only here — a cron between 49 and 1000 triggers passes
+        // validation everywhere and must surface at render time as the
+        // friendly TooManyTriggers error, not a panic (2026-07-29 full-epic
+        // audit, BLOCKER 2).
+        let shape = trigger_shape(entry)?;
+        let timing = trigger_timing(entry)?;
         let by_block = schedule_by_block(&shape);
         // Fixed epoch date: a recurring trigger's start DATE is semantically
         // irrelevant, and a clock here would make every snapshot
@@ -486,7 +493,7 @@ pub fn generate_task_xml(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Strin
         .map(|(cmd, args)| (xml_escape(&cmd), xml_escape(&args)))
         .expect("argv always has a command");
 
-    format!(
+    Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
          <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
          \x20 <RegistrationInfo><Description>OneBrain scheduled entry</Description></RegistrationInfo>\n\
@@ -509,7 +516,7 @@ pub fn generate_task_xml(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Strin
          \x20 </Actions>\n\
          </Task>\n",
         arguments.0, arguments.1
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -653,6 +660,23 @@ mod tests {
         );
     }
 
+    /// Audit BLOCKER 2 regression: a cron between 49 and 1000 triggers
+    /// passes the shared cross-platform validator (1000-combination cap), so
+    /// the 48-trigger Task Scheduler cap is only reachable at render time —
+    /// which must surface as the friendly TooManyTriggers error, never a
+    /// panic (the old `.expect` crashed register AND --dry-run on Windows).
+    #[test]
+    fn render_surfaces_too_many_triggers_instead_of_panicking() {
+        let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        let entry =
+            crate::scheduler::test_support::entry_cron("1,2,4,8,16,32,59 0,1,3,7,9,13,19,23 * * *");
+        let err = generate_task_xml(&entry, &ctx).unwrap_err();
+        assert!(
+            matches!(err, SchedulerError::TooManyTriggers { .. }),
+            "got {err:?}"
+        );
+    }
+
     #[test]
     fn an_explicit_product_over_the_limit_is_refused_with_a_useful_message() {
         // 7 irregular minutes × 8 irregular hours = 56 explicit triggers.
@@ -749,7 +773,7 @@ mod tests {
     #[test]
     fn recurring_entry_has_a_start_boundary_and_no_password() {
         let ctx = ctx_with_cli(r"C:\Users\u\scoop\shims\onebrain.exe");
-        let out = generate_task_xml(&daily_entry(), &ctx);
+        let out = generate_task_xml(&daily_entry(), &ctx).unwrap();
         assert!(out.contains("<CalendarTrigger>"), "{out}");
         assert!(
             out.contains("<StartBoundary>2000-01-01T09:00:00</StartBoundary>"),
@@ -771,7 +795,9 @@ mod tests {
         // an environment element makes schtasks reject the document while
         // every pure test still passes (round 2, B4).
         let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
-        assert!(!generate_task_xml(&daily_entry(), &ctx).contains("<Environment"));
+        assert!(!generate_task_xml(&daily_entry(), &ctx)
+            .unwrap()
+            .contains("<Environment"));
     }
 
     #[test]
@@ -780,7 +806,7 @@ mod tests {
         // path — a `command: rsync` entry would have run onebrain with rsync's
         // arguments.
         let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
-        let out = generate_task_xml(&foreign_command_entry(), &ctx);
+        let out = generate_task_xml(&foreign_command_entry(), &ctx).unwrap();
         assert!(out.contains("<Command>rsync</Command>"), "{out}");
         assert!(
             !out.contains("--vault"),
@@ -791,7 +817,7 @@ mod tests {
     #[test]
     fn command_mode_onebrain_gets_the_vault_appended() {
         let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
-        let out = generate_task_xml(&daily_command_entry(), &ctx);
+        let out = generate_task_xml(&daily_command_entry(), &ctx).unwrap();
         assert!(out.contains("<Command>onebrain</Command>"), "{out}");
         assert!(
             out.contains("search reindex --vault"),
@@ -805,7 +831,7 @@ mod tests {
         // trigger never expires; DeleteExpiredTaskAfter under <Settings>;
         // clock runs from the EndBoundary.
         let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
-        let out = generate_task_xml(&one_shot_entry(), &ctx);
+        let out = generate_task_xml(&one_shot_entry(), &ctx).unwrap();
         assert!(out.contains("<TimeTrigger>"), "{out}");
         assert!(
             out.contains("<StartBoundary>2026-08-01T09:00:00</StartBoundary>"),
@@ -836,7 +862,8 @@ mod tests {
         let out = generate_task_xml(
             &crate::scheduler::test_support::entry_cron("0 17 * 3 5"),
             &ctx,
-        );
+        )
+        .unwrap();
         assert!(
             out.contains(
                 "<Weeks><Week>1</Week><Week>2</Week><Week>3</Week><Week>4</Week><Week>Last</Week></Weeks>"
@@ -853,7 +880,8 @@ mod tests {
         let out = generate_task_xml(
             &crate::scheduler::test_support::entry_cron("0,5,10 * * * *"),
             &ctx,
-        );
+        )
+        .unwrap();
         assert_eq!(out.matches("<CalendarTrigger>").count(), 3, "{out}");
         assert_eq!(
             out.matches(
@@ -868,7 +896,7 @@ mod tests {
     #[test]
     fn snapshot_recurring_skill() {
         let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
-        insta::assert_snapshot!(generate_task_xml(&daily_entry(), &ctx));
+        insta::assert_snapshot!(generate_task_xml(&daily_entry(), &ctx).unwrap());
     }
 
     /// Writes this renderer's REAL output into the corpus, where the schema
@@ -898,14 +926,14 @@ mod tests {
             let entry = crate::scheduler::test_support::entry_cron(cron);
             std::fs::write(
                 dir.join(format!("accept-generated-{name}.xml")),
-                generate_task_xml(&entry, &ctx),
+                generate_task_xml(&entry, &ctx).unwrap(),
             )
             .unwrap();
         }
         // command mode — the quarter of the matrix no hand-written case covers
         std::fs::write(
             dir.join("accept-generated-command.xml"),
-            generate_task_xml(&daily_command_entry(), &ctx),
+            generate_task_xml(&daily_command_entry(), &ctx).unwrap(),
         )
         .unwrap();
     }
@@ -915,8 +943,8 @@ mod tests {
         // Guards against a clock creeping into StartBoundary.
         let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
         assert_eq!(
-            generate_task_xml(&daily_entry(), &ctx),
-            generate_task_xml(&daily_entry(), &ctx)
+            generate_task_xml(&daily_entry(), &ctx).unwrap(),
+            generate_task_xml(&daily_entry(), &ctx).unwrap()
         );
     }
 }
