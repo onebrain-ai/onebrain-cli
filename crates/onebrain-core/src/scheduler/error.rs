@@ -52,6 +52,9 @@ pub enum SchedulerError {
         path: String,
     },
 
+    #[error("no scheduler backend for {os}; `onebrain schedule` cannot install anything on this platform")]
+    UnsupportedPlatform { os: &'static str },
+
     #[error("cron \"{cron}\" needs {needed} Task Scheduler triggers; the limit is 48 (measured — 49 is rejected with 'too many nodes of the same type'). Split it into separate `schedule:` entries.")]
     TooManyTriggers { cron: String, needed: usize },
 

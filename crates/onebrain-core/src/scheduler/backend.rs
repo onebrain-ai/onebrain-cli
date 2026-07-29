@@ -14,7 +14,7 @@
 
 use crate::scheduler::context::SchedulerContext;
 use crate::scheduler::error::SchedulerError;
-use crate::scheduler::launchd::{generate_plist, plist_path};
+use crate::scheduler::launchd::plist_path;
 use crate::scheduler::types::ScheduleEntry;
 use std::path::PathBuf;
 
@@ -50,6 +50,25 @@ pub fn is_installed(
 /// Human-readable name of the active backend, for help text and diagnostics.
 pub fn describe() -> &'static str {
     imp::describe()
+}
+
+/// What `--dry-run` prints for this entry on this platform, or `None` when
+/// the platform has no backend (a dry run that errors teaches nothing, and
+/// printing another OS's format teaches the wrong thing) [M5].
+pub fn render_preview(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(crate::scheduler::launchd::generate_plist(entry, ctx))
+    }
+    #[cfg(windows)]
+    {
+        Some(crate::scheduler::schtasks::generate_task_xml(entry, ctx))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = (entry, ctx);
+        None
+    }
 }
 
 /// The identity `detect_collisions` keys uniqueness on. Two entries whose
@@ -178,48 +197,39 @@ mod imp {
 mod imp {
     use super::*;
 
-    /// PLACEHOLDER, and deliberately behaviour-preserving: it does exactly
-    /// what the code does today on these platforms — writes a launchd plist
-    /// that nothing will ever read. That is wrong, and it is the *documented
-    /// current bug* (#313): Task 6 is where Linux starts refusing, and Task 7c
-    /// is where Windows gets a real backend.
-    ///
-    /// Preserving the wrong behaviour here is what makes Task 3 a pure seam
-    /// with no behaviour change anywhere — and it is what Task 6's failing
-    /// test asserts against ("install succeeds and ~/Library exists"). If
-    /// this arm refused instead, that test would pass before Task 6 wrote a
-    /// line, and Task 6 would prove nothing.
+    /// Linux refuses instead of lying (#313). The placeholder this replaces
+    /// wrote a launchd plist into a `~/Library` no Linux convention owns and
+    /// `list` then reported it `\u{2713}` — worse than Windows' honest `\u{2717}`,
+    /// because the file really was on disk. The systemd backend (Task 9b)
+    /// replaces this arm; until then, failing loudly beats succeeding
+    /// falsely — the release's whole thesis.
     pub fn install(
-        entry: &ScheduleEntry,
-        ctx: &SchedulerContext,
+        _entry: &ScheduleEntry,
+        _ctx: &SchedulerContext,
     ) -> Result<PathBuf, SchedulerError> {
-        write_plist(entry, ctx)
-    }
-
-    pub fn remove(label_safe: &str, ctx: &SchedulerContext) -> Result<bool, SchedulerError> {
-        let target = plist_path(label_safe, &ctx.homedir);
-        if target.exists() {
-            std::fs::remove_file(&target)?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    pub fn is_installed(
-        label_safe: &str,
-        ctx: &SchedulerContext,
-    ) -> Result<InstallState, SchedulerError> {
-        let target = plist_path(label_safe, &ctx.homedir);
-        Ok(if target.exists() {
-            InstallState::Active
-        } else {
-            InstallState::Absent
+        Err(SchedulerError::UnsupportedPlatform {
+            os: std::env::consts::OS,
         })
     }
 
+    /// Nothing can have been installed by us; removing is a clean no-op so
+    /// `--remove` and `plugin update` never fail on a platform with no
+    /// backend.
+    pub fn remove(_label_safe: &str, _ctx: &SchedulerContext) -> Result<bool, SchedulerError> {
+        Ok(false)
+    }
+
+    /// Never \u{2713}: a platform with no backend has nothing active by
+    /// definition, whatever files may exist on disk.
+    pub fn is_installed(
+        _label_safe: &str,
+        _ctx: &SchedulerContext,
+    ) -> Result<InstallState, SchedulerError> {
+        Ok(InstallState::Absent)
+    }
+
     pub fn describe() -> &'static str {
-        "launchd (placeholder — not this platform's scheduler)"
+        "none (unsupported platform — systemd backend lands in v3.4.20's Linux chain)"
     }
 }
 
@@ -371,8 +381,12 @@ mod imp {
     }
 }
 
-/// Shared by the remaining unix arms while the placeholder exists; Task 6 specialises Linux.
+/// The plist writer — used only by the macOS arm now: Windows renders
+/// task XML and Linux refuses (#313). Gated so the Linux build, which is
+/// the one `-D warnings` leg that measures, sees no dead code.
+#[cfg(target_os = "macos")]
 fn write_plist(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Result<PathBuf, SchedulerError> {
+    use crate::scheduler::launchd::generate_plist;
     ensure_log_dir(ctx)?;
     let label = crate::scheduler::launchd::label_for_entry(entry);
     let target = plist_path(&label, &ctx.homedir);
@@ -387,6 +401,26 @@ fn write_plist(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Result<PathBuf,
 mod tests {
     use super::*;
     use crate::scheduler::test_support;
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn linux_refuses_instead_of_writing_a_plist_nothing_reads() {
+        let home = tempfile::tempdir().unwrap();
+        let ctx = test_support::ctx_in(home.path());
+
+        let err = install(&test_support::daily_entry(), &ctx).unwrap_err();
+        assert!(
+            matches!(err, SchedulerError::UnsupportedPlatform { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            !home.path().join("Library").exists(),
+            "must not create a macOS-only ~/Library on Linux"
+        );
+        assert_eq!(is_installed("daily", &ctx).unwrap(), InstallState::Absent);
+        assert!(!remove("daily", &ctx).unwrap(), "remove is a clean no-op");
+        assert!(render_preview(&test_support::daily_entry(), &ctx).is_none());
+    }
 
     #[test]
     fn describe_names_the_active_backend() {
@@ -425,10 +459,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        any(target_os = "macos", windows),
-        ignore = "touches the real OS scheduler domain — run explicitly (Task 8's CI job does), never in the default suite"
-    )]
+    #[ignore = "touches the real OS scheduler domain (Linux refuses until Task 9b) — run explicitly (Task 8's CI job does), never in the default suite"]
     fn install_then_remove_round_trips_through_the_backend() {
         let home = tempfile::tempdir().unwrap();
         let ctx = test_support::ctx_in(home.path());
@@ -448,6 +479,10 @@ mod tests {
             );
             #[cfg(not(windows))]
             assert!(artifact.exists(), "install must write the artifact");
+            assert!(
+                ctx.log_base_path.is_dir(),
+                "install must create the log dir — launchd opens the log paths before exec"
+            );
             assert_ne!(
                 is_installed(&label, &ctx).unwrap(),
                 InstallState::Absent,
@@ -476,7 +511,11 @@ mod tests {
         // Write the artifact WITHOUT going through install() — no bootstrap.
         let target = plist_path(&label, &ctx.homedir);
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        std::fs::write(&target, generate_plist(&entry, &ctx)).unwrap();
+        std::fs::write(
+            &target,
+            crate::scheduler::launchd::generate_plist(&entry, &ctx),
+        )
+        .unwrap();
 
         #[cfg(target_os = "macos")]
         assert_eq!(is_installed(&label, &ctx).unwrap(), InstallState::Inactive);
@@ -498,16 +537,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn install_creates_the_log_directory_as_part_of_writing() {
-        // Filesystem-only in Task 3's placeholder arms — safe everywhere.
-        // The OS-touching round-trip lives in Task 4's #[ignore]d tests.
-        let home = tempfile::tempdir().unwrap();
-        let ctx = test_support::ctx_in(home.path());
-        install(&test_support::entry_labelled("logdir-probe"), &ctx).unwrap();
-        assert!(ctx.log_base_path.is_dir());
-        let _ = remove("logdir-probe", &ctx);
-    }
+    // NOTE: the former `install_creates_the_log_directory_as_part_of_writing`
+    // test was folded into the round-trip test above. Its "safe everywhere"
+    // premise died with the placeholder arms: a real install() bootstraps
+    // launchd on macOS, registers a schtasks task on Windows, and refuses on
+    // Linux until Task 9b — none of which belongs in the default suite.
 
     #[test]
     fn artifact_key_collides_exactly_when_labels_collide() {

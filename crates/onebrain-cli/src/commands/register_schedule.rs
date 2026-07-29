@@ -16,9 +16,9 @@
 use anyhow::{anyhow, Context, Result};
 use onebrain_core::scheduler::backend;
 use onebrain_core::scheduler::{
-    self, generate_plist, is_command_mode, is_one_shot, is_skill_mode, label_for_entry,
-    validate_at, validate_cron, validate_entry, Args, ScheduleConfig, ScheduleEntry,
-    SchedulerContext, SchedulerError, SkillFrontmatter,
+    self, is_command_mode, is_one_shot, is_skill_mode, label_for_entry, validate_at, validate_cron,
+    validate_entry, Args, ScheduleConfig, ScheduleEntry, SchedulerContext, SchedulerError,
+    SkillFrontmatter,
 };
 use std::collections::HashMap;
 use std::env;
@@ -157,12 +157,24 @@ fn run_with(
     }
 
     for entry in &resolved {
-        let plist = generate_plist(entry, &ctx);
         let target = backend::artifact_key(entry, &ctx);
         if dry_run {
             if !quiet {
-                println!("---  {}  ---", target.display());
-                println!("{plist}");
+                // Platform-aware preview [M5]: launchd plist on macOS, task
+                // XML on Windows, and an honest note where no backend exists
+                // — a dry run that errors teaches nothing, and printing
+                // another OS's format teaches the wrong thing.
+                match backend::render_preview(entry, &ctx) {
+                    Some(artifact) => {
+                        println!("---  {}  ---", target.display());
+                        println!("{artifact}");
+                    }
+                    None => println!(
+                        "---  {}  ---\n(no scheduler backend on {}; entry validates but no artifact can be produced here)",
+                        target.display(),
+                        std::env::consts::OS
+                    ),
+                }
             }
             continue;
         }
