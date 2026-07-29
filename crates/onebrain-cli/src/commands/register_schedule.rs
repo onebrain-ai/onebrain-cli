@@ -656,11 +656,13 @@ fn remove_all(vault: &Path) -> Result<()> {
 /// escaped through once.
 fn remove_entries(config: &ScheduleConfig, ctx: &SchedulerContext) -> Result<()> {
     for entry in &config.schedule {
-        let target = backend::artifact_key(entry, ctx);
-        if backend::remove(&label_for_entry(entry), ctx)
-            .with_context(|| format!("remove {}", target.display()))?
-        {
-            println!("\u{2713} Removed {}", target.display());
+        // Report the label, not `artifact_key` — that key is the launchd
+        // plist path on every platform BY DESIGN (a collision identity, not
+        // a location), so displaying it printed a `~/Library/...plist` that
+        // never existed on Linux (caught by the 9b VM verify).
+        let label = label_for_entry(entry);
+        if backend::remove(&label, ctx).with_context(|| format!("remove schedule '{label}'"))? {
+            println!("\u{2713} Removed schedule '{label}'");
         }
     }
     Ok(())
