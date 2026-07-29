@@ -119,3 +119,18 @@ jobs:
   # its own canonical contract (Envelope shape · snapshot tests in
   # `tests/v31_envelope_snapshots.rs` · `tests/output_format_matrix.rs`);
   # regressions against the v2 wire format are no longer the active concern.
+
+  # Fire-proof: a task registered through the real Windows backend actually
+  # RUNS, and a one-shot deletes itself. The regression guard for "installs
+  # cleanly, never fires" — the failure class that motivated v3.4.20.
+  # Own job, not in the test matrix: it sleeps for minutes and is
+  # Windows-only; burying it there would make every platform wait.
+  # scheduler-schema.yml's header comment forward-references this job.
+  windows-schedule-fires:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p onebrain-cli --test windows_schedule_fires -- --ignored --nocapture
