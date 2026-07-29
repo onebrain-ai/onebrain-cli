@@ -10,9 +10,14 @@
 //! Task 7b; this module only decides **which** trigger shape a cron maps to
 //! and **how** its times of day are expressed.
 
-use crate::scheduler::cron_parse::cron_fields_expanded;
+use crate::scheduler::context::SchedulerContext;
+use crate::scheduler::cron_parse::{at_fields, cron_fields_expanded};
+use crate::scheduler::entry::{is_command_mode, is_one_shot};
 use crate::scheduler::error::SchedulerError;
+use crate::scheduler::launchd::should_append_vault;
+use crate::scheduler::types::Args;
 use crate::scheduler::types::ScheduleEntry;
+use crate::scheduler::xml::escape as xml_escape;
 
 /// Which `CalendarTrigger` subtree a cron maps to. The schema offers four
 /// mutually-exclusive shapes — this is a choice, not a field mapping.
@@ -239,6 +244,274 @@ fn plan_timing(minutes: &[u32], hours: &[u32]) -> TriggerTiming {
     TriggerTiming::Explicit(times)
 }
 
+// ─── rendering ───────────────────────────────────────────────────────────────
+
+/// Task Scheduler task name, namespaced so `/doctor` and cleanup can
+/// enumerate ours with one `\OneBrain\` query.
+pub fn task_name(label_safe: &str) -> String {
+    format!("\\OneBrain\\{label_safe}")
+}
+
+/// Cron weekday number → `<DaysOfWeek>` child element name.
+///
+/// Cron is `0 = Sunday … 6 = Saturday` (7 normalised to 0 by validation);
+/// the schema wants empty named elements. An off-by-one here is a silent
+/// wrong-day-forever bug, and nothing else in the chain catches it — the
+/// hand-written corpus case hardcodes `<Friday/>`, so it pins the schema,
+/// not this mapping. The exhaustive test below is the guard.
+pub fn weekday_element(cron_weekday: u32) -> &'static str {
+    match cron_weekday % 7 {
+        0 => "Sunday",
+        1 => "Monday",
+        2 => "Tuesday",
+        3 => "Wednesday",
+        4 => "Thursday",
+        5 => "Friday",
+        _ => "Saturday",
+    }
+}
+
+/// Cron month number (1–12) → `<Months>` child element name.
+pub fn month_element(cron_month: u32) -> &'static str {
+    match cron_month {
+        1 => "January",
+        2 => "February",
+        3 => "March",
+        4 => "April",
+        5 => "May",
+        6 => "June",
+        7 => "July",
+        8 => "August",
+        9 => "September",
+        10 => "October",
+        11 => "November",
+        _ => "December",
+    }
+}
+
+/// ISO-8601 duration for a repetition interval/window, in the exact forms the
+/// corpus measured: `PT1M` (spike D), `PT1H` and `P1D`
+/// (`accept-multi-repetition.xml`). Other minute counts use the same `PT<n>M`
+/// lexical family.
+fn iso_minutes(mins: u32) -> String {
+    match mins {
+        60 => "PT1H".to_string(),
+        1440 => "P1D".to_string(),
+        m => format!("PT{m}M"),
+    }
+}
+
+fn schedule_by_block(shape: &TriggerShape) -> String {
+    match shape {
+        TriggerShape::Daily => {
+            "      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>\n".to_string()
+        }
+        TriggerShape::Weekly { days } => {
+            let days: String = days
+                .iter()
+                .map(|&d| format!("<{0} />", weekday_element(d)))
+                .collect();
+            format!(
+                "      <ScheduleByWeek>\n        <WeeksInterval>1</WeeksInterval>\n        <DaysOfWeek>{days}</DaysOfWeek>\n      </ScheduleByWeek>\n"
+            )
+        }
+        TriggerShape::Monthly { days, months } => {
+            let days: String = days.iter().map(|d| format!("<Day>{d}</Day>")).collect();
+            // months empty = every month. Omission measurably means exactly
+            // that ("Every month" — the accept-monthly pair), so omitting is
+            // both correct and the smaller document. When restricted, <Months>
+            // is MANDATORY or 0 9 1 3 * fires 12x/year.
+            let months_block = if months.is_empty() {
+                String::new()
+            } else {
+                let m: String = months
+                    .iter()
+                    .map(|&m| format!("<{0} />", month_element(m)))
+                    .collect();
+                format!("        <Months>{m}</Months>\n")
+            };
+            format!(
+                "      <ScheduleByMonth>\n        <DaysOfMonth>{days}</DaysOfMonth>\n{months_block}      </ScheduleByMonth>\n"
+            )
+        }
+        TriggerShape::MonthlyByWeekday {
+            weeks,
+            days_of_week,
+            months,
+        } => {
+            let weeks: String = weeks
+                .iter()
+                .map(|w| match w {
+                    Week::N(n) => format!("<Week>{n}</Week>"),
+                    Week::Last => "<Week>Last</Week>".to_string(),
+                })
+                .collect();
+            let dows: String = days_of_week
+                .iter()
+                .map(|&d| format!("<{0} />", weekday_element(d)))
+                .collect();
+            let m: String = months
+                .iter()
+                .map(|&m| format!("<{0} />", month_element(m)))
+                .collect();
+            format!(
+                "      <ScheduleByMonthDayOfWeek>\n        <Weeks>{weeks}</Weeks>\n        <DaysOfWeek>{dows}</DaysOfWeek>\n        <Months>{m}</Months>\n      </ScheduleByMonthDayOfWeek>\n"
+            )
+        }
+    }
+}
+
+/// The argv every backend agrees on. Skill mode mirrors the launchd emitter's
+/// `onebrain skill run --vault … --skill … --harness … [--arg k=v]`; command
+/// mode is `entry.command` + its args, with `--vault` appended only when
+/// `should_append_vault` says so — the same #263 R2-guarded helper launchd
+/// uses, shared rather than re-derived.
+fn argv_for_entry(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Vec<String> {
+    if is_command_mode(entry) {
+        let mut argv = vec![entry.command.clone().unwrap_or_default()];
+        if let Some(Args::List(list)) = &entry.args {
+            argv.extend(list.iter().cloned());
+        }
+        if should_append_vault(entry, ctx) {
+            argv.push("--vault".to_string());
+            argv.push(ctx.vault_path.to_string_lossy().into_owned());
+        }
+        argv
+    } else {
+        let mut argv = vec![
+            ctx.skill_cli_path.clone(),
+            "skill".to_string(),
+            "run".to_string(),
+            "--vault".to_string(),
+            ctx.vault_path.to_string_lossy().into_owned(),
+            "--skill".to_string(),
+            entry.skill.clone().unwrap_or_default(),
+            "--harness".to_string(),
+            entry.effective_harness().as_str().to_string(),
+        ];
+        if let Some(Args::Map(map)) = &entry.args {
+            for (k, v) in map {
+                argv.push("--arg".to_string());
+                argv.push(format!("{k}={v}"));
+            }
+        }
+        argv
+    }
+}
+
+/// One-shot boundaries: `StartBoundary` at the `at:` datetime, `EndBoundary`
+/// 60 s later. All three self-deletion requirements are measured facts:
+/// a trigger with no `EndBoundary` NEVER expires (so the task is never
+/// deleted), `DeleteExpiredTaskAfter` lives under `<Settings>`, and its
+/// clock runs from the EndBoundary — observed disappearance ~180 s after
+/// registration with this exact shape (spike section E). The short window's
+/// cost is real and documented: a one-shot missed while the machine sleeps
+/// expires unfired.
+fn one_shot_boundaries(at: &str) -> (String, String) {
+    let f = at_fields(at);
+    let start = chrono::NaiveDate::from_ymd_opt(f.year as i32, f.month, f.day)
+        .and_then(|d| d.and_hms_opt(f.hour, f.minute, 0))
+        .expect("validated at: fields form a real datetime");
+    let end = start + chrono::Duration::seconds(60);
+    (
+        start.format("%Y-%m-%dT%H:%M:%S").to_string(),
+        end.format("%Y-%m-%dT%H:%M:%S").to_string(),
+    )
+}
+
+/// Emit the full Task Scheduler document.
+///
+/// Structure, element ORDER, and the `__USER__` placeholder are copied from
+/// the corpus cases the schema workflow round-trips against a real Task
+/// Scheduler (`tests/scheduler-corpus/windows/`) — order was measured
+/// accepted there, so this renderer does not improvise its own. `__USER__`
+/// is substituted with the real account by the installer (7c) and by the
+/// workflow; keeping it out of the renderer keeps this function pure.
+///
+/// Deliberately absent, per measurement: any environment element
+/// (`ExecAction` admits only Command/Arguments/WorkingDirectory), any shell
+/// wrapper, any password (`LogonType=InteractiveToken`, verified to fire on
+/// hosted runners).
+pub fn generate_task_xml(entry: &ScheduleEntry, ctx: &SchedulerContext) -> String {
+    let mut triggers = String::new();
+    let mut expired_settings = String::new();
+
+    if is_one_shot(entry) {
+        let (start, end) = one_shot_boundaries(entry.at.as_deref().unwrap_or_default());
+        triggers.push_str(&format!(
+            "    <TimeTrigger>\n      <StartBoundary>{start}</StartBoundary>\n      <EndBoundary>{end}</EndBoundary>\n      <Enabled>true</Enabled>\n    </TimeTrigger>\n"
+        ));
+        expired_settings =
+            "    <DeleteExpiredTaskAfter>PT1M</DeleteExpiredTaskAfter>\n".to_string();
+    } else {
+        // Shape/timing errors surface at validation or registration; by
+        // rendering time the cron is known translatable.
+        let shape = trigger_shape(entry).expect("validated cron has a trigger shape");
+        let timing = trigger_timing(entry).expect("validated cron has a trigger timing");
+        let by_block = schedule_by_block(&shape);
+        // Fixed epoch date: a recurring trigger's start DATE is semantically
+        // irrelevant, and a clock here would make every snapshot
+        // nondeterministic.
+        let render_one = |h: u32, m: u32, repetition: &str| {
+            format!(
+                "    <CalendarTrigger>\n      <StartBoundary>2000-01-01T{h:02}:{m:02}:00</StartBoundary>\n      <Enabled>true</Enabled>\n{repetition}{by_block}    </CalendarTrigger>\n"
+            )
+        };
+        match timing {
+            TriggerTiming::Explicit(times) => {
+                for (h, m) in times {
+                    triggers.push_str(&render_one(h, m, ""));
+                }
+            }
+            TriggerTiming::Repeating {
+                starts,
+                interval_minutes,
+                duration_minutes,
+            } => {
+                let rep = format!(
+                    "      <Repetition><Interval>{}</Interval><Duration>{}</Duration></Repetition>\n",
+                    iso_minutes(interval_minutes),
+                    iso_minutes(duration_minutes)
+                );
+                for (h, m) in starts {
+                    triggers.push_str(&render_one(h, m, &rep));
+                }
+            }
+        }
+    }
+
+    let arguments = argv_for_entry(entry, ctx)
+        .split_first()
+        .map(|(cmd, rest)| (cmd.clone(), rest.join(" ")))
+        .map(|(cmd, args)| (xml_escape(&cmd), xml_escape(&args)))
+        .expect("argv always has a command");
+
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
+         <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
+         \x20 <RegistrationInfo><Description>OneBrain scheduled entry</Description></RegistrationInfo>\n\
+         \x20 <Triggers>\n{triggers}  </Triggers>\n\
+         \x20 <Principals>\n\
+         \x20   <Principal id=\"Author\">\n\
+         \x20     <UserId>__USER__</UserId>\n\
+         \x20     <LogonType>InteractiveToken</LogonType>\n\
+         \x20     <RunLevel>LeastPrivilege</RunLevel>\n\
+         \x20   </Principal>\n\
+         \x20 </Principals>\n\
+         \x20 <Settings>\n\
+         \x20   <Enabled>true</Enabled>\n\
+         \x20   <AllowStartOnDemand>true</AllowStartOnDemand>\n\
+         \x20   <StartWhenAvailable>true</StartWhenAvailable>\n\
+         \x20   <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n{expired_settings}\
+         \x20 </Settings>\n\
+         \x20 <Actions Context=\"Author\">\n\
+         \x20   <Exec><Command>{}</Command><Arguments>{}</Arguments></Exec>\n\
+         \x20 </Actions>\n\
+         </Task>\n",
+        arguments.0, arguments.1
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +692,192 @@ mod tests {
         assert!(
             trigger_timing(&entry).is_err(),
             "49 starts must exceed the cap"
+        );
+    }
+
+    // ── rendering ────────────────────────────────────────────────────────
+
+    use crate::scheduler::test_support::{
+        ctx_with_cli, daily_command_entry, daily_entry, foreign_command_entry, one_shot_entry,
+    };
+
+    #[test]
+    fn task_name_is_namespaced_under_onebrain() {
+        assert_eq!(task_name("daily"), r"\OneBrain\daily");
+    }
+
+    #[test]
+    fn every_weekday_number_maps_to_the_right_element() {
+        // MJ-2: nothing else catches an off-by-one here — the corpus case
+        // hardcodes <Friday/>, pinning the schema, not this mapping.
+        let names = [
+            "Sunday",
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+        ];
+        for (n, want) in names.iter().enumerate() {
+            assert_eq!(weekday_element(n as u32), *want, "cron weekday {n}");
+        }
+        assert_eq!(weekday_element(7), "Sunday", "cron 7 normalises to 0");
+    }
+
+    #[test]
+    fn every_month_number_maps_to_the_right_element() {
+        let names = [
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ];
+        for (i, want) in names.iter().enumerate() {
+            assert_eq!(month_element(i as u32 + 1), *want, "cron month {}", i + 1);
+        }
+    }
+
+    #[test]
+    fn recurring_entry_has_a_start_boundary_and_no_password() {
+        let ctx = ctx_with_cli(r"C:\Users\u\scoop\shims\onebrain.exe");
+        let out = generate_task_xml(&daily_entry(), &ctx);
+        assert!(out.contains("<CalendarTrigger>"), "{out}");
+        assert!(
+            out.contains("<StartBoundary>2000-01-01T09:00:00</StartBoundary>"),
+            "fixed epoch date, time from the cron: {out}"
+        );
+        assert!(
+            out.contains("<LogonType>InteractiveToken</LogonType>"),
+            "{out}"
+        );
+        assert!(
+            !out.to_lowercase().contains("password"),
+            "must never emit a password: {out}"
+        );
+    }
+
+    #[test]
+    fn the_renderer_emits_no_environment_element() {
+        // ExecAction admits only Command/Arguments/WorkingDirectory; emitting
+        // an environment element makes schtasks reject the document while
+        // every pure test still passes (round 2, B4).
+        let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        assert!(!generate_task_xml(&daily_entry(), &ctx).contains("<Environment"));
+    }
+
+    #[test]
+    fn command_mode_renders_the_entry_command_not_the_cli() {
+        // Round 4 M6: an earlier element table hardcoded <Command> to the CLI
+        // path — a `command: rsync` entry would have run onebrain with rsync's
+        // arguments.
+        let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        let out = generate_task_xml(&foreign_command_entry(), &ctx);
+        assert!(out.contains("<Command>rsync</Command>"), "{out}");
+        assert!(
+            !out.contains("--vault"),
+            "#263 R2: a non-onebrain command must not get --vault appended: {out}"
+        );
+    }
+
+    #[test]
+    fn command_mode_onebrain_gets_the_vault_appended() {
+        let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        let out = generate_task_xml(&daily_command_entry(), &ctx);
+        assert!(out.contains("<Command>onebrain</Command>"), "{out}");
+        assert!(
+            out.contains("search reindex --vault"),
+            "shared should_append_vault must fire for an onebrain command: {out}"
+        );
+    }
+
+    #[test]
+    fn one_shot_can_actually_expire() {
+        // All three requirements measured (spike E): EndBoundary or the
+        // trigger never expires; DeleteExpiredTaskAfter under <Settings>;
+        // clock runs from the EndBoundary.
+        let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        let out = generate_task_xml(&one_shot_entry(), &ctx);
+        assert!(out.contains("<TimeTrigger>"), "{out}");
+        assert!(
+            out.contains("<StartBoundary>2026-08-01T09:00:00</StartBoundary>"),
+            "{out}"
+        );
+        assert!(
+            out.contains("<EndBoundary>2026-08-01T09:01:00</EndBoundary>"),
+            "{out}"
+        );
+        let settings = out.split("<Settings>").nth(1).expect("no Settings block");
+        let settings = settings.split("</Settings>").next().unwrap();
+        assert!(
+            settings.contains("<DeleteExpiredTaskAfter>"),
+            "DeleteExpiredTaskAfter must sit inside Settings, not the trigger: {out}"
+        );
+        assert!(
+            !out.contains("/bin/sh"),
+            "no shell wrapper on Windows: {out}"
+        );
+    }
+
+    #[test]
+    fn month_weekday_renders_all_five_weeks() {
+        // MJ-1 / round 4 BL-4: <Week>1</Week> alone is a silent 5x under-fire
+        // that the shape test, the hand-written corpus, and the month-only
+        // .expect are all blind to. This is the layer that pins it.
+        let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        let out = generate_task_xml(
+            &crate::scheduler::test_support::entry_cron("0 17 * 3 5"),
+            &ctx,
+        );
+        assert!(
+            out.contains(
+                "<Weeks><Week>1</Week><Week>2</Week><Week>3</Week><Week>4</Week><Week>Last</Week></Weeks>"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("<DaysOfWeek><Friday /></DaysOfWeek>"), "{out}");
+        assert!(out.contains("<Months><March /></Months>"), "{out}");
+    }
+
+    #[test]
+    fn an_irregular_minute_list_renders_one_repeating_trigger_per_start() {
+        let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        let out = generate_task_xml(
+            &crate::scheduler::test_support::entry_cron("0,5,10 * * * *"),
+            &ctx,
+        );
+        assert_eq!(out.matches("<CalendarTrigger>").count(), 3, "{out}");
+        assert_eq!(
+            out.matches(
+                "<Repetition><Interval>PT1H</Interval><Duration>P1D</Duration></Repetition>"
+            )
+            .count(),
+            3,
+            "each start carries its own repetition (accept-multi-repetition): {out}"
+        );
+    }
+
+    #[test]
+    fn snapshot_recurring_skill() {
+        let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        insta::assert_snapshot!(generate_task_xml(&daily_entry(), &ctx));
+    }
+
+    #[test]
+    fn snapshot_is_stable_across_runs() {
+        // Guards against a clock creeping into StartBoundary.
+        let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        assert_eq!(
+            generate_task_xml(&daily_entry(), &ctx),
+            generate_task_xml(&daily_entry(), &ctx)
         );
     }
 }
