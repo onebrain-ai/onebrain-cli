@@ -140,13 +140,13 @@ fn recurring_skill_block(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Strin
 
 /// Strip a trailing `.exe` (Windows) from a filename and return the bare
 /// stem. `onebrain.exe` → `onebrain`; `rsync` → `rsync`.
-fn strip_exe(name: &str) -> &str {
+pub(crate) fn strip_exe(name: &str) -> &str {
     name.strip_suffix(".exe").unwrap_or(name)
 }
 
 /// The basename of a path/command string, with any `.exe` suffix stripped.
 /// Returns `None` when the path has no final component.
-fn command_basename(cmd: &str) -> Option<&str> {
+pub(crate) fn command_basename(cmd: &str) -> Option<&str> {
     Path::new(cmd)
         .file_name()
         .and_then(|s| s.to_str())
@@ -169,7 +169,7 @@ fn command_basename(cmd: &str) -> Option<&str> {
 /// `onebrain.exe`. We also match when the command's basename equals
 /// `ctx.skill_cli_path`'s basename — the exact binary launchd would exec
 /// for skill-mode — so a renamed/aliased install still resolves.
-fn command_is_onebrain(cmd: &str, ctx: &SchedulerContext) -> bool {
+pub(crate) fn command_is_onebrain(cmd: &str, ctx: &SchedulerContext) -> bool {
     let Some(cmd_base) = command_basename(cmd) else {
         return false;
     };
@@ -183,7 +183,7 @@ fn command_is_onebrain(cmd: &str, ctx: &SchedulerContext) -> bool {
 /// vault flag — `--vault`, `--vault-dir`, or their `=`-joined forms. When
 /// present we must NOT append our own `--vault`: respect the user's
 /// explicit choice and avoid a double-flag clobber (#263 R2 finding).
-fn args_have_explicit_vault(entry: &ScheduleEntry) -> bool {
+pub(crate) fn args_have_explicit_vault(entry: &ScheduleEntry) -> bool {
     match &entry.args {
         Some(Args::List(argv)) => argv.iter().any(|a| {
             a == "--vault"
@@ -198,7 +198,7 @@ fn args_have_explicit_vault(entry: &ScheduleEntry) -> bool {
 /// Whether `--vault <ctx.vault_path>` should be appended to a command-mode
 /// entry's argv: only when the command is onebrain (a generic binary would
 /// choke on the flag) AND the user hasn't already supplied a vault flag.
-fn should_append_vault(entry: &ScheduleEntry, ctx: &SchedulerContext) -> bool {
+pub(crate) fn should_append_vault(entry: &ScheduleEntry, ctx: &SchedulerContext) -> bool {
     command_is_onebrain(entry.command.as_deref().unwrap_or(""), ctx)
         && !args_have_explicit_vault(entry)
 }

@@ -1,0 +1,32 @@
+---
+source: crates/onebrain-core/src/scheduler/schtasks.rs
+assertion_line: 871
+expression: "generate_task_xml(&daily_entry(), &ctx)"
+---
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>OneBrain scheduled entry</Description></RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2000-01-01T09:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>__USER__</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <Enabled>true</Enabled>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+  </Settings>
+  <Actions Context="Author">
+    <Exec><Command>C:\bin\onebrain.exe</Command><Arguments>skill run --vault /v/ob-1 --skill /daily --harness claude</Arguments></Exec>
+  </Actions>
+</Task>
