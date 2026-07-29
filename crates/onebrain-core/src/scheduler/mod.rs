@@ -15,6 +15,7 @@
 //! - [`xml`] — XML escaping, shared by every renderer that emits XML
 //! - [`log_dir`] — machine-local log destination + in-vault detection (#315)
 //! - [`launchd`] — plist emitter (byte-for-byte parity with Bun's templating)
+//! - [`schtasks`] — Windows trigger translation (pure; corpus-backed)
 //! - [`log_paths`] — runtime stdout/stderr log path builder
 //! - [`error`] — `SchedulerError` (matched error strings for parity tests)
 
@@ -26,6 +27,7 @@ pub mod error;
 pub mod launchd;
 pub mod log_dir;
 pub mod log_paths;
+pub mod schtasks;
 pub mod types;
 pub mod xml;
 

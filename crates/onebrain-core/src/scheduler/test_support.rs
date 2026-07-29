@@ -91,3 +91,15 @@ pub fn foreign_command_entry() -> ScheduleEntry {
         ..Default::default()
     }
 }
+
+/// Skill-mode entry with an arbitrary cron. Built WITHOUT running
+/// `validate_cron`, which lets shape tests exercise defensive arms that
+/// validation normally makes unreachable (DOM+DOW). The single most-used
+/// fixture in the Windows-translation tests.
+pub fn entry_cron(cron: &str) -> ScheduleEntry {
+    ScheduleEntry {
+        cron: Some(cron.to_string()),
+        skill: Some("/daily".to_string()),
+        ..Default::default()
+    }
+}
