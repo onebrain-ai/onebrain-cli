@@ -342,7 +342,17 @@ mod tests {
             ("weekly", entry_cron("0 17 * * 5")),
             ("monthly", entry_cron("0 9 1 3 *")),
             ("one-shot", one_shot_entry()),
-            ("command", daily_command_entry()),
+            // systemd requires an ABSOLUTE ExecStart binary — verify rejects
+            // a bare name (measured: this exact case went red on main). The
+            // real CLI guarantees absoluteness via resolve_command_binary at
+            // register time, so the fixture models that contract, not the
+            // raw yaml. Same binary as skill_cli_path → the path-equality arm
+            // of command_is_onebrain keeps the --vault append covered.
+            ("command", {
+                let mut e = daily_command_entry();
+                e.command = Some("/bin/echo".to_string());
+                e
+            }),
         ] {
             std::fs::write(
                 dir.join(format!("accept-generated-{name}.service")),
