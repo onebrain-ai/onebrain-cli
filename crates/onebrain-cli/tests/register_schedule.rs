@@ -182,8 +182,8 @@ fn skill_and_command_with_same_basename_no_longer_collide() {
         .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
-        .stdout(predicate::str::contains("com.onebrain.echo"))
-        .stdout(predicate::str::contains("com.onebrain.echo-0-3-----0"));
+        .stdout(predicate::str::contains("---  echo  ---"))
+        .stdout(predicate::str::contains("---  echo-0-3-----0  ---"));
 }
 
 /// Two `command:` entries sharing a binary basename but with different args

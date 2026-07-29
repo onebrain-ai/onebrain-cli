@@ -588,10 +588,26 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "touches the real OS scheduler domain (Linux refuses until Task 9b) — run explicitly (Task 8's CI job does), never in the default suite"]
+    #[ignore = "touches the real OS scheduler domain — run explicitly (Task 8's CI job and the 9b VM audit do), never in the default suite"]
     fn install_then_remove_round_trips_through_the_backend() {
+        // macOS/Windows isolate under a tempdir home because their install
+        // mechanisms take explicit paths/documents (`launchctl bootstrap
+        // <plist>`, `schtasks /XML <file>`). Linux cannot be fooled that way:
+        // `systemctl --user enable <name>` resolves against the REAL user
+        // manager's search path, which never sees a tempdir $HOME — measured
+        // on the 9b VM audit, the tempdir variant dies with "Unit not
+        // found". So the systemd leg runs against the real unit directory,
+        // leaning on the run-unique label + teardown that were already
+        // mandatory here (B2).
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
         let home = tempfile::tempdir().unwrap();
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
         let ctx = test_support::ctx_in(home.path());
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let real_home = std::env::var_os("HOME").expect("HOME must be set");
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let ctx = test_support::ctx_in(std::path::Path::new(&real_home));
+
         let label = unique_label("roundtrip");
         let entry = test_support::entry_labelled(&label);
 
@@ -608,6 +624,9 @@ mod tests {
             );
             #[cfg(not(windows))]
             assert!(artifact.exists(), "install must write the artifact");
+            // Not on Linux: output capture is the journal's job (BL-1), so
+            // the systemd arm deliberately creates no log directory.
+            #[cfg(not(all(unix, not(target_os = "macos"))))]
             assert!(
                 ctx.log_base_path.is_dir(),
                 "install must create the log dir — launchd opens the log paths before exec"
