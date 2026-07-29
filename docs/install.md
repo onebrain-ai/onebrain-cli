@@ -67,7 +67,7 @@ cargo build --release -p onebrain-cli
 # → target/release/onebrain
 ```
 
-Requires a recent stable Rust toolchain (`rustup default stable`). The only `unsafe` in OneBrain crates is a single `libc::getuid()` call (the launchd plist UID); the workspace otherwise builds cleanly on Linux, macOS, and Windows.
+Requires a recent stable Rust toolchain (`rustup default stable`). The only `unsafe` in OneBrain crates is a single `libc::getuid()` call (the scheduler context UID); the workspace otherwise builds cleanly on Linux, macOS, and Windows.
 
 ## Security & trust model
 

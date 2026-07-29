@@ -1,6 +1,8 @@
-//! Launchd plist emitter. Mirrors Bun `src/lib/scheduler/launchd.ts`
-//! byte-for-byte for **skill-mode** plists — every newline and indent space
-//! must match for the Layer-4 parity test against the Bun v2.3.3 binary.
+//! Launchd plist emitter — the macOS renderer behind the scheduler backend
+//! seam (`backend.rs`; Windows renders via `schtasks.rs`, Linux via
+//! `systemd.rs`). The byte format originated as a byte-parity port of Bun
+//! v2.3.3's `launchd.ts` and is now pinned by snapshot tests here — every
+//! newline and indent space is contract.
 //!
 //! **Command-mode is a deliberate divergence from Bun (#263):** onebrain
 //! command-mode entries now append `--vault <path>` to their argv (launchd
