@@ -8,9 +8,8 @@
 //! makes `cargo test --workspace` fail there for every commit until its real
 //! backend lands — the round-4 BL-A failure, which is the same class as B1
 //! (gating `uid`), reintroduced one task after the plan congratulated itself
-//! for avoiding it. The non-macOS arm below is a deliberately
-//! behaviour-preserving placeholder, replaced by Task 6 (Linux refuses) and
-//! Task 7c (Windows gets schtasks).
+//! for avoiding it. All three arms are real backends now: launchd (macOS),
+//! Task Scheduler (Windows), systemd user timers (Linux).
 
 use crate::scheduler::context::SchedulerContext;
 use crate::scheduler::error::SchedulerError;
@@ -66,8 +65,15 @@ pub fn render_preview(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Option<S
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let _ = (entry, ctx);
-        None
+        // Both units, labelled: a dry run must show everything install would
+        // write, and which file each block lands in.
+        let label = crate::scheduler::launchd::label_for_entry(entry);
+        let base = crate::scheduler::systemd::unit_base_name(&label);
+        Some(format!(
+            "# {base}.service\n{}\n# {base}.timer\n{}",
+            crate::scheduler::systemd::generate_service_unit(entry, ctx),
+            crate::scheduler::systemd::generate_timer_unit(entry, ctx)
+        ))
     }
 }
 
@@ -196,40 +202,140 @@ mod imp {
 #[cfg(all(unix, not(target_os = "macos")))]
 mod imp {
     use super::*;
+    use crate::scheduler::systemd::{
+        generate_service_unit, generate_timer_unit, unit_base_name, unit_dir,
+    };
+    use std::process::Command;
 
-    /// Linux refuses instead of lying (#313). The placeholder this replaces
-    /// wrote a launchd plist into a `~/Library` no Linux convention owns and
-    /// `list` then reported it `\u{2713}` — worse than Windows' honest `\u{2717}`,
-    /// because the file really was on disk. The systemd backend (Task 9b)
-    /// replaces this arm; until then, failing loudly beats succeeding
-    /// falsely — the release's whole thesis.
+    /// Same test-isolation kill-switch as the other arms, same incident
+    /// behind it: `onebrain-<label>` unit names live in the user's global
+    /// systemd namespace, and an integration test running the real binary
+    /// with `HOME=tempdir` would still `enable --now` the REAL
+    /// `onebrain-daily.timer` in the operator's user manager.
+    fn activation_disabled() -> bool {
+        std::env::var_os("ONEBRAIN_SCHEDULER_NO_ACTIVATE").is_some()
+    }
+
+    fn systemctl(args: &[&str]) -> Result<std::process::Output, SchedulerError> {
+        Command::new("systemctl")
+            .arg("--user")
+            .args(args)
+            .output()
+            .map_err(|e| SchedulerError::BackendCommand {
+                command: format!("systemctl --user {}", args.join(" ")),
+                status: "spawn failed".to_string(),
+                stderr: e.to_string(),
+            })
+    }
+
+    fn run_systemctl(args: &[&str]) -> Result<(), SchedulerError> {
+        let out = systemctl(args)?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(SchedulerError::BackendCommand {
+                command: format!("systemctl --user {}", args.join(" ")),
+                status: out.status.to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            })
+        }
+    }
+
+    /// Write both units, then make systemd actually run the timer:
+    /// `daemon-reload` → `enable` (the timers.target symlink, so it starts
+    /// at login) → `restart` (starts it NOW and — unlike `enable --now`,
+    /// which is a no-op on an already-running timer — picks up a regenerated
+    /// OnCalendar immediately, the same re-registration semantics as the
+    /// macOS arm's bootout→bootstrap pair).
+    ///
+    /// Failures surface verbatim. A Linux box where `systemctl --user` does
+    /// not work (no systemd, no user session) gets a loud error, not
+    /// write-and-report-success — failing loudly beats succeeding falsely,
+    /// the release's whole thesis (#313).
+    ///
+    /// No `ensure_log_dir` here: output capture is the journal's job by
+    /// design (BL-1) — no unit line references a log path, so there is no
+    /// directory whose absence could re-create the exit-78 class of bug.
     pub fn install(
-        _entry: &ScheduleEntry,
-        _ctx: &SchedulerContext,
+        entry: &ScheduleEntry,
+        ctx: &SchedulerContext,
     ) -> Result<PathBuf, SchedulerError> {
-        Err(SchedulerError::UnsupportedPlatform {
-            os: std::env::consts::OS,
-        })
+        let label = crate::scheduler::launchd::label_for_entry(entry);
+        let base = unit_base_name(&label);
+        let dir = unit_dir(&ctx.homedir);
+        std::fs::create_dir_all(&dir)?;
+        let timer_path = dir.join(format!("{base}.timer"));
+        std::fs::write(
+            dir.join(format!("{base}.service")),
+            generate_service_unit(entry, ctx),
+        )?;
+        std::fs::write(&timer_path, generate_timer_unit(entry, ctx))?;
+        if activation_disabled() {
+            return Ok(timer_path);
+        }
+        run_systemctl(&["daemon-reload"])?;
+        let timer_unit = format!("{base}.timer");
+        run_systemctl(&["enable", &timer_unit])?;
+        run_systemctl(&["restart", &timer_unit])?;
+        Ok(timer_path)
     }
 
-    /// Nothing can have been installed by us; removing is a clean no-op so
-    /// `--remove` and `plugin update` never fail on a platform with no
-    /// backend.
-    pub fn remove(_label_safe: &str, _ctx: &SchedulerContext) -> Result<bool, SchedulerError> {
-        Ok(false)
+    /// `disable --now` BEFORE deleting (a live timer with its units gone
+    /// keeps firing until reload — the Linux spelling of the `--remove` lie),
+    /// then remove both units, then `daemon-reload` so the removal is
+    /// observed. Missing units → Ok(false).
+    pub fn remove(label_safe: &str, ctx: &SchedulerContext) -> Result<bool, SchedulerError> {
+        let base = unit_base_name(label_safe);
+        if !activation_disabled() {
+            // Failure ignored — the timer may simply not be loaded.
+            let _ = systemctl(&["disable", "--now", &format!("{base}.timer")]);
+        }
+        let dir = unit_dir(&ctx.homedir);
+        let mut removed = false;
+        for name in [format!("{base}.timer"), format!("{base}.service")] {
+            let path = dir.join(name);
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+                removed = true;
+            }
+        }
+        if removed && !activation_disabled() {
+            let _ = systemctl(&["daemon-reload"]);
+        }
+        Ok(removed)
     }
 
-    /// Never \u{2713}: a platform with no backend has nothing active by
-    /// definition, whatever files may exist on disk.
+    /// Ask systemd, not the filesystem (#312): `is-active <base>.timer` —
+    /// NOT `is-enabled`, which reports yes for a stopped-but-symlinked timer
+    /// (MJ-7's Linux sibling). Fall back to file existence: present →
+    /// Inactive, absent → Absent. A missing `systemctl` binary lands in the
+    /// same fallback rather than erroring.
     pub fn is_installed(
-        _label_safe: &str,
-        _ctx: &SchedulerContext,
+        label_safe: &str,
+        ctx: &SchedulerContext,
     ) -> Result<InstallState, SchedulerError> {
-        Ok(InstallState::Absent)
+        let base = unit_base_name(label_safe);
+        let active = !activation_disabled()
+            && systemctl(&["is-active", &format!("{base}.timer")])
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+        if active {
+            return Ok(InstallState::Active);
+        }
+        Ok(
+            if unit_dir(&ctx.homedir)
+                .join(format!("{base}.timer"))
+                .exists()
+            {
+                InstallState::Inactive
+            } else {
+                InstallState::Absent
+            },
+        )
     }
 
     pub fn describe() -> &'static str {
-        "none (unsupported platform — systemd backend lands in v3.4.20's Linux chain)"
+        "systemd user timers"
     }
 }
 
@@ -402,24 +508,47 @@ mod tests {
     use super::*;
     use crate::scheduler::test_support;
 
+    /// The whole lifecycle with activation disabled — filesystem-only, so it
+    /// runs in the default suite without touching the user's real systemd
+    /// manager. The systemctl legs are covered by the VM verify (#314) and
+    /// the explicit `--ignored` round-trip above.
     #[test]
     #[cfg(all(unix, not(target_os = "macos")))]
-    fn linux_refuses_instead_of_writing_a_plist_nothing_reads() {
+    fn linux_units_round_trip_on_disk_without_activation() {
+        // No guard/lock needed: this is the only in-process test that
+        // mutates this var on Linux, and it never unsets it — the kill-switch
+        // is exactly what every other env-reading path here wants anyway.
+        std::env::set_var("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1");
         let home = tempfile::tempdir().unwrap();
         let ctx = test_support::ctx_in(home.path());
+        let entry = test_support::daily_entry();
 
-        let err = install(&test_support::daily_entry(), &ctx).unwrap_err();
+        let artifact = install(&entry, &ctx).unwrap();
+        let dir = crate::scheduler::systemd::unit_dir(&ctx.homedir);
+        assert_eq!(artifact, dir.join("onebrain-daily.timer"));
+        assert!(artifact.exists(), "timer unit must be written");
         assert!(
-            matches!(err, SchedulerError::UnsupportedPlatform { .. }),
-            "got {err:?}"
+            dir.join("onebrain-daily.service").exists(),
+            "service unit must be written"
         );
         assert!(
             !home.path().join("Library").exists(),
             "must not create a macOS-only ~/Library on Linux"
         );
+        assert_eq!(
+            is_installed("daily", &ctx).unwrap(),
+            InstallState::Inactive,
+            "on disk but not enabled — never \u{2713} from file existence alone"
+        );
+
+        let preview = render_preview(&entry, &ctx).unwrap();
+        assert!(preview.contains("[Timer]"), "{preview}");
+        assert!(preview.contains("OnCalendar="), "{preview}");
+
+        assert!(remove("daily", &ctx).unwrap());
+        assert!(!artifact.exists() && !dir.join("onebrain-daily.service").exists());
         assert_eq!(is_installed("daily", &ctx).unwrap(), InstallState::Absent);
-        assert!(!remove("daily", &ctx).unwrap(), "remove is a clean no-op");
-        assert!(render_preview(&test_support::daily_entry(), &ctx).is_none());
+        assert!(!remove("daily", &ctx).unwrap(), "second remove is a no-op");
     }
 
     #[test]

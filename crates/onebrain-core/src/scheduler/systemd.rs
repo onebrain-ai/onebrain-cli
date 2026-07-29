@@ -308,6 +308,28 @@ mod tests {
         assert!(!foreign.contains("--vault"), "#263 R2: {foreign}");
     }
 
+    /// systemd rejects a relative ExecStart binary (measured, #330 — that
+    /// exact case went red on main). The CLI resolves command binaries at
+    /// register time; given that contract, both modes must yield an
+    /// absolute ExecStart.
+    #[test]
+    fn execstart_is_absolute_for_resolved_entries() {
+        let ctx = ctx_with_cli("/usr/local/bin/onebrain");
+        let resolved_command = {
+            let mut e = daily_command_entry();
+            e.command = Some("/usr/bin/rsync".to_string());
+            e
+        };
+        for entry in [daily_entry(), one_shot_entry(), resolved_command] {
+            let out = generate_service_unit(&entry, &ctx);
+            let exec = out
+                .lines()
+                .find(|l| l.starts_with("ExecStart="))
+                .expect("service must have ExecStart");
+            assert!(exec.starts_with("ExecStart=/"), "{exec}");
+        }
+    }
+
     #[test]
     fn args_with_spaces_are_quoted() {
         let mut ctx = ctx_with_cli("/usr/local/bin/onebrain");
