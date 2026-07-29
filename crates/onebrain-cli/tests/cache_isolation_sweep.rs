@@ -433,3 +433,31 @@ fn every_binary_invoking_test_pins_the_cache_dir() {
         offenders.join("\n")
     );
 }
+
+/// #305: the two isolation helpers are the single place the test-collection
+/// marker var is exported — the engine stamps `.onebrain-test-collection`
+/// into every collection it creates under that var, which is what makes any
+/// future cache-root cleanup an enumeration instead of a name-based guess.
+/// If either helper loses the export, collections silently go back to being
+/// unmarked; pin the export at the source level, next to the sweep that pins
+/// the helpers' use.
+#[test]
+fn both_isolation_helpers_export_the_test_collection_marker() {
+    let marker = "ONEBRAIN_TEST_COLLECTION_MARKER";
+    let support = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/mod.rs"),
+    )
+    .unwrap();
+    let daemon = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/daemon.rs"),
+    )
+    .unwrap();
+    assert!(
+        support.contains(marker),
+        "tests/support::scratch_cache_root no longer exports {marker}"
+    );
+    assert!(
+        daemon.contains(marker),
+        "daemon's isolate_cache_root no longer exports {marker}"
+    );
+}

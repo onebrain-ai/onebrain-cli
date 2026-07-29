@@ -47,6 +47,12 @@ use std::path::PathBuf;
 /// collection name unique to that test. Two such tests would otherwise race
 /// over one index, with nothing in the failure pointing at the cause.
 pub fn scratch_cache_root() -> PathBuf {
+    // #305: export the test-collection marker for every binary this test
+    // process spawns — the engine then stamps `.onebrain-test-collection`
+    // into any collection dir it creates, making residue enumerable instead
+    // of guessable. Process-wide on purpose: children inherit it no matter
+    // which helper (or bare `.env`) wired the cache root.
+    std::env::set_var("ONEBRAIN_TEST_COLLECTION_MARKER", "1");
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("search-cache");
     // Best-effort: consumers `create_dir_all` what they need anyway, and a
     // failure here must not panic a test for a reason unrelated to its subject.
