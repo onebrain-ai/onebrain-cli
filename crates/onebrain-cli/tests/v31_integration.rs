@@ -668,6 +668,12 @@ fn plugin_update_outside_vault_exits_64_not_101() {
     out.failure().code(64);
 }
 
+// Unix-only: spawns `bash` for the `| head -c 0` pipeline. windows-latest
+// CI only ever passed this by COINCIDENCE (Git Bash on the runner's
+// PATH); a real Windows box has no bash and the spawn dies with
+// program-not-found — measured on the v3.4.20 ARM64 audit VM. Broken-pipe
+// (SIGPIPE) semantics are unix-flavored anyway.
+#[cfg(unix)]
 #[test]
 fn plugin_update_broken_pipe_does_not_silently_succeed() {
     // Round 1 A4: previously the text-mode summary used `let _ = emit(...)`
