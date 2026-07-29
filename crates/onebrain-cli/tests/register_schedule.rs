@@ -182,8 +182,8 @@ fn skill_and_command_with_same_basename_no_longer_collide() {
         .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
-        .stdout(predicate::str::contains("com.onebrain.echo"))
-        .stdout(predicate::str::contains("com.onebrain.echo-0-3-----0"));
+        .stdout(predicate::str::contains("---  echo  ---"))
+        .stdout(predicate::str::contains("---  echo-0-3-----0  ---"));
 }
 
 /// Two `command:` entries sharing a binary basename but with different args
@@ -210,8 +210,8 @@ fn command_mode_entries_same_binary_different_args_no_collision() {
         .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
-        .stdout(predicate::str::contains("com.onebrain.echo-hello"))
-        .stdout(predicate::str::contains("com.onebrain.echo-world"));
+        .stdout(predicate::str::contains("---  echo-hello  ---"))
+        .stdout(predicate::str::contains("---  echo-world  ---"));
 }
 
 /// Two `command:` entries with IDENTICAL command + args + cron are a
@@ -747,9 +747,9 @@ fn registration_writes_plist_file() {
 /// because this harness disables activation — present-but-not-loaded → ⚠.
 /// The old test asserted ✓ here, which was precisely the lie #312 fixes:
 /// a file on disk is not a scheduled job.
-// macOS-only since Task 6: registers/renders launchd artifacts, which
-// Linux now refuses (#313) and Windows renders differently.
-#[cfg(target_os = "macos")]
+// Unix-only: macOS and Linux share the artifact-on-disk model this asserts;
+// Windows persists no file, so ⚠ can never arise there (decision 4).
+#[cfg(unix)]
 #[test]
 fn status_marks_installed_and_uninstalled() {
     let v = tempdir().unwrap();
@@ -784,16 +784,11 @@ fn status_marks_installed_and_uninstalled() {
         .assert()
         .success();
 
-    // After registration, with activation disabled by the harness:
-    //  - macOS (real activation semantics, #312): artifact on disk but
-    //    launchd not running it → Inactive (⚠). Asserting ✓ here would
-    //    re-assert the pre-#312 file-existence lie.
-    //  - other platforms (placeholder arm until Tasks 6/7c): is_installed is
-    //    still file-existence, so present truthfully reads Active (✓).
-    #[cfg(target_os = "macos")]
+    // After registration, with activation disabled by the harness: artifact
+    // on disk but the OS scheduler (launchd / systemd) not running it →
+    // Inactive (⚠). Asserting ✓ here would re-assert the pre-#312
+    // file-existence lie on either platform.
     let expected = "\u{26a0}";
-    #[cfg(not(target_os = "macos"))]
-    let expected = "\u{2713}";
     Command::cargo_bin("onebrain")
         .unwrap()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
@@ -913,13 +908,14 @@ fn pathological_cron_expansion_rejected() {
         .stderr(predicate::str::contains("exceeding the cap"));
 }
 
-/// Linux (#313): `register` refuses loudly instead of writing a plist
-/// nothing reads. Drives the full resolve→collision→install path through
-/// the UnsupportedPlatform arm — the coverage the re-gated tests stopped
-/// providing on the one runner that measures (MJ-9, option 1).
+/// Linux (#314): `register` writes both systemd user units. Drives the full
+/// resolve→collision→install path through the systemd arm on the one runner
+/// that measures (MJ-9, option 1); the activation legs (`daemon-reload`,
+/// `enable`, `restart`) are covered by the VM verify, since the harness
+/// disables activation.
 #[cfg(all(unix, not(target_os = "macos")))]
 #[test]
-fn linux_register_refuses_with_a_clear_error() {
+fn linux_register_writes_systemd_user_units() {
     let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n");
     let home = tempdir().unwrap();
     Command::cargo_bin("onebrain")
@@ -930,20 +926,60 @@ fn linux_register_refuses_with_a_clear_error() {
         .env("HOME", home.path())
         .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("no scheduler backend"));
+        .success()
+        .stdout(predicate::str::contains("systemd user timers"));
+    let unit_dir = home.path().join(".config/systemd/user");
+    assert!(unit_dir.join("onebrain-daily.timer").exists());
+    assert!(unit_dir.join("onebrain-daily.service").exists());
     assert!(
         !home.path().join("Library").exists(),
         "must not create a macOS-only ~/Library on Linux"
     );
 }
 
-/// Linux `--dry-run` validates the entry and says plainly that no artifact
-/// can be produced here — it neither errors (a dry run that fails teaches
-/// nothing) nor prints another OS's format [M5].
+/// The #330 lesson pinned end-to-end: systemd refuses a relative ExecStart
+/// binary (measured — that exact case went red on main), so the unit
+/// actually written for a bare command name must carry the absolute path
+/// `resolve_command_binary` found at register time.
 #[cfg(all(unix, not(target_os = "macos")))]
 #[test]
-fn linux_dry_run_prints_an_honest_note() {
+fn linux_written_service_unit_has_an_absolute_execstart() {
+    let v = write_skill_vault("schedule:\n  - cron: \"0 3 * * 0\"\n    command: sh\n");
+    let home = tempdir().unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
+        .args(["register-schedule"])
+        .current_dir(v.path())
+        .env("HOME", home.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
+        .assert()
+        .success();
+    // Find the written unit rather than hard-coding the label: command-mode
+    // labels carry a discriminator (args/cron/at), so the exact filename is
+    // `command_discriminator`'s business, not this test's.
+    let unit_dir = home.path().join(".config/systemd/user");
+    let service = std::fs::read_dir(&unit_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "service"))
+        .expect("register must write a .service unit");
+    let text = std::fs::read_to_string(&service).unwrap();
+    let exec = text
+        .lines()
+        .find(|l| l.starts_with("ExecStart="))
+        .expect("service must have ExecStart");
+    assert!(
+        exec.starts_with("ExecStart=/"),
+        "systemd rejects relative binaries: {exec}"
+    );
+}
+
+/// Linux `--dry-run` prints the real artifacts — both units, labelled per
+/// file — and writes nothing [M5].
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn linux_dry_run_prints_both_units() {
     let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n");
     let home = tempdir().unwrap();
     Command::cargo_bin("onebrain")
@@ -955,6 +991,11 @@ fn linux_dry_run_prints_an_honest_note() {
         .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
-        .stdout(predicate::str::contains("no scheduler backend on"))
-        .stdout(predicate::str::contains("com.onebrain.daily"));
+        .stdout(predicate::str::contains("# onebrain-daily.service"))
+        .stdout(predicate::str::contains("# onebrain-daily.timer"))
+        .stdout(predicate::str::contains("OnCalendar=*-*-* 09:00:00"));
+    assert!(
+        !home.path().join(".config/systemd/user").exists(),
+        "a dry run must write nothing"
+    );
 }

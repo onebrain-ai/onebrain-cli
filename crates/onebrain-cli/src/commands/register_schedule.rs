@@ -164,14 +164,19 @@ fn run_with(
                 // XML on Windows, and an honest note where no backend exists
                 // — a dry run that errors teaches nothing, and printing
                 // another OS's format teaches the wrong thing.
+                // Headed by the entry's label, not `artifact_key` — that key
+                // is the launchd plist path on every platform (a collision
+                // identity, not a location), and displaying it printed a
+                // `~/Library/...plist` banner over systemd units (caught by
+                // the 9b Linux audit).
+                let label = label_for_entry(entry);
                 match backend::render_preview(entry, &ctx) {
                     Some(artifact) => {
-                        println!("---  {}  ---", target.display());
+                        println!("---  {label}  ---");
                         println!("{artifact}");
                     }
                     None => println!(
-                        "---  {}  ---\n(no scheduler backend on {}; entry validates but no artifact can be produced here)",
-                        target.display(),
+                        "---  {label}  ---\n(no scheduler backend on {}; entry validates but no artifact can be produced here)",
                         std::env::consts::OS
                     ),
                 }
@@ -656,11 +661,13 @@ fn remove_all(vault: &Path) -> Result<()> {
 /// escaped through once.
 fn remove_entries(config: &ScheduleConfig, ctx: &SchedulerContext) -> Result<()> {
     for entry in &config.schedule {
-        let target = backend::artifact_key(entry, ctx);
-        if backend::remove(&label_for_entry(entry), ctx)
-            .with_context(|| format!("remove {}", target.display()))?
-        {
-            println!("\u{2713} Removed {}", target.display());
+        // Report the label, not `artifact_key` — that key is the launchd
+        // plist path on every platform BY DESIGN (a collision identity, not
+        // a location), so displaying it printed a `~/Library/...plist` that
+        // never existed on Linux (caught by the 9b VM verify).
+        let label = label_for_entry(entry);
+        if backend::remove(&label, ctx).with_context(|| format!("remove schedule '{label}'"))? {
+            println!("\u{2713} Removed schedule '{label}'");
         }
     }
     Ok(())
