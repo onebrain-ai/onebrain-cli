@@ -149,6 +149,35 @@ pub fn persist_search_key(vault_root: &Path, key: &str, value: &str) -> anyhow::
         }
     };
 
+    // #333: self-document the key we just wrote. The fresh template carries
+    // a comment for every key it EMITS, but `search.collection` is unset by
+    // design and only materializes here (first `search reindex` persists the
+    // generated name) — so the very first `doctor` run on a pristine vault
+    // flagged the one key the CLI itself wrote. Same mechanism as doctor
+    // --fix's comment backfill: comment directly above the key, never
+    // replacing a user's own comment (`insert_comment_above` no-ops then).
+    // Scoped to `collection` alone: it is the only search key the CLI
+    // invents and writes of its own accord — other keys (`embed_model` via
+    // `search model set`) keep the long-standing value-only contract, pinned
+    // by `persist_search_key_preserves_comments`.
+    let updated = match crate::init::config_key_docs()
+        .iter()
+        .find(|d| d.segments == ["search", "collection"])
+    {
+        Some(doc)
+            if key == "collection"
+                && crate::yaml_edit::key_lacks_comment(&updated, &["search", "collection"]) =>
+        {
+            crate::yaml_edit::insert_comment_above(
+                &updated,
+                &["search", "collection"],
+                &doc.comment,
+            )
+            .unwrap_or(updated)
+        }
+        _ => updated,
+    };
+
     // Defense-in-depth: back up the existing config before overwriting it.
     // Hard precondition — refuse the write if the backup couldn't be made.
     backup_config_file(&path)
@@ -189,6 +218,41 @@ pub fn remove_search_key(vault_root: &Path, key: &str) -> anyhow::Result<bool> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// #333 regression: the collection name the CLI itself persists must
+    /// arrive self-documented, so a pristine vault's first `doctor` run is
+    /// clean instead of flagging the one key OneBrain wrote.
+    #[test]
+    fn persisted_collection_carries_its_doc_comment() {
+        let dir = tempdir().unwrap();
+        persist_search_key(dir.path(), "collection", "myvault-abc123").unwrap();
+        let yaml = std::fs::read_to_string(dir.path().join("onebrain.yml")).unwrap();
+        assert!(
+            !crate::yaml_edit::key_lacks_comment(&yaml, &["search", "collection"]),
+            "collection must have a comment directly above it:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("# Collection name binding this vault to its index"),
+            "and it must be the template's own doc text:\n{yaml}"
+        );
+    }
+
+    /// A user's own comment above the key is never replaced (the
+    /// insert_comment_above contract, re-asserted through this caller).
+    #[test]
+    fn persist_never_replaces_a_users_own_comment() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("onebrain.yml"),
+            "search:\n  # my precious note\n  collection: old\n",
+        )
+        .unwrap();
+        persist_search_key(dir.path(), "collection", "new-name").unwrap();
+        let yaml = std::fs::read_to_string(dir.path().join("onebrain.yml")).unwrap();
+        assert!(yaml.contains("# my precious note"), "{yaml}");
+        assert!(!yaml.contains("# Collection name binding"), "{yaml}");
+        assert!(yaml.contains("collection: new-name"), "{yaml}");
+    }
 
     #[test]
     fn persist_search_key_creates_fresh_config() {
