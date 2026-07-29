@@ -1281,20 +1281,32 @@ pub(crate) fn confine_reindex_path(vault_root: &Path, rel: &str) -> Result<Strin
 
 /// File mtime as whole nanoseconds since the Unix epoch (`None` if unavailable).
 /// #335: guarantee the mtime-based rev advanced past `prev`. A no-op when
-/// the filesystem already moved the clock; otherwise sets mtime to
-/// `prev + 1ns`. Idempotent and monotonic — never moves mtime backwards.
+/// the filesystem already moved the clock; otherwise bumps mtime past
+/// `prev` with escalating deltas, VERIFYING each write by reading back —
+/// filesystems round sub-granularity timestamps (NTFS stores 100 ns ticks,
+/// so a naive `+1 ns` reads back unchanged — measured on the ARM64 audit
+/// VM; HFS+ is whole seconds). Idempotent and monotonic: once the mtime
+/// reads back greater than `prev`, later calls with the same `prev` no-op.
 fn ensure_rev_advanced(path: &Path, prev: Option<u128>) -> std::io::Result<()> {
     let Some(prev) = prev else { return Ok(()) };
-    if mtime_nanos(path).is_some_and(|now| now > prev) {
-        return Ok(());
+    let prev_time = std::time::UNIX_EPOCH
+        + std::time::Duration::new((prev / 1_000_000_000) as u64, (prev % 1_000_000_000) as u32);
+    for delta_ns in [1u64, 100, 1_000_000, 1_000_000_000] {
+        if mtime_nanos(path).is_some_and(|now| now > prev) {
+            return Ok(());
+        }
+        std::fs::File::options()
+            .write(true)
+            .open(path)?
+            .set_modified(prev_time + std::time::Duration::from_nanos(delta_ns))?;
     }
-    let bumped = std::time::UNIX_EPOCH
-        + std::time::Duration::new((prev / 1_000_000_000) as u64, (prev % 1_000_000_000) as u32)
-        + std::time::Duration::from_nanos(1);
-    std::fs::File::options()
-        .write(true)
-        .open(path)?
-        .set_modified(bumped)
+    if mtime_nanos(path).is_some_and(|now| now > prev) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "mtime would not advance past the previous revision",
+        ))
+    }
 }
 
 fn mtime_nanos(path: &Path) -> Option<u128> {
