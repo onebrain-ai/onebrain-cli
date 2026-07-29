@@ -381,7 +381,10 @@ mod imp {
     }
 }
 
-/// Shared by the remaining unix arms while the placeholder exists; Task 6 specialises Linux.
+/// The plist writer — used only by the macOS arm now: Windows renders
+/// task XML and Linux refuses (#313). Gated so the Linux build, which is
+/// the one `-D warnings` leg that measures, sees no dead code.
+#[cfg(target_os = "macos")]
 fn write_plist(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Result<PathBuf, SchedulerError> {
     ensure_log_dir(ctx)?;
     let label = crate::scheduler::launchd::label_for_entry(entry);
