@@ -1,0 +1,7 @@
+[Unit]
+Description=OneBrain scheduled entry (daily)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/echo skill run --vault /v/ob-1 --skill /daily --harness claude
+ExecStopPost=/bin/sh -c 'systemctl --user --no-block disable --now onebrain-daily.timer; rm -f "$HOME/.config/systemd/user/onebrain-daily.timer" "$HOME/.config/systemd/user/onebrain-daily.service"; systemctl --user --no-block daemon-reload'

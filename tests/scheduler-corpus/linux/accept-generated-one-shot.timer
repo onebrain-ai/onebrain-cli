@@ -1,0 +1,9 @@
+[Unit]
+Description=OneBrain scheduled entry timer (daily)
+
+[Timer]
+OnCalendar=2026-08-01 09:00:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target
