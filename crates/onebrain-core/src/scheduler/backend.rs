@@ -54,14 +54,19 @@ pub fn describe() -> &'static str {
 /// What `--dry-run` prints for this entry on this platform, or `None` when
 /// the platform has no backend (a dry run that errors teaches nothing, and
 /// printing another OS's format teaches the wrong thing) [M5].
-pub fn render_preview(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Option<String> {
+pub fn render_preview(
+    entry: &ScheduleEntry,
+    ctx: &SchedulerContext,
+) -> Result<Option<String>, SchedulerError> {
     #[cfg(target_os = "macos")]
     {
-        Some(crate::scheduler::launchd::generate_plist(entry, ctx))
+        Ok(Some(crate::scheduler::launchd::generate_plist(entry, ctx)))
     }
     #[cfg(windows)]
     {
-        Some(crate::scheduler::schtasks::generate_task_xml(entry, ctx))
+        Ok(Some(crate::scheduler::schtasks::generate_task_xml(
+            entry, ctx,
+        )?))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -69,11 +74,11 @@ pub fn render_preview(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Option<S
         // write, and which file each block lands in.
         let label = crate::scheduler::launchd::label_for_entry(entry);
         let base = crate::scheduler::systemd::unit_base_name(&label);
-        Some(format!(
+        Ok(Some(format!(
             "# {base}.service\n{}\n# {base}.timer\n{}",
             crate::scheduler::systemd::generate_service_unit(entry, ctx),
             crate::scheduler::systemd::generate_timer_unit(entry, ctx)
-        ))
+        )))
     }
 }
 
@@ -89,6 +94,22 @@ pub fn artifact_key(entry: &ScheduleEntry, ctx: &SchedulerContext) -> PathBuf {
     plist_path(&label, &ctx.homedir)
 }
 
+/// Test-isolation kill-switch shared by every backend arm AND by the CLI's
+/// legacy-plist cleanup path — NOT a user feature.
+///
+/// Labels/task names/unit names are process- or user-global namespaces: an
+/// integration test running the real binary with `HOME=tempdir` still
+/// targets the REAL scheduler entries on activate/deactivate. The first
+/// suite run after macOS activation landed hijacked the operator's real
+/// `/daily` (bootstrapped it from a since-deleted tempdir) and deleted its
+/// plist. The integration harness sets this for every spawned binary;
+/// nothing else should. The 37th call site that spawned a scheduler command
+/// WITHOUT checking this (the legacy-plist bootout) is why it is `pub` and
+/// shared rather than copied per arm.
+pub fn activation_disabled() -> bool {
+    std::env::var_os("ONEBRAIN_SCHEDULER_NO_ACTIVATE").is_some()
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
@@ -96,19 +117,6 @@ mod imp {
 
     fn service_target(label_safe: &str, ctx: &SchedulerContext) -> String {
         format!("gui/{}/com.onebrain.{label_safe}", ctx.uid)
-    }
-
-    /// Test-isolation kill-switch, NOT a user feature.
-    ///
-    /// Labels are a process-global launchd namespace: an integration test
-    /// running the real binary with `HOME=tempdir` still targets the REAL
-    /// `gui/<uid>/com.onebrain.daily` on bootout/bootstrap. The first suite
-    /// run after activation landed hijacked the operator's real `/daily`
-    /// (bootstrapped it from a since-deleted tempdir) and deleted its plist.
-    /// The integration harness sets this for every spawned binary; nothing
-    /// else should.
-    fn activation_disabled() -> bool {
-        std::env::var_os("ONEBRAIN_SCHEDULER_NO_ACTIVATE").is_some()
     }
 
     /// Write the plist, then make launchd actually run it (#312).
@@ -206,15 +214,6 @@ mod imp {
         generate_service_unit, generate_timer_unit, unit_base_name, unit_dir,
     };
     use std::process::Command;
-
-    /// Same test-isolation kill-switch as the other arms, same incident
-    /// behind it: `onebrain-<label>` unit names live in the user's global
-    /// systemd namespace, and an integration test running the real binary
-    /// with `HOME=tempdir` would still `enable --now` the REAL
-    /// `onebrain-daily.timer` in the operator's user manager.
-    fn activation_disabled() -> bool {
-        std::env::var_os("ONEBRAIN_SCHEDULER_NO_ACTIVATE").is_some()
-    }
 
     fn systemctl(args: &[&str]) -> Result<std::process::Output, SchedulerError> {
         Command::new("systemctl")
@@ -357,14 +356,6 @@ mod imp {
     use crate::scheduler::schtasks::{generate_task_xml, task_name};
     use std::process::Command;
 
-    /// Same test-isolation kill-switch as the macOS arm, same incident behind
-    /// it: task names are a machine-global namespace, and an integration test
-    /// running the real binary would otherwise register real tasks on the
-    /// developer's machine and CI runners.
-    fn activation_disabled() -> bool {
-        std::env::var_os("ONEBRAIN_SCHEDULER_NO_ACTIVATE").is_some()
-    }
-
     /// Render → temp file → `schtasks /Create /XML <tmp> /TN <name> /F` →
     /// delete the temp in every path.
     ///
@@ -384,7 +375,7 @@ mod imp {
         let label = crate::scheduler::launchd::label_for_entry(entry);
         let name = task_name(&label);
         let user = std::env::var("USERNAME").unwrap_or_else(|_| "SYSTEM".into());
-        let xml = generate_task_xml(entry, ctx).replace("__USER__", &user);
+        let xml = generate_task_xml(entry, ctx)?.replace("__USER__", &user);
 
         // Report the task name as the "artifact": Windows persists nothing on
         // disk by design, and the CLI's "Wrote {}" line becomes the task name.
@@ -541,7 +532,9 @@ mod tests {
             "on disk but not enabled — never \u{2713} from file existence alone"
         );
 
-        let preview = render_preview(&entry, &ctx).unwrap();
+        let preview = render_preview(&entry, &ctx)
+            .unwrap()
+            .expect("linux has a backend, so a preview");
         assert!(preview.contains("[Timer]"), "{preview}");
         assert!(preview.contains("OnCalendar="), "{preview}");
 

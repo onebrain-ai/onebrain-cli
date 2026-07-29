@@ -170,7 +170,7 @@ fn run_with(
                 // `~/Library/...plist` banner over systemd units (caught by
                 // the 9b Linux audit).
                 let label = label_for_entry(entry);
-                match backend::render_preview(entry, &ctx) {
+                match backend::render_preview(entry, &ctx)? {
                     Some(artifact) => {
                         println!("---  {label}  ---");
                         println!("{artifact}");
@@ -620,11 +620,19 @@ fn cleanup_stale_legacy_plist(
 
     // Best-effort unload — ignore failure (job may not be loaded, or
     // `launchctl` may be unavailable in a sandboxed/CI environment).
-    let _ = std::process::Command::new("launchctl")
-        .arg("bootout")
-        .arg(format!("gui/{}", ctx.uid))
-        .arg(&legacy_target)
-        .output();
+    // Guarded by the shared kill-switch (2026-07-29 full-epic audit,
+    // BLOCKER 1): this was the one scheduler-touching spawn outside
+    // backend.rs, and the un-gated macOS integration test that exercises it
+    // ran `launchctl bootout` against the REAL gui domain of every machine
+    // running the suite. Only the spawn is guarded — removing the stale
+    // FILE stays, mirroring backend::remove's skip-OS-keep-file semantics.
+    if !backend::activation_disabled() {
+        let _ = std::process::Command::new("launchctl")
+            .arg("bootout")
+            .arg(format!("gui/{}", ctx.uid))
+            .arg(&legacy_target)
+            .output();
+    }
 
     match std::fs::remove_file(&legacy_target) {
         Ok(()) => {
