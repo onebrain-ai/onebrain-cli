@@ -1,6 +1,6 @@
 ---
-latest_version: 3.4.19
-released: 2026-07-26
+latest_version: 3.4.20
+released: 2026-07-29
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,21 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.20] — 2026-07-29 — Cross-platform scheduling parity: `onebrain schedule` actually schedules on macOS, Windows, and Linux
+
+Theme: the scheduler stops being macOS-only and stops lying. Every claim below is backed by a real fire or a measured corpus, not a rendered file.
+
+- **Windows: real Task Scheduler backend** — `schedule register` compiles cron/at entries into Scheduled Tasks under `\OneBrain\` (UTF-16 XML via `schtasks /Create`; the measured 48-trigger cap, month semantics, and multi-`Repetition` behavior are pinned by a schema corpus CI re-validates against real `schtasks` on every PR), fire-proven end-to-end on `windows-latest` — register → fire → one-shot self-delete ([#310](https://github.com/onebrain-ai/onebrain-cli/issues/310))
+- **Linux: real systemd user-timer backend** — units written to `~/.config/systemd/user`, activated `daemon-reload → enable → restart`; one-shots fully self-delete (units + `timers.target.wants` symlink) via `ExecStopPost`; fire-proven on a real systemd 255 user session, corpus checked by `systemd-analyze verify` on every PR ([#313](https://github.com/onebrain-ai/onebrain-cli/issues/313), [#314](https://github.com/onebrain-ai/onebrain-cli/issues/314))
+- **Scheduler logs move out of the vault** into per-OS state dirs (`~/Library/Logs/onebrain` · journald · Task Scheduler history) — a cloud-synced vault can no longer make launchd fail every run with a silent exit 78, which is the incident this release exists to end ([#315](https://github.com/onebrain-ai/onebrain-cli/issues/315))
+- **`schedule list` / `--status` report what the OS scheduler says**, not what's on disk: `launchctl print` / `schtasks /Query` / `systemctl --user is-active`, with `⚠` for present-but-inactive — the state the old file-existence check could not see ([#312](https://github.com/onebrain-ai/onebrain-cli/issues/312))
+- **macOS activation is imperative**: register boots the job out and back in immediately (no more plists waiting for next login), and `--remove` boots out *before* deleting so a removed job actually stops firing ([#312](https://github.com/onebrain-ai/onebrain-cli/issues/312))
+- `--dry-run` prints the platform's real artifact(s) headed by the entry label; remove/preview messages no longer show launchd paths on non-macOS hosts
+- Help text and docs are platform-neutral, with a new `docs/platform-support.md` section on backend semantics (logged-in-only across all three; missed runs skip on Windows/Linux by design, coalesce on macOS wake)
+- Test-created search collections now stamp `.onebrain-test-collection` at creation, so any future cache-root cleanup enumerates a closed set instead of guessing from names ([#305](https://github.com/onebrain-ai/onebrain-cli/issues/305))
+
+Known: `plugin update` re-registers schedules while it runs, so an entry firing in that exact window sees a brief bootout/re-register gap (MN-6 — accepted, logged in the epic's decisions).
 
 ## [3.4.19] — 2026-07-26 — The daemon runs on Windows, so the MCP server stops holding the index lock
 
