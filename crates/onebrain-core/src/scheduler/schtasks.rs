@@ -871,6 +871,45 @@ mod tests {
         insta::assert_snapshot!(generate_task_xml(&daily_entry(), &ctx));
     }
 
+    /// Writes this renderer's REAL output into the corpus, where the schema
+    /// workflow round-trips it through an actual Task Scheduler on every PR.
+    ///
+    /// Hand-written corpus cases prove what the schema accepts; these prove
+    /// what THIS CODE emits is inside that. A renderer that dropped <Months>
+    /// would pass every unit test and snapshot above — and fail
+    /// accept-generated-monthly's .expect when the resolved date leaves
+    /// March. Regenerate with:
+    ///   cargo test -p onebrain-core emit_generated_corpus -- --ignored
+    #[test]
+    #[ignore = "writes files into tests/scheduler-corpus — run explicitly after renderer changes"]
+    fn emit_generated_corpus() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/scheduler-corpus/windows");
+        assert!(dir.is_dir(), "corpus dir missing: {}", dir.display());
+        let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        for (name, cron) in [
+            ("daily", "0 9 * * *"),
+            ("weekly", "0 17 * * 5"),
+            ("monthly", "0 9 1 3 *"),
+            ("monthly-weekday", "0 17 * 3 5"),
+            ("repeating", "*/5 * * * *"),
+            ("multi-repetition", "0,5,10 * * * *"),
+        ] {
+            let entry = crate::scheduler::test_support::entry_cron(cron);
+            std::fs::write(
+                dir.join(format!("accept-generated-{name}.xml")),
+                generate_task_xml(&entry, &ctx),
+            )
+            .unwrap();
+        }
+        // command mode — the quarter of the matrix no hand-written case covers
+        std::fs::write(
+            dir.join("accept-generated-command.xml"),
+            generate_task_xml(&daily_command_entry(), &ctx),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn snapshot_is_stable_across_runs() {
         // Guards against a clock creeping into StartBoundary.
