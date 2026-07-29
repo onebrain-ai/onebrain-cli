@@ -459,10 +459,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        any(target_os = "macos", windows),
-        ignore = "touches the real OS scheduler domain — run explicitly (Task 8's CI job does), never in the default suite"
-    )]
+    #[ignore = "touches the real OS scheduler domain (Linux refuses until Task 9b) — run explicitly (Task 8's CI job does), never in the default suite"]
     fn install_then_remove_round_trips_through_the_backend() {
         let home = tempfile::tempdir().unwrap();
         let ctx = test_support::ctx_in(home.path());
@@ -482,6 +479,10 @@ mod tests {
             );
             #[cfg(not(windows))]
             assert!(artifact.exists(), "install must write the artifact");
+            assert!(
+                ctx.log_base_path.is_dir(),
+                "install must create the log dir — launchd opens the log paths before exec"
+            );
             assert_ne!(
                 is_installed(&label, &ctx).unwrap(),
                 InstallState::Absent,
@@ -536,16 +537,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn install_creates_the_log_directory_as_part_of_writing() {
-        // Filesystem-only in Task 3's placeholder arms — safe everywhere.
-        // The OS-touching round-trip lives in Task 4's #[ignore]d tests.
-        let home = tempfile::tempdir().unwrap();
-        let ctx = test_support::ctx_in(home.path());
-        install(&test_support::entry_labelled("logdir-probe"), &ctx).unwrap();
-        assert!(ctx.log_base_path.is_dir());
-        let _ = remove("logdir-probe", &ctx);
-    }
+    // NOTE: the former `install_creates_the_log_directory_as_part_of_writing`
+    // test was folded into the round-trip test above. Its "safe everywhere"
+    // premise died with the placeholder arms: a real install() bootstraps
+    // launchd on macOS, registers a schtasks task on Windows, and refuses on
+    // Linux until Task 9b — none of which belongs in the default suite.
 
     #[test]
     fn artifact_key_collides_exactly_when_labels_collide() {
