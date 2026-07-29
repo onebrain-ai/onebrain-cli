@@ -532,10 +532,15 @@ fn detect_collisions(resolved: &[ScheduleEntry], ctx: &SchedulerContext) -> Resu
             } else {
                 format!("skill:{}", entry.skill.as_deref().unwrap_or(""))
             };
+            // Report the shared LABEL, not `artifact_key` — that key is the
+            // launchd plist path on every platform by design, and printing
+            // it showed a `~/Library/...plist` that never existed on
+            // Windows/Linux (third member of the display family fixed in
+            // v3.4.20; caught by the Windows ARM64 audit).
             return Err(anyhow!(SchedulerError::Conflict {
                 new: new_label,
                 existing: existing_label,
-                path: target.display().to_string(),
+                path: label_for_entry(entry),
             }));
         }
         seen.insert(target, entry.clone());
