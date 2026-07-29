@@ -174,7 +174,7 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 mod imp {
     use super::*;
 
@@ -235,7 +235,143 @@ pub fn ensure_log_dir(ctx: &SchedulerContext) -> std::io::Result<()> {
     std::fs::create_dir_all(&ctx.log_base_path)
 }
 
-/// Shared by both arms while the placeholder exists; Task 6/7c specialise.
+#[cfg(windows)]
+mod imp {
+    use super::*;
+    use crate::scheduler::schtasks::{generate_task_xml, task_name};
+    use std::process::Command;
+
+    /// Same test-isolation kill-switch as the macOS arm, same incident behind
+    /// it: task names are a machine-global namespace, and an integration test
+    /// running the real binary would otherwise register real tasks on the
+    /// developer's machine and CI runners.
+    fn activation_disabled() -> bool {
+        std::env::var_os("ONEBRAIN_SCHEDULER_NO_ACTIVATE").is_some()
+    }
+
+    /// Render → temp file → `schtasks /Create /XML <tmp> /TN <name> /F` →
+    /// delete the temp in every path.
+    ///
+    /// `/Create /XML` takes a path, not stdin, so a temp file is unavoidable;
+    /// it is removed even on failure because a leftover copy is exactly the
+    /// artifact-vs-reality drift this design rejects (decision 4: Task
+    /// Scheduler owns the definition, `/Query /XML` returns it on demand).
+    /// `/F` makes re-registration idempotent with no pre-check.
+    ///
+    /// `__USER__` in the rendered document (see `generate_task_xml`) is
+    /// substituted with the real account here — the renderer stays pure.
+    pub fn install(
+        entry: &ScheduleEntry,
+        ctx: &SchedulerContext,
+    ) -> Result<PathBuf, SchedulerError> {
+        ensure_log_dir(ctx)?;
+        let label = crate::scheduler::launchd::label_for_entry(entry);
+        let name = task_name(&label);
+        let user = std::env::var("USERNAME").unwrap_or_else(|_| "SYSTEM".into());
+        let xml = generate_task_xml(entry, ctx).replace("__USER__", &user);
+
+        // Report the task name as the "artifact": Windows persists nothing on
+        // disk by design, and the CLI's "Wrote {}" line becomes the task name.
+        let artifact = PathBuf::from(&name);
+        if activation_disabled() {
+            return Ok(artifact);
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "onebrain-task-{}-{}.xml",
+            std::process::id(),
+            label
+        ));
+        // Task Scheduler expects UTF-16 for /XML documents.
+        let utf16: Vec<u8> = std::iter::once(0xFEFFu16)
+            .chain(xml.encode_utf16())
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        std::fs::write(&tmp, utf16)?;
+
+        let out = Command::new("schtasks")
+            .args(["/Create", "/XML"])
+            .arg(&tmp)
+            .args(["/TN", &name, "/F"])
+            .output();
+        let _ = std::fs::remove_file(&tmp);
+
+        match out {
+            Ok(o) if o.status.success() => Ok(artifact),
+            Ok(o) => Err(SchedulerError::BackendCommand {
+                command: format!("schtasks /Create /XML <tmp> /TN {name} /F"),
+                status: o.status.to_string(),
+                stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+            }),
+            Err(e) => Err(SchedulerError::BackendCommand {
+                command: "schtasks /Create".to_string(),
+                status: "spawn failed".to_string(),
+                stderr: e.to_string(),
+            }),
+        }
+    }
+
+    /// `/Delete /TN <name> /F`; a missing task is Ok(false), any other
+    /// failure surfaces verbatim.
+    pub fn remove(label_safe: &str, ctx: &SchedulerContext) -> Result<bool, SchedulerError> {
+        let _ = ctx;
+        if activation_disabled() {
+            return Ok(false);
+        }
+        let name = task_name(label_safe);
+        let out = Command::new("schtasks")
+            .args(["/Delete", "/TN", &name, "/F"])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => Ok(true),
+            // ERROR: The system cannot find the file specified — not a task.
+            Ok(_) => Ok(false),
+            Err(e) => Err(SchedulerError::BackendCommand {
+                command: format!("schtasks /Delete /TN {name} /F"),
+                status: "spawn failed".to_string(),
+                stderr: e.to_string(),
+            }),
+        }
+    }
+
+    /// `/Query /FO LIST /V` and parse `Status:` — exit code alone reports 0
+    /// for a DISABLED task, which is "present but inert", the exact state
+    /// this release exists to stop mis-reporting (round 3, MJ-7).
+    pub fn is_installed(
+        label_safe: &str,
+        ctx: &SchedulerContext,
+    ) -> Result<InstallState, SchedulerError> {
+        let _ = ctx;
+        if activation_disabled() {
+            return Ok(InstallState::Absent);
+        }
+        let name = task_name(label_safe);
+        let out = Command::new("schtasks")
+            .args(["/Query", "/TN", &name, "/FO", "LIST", "/V"])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let text = String::from_utf8_lossy(&o.stdout);
+                let disabled = text
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("Status:") && l.contains("Disabled"));
+                Ok(if disabled {
+                    InstallState::Inactive
+                } else {
+                    InstallState::Active
+                })
+            }
+            Ok(_) => Ok(InstallState::Absent),
+            Err(_) => Ok(InstallState::Absent),
+        }
+    }
+
+    pub fn describe() -> &'static str {
+        "Task Scheduler"
+    }
+}
+
+/// Shared by the remaining unix arms while the placeholder exists; Task 6 specialises Linux.
 fn write_plist(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Result<PathBuf, SchedulerError> {
     ensure_log_dir(ctx)?;
     let label = crate::scheduler::launchd::label_for_entry(entry);
@@ -290,8 +426,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "touches the real launchd domain — run explicitly, never in the default suite"
+        any(target_os = "macos", windows),
+        ignore = "touches the real OS scheduler domain — run explicitly (Task 8's CI job does), never in the default suite"
     )]
     fn install_then_remove_round_trips_through_the_backend() {
         let home = tempfile::tempdir().unwrap();
@@ -302,8 +438,16 @@ mod tests {
         // Teardown must run even if an assertion panics: a leaked bootstrapped
         // job pointing at a deleted tempdir outlives the test process.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let path = install(&entry, &ctx).unwrap();
-            assert!(path.exists(), "install must write the artifact");
+            let artifact = install(&entry, &ctx).unwrap();
+            // Decision 4: Windows persists NO artifact on disk — install
+            // reports the task NAME. Everywhere else the artifact is a file.
+            #[cfg(windows)]
+            assert!(
+                artifact.to_string_lossy().starts_with("\\OneBrain\\"),
+                "windows artifact is the task name: {artifact:?}"
+            );
+            #[cfg(not(windows))]
+            assert!(artifact.exists(), "install must write the artifact");
             assert_ne!(
                 is_installed(&label, &ctx).unwrap(),
                 InstallState::Absent,
@@ -318,8 +462,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "touches the real launchd domain — run explicitly, never in the default suite"
+        any(target_os = "macos", windows),
+        ignore = "queries the real OS scheduler domain — run explicitly, never in the default suite"
     )]
     fn an_artifact_the_os_does_not_know_about_reports_inactive() {
         // The regression guard for the actual #312 bug: a file on disk must
