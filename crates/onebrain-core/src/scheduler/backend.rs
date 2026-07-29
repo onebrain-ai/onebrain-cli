@@ -426,8 +426,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "touches the real launchd domain — run explicitly, never in the default suite"
+        any(target_os = "macos", windows),
+        ignore = "touches the real OS scheduler domain — run explicitly (Task 8's CI job does), never in the default suite"
     )]
     fn install_then_remove_round_trips_through_the_backend() {
         let home = tempfile::tempdir().unwrap();
@@ -438,8 +438,16 @@ mod tests {
         // Teardown must run even if an assertion panics: a leaked bootstrapped
         // job pointing at a deleted tempdir outlives the test process.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let path = install(&entry, &ctx).unwrap();
-            assert!(path.exists(), "install must write the artifact");
+            let artifact = install(&entry, &ctx).unwrap();
+            // Decision 4: Windows persists NO artifact on disk — install
+            // reports the task NAME. Everywhere else the artifact is a file.
+            #[cfg(windows)]
+            assert!(
+                artifact.to_string_lossy().starts_with("\\OneBrain\\"),
+                "windows artifact is the task name: {artifact:?}"
+            );
+            #[cfg(not(windows))]
+            assert!(artifact.exists(), "install must write the artifact");
             assert_ne!(
                 is_installed(&label, &ctx).unwrap(),
                 InstallState::Absent,
@@ -454,8 +462,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "touches the real launchd domain — run explicitly, never in the default suite"
+        any(target_os = "macos", windows),
+        ignore = "queries the real OS scheduler domain — run explicitly, never in the default suite"
     )]
     fn an_artifact_the_os_does_not_know_about_reports_inactive() {
         // The regression guard for the actual #312 bug: a file on disk must
