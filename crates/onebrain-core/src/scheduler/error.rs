@@ -52,6 +52,9 @@ pub enum SchedulerError {
         path: String,
     },
 
+    #[error("cron \"{cron}\" needs {needed} Task Scheduler triggers; the limit is 48 (measured — 49 is rejected with 'too many nodes of the same type'). Split it into separate `schedule:` entries.")]
+    TooManyTriggers { cron: String, needed: usize },
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
