@@ -28,6 +28,9 @@ fn write_skill_vault(yaml: &str) -> tempfile::TempDir {
 
 /// `--dry-run` prints the plist for a recurring skill entry without writing
 /// to disk.
+// macOS-only since Task 6: asserts launchd plist text; other platforms
+// preview their own artifact (or an honest note) via render_preview [M5].
+#[cfg(target_os = "macos")]
 #[test]
 fn dry_run_emits_plist_to_stdout() {
     let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n");
@@ -46,6 +49,9 @@ fn dry_run_emits_plist_to_stdout() {
 
 /// `--dry-run` of a one-shot entry emits `Year/Month/Day/Hour/Minute` keys
 /// plus the self-deleting shell wrapper.
+// macOS-only since Task 6: asserts launchd plist text; other platforms
+// preview their own artifact (or an honest note) via render_preview [M5].
+#[cfg(target_os = "macos")]
 #[test]
 fn one_shot_dry_run_emits_year_field_and_self_delete_wrapper() {
     let v = write_skill_vault("schedule:\n  - at: \"2026-05-13 14:30\"\n    skill: /daily\n");
@@ -87,7 +93,9 @@ fn status_lists_entries_with_cron_tag() {
 ///
 /// macOS/Unix-only: launchd is macOS-only, so the plist write path is
 /// gated to Unix-style HOME layouts.
-#[cfg(unix)]
+// macOS-only since Task 6: registers/renders launchd artifacts, which
+// Linux now refuses (#313) and Windows renders differently.
+#[cfg(target_os = "macos")]
 #[test]
 fn remove_deletes_plists_from_launch_agents() {
     let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n");
@@ -241,7 +249,9 @@ fn command_mode_entries_fully_identical_still_collide() {
 /// (rsync, etc.): appending `--vault` there would break the job.
 ///
 /// Unix-only: relies on `/bin/echo` existing.
-#[cfg(unix)]
+// macOS-only since Task 6: registers/renders launchd artifacts, which
+// Linux now refuses (#313) and Windows renders differently.
+#[cfg(target_os = "macos")]
 #[test]
 fn command_mode_dry_run_produces_hook_style_argv() {
     let v = tempdir().unwrap();
@@ -271,7 +281,9 @@ fn command_mode_dry_run_produces_hook_style_argv() {
 /// `command:` at the built onebrain test binary by absolute path — the
 /// register path resolves it (it exists) and its basename `onebrain` is
 /// detected as the onebrain binary.
-#[cfg(unix)]
+// macOS-only since Task 6: registers/renders launchd artifacts, which
+// Linux now refuses (#313) and Windows renders differently.
+#[cfg(target_os = "macos")]
 #[test]
 fn command_mode_onebrain_dry_run_embeds_vault() {
     let v = tempdir().unwrap();
@@ -328,7 +340,9 @@ fn unschedulable_skill_rejected() {
 /// with both the old and new jobs loaded.
 ///
 /// Unix-only: relies on `/bin/echo` existing and writes to a tempdir HOME.
-#[cfg(unix)]
+// macOS-only since Task 6: registers/renders launchd artifacts, which
+// Linux now refuses (#313) and Windows renders differently.
+#[cfg(target_os = "macos")]
 #[test]
 fn stale_legacy_plist_removed_on_reregister() {
     let v = tempdir().unwrap();
@@ -393,6 +407,9 @@ fn one_shot_command_rejects_shell_special_chars() {
 }
 
 /// `--refresh` prints a notice line before writing plists.
+// macOS-only since Task 6: asserts launchd plist text; other platforms
+// preview their own artifact (or an honest note) via render_preview [M5].
+#[cfg(target_os = "macos")]
 #[test]
 fn refresh_emits_notice_line() {
     // Use onebrain.yml (canonical v3.1+ format).
@@ -693,7 +710,9 @@ fn remove_when_no_plists_exits_cleanly() {
 /// Actual registration (no --dry-run) writes plist to LaunchAgents.
 ///
 /// Unix-only: LaunchAgents is macOS/Linux HOME convention.
-#[cfg(unix)]
+// macOS-only since Task 6: registers/renders launchd artifacts, which
+// Linux now refuses (#313) and Windows renders differently.
+#[cfg(target_os = "macos")]
 #[test]
 fn registration_writes_plist_file() {
     let v = tempdir().unwrap();
@@ -728,7 +747,9 @@ fn registration_writes_plist_file() {
 /// because this harness disables activation — present-but-not-loaded → ⚠.
 /// The old test asserted ✓ here, which was precisely the lie #312 fixes:
 /// a file on disk is not a scheduled job.
-#[cfg(unix)]
+// macOS-only since Task 6: registers/renders launchd artifacts, which
+// Linux now refuses (#313) and Windows renders differently.
+#[cfg(target_os = "macos")]
 #[test]
 fn status_marks_installed_and_uninstalled() {
     let v = tempdir().unwrap();
@@ -789,6 +810,9 @@ fn status_marks_installed_and_uninstalled() {
 
 /// A `*/N` step cron expression is accepted end-to-end and emits an
 /// array-form `StartCalendarInterval` in the dry-run plist output.
+// macOS-only since Task 6: asserts launchd plist text; other platforms
+// preview their own artifact (or an honest note) via render_preview [M5].
+#[cfg(target_os = "macos")]
 #[test]
 fn step_cron_dry_run_emits_array_form_calendar_interval() {
     let v = write_skill_vault("schedule:\n  - cron: \"0 */6 * * *\"\n    skill: /daily\n");
@@ -810,6 +834,9 @@ fn step_cron_dry_run_emits_array_form_calendar_interval() {
 }
 
 /// A list (`1,3,5`) cron expression is accepted end-to-end.
+// macOS-only since Task 6: asserts launchd plist text; other platforms
+// preview their own artifact (or an honest note) via render_preview [M5].
+#[cfg(target_os = "macos")]
 #[test]
 fn list_cron_dry_run_succeeds() {
     let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * 1,3,5\"\n    skill: /daily\n");
@@ -826,6 +853,9 @@ fn list_cron_dry_run_succeeds() {
 }
 
 /// A range (`1-5`) cron expression is accepted end-to-end.
+// macOS-only since Task 6: asserts launchd plist text; other platforms
+// preview their own artifact (or an honest note) via render_preview [M5].
+#[cfg(target_os = "macos")]
 #[test]
 fn range_cron_dry_run_succeeds() {
     let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * 1-5\"\n    skill: /daily\n");
@@ -844,6 +874,9 @@ fn range_cron_dry_run_succeeds() {
 /// A single-value cron expression (the common case) still emits the plain
 /// single-`<dict>` calendar interval form, not an array — byte-parity
 /// regression guard at the CLI-integration layer.
+// macOS-only since Task 6: asserts launchd plist text; other platforms
+// preview their own artifact (or an honest note) via render_preview [M5].
+#[cfg(target_os = "macos")]
 #[test]
 fn plain_cron_dry_run_still_emits_single_dict_form() {
     let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n");
@@ -878,4 +911,50 @@ fn pathological_cron_expansion_rejected() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("exceeding the cap"));
+}
+
+/// Linux (#313): `register` refuses loudly instead of writing a plist
+/// nothing reads. Drives the full resolve→collision→install path through
+/// the UnsupportedPlatform arm — the coverage the re-gated tests stopped
+/// providing on the one runner that measures (MJ-9, option 1).
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn linux_register_refuses_with_a_clear_error() {
+    let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n");
+    let home = tempdir().unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
+        .args(["register-schedule"])
+        .current_dir(v.path())
+        .env("HOME", home.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no scheduler backend"));
+    assert!(
+        !home.path().join("Library").exists(),
+        "must not create a macOS-only ~/Library on Linux"
+    );
+}
+
+/// Linux `--dry-run` validates the entry and says plainly that no artifact
+/// can be produced here — it neither errors (a dry run that fails teaches
+/// nothing) nor prints another OS's format [M5].
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn linux_dry_run_prints_an_honest_note() {
+    let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n");
+    let home = tempdir().unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", home.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no scheduler backend on"))
+        .stdout(predicate::str::contains("com.onebrain.daily"));
 }

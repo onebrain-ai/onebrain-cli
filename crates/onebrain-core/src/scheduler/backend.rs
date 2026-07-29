@@ -52,6 +52,25 @@ pub fn describe() -> &'static str {
     imp::describe()
 }
 
+/// What `--dry-run` prints for this entry on this platform, or `None` when
+/// the platform has no backend (a dry run that errors teaches nothing, and
+/// printing another OS's format teaches the wrong thing) [M5].
+pub fn render_preview(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(crate::scheduler::launchd::generate_plist(entry, ctx))
+    }
+    #[cfg(windows)]
+    {
+        Some(crate::scheduler::schtasks::generate_task_xml(entry, ctx))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = (entry, ctx);
+        None
+    }
+}
+
 /// The identity `detect_collisions` keys uniqueness on. Two entries whose
 /// artifact keys are equal would overwrite each other at install time.
 ///
@@ -178,48 +197,39 @@ mod imp {
 mod imp {
     use super::*;
 
-    /// PLACEHOLDER, and deliberately behaviour-preserving: it does exactly
-    /// what the code does today on these platforms — writes a launchd plist
-    /// that nothing will ever read. That is wrong, and it is the *documented
-    /// current bug* (#313): Task 6 is where Linux starts refusing, and Task 7c
-    /// is where Windows gets a real backend.
-    ///
-    /// Preserving the wrong behaviour here is what makes Task 3 a pure seam
-    /// with no behaviour change anywhere — and it is what Task 6's failing
-    /// test asserts against ("install succeeds and ~/Library exists"). If
-    /// this arm refused instead, that test would pass before Task 6 wrote a
-    /// line, and Task 6 would prove nothing.
+    /// Linux refuses instead of lying (#313). The placeholder this replaces
+    /// wrote a launchd plist into a `~/Library` no Linux convention owns and
+    /// `list` then reported it `\u{2713}` — worse than Windows' honest `\u{2717}`,
+    /// because the file really was on disk. The systemd backend (Task 9b)
+    /// replaces this arm; until then, failing loudly beats succeeding
+    /// falsely — the release's whole thesis.
     pub fn install(
-        entry: &ScheduleEntry,
-        ctx: &SchedulerContext,
+        _entry: &ScheduleEntry,
+        _ctx: &SchedulerContext,
     ) -> Result<PathBuf, SchedulerError> {
-        write_plist(entry, ctx)
-    }
-
-    pub fn remove(label_safe: &str, ctx: &SchedulerContext) -> Result<bool, SchedulerError> {
-        let target = plist_path(label_safe, &ctx.homedir);
-        if target.exists() {
-            std::fs::remove_file(&target)?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    pub fn is_installed(
-        label_safe: &str,
-        ctx: &SchedulerContext,
-    ) -> Result<InstallState, SchedulerError> {
-        let target = plist_path(label_safe, &ctx.homedir);
-        Ok(if target.exists() {
-            InstallState::Active
-        } else {
-            InstallState::Absent
+        Err(SchedulerError::UnsupportedPlatform {
+            os: std::env::consts::OS,
         })
     }
 
+    /// Nothing can have been installed by us; removing is a clean no-op so
+    /// `--remove` and `plugin update` never fail on a platform with no
+    /// backend.
+    pub fn remove(_label_safe: &str, _ctx: &SchedulerContext) -> Result<bool, SchedulerError> {
+        Ok(false)
+    }
+
+    /// Never \u{2713}: a platform with no backend has nothing active by
+    /// definition, whatever files may exist on disk.
+    pub fn is_installed(
+        _label_safe: &str,
+        _ctx: &SchedulerContext,
+    ) -> Result<InstallState, SchedulerError> {
+        Ok(InstallState::Absent)
+    }
+
     pub fn describe() -> &'static str {
-        "launchd (placeholder — not this platform's scheduler)"
+        "none (unsupported platform — systemd backend lands in v3.4.20's Linux chain)"
     }
 }
 
@@ -387,6 +397,26 @@ fn write_plist(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Result<PathBuf,
 mod tests {
     use super::*;
     use crate::scheduler::test_support;
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn linux_refuses_instead_of_writing_a_plist_nothing_reads() {
+        let home = tempfile::tempdir().unwrap();
+        let ctx = test_support::ctx_in(home.path());
+
+        let err = install(&test_support::daily_entry(), &ctx).unwrap_err();
+        assert!(
+            matches!(err, SchedulerError::UnsupportedPlatform { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            !home.path().join("Library").exists(),
+            "must not create a macOS-only ~/Library on Linux"
+        );
+        assert_eq!(is_installed("daily", &ctx).unwrap(), InstallState::Absent);
+        assert!(!remove("daily", &ctx).unwrap(), "remove is a clean no-op");
+        assert!(render_preview(&test_support::daily_entry(), &ctx).is_none());
+    }
 
     #[test]
     fn describe_names_the_active_backend() {

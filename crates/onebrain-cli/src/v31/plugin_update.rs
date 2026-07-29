@@ -165,9 +165,24 @@ pub fn run(
                 report.plists_count = Some(count as u32);
             }
             Err(e) => {
-                report.partial_failure = Some(format!(
-                    "schedule re-register failed after hook rewrite: {e:#}"
-                ));
+                // A platform with no scheduler backend is a SKIP, not a
+                // failure — otherwise every Linux user sees partial_failure
+                // on every plugin update until the systemd backend lands
+                // (round 3, M10). Everything else stays a partial failure.
+                let unsupported = e.chain().any(|c| {
+                    matches!(
+                        c.downcast_ref::<onebrain_core::scheduler::SchedulerError>(),
+                        Some(onebrain_core::scheduler::SchedulerError::UnsupportedPlatform { .. })
+                    )
+                });
+                if unsupported {
+                    report.plists_rewritten = false;
+                    report.plists_count = None;
+                } else {
+                    report.partial_failure = Some(format!(
+                        "schedule re-register failed after hook rewrite: {e:#}"
+                    ));
+                }
             }
         }
     }
