@@ -3183,6 +3183,9 @@ mod tests {
         ($t:ty) => {
             impl IsolateCacheRoot for $t {
                 fn isolate_cache_root(&mut self, cache: &Path) -> &mut Self {
+                    // #305: see tests/support::scratch_cache_root — the
+                    // engine stamps collections it creates under this var.
+                    std::env::set_var("ONEBRAIN_TEST_COLLECTION_MARKER", "1");
                     self.env("ONEBRAIN_CACHE_DIR", cache)
                         .env_remove("XDG_DATA_HOME")
                 }

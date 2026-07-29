@@ -841,6 +841,21 @@ impl Engine {
         std::fs::create_dir_all(cache_dir)
             .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
 
+        // #305: a collection created under the test harness identifies
+        // itself with a sentinel file, so any future cleanup of the real
+        // cache root enumerates a closed set instead of guessing membership
+        // from names (the failure mode that stranded 30+ residue dirs no
+        // predicate could safely match). Both test isolation helpers
+        // (`tests/support::scratch_cache_root`, daemon's
+        // `isolate_cache_root`) export this var process-wide, so every
+        // binary they spawn inherits it; no production path sets it.
+        if std::env::var_os("ONEBRAIN_TEST_COLLECTION_MARKER").is_some() {
+            let _ = std::fs::write(
+                cache_dir.join(".onebrain-test-collection"),
+                b"created by the onebrain test harness; safe to delete (onebrain-cli #305)\n",
+            );
+        }
+
         let layout = CollectionLayout::new(cache_dir);
 
         // Collection-level advisory lock (#223), acquired BEFORE `migrate()`
@@ -2817,6 +2832,22 @@ mod tests {
 
     fn fake_engine_result(dir: &Path) -> Result<Engine> {
         Engine::open_with_embedder(dir, "fake-model", Box::new(FakeEmbedder { dims: 16 }))
+    }
+
+    /// #305: with the harness marker var exported, every collection this
+    /// engine creates stamps itself `.onebrain-test-collection` — the
+    /// closed-set signal future cache-root cleanups enumerate instead of
+    /// deriving membership from names. (Setting the var here also covers any
+    /// parallel engine test's collections; the sentinel is inert.)
+    #[test]
+    fn collections_created_under_the_marker_var_stamp_themselves() {
+        std::env::set_var("ONEBRAIN_TEST_COLLECTION_MARKER", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let _e = fake_engine(dir.path());
+        assert!(
+            dir.path().join(".onebrain-test-collection").is_file(),
+            "open_inner must stamp the sentinel when the marker var is set"
+        );
     }
 
     #[test]
