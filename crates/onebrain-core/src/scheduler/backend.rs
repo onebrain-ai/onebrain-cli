@@ -14,7 +14,7 @@
 
 use crate::scheduler::context::SchedulerContext;
 use crate::scheduler::error::SchedulerError;
-use crate::scheduler::launchd::{generate_plist, plist_path};
+use crate::scheduler::launchd::plist_path;
 use crate::scheduler::types::ScheduleEntry;
 use std::path::PathBuf;
 
@@ -386,6 +386,7 @@ mod imp {
 /// the one `-D warnings` leg that measures, sees no dead code.
 #[cfg(target_os = "macos")]
 fn write_plist(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Result<PathBuf, SchedulerError> {
+    use crate::scheduler::launchd::generate_plist;
     ensure_log_dir(ctx)?;
     let label = crate::scheduler::launchd::label_for_entry(entry);
     let target = plist_path(&label, &ctx.homedir);
@@ -509,7 +510,11 @@ mod tests {
         // Write the artifact WITHOUT going through install() — no bootstrap.
         let target = plist_path(&label, &ctx.homedir);
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        std::fs::write(&target, generate_plist(&entry, &ctx)).unwrap();
+        std::fs::write(
+            &target,
+            crate::scheduler::launchd::generate_plist(&entry, &ctx),
+        )
+        .unwrap();
 
         #[cfg(target_os = "macos")]
         assert_eq!(is_installed(&label, &ctx).unwrap(), InstallState::Inactive);
