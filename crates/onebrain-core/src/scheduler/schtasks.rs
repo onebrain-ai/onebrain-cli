@@ -660,7 +660,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// Audit BLOCKER 2 regression: a cron between 49 and 1000 triggers
     /// passes the shared cross-platform validator (1000-combination cap), so
     /// the 48-trigger Task Scheduler cap is only reachable at render time —
@@ -678,6 +677,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn an_explicit_product_over_the_limit_is_refused_with_a_useful_message() {
         // 7 irregular minutes × 8 irregular hours = 56 explicit triggers.
         // Both lists are gap-irregular so no repetition path applies.
