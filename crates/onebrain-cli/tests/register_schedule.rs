@@ -37,6 +37,7 @@ fn dry_run_emits_plist_to_stdout() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("com.onebrain.daily"))
@@ -54,6 +55,7 @@ fn one_shot_dry_run_emits_year_field_and_self_delete_wrapper() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("<key>Year</key>"))
@@ -72,6 +74,7 @@ fn status_lists_entries_with_cron_tag() {
         .args(["register-schedule", "--status"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("Registered schedules: 1"))
@@ -98,6 +101,7 @@ fn remove_deletes_plists_from_launch_agents() {
         .args(["register-schedule"])
         .current_dir(v.path())
         .env("HOME", home.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success();
     let plist = home
@@ -112,6 +116,7 @@ fn remove_deletes_plists_from_launch_agents() {
         .args(["register-schedule", "--remove"])
         .current_dir(v.path())
         .env("HOME", home.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("\u{2713} Removed"));
@@ -132,6 +137,7 @@ fn resume_clears_paused_marker_file() {
         .args(["register-schedule", "--resume", "/daily"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("\u{2713} Resumed /daily"));
@@ -165,6 +171,7 @@ fn skill_and_command_with_same_basename_no_longer_collide() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("com.onebrain.echo"))
@@ -192,6 +199,7 @@ fn command_mode_entries_same_binary_different_args_no_collision() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("com.onebrain.echo-hello"))
@@ -219,6 +227,7 @@ fn command_mode_entries_fully_identical_still_collide() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -247,6 +256,7 @@ fn command_mode_dry_run_produces_hook_style_argv() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("<string>/bin/echo</string>"))
@@ -281,6 +291,7 @@ fn command_mode_onebrain_dry_run_embeds_vault() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("<string>search</string>"))
@@ -304,6 +315,7 @@ fn unschedulable_skill_rejected() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .failure()
         .stderr(predicate::str::contains("requires user input"));
@@ -341,6 +353,7 @@ fn stale_legacy_plist_removed_on_reregister() {
         .args(["register-schedule"])
         .current_dir(v.path())
         .env("HOME", home.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("Removed stale legacy plist"));
@@ -373,6 +386,7 @@ fn one_shot_command_rejects_shell_special_chars() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .failure()
         .stderr(predicate::str::contains("shell-special"));
@@ -395,6 +409,7 @@ fn refresh_emits_notice_line() {
         .args(["register-schedule", "--refresh", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("--refresh: re-emitting"));
@@ -416,6 +431,7 @@ fn status_shows_once_tag_for_at_entries() {
         .args(["register-schedule", "--status"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("[once]"));
@@ -437,6 +453,7 @@ fn status_shows_skill_args_in_parens() {
         .args(["register-schedule", "--status"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         // Args formatted as "(topic=this-week)"
@@ -461,6 +478,7 @@ fn status_shows_cmd_label_for_command_mode_entry() {
         .args(["register-schedule", "--status"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("cmd: /bin/echo"));
@@ -484,6 +502,7 @@ fn status_shows_cmd_with_args() {
         .args(["register-schedule", "--status"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("cmd: /bin/echo hello"));
@@ -505,6 +524,7 @@ fn resume_when_not_paused_prints_not_paused() {
         .args(["register-schedule", "--resume", "/daily"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("is not paused"));
@@ -521,6 +541,7 @@ fn empty_schedule_block_exits_cleanly() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("Nothing to register"));
@@ -542,6 +563,7 @@ fn invalid_cron_produces_error() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .failure()
         .stderr(predicate::str::contains("Invalid cron").or(predicate::str::contains("cron")));
@@ -569,6 +591,7 @@ fn schedulable_with_args_missing_required_arg_fails() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .failure()
         .stderr(predicate::str::contains("requires args").or(predicate::str::contains("topic")));
@@ -592,6 +615,7 @@ fn skill_no_schedulable_key_fails() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .failure()
         .stderr(predicate::str::contains("does not declare schedulable"));
@@ -613,6 +637,7 @@ fn skill_mode_args_with_shell_special_rejected() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .failure()
         .stderr(predicate::str::contains("shell-special"));
@@ -634,6 +659,7 @@ fn test_run_missing_skill_fails_with_message() {
         .args(["register-schedule", "--test", "/nonexistent"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -659,6 +685,7 @@ fn remove_when_no_plists_exits_cleanly() {
         .args(["register-schedule", "--remove"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success();
 }
@@ -683,10 +710,13 @@ fn registration_writes_plist_file() {
         .args(["register-schedule"])
         .current_dir(v.path())
         .env("HOME", home.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("\u{2713} Wrote"))
-        .stdout(predicate::str::contains("Registered 1 schedule entries"));
+        .stdout(predicate::str::contains(
+            "Registered and activated 1 schedule entries",
+        ));
 
     let plist = home
         .path()
@@ -694,7 +724,10 @@ fn registration_writes_plist_file() {
     assert!(plist.exists(), "plist must exist at {}", plist.display());
 }
 
-/// `--status` marks installed plist with ✓ and uninstalled with ✗.
+/// `--status` reports the artifact's real state (#312): absent → ✗, and —
+/// because this harness disables activation — present-but-not-loaded → ⚠.
+/// The old test asserted ✓ here, which was precisely the lie #312 fixes:
+/// a file on disk is not a scheduled job.
 #[cfg(unix)]
 #[test]
 fn status_marks_installed_and_uninstalled() {
@@ -714,6 +747,7 @@ fn status_marks_installed_and_uninstalled() {
         .args(["register-schedule", "--status"])
         .current_dir(v.path())
         .env("HOME", home.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("\u{2717}"));
@@ -725,19 +759,30 @@ fn status_marks_installed_and_uninstalled() {
         .args(["register-schedule"])
         .current_dir(v.path())
         .env("HOME", home.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success();
 
-    // After registration → installed (✓)
+    // After registration, with activation disabled by the harness:
+    //  - macOS (real activation semantics, #312): artifact on disk but
+    //    launchd not running it → Inactive (⚠). Asserting ✓ here would
+    //    re-assert the pre-#312 file-existence lie.
+    //  - other platforms (placeholder arm until Tasks 6/7c): is_installed is
+    //    still file-existence, so present truthfully reads Active (✓).
+    #[cfg(target_os = "macos")]
+    let expected = "\u{26a0}";
+    #[cfg(not(target_os = "macos"))]
+    let expected = "\u{2713}";
     Command::cargo_bin("onebrain")
         .unwrap()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--status"])
         .current_dir(v.path())
         .env("HOME", home.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
-        .stdout(predicate::str::contains("\u{2713}"));
+        .stdout(predicate::str::contains(expected));
 }
 
 // ── #116 bug 1: cron step/list/range end-to-end ────────────────────────────
@@ -753,6 +798,7 @@ fn step_cron_dry_run_emits_array_form_calendar_interval() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("<key>StartCalendarInterval</key>"))
@@ -773,6 +819,7 @@ fn list_cron_dry_run_succeeds() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("<array>"));
@@ -788,6 +835,7 @@ fn range_cron_dry_run_succeeds() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains("<array>"));
@@ -805,6 +853,7 @@ fn plain_cron_dry_run_still_emits_single_dict_form() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
         .stdout(predicate::str::contains(
@@ -825,6 +874,7 @@ fn pathological_cron_expansion_rejected() {
         .args(["register-schedule", "--dry-run"])
         .current_dir(v.path())
         .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .failure()
         .stderr(predicate::str::contains("exceeding the cap"));

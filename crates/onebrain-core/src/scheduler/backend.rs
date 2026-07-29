@@ -67,18 +67,73 @@ pub fn artifact_key(entry: &ScheduleEntry, ctx: &SchedulerContext) -> PathBuf {
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
+    use std::process::Command;
 
-    /// Write the plist. Exactly the sequence `register_schedule.rs` performed
-    /// before the seam existed — moved, not changed. `launchctl bootstrap`
-    /// comes in Task 4.
+    fn service_target(label_safe: &str, ctx: &SchedulerContext) -> String {
+        format!("gui/{}/com.onebrain.{label_safe}", ctx.uid)
+    }
+
+    /// Test-isolation kill-switch, NOT a user feature.
+    ///
+    /// Labels are a process-global launchd namespace: an integration test
+    /// running the real binary with `HOME=tempdir` still targets the REAL
+    /// `gui/<uid>/com.onebrain.daily` on bootout/bootstrap. The first suite
+    /// run after activation landed hijacked the operator's real `/daily`
+    /// (bootstrapped it from a since-deleted tempdir) and deleted its plist.
+    /// The integration harness sets this for every spawned binary; nothing
+    /// else should.
+    fn activation_disabled() -> bool {
+        std::env::var_os("ONEBRAIN_SCHEDULER_NO_ACTIVATE").is_some()
+    }
+
+    /// Write the plist, then make launchd actually run it (#312).
+    ///
+    /// `bootout` first (failure ignored — the job may simply not be loaded),
+    /// then `bootstrap` (failure is a real error). The pair makes
+    /// re-registration idempotent and picks up a regenerated plist
+    /// immediately — the file-only model only converged at next login, which
+    /// is how a regenerated plist sat unloaded for months.
     pub fn install(
         entry: &ScheduleEntry,
         ctx: &SchedulerContext,
     ) -> Result<PathBuf, SchedulerError> {
-        write_plist(entry, ctx)
+        let target = write_plist(entry, ctx)?;
+        if activation_disabled() {
+            return Ok(target);
+        }
+        let label = crate::scheduler::launchd::label_for_entry(entry);
+
+        let _ = Command::new("launchctl")
+            .args(["bootout", &service_target(&label, ctx)])
+            .output();
+
+        let bootstrap = Command::new("launchctl")
+            .args(["bootstrap", &format!("gui/{}", ctx.uid)])
+            .arg(&target)
+            .output();
+        match bootstrap {
+            Ok(out) if out.status.success() => Ok(target),
+            Ok(out) => Err(SchedulerError::BackendCommand {
+                command: format!("launchctl bootstrap gui/{} {}", ctx.uid, target.display()),
+                status: out.status.to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            }),
+            // launchctl itself unavailable (sandboxed CI, containers): the
+            // artifact is written and launchd will pick it up at login — the
+            // pre-#312 behaviour. Degraded but not silent: `is_installed`
+            // will report Inactive, not Active.
+            Err(_) => Ok(target),
+        }
     }
 
+    /// `bootout` BEFORE deleting — a loaded job keeps firing after its plist
+    /// is gone, which is how `--remove` used to lie.
     pub fn remove(label_safe: &str, ctx: &SchedulerContext) -> Result<bool, SchedulerError> {
+        if !activation_disabled() {
+            let _ = Command::new("launchctl")
+                .args(["bootout", &service_target(label_safe, ctx)])
+                .output();
+        }
         let target = plist_path(label_safe, &ctx.homedir);
         if target.exists() {
             std::fs::remove_file(&target)?;
@@ -88,15 +143,27 @@ mod imp {
         }
     }
 
-    /// File existence, for now. Task 4 replaces this with a launchctl query —
-    /// a file on disk must not read as scheduled (#312).
+    /// Ask launchd, not the filesystem (#312). Exit 0 from `launchctl print`
+    /// → Active. Otherwise fall back to file existence: present → Inactive
+    /// (artifact on disk, OS not running it — the state the old `list`
+    /// could not see), absent → Absent. A missing `launchctl` binary lands
+    /// in the same fallback rather than erroring.
     pub fn is_installed(
         label_safe: &str,
         ctx: &SchedulerContext,
     ) -> Result<InstallState, SchedulerError> {
+        let loaded = !activation_disabled()
+            && Command::new("launchctl")
+                .args(["print", &service_target(label_safe, ctx)])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+        if loaded {
+            return Ok(InstallState::Active);
+        }
         let target = plist_path(label_safe, &ctx.homedir);
         Ok(if target.exists() {
-            InstallState::Active
+            InstallState::Inactive
         } else {
             InstallState::Absent
         })
@@ -194,9 +261,11 @@ mod tests {
 
     #[test]
     fn is_installed_reports_absent_for_an_unknown_label() {
-        // File-existence only in Task 3 — safe everywhere. When Task 4 makes
-        // this a live launchctl query, THIS test must gain #[ignore] per [B2];
-        // the label is already non-colliding by construction.
+        // READ-ONLY exemption from [B2]: on macOS this now performs a
+        // `launchctl print` on a label that cannot exist, mutating nothing.
+        // It stays in the default suite deliberately — it is also the proof
+        // that a missing/failing launchctl degrades to the file fallback
+        // instead of erroring (sandboxed CI).
         let home = tempfile::tempdir().unwrap();
         let ctx = test_support::ctx_in(home.path());
         assert_eq!(
@@ -205,28 +274,70 @@ mod tests {
         );
     }
 
+    /// Run-unique label per [B2]: `gui/<uid>/<label>` is a process-global OS
+    /// namespace that `HOME=tempdir` does not sandbox. A fixed label here
+    /// would boot out a developer's real job of the same name.
+    fn unique_label(tag: &str) -> String {
+        format!(
+            "onebrain-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
     #[test]
-    fn install_then_remove_round_trips_on_the_filesystem() {
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "touches the real launchd domain — run explicitly, never in the default suite"
+    )]
+    fn install_then_remove_round_trips_through_the_backend() {
         let home = tempfile::tempdir().unwrap();
         let ctx = test_support::ctx_in(home.path());
-        let entry = test_support::entry_labelled("seam-roundtrip");
+        let label = unique_label("roundtrip");
+        let entry = test_support::entry_labelled(&label);
 
-        let path = install(&entry, &ctx).unwrap();
-        assert!(path.exists(), "install must write the artifact");
-        assert_eq!(
-            is_installed("seam-roundtrip", &ctx).unwrap(),
-            InstallState::Active
-        );
+        // Teardown must run even if an assertion panics: a leaked bootstrapped
+        // job pointing at a deleted tempdir outlives the test process.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let path = install(&entry, &ctx).unwrap();
+            assert!(path.exists(), "install must write the artifact");
+            assert_ne!(
+                is_installed(&label, &ctx).unwrap(),
+                InstallState::Absent,
+                "installed entry must not read as absent"
+            );
+        }));
+        let removed = remove(&label, &ctx).unwrap();
+        assert_eq!(is_installed(&label, &ctx).unwrap(), InstallState::Absent);
+        result.unwrap();
+        assert!(removed, "teardown should have found the artifact");
+    }
 
-        assert!(remove("seam-roundtrip", &ctx).unwrap());
-        assert_eq!(
-            is_installed("seam-roundtrip", &ctx).unwrap(),
-            InstallState::Absent
-        );
-        assert!(
-            !remove("seam-roundtrip", &ctx).unwrap(),
-            "second remove is a no-op"
-        );
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "touches the real launchd domain — run explicitly, never in the default suite"
+    )]
+    fn an_artifact_the_os_does_not_know_about_reports_inactive() {
+        // The regression guard for the actual #312 bug: a file on disk must
+        // not read as scheduled.
+        let home = tempfile::tempdir().unwrap();
+        let ctx = test_support::ctx_in(home.path());
+        let label = unique_label("inactive");
+        let entry = test_support::entry_labelled(&label);
+
+        // Write the artifact WITHOUT going through install() — no bootstrap.
+        let target = plist_path(&label, &ctx.homedir);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, generate_plist(&entry, &ctx)).unwrap();
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(is_installed(&label, &ctx).unwrap(), InstallState::Inactive);
+
+        let _ = std::fs::remove_file(&target);
     }
 
     #[test]

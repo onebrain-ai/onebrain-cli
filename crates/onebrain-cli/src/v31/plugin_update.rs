@@ -145,7 +145,8 @@ pub fn run(
     //    the dispatcher can render the partial state in the envelope.
     //
     //    v3.2.13: use the `run_embedded` entry so the per-plist `✓ Wrote …`
-    //    confirmation lines and the trailing "Use launchctl to load …" hint
+    //    confirmation lines and the activation summary (pre-#312: a "Use
+    //    launchctl to load" hint, since deleted)
     //    don't leak through plugin update's framed report — those belong on
     //    the direct `onebrain schedule register` surface, not embedded.
     if !dry_run {
