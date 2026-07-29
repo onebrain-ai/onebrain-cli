@@ -659,9 +659,32 @@ fn cleanup_stale_legacy_plist(
 }
 
 fn remove_all(vault: &Path) -> Result<()> {
-    let config = read_vault_config(vault)?;
+    let mut config = read_vault_config(vault)?;
     let ctx = build_scheduler_context(vault)?;
+    resolve_commands_best_effort(&mut config, vault);
     remove_entries(&config, &ctx)
+}
+
+/// Rewrite command-mode entries to their resolved absolute binary, exactly
+/// as register's Pass 2 does — labels derive from the command's BASENAME,
+/// and on Windows resolution changes it (`cmd` → `cmd.exe` → label
+/// `cmd-exe`), so a remove/status over the RAW config derived a label no
+/// installed artifact ever had: `--remove` silently removed nothing and
+/// status read ✗ for entries that were firing (caught live by the v3.4.20
+/// Windows ARM64 audit). Best-effort on purpose, unlike register's
+/// hard-error resolution: a binary the user has since uninstalled must not
+/// wedge removal of its own entry — the raw-name label is still correct on
+/// platforms where resolution keeps the basename.
+fn resolve_commands_best_effort(config: &mut ScheduleConfig, vault: &Path) {
+    for entry in &mut config.schedule {
+        if is_command_mode(entry) {
+            if let Some(cmd) = entry.command.as_deref() {
+                if let Ok(abs) = resolve_command_binary(cmd, Some(vault)) {
+                    entry.command = Some(abs);
+                }
+            }
+        }
+    }
 }
 
 /// Split from [`remove_all`] so unit tests inject a tempdir-rooted context
@@ -682,8 +705,11 @@ fn remove_entries(config: &ScheduleConfig, ctx: &SchedulerContext) -> Result<()>
 }
 
 fn print_status(vault: &Path) -> Result<()> {
-    let config = read_vault_config(vault)?;
+    let mut config = read_vault_config(vault)?;
     let ctx = build_scheduler_context(vault)?;
+    // Same label symmetry as remove_all — status over raw labels reported
+    // ✗ for command entries the OS scheduler was actively running.
+    resolve_commands_best_effort(&mut config, vault);
     print_status_with(&config, &ctx)
 }
 
@@ -1080,6 +1106,57 @@ mod tests {
         // the popped path equals `dir.path()` exactly — no macOS
         // `/var`→`/private/var` mismatch to guard against here.
         assert_eq!(result, dir.path());
+    }
+
+    /// The v3.4.20 Windows-audit regression: register resolves `cmd` →
+    /// `...\cmd.exe` before deriving the label (`cmd-exe--…`), so a remove
+    /// or status pass over the RAW config derives `cmd--…` — a label no
+    /// installed artifact ever had. The resolver rewrite must produce the
+    /// SAME label register used.
+    #[test]
+    fn remove_and_register_derive_the_same_label_for_command_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw: ScheduleConfig = serde_yaml::from_str(
+            "schedule:\n  - cron: \"0 9 * * *\"\n    command: sh\n    args: [-c, hi]\n",
+        )
+        .unwrap();
+
+        // Register's Pass 2 resolution:
+        let registered_label = {
+            let abs = resolve_command_binary(
+                raw.schedule[0].command.as_deref().unwrap(),
+                Some(dir.path()),
+            )
+            .unwrap();
+            let mut e = raw.schedule[0].clone();
+            e.command = Some(abs);
+            label_for_entry(&e)
+        };
+
+        // The remove/status path after the fix:
+        let mut cfg = raw;
+        resolve_commands_best_effort(&mut cfg, dir.path());
+        assert_eq!(
+            label_for_entry(&cfg.schedule[0]),
+            registered_label,
+            "remove/status must address the artifact register created"
+        );
+    }
+
+    /// Best-effort contract: a command binary that no longer exists must not
+    /// wedge removal — the raw entry passes through untouched.
+    #[test]
+    fn missing_binary_does_not_block_the_resolver_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg: ScheduleConfig = serde_yaml::from_str(
+            "schedule:\n  - cron: \"0 9 * * *\"\n    command: definitely-not-a-real-binary-xyz\n",
+        )
+        .unwrap();
+        resolve_commands_best_effort(&mut cfg, dir.path());
+        assert_eq!(
+            cfg.schedule[0].command.as_deref(),
+            Some("definitely-not-a-real-binary-xyz")
+        );
     }
 
     // ── resolve_command_binary ────────────────────────────────────────────────
