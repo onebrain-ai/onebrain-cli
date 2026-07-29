@@ -898,12 +898,23 @@ async fn put_vault_file(
         .unwrap_or(Path::new(&q.path))
         .to_path_buf();
     let root2 = root.clone();
+    let prev_nanos = mtime_nanos(&safe);
     tokio::task::spawn_blocking(move || onebrain_fs::note::write_note(&root2, &rel, &body))
         .await
         .map_err(|e| {
             tracing::warn!(error = %e, "write task failed");
             ApiError::Internal("write task failed".into())
         })??;
+
+    // The rev must actually rev (#335): mtime is the revision tag, and on
+    // coarse-clock platforms (Windows' ~15.6 ms timer; any platform under
+    // enough load) a write can land within the SAME tick as the previous
+    // one — the stale rev then still matches and a conflicting client
+    // silently overwrites (lost update). If the write didn't advance the
+    // mtime, advance it ourselves by one nanosecond past the old rev.
+    if let Err(e) = ensure_rev_advanced(&safe, prev_nanos) {
+        tracing::warn!(error = %e, "could not advance rev mtime");
+    }
 
     let rev = mtime_nanos(&safe)
         .map(|n| n.to_string())
@@ -1269,6 +1280,23 @@ pub(crate) fn confine_reindex_path(vault_root: &Path, rel: &str) -> Result<Strin
 }
 
 /// File mtime as whole nanoseconds since the Unix epoch (`None` if unavailable).
+/// #335: guarantee the mtime-based rev advanced past `prev`. A no-op when
+/// the filesystem already moved the clock; otherwise sets mtime to
+/// `prev + 1ns`. Idempotent and monotonic — never moves mtime backwards.
+fn ensure_rev_advanced(path: &Path, prev: Option<u128>) -> std::io::Result<()> {
+    let Some(prev) = prev else { return Ok(()) };
+    if mtime_nanos(path).is_some_and(|now| now > prev) {
+        return Ok(());
+    }
+    let bumped = std::time::UNIX_EPOCH
+        + std::time::Duration::new((prev / 1_000_000_000) as u64, (prev % 1_000_000_000) as u32)
+        + std::time::Duration::from_nanos(1);
+    std::fs::File::options()
+        .write(true)
+        .open(path)?
+        .set_modified(bumped)
+}
+
 fn mtime_nanos(path: &Path) -> Option<u128> {
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().ok()?;
@@ -1276,6 +1304,21 @@ fn mtime_nanos(path: &Path) -> Option<u128> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .map(|d| d.as_nanos())
+}
+
+/// Test seam for the sibling `server::tests` module (integration-style tests
+/// over the router live there, not in this file's unit tests).
+#[cfg(test)]
+pub(crate) mod api_test {
+    pub(crate) fn ensure_rev_advanced_for_test(
+        path: &std::path::Path,
+        prev: Option<u128>,
+    ) -> std::io::Result<()> {
+        super::ensure_rev_advanced(path, prev)
+    }
+    pub(crate) fn mtime_nanos_for_test(path: &std::path::Path) -> Option<u128> {
+        super::mtime_nanos(path)
+    }
 }
 
 #[cfg(test)]
