@@ -250,6 +250,40 @@ async fn put_file_saves_and_bumps_rev() {
     assert!(serde_json::from_str::<serde_json::Value>(&body2).unwrap()["rev"].is_string());
 }
 
+/// #335 regression, deterministic: pin the file's mtime, call the bump
+/// helper with that exact value (simulating a write that landed within the
+/// same clock tick), and the rev must move strictly forward. This is the
+/// mechanism that turns the racy same-tick overwrite into a 409.
+#[tokio::test]
+async fn rev_advances_even_when_the_clock_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("note.md");
+    std::fs::write(&f, "x").unwrap();
+    let pinned = std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 500);
+    std::fs::File::options()
+        .write(true)
+        .open(&f)
+        .unwrap()
+        .set_modified(pinned)
+        .unwrap();
+    let before = super::api::api_test::mtime_nanos_for_test(&f).unwrap();
+
+    super::api::api_test::ensure_rev_advanced_for_test(&f, Some(before)).unwrap();
+    let after = super::api::api_test::mtime_nanos_for_test(&f).unwrap();
+    assert!(
+        after > before,
+        "rev must strictly advance: {before} -> {after}"
+    );
+
+    // Idempotent + monotonic: a second call with the ORIGINAL prev must not
+    // move the (already newer) mtime backwards.
+    super::api::api_test::ensure_rev_advanced_for_test(&f, Some(before)).unwrap();
+    assert_eq!(
+        super::api::api_test::mtime_nanos_for_test(&f).unwrap(),
+        after
+    );
+}
+
 #[tokio::test]
 async fn put_missing_file_is_404() {
     let (_dir, router) = vault_router(None);
