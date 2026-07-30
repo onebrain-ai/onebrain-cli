@@ -30,12 +30,13 @@ pub enum SchedulerError {
     #[error("Skill {0} does not declare schedulable: true in frontmatter")]
     SkillSchedulableMissing(String),
 
-    #[error("Arg \"{key}\"=\"{value}\" must not contain shell-special chars (\", $, `, \\) in its key or value")]
-    ShellSpecialInArg { key: String, value: String },
-
-    #[error("Arg key or value must not contain shell-special chars (\", $, `, \\): {0}")]
-    ShellSpecialInOneShotArg(String),
-
+    // ShellSpecialInArg / ShellSpecialInOneShotArg lived here until v3.4.21
+    // (#344). They reported a register-time ban on `"`, `$`, backtick and `\`
+    // in args, which is gone: each renderer now escapes its OWN sink, so the
+    // characters are ordinary data rather than something to refuse. Removed
+    // rather than left in place — nothing constructs them, and a dead error
+    // variant reads as a rule the code still enforces. (Clippy cannot see it:
+    // the enum is `pub`, so an unconstructed variant raises no dead_code.)
     #[error("Command not found at absolute path: {0}. Check the path in onebrain.yml — the scheduler will silently fail at run time if the binary is missing.")]
     CommandNotFoundAbsolute(String),
 
