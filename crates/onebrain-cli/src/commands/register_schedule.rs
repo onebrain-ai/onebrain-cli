@@ -191,8 +191,14 @@ fn run_with(
         cleanup_stale_legacy_plist(entry, &target, &ctx, quiet);
         // The backend owns directory creation + artifact write (Task 3 seam);
         // activation with the OS itself lands in Task 4 (#312).
+        // Context names the LABEL, not `artifact_key` — that key is the
+        // launchd plist path on every platform (a collision identity, not a
+        // location), so this line printed a `~/Library/...plist` inside a
+        // Linux error message. Fourth member of the same display family
+        // (v3.4.20 fixed remove, dry-run, and the collision error); caught by
+        // the Track A Linux fire proof.
         let written = backend::install(entry, &ctx)
-            .with_context(|| format!("install schedule artifact {}", target.display()))?;
+            .with_context(|| format!("install schedule '{}'", label_for_entry(entry)))?;
         if !quiet {
             println!("\u{2713} Wrote {}", written.display());
         }
