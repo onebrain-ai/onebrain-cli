@@ -366,6 +366,52 @@ fn schedule_by_block(shape: &TriggerShape) -> String {
 /// mode is `entry.command` + its args, with `--vault` appended only when
 /// `should_append_vault` says so — the same #263 R2-guarded helper launchd
 /// uses, shared rather than re-derived.
+/// Join argv into the single `<Arguments>` string Task Scheduler passes to
+/// `CreateProcess` — quoting per element, EXCEPT for a `cmd.exe /c` payload.
+///
+/// Two different parsers live behind this one string, and picking the wrong
+/// one produces a task that registers, fires, and does nothing:
+/// - a normal program re-splits with `CommandLineToArgvW` → per-arg quoting
+///   is required (without it `--vault C:\My Vault\ob` arrives as three
+///   arguments — the v3.4.21 cold review's M2)
+/// - `cmd.exe` parses its own `/c` (or `/k`) payload with **CMD** rules,
+///   which do not recognise `\"`. Quoting that payload turns a working
+///   command into a literal-backslash mess. Measured on the ARM64 VM: a
+///   quoted `/c copy … "C:\ob test\out.txt"` registered and then silently
+///   did nothing, while the same entry worked pre-v3.4.21.
+///
+/// So: everything up to and including the switch is quoted normally; the
+/// payload after it is passed through verbatim, which is exactly what cmd
+/// expects to receive.
+fn join_win_args(command: &str, rest: &[String]) -> String {
+    // Split on BOTH separators by hand: this renderer is pure and its tests
+    // run on any host, where `std::path::Path` would treat a Windows `\` as
+    // an ordinary character and hand back the whole string as the basename.
+    let basename = command.rsplit(['\\', '/']).next().unwrap_or(command);
+    let stem = basename
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(basename);
+    let is_cmd = stem.eq_ignore_ascii_case("cmd");
+    let switch_at = rest
+        .iter()
+        .position(|a| a.eq_ignore_ascii_case("/c") || a.eq_ignore_ascii_case("/k"));
+
+    match (is_cmd, switch_at) {
+        (true, Some(i)) => {
+            let mut parts: Vec<String> = rest[..=i].iter().map(|a| quote_win_arg(a)).collect();
+            // Verbatim payload — CMD's parser owns everything past the switch.
+            parts.extend(rest[i + 1..].iter().cloned());
+            parts.join(" ")
+        }
+        _ => rest
+            .iter()
+            .map(|a| quote_win_arg(a))
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
 /// Quote one argv element per the `CommandLineToArgvW` rules every Windows
 /// process uses to re-split `<Arguments>`.
 ///
@@ -538,15 +584,7 @@ pub fn generate_task_xml(
 
     let arguments = argv_for_entry(entry, ctx)
         .split_first()
-        .map(|(cmd, rest)| {
-            (
-                cmd.clone(),
-                rest.iter()
-                    .map(|a| quote_win_arg(a))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            )
-        })
+        .map(|(cmd, rest)| (cmd.clone(), join_win_args(cmd, rest)))
         .map(|(cmd, args)| (xml_escape(&cmd), xml_escape(&args)))
         .expect("argv always has a command");
 
@@ -721,21 +759,54 @@ mod tests {
     /// joined with a bare space, so a space-bearing path arrived at the child
     /// as several arguments. Task Scheduler passes `<Arguments>` to
     /// CreateProcess as ONE string and the child re-splits it with
-    /// CommandLineToArgvW, so each element must be quoted per those rules.
+    /// CommandLineToArgvW, so each element must be quoted per those rules —
+    /// skill mode included, which is where `--vault "C:\My Vault\ob"` lives.
     #[test]
-    fn space_bearing_paths_are_quoted_per_commandlinetoargvw() {
+    fn skill_mode_vault_path_with_spaces_stays_one_argument() {
+        let mut ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        ctx.vault_path = std::path::PathBuf::from(r"C:\My Vault\ob");
+        let out = generate_task_xml(&daily_entry(), &ctx).unwrap();
+        assert!(
+            out.contains(r#"--vault &quot;C:\My Vault\ob&quot;"#),
+            "{out}"
+        );
+    }
+
+    /// Measured on the ARM64 VM (v3.4.21 Track A verify): quoting a
+    /// `cmd.exe /c` payload made the task register, fire, and do NOTHING —
+    /// CMD parses its own payload and does not recognise `\"`. The payload
+    /// after the switch is therefore passed through verbatim, while
+    /// everything else keeps CommandLineToArgvW quoting. This is also a
+    /// REGRESSION GUARD: the pattern below is the one the v3.4.20 Windows
+    /// audit used successfully, and per-arg quoting had broken it.
+    #[test]
+    fn cmd_slash_c_payload_is_passed_through_verbatim() {
         let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
         let mut e = daily_command_entry();
         e.command = Some(r"C:\Windows\system32\cmd.exe".into());
         e.args = Some(Args::List(vec![
             "/c".into(),
-            r"echo hi> C:\ob test\out.txt".into(),
+            r#"copy C:\Windows\win.ini "C:\ob test\out.txt""#.into(),
         ]));
         let out = generate_task_xml(&e, &ctx).unwrap();
-        // The space-bearing element is quoted; the flag is not.
         assert!(
-            out.contains(r#"/c &quot;echo hi&gt; C:\ob test\out.txt&quot;"#),
-            "{out}"
+            out.contains(r#"/c copy C:\Windows\win.ini &quot;C:\ob test\out.txt&quot;"#),
+            "cmd payload must not be re-quoted: {out}"
+        );
+    }
+
+    /// A non-cmd binary keeps per-arg quoting — the M2 fix must not be
+    /// undone by the cmd carve-out.
+    #[test]
+    fn non_cmd_binaries_still_get_per_arg_quoting() {
+        let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        let mut e = daily_command_entry();
+        e.command = Some(r"C:\tools\rsync.exe".into());
+        e.args = Some(Args::List(vec!["-av".into(), r"C:\My Vault\ob".into()]));
+        let out = generate_task_xml(&e, &ctx).unwrap();
+        assert!(
+            out.contains(r#"-av &quot;C:\My Vault\ob&quot;"#),
+            "space-bearing path must stay one argument: {out}"
         );
     }
 
