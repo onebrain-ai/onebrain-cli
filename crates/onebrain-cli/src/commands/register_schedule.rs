@@ -155,8 +155,11 @@ fn run_with(
         );
     }
 
+    // Every label this config currently owns. A legacy label is only stale if
+    // NO current entry answers to it — see `cleanup_stale_labels`.
+    let current_labels: Vec<String> = resolved.iter().map(label_for_entry).collect();
+
     for entry in &resolved {
-        let target = backend::artifact_key(entry, &ctx);
         if dry_run {
             if !quiet {
                 // Platform-aware preview [M5]: launchd plist on macOS, task
@@ -182,13 +185,6 @@ fn run_with(
             }
             continue;
         }
-        // #116 bug 2 introduced an args/cron discriminator into command-mode
-        // labels, so a command entry registered before this release has a
-        // stale plist sitting at the OLD basename-only path — still on disk
-        // AND still loaded in launchd. Clean it up before writing the new
-        // plist so a `--refresh` doesn't leave both the old and new jobs
-        // firing. Best-effort: never blocks registration on failure.
-        cleanup_stale_legacy_plist(entry, &target, &ctx, quiet);
         // The backend owns directory creation + artifact write (Task 3 seam);
         // activation with the OS itself lands in Task 4 (#312).
         // Context names the LABEL, not `artifact_key` — that key is the
@@ -202,6 +198,19 @@ fn run_with(
         if !quiet {
             println!("\u{2713} Wrote {}", written.display());
         }
+        // #116 bug 2 introduced an args/cron discriminator into command-mode
+        // labels, so a command entry registered before this release has a
+        // stale artifact sitting at the OLD basename-only label — still on
+        // disk AND still loaded — and #345's hash suffix adds a second such
+        // generation. Remove those so a `--refresh` doesn't leave the old and
+        // new jobs both firing. Best-effort: never blocks registration.
+        //
+        // AFTER the install, not before: `backend::remove` boots the job out
+        // as well as deleting it, so cleaning up first meant a failed install
+        // (a `launchctl bootstrap` error is a hard `Err`) left the user with
+        // the old job destroyed and no replacement. Ordering it after makes
+        // the failure mode "nothing changed" instead of "schedule lost".
+        cleanup_stale_labels(entry, &current_labels, &ctx, quiet);
     }
 
     if !quiet {
@@ -580,76 +589,61 @@ fn sanitize_label_for_migration(raw: &str) -> String {
         .collect()
 }
 
-/// During registration, remove a stale pre-#116 legacy-labeled plist for a
-/// command-mode entry whose NEW (discriminator-bearing) label differs from
-/// the legacy one. Without this, `--refresh` would leave the old plist both
-/// on disk AND still loaded in launchd, so the same command fires twice
-/// (old schedule + new schedule) until the user manually cleans it up.
+/// During registration, remove the artifact any PREVIOUS label of this entry
+/// owned, so a label change never leaves a second copy of the job installed.
 ///
-/// Best-effort in both steps — never fails registration:
-/// - `launchctl bootout gui/<uid>/<legacy-label>` unloads the running job
-///   (ignored if launchd doesn't have it loaded, or `launchctl` itself is
-///   unavailable in the test/CI sandbox).
-/// - The stale plist FILE is always removed when present, independent of
-///   whether bootout succeeded — this is the one step that matters for "does
-///   it fire again after the next login", since a file-only bootout failure
-///   just means the CURRENTLY loaded instance keeps running until the user's
-///   next logout/login cycle (the residual caveat callers should surface).
-fn cleanup_stale_legacy_plist(
+/// Two label generations can be stale for one command entry:
+/// - **pre-#116**: the bare basename, before args/cron became part of the label
+/// - **pre-v3.4.21**: the plain 40-char truncation, before `#345`'s bounded
+///   discriminator gave same-prefix args distinct labels
+///
+/// Both are cleaned **through `backend::remove`**, which is what makes this
+/// work off macOS at all. It previously built a `~/Library/LaunchAgents`
+/// path directly and returned early on every other platform, so a Linux or
+/// Windows label change left a timer/task installed and firing that
+/// `--remove` could never reach either — removal derives labels from the
+/// CURRENT config (v3.4.21 cold review, B3). Going through the seam also
+/// means the OS-side deactivation (bootout / `disable --now` / `/Delete`)
+/// happens per platform, and the `NO_ACTIVATE` kill-switch is honoured by
+/// the arms rather than re-implemented here.
+///
+/// `current_labels` is EVERY label this config owns, not just this entry's.
+/// One entry's legacy label can be another entry's live one: an entry whose
+/// joined args are exactly the 40-char prefix of a longer entry's produces a
+/// current label byte-identical to that longer entry's pre-v3.4.21 truncation.
+/// Comparing against `entry`'s own label alone deleted a job that was still in
+/// the config, on every run, while printing "Registered and activated N
+/// entries" and exiting 0 — the removal line even named a different entry as
+/// the superseder. Found by the v3.4.21 cold recovery review (F1); guarded by
+/// `legacy_label_matching_another_entry_is_never_removed`.
+///
+/// Best-effort throughout: a failure is reported, never fatal to
+/// registration.
+fn cleanup_stale_labels(
     entry: &ScheduleEntry,
-    new_target: &Path,
+    current_labels: &[String],
     ctx: &SchedulerContext,
     quiet: bool,
 ) {
-    let Some(legacy_label_safe) = legacy_command_label(entry) else {
-        return;
-    };
-    let legacy_label = format!("com.onebrain.{legacy_label_safe}");
-    let legacy_target = ctx
-        .homedir
-        .join("Library/LaunchAgents")
-        .join(format!("{legacy_label}.plist"));
-
-    if legacy_target == *new_target || !legacy_target.exists() {
-        return;
-    }
-
-    // Best-effort unload — ignore failure (job may not be loaded, or
-    // `launchctl` may be unavailable in a sandboxed/CI environment).
-    // Guarded by the shared kill-switch (2026-07-29 full-epic audit,
-    // BLOCKER 1): this was the one scheduler-touching spawn outside
-    // backend.rs, and the un-gated macOS integration test that exercises it
-    // ran `launchctl bootout` against the REAL gui domain of every machine
-    // running the suite. Only the spawn is guarded — removing the stale
-    // FILE stays, mirroring backend::remove's skip-OS-keep-file semantics.
-    if !backend::activation_disabled() {
-        let _ = std::process::Command::new("launchctl")
-            .arg("bootout")
-            .arg(format!("gui/{}", ctx.uid))
-            .arg(&legacy_target)
-            .output();
-    }
-
-    match std::fs::remove_file(&legacy_target) {
-        Ok(()) => {
-            if !quiet {
-                println!(
-                    "\u{2713} Removed stale legacy plist {} (superseded by {})",
-                    legacy_target.display(),
-                    new_target.display()
-                );
-            }
+    let stale = [
+        legacy_command_label(entry),
+        onebrain_core::scheduler::legacy_truncated_label(entry),
+    ];
+    for legacy in stale.into_iter().flatten() {
+        if current_labels.contains(&legacy) {
+            continue;
         }
-        Err(e) => {
-            if !quiet {
-                eprintln!(
-                    "⚠ Could not remove stale legacy plist {} — {e}; it may keep firing until \
-                     removed\n\
-                     💡 delete {} manually",
-                    legacy_target.display(),
-                    legacy_target.display()
-                );
-            }
+        match backend::remove(&legacy, ctx) {
+            Ok(true) if !quiet => println!(
+                "\u{2713} Removed stale schedule '{legacy}' (superseded by '{}')",
+                label_for_entry(entry)
+            ),
+            Ok(_) => {}
+            Err(e) if !quiet => eprintln!(
+                "⚠ Could not remove stale schedule '{legacy}' — {e}; it may keep firing until \
+                 removed manually"
+            ),
+            Err(_) => {}
         }
     }
 }
@@ -1719,92 +1713,93 @@ mod tests {
         assert_eq!(legacy_command_label(&e), Some("onebrain".to_string()));
     }
 
+    /// #345 + B3: an entry whose discriminator used to truncate changes
+    /// label, so registration must be able to name — and remove — the
+    /// artifact the OLD label owned. `legacy_truncated_label` is that name;
+    /// it is `None` for entries whose label is unchanged, so an upgrade does
+    /// no work for them.
     #[test]
-    fn cleanup_stale_legacy_plist_removes_file_when_labels_differ() {
-        use onebrain_core::scheduler::{Args, ScheduleEntry, SchedulerContext};
-        let dir = tempfile::tempdir().unwrap();
-        let agents_dir = dir.path().join("Library/LaunchAgents");
-        std::fs::create_dir_all(&agents_dir).unwrap();
-        let legacy = agents_dir.join("com.onebrain.echo.plist");
-        std::fs::write(&legacy, "stale").unwrap();
-
-        let ctx = SchedulerContext {
-            vault_path: dir.path().to_path_buf(),
-            skill_cli_path: "onebrain".to_string(),
-            log_base_path: dir.path().join("logs"),
-            homedir: dir.path().to_path_buf(),
-            uid: 501,
-        };
-        let entry = ScheduleEntry {
+    fn legacy_truncated_label_only_for_entries_that_used_to_truncate() {
+        use onebrain_core::scheduler::{legacy_truncated_label, Args, ScheduleEntry};
+        let short = ScheduleEntry {
             cron: Some("0 3 * * 0".to_string()),
             command: Some("/bin/echo".to_string()),
-            args: Some(Args::List(vec!["hello".to_string()])),
+            args: Some(Args::List(vec!["hi".to_string()])),
             ..Default::default()
         };
-        let new_target = agents_dir.join("com.onebrain.echo-hello.plist");
-        cleanup_stale_legacy_plist(&entry, &new_target, &ctx, true);
+        assert_eq!(legacy_truncated_label(&short), None, "short: no change");
 
-        assert!(!legacy.exists(), "stale legacy plist must be removed");
+        let long = ScheduleEntry {
+            cron: Some("0 3 * * 0".to_string()),
+            command: Some("/bin/echo".to_string()),
+            args: Some(Args::List(vec![
+                "/some/quite/long/path/that/goes/past/forty/characters/one".to_string(),
+            ])),
+            ..Default::default()
+        };
+        let legacy = legacy_truncated_label(&long).expect("long entry has a legacy label");
+        assert!(legacy.starts_with("echo-"), "got {legacy}");
+        // The legacy form is the plain 40-char truncation; the new label
+        // carries the hash suffix, so they must differ — otherwise the
+        // cleanup would delete the artifact just written.
+        assert_ne!(legacy, label_for_entry(&long));
     }
 
+    /// F1 from the v3.4.21 cold recovery review: one entry's LEGACY label can
+    /// be another entry's LIVE one, so the staleness test has to be "no
+    /// current entry answers to this label", not "not my own label".
+    ///
+    /// The shape: `short`'s joined args are exactly the 40-char prefix of
+    /// `long`'s, so `short`'s current label equals `long`'s pre-v3.4.21
+    /// truncation. Cleaning up `long` used to remove the artifact `short` had
+    /// just been registered under — silently, and on every subsequent run.
     #[test]
-    fn cleanup_stale_legacy_plist_noop_when_new_target_equals_legacy() {
-        // No discriminator (no args, no distinguishing cron collision risk in
-        // this synthetic case) → new label == legacy label → nothing to clean.
-        use onebrain_core::scheduler::{ScheduleEntry, SchedulerContext};
-        let dir = tempfile::tempdir().unwrap();
-        let agents_dir = dir.path().join("Library/LaunchAgents");
-        std::fs::create_dir_all(&agents_dir).unwrap();
-        let legacy = agents_dir.join("com.onebrain.true.plist");
-        std::fs::write(&legacy, "not actually stale").unwrap();
-
-        let ctx = SchedulerContext {
-            vault_path: dir.path().to_path_buf(),
-            skill_cli_path: "onebrain".to_string(),
-            log_base_path: dir.path().join("logs"),
-            homedir: dir.path().to_path_buf(),
-            uid: 501,
-        };
-        // No args and no cron discriminator possible here since command_discriminator
-        // falls back to cron when args are absent — use a bare command with a cron
-        // that still produces a discriminator UNLESS we bypass by pointing
-        // new_target at the same legacy path directly (simulating "no change").
-        let entry = ScheduleEntry {
-            cron: Some("0 9 * * *".to_string()),
-            command: Some("/usr/bin/true".to_string()),
+    fn legacy_label_matching_another_entry_is_never_removed() {
+        use onebrain_core::scheduler::{legacy_truncated_label, Args, ScheduleEntry};
+        let mk = |arg: &str| ScheduleEntry {
+            cron: Some("0 3 * * 0".to_string()),
+            command: Some("/bin/echo".to_string()),
+            args: Some(Args::List(vec![arg.to_string()])),
             ..Default::default()
         };
-        cleanup_stale_legacy_plist(&entry, &legacy, &ctx, true);
+        // 40 chars exactly — `command_discriminator` passes it through
+        // unbounded, so it IS the label suffix.
+        let prefix = "/Volumes/Backup/photos/library-2024-01ab";
+        assert_eq!(prefix.len(), 40, "the premise of this test");
+        let short = mk(prefix);
+        let long = mk(&format!("{prefix}cdef"));
 
+        let victim = label_for_entry(&short);
+        let legacy = legacy_truncated_label(&long).expect("long entry truncated before v3.4.21");
+        assert_eq!(
+            legacy, victim,
+            "premise: long's legacy label collides with short's live label"
+        );
+
+        // With both entries in the config, that label belongs to a live entry
+        // and must survive `long`'s cleanup.
+        let current = [label_for_entry(&short), label_for_entry(&long)];
         assert!(
-            legacy.exists(),
-            "must not remove the plist when new_target IS the legacy path"
+            current.contains(&legacy),
+            "the collision must be visible to cleanup_stale_labels' guard"
         );
     }
 
+    /// The two forms are length-disjoint, which is what makes a truncating
+    /// entry unable to collide with a non-truncating one (#345).
     #[test]
-    fn cleanup_stale_legacy_plist_noop_when_no_legacy_file_present() {
-        use onebrain_core::scheduler::{Args, ScheduleEntry, SchedulerContext};
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("Library/LaunchAgents")).unwrap();
-
-        let ctx = SchedulerContext {
-            vault_path: dir.path().to_path_buf(),
-            skill_cli_path: "onebrain".to_string(),
-            log_base_path: dir.path().join("logs"),
-            homedir: dir.path().to_path_buf(),
-            uid: 501,
-        };
-        let entry = ScheduleEntry {
+    fn same_prefix_long_args_get_distinct_labels() {
+        use onebrain_core::scheduler::{Args, ScheduleEntry};
+        let mk = |tail: &str| ScheduleEntry {
             cron: Some("0 3 * * 0".to_string()),
             command: Some("/bin/echo".to_string()),
-            args: Some(Args::List(vec!["hello".to_string()])),
+            args: Some(Args::List(vec![format!(
+                "/a/very/long/argument/sharing/a/common/prefix/{tail}"
+            )])),
             ..Default::default()
         };
-        let new_target = dir
-            .path()
-            .join("Library/LaunchAgents/com.onebrain.echo-hello.plist");
-        // No legacy file on disk — must be a silent no-op, no panic.
-        cleanup_stale_legacy_plist(&entry, &new_target, &ctx, true);
+        let a = label_for_entry(&mk("alpha"));
+        let b = label_for_entry(&mk("beta"));
+        assert_ne!(a, b, "differing only past char 40 must still differ: {a}");
     }
 }

@@ -16,6 +16,7 @@ chrono         = { workspace = true }
 regex          = { workspace = true }
 indexmap       = { workspace = true }
 onebrain-token = { workspace = true }
+sha2           = { workspace = true }
 
 [dev-dependencies]
 tempfile          = { workspace = true }

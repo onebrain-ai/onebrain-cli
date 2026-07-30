@@ -77,14 +77,79 @@ pub fn label_for_entry(entry: &ScheduleEntry) -> String {
 /// basename, matching the pre-#116 behavior for the common single-entry
 /// case).
 fn command_discriminator(entry: &ScheduleEntry) -> Option<String> {
+    let raw = raw_discriminator(entry)?;
+    Some(sanitize_label(&bounded_discriminator(&raw)))
+}
+
+/// The unbounded source string a command-mode label discriminates on.
+fn raw_discriminator(entry: &ScheduleEntry) -> Option<String> {
     let from_args = match &entry.args {
         Some(Args::List(argv)) if !argv.is_empty() => Some(argv.join("-")),
         _ => None,
     };
-    let raw = from_args.or_else(|| entry.cron.clone().or_else(|| entry.at.clone()))?;
+    from_args.or_else(|| entry.cron.clone().or_else(|| entry.at.clone()))
+}
+
+/// Bound the discriminator's length without letting two different inputs
+/// land on the same label (#345).
+///
+/// A plain `take(40)` made entries whose args differ only after char 40
+/// normalize identically — `detect_collisions` then refused the pair at
+/// register time: fail-closed, but invisible until hit, and easy to hit with
+/// path-bearing args. When the input would truncate, the tail becomes an
+/// 8-hex digest of the FULL string instead.
+///
+/// The suffix is deliberately NOT applied to inputs that already fit: those
+/// labels stay byte-identical, so an upgrade re-registers them onto the same
+/// artifact and only the previously-at-risk entries change identity. The two
+/// forms are also length-disjoint (≤ 40 vs exactly 41 chars), so a truncating
+/// entry can never collide with a non-truncating one.
+fn bounded_discriminator(raw: &str) -> String {
     const MAX_LEN: usize = 40;
-    let truncated: String = raw.chars().take(MAX_LEN).collect();
-    Some(sanitize_label(&truncated))
+    const PREFIX_LEN: usize = 32;
+    if raw.chars().count() <= MAX_LEN {
+        return raw.to_string();
+    }
+    let prefix: String = raw.chars().take(PREFIX_LEN).collect();
+    format!("{prefix}-{}", short_hash(raw))
+}
+
+/// First 8 hex chars of sha256 — enough to keep same-prefix args distinct
+/// without turning the label into something unreadable.
+fn short_hash(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(input.as_bytes())
+        .iter()
+        .take(4)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The label this entry carried BEFORE v3.4.21's bounded discriminator (the
+/// plain 40-char truncation), or `None` when its label is unchanged.
+///
+/// `register` uses this to remove the artifact the old label owned. Without
+/// it a label change leaves the previous timer/task/plist installed and
+/// firing, and `--remove` cannot reach it either, because removal derives
+/// labels from the current config (v3.4.21 cold review, B3).
+pub fn legacy_truncated_label(entry: &ScheduleEntry) -> Option<String> {
+    if !is_command_mode(entry) {
+        return None;
+    }
+    let raw = raw_discriminator(entry)?;
+    if raw.chars().count() <= 40 {
+        return None;
+    }
+    let cmd = entry.command.as_deref().unwrap_or("");
+    let basename = Path::new(cmd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(cmd);
+    let truncated: String = raw.chars().take(40).collect();
+    Some(sanitize_label(&format!(
+        "{basename}-{}",
+        sanitize_label(&truncated)
+    )))
 }
 
 fn sanitize_label(raw: &str) -> String {
