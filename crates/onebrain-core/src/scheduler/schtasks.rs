@@ -388,11 +388,13 @@ fn join_win_args(command: &str, rest: &[String]) -> String {
     // run on any host, where `std::path::Path` would treat a Windows `\` as
     // an ordinary character and hand back the whole string as the basename.
     let basename = command.rsplit(['\\', '/']).next().unwrap_or(command);
-    let stem = basename
-        .rsplit_once('.')
-        .map(|(s, _)| s)
-        .unwrap_or(basename);
-    let is_cmd = stem.eq_ignore_ascii_case("cmd");
+    // Only bare `cmd` or `cmd.exe`. Matching on the STEM alone also swept in
+    // `cmd.com`, `cmd.bat`, `cmd.anything` — programs that do NOT parse their
+    // tail with CMD rules, and which would therefore silently lose per-arg
+    // quoting. The carve-out's whole justification is "cmd.exe parses its own
+    // /c payload", so it should reach exactly that (v3.4.21 cold injection
+    // review).
+    let is_cmd = basename.eq_ignore_ascii_case("cmd") || basename.eq_ignore_ascii_case("cmd.exe");
     let switch_at = rest
         .iter()
         .position(|a| a.eq_ignore_ascii_case("/c") || a.eq_ignore_ascii_case("/k"));
@@ -808,6 +810,34 @@ mod tests {
             out.contains(r#"-av &quot;C:\My Vault\ob&quot;"#),
             "space-bearing path must stay one argument: {out}"
         );
+    }
+
+    /// The carve-out exists because `cmd.exe` parses its own `/c` tail with
+    /// CMD rules. Matching on the STEM let `cmd.com` / `cmd.bat` / any
+    /// `cmd.*` take the verbatim path too — programs that do no such thing,
+    /// and which therefore silently lost per-arg quoting.
+    /// (v3.4.21 cold injection review.)
+    #[test]
+    fn only_real_cmd_takes_the_verbatim_path() {
+        let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        let render = |command: &str| {
+            let mut e = daily_command_entry();
+            e.command = Some(command.into());
+            e.args = Some(Args::List(vec!["/c".into(), r"C:\My Vault\ob".into()]));
+            generate_task_xml(&e, &ctx).unwrap()
+        };
+        for real in ["cmd", "cmd.exe", "CMD.EXE", r"C:\WINDOWS\system32\cmd.exe"] {
+            assert!(
+                render(real).contains(r#"/c C:\My Vault\ob"#),
+                "{real}: CMD must receive its payload verbatim"
+            );
+        }
+        for impostor in [r"C:\evil\cmd.com", r"C:\evil\cmd.bat", "notcmd.exe"] {
+            assert!(
+                render(impostor).contains(r#"&quot;C:\My Vault\ob&quot;"#),
+                "{impostor}: does not parse CMD-style, so it must get per-arg quoting"
+            );
+        }
     }
 
     /// The CommandLineToArgvW backslash rule: a run of backslashes is

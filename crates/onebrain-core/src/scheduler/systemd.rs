@@ -48,6 +48,18 @@ pub fn unit_dir(homedir: &Path) -> PathBuf {
 /// - `%` → `%%` — unit **specifiers** (`%h`, `%i`, `%n`, …) expand the same
 ///   way; `date +%F` in an arg would otherwise be rewritten before exec
 ///
+/// Two more characters do not need ESCAPING but do need QUOTING, because
+/// systemd gives them meaning between words rather than inside one:
+/// - `;` — a lone `;` separates command lines within a single `ExecStart=`,
+///   so `args: [hi, ";", /bin/rm, -f, /tmp/x]` rendered TWO commands out of
+///   what the config, `--dry-run` and `--status` all present as one
+/// - `'` — systemd's word splitter is shell-like, so a stray single quote
+///   opens a quoted region that swallows the following words
+///
+/// Wrapping either in double quotes makes it an ordinary character of its own
+/// argument. Found by the v3.4.21 cold injection review; guarded by
+/// `semicolon_and_single_quote_stay_inside_one_argument`.
+///
 /// A newline or carriage return cannot be escaped at all: unit files are
 /// line-oriented, so a raw `\n` in a value ENDS the `ExecStart=` line and
 /// whatever follows is parsed as a new directive. `sanitize_unit_value`
@@ -59,7 +71,11 @@ fn quote_arg(arg: &str) -> String {
         .replace('"', "\\\"")
         .replace('$', "$$")
         .replace('%', "%%");
-    if arg.is_empty() || arg.chars().any(char::is_whitespace) || escaped != arg {
+    if arg.is_empty()
+        || arg.chars().any(char::is_whitespace)
+        || arg.contains([';', '\''])
+        || escaped != arg
+    {
         format!("\"{escaped}\"")
     } else {
         arg.to_string()
@@ -73,8 +89,10 @@ fn quote_arg(arg: &str) -> String {
 /// (`x\nExecStartPost=/bin/sh -c '…'` injects a real hook). No escape exists
 /// for it in the unit-file format, so the renderer refuses instead — the
 /// single character class where refusal is the correct answer rather than
-/// escaping. Applies to every value that reaches a unit line: argv elements
-/// AND the label the unit is named for.
+/// escaping. Applies to the argv elements that reach a unit line. The LABEL
+/// needs no check — `sanitize_label` has already restricted it to
+/// `[A-Za-z0-9-]`, so it cannot carry a line break; the call site says so
+/// too, and this docstring used to claim the opposite.
 pub fn sanitize_unit_value(value: &str) -> Result<(), SchedulerError> {
     if value.contains('\n') || value.contains('\r') {
         return Err(SchedulerError::InvalidEntry {
@@ -409,6 +427,43 @@ mod tests {
         ]));
         let out = generate_service_unit(&e, &ctx).unwrap();
         assert!(out.contains("$$HOME/%%h-report"), "{out}");
+    }
+
+    /// A lone `;` separates command lines inside one `ExecStart=`, so an
+    /// unquoted one turned a single configured command into two. A stray `'`
+    /// opens a quoted region in systemd's shell-like splitter and swallows
+    /// the words after it. Neither needs escaping — both need QUOTING.
+    /// (v3.4.21 cold injection review.)
+    #[test]
+    fn semicolon_and_single_quote_stay_inside_one_argument() {
+        let ctx = ctx_with_cli("/usr/local/bin/onebrain");
+        let mut e = daily_command_entry();
+        e.command = Some("/bin/echo".into());
+        e.args = Some(crate::scheduler::types::Args::List(vec![
+            "hi".to_string(),
+            ";".to_string(),
+            "/bin/rm".to_string(),
+            "-f".to_string(),
+            "/tmp/x".to_string(),
+            "it's".to_string(),
+        ]));
+        let out = generate_service_unit(&e, &ctx).unwrap();
+        let exec = out
+            .lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .expect("ExecStart line");
+        assert!(
+            exec.contains("\";\""),
+            "a bare `;` would start a second command line:\n{exec}"
+        );
+        assert!(
+            exec.contains("\"it's\""),
+            "a bare `'` would open a quoted region:\n{exec}"
+        );
+        assert!(
+            !exec.contains(" ; "),
+            "no unquoted command separator may survive:\n{exec}"
+        );
     }
 
     /// #344 on the Linux sink: a Windows-style path is data, and a

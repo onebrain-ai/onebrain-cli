@@ -268,8 +268,21 @@ fn read_vault_config(vault: &Path) -> Result<ScheduleConfig> {
 // string; every renderer now escapes its own sink instead —
 // `shell_escape_double_quoted` on both launchd one-shot blocks,
 // `quote_arg` + `sanitize_unit_value` for systemd, `quote_win_arg` for Task
-// Scheduler XML — each with a real-interpreter test (a `/bin/sh` injection
-// PoC, `systemd-analyze verify`, `schtasks /Create`).
+// Scheduler XML — with the deliberate exception of a `cmd.exe /c` payload,
+// passed through verbatim because CMD parses its own tail.
+//
+// How well each is verified, stated honestly, because an earlier version of
+// this comment claimed "a real-interpreter test" for all three and that was
+// false for two of them (v3.4.21 cold injection review):
+// - launchd — a genuine inertness proof IN THE SUITE: the PoCs run their
+//   payload through a real `/bin/sh` and assert a sentinel is never created
+// - systemd and Task Scheduler — string assertions in the suite, plus a
+//   ONE-OFF manual VM run per platform during this release (`systemd-analyze
+//   verify` rc=0 on a `$`/`%`/`;`-bearing arg; a space-bearing path
+//   registered and fired on Windows ARM64). Nothing in CI re-runs those: the
+//   fixtures under `tests/scheduler-corpus/` carry no escaped values, so
+//   `cargo test` stays green even if either escaper regresses. That gap is
+//   tracked as #353.
 //
 // Removing it was the point, not a side effect: a `\` is a path separator on
 // Windows, and a ban at register time made `args: [/c, "echo x> C:\dir\f"]`

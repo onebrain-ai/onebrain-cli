@@ -251,13 +251,20 @@ fn recurring_command_block(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Str
 /// containing `"` would break the shell string; `$` / `` ` `` / `\` would
 /// allow injection or corrupt the command launchd actually runs.
 ///
-/// `args:` map keys/values are ALSO rejected at register time by
-/// `sanitize_args_for_one_shot` / `validate_schedulable` (see
-/// `commands/register_schedule.rs`), which scan both keys and values — but
-/// we escape them here too as defense-in-depth, so a bypassed or future
-/// unvalidated code path still can't inject. (The register-time check
-/// originally scanned VALUES only, leaving map keys as an unguarded
-/// injection vector — this escape is the second layer that closes it.)
+/// **This is the ONLY layer.** Until v3.4.21 a register-time ban
+/// (`sanitize_args_for_one_shot`, plus a `validate_schedulable` scan) refused
+/// these characters before they could reach here, and this docstring called
+/// itself defense-in-depth. #344 deleted that ban deliberately — a `\` is a
+/// path separator on Windows, so refusing it made legitimate configs
+/// unregisterable — and there is no net beneath this function any more.
+/// Saying otherwise is how the single-layer bug got written in the first
+/// place, so it is worth being exact.
+///
+/// Treat any edit here as a security change:
+/// `one_shot_skill_map_key_injection_neutralized_through_real_sh` and
+/// `one_shot_command_list_arg_injection_neutralized_through_real_sh` run
+/// their payloads through a real `/bin/sh` and assert a sentinel file is
+/// never created. Keep both passing.
 fn shell_escape_double_quoted(input: &str) -> String {
     input
         .replace('\\', "\\\\")
@@ -1209,10 +1216,11 @@ mod tests {
     }
 
     // `#[cfg(unix)]`: shells out to a real `/bin/sh`, absent on Windows. The
-    // one-shot `/bin/sh -c` wrapper it exercises is a unix/launchd construct;
-    // the key-escaping logic is also covered platform-independently by the
-    // pure-string assertions in `one_shot_skill_map_key_escaped_in_wrapper`-
-    // style checks and the register-time validator tests.
+    // one-shot `/bin/sh -c` wrapper it exercises is a unix/launchd construct.
+    // The escaping primitive underneath it IS covered platform-independently,
+    // by `shell_escape_double_quoted_escapes_all_four_chars_in_order`. (This
+    // comment used to point at a test that does not exist and at the
+    // register-time validator tests, which #344 deleted.)
     #[cfg(unix)]
     #[test]
     fn one_shot_skill_map_key_injection_neutralized_through_real_sh() {
