@@ -34,9 +34,17 @@ The template groups keys under labelled banners in a fixed order:
 # ── Agent behavior ──…   checkpoint, recap
 # ── Search ──…           search
 # ── Token optimization ──… token_optimization
-# ── Automation ──…       schedule
+# ── Automation ──…       schedule, notifications
 # ── System ──…           stats   (managed by OneBrain — do not edit)
 ```
+
+`notifications` joined the Automation section in v3.4.21. It is **not** in the
+fresh template — like `recap` and `stats`, an unset block is simply absent —
+so a new vault never grows it, and a vault that sets it has the block placed
+and self-documented by `doctor --fix`. One consequence worth expecting: a vault
+that hand-added `notifications` before v3.4.21 reports layout drift once, until
+the next `--fix` moves it into the Automation group. Nothing is lost — the
+existing value and its comment are carried across verbatim.
 
 `onebrain doctor` reports "layout differs from template" when an existing
 config's top-level blocks are out of this order or missing their banners;
@@ -101,6 +109,7 @@ a completeness test enforces this against the config structs.
 | `recap.min_sessions` | Unrecapped session logs required before `/recap` runs (plugin key) | `6` | integer ≥ 1 | not validated (plugin-level) |
 | `recap.min_frequency` | Sessions a topic must recur in to be promoted to memory (plugin key) | `2` | integer ≥ 1 | not validated (plugin-level) |
 | `schedule` | Scheduled skill/command entries compiled by `onebrain schedule register` | *(none)* | see `schedule register` docs | not validated |
+| `notifications.telegram_chat_id` | Telegram chat id a scheduled run also sends its output to; unset = the run's vault log file only (plugin key) | *(unset)* | Telegram chat id | not validated (plugin-level) |
 | `stats.*` | Doctor run timestamps, stamped by `onebrain doctor`, plus `qmd_cleanup_declined`, a flag written by `doctor --fix` when the user declines legacy-qmd cleanup | — | managed automatically | — |
 
 Validation sources: the defaults above are the Rust runtime's own default
