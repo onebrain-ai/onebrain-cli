@@ -60,7 +60,10 @@ const SECTIONS: &[SectionDef] = &[
     },
     SectionDef {
         title: "Automation",
-        keys: &["schedule"],
+        // `notifications` belongs with `schedule` because it only affects
+        // scheduled runs: a headless run also sends its output to the
+        // configured chat, and nothing reads the key interactively.
+        keys: &["schedule", "notifications"],
     },
     SectionDef {
         title: "System",

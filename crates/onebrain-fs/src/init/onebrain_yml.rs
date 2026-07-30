@@ -311,6 +311,18 @@ pub fn config_key_docs() -> Vec<ConfigKeyDoc> {
              # skill) or `command` + `args` (any CLI)."
                 .to_string(),
         ),
+        // Read by the PLUGIN, never by this binary: a headless skill run
+        // sends its output to this chat in addition to the vault skill log.
+        // Absent from the fresh template for the same reason `stats` is —
+        // an unset optional block is simply not written — but the doc entry
+        // exists so a hand-added or wizard-added block gets its comment
+        // backfilled by `doctor --fix` instead of being reported as an
+        // undocumented key (#348).
+        doc(
+            &["notifications", "telegram_chat_id"],
+            "# Telegram chat id that scheduled runs also deliver to · unset = vault log only"
+                .to_string(),
+        ),
     ]
 }
 
@@ -858,6 +870,16 @@ mod tests {
                 assert!(
                     !yaml.contains("stats:"),
                     "fresh template must not emit a stats block:\n{yaml}"
+                );
+                continue;
+            }
+            // notifications.* is plugin-read and opt-in (#348): absent from
+            // the fresh template like every other unset optional block, with
+            // the doc entry present for the `doctor --fix` backfill.
+            if doc.segments.first() == Some(&"notifications") {
+                assert!(
+                    !yaml.contains("notifications:"),
+                    "fresh template must not emit a notifications block:\n{yaml}"
                 );
                 continue;
             }
