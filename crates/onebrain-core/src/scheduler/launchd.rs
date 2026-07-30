@@ -325,17 +325,20 @@ fn one_shot_command_block(entry: &ScheduleEntry, ctx: &SchedulerContext, label: 
         "{}/Library/LaunchAgents/{label}.plist",
         ctx.homedir.to_string_lossy()
     );
-    // NOTE: user-supplied `args:` list elements (`a`) are intentionally left
-    // unescaped here — `sanitize_args_for_one_shot` already rejects any
-    // value containing `"` / `$` / `` ` `` / `\` before this runs, so
-    // escaping them too would double-escape a value that's already known
-    // to be clean. `entry.command` and `ctx.vault_path` are NOT covered by
-    // that check (it only validates `args:`), so those get
-    // `shell_escape_double_quoted` below.
+    // Command-mode list args are escaped HERE, like every other value in
+    // this block. They used to be interpolated raw on the theory that the
+    // register-time character ban had already rejected anything dangerous —
+    // which made this the ONE single-layer path in the file, with its only
+    // layer in another crate behind a `cfg`. The v3.4.21 cold review found
+    // it, and the injection PoC that was supposed to guard it actually
+    // exercised the (already-escaped) skill-mode map-key path, so deleting
+    // the ban would not have turned any test red. Escaping at the sink is
+    // what makes the ban removable at all (#344).
     let mut parts: Vec<String> = match &entry.args {
-        Some(Args::List(argv)) if !argv.is_empty() => {
-            argv.iter().map(|a| format!("\"{a}\"")).collect()
-        }
+        Some(Args::List(argv)) if !argv.is_empty() => argv
+            .iter()
+            .map(|a| format!("\"{}\"", shell_escape_double_quoted(a)))
+            .collect(),
         _ => Vec::new(),
     };
     if should_append_vault(entry, ctx) {
@@ -1252,6 +1255,61 @@ mod tests {
             !sentinel.exists(),
             "SHELL INJECTION: emitted one-shot payload executed the injected \
              command. shell string was:\n{shell}"
+        );
+    }
+
+    /// SECURITY PoC for the path the OLD PoC did not cover (v3.4.21 cold
+    /// review, B2): command-mode LIST args in a one-shot plist. The previous
+    /// test exercised skill-mode map keys — already escaped — so it stayed
+    /// green even with the register-time ban removed. This one goes red if
+    /// `one_shot_command_block` ever stops escaping list elements.
+    #[test]
+    fn one_shot_command_list_arg_injection_neutralized_through_real_sh() {
+        let td = tempfile::tempdir().unwrap();
+        let sentinel = td.path().join("onebrain_poc_list_arg_pwned");
+        assert!(!sentinel.exists());
+
+        let e = ScheduleEntry {
+            at: Some("2026-05-13 14:30".into()),
+            command: Some("/usr/bin/true".into()),
+            args: Some(Args::List(vec![format!(
+                "x\"; touch {}; echo \"",
+                sentinel.display()
+            )])),
+            ..Default::default()
+        };
+        let out = generate_plist(&e, &test_ctx());
+        let shell = extract_one_shot_shell(&out);
+
+        let _ = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&shell)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("run /bin/sh");
+        assert!(
+            !sentinel.exists(),
+            "SHELL INJECTION via command-mode list arg. shell string was:\n{shell}"
+        );
+    }
+
+    /// #344: a Windows-style absolute path in a one-shot list arg must
+    /// survive escaping intact — the backslashes are data, and the whole
+    /// point of escaping at the sink is that the register-time ban can go.
+    #[test]
+    fn one_shot_command_list_arg_keeps_backslash_paths_intact() {
+        let e = ScheduleEntry {
+            at: Some("2026-05-13 14:30".into()),
+            command: Some("/usr/bin/true".into()),
+            args: Some(Args::List(vec![r"C:\ob test\out.txt".to_string()])),
+            ..Default::default()
+        };
+        let shell = extract_one_shot_shell(&generate_plist(&e, &test_ctx()));
+        // Escaped form inside the double-quoted shell string.
+        assert!(
+            shell.contains(r"C:\\ob test\\out.txt"),
+            "path must be present, backslash-escaped: {shell}"
         );
     }
 

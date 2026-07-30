@@ -385,9 +385,15 @@ fn stale_legacy_plist_removed_on_reregister() {
     );
 }
 
-/// One-shot args containing shell-special chars are rejected.
+/// v3.4.21 (#344) inverted this: shell-special characters in a one-shot arg
+/// are ACCEPTED at register time now — the renderers escape their own sinks,
+/// and the `/bin/sh` injection PoCs in `onebrain-core::scheduler::launchd`
+/// are what prove the value stays inert. End-to-end, this asserts the two
+/// halves that matter: registration succeeds, and the rendered artifact
+/// carries the value ESCAPED rather than raw.
+#[cfg(target_os = "macos")]
 #[test]
-fn one_shot_command_rejects_shell_special_chars() {
+fn one_shot_command_accepts_and_escapes_shell_special_chars() {
     let v = tempdir().unwrap();
     std::fs::write(
         v.path().join("vault.yml"),
@@ -402,8 +408,30 @@ fn one_shot_command_rejects_shell_special_chars() {
         .env("HOME", v.path())
         .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("shell-special"));
+        .success()
+        // Escaped in the emitted shell string — a bare `$EVIL` would expand.
+        .stdout(predicate::str::contains(r"\$EVIL"));
+}
+
+/// #344's headline case end-to-end: a Windows-style absolute path in a
+/// one-shot command arg registered nowhere before v3.4.21.
+#[test]
+fn one_shot_command_accepts_windows_style_paths() {
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("vault.yml"),
+        "schedule:\n  - at: \"2026-05-13 14:30\"\n    command: /bin/echo\n    args:\n      - \"C:\\\\ob test\\\\out.txt\"\n",
+    )
+    .unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
+        .assert()
+        .success();
 }
 
 /// `--refresh` prints a notice line before writing plists.
@@ -640,7 +668,8 @@ fn skill_no_schedulable_key_fails() {
 
 /// skill-mode args with shell-special chars are rejected at register time.
 #[test]
-fn skill_mode_args_with_shell_special_rejected() {
+fn skill_mode_args_with_shell_special_accepted_and_escaped() {
+    // Inverted in v3.4.21 (#344) — see the one-shot counterpart above.
     let v = tempdir().unwrap();
     write_skill(v.path(), "distill", "name: distill\nschedulable: true");
     std::fs::write(
@@ -656,8 +685,7 @@ fn skill_mode_args_with_shell_special_rejected() {
         .env("HOME", v.path())
         .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("shell-special"));
+        .success();
 }
 
 /// `--test` with a skill that isn't in the schedule fails with a helpful error.

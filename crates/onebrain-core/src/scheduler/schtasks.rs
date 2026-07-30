@@ -366,6 +366,55 @@ fn schedule_by_block(shape: &TriggerShape) -> String {
 /// mode is `entry.command` + its args, with `--vault` appended only when
 /// `should_append_vault` says so — the same #263 R2-guarded helper launchd
 /// uses, shared rather than re-derived.
+/// Quote one argv element per the `CommandLineToArgvW` rules every Windows
+/// process uses to re-split `<Arguments>`.
+///
+/// Task Scheduler hands `<Arguments>` to `CreateProcess` as ONE string; the
+/// child then splits it. Joining with a bare space (what this file did
+/// before v3.4.21) meant `--vault C:\My Vault\ob` arrived as three
+/// arguments — the task registered, fired, and ran wrong, which no
+/// XML-contents assertion could catch (v3.4.21 cold review, M2).
+///
+/// The backslash rule is the fiddly part of the Microsoft algorithm:
+/// backslashes are literal EXCEPT when they immediately precede a `"`, where
+/// each must be doubled — so `C:\dir\` inside quotes becomes `C:\dir\\"`.
+/// XML escaping runs afterwards and is a separate layer.
+fn quote_win_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => {
+                backslashes += 1;
+                out.push('\\');
+            }
+            '"' => {
+                // Double the run that precedes the quote, then escape it.
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push('\\');
+                out.push('"');
+            }
+            _ => {
+                backslashes = 0;
+                out.push(c);
+            }
+        }
+    }
+    // A trailing run would otherwise escape our own closing quote.
+    for _ in 0..backslashes {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
 fn argv_for_entry(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Vec<String> {
     if is_command_mode(entry) {
         let mut argv = vec![entry.command.clone().unwrap_or_default()];
@@ -489,7 +538,15 @@ pub fn generate_task_xml(
 
     let arguments = argv_for_entry(entry, ctx)
         .split_first()
-        .map(|(cmd, rest)| (cmd.clone(), rest.join(" ")))
+        .map(|(cmd, rest)| {
+            (
+                cmd.clone(),
+                rest.iter()
+                    .map(|a| quote_win_arg(a))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        })
         .map(|(cmd, args)| (xml_escape(&cmd), xml_escape(&args)))
         .expect("argv always has a command");
 
@@ -660,11 +717,49 @@ mod tests {
         );
     }
 
-    /// Audit BLOCKER 2 regression: a cron between 49 and 1000 triggers
-    /// passes the shared cross-platform validator (1000-combination cap), so
-    /// the 48-trigger Task Scheduler cap is only reachable at render time —
-    /// which must surface as the friendly TooManyTriggers error, never a
-    /// panic (the old `.expect` crashed register AND --dry-run on Windows).
+    /// M2 (v3.4.21 cold review) — LIVE bug in shipped v3.4.20: args were
+    /// joined with a bare space, so a space-bearing path arrived at the child
+    /// as several arguments. Task Scheduler passes `<Arguments>` to
+    /// CreateProcess as ONE string and the child re-splits it with
+    /// CommandLineToArgvW, so each element must be quoted per those rules.
+    #[test]
+    fn space_bearing_paths_are_quoted_per_commandlinetoargvw() {
+        let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        let mut e = daily_command_entry();
+        e.command = Some(r"C:\Windows\system32\cmd.exe".into());
+        e.args = Some(Args::List(vec![
+            "/c".into(),
+            r"echo hi> C:\ob test\out.txt".into(),
+        ]));
+        let out = generate_task_xml(&e, &ctx).unwrap();
+        // The space-bearing element is quoted; the flag is not.
+        assert!(
+            out.contains(r#"/c &quot;echo hi&gt; C:\ob test\out.txt&quot;"#),
+            "{out}"
+        );
+    }
+
+    /// The CommandLineToArgvW backslash rule: a run of backslashes is
+    /// literal unless it precedes a quote, where it must be doubled. A
+    /// trailing run before our own closing quote counts.
+    #[test]
+    fn trailing_backslash_run_is_doubled_before_the_closing_quote() {
+        // `C:\ob test\` → the trailing run doubles so it cannot escape our
+        // own closing quote.
+        assert_eq!(quote_win_arg("C:\\ob test\\"), r#""C:\ob test\\""#);
+        // `a"b` → the embedded quote is escaped.
+        assert_eq!(quote_win_arg("a\"b"), r#""a\"b""#);
+        // No metacharacters: left bare, so nothing double-quotes a flag.
+        assert_eq!(quote_win_arg("plain"), "plain");
+        // Empty string still needs to occupy an argv slot.
+        assert_eq!(quote_win_arg(""), r#""""#);
+    }
+
+    /// Audit BLOCKER 2 regression (v3.4.20): a cron between 49 and 1000
+    /// triggers passes the shared cross-platform validator (1000-combination
+    /// cap), so the 48-trigger Task Scheduler cap is only reachable at render
+    /// time — which must surface as the friendly TooManyTriggers error, never
+    /// a panic (the old `.expect` crashed register AND --dry-run on Windows).
     #[test]
     fn render_surfaces_too_many_triggers_instead_of_panicking() {
         let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
