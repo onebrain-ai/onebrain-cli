@@ -370,7 +370,9 @@ fn stale_legacy_plist_removed_on_reregister() {
         .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Removed stale legacy plist"));
+        // v3.4.21: the cleanup goes through `backend::remove`, so it works on
+        // every platform and reports the LABEL rather than a launchd path.
+        .stdout(predicate::str::contains("Removed stale schedule 'echo'"));
 
     assert!(
         !legacy_plist.exists(),
@@ -383,6 +385,68 @@ fn stale_legacy_plist_removed_on_reregister() {
         "expected new plist at {}",
         new_plist.display()
     );
+}
+
+/// F1 from the v3.4.21 cold recovery review, end to end: registering must not
+/// delete a job that IS in the config.
+///
+/// One entry's args are exactly the 40-char prefix of the other's, so the
+/// short entry's CURRENT label equals the long entry's pre-v3.4.21 truncation.
+/// Cleaning up the long entry's legacy label therefore removed the short
+/// entry's live plist — while reporting "Registered and activated 2 schedule
+/// entries" and exiting 0, with the removal line naming the wrong entry as its
+/// superseder. It also never self-healed: every later run repeated it.
+///
+/// Order matters — the short entry is listed FIRST, which is the destructive
+/// direction (long-first is only a transient bootout the loop re-bootstraps).
+#[cfg(target_os = "macos")]
+#[test]
+fn registering_never_removes_a_plist_another_entry_still_owns() {
+    // Exactly 40 characters: `command_discriminator` passes it through
+    // unbounded, so it is the short entry's whole label suffix.
+    let prefix = "/Volumes/Backup/photos/library-2024-01ab";
+    assert_eq!(prefix.len(), 40, "the premise of this test");
+
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("vault.yml"),
+        format!(
+            "schedule:\n  \
+             - cron: \"0 1 * * *\"\n    command: /bin/echo\n    args:\n      - \"{prefix}\"\n  \
+             - cron: \"0 2 * * *\"\n    command: /bin/echo\n    args:\n      - \"{prefix}cdef\"\n"
+        ),
+    )
+    .unwrap();
+    let home = tempdir().unwrap();
+    let agents_dir = home.path().join("Library/LaunchAgents");
+    std::fs::create_dir_all(&agents_dir).unwrap();
+
+    let count_plists = || {
+        std::fs::read_dir(&agents_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("com.onebrain."))
+            .count()
+    };
+
+    // Run twice: the bug was stable across runs, so a single run could pass by
+    // luck of ordering while the second still destroyed the entry.
+    for run in 1..=2 {
+        Command::cargo_bin("onebrain")
+            .unwrap()
+            .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
+            .args(["register-schedule"])
+            .current_dir(v.path())
+            .env("HOME", home.path())
+            .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
+            .assert()
+            .success();
+        assert_eq!(
+            count_plists(),
+            2,
+            "run {run}: both configured entries must stay installed"
+        );
+    }
 }
 
 /// v3.4.21 (#344) inverted this: shell-special characters in a one-shot arg

@@ -46,7 +46,7 @@ pub use cron_parse::{
 };
 pub use entry::{is_command_mode, is_one_shot, is_skill_mode, validate_entry};
 pub use error::SchedulerError;
-pub use launchd::{generate_plist, label_for_entry, plist_path};
+pub use launchd::{generate_plist, label_for_entry, legacy_truncated_label, plist_path};
 pub use log_dir::{default_log_dir, is_in_vault};
 pub use log_paths::scheduler_log_path;
 pub use types::{Args, ScheduleConfig, ScheduleEntry, SkillFrontmatter};
