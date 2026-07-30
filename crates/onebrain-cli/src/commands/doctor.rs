@@ -9413,9 +9413,9 @@ mod tests {
         for doc in onebrain_fs::config_key_docs() {
             let key = doc.segments.last().unwrap();
             // Keys not present in this legacy config are never added
-            // (recap.*, stats.*, schedule, token_optimization.*, and the
-            // search reranker/top_k/exclude/embed.* keys are all absent
-            // here).
+            // (recap.*, stats.*, schedule, notifications.*,
+            // token_optimization.*, and the search reranker/top_k/exclude/
+            // embed.* keys are all absent here).
             if doc.segments.join(".").starts_with("search.reranker")
                 || doc.segments == ["search", "default_top_k"]
                 || doc.segments == ["search", "exclude"]
@@ -9423,6 +9423,7 @@ mod tests {
                 || doc.segments.first() == Some(&"recap")
                 || doc.segments.first() == Some(&"stats")
                 || doc.segments.first() == Some(&"token_optimization")
+                || doc.segments.first() == Some(&"notifications")
                 || doc.segments == ["schedule"]
             {
                 assert!(
