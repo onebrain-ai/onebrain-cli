@@ -1180,10 +1180,11 @@ mod tests {
     /// Reverse of [`xml_escape`] — recovers the raw text of a `<string>`
     /// payload. `&amp;` LAST so an already-decoded `&` can't be re-decoded.
     ///
-    /// `#[cfg(unix)]`: only feeds the `/bin/sh` round-trip test below, which
-    /// is unix-only — keeping it unguarded would be dead code (and a
-    /// `-D warnings` clippy failure) on Windows.
-    #[cfg(unix)]
+    /// Not gated: `generate_plist` is a pure renderer that compiles and is
+    /// tested on every host, so the escaping assertions that read its output
+    /// back must run everywhere too. (This was `#[cfg(unix)]` while its only
+    /// caller shelled out to `/bin/sh`; a Windows-path test now reads it back
+    /// with no shell involved.)
     fn un_xml_escape(s: &str) -> String {
         s.replace("&lt;", "<")
             .replace("&gt;", ">")
@@ -1195,8 +1196,8 @@ mod tests {
     /// right after `-c`) out of a generated one-shot plist and un-XML-escape
     /// it back to the raw shell command that launchd would actually run.
     ///
-    /// `#[cfg(unix)]`: only used by the unix-only `/bin/sh` injection test.
-    #[cfg(unix)]
+    /// Not gated, for the same reason as [`un_xml_escape`]: it only parses a
+    /// generated plist string, and the Windows-path escaping test needs it.
     fn extract_one_shot_shell(plist: &str) -> String {
         let marker = "<string>-c</string>";
         let after = &plist[plist.find(marker).expect("no -c marker") + marker.len()..];
@@ -1263,6 +1264,11 @@ mod tests {
     /// test exercised skill-mode map keys — already escaped — so it stayed
     /// green even with the register-time ban removed. This one goes red if
     /// `one_shot_command_block` ever stops escaping list elements.
+    ///
+    /// `#[cfg(unix)]`: it executes the payload through a real `/bin/sh`,
+    /// which Windows does not have. The escaping itself is asserted on every
+    /// host by `one_shot_command_list_arg_keeps_backslash_paths_intact`.
+    #[cfg(unix)]
     #[test]
     fn one_shot_command_list_arg_injection_neutralized_through_real_sh() {
         let td = tempfile::tempdir().unwrap();
