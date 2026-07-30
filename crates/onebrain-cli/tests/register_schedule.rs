@@ -415,12 +415,21 @@ fn one_shot_command_accepts_and_escapes_shell_special_chars() {
 
 /// #344's headline case end-to-end: a Windows-style absolute path in a
 /// one-shot command arg registered nowhere before v3.4.21.
+///
+/// The `command` is chosen per host deliberately. It is incidental to what is
+/// asserted — that the ARG is accepted — but it must still resolve, because
+/// `register-schedule` refuses a command it cannot find in PATH. Hardcoding
+/// `/bin/echo` failed on windows-latest for exactly that reason, on the one
+/// platform where a Windows path in an arg is not hypothetical.
 #[test]
 fn one_shot_command_accepts_windows_style_paths() {
+    let cmd = if cfg!(windows) { "cmd" } else { "/bin/echo" };
     let v = tempdir().unwrap();
     std::fs::write(
         v.path().join("vault.yml"),
-        "schedule:\n  - at: \"2026-05-13 14:30\"\n    command: /bin/echo\n    args:\n      - \"C:\\\\ob test\\\\out.txt\"\n",
+        format!(
+            "schedule:\n  - at: \"2026-05-13 14:30\"\n    command: {cmd}\n    args:\n      - \"C:\\\\ob test\\\\out.txt\"\n"
+        ),
     )
     .unwrap();
     Command::cargo_bin("onebrain")
