@@ -156,9 +156,11 @@ Builds the relative log path for a scheduled-skill invocation.
 ### `src/scheduler/error.rs`
 Typed scheduler errors with verbatim Bun-matched strings (parity tests assert on exact substrings).
 **Key types**
-- `SchedulerError` — `thiserror` enum: `InvalidCron`, `InvalidAt`, `InvalidEntry`, `SkillNotFound`, `SkillNoFrontmatter`, `SkillNotSchedulable`, `SkillMissingArgs`, `SkillSchedulableMissing`, `ShellSpecialInArg`, `ShellSpecialInOneShotArg`, `CommandNotFound{Absolute,Relative,InPath}`, `Conflict`, plus `Io`/`Yaml` `#[from]` bridges.
+- `SchedulerError` — `thiserror` enum: `InvalidCron`, `InvalidAt`, `InvalidEntry`, `SkillNotFound`, `SkillNoFrontmatter`, `SkillNotSchedulable`, `SkillMissingArgs`, `SkillSchedulableMissing`, `CommandNotFound{Absolute,Relative,InPath}`, `Conflict`, plus `Io`/`Yaml` `#[from]` bridges.
 
-**Connections** — produced by: `cron_parse`, `entry`, and onebrain-cli schedule-registration validation (skill/command existence, shell-special-char, plist-path conflict). Consumed by: onebrain-cli error rendering.
+> `ShellSpecialInArg` / `ShellSpecialInOneShotArg` were removed in v3.4.21 (#344) along with the register-time character ban they reported. Each renderer escapes its own sink now, so `"`, `$`, backtick and `\` are ordinary data in args.
+
+**Connections** — produced by: `cron_parse`, `entry`, and onebrain-cli schedule-registration validation (skill/command existence, plist-path conflict). Consumed by: onebrain-cli error rendering.
 
 ## types/ submodules
 

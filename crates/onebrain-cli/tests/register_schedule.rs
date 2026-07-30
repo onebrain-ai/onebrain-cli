@@ -385,9 +385,15 @@ fn stale_legacy_plist_removed_on_reregister() {
     );
 }
 
-/// One-shot args containing shell-special chars are rejected.
+/// v3.4.21 (#344) inverted this: shell-special characters in a one-shot arg
+/// are ACCEPTED at register time now — the renderers escape their own sinks,
+/// and the `/bin/sh` injection PoCs in `onebrain-core::scheduler::launchd`
+/// are what prove the value stays inert. End-to-end, this asserts the two
+/// halves that matter: registration succeeds, and the rendered artifact
+/// carries the value ESCAPED rather than raw.
+#[cfg(target_os = "macos")]
 #[test]
-fn one_shot_command_rejects_shell_special_chars() {
+fn one_shot_command_accepts_and_escapes_shell_special_chars() {
     let v = tempdir().unwrap();
     std::fs::write(
         v.path().join("vault.yml"),
@@ -402,8 +408,39 @@ fn one_shot_command_rejects_shell_special_chars() {
         .env("HOME", v.path())
         .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("shell-special"));
+        .success()
+        // Escaped in the emitted shell string — a bare `$EVIL` would expand.
+        .stdout(predicate::str::contains(r"\$EVIL"));
+}
+
+/// #344's headline case end-to-end: a Windows-style absolute path in a
+/// one-shot command arg registered nowhere before v3.4.21.
+///
+/// The `command` is chosen per host deliberately. It is incidental to what is
+/// asserted — that the ARG is accepted — but it must still resolve, because
+/// `register-schedule` refuses a command it cannot find in PATH. Hardcoding
+/// `/bin/echo` failed on windows-latest for exactly that reason, on the one
+/// platform where a Windows path in an arg is not hypothetical.
+#[test]
+fn one_shot_command_accepts_windows_style_paths() {
+    let cmd = if cfg!(windows) { "cmd" } else { "/bin/echo" };
+    let v = tempdir().unwrap();
+    std::fs::write(
+        v.path().join("vault.yml"),
+        format!(
+            "schedule:\n  - at: \"2026-05-13 14:30\"\n    command: {cmd}\n    args:\n      - \"C:\\\\ob test\\\\out.txt\"\n"
+        ),
+    )
+    .unwrap();
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
+        .args(["register-schedule", "--dry-run"])
+        .current_dir(v.path())
+        .env("HOME", v.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
+        .assert()
+        .success();
 }
 
 /// `--refresh` prints a notice line before writing plists.
@@ -638,9 +675,25 @@ fn skill_no_schedulable_key_fails() {
         .stderr(predicate::str::contains("does not declare schedulable"));
 }
 
-/// skill-mode args with shell-special chars are rejected at register time.
+/// v3.4.21 (#344) inverted this: a skill-mode arg containing shell-special
+/// characters is ACCEPTED at register time, and the renderer escapes it.
+///
+/// The docstring used to say "rejected" — the assertion below was flipped for
+/// #344 but the prose was left describing the old behaviour, and the
+/// `_and_escaped` half of the name asserted nothing at all (v3.4.21 cold
+/// consistency review).
+///
+/// What is asserted is NOT that the value is escaped. A RECURRING skill entry
+/// renders as a `ProgramArguments` argv array — there is no `/bin/sh -c`
+/// string on this path, so the value reaches the child as one literal
+/// argument and there is nothing to expand it. Escaping it would in fact be a
+/// bug: the skill would receive `\$(evil)`.
+///
+/// So the guarantee here is argv-literalness, which is what actually makes
+/// the character safe. The one-shot counterpart above is the path that DOES
+/// build a shell string, and that is where the escape assertion belongs.
 #[test]
-fn skill_mode_args_with_shell_special_rejected() {
+fn skill_mode_args_with_shell_special_are_accepted_and_passed_as_literal_argv() {
     let v = tempdir().unwrap();
     write_skill(v.path(), "distill", "name: distill\nschedulable: true");
     std::fs::write(
@@ -648,7 +701,7 @@ fn skill_mode_args_with_shell_special_rejected() {
         "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /distill\n    args:\n      topic: \"$(evil)\"\n",
     )
     .unwrap();
-    Command::cargo_bin("onebrain")
+    let assert = Command::cargo_bin("onebrain")
         .unwrap()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .args(["register-schedule", "--dry-run"])
@@ -656,8 +709,14 @@ fn skill_mode_args_with_shell_special_rejected() {
         .env("HOME", v.path())
         .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("shell-special"));
+        .success();
+
+    // macOS is the platform whose artifact makes the argv form visible: one
+    // `<string>` element carrying the whole `key=value`, verbatim.
+    #[cfg(target_os = "macos")]
+    assert.stdout(predicate::str::contains("<string>topic=$(evil)</string>"));
+    #[cfg(not(target_os = "macos"))]
+    let _ = assert;
 }
 
 /// `--test` with a skill that isn't in the schedule fails with a helpful error.

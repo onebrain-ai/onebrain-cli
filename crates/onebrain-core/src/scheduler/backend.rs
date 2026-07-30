@@ -76,7 +76,7 @@ pub fn render_preview(
         let base = crate::scheduler::systemd::unit_base_name(&label);
         Ok(Some(format!(
             "# {base}.service\n{}\n# {base}.timer\n{}",
-            crate::scheduler::systemd::generate_service_unit(entry, ctx),
+            crate::scheduler::systemd::generate_service_unit(entry, ctx)?,
             crate::scheduler::systemd::generate_timer_unit(entry, ctx)
         )))
     }
@@ -266,7 +266,7 @@ mod imp {
         let timer_path = dir.join(format!("{base}.timer"));
         std::fs::write(
             dir.join(format!("{base}.service")),
-            generate_service_unit(entry, ctx),
+            generate_service_unit(entry, ctx)?,
         )?;
         std::fs::write(&timer_path, generate_timer_unit(entry, ctx))?;
         if activation_disabled() {

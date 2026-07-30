@@ -366,6 +366,103 @@ fn schedule_by_block(shape: &TriggerShape) -> String {
 /// mode is `entry.command` + its args, with `--vault` appended only when
 /// `should_append_vault` says so — the same #263 R2-guarded helper launchd
 /// uses, shared rather than re-derived.
+/// Join argv into the single `<Arguments>` string Task Scheduler passes to
+/// `CreateProcess` — quoting per element, EXCEPT for a `cmd.exe /c` payload.
+///
+/// Two different parsers live behind this one string, and picking the wrong
+/// one produces a task that registers, fires, and does nothing:
+/// - a normal program re-splits with `CommandLineToArgvW` → per-arg quoting
+///   is required (without it `--vault C:\My Vault\ob` arrives as three
+///   arguments — the v3.4.21 cold review's M2)
+/// - `cmd.exe` parses its own `/c` (or `/k`) payload with **CMD** rules,
+///   which do not recognise `\"`. Quoting that payload turns a working
+///   command into a literal-backslash mess. Measured on the ARM64 VM: a
+///   quoted `/c copy … "C:\ob test\out.txt"` registered and then silently
+///   did nothing, while the same entry worked pre-v3.4.21.
+///
+/// So: everything up to and including the switch is quoted normally; the
+/// payload after it is passed through verbatim, which is exactly what cmd
+/// expects to receive.
+fn join_win_args(command: &str, rest: &[String]) -> String {
+    // Split on BOTH separators by hand: this renderer is pure and its tests
+    // run on any host, where `std::path::Path` would treat a Windows `\` as
+    // an ordinary character and hand back the whole string as the basename.
+    let basename = command.rsplit(['\\', '/']).next().unwrap_or(command);
+    // Only bare `cmd` or `cmd.exe`. Matching on the STEM alone also swept in
+    // `cmd.com`, `cmd.bat`, `cmd.anything` — programs that do NOT parse their
+    // tail with CMD rules, and which would therefore silently lose per-arg
+    // quoting. The carve-out's whole justification is "cmd.exe parses its own
+    // /c payload", so it should reach exactly that (v3.4.21 cold injection
+    // review).
+    let is_cmd = basename.eq_ignore_ascii_case("cmd") || basename.eq_ignore_ascii_case("cmd.exe");
+    let switch_at = rest
+        .iter()
+        .position(|a| a.eq_ignore_ascii_case("/c") || a.eq_ignore_ascii_case("/k"));
+
+    match (is_cmd, switch_at) {
+        (true, Some(i)) => {
+            let mut parts: Vec<String> = rest[..=i].iter().map(|a| quote_win_arg(a)).collect();
+            // Verbatim payload — CMD's parser owns everything past the switch.
+            parts.extend(rest[i + 1..].iter().cloned());
+            parts.join(" ")
+        }
+        _ => rest
+            .iter()
+            .map(|a| quote_win_arg(a))
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+/// Quote one argv element per the `CommandLineToArgvW` rules every Windows
+/// process uses to re-split `<Arguments>`.
+///
+/// Task Scheduler hands `<Arguments>` to `CreateProcess` as ONE string; the
+/// child then splits it. Joining with a bare space (what this file did
+/// before v3.4.21) meant `--vault C:\My Vault\ob` arrived as three
+/// arguments — the task registered, fired, and ran wrong, which no
+/// XML-contents assertion could catch (v3.4.21 cold review, M2).
+///
+/// The backslash rule is the fiddly part of the Microsoft algorithm:
+/// backslashes are literal EXCEPT when they immediately precede a `"`, where
+/// each must be doubled — so `C:\dir\` inside quotes becomes `C:\dir\\"`.
+/// XML escaping runs afterwards and is a separate layer.
+fn quote_win_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => {
+                backslashes += 1;
+                out.push('\\');
+            }
+            '"' => {
+                // Double the run that precedes the quote, then escape it.
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push('\\');
+                out.push('"');
+            }
+            _ => {
+                backslashes = 0;
+                out.push(c);
+            }
+        }
+    }
+    // A trailing run would otherwise escape our own closing quote.
+    for _ in 0..backslashes {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
 fn argv_for_entry(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Vec<String> {
     if is_command_mode(entry) {
         let mut argv = vec![entry.command.clone().unwrap_or_default()];
@@ -489,7 +586,7 @@ pub fn generate_task_xml(
 
     let arguments = argv_for_entry(entry, ctx)
         .split_first()
-        .map(|(cmd, rest)| (cmd.clone(), rest.join(" ")))
+        .map(|(cmd, rest)| (cmd.clone(), join_win_args(cmd, rest)))
         .map(|(cmd, args)| (xml_escape(&cmd), xml_escape(&args)))
         .expect("argv always has a command");
 
@@ -660,11 +757,110 @@ mod tests {
         );
     }
 
-    /// Audit BLOCKER 2 regression: a cron between 49 and 1000 triggers
-    /// passes the shared cross-platform validator (1000-combination cap), so
-    /// the 48-trigger Task Scheduler cap is only reachable at render time —
-    /// which must surface as the friendly TooManyTriggers error, never a
-    /// panic (the old `.expect` crashed register AND --dry-run on Windows).
+    /// M2 (v3.4.21 cold review) — LIVE bug in shipped v3.4.20: args were
+    /// joined with a bare space, so a space-bearing path arrived at the child
+    /// as several arguments. Task Scheduler passes `<Arguments>` to
+    /// CreateProcess as ONE string and the child re-splits it with
+    /// CommandLineToArgvW, so each element must be quoted per those rules —
+    /// skill mode included, which is where `--vault "C:\My Vault\ob"` lives.
+    #[test]
+    fn skill_mode_vault_path_with_spaces_stays_one_argument() {
+        let mut ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        ctx.vault_path = std::path::PathBuf::from(r"C:\My Vault\ob");
+        let out = generate_task_xml(&daily_entry(), &ctx).unwrap();
+        assert!(
+            out.contains(r#"--vault &quot;C:\My Vault\ob&quot;"#),
+            "{out}"
+        );
+    }
+
+    /// Measured on the ARM64 VM (v3.4.21 Track A verify): quoting a
+    /// `cmd.exe /c` payload made the task register, fire, and do NOTHING —
+    /// CMD parses its own payload and does not recognise `\"`. The payload
+    /// after the switch is therefore passed through verbatim, while
+    /// everything else keeps CommandLineToArgvW quoting. This is also a
+    /// REGRESSION GUARD: the pattern below is the one the v3.4.20 Windows
+    /// audit used successfully, and per-arg quoting had broken it.
+    #[test]
+    fn cmd_slash_c_payload_is_passed_through_verbatim() {
+        let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        let mut e = daily_command_entry();
+        e.command = Some(r"C:\Windows\system32\cmd.exe".into());
+        e.args = Some(Args::List(vec![
+            "/c".into(),
+            r#"copy C:\Windows\win.ini "C:\ob test\out.txt""#.into(),
+        ]));
+        let out = generate_task_xml(&e, &ctx).unwrap();
+        assert!(
+            out.contains(r#"/c copy C:\Windows\win.ini &quot;C:\ob test\out.txt&quot;"#),
+            "cmd payload must not be re-quoted: {out}"
+        );
+    }
+
+    /// A non-cmd binary keeps per-arg quoting — the M2 fix must not be
+    /// undone by the cmd carve-out.
+    #[test]
+    fn non_cmd_binaries_still_get_per_arg_quoting() {
+        let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        let mut e = daily_command_entry();
+        e.command = Some(r"C:\tools\rsync.exe".into());
+        e.args = Some(Args::List(vec!["-av".into(), r"C:\My Vault\ob".into()]));
+        let out = generate_task_xml(&e, &ctx).unwrap();
+        assert!(
+            out.contains(r#"-av &quot;C:\My Vault\ob&quot;"#),
+            "space-bearing path must stay one argument: {out}"
+        );
+    }
+
+    /// The carve-out exists because `cmd.exe` parses its own `/c` tail with
+    /// CMD rules. Matching on the STEM let `cmd.com` / `cmd.bat` / any
+    /// `cmd.*` take the verbatim path too — programs that do no such thing,
+    /// and which therefore silently lost per-arg quoting.
+    /// (v3.4.21 cold injection review.)
+    #[test]
+    fn only_real_cmd_takes_the_verbatim_path() {
+        let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        let render = |command: &str| {
+            let mut e = daily_command_entry();
+            e.command = Some(command.into());
+            e.args = Some(Args::List(vec!["/c".into(), r"C:\My Vault\ob".into()]));
+            generate_task_xml(&e, &ctx).unwrap()
+        };
+        for real in ["cmd", "cmd.exe", "CMD.EXE", r"C:\WINDOWS\system32\cmd.exe"] {
+            assert!(
+                render(real).contains(r#"/c C:\My Vault\ob"#),
+                "{real}: CMD must receive its payload verbatim"
+            );
+        }
+        for impostor in [r"C:\evil\cmd.com", r"C:\evil\cmd.bat", "notcmd.exe"] {
+            assert!(
+                render(impostor).contains(r#"&quot;C:\My Vault\ob&quot;"#),
+                "{impostor}: does not parse CMD-style, so it must get per-arg quoting"
+            );
+        }
+    }
+
+    /// The CommandLineToArgvW backslash rule: a run of backslashes is
+    /// literal unless it precedes a quote, where it must be doubled. A
+    /// trailing run before our own closing quote counts.
+    #[test]
+    fn trailing_backslash_run_is_doubled_before_the_closing_quote() {
+        // `C:\ob test\` → the trailing run doubles so it cannot escape our
+        // own closing quote.
+        assert_eq!(quote_win_arg("C:\\ob test\\"), r#""C:\ob test\\""#);
+        // `a"b` → the embedded quote is escaped.
+        assert_eq!(quote_win_arg("a\"b"), r#""a\"b""#);
+        // No metacharacters: left bare, so nothing double-quotes a flag.
+        assert_eq!(quote_win_arg("plain"), "plain");
+        // Empty string still needs to occupy an argv slot.
+        assert_eq!(quote_win_arg(""), r#""""#);
+    }
+
+    /// Audit BLOCKER 2 regression (v3.4.20): a cron between 49 and 1000
+    /// triggers passes the shared cross-platform validator (1000-combination
+    /// cap), so the 48-trigger Task Scheduler cap is only reachable at render
+    /// time — which must surface as the friendly TooManyTriggers error, never
+    /// a panic (the old `.expect` crashed register AND --dry-run on Windows).
     #[test]
     fn render_surfaces_too_many_triggers_instead_of_panicking() {
         let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");

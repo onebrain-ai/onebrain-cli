@@ -22,6 +22,7 @@
 use crate::scheduler::context::SchedulerContext;
 use crate::scheduler::cron_parse::{at_fields, cron_fields_expanded};
 use crate::scheduler::entry::{is_command_mode, is_one_shot};
+use crate::scheduler::error::SchedulerError;
 use crate::scheduler::launchd::should_append_vault;
 use crate::scheduler::types::{Args, ScheduleEntry};
 use std::path::{Path, PathBuf};
@@ -36,19 +37,71 @@ pub fn unit_dir(homedir: &Path) -> PathBuf {
     homedir.join(".config/systemd/user")
 }
 
-/// systemd-quote one argv element for an `ExecStart=` line: wrap in double
-/// quotes when it contains whitespace or quotes, escaping `\` and `"`.
+/// systemd-quote one argv element for an `ExecStart=` line.
+///
+/// Four escapes, each for a distinct systemd behaviour — quoting alone is
+/// NOT enough, because systemd expands inside double quotes:
+/// - `\` and `"` — the quoting syntax itself
+/// - `$` → `$$` — systemd expands `$VAR` / `${VAR}` in `ExecStart` even
+///   within double quotes; an unescaped `$` silently becomes an empty
+///   string (or a leaked environment value) at run time
+/// - `%` → `%%` — unit **specifiers** (`%h`, `%i`, `%n`, …) expand the same
+///   way; `date +%F` in an arg would otherwise be rewritten before exec
+///
+/// Two more characters do not need ESCAPING but do need QUOTING, because
+/// systemd gives them meaning between words rather than inside one:
+/// - `;` — a lone `;` separates command lines within a single `ExecStart=`,
+///   so `args: [hi, ";", /bin/rm, -f, /tmp/x]` rendered TWO commands out of
+///   what the config, `--dry-run` and `--status` all present as one
+/// - `'` — systemd's word splitter is shell-like, so a stray single quote
+///   opens a quoted region that swallows the following words
+///
+/// Wrapping either in double quotes makes it an ordinary character of its own
+/// argument. Found by the v3.4.21 cold injection review; guarded by
+/// `semicolon_and_single_quote_stay_inside_one_argument`.
+///
+/// A newline or carriage return cannot be escaped at all: unit files are
+/// line-oriented, so a raw `\n` in a value ENDS the `ExecStart=` line and
+/// whatever follows is parsed as a new directive. `sanitize_unit_value`
+/// rejects those before we get here — the one case where refusing beats
+/// escaping, because the format has no representation for it.
 fn quote_arg(arg: &str) -> String {
+    let escaped = arg
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "$$")
+        .replace('%', "%%");
     if arg.is_empty()
-        || arg
-            .chars()
-            .any(|c| c.is_whitespace() || c == '"' || c == '\\')
+        || arg.chars().any(char::is_whitespace)
+        || arg.contains([';', '\''])
+        || escaped != arg
     {
-        let escaped = arg.replace('\\', "\\\\").replace('"', "\\\"");
         format!("\"{escaped}\"")
     } else {
         arg.to_string()
     }
+}
+
+/// Reject values that a line-oriented unit file cannot carry at all.
+///
+/// A newline inside an `ExecStart=` value terminates the directive; the
+/// remainder of the value is then read as a unit directive in its own right
+/// (`x\nExecStartPost=/bin/sh -c '…'` injects a real hook). No escape exists
+/// for it in the unit-file format, so the renderer refuses instead — the
+/// single character class where refusal is the correct answer rather than
+/// escaping. Applies to the argv elements that reach a unit line. The LABEL
+/// needs no check — `sanitize_label` has already restricted it to
+/// `[A-Za-z0-9-]`, so it cannot carry a line break; the call site says so
+/// too, and this docstring used to claim the opposite.
+pub fn sanitize_unit_value(value: &str) -> Result<(), SchedulerError> {
+    if value.contains('\n') || value.contains('\r') {
+        return Err(SchedulerError::InvalidEntry {
+            reason: format!(
+                "value contains a newline, which a systemd unit file cannot carry: {value:?}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// The same argv every backend agrees on (mirrors `schtasks::argv_for_entry`;
@@ -151,10 +204,20 @@ pub fn on_calendar_exprs(entry: &ScheduleEntry) -> Vec<String> {
 }
 
 /// The `.service` unit.
-pub fn generate_service_unit(entry: &ScheduleEntry, ctx: &SchedulerContext) -> String {
+pub fn generate_service_unit(
+    entry: &ScheduleEntry,
+    ctx: &SchedulerContext,
+) -> Result<String, SchedulerError> {
     let label = crate::scheduler::launchd::label_for_entry(entry);
     let base = unit_base_name(&label);
-    let exec = argv_for_entry(entry, ctx)
+    let argv = argv_for_entry(entry, ctx);
+    // Refuse before rendering: a newline has no escape in this format.
+    // (The label needs no check — `sanitize_label` restricts it to
+    // `[A-Za-z0-9-]`.)
+    for a in &argv {
+        sanitize_unit_value(a)?;
+    }
+    let exec = argv
         .iter()
         .map(|a| quote_arg(a))
         .collect::<Vec<_>>()
@@ -179,7 +242,7 @@ pub fn generate_service_unit(entry: &ScheduleEntry, ctx: &SchedulerContext) -> S
             "ExecStopPost=/bin/sh -c 'systemctl --user --no-block disable --now {base}.timer; rm -f \"$HOME/.config/systemd/user/{base}.timer\" \"$HOME/.config/systemd/user/{base}.service\"; systemctl --user --no-block daemon-reload'\n"
         ));
     }
-    out
+    Ok(out)
 }
 
 /// The `.timer` unit.
@@ -252,7 +315,7 @@ mod tests {
     #[test]
     fn service_never_carries_dropped_designs_or_linger() {
         let ctx = ctx_with_cli("/usr/local/bin/onebrain");
-        let out = generate_service_unit(&daily_entry(), &ctx);
+        let out = generate_service_unit(&daily_entry(), &ctx).unwrap();
         assert!(!out.contains("Environment=PATH"), "dropped design: {out}");
         assert!(!out.contains("StandardOutput"), "journal, not files: {out}");
         assert!(!out.contains("linger"), "logged-in-only: {out}");
@@ -264,7 +327,7 @@ mod tests {
         // (no --now): symlink dropped, TIMER KEPT FIRING. And a blocking
         // systemctl in ExecStopPost deadlocks against the manager [M9].
         let ctx = ctx_with_cli("/usr/local/bin/onebrain");
-        let out = generate_service_unit(&one_shot_entry(), &ctx);
+        let out = generate_service_unit(&one_shot_entry(), &ctx).unwrap();
         let line = out
             .lines()
             .find(|l| l.starts_with("ExecStopPost="))
@@ -284,7 +347,9 @@ mod tests {
     #[test]
     fn recurring_service_has_no_stop_hook() {
         let ctx = ctx_with_cli("/usr/local/bin/onebrain");
-        assert!(!generate_service_unit(&daily_entry(), &ctx).contains("ExecStopPost"));
+        assert!(!generate_service_unit(&daily_entry(), &ctx)
+            .unwrap()
+            .contains("ExecStopPost"));
     }
 
     #[test]
@@ -298,12 +363,12 @@ mod tests {
     #[test]
     fn command_mode_execs_the_entry_command_with_vault_rules() {
         let ctx = ctx_with_cli("/usr/local/bin/onebrain");
-        let cmd = generate_service_unit(&daily_command_entry(), &ctx);
+        let cmd = generate_service_unit(&daily_command_entry(), &ctx).unwrap();
         assert!(
             cmd.contains("ExecStart=onebrain search reindex --vault"),
             "{cmd}"
         );
-        let foreign = generate_service_unit(&foreign_command_entry(), &ctx);
+        let foreign = generate_service_unit(&foreign_command_entry(), &ctx).unwrap();
         assert!(foreign.contains("ExecStart=rsync -av /a /b"), "{foreign}");
         assert!(!foreign.contains("--vault"), "#263 R2: {foreign}");
     }
@@ -321,7 +386,7 @@ mod tests {
             e
         };
         for entry in [daily_entry(), one_shot_entry(), resolved_command] {
-            let out = generate_service_unit(&entry, &ctx);
+            let out = generate_service_unit(&entry, &ctx).unwrap();
             let exec = out
                 .lines()
                 .find(|l| l.starts_with("ExecStart="))
@@ -330,11 +395,98 @@ mod tests {
         }
     }
 
+    /// M1 (v3.4.21 cold review) — LIVE bug in shipped v3.4.20: a newline in
+    /// an arg was written verbatim into a line-oriented unit file, so the
+    /// text after it parsed as a fresh directive. Recurring command-mode
+    /// args had no register-time guard at all, so this was reachable from
+    /// plain YAML. The renderer now refuses; there is no escape for it.
+    #[test]
+    fn newline_in_an_arg_is_refused_not_written() {
+        let ctx = ctx_with_cli("/usr/local/bin/onebrain");
+        let mut e = daily_command_entry();
+        e.command = Some("/bin/echo".into());
+        e.args = Some(crate::scheduler::types::Args::List(vec![
+            "x\nExecStartPost=/bin/sh -c 'touch /tmp/pwned'".to_string(),
+        ]));
+        let err = generate_service_unit(&e, &ctx).unwrap_err();
+        assert!(
+            matches!(err, SchedulerError::InvalidEntry { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// systemd expands `$VAR` and `%SPECIFIER` INSIDE double quotes, so
+    /// quoting alone silently rewrote these args at run time.
+    #[test]
+    fn dollar_and_percent_are_escaped_for_systemd_expansion() {
+        let ctx = ctx_with_cli("/usr/local/bin/onebrain");
+        let mut e = daily_command_entry();
+        e.command = Some("/bin/echo".into());
+        e.args = Some(crate::scheduler::types::Args::List(vec![
+            "$HOME/%h-report".to_string()
+        ]));
+        let out = generate_service_unit(&e, &ctx).unwrap();
+        assert!(out.contains("$$HOME/%%h-report"), "{out}");
+    }
+
+    /// A lone `;` separates command lines inside one `ExecStart=`, so an
+    /// unquoted one turned a single configured command into two. A stray `'`
+    /// opens a quoted region in systemd's shell-like splitter and swallows
+    /// the words after it. Neither needs escaping — both need QUOTING.
+    /// (v3.4.21 cold injection review.)
+    #[test]
+    fn semicolon_and_single_quote_stay_inside_one_argument() {
+        let ctx = ctx_with_cli("/usr/local/bin/onebrain");
+        let mut e = daily_command_entry();
+        e.command = Some("/bin/echo".into());
+        e.args = Some(crate::scheduler::types::Args::List(vec![
+            "hi".to_string(),
+            ";".to_string(),
+            "/bin/rm".to_string(),
+            "-f".to_string(),
+            "/tmp/x".to_string(),
+            "it's".to_string(),
+        ]));
+        let out = generate_service_unit(&e, &ctx).unwrap();
+        let exec = out
+            .lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .expect("ExecStart line");
+        assert!(
+            exec.contains("\";\""),
+            "a bare `;` would start a second command line:\n{exec}"
+        );
+        assert!(
+            exec.contains("\"it's\""),
+            "a bare `'` would open a quoted region:\n{exec}"
+        );
+        assert!(
+            !exec.contains(" ; "),
+            "no unquoted command separator may survive:\n{exec}"
+        );
+    }
+
+    /// #344 on the Linux sink: a Windows-style path is data, and a
+    /// space-bearing POSIX path must survive quoting intact.
+    #[test]
+    fn backslash_and_space_paths_survive_quoting() {
+        let ctx = ctx_with_cli("/usr/local/bin/onebrain");
+        let mut e = daily_command_entry();
+        e.command = Some("/bin/echo".into());
+        e.args = Some(crate::scheduler::types::Args::List(vec![
+            "/home/u/ob test/out.txt".to_string(),
+            r"C:\ob test\out.txt".to_string(),
+        ]));
+        let out = generate_service_unit(&e, &ctx).unwrap();
+        assert!(out.contains(r#""/home/u/ob test/out.txt""#), "{out}");
+        assert!(out.contains(r#""C:\\ob test\\out.txt""#), "{out}");
+    }
+
     #[test]
     fn args_with_spaces_are_quoted() {
         let mut ctx = ctx_with_cli("/usr/local/bin/onebrain");
         ctx.vault_path = PathBuf::from("/home/u/My Vault/ob-1");
-        let out = generate_service_unit(&daily_entry(), &ctx);
+        let out = generate_service_unit(&daily_entry(), &ctx).unwrap();
         assert!(
             out.contains("\"/home/u/My Vault/ob-1\""),
             "space-bearing paths must be quoted: {out}"
@@ -378,7 +530,7 @@ mod tests {
         ] {
             std::fs::write(
                 dir.join(format!("accept-generated-{name}.service")),
-                generate_service_unit(&entry, &ctx),
+                generate_service_unit(&entry, &ctx).unwrap(),
             )
             .unwrap();
             std::fs::write(
@@ -392,7 +544,7 @@ mod tests {
     #[test]
     fn service_snapshot() {
         let ctx = ctx_with_cli("/usr/local/bin/onebrain");
-        insta::assert_snapshot!(generate_service_unit(&daily_entry(), &ctx));
+        insta::assert_snapshot!(generate_service_unit(&daily_entry(), &ctx).unwrap());
     }
 
     #[test]
