@@ -353,6 +353,10 @@ fn all_checks(vault_root: &Path, config: &onebrain_core::VaultConfig) -> Vec<Doc
     results.push(token_optimization_check(vault_root));
     results.push(read_hook_failopen_check(vault_root));
     results.push(scheduler_log_dir_check(vault_root));
+    results.push(scheduler_silent_runs_check(
+        vault_root,
+        &config.folders.logs,
+    ));
     results.push(daemon_status_check(vault_root));
     results.push(native_search_check(vault_root));
     results.push(lex_index_check(vault_root));
@@ -975,6 +979,176 @@ fn token_optimization_check(vault_root: &Path) -> DoctorResult {
         );
     }
     DoctorResult::ok(TOKEN_OPTIMIZATION_CHECK, "token_optimization ok")
+}
+
+const SCHEDULER_SILENT_CHECK: &str = "scheduler-silent-runs";
+
+/// How often an entry is supposed to produce something.
+///
+/// Derived from the cron expression only to size a tolerance — this is not a
+/// scheduler. `cron_fields_expanded` leaves a wildcard field EMPTY, which is
+/// what makes the classification cheap: a constrained weekday means weekly, a
+/// constrained day-of-month means monthly, neither means it fires every day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cadence {
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl Cadence {
+    /// Silence longer than this is worth reporting. Deliberately ~2× the
+    /// period: one missed run can be a laptop that was asleep, and a check
+    /// that fires on that teaches the reader to ignore it.
+    fn tolerance_days(self) -> i64 {
+        match self {
+            Cadence::Daily => 2,
+            Cadence::Weekly => 9,
+            Cadence::Monthly => 40,
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Cadence::Daily => "daily",
+            Cadence::Weekly => "weekly",
+            Cadence::Monthly => "monthly",
+        }
+    }
+}
+
+fn cadence_of(cron: &str) -> Option<Cadence> {
+    if onebrain_core::scheduler::validate_cron(cron).is_err() {
+        return None;
+    }
+    let f = onebrain_core::scheduler::cron_fields_expanded(cron);
+    if !f.weekday.is_empty() {
+        Some(Cadence::Weekly)
+    } else if !f.day.is_empty() {
+        Some(Cadence::Monthly)
+    } else {
+        Some(Cadence::Daily)
+    }
+}
+
+/// Does this skill write an audit log at all?
+///
+/// Read from the skill's own `SKILL.md` rather than a list kept here: a
+/// hardcoded roster is wrong the moment a skill gains or loses its log, and
+/// wrong silently. Of the 13 schedulable skills only 6 write one, so guessing
+/// would make this check cry wolf on more than half of them.
+fn skill_writes_an_audit_log(vault_root: &Path, skill: &str) -> Option<bool> {
+    let md = vault_root
+        .join(".claude/plugins/onebrain/skills")
+        .join(skill)
+        .join("SKILL.md");
+    let body = std::fs::read_to_string(md).ok()?;
+    Some(body.contains("/log/YYYY/MM/") || body.contains("audit-log"))
+}
+
+/// The newest audit-log entry for `skill`, as whole days before `today`.
+fn newest_log_age_days(logs_dir: &Path, skill: &str, today: chrono::NaiveDate) -> Option<i64> {
+    let suffix = format!("-{skill}.md");
+    let mut newest: Option<chrono::NaiveDate> = None;
+    for entry in walkdir::WalkDir::new(logs_dir.join("log"))
+        .max_depth(3)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // `YYYY-MM-DD-<skill>.md`, and the discriminator form
+        // `YYYY-MM-DD-<skill>-<slug>.md` some skills use.
+        let matches = name.ends_with(&suffix)
+            || (name.starts_with(char::is_numeric)
+                && name.contains(&format!("-{skill}-"))
+                && name.ends_with(".md"));
+        if !matches || name.len() < 10 {
+            continue;
+        }
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(&name[..10], "%Y-%m-%d") {
+            newest = Some(newest.map_or(d, |n: chrono::NaiveDate| n.max(d)));
+        }
+    }
+    newest.map(|d| (today - d).num_days())
+}
+
+/// A scheduled run that produced nothing at all is reported, instead of being
+/// an absence nobody reads (#363).
+///
+/// The failure this exists for is invisible by construction: launchd opens the
+/// log file before exec, so a job that cannot start never reaches the CLI and
+/// writes zero bytes — no vault log, no stderr, no notification. Two of the
+/// user's five jobs were dead for over a day and the detector was a human
+/// noticing that a morning digest had not arrived.
+///
+/// `scheduler-log-dir` catches the one CAUSE that is provable in advance. This
+/// catches the SYMPTOM regardless of cause, which is the only half that
+/// generalises: whatever stops a job, the evidence is the same silence.
+///
+/// **Deliberately reports its own coverage.** Only 6 of the 13 schedulable
+/// skills write an audit log, and command-mode entries write none, so this can
+/// speak for some entries and not others. A check that hid that distinction
+/// would read as "all clear" while saying nothing about half the schedule —
+/// which is the exact shape of failure this release is about.
+fn scheduler_silent_runs_check(vault_root: &Path, logs_folder: &str) -> DoctorResult {
+    let cfg = match crate::commands::register_schedule::read_vault_config(vault_root) {
+        Ok(c) => c,
+        Err(_) => return DoctorResult::ok(SCHEDULER_SILENT_CHECK, "skipped — config unreadable"),
+    };
+    if cfg.schedule.is_empty() {
+        return DoctorResult::ok(SCHEDULER_SILENT_CHECK, "no scheduled entries");
+    }
+    let logs_dir = vault_root.join(logs_folder);
+    let today = chrono::Local::now().date_naive();
+
+    let mut silent: Vec<String> = Vec::new();
+    let mut observed = 0usize;
+    let mut unobservable = 0usize;
+
+    for entry in &cfg.schedule {
+        let (Some(skill), Some(cron)) = (entry.skill.as_deref(), entry.cron.as_deref()) else {
+            // Command mode, or a one-shot `at:` that is not expected to recur.
+            unobservable += 1;
+            continue;
+        };
+        let skill = skill.trim_start_matches('/');
+        let (Some(true), Some(cadence)) = (
+            skill_writes_an_audit_log(vault_root, skill),
+            cadence_of(cron),
+        ) else {
+            unobservable += 1;
+            continue;
+        };
+        observed += 1;
+        let tolerance = cadence.tolerance_days();
+        match newest_log_age_days(&logs_dir, skill, today) {
+            None => silent.push(format!("/{skill} ({}) — no log ever", cadence.describe())),
+            Some(age) if age > tolerance => silent.push(format!(
+                "/{skill} ({}) — nothing for {age}d",
+                cadence.describe()
+            )),
+            Some(_) => {}
+        }
+    }
+
+    let coverage = format!("{observed} observable, {unobservable} without a log to check",);
+    if observed == 0 {
+        return DoctorResult::ok(
+            SCHEDULER_SILENT_CHECK,
+            format!("nothing to check — {coverage}"),
+        );
+    }
+    if silent.is_empty() {
+        DoctorResult::ok(
+            SCHEDULER_SILENT_CHECK,
+            format!("all producing output — {coverage}"),
+        )
+    } else {
+        DoctorResult::warn(
+            SCHEDULER_SILENT_CHECK,
+            format!("{} — {coverage}", silent.join("; ")),
+        )
+    }
 }
 
 const SCHEDULER_LOG_DIR_CHECK: &str = "scheduler-log-dir";
@@ -4503,6 +4677,7 @@ const DOCTOR_SECTIONS: [(&str, &str, &[&str]); 4] = [
             "daemon",
             "read-hook-failopen",
             "scheduler-log-dir",
+            "scheduler-silent-runs",
             "legacy-index-stub",
             "qmd-leftovers",
         ],
@@ -4532,6 +4707,7 @@ fn display_label(check: &str) -> &str {
         "daemon" => "daemon",
         "read-hook-failopen" => "read-hook gate",
         "scheduler-log-dir" => "scheduler logs",
+        "scheduler-silent-runs" => "scheduled output",
         "legacy-index-stub" => "legacy index stub",
         "qmd-leftovers" => "qmd cleanup",
         other => other,
@@ -7908,6 +8084,140 @@ mod tests {
                 "check '{check}' should have planned action"
             );
         }
+    }
+
+    // ── scheduler-silent-runs (#363) ─────────────────────────────────────────
+    // Every case builds its own vault under a tempdir. The Track A version of
+    // this check resolved through the real $HOME and passed vacuously; these
+    // never read anything outside the fixture.
+
+    fn silent_vault(entries: &str, skills: &[(&str, bool)]) -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        std::fs::create_dir_all(root.join("07-logs/log/2026/07")).unwrap();
+        std::fs::write(
+            root.join("onebrain.yml"),
+            format!(
+                "folders:\n  inbox: 00-inbox\n  projects: 01-projects\n  areas: 02-areas\n  \
+                 knowledge: 03-knowledge\n  resources: 04-resources\n  agent: 05-agent\n  \
+                 archive: 06-archive\n  logs: 07-logs\nschedule:\n{entries}"
+            ),
+        )
+        .unwrap();
+        for (name, logs) in skills {
+            let dir = root.join(".claude/plugins/onebrain/skills").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let body = if *logs {
+                "---\nname: x\nschedulable: true\n---\nAppend to `[logs_folder]/log/YYYY/MM/` per audit-log format."
+            } else {
+                "---\nname: x\nschedulable: true\n---\nWrites nothing to the logs folder."
+            };
+            std::fs::write(dir.join("SKILL.md"), body).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn cadence_is_read_off_the_cron_not_guessed() {
+        assert_eq!(cadence_of("0 9 * * *"), Some(Cadence::Daily));
+        assert_eq!(cadence_of("0 17 * * 5"), Some(Cadence::Weekly));
+        assert_eq!(cadence_of("0 9 1 * *"), Some(Cadence::Monthly));
+        // Day-of-month AND weekday together is refused by `validate_cron` —
+        // no single launchd/schtasks trigger expresses it — so the cadence is
+        // genuinely unknown rather than "weekly". Asserting the refusal here
+        // pins that this check defers to the validator instead of inventing a
+        // cadence for an expression the scheduler will not accept anyway.
+        assert_eq!(cadence_of("0 9 1 * 5"), None);
+        assert_eq!(cadence_of("not a cron"), None);
+    }
+
+    #[test]
+    fn tolerance_is_wider_than_the_period_so_one_missed_run_is_not_noise() {
+        assert!(Cadence::Daily.tolerance_days() > 1);
+        assert!(Cadence::Weekly.tolerance_days() > 7);
+        assert!(Cadence::Monthly.tolerance_days() > 31);
+    }
+
+    #[test]
+    fn a_skill_that_writes_no_log_is_known_to_be_unobservable() {
+        let d = silent_vault("", &[("digest", true), ("tasks", false)]);
+        assert_eq!(skill_writes_an_audit_log(d.path(), "digest"), Some(true));
+        assert_eq!(skill_writes_an_audit_log(d.path(), "tasks"), Some(false));
+        // A skill that isn't installed at all is unknown, NOT "no log" — the
+        // difference decides between staying quiet and crying wolf.
+        assert_eq!(skill_writes_an_audit_log(d.path(), "nope"), None);
+    }
+
+    #[test]
+    fn newest_log_wins_including_the_discriminator_filename_form() {
+        let d = silent_vault("", &[]);
+        let logs = d.path().join("07-logs");
+        let dir = logs.join("log/2026/07");
+        std::fs::write(dir.join("2026-07-10-digest.md"), "x").unwrap();
+        std::fs::write(dir.join("2026-07-20-digest.md"), "x").unwrap();
+        // another skill's file must not count for digest
+        std::fs::write(dir.join("2026-07-30-daily.md"), "x").unwrap();
+        // the discriminator form some skills use
+        std::fs::write(dir.join("2026-07-25-distill-topic.md"), "x").unwrap();
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+        assert_eq!(newest_log_age_days(&logs, "digest", today), Some(11));
+        assert_eq!(newest_log_age_days(&logs, "distill", today), Some(6));
+        assert_eq!(newest_log_age_days(&logs, "recap", today), None);
+    }
+
+    #[test]
+    fn a_daily_skill_with_no_recent_log_is_reported() {
+        let d = silent_vault(
+            "  - cron: \"0 9 * * *\"\n    skill: /digest\n",
+            &[("digest", true)],
+        );
+        let r = scheduler_silent_runs_check(d.path(), "07-logs");
+        assert_eq!(r.status, DoctorStatus::Warn, "{r:?}");
+        assert!(r.message.contains("/digest"), "{r:?}");
+        assert!(r.message.contains("no log ever"), "{r:?}");
+    }
+
+    #[test]
+    fn a_fresh_log_clears_it() {
+        let d = silent_vault(
+            "  - cron: \"0 9 * * *\"\n    skill: /digest\n",
+            &[("digest", true)],
+        );
+        let today = chrono::Local::now().date_naive();
+        let dir = d.path().join("07-logs/log/2026/07");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{today}-digest.md")), "x").unwrap();
+        let r = scheduler_silent_runs_check(d.path(), "07-logs");
+        assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
+    }
+
+    #[test]
+    fn coverage_is_always_stated_so_a_pass_cannot_read_as_all_clear() {
+        // One observable skill with a fresh log, one skill that writes nothing,
+        // and one command-mode entry. The check can only speak for the first.
+        let d = silent_vault(
+            "  - cron: \"0 9 * * *\"\n    skill: /digest\n\
+             \x20 - cron: \"0 6 * * *\"\n    skill: /tasks\n\
+             \x20 - cron: \"0 3 * * 0\"\n    command: onebrain\n    args: [search, reindex]\n",
+            &[("digest", true), ("tasks", false)],
+        );
+        let today = chrono::Local::now().date_naive();
+        let dir = d.path().join("07-logs/log/2026/07");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{today}-digest.md")), "x").unwrap();
+        let r = scheduler_silent_runs_check(d.path(), "07-logs");
+        assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
+        assert!(
+            r.message.contains("1 observable") && r.message.contains("2 without a log"),
+            "a clean result must still say what it could NOT check: {r:?}"
+        );
+    }
+
+    #[test]
+    fn no_entries_is_not_a_warning() {
+        let d = silent_vault("", &[]);
+        let r = scheduler_silent_runs_check(d.path(), "07-logs");
+        assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
     }
 
     // ── scheduler-log-dir (#362) ─────────────────────────────────────────────
