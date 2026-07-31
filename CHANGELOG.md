@@ -719,3 +719,6 @@ These shipped under the v3.0.x patch line after the 2026-05-22 GA and are not pa
 [v3.0.0]: https://github.com/onebrain-ai/onebrain-cli/releases/tag/v3.0.0
 [v3.0.0-alpha.1]: https://github.com/onebrain-ai/onebrain-cli/releases/tag/v3.0.0-alpha.1
 [v3.0.0-alpha.0]: https://github.com/onebrain-ai/onebrain-cli/releases/tag/v3.0.0-alpha.0
+
+<!-- v3.4.22 skip-matrix experiment: does a SKIPPED job satisfy a required check?
+     Proving #360 on a real PR before trusting it. This line is removed either way. -->
