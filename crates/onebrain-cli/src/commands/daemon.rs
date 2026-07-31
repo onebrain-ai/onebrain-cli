@@ -3616,12 +3616,30 @@ mod tests {
         // Spawn N threads that each run `onebrain daemon start` as close to
         // simultaneously as possible, collecting each invocation's stdout.
         const N: usize = 6;
-        let mut handles = Vec::with_capacity(N);
-        for _ in 0..N {
+        // `Command::output()` has no timeout, and `JoinHandle::join()` has no
+        // deadline. If ONE of these invocations fails to exit, the collect
+        // below waits forever — which is what happened on macOS CI: this test
+        // ran past 32 MINUTES before the job was cancelled, and the only
+        // artefact was libtest's "has been running for over 60 seconds"
+        // (#361). Thirty runner-minutes bought exactly no diagnosis.
+        //
+        // The waits inside `daemon start` are all bounded — `wait_until_ready`
+        // carries a deadline and `acquire_start_lock` returns `Contended`
+        // rather than blocking — so the unbounded wait is HERE, in the test's
+        // own collect. Bounding it turns a silent 30-minute burn into a fast
+        // failure that says how many invocations came back and which did not.
+        //
+        // Not reproduced locally: 15 runs on macOS ARM under 8-way CPU load,
+        // all green. So this bounds the symptom and preserves evidence for the
+        // next occurrence; it does not claim to fix the cause.
+        const COLLECT_BUDGET: Duration = Duration::from_secs(90);
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, String)>();
+        for i in 0..N {
             let bin = bin.clone();
             let home_path = home_path.clone();
             let cache_path = cache_path.clone();
-            handles.push(std::thread::spawn(move || {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
                 let out = StdCommand::new(&bin)
                     .env("HOME", &home_path)
                     .isolate_cache_root(&cache_path)
@@ -3634,10 +3652,49 @@ mod tests {
                     out.status.success(),
                     "daemon start exited non-zero: {out:?}"
                 );
-                String::from_utf8_lossy(&out.stdout).into_owned()
-            }));
+                let _ = tx.send((i, String::from_utf8_lossy(&out.stdout).into_owned()));
+            });
         }
-        let outputs: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        // The loop's own clone must go, or `Disconnected` can never arrive.
+        drop(tx);
+
+        let deadline = Instant::now() + COLLECT_BUDGET;
+        let mut returned = vec![false; N];
+        let mut outputs: Vec<String> = Vec::with_capacity(N);
+        while outputs.len() < N {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let stalled = |returned: &[bool]| -> Vec<usize> {
+                returned
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, done)| !**done)
+                    .map(|(i, _)| i)
+                    .collect()
+            };
+            match rx.recv_timeout(left) {
+                Ok((i, out)) => {
+                    returned[i] = true;
+                    outputs.push(out);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                    "only {}/{N} `daemon start` invocations returned within {COLLECT_BUDGET:?}; \
+                     invocation(s) {:?} never exited — this is #361, and the hang is real, \
+                     not a slow machine",
+                    outputs.len(),
+                    stalled(&returned)
+                ),
+                // Every sender is gone but we are short: a worker panicked
+                // (its own assert prints the reason). Say so rather than
+                // blaming a stall, which would send the next reader hunting
+                // the wrong thing.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                    "only {}/{N} `daemon start` invocations reported; invocation(s) {:?} \
+                     panicked before sending — see the failure above this one",
+                    outputs.len(),
+                    stalled(&returned)
+                ),
+            }
+        }
 
         // Exactly one invocation reports a fresh start; the rest are no-ops.
         // (A racing loser may briefly see "already running" before daemon.json
