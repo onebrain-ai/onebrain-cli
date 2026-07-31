@@ -1138,6 +1138,26 @@ mod tests {
             generate_task_xml(&daily_command_entry(), &ctx).unwrap(),
         )
         .unwrap();
+        // #353: no fixture carried an escaped argument, so `quote_win_arg`
+        // could regress without `schtasks /Create` ever noticing. Its
+        // `.expect` pins the arguments as Task Scheduler reports them BACK,
+        // which is the half a well-formed document cannot prove on its own.
+        std::fs::write(
+            dir.join("accept-generated-escaping.xml"),
+            generate_task_xml(
+                &{
+                    let mut e = daily_command_entry();
+                    e.command = Some(r"C:\Windows\System32\cmd.exe".to_string());
+                    e.args = Some(crate::scheduler::types::Args::List(
+                        crate::scheduler::test_support::escaping_args(),
+                    ));
+                    e
+                },
+                &ctx,
+            )
+            .unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]

@@ -294,13 +294,21 @@ pub(crate) fn read_vault_config(vault: &Path) -> Result<ScheduleConfig> {
 // false for two of them (v3.4.21 cold injection review):
 // - launchd — a genuine inertness proof IN THE SUITE: the PoCs run their
 //   payload through a real `/bin/sh` and assert a sentinel is never created
-// - systemd and Task Scheduler — string assertions in the suite, plus a
-//   ONE-OFF manual VM run per platform during this release (`systemd-analyze
-//   verify` rc=0 on a `$`/`%`/`;`-bearing arg; a space-bearing path
-//   registered and fired on Windows ARM64). Nothing in CI re-runs those: the
-//   fixtures under `tests/scheduler-corpus/` carry no escaped values, so
-//   `cargo test` stays green even if either escaper regresses. That gap is
-//   tracked as #353.
+// - systemd and Task Scheduler — string assertions in the suite, PLUS a
+//   standing corpus case since v3.4.22 (#353):
+//   `accept-generated-escaping.{service,timer,xml}` carries `$`, `%`, a
+//   space, a trailing backslash run, `;`, `'` and `"` in one argument list,
+//   and the existing CI jobs feed it to the real tools on every PR —
+//   `systemd-analyze verify` on Linux, `schtasks /Create` on Windows, where
+//   its `.expect` pins the arguments as Task Scheduler reports them BACK.
+//   Until then the corpus carried no escaped value at all, so either escaper
+//   could regress with every gate green.
+//   Measured while adding it, on the VMs rather than from the strings:
+//   systemd RAN the unit and `/bin/echo` received `$HOME` unexpanded, and
+//   Task Scheduler reported back `"C:\My Vault\\"` with the backslash run
+//   doubled. What is still NOT automated is a runtime argv proof on Windows
+//   — `schtasks` reports the command LINE, and splitting it back is
+//   `CommandLineToArgvW`'s job, which no CI job observes.
 //
 // Removing it was the point, not a side effect: a `\` is a path separator on
 // Windows, and a ban at register time made `args: [/c, "echo x> C:\dir\f"]`

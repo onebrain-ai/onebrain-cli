@@ -557,6 +557,20 @@ mod tests {
                 e.command = Some("/bin/echo".to_string());
                 e
             }),
+            // #353: the corpus carried no escaped value at all, so
+            // `systemd-analyze verify` — the only automated check that reads
+            // these files with systemd's own parser — never saw a `$`, `%`,
+            // `;`, quote or space. `quote_arg` could regress and every gate
+            // stayed green. This fixture makes the existing CI job the
+            // standing proof the v3.4.21 VM run was a one-off of.
+            ("escaping", {
+                let mut e = daily_command_entry();
+                e.command = Some("/bin/echo".to_string());
+                e.args = Some(crate::scheduler::types::Args::List(
+                    crate::scheduler::test_support::escaping_args(),
+                ));
+                e
+            }),
         ] {
             std::fs::write(
                 dir.join(format!("accept-generated-{name}.service")),

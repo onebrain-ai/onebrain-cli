@@ -78,6 +78,34 @@ pub fn daily_command_entry() -> ScheduleEntry {
     }
 }
 
+/// The one argument list that touches every escaping rule both sinks own.
+/// Kept identical in the systemd and schtasks regenerators so the two
+/// fixtures are readable side by side: `$` and `%` are systemd expansions,
+/// the trailing backslash run is the fiddly half of the Windows
+/// `CommandLineToArgvW` algorithm, and the space, `;`, `'` and `"` are
+/// word-splitting hazards on one or both.
+///
+/// Until v3.4.22 no fixture in the corpus carried ANY of these, so both
+/// escapers could regress and `cargo test`, `systemd-analyze verify` and
+/// `schtasks /Create` all stayed green (#353).
+pub fn escaping_args() -> Vec<String> {
+    [
+        "$HOME",           // systemd variable expansion  -> $$HOME
+        "100%",            // systemd specifier           -> 100%%
+        "a b",             // whitespace: must stay ONE argument on both
+        r#"C:\dir\"#,      // trailing backslash, but NO space: must stay unquoted
+        r#"C:\My Vault\"#, // space AND trailing backslash — the only shape that
+        // reaches the Windows backslash-doubling rule at all, and the real one
+        // (`--vault C:\My Vault\ob`) that motivated `quote_win_arg` in v3.4.21.
+        "semi;colon",    // systemd word splitter
+        "it's",          // stray single quote opens a quoted region
+        "quote\"inside", // literal double quote through both layers
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 /// A command that is NOT onebrain — guards `should_append_vault`.
 pub fn foreign_command_entry() -> ScheduleEntry {
     ScheduleEntry {
