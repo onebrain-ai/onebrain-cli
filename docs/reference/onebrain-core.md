@@ -107,14 +107,16 @@ Cron + at-string validation and conversion to launchd `StartCalendarInterval` fi
 **Tests** — `#[cfg(test)]` covers accepted/rejected cron syntax (step/range/list/field-count/chars), at-format + out-of-range fields, and conversion round-trips.
 
 ### `src/scheduler/entry.rs`
-Schedule-entry mode classifiers and a structural shape validator (no field-format checks).
+Schedule-entry mode classifiers, a structural shape validator, and the shared control-character refusal every renderer applies.
 **Key functions**
 - `is_one_shot(&ScheduleEntry) -> bool` — has `at:`.
 - `is_skill_mode(&ScheduleEntry) -> bool` — has `skill:`.
 - `is_command_mode(&ScheduleEntry) -> bool` — has `command:`.
 - `validate_entry(&ScheduleEntry) -> Result<(), SchedulerError>` — enforces exactly-one-of cron/at, exactly-one-of skill/command, non-empty skill/command, and args-type-matches-mode (map↔skill, list↔command).
+- `reject_control_chars(field, value) -> Result<(), SchedulerError>` — refuses any control character except TAB, naming the field the user typed.
+- `reject_control_chars_in_entry(&ScheduleEntry) -> Result<(), SchedulerError>` — applies it to `command`, `skill`, and every arg, list element and map **key and value** (#355).
 
-**Connections** — reads `types::{Args, ScheduleEntry}`; produces `SchedulerError::InvalidEntry`. Called by: `launchd` (mode classifiers steer block selection) and onebrain-cli schedule loader (`validate_entry` surfaces friendly errors).
+**Connections** — reads `types::{Args, ScheduleEntry}`; produces `SchedulerError::InvalidEntry`. Called by: `launchd` (mode classifiers steer block selection), all three renderers — `launchd`, `systemd`, `schtasks` — for `reject_control_chars_in_entry`, and the onebrain-cli schedule loader, which calls both `validate_entry` and `reject_control_chars_in_entry` up front in Pass 1 so a bad entry cannot half-register.
 **Tests** — `#[cfg(test)]` covers each classifier and every `validate_entry` rejection/acceptance path.
 
 ### `src/scheduler/context.rs`
@@ -137,12 +139,12 @@ launchd `.plist` emitter — **string templating, not quick-xml**, to guarantee 
 **Key types** — takes [`SchedulerContext`](#srcschedulercontextrs) (formerly `LaunchdContext`, moved to its own module for the cross-platform seam).
 
 **Key functions**
-- `generate_plist(entry, ctx) -> String` — full plist; dispatches on `(is_one_shot, is_command_mode)` to one of four `<ProgramArguments>` blocks (recurring/one-shot × skill/command).
+- `generate_plist(entry, ctx) -> Result<String, SchedulerError>` — full plist, refusing control characters before rendering (#355); dispatches on `(is_one_shot, is_command_mode)` to one of four `<ProgramArguments>` blocks (recurring/one-shot × skill/command).
 - `label_for_entry(entry) -> String` — derive label suffix (command basename, or skill with leading `/` stripped; non-`[a-zA-Z0-9-]` → `-`).
 - `plist_path(skill_or_label, homedir) -> PathBuf` — `~/Library/LaunchAgents/com.onebrain.<label>.plist`; accepts `/daily` or `daily`.
 - (private block builders: `recurring_skill_block`, `recurring_command_block`, `one_shot_skill_block`, `one_shot_command_block`, `calendar_block`, `sanitize_label`.)
 
-**Connections** — calls: `cron_parse::{at_fields, cron_fields_expanded}`, `entry::{is_command_mode, is_one_shot}`, `types::{Args, ScheduleEntry}`, `xml::escape`. Called by: onebrain-cli schedule registration (writes the emitted string to disk + `launchctl`).
+**Connections** — calls: `cron_parse::{at_fields, cron_fields_expanded}`, `entry::{is_command_mode, is_one_shot, reject_control_chars_in_entry}`, `types::{Args, ScheduleEntry}`, `xml::escape`. Called by: onebrain-cli schedule registration (writes the emitted string to disk + `launchctl`).
 **Tests** — large `#[cfg(test)]` block plus an `insta` snapshot (`generate_plist_snapshot_recurring_skill`) asserting label, calendar fields, escaping, self-delete shell wrapper, and command/skill argv parity.
 
 ### `src/scheduler/log_paths.rs`

@@ -533,6 +533,12 @@ pub fn generate_task_xml(
     entry: &ScheduleEntry,
     ctx: &SchedulerContext,
 ) -> Result<String, SchedulerError> {
+    // Refuse what XML cannot carry BEFORE rendering anything — a control
+    // character has no escape (`&#1;` is itself illegal), so the alternative is
+    // a document `schtasks /Create /XML` rejects with an opaque error naming
+    // nothing (#355).
+    crate::scheduler::entry::reject_control_chars_in_entry(entry)?;
+
     let mut triggers = String::new();
     let mut expired_settings = String::new();
 

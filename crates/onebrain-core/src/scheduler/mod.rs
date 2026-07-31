@@ -11,7 +11,8 @@
 //! - [`context`] — `SchedulerContext`, the inputs every backend renderer takes
 //! - [`types`] — `ScheduleEntry`, `ScheduleConfig`, `SkillFrontmatter`, `Args`
 //! - [`cron_parse`] — `validate_cron`, `validate_at`, expansion to calendar fields
-//! - [`entry`] — `is_*` classifiers + `validate_entry` shape check
+//! - [`entry`] — `is_*` classifiers, `validate_entry` shape check, and the
+//!   control-character refusal shared by all three renderers
 //! - [`xml`] — XML escaping, shared by every renderer that emits XML
 //! - [`log_dir`] — machine-local log destination + in-vault detection (#315)
 //! - [`launchd`] — plist emitter (byte-for-byte parity with Bun's templating)

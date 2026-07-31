@@ -547,7 +547,19 @@ fn calendar_block(entry: &ScheduleEntry) -> String {
 
 /// Emit a complete launchd plist for the given entry. Byte parity with Bun
 /// is mandatory — adjust whitespace only with the parity test running.
-pub fn generate_plist(entry: &ScheduleEntry, ctx: &SchedulerContext) -> String {
+pub fn generate_plist(
+    entry: &ScheduleEntry,
+    ctx: &SchedulerContext,
+) -> Result<String, crate::scheduler::error::SchedulerError> {
+    // Refuse control characters BEFORE rendering. For this sink the reason is
+    // XML — `&#1;` is itself illegal, so the character has no representation at
+    // all and `plutil` / `launchctl bootstrap` would reject the document with an
+    // opaque error naming nothing (#355). The rule itself is not XML's: it lives
+    // in `entry` and every renderer applies it, so one config gets one verdict
+    // on all three platforms. Fallible for the same reason
+    // `generate_service_unit` became fallible in v3.4.21.
+    crate::scheduler::entry::reject_control_chars_in_entry(entry)?;
+
     let label_safe = label_for_entry(entry);
     let label = format!("com.onebrain.{label_safe}");
 
@@ -560,7 +572,7 @@ pub fn generate_plist(entry: &ScheduleEntry, ctx: &SchedulerContext) -> String {
     };
 
     let log_base = ctx.log_base_path.to_string_lossy();
-    format!(
+    Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
          <plist version=\"1.0\">\n\
@@ -587,7 +599,7 @@ pub fn generate_plist(entry: &ScheduleEntry, ctx: &SchedulerContext) -> String {
         label_safe,
         xml_escape(&log_base),
         label_safe,
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -678,7 +690,7 @@ mod tests {
 
     #[test]
     fn recurring_skill_emits_skill_run_subcommand() {
-        let out = generate_plist(&skill_entry("/daily", "0 9 * * *"), &test_ctx());
+        let out = generate_plist(&skill_entry("/daily", "0 9 * * *"), &test_ctx()).unwrap();
         assert!(out.contains("<string>com.onebrain.daily</string>"));
         assert!(
             out.contains("<key>Hour</key>\n        <integer>9</integer>"),
@@ -700,7 +712,7 @@ mod tests {
         let mut map = IndexMap::new();
         map.insert("topic".into(), "this-week".into());
         e.args = Some(Args::Map(map));
-        let out = generate_plist(&e, &test_ctx());
+        let out = generate_plist(&e, &test_ctx()).unwrap();
         assert!(out.contains("<string>--arg</string>"));
         assert!(
             out.contains("<string>topic=this-week</string>"),
@@ -712,7 +724,7 @@ mod tests {
     fn recurring_codex_skill_forwards_harness() {
         let mut entry = skill_entry("/daily", "0 9 * * *");
         entry.harness = Some(crate::Harness::Codex);
-        let out = generate_plist(&entry, &test_ctx());
+        let out = generate_plist(&entry, &test_ctx()).unwrap();
         assert!(out.contains("<string>--harness</string>\n        <string>codex</string>"));
     }
 
@@ -722,7 +734,7 @@ mod tests {
         let mut map = IndexMap::new();
         map.insert("msg".into(), "a & b < c".into());
         e.args = Some(Args::Map(map));
-        let out = generate_plist(&e, &test_ctx());
+        let out = generate_plist(&e, &test_ctx()).unwrap();
         assert!(
             out.contains("<string>msg=a &amp; b &lt; c</string>"),
             "out:\n{out}"
@@ -733,7 +745,7 @@ mod tests {
 
     #[test]
     fn recurring_skill_no_blank_line_when_args_absent() {
-        let out = generate_plist(&skill_entry("/daily", "0 9 * * *"), &test_ctx());
+        let out = generate_plist(&skill_entry("/daily", "0 9 * * *"), &test_ctx()).unwrap();
         // Bun guarantees a tight `<string>/daily</string>\n    </array>` join.
         assert!(!out.contains("<string>/daily</string>\n\n"), "out:\n{out}");
     }
@@ -745,7 +757,7 @@ mod tests {
             skill: Some("/reminder".into()),
             ..Default::default()
         };
-        let out = generate_plist(&e, &test_ctx());
+        let out = generate_plist(&e, &test_ctx()).unwrap();
         assert!(out.contains("<key>Year</key>\n        <integer>2026</integer>"));
         assert!(out.contains("<key>Month</key>\n        <integer>5</integer>"));
         assert!(out.contains("<key>Day</key>\n        <integer>13</integer>"));
@@ -760,7 +772,7 @@ mod tests {
             skill: Some("/reminder".into()),
             ..Default::default()
         };
-        let out = generate_plist(&e, &test_ctx());
+        let out = generate_plist(&e, &test_ctx()).unwrap();
         assert!(out.contains("<string>/bin/sh</string>"));
         assert!(out.contains("<string>-c</string>"));
         assert!(out.contains("skill run"));
@@ -781,7 +793,7 @@ mod tests {
         let mut map = IndexMap::new();
         map.insert("msg".into(), "hello".into());
         e.args = Some(Args::Map(map));
-        let out = generate_plist(&e, &test_ctx());
+        let out = generate_plist(&e, &test_ctx()).unwrap();
         assert!(out.contains("--arg=&quot;msg=hello&quot;"));
     }
 
@@ -799,7 +811,7 @@ mod tests {
             args: Some(Args::List(vec!["qmd-reindex".into()])),
             ..Default::default()
         };
-        let out = generate_plist(&e, &test_ctx());
+        let out = generate_plist(&e, &test_ctx()).unwrap();
         assert!(out.contains("<string>/opt/homebrew/bin/onebrain</string>"));
         assert!(out.contains("<string>qmd-reindex</string>"));
         assert!(!out.contains("<string>--skill</string>"));
@@ -832,8 +844,8 @@ mod tests {
             args: Some(Args::List(vec!["qmd-reindex".into()])),
             ..Default::default()
         };
-        let out_bare = generate_plist(&bare, &test_ctx());
-        let out_abs = generate_plist(&abs, &test_ctx());
+        let out_bare = generate_plist(&bare, &test_ctx()).unwrap();
+        let out_abs = generate_plist(&abs, &test_ctx()).unwrap();
         assert!(out_bare.contains("<string>com.onebrain.onebrain-qmd-reindex</string>"));
         assert!(out_abs.contains("<string>com.onebrain.onebrain-qmd-reindex</string>"));
     }
@@ -898,7 +910,7 @@ mod tests {
             args: Some(Args::List(vec!["qmd-reindex".into()])),
             ..Default::default()
         };
-        let out = generate_plist(&e, &test_ctx());
+        let out = generate_plist(&e, &test_ctx()).unwrap();
         assert!(out.contains("<string>/bin/sh</string>"));
         assert!(out.contains("&quot;/opt/homebrew/bin/onebrain&quot; &quot;qmd-reindex&quot;"));
         assert!(out.contains("launchctl bootout gui/501/com.onebrain.onebrain-qmd-reindex"));
@@ -921,7 +933,7 @@ mod tests {
             command: Some("/opt/homebrew/bin/onebrain".into()),
             ..Default::default()
         };
-        let out = generate_plist(&e, &test_ctx());
+        let out = generate_plist(&e, &test_ctx()).unwrap();
         assert!(out.contains("<string>/opt/homebrew/bin/onebrain</string>"));
         assert!(out.contains("<string>--vault</string>"));
         assert!(out.contains("<string>/Users/test/vault</string>"));
@@ -940,7 +952,7 @@ mod tests {
                 args: Some(Args::List(vec!["search".into(), "reindex".into()])),
                 ..Default::default()
             };
-            let out = generate_plist(&e, &test_ctx());
+            let out = generate_plist(&e, &test_ctx()).unwrap();
             assert!(
                 out.contains("<string>--vault</string>"),
                 "expected --vault for onebrain command `{cmd}`, out:\n{out}"
@@ -964,7 +976,7 @@ mod tests {
             ])),
             ..Default::default()
         };
-        let out = generate_plist(&e, &test_ctx());
+        let out = generate_plist(&e, &test_ctx()).unwrap();
         assert!(out.contains("<string>/usr/bin/rsync</string>"));
         assert!(out.contains("<string>-av</string>"));
         assert!(
@@ -982,7 +994,7 @@ mod tests {
             command: Some("/usr/bin/true".into()),
             ..Default::default()
         };
-        let out = generate_plist(&e, &test_ctx());
+        let out = generate_plist(&e, &test_ctx()).unwrap();
         assert!(out.contains("<string>/usr/bin/true</string>"));
         assert!(!out.contains("<string>--vault</string>"));
     }
@@ -1001,7 +1013,7 @@ mod tests {
             args: Some(Args::List(vec!["-av".into(), "/src".into(), "/dst".into()])),
             ..Default::default()
         };
-        let out = generate_plist(&e, &test_ctx());
+        let out = generate_plist(&e, &test_ctx()).unwrap();
         assert!(out.contains("&quot;/usr/bin/rsync&quot;"));
         assert!(
             !out.contains("&quot;--vault&quot;"),
@@ -1024,7 +1036,7 @@ mod tests {
             ])),
             ..Default::default()
         };
-        let out = generate_plist(&e, &test_ctx());
+        let out = generate_plist(&e, &test_ctx()).unwrap();
         assert_eq!(
             out.matches("<string>--vault</string>").count(),
             1,
@@ -1045,7 +1057,7 @@ mod tests {
                 args: Some(Args::List(vec!["reindex".into(), arg.into()])),
                 ..Default::default()
             };
-            let out = generate_plist(&e, &test_ctx());
+            let out = generate_plist(&e, &test_ctx()).unwrap();
             assert!(
                 !out.contains("<string>/Users/test/vault</string>"),
                 "explicit vault flag `{arg}` should suppress the appended \
@@ -1066,7 +1078,7 @@ mod tests {
             args: Some(Args::List(vec!["reindex".into()])),
             ..Default::default()
         };
-        let out = generate_plist(&e, &test_ctx_with_vault("/tmp/My Vault/x"));
+        let out = generate_plist(&e, &test_ctx_with_vault("/tmp/My Vault/x")).unwrap();
         assert!(out.contains("<string>--vault</string>"));
         assert!(
             out.contains("<string>/tmp/My Vault/x</string>"),
@@ -1085,7 +1097,7 @@ mod tests {
             args: Some(Args::List(vec!["reindex".into()])),
             ..Default::default()
         };
-        let out = generate_plist(&e, &test_ctx_with_vault("/tmp/My Vault/x"));
+        let out = generate_plist(&e, &test_ctx_with_vault("/tmp/My Vault/x")).unwrap();
         // xml_escape turns the surrounding double-quotes into &quot; — the
         // space stays literal inside them.
         assert!(
@@ -1168,7 +1180,7 @@ mod tests {
             ..Default::default()
         };
         let vault = "/tmp/weird\"$(id)\"vault";
-        let out = generate_plist(&e, &test_ctx_with_vault(vault));
+        let out = generate_plist(&e, &test_ctx_with_vault(vault)).unwrap();
 
         // Compute the expected escaped-then-xml-escaped fragment using the
         // real helpers so this test can't silently drift from the emitter.
@@ -1200,7 +1212,7 @@ mod tests {
             args: Some(Args::List(vec!["reindex".into()])),
             ..Default::default()
         };
-        let out = generate_plist(&e, &test_ctx());
+        let out = generate_plist(&e, &test_ctx()).unwrap();
 
         let expected_in_plist = xml_escape(&format!(
             "\"{}\"",
@@ -1236,7 +1248,7 @@ mod tests {
             homedir: PathBuf::from("/tmp/weird\"$home"),
             uid: 501,
         };
-        let out = generate_plist(&e, &ctx);
+        let out = generate_plist(&e, &ctx).unwrap();
         let plist_file = "/tmp/weird\"$home/Library/LaunchAgents/com.onebrain.reminder.plist";
         let expected_in_plist = xml_escape(&format!(
             "rm -f \"{}\"",
@@ -1312,7 +1324,7 @@ mod tests {
             args: Some(Args::Map(map)),
             ..Default::default()
         };
-        let out = generate_plist(&e, &test_ctx());
+        let out = generate_plist(&e, &test_ctx()).unwrap();
         let shell = extract_one_shot_shell(&out);
 
         // Run the real payload. The `onebrain` / `launchctl` commands inside
@@ -1357,7 +1369,7 @@ mod tests {
             )])),
             ..Default::default()
         };
-        let out = generate_plist(&e, &test_ctx());
+        let out = generate_plist(&e, &test_ctx()).unwrap();
         let shell = extract_one_shot_shell(&out);
 
         let _ = std::process::Command::new("/bin/sh")
@@ -1384,7 +1396,7 @@ mod tests {
             args: Some(Args::List(vec![r"C:\ob test\out.txt".to_string()])),
             ..Default::default()
         };
-        let shell = extract_one_shot_shell(&generate_plist(&e, &test_ctx()));
+        let shell = extract_one_shot_shell(&generate_plist(&e, &test_ctx()).unwrap());
         // Escaped form inside the double-quoted shell string.
         assert!(
             shell.contains(r"C:\\ob test\\out.txt"),
@@ -1411,7 +1423,7 @@ mod tests {
             homedir: PathBuf::from("/tmp/weird\"$home"),
             uid: 501,
         };
-        let out = generate_plist(&e, &ctx);
+        let out = generate_plist(&e, &ctx).unwrap();
         let label = format!("com.onebrain.{}", label_for_entry(&e));
         let plist_file = format!("/tmp/weird\"$home/Library/LaunchAgents/{label}.plist");
         let expected_in_plist = xml_escape(&format!(
@@ -1433,7 +1445,7 @@ mod tests {
             args: Some(Args::List(vec!["--exclude".into(), "a & b".into()])),
             ..Default::default()
         };
-        let out = generate_plist(&e, &test_ctx());
+        let out = generate_plist(&e, &test_ctx()).unwrap();
         assert!(out.contains("<string>--exclude</string>"));
         assert!(out.contains("<string>a &amp; b</string>"));
         assert!(!out.contains("<string>a & b</string>"));
@@ -1441,7 +1453,7 @@ mod tests {
 
     #[test]
     fn generate_plist_snapshot_recurring_skill() {
-        let out = generate_plist(&skill_entry("/daily", "0 9 * * *"), &test_ctx());
+        let out = generate_plist(&skill_entry("/daily", "0 9 * * *"), &test_ctx()).unwrap();
         insta::assert_snapshot!(out);
     }
 
@@ -1452,7 +1464,7 @@ mod tests {
         // A bare-value/wildcard cron (the common case) must still produce
         // a single `<dict>`, not a one-element `<array>` — byte parity
         // with the existing snapshot depends on this.
-        let out = generate_plist(&skill_entry("/daily", "0 9 * * *"), &test_ctx());
+        let out = generate_plist(&skill_entry("/daily", "0 9 * * *"), &test_ctx()).unwrap();
         assert!(out.contains("<key>StartCalendarInterval</key>\n    <dict>"));
         assert!(!out.contains("<key>StartCalendarInterval</key>\n    <array>"));
     }
@@ -1460,7 +1472,7 @@ mod tests {
     #[test]
     fn calendar_block_step_hour_emits_array_of_dicts() {
         // `*/2` on hour → 12 combinations → array form, one <dict> per hour.
-        let out = generate_plist(&skill_entry("/daily", "0 */2 * * *"), &test_ctx());
+        let out = generate_plist(&skill_entry("/daily", "0 */2 * * *"), &test_ctx()).unwrap();
         assert!(out.contains("<key>StartCalendarInterval</key>\n    <array>"));
         assert!(out.contains("<key>Hour</key>\n            <integer>0</integer>"));
         assert!(out.contains("<key>Hour</key>\n            <integer>22</integer>"));
@@ -1476,7 +1488,7 @@ mod tests {
 
     #[test]
     fn calendar_block_list_weekday_emits_one_dict_per_value() {
-        let out = generate_plist(&skill_entry("/daily", "0 9 * * 1,3,5"), &test_ctx());
+        let out = generate_plist(&skill_entry("/daily", "0 9 * * 1,3,5"), &test_ctx()).unwrap();
         assert!(out.contains("<key>StartCalendarInterval</key>\n    <array>"));
         assert!(out.contains("<key>Weekday</key>\n            <integer>1</integer>"));
         assert!(out.contains("<key>Weekday</key>\n            <integer>3</integer>"));
@@ -1490,7 +1502,7 @@ mod tests {
     fn calendar_block_weekday_seven_emits_zero() {
         // Standard cron 7 = Sunday, but launchd's `Weekday` key only
         // understands 0-6 — must be normalized before it reaches the plist.
-        let out = generate_plist(&skill_entry("/daily", "0 9 * * 7"), &test_ctx());
+        let out = generate_plist(&skill_entry("/daily", "0 9 * * 7"), &test_ctx()).unwrap();
         assert!(out.contains("<key>Weekday</key>\n        <integer>0</integer>"));
         // Single value → stays plain <dict>, not <array>.
         assert!(out.contains("<key>StartCalendarInterval</key>\n    <dict>"));
@@ -1498,7 +1510,7 @@ mod tests {
 
     #[test]
     fn calendar_block_range_weekday_emits_inclusive_dicts() {
-        let out = generate_plist(&skill_entry("/daily", "0 9 * * 1-5"), &test_ctx());
+        let out = generate_plist(&skill_entry("/daily", "0 9 * * 1-5"), &test_ctx()).unwrap();
         for w in 1..=5 {
             assert!(
                 out.contains(&format!(
@@ -1513,7 +1525,7 @@ mod tests {
     fn generate_plist_snapshot_recurring_skill_array_form() {
         // New insta snapshot (#116 bug 1) covering the multi-value array
         // shape — distinct from the single-`<dict>` snapshot above.
-        let out = generate_plist(&skill_entry("/daily", "0 */6 * * *"), &test_ctx());
+        let out = generate_plist(&skill_entry("/daily", "0 */6 * * *"), &test_ctx()).unwrap();
         insta::assert_snapshot!(out);
     }
 
@@ -1527,7 +1539,7 @@ mod tests {
 
     #[test]
     fn calendar_block_day_only_restricted_emits_array_of_day_dicts() {
-        let out = generate_plist(&skill_entry("/daily", "0 9 1,15 * *"), &test_ctx());
+        let out = generate_plist(&skill_entry("/daily", "0 9 1,15 * *"), &test_ctx()).unwrap();
         assert!(out.contains("<key>StartCalendarInterval</key>\n    <array>"));
         assert!(out.contains("<key>Day</key>\n            <integer>1</integer>"));
         assert!(out.contains("<key>Day</key>\n            <integer>15</integer>"));
