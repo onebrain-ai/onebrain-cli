@@ -13,6 +13,71 @@ permissions:
   contents: read
 
 jobs:
+  # Does this PR touch anything a test could possibly observe?
+  #
+  # Gated at the JOB level, never with a workflow-level `paths-ignore`. Eight
+  # checks are REQUIRED on main; a workflow that does not run reports nothing,
+  # and every PR then waits forever on "Expected — waiting for status to be
+  # reported". A skipped JOB still reports a conclusion (#360).
+  #
+  # The filter is deliberately blunt: `.md` and `docs/` are docs, EVERYTHING
+  # else is code. Over-running costs minutes; over-skipping ships bugs. This
+  # release alone CI caught two Windows breaks no VM could see — a
+  # `#[cfg(unix)]` helper that broke the Windows lib-test build, and a test
+  # hardcoding `/bin/echo`. A filter that called either of those "docs" would
+  # have let them through, which is why this errs toward running.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: filter
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "not a pull_request event -> run everything"
+            exit 0
+          fi
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          # A diff we cannot compute is a diff we must assume is code.
+          if ! files=$(git diff --name-only "$base" "$head"); then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "diff failed -> run everything"
+            exit 0
+          fi
+          if [ -z "$files" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "empty diff -> run everything"
+            exit 0
+          fi
+          # Read line-by-line, not word-by-word: a path with a space would
+          # otherwise split into fragments, and each fragment would be judged
+          # on its own — `docs/my notes.md` becoming `docs/my` and `notes.md`
+          # is a classification bug, not a lint nit.
+          code=false
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            case "$f" in
+              # Markdown under a tests/ directory is NOT documentation: this
+              # repo `include_str!`s fixture .md files straight into the build
+              # (crates/onebrain-token/tests/fixtures/**), so editing one
+              # changes what the tests assert. Classifying those as docs would
+              # skip the matrix on a real behaviour change — the exact
+              # over-skip this filter is supposed to be too blunt to commit.
+              tests/*|*/tests/*) code=true; echo "  CODE (under tests/): $f" ;;
+              docs/*|*.md)       echo "  docs: $f" ;;
+              *)                 code=true; echo "  CODE: $f" ;;
+            esac
+          done <<< "$files"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "verdict: code=$code"
+
   fmt:
     runs-on: ubuntu-latest
     steps:
@@ -73,6 +138,8 @@ jobs:
       - run: cargo test -p onebrain-cli -p onebrain-search --no-default-features --no-fail-fast
 
   test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -102,6 +169,8 @@ jobs:
   # only (one canonical surface); the threshold absorbs platform jitter. See
   # docs/coverage.md for the exclusion allowlist + documented residuals.
   coverage:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -127,6 +196,8 @@ jobs:
   # Windows-only; burying it there would make every platform wait.
   # scheduler-schema.yml's header comment forward-references this job.
   windows-schedule-fires:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
