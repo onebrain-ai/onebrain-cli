@@ -137,17 +137,35 @@ jobs:
       # Without this, those branches compile but never run in any CI job (#119).
       - run: cargo test -p onebrain-cli -p onebrain-search --no-default-features --no-fail-fast
 
+  # Gated at STEP level, not job level — a required matrix check cannot be
+  # skipped as a job. MEASURED on PR #369, a docs-only throwaway opened to
+  # settle exactly this: a skipped non-matrix job (`coverage`) reports its
+  # context as `skipping` and satisfies the requirement, but a skipped MATRIX
+  # job is never EXPANDED, so `test (ubuntu-latest)` / `(macos-latest)` /
+  # `(windows-latest)` — the three names branch protection actually requires —
+  # are never reported at all. The PR came back `mergeStateStatus=BLOCKED`:
+  # the "waiting for status to be reported" deadlock #360 set out to avoid,
+  # reached through a door the issue did not anticipate.
+  #
+  # So the job always STARTS (its three expanded contexts always report) and
+  # every step that costs anything is gated instead. A docs-only PR pays three
+  # runner startups, seconds each, in place of ~27 minutes.
   test:
     needs: changes
-    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      CODE: ${{ needs.changes.outputs.code }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - if: env.CODE != 'true'
+        run: echo "docs-only change — matrix work skipped, context still reported"
+      - if: env.CODE == 'true'
+        uses: actions/checkout@v6
+      - if: env.CODE == 'true'
+        uses: dtolnay/rust-toolchain@stable
       # macOS: simsimd's build script bakes the active Xcode's clang runtime
       # dir (…/lib/clang/<ver>/lib/darwin, for -lclang_rt.osx) into its cached
       # output. When the runner image rotates Xcode versions, a restored cache
@@ -155,14 +173,16 @@ jobs:
       # not found`. Key the cache by Xcode version so caches never cross
       # images, and export the CURRENT runtime dir as a fallback search path.
       - name: Key cache by Xcode version (macOS)
-        if: runner.os == 'macOS'
+        if: env.CODE == 'true' && runner.os == 'macOS'
         run: |
           echo "RUST_CACHE_KEY=$(xcodebuild -version | head -1 | tr -d ' ')" >> "$GITHUB_ENV"
           echo "LIBRARY_PATH=$(cd "$(dirname "$(xcrun -f clang)")/../lib/clang" && echo "$PWD"/*/lib/darwin)" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@v2
+      - if: env.CODE == 'true'
+        uses: Swatinem/rust-cache@v2
         with:
           key: ${{ env.RUST_CACHE_KEY }}
-      - run: cargo test --workspace --no-fail-fast
+      - if: env.CODE == 'true'
+        run: cargo test --workspace --no-fail-fast
 
   # Ratchet coverage gate — fails if core line coverage drops below the
   # threshold in scripts/coverage.sh (CORE_LINE_THRESHOLD). Measured on Linux
