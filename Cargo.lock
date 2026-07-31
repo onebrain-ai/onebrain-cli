@@ -2065,7 +2065,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onebrain-cache"
-version = "3.4.21"
+version = "3.4.22"
 dependencies = [
  "chrono",
  "onebrain-core",
@@ -2081,7 +2081,7 @@ dependencies = [
 
 [[package]]
 name = "onebrain-cli"
-version = "3.4.21"
+version = "3.4.22"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2137,7 +2137,7 @@ dependencies = [
 
 [[package]]
 name = "onebrain-core"
-version = "3.4.21"
+version = "3.4.22"
 dependencies = [
  "chrono",
  "indexmap",
@@ -2155,7 +2155,7 @@ dependencies = [
 
 [[package]]
 name = "onebrain-fs"
-version = "3.4.21"
+version = "3.4.22"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2187,7 +2187,7 @@ dependencies = [
 
 [[package]]
 name = "onebrain-search"
-version = "3.4.21"
+version = "3.4.22"
 dependencies = [
  "anyhow",
  "fastembed",
@@ -2204,7 +2204,7 @@ dependencies = [
 
 [[package]]
 name = "onebrain-token"
-version = "3.4.21"
+version = "3.4.22"
 dependencies = [
  "chrono",
  "pretty_assertions",
