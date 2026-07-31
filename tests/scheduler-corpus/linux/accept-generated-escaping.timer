@@ -1,0 +1,9 @@
+[Unit]
+Description=OneBrain scheduled entry timer (echo--HOME-100--a-b-C--dir--C--My-Vau-c7ba3b10)
+
+[Timer]
+OnCalendar=Sun *-*-* 03:00:00
+Persistent=false
+
+[Install]
+WantedBy=timers.target

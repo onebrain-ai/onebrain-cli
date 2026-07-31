@@ -78,6 +78,48 @@ pub fn daily_command_entry() -> ScheduleEntry {
     }
 }
 
+/// One argument list covering every escaping branch both sinks own — and
+/// "every" here is a coverage measurement, not a reading of the code.
+///
+/// An earlier version of this list claimed the same thing and was wrong:
+/// `cargo llvm-cov --lib -p onebrain-core --show-missing-lines -- --include-ignored`
+/// reported `quote_win_arg`'s doubling loop unexecuted, because every quote in
+/// the list was preceded by a letter, and no unit test covered it either. Re-run
+/// that command after touching this list; a rule with no argument reaching it is
+/// exactly the hole #353 exists to close.
+/// Kept identical in the systemd and schtasks regenerators so the two
+/// fixtures are readable side by side: `$` and `%` are systemd expansions,
+/// the trailing backslash run is the fiddly half of the Windows
+/// `CommandLineToArgvW` algorithm, and the space, `;`, `'` and `"` are
+/// word-splitting hazards on one or both.
+///
+/// Until v3.4.22 no fixture in the corpus carried ANY of these, so both
+/// escapers could regress and `cargo test`, `systemd-analyze verify` and
+/// `schtasks /Create` all stayed green (#353).
+pub fn escaping_args() -> Vec<String> {
+    [
+        "$HOME",           // systemd variable expansion  -> $$HOME
+        "100%",            // systemd specifier           -> 100%%
+        "a b",             // whitespace: must stay ONE argument on both
+        r#"C:\dir\"#,      // trailing backslash, but NO space: must stay unquoted
+        r#"C:\My Vault\"#, // space AND trailing backslash — the only shape that
+        // reaches the Windows backslash-doubling rule at all, and the real one
+        // (`--vault C:\My Vault\ob`) that motivated `quote_win_arg` in v3.4.21.
+        "semi;colon",    // systemd word splitter
+        "it's",          // stray single quote opens a quoted region
+        "quote\"inside", // literal double quote through both layers
+        r#"C:\dir\"q""#, // backslash run IMMEDIATELY before a quote — the
+        // interior half of the Windows doubling rule. `quote"inside` does not
+        // reach it (the quote is preceded by a letter), and neither did any
+        // unit test: `cargo llvm-cov` reported the loop body unexecuted.
+        "a&b<c>d", // the XML layer, round-tripped through a real sink
+        "",        // empty argument: its own branch in BOTH quoters
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 /// A command that is NOT onebrain — guards `should_append_vault`.
 pub fn foreign_command_entry() -> ScheduleEntry {
     ScheduleEntry {
