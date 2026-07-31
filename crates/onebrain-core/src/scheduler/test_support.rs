@@ -120,6 +120,16 @@ pub fn escaping_args() -> Vec<String> {
     .collect()
 }
 
+/// The escaping fixture's entry, built once so the regenerator that WRITES
+/// it and the drift guard that CHECKS it cannot come to describe different
+/// things.
+pub fn escaping_entry(command: &str) -> ScheduleEntry {
+    let mut e = daily_command_entry();
+    e.command = Some(command.to_string());
+    e.args = Some(crate::scheduler::Args::List(escaping_args()));
+    e
+}
+
 /// A command that is NOT onebrain — guards `should_append_vault`.
 pub fn foreign_command_entry() -> ScheduleEntry {
     ScheduleEntry {

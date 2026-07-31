@@ -297,12 +297,20 @@ pub(crate) fn read_vault_config(vault: &Path) -> Result<ScheduleConfig> {
 // - systemd and Task Scheduler — string assertions in the suite, PLUS a
 //   standing corpus case since v3.4.22 (#353):
 //   `accept-generated-escaping.{service,timer,xml}` carries `$`, `%`, a
-//   space, a trailing backslash run, `;`, `'` and `"` in one argument list,
-//   and the existing CI jobs feed it to the real tools on every PR —
-//   `systemd-analyze verify` on Linux, `schtasks /Create` on Windows, where
-//   its `.expect` pins the arguments as Task Scheduler reports them BACK.
-//   Until then the corpus carried no escaped value at all, so either escaper
-//   could regress with every gate green.
+//   space, a trailing backslash run, `;`, `'` and `"` in one argument list.
+//   It takes TWO jobs to make that a regression guard, and the first version
+//   shipped only one of them:
+//     (a) the real tools consume the fixture on every PR — `systemd-analyze
+//         verify` on Linux, `schtasks /Create` on Windows, whose `.expect`
+//         pins the arguments as Task Scheduler reports them BACK; and
+//     (b) `the_committed_escaping_fixture_still_matches_this_renderer` (one
+//         per renderer, NOT `#[ignore]`d) asserts the committed bytes equal
+//         what the escaper emits today.
+//   Without (b) the round-trip installs a FROZEN document: it proves the OS
+//   accepts that XML and is blind to the escaper changing underneath it. The
+//   regenerators are `#[ignore]`d and CI never passes `--ignored`, so nothing
+//   re-rendered them. Caught by the v3.4.22 full-epic audit, after #353 had
+//   been closed.
 //   Measured while adding it, on the VMs rather than from the strings:
 //   systemd RAN the unit and `/bin/echo` received `$HOME` unexpanded, and
 //   Task Scheduler reported back `"C:\My Vault\\"` with the backslash run

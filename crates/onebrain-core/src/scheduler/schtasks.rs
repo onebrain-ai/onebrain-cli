@@ -1145,19 +1145,42 @@ mod tests {
         std::fs::write(
             dir.join("accept-generated-escaping.xml"),
             generate_task_xml(
-                &{
-                    let mut e = daily_command_entry();
-                    e.command = Some(r"C:\Windows\System32\cmd.exe".to_string());
-                    e.args = Some(crate::scheduler::types::Args::List(
-                        crate::scheduler::test_support::escaping_args(),
-                    ));
-                    e
-                },
+                &crate::scheduler::test_support::escaping_entry(r"C:\Windows\System32\cmd.exe"),
                 &ctx,
             )
             .unwrap(),
         )
         .unwrap();
+    }
+
+    /// The committed escaping fixture still matches what this renderer emits.
+    ///
+    /// The Windows half of the same gap: `emit_generated_corpus` is `#[ignore]`d
+    /// and CI never passes `--ignored`, so the `schtasks /Create` round-trip was
+    /// installing a FROZEN document. It proved Task Scheduler accepts that XML —
+    /// it could not notice `quote_win_arg` changing underneath it, which is
+    /// precisely what #353 says was fixed.
+    ///
+    /// This runs in a plain `cargo test`, so the escaper is executed on
+    /// `escaping_args` on every PR, on every platform.
+    #[test]
+    fn the_committed_escaping_fixture_still_matches_this_renderer() {
+        let ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        let entry = crate::scheduler::test_support::escaping_entry(r"C:\Windows\System32\cmd.exe");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/scheduler-corpus/windows/accept-generated-escaping.xml");
+        let committed =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        // A `\r` can only come from the CHECKOUT — the renderers refuse
+        // control characters outright — so normalising it compares content
+        // rather than git's eol config, without weakening the guard.
+        let committed = committed.replace("\r\n", "\n");
+        assert_eq!(
+            generate_task_xml(&entry, &ctx).unwrap(),
+            committed,
+            "{} is stale — the renderer changed but the corpus CI feeds to schtasks did not. Regenerate: cargo test -p onebrain-core schtasks::tests::emit_generated_corpus -- --ignored",
+            path.display()
+        );
     }
 
     #[test]
