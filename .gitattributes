@@ -10,3 +10,12 @@
 # assertions. Pin them to LF. (This is in ADDITION to the transforms being
 # CRLF-safe at runtime, never instead of it.)
 crates/onebrain-token/tests/fixtures/** text eol=lf
+
+# Scheduler corpus fixtures are compared BYTE FOR BYTE against renderer output
+# (`the_committed_escaping_fixture_still_matches_this_renderer`), and CI feeds
+# the same files to real schedulers. A CRLF checkout on Windows makes the
+# committed bytes differ from what the renderer emits, failing the guard for a
+# reason that has nothing to do with the escapers. Same defect the
+# onebrain-token fixtures above were pinned for; the corpus needed the rule too
+# and did not have it until a Windows CI leg said so.
+tests/scheduler-corpus/** text eol=lf

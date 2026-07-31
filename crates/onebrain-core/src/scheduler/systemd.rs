@@ -609,6 +609,10 @@ mod tests {
             let path = dir.join(format!("accept-generated-escaping.{suffix}"));
             let committed = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            // A `\r` can only come from the CHECKOUT — the renderers refuse
+            // control characters outright — so normalising it compares content
+            // rather than git's eol config, without weakening the guard.
+            let committed = committed.replace("\r\n", "\n");
             assert_eq!(
                 rendered,
                 committed,

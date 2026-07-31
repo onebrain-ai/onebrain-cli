@@ -1171,6 +1171,10 @@ mod tests {
             .join("../../tests/scheduler-corpus/windows/accept-generated-escaping.xml");
         let committed =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        // A `\r` can only come from the CHECKOUT — the renderers refuse
+        // control characters outright — so normalising it compares content
+        // rather than git's eol config, without weakening the guard.
+        let committed = committed.replace("\r\n", "\n");
         assert_eq!(
             generate_task_xml(&entry, &ctx).unwrap(),
             committed,
