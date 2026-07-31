@@ -1,6 +1,6 @@
 ---
-latest_version: 3.4.21
-released: 2026-07-31
+latest_version: 3.4.22
+released: 2026-08-01
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,27 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.22] — 2026-08-01 — Make failure visible
+
+### Fixed
+- Control characters in schedule args are refused by every backend, not only the XML ones — one config now gets one verdict on all three platforms ([#355](https://github.com/onebrain-ai/onebrain-cli/issues/355))
+- `schedule register --resume` can no longer delete a file outside the marker directory; a drive-relative name escaped it on Windows ([#354](https://github.com/onebrain-ai/onebrain-cli/issues/354))
+- A bad entry no longer half-registers — control characters are refused before anything is written or activated ([#355](https://github.com/onebrain-ai/onebrain-cli/issues/355))
+
+### Added
+- `doctor` reports a missing scheduler log directory, the fault that kills every launchd job with no output at all ([#362](https://github.com/onebrain-ai/onebrain-cli/issues/362))
+- `doctor` reports a scheduled skill that has produced nothing, and states how much of your schedule it can actually speak for ([#363](https://github.com/onebrain-ai/onebrain-cli/issues/363))
+
+### Internal
+- An escaper regression now fails CI: the corpus carries an escaped-argument case, and a non-ignored test pins the committed fixture to what the renderer emits today ([#353](https://github.com/onebrain-ai/onebrain-cli/issues/353))
+- A cited corpus fixture must exist — the evidence contract is enforced rather than stated ([#359](https://github.com/onebrain-ai/onebrain-cli/issues/359))
+- Docs-only PRs skip the test matrix without stranding its required checks ([#360](https://github.com/onebrain-ai/onebrain-cli/issues/360))
+
+### Upgrade notes
+Two new `doctor` checks may warn on an existing vault. `scheduler logs` is auto-fixable with `doctor --fix`.
+`scheduled output` is informational — it names any scheduled skill that has produced no log, and always states
+how many entries it could not check (command-mode entries and skills that write no log).
 
 ## [3.4.21] — 2026-07-31 — Scheduler polish + notifications config
 
