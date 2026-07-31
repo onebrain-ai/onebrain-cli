@@ -551,10 +551,12 @@ pub fn generate_plist(
     entry: &ScheduleEntry,
     ctx: &SchedulerContext,
 ) -> Result<String, crate::scheduler::error::SchedulerError> {
-    // Refuse what XML cannot carry BEFORE rendering — `&#1;` is itself illegal,
-    // so a control character has no representation here at all and the plist
-    // would be rejected by `plutil` / `launchctl bootstrap` with an opaque
-    // error naming nothing (#355). Fallible for the same reason
+    // Refuse control characters BEFORE rendering. For this sink the reason is
+    // XML — `&#1;` is itself illegal, so the character has no representation at
+    // all and `plutil` / `launchctl bootstrap` would reject the document with an
+    // opaque error naming nothing (#355). The rule itself is not XML's: it lives
+    // in `entry` and every renderer applies it, so one config gets one verdict
+    // on all three platforms. Fallible for the same reason
     // `generate_service_unit` became fallible in v3.4.21.
     crate::scheduler::entry::reject_control_chars_in_entry(entry)?;
 

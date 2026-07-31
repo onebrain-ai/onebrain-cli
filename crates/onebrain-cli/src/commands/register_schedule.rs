@@ -113,6 +113,15 @@ fn run_with(
     for entry in &entries {
         validate_entry(entry)
             .map_err(|e| anyhow!("Invalid schedule entry: {}", inner_reason(&e)))?;
+        // Up front, NOT at render time. The renderers refuse control characters
+        // too (defence in depth), but reaching the check only from inside the
+        // per-entry install loop meant entry 3 failing after entries 1 and 2 had
+        // already been written AND `launchctl bootstrap`ed, with no rollback —
+        // defeating the "nothing changed" ordering this function documents
+        // below. It also stopped `--dry-run` at the first bad entry, so the one
+        // command meant for checking a config could not list its mistakes.
+        onebrain_core::scheduler::entry::reject_control_chars_in_entry(entry)
+            .map_err(|e| anyhow!("Invalid schedule entry: {}", inner_reason(&e)))?;
         if is_one_shot(entry) {
             let at = entry.at.as_deref().unwrap();
             validate_at(at).map_err(|e| anyhow!("Invalid at \"{at}\": {}", inner_reason(&e)))?;
@@ -833,19 +842,47 @@ fn resume_skill(vault: &Path, skill: &str) -> Result<()> {
     // directory and nothing else. A leading-slash trim alone let `../` walk out
     // and delete any `.txt` the user could write (#354).
     //
-    // Checked on the raw component rather than by canonicalising the result:
-    // the marker usually does NOT exist — that is the ordinary "not paused"
-    // case — and `canonicalize` fails on a missing path, so a resolve-then-
-    // compare guard would reject the common case and still need this test for
-    // everything else.
-    if skill_safe.is_empty()
-        || skill_safe.contains("..")
-        || skill_safe.contains('/')
-        || skill_safe.contains('\\')
+    // ALLOWLIST, not denylist. The first fix for #354 banned `..`, `/` and `\\`,
+    // which closes only the POSIX spelling. On Windows a drive-relative name
+    // carries a path PREFIX, and `PathBuf::push` CLEARS the buffer when it sees
+    // one — so `--resume "C:precious"` discarded the whole marker path and
+    // deleted `precious.txt` from the process's current directory on C:,
+    // outside both the marker directory and the vault. Proved on the win11-arm64
+    // VM against the denylist build: it printed `✓ Resumed C:precious` and the
+    // victim file was gone. `:` also opens an NTFS alternate data stream
+    // (`daily:evil`), which a separator ban does not see either.
+    //
+    // Enumerating Windows path spellings is a losing game, so this states what
+    // a skill name IS: ASCII letters, digits, `-` and `_`. Every skill in the
+    // vault is kebab-case, and the rule reads the same on all three platforms —
+    // a name refused on one host is refused on all of them, which is the same
+    // property #355 is about.
+    //
+    // Checked on the raw string rather than by canonicalising the result: the
+    // marker usually does NOT exist — that is the ordinary "not paused" case —
+    // and `canonicalize` fails on a missing path.
+    let allowed = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    if skill_safe.is_empty() || !skill_safe.chars().all(allowed) {
+        anyhow::bail!(
+            "invalid skill name {skill:?} — a skill is a bare name like `/daily`: \
+             ASCII letters, digits, `-` and `_` only, with no path separators, \
+             drive letters or `:`"
+        );
+    }
+    // Reserved DOS device names resolve to the device from ANY directory, so
+    // `NUL.txt` never names a file in the marker dir. Harmless (the delete just
+    // fails) but the resulting error explains nothing.
+    const DOS_DEVICES: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if DOS_DEVICES
+        .iter()
+        .any(|d| skill_safe.eq_ignore_ascii_case(d))
     {
         anyhow::bail!(
-            "invalid skill name {skill:?} — a skill is a bare name like `/daily`, \
-             with no path separators"
+            "invalid skill name {skill:?} — that is a reserved device name on Windows, \
+             so it cannot name a file in the marker directory"
         );
     }
     let logs_folder = resolve_logs_folder(vault);
@@ -1732,12 +1769,14 @@ mod tests {
         assert_eq!(legacy_command_label(&e), Some("onebrain".to_string()));
     }
 
-    /// #345 + B3: an entry whose discriminator used to truncate changes
-    /// label, so registration must be able to name — and remove — the
-    /// artifact the OLD label owned. `legacy_truncated_label` is that name;
     /// #354: the `--resume` value reaches `remove_file`, so a `../` in it used
     /// to delete any `.txt` the user could write, outside the vault entirely.
-    /// A leading-slash trim is not containment.
+    /// A leading-slash trim is not containment — and neither is banning the
+    /// POSIX spellings, which is why the Windows cases below are here: a
+    /// drive-relative `C:precious` carries a path PREFIX, and `PathBuf::push`
+    /// clears the buffer when it sees one, so the marker path evaporated and
+    /// the delete landed in the current directory on C:. Confirmed on the
+    /// win11-arm64 VM before the guard became an allowlist.
     #[test]
     fn resume_refuses_a_skill_name_that_could_escape_the_marker_directory() {
         let d = tempfile::tempdir().unwrap();
@@ -1746,6 +1785,7 @@ mod tests {
         std::fs::write(&victim, "keep me").unwrap();
 
         for evil in [
+            // POSIX spellings
             "../precious",
             "../../precious",
             "/../precious",
@@ -1753,11 +1793,27 @@ mod tests {
             "sub\\precious",
             "",
             "/",
+            // Windows spellings. These run on every platform on purpose: the
+            // rule is a character allowlist, so the verdict must not depend on
+            // which host is asking. Before the allowlist, `C:precious` was
+            // ACCEPTED here and deleted the victim on Windows.
+            "C:precious",
+            "C:/precious",
+            "daily:evil", // NTFS alternate data stream
+            "NUL",        // reserved device, resolves from any directory
+            "con",        // reserved, case-insensitively
+            ".",
+            "..",
         ] {
             let r = resume_skill(d.path(), evil);
             assert!(r.is_err(), "{evil:?} should be refused");
             let msg = r.unwrap_err().to_string();
             assert!(msg.contains("invalid skill name"), "{evil:?}: {msg}");
+            // The reason must name what is wrong, not just say no.
+            assert!(
+                msg.contains("no path separators") || msg.contains("reserved device name"),
+                "{evil:?} refused without explaining why: {msg}"
+            );
         }
         assert!(victim.exists(), "the guard let a delete through");
     }
@@ -1779,6 +1835,9 @@ mod tests {
         resume_skill(d.path(), "weekly").unwrap();
     }
 
+    /// #345 + B3: an entry whose discriminator used to truncate changes
+    /// label, so registration must be able to name — and remove — the
+    /// artifact the OLD label owned. `legacy_truncated_label` is that name;
     /// it is `None` for entries whose label is unchanged, so an upgrade does
     /// no work for them.
     #[test]

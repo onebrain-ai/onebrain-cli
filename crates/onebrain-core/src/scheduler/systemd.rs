@@ -419,6 +419,30 @@ mod tests {
             matches!(err, SchedulerError::InvalidEntry { .. }),
             "got {err:?}"
         );
+        // Which guard fired matters. Since #355 the shared control-character
+        // refusal runs FIRST, so this case no longer reaches
+        // `sanitize_unit_value` — asserting only `InvalidEntry` would let this
+        // test keep passing while the systemd-specific newline ban rotted away
+        // underneath it. Pin the wording, and cover the newline ban directly in
+        // `the_newline_ban_still_stands_on_its_own` below.
+        assert!(
+            err.to_string().contains("control character"),
+            "expected the shared control-char guard to fire first, got {err:?}"
+        );
+    }
+
+    /// `sanitize_unit_value` still guards the values the shared entry check
+    /// cannot see: argv derived from the CONTEXT (vault path, CLI path), not
+    /// from the user's `onebrain.yml` entry. Without this, the newline ban has
+    /// no test of its own.
+    #[test]
+    fn the_newline_ban_still_stands_on_its_own() {
+        assert!(sanitize_unit_value("plain value").is_ok());
+        assert!(sanitize_unit_value("tab\there is fine").is_ok());
+        for bad in ["x\nExecStartPost=/bin/sh -c 'touch /tmp/pwned'", "x\ry"] {
+            let err = sanitize_unit_value(bad).unwrap_err();
+            assert!(err.to_string().contains("newline"), "{bad:?} gave {err:?}");
+        }
     }
 
     /// systemd expands `$VAR` and `%SPECIFIER` INSIDE double quotes, so
