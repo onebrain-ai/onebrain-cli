@@ -78,7 +78,15 @@ pub fn daily_command_entry() -> ScheduleEntry {
     }
 }
 
-/// The one argument list that touches every escaping rule both sinks own.
+/// One argument list covering every escaping branch both sinks own — and
+/// "every" here is a coverage measurement, not a reading of the code.
+///
+/// An earlier version of this list claimed the same thing and was wrong:
+/// `cargo llvm-cov --lib -p onebrain-core --show-missing-lines -- --include-ignored`
+/// reported `quote_win_arg`'s doubling loop unexecuted, because every quote in
+/// the list was preceded by a letter, and no unit test covered it either. Re-run
+/// that command after touching this list; a rule with no argument reaching it is
+/// exactly the hole #353 exists to close.
 /// Kept identical in the systemd and schtasks regenerators so the two
 /// fixtures are readable side by side: `$` and `%` are systemd expansions,
 /// the trailing backslash run is the fiddly half of the Windows
@@ -100,6 +108,12 @@ pub fn escaping_args() -> Vec<String> {
         "semi;colon",    // systemd word splitter
         "it's",          // stray single quote opens a quoted region
         "quote\"inside", // literal double quote through both layers
+        r#"C:\dir\"q""#, // backslash run IMMEDIATELY before a quote — the
+        // interior half of the Windows doubling rule. `quote"inside` does not
+        // reach it (the quote is preceded by a letter), and neither did any
+        // unit test: `cargo llvm-cov` reported the loop body unexecuted.
+        "a&b<c>d", // the XML layer, round-tripped through a real sink
+        "",        // empty argument: its own branch in BOTH quoters
     ]
     .iter()
     .map(|s| s.to_string())

@@ -1335,7 +1335,7 @@ mod tests {
     /// renderers escape their own sinks (see the note above
     /// `validate_schedulable`). Validation must now ACCEPT it, and the
     /// injection PoCs in `onebrain-core::scheduler::launchd` are what prove
-    /// the value stays inert. Keeping these as accept-cases pins the
+    /// the value stays inert. Keeping these as acceptance cases pins the
     /// inversion: if the ban ever returns without the escaping being
     /// reverted too, these go red.
     #[test]

@@ -1,6 +1,6 @@
 [Unit]
-Description=OneBrain scheduled entry (echo--HOME-100--a-b-C--dir--C--My-Vau-3d5faff4)
+Description=OneBrain scheduled entry (echo--HOME-100--a-b-C--dir--C--My-Vau-c7ba3b10)
 
 [Service]
 Type=oneshot
-ExecStart=/bin/echo "$$HOME" "100%%" "a b" "C:\\dir\\" "C:\\My Vault\\" "semi;colon" "it's" "quote\"inside" --vault /v/ob-1
+ExecStart=/bin/echo "$$HOME" "100%%" "a b" "C:\\dir\\" "C:\\My Vault\\" "semi;colon" "it's" "quote\"inside" "C:\\dir\\\"q\"" a&b<c>d "" --vault /v/ob-1

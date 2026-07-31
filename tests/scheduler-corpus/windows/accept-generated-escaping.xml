@@ -25,6 +25,6 @@
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
   </Settings>
   <Actions Context="Author">
-    <Exec><Command>C:\Windows\System32\cmd.exe</Command><Arguments>$HOME 100% &quot;a b&quot; C:\dir\ &quot;C:\My Vault\\&quot; semi;colon it's &quot;quote\&quot;inside&quot;</Arguments></Exec>
+    <Exec><Command>C:\Windows\System32\cmd.exe</Command><Arguments>$HOME 100% &quot;a b&quot; C:\dir\ &quot;C:\My Vault\\&quot; semi;colon it's &quot;quote\&quot;inside&quot; &quot;C:\dir\\\&quot;q\&quot;&quot; a&amp;b&lt;c&gt;d &quot;&quot;</Arguments></Exec>
   </Actions>
 </Task>
