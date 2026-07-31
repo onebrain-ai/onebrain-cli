@@ -13,25 +13,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [3.4.21] — 2026-07-31 — Scheduler polish + notifications config
 
 ### Fixed
-- Schedule args may contain `"`, `$`, backtick and `\` again — each renderer escapes its own sink (launchd shell, systemd unit, Task Scheduler XML) instead of a blanket register-time ban, so Windows paths like `C:\ob test\out.txt` register and fire correctly ([#344](https://github.com/onebrain-ai/onebrain-cli/issues/344))
-- **systemd: a newline in a scheduled arg is now refused at the renderer** — a line-oriented unit file has no escape for it, and it could previously inject arbitrary unit directives ([#344](https://github.com/onebrain-ai/onebrain-cli/issues/344))
-- **Windows: args with spaces are quoted per `CommandLineToArgvW`** — a space-bearing path previously arrived as several arguments and the job silently did nothing; a `cmd.exe /c` payload is passed through verbatim, since CMD parses its own payload ([#344](https://github.com/onebrain-ai/onebrain-cli/issues/344))
-- Command-mode schedule labels no longer truncate at 40 characters — two entries differing only after that point collapsed onto one label and silently overwrote each other's job. Longer labels now carry a hash suffix; shorter ones are unchanged, so nothing re-registers ([#345](https://github.com/onebrain-ai/onebrain-cli/issues/345))
-- Stale-label cleanup now goes through the backend seam (so it works on Linux and Windows — it previously unlinked a launchd path directly and was a no-op off macOS) and runs *after* the new artifact is installed, so a failed install can no longer leave the old job destroyed with no replacement ([#345](https://github.com/onebrain-ai/onebrain-cli/issues/345))
-- **Registering no longer deletes a job that is still in your config.** An entry whose args were exactly the 40-character prefix of another entry's had its live artifact removed by that other entry's stale-label cleanup — on every run, while reporting success ([#345](https://github.com/onebrain-ai/onebrain-cli/issues/345))
-- systemd: a `;` or `'` in an argument is quoted — a bare `;` separates command lines inside `ExecStart=`, so one configured command could render as two ([#344](https://github.com/onebrain-ai/onebrain-cli/issues/344))
+- Schedule args may contain `"`, `$`, backtick and `\` again — each renderer escapes its own sink ([#344](https://github.com/onebrain-ai/onebrain-cli/issues/344))
+- systemd: newlines refused, `;` and `'` quoted — a bare `;` split one command into two ([#344](https://github.com/onebrain-ai/onebrain-cli/issues/344))
+- Windows: args quoted per `CommandLineToArgvW`; a `cmd.exe /c` payload passes through verbatim ([#344](https://github.com/onebrain-ai/onebrain-cli/issues/344))
+- Command labels no longer truncate at 40 characters and collide — longer ones carry a hash suffix ([#345](https://github.com/onebrain-ai/onebrain-cli/issues/345))
+- Registering no longer deletes a job that is still in your config ([#345](https://github.com/onebrain-ai/onebrain-cli/issues/345))
+- Stale-label cleanup works on Linux and Windows, and runs after the replacement is installed ([#345](https://github.com/onebrain-ai/onebrain-cli/issues/345))
 
 ### Added
-- `notifications.telegram_chat_id` is a known config key: placed in the Automation section and self-documented by `doctor --fix` ([#348](https://github.com/onebrain-ai/onebrain-cli/issues/348))
+- `notifications.telegram_chat_id` is a known config key, placed and self-documented by `doctor --fix` ([#348](https://github.com/onebrain-ai/onebrain-cli/issues/348))
 
 ### Upgrade notes
-- A vault that hand-added a `notifications:` block before this release reports **config layout drift once**. `onebrain doctor --fix` moves the block into the Automation section; the existing value and its comment are preserved. Fresh vaults are unaffected — the key stays absent from the template until set.
-- **Known issue, not fixed here ([#352](https://github.com/onebrain-ai/onebrain-cli/issues/352)).** Editing a schedule entry's args leaves the job its *old* label owned installed and firing. This is long-standing — v3.4.20 and earlier behave identically — and **no CLI command can clear it**: `--remove` derives labels from the current config, which no longer names the old one. If you have edited an entry's args, check for a leftover and remove it by hand:
-  - macOS — `ls ~/Library/LaunchAgents/com.onebrain.*`, then `launchctl bootout gui/$(id -u)/<label>` and delete the plist
-  - Linux — `ls ~/.config/systemd/user/onebrain-*`, then `systemctl --user disable --now <unit>` and delete it
-  - Windows — Task Scheduler, `\OneBrain\` folder, or `schtasks /Delete /TN "\OneBrain\<label>" /F`
+A vault that hand-added a `notifications:` block reports config layout drift **once**; `doctor --fix` moves it into
+the Automation section, preserving the value and its comment. Fresh vaults are unaffected.
 
-  A fix was built for this release and pulled back out: it could delete live jobs, including another vault's, because schedule labels are global while the bookkeeping was per-vault. #352 redesigns it around verifying artifact ownership instead.
+**Known issue — editing a schedule entry's args strands the old job** ([#352](https://github.com/onebrain-ai/onebrain-cli/issues/352)). It stays installed and
+firing, and no CLI command can reach it: `--remove` derives labels from the current config. v3.4.20 and earlier
+behave identically. Remove a leftover by hand:
+
+- macOS — `ls ~/Library/LaunchAgents/com.onebrain.*`, then `launchctl bootout gui/$(id -u)/<label>` and delete the plist
+- Linux — `ls ~/.config/systemd/user/onebrain-*`, then `systemctl --user disable --now <unit>` and delete it
+- Windows — `schtasks /Delete /TN "\OneBrain\<label>" /F`
+
+A fix was built for this release and withdrawn: schedule labels are global while its bookkeeping was per-vault, so
+it could delete another vault's live job. #352 redesigns it around verifying artifact ownership.
 
 ## [3.4.20] — 2026-07-29 — Cross-platform scheduling parity: `onebrain schedule` actually schedules on macOS, Windows, and Linux
 
