@@ -60,7 +60,7 @@ pub fn render_preview(
 ) -> Result<Option<String>, SchedulerError> {
     #[cfg(target_os = "macos")]
     {
-        Ok(Some(crate::scheduler::launchd::generate_plist(entry, ctx)))
+        Ok(Some(crate::scheduler::launchd::generate_plist(entry, ctx)?))
     }
     #[cfg(windows)]
     {
@@ -490,7 +490,7 @@ fn write_plist(entry: &ScheduleEntry, ctx: &SchedulerContext) -> Result<PathBuf,
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&target, generate_plist(entry, ctx))?;
+    std::fs::write(&target, generate_plist(entry, ctx)?)?;
     Ok(target)
 }
 
@@ -654,7 +654,7 @@ mod tests {
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::fs::write(
             &target,
-            crate::scheduler::launchd::generate_plist(&entry, &ctx),
+            crate::scheduler::launchd::generate_plist(&entry, &ctx).unwrap(),
         )
         .unwrap();
 

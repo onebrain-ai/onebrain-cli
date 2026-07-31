@@ -208,6 +208,12 @@ pub fn generate_service_unit(
     entry: &ScheduleEntry,
     ctx: &SchedulerContext,
 ) -> Result<String, SchedulerError> {
+    // The same refusal the other two renderers apply. `sanitize_unit_value`
+    // below covers only what a LINE-oriented format cannot carry (newline/CR);
+    // this covers what no scheduler format can carry honestly. Caught by a
+    // Linux gate-8 run: without it, `\u{1}` registered cleanly here while
+    // being refused on macOS and Windows (#355).
+    crate::scheduler::entry::reject_control_chars_in_entry(entry)?;
     let label = crate::scheduler::launchd::label_for_entry(entry);
     let base = unit_base_name(&label);
     let argv = argv_for_entry(entry, ctx);

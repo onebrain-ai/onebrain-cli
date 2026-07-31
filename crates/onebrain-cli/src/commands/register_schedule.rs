@@ -829,6 +829,25 @@ fn test_run(vault: &Path, skill: &str) -> Result<()> {
 
 fn resume_skill(vault: &Path, skill: &str) -> Result<()> {
     let skill_safe = skill.trim_start_matches('/');
+    // The value reaches `remove_file`, so it must name a FILE inside the marker
+    // directory and nothing else. A leading-slash trim alone let `../` walk out
+    // and delete any `.txt` the user could write (#354).
+    //
+    // Checked on the raw component rather than by canonicalising the result:
+    // the marker usually does NOT exist — that is the ordinary "not paused"
+    // case — and `canonicalize` fails on a missing path, so a resolve-then-
+    // compare guard would reject the common case and still need this test for
+    // everything else.
+    if skill_safe.is_empty()
+        || skill_safe.contains("..")
+        || skill_safe.contains('/')
+        || skill_safe.contains('\\')
+    {
+        anyhow::bail!(
+            "invalid skill name {skill:?} — a skill is a bare name like `/daily`, \
+             with no path separators"
+        );
+    }
     let logs_folder = resolve_logs_folder(vault);
     let marker = vault
         .join(&logs_folder)
@@ -1716,6 +1735,50 @@ mod tests {
     /// #345 + B3: an entry whose discriminator used to truncate changes
     /// label, so registration must be able to name — and remove — the
     /// artifact the OLD label owned. `legacy_truncated_label` is that name;
+    /// #354: the `--resume` value reaches `remove_file`, so a `../` in it used
+    /// to delete any `.txt` the user could write, outside the vault entirely.
+    /// A leading-slash trim is not containment.
+    #[test]
+    fn resume_refuses_a_skill_name_that_could_escape_the_marker_directory() {
+        let d = tempfile::tempdir().unwrap();
+        // A file that must survive every attempt below.
+        let victim = d.path().join("precious.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+
+        for evil in [
+            "../precious",
+            "../../precious",
+            "/../precious",
+            "sub/precious",
+            "sub\\precious",
+            "",
+            "/",
+        ] {
+            let r = resume_skill(d.path(), evil);
+            assert!(r.is_err(), "{evil:?} should be refused");
+            let msg = r.unwrap_err().to_string();
+            assert!(msg.contains("invalid skill name"), "{evil:?}: {msg}");
+        }
+        assert!(victim.exists(), "the guard let a delete through");
+    }
+
+    /// The ordinary shapes still work — a guard that rejects `/daily` would be
+    /// worse than the bug.
+    #[test]
+    fn resume_still_accepts_an_ordinary_skill_name() {
+        let d = tempfile::tempdir().unwrap();
+        let paused = d.path().join("07-logs/scheduler/.paused");
+        std::fs::create_dir_all(&paused).unwrap();
+        let marker = paused.join("daily.txt");
+        std::fs::write(&marker, "paused").unwrap();
+
+        resume_skill(d.path(), "/daily").unwrap();
+        assert!(!marker.exists(), "the marker should have been cleared");
+
+        // Not paused → not an error.
+        resume_skill(d.path(), "weekly").unwrap();
+    }
+
     /// it is `None` for entries whose label is unchanged, so an upgrade does
     /// no work for them.
     #[test]
