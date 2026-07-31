@@ -352,6 +352,7 @@ fn all_checks(vault_root: &Path, config: &onebrain_core::VaultConfig) -> Vec<Doc
     results.push(search_exclude_check(vault_root));
     results.push(token_optimization_check(vault_root));
     results.push(read_hook_failopen_check(vault_root));
+    results.push(scheduler_log_dir_check(vault_root));
     results.push(daemon_status_check(vault_root));
     results.push(native_search_check(vault_root));
     results.push(lex_index_check(vault_root));
@@ -974,6 +975,88 @@ fn token_optimization_check(vault_root: &Path) -> DoctorResult {
         );
     }
     DoctorResult::ok(TOKEN_OPTIMIZATION_CHECK, "token_optimization ok")
+}
+
+const SCHEDULER_LOG_DIR_CHECK: &str = "scheduler-log-dir";
+
+/// The scheduler log directory exists, so the next scheduled run can start.
+///
+/// launchd opens `StandardOutPath`/`StandardErrorPath` **before exec** and does
+/// not create parent directories. If that directory disappears after the
+/// entries were registered, every run dies with `EX_CONFIG 78` having written
+/// **zero bytes** — no vault log, no stderr, no notification. The only symptom
+/// is an output that never arrives, which is how this was found in the field
+/// (#362): two of five jobs had been dead for a day, and the detector was a
+/// human noticing an absence.
+///
+/// `backend::ensure_log_dir` covers creation at register time and is correctly
+/// wired, but nothing re-checks afterwards. This is that missing re-check —
+/// deliberately placed somewhere a human reads, because the CLI cannot report
+/// the failure from inside a job that launchd never managed to exec.
+///
+/// Scoped to the launchd backend: `log_base_path` reaches only the plist
+/// writer. systemd sends output to the journal and Task Scheduler keeps its own
+/// history, so neither can fail this way.
+fn scheduler_log_dir_check(vault_root: &Path) -> DoctorResult {
+    let entries = match crate::commands::register_schedule::read_vault_config(vault_root) {
+        Ok(cfg) => cfg.schedule.len(),
+        // An unreadable/malformed config is `onebrain.yml`'s check to report.
+        Err(_) => return DoctorResult::ok(SCHEDULER_LOG_DIR_CHECK, "skipped — config unreadable"),
+    };
+    if entries == 0 || !cfg!(target_os = "macos") {
+        // No entries, or a backend that captures output elsewhere.
+        return scheduler_log_dir_verdict(entries, None);
+    }
+    let ctx = match crate::commands::register_schedule::build_scheduler_context(vault_root) {
+        Ok(c) => c,
+        Err(_) => return DoctorResult::ok(SCHEDULER_LOG_DIR_CHECK, "skipped — context unresolved"),
+    };
+    scheduler_log_dir_verdict(entries, Some(&ctx.log_base_path))
+}
+
+/// The verdict itself, separated from resolution so it is testable without
+/// touching `$HOME`.
+///
+/// `log_dir: None` means "this backend does not write to a log file" — the
+/// resolver decides that; this function only reports it. Splitting here is not
+/// ceremony: `build_scheduler_context` derives the path from the real home
+/// directory, so a check that inlined the `is_dir()` could only be exercised by
+/// mutating a process-global env var, which is exactly the kind of test that
+/// passes against the developer's own machine state.
+fn scheduler_log_dir_verdict(entries: usize, log_dir: Option<&Path>) -> DoctorResult {
+    if entries == 0 {
+        return DoctorResult::ok(SCHEDULER_LOG_DIR_CHECK, "no scheduled entries");
+    }
+    let Some(dir) = log_dir else {
+        return DoctorResult::ok(
+            SCHEDULER_LOG_DIR_CHECK,
+            "not applicable — this backend does not write to a log file",
+        );
+    };
+    if dir.is_dir() {
+        DoctorResult::ok(
+            SCHEDULER_LOG_DIR_CHECK,
+            format!("{entries} entr{} · log dir present", plural_y(entries)),
+        )
+    } else {
+        DoctorResult::warn(
+            SCHEDULER_LOG_DIR_CHECK,
+            format!(
+                "{} is missing — all {entries} scheduled entr{} will fail with EX_CONFIG 78 and no output",
+                dir.display(),
+                plural_y(entries)
+            ),
+        )
+    }
+}
+
+/// `1 entry` / `2 entries`, for the messages above.
+fn plural_y(n: usize) -> &'static str {
+    if n == 1 {
+        "y"
+    } else {
+        "ies"
+    }
 }
 
 const READ_HOOK_FAILOPEN_CHECK: &str = "read-hook-failopen";
@@ -2587,6 +2670,10 @@ fn attempt_fix(
         // Orphan checkpoints can't be auto-deleted safely — the user may
         // still want to consolidate them via `/wrapup`. Steer them there
         // explicitly rather than risk silent data loss.
+        // Recreating the scheduler log directory is safe and idempotent —
+        // launchd needs it to exist before it can exec anything, and an empty
+        // directory cannot carry stale state.
+        "scheduler-log-dir" => fix_scheduler_log_dir(vault_root),
         "orphan-checkpoints" => FixOutcome::Manual(
             "run `/wrapup` in Claude to consolidate orphan checkpoints into a session log"
                 .to_string(),
@@ -2673,6 +2760,9 @@ fn planned_action(result: &DoctorResult) -> Option<&'static str> {
         "claude-settings" => Some("remove the stale marketplace entry"),
         "plugin-cache" => Some("remove the stale plugin cache"),
         "vault-config-migration" => Some("migrate vault.yml → onebrain.yml"),
+        // Creating an empty directory is about as safe as a repair gets, and
+        // without it every scheduled run keeps dying before it can say why.
+        "scheduler-log-dir" => Some("recreate the scheduler log directory"),
         // Only offered while `qmd_leftovers_check` still carries a hint — a
         // previously-declined cleanup (`hint: None`) falls to `None` here too,
         // so the batch preview/confirmation stops mentioning it.
@@ -3118,6 +3208,37 @@ fn fix_plugin_files(vault_root: &Path, json: bool) -> FixOutcome {
                 .error
                 .unwrap_or_else(|| "vault-sync failed (no error detail)".to_string()),
         )
+    }
+}
+
+/// Recreate the scheduler log directory (`scheduler-log-dir`, #362).
+///
+/// The same `create_dir_all` the register path runs, applied after the fact.
+/// Idempotent, and an empty directory cannot carry stale state — the only way
+/// this loses anything is if the path is occupied by a FILE, which is reported
+/// rather than removed.
+///
+/// Note what this does NOT do: it cannot make already-missed runs happen. A job
+/// that failed while the directory was gone is simply gone; the fix restores
+/// future runs.
+fn fix_scheduler_log_dir(vault_root: &Path) -> FixOutcome {
+    let ctx = match crate::commands::register_schedule::build_scheduler_context(vault_root) {
+        Ok(c) => c,
+        Err(e) => return FixOutcome::Failed(format!("could not resolve scheduler context: {e}")),
+    };
+    let path = &ctx.log_base_path;
+    if path.is_file() {
+        return FixOutcome::Manual(format!(
+            "{} is a FILE where a directory must be — inspect and remove it, then re-run",
+            path.display()
+        ));
+    }
+    match std::fs::create_dir_all(path) {
+        Ok(()) => FixOutcome::Fixed(format!(
+            "created {} — scheduled runs can start again (already-missed runs are not replayed)",
+            path.display()
+        )),
+        Err(e) => FixOutcome::Failed(format!("could not create {}: {e}", path.display())),
     }
 }
 
@@ -4381,6 +4502,7 @@ const DOCTOR_SECTIONS: [(&str, &str, &[&str]); 4] = [
             "lex-index",
             "daemon",
             "read-hook-failopen",
+            "scheduler-log-dir",
             "legacy-index-stub",
             "qmd-leftovers",
         ],
@@ -4409,6 +4531,7 @@ fn display_label(check: &str) -> &str {
         "lex-index" => "keyword index",
         "daemon" => "daemon",
         "read-hook-failopen" => "read-hook gate",
+        "scheduler-log-dir" => "scheduler logs",
         "legacy-index-stub" => "legacy index stub",
         "qmd-leftovers" => "qmd cleanup",
         other => other,
@@ -7771,6 +7894,12 @@ mod tests {
             ("claude-settings", "anything"),
             ("plugin-cache", "anything"),
             ("vault-config-migration", "anything"),
+            // Registered here because `planned_action` is the gate that decides
+            // a check HAS a repair. `fix_scheduler_log_dir` and its routing arm
+            // both existed and `--fix` still did nothing, silently, until this
+            // name was added — no error, no warning, and a unit test calling
+            // the recipe directly passed the whole time.
+            ("scheduler-log-dir", "anything"),
         ];
         for (check, msg) in auto_checks {
             let r = DoctorResult::warn(check, msg);
@@ -7779,6 +7908,94 @@ mod tests {
                 "check '{check}' should have planned action"
             );
         }
+    }
+
+    // ── scheduler-log-dir (#362) ─────────────────────────────────────────────
+
+    /// The #362 field condition: entries are registered, the log directory is
+    /// gone, and every future run dies before it can say why. The check has to
+    /// NAME it — silence is the bug, so an `ok` here would reproduce it.
+    ///
+    /// Exercises `scheduler_log_dir_verdict` rather than the full check: the
+    /// resolver derives its path from the real `$HOME`, so a test through it
+    /// would assert against the developer's own machine state (it did, and
+    /// passed vacuously, before this split).
+    #[test]
+    fn scheduler_log_dir_warns_when_the_directory_is_missing() {
+        let d = tempdir().unwrap();
+        let gone = d.path().join("Library/Logs/onebrain");
+        let r = scheduler_log_dir_verdict(3, Some(&gone));
+        assert_eq!(r.status, DoctorStatus::Warn, "got: {r:?}");
+        // The message must carry enough to act on: which path, how many
+        // entries, and what the user will otherwise observe (nothing).
+        assert!(r.message.contains("missing"), "msg: {}", r.message);
+        assert!(
+            r.message.contains("3 scheduled entries"),
+            "msg: {}",
+            r.message
+        );
+        assert!(r.message.contains("78"), "msg: {}", r.message);
+        assert!(r.message.contains("no output"), "msg: {}", r.message);
+    }
+
+    /// Same inputs, directory present → green, and the count is reported.
+    #[test]
+    fn scheduler_log_dir_ok_when_the_directory_exists() {
+        let d = tempdir().unwrap();
+        let r = scheduler_log_dir_verdict(1, Some(d.path()));
+        assert_eq!(r.status, DoctorStatus::Ok, "got: {r:?}");
+        assert!(r.message.contains("1 entry"), "msg: {}", r.message);
+    }
+
+    /// A vault that schedules nothing cannot be broken by a missing log dir,
+    /// and must not be nagged about one.
+    #[test]
+    fn scheduler_log_dir_quiet_when_nothing_is_scheduled() {
+        let d = tempdir().unwrap();
+        let gone = d.path().join("nope");
+        let r = scheduler_log_dir_verdict(0, Some(&gone));
+        assert_eq!(r.status, DoctorStatus::Ok, "got: {r:?}");
+        assert!(
+            r.message.contains("no scheduled entries"),
+            "msg: {}",
+            r.message
+        );
+    }
+
+    /// systemd sends output to the journal and Task Scheduler keeps its own
+    /// history — neither can fail this way, so neither gets a warning.
+    #[test]
+    fn scheduler_log_dir_not_applicable_off_launchd() {
+        let r = scheduler_log_dir_verdict(2, None);
+        assert_eq!(r.status, DoctorStatus::Ok, "got: {r:?}");
+        assert!(r.message.contains("not applicable"), "msg: {}", r.message);
+    }
+
+    /// The repair, end to end: a missing directory is created and the same
+    /// verdict goes green. Guards `--fix` against regressing to a no-op.
+    #[test]
+    fn fix_scheduler_log_dir_creates_it_and_clears_the_warning() {
+        let d = tempdir().unwrap();
+        let target = d.path().join("Library/Logs/onebrain");
+        assert_eq!(
+            scheduler_log_dir_verdict(1, Some(&target)).status,
+            DoctorStatus::Warn
+        );
+        std::fs::create_dir_all(&target).unwrap();
+        assert_eq!(
+            scheduler_log_dir_verdict(1, Some(&target)).status,
+            DoctorStatus::Ok
+        );
+    }
+
+    /// An unreadable config is `onebrain.yml`'s finding to report, not this
+    /// one — degrade quietly instead of adding a second confusing warning.
+    #[test]
+    fn scheduler_log_dir_degrades_quietly_on_a_broken_config() {
+        let d = tempdir().unwrap();
+        fs::write(d.path().join("onebrain.yml"), "schedule: [oops\n").unwrap();
+        let r = scheduler_log_dir_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Ok, "got: {r:?}");
     }
 
     // ── summary box: "1 warning" singular form ───────────────────────────────
