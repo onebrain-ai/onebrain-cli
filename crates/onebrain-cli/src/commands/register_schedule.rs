@@ -252,7 +252,7 @@ fn inner_reason(e: &SchedulerError) -> String {
     }
 }
 
-fn read_vault_config(vault: &Path) -> Result<ScheduleConfig> {
+pub(crate) fn read_vault_config(vault: &Path) -> Result<ScheduleConfig> {
     // Dual-read: canonical `onebrain.yml` preferred, legacy `vault.yml`
     // fallback. Hardcoding `vault.yml` here made `schedule register` find no
     // entries on v3.1 vaults (onebrain.yml only) — it silently refused to
@@ -413,7 +413,7 @@ fn normalize_path(p: &Path) -> PathBuf {
     out
 }
 
-fn build_scheduler_context(vault: &Path) -> Result<SchedulerContext> {
+pub(crate) fn build_scheduler_context(vault: &Path) -> Result<SchedulerContext> {
     let skill_cli_path = env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(String::from))
