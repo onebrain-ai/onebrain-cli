@@ -563,14 +563,10 @@ mod tests {
             // `;`, quote or space. `quote_arg` could regress and every gate
             // stayed green. This fixture makes the existing CI job the
             // standing proof the v3.4.21 VM run was a one-off of.
-            ("escaping", {
-                let mut e = daily_command_entry();
-                e.command = Some("/bin/echo".to_string());
-                e.args = Some(crate::scheduler::types::Args::List(
-                    crate::scheduler::test_support::escaping_args(),
-                ));
-                e
-            }),
+            (
+                "escaping",
+                crate::scheduler::test_support::escaping_entry("/bin/echo"),
+            ),
         ] {
             std::fs::write(
                 dir.join(format!("accept-generated-{name}.service")),
@@ -582,6 +578,43 @@ mod tests {
                 generate_timer_unit(&entry, &ctx),
             )
             .unwrap();
+        }
+    }
+
+    /// The committed escaping fixture still matches what this renderer emits.
+    ///
+    /// Without this, #353 was half a fix. The regenerators are `#[ignore]`d and
+    /// CI never passes `--ignored`, so `systemd-analyze verify` was reading a
+    /// FROZEN file: it proved the OS accepts that document, and was by
+    /// construction blind to what `quote_arg` produces today. An escaper could
+    /// regress and every gate — unit tests, clippy, the real-tool round-trip —
+    /// stayed green, which is the exact condition #353 was filed to end.
+    ///
+    /// Being non-ignored is the point: it runs in `cargo test --workspace`, so
+    /// the escaper is EXECUTED on `escaping_args` on every PR.
+    #[test]
+    fn the_committed_escaping_fixture_still_matches_this_renderer() {
+        let ctx = crate::scheduler::test_support::ctx(
+            "/home/u".as_ref(),
+            "/bin/echo",
+            "/home/u/logs".as_ref(),
+        );
+        let entry = crate::scheduler::test_support::escaping_entry("/bin/echo");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/scheduler-corpus/linux");
+        for (suffix, rendered) in [
+            ("service", generate_service_unit(&entry, &ctx).unwrap()),
+            ("timer", generate_timer_unit(&entry, &ctx)),
+        ] {
+            let path = dir.join(format!("accept-generated-escaping.{suffix}"));
+            let committed = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert_eq!(
+                rendered,
+                committed,
+                "{} is stale — the renderer changed but the corpus CI feeds to systemd-analyze did not. Regenerate: cargo test -p onebrain-core systemd::tests::emit_generated_corpus -- --ignored",
+                path.display()
+            );
         }
     }
 
