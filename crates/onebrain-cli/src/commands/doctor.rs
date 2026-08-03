@@ -1031,41 +1031,57 @@ fn cadence_of(cron: &str) -> Option<Cadence> {
     }
 }
 
-/// Does this skill write an audit log at all?
+/// Has the run-record mechanism produced anything at all, for any entry?
 ///
-/// Read from the skill's own `SKILL.md` rather than a list kept here: a
-/// hardcoded roster is wrong the moment a skill gains or loses its log, and
-/// wrong silently. Of the 13 schedulable skills only 6 write one, so guessing
-/// would make this check cry wolf on more than half of them.
-fn skill_writes_an_audit_log(vault_root: &Path, skill: &str) -> Option<bool> {
-    let md = vault_root
-        .join(".claude/plugins/onebrain/skills")
-        .join(skill)
-        .join("SKILL.md");
-    let body = std::fs::read_to_string(md).ok()?;
-    Some(body.contains("/log/YYYY/MM/") || body.contains("audit-log"))
+/// Distinguishes "this job stopped running" from "this feature has not run
+/// yet". Without it, the first `doctor` after an upgrade accuses every healthy
+/// scheduled job of never having run — the check overstating a problem, which
+/// is the same defect it exists to catch.
+fn any_scheduled_record_exists(logs_dir: &Path) -> bool {
+    walkdir::WalkDir::new(logs_dir.join("log"))
+        .max_depth(3)
+        .into_iter()
+        .filter_map(Result::ok)
+        .any(|e| {
+            e.file_name().to_string_lossy().ends_with(".md")
+                && std::fs::read_to_string(e.path())
+                    .map(|b| b.contains("**source:** scheduled"))
+                    .unwrap_or(false)
+        })
 }
 
-/// The newest audit-log entry for `skill`, as whole days before `today`.
-fn newest_log_age_days(logs_dir: &Path, skill: &str, today: chrono::NaiveDate) -> Option<i64> {
-    let suffix = format!("-{skill}.md");
+/// The newest **scheduled run record** for `entry`, as whole days before `today`.
+///
+/// Filename alone is not enough. `run_skill::run` serves both the scheduler and
+/// a human typing `onebrain skill run`, and both append to the same daily file
+/// — so matching on the name alone would let ONE manual run, or the operator's
+/// own `launchctl kickstart` while testing, vouch for a cron job that has been
+/// dead for a week. That is precisely the failure this check exists to catch,
+/// so it reads the file and requires a record actually tagged `scheduled`.
+fn newest_scheduled_record_age_days(
+    logs_dir: &Path,
+    entry: &str,
+    today: chrono::NaiveDate,
+) -> Option<i64> {
+    let suffix = format!("-{entry}.md");
     let mut newest: Option<chrono::NaiveDate> = None;
-    for entry in walkdir::WalkDir::new(logs_dir.join("log"))
+    for e in walkdir::WalkDir::new(logs_dir.join("log"))
         .max_depth(3)
         .into_iter()
         .filter_map(Result::ok)
     {
-        let name = entry.file_name().to_string_lossy().to_string();
-        // `YYYY-MM-DD-<skill>.md`, and the discriminator form
-        // `YYYY-MM-DD-<skill>-<slug>.md` some skills use.
-        let matches = name.ends_with(&suffix)
-            || (name.starts_with(char::is_numeric)
-                && name.contains(&format!("-{skill}-"))
-                && name.ends_with(".md"));
-        if !matches || name.len() < 10 {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.ends_with(&suffix) || name.len() < 10 {
             continue;
         }
-        if let Ok(d) = chrono::NaiveDate::parse_from_str(&name[..10], "%Y-%m-%d") {
+        let Ok(d) = chrono::NaiveDate::parse_from_str(&name[..10], "%Y-%m-%d") else {
+            continue;
+        };
+        let Ok(body) = std::fs::read_to_string(e.path()) else {
+            continue;
+        };
+        // The day counts only if a SCHEDULED record landed in it.
+        if body.contains("**source:** scheduled") {
             newest = Some(newest.map_or(d, |n: chrono::NaiveDate| n.max(d)));
         }
     }
@@ -1101,6 +1117,17 @@ fn scheduler_silent_runs_check(vault_root: &Path, logs_folder: &str) -> DoctorRe
     let logs_dir = vault_root.join(logs_folder);
     let today = chrono::Local::now().date_naive();
 
+    // Run records are a v3.4.23 mechanism, so immediately after upgrading no
+    // entry has one yet. Evaluated per entry that reads as "never ran", which
+    // accuses every healthy job at once. Caught by running against a real
+    // vault: shipped 3.4.22 said "all producing output" while this said four
+    // jobs had never run — and the jobs were fine.
+    //
+    // Absence is only evidence once the mechanism has produced a record for
+    // SOMETHING. Computed here but applied AFTER the loop, so the coverage
+    // line — the count of what this check cannot see — is still reported.
+    let mechanism_has_run = any_scheduled_record_exists(&logs_dir);
+
     let mut silent: Vec<String> = Vec::new();
     let mut observed = 0usize;
     let mut unobservable = 0usize;
@@ -1108,21 +1135,37 @@ fn scheduler_silent_runs_check(vault_root: &Path, logs_folder: &str) -> DoctorRe
     for entry in &cfg.schedule {
         let (Some(skill), Some(cron)) = (entry.skill.as_deref(), entry.cron.as_deref()) else {
             // Command mode, or a one-shot `at:` that is not expected to recur.
+            //
+            // Command mode stays unobservable ON PURPOSE (v3.4.23): launchd
+            // execs its binary directly, so no OneBrain process exists to write
+            // a run record for it. Dropping this branch would make the check
+            // report "all producing output" about entries producing nothing
+            // anywhere — a check overstating its own reach, which is the defect
+            // this release is named for, one level up.
             unobservable += 1;
             continue;
         };
         let skill = skill.trim_start_matches('/');
-        let (Some(true), Some(cadence)) = (
-            skill_writes_an_audit_log(vault_root, skill),
-            cadence_of(cron),
-        ) else {
+        // v3.4.23: no longer gated on `skill_writes_an_audit_log`. Every
+        // skill-mode run now leaves a record written by the CLI itself, so
+        // observability no longer depends on the skill choosing to log — which
+        // was true of only 6 of 13 schedulable skills.
+        let Some(cadence) = cadence_of(cron) else {
+            // An invalid cron: `onebrain.yml`'s own check reports that.
             unobservable += 1;
             continue;
         };
         observed += 1;
         let tolerance = cadence.tolerance_days();
-        match newest_log_age_days(&logs_dir, skill, today) {
-            None => silent.push(format!("/{skill} ({}) — no log ever", cadence.describe())),
+        match newest_scheduled_record_age_days(&logs_dir, skill, today) {
+            // "Never" is only evidence once the mechanism has produced a record
+            // for something. Before that it means "this feature is new", not
+            // "this job is broken".
+            None if !mechanism_has_run => {}
+            None => silent.push(format!(
+                "/{skill} ({}) — no scheduled run recorded, ever",
+                cadence.describe()
+            )),
             Some(age) if age > tolerance => silent.push(format!(
                 "/{skill} ({}) — nothing for {age}d",
                 cadence.describe()
@@ -1131,7 +1174,10 @@ fn scheduler_silent_runs_check(vault_root: &Path, logs_folder: &str) -> DoctorRe
         }
     }
 
-    let coverage = format!("{observed} observable, {unobservable} without a log to check",);
+    // The caveat SURVIVES, narrowed. It now counts only entries this check
+    // genuinely cannot see — command mode and one-shots — instead of also
+    // counting skills that simply chose not to log.
+    let coverage = format!("{observed} observable, {unobservable} without a record to check",);
     if observed == 0 {
         return DoctorResult::ok(
             SCHEDULER_SILENT_CHECK,
@@ -1139,10 +1185,14 @@ fn scheduler_silent_runs_check(vault_root: &Path, logs_folder: &str) -> DoctorRe
         );
     }
     if silent.is_empty() {
-        DoctorResult::ok(
-            SCHEDULER_SILENT_CHECK,
-            format!("all producing output — {coverage}"),
-        )
+        // Say WHICH kind of clean this is. "all producing output" would be a
+        // claim about evidence we do not have yet on a fresh upgrade.
+        let headline = if mechanism_has_run {
+            "all producing output"
+        } else {
+            "no run records yet — they begin at the first scheduled run on this version"
+        };
+        DoctorResult::ok(SCHEDULER_SILENT_CHECK, format!("{headline} — {coverage}"))
     } else {
         DoctorResult::warn(
             SCHEDULER_SILENT_CHECK,
@@ -1163,10 +1213,23 @@ const SCHEDULER_LOG_DIR_CHECK: &str = "scheduler-log-dir";
 /// (#362): two of five jobs had been dead for a day, and the detector was a
 /// human noticing an absence.
 ///
-/// `backend::ensure_log_dir` covers creation at register time and is correctly
-/// wired, but nothing re-checks afterwards. This is that missing re-check —
-/// deliberately placed somewhere a human reads, because the CLI cannot report
-/// the failure from inside a job that launchd never managed to exec.
+/// **v3.4.23 narrowed what this protects, and the old wording is no longer
+/// true.** Skill-mode plists no longer carry a redirect at all, so a missing
+/// directory can no longer kill them — the CLI opens its own log after exec and
+/// recreates the directory itself.
+///
+/// What remains is real and worth reporting:
+///
+/// - **Command-mode entries still depend on this directory.** launchd execs
+///   their binary directly, so their plist redirect is their only output
+///   channel and it is still opened pre-exec. For them the failure above is
+///   unchanged.
+/// - **The directory keeps disappearing for an unknown cause** (#372 — twice on
+///   a machine whose vault is not even synced, so #315's iCloud mechanism is
+///   ruled out). Reporting it stays useful even where it is no longer fatal.
+///
+/// So this is now an advisory check plus a hard requirement for command mode,
+/// not the silent-death detector it was written as.
 ///
 /// Scoped to the launchd backend: `log_base_path` reaches only the plist
 /// writer. systemd sends output to the journal and Task Scheduler keeps its own
@@ -8091,6 +8154,147 @@ mod tests {
     // this check resolved through the real $HOME and passed vacuously; these
     // never read anything outside the fixture.
 
+    /// Write a v3.4.23 run record for `entry` dated `days_ago`, tagged either
+    /// `scheduled` or `manual` — the distinction the whole `source` field
+    /// exists for.
+    fn write_record(root: &Path, entry: &str, days_ago: i64, scheduled: bool) {
+        let d = chrono::Local::now().date_naive() - chrono::Duration::days(days_ago);
+        let dir = root
+            .join("07-logs/log")
+            .join(d.format("%Y").to_string())
+            .join(d.format("%m").to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = if scheduled { "scheduled" } else { "manual" };
+        std::fs::write(
+            dir.join(format!("{}-{entry}.md", d.format("%Y-%m-%d"))),
+            format!("\n## 09:00 · {entry}\n\n- **status:** ✅ ok\n- **source:** {source}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_skill_that_writes_no_log_of_its_own_is_still_observable() {
+        // The v3.4.23 point: observability no longer depends on the skill
+        // choosing to log — only 6 of 13 did — because the CLI writes the
+        // record itself.
+        let d = silent_vault(
+            "  - cron: \"0 9 * * *\"\n    skill: /daily\n",
+            &[("daily", false)],
+        );
+        write_record(d.path(), "daily", 0, true);
+
+        let r = scheduler_silent_runs_check(d.path(), "07-logs");
+
+        assert_eq!(r.status, DoctorStatus::Ok, "{}", r.message);
+        assert!(r.message.contains("1 observable"), "{}", r.message);
+    }
+
+    #[test]
+    fn a_fresh_upgrade_with_no_records_yet_does_not_accuse_healthy_jobs() {
+        // Caught by running against a real vault: shipped 3.4.22 reported "all
+        // producing output" while the new check reported four jobs as never
+        // having run — and they were fine. Absence is only evidence once the
+        // mechanism has produced a record for something.
+        let d = silent_vault(
+            "  - cron: \"0 9 * * *\"\n    skill: /daily\n\
+             \x20 - cron: \"0 8 * * *\"\n    skill: /digest\n",
+            &[("daily", false), ("digest", false)],
+        );
+        // No records at all — the state right after upgrading.
+
+        let r = scheduler_silent_runs_check(d.path(), "07-logs");
+
+        assert_eq!(r.status, DoctorStatus::Ok, "{}", r.message);
+        assert!(
+            !r.message.contains("ever"),
+            "must not accuse any job of never running: {}",
+            r.message
+        );
+    }
+
+    #[test]
+    fn once_one_record_exists_a_missing_one_is_a_real_signal() {
+        // The other half: the grace period must END. Once the mechanism has
+        // demonstrably run, a job with no record is genuinely silent.
+        let d = silent_vault(
+            "  - cron: \"0 9 * * *\"\n    skill: /daily\n\
+             \x20 - cron: \"0 8 * * *\"\n    skill: /digest\n",
+            &[("daily", false), ("digest", false)],
+        );
+        write_record(d.path(), "daily", 0, true); // only /daily has one
+
+        let r = scheduler_silent_runs_check(d.path(), "07-logs");
+
+        assert_eq!(r.status, DoctorStatus::Warn, "{}", r.message);
+        assert!(
+            r.message.contains("/digest"),
+            "names the silent one: {}",
+            r.message
+        );
+        assert!(
+            !r.message.contains("/daily "),
+            "not the healthy one: {}",
+            r.message
+        );
+    }
+
+    #[test]
+    fn a_manual_record_does_not_satisfy_the_staleness_check() {
+        // One `onebrain skill run` by hand — or the operator's own
+        // `launchctl kickstart` while testing — must not make a dead cron job
+        // look alive. This is why RunRecord carries `source` at all.
+        let d = silent_vault(
+            "  - cron: \"0 9 * * *\"\n    skill: /daily\n\
+             \x20 - cron: \"0 8 * * *\"\n    skill: /digest\n",
+            &[("daily", false), ("digest", false)],
+        );
+        write_record(d.path(), "daily", 0, false); // manual, today
+                                                   // /digest carries a SCHEDULED record so the mechanism is demonstrably
+                                                   // live. Without it the fresh-upgrade grace period would suppress the
+                                                   // warning and this test would pass for entirely the wrong reason.
+        write_record(d.path(), "digest", 0, true);
+
+        let r = scheduler_silent_runs_check(d.path(), "07-logs");
+
+        assert_eq!(
+            r.status,
+            DoctorStatus::Warn,
+            "a manual run must not vouch for a scheduled one: {}",
+            r.message
+        );
+    }
+
+    #[test]
+    fn command_mode_entries_are_still_counted_as_unobservable() {
+        // launchd execs them directly (launchd.rs:284-300) — no OneBrain
+        // process writes a record. Claiming otherwise would overstate the
+        // check's reach, which is the defect this release is named for.
+        let d = silent_vault(
+            "  - cron: \"0 3 * * 0\"\n    command: onebrain\n    args: [search, reindex]\n",
+            &[],
+        );
+
+        let r = scheduler_silent_runs_check(d.path(), "07-logs");
+
+        // Assert the COUNT, not the phrase. An earlier version of this test
+        // checked only for "without a record to check", which "0 without a
+        // record to check" also satisfies — so deleting the `unobservable += 1`
+        // left the test green. A guard that passes while the thing it guards is
+        // removed is the exact defect this release is named for, and this test
+        // had it.
+        assert!(
+            r.message.contains("1 without a record to check"),
+            "the command-mode entry must be COUNTED as unobservable, not just \
+             described by a phrase that survives a zero: {}",
+            r.message
+        );
+        assert!(
+            r.message.contains("0 observable"),
+            "a command-mode-only schedule has nothing this check can see: {}",
+            r.message
+        );
+    }
+
     fn silent_vault(entries: &str, skills: &[(&str, bool)]) -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
         let root = d.path();
@@ -8139,42 +8343,19 @@ mod tests {
     }
 
     #[test]
-    fn a_skill_that_writes_no_log_is_known_to_be_unobservable() {
-        let d = silent_vault("", &[("digest", true), ("tasks", false)]);
-        assert_eq!(skill_writes_an_audit_log(d.path(), "digest"), Some(true));
-        assert_eq!(skill_writes_an_audit_log(d.path(), "tasks"), Some(false));
-        // A skill that isn't installed at all is unknown, NOT "no log" — the
-        // difference decides between staying quiet and crying wolf.
-        assert_eq!(skill_writes_an_audit_log(d.path(), "nope"), None);
-    }
-
-    #[test]
-    fn newest_log_wins_including_the_discriminator_filename_form() {
-        let d = silent_vault("", &[]);
-        let logs = d.path().join("07-logs");
-        let dir = logs.join("log/2026/07");
-        std::fs::write(dir.join("2026-07-10-digest.md"), "x").unwrap();
-        std::fs::write(dir.join("2026-07-20-digest.md"), "x").unwrap();
-        // another skill's file must not count for digest
-        std::fs::write(dir.join("2026-07-30-daily.md"), "x").unwrap();
-        // the discriminator form some skills use
-        std::fs::write(dir.join("2026-07-25-distill-topic.md"), "x").unwrap();
-        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
-        assert_eq!(newest_log_age_days(&logs, "digest", today), Some(11));
-        assert_eq!(newest_log_age_days(&logs, "distill", today), Some(6));
-        assert_eq!(newest_log_age_days(&logs, "recap", today), None);
-    }
-
-    #[test]
     fn a_daily_skill_with_no_recent_log_is_reported() {
         let d = silent_vault(
-            "  - cron: \"0 9 * * *\"\n    skill: /digest\n",
-            &[("digest", true)],
+            "  - cron: \"0 9 * * *\"\n    skill: /digest\n\
+             \x20 - cron: \"0 6 * * *\"\n    skill: /tasks\n",
+            &[("digest", true), ("tasks", true)],
         );
+        // /tasks has a record, so the mechanism is demonstrably live and
+        // /digest having none is a real signal rather than a fresh upgrade.
+        write_record(d.path(), "tasks", 0, true);
         let r = scheduler_silent_runs_check(d.path(), "07-logs");
         assert_eq!(r.status, DoctorStatus::Warn, "{r:?}");
         assert!(r.message.contains("/digest"), "{r:?}");
-        assert!(r.message.contains("no log ever"), "{r:?}");
+        assert!(r.message.contains("no scheduled run recorded"), "{r:?}");
     }
 
     #[test]
@@ -8183,10 +8364,9 @@ mod tests {
             "  - cron: \"0 9 * * *\"\n    skill: /digest\n",
             &[("digest", true)],
         );
-        let today = chrono::Local::now().date_naive();
-        let dir = d.path().join("07-logs/log/2026/07");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{today}-digest.md")), "x").unwrap();
+        // A real v3.4.23 record, not a placeholder: the check now requires a
+        // run tagged `scheduled`, so a bare file no longer clears it.
+        write_record(d.path(), "digest", 0, true);
         let r = scheduler_silent_runs_check(d.path(), "07-logs");
         assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
     }
@@ -8201,14 +8381,20 @@ mod tests {
              \x20 - cron: \"0 3 * * 0\"\n    command: onebrain\n    args: [search, reindex]\n",
             &[("digest", true), ("tasks", false)],
         );
-        let today = chrono::Local::now().date_naive();
-        let dir = d.path().join("07-logs/log/2026/07");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{today}-digest.md")), "x").unwrap();
+        write_record(d.path(), "digest", 0, true);
+        write_record(d.path(), "tasks", 0, true);
         let r = scheduler_silent_runs_check(d.path(), "07-logs");
         assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
+        // v3.4.23 moved the boundary, and these numbers ARE the proof.
+        // Before: 1 observable, 2 unobservable — `/tasks` counted as blind
+        // purely because that skill wrote no log of its own.
+        // After: 2 observable, 1 unobservable — every skill-mode entry now
+        // leaves a CLI-written record, so only the command-mode entry is
+        // genuinely unseeable. The caveat SHRINKS; it does not disappear,
+        // because a check that stopped stating its blind spot would be
+        // overstating its own reach.
         assert!(
-            r.message.contains("1 observable") && r.message.contains("2 without a log"),
+            r.message.contains("2 observable") && r.message.contains("1 without a record"),
             "a clean result must still say what it could NOT check: {r:?}"
         );
     }
