@@ -477,7 +477,7 @@ fn legacy_in_vault_log_dir(vault: &Path) -> PathBuf {
 /// launchd `StandardOutPath` outside the vault — file clobbering at user
 /// uid. We reject any path containing `..` segments OR starting with `/`
 /// (or a Windows drive prefix) and fall back to the default.
-fn resolve_logs_folder(vault: &Path) -> String {
+pub(crate) fn resolve_logs_folder(vault: &Path) -> String {
     let raw = onebrain_core::find_vault_root(vault)
         .and_then(|root| onebrain_core::load_vault_config(&root).ok())
         .map(|cfg| cfg.folders.logs)

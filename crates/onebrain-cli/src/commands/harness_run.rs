@@ -120,7 +120,7 @@ pub fn run(
     if let Some(dir) = context_dir {
         add_managed_hook_trust(harness, dir, &mut argv);
     }
-    spawn_harness(&resolution.path, &argv, cwd, harness, "the prompt")
+    spawn_harness(&resolution.path, &argv, cwd, harness, "the prompt").map(|o| o.code)
 }
 
 /// Read the prompt from stdin. Errors only on a real IO failure — an empty

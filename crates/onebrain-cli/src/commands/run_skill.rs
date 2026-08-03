@@ -44,6 +44,7 @@
 use crate::cli::HarnessArg;
 use anyhow::{anyhow, Context, Result};
 use onebrain_core::find_config_file;
+use onebrain_core::scheduler::run_record::{safe_tail, RunRecord, RunSource, TAIL_MAX_BYTES};
 use onebrain_core::Harness;
 use onebrain_fs::{
     build_prompt_for_harness, resolve_claude_bin, resolve_codex_bin, resolve_gemini_bin,
@@ -95,7 +96,132 @@ pub fn run(
     // Skills always run with-context: --add-dir / --include-directories the vault.
     let mut argv = harness_argv(harness, &prompt, Some(vault), model, want_json);
     add_managed_hook_trust(harness, &vault_path, &mut argv);
-    spawn_harness(&resolution.path, &argv, &vault_path, harness, "the skill")
+
+    let started = chrono::Local::now();
+    let t0 = std::time::Instant::now();
+    let outcome = spawn_harness(&resolution.path, &argv, &vault_path, harness, "the skill")?;
+
+    // Finally-equivalent: everything below runs whether the harness succeeded,
+    // failed, or was killed. A logging failure must NEVER change the exit code —
+    // a mechanism that can kill the job it logs is the bug class this release
+    // exists to remove (#372).
+    let entry_name = skill.trim_start_matches('/').to_string();
+    let log_note = write_job_log(&entry_name, &outcome.captured);
+    let record = RunRecord {
+        started,
+        entry_name: entry_name.clone(),
+        harness: Some(core_harness.as_str().to_string()),
+        exit_code: outcome.code,
+        duration_secs: t0.elapsed().as_secs(),
+        machine: machine_name(),
+        source: if std::env::var_os("ONEBRAIN_SCHEDULED").is_some() {
+            RunSource::Scheduled
+        } else {
+            RunSource::Manual
+        },
+        output_tail: build_tail(&outcome.captured, log_note.as_deref()),
+    };
+    if let Err(e) = append_run_record(&vault_path, &record) {
+        // Under the scheduler this eprintln has no reader (v3.4.23 removed the
+        // plist redirect), which is exactly why the vault record is the primary
+        // channel and this is only a courtesy for interactive runs.
+        eprintln!("⚠ could not write the vault run record: {e}");
+    }
+
+    Ok(outcome.code)
+}
+
+/// Append the run's raw output to the CLI-owned job log.
+///
+/// Returns `Some(reason)` when the log could not be written, so the reason can
+/// be carried into the vault record — under the scheduler nothing reads stderr,
+/// so a suppressed log that only complained to stderr would be invisible. That
+/// is the "fall back and *report*" half of the redirect change; without this it
+/// would have no channel.
+fn write_job_log(label: &str, captured: &[u8]) -> Option<String> {
+    use onebrain_core::scheduler::run_log::{open_job_log, LogSink};
+    use std::io::Write;
+
+    let home = std::env::var("HOME").map(PathBuf::from).ok()?;
+    let dir = onebrain_core::scheduler::log_dir::default_log_dir(&home, &|k| std::env::var(k).ok());
+    match open_job_log(&dir, label) {
+        LogSink::File(mut f, _) => {
+            let _ = f.write_all(captured);
+            let _ = f.flush();
+            None
+        }
+        LogSink::Suppressed { reason } => Some(reason),
+    }
+}
+
+/// The record's output tail, with a note appended when the raw log could not be
+/// written — so the vault record reports the degradation rather than hiding it.
+fn build_tail(captured: &[u8], log_note: Option<&str>) -> String {
+    let text = String::from_utf8_lossy(captured);
+    let mut tail = safe_tail(&text, TAIL_MAX_BYTES);
+    if let Some(reason) = log_note {
+        tail.push_str(&format!("\n\n[job log unavailable: {reason}]"));
+    }
+    tail
+}
+
+/// This machine's hostname, for telling records apart once vaults sync.
+///
+/// `$HOSTNAME` is NOT set under launchd, so reading the environment would make
+/// every scheduled record read "unknown" — the one context this field exists
+/// for. `gethostname(2)` is the only reliable source.
+fn machine_name() -> String {
+    #[cfg(unix)]
+    {
+        let mut buf = vec![0u8; 256];
+        // SAFETY: `buf` is a valid writable allocation of `buf.len()` bytes,
+        // which is exactly the contract `gethostname` requires.
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if rc == 0 {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Ok(n) = std::env::var("COMPUTERNAME") {
+            if !n.is_empty() {
+                return n;
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
+/// Append `record` to the vault skill log for its day.
+///
+/// `logs_folder` is resolved through the SAME validator the scheduler uses
+/// (`resolve_logs_folder`), which rejects `..` and absolute paths. Every other
+/// reader in the codebase takes `folders.logs` raw, which is fine for reading
+/// but not for a `create_dir_all` + append running unattended at user uid.
+fn append_run_record(vault: &Path, record: &RunRecord) -> Result<()> {
+    use std::io::Write;
+
+    let logs_folder = crate::commands::register_schedule::resolve_logs_folder(vault);
+    let day = record.started.format("%Y-%m-%d").to_string();
+    let dir = vault
+        .join(&logs_folder)
+        .join("log")
+        .join(record.started.format("%Y").to_string())
+        .join(record.started.format("%m").to_string());
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join(format!("{day}-{}.md", record.entry_name));
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    f.write_all(record.render().as_bytes())
+        .with_context(|| format!("append to {}", path.display()))?;
+    Ok(())
 }
 
 pub(crate) fn add_managed_hook_trust(harness: HarnessArg, vault: &Path, argv: &mut Vec<String>) {
@@ -222,13 +348,107 @@ fn child_path_with_exe_dir(exe_dir: &str, existing_path: &str) -> String {
 /// and `harness run` — `subject` is the noun in the spinner message
 /// ("the skill" vs "the prompt") so the watched-run UI matches whichever
 /// command the user invoked.
+/// What a harness run produced: the exit code the binary should return, and
+/// the child's output as we saw it.
+///
+/// `captured` feeds the CLI-owned job log and the vault run record. It is empty
+/// when the child could not be spawned or observed at all — there is nothing to
+/// record in that case, and an empty tail is honest about it.
+pub(crate) struct HarnessOutcome {
+    pub(crate) code: i32,
+    pub(crate) captured: Vec<u8>,
+}
+
+impl HarnessOutcome {
+    /// An outcome with a code but no output — spawn failed, or we lost the child.
+    fn bare(code: i32) -> Self {
+        Self {
+            code,
+            captured: Vec::new(),
+        }
+    }
+}
+
+/// A finished child plus everything it wrote.
+struct Drained {
+    status: std::process::ExitStatus,
+    stdout_bytes: Vec<u8>,
+    stderr_bytes: Vec<u8>,
+}
+
+impl Drained {
+    /// Pass the child's output through to our own streams, verbatim.
+    ///
+    /// stderr first (warnings, the YOLO note), then stdout (the result) — the
+    /// natural reading order. Raw `write_all` on BYTES, never line-oriented
+    /// printing: a `println!` per line would append a newline to a trailing
+    /// partial line, lose the interleaving, and turn an I/O error or non-UTF-8
+    /// output into a silently empty line. Errors are swallowed because the run
+    /// already completed; a downstream pipe closing must not flip the exit code.
+    fn write_through(&self) {
+        use std::io::Write;
+        {
+            let stderr = std::io::stderr();
+            let mut h = stderr.lock();
+            let _ = h.write_all(&self.stderr_bytes);
+            let _ = h.flush();
+        }
+        {
+            let stdout = std::io::stdout();
+            let mut h = stdout.lock();
+            let _ = h.write_all(&self.stdout_bytes);
+            let _ = h.flush();
+        }
+    }
+
+    /// Both streams in the same order they are written through, for the log and
+    /// the record tail.
+    fn combined(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(self.stderr_bytes.len() + self.stdout_bytes.len());
+        v.extend_from_slice(&self.stderr_bytes);
+        v.extend_from_slice(&self.stdout_bytes);
+        v
+    }
+}
+
+/// Wait for `child` while draining BOTH pipes concurrently on threads.
+///
+/// The concurrency is the point, not a style choice. Reading one pipe to EOF
+/// and only then calling `wait()` deadlocks as soon as the child fills the
+/// other pipe's buffer: the child blocks writing, we block reading, neither
+/// moves. `wait_with_output` avoids that internally but consumes the child
+/// handle, so a `wait()` error would leave us unable to `kill()` the harness —
+/// which would keep running and burning API tokens. Draining on threads gets
+/// both properties.
+fn wait_draining(child: &mut std::process::Child) -> std::io::Result<Drained> {
+    use std::io::Read;
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let status = child.wait()?;
+    Ok(Drained {
+        status,
+        stdout_bytes: stdout_thread.join().unwrap_or_default(),
+        stderr_bytes: stderr_thread.join().unwrap_or_default(),
+    })
+}
+
 pub(crate) fn spawn_harness(
     bin: &Path,
     argv: &[String],
     cwd: &Path,
     harness: HarnessArg,
     subject: &str,
-) -> Result<i32> {
+) -> Result<HarnessOutcome> {
     use std::io::IsTerminal;
     let label = harness.as_str();
     let bin_env_var = match harness {
@@ -267,12 +487,22 @@ pub(crate) fn spawn_harness(
         }
     }
 
-    // Non-interactive (launchd scheduler, piped, CI): block and let the
-    // captured StandardOutPath / pipe collect the output. No progress lines —
-    // they'd only litter a log file.
+    // Non-interactive (launchd scheduler, piped, CI). This used to be a bare
+    // `command.status()` with INHERITED stdio, which worked only because the
+    // plist redirected stdout/stderr to a file. v3.4.23 removed that redirect
+    // for skill-mode entries — it was the pre-exec failure path behind #315 and
+    // #372 — so inherited output would now go to launchd's discard and vanish.
+    // We capture it here instead, where a real process can also write it to its
+    // own log and into the vault run record.
+    //
+    // Piped and drained on THREADS, exactly like the interactive branch below.
+    // Reading one pipe to EOF before `wait()` deadlocks the moment the child
+    // fills the other pipe's ~64 KB buffer, and `wait_with_output` consumes the
+    // child handle, which would make the kill+reap recovery below impossible.
     if !std::io::stderr().is_terminal() {
-        return match command.status() {
-            Ok(s) => Ok(translate_exit(&s)),
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = match command.spawn() {
+            Ok(c) => c,
             Err(e) => {
                 eprintln!(
                     "✗ Failed to spawn {label} ({}): {e}\n\
@@ -280,9 +510,27 @@ pub(crate) fn spawn_harness(
                      or set `{bin_env_var}` to its full path",
                     bin.display()
                 );
-                Ok(127)
+                return Ok(HarnessOutcome::bare(127));
             }
         };
+        let drained = match wait_draining(&mut child) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!(
+                    "✗ Lost track of {label} while it was running: {e}\n\
+                     💡 this is an OS/process fault, not a skill problem — rerun \
+                     `onebrain skill run`"
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(HarnessOutcome::bare(127));
+            }
+        };
+        drained.write_through();
+        return Ok(HarnessOutcome {
+            code: translate_exit(&drained.status),
+            captured: drained.combined(),
+        });
     }
 
     // Interactive: the harness runs a full headless agent session (plugin load,
@@ -302,7 +550,6 @@ pub(crate) fn spawn_harness(
     // answer an approval prompt — gemini runs with `--approval-mode yolo`.
     // Note that explicitly on a watched run so it isn't a surprise.
     use indicatif::{ProgressBar, ProgressStyle};
-    use std::io::{Read, Write};
 
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -331,36 +578,15 @@ pub(crate) fn spawn_harness(
                  or set `{bin_env_var}` to its full path",
                 bin.display()
             );
-            return Ok(127);
+            return Ok(HarnessOutcome::bare(127));
         }
     };
 
-    // Drain both pipes on spawned threads (avoids the pipe-deadlock that
-    // `wait_with_output` handles internally) while we keep the child handle.
-    // That way, if `child.wait()` later errors with the child still running,
-    // we can still `kill()` + `wait()` — `wait_with_output` consumes the
-    // handle and would leak an orphan harness still burning API tokens.
-    let mut stdout_pipe = child
-        .stdout
-        .take()
-        .expect("stdout was piped, must be present");
-    let mut stderr_pipe = child
-        .stderr
-        .take()
-        .expect("stderr was piped, must be present");
-    let stdout_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let stderr_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
-    });
-
-    let status = match child.wait() {
-        Ok(s) => s,
+    // Drain both pipes concurrently on threads while we keep the child handle —
+    // see `wait_draining`, which both this branch and the non-interactive one
+    // use so the deadlock reasoning lives in exactly one place.
+    let drained = match wait_draining(&mut child) {
+        Ok(d) => d,
         Err(e) => {
             // Couldn't observe the child — a harness/OS fault, not a skill
             // failure, so 127 (the "couldn't run it properly" class) rather
@@ -374,34 +600,20 @@ pub(crate) fn spawn_harness(
             );
             let _ = child.kill();
             let _ = child.wait();
-            return Ok(127);
+            return Ok(HarnessOutcome::bare(127));
         }
     };
-    let stdout_bytes = stdout_thread.join().unwrap_or_default();
-    let stderr_bytes = stderr_thread.join().unwrap_or_default();
     spinner.finish_and_clear();
 
-    // Flush captured streams in the natural order: stderr first (warnings,
-    // YOLO note), then stdout (the actual result). Raw `write_all` so any
-    // ANSI colour the harness emitted (when it kept colour despite the pipe)
-    // reaches the terminal verbatim. Errors are swallowed — the run already
-    // completed; a downstream pipe closing after success shouldn't flip the
-    // exit code. Explicit `flush` covers the block-buffered piped-stdout case
-    // (e.g. `onebrain skill run … | tee log`).
-    {
-        let stderr = std::io::stderr();
-        let mut handle = stderr.lock();
-        let _ = handle.write_all(&stderr_bytes);
-        let _ = handle.flush();
-    }
-    {
-        let stdout = std::io::stdout();
-        let mut handle = stdout.lock();
-        let _ = handle.write_all(&stdout_bytes);
-        let _ = handle.flush();
-    }
+    // Flush the captured streams verbatim — see `Drained::write_through`, which
+    // both branches share. Explicit `flush` there covers the block-buffered
+    // piped-stdout case (e.g. `onebrain skill run … | tee log`).
+    drained.write_through();
 
-    Ok(translate_exit(&status))
+    Ok(HarnessOutcome {
+        code: translate_exit(&drained.status),
+        captured: drained.combined(),
+    })
 }
 
 #[cfg(unix)]
@@ -722,7 +934,9 @@ mod tests {
         }
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         let argv = vec!["-p".to_string(), "/daily".to_string()];
-        let code = spawn_harness(&stub, &argv, dir.path(), HarnessArg::Claude, "the test").unwrap();
+        let code = spawn_harness(&stub, &argv, dir.path(), HarnessArg::Claude, "the test")
+            .unwrap()
+            .code;
         assert_eq!(code, 43, "child should see EOF on a null stdin, not block");
     }
 }
