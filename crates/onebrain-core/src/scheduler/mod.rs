@@ -19,6 +19,7 @@
 //! - [`systemd`] — Linux user-timer unit rendering (pure; corpus-backed)
 //! - [`schtasks`] — Windows trigger translation (pure; corpus-backed)
 //! - [`log_paths`] — runtime stdout/stderr log path builder
+//! - [`run_log`] — the CLI-owned job log, opened after exec (#372)
 //! - [`error`] — `SchedulerError` (matched error strings for parity tests)
 
 pub mod backend;
@@ -29,6 +30,7 @@ pub mod error;
 pub mod launchd;
 pub mod log_dir;
 pub mod log_paths;
+pub mod run_log;
 pub mod schtasks;
 pub mod systemd;
 pub mod types;
