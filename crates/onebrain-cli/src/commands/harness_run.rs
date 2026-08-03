@@ -23,7 +23,7 @@
 //! gemini`.
 
 use crate::cli::HarnessArg;
-use crate::commands::run_skill::{add_managed_hook_trust, harness_argv, spawn_harness};
+use crate::commands::run_skill::{add_managed_hook_trust, harness_argv, spawn_harness, Capture};
 use anyhow::{anyhow, Result};
 use onebrain_core::find_config_file;
 use onebrain_fs::{resolve_claude_bin, resolve_codex_bin, resolve_gemini_bin};
@@ -120,7 +120,17 @@ pub fn run(
     if let Some(dir) = context_dir {
         add_managed_hook_trust(harness, dir, &mut argv);
     }
-    spawn_harness(&resolution.path, &argv, cwd, harness, "the prompt").map(|o| o.code)
+    // Capture::No — `harness run` streams; it writes no record and
+    // must not buffer the child until exit.
+    spawn_harness(
+        &resolution.path,
+        &argv,
+        cwd,
+        harness,
+        "the prompt",
+        Capture::No,
+    )
+    .map(|o| o.code)
 }
 
 /// Read the prompt from stdin. Errors only on a real IO failure — an empty

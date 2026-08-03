@@ -7,6 +7,16 @@ use chrono::{DateTime, Local};
 
 pub const TAIL_MAX_BYTES: usize = 2000;
 
+/// The exact line a record carries when the run was scheduler-initiated.
+///
+/// SHARED so the writer and the reader cannot drift. `doctor` greps for this
+/// to decide whether a cron job is alive; before this constant existed the
+/// string was duplicated as a literal in another crate, so renaming the field
+/// would have left every test passing while doctor silently saw zero records
+/// — and, because "no records" degrades to a warning rather than a per-entry
+/// accusation, the drift would have been invisible.
+pub const SCHEDULED_MARKER: &str = "- **source:** scheduled";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunSource {
     Scheduled,
@@ -35,9 +45,11 @@ impl RunRecord {
         } else {
             format!("❌ exit {}", self.exit_code)
         };
-        let source = match self.source {
-            RunSource::Scheduled => "scheduled",
-            RunSource::Manual => "manual",
+        // The scheduled line is the SHARED constant doctor greps for, so the
+        // writer and the reader cannot drift apart.
+        let source_line = match self.source {
+            RunSource::Scheduled => SCHEDULED_MARKER,
+            RunSource::Manual => "- **source:** manual",
         };
         let harness = self
             .harness
@@ -48,7 +60,7 @@ impl RunRecord {
             "\n## {} · {}\n\n\
              - **status:** {status}\n\
              - **entry:** `{}`{harness}\n\
-             - **source:** {source}\n\
+             {source_line}\n\
              - **duration:** {}s\n\
              - **machine:** {}\n\n\
              ```text\n{}\n```\n",
@@ -63,9 +75,27 @@ impl RunRecord {
 }
 
 /// Last `max_bytes` of `output`, made safe to embed in a vault markdown note:
-/// ANSI escapes stripped, fence-closing runs neutralised, never split mid-char.
+/// ANSI escapes stripped, fence-closing runs neutralised, the `source:` marker
+/// defanged, never split mid-char.
+///
+/// **Slices BEFORE the expensive passes.** `strip_ansi` allocates a copy of its
+/// input, so running it over a whole harness transcript to keep 2 KB was O(n)
+/// for an O(1) result. We take a generous raw window first — ANSI escapes and
+/// the neutralisations only ever shrink the text, so a 4× window cannot
+/// under-fill the final slice.
 pub fn safe_tail(output: &str, max_bytes: usize) -> String {
-    let stripped = strip_ansi(output);
+    let raw_window = max_bytes.saturating_mul(4);
+    let pre = if output.len() <= raw_window {
+        output
+    } else {
+        let mut start = output.len() - raw_window;
+        while start < output.len() && !output.is_char_boundary(start) {
+            start += 1;
+        }
+        &output[start..]
+    };
+
+    let stripped = strip_ansi(pre);
     let sliced = if stripped.len() <= max_bytes {
         stripped
     } else {
@@ -75,8 +105,23 @@ pub fn safe_tail(output: &str, max_bytes: usize) -> String {
         }
         format!("…{}", &stripped[start..])
     };
+
     // U+200B between the backticks: renders invisibly, cannot close the fence.
-    sliced.replace("```", "``\u{200b}`")
+    let sliced = sliced.replace("```", "``\u{200b}`");
+
+    // Defang the source marker. `doctor` decides a cron job is alive by finding
+    // `SCHEDULED_MARKER` in a record file, and this tail embeds up to 2 KB of
+    // harness output verbatim — so a MANUAL run of any skill that quotes an
+    // existing record (`/distill`, `/recap`, `/search` over the log folder)
+    // would reproduce the marker inside its own manual record and vouch for a
+    // dead job. That is exactly the failure `source` was added to prevent, and
+    // it is reachable by ordinary use of one's own vault, not by an attacker.
+    //
+    // The zero-width space keeps the text readable while making the line
+    // unmatchable. Applied to the field name, so `manual` is defanged too — a
+    // record must never be able to describe its own provenance from quoted
+    // content, whatever it claims.
+    sliced.replace("**source:**", "**source:\u{200b}**")
 }
 
 /// Remove ANSI CSI sequences (`ESC [ … final-byte`) and a bare trailing ESC.
@@ -176,6 +221,35 @@ mod tests {
             "no escape bytes reach the vault: {t:?}"
         );
         assert!(t.contains("red error"), "the text survives: {t:?}");
+    }
+
+    #[test]
+    fn safe_tail_defangs_a_quoted_source_marker() {
+        // doctor decides a cron job is alive by finding SCHEDULED_MARKER in a
+        // record. The tail embeds harness output verbatim, so a MANUAL run of a
+        // skill that quotes an existing record — /distill, /recap, /search over
+        // the log folder — would reproduce the marker inside its own manual
+        // record and vouch for a dead job. Reachable by ordinary use of one's
+        // own vault, not by an attacker.
+        let quoted = format!("here is a previous record:\n{SCHEDULED_MARKER}\nend");
+        let t = safe_tail(&quoted, TAIL_MAX_BYTES);
+
+        assert!(
+            !t.lines().any(|l| l.trim() == SCHEDULED_MARKER),
+            "a quoted marker must not survive as a matchable line: {t:?}"
+        );
+        assert!(t.contains("source"), "still readable to a human: {t:?}");
+    }
+
+    #[test]
+    fn safe_tail_does_not_scan_the_whole_transcript_to_keep_a_small_window() {
+        // Slicing happens BEFORE strip_ansi, which allocates a copy of its
+        // input. Without the pre-slice this was O(transcript) for an O(1)
+        // result on every scheduled run.
+        let huge = "\x1b[31mnoise\x1b[0m ".repeat(200_000); // ~3 MB
+        let t = safe_tail(&huge, 100);
+        assert!(t.len() <= 128, "bounded output: {} bytes", t.len());
+        assert!(!t.contains('\x1b'), "still strips ANSI in the window");
     }
 
     #[test]

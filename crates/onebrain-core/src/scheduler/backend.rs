@@ -340,12 +340,16 @@ mod imp {
 
 /// Create the scheduler log directory before any artifact references it.
 ///
-/// launchd opens `StandardOutPath`/`StandardErrorPath` **before exec** and
-/// does not create parent directories. The machine-local default
-/// (`~/Library/Logs/onebrain`) does not exist on a fresh install, so skipping
-/// this ships EX_CONFIG-78-with-no-output — a byte-for-byte re-creation of
-/// the #315 headline bug (round 4, BL-2: "the cheapest way to sink the
-/// release").
+/// launchd opens `StandardOutPath`/`StandardErrorPath` **before exec** and does
+/// not create parent directories, so a missing directory is fatal for any entry
+/// that still carries a redirect.
+///
+/// **v3.4.23 narrowed which entries those are.** Skill-mode plists no longer
+/// emit a redirect at all — the CLI opens its own log after exec and recreates
+/// the directory itself (`scheduler::run_log`). **Command-mode entries still
+/// depend on this**: launchd execs their binary directly, so no OneBrain
+/// process exists to own a log, and for them skipping this still ships
+/// EX_CONFIG-78-with-no-output — the #315 headline bug.
 pub fn ensure_log_dir(ctx: &SchedulerContext) -> std::io::Result<()> {
     std::fs::create_dir_all(&ctx.log_base_path)
 }
