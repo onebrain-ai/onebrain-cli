@@ -18,17 +18,69 @@ fn write_minimal_vault(dir: &Path) {
 }
 
 /// Mock harness printing `msg` to stdout and exiting `code`.
+///
+/// Per-platform on purpose. A `#!/bin/bash` script is not executable on
+/// Windows — the spawn fails with 127 instead of the arranged code, so every
+/// assertion about the record's *contents* silently becomes an assertion about
+/// a failed spawn. Windows CI caught this; the ARM64 VM did not, because its
+/// suite aborts earlier on a pre-existing `sh`-on-PATH failure (#382).
 fn write_mock(dir: &Path, msg: &str, code: i32) -> PathBuf {
-    let path = dir.join("claude-mock.sh");
-    fs::write(&path, format!("#!/bin/bash\necho '{msg}'\nexit {code}\n")).unwrap();
+    #[cfg(windows)]
+    {
+        let path = dir.join("claude-mock.cmd");
+        // `@echo` avoids echoing the command itself; `exit /b` sets ERRORLEVEL
+        // without killing the whole cmd host.
+        fs::write(&path, format!("@echo {msg}\r\n@exit /b {code}\r\n")).unwrap();
+        return path;
+    }
     #[cfg(unix)]
     {
+        let path = dir.join("claude-mock.sh");
+        fs::write(&path, format!("#!/bin/bash\necho '{msg}'\nexit {code}\n")).unwrap();
         use std::os::unix::fs::PermissionsExt;
         let mut p = fs::metadata(&path).unwrap().permissions();
         p.set_mode(0o755);
         fs::set_permissions(&path, p).unwrap();
+        path
     }
-    path
+}
+
+/// A mock harness that floods stderr well past the ~64 KB pipe buffer, so a
+/// non-concurrent drain deadlocks. Per-platform for the same reason as
+/// [`write_mock`].
+fn write_flood_mock(dir: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let path = dir.join("flood.cmd");
+        fs::write(
+            &path,
+            "@echo off\r\n\
+             for /L %%i in (1,1,4000) do @echo stderr line %%i padding padding padding padding padding 1>&2\r\n\
+             @echo done-stdout\r\n\
+             @exit /b 0\r\n",
+        )
+        .unwrap();
+        return path;
+    }
+    #[cfg(unix)]
+    {
+        let path = dir.join("flood.sh");
+        fs::write(
+            &path,
+            "#!/bin/bash\n\
+             for i in $(seq 1 4000); do\n\
+             \x20 echo \"stderr line $i padding padding padding padding padding\" >&2\n\
+             done\n\
+             echo done-stdout\n\
+             exit 0\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = fs::metadata(&path).unwrap().permissions();
+        p.set_mode(0o755);
+        fs::set_permissions(&path, p).unwrap();
+        path
+    }
 }
 
 /// First record file under `07-logs/log/**` whose name ends `-<entry>.md`.
@@ -156,24 +208,7 @@ fn a_child_flooding_stderr_does_not_deadlock() {
     // this repo is an unexplained pipe hang and we must not ship a second one.
     let d = tempdir().unwrap();
     write_minimal_vault(d.path());
-    let path = d.path().join("flood.sh");
-    fs::write(
-        &path,
-        "#!/bin/bash\n\
-         for i in $(seq 1 4000); do\n\
-         \x20 echo \"stderr line $i padding padding padding padding padding\" >&2\n\
-         done\n\
-         echo done-stdout\n\
-         exit 0\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut p = fs::metadata(&path).unwrap().permissions();
-        p.set_mode(0o755);
-        fs::set_permissions(&path, p).unwrap();
-    }
+    let path = write_flood_mock(d.path());
 
     let out = run_skill(d.path(), &path, true);
 
