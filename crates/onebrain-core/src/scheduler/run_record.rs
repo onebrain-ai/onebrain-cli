@@ -7,6 +7,16 @@ use chrono::{DateTime, Local};
 
 pub const TAIL_MAX_BYTES: usize = 2000;
 
+/// The exact line a record carries when the run was scheduler-initiated.
+///
+/// SHARED so the writer and the reader cannot drift. `doctor` greps for this
+/// to decide whether a cron job is alive; before this constant existed the
+/// string was duplicated as a literal in another crate, so renaming the field
+/// would have left every test passing while doctor silently saw zero records
+/// — and, because "no records" degrades to a warning rather than a per-entry
+/// accusation, the drift would have been invisible.
+pub const SCHEDULED_MARKER: &str = "- **source:** scheduled";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunSource {
     Scheduled,
@@ -35,9 +45,11 @@ impl RunRecord {
         } else {
             format!("❌ exit {}", self.exit_code)
         };
-        let source = match self.source {
-            RunSource::Scheduled => "scheduled",
-            RunSource::Manual => "manual",
+        // The scheduled line is the SHARED constant doctor greps for, so the
+        // writer and the reader cannot drift apart.
+        let source_line = match self.source {
+            RunSource::Scheduled => SCHEDULED_MARKER,
+            RunSource::Manual => "- **source:** manual",
         };
         let harness = self
             .harness
@@ -48,7 +60,7 @@ impl RunRecord {
             "\n## {} · {}\n\n\
              - **status:** {status}\n\
              - **entry:** `{}`{harness}\n\
-             - **source:** {source}\n\
+             {source_line}\n\
              - **duration:** {}s\n\
              - **machine:** {}\n\n\
              ```text\n{}\n```\n",

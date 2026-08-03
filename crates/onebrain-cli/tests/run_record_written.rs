@@ -111,7 +111,19 @@ fn find_record(vault: &Path, entry: &str) -> Option<String> {
 
 fn run_skill(vault: &Path, harness: &Path, scheduled: bool) -> std::process::Output {
     let mut cmd = Command::cargo_bin("onebrain").unwrap();
-    cmd.env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
+    // HOME must be pinned inside the fixture. `write_job_log` resolves
+    // `default_log_dir($HOME)` and APPENDS the child's entire captured output,
+    // so an inherited HOME makes every run of this file write into the
+    // developer's real `~/Library/Logs/onebrain` — unbounded, no rotation, and
+    // the stderr-flood case alone adds ~200 KB per run. It also leaves
+    // `doctor`'s scheduler-log-dir check passing vacuously afterwards, because
+    // the tests created the very directory it looks for.
+    //
+    // Every sibling test file already pins it — see `tests/support/mod.rs`
+    // ("never in the developer's home") and `run_skill.rs`'s `env_remove`.
+    cmd.env("HOME", vault)
+        .env("USERPROFILE", vault)
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .env("CLAUDE_BIN", harness)
         .args([
             "skill",

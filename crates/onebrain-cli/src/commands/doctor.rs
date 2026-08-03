@@ -1045,7 +1045,7 @@ fn any_scheduled_record_exists(logs_dir: &Path) -> bool {
         .any(|e| {
             e.file_name().to_string_lossy().ends_with(".md")
                 && std::fs::read_to_string(e.path())
-                    .map(|b| b.contains("**source:** scheduled"))
+                    .map(|b| b.contains(onebrain_core::scheduler::run_record::SCHEDULED_MARKER))
                     .unwrap_or(false)
         })
 }
@@ -1081,7 +1081,7 @@ fn newest_scheduled_record_age_days(
             continue;
         };
         // The day counts only if a SCHEDULED record landed in it.
-        if body.contains("**source:** scheduled") {
+        if body.contains(onebrain_core::scheduler::run_record::SCHEDULED_MARKER) {
             newest = Some(newest.map_or(d, |n: chrono::NaiveDate| n.max(d)));
         }
     }
@@ -1185,15 +1185,39 @@ fn scheduler_silent_runs_check(vault_root: &Path, logs_folder: &str) -> DoctorRe
         );
     }
     if silent.is_empty() {
-        // Say WHICH kind of clean this is. "all producing output" would be a
-        // claim about evidence we do not have yet on a fresh upgrade.
-        let headline = if mechanism_has_run {
-            "all producing output"
-        } else {
-            "no run records yet — they begin at the first scheduled run on this version"
-        };
-        DoctorResult::ok(SCHEDULER_SILENT_CHECK, format!("{headline} — {coverage}"))
-    } else {
+        if mechanism_has_run {
+            return DoctorResult::ok(
+                SCHEDULER_SILENT_CHECK,
+                format!("all producing output — {coverage}"),
+            );
+        }
+        // No record exists for ANY entry. Two possibilities, and this check
+        // cannot tell them apart:
+        //   1. the vault just upgraded and nothing has fired yet — benign
+        //   2. every scheduled job is dead — #372's exact scenario, twice on
+        //      the reporting user's own machine
+        //
+        // Returning `ok` here was a DETECTION REGRESSION: 3.4.22 warned in
+        // case 2 immediately, because it read the skills' own audit logs and
+        // needed no prior record. Reporting green while unable to distinguish
+        // "new" from "all dead" is the check overstating its reach — the
+        // defect this release is named for.
+        //
+        // So: warn, but ONCE and without accusing any individual job. The
+        // per-entry "never ran" lines stay suppressed (they would be four
+        // false accusations on upgrade day); this single line states the real
+        // epistemic position and tells the user how to resolve it.
+        return DoctorResult::warn(
+            SCHEDULER_SILENT_CHECK,
+            format!(
+                "no scheduled run recorded on this version yet — expected right after \
+                 upgrading, but if these entries were registered before today it is the \
+                 silence #372 describes; re-run `onebrain schedule register`, then check \
+                 again after the next fire — {coverage}"
+            ),
+        );
+    }
+    {
         DoctorResult::warn(
             SCHEDULER_SILENT_CHECK,
             format!("{} — {coverage}", silent.join("; ")),
@@ -1279,7 +1303,8 @@ fn scheduler_log_dir_verdict(entries: usize, log_dir: Option<&Path>) -> DoctorRe
         DoctorResult::warn(
             SCHEDULER_LOG_DIR_CHECK,
             format!(
-                "{} is missing — all {entries} scheduled entr{} will fail with EX_CONFIG 78 and no output",
+                "{} is missing — command-mode entries will fail with EX_CONFIG 78 and no \
+                 output; skill-mode entries recreate it themselves ({entries} entr{} total)",
                 dir.display(),
                 plural_y(entries)
             ),
@@ -8164,10 +8189,34 @@ mod tests {
             .join(d.format("%Y").to_string())
             .join(d.format("%m").to_string());
         std::fs::create_dir_all(&dir).unwrap();
-        let source = if scheduled { "scheduled" } else { "manual" };
+        // Render through the REAL writer rather than hand-copying its output.
+        // A hand-written fixture reproduces the format by hand, so renaming a
+        // field in `RunRecord::render` leaves both sides' tests green while
+        // doctor silently sees zero records — and "zero records" now degrades
+        // to a single advisory line, so the drift would be nearly invisible.
+        // This is the seam a cold review found unguarded.
+        use onebrain_core::scheduler::run_record::{RunRecord, RunSource};
+        let rec = RunRecord {
+            started: d
+                .and_hms_opt(9, 0, 0)
+                .unwrap()
+                .and_local_timezone(chrono::Local)
+                .unwrap(),
+            entry_name: entry.to_string(),
+            harness: Some("claude".into()),
+            exit_code: 0,
+            duration_secs: 1,
+            machine: "fixture-host".into(),
+            source: if scheduled {
+                RunSource::Scheduled
+            } else {
+                RunSource::Manual
+            },
+            output_tail: String::new(),
+        };
         std::fs::write(
             dir.join(format!("{}-{entry}.md", d.format("%Y-%m-%d"))),
-            format!("\n## 09:00 · {entry}\n\n- **status:** ✅ ok\n- **source:** {source}\n"),
+            rec.render(),
         )
         .unwrap();
     }
@@ -8204,10 +8253,20 @@ mod tests {
 
         let r = scheduler_silent_runs_check(d.path(), "07-logs");
 
-        assert_eq!(r.status, DoctorStatus::Ok, "{}", r.message);
+        // WARN, not Ok. The check cannot distinguish "just upgraded" from
+        // "every job is dead" (#372's own scenario), and reporting green while
+        // unable to tell was a detection regression versus 3.4.22.
+        assert_eq!(r.status, DoctorStatus::Warn, "{}", r.message);
+        // But it must not accuse any INDIVIDUAL job — on upgrade day those
+        // would be false accusations against healthy jobs.
         assert!(
-            !r.message.contains("ever"),
-            "must not accuse any job of never running: {}",
+            !r.message.contains("/daily") && !r.message.contains("/digest"),
+            "no per-job accusation: {}",
+            r.message
+        );
+        assert!(
+            r.message.contains("#372"),
+            "names the real possibility: {}",
             r.message
         );
     }
@@ -8425,13 +8484,25 @@ mod tests {
         // The message must carry enough to act on: which path, how many
         // entries, and what the user will otherwise observe (nothing).
         assert!(r.message.contains("missing"), "msg: {}", r.message);
-        assert!(
-            r.message.contains("3 scheduled entries"),
-            "msg: {}",
-            r.message
-        );
+        assert!(r.message.contains("3 entries"), "msg: {}", r.message);
         assert!(r.message.contains("78"), "msg: {}", r.message);
         assert!(r.message.contains("no output"), "msg: {}", r.message);
+        // v3.4.23: this string previously read "all 3 scheduled entries will
+        // fail". No longer true — only command-mode entries still depend on
+        // this directory pre-exec; skill-mode entries recreate it themselves.
+        // The check's doc comment was rewritten to say exactly that and this
+        // string was not, so doctor was telling a user with 4 skill entries and
+        // 1 command entry that all 5 would die. Caught by a cold review.
+        assert!(
+            r.message.contains("command-mode"),
+            "the fatal claim must be scoped to the entries it is true of: {}",
+            r.message
+        );
+        assert!(
+            !r.message.contains("all 3"),
+            "must not claim every entry dies: {}",
+            r.message
+        );
     }
 
     /// Same inputs, directory present → green, and the count is reported.
