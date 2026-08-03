@@ -1031,6 +1031,24 @@ fn cadence_of(cron: &str) -> Option<Cadence> {
     }
 }
 
+/// Does this record file contain a line that IS the scheduled marker?
+///
+/// Line-anchored and trimmed, NOT a substring search over the whole file. A
+/// record embeds up to 2 KB of harness output verbatim, so a substring match
+/// counts a quoted marker inside someone else's output as evidence of a
+/// scheduled run. `safe_tail` defangs the marker on the writing side; this is
+/// the reading side of the same defence, so a record written before that fix —
+/// or by any other producer — still cannot forge provenance.
+fn record_marks_a_scheduled_run(body: &str) -> bool {
+    let marker = onebrain_core::scheduler::run_record::SCHEDULED_MARKER;
+    // `trim_end` only — NEVER `trim`. A real record emits the marker at column
+    // zero, while output quoted inside a fenced block is usually indented. The
+    // first version of this fix used `trim()`, which strips the indentation and
+    // so matched a quoted marker anyway — defeating the whole point. Caught by
+    // `a_record_written_before_the_defang_still_cannot_forge_liveness`.
+    body.lines().any(|l| l.trim_end() == marker)
+}
+
 /// Has the run-record mechanism produced anything at all, for any entry?
 ///
 /// Distinguishes "this job stopped running" from "this feature has not run
@@ -1045,7 +1063,7 @@ fn any_scheduled_record_exists(logs_dir: &Path) -> bool {
         .any(|e| {
             e.file_name().to_string_lossy().ends_with(".md")
                 && std::fs::read_to_string(e.path())
-                    .map(|b| b.contains(onebrain_core::scheduler::run_record::SCHEDULED_MARKER))
+                    .map(|b| record_marks_a_scheduled_run(&b))
                     .unwrap_or(false)
         })
 }
@@ -1081,7 +1099,7 @@ fn newest_scheduled_record_age_days(
             continue;
         };
         // The day counts only if a SCHEDULED record landed in it.
-        if body.contains(onebrain_core::scheduler::run_record::SCHEDULED_MARKER) {
+        if record_marks_a_scheduled_run(&body) {
             newest = Some(newest.map_or(d, |n: chrono::NaiveDate| n.max(d)));
         }
     }
@@ -1091,21 +1109,29 @@ fn newest_scheduled_record_age_days(
 /// A scheduled run that produced nothing at all is reported, instead of being
 /// an absence nobody reads (#363).
 ///
-/// The failure this exists for is invisible by construction: launchd opens the
-/// log file before exec, so a job that cannot start never reaches the CLI and
-/// writes zero bytes — no vault log, no stderr, no notification. Two of the
-/// user's five jobs were dead for over a day and the detector was a human
+/// The failure this exists for is invisible by construction: a job that cannot
+/// start writes zero bytes — no vault log, no stderr, no notification. Two of
+/// the user's five jobs were dead for over a day and the detector was a human
 /// noticing that a morning digest had not arrived.
 ///
 /// `scheduler-log-dir` catches the one CAUSE that is provable in advance. This
 /// catches the SYMPTOM regardless of cause, which is the only half that
 /// generalises: whatever stops a job, the evidence is the same silence.
 ///
-/// **Deliberately reports its own coverage.** Only 6 of the 13 schedulable
-/// skills write an audit log, and command-mode entries write none, so this can
-/// speak for some entries and not others. A check that hid that distinction
-/// would read as "all clear" while saying nothing about half the schedule —
-/// which is the exact shape of failure this release is about.
+/// **Deliberately reports its own coverage** — but the boundary MOVED in
+/// v3.4.23, and this header used to describe the old one. Observability no
+/// longer depends on a skill choosing to log (it did for only 6 of 13); every
+/// skill-mode run now leaves a CLI-written record. What this still cannot see
+/// is **command-mode entries**: launchd execs their binary directly, so no
+/// OneBrain process writes a record for them. That count is reported on every
+/// verdict. A check that hid the distinction would read as "all clear" while
+/// saying nothing about part of the schedule — the exact shape of failure this
+/// release is about.
+///
+/// **Staleness reads the record's `source`, not its filename.** This function
+/// serves a scheduler and a human at a terminal from the same entry point, and
+/// both append to the same daily file, so a filename match would let one manual
+/// run vouch for a cron job dead for a week.
 fn scheduler_silent_runs_check(vault_root: &Path, logs_folder: &str) -> DoctorResult {
     let cfg = match crate::commands::register_schedule::read_vault_config(vault_root) {
         Ok(c) => c,
@@ -8295,6 +8321,105 @@ mod tests {
             "not the healthy one: {}",
             r.message
         );
+    }
+
+    #[test]
+    fn a_manual_record_quoting_a_scheduled_one_cannot_forge_liveness() {
+        // End-to-end version of the writer-side defang: a MANUAL run whose
+        // output quoted an earlier record must not vouch for a dead cron job.
+        // Both halves are exercised — safe_tail defangs on write, and doctor
+        // matches line-anchored on read, so a record produced before either
+        // fix still cannot forge provenance.
+        use onebrain_core::scheduler::run_record::{
+            safe_tail, RunRecord, RunSource, SCHEDULED_MARKER, TAIL_MAX_BYTES,
+        };
+        let d = silent_vault(
+            "  - cron: \"0 9 * * *\"\n    skill: /daily\n\
+             \x20 - cron: \"0 8 * * *\"\n    skill: /digest\n",
+            &[("daily", false), ("digest", false)],
+        );
+        write_record(d.path(), "digest", 0, true); // mechanism is live
+
+        // A manual /daily whose harness output quoted a real record.
+        let today = chrono::Local::now().date_naive();
+        let dir = d
+            .path()
+            .join("07-logs/log")
+            .join(today.format("%Y").to_string())
+            .join(today.format("%m").to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = RunRecord {
+            started: chrono::Local::now(),
+            entry_name: "daily".into(),
+            harness: Some("claude".into()),
+            exit_code: 0,
+            duration_secs: 1,
+            machine: "h".into(),
+            source: RunSource::Manual,
+            output_tail: safe_tail(
+                &format!("quoting an old record:\n{SCHEDULED_MARKER}\n"),
+                TAIL_MAX_BYTES,
+            ),
+        };
+        std::fs::write(
+            dir.join(format!("{}-daily.md", today.format("%Y-%m-%d"))),
+            rec.render(),
+        )
+        .unwrap();
+
+        let r = scheduler_silent_runs_check(d.path(), "07-logs");
+
+        assert_eq!(
+            r.status,
+            DoctorStatus::Warn,
+            "/daily is manual-only; a quoted marker must not make it look alive: {}",
+            r.message
+        );
+        assert!(r.message.contains("/daily"), "names it: {}", r.message);
+    }
+
+    #[test]
+    fn a_record_written_before_the_defang_still_cannot_forge_liveness() {
+        // The reader half, tested on its own. safe_tail defangs the marker on
+        // write — but records already on disk from an earlier version, or
+        // written by anything else, carry it raw. Line-anchored matching is
+        // what protects those, and the writer-side test cannot exercise it
+        // (the defang stops the marker ever reaching the reader).
+        use onebrain_core::scheduler::run_record::SCHEDULED_MARKER;
+        let d = silent_vault(
+            "  - cron: \"0 9 * * *\"\n    skill: /daily\n\
+             \x20 - cron: \"0 8 * * *\"\n    skill: /digest\n",
+            &[("daily", false), ("digest", false)],
+        );
+        write_record(d.path(), "digest", 0, true); // mechanism is live
+
+        // Hand-written, UNDEFANGED: a manual record quoting the marker inside
+        // its fenced output block, exactly as a pre-fix record would look.
+        let today = chrono::Local::now().date_naive();
+        let dir = d
+            .path()
+            .join("07-logs/log")
+            .join(today.format("%Y").to_string())
+            .join(today.format("%m").to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{}-daily.md", today.format("%Y-%m-%d"))),
+            format!(
+                "\n## 09:00 · daily\n\n- **status:** ✅ ok\n- **source:** manual\n\n\
+                 ```text\nprevious record said:\n  {SCHEDULED_MARKER}\n```\n"
+            ),
+        )
+        .unwrap();
+
+        let r = scheduler_silent_runs_check(d.path(), "07-logs");
+
+        assert_eq!(
+            r.status,
+            DoctorStatus::Warn,
+            "an indented quoted marker must not count as a scheduled run: {}",
+            r.message
+        );
+        assert!(r.message.contains("/daily"), "names it: {}", r.message);
     }
 
     #[test]

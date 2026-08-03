@@ -99,7 +99,14 @@ pub fn run(
 
     let started = chrono::Local::now();
     let t0 = std::time::Instant::now();
-    let outcome = spawn_harness(&resolution.path, &argv, &vault_path, harness, "the skill")?;
+    let outcome = spawn_harness(
+        &resolution.path,
+        &argv,
+        &vault_path,
+        harness,
+        "the skill",
+        Capture::Yes,
+    )?;
 
     // Finally-equivalent: everything below runs whether the harness succeeded,
     // failed, or was killed. A logging failure must NEVER change the exit code —
@@ -442,12 +449,28 @@ fn wait_draining(child: &mut std::process::Child) -> std::io::Result<Drained> {
     })
 }
 
+/// Whether the caller needs the child's output back.
+///
+/// `skill run` does — it writes the job log and the vault run record. `harness
+/// run` does NOT: it is a general-purpose "run this prompt" command with no
+/// plist and no record, and capturing there would silently convert a streaming
+/// command into one that emits nothing until the child exits. That regression
+/// was found by a cold review, not by any test.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Capture {
+    /// Pipe and drain, returning the bytes. Required when a record is written.
+    Yes,
+    /// Inherit the parent's streams — output flows through as it is produced.
+    No,
+}
+
 pub(crate) fn spawn_harness(
     bin: &Path,
     argv: &[String],
     cwd: &Path,
     harness: HarnessArg,
     subject: &str,
+    capture: Capture,
 ) -> Result<HarnessOutcome> {
     use std::io::IsTerminal;
     let label = harness.as_str();
@@ -500,6 +523,23 @@ pub(crate) fn spawn_harness(
     // fills the other pipe's ~64 KB buffer, and `wait_with_output` consumes the
     // child handle, which would make the kill+reap recovery below impossible.
     if !std::io::stderr().is_terminal() {
+        // Capture::No keeps the pre-v3.4.23 behaviour: inherited stdio, so
+        // output streams through as the child produces it. Only `skill run`
+        // needs the bytes back, and only because it writes a record.
+        if capture == Capture::No {
+            return match command.status() {
+                Ok(st) => Ok(HarnessOutcome::bare(translate_exit(&st))),
+                Err(e) => {
+                    eprintln!(
+                        "✗ Failed to spawn {label} ({}): {e}\n\
+                         💡 make sure `{label}` is installed and on PATH (check with \
+                         `which {label}`), or set `{bin_env_var}` to its full path",
+                        bin.display()
+                    );
+                    Ok(HarnessOutcome::bare(127))
+                }
+            };
+        }
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = match command.spawn() {
             Ok(c) => c,
@@ -934,9 +974,16 @@ mod tests {
         }
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         let argv = vec!["-p".to_string(), "/daily".to_string()];
-        let code = spawn_harness(&stub, &argv, dir.path(), HarnessArg::Claude, "the test")
-            .unwrap()
-            .code;
+        let code = spawn_harness(
+            &stub,
+            &argv,
+            dir.path(),
+            HarnessArg::Claude,
+            "the test",
+            Capture::Yes,
+        )
+        .unwrap()
+        .code;
         assert_eq!(code, 43, "child should see EOF on a null stdin, not block");
     }
 }

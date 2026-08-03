@@ -28,7 +28,7 @@ Download links for each target: the [pre-built binaries table](install.md#pre-bu
 
 | Platform | Backend | Artifact | Output capture |
 |---|---|---|---|
-| macOS | launchd (gui domain) | `~/Library/LaunchAgents/com.onebrain.<label>.plist` | file redirect → `~/Library/Logs/onebrain/` |
+| macOS | launchd (gui domain) | `~/Library/LaunchAgents/com.onebrain.<label>.plist` | **skill mode:** the CLI opens `~/Library/Logs/onebrain/onebrain-<label>.log` itself, after exec, and writes a run record into the vault. **command mode:** plist file redirect → `~/Library/Logs/onebrain/` (launchd opens it *before* exec, so a missing directory is still fatal there) |
 | Windows | Task Scheduler | task `\OneBrain\<label>` (no file on disk — Task Scheduler owns the definition) | none from OneBrain — use Task Scheduler history |
 | Linux | systemd user timers | `~/.config/systemd/user/onebrain-<label>.{service,timer}` | journald — `journalctl --user -u onebrain-<label>.service` |
 
