@@ -27,10 +27,6 @@ expression: out
         <key>Hour</key>
         <integer>9</integer>
     </dict>
-    <key>StandardOutPath</key>
-    <string>/Users/test/Library/Logs/onebrain/onebrain-daily.stdout</string>
-    <key>StandardErrorPath</key>
-    <string>/Users/test/Library/Logs/onebrain/onebrain-daily.stderr</string>
     <key>RunAtLoad</key>
     <false/>
 </dict>

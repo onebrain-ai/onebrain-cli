@@ -571,7 +571,34 @@ pub fn generate_plist(
         (false, false) => recurring_skill_block(entry, ctx),
     };
 
-    let log_base = ctx.log_base_path.to_string_lossy();
+    // Skill-mode entries carry NO StandardOutPath/StandardErrorPath, deliberately.
+    // launchd opens those paths BEFORE exec and does not create parent
+    // directories, so any path here is a way for every run to die with
+    // EX_CONFIG 78 having written zero bytes (#315: iCloud compression made
+    // vault log files unopenable; #372: the machine-local directory vanished,
+    // cause still unknown). An absent key has no path to open. The CLI opens its
+    // own log AFTER exec, where it can mkdir, fall back and report — see
+    // scheduler::run_log.
+    //
+    // Command-mode entries KEEP the redirect: launchd execs their binary
+    // directly (recurring_command_block), so no OneBrain process exists to own a
+    // log. For them this redirect is the only output channel there is.
+    let redirect = if is_command_mode(entry) {
+        let log_base = ctx.log_base_path.to_string_lossy();
+        format!(
+            "\x20   <key>StandardOutPath</key>\n\
+             \x20   <string>{}/onebrain-{}.stdout</string>\n\
+             \x20   <key>StandardErrorPath</key>\n\
+             \x20   <string>{}/onebrain-{}.stderr</string>\n",
+            xml_escape(&log_base),
+            label_safe,
+            xml_escape(&log_base),
+            label_safe,
+        )
+    } else {
+        String::new()
+    };
+
     Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -584,10 +611,7 @@ pub fn generate_plist(
          {}\n\
          \x20   </array>\n\
          {}\n\
-         \x20   <key>StandardOutPath</key>\n\
-         \x20   <string>{}/onebrain-{}.stdout</string>\n\
-         \x20   <key>StandardErrorPath</key>\n\
-         \x20   <string>{}/onebrain-{}.stderr</string>\n\
+         {redirect}\
          \x20   <key>RunAtLoad</key>\n\
          \x20   <false/>\n\
          </dict>\n\
@@ -595,10 +619,6 @@ pub fn generate_plist(
         xml_escape(&label),
         program_args,
         calendar,
-        xml_escape(&log_base),
-        label_safe,
-        xml_escape(&log_base),
-        label_safe,
     ))
 }
 
@@ -629,6 +649,71 @@ mod tests {
             skill: Some(skill.into()),
             ..Default::default()
         }
+    }
+
+    /// Build a command-mode entry the same way the surrounding command-mode
+    /// tests do (see `label_for_command_uses_basename_plus_cron_discriminator`
+    /// above) — not a new construction style.
+    fn command_entry(command: &str, args: &[&str], cron: &str) -> ScheduleEntry {
+        ScheduleEntry {
+            cron: Some(cron.into()),
+            command: Some(command.into()),
+            args: Some(Args::List(args.iter().map(|s| s.to_string()).collect())),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn skill_mode_plist_carries_no_output_redirect() {
+        // #372/#315: launchd opens StandardOutPath BEFORE exec and does not
+        // create parent directories, so any path here is a way for the job
+        // to die before it starts. An ABSENT key has no path to open. The
+        // CLI opens its own log after exec instead (scheduler::run_log).
+        let entry = skill_entry("daily", "0 9 * * *");
+        let ctx = test_ctx();
+        let out = generate_plist(&entry, &ctx).expect("plist generates");
+
+        assert!(
+            !out.contains("StandardOutPath"),
+            "no stdout redirect: {out}"
+        );
+        assert!(
+            !out.contains("StandardErrorPath"),
+            "no stderr redirect: {out}"
+        );
+        // test_ctx()'s log_base_path is /Users/test/Library/Logs/onebrain
+        // (launchd.rs:620), so this assertion is non-vacuous.
+        assert!(
+            !out.contains("Library/Logs/onebrain"),
+            "no log path leaks: {out}"
+        );
+        // Guard against deleting too much.
+        assert!(out.contains("<key>Label</key>"), "still a valid job: {out}");
+        assert!(
+            out.contains("<key>ProgramArguments</key>"),
+            "still a valid job: {out}"
+        );
+    }
+
+    #[test]
+    fn command_mode_plist_keeps_its_redirect() {
+        // Command-mode entries are exec'd DIRECTLY by launchd
+        // (recurring_command_block, launchd.rs:284-300) — there is no
+        // OneBrain process in the pipeline to own a log. Removing their
+        // redirect would delete their only output channel and replace it
+        // with nothing. They keep exactly today's behaviour.
+        let entry = command_entry("onebrain", &["search", "reindex"], "0 3 * * 0");
+        let ctx = test_ctx();
+        let out = generate_plist(&entry, &ctx).expect("plist generates");
+
+        assert!(
+            out.contains("StandardOutPath"),
+            "command mode keeps stdout: {out}"
+        );
+        assert!(
+            out.contains("StandardErrorPath"),
+            "command mode keeps stderr: {out}"
+        );
     }
 
     #[test]

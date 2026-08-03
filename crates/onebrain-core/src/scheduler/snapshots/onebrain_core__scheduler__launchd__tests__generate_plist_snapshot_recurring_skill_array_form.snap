@@ -47,10 +47,6 @@ expression: out
             <integer>18</integer>
         </dict>
     </array>
-    <key>StandardOutPath</key>
-    <string>/Users/test/Library/Logs/onebrain/onebrain-daily.stdout</string>
-    <key>StandardErrorPath</key>
-    <string>/Users/test/Library/Logs/onebrain/onebrain-daily.stderr</string>
     <key>RunAtLoad</key>
     <false/>
 </dict>
