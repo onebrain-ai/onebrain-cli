@@ -44,7 +44,7 @@
 use crate::cli::HarnessArg;
 use anyhow::{anyhow, Context, Result};
 use onebrain_core::find_config_file;
-use onebrain_core::scheduler::run_record::{safe_tail, RunRecord, RunSource, TAIL_MAX_BYTES};
+use onebrain_core::scheduler::run_record::{safe_tail, RunRecord, TAIL_MAX_BYTES};
 use onebrain_core::Harness;
 use onebrain_fs::{
     build_prompt_for_harness, resolve_claude_bin, resolve_codex_bin, resolve_gemini_bin,
@@ -121,11 +121,6 @@ pub fn run(
         exit_code: outcome.code,
         duration_secs: t0.elapsed().as_secs(),
         machine: machine_name(),
-        source: if std::env::var_os("ONEBRAIN_SCHEDULED").is_some() {
-            RunSource::Scheduled
-        } else {
-            RunSource::Manual
-        },
         output_tail: build_tail(&outcome.captured, log_note.as_deref()),
     };
     if let Err(e) = append_run_record(&vault_path, &record) {

@@ -47,11 +47,6 @@ expression: out
             <integer>18</integer>
         </dict>
     </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>ONEBRAIN_SCHEDULED</key>
-        <string>1</string>
-    </dict>
     <key>RunAtLoad</key>
     <false/>
 </dict>
