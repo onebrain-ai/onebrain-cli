@@ -149,7 +149,15 @@ fn write_job_log(label: &str, captured: &[u8]) -> Option<String> {
     use onebrain_core::scheduler::run_log::{open_job_log, LogSink};
     use std::io::Write;
 
-    let home = std::env::var("HOME").map(PathBuf::from).ok()?;
+    // `dirs::home_dir`, not `env::var("HOME")`. HOME is normally UNSET on
+    // Windows, so the env read returned None there and the `?` short-circuited
+    // — the `LOCALAPPDATA` branch of `default_log_dir` was unreachable from
+    // this caller, Windows silently got no CLI-owned job log at all, AND the
+    // `None` read to `build_tail` as "log written fine", so the record carried
+    // no `[job log unavailable]` note either. Two failures hiding each other.
+    let Some(home) = dirs::home_dir() else {
+        return Some("cannot resolve the home directory".to_string());
+    };
     let dir = onebrain_core::scheduler::log_dir::default_log_dir(&home, &|k| std::env::var(k).ok());
     match open_job_log(&dir, label) {
         LogSink::File(mut f, _) => {

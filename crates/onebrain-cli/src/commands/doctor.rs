@@ -1061,10 +1061,24 @@ fn record_marks_a_scheduled_run(body: &str) -> bool {
 /// skill-mode plist has none, and a command-mode plist has one AND no
 /// `ONEBRAIN_SCHEDULED`. Anything with a redirect but also the marker would be
 /// contradictory and is treated as not-current.
-#[cfg(target_os = "macos")]
-fn skill_mode_plists_are_current() -> Option<bool> {
-    let dir = dirs::home_dir()?.join("Library/LaunchAgents");
-    let mut saw_any = false;
+/// Pure half: classify the plists in `dir`. Split from the `$HOME` resolver so
+/// it is testable with REAL plist bodies and no env mutation — v3.4.22 shipped
+/// a check whose tests asserted against the developer's own machine and passed
+/// vacuously, and the first version of THIS guard shipped a no-op because its
+/// only test hand-injected the verdict instead of driving a plist.
+///
+/// `Some(false)` if any skill-mode plist still predates v3.4.23 · `Some(true)`
+/// if every skill-mode plist is current · `None` if there are no skill-mode
+/// plists to judge, or the directory cannot be read.
+///
+/// Not `cfg`-gated to macOS despite only the macOS resolver calling it: the
+/// logic is pure string matching over a plist body, so it stays testable on
+/// every platform. It IS unused in the non-macOS non-test build, hence the
+/// conditional allow — CI's Linux clippy caught that; macOS clippy structurally
+/// cannot, because the caller exists there.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn classify_plists_in(dir: &Path) -> Option<bool> {
+    let mut saw_skill_mode = false;
     for e in std::fs::read_dir(dir).ok()?.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
         if !name.starts_with("com.onebrain.") || !name.ends_with(".plist") {
@@ -1073,19 +1087,28 @@ fn skill_mode_plists_are_current() -> Option<bool> {
         let Ok(body) = std::fs::read_to_string(e.path()) else {
             continue;
         };
-        let has_redirect = body.contains("StandardOutPath");
-        let is_command_mode = has_redirect && !body.contains("ONEBRAIN_SCHEDULED");
-        saw_any = true;
-        // A skill-mode plist that still redirects is the stale shape.
-        if has_redirect && !is_command_mode {
-            return Some(false);
+        // Classify by ARGV, never by the marker — see the note in the caller.
+        let is_skill_mode =
+            body.contains("<string>skill</string>") && body.contains("<string>run</string>");
+        if !is_skill_mode {
+            continue; // command mode keeps its redirect by design
         }
-        // A plist with neither redirect nor marker predates both — stale too.
-        if !has_redirect && !body.contains("ONEBRAIN_SCHEDULED") {
-            return Some(false);
+        saw_skill_mode = true;
+        if body.contains("StandardOutPath") || !body.contains("ONEBRAIN_SCHEDULED") {
+            return Some(false); // one stale plist is enough; never masked
         }
     }
-    saw_any.then_some(true)
+    saw_skill_mode.then_some(true)
+}
+
+/// Do the registered launchd plists already carry the v3.4.23 shape?
+///
+/// The fix lives in the plist, not the binary, so upgrading alone does not
+/// deliver it. Only `Some(true)` may earn the reassuring message; `None`
+/// (cannot tell) is treated as stale, never as permission to reassure.
+#[cfg(target_os = "macos")]
+fn skill_mode_plists_are_current() -> Option<bool> {
+    classify_plists_in(&dirs::home_dir()?.join("Library/LaunchAgents"))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1214,6 +1237,9 @@ fn scheduler_silent_runs_check(vault_root: &Path, logs_folder: &str) -> DoctorRe
     let mechanism_has_run = mechanism_age_days.is_some();
 
     let mut silent: Vec<String> = Vec::new();
+    // Entries with NO record whose own window has not yet elapsed since records
+    // began. Not evidence of failure — and not evidence of health either.
+    let mut too_early: Vec<String> = Vec::new();
     let mut observed = 0usize;
     let mut unobservable = 0usize;
 
@@ -1259,7 +1285,12 @@ fn scheduler_silent_runs_check(vault_root: &Path, logs_folder: &str) -> DoctorRe
             // entry's tolerance, absence proves nothing about this entry —
             // whatever other entries have done. Platform-neutral, per-entry, and
             // it expires on its own.
-            None if mechanism_age_days.is_none_or(|age| age < tolerance) => {}
+            None if mechanism_age_days.is_none_or(|age| age < tolerance) => {
+                // Suppressed, NOT vouched for. Counted so the verdict cannot
+                // claim "all producing output" over an entry that has produced
+                // nothing — see below.
+                too_early.push(format!("/{skill} ({})", cadence.describe()));
+            }
             None => silent.push(format!(
                 "/{skill} ({}) — no scheduled run recorded, ever",
                 cadence.describe()
@@ -1284,9 +1315,25 @@ fn scheduler_silent_runs_check(vault_root: &Path, logs_folder: &str) -> DoctorRe
     }
     if silent.is_empty() {
         if mechanism_has_run {
+            if too_early.is_empty() {
+                return DoctorResult::ok(
+                    SCHEDULER_SILENT_CHECK,
+                    format!("all producing output — {coverage}"),
+                );
+            }
+            // Some entry has produced NOTHING, but records have not existed
+            // long enough to judge it. Saying "all producing output" here would
+            // assert health for an entry with zero evidence — the same
+            // overstatement this release is named for, which the previous fix
+            // introduced while removing a false accusation. Neither accuse nor
+            // vouch: name them and say why.
             return DoctorResult::ok(
                 SCHEDULER_SILENT_CHECK,
-                format!("all producing output — {coverage}"),
+                format!(
+                    "others producing output; no record yet for {} — too soon to judge, \
+                     their window has not elapsed since records began — {coverage}",
+                    too_early.join(", ")
+                ),
             );
         }
         // No record exists for ANY entry. Two possibilities, and this check
@@ -8359,6 +8406,67 @@ mod tests {
         assert!(r.message.contains("1 observable"), "{}", r.message);
     }
 
+    /// Write a plist body of the given shape into `dir`.
+    fn write_plist(dir: &Path, label: &str, skill_mode: bool, current: bool) {
+        std::fs::create_dir_all(dir).unwrap();
+        let argv = if skill_mode {
+            "<string>/opt/homebrew/bin/onebrain</string>\n<string>skill</string>\n<string>run</string>"
+        } else {
+            "<string>/opt/homebrew/bin/onebrain</string>\n<string>search</string>\n<string>reindex</string>"
+        };
+        let mut body =
+            format!("<plist><dict><key>ProgramArguments</key><array>\n{argv}\n</array>\n");
+        if skill_mode && current {
+            body.push_str("<key>EnvironmentVariables</key><dict><key>ONEBRAIN_SCHEDULED</key><string>1</string></dict>\n");
+        } else {
+            // stale skill-mode AND command-mode both carry a redirect and no
+            // marker — which is exactly why the first version of this guard,
+            // keyed on the marker, could not tell them apart.
+            body.push_str("<key>StandardOutPath</key><string>/x.stdout</string>\n");
+        }
+        body.push_str("</dict></plist>");
+        std::fs::write(dir.join(format!("com.onebrain.{label}.plist")), body).unwrap();
+    }
+
+    #[test]
+    fn a_stale_skill_plist_is_not_mistaken_for_command_mode() {
+        // The first fix keyed `is_command_mode` on the marker's ABSENCE — the
+        // very property whose absence defines staleness. A stale skill-mode
+        // plist was therefore byte-identical to a command-mode one, got
+        // classified as command mode, and the stale branch never fired: a
+        // no-op that read like protection. Driving REAL plist bodies is what
+        // exposes it; the earlier test hand-injected `Some(false)` and could
+        // not.
+        let d = tempdir().unwrap();
+
+        // Stale skill-mode alone → stale.
+        let a = d.path().join("a");
+        write_plist(&a, "daily", true, false);
+        assert_eq!(classify_plists_in(&a), Some(false), "stale skill-mode");
+
+        // Command mode alone → it keeps its redirect by design, so it says
+        // nothing about whether skill mode is current.
+        let b = d.path().join("b");
+        write_plist(&b, "reindex", false, false);
+        assert_eq!(classify_plists_in(&b), None, "command mode is not evidence");
+
+        // Current skill-mode alone → current.
+        let c = d.path().join("c");
+        write_plist(&c, "daily", true, true);
+        assert_eq!(classify_plists_in(&c), Some(true), "current skill-mode");
+
+        // MIXED: one current skill plist and one stale one. The stale one must
+        // win — an earlier version let the current one mask it.
+        let e = d.path().join("e");
+        write_plist(&e, "daily", true, true);
+        write_plist(&e, "weekly", true, false);
+        assert_eq!(
+            classify_plists_in(&e),
+            Some(false),
+            "a stale plist must not be masked"
+        );
+    }
+
     #[test]
     fn a_stale_plist_must_not_be_told_skill_mode_self_heals() {
         // The fix lives in the PLIST, not the binary. Until the user
@@ -8417,12 +8525,26 @@ mod tests {
 
         let r = scheduler_silent_runs_check(d.path(), "07-logs");
 
+        // Not ACCUSED — but not vouched for either. A re-audit caught the
+        // first version of this fix reporting "all producing output" over an
+        // entry that had produced nothing, trading a false accusation for a
+        // false reassurance. It must say it cannot judge yet.
+        assert_eq!(r.status, DoctorStatus::Ok, "{}", r.message);
         assert!(
-            !r.message.contains("/doctor"),
-            "a monthly entry cannot be judged by a one-day-old mechanism: {}",
+            !r.message.contains("no scheduled run recorded, ever"),
+            "must not accuse a monthly entry on a one-day-old mechanism: {}",
             r.message
         );
-        assert_eq!(r.status, DoctorStatus::Ok, "{}", r.message);
+        assert!(
+            r.message.contains("too soon to judge") && r.message.contains("/doctor"),
+            "must NAME it as unjudged rather than fold it into 'all producing output': {}",
+            r.message
+        );
+        assert!(
+            !r.message.contains("all producing output"),
+            "must not claim health for an entry with zero evidence: {}",
+            r.message
+        );
     }
 
     #[test]

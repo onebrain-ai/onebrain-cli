@@ -1,6 +1,6 @@
 ---
-latest_version: 3.4.22
-released: 2026-08-01
+latest_version: 3.4.23
+released: 2026-08-04
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,33 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.23] — 2026-08-04 — A scheduled job always runs, and always leaves a trace
+
+### Fixed
+- A vanished log directory can no longer kill a scheduled skill — launchd opens no redirect for it, so there is no path left to fail ([#372](https://github.com/onebrain-ai/onebrain-cli/issues/372))
+
+### Added
+- Every scheduled skill run appends a record to the vault — readable in Obsidian, found by vault search, whether the run succeeded or failed ([#377](https://github.com/onebrain-ai/onebrain-cli/issues/377))
+- The CLI opens its own job log after it starts, so it can recreate a missing directory instead of dying before it exists ([#372](https://github.com/onebrain-ai/onebrain-cli/issues/372))
+
+### Changed
+- `doctor`'s `scheduled output` reads run records instead of depending on each skill choosing to log, and still states what it cannot see ([#377](https://github.com/onebrain-ai/onebrain-cli/issues/377))
+- A manual `onebrain skill run` no longer counts as proof a cron job is alive; only records tagged `scheduled` do ([#377](https://github.com/onebrain-ai/onebrain-cli/issues/377))
+- `doctor`'s missing-log-directory warning reads the registered plists and says what is true of them: all entries die while the plists are pre-v3.4.23, only command-mode ones once they are current ([#377](https://github.com/onebrain-ai/onebrain-cli/issues/377))
+
+### Upgrade notes
+**Run `onebrain schedule register` after upgrading.** The fix lives in the plist, not the binary —
+existing plists keep their old redirect until they are re-emitted, so a vault that skips this step
+still carries the #372 failure mode.
+
+Command-mode entries (`command:` rather than `skill:`) are deliberately unchanged: launchd execs
+their binary directly, so no OneBrain process exists to own a log or write a record for them. They
+keep their redirect, and `doctor` keeps counting them as entries it cannot see.
+
+`doctor` reports `no scheduled run recorded on this version yet` until the first scheduled fire.
+That is expected right after upgrading — but if the entries were registered before today it is the
+silence #372 describes, so re-register and check again after the next fire.
 
 ## [3.4.22] — 2026-08-01 — Make failure visible
 
