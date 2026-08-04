@@ -24,7 +24,10 @@
 //! piped stdin to the prompt, so an inherited interactive TTY (no EOF) makes
 //! it block forever. launchd already gives the child a null stdin, but a
 //! manual terminal run does not — so we set it explicitly to keep both paths
-//! non-blocking. stdout/stderr stay inherited so the user sees the output.
+//! non-blocking. stdout/stderr are PIPED and written through verbatim for
+//! `skill run` (v3.4.23 — the captured bytes feed the CLI-owned job log and the
+//! vault run record), and stay INHERITED for `harness run`, which writes
+//! neither and must keep streaming. See `Capture`.
 //!
 //! Exit codes mirror Bun's `runSkillCommand`:
 //!
@@ -483,8 +486,9 @@ pub(crate) fn spawn_harness(
         HarnessArg::Codex => "CODEX_BIN",
     };
     // No `env` override beyond ONEBRAIN_HEADLESS: child inherits parent env so
-    // PATH/HOME survive. stdout/stderr stay inherited so the harness's output
-    // (and colour) reach the terminal verbatim; stdin is forced to null so
+    // PATH/HOME survive. stdout/stderr are set per `Capture` below — piped and
+    // written through verbatim (colour included) when the caller needs the
+    // bytes, inherited when it does not; stdin is forced to null so
     // `claude -p` / `gemini -p` never block reading an interactive TTY — see
     // module docs. ONEBRAIN_HEADLESS=1 drives the session-init handshake that
     // lets the skill skip the interactive startup ceremony.
