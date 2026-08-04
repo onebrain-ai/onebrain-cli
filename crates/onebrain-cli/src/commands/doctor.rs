@@ -1049,23 +1049,79 @@ fn record_marks_a_scheduled_run(body: &str) -> bool {
     body.lines().any(|l| l.trim_end() == marker)
 }
 
-/// Has the run-record mechanism produced anything at all, for any entry?
+/// Do the registered launchd plists already carry the v3.4.23 shape?
 ///
-/// Distinguishes "this job stopped running" from "this feature has not run
-/// yet". Without it, the first `doctor` after an upgrade accuses every healthy
-/// scheduled job of never having run — the check overstating a problem, which
-/// is the same defect it exists to catch.
-fn any_scheduled_record_exists(logs_dir: &Path) -> bool {
-    walkdir::WalkDir::new(logs_dir.join("log"))
+/// `Some(false)` while any `com.onebrain.*.plist` still emits a redirect for a
+/// skill-mode entry — the pre-v3.4.23 shape, which is what a user has until
+/// they re-register. `None` when the directory cannot be read, so the caller
+/// stays on the pessimistic message rather than guessing.
+///
+/// A skill-mode plist is identified by the absence of the marker being the
+/// thing we are testing, so we key off the redirect directly: a v3.4.23
+/// skill-mode plist has none, and a command-mode plist has one AND no
+/// `ONEBRAIN_SCHEDULED`. Anything with a redirect but also the marker would be
+/// contradictory and is treated as not-current.
+#[cfg(target_os = "macos")]
+fn skill_mode_plists_are_current() -> Option<bool> {
+    let dir = dirs::home_dir()?.join("Library/LaunchAgents");
+    let mut saw_any = false;
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.starts_with("com.onebrain.") || !name.ends_with(".plist") {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(e.path()) else {
+            continue;
+        };
+        let has_redirect = body.contains("StandardOutPath");
+        let is_command_mode = has_redirect && !body.contains("ONEBRAIN_SCHEDULED");
+        saw_any = true;
+        // A skill-mode plist that still redirects is the stale shape.
+        if has_redirect && !is_command_mode {
+            return Some(false);
+        }
+        // A plist with neither redirect nor marker predates both — stale too.
+        if !has_redirect && !body.contains("ONEBRAIN_SCHEDULED") {
+            return Some(false);
+        }
+    }
+    saw_any.then_some(true)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn skill_mode_plists_are_current() -> Option<bool> {
+    // Only launchd has this failure mode at all; the check is macOS-scoped.
+    None
+}
+
+/// Age in whole days of the OLDEST scheduled run record on this vault, i.e.
+/// how long the record mechanism has been producing anything at all.
+///
+/// Used as a per-entry baseline: an entry with no record is only "silent" once
+/// records have existed for longer than that entry's own tolerance. A weekly
+/// job cannot be judged by a mechanism that has only been running a day.
+fn oldest_scheduled_record_age_days(logs_dir: &Path, today: chrono::NaiveDate) -> Option<i64> {
+    let mut oldest: Option<chrono::NaiveDate> = None;
+    for e in walkdir::WalkDir::new(logs_dir.join("log"))
         .max_depth(3)
         .into_iter()
         .filter_map(Result::ok)
-        .any(|e| {
-            e.file_name().to_string_lossy().ends_with(".md")
-                && std::fs::read_to_string(e.path())
-                    .map(|b| record_marks_a_scheduled_run(&b))
-                    .unwrap_or(false)
-        })
+    {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".md") || name.len() < 10 {
+            continue;
+        }
+        let Ok(d) = chrono::NaiveDate::parse_from_str(&name[..10], "%Y-%m-%d") else {
+            continue;
+        };
+        let Ok(body) = std::fs::read_to_string(e.path()) else {
+            continue;
+        };
+        if record_marks_a_scheduled_run(&body) {
+            oldest = Some(oldest.map_or(d, |o: chrono::NaiveDate| o.min(d)));
+        }
+    }
+    oldest.map(|d| (today - d).num_days())
 }
 
 /// The newest **scheduled run record** for `entry`, as whole days before `today`.
@@ -1152,7 +1208,10 @@ fn scheduler_silent_runs_check(vault_root: &Path, logs_folder: &str) -> DoctorRe
     // Absence is only evidence once the mechanism has produced a record for
     // SOMETHING. Computed here but applied AFTER the loop, so the coverage
     // line — the count of what this check cannot see — is still reported.
-    let mechanism_has_run = any_scheduled_record_exists(&logs_dir);
+    // How long run records have existed AT ALL, from the oldest one found.
+    // `None` = the mechanism has never produced a record on this vault.
+    let mechanism_age_days = oldest_scheduled_record_age_days(&logs_dir, today);
+    let mechanism_has_run = mechanism_age_days.is_some();
 
     let mut silent: Vec<String> = Vec::new();
     let mut observed = 0usize;
@@ -1184,10 +1243,23 @@ fn scheduler_silent_runs_check(vault_root: &Path, logs_folder: &str) -> DoctorRe
         observed += 1;
         let tolerance = cadence.tolerance_days();
         match newest_scheduled_record_age_days(&logs_dir, skill, today) {
-            // "Never" is only evidence once the mechanism has produced a record
-            // for something. Before that it means "this feature is new", not
-            // "this job is broken".
-            None if !mechanism_has_run => {}
+            // "Never" is only evidence once the mechanism has been RUNNING long
+            // enough for THIS entry to have had a window.
+            //
+            // A global "has any record appeared" flag is not enough, and shipped
+            // as a live false-accusation: the moment one daily entry produced a
+            // record, every other entry was accused of never running — including
+            // a monthly one whose next fire was three weeks away, and including
+            // healthy daily entries whose own window simply had not come round
+            // yet. On the release machine, the epic's OWN verification runs
+            // flipped the flag and made two healthy jobs look dead.
+            //
+            // `mechanism_age_days` is the age of the OLDEST record, i.e. how
+            // long records have existed at all. If that is shorter than this
+            // entry's tolerance, absence proves nothing about this entry —
+            // whatever other entries have done. Platform-neutral, per-entry, and
+            // it expires on its own.
+            None if mechanism_age_days.is_none_or(|age| age < tolerance) => {}
             None => silent.push(format!(
                 "/{skill} ({}) — no scheduled run recorded, ever",
                 cadence.describe()
@@ -1292,13 +1364,17 @@ fn scheduler_log_dir_check(vault_root: &Path) -> DoctorResult {
     };
     if entries == 0 || !cfg!(target_os = "macos") {
         // No entries, or a backend that captures output elsewhere.
-        return scheduler_log_dir_verdict(entries, None);
+        return scheduler_log_dir_verdict(entries, None, None);
     }
     let ctx = match crate::commands::register_schedule::build_scheduler_context(vault_root) {
         Ok(c) => c,
         Err(_) => return DoctorResult::ok(SCHEDULER_LOG_DIR_CHECK, "skipped — context unresolved"),
     };
-    scheduler_log_dir_verdict(entries, Some(&ctx.log_base_path))
+    scheduler_log_dir_verdict(
+        entries,
+        Some(&ctx.log_base_path),
+        skill_mode_plists_are_current(),
+    )
 }
 
 /// The verdict itself, separated from resolution so it is testable without
@@ -1310,7 +1386,16 @@ fn scheduler_log_dir_check(vault_root: &Path) -> DoctorResult {
 /// directory, so a check that inlined the `is_dir()` could only be exercised by
 /// mutating a process-global env var, which is exactly the kind of test that
 /// passes against the developer's own machine state.
-fn scheduler_log_dir_verdict(entries: usize, log_dir: Option<&Path>) -> DoctorResult {
+/// `skill_mode_is_current`: do the plists ON DISK already carry the v3.4.23
+/// shape (no redirect)? `None` = could not tell. Only when this is `Some(true)`
+/// may the message claim skill-mode entries recreate the directory themselves —
+/// the fix lives in the plist, not the binary, so upgrading alone does not
+/// deliver it, and saying otherwise sends a user to fix half their problem.
+fn scheduler_log_dir_verdict(
+    entries: usize,
+    log_dir: Option<&Path>,
+    skill_mode_is_current: Option<bool>,
+) -> DoctorResult {
     if entries == 0 {
         return DoctorResult::ok(SCHEDULER_LOG_DIR_CHECK, "no scheduled entries");
     }
@@ -1328,12 +1413,22 @@ fn scheduler_log_dir_verdict(entries: usize, log_dir: Option<&Path>) -> DoctorRe
     } else {
         DoctorResult::warn(
             SCHEDULER_LOG_DIR_CHECK,
-            format!(
-                "{} is missing — command-mode entries will fail with EX_CONFIG 78 and no \
-                 output; skill-mode entries recreate it themselves ({entries} entr{} total)",
-                dir.display(),
-                plural_y(entries)
-            ),
+            match skill_mode_is_current {
+                Some(true) => format!(
+                    "{} is missing — command-mode entries will fail with EX_CONFIG 78 and no \
+                     output; skill-mode entries recreate it themselves ({entries} entr{} total)",
+                    dir.display(),
+                    plural_y(entries)
+                ),
+                _ => format!(
+                    "{} is missing — ALL {entries} scheduled entr{} will fail with EX_CONFIG 78 \
+                     and no output, because the registered plists still redirect into it. \
+                     Run `onebrain schedule register` to apply the v3.4.23 fix, then \
+                     `doctor --fix`",
+                    dir.display(),
+                    plural_y(entries)
+                ),
+            },
         )
     }
 }
@@ -8265,6 +8360,72 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_plist_must_not_be_told_skill_mode_self_heals() {
+        // The fix lives in the PLIST, not the binary. Until the user
+        // re-registers, their skill-mode plists still redirect — so telling
+        // them "skill-mode entries recreate it themselves" sends them to fix
+        // half their problem while four jobs die silently. Caught by the
+        // full-epic audit, in a message this release itself added.
+        let d = tempdir().unwrap();
+        let gone = d.path().join("Library/Logs/onebrain");
+
+        let stale = scheduler_log_dir_verdict(4, Some(&gone), Some(false));
+        assert_eq!(stale.status, DoctorStatus::Warn, "{}", stale.message);
+        assert!(
+            !stale.message.contains("recreate it themselves"),
+            "must not promise self-healing to a stale plist: {}",
+            stale.message
+        );
+        assert!(
+            stale.message.contains("ALL 4") && stale.message.contains("schedule register"),
+            "must say what is actually true and how to fix it: {}",
+            stale.message
+        );
+
+        // Unknown is treated as stale — pessimistic, never reassuring.
+        let unknown = scheduler_log_dir_verdict(4, Some(&gone), None);
+        assert!(
+            !unknown.message.contains("recreate it themselves"),
+            "unknown must not reassure: {}",
+            unknown.message
+        );
+
+        // Only a proven-current plist earns the reassuring wording.
+        let current = scheduler_log_dir_verdict(4, Some(&gone), Some(true));
+        assert!(
+            current.message.contains("recreate it themselves"),
+            "a current plist gets the accurate, narrower claim: {}",
+            current.message
+        );
+    }
+
+    #[test]
+    fn an_entry_whose_window_has_not_come_round_is_not_accused() {
+        // A global "some record exists" flag made every recordless entry look
+        // dead the moment ANY entry produced one — including a monthly job
+        // three weeks from its next fire, and including healthy daily jobs.
+        // On the release machine the epic's OWN verification runs flipped that
+        // flag and made two healthy jobs look dead. The baseline must be how
+        // long records have existed, compared against EACH entry's tolerance.
+        let d = silent_vault(
+            "  - cron: \"0 9 * * *\"\n    skill: /daily\n\
+             \x20 - cron: \"0 3 1 * *\"\n    skill: /doctor\n",
+            &[("daily", false), ("doctor", false)],
+        );
+        // Records have existed for ONE day, via /daily only.
+        write_record(d.path(), "daily", 0, true);
+
+        let r = scheduler_silent_runs_check(d.path(), "07-logs");
+
+        assert!(
+            !r.message.contains("/doctor"),
+            "a monthly entry cannot be judged by a one-day-old mechanism: {}",
+            r.message
+        );
+        assert_eq!(r.status, DoctorStatus::Ok, "{}", r.message);
+    }
+
+    #[test]
     fn a_fresh_upgrade_with_no_records_yet_does_not_accuse_healthy_jobs() {
         // Caught by running against a real vault: shipped 3.4.22 reported "all
         // producing output" while the new check reported four jobs as never
@@ -8306,6 +8467,7 @@ mod tests {
              \x20 - cron: \"0 8 * * *\"\n    skill: /digest\n",
             &[("daily", false), ("digest", false)],
         );
+        write_record(d.path(), "daily", 90, true); // mechanism has existed 90d
         write_record(d.path(), "daily", 0, true); // only /daily has one
 
         let r = scheduler_silent_runs_check(d.path(), "07-logs");
@@ -8338,7 +8500,8 @@ mod tests {
              \x20 - cron: \"0 8 * * *\"\n    skill: /digest\n",
             &[("daily", false), ("digest", false)],
         );
-        write_record(d.path(), "digest", 0, true); // mechanism is live
+        write_record(d.path(), "digest", 90, true); // mechanism has existed 90d
+        write_record(d.path(), "digest", 0, true); // and is current
 
         // A manual /daily whose harness output quoted a real record.
         let today = chrono::Local::now().date_naive();
@@ -8391,7 +8554,8 @@ mod tests {
              \x20 - cron: \"0 8 * * *\"\n    skill: /digest\n",
             &[("daily", false), ("digest", false)],
         );
-        write_record(d.path(), "digest", 0, true); // mechanism is live
+        write_record(d.path(), "digest", 90, true); // mechanism has existed 90d
+        write_record(d.path(), "digest", 0, true); // and is current
 
         // Hand-written, UNDEFANGED: a manual record quoting the marker inside
         // its fenced output block, exactly as a pre-fix record would look.
@@ -8433,9 +8597,11 @@ mod tests {
             &[("daily", false), ("digest", false)],
         );
         write_record(d.path(), "daily", 0, false); // manual, today
-                                                   // /digest carries a SCHEDULED record so the mechanism is demonstrably
-                                                   // live. Without it the fresh-upgrade grace period would suppress the
-                                                   // warning and this test would pass for entirely the wrong reason.
+                                                   // /digest carries SCHEDULED records so the mechanism is demonstrably
+                                                   // live, and has been for long enough to judge a daily entry. Without
+                                                   // the aged one the per-entry baseline would suppress the warning and
+                                                   // this test would pass for entirely the wrong reason.
+        write_record(d.path(), "digest", 90, true);
         write_record(d.path(), "digest", 0, true);
 
         let r = scheduler_silent_runs_check(d.path(), "07-logs");
@@ -8535,6 +8701,7 @@ mod tests {
         );
         // /tasks has a record, so the mechanism is demonstrably live and
         // /digest having none is a real signal rather than a fresh upgrade.
+        write_record(d.path(), "tasks", 90, true); // mechanism has existed 90d
         write_record(d.path(), "tasks", 0, true);
         let r = scheduler_silent_runs_check(d.path(), "07-logs");
         assert_eq!(r.status, DoctorStatus::Warn, "{r:?}");
@@ -8566,6 +8733,7 @@ mod tests {
             &[("digest", true), ("tasks", false)],
         );
         write_record(d.path(), "digest", 0, true);
+        write_record(d.path(), "tasks", 90, true); // mechanism has existed 90d
         write_record(d.path(), "tasks", 0, true);
         let r = scheduler_silent_runs_check(d.path(), "07-logs");
         assert_eq!(r.status, DoctorStatus::Ok, "{r:?}");
@@ -8604,7 +8772,7 @@ mod tests {
     fn scheduler_log_dir_warns_when_the_directory_is_missing() {
         let d = tempdir().unwrap();
         let gone = d.path().join("Library/Logs/onebrain");
-        let r = scheduler_log_dir_verdict(3, Some(&gone));
+        let r = scheduler_log_dir_verdict(3, Some(&gone), Some(true));
         assert_eq!(r.status, DoctorStatus::Warn, "got: {r:?}");
         // The message must carry enough to act on: which path, how many
         // entries, and what the user will otherwise observe (nothing).
@@ -8634,7 +8802,7 @@ mod tests {
     #[test]
     fn scheduler_log_dir_ok_when_the_directory_exists() {
         let d = tempdir().unwrap();
-        let r = scheduler_log_dir_verdict(1, Some(d.path()));
+        let r = scheduler_log_dir_verdict(1, Some(d.path()), Some(true));
         assert_eq!(r.status, DoctorStatus::Ok, "got: {r:?}");
         assert!(r.message.contains("1 entry"), "msg: {}", r.message);
     }
@@ -8645,7 +8813,7 @@ mod tests {
     fn scheduler_log_dir_quiet_when_nothing_is_scheduled() {
         let d = tempdir().unwrap();
         let gone = d.path().join("nope");
-        let r = scheduler_log_dir_verdict(0, Some(&gone));
+        let r = scheduler_log_dir_verdict(0, Some(&gone), Some(true));
         assert_eq!(r.status, DoctorStatus::Ok, "got: {r:?}");
         assert!(
             r.message.contains("no scheduled entries"),
@@ -8658,7 +8826,7 @@ mod tests {
     /// history — neither can fail this way, so neither gets a warning.
     #[test]
     fn scheduler_log_dir_not_applicable_off_launchd() {
-        let r = scheduler_log_dir_verdict(2, None);
+        let r = scheduler_log_dir_verdict(2, None, Some(true));
         assert_eq!(r.status, DoctorStatus::Ok, "got: {r:?}");
         assert!(r.message.contains("not applicable"), "msg: {}", r.message);
     }
@@ -8670,12 +8838,12 @@ mod tests {
         let d = tempdir().unwrap();
         let target = d.path().join("Library/Logs/onebrain");
         assert_eq!(
-            scheduler_log_dir_verdict(1, Some(&target)).status,
+            scheduler_log_dir_verdict(1, Some(&target), Some(true)).status,
             DoctorStatus::Warn
         );
         std::fs::create_dir_all(&target).unwrap();
         assert_eq!(
-            scheduler_log_dir_verdict(1, Some(&target)).status,
+            scheduler_log_dir_verdict(1, Some(&target), Some(true)).status,
             DoctorStatus::Ok
         );
     }
