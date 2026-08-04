@@ -109,7 +109,7 @@ fn find_record(vault: &Path, entry: &str) -> Option<String> {
         .and_then(|p| fs::read_to_string(p).ok())
 }
 
-fn run_skill(vault: &Path, harness: &Path, scheduled: bool) -> std::process::Output {
+fn run_skill(vault: &Path, harness: &Path) -> std::process::Output {
     let mut cmd = Command::cargo_bin("onebrain").unwrap();
     // HOME must be pinned inside the fixture. `write_job_log` resolves
     // `default_log_dir($HOME)` and APPENDS the child's entire captured output,
@@ -133,11 +133,6 @@ fn run_skill(vault: &Path, harness: &Path, scheduled: bool) -> std::process::Out
             "--skill",
             "daily",
         ]);
-    if scheduled {
-        cmd.env("ONEBRAIN_SCHEDULED", "1");
-    } else {
-        cmd.env_remove("ONEBRAIN_SCHEDULED");
-    }
     cmd.output().unwrap()
 }
 
@@ -147,33 +142,13 @@ fn a_failing_run_still_leaves_a_record() {
     write_minimal_vault(d.path());
     let mock = write_mock(d.path(), "boom", 3);
 
-    let out = run_skill(d.path(), &mock, true);
+    let out = run_skill(d.path(), &mock);
     assert_eq!(out.status.code(), Some(3), "exit code propagates");
 
     let body = find_record(d.path(), "daily")
         .expect("a FAILING run must still leave a record — that is the point");
     assert!(body.contains("❌"), "failure is legible: {body}");
     assert!(body.contains("exit 3"), "exit code named: {body}");
-}
-
-#[test]
-fn a_scheduled_run_is_tagged_scheduled_and_a_manual_one_is_not() {
-    // doctor's staleness check counts ONLY scheduled runs. Without the marker
-    // one manual run would make a week-dead cron job look alive.
-    let d = tempdir().unwrap();
-    write_minimal_vault(d.path());
-    let mock = write_mock(d.path(), "ok", 0);
-
-    run_skill(d.path(), &mock, true);
-    let sched = find_record(d.path(), "daily").expect("record written");
-    assert!(sched.contains("scheduled"), "tagged scheduled: {sched}");
-
-    let d2 = tempdir().unwrap();
-    write_minimal_vault(d2.path());
-    let mock2 = write_mock(d2.path(), "ok", 0);
-    run_skill(d2.path(), &mock2, false);
-    let manual = find_record(d2.path(), "daily").expect("record written");
-    assert!(manual.contains("manual"), "tagged manual: {manual}");
 }
 
 #[test]
@@ -184,7 +159,7 @@ fn a_record_failure_does_not_fail_the_run() {
     fs::write(d.path().join("07-logs"), "not a directory").unwrap();
     let mock = write_mock(d.path(), "fine", 0);
 
-    let out = run_skill(d.path(), &mock, true);
+    let out = run_skill(d.path(), &mock);
 
     assert_eq!(
         out.status.code(),
@@ -203,7 +178,7 @@ fn the_child_output_still_reaches_our_stdout() {
     write_minimal_vault(d.path());
     let mock = write_mock(d.path(), "HELLO_FROM_CHILD", 0);
 
-    let out = run_skill(d.path(), &mock, true);
+    let out = run_skill(d.path(), &mock);
 
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("HELLO_FROM_CHILD"),
@@ -222,7 +197,7 @@ fn a_child_flooding_stderr_does_not_deadlock() {
     write_minimal_vault(d.path());
     let path = write_flood_mock(d.path());
 
-    let out = run_skill(d.path(), &path, true);
+    let out = run_skill(d.path(), &path);
 
     assert_eq!(out.status.code(), Some(0), "completed without deadlocking");
     assert!(

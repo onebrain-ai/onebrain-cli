@@ -583,25 +583,6 @@ pub fn generate_plist(
     // Command-mode entries KEEP the redirect: launchd execs their binary
     // directly (recurring_command_block), so no OneBrain process exists to own a
     // log. For them this redirect is the only output channel there is.
-    // Skill-mode runs are marked scheduler-initiated so the vault run record can
-    // tell them apart from a human typing `onebrain skill run`. Without the
-    // marker, doctor's staleness check would accept one manual run as proof that
-    // a cron job is alive — and would have been satisfied by the operator's own
-    // `launchctl kickstart` during the platform proof.
-    //
-    // Command mode gets no marker: launchd execs its binary directly, so no
-    // OneBrain process is there to read it.
-    let env_block = if is_command_mode(entry) {
-        String::new()
-    } else {
-        "\x20   <key>EnvironmentVariables</key>\n\
-         \x20   <dict>\n\
-         \x20       <key>ONEBRAIN_SCHEDULED</key>\n\
-         \x20       <string>1</string>\n\
-         \x20   </dict>\n"
-            .to_string()
-    };
-
     let redirect = if is_command_mode(entry) {
         let log_base = ctx.log_base_path.to_string_lossy();
         format!(
@@ -630,7 +611,6 @@ pub fn generate_plist(
          {}\n\
          \x20   </array>\n\
          {}\n\
-         {env_block}\
          {redirect}\
          \x20   <key>RunAtLoad</key>\n\
          \x20   <false/>\n\
@@ -712,37 +692,6 @@ mod tests {
         assert!(
             out.contains("<key>ProgramArguments</key>"),
             "still a valid job: {out}"
-        );
-    }
-
-    #[test]
-    fn skill_mode_plist_marks_the_run_as_scheduled() {
-        // The vault run record uses ONEBRAIN_SCHEDULED to distinguish a cron
-        // run from a human typing `onebrain skill run`. Without the marker in
-        // the plist, every scheduled run records as "manual" and doctor's
-        // staleness check silently counts nothing — a guard reporting green
-        // over an empty set.
-        let out = generate_plist(&skill_entry("daily", "0 9 * * *"), &test_ctx())
-            .expect("plist generates");
-        assert!(
-            out.contains("<key>EnvironmentVariables</key>"),
-            "env block present: {out}"
-        );
-        assert!(
-            out.contains("<key>ONEBRAIN_SCHEDULED</key>"),
-            "marker present: {out}"
-        );
-    }
-
-    #[test]
-    fn command_mode_plist_gets_no_scheduled_marker() {
-        // launchd execs a command-mode binary directly — no OneBrain process
-        // reads this, so emitting it would be cargo-culted noise.
-        let entry = command_entry("onebrain", &["search", "reindex"], "0 3 * * 0");
-        let out = generate_plist(&entry, &test_ctx()).expect("plist generates");
-        assert!(
-            !out.contains("ONEBRAIN_SCHEDULED"),
-            "no marker for command mode: {out}"
         );
     }
 
@@ -1630,12 +1579,8 @@ mod tests {
         assert!(out.contains("<key>Weekday</key>\n            <integer>3</integer>"));
         assert!(out.contains("<key>Weekday</key>\n            <integer>5</integer>"));
         let dict_count = out.matches("<dict>").count();
-        // 1 top-level <dict> (the plist root) + 3 StartCalendarInterval dicts
-        // + 1 EnvironmentVariables dict (v3.4.23: skill-mode entries carry
-        // ONEBRAIN_SCHEDULED so the vault run record can tell a cron run from a
-        // human one). Command-mode entries get no env dict, so the equivalent
-        // count there is still 4.
-        assert_eq!(dict_count, 5, "out:\n{out}");
+        // 1 top-level <dict> (the plist root) + 3 StartCalendarInterval dicts.
+        assert_eq!(dict_count, 4, "out:\n{out}");
     }
 
     #[test]

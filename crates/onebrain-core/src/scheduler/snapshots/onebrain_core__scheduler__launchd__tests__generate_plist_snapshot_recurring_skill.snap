@@ -27,11 +27,6 @@ expression: out
         <key>Hour</key>
         <integer>9</integer>
     </dict>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>ONEBRAIN_SCHEDULED</key>
-        <string>1</string>
-    </dict>
     <key>RunAtLoad</key>
     <false/>
 </dict>
