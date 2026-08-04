@@ -1070,6 +1070,13 @@ fn record_marks_a_scheduled_run(body: &str) -> bool {
 /// `Some(false)` if any skill-mode plist still predates v3.4.23 · `Some(true)`
 /// if every skill-mode plist is current · `None` if there are no skill-mode
 /// plists to judge, or the directory cannot be read.
+///
+/// Not `cfg`-gated to macOS despite only the macOS resolver calling it: the
+/// logic is pure string matching over a plist body, so it stays testable on
+/// every platform. It IS unused in the non-macOS non-test build, hence the
+/// conditional allow — CI's Linux clippy caught that; macOS clippy structurally
+/// cannot, because the caller exists there.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn classify_plists_in(dir: &Path) -> Option<bool> {
     let mut saw_skill_mode = false;
     for e in std::fs::read_dir(dir).ok()?.flatten() {
