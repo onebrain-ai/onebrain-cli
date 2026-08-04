@@ -22,7 +22,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 - `doctor`'s `scheduled output` reads run records instead of depending on each skill choosing to log, and still states what it cannot see ([#377](https://github.com/onebrain-ai/onebrain-cli/issues/377))
 - A manual `onebrain skill run` no longer counts as proof a cron job is alive; only records tagged `scheduled` do ([#377](https://github.com/onebrain-ai/onebrain-cli/issues/377))
-- `doctor`'s missing-log-directory warning now names only the entries it is fatal for, instead of claiming every entry will die ([#377](https://github.com/onebrain-ai/onebrain-cli/issues/377))
+- `doctor`'s missing-log-directory warning reads the registered plists and says what is true of them: all entries die while the plists are pre-v3.4.23, only command-mode ones once they are current ([#377](https://github.com/onebrain-ai/onebrain-cli/issues/377))
 
 ### Upgrade notes
 **Run `onebrain schedule register` after upgrading.** The fix lives in the plist, not the binary —
