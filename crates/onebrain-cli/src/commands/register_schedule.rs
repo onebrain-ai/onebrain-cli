@@ -111,10 +111,22 @@ fn run_with(
     // Pass 1 — structural + field-format validation. We do NOT mutate input
     // (mirrors Bun's "callers may pass their own entry array" contract).
     // Delegates to `validate_entry_fully`, which `--test` also calls — a second
-    // copy of these rules is how the two commands drifted apart in the first
-    // place (#375). Still fail-fast here; Task B2 (#376) makes it collect.
+    // copy of these rules is how the two commands drifted apart (#375).
+    //
+    // Collect ALL failures before returning: this is the pass `--dry-run` exists
+    // to serve, and stopping at the first bad entry meant the one command meant
+    // for checking a config could not list its mistakes, so a user fixed and
+    // reran N times for N mistakes (#376). Collecting does NOT mean proceeding —
+    // nothing below runs unless every entry validated, which is what preserves
+    // the "nothing changed" ordering documented further down.
+    let mut problems: Vec<String> = Vec::new();
     for entry in &entries {
-        validate_entry_fully(&vault, entry)?;
+        if let Err(e) = validate_entry_fully(&vault, entry) {
+            problems.push(e.to_string());
+        }
+    }
+    if !problems.is_empty() {
+        return Err(anyhow!(problems.join("\n")));
     }
 
     // Pass 2 — build the resolved entry list. Command-mode entries are
@@ -981,6 +993,44 @@ mod tests {
     /// config-loading path the real commands do.
     fn write_config(dir: &std::path::Path, yaml: &str) {
         std::fs::write(dir.join("onebrain.yml"), yaml).unwrap();
+    }
+
+    #[test]
+    fn dry_run_lists_every_bad_entry_not_just_the_first() {
+        // The command that exists to CHECK a config could not list a config's
+        // mistakes — it stopped at the first, so a user fixed-and-reran N times
+        // for N mistakes (#376).
+        //
+        // All three fail on their CRON, which `validate_entry_fully` checks
+        // before `validate_schedulable` — so no SKILL.md files are needed here.
+        let d = tempfile::tempdir().unwrap();
+        write_config(
+            d.path(),
+            "schedule:\n\
+             \x20 - cron: \"bad one\"\n    skill: /daily\n\
+             \x20 - cron: \"also bad\"\n    skill: /digest\n\
+             \x20 - cron: \"third bad\"\n    skill: /weekly\n",
+        );
+
+        let err = run_with(
+            Some(d.path().into()),
+            true,
+            false,
+            false,
+            None,
+            false,
+            None,
+            true,
+        )
+        .expect_err("an invalid config must fail");
+        let msg = err.to_string();
+
+        for needle in ["bad one", "also bad", "third bad"] {
+            assert!(
+                msg.contains(needle),
+                "must name every bad entry; missing {needle}: {msg}"
+            );
+        }
     }
 
     #[test]

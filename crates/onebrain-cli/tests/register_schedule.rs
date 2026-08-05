@@ -1122,3 +1122,51 @@ fn linux_dry_run_prints_both_units() {
         "a dry run must write nothing"
     );
 }
+
+/// The "nothing changed" ordering the function documents must survive the
+/// change from fail-fast to collect-all. Collecting errors must not mean
+/// proceeding past them.
+///
+/// This is an INTEGRATION test on purpose. `run_with(dry_run=false)` reaches
+/// `build_scheduler_context` -> `dirs::home_dir()` and writes real plists into
+/// the caller's ~/Library/LaunchAgents. There is no injection seam in that
+/// path — `ctx` is built inside `run_with` and `backend::install(entry, &ctx)`
+/// is called inline in the same function. Pinning HOME at the PROCESS level is
+/// the only mechanism that actually redirects `dirs::home_dir()`;
+/// `ONEBRAIN_SCHEDULER_NO_ACTIVATE=1` additionally keeps `launchctl` out of it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_bad_entry_still_installs_nothing() {
+    // First entry valid, second invalid. Fail-fast-after-install would leave
+    // com.onebrain.daily.plist behind; validate-all-first leaves nothing.
+    //
+    // The second entry MUST be a DIFFERENT skill. Skill-mode labels carry no
+    // discriminator (`sanitize_label(skill.trim_start_matches('/'))`), so two
+    // `/daily` entries normalize to the same artifact and `detect_collisions`
+    // aborts BEFORE the install loop — which would make the sabotage for this
+    // test unable to fire, since collisions abort in the same place the moved
+    // check would have.
+    let v = write_skill_vault(
+        "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n\
+         \x20 - cron: \"not a cron\"\n    skill: /digest\n",
+    );
+    // write_skill_vault only creates the `daily` skill; the second entry needs
+    // its own schedulable skill or it fails validation for the wrong reason.
+    write_skill(v.path(), "digest", "name: digest\nschedulable: true");
+    let home = tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("Library/LaunchAgents")).unwrap();
+
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
+        .args(["register-schedule"]) // NOT --dry-run: the install path is the point
+        .current_dir(v.path())
+        .env("HOME", home.path())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
+        .assert()
+        .failure();
+
+    let agents = home.path().join("Library/LaunchAgents");
+    let n = std::fs::read_dir(&agents).unwrap().count();
+    assert_eq!(n, 0, "a config with any invalid entry must install NOTHING");
+}
