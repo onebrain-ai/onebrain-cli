@@ -110,28 +110,11 @@ fn run_with(
 
     // Pass 1 — structural + field-format validation. We do NOT mutate input
     // (mirrors Bun's "callers may pass their own entry array" contract).
+    // Delegates to `validate_entry_fully`, which `--test` also calls — a second
+    // copy of these rules is how the two commands drifted apart in the first
+    // place (#375). Still fail-fast here; Task B2 (#376) makes it collect.
     for entry in &entries {
-        validate_entry(entry)
-            .map_err(|e| anyhow!("Invalid schedule entry: {}", inner_reason(&e)))?;
-        // Up front, NOT at render time. The renderers refuse control characters
-        // too (defence in depth), but reaching the check only from inside the
-        // per-entry install loop meant entry 3 failing after entries 1 and 2 had
-        // already been written AND `launchctl bootstrap`ed, with no rollback —
-        // defeating the "nothing changed" ordering this function documents
-        // below. It also stopped `--dry-run` at the first bad entry, so the one
-        // command meant for checking a config could not list its mistakes.
-        onebrain_core::scheduler::entry::reject_control_chars_in_entry(entry)
-            .map_err(|e| anyhow!("Invalid schedule entry: {}", inner_reason(&e)))?;
-        if is_one_shot(entry) {
-            let at = entry.at.as_deref().unwrap();
-            validate_at(at).map_err(|e| anyhow!("Invalid at \"{at}\": {}", inner_reason(&e)))?;
-        } else if let Some(cron) = &entry.cron {
-            validate_cron(cron)
-                .map_err(|e| anyhow!("Invalid cron \"{cron}\": {}", inner_reason(&e)))?;
-        }
-        if is_skill_mode(entry) {
-            validate_schedulable(&vault, entry)?;
-        }
+        validate_entry_fully(&vault, entry)?;
     }
 
     // Pass 2 — build the resolved entry list. Command-mode entries are
@@ -324,6 +307,34 @@ pub(crate) fn read_vault_config(vault: &Path) -> Result<ScheduleConfig> {
 // reached. Escaping at the sink also covers the paths the ban never saw at
 // all (recurring command-mode args were unchecked), so this is a net gain in
 // safety, not a trade.
+
+/// Validate one entry exactly as `register`'s Pass 1 does.
+///
+/// Shared so `--test` and `register` cannot disagree about what a valid entry
+/// is. They did: `--test` ran none of these and accepted entries `register`
+/// refuses outright — including control characters no scheduler format can
+/// carry — then executed them (#375). The permissive command was the one you
+/// reach for to CHECK a config before committing to it.
+fn validate_entry_fully(vault: &Path, entry: &ScheduleEntry) -> Result<()> {
+    validate_entry(entry).map_err(|e| anyhow!("Invalid schedule entry: {}", inner_reason(&e)))?;
+    // Up front, NOT at render time. The renderers refuse control characters too
+    // (defence in depth), but reaching the check only from inside the per-entry
+    // install loop meant entry 3 failing after entries 1 and 2 had already been
+    // written AND `launchctl bootstrap`ed, with no rollback.
+    onebrain_core::scheduler::entry::reject_control_chars_in_entry(entry)
+        .map_err(|e| anyhow!("Invalid schedule entry: {}", inner_reason(&e)))?;
+    if is_one_shot(entry) {
+        let at = entry.at.as_deref().unwrap();
+        validate_at(at).map_err(|e| anyhow!("Invalid at \"{at}\": {}", inner_reason(&e)))?;
+    } else if let Some(cron) = &entry.cron {
+        validate_cron(cron)
+            .map_err(|e| anyhow!("Invalid cron \"{cron}\": {}", inner_reason(&e)))?;
+    }
+    if is_skill_mode(entry) {
+        validate_schedulable(vault, entry)?;
+    }
+    Ok(())
+}
 
 /// Read the target skill's `SKILL.md` and confirm it declares schedulability.
 fn validate_schedulable(vault: &Path, entry: &ScheduleEntry) -> Result<()> {
@@ -778,16 +789,32 @@ fn print_status_with(config: &ScheduleConfig, ctx: &SchedulerContext) -> Result<
 /// schedule entry actually works end-to-end (claude binary on PATH, vault
 /// path correct, args parsed) before committing to a recurring cron line.
 ///
-/// Implementation: walk vault.yml to find the entry matching `skill`, build
-/// the same argv the launchd plist would emit (`onebrain run-skill --vault
-/// <path> --skill <name> [--arg key=value ...]` for skill-mode entries, or
-/// the raw `command + args[]` for command-mode entries), spawn it
+/// **Skill-mode entries only.** Command-mode entries cannot be tested this way;
+/// the matcher below returns `false` for them and the not-found error says so
+/// explicitly. This comment previously claimed command-mode support that the
+/// code never had, so every `--test` against a command-mode entry failed with
+/// `no schedule: entry matching skill …` — which reads as a typo rather than an
+/// unsupported entry type (#375).
+///
+/// Implementation: walk the config to find the skill-mode entry matching
+/// `skill`, build the same argv the launchd plist would emit (`onebrain
+/// run-skill --vault <path> --skill <name> [--arg key=value ...]`), spawn it
 /// synchronously with the parent process's env, and stream stdout/stderr.
 /// Exit code is propagated.
 fn test_run(vault: &Path, skill: &str) -> Result<()> {
     use std::process::{Command, Stdio};
 
     let config = read_vault_config(vault)?;
+
+    // Validate EVERY entry before matching, exactly as `register` does.
+    // Validating only the matched entry would still accept a config `register`
+    // refuses (a control character in a different entry), so `--test` would
+    // report a config as fine that cannot be registered — the parity this
+    // function is supposed to have (#375).
+    for entry in &config.schedule {
+        validate_entry_fully(vault, entry)?;
+    }
+
     let target = config
         .schedule
         .iter()
@@ -805,10 +832,30 @@ fn test_run(vault: &Path, skill: &str) -> Result<()> {
             }
         })
         .ok_or_else(|| {
-            anyhow!(
-                "no `schedule:` entry matching skill `{skill}` in onebrain.yml — \
-                 run `onebrain schedule register --status` to list entries"
-            )
+            // Distinguish "no such entry" from "that entry is command-mode".
+            // Reporting the latter as the former reads as a typo and sends the
+            // user hunting a misspelling that isn't there (#375).
+            let asked = skill.trim_start_matches('/');
+            let is_command_mode_entry = config.schedule.iter().any(|e| {
+                is_command_mode(e)
+                    && (label_for_entry(e) == asked
+                        || e.command
+                            .as_deref()
+                            .and_then(|c| Path::new(c).file_name())
+                            .and_then(|s| s.to_str())
+                            == Some(asked))
+            });
+            if is_command_mode_entry {
+                anyhow!(
+                    "`--test` supports skill-mode entries only; `{skill}` is a command-mode \
+                     entry — run its command directly to test it"
+                )
+            } else {
+                anyhow!(
+                    "no `schedule:` entry matching skill `{skill}` in onebrain.yml — \
+                     run `onebrain schedule register --status` to list entries"
+                )
+            }
         })?;
 
     let exe = env::current_exe()
@@ -927,6 +974,59 @@ fn _unused_marker() {
 mod tests {
     use super::*;
     use onebrain_core::scheduler::SchedulerError;
+
+    /// Write an `onebrain.yml` into `dir`.
+    ///
+    /// Shared by the `--test` and `--dry-run` tests so both drive the same
+    /// config-loading path the real commands do.
+    fn write_config(dir: &std::path::Path, yaml: &str) {
+        std::fs::write(dir.join("onebrain.yml"), yaml).unwrap();
+    }
+
+    #[test]
+    fn test_run_refuses_what_register_refuses() {
+        // --test is the command you reach for to CHECK a config before
+        // committing to it. It running fewer validators than `register` is
+        // backwards: an entry register rejects outright was accepted and
+        // executed here (#375).
+        //
+        //  — NO braces. YAML's \u escape takes exactly four hex digits;
+        // `\u{0007}` fails the PARSER ("did not find expected hexadecimal
+        // number") before any validator runs, so the assertion below would
+        // stay false even after the fix.
+        let d = tempfile::tempdir().unwrap();
+        write_config(
+            d.path(),
+            "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n    args:\n      bad: \"x\\u0007y\"\n",
+        );
+
+        let err = test_run(d.path(), "daily").expect_err("a control character must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Invalid schedule entry"),
+            "must fail validation, not spawn: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_run_says_command_mode_is_unsupported_instead_of_not_found() {
+        // The doc comment promised command-mode support the matcher never had,
+        // so `--test sh` reported "no entry matching skill `sh`" — which reads
+        // as a typo and sends the user hunting a misspelling that isn't there.
+        // `--test` is skill-mode only; the error must say that (#375).
+        let d = tempfile::tempdir().unwrap();
+        write_config(
+            d.path(),
+            "schedule:\n  - cron: \"0 9 * * *\"\n    command: sh\n    args: [-c, hi]\n",
+        );
+
+        let err = test_run(d.path(), "sh").expect_err("command-mode entries are not testable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("supports skill-mode entries only"),
+            "must name the real reason, not read as a typo: {msg}"
+        );
+    }
 
     #[test]
     fn normalize_path_strips_curdir_and_pops_parentdir() {
