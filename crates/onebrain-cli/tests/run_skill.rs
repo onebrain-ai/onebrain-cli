@@ -7,7 +7,10 @@ mod support;
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+// `PathBuf` is named only by `write_mock_claude`, which is unix-gated (#383).
+#[cfg(unix)]
+use std::path::PathBuf;
 use tempfile::tempdir;
 
 /// Build a minimal vault directory with just `onebrain.yml`.
