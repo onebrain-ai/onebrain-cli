@@ -928,6 +928,21 @@ mod tests {
     use super::*;
     use onebrain_core::scheduler::SchedulerError;
 
+    /// A command guaranteed to resolve on PATH on this platform.
+    ///
+    /// The test that uses this is about `remove` and `register` deriving the
+    /// SAME label; the binary is incidental. `sh` is not on PATH on a real
+    /// Windows machine — `sh.exe` ships at `C:\Program Files\Git\bin\` but Git
+    /// deliberately keeps that directory off PATH, so the test passed only on
+    /// CI runners that happen to add it (#382).
+    fn resolvable_command() -> &'static str {
+        if cfg!(windows) {
+            "cmd"
+        } else {
+            "sh"
+        }
+    }
+
     #[test]
     fn normalize_path_strips_curdir_and_pops_parentdir() {
         let p = normalize_path(Path::new("/a/b/./c/../d"));
@@ -1095,9 +1110,10 @@ mod tests {
     #[test]
     fn remove_and_register_derive_the_same_label_for_command_entries() {
         let dir = tempfile::tempdir().unwrap();
-        let raw: ScheduleConfig = serde_yaml::from_str(
-            "schedule:\n  - cron: \"0 9 * * *\"\n    command: sh\n    args: [-c, hi]\n",
-        )
+        let raw: ScheduleConfig = serde_yaml::from_str(&format!(
+            "schedule:\n  - cron: \"0 9 * * *\"\n    command: {}\n    args: [-c, hi]\n",
+            resolvable_command(),
+        ))
         .unwrap();
 
         // Register's Pass 2 resolution:
