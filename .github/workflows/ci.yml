@@ -116,6 +116,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # A SEPARATE job, deliberately NOT a matrix leg on `clippy` above: adding
+  # `strategy.matrix` renames that job's status context, so the bare `clippy`
+  # context branch protection requires would never report again and every PR
+  # would block forever — including the one landing this change. Same trap as
+  # the `test` job documents below, reached from the other direction.
+  #
+  # Why it exists: `clippy -D warnings` had NEVER passed on real Windows (#383).
+  # CI ran it on ubuntu-latest only, so 15 errors in `cfg(windows)`- and
+  # `cfg(unix)`-gated code were invisible — no Linux or macOS run type-checks
+  # them. `--all-targets` also aborts at the first failing target, which hid 11
+  # of the 15 behind the first 4; enumerate with `--keep-going`.
+  clippy-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
   # Lex-only tier gate: the `--no-default-features` build drops the `semantic`
   # feature (no fastembed / ONNX runtime) and is what ships on release targets
   # with no ONNX Runtime prebuilt (musl, ARM32, x86_64 macOS —

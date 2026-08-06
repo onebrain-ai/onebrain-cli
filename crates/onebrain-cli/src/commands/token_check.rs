@@ -230,17 +230,17 @@ thread_local! {
 /// RAII guard that clears it on drop (so a panicking test can't leak the
 /// override onto a reused pool thread). Consumed by the next
 /// `query_daemon_leg_with_deadline` call via `take()`.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[must_use]
 fn override_daemon_leg(leg: DaemonLeg) -> DaemonLegGuard {
     DAEMON_LEG_OVERRIDE.with(|c| *c.borrow_mut() = Some(leg));
     DaemonLegGuard
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 struct DaemonLegGuard;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for DaemonLegGuard {
     fn drop(&mut self) {
         DAEMON_LEG_OVERRIDE.with(|c| *c.borrow_mut() = None);

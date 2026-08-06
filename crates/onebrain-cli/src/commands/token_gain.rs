@@ -1177,6 +1177,7 @@ mod tests {
     // to the daemon, and (c) a genuine Direct lock reports an actionable message
     // instead of the raw redb error.
 
+    #[cfg(unix)]
     use onebrain_token::PivotRow;
     #[cfg(unix)]
     use std::io::{Read, Write};
@@ -1421,6 +1422,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(unix)]
     type CapturedReqs = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
     /// A minimal HTTP/1.1 responder for the two routes `resolve_all_epoch_pivot`

@@ -31,7 +31,7 @@ fn write_mock(dir: &Path, msg: &str, code: i32) -> PathBuf {
         // `@echo` avoids echoing the command itself; `exit /b` sets ERRORLEVEL
         // without killing the whole cmd host.
         fs::write(&path, format!("@echo {msg}\r\n@exit /b {code}\r\n")).unwrap();
-        return path;
+        path
     }
     #[cfg(unix)]
     {
@@ -60,7 +60,7 @@ fn write_flood_mock(dir: &Path) -> PathBuf {
              @exit /b 0\r\n",
         )
         .unwrap();
-        return path;
+        path
     }
     #[cfg(unix)]
     {
