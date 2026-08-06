@@ -128,7 +128,7 @@ Interactive commands print human-readable text; every command also speaks struct
 - [ ] **v3.8** *(may not ship)* — **remaining cleanup**: full daemon refactor of surfaces beyond mcp + search + daily-brief precompute — only if not already absorbed by v3.4 + v3.7.
 
 ### 📦 Phase 3 · bundles (v3.9–v3.12)
-- [ ] Bundle CLI (`onebrain bundle install/list/info/lint/…`) · four first-party bundles (`dashboard` · `synthesis` · `research` · `scheduler`) · core skills slimmed 32 → 18 · `onebrain.run/bundles` portal.
+- [ ] Bundle CLI (`onebrain bundle …`) · four first-party bundles (`dashboard` · `synthesis` · `research` · `scheduler`) · core skills slimmed 32 → 18 · `onebrain.run/bundles` portal.
 
 ### 🔭 Signal-driven (Tier 2/3)
 - [ ] Broader harness support — Codex, Qwen, and other agentic harnesses beyond today's Claude Code + Gemini CLI.

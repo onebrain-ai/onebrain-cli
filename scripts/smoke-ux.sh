@@ -29,7 +29,7 @@ BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
 run() {
     echo
     echo "=== $* ==="
-    # || true so a non-zero exit (e.g., E_NOT_IMPLEMENTED = 72) doesn't kill
+    # || true so a non-zero exit (e.g., an unknown command = 2) doesn't kill
     # the whole smoke run. We're collecting visual output, not gating.
     "$BIN" "$@" 2>&1 | head -40 || true
 }

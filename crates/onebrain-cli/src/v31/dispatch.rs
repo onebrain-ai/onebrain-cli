@@ -104,9 +104,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 session_token.as_deref(),
                 &mode,
             ),
-            SessionVerb::Current => stubs::not_implemented("session current"),
-            SessionVerb::List => stubs::not_implemented("session list"),
-            SessionVerb::Get { .. } => stubs::not_implemented("session get"),
         },
 
         // ───── Checkpoint ───────────────────────────────────────────
@@ -146,18 +143,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             ScheduleVerb::List => {
                 let v = vault_flag.clone();
                 commands::register_schedule::run(v, false, false, false, None, true, None)
-            }
-            // Non-protocol verbs are vault-required (need to know which
-            // vault's plists to list / which YAML to modify).
-            ScheduleVerb::Add { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "schedule add")
-            }
-            ScheduleVerb::Remove { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "schedule remove")
-            }
-            ScheduleVerb::Status => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "schedule status")
-            }
+            } // Non-protocol verbs are vault-required (need to know which
+              // vault's plists to list / which YAML to modify).
         },
 
         // ───── Plugin ───────────────────────────────────────────────
@@ -226,8 +213,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     .map(|p| p.to_string_lossy().to_string());
                 commands::migrate::run(&name, resolved.as_deref(), vault_str.as_deref())
             }
-            PluginVerb::Status => stubs::not_implemented("plugin status"),
-            PluginVerb::Verify => stubs::not_implemented("plugin verify"),
         },
 
         // ───── Vault ────────────────────────────────────────────────
@@ -244,15 +229,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             // Scan / stats / verify need to know which vault — gate on vault
             // presence so the stub returns 64 outside (R1 C3). `current` is
             // intentionally vault-free (it reports detected:false instead).
-            VaultVerb::Scan => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "vault scan")
-            }
-            VaultVerb::Stats => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "vault stats")
-            }
-            VaultVerb::Verify => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "vault verify")
-            }
             VaultVerb::Current => vault_current::run(vault_flag.clone(), &mode),
         },
 
@@ -289,8 +265,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 )?;
                 std::process::exit(code);
             }
-            SkillVerb::List => stubs::not_implemented("skill list"),
-            SkillVerb::Bootstrap { .. } => stubs::not_implemented("skill bootstrap"),
             SkillVerb::Show { name } => {
                 let resolved = crate::vault_ctx::require(vault_flag.clone())?;
                 let code =
@@ -353,41 +327,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             }
         },
 
-        // ───── Stub-only resource groups ────────────────────────────
-        Cmd::Avatar(AvatarCmd { verb }) => match verb {
-            AvatarVerb::Start => stubs::not_implemented("avatar start"),
-            AvatarVerb::Pair => stubs::not_implemented("avatar pair"),
-            AvatarVerb::Status => stubs::not_implemented("avatar status"),
-            AvatarVerb::Revoke => stubs::not_implemented("avatar revoke"),
-            AvatarVerb::Doctor => stubs::not_implemented("avatar doctor"),
-        },
-        Cmd::Bookmark(BookmarkCmd { verb }) => match verb {
-            BookmarkVerb::List => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "bookmark list")
-            }
-            BookmarkVerb::Get { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "bookmark get")
-            }
-            BookmarkVerb::Import { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "bookmark import")
-            }
-        },
-        Cmd::Bundle(BundleCmd { verb }) => match verb {
-            BundleVerb::Install { .. } => stubs::not_implemented("bundle install"),
-            BundleVerb::Show { .. } => stubs::not_implemented("bundle show"),
-            BundleVerb::Info { .. } => stubs::not_implemented("bundle info"),
-            BundleVerb::Init { .. } => stubs::not_implemented("bundle init"),
-            BundleVerb::Lint { .. } => stubs::not_implemented("bundle lint"),
-            BundleVerb::Update { .. } => stubs::not_implemented("bundle update"),
-            BundleVerb::Remove { .. } => stubs::not_implemented("bundle remove"),
-            BundleVerb::Doctor => stubs::not_implemented("bundle doctor"),
-        },
-        Cmd::Config(ConfigCmd { verb }) => match verb {
-            ConfigVerb::Get { .. } => stubs::not_implemented("config get"),
-            ConfigVerb::Set { .. } => stubs::not_implemented("config set"),
-            ConfigVerb::List => stubs::not_implemented("config list"),
-            ConfigVerb::Init => stubs::not_implemented("config init"),
-        },
         Cmd::Daemon(DaemonCmd { verb }) => match verb {
             DaemonVerb::Start { vault } => commands::daemon::run_start(&mode, vault.as_deref()),
             DaemonVerb::Stop { vault, all } => {
@@ -400,85 +339,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             DaemonVerb::Status => commands::daemon::run_status(&mode),
             // Hidden internal verb — the detached child's body.
             DaemonVerb::Run { vault } => commands::daemon::run_internal(vault.as_deref()),
-        },
-        Cmd::Date(DateCmd { verb }) => match verb {
-            DateVerb::Today => stubs::not_implemented("date today"),
-            DateVerb::Now => stubs::not_implemented("date now"),
-            DateVerb::Format { .. } => stubs::not_implemented("date format"),
-            DateVerb::Parse { .. } => stubs::not_implemented("date parse"),
-        },
-        Cmd::Dream(DreamCmd { verb }) => match verb {
-            DreamVerb::List => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "dream list")
-            }
-            DreamVerb::Tick { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "dream tick")
-            }
-            DreamVerb::Done { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "dream done")
-            }
-            DreamVerb::Snooze { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "dream snooze")
-            }
-        },
-        Cmd::Frontmatter(FrontmatterCmd { verb }) => match verb {
-            FrontmatterVerb::Parse { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "frontmatter parse")
-            }
-            FrontmatterVerb::Extract { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "frontmatter extract")
-            }
-            FrontmatterVerb::Update { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "frontmatter update")
-            }
-        },
-        Cmd::Gateway(GatewayCmd { verb }) => match verb {
-            GatewayVerb::Telegram => stubs::not_implemented("gateway telegram"),
-        },
-        Cmd::Inbox(InboxCmd { verb }) => match verb {
-            InboxVerb::List => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "inbox list")
-            }
-            InboxVerb::Next => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "inbox next")
-            }
-            InboxVerb::Process { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "inbox process")
-            }
-        },
-        Cmd::Log(LogCmd { verb }) => match verb {
-            LogVerb::Query { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "log query")
-            }
-            LogVerb::Append { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "log append")
-            }
-            LogVerb::Rotate => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "log rotate")
-            }
-            LogVerb::Stats => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "log stats")
-            }
-        },
-        Cmd::Memory(MemoryCmd { verb }) => match verb {
-            MemoryVerb::List => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "memory list")
-            }
-            MemoryVerb::Add { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "memory add")
-            }
-            MemoryVerb::Update { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "memory update")
-            }
-            MemoryVerb::Remove { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "memory remove")
-            }
-            MemoryVerb::Promote { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "memory promote")
-            }
-            MemoryVerb::Index => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "memory index")
-            }
         },
         Cmd::Note(NoteCmd { verb }) => match verb {
             NoteVerb::Search(args) => commands::note_search::run(vault_flag.clone(), &mode, &args),
@@ -531,17 +391,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             },
         },
         Cmd::Mcp => commands::mcp::run(vault_flag.clone()),
-        Cmd::Pause(PauseCmd { verb }) => match verb {
-            PauseVerb::List => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "pause list")
-            }
-            PauseVerb::Snapshot { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "pause snapshot")
-            }
-            PauseVerb::Resume { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "pause resume")
-            }
-        },
         Cmd::Serve(args) => {
             // Fold the global `--vault` into the serve-local override so
             // `onebrain serve --vault PATH` and `--vault-dir PATH` both work.
@@ -553,12 +402,6 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Cmd::Task(TaskCmd { verb }) => match verb {
             TaskVerb::List(args) => commands::task_list::run(vault_flag.clone(), &mode, &args),
-            TaskVerb::Add { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "task add")
-            }
-            TaskVerb::Done { .. } => {
-                stubs::not_implemented_vault_required(vault_flag.clone(), "task done")
-            }
         },
         Cmd::Token(TokenCmd { verb }) => match verb {
             TokenVerb::Gain(args) => commands::token_gain::run(vault_flag.clone(), &mode, &args),

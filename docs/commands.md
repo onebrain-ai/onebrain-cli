@@ -37,7 +37,7 @@ onebrain
 | **Maintenance** | `doctor [--fix]`, `plugin update · migrate`, `schedule register` | Read-only health checks + `--fix` recipes (incl. per-key config-value validation with comment-preserving reset-to-default), self-update the binary + rewrite hooks + rebind OS scheduler artifacts, compile the `onebrain.yml schedule:` block into OS scheduler artifacts. |
 | **Diagnostics** | `vault current`, `harness detect` | Report which mechanism resolved the active vault, and which AI harness is running. |
 
-> The tree shape is **locked for v3.2+** — 200+ verbs beyond the working set above are stubbed with a stable `E_NOT_IMPLEMENTED` (exit 72) so the grammar can't drift while features land. Hidden v3.0 flat aliases (`session-init`, `qmd-reindex`, `register-hooks`, …) still dispatch, printing a one-time migration notice (silence with `ONEBRAIN_QUIET_MIGRATION=1`); they're removed no earlier than v4.
+> The tree shape was **locked for v3.2+** — verbs beyond the working set above were stubbed with a stable `E_NOT_IMPLEMENTED` (exit 72) so the grammar couldn't drift while features landed. **v3.4.24 (#334) reversed that**: the 63 verbs that only ever returned 72 were removed from the parser and now fail as unknown commands, because a shipped binary that accepts verbs it cannot perform is a trap for scripts and docs. See ADR 0006 (superseded). Hidden v3.0 flat aliases (`session-init`, `qmd-reindex`, `register-hooks`, …) still dispatch, printing a one-time migration notice (silence with `ONEBRAIN_QUIET_MIGRATION=1`); they're removed no earlier than v4.
 
 Not every target ships every search capability — see the [platform-support matrix](platform-support.md) for which binaries are semantic-search-enabled vs keyword-only.
 

@@ -1,7 +1,9 @@
 # 0006 — Locked `<noun> <verb>` command tree
 
-- **Status:** accepted
+- **Status:** partially superseded by v3.4.24 ([#334](https://github.com/onebrain-ai/onebrain-cli/issues/334))
 - **Date:** 2026-05-24
+- **Superseded:** 2026-08-06 — the stub-the-unbuilt-verbs half only. The
+  `<noun> <verb>` grammar and the hidden-alias migration remain in force.
 
 ## Context
 
@@ -13,7 +15,7 @@ Adopt a singular-noun, two-level grammar — **`onebrain <noun> <verb>`** — an
 
 - **3 root verbs:** `init`, `update`, `doctor`.
 - **Resource groups** with verbs: `session init`, `checkpoint stop/reset/orphans`, `qmd reindex/embed/status`, `vault sync/current`, `harness detect`, `plugin install/update/migrate`, `schedule register`, `skill run`.
-- The full tree (27 entries) is **locked for v3.2+**: the ~200 verbs that aren't built yet are stubbed and return a stable `E_NOT_IMPLEMENTED` (exit 72), so the grammar can't drift while features land one at a time.
+- ~~The full tree (27 entries) is **locked for v3.2+**: the ~200 verbs that aren't built yet are stubbed and return a stable `E_NOT_IMPLEMENTED` (exit 72), so the grammar can't drift while features land one at a time.~~ **Superseded by v3.4.24 (#334).** Locking the shape did prevent drift, but it also shipped a binary whose parser accepted 63 verbs it could not perform — and "hidden from `--help`" protects nothing that discovers verbs by trying them, so scripts and docs could reach a surface that did not exist. Those 63 were removed from the parser; they now fail as unknown commands (exit 2), indistinguishable from a typo. The grammar is still locked in the sense that matters: new verbs must fit `<noun> <verb>`.
 - Old flat names ship as **hidden clap aliases** that print a one-time migration notice and dispatch to the new handler. `plugin update` rewrites hook paths and launchd plists to the new names. Aliases are removed no earlier than a future major.
 
 ## Consequences
