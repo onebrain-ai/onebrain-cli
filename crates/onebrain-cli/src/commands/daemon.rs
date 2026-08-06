@@ -1630,7 +1630,7 @@ fn spawn_detached_run(log_path: &Path, vault: Option<&Path>) -> Result<u32> {
             // SAFETY: plain FFI on a std handle we own; the call only clears an
             // inheritance flag and cannot invalidate the handle.
             unsafe {
-                let _ = SetHandleInformation(h as *mut core::ffi::c_void, HANDLE_FLAG_INHERIT, 0);
+                let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
             }
         }
     }

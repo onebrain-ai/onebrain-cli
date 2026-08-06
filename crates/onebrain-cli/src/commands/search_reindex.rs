@@ -318,7 +318,7 @@ fn spawn_detached_pending_embed(vault_flag: Option<&PathBuf>) -> std::io::Result
             std::io::stdin().as_raw_handle(),
         ] {
             unsafe {
-                let _ = SetHandleInformation(h as *mut core::ffi::c_void, HANDLE_FLAG_INHERIT, 0);
+                let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
             }
         }
     }

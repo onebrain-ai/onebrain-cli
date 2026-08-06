@@ -2020,6 +2020,7 @@ fn doctor_fix_text_mode_partial_outcome_renders_distinct_glyph() {
 /// never returned. Needed because `config_key_docs()` has more than one entry
 /// sharing a leaf name across different blocks (e.g. `search.reranker.model`
 /// / `token_optimization.model`).
+#[cfg(unix)]
 fn find_scoped_key_line(lines: &[&str], segments: &[&str]) -> Option<usize> {
     let top = *segments.first()?;
     let key = segments.last()?;

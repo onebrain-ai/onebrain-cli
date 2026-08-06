@@ -2,9 +2,11 @@ mod support;
 
 #[cfg(unix)]
 use assert_cmd::Command;
+#[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use tempfile::tempdir;
 
 #[cfg(unix)]

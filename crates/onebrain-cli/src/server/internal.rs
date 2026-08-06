@@ -861,6 +861,9 @@ mod tests {
         );
 
         // Each hostile entry, tried on its own → must be 400 (rejected).
+        // `mut` is needed only on unix, where the symlink case is pushed below;
+        // on Windows the binding is never mutated and `-D warnings` failed (#383).
+        #[allow(unused_mut)]
         let mut hostile: Vec<String> = vec![
             "../../../../etc/passwd".to_string(),
             secret.display().to_string(), // absolute path

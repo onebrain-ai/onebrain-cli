@@ -7,7 +7,10 @@ mod support;
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+// `PathBuf` is named only by `write_mock_claude`, which is unix-gated (#383).
+#[cfg(unix)]
+use std::path::PathBuf;
 use tempfile::tempdir;
 
 /// Build a minimal vault directory with just `onebrain.yml`.
@@ -18,6 +21,7 @@ fn write_minimal_vault(dir: &Path) {
 /// Write a mock `claude` shell script that logs its argv (one per line) to
 /// `$ARGV_LOG` and exits with `$MOCK_EXIT` (defaults to 0). Returns the
 /// script path. The script is `chmod +x` so we can point `CLAUDE_BIN` at it.
+#[cfg(unix)]
 fn write_mock_claude(dir: &Path, body: &str) -> PathBuf {
     let path = dir.join("claude-mock.sh");
     fs::write(&path, body).unwrap();
@@ -33,6 +37,7 @@ fn write_mock_claude(dir: &Path, body: &str) -> PathBuf {
 
 // Absolute shebang (not `/usr/bin/env bash`) so the script survives tests
 // that clear `PATH` to provoke spawn failures.
+#[cfg(unix)]
 const ARGV_LOG_SCRIPT: &str = r#"#!/bin/bash
 : > "$ARGV_LOG"
 for a in "$@"; do
@@ -430,6 +435,7 @@ fn claude_bin_env_missing_emits_warning() {
 // `--json` flags only exist on `skill run`.
 
 /// Minimal mock script for gemini — same argv-log contract as ARGV_LOG_SCRIPT.
+#[cfg(unix)]
 const GEMINI_ARGV_LOG_SCRIPT: &str = r#"#!/bin/bash
 : > "$ARGV_LOG"
 for a in "$@"; do
