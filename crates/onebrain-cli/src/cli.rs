@@ -92,47 +92,32 @@ pub enum Cmd {
     #[command(hide = true)]
     Completions(CompletionsArgs),
 
-    // ───── Resource groups (25 · alphabetical) ─────────────────────────
-    // v3.1.0 UX: groups whose every verb still returns `E_NOT_IMPLEMENTED`
-    // are marked `hide = true` so they don't clutter `onebrain --help`. The
-    // tree shape stays locked per spec §2.4 — typed commands still parse and
-    // dispatch (returning exit 72), they just don't advertise in help.
-    #[command(hide = true)]
-    Avatar(AvatarCmd),
-    #[command(hide = true)]
-    Bookmark(BookmarkCmd),
-    #[command(hide = true)]
-    Bundle(BundleCmd),
+    // ───── Resource groups (13 · alphabetical) ─────────────────────────
+    // v3.4.24 (#334): the 12 groups whose every verb returned
+    // `E_NOT_IMPLEMENTED` were REMOVED from the parser — avatar, bookmark,
+    // bundle, config, date, dream, frontmatter, gateway, inbox, log, memory,
+    // pause. `hide = true` kept them out of `--help`, but the parser still
+    // accepted them, so anything that discovers verbs by trying them (a
+    // script, a doc, a user) got exit 72 for a surface that did not exist.
+    // They now fail as unknown commands, indistinguishable from a typo.
+    //
+    // This deliberately overrides the v3.1 "the tree shape IS the deliverable"
+    // position (spec §2.4) and ADR 0006; both are marked superseded.
+    //
+    // `hide = true` remains for groups that are hidden but REAL (daemon), and
+    // for the hidden v3.0 aliases further down.
     #[command(display_order = 12)]
     Checkpoint(CheckpointCmd),
     #[command(hide = true)]
-    Config(ConfigCmd),
-    #[command(hide = true)]
     Daemon(DaemonCmd),
-    #[command(hide = true)]
-    Date(DateCmd),
-    #[command(hide = true)]
-    Dream(DreamCmd),
-    #[command(hide = true)]
-    Frontmatter(FrontmatterCmd),
-    #[command(hide = true)]
-    Gateway(GatewayCmd),
     #[command(display_order = 13)]
     Harness(HarnessCmd),
-    #[command(hide = true)]
-    Inbox(InboxCmd),
-    #[command(hide = true)]
-    Log(LogCmd),
     /// Serve OneBrain over MCP (stdio) — search tools today, more vault tool
     /// groups to come.
     #[command(display_order = 18)]
     Mcp,
-    #[command(hide = true)]
-    Memory(MemoryCmd),
     #[command(display_order = 15)]
     Note(NoteCmd),
-    #[command(hide = true)]
-    Pause(PauseCmd),
     #[command(display_order = 20)]
     Plugin(PluginCmd),
     #[command(display_order = 21)]
@@ -234,120 +219,6 @@ pub struct CompletionsArgs {
     /// Target shell (bash · zsh · fish · powershell · elvish).
     pub shell: clap_complete::Shell,
 }
-
-// ─────────────────────────────────────────────────────────────────────────
-// Resource group: avatar (forward-compat, all verbs unimplemented in v3.1)
-// ─────────────────────────────────────────────────────────────────────────
-
-#[derive(Args, Debug)]
-#[command(disable_help_subcommand = true)]
-pub struct AvatarCmd {
-    #[command(subcommand)]
-    pub verb: AvatarVerb,
-}
-#[derive(Subcommand, Debug)]
-pub enum AvatarVerb {
-    /// Start the avatar mesh (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Start,
-    /// Pair with another avatar node (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Pair,
-    /// Show avatar status (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Status,
-    /// Revoke an existing avatar pairing (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Revoke,
-    /// Run avatar diagnostics (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Doctor,
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// bookmark
-// ─────────────────────────────────────────────────────────────────────────
-
-#[derive(Args, Debug)]
-#[command(disable_help_subcommand = true)]
-pub struct BookmarkCmd {
-    #[command(subcommand)]
-    pub verb: BookmarkVerb,
-}
-#[derive(Subcommand, Debug)]
-pub enum BookmarkVerb {
-    /// List saved bookmarks (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    List,
-    /// Get a bookmark by id (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Get { id: String },
-    /// Import a bookmark file (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Import { source: PathBuf },
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// bundle (forward-compat)
-// ─────────────────────────────────────────────────────────────────────────
-
-#[derive(Args, Debug)]
-#[command(disable_help_subcommand = true)]
-pub struct BundleCmd {
-    #[command(subcommand)]
-    pub verb: BundleVerb,
-}
-#[derive(Subcommand, Debug)]
-pub enum BundleVerb {
-    /// Install a bundle (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Install {
-        /// Bundle name (npm-style identifier).
-        name: String,
-    },
-    /// Print a bundle's overview / README body (not yet implemented · v3.x
-    /// roadmap). Mirrors `SkillVerb::Show` semantics: renders the bundle's
-    /// human-readable body, NOT clap's CLI usage (use `--help` for that).
-    #[command(hide = true)]
-    Show {
-        /// Bundle name (npm-style identifier).
-        name: String,
-    },
-    /// Print bundle metadata (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Info {
-        /// Bundle name (npm-style identifier).
-        name: String,
-    },
-    /// Scaffold a new bundle (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Init {
-        /// Bundle name to create (npm-style identifier).
-        name: String,
-    },
-    /// Lint a bundle (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Lint {
-        /// Bundle name (npm-style identifier).
-        name: String,
-    },
-    /// Update a bundle (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Update {
-        /// Bundle name (npm-style identifier).
-        name: String,
-    },
-    /// Remove an installed bundle (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Remove {
-        /// Bundle name (npm-style identifier).
-        name: String,
-    },
-    /// Run bundle diagnostics (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Doctor,
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // checkpoint (3 verbs · stop/reset wired to legacy, orphans wired to legacy)
 // ─────────────────────────────────────────────────────────────────────────
@@ -383,33 +254,6 @@ pub enum CheckpointVerb {
         session_token: String,
     },
 }
-
-// ─────────────────────────────────────────────────────────────────────────
-// config (vault.yml shaping · stubs in v3.1)
-// ─────────────────────────────────────────────────────────────────────────
-
-#[derive(Args, Debug)]
-#[command(disable_help_subcommand = true)]
-pub struct ConfigCmd {
-    #[command(subcommand)]
-    pub verb: ConfigVerb,
-}
-#[derive(Subcommand, Debug)]
-pub enum ConfigVerb {
-    /// Read a config value (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Get { key: String },
-    /// Write a config value (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Set { key: String, value: String },
-    /// List all config keys (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    List,
-    /// Initialize a default config (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Init,
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // daemon (forward-compat)
 // ─────────────────────────────────────────────────────────────────────────
@@ -456,103 +300,6 @@ pub enum DaemonVerb {
         vault: Option<PathBuf>,
     },
 }
-
-// ─────────────────────────────────────────────────────────────────────────
-// date (vault-free utilities)
-// ─────────────────────────────────────────────────────────────────────────
-
-#[derive(Args, Debug)]
-#[command(disable_help_subcommand = true)]
-pub struct DateCmd {
-    #[command(subcommand)]
-    pub verb: DateVerb,
-}
-#[derive(Subcommand, Debug)]
-pub enum DateVerb {
-    /// Print today's date (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Today,
-    /// Print the current datetime (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Now,
-    /// Format a datetime string (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Format { input: String, fmt: String },
-    /// Parse a datetime string (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Parse { input: String },
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// dream (forward-compat)
-// ─────────────────────────────────────────────────────────────────────────
-
-#[derive(Args, Debug)]
-#[command(disable_help_subcommand = true)]
-pub struct DreamCmd {
-    #[command(subcommand)]
-    pub verb: DreamVerb,
-}
-#[derive(Subcommand, Debug)]
-pub enum DreamVerb {
-    /// List active dreams (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    List,
-    /// Tick a dream forward (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Tick { id: String },
-    /// Mark a dream done (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Done { id: String },
-    /// Snooze a dream until a date (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Snooze { id: String, until: String },
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// frontmatter (note-level)
-// ─────────────────────────────────────────────────────────────────────────
-
-#[derive(Args, Debug)]
-#[command(disable_help_subcommand = true)]
-pub struct FrontmatterCmd {
-    #[command(subcommand)]
-    pub verb: FrontmatterVerb,
-}
-#[derive(Subcommand, Debug)]
-pub enum FrontmatterVerb {
-    /// Parse and print a note's frontmatter (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Parse { path: PathBuf },
-    /// Extract a single frontmatter key (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Extract { path: PathBuf, key: String },
-    /// Update a frontmatter key (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Update {
-        path: PathBuf,
-        key: String,
-        value: String,
-    },
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// gateway (forward-compat)
-// ─────────────────────────────────────────────────────────────────────────
-
-#[derive(Args, Debug)]
-#[command(disable_help_subcommand = true)]
-pub struct GatewayCmd {
-    #[command(subcommand)]
-    pub verb: GatewayVerb,
-}
-#[derive(Subcommand, Debug)]
-pub enum GatewayVerb {
-    /// Telegram gateway (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Telegram,
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // harness (1-verb · documented exception · wired to legacy)
 // ─────────────────────────────────────────────────────────────────────────
@@ -633,88 +380,6 @@ pub enum HarnessMode {
     WithContext,
     AdHoc,
 }
-
-// ─────────────────────────────────────────────────────────────────────────
-// inbox
-// ─────────────────────────────────────────────────────────────────────────
-
-#[derive(Args, Debug)]
-#[command(disable_help_subcommand = true)]
-pub struct InboxCmd {
-    #[command(subcommand)]
-    pub verb: InboxVerb,
-}
-#[derive(Subcommand, Debug)]
-pub enum InboxVerb {
-    /// List inbox items (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    List,
-    /// Show the next inbox item to process (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Next,
-    /// Process an inbox item (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Process { id: Option<String> },
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// log
-// ─────────────────────────────────────────────────────────────────────────
-
-#[derive(Args, Debug)]
-#[command(disable_help_subcommand = true)]
-pub struct LogCmd {
-    #[command(subcommand)]
-    pub verb: LogVerb,
-}
-#[derive(Subcommand, Debug)]
-pub enum LogVerb {
-    /// Query session/skill logs (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Query { pattern: String },
-    /// Append a log entry (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Append { entry: String },
-    /// Rotate log files (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Rotate,
-    /// Print log statistics (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Stats,
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// memory
-// ─────────────────────────────────────────────────────────────────────────
-
-#[derive(Args, Debug)]
-#[command(disable_help_subcommand = true)]
-pub struct MemoryCmd {
-    #[command(subcommand)]
-    pub verb: MemoryVerb,
-}
-#[derive(Subcommand, Debug)]
-pub enum MemoryVerb {
-    /// List memory entries (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    List,
-    /// Add a memory entry (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Add { topic: String, content: String },
-    /// Update a memory entry (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Update { id: String, content: String },
-    /// Remove a memory entry (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Remove { id: String },
-    /// Promote a session insight into memory/ (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Promote { id: String },
-    /// Rebuild the MEMORY-INDEX.md (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Index,
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // note (14 verbs · 11 locked 2026-05-25 ship v3.2.0 · edit/delete/mkdir added 2026-06-25)
 // ─────────────────────────────────────────────────────────────────────────
@@ -1139,30 +804,6 @@ pub struct SearchReindexArgs {
     )]
     pub pending_only: bool,
 }
-
-// ─────────────────────────────────────────────────────────────────────────
-// pause
-// ─────────────────────────────────────────────────────────────────────────
-
-#[derive(Args, Debug)]
-#[command(disable_help_subcommand = true)]
-pub struct PauseCmd {
-    #[command(subcommand)]
-    pub verb: PauseVerb,
-}
-#[derive(Subcommand, Debug)]
-pub enum PauseVerb {
-    /// List pause snapshots (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    List,
-    /// Write a pause snapshot for the active thread (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Snapshot { slug: String },
-    /// Resume a paused thread (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Resume { slug: Option<String> },
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // plugin (install/migrate hidden · update/uninstall/status/verify visible)
 // ─────────────────────────────────────────────────────────────────────────
@@ -1224,12 +865,6 @@ pub enum PluginVerb {
         #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
         vault_dir: Option<PathBuf>,
     },
-    /// Plugin install status (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Status,
-    /// Verify plugin install integrity (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Verify,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1249,13 +884,6 @@ pub struct ScheduleCmd {
 pub enum ScheduleVerb {
     /// Show scheduled entries from `onebrain.yml` (or legacy `vault.yml`) with cron/at expression and installed status.
     List,
-    /// Add a scheduled skill (not yet implemented · v3.x roadmap · edit `onebrain.yml` directly meanwhile).
-    #[command(hide = true)]
-    Add { skill: String },
-    /// Remove a scheduled skill (not yet implemented · v3.x roadmap · edit `onebrain.yml` directly meanwhile).
-    #[command(hide = true)]
-    Remove { skill: String },
-    /// Compile the `onebrain.yml` (or legacy `vault.yml`) schedule block into OS scheduler artifacts (launchd plists · Scheduled Tasks · systemd user units) and activate them · called by `plugin update`.
     Register {
         /// Vault root override · also accepts global `--vault`; walks up from cwd when omitted.
         #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
@@ -1279,9 +907,6 @@ pub enum ScheduleVerb {
         #[arg(long)]
         test: Option<String>,
     },
-    /// Schedule status (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Status,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1336,19 +961,10 @@ pub enum SessionVerb {
         #[arg(long, value_name = "TOKEN", hide = true)]
         session_token: Option<String>,
     },
-    /// Print the active session token (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Current,
-    /// List recent sessions (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    List,
-    /// Get session by id (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Get { id: String },
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// skill (bootstrap hidden, list/run/show/info visible)
+// skill (run/show/info visible)
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
@@ -1382,9 +998,6 @@ impl HarnessArg {
 
 #[derive(Subcommand, Debug)]
 pub enum SkillVerb {
-    /// List installed skills (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    List,
     // v3.2.15: same about/long_about split as `HarnessVerb::Run` — flag
     // breakdown only in the parent-level `skill --help` Commands: listing
     // (where it's the only summary the user sees of `run`); the verb-level
@@ -1416,11 +1029,6 @@ pub enum SkillVerb {
         #[arg(long = "arg")]
         args: Vec<String>,
     },
-    /// Bootstrap a skill's state files · called by skills internally.
-    Bootstrap {
-        /// Skill name (with or without slash prefix · e.g. `daily` or `/daily`).
-        name: String,
-    },
     /// Print a skill's SKILL.md body (workflow markdown) · convenience for
     /// skill scripting. Use `onebrain skill run --help` for CLI usage.
     Show {
@@ -1451,12 +1059,6 @@ pub struct TaskCmd {
 pub enum TaskVerb {
     /// List dated tasks across the vault (fence-aware), filterable by due date.
     List(TaskListArgs),
-    /// Add a task (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Add { content: String },
-    /// Mark a task done (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Done { id: String },
 }
 
 #[derive(Args, Debug)]
@@ -1590,15 +1192,6 @@ pub enum VaultVerb {
         #[arg(long)]
         branch: Option<String>,
     },
-    /// Scan vault for issues (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Scan,
-    /// Vault statistics (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Stats,
-    /// Verify vault integrity (not yet implemented · v3.x roadmap).
-    #[command(hide = true)]
-    Verify,
     /// Print active vault + resolution source (new in v3.1).
     Current,
 }
@@ -1725,15 +1318,20 @@ mod tests {
         let root_help = cmd.render_long_help().to_string();
         assert!(root_help.contains("note"), "note missing from root --help");
         assert!(root_help.contains("task"), "task missing from root --help");
-        // A known-hidden stub group must NOT appear. `render_long_help` omits
+        // A hidden-but-REAL group must NOT appear. `render_long_help` omits
         // hidden commands entirely, and no visible group's text contains the
         // word, so a bare-name check is both strong and spacing-independent.
+        //
+        // This was `avatar` until v3.4.24 (#334) removed that group outright —
+        // at which point "avatar is absent from help" became true for the
+        // wrong reason and could no longer fail. `daemon` is hidden and real,
+        // so it still tests what this assertion is for.
         assert!(
-            !root_help.contains("avatar"),
-            "hidden stub group `avatar` leaked into root --help"
+            !root_help.contains("daemon"),
+            "hidden group `daemon` leaked into root --help"
         );
 
-        // `task --help`: `list` visible; `add` and `done` must stay hidden.
+        // `task --help`: `list` is the only verb since #334 removed add/done.
         let mut cmd = Cli::command();
         let task_help = cmd
             .find_subcommand_mut("task")
@@ -1741,17 +1339,6 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(task_help.contains("list"), "list missing from task --help");
-        // `add` / `done` are hidden stubs — neither the verb names nor the
-        // group/verb `about` text contain those words, so a bare-name check is
-        // strong and spacing-independent.
-        assert!(
-            !task_help.contains("add"),
-            "stub verb `add` leaked into task --help"
-        );
-        assert!(
-            !task_help.contains("done"),
-            "stub verb `done` leaked into task --help"
-        );
     }
 
     #[test]
@@ -1992,14 +1579,30 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_groups_still_parse() {
-        // A representative sample — Bundle, Daemon, Dream all parse even
-        // though their bodies will be unimplemented in v3.1.
-        let _ = Cli::try_parse_from(["onebrain", "bundle", "install", "designer"]).unwrap();
+    fn hidden_but_real_groups_still_parse() {
+        // Was `unimplemented_groups_still_parse`, whose premise v3.4.24 (#334)
+        // deleted: it asserted that bundle/dream/memory parse, and they no
+        // longer do. `daemon` is the surviving hidden-but-REAL group — hidden
+        // from `--help`, fully implemented — so the property worth pinning is
+        // that hiding a group does not stop it parsing.
         let _ = Cli::try_parse_from(["onebrain", "daemon", "start"]).unwrap();
-        let _ = Cli::try_parse_from(["onebrain", "dream", "list"]).unwrap();
-        let _ = Cli::try_parse_from(["onebrain", "memory", "list"]).unwrap();
         let _ = Cli::try_parse_from(["onebrain", "note", "search", "TODO"]).unwrap();
+    }
+
+    #[test]
+    fn removed_groups_no_longer_parse() {
+        // The other half of #334: the 12 removed groups must fail to parse.
+        // Paired with the one above so a future re-add cannot pass silently.
+        for argv in [
+            ["onebrain", "bundle", "install"],
+            ["onebrain", "dream", "list"],
+            ["onebrain", "memory", "list"],
+        ] {
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "{argv:?} must no longer parse"
+            );
+        }
     }
 
     // v3.3 step 2 — `serve` is a flag-based foreground command (not a verb

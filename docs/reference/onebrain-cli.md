@@ -7,7 +7,7 @@
 ```
 src/
 ├── main.rs              argv → clap → dispatch; help-banner pre-pass; structured-mode error renderer
-├── cli.rs               clap command tree (Cli + Cmd) — 3 root verbs + 24 groups + 8 hidden v3.0 aliases
+├── cli.rs               clap command tree (Cli + Cmd) — 3 root verbs + 13 groups + 8 hidden v3.0 aliases
 ├── banner.rs            TTY-only branded wordmark banner + help-banner gating
 ├── exit.rs              CoreError → stable i32 exit-code mapping (walks anyhow chain)
 ├── vault_ctx.rs         CLI-side wiring for onebrain_core vault resolution (resolve/require/hook)
@@ -40,7 +40,7 @@ src/
     ├── hook_rewriter.rs settings.json v3.0→v3.1 hook-arg rewriter + --json injection
     ├── plugin_update.rs plugin update — CLI-self-update-adjacent vault overlay workflow
     ├── vault_current.rs vault current — active-vault + resolution-source report
-    └── stubs.rs         not_implemented / not_implemented_vault_required (exit 72 / 64)
+    └── stubs.rs         not_implemented (exit 72) — one caller: the `plugin uninstall` hybrid
 ```
 
 ## Top-level modules
@@ -86,7 +86,7 @@ CLI-side wiring for `onebrain_core::resolve_vault` — snapshots `--vault` flag 
 - `resolve(flag) -> Result<Option<ResolvedVault>>` — vault-free/informational, never errors.
 - `require(flag) -> Result<ResolvedVault>` — vault-required, errors `E_VAULT_NOT_FOUND` (exit 64). Dresses the error in the ✗/💡 `HintedError` contract via `dress_vault_not_found` (#288): the walk-up `VaultNotFound` gets a "run inside a vault / pass `--vault`" hint, and `NotAVault` (an explicit path that isn't a vault root) gets its own "check the path" hint — exit 64 preserved in both (the original `CoreError` stays in the chain under the `.context(..)` wrapper).
 - `resolve_for_hook` / `info_from` / `print_vault_not_found_help` — reserved for v3.2+ hook-protocol and vault-required handlers (dead-code-allowed in v3.1).
-**Connections** — calls: `onebrain_core::{resolve_vault, require_vault}`; called by: `stubs::not_implemented_vault_required`, `plugin_update`, `vault_current`, `doctor`.
+**Connections** — calls: `onebrain_core::{resolve_vault, require_vault}`; called by: `plugin_update`, `vault_current`, `doctor` (and `stubs::not_implemented_vault_required` until v3.4.24 removed it).
 
 ### `src/safety.rs`
 Shared filesystem-mutation guard.
@@ -170,7 +170,7 @@ Implements `schedule register` (and the `register-schedule` alias). Six flags ro
 Implements `skill run` (and the `run-skill` alias). The skill name is positional (`skill run daily`) or `--skill <name>` (parity with `run-skill`; clap `conflicts_with` rejects both). `--harness {claude,gemini,codex}` (default claude) picks the runtime and `--model <m>` the model. Prompts use `/onebrain:<name>` for Claude/Gemini and `$onebrain:<name>` for Codex. Codex runs `codex exec --sandbox workspace-write --skip-git-repo-check --ephemeral -C <vault>`; a managed unattended installation also enables trusted hooks. All harnesses inherit the environment, receive null stdin, and propagate their exit code.
 
 ## `v31/` — command-tree migration & v3.1 verbs
-The v3.1 layer: `dispatch.rs` is the routing brain mapping every `Cmd` variant to a handler; hidden v3.0 aliases call the corresponding new-path handler **after** `migration::print_once`; `hook_rewriter` migrates on-disk `settings.json` hook args; `plugin_update` is the plugin-side overlay workflow (distinct from `commands::update`, which is the CLI binary self-update); `vault_current` is a new informational verb; `stubs` turns the forward-declared command surface into clean `E_NOT_IMPLEMENTED` (exit 72) or `E_VAULT_NOT_FOUND` (exit 64) responses.
+The v3.1 layer: `dispatch.rs` is the routing brain mapping every `Cmd` variant to a handler; hidden v3.0 aliases call the corresponding new-path handler **after** `migration::print_once`; `hook_rewriter` migrates on-disk `settings.json` hook args; `plugin_update` is the plugin-side overlay workflow (distinct from `commands::update`, which is the CLI binary self-update); `vault_current` is a new informational verb; `stubs` now holds a single `not_implemented` used by the one hybrid arm (`plugin uninstall` for non-Codex harnesses) — the forward-declared surface it used to serve was removed in v3.4.24 (#334).
 
 ### `src/v31/mod.rs`
 Declares `dispatch`, `hook_rewriter`, `plugin_update`, `stubs`, `vault_current`.
@@ -180,7 +180,7 @@ Central dispatcher.
 **Key items**
 - `AlreadyReported` — sentinel `Error` attached as anyhow context by commands that already emitted their envelope (so `main::render_error` skips a duplicate while the exit code still propagates; R2-H3).
 - `output_mode(&Cli) -> OutputMode` — wraps `TtyInputs::from_env` + `resolve_output_mode`.
-- `dispatch(cli: Cli) -> Result<()>` — emits the banner, then the giant `match` over `Cmd`: root verbs → `commands::{init,update,doctor}` (which `process::exit`); hook-protocol verbs → legacy handlers; new verbs → `vault_current`/`plugin_update`; everything else → `stubs::{not_implemented, not_implemented_vault_required}`; hidden aliases → `migration::print_once` then the new handler. `harness` with no verb defaults to `Detect`.
+- `dispatch(cli: Cli) -> Result<()>` — emits the banner, then the giant `match` over `Cmd`: root verbs → `commands::{init,update,doctor}` (which `process::exit`); hook-protocol verbs → legacy handlers; new verbs → `vault_current`/`plugin_update`; the `plugin uninstall` non-Codex branch → `stubs::not_implemented`; hidden aliases → `migration::print_once` then the new handler. `harness` with no verb defaults to `Detect`.
 - `emit_plugin_update_summary_to<W>(report, mode, writer) -> Result<()>` — renders the `plugin update` envelope (`Envelope::ok`/`partial` + plumbed rewriter warnings), with an injectable writer for the broken-pipe test.
 **Connections** — calls: every `commands::*` handler, `vault_current`, `plugin_update`, `stubs`, `banner`, `migration`; called by: `main`. Tests cover the `AlreadyReported` downcast quirk + broken-pipe→exit-0 classification.
 
@@ -201,7 +201,7 @@ Implements `vault current` (new in v3.1) — reports the active vault and **how*
 
 ### `src/v31/stubs.rs`
 Turns the forward-declared command surface into clean exits.
-**Key functions** — `not_implemented(path: &str) -> Result<()>` (→ `CoreError::NotImplemented`, exit 72); `not_implemented_vault_required(vault_flag, path) -> Result<()>` (`vault_ctx::require` first so outside-vault returns exit 64, else exit 72; R1 C3).
+**Key functions** — `not_implemented(path: &str) -> Result<()>` (→ `CoreError::NotImplemented`, exit 72). `not_implemented_vault_required` was removed in v3.4.24 (#334) along with all 34 of its callers.
 **Connections** — called by: most arms of `dispatch`. Returns plumb through `main`'s envelope/exit-code path rather than panicking.
 
 ## Command → handler map
@@ -223,7 +223,7 @@ Turns the forward-declared command surface into clean exits.
 | `init` | `commands/init.rs` | onebrain-fs (`init::run_init`) |
 | `update` | `commands/update.rs` | onebrain-fs (`update::run_update`) |
 | `doctor` | `commands/doctor.rs` | onebrain-fs (`doctor::run_all_checks`) · onebrain-core (config) |
-| all other `<noun> <verb>` | `v31/stubs.rs` | none (exit 72, or 64 outside a vault) |
+| `plugin uninstall` (non-Codex harness) | `v31/stubs.rs` | none (exit 72) |
 
 Hidden v3.0 aliases route through the same handlers after a one-time migration notice: `session-init`→`session_init`, `orphan-scan`→`orphan_scan`, `qmd-reindex`→`search_reindex` (dispatches to the native `search reindex` handler, kept for un-migrated hooks), `register-hooks`→`register_hooks`, `register-schedule`→`register_schedule`, `migrate`→`migrate`, `vault-sync`→`vault_sync`, `run-skill`→`run_skill`.
 

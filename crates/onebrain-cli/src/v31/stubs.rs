@@ -1,26 +1,23 @@
-//! Stub handlers for unimplemented v3.1 verbs.
+//! Stub handler for the one remaining unimplemented dispatch path.
 //!
-//! Every group's verb list is wired into the dispatcher (the tree shape IS
-//! the v3.1 deliverable per the design doc) but most verbs are deferred to
-//! later v3.x minors. Stubs return `CoreError::NotImplemented` so the CLI
-//! exits 72 with the canonical envelope/exit-code path instead of panicking.
+//! v3.4.24 (#334) removed the 63 verbs that only ever returned
+//! `E_NOT_IMPLEMENTED` — they no longer parse, so they no longer need a stub.
+//! What remains is a single HYBRID arm: `plugin uninstall` runs a real
+//! implementation for `--harness codex` and falls through to here for every
+//! other harness. That is a genuinely-unimplemented branch of a real command,
+//! not a placeholder for an absent one.
+//!
+//! `not_implemented_vault_required` was deleted with the verbs: all 34 of its
+//! callers were among the removed 63, and no surviving verb needs the
+//! "check the vault first so outside-vault is 64, not 72" ordering — a real
+//! vault-required verb reaches `vault_ctx::require` through its own handler.
 
 use anyhow::Result;
 use onebrain_core::CoreError;
-use std::path::PathBuf;
 
 /// Return an unimplemented-verb error. Caller is the dispatcher; the
 /// envelope/exit-code layer turns this into stable exit 72 + a clean error
-/// message containing the path (`"note search"`, `"memory promote"`, etc.).
+/// message containing the path (`"plugin uninstall"`).
 pub fn not_implemented(path: &str) -> Result<()> {
-    Err(CoreError::NotImplemented(path.to_string()).into())
-}
-
-/// R1 C3: vault-required group stubs MUST check for a vault first so the
-/// outside-vault path returns exit 64 (E_VAULT_NOT_FOUND) instead of
-/// silently short-circuiting on exit 72 (E_NOT_IMPLEMENTED). Inside a
-/// vault we still surface "not implemented".
-pub fn not_implemented_vault_required(vault_flag: Option<PathBuf>, path: &str) -> Result<()> {
-    crate::vault_ctx::require(vault_flag)?;
     Err(CoreError::NotImplemented(path.to_string()).into())
 }
