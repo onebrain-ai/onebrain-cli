@@ -149,17 +149,19 @@ fn root_help_hides_v30_aliases() {
 #[test]
 fn top_level_help_hides_stub_groups() {
     // v3.1.0 final UX (user-decided 2026-05-25): only groups with ≥1 real
-    // user-facing verb are visible at root `--help`. Stub-only groups
-    // (`avatar`, `bookmark`, `bundle`, `config`, `daemon`, `date`, `dream`,
-    // `frontmatter`, `gateway`, `inbox`, `log`, `memory`, `pause`) are hidden
-    // — they still parse + dispatch (see `hidden_stub_still_dispatches`),
-    // they just don't clutter the help.
+    // user-facing verb are visible at root `--help`.
+    //
+    // v3.4.24 (#334): the stub-only groups were REMOVED from the parser, not
+    // just hidden. Only two names below are still hidden-but-present —
+    // `daemon` (real, hidden) and `qmd` (a hidden catch-all that emits a
+    // migration error). The other twelve are gone, and asserting they are
+    // absent from `--help` can no longer fail, so they are not listed here;
+    // `cli::tests::removed_groups_no_longer_parse` and Task 8's
+    // `every_removed_verb_is_now_an_unknown_command` cover them instead.
+    //
     // `serve` became VISIBLE in v3.3 step 2 (foreground HTTP surface).
-    // `note` and `task` became VISIBLE in v3.3.14 (all 14 note verbs + task
-    // list are implemented; task add/done stub verbs stay hidden).
-    // `qmd` was REMOVED in v3.4.5 (native search replaces it) — it's now a
-    // hidden catch-all that only emits a migration error, so it moved from
-    // the visible list to the hidden/stub list below.
+    // `note` and `task` became VISIBLE in v3.3.14.
+    // `qmd` was REMOVED as a real group in v3.4.5 (native search replaces it).
     let out = Command::cargo_bin("onebrain")
         .unwrap()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
@@ -192,57 +194,20 @@ fn top_level_help_hides_stub_groups() {
         );
     }
 
-    for stub in [
-        "avatar",
-        "bookmark",
-        "bundle",
-        "config",
-        "daemon",
-        "date",
-        "dream",
-        "frontmatter",
-        "gateway",
-        "inbox",
-        "log",
-        "memory",
-        "pause",
-        "qmd",
-    ] {
+    // Only the two names that still EXIST but are hidden. The twelve removed
+    // in #334 were dropped from this list: a name the parser does not know
+    // cannot leak into help, so asserting its absence is a guard that can
+    // never fail.
+    for hidden in ["daemon", "qmd"] {
         assert!(
             // 2-space indent is the categorized-block command row form
-            // (v3.3.17); a leaked stub would appear there.
-            !stdout.contains(&format!("  {stub}\n"))
-                && !stdout.contains(&format!("  {stub}  "))
-                && !stdout.contains(&format!("  {stub} ")),
-            "stub group `{stub}` leaked into top-level --help. Got:\n{stdout}"
+            // (v3.3.17); a leaked hidden group would appear there.
+            !stdout.contains(&format!("  {hidden}\n"))
+                && !stdout.contains(&format!("  {hidden}  "))
+                && !stdout.contains(&format!("  {hidden} ")),
+            "hidden group `{hidden}` leaked into top-level --help. Got:\n{stdout}"
         );
     }
-}
-
-#[test]
-fn hidden_stub_still_dispatches() {
-    // `#[command(hide = true)]` is purely a help-display flag — the parser
-    // still accepts hidden commands and the dispatcher still routes them.
-    // A hidden stub group + verb must produce exit 72 with the canonical
-    // `not implemented: <group> <verb>` error message.
-    let out = Command::cargo_bin("onebrain")
-        .unwrap()
-        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
-        .args(["avatar", "pair"])
-        .assert()
-        .failure()
-        .code(72)
-        .get_output()
-        .clone();
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        combined.contains("not implemented: avatar pair"),
-        "expected canonical not-implemented message. Got:\n{combined}"
-    );
 }
 
 #[test]
@@ -606,44 +571,71 @@ fn orphan_scan_alias_dispatches_to_checkpoint_orphans() {
 }
 
 #[test]
-fn vault_required_stub_returns_64_outside_vault_or_72_inside() {
-    // R1 C3: vault-required group stubs (task add/done, memory, note, inbox,
-    // pause, bookmark, dream, frontmatter, log, qmd non-reindex, schedule
-    // non-protocol, vault non-current/sync) must check vault BEFORE
-    // short-circuiting on E_NOT_IMPLEMENTED. Two paths:
-    //
-    //   1. Inside a vault   → exit 72 (E_NOT_IMPLEMENTED) — the stub fires.
-    //   2. Outside any vault → exit 64 (E_VAULT_NOT_FOUND) — vault check fails.
-    //
-    // Note: `task list` is now implemented (v3.3+), so we use `task add` as
-    // the representative stub for the `task` group.
+fn a_removed_stub_verb_fails_as_an_unknown_command() {
+    // A parser that accepts 63 verbs it cannot perform is a trap for scripts
+    // and docs; "hidden from --help" protects nothing that discovers verbs by
+    // trying them (#334). After removal these must be indistinguishable from
+    // a typo — NOT exit 72, which advertises a surface that does not exist.
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
+        .env_remove("ONEBRAIN_VAULT")
+        .args(["date", "now"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a removed verb must fail as an unknown command, not as not-implemented"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unrecognized subcommand") || stderr.contains("unexpected argument"),
+        "must read like a typo: {stderr}"
+    );
+}
 
-    // Path 1: inside a vault → 72.
-    let dir = tempdir().unwrap();
-    make_vault(dir.path());
+#[test]
+fn a_real_vault_required_verb_still_returns_64_outside_a_vault() {
+    // `not_implemented_vault_required` existed so a vault-required STUB run
+    // outside a vault returned 64 (E_VAULT_NOT_FOUND) rather than 72. Removing
+    // the stubs removes that path — correctly — but the exit-code contract for
+    // genuinely-implemented vault-required verbs must be untouched.
+    //
+    // `task list`, NOT `schedule list`: `schedule list` returns 0 because it
+    // never resolves a vault, so it could not detect a regression here.
+    //
+    // Both legs are pinned by their MESSAGE, not just the code, because three
+    // distinct CoreError variants map to 64 (exit.rs: VaultYamlMissing,
+    // VaultNotFound, NotAVault). Asserting the code alone lets one source
+    // silently stand in for another and makes the guard unfalsifiable.
+
+    // Leg 1: an explicit --vault that is not a vault → NotAVault.
+    let empty = tempdir().unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
-        .current_dir(dir.path())
         .env_remove("ONEBRAIN_VAULT")
-        .args(["task", "add", "my task"])
+        .args(["task", "list", "--vault", empty.path().to_str().unwrap()])
         .assert()
         .failure()
-        .code(72)
-        .stderr(predicate::str::contains("not implemented"))
-        .stderr(predicate::str::contains("task add"));
+        .code(64)
+        .stderr(predicate::str::contains("not a valid vault root"));
 
-    // Path 2: outside any vault → 64.
+    // Leg 2: no --vault, cwd outside any vault → the walk-up failure.
     let no_vault = tempdir().unwrap();
     Command::cargo_bin("onebrain")
         .unwrap()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
-        .current_dir(no_vault.path())
         .env_remove("ONEBRAIN_VAULT")
-        .args(["task", "add", "my task"])
+        .current_dir(no_vault.path())
+        .args(["task", "list"])
         .assert()
         .failure()
-        .code(64);
+        .code(64)
+        .stderr(predicate::str::contains(
+            "no OneBrain vault found by walking up from",
+        ));
 }
 
 #[test]

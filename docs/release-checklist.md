@@ -18,8 +18,10 @@ Paste the resulting log into the release PR.
 
 - [ ] `onebrain` → banner + 3 root verbs + visible groups · matches
       snapshot `crates/onebrain-cli/src/snapshots/`
-- [ ] `onebrain --help` → help screen · stub-only groups hidden (no
-      `bookmark`, `daemon`, `dream`, etc.)
+- [ ] `onebrain --help` → help screen · no `daemon` (hidden but real). The
+      stub-only groups (`bookmark`, `dream`, …) were REMOVED in v3.4.24
+      (#334), so they are absent from the parser entirely — `onebrain dream
+      list` must exit 2, not 72.
 - [ ] `onebrain session init` (outside vault) → text starting with
       `⚠ No OneBrain vault found at …` · NOT a JSON brace
 - [ ] `onebrain session init` (inside vault) → text starting with
