@@ -25,7 +25,7 @@ trustworthy first. No new features by design.
 - 15 clippy errors in `cfg(windows)`- and `cfg(unix)`-gated code that no Linux or macOS run type-checks ([#383](https://github.com/onebrain-ai/onebrain-cli/issues/383))
 
 ### Changed
-- CI runs `clippy -D warnings` on `windows-latest`. It had never passed there: CI linted on `ubuntu-latest` only, and `--all-targets` aborts at the first failing target, hiding 11 of the 15 errors behind the first 4 ([#383](https://github.com/onebrain-ai/onebrain-cli/issues/383))
+- CI runs `clippy -D warnings` on `windows-latest` as a separate `clippy-windows` job. It had never passed there: CI linted on `ubuntu-latest` only, and `--all-targets` aborts at the first failing target, hiding 11 of the 15 errors behind the first 4. It is a separate job, not a matrix leg on `clippy` — adding `strategy.matrix` renames that job's status context, so the `clippy` context branch protection requires would stop reporting and every PR would block ([#383](https://github.com/onebrain-ai/onebrain-cli/issues/383))
 - A scheduler unit test no longer depends on the host's shell layout. It used a bare `sh`, which resolves on CI's Windows runner because Git Bash is on PATH and does not on a real Windows machine — so it was green in CI and red on the platform it was meant to protect ([#382](https://github.com/onebrain-ai/onebrain-cli/issues/382))
 - `docs/platform-support.md` documents the onnxruntime `cpuid_info` line accurately: it affects *virtualized* ARM Linux whose hypervisor reports an invalid MIDR part number, not aarch64 Linux generally ([#332](https://github.com/onebrain-ai/onebrain-cli/issues/332))
 
