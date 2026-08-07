@@ -20,6 +20,24 @@ Every release target ships a binary with the **full CLI** and **keyword (lexical
 
 On a keyword-only (lex-only) binary: `search search`, `get`, `status`, and `reindex` work fully; hybrid `query` falls back to keyword ranking with a one-line notice; `vsearch` and `model set` report that semantic search is unavailable in that build.
 
+### A harmless onnxruntime line on some virtual machines
+
+On a **virtualized** ARM Linux guest you may see this on stderr, once per command, including on commands unrelated to search:
+
+```
+onnxruntime cpuid_info warning: Unknown CPU vendor. cpuinfo_vendor value: 0
+```
+
+It is cosmetic — exit codes and output are unaffected, and semantic search works normally. onnxruntime identifies an ARM core by the `(CPU implementer, CPU part)` pair in `/proc/cpuinfo`; some hypervisors pass the implementer through but zero the part number, so no known core matches. Measured on a VMware guest under Apple Silicon, which reports implementer `0x61` with part `0x000`.
+
+**Bare-metal ARM Linux is not affected.** Verified emitting nothing on Raspberry Pi 5 (Cortex-A76, part `0xd0b`) and Raspberry Pi 4 (Cortex-A72, part `0xd08`). Check your own machine with:
+
+```bash
+grep -m1 "CPU part" /proc/cpuinfo   # 0x000 → you'll see the line; a real part (e.g. 0xd08) → you won't
+```
+
+Suppress it with `2>/dev/null` if it disturbs a script. See [#332](https://github.com/onebrain-ai/onebrain-cli/issues/332).
+
 Download links for each target: the [pre-built binaries table](install.md#pre-built-binaries). How the `semantic` cargo feature implements the seam: [`reference/onebrain-search.md`](reference/onebrain-search.md).
 
 ## OS scheduler backends (v3.4.20+)
