@@ -1,6 +1,6 @@
 ---
-latest_version: 3.4.23
-released: 2026-08-04
+latest_version: 3.4.24
+released: 2026-08-07
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,38 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.24] — 2026-08-07 — The gates and the surfaces tell the truth
+
+A backlog-clearing release taken deliberately before v3.5, so the gates v3.5 leans on are
+trustworthy first. No new features by design.
+
+### Removed
+- **63 verbs that only ever answered "not implemented" no longer parse.** They now fail as unknown commands (exit 2), indistinguishable from a typo, instead of advertising a surface that does not exist. `hide = true` kept them out of `--help` but the parser still accepted them, so anything that discovers verbs by trying them — a script, a doc, a user — reached exit 72 for a command that was never built ([#334](https://github.com/onebrain-ai/onebrain-cli/issues/334))
+
+### Fixed
+- `schedule register --test` now runs the same validators `register` does. A config `register` refuses outright — a control character in an argument, say — was previously accepted and executed by the one command you reach for to *check* a config ([#375](https://github.com/onebrain-ai/onebrain-cli/issues/375))
+- `schedule register --dry-run` lists every bad entry instead of stopping at the first, so a config with three mistakes reports three ([#376](https://github.com/onebrain-ai/onebrain-cli/issues/376))
+- `--test` against a command-mode entry says so, rather than reporting `no schedule: entry matching skill …` and sending you hunting a typo that is not there ([#375](https://github.com/onebrain-ai/onebrain-cli/issues/375))
+- 15 clippy errors in `cfg(windows)`- and `cfg(unix)`-gated code that no Linux or macOS run type-checks ([#383](https://github.com/onebrain-ai/onebrain-cli/issues/383))
+
+### Changed
+- CI runs `clippy -D warnings` on `windows-latest` as a separate `clippy-windows` job. It had never passed there: CI linted on `ubuntu-latest` only, and `--all-targets` aborts at the first failing target, hiding 11 of the 15 errors behind the first 4. It is a separate job, not a matrix leg on `clippy` — adding `strategy.matrix` renames that job's status context, so the `clippy` context branch protection requires would stop reporting and every PR would block. `clippy-windows` is a required check on `main` ([#383](https://github.com/onebrain-ai/onebrain-cli/issues/383))
+- A scheduler unit test no longer depends on the host's shell layout. It used a bare `sh`, which resolves on CI's Windows runner because Git Bash is on PATH and does not on a real Windows machine — so it was green in CI and red on the platform it was meant to protect ([#382](https://github.com/onebrain-ai/onebrain-cli/issues/382))
+- `docs/platform-support.md` documents the onnxruntime `cpuid_info` line accurately: it affects *virtualized* ARM Linux whose hypervisor reports an invalid MIDR part number, not aarch64 Linux generally ([#332](https://github.com/onebrain-ai/onebrain-cli/issues/332))
+
+### Upgrade notes
+**If a script calls one of the removed verbs, it now gets exit 2 instead of 72.** That is the
+point of the change — the verbs were never implemented — but a script that treated 72 as
+"expected, skip" will now see an unknown-command failure. The full list is committed at
+`crates/onebrain-cli/tests/fixtures/removed-verbs.txt`.
+
+`plugin uninstall` is **not** among them. It is a hybrid: a real, shipped implementation for
+`--harness codex`, falling through to not-implemented only for other harnesses.
+
+This release supersedes half of [ADR 0006](docs/decisions/0006-locked-command-tree.md), which
+required unbuilt verbs to be stubbed so the grammar could not drift. The `<noun> <verb>` grammar
+and the hidden v3.0 aliases remain in force; only the stub-the-unbuilt-verbs half is reversed.
 
 ## [3.4.23] — 2026-08-04 — A scheduled job always runs, and always leaves a trace
 
