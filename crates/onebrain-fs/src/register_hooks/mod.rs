@@ -50,11 +50,8 @@ pub struct RegisterHooksResult {
     /// Status for the qmd PostToolUse hook. None when `qmd_collection` is absent
     /// from vault.yml (the hook is then stripped silently) or --remove was given.
     pub qmd: Option<HookStatus>,
-    /// Status for the Stop `search reindex --pending-only --json` embed hook.
-    /// Registered under the same condition as `qmd` (qmd_collection set),
-    /// as a separate Stop entry alongside the checkpoint `stop` entry. None
-    /// when `qmd_collection` is absent (stripped silently) or --remove was
-    /// given.
+    /// Retained for source compatibility. Always `None`: the shared Stop
+    /// lifecycle runner now performs checkpoint and pending reindex together.
     pub embed: Option<HookStatus>,
     /// Permission entries appended on this run (empty on idempotent re-run).
     pub permissions_added: Vec<String>,
@@ -135,20 +132,14 @@ pub fn run(opts: RegisterHooksOptions) -> Result<RegisterHooksResult> {
     }
 
     // Stop hook + stale-event cleanup.
-    let stop_results = hooks::apply_hooks(&mut settings_json);
-    if let Some((_, status)) = stop_results.first() {
-        result.stop = Some(*status);
-    }
+    result.stop = Some(hooks::apply_lifecycle_hook(&mut settings_json));
 
-    // qmd PostToolUse + Stop embed — register only when qmd_collection is
-    // configured. The embed hook is a separate Stop entry alongside the
-    // checkpoint `stop` entry registered above by `hooks::apply_hooks`.
+    // PostToolUse is useful only when search is configured. Stop always uses
+    // the shared runner, which owns both checkpoint and pending reindex.
     if qmd_collection.is_some() {
-        result.qmd = Some(qmd::apply_qmd_hook(&mut settings_json));
-        result.embed = Some(qmd::apply_embed_hook(&mut settings_json));
+        result.qmd = Some(qmd::apply_lifecycle_hook(&mut settings_json));
     } else {
-        let _stripped = qmd::strip_qmd_hook(&mut settings_json);
-        let _stripped = qmd::strip_embed_hook(&mut settings_json);
+        let _stripped = qmd::strip_lifecycle_hook(&mut settings_json);
     }
 
     result.permissions_added = permissions::apply_permissions(&mut settings_json);
@@ -184,6 +175,92 @@ mod tests {
     fn read_back(vault: &std::path::Path) -> serde_json::Value {
         let text = fs::read_to_string(vault.join(".claude").join("settings.json")).unwrap();
         serde_json::from_str(&text).unwrap()
+    }
+
+    fn managed_entries<'a>(
+        settings: &'a serde_json::Value,
+        event: &str,
+    ) -> Vec<&'a serde_json::Value> {
+        settings["hooks"][event]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|group| group["hooks"].as_array())
+            .flatten()
+            .filter(|entry| {
+                entry["command"] == "onebrain"
+                    || entry["command"]
+                        .as_str()
+                        .is_some_and(|command| command.contains("onebrain"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn run_fresh_uses_one_generic_runner_per_managed_event() {
+        let v = fresh_vault(true, Some("ob-1-test"));
+
+        let result = run(RegisterHooksOptions {
+            vault_dir: Some(v.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let after = read_back(v.path());
+        for event in ["Stop", "PostToolUse"] {
+            let entries = managed_entries(&after, event);
+            assert_eq!(entries.len(), 1, "{event} entries: {entries:?}");
+            assert_eq!(entries[0]["command"], "onebrain");
+            assert_eq!(entries[0]["args"], json!(["hook"]));
+        }
+        assert!(result.embed.is_none());
+    }
+
+    #[test]
+    fn run_collapses_legacy_stop_entries_and_preserves_foreign_hook() {
+        let v = fresh_vault(true, Some("ob-1-test"));
+        let path = v.path().join(".claude/settings.json");
+        fs::write(
+            &path,
+            serde_json::to_string(&json!({
+                "hooks": {
+                    "Stop": [{
+                        "matcher": "",
+                        "hooks": [
+                            {"type": "command", "command": "onebrain", "args": ["checkpoint", "stop", "--json"], "comment": "migrate me"},
+                            {"type": "command", "command": "onebrain", "args": ["search", "reindex", "--pending-only", "--json"]},
+                            {"type": "command", "command": "notify-send", "args": ["done"]}
+                        ]
+                    }]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        run(RegisterHooksOptions {
+            vault_dir: Some(v.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+        let first = read_back(v.path());
+        run(RegisterHooksOptions {
+            vault_dir: Some(v.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+        let second = read_back(v.path());
+
+        let stop = managed_entries(&second, "Stop");
+        assert_eq!(stop.len(), 1, "Stop entries: {stop:?}");
+        assert_eq!(stop[0]["args"], json!(["hook"]));
+        assert_eq!(stop[0]["comment"], "migrate me");
+        assert!(second["hooks"]["Stop"][0]["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["command"] == "notify-send"));
+        assert_eq!(first, second, "second registration pass must be a no-op");
     }
 
     #[test]
@@ -299,7 +376,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(r.qmd, Some(HookStatus::Added));
-        assert_eq!(r.embed, Some(HookStatus::Added));
+        assert!(r.embed.is_none());
         let after = read_back(v.path());
 
         let post_tool_use: Vec<_> = after["hooks"]["PostToolUse"]
@@ -309,10 +386,7 @@ mod tests {
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
         assert_eq!(post_tool_use.len(), 1);
-        assert_eq!(
-            post_tool_use[0]["args"],
-            json!(["search", "reindex", "--lex-only", "--json"])
-        );
+        assert_eq!(post_tool_use[0]["args"], json!(["hook"]));
 
         let stop: Vec<_> = after["hooks"]["Stop"]
             .as_array()
@@ -320,17 +394,8 @@ mod tests {
             .iter()
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
-        assert!(
-            stop.iter()
-                .any(|e| e["args"] == json!(["checkpoint", "stop", "--json"])),
-            "stop entries: {stop:?}"
-        );
-        assert!(
-            stop.iter()
-                .any(|e| e["args"] == json!(["search", "reindex", "--pending-only", "--json"])),
-            "stop entries: {stop:?}"
-        );
-        assert_eq!(stop.len(), 2, "stop entries: {stop:?}");
+        assert_eq!(stop.len(), 1, "stop entries: {stop:?}");
+        assert_eq!(stop[0]["args"], json!(["hook"]));
     }
 
     /// Brief test 2: apply twice → no duplicates for either hook.
@@ -348,7 +413,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(r2.qmd, Some(HookStatus::Ok));
-        assert_eq!(r2.embed, Some(HookStatus::Ok));
+        assert!(r2.embed.is_none());
         let after = read_back(v.path());
         let post_tool_use = after["hooks"]["PostToolUse"][0]["hooks"]
             .as_array()
@@ -360,7 +425,8 @@ mod tests {
             .iter()
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
-        assert_eq!(stop.len(), 2, "stop entries: {stop:?}");
+        assert_eq!(stop.len(), 1, "stop entries: {stop:?}");
+        assert_eq!(stop[0]["args"], json!(["hook"]));
     }
 
     /// Brief test 3: existing settings with Track-2 PostToolUse
@@ -401,10 +467,7 @@ mod tests {
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
         assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0]["args"],
-            json!(["search", "reindex", "--lex-only", "--json"])
-        );
+        assert_eq!(entries[0]["args"], json!(["hook"]));
     }
 
     /// Brief test 4: legacy `["qmd","reindex","--json"]` exec and
@@ -443,10 +506,7 @@ mod tests {
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
         assert_eq!(entries.len(), 1, "entries: {entries:?}");
-        assert_eq!(
-            entries[0]["args"],
-            json!(["search", "reindex", "--lex-only", "--json"])
-        );
+        assert_eq!(entries[0]["args"], json!(["hook"]));
 
         // Shell-form legacy alias on a fresh vault.
         let v2 = fresh_vault(true, Some("ob-1-test"));
@@ -477,10 +537,7 @@ mod tests {
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
         assert_eq!(entries2.len(), 1, "entries: {entries2:?}");
-        assert_eq!(
-            entries2[0]["args"],
-            json!(["search", "reindex", "--lex-only", "--json"])
-        );
+        assert_eq!(entries2[0]["args"], json!(["hook"]));
     }
 
     /// Brief test 5: Stop embed entry is not clobbered by (PostToolUse)
@@ -528,16 +585,9 @@ mod tests {
             .iter()
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
-        assert_eq!(stop.len(), 2, "stop entries: {stop:?}");
-        let checkpoint_after = stop
-            .iter()
-            .find(|e| e["args"] == json!(["checkpoint", "stop", "--json"]))
-            .expect("checkpoint entry present");
-        // Byte-for-byte: unknown fields (comment) preserved, nothing altered.
-        assert_eq!(**checkpoint_after, checkpoint_entry);
-        assert!(stop
-            .iter()
-            .any(|e| e["args"] == json!(["search", "reindex", "--pending-only", "--json"])));
+        assert_eq!(stop.len(), 1, "stop entries: {stop:?}");
+        assert_eq!(stop[0]["args"], json!(["hook"]));
+        assert_eq!(stop[0]["comment"], checkpoint_entry["comment"]);
     }
 
     /// Brief test 6: `--remove` strips PostToolUse reindex entry AND Stop
@@ -605,7 +655,7 @@ mod tests {
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
         assert_eq!(stop.len(), 1, "stop entries: {stop:?}");
-        assert_eq!(stop[0]["args"], json!(["checkpoint", "stop", "--json"]));
+        assert_eq!(stop[0]["args"], json!(["hook"]));
     }
 
     #[test]
@@ -677,7 +727,7 @@ mod tests {
         // consumers keep getting JSON envelope now that text is default).
         assert_eq!(
             after["hooks"]["Stop"][0]["hooks"][0]["args"],
-            json!(["checkpoint", "stop", "--json"])
+            json!(["hook"])
         );
     }
 
@@ -771,9 +821,120 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1, "entries: {entries:?}");
         assert_eq!(entries[0]["command"], "onebrain");
+        assert_eq!(entries[0]["args"], json!(["hook"]));
+    }
+
+    #[test]
+    fn task3a_fresh_install_uses_one_generic_runner_and_no_embed_result() {
+        let v = fresh_vault(true, Some("ob-1-test"));
+        let r = run(RegisterHooksOptions {
+            vault_dir: Some(v.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(r.embed, None);
+        let after = read_back(v.path());
+        for event in ["Stop", "PostToolUse"] {
+            let entries: Vec<_> = after["hooks"][event]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|g| g["hooks"].as_array().unwrap().iter())
+                .collect();
+            assert_eq!(entries.len(), 1, "{event}: {entries:?}");
+            assert_eq!(
+                entries[0],
+                &json!({
+                    "type": "command", "command": "onebrain", "args": ["hook"]
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn task3a_migration_collapses_managed_entries_but_preserves_foreign_hooks() {
+        let v = fresh_vault(true, Some("ob-1-test"));
+        let settings_path = v.path().join(".claude").join("settings.json");
+        fs::write(
+            &settings_path,
+            serde_json::to_string(&json!({
+                "hooks": {
+                    "Stop": [{"matcher": "", "hooks": [
+                        {"command": "onebrain checkpoint stop", "user": "keep"},
+                        {"command": "onebrain", "args": ["hook"]},
+                        {"command": "onebrain", "args": ["search", "reindex", "--pending-only", "--json"]},
+                        {"command": "foreign-stop"}
+                    ]}],
+                    "PostToolUse": [{"matcher": "Old", "hooks": [
+                        {"command": "onebrain qmd-reindex"},
+                        {"command": "onebrain", "args": ["search", "reindex", "--json"]},
+                        {"command": "foreign-post"}
+                    ]}],
+                    "UserPromptSubmit": [{"matcher": "", "custom": true, "hooks": [
+                        {"command": "foreign-user-custom"}
+                    ]}]
+                },
+                "customTopLevel": {"keep": true}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let r = run(RegisterHooksOptions {
+            vault_dir: Some(v.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(r.stop, Some(HookStatus::Migrated));
+        assert_eq!(r.qmd, Some(HookStatus::Migrated));
+        let after = read_back(v.path());
+        assert_eq!(after["customTopLevel"]["keep"], true);
+        assert_eq!(after["hooks"]["UserPromptSubmit"][0]["custom"], true);
         assert_eq!(
-            entries[0]["args"],
-            json!(["search", "reindex", "--lex-only", "--json"])
+            after["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+            "foreign-user-custom"
+        );
+        assert_eq!(
+            after["hooks"]["Stop"][0]["hooks"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(after["hooks"]["PostToolUse"][0]["matcher"], "Write|Edit");
+        assert_eq!(
+            after["hooks"]["PostToolUse"][0]["hooks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn task3a_missing_collection_removes_managed_post_tool_use_only() {
+        let v = fresh_vault(true, None);
+        let settings_path = v.path().join(".claude").join("settings.json");
+        fs::write(
+            &settings_path,
+            serde_json::to_string(&json!({
+                "hooks": {"PostToolUse": [{"matcher": "Write|Edit", "hooks": [
+                    {"command": "onebrain", "args": ["hook"]},
+                    {"command": "foreign-post"}
+                ]}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        run(RegisterHooksOptions {
+            vault_dir: Some(v.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+        let after = read_back(v.path());
+        assert_eq!(
+            after["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "foreign-post"
+        );
+        assert_eq!(
+            after["hooks"]["Stop"][0]["hooks"][0]["args"],
+            json!(["hook"])
         );
     }
 }

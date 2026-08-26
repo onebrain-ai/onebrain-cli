@@ -3,8 +3,8 @@
 //! Bun parity: `src/lib/validator.ts::checkSettingsHooks` (lines 574-760).
 //!
 //! Validates that:
-//! - The Stop hook is registered in canonical exec form
-//!   (`command: "onebrain", args: ["checkpoint", "stop"]`).
+//! - The Stop hook is registered through the shared lifecycle runner
+//!   (`command: "onebrain", args: ["hook"]`).
 //! - If `qmd_collection` is set in vault.yml, the PostToolUse reindex hook
 //!   (canonical `search reindex`) is also registered.
 //! - No onebrain-* commands are registered under hook events other than
@@ -22,7 +22,8 @@ pub struct SettingsHooksCheck;
 
 /// Hooks OneBrain must register. Each entry pairs the event name with the
 /// substring expected to appear in the joined `command + args` string.
-const REQUIRED_HOOKS: &[(&str, &str)] = &[("Stop", "onebrain checkpoint stop")];
+const REQUIRED_HOOKS: &[(&str, &str)] = &[("Stop", "onebrain hook")];
+const LEGACY_STOP_HOOK_SUBSTRING: &str = "onebrain checkpoint stop";
 
 /// Hook events OneBrain is allowed to register. Any onebrain-* command found
 /// under any other hook event (PreCompact, PostCompact, UserPromptSubmit,
@@ -31,7 +32,8 @@ const ALLOWED_HOOK_EVENTS: &[&str] = &["Stop", "PostToolUse"];
 
 /// Canonical NEW reindex hook form (v3.4.5+): the native `search reindex`
 /// subcommand.
-const QMD_HOOK_SUBSTRING_NEW: &str = "onebrain search reindex";
+const QMD_HOOK_SUBSTRING_NEW: &str = "onebrain hook";
+const QMD_HOOK_SUBSTRING_DIRECT: &str = "onebrain search reindex";
 /// Legacy v3.2–v3.4 form: `qmd reindex` (space). doctor must still recognize
 /// this so it can advise migrating to the new form via `--fix`.
 const QMD_HOOK_SUBSTRING_LEGACY_QMD_REINDEX: &str = "onebrain qmd reindex";
@@ -164,7 +166,8 @@ fn detect_qmd_hook_form(settings: &Value) -> HookForm {
             for h in hooks {
                 let cmd = effective_command(h);
                 let is_new = cmd.contains(QMD_HOOK_SUBSTRING_NEW);
-                let is_legacy = cmd.contains(QMD_HOOK_SUBSTRING_LEGACY_QMD_REINDEX)
+                let is_legacy = cmd.contains(QMD_HOOK_SUBSTRING_DIRECT)
+                    || cmd.contains(QMD_HOOK_SUBSTRING_LEGACY_QMD_REINDEX)
                     || cmd.contains(QMD_HOOK_SUBSTRING_LEGACY);
                 if !is_new && !is_legacy {
                     continue;
@@ -229,6 +232,18 @@ impl Check for SettingsHooksCheck {
                     "{} hook in legacy shell form — --fix will migrate to exec form",
                     event
                 )),
+                HookForm::Absent if *event == "Stop" => {
+                    match detect_hook_form(&settings, event, LEGACY_STOP_HOOK_SUBSTRING) {
+                        HookForm::Exec => confirmed_hooks.push(format!("{} ✓", event)),
+                        HookForm::LegacyShell => warnings.push(format!(
+                            "{} hook in legacy shell form — --fix will migrate to exec form",
+                            event
+                        )),
+                        HookForm::Absent | HookForm::LegacyAlias | HookForm::Duplicate(_) => {
+                            warnings.push(format!("{} hook missing", event))
+                        }
+                    }
+                }
                 HookForm::Absent => warnings.push(format!("{} hook missing", event)),
                 // detect_hook_form (Stop) never yields these; covered for
                 // exhaustiveness only.
@@ -377,6 +392,32 @@ mod tests {
             },
             "permissions": { "allow": ["Bash(onebrain *)"] }
         })
+    }
+
+    #[test]
+    fn generic_lifecycle_runner_is_the_canonical_doctor_form() {
+        let d = tempdir().unwrap();
+        let settings = json!({
+            "hooks": {
+                "Stop": [{"matcher": "", "hooks": [
+                    {"type": "command", "command": "onebrain", "args": ["hook"]}
+                ]}],
+                "PostToolUse": [{"matcher": "Write|Edit", "hooks": [
+                    {"type": "command", "command": "onebrain", "args": ["hook"]}
+                ]}]
+            },
+            "permissions": {"allow": ["Bash(onebrain *)"]}
+        });
+        write_settings(d.path(), &settings);
+
+        let result = SettingsHooksCheck.run(d.path(), &cfg(Some("ob-1")));
+
+        assert_eq!(result.status, DoctorStatus::Ok, "{:?}", result.details);
+        assert!(result.details.iter().any(|line| line.contains("Stop ✓")));
+        assert!(result
+            .details
+            .iter()
+            .any(|line| line.contains("PostToolUse ✓")));
     }
 
     #[test]
@@ -599,7 +640,7 @@ mod tests {
                         "hooks": [
                             // Canonical NEW form: `search reindex`, not a
                             // legacy `qmd reindex` / `qmd-reindex` form.
-                            { "command": "onebrain", "args": ["search", "reindex", "--json"] }
+                            { "command": "onebrain", "args": ["hook"] }
                         ]
                     }
                 ]
@@ -627,7 +668,7 @@ mod tests {
     /// shape `apply_qmd_hook` (register_hooks/hooks.rs) now emits — this
     /// test is the cross-check that prevents the two modules from drifting.
     #[test]
-    fn qmd_new_exec_form_reports_ok() {
+    fn shared_runner_exec_form_reports_ok() {
         let d = tempdir().unwrap();
         let s = json!({
             "hooks": {
@@ -638,7 +679,7 @@ mod tests {
                 ],
                 "PostToolUse": [
                     { "matcher": "Write|Edit", "hooks": [
-                        { "command": "onebrain", "args": ["search", "reindex", "--json"] }
+                        { "command": "onebrain", "args": ["hook"] }
                     ] }
                 ]
             },
@@ -655,10 +696,7 @@ mod tests {
         assert!(hooks_detail.contains("PostToolUse ✓"));
     }
 
-    /// `detect_qmd_hook_form` directly on the exact entry shape emitted by
-    /// `apply_qmd_hook`'s `HookSpec::REINDEX` (`{"type":"command","command":
-    /// "onebrain","args":["search","reindex","--lex-only","--json"]}`) —
-    /// classifies as the present canonical form.
+    /// The exact shared runner entry emitted by registration is canonical.
     #[test]
     fn apply_qmd_hook_emitted_entry_is_recognized_as_canonical() {
         let settings = json!({
@@ -668,7 +706,7 @@ mod tests {
                         {
                             "type": "command",
                             "command": "onebrain",
-                            "args": ["search", "reindex", "--lex-only", "--json"]
+                            "args": ["hook"]
                         }
                     ] }
                 ]

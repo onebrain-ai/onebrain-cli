@@ -13,6 +13,12 @@ pub(crate) struct HookSpec {
 }
 
 impl HookSpec {
+    /// Shared lifecycle runner. The harness event is read from hook stdin.
+    pub(crate) const RUNNER: HookSpec = HookSpec {
+        command: "onebrain",
+        args: &["hook"],
+    };
+
     // v3.1: hook-protocol commands default to text output for interactive
     // use; machine consumers (Claude Code Stop / PostToolUse hooks) need
     // `--json` to keep getting the structured envelope they parse. Fresh
@@ -342,7 +348,21 @@ pub(crate) fn apply_hooks(settings: &mut Value) -> Vec<(&'static str, HookStatus
             }
         }
 
-        let presence = check_hook_presence(groups, spec);
+        let runner_present = groups.iter().any(|group| {
+            group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| matches_spec(entry, &HookSpec::RUNNER))
+                })
+        });
+        let presence = if runner_present {
+            Presence::Found
+        } else {
+            check_hook_presence(groups, spec)
+        };
         let status = match presence {
             Presence::Found => {
                 if rewrote_shell {
@@ -393,6 +413,123 @@ pub(crate) fn apply_hooks(settings: &mut Value) -> Vec<(&'static str, HookStatus
         results.push((*event, status));
     }
     results
+}
+
+fn is_managed_stop_entry(entry: &Value) -> bool {
+    matches_spec(entry, &HookSpec::RUNNER)
+        || matches_spec(entry, &HookSpec::STOP)
+        || matches_spec(entry, &HookSpec::EMBED)
+        || entry
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|command| command.contains("checkpoint-hook.sh"))
+}
+
+fn is_canonical_runner(entry: &Value) -> bool {
+    entry.get("command").and_then(Value::as_str) == Some(HookSpec::RUNNER.command)
+        && entry
+            .get("args")
+            .and_then(Value::as_array)
+            .is_some_and(|args| args.as_slice() == [json!("hook")])
+}
+
+fn rewrite_to_runner(entry: &mut Value) {
+    let Some(object) = entry.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "command".to_string(),
+        Value::String(HookSpec::RUNNER.command.to_string()),
+    );
+    object.insert("args".to_string(), json!(["hook"]));
+    object
+        .entry("type".to_string())
+        .or_insert_with(|| Value::String("command".to_string()));
+}
+
+fn converge_stop_entries(settings: &mut Value) -> bool {
+    let hooks = settings
+        .as_object_mut()
+        .expect("settings is a JSON object")
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !hooks.is_object() {
+        *hooks = Value::Object(Map::new());
+    }
+    let stop = hooks
+        .as_object_mut()
+        .unwrap()
+        .entry("Stop".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !stop.is_array() {
+        *stop = Value::Array(Vec::new());
+    }
+    let groups = stop.as_array_mut().unwrap();
+
+    let mut seen = false;
+    let mut changed = false;
+    for group in groups.iter_mut() {
+        let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        entries.retain_mut(|entry| {
+            if !is_managed_stop_entry(entry) {
+                return true;
+            }
+            if seen {
+                changed = true;
+                return false;
+            }
+            seen = true;
+            if !is_canonical_runner(entry) {
+                rewrite_to_runner(entry);
+                changed = true;
+            }
+            true
+        });
+    }
+    groups.retain(|group| {
+        group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| !entries.is_empty())
+    });
+
+    if !seen {
+        groups.push(json!({
+            "matcher": "",
+            "hooks": [HookSpec::RUNNER.to_canonical_entry()],
+        }));
+        changed = true;
+    }
+    changed
+}
+
+/// Register one shared Stop runner and collapse every legacy OneBrain Stop
+/// action into that single entry.
+pub(crate) fn apply_lifecycle_hook(settings: &mut Value) -> HookStatus {
+    let initial: Vec<&Value> = settings
+        .pointer("/hooks/Stop")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter(|entry| is_managed_stop_entry(entry))
+        .collect();
+    let initially_clean = initial.len() == 1 && is_canonical_runner(initial[0]);
+    let initially_missing = initial.is_empty();
+
+    let _ = apply_hooks(settings);
+    let changed = converge_stop_entries(settings);
+
+    if initially_missing {
+        HookStatus::Added
+    } else if initially_clean && !changed {
+        HookStatus::Ok
+    } else {
+        HookStatus::Migrated
+    }
 }
 
 /// Strip OneBrain-managed hook entries from every event. Used by `--remove`.
