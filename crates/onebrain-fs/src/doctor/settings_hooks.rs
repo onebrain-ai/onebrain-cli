@@ -5,8 +5,8 @@
 //! Validates that:
 //! - The Stop hook is registered through the shared lifecycle runner
 //!   (`command: "onebrain", args: ["hook"]`).
-//! - If `qmd_collection` is set in vault.yml, the PostToolUse reindex hook
-//!   (canonical `search reindex`) is also registered.
+//! - If `qmd_collection` is set in vault.yml, the PostToolUse lifecycle runner
+//!   is also registered.
 //! - No onebrain-* commands are registered under hook events other than
 //!   `Stop` / `PostToolUse` (stale events from previous CLI versions).
 //! - No stale bash-wrapper scripts (`checkpoint-hook.sh`, `session-init.sh`)
@@ -30,8 +30,7 @@ const LEGACY_STOP_HOOK_SUBSTRING: &str = "onebrain checkpoint stop";
 /// SessionStart, etc.) is stale and must be removed.
 const ALLOWED_HOOK_EVENTS: &[&str] = &["Stop", "PostToolUse"];
 
-/// Canonical NEW reindex hook form (v3.4.5+): the native `search reindex`
-/// subcommand.
+/// Canonical PostToolUse lifecycle runner form.
 const QMD_HOOK_SUBSTRING_NEW: &str = "onebrain hook";
 const QMD_HOOK_SUBSTRING_DIRECT: &str = "onebrain search reindex";
 /// Legacy v3.2–v3.4 form: `qmd reindex` (space). doctor must still recognize
@@ -51,7 +50,7 @@ const CANONICAL_HOOK_COMMAND: &str = "onebrain";
 ///   (shell-form, wrapper like `bash -c …`, missing args[], etc.).
 /// - `LegacyAlias` — exactly one matching entry in exec form but using a
 ///   legacy reindex subcommand (`qmd reindex` space or `qmd-reindex` hyphen)
-///   instead of the canonical `search reindex`. qmd-specific.
+///   instead of the shared lifecycle runner. qmd-specific.
 /// - `Duplicate(n)` — `n >= 2` matching entries (any mix of forms).
 /// - `Absent`      — no entry matches.
 #[derive(Debug, PartialEq, Eq)]
@@ -93,24 +92,63 @@ fn effective_command(hook: &Value) -> String {
 }
 
 /// Returns true iff the hook entry is in canonical exec form:
-/// `command == "onebrain"` AND `args` is a non-empty array.
+/// `type == "command"`, `command == "onebrain"` AND `args` is a non-empty array.
 fn is_canonical(hook: &Value) -> bool {
+    let type_ok = hook.get("type").and_then(|v| v.as_str()) == Some("command");
     let cmd_ok = hook.get("command").and_then(|v| v.as_str()) == Some(CANONICAL_HOOK_COMMAND);
     let args_ok = hook
         .get("args")
         .and_then(|v| v.as_array())
         .map(|a| !a.is_empty())
         .unwrap_or(false);
-    cmd_ok && args_ok
+    type_ok && cmd_ok && args_ok
 }
 
-/// Classify all matching hook entries under `event`. Scan ALL matches first —
-/// if any one is in canonical exec form, return `Exec` even when a legacy
-/// duplicate also matches. This handles partial migrations where a new
-/// canonical entry was added before the legacy one was removed: the canonical
-/// entry is what actually fires, so it should win the form classification.
+/// Match a known OneBrain command exactly, without treating arbitrary foreign
+/// shell text that merely contains the phrase as a managed hook.
+fn matches_command_phrase(hook: &Value, phrase: &str) -> bool {
+    let Some(command) = hook.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    if hook.get("args").is_some() {
+        command == CANONICAL_HOOK_COMMAND && effective_command(hook) == phrase
+    } else {
+        command == phrase
+    }
+}
+
+/// Match a historical command family whose entries may carry trailing flags
+/// such as `--json`, while still requiring `onebrain` to be the actual
+/// executable rather than arbitrary shell text.
+fn matches_command_prefix(hook: &Value, phrase: &str) -> bool {
+    let Some(command) = hook.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    let expected: Vec<&str> = phrase.split_whitespace().collect();
+    let Some(first) = expected.first() else {
+        return false;
+    };
+    if hook.get("args").is_some() {
+        if command != *first {
+            return false;
+        }
+        let Some(args) = hook.get("args").and_then(Value::as_array) else {
+            return false;
+        };
+        let expected_args = &expected[1..];
+        args.len() >= expected_args.len()
+            && args
+                .iter()
+                .zip(expected_args)
+                .all(|(actual, expected)| actual.as_str() == Some(*expected))
+    } else {
+        command == phrase || command.starts_with(&format!("{phrase} "))
+    }
+}
+
+/// Classify all matching hook entries under `event`.
 fn detect_hook_form(settings: &Value, event: &str, substring: &str) -> HookForm {
-    let mut saw_legacy = false;
+    let mut matches: Vec<bool> = Vec::new();
     let Some(groups) = settings
         .pointer(&format!("/hooks/{}", event))
         .and_then(|v| v.as_array())
@@ -122,24 +160,22 @@ fn detect_hook_form(settings: &Value, event: &str, substring: &str) -> HookForm 
             continue;
         };
         for h in hooks {
-            if !effective_command(h).contains(substring) {
+            if !matches_command_phrase(h, substring) {
                 continue;
             }
-            if is_canonical(h) {
-                return HookForm::Exec;
-            }
-            saw_legacy = true;
+            matches.push(is_canonical(h));
         }
     }
-    if saw_legacy {
-        HookForm::LegacyShell
-    } else {
-        HookForm::Absent
+    match matches.as_slice() {
+        [] => HookForm::Absent,
+        [true] => HookForm::Exec,
+        [_] => HookForm::LegacyShell,
+        matches => HookForm::Duplicate(matches.len()),
     }
 }
 
-/// Classify the PostToolUse reindex hook by counting EVERY entry whose
-/// effective command matches the new canonical (`onebrain search reindex`)
+/// Classify the PostToolUse lifecycle hook by counting EVERY entry whose
+/// command matches the shared runner (`onebrain hook`)
 /// OR either legacy form (`onebrain qmd reindex` space, `onebrain
 /// qmd-reindex` hyphen). Unlike `detect_hook_form` (which short-circuits on
 /// the first canonical match), this counts all matches so a duplicated hook
@@ -148,7 +184,7 @@ fn detect_hook_form(settings: &Value, event: &str, substring: &str) -> HookForm 
 /// Returns:
 /// - `Absent`        — 0 matches
 /// - `Duplicate(n)`  — n >= 2 matches (any mix of forms)
-/// - `Exec`          — exactly 1, new canonical exec form (`search reindex`)
+/// - `Exec`          — exactly 1, new canonical lifecycle-runner exec form
 /// - `LegacyAlias`   — exactly 1, exec form using a legacy subcommand
 ///   (`qmd reindex` or `qmd-reindex`)
 /// - `LegacyShell`   — exactly 1, shell form (command string, no args[])
@@ -164,11 +200,10 @@ fn detect_qmd_hook_form(settings: &Value) -> HookForm {
                 continue;
             };
             for h in hooks {
-                let cmd = effective_command(h);
-                let is_new = cmd.contains(QMD_HOOK_SUBSTRING_NEW);
-                let is_legacy = cmd.contains(QMD_HOOK_SUBSTRING_DIRECT)
-                    || cmd.contains(QMD_HOOK_SUBSTRING_LEGACY_QMD_REINDEX)
-                    || cmd.contains(QMD_HOOK_SUBSTRING_LEGACY);
+                let is_new = matches_command_phrase(h, QMD_HOOK_SUBSTRING_NEW);
+                let is_legacy = matches_command_prefix(h, QMD_HOOK_SUBSTRING_DIRECT)
+                    || matches_command_prefix(h, QMD_HOOK_SUBSTRING_LEGACY_QMD_REINDEX)
+                    || matches_command_prefix(h, QMD_HOOK_SUBSTRING_LEGACY);
                 if !is_new && !is_legacy {
                     continue;
                 }
@@ -227,34 +262,54 @@ impl Check for SettingsHooksCheck {
         // Required hooks
         for (event, cmd_substring) in REQUIRED_HOOKS {
             match detect_hook_form(&settings, event, cmd_substring) {
-                HookForm::Exec => confirmed_hooks.push(format!("{} ✓", event)),
+                HookForm::Exec => {
+                    let legacy_form = if *event == "Stop" {
+                        detect_hook_form(&settings, event, LEGACY_STOP_HOOK_SUBSTRING)
+                    } else {
+                        HookForm::Absent
+                    };
+                    match legacy_form {
+                        HookForm::Absent => confirmed_hooks.push(format!("{} ✓", event)),
+                        HookForm::Duplicate(n) => warnings.push(format!(
+                            "{} hook duplicated (×{n}) — run onebrain doctor --fix",
+                            event
+                        )),
+                        HookForm::Exec | HookForm::LegacyShell | HookForm::LegacyAlias => warnings
+                            .push(format!(
+                                "{} hook needs repair — run onebrain doctor --fix",
+                                event
+                            )),
+                    }
+                }
                 HookForm::LegacyShell => warnings.push(format!(
                     "{} hook in legacy shell form — --fix will migrate to exec form",
                     event
                 )),
                 HookForm::Absent if *event == "Stop" => {
                     match detect_hook_form(&settings, event, LEGACY_STOP_HOOK_SUBSTRING) {
-                        HookForm::Exec => confirmed_hooks.push(format!("{} ✓", event)),
-                        HookForm::LegacyShell => warnings.push(format!(
+                        HookForm::Exec | HookForm::LegacyShell => warnings.push(format!(
                             "{} hook in legacy shell form — --fix will migrate to exec form",
                             event
                         )),
-                        HookForm::Absent | HookForm::LegacyAlias | HookForm::Duplicate(_) => {
-                            warnings.push(format!("{} hook missing", event))
+                        HookForm::Absent => warnings.push(format!("{} hook missing", event)),
+                        HookForm::LegacyAlias | HookForm::Duplicate(_) => {
+                            warnings.push(format!("{} hook needs repair", event))
                         }
                     }
                 }
                 HookForm::Absent => warnings.push(format!("{} hook missing", event)),
                 // detect_hook_form (Stop) never yields these; covered for
                 // exhaustiveness only.
-                HookForm::LegacyAlias | HookForm::Duplicate(_) => {
-                    warnings.push(format!("{} hook needs repair", event))
-                }
+                HookForm::LegacyAlias => warnings.push(format!("{} hook needs repair", event)),
+                HookForm::Duplicate(n) => warnings.push(format!(
+                    "{} hook duplicated (×{n}) — run onebrain doctor --fix",
+                    event
+                )),
             }
         }
 
         // PostToolUse (qmd) — conditional on qmd_collection. Recognizes the
-        // new canonical `search reindex` form as well as either legacy form
+        // shared lifecycle runner as well as either legacy form
         // (`qmd reindex` space, `qmd-reindex` hyphen).
         if config.qmd_collection.is_some() {
             match detect_qmd_hook_form(&settings) {
@@ -385,7 +440,7 @@ mod tests {
                     {
                         "matcher": "",
                         "hooks": [
-                            { "command": "onebrain", "args": ["checkpoint", "stop"] }
+                            { "type": "command", "command": "onebrain", "args": ["hook"] }
                         ]
                     }
                 ]
@@ -418,6 +473,133 @@ mod tests {
             .details
             .iter()
             .any(|line| line.contains("PostToolUse ✓")));
+    }
+
+    #[test]
+    fn doctor_rejects_missing_runner_type() {
+        let d = tempdir().unwrap();
+        let settings = json!({
+            "hooks": {
+                "Stop": [{"matcher": "", "hooks": [
+                    {"command": "onebrain", "args": ["hook"]}
+                ]}],
+                "PostToolUse": [{"matcher": "Write|Edit", "hooks": [
+                    {"command": "onebrain", "args": ["hook"]}
+                ]}]
+            },
+            "permissions": {"allow": ["Bash(onebrain *)"]}
+        });
+        write_settings(d.path(), &settings);
+
+        let result = SettingsHooksCheck.run(d.path(), &cfg(Some("ob-1")));
+
+        assert_eq!(
+            result.status,
+            DoctorStatus::Warn,
+            "details: {:?}",
+            result.details
+        );
+    }
+
+    #[test]
+    fn doctor_rejects_wrong_runner_type() {
+        let d = tempdir().unwrap();
+        let settings = json!({
+            "hooks": {
+                "Stop": [{"matcher": "", "hooks": [
+                    {"type": "shell", "command": "onebrain", "args": ["hook"]}
+                ]}],
+                "PostToolUse": [{"matcher": "Write|Edit", "hooks": [
+                    {"type": "shell", "command": "onebrain", "args": ["hook"]}
+                ]}]
+            },
+            "permissions": {"allow": ["Bash(onebrain *)"]}
+        });
+        write_settings(d.path(), &settings);
+
+        let result = SettingsHooksCheck.run(d.path(), &cfg(Some("ob-1")));
+
+        assert_eq!(
+            result.status,
+            DoctorStatus::Warn,
+            "details: {:?}",
+            result.details
+        );
+    }
+
+    #[test]
+    fn doctor_warns_on_duplicate_stop_runners() {
+        let d = tempdir().unwrap();
+        let settings = json!({
+            "hooks": {
+                "Stop": [
+                    {"matcher": "", "hooks": [
+                        {"type": "command", "command": "onebrain", "args": ["hook"]}
+                    ]},
+                    {"matcher": "", "hooks": [
+                        {"type": "command", "command": "onebrain", "args": ["hook"]}
+                    ]}
+                ]
+            },
+            "permissions": {"allow": ["Bash(onebrain *)"]}
+        });
+        write_settings(d.path(), &settings);
+
+        let result = SettingsHooksCheck.run(d.path(), &cfg(None));
+
+        assert_eq!(
+            result.status,
+            DoctorStatus::Warn,
+            "details: {:?}",
+            result.details
+        );
+        assert!(result
+            .details
+            .iter()
+            .any(|detail| detail.contains("Stop hook duplicated")));
+    }
+
+    #[test]
+    fn doctor_warns_on_legacy_direct_checkpoint_runner() {
+        let d = tempdir().unwrap();
+        let settings = json!({
+            "hooks": {
+                "Stop": [{"matcher": "", "hooks": [
+                    {"type": "command", "command": "onebrain", "args": ["checkpoint", "stop"]}
+                ]}]
+            },
+            "permissions": {"allow": ["Bash(onebrain *)"]}
+        });
+        write_settings(d.path(), &settings);
+
+        let result = SettingsHooksCheck.run(d.path(), &cfg(None));
+
+        assert_eq!(
+            result.status,
+            DoctorStatus::Warn,
+            "details: {:?}",
+            result.details
+        );
+        assert!(result
+            .details
+            .iter()
+            .any(|detail| detail.contains("legacy")));
+    }
+
+    #[test]
+    fn doctor_ignores_foreign_shell_command_containing_runner_text() {
+        let settings = json!({
+            "hooks": {
+                "Stop": [{"matcher": "", "hooks": [
+                    {"command": "echo onebrain hook"}
+                ]}]
+            }
+        });
+
+        assert_eq!(
+            detect_hook_form(&settings, "Stop", "onebrain hook"),
+            HookForm::Absent
+        );
     }
 
     #[test]
@@ -500,9 +682,9 @@ mod tests {
     }
 
     #[test]
-    fn canonical_wins_over_legacy_duplicate() {
-        // Partial-migration: legacy duplicate still present alongside canonical.
-        // The canonical entry is what actually fires, so it should win classification.
+    fn legacy_stop_runner_with_generic_runner_needs_repair() {
+        // Partial-migration: the legacy direct runner still present alongside
+        // the canonical lifecycle runner must not be reported as healthy.
         let d = tempdir().unwrap();
         let s = json!({
             "hooks": {
@@ -511,7 +693,7 @@ mod tests {
                         "matcher": "",
                         "hooks": [
                             { "command": "onebrain checkpoint stop" },
-                            { "command": "onebrain", "args": ["checkpoint", "stop"] }
+                            { "type": "command", "command": "onebrain", "args": ["hook"] }
                         ]
                     }
                 ]
@@ -520,7 +702,7 @@ mod tests {
         });
         write_settings(d.path(), &s);
         let r = SettingsHooksCheck.run(d.path(), &cfg(None));
-        assert_eq!(r.status, DoctorStatus::Ok, "details: {:?}", r.details);
+        assert_eq!(r.status, DoctorStatus::Warn, "details: {:?}", r.details);
     }
 
     #[test]
@@ -532,7 +714,7 @@ mod tests {
                     {
                         "matcher": "",
                         "hooks": [
-                            { "command": "onebrain", "args": ["checkpoint", "stop"] }
+                            { "type": "command", "command": "onebrain", "args": ["hook"] }
                         ]
                     }
                 ],
@@ -541,7 +723,7 @@ mod tests {
                     {
                         "matcher": "",
                         "hooks": [
-                            { "command": "onebrain", "args": ["checkpoint", "stop"] }
+                            { "type": "command", "command": "onebrain", "args": ["checkpoint", "stop"] }
                         ]
                     }
                 ]
@@ -630,7 +812,7 @@ mod tests {
                     {
                         "matcher": "",
                         "hooks": [
-                            { "command": "onebrain", "args": ["checkpoint", "stop"] }
+                            { "type": "command", "command": "onebrain", "args": ["hook"] }
                         ]
                     }
                 ],
@@ -638,9 +820,8 @@ mod tests {
                     {
                         "matcher": "Write|Edit",
                         "hooks": [
-                            // Canonical NEW form: `search reindex`, not a
-                            // legacy `qmd reindex` / `qmd-reindex` form.
-                            { "command": "onebrain", "args": ["hook"] }
+                            // Canonical shared lifecycle runner form.
+                            { "type": "command", "command": "onebrain", "args": ["hook"] }
                         ]
                     }
                 ]
@@ -664,9 +845,7 @@ mod tests {
             .any(|s| s.contains("permissions: Bash(onebrain *) ✓")));
     }
 
-    /// New canonical exec form `search reindex` → ✓ ok. This is exactly the
-    /// shape `apply_qmd_hook` (register_hooks/hooks.rs) now emits — this
-    /// test is the cross-check that prevents the two modules from drifting.
+    /// The shared runner form is recognized consistently for both events.
     #[test]
     fn shared_runner_exec_form_reports_ok() {
         let d = tempdir().unwrap();
@@ -674,12 +853,12 @@ mod tests {
             "hooks": {
                 "Stop": [
                     { "matcher": "", "hooks": [
-                        { "command": "onebrain", "args": ["checkpoint", "stop"] }
+                        { "type": "command", "command": "onebrain", "args": ["hook"] }
                     ] }
                 ],
                 "PostToolUse": [
                     { "matcher": "Write|Edit", "hooks": [
-                        { "command": "onebrain", "args": ["hook"] }
+                        { "type": "command", "command": "onebrain", "args": ["hook"] }
                     ] }
                 ]
             },
@@ -728,7 +907,7 @@ mod tests {
                 ],
                 "PostToolUse": [
                     { "matcher": "Write|Edit", "hooks": [
-                        { "command": "onebrain", "args": ["qmd", "reindex", "--json"] }
+                        { "type": "command", "command": "onebrain", "args": ["qmd", "reindex", "--json"] }
                     ] }
                 ]
             },
@@ -755,7 +934,7 @@ mod tests {
                 ],
                 "PostToolUse": [
                     { "matcher": "Write|Edit", "hooks": [
-                        { "command": "onebrain", "args": ["qmd-reindex", "--json"] }
+                        { "type": "command", "command": "onebrain", "args": ["qmd-reindex", "--json"] }
                     ] }
                 ]
             },
@@ -908,7 +1087,7 @@ mod tests {
                     {
                         "matcher": "",
                         "hooks": [
-                            { "command": "onebrain", "args": ["checkpoint", "stop"] }
+                            { "type": "command", "command": "onebrain", "args": ["checkpoint", "stop"] }
                         ]
                     }
                 ]
@@ -955,7 +1134,7 @@ mod tests {
             "hooks": {
                 "Stop": [{
                     "matcher": "",
-                    "hooks": [{ "command": "onebrain", "args": ["checkpoint", "stop"] }]
+                    "hooks": [{ "type": "command", "command": "onebrain", "args": ["hook"] }]
                 }],
                 "UserPromptSubmit": "not-an-array"
             },
@@ -978,7 +1157,7 @@ mod tests {
                     { "matcher": "" },  // no "hooks" key → skipped
                     {
                         "matcher": "",
-                        "hooks": [{ "command": "onebrain", "args": ["checkpoint", "stop"] }]
+                        "hooks": [{ "type": "command", "command": "onebrain", "args": ["hook"] }]
                     }
                 ]
             },
