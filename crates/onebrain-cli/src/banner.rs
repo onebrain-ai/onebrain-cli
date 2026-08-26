@@ -161,7 +161,7 @@ pub fn should_show_banner(cli: &Cli, mode: &OutputMode) -> bool {
 /// banners on stderr can confuse log scrapers).
 fn is_hook_protocol(cmd: &Cmd) -> bool {
     match cmd {
-        Cmd::CodexHook(_) => true,
+        Cmd::Hook => true,
         Cmd::Session(SessionCmd {
             verb: SessionVerb::Init { .. },
         }) => true,

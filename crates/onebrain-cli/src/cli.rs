@@ -91,10 +91,10 @@ pub enum Cmd {
     /// formula and the post-init hint). Writes to stdout.
     #[command(hide = true)]
     Completions(CompletionsArgs),
-    /// Internal Codex hook bridge. Kept in the installed CLI so an active
-    /// task does not depend on files inside a replaceable plugin cache.
-    #[command(hide = true, name = "codex-hook")]
-    CodexHook(CodexHookArgs),
+    /// Internal cross-harness hook bridge. Kept in the installed CLI so an
+    /// active task does not depend on files inside a replaceable plugin cache.
+    #[command(hide = true)]
+    Hook,
 
     // ───── Resource groups (13 · alphabetical) ─────────────────────────
     // v3.4.24 (#334): the 12 groups whose every verb returned
@@ -1096,25 +1096,6 @@ fn parse_positive_usize(raw: &str) -> Result<usize, String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// codex-hook (internal)
-// ─────────────────────────────────────────────────────────────────────────
-
-#[derive(Args, Debug)]
-pub struct CodexHookArgs {
-    #[command(subcommand)]
-    pub mode: CodexHookMode,
-}
-
-#[derive(Subcommand, Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CodexHookMode {
-    #[command(name = "session-start")]
-    SessionStart,
-    Checkpoint,
-    Lex,
-    Pending,
-}
-
-// ─────────────────────────────────────────────────────────────────────────
 // token (v3.4.10 · gain · check · discover)
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -1763,19 +1744,19 @@ mod tests {
     }
 
     #[test]
-    fn codex_hook_modes_parse_but_stay_hidden() {
-        for mode in ["session-start", "checkpoint", "lex", "pending"] {
-            assert!(
-                Cli::try_parse_from(["onebrain", "codex-hook", mode]).is_ok(),
-                "codex-hook mode `{mode}` should parse"
-            );
-        }
-
-        let mut cmd = Cli::command();
-        let help = cmd.render_long_help().to_string();
+    fn generic_hook_parses_without_modes_and_stays_hidden() {
+        assert!(Cli::try_parse_from(["onebrain", "hook"]).is_ok());
         assert!(
-            !help.contains("codex-hook"),
-            "internal codex-hook command must stay hidden"
+            Cli::try_parse_from(["onebrain", "codex-hook", "session-start"]).is_err(),
+            "the removed harness-specific hook command must not parse"
+        );
+
+        let command = Cli::command();
+        assert!(
+            command
+                .find_subcommand("hook")
+                .is_some_and(clap::Command::is_hide_set),
+            "internal hook command must stay hidden"
         );
     }
 

@@ -1,5 +1,4 @@
 pub mod checkpoint;
-pub mod codex_hook;
 pub mod codex_plugin;
 pub mod completions;
 pub mod daemon;
@@ -7,6 +6,7 @@ pub mod daemon_client;
 pub mod doctor;
 pub mod harness;
 pub mod harness_run;
+pub mod hook;
 pub mod init;
 pub mod mcp;
 pub mod migrate;

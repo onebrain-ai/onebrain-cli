@@ -63,6 +63,25 @@ fn codex_chats_with_same_prefix_receive_distinct_session_tokens() {
 }
 
 #[test]
+fn generic_hook_session_id_has_highest_priority_and_hashes_the_full_value() {
+    let cache = tempdir().unwrap();
+    let output = Command::cargo_bin("onebrain")
+        .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .env("ONEBRAIN_HOOK_SESSION_ID", "same-session-id")
+        .env("CODEX_SESSION_ID", "lower-priority-codex-id")
+        .env("CLAUDE_CODE_SESSION_ID", "lower-priority-claude-id")
+        .args(["session", "init", "--json"])
+        .current_dir(fixture("minimal_vault"))
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["session_token"], "958f9d9b674d9298");
+}
+
+#[test]
 fn explicit_hook_token_survives_startup_metadata_collection() {
     let cache = tempdir().unwrap();
     let output = Command::cargo_bin("onebrain")

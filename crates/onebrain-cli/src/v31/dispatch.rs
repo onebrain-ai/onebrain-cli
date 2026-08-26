@@ -58,7 +58,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     // The hook bridge must keep stderr clean and only delegates to another
     // OneBrain command, which performs this migration in its own process with
     // stderr suppressed. Every other command migrates here as usual.
-    if !matches!(&cli.command, Cmd::CodexHook(_)) {
+    if !matches!(&cli.command, Cmd::Hook) {
         migration::migrate_search_cache();
     }
     let vault_flag = cli.vault.clone();
@@ -66,7 +66,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
     match cli.command {
         // ───── Root verbs ────────────────────────────────────────────
-        Cmd::CodexHook(args) => commands::codex_hook::run(args.mode),
+        Cmd::Hook => commands::hook::run(),
         Cmd::Init(a) => {
             // Item D: `init` uses the global `--vault` flag for target dir
             // (was `--vault-dir` as an init-specific arg). Walk-up discovery

@@ -1,3 +1,5 @@
+//! Cross-harness lifecycle hook integration tests.
+
 #![cfg(unix)]
 
 use assert_cmd::Command;
@@ -28,7 +30,7 @@ if os.environ.get("FAKE_SLEEP_SECS"):
             handle.write("completed")
 
 args = sys.argv[1:]
-session_id = os.environ.get("CODEX_SESSION_ID", "")
+session_id = os.environ.get("ONEBRAIN_HOOK_SESSION_ID", "")
 if args == ["--version"]:
     if os.environ.get("FAKE_VERSION_PROBE_FILE"):
         with open(os.environ["FAKE_VERSION_PROBE_FILE"], "w", encoding="utf-8") as handle:
@@ -42,7 +44,8 @@ elif args[:2] == ["session", "init"]:
         payload["blob"] = "x" * 131072
     print(json.dumps(payload))
 elif args[:2] == ["checkpoint", "stop"]:
-    print(json.dumps({"decision": "block", "reason": "15 since start"}))
+    if not os.environ.get("FAKE_CHECKPOINT_SILENT"):
+        print(json.dumps({"decision": "block", "reason": "15 since start"}))
 elif args[:2] == ["search", "reindex"]:
     print("background output must stay hidden")
 else:
@@ -56,13 +59,24 @@ else:
     path
 }
 
-fn hook_command(fake: &Path, cache: &Path, mode: &str, session_id: &str) -> Command {
+fn hook_command(fake: &Path, cache: &Path, event: &str, session_id: &str) -> Command {
     let mut command = Command::cargo_bin("onebrain").unwrap();
     command
-        .args(["codex-hook", mode])
+        .arg("hook")
         .env("ONEBRAIN_BIN", fake)
         .env("ONEBRAIN_CACHE_DIR", cache)
-        .write_stdin(serde_json::json!({"session_id": session_id}).to_string());
+        .write_stdin(
+            serde_json::json!({
+                "session_id": session_id,
+                "transcript_path": "/tmp/session.jsonl",
+                "cwd": "/tmp/vault",
+                "hook_event_name": event,
+                "timestamp": "2026-08-26T10:00:00Z",
+                "model": "gpt-5.6-sol",
+                "permission_mode": "default"
+            })
+            .to_string(),
+        );
     command
 }
 
@@ -80,7 +94,7 @@ fn session_start_drains_output_larger_than_a_pipe() {
     let temp = TempDir::new().unwrap();
     let fake = fake_onebrain(temp.path());
 
-    let output = hook_command(&fake, temp.path(), "session-start", "large-output")
+    let output = hook_command(&fake, temp.path(), "SessionStart", "large-output")
         .env("FAKE_LARGE_OUTPUT", "1")
         .output()
         .unwrap();
@@ -101,7 +115,7 @@ fn bare_onebrain_override_is_injected_as_the_resolved_absolute_path() {
     let mut command = hook_command(
         Path::new("onebrain-child"),
         temp.path(),
-        "session-start",
+        "SessionStart",
         "resolved-path",
     );
 
@@ -123,7 +137,7 @@ fn relative_onebrain_override_is_injected_as_the_resolved_absolute_path() {
     let mut command = hook_command(
         Path::new("./onebrain-child"),
         temp.path(),
-        "session-start",
+        "SessionStart",
         "relative-path",
     );
 
@@ -140,13 +154,13 @@ fn stale_onebrain_override_fails_open_before_session_init() {
     let temp = TempDir::new().unwrap();
     let fake = fake_onebrain(temp.path());
 
-    let output = hook_command(&fake, temp.path(), "session-start", "stale-override")
+    let output = hook_command(&fake, temp.path(), "SessionStart", "stale-override")
         .env("FAKE_VERSION", "3.4.24")
         .output()
         .unwrap();
 
     assert!(output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"{}\n");
     assert!(output.stderr.is_empty());
 }
 
@@ -155,7 +169,7 @@ fn compatible_override_version_probe_uses_the_foreground_budget() {
     let temp = TempDir::new().unwrap();
     let fake = fake_onebrain(temp.path());
 
-    let output = hook_command(&fake, temp.path(), "session-start", "loaded-host")
+    let output = hook_command(&fake, temp.path(), "SessionStart", "loaded-host")
         .env("FAKE_VERSION_SLEEP_SECS", "2.25")
         .output()
         .unwrap();
@@ -171,13 +185,13 @@ fn background_hook_does_not_probe_the_override_version() {
     let fake = fake_onebrain(temp.path());
     let probe_file = temp.path().join("version-probed");
 
-    let output = hook_command(&fake, temp.path(), "lex", "background-fast")
+    let output = hook_command(&fake, temp.path(), "PostToolUse", "background-fast")
         .env("FAKE_VERSION_PROBE_FILE", &probe_file)
         .output()
         .unwrap();
 
     assert!(output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"{}\n");
     assert!(
         !probe_file.exists(),
         "background hook spawned an unnecessary version probe"
@@ -185,17 +199,14 @@ fn background_hook_does_not_probe_the_override_version() {
 }
 
 #[test]
-fn checkpoint_forwards_and_background_modes_suppress_real_child_output() {
+fn stop_forwards_checkpoint_and_suppresses_pending_output() {
     let temp = TempDir::new().unwrap();
     let fake = fake_onebrain(temp.path());
 
-    let checkpoint = hook_command(&fake, temp.path(), "checkpoint", "protocol")
+    let checkpoint = hook_command(&fake, temp.path(), "Stop", "protocol")
         .output()
         .unwrap();
-    let lex = hook_command(&fake, temp.path(), "lex", "protocol")
-        .output()
-        .unwrap();
-    let pending = hook_command(&fake, temp.path(), "pending", "protocol")
+    let lex = hook_command(&fake, temp.path(), "AfterTool", "protocol")
         .output()
         .unwrap();
 
@@ -203,8 +214,21 @@ fn checkpoint_forwards_and_background_modes_suppress_real_child_output() {
         String::from_utf8(checkpoint.stdout).unwrap(),
         "{\"decision\": \"block\", \"reason\": \"15 since start\"}\n"
     );
-    assert!(lex.stdout.is_empty());
-    assert!(pending.stdout.is_empty());
+    assert_eq!(lex.stdout, b"{}\n");
+}
+
+#[test]
+fn silent_stop_emits_an_empty_json_object() {
+    let temp = TempDir::new().unwrap();
+    let fake = fake_onebrain(temp.path());
+
+    let output = hook_command(&fake, temp.path(), "AfterAgent", "quiet-stop")
+        .env("FAKE_CHECKPOINT_SILENT", "1")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"{}\n");
 }
 
 #[test]
@@ -215,7 +239,7 @@ fn timed_out_child_is_killed_reaped_and_fails_open() {
     let completed_file = temp.path().join("child.completed");
     let started = Instant::now();
 
-    let output = hook_command(&fake, temp.path(), "session-start", "timeout")
+    let output = hook_command(&fake, temp.path(), "SessionStart", "timeout")
         .env("FAKE_SLEEP_SECS", "10")
         .env("FAKE_PID_FILE", &pid_file)
         .env("FAKE_COMPLETED_FILE", &completed_file)
@@ -223,7 +247,7 @@ fn timed_out_child_is_killed_reaped_and_fails_open() {
         .unwrap();
 
     assert!(output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"{}\n");
     assert!(output.stderr.is_empty());
     let elapsed = started.elapsed();
     assert!(
@@ -249,10 +273,16 @@ fn outer_hook_dispatch_skips_search_cache_migration_noise() {
     let fake = fake_onebrain(temp.path());
     let mut command = Command::cargo_bin("onebrain").unwrap();
     command
-        .args(["codex-hook", "session-start"])
+        .arg("hook")
         .env("ONEBRAIN_BIN", &fake)
         .env_remove("ONEBRAIN_CACHE_DIR")
-        .write_stdin(serde_json::json!({"session_id": "quiet-prelude"}).to_string());
+        .write_stdin(
+            serde_json::json!({
+                "session_id": "quiet-prelude",
+                "hook_event_name": "SessionStart"
+            })
+            .to_string(),
+        );
 
     #[cfg(target_os = "macos")]
     {

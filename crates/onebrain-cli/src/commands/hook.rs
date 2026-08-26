@@ -1,10 +1,9 @@
-//! Cache-independent bridge for Codex plugin hooks.
+//! Cache-independent lifecycle hook bridge shared by every supported harness.
 //!
-//! Codex retains hook commands for the lifetime of an active task. Keeping
-//! the bridge in the installed CLI avoids binding those commands to a plugin
-//! cache directory that the plugin manager may replace mid-task.
+//! Harnesses retain hook commands for the lifetime of an active session. Keeping
+//! this bridge in the installed CLI avoids binding commands to a plugin cache
+//! directory that the plugin manager may replace mid-session.
 
-use crate::cli::CodexHookMode;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -18,13 +17,31 @@ const FOREGROUND_TIMEOUT: Duration = Duration::from_secs(7);
 const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(2);
 const MIN_HOOK_CHILD_VERSION: &str = "3.4.25";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HookEvent {
+    SessionStart,
+    ToolCompleted,
+    Stop,
+}
+
+impl HookEvent {
+    fn from_payload(payload: &Value) -> Option<Self> {
+        match payload.get("hook_event_name").and_then(Value::as_str) {
+            Some("SessionStart") => Some(Self::SessionStart),
+            Some("PostToolUse" | "AfterTool") => Some(Self::ToolCompleted),
+            Some("Stop" | "AfterAgent") => Some(Self::Stop),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ChildResult {
     success: bool,
     stdout: String,
 }
 
-trait HookRunner {
+trait HookRunner: Sync {
     fn executable(&self) -> &Path;
     fn invoke(
         &self,
@@ -40,7 +57,7 @@ struct ProcessRunner {
 }
 
 impl ProcessRunner {
-    fn resolve(mode: CodexHookMode) -> Option<Self> {
+    fn resolve(needs_contract_probe: bool) -> Option<Self> {
         if let Some(executable) = std::env::var_os("ONEBRAIN_BIN")
             .filter(|value| !value.is_empty())
             .map(resolve_command_path)
@@ -49,8 +66,8 @@ impl ProcessRunner {
             let is_current = std::env::current_exe()
                 .ok()
                 .is_some_and(|current| same_executable(runner.executable(), &current));
-            let needs_contract_probe = mode == CodexHookMode::SessionStart && !is_current;
-            return (!needs_contract_probe || runner.supports_hook_contract()).then_some(runner);
+            return (!needs_contract_probe || is_current || runner.supports_hook_contract())
+                .then_some(runner);
         }
 
         let executable = std::env::current_exe()
@@ -63,6 +80,25 @@ impl ProcessRunner {
             })
             .unwrap_or_else(|| PathBuf::from("onebrain"));
         Some(Self { executable })
+    }
+
+    /// `ONEBRAIN_BIN` is an explicit child override used by managed skill runs
+    /// and integration tests. Refuse a stale override rather than injecting an
+    /// executable that lacks the lifecycle-hook contract required by this plugin.
+    fn supports_hook_contract(&self) -> bool {
+        let Some(result) = self.invoke(&["--version"], "", FOREGROUND_TIMEOUT, true) else {
+            return false;
+        };
+        if !result.success {
+            return false;
+        }
+        let minimum =
+            semver::Version::parse(MIN_HOOK_CHILD_VERSION).expect("valid minimum version");
+        result
+            .stdout
+            .split_whitespace()
+            .filter_map(|part| semver::Version::parse(part.trim_start_matches('v')).ok())
+            .any(|version| version >= minimum)
     }
 }
 
@@ -108,7 +144,7 @@ impl HookRunner for ProcessRunner {
         let mut command = Command::new(&self.executable);
         command
             .args(args)
-            .env("CODEX_SESSION_ID", session_id)
+            .env("ONEBRAIN_HOOK_SESSION_ID", session_id)
             .stdin(Stdio::null())
             .stdout(if capture_stdout {
                 Stdio::piped()
@@ -152,97 +188,104 @@ impl HookRunner for ProcessRunner {
     }
 }
 
-impl ProcessRunner {
-    /// `ONEBRAIN_BIN` is an explicit child override used by managed skill runs
-    /// and integration tests. Refuse a stale override rather than injecting an
-    /// executable that lacks the hook/task contracts required by this plugin.
-    /// The normal `current_exe` path needs no extra probe: reaching this command
-    /// already proves that binary contains the v3.4.25 hook runner.
-    fn supports_hook_contract(&self) -> bool {
-        let Some(result) = self.invoke(&["--version"], "", FOREGROUND_TIMEOUT, true) else {
-            return false;
-        };
-        if !result.success {
-            return false;
-        }
-        let minimum =
-            semver::Version::parse(MIN_HOOK_CHILD_VERSION).expect("valid minimum version");
-        result
-            .stdout
-            .split_whitespace()
-            .filter_map(|part| semver::Version::parse(part.trim_start_matches('v')).ok())
-            .any(|version| version >= minimum)
-    }
-}
-
-/// Hook failures are deliberately fail-open: Codex work must continue even
+/// Hook failures are deliberately fail-open: agent work must continue even
 /// when OneBrain is missing, slow, or returns malformed data.
-pub fn run(mode: CodexHookMode) -> Result<()> {
+pub fn run() -> Result<()> {
     let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
-        return Ok(());
-    }
-    let Some(runner) = ProcessRunner::resolve(mode) else {
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let mut output = std::io::stdout().lock();
+
+    let Ok(payload) = serde_json::from_str::<Value>(&input) else {
+        emit_empty(&mut output);
         return Ok(());
     };
-    handle(mode, &input, &runner, &mut std::io::stdout().lock());
+    let Some(event) = HookEvent::from_payload(&payload) else {
+        emit_empty(&mut output);
+        return Ok(());
+    };
+    let Some(runner) = ProcessRunner::resolve(event == HookEvent::SessionStart) else {
+        emit_empty(&mut output);
+        return Ok(());
+    };
+
+    handle(event, &payload, &runner, &mut output);
     Ok(())
 }
 
-fn handle(mode: CodexHookMode, input: &str, runner: &impl HookRunner, output: &mut impl Write) {
-    let Ok(payload) = serde_json::from_str::<Value>(input) else {
-        return;
-    };
+fn handle(
+    event: HookEvent,
+    payload: &Value,
+    runner: &(impl HookRunner + ?Sized),
+    output: &mut impl Write,
+) {
     let Some(session_id) = payload
         .get("session_id")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
     else {
+        emit_empty(output);
         return;
     };
 
-    let (args, timeout) = match mode {
-        CodexHookMode::SessionStart => {
-            (["session", "init", "--json"].as_slice(), FOREGROUND_TIMEOUT)
+    match event {
+        HookEvent::SessionStart => {
+            let result = runner.invoke(
+                &["session", "init", "--json"],
+                session_id,
+                FOREGROUND_TIMEOUT,
+                true,
+            );
+            if let Some(child) = result.filter(|child| child.success) {
+                if emit_session_start(&child.stdout, runner.executable(), output) {
+                    return;
+                }
+            }
+            emit_empty(output);
         }
-        CodexHookMode::Checkpoint => (
-            ["checkpoint", "stop", "--json"].as_slice(),
-            FOREGROUND_TIMEOUT,
-        ),
-        CodexHookMode::Lex => (
-            ["search", "reindex", "--lex-only", "--json"].as_slice(),
-            BACKGROUND_TIMEOUT,
-        ),
-        CodexHookMode::Pending => (
-            ["search", "reindex", "--pending-only", "--json"].as_slice(),
-            BACKGROUND_TIMEOUT,
-        ),
-    };
-    let capture_stdout = matches!(
-        mode,
-        CodexHookMode::SessionStart | CodexHookMode::Checkpoint
-    );
-    let Some(child) = runner.invoke(args, session_id, timeout, capture_stdout) else {
-        return;
-    };
-    if !child.success {
-        return;
-    }
-
-    match mode {
-        CodexHookMode::SessionStart => {
-            emit_session_start(&child.stdout, runner.executable(), output)
+        HookEvent::ToolCompleted => {
+            let _ = runner.invoke(
+                &["search", "reindex", "--lex-only", "--json"],
+                session_id,
+                BACKGROUND_TIMEOUT,
+                false,
+            );
+            emit_empty(output);
         }
-        CodexHookMode::Checkpoint => {
-            let _ = output.write_all(child.stdout.as_bytes());
+        HookEvent::Stop => {
+            let checkpoint = std::thread::scope(|scope| {
+                let checkpoint = scope.spawn(|| {
+                    runner.invoke(
+                        &["checkpoint", "stop", "--json"],
+                        session_id,
+                        FOREGROUND_TIMEOUT,
+                        true,
+                    )
+                });
+                let pending = scope.spawn(|| {
+                    runner.invoke(
+                        &["search", "reindex", "--pending-only", "--json"],
+                        session_id,
+                        BACKGROUND_TIMEOUT,
+                        false,
+                    )
+                });
+                let checkpoint = checkpoint.join().ok().flatten();
+                let _ = pending.join();
+                checkpoint
+            });
+            if let Some(child) = checkpoint.filter(|child| child.success) {
+                if emit_protocol_json(&child.stdout, output) {
+                    return;
+                }
+            }
+            emit_empty(output);
         }
-        CodexHookMode::Lex | CodexHookMode::Pending => {}
     }
 }
 
-fn emit_session_start(raw: &str, executable: &Path, output: &mut impl Write) {
+fn emit_session_start(raw: &str, executable: &Path, output: &mut impl Write) -> bool {
     let Ok(metadata) = serde_json::from_str::<Value>(raw) else {
-        return;
+        return false;
     };
     let Some(token) = metadata
         .get("session_token")
@@ -250,7 +293,7 @@ fn emit_session_start(raw: &str, executable: &Path, output: &mut impl Write) {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
     else {
-        return;
+        return false;
     };
 
     let executable = executable.to_string_lossy();
@@ -258,7 +301,7 @@ fn emit_session_start(raw: &str, executable: &Path, output: &mut impl Write) {
     let powershell_path = executable.replace('\'', "''");
     let compact_metadata = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".into());
     let context = format!(
-        "OneBrain Codex session_token: {token}. Preserve this token for checkpoint and wrapup isolation in this chat. Session initialization already completed inside the hook; do not invoke `session init` again. Startup metadata: {compact_metadata}. Use this exact executable path for every later OneBrain CLI call in this chat: POSIX {posix_path}; Windows PowerShell & '{powershell_path}'."
+        "OneBrain session_token: {token}. Preserve this token for checkpoint and wrapup isolation in this chat. Session initialization already completed inside the hook; do not invoke `session init` again. Startup metadata: {compact_metadata}. Use this exact executable path for every later OneBrain CLI call in this chat: POSIX {posix_path}; Windows PowerShell & '{powershell_path}'."
     );
     let response = json!({
         "hookSpecificOutput": {
@@ -266,7 +309,21 @@ fn emit_session_start(raw: &str, executable: &Path, output: &mut impl Write) {
             "additionalContext": context,
         }
     });
-    let _ = serde_json::to_writer(output, &response);
+    serde_json::to_writer(&mut *output, &response).is_ok() && output.write_all(b"\n").is_ok()
+}
+
+fn emit_protocol_json(raw: &str, output: &mut impl Write) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || !serde_json::from_str::<Value>(trimmed).is_ok_and(|value| value.is_object())
+    {
+        return false;
+    }
+    output.write_all(trimmed.as_bytes()).is_ok() && output.write_all(b"\n").is_ok()
+}
+
+fn emit_empty(output: &mut impl Write) {
+    let _ = output.write_all(b"{}\n");
 }
 
 fn posix_quote(value: &str) -> String {
@@ -276,7 +333,7 @@ fn posix_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::sync::Mutex;
 
     #[derive(Debug, Eq, PartialEq)]
     struct Call {
@@ -288,20 +345,24 @@ mod tests {
 
     struct FakeRunner {
         executable: PathBuf,
-        result: Option<ChildResult>,
-        calls: RefCell<Vec<Call>>,
+        results: Mutex<Vec<ChildResult>>,
+        calls: Mutex<Vec<Call>>,
     }
 
     impl FakeRunner {
         fn successful(stdout: &str) -> Self {
             Self {
                 executable: PathBuf::from("/opt/homebrew/bin/onebrain"),
-                result: Some(ChildResult {
+                results: Mutex::new(vec![ChildResult {
                     success: true,
                     stdout: stdout.into(),
-                }),
-                calls: RefCell::new(Vec::new()),
+                }]),
+                calls: Mutex::new(Vec::new()),
             }
+        }
+
+        fn calls(&self) -> Vec<Call> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
         }
     }
 
@@ -317,18 +378,35 @@ mod tests {
             timeout: Duration,
             capture_stdout: bool,
         ) -> Option<ChildResult> {
-            self.calls.borrow_mut().push(Call {
+            self.calls.lock().unwrap().push(Call {
                 args: args.iter().map(|arg| (*arg).to_string()).collect(),
                 session_id: session_id.into(),
                 timeout,
                 capture_stdout,
             });
-            self.result.clone()
+            self.results.lock().unwrap().pop()
         }
     }
 
-    fn hook_input(session_id: &str) -> String {
-        json!({"session_id": session_id}).to_string()
+    fn hook_payload(event: &str, session_id: &str) -> Value {
+        json!({"hook_event_name": event, "session_id": session_id})
+    }
+
+    #[test]
+    fn event_names_map_across_supported_protocols() {
+        for (name, expected) in [
+            ("SessionStart", Some(HookEvent::SessionStart)),
+            ("PostToolUse", Some(HookEvent::ToolCompleted)),
+            ("AfterTool", Some(HookEvent::ToolCompleted)),
+            ("Stop", Some(HookEvent::Stop)),
+            ("AfterAgent", Some(HookEvent::Stop)),
+            ("BeforeTool", None),
+        ] {
+            assert_eq!(
+                HookEvent::from_payload(&json!({"hook_event_name": name})),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -339,17 +417,17 @@ mod tests {
         let mut output = Vec::new();
 
         handle(
-            CodexHookMode::SessionStart,
-            &hook_input("codex-session"),
+            HookEvent::SessionStart,
+            &hook_payload("SessionStart", "shared-session"),
             &runner,
             &mut output,
         );
 
         assert_eq!(
-            runner.calls.into_inner(),
+            runner.calls(),
             vec![Call {
                 args: vec!["session".into(), "init".into(), "--json".into()],
-                session_id: "codex-session".into(),
+                session_id: "shared-session".into(),
                 timeout: FOREGROUND_TIMEOUT,
                 capture_stdout: true,
             }]
@@ -366,71 +444,47 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_forwards_cli_protocol_output() {
-        let runner = FakeRunner::successful("{\"continue\":true}\n");
+    fn tool_event_suppresses_child_stdout_and_emits_json() {
+        let runner = FakeRunner::successful("noisy child output");
         let mut output = Vec::new();
 
         handle(
-            CodexHookMode::Checkpoint,
-            &hook_input("codex-session"),
+            HookEvent::ToolCompleted,
+            &hook_payload("AfterTool", "shared-session"),
             &runner,
             &mut output,
         );
 
-        assert_eq!(String::from_utf8(output).unwrap(), "{\"continue\":true}\n");
+        assert_eq!(output, b"{}\n");
         assert_eq!(
-            runner.calls.into_inner()[0].args,
-            ["checkpoint", "stop", "--json"]
+            runner.calls(),
+            vec![Call {
+                args: vec![
+                    "search".into(),
+                    "reindex".into(),
+                    "--lex-only".into(),
+                    "--json".into(),
+                ],
+                session_id: "shared-session".into(),
+                timeout: BACKGROUND_TIMEOUT,
+                capture_stdout: false,
+            }]
         );
     }
 
     #[test]
-    fn background_modes_suppress_child_stdout() {
-        for (mode, expected_tail) in [
-            (CodexHookMode::Lex, "--lex-only"),
-            (CodexHookMode::Pending, "--pending-only"),
-        ] {
-            let runner = FakeRunner::successful("noisy child output");
-            let mut output = Vec::new();
-
-            handle(mode, &hook_input("codex-session"), &runner, &mut output);
-
-            assert!(output.is_empty());
-            let calls = runner.calls.into_inner();
-            assert!(calls[0].args.iter().any(|arg| arg == expected_tail));
-            assert_eq!(calls[0].timeout, BACKGROUND_TIMEOUT);
-            assert!(!calls[0].capture_stdout);
-        }
-    }
-
-    #[test]
-    fn invalid_input_and_child_failure_fail_open() {
-        let runner = FakeRunner::successful("unused");
+    fn malformed_session_metadata_fails_open_with_json() {
+        let runner = FakeRunner::successful("not-json");
         let mut output = Vec::new();
+
         handle(
-            CodexHookMode::SessionStart,
-            "not-json",
+            HookEvent::SessionStart,
+            &hook_payload("SessionStart", "shared-session"),
             &runner,
             &mut output,
         );
-        assert!(runner.calls.into_inner().is_empty());
-        assert!(output.is_empty());
 
-        let failed = FakeRunner {
-            executable: PathBuf::from("onebrain"),
-            result: Some(ChildResult {
-                success: false,
-                stdout: "error".into(),
-            }),
-            calls: RefCell::new(Vec::new()),
-        };
-        handle(
-            CodexHookMode::Checkpoint,
-            &hook_input("codex-session"),
-            &failed,
-            &mut output,
-        );
-        assert!(output.is_empty());
+        assert_eq!(output, b"{}\n");
     }
 
     #[cfg(unix)]
