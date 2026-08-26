@@ -160,7 +160,12 @@ fn detect_hook_form(settings: &Value, event: &str, substring: &str) -> HookForm 
             continue;
         };
         for h in hooks {
-            if !matches_command_phrase(h, substring) {
+            let matched = if substring == LEGACY_STOP_HOOK_SUBSTRING {
+                matches_command_prefix(h, substring)
+            } else {
+                matches_command_phrase(h, substring)
+            };
+            if !matched {
                 continue;
             }
             matches.push(is_canonical(h));
@@ -566,6 +571,33 @@ mod tests {
             "hooks": {
                 "Stop": [{"matcher": "", "hooks": [
                     {"type": "command", "command": "onebrain", "args": ["checkpoint", "stop"]}
+                ]}]
+            },
+            "permissions": {"allow": ["Bash(onebrain *)"]}
+        });
+        write_settings(d.path(), &settings);
+
+        let result = SettingsHooksCheck.run(d.path(), &cfg(None));
+
+        assert_eq!(
+            result.status,
+            DoctorStatus::Warn,
+            "details: {:?}",
+            result.details
+        );
+        assert!(result
+            .details
+            .iter()
+            .any(|detail| detail.contains("legacy")));
+    }
+
+    #[test]
+    fn doctor_warns_on_legacy_direct_checkpoint_exec_with_json() {
+        let d = tempdir().unwrap();
+        let settings = json!({
+            "hooks": {
+                "Stop": [{"matcher": "", "hooks": [
+                    {"type": "command", "command": "onebrain", "args": ["checkpoint", "stop", "--json"]}
                 ]}]
             },
             "permissions": {"allow": ["Bash(onebrain *)"]}
