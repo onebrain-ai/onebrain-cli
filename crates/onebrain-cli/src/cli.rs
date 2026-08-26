@@ -91,6 +91,10 @@ pub enum Cmd {
     /// formula and the post-init hint). Writes to stdout.
     #[command(hide = true)]
     Completions(CompletionsArgs),
+    /// Internal Codex hook bridge. Kept in the installed CLI so an active
+    /// task does not depend on files inside a replaceable plugin cache.
+    #[command(hide = true, name = "codex-hook")]
+    CodexHook(CodexHookArgs),
 
     // ───── Resource groups (13 · alphabetical) ─────────────────────────
     // v3.4.24 (#334): the 12 groups whose every verb returned
@@ -1072,6 +1076,42 @@ pub struct TaskListArgs {
     /// Include done (`- [x]`) tasks. Default returns open tasks only.
     #[arg(long)]
     pub all: bool,
+    /// Return at most this many tasks after filtering and deterministic sorting.
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = parse_positive_usize
+    )]
+    pub limit: Option<usize>,
+}
+
+fn parse_positive_usize(raw: &str) -> Result<usize, String> {
+    let value = raw
+        .parse::<usize>()
+        .map_err(|_| format!("expected a positive integer, got `{raw}`"))?;
+    if value == 0 {
+        return Err("expected a positive integer, got `0`".into());
+    }
+    Ok(value)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// codex-hook (internal)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[derive(Args, Debug)]
+pub struct CodexHookArgs {
+    #[command(subcommand)]
+    pub mode: CodexHookMode,
+}
+
+#[derive(Subcommand, Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodexHookMode {
+    #[command(name = "session-start")]
+    SessionStart,
+    Checkpoint,
+    Lex,
+    Pending,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1723,6 +1763,38 @@ mod tests {
     }
 
     #[test]
+    fn codex_hook_modes_parse_but_stay_hidden() {
+        for mode in ["session-start", "checkpoint", "lex", "pending"] {
+            assert!(
+                Cli::try_parse_from(["onebrain", "codex-hook", mode]).is_ok(),
+                "codex-hook mode `{mode}` should parse"
+            );
+        }
+
+        let mut cmd = Cli::command();
+        let help = cmd.render_long_help().to_string();
+        assert!(
+            !help.contains("codex-hook"),
+            "internal codex-hook command must stay hidden"
+        );
+    }
+
+    #[test]
+    fn task_list_parses_limit() {
+        let cli = Cli::try_parse_from(["onebrain", "task", "list", "--limit", "5"]).unwrap();
+        match cli.command {
+            Cmd::Task(TaskCmd {
+                verb: TaskVerb::List(args),
+            }) => assert_eq!(args.limit, Some(5)),
+            _ => panic!("expected task list"),
+        }
+        assert!(
+            Cli::try_parse_from(["onebrain", "task", "list", "--limit", "0"]).is_err(),
+            "task list should reject a zero limit"
+        );
+    }
+
+    #[test]
     fn task_list_parses_filters() {
         let cli = Cli::try_parse_from([
             "onebrain",
@@ -1742,6 +1814,7 @@ mod tests {
                 assert_eq!(args.due_by.as_deref(), Some("today"));
                 assert_eq!(args.folder, vec!["01-projects".to_string()]);
                 assert!(args.all);
+                assert_eq!(args.limit, None);
             }
             _ => panic!("expected task list"),
         }

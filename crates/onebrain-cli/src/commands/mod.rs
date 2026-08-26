@@ -1,4 +1,5 @@
 pub mod checkpoint;
+pub mod codex_hook;
 pub mod codex_plugin;
 pub mod completions;
 pub mod daemon;

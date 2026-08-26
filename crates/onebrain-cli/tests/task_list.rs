@@ -54,3 +54,63 @@ fn task_list_json_excludes_fenced_and_respects_due_by() {
     assert_eq!(tasks.len(), 1, "only the overdue non-fenced task: {v}");
     assert_eq!(tasks[0]["text"], "overdue real");
 }
+
+#[test]
+fn task_list_limit_keeps_full_total_and_deterministic_order() {
+    let dir = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let root = dir.path();
+    write(root, "onebrain.yml", "qmd_collection: t\n");
+    write(
+        root,
+        "01-projects/b.md",
+        "- [ ] sixth 📅 2026-06-06\n\
+         - [ ] second-b 📅 2026-06-02\n",
+    );
+    write(
+        root,
+        "01-projects/a.md",
+        "- [ ] fifth 📅 2026-06-05\n\
+         - [ ] second-a-first 📅 2026-06-02\n\
+         - [ ] first 📅 2026-06-01\n\
+         - [ ] seventh 📅 2026-06-07\n\
+         - [ ] second-a-second 📅 2026-06-02\n",
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_onebrain"))
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .args([
+            "--vault",
+            root.to_str().unwrap(),
+            "--json",
+            "task",
+            "list",
+            "--limit",
+            "5",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let tasks = v["data"]["tasks"].as_array().unwrap();
+    let texts: Vec<&str> = tasks
+        .iter()
+        .map(|task| task["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "first",
+            "second-a-first",
+            "second-a-second",
+            "second-b",
+            "fifth",
+        ]
+    );
+    assert_eq!(v["data"]["total"], 7);
+}
