@@ -427,8 +427,10 @@ mod tests {
 
     fn cfg(qmd: Option<&str>) -> VaultConfig {
         let qmd_collection = qmd.map(str::to_string);
-        let mut search = onebrain_core::config::SearchConfig::default();
-        search.collection = qmd_collection.clone();
+        let search = onebrain_core::config::SearchConfig {
+            collection: qmd_collection.clone(),
+            ..Default::default()
+        };
         VaultConfig {
             qmd_collection,
             checkpoint: Default::default(),
