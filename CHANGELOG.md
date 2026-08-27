@@ -14,6 +14,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 - Codex hooks now run through the installed CLI instead of a Python file inside a replaceable versioned plugin cache, so refreshing the plugin cannot break an active task.
+- `checkpoint reset` accepts `--session-token <TOKEN>`, so `/wrapup` clears the counter the hook actually incremented instead of a state file resolved from the agent shell's own environment.
 
 ### Added
 - `task list --limit N` returns a deterministic bounded result while preserving the full filtered count in `data.total`, keeping startup task payloads small.

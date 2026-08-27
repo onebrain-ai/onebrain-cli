@@ -47,6 +47,9 @@ elif args[:2] == ["checkpoint", "stop"]:
     if not os.environ.get("FAKE_CHECKPOINT_SILENT"):
         print(json.dumps({"decision": "block", "reason": "15 since start"}))
 elif args[:2] == ["search", "reindex"]:
+    if os.environ.get("FAKE_REINDEX_FILE"):
+        with open(os.environ["FAKE_REINDEX_FILE"], "w", encoding="utf-8") as handle:
+            handle.write(" ".join(args))
     print("background output must stay hidden")
 else:
     sys.exit(64)
@@ -215,6 +218,35 @@ fn stop_forwards_checkpoint_and_suppresses_pending_output() {
         "{\"decision\": \"block\", \"reason\": \"15 since start\"}\n"
     );
     assert_eq!(lex.stdout, b"{}\n");
+}
+
+/// End of session: the Stop hook must ALSO dispatch the deferred embedding
+/// pass, not just the checkpoint. The fake child records its own argv, so a
+/// dropped `search reindex --pending-only` spawn leaves no marker behind.
+#[test]
+fn stop_dispatches_the_pending_embed_child() {
+    let temp = TempDir::new().unwrap();
+    let fake = fake_onebrain(temp.path());
+    let reindex_file = temp.path().join("pending-embed.args");
+
+    let output = hook_command(&fake, temp.path(), "Stop", "pending-embed")
+        .env("FAKE_REINDEX_FILE", &reindex_file)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(&reindex_file)
+            .expect("Stop must dispatch the pending-embed child")
+            .trim(),
+        "search reindex --pending-only --json"
+    );
+    // The background child's stdout still never reaches the harness — only
+    // the foreground checkpoint's protocol JSON does.
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "{\"decision\": \"block\", \"reason\": \"15 since start\"}\n"
+    );
 }
 
 #[test]

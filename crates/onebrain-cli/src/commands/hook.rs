@@ -333,6 +333,7 @@ fn posix_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     #[derive(Debug, Eq, PartialEq)]
@@ -343,26 +344,66 @@ mod tests {
         capture_stdout: bool,
     }
 
+    /// Canned child results.
+    ///
+    /// `Uniform` answers every invocation with the same result — enough for
+    /// the single-child events. `PerArgs` keys results by exact argv, which
+    /// `Stop` needs: its two children run on separate scoped threads, so the
+    /// order in which they reach the runner is nondeterministic and a
+    /// pop-a-queue model would hand the checkpoint child the pending child's
+    /// stdout half the time. An argv absent from the map yields `None` (a
+    /// child that produced no result).
+    enum FakeResults {
+        Uniform(ChildResult),
+        PerArgs(HashMap<Vec<String>, ChildResult>),
+    }
+
     struct FakeRunner {
         executable: PathBuf,
-        results: Mutex<Vec<ChildResult>>,
+        results: FakeResults,
         calls: Mutex<Vec<Call>>,
     }
 
     impl FakeRunner {
         fn successful(stdout: &str) -> Self {
+            Self::new(FakeResults::Uniform(ChildResult {
+                success: true,
+                stdout: stdout.into(),
+            }))
+        }
+
+        fn per_args<'a>(results: impl IntoIterator<Item = (&'a [&'a str], &'a str)>) -> Self {
+            Self::new(FakeResults::PerArgs(
+                results
+                    .into_iter()
+                    .map(|(args, stdout)| {
+                        (
+                            args.iter().map(|arg| (*arg).to_string()).collect(),
+                            ChildResult {
+                                success: true,
+                                stdout: stdout.into(),
+                            },
+                        )
+                    })
+                    .collect(),
+            ))
+        }
+
+        fn new(results: FakeResults) -> Self {
             Self {
                 executable: PathBuf::from("/opt/homebrew/bin/onebrain"),
-                results: Mutex::new(vec![ChildResult {
-                    success: true,
-                    stdout: stdout.into(),
-                }]),
+                results,
                 calls: Mutex::new(Vec::new()),
             }
         }
 
+        /// Recorded invocations, sorted by argv — `Stop` records its two
+        /// children in nondeterministic order, so callers compare an
+        /// unordered set rather than a sequence.
         fn calls(&self) -> Vec<Call> {
-            std::mem::take(&mut *self.calls.lock().unwrap())
+            let mut calls = std::mem::take(&mut *self.calls.lock().unwrap());
+            calls.sort_by(|left, right| left.args.cmp(&right.args));
+            calls
         }
     }
 
@@ -378,13 +419,17 @@ mod tests {
             timeout: Duration,
             capture_stdout: bool,
         ) -> Option<ChildResult> {
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
             self.calls.lock().unwrap().push(Call {
-                args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                args: args.clone(),
                 session_id: session_id.into(),
                 timeout,
                 capture_stdout,
             });
-            self.results.lock().unwrap().pop()
+            match &self.results {
+                FakeResults::Uniform(result) => Some(result.clone()),
+                FakeResults::PerArgs(results) => results.get(&args).cloned(),
+            }
         }
     }
 
@@ -469,6 +514,61 @@ mod tests {
                 timeout: BACKGROUND_TIMEOUT,
                 capture_stdout: false,
             }]
+        );
+    }
+
+    #[test]
+    fn stop_dispatches_the_checkpoint_and_the_pending_embed() {
+        // Stop fans out to TWO children: the foreground checkpoint, whose
+        // stdout becomes the hook's protocol response, and the background
+        // pending-embed pass, whose output must stay suppressed. Deleting
+        // either spawn must fail this test.
+        let runner = FakeRunner::per_args([
+            (
+                &["checkpoint", "stop", "--json"][..],
+                r#"{"decision":"block","reason":"15 since start"}"#,
+            ),
+            (
+                &["search", "reindex", "--pending-only", "--json"][..],
+                "background output must stay hidden",
+            ),
+        ]);
+        let mut output = Vec::new();
+
+        handle(
+            HookEvent::Stop,
+            &hook_payload("Stop", "shared-session"),
+            &runner,
+            &mut output,
+        );
+
+        // `calls()` sorts by argv — the two children race on separate scoped
+        // threads, so only the SET of invocations is deterministic.
+        assert_eq!(
+            runner.calls(),
+            vec![
+                Call {
+                    args: vec!["checkpoint".into(), "stop".into(), "--json".into()],
+                    session_id: "shared-session".into(),
+                    timeout: FOREGROUND_TIMEOUT,
+                    capture_stdout: true,
+                },
+                Call {
+                    args: vec![
+                        "search".into(),
+                        "reindex".into(),
+                        "--pending-only".into(),
+                        "--json".into(),
+                    ],
+                    session_id: "shared-session".into(),
+                    timeout: BACKGROUND_TIMEOUT,
+                    capture_stdout: false,
+                },
+            ]
+        );
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "{\"decision\":\"block\",\"reason\":\"15 since start\"}\n"
         );
     }
 

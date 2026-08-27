@@ -109,8 +109,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
 
         // ───── Checkpoint ───────────────────────────────────────────
         Cmd::Checkpoint(CheckpointCmd { verb }) => match verb {
-            CheckpointVerb::Stop { vault_dir } => commands::checkpoint::run("stop", vault_dir),
-            CheckpointVerb::Reset { vault_dir } => commands::checkpoint::run("reset", vault_dir),
+            CheckpointVerb::Stop { vault_dir } => {
+                commands::checkpoint::run("stop", vault_dir, None)
+            }
+            CheckpointVerb::Reset {
+                vault_dir,
+                session_token,
+            } => commands::checkpoint::run("reset", vault_dir, session_token.as_deref()),
             CheckpointVerb::Orphans {
                 logs_folder,
                 session_token,

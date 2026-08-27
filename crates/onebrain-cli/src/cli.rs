@@ -249,6 +249,15 @@ pub enum CheckpointVerb {
         /// Vault root override.
         #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
         vault_dir: Option<PathBuf>,
+        /// Reset the cadence state of an ALREADY-RESOLVED session token instead
+        /// of re-deriving one from the environment. `onebrain hook` counts
+        /// cadence under the token it derives from the harness session id
+        /// (`ONEBRAIN_HOOK_SESSION_ID`), which the agent shell running
+        /// `/wrapup` does not have — without this flag the reset lands on a
+        /// different token's state file and the counter survives the wrapup.
+        /// Takes the resolved token verbatim (never re-hashed).
+        #[arg(long, value_name = "TOKEN", hide = true)]
+        session_token: Option<String>,
     },
     /// Find orphan checkpoints needing /wrapup synthesis · used by SessionStart hook.
     Orphans {
