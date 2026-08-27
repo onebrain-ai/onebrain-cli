@@ -397,11 +397,17 @@ mod tests {
             }
         }
 
-        /// Recorded invocations, sorted by argv — `Stop` records its two
-        /// children in nondeterministic order, so callers compare an
-        /// unordered set rather than a sequence.
+        /// Recorded invocations, in dispatch order.
         fn calls(&self) -> Vec<Call> {
-            let mut calls = std::mem::take(&mut *self.calls.lock().unwrap());
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+
+        /// Recorded invocations, sorted by argv — `Stop` records its two
+        /// children in nondeterministic order (they race on separate scoped
+        /// threads), so its test compares an unordered set rather than a
+        /// sequence. Only that test should need this.
+        fn sorted_calls(&self) -> Vec<Call> {
+            let mut calls = self.calls();
             calls.sort_by(|left, right| left.args.cmp(&right.args));
             calls
         }
@@ -542,10 +548,11 @@ mod tests {
             &mut output,
         );
 
-        // `calls()` sorts by argv — the two children race on separate scoped
-        // threads, so only the SET of invocations is deterministic.
+        // The two children race on separate scoped threads, so only the SET
+        // of invocations is deterministic — `sorted_calls()` sorts by argv
+        // so the assertion doesn't depend on which one wins the race.
         assert_eq!(
-            runner.calls(),
+            runner.sorted_calls(),
             vec![
                 Call {
                     args: vec!["checkpoint".into(), "stop".into(), "--json".into()],
