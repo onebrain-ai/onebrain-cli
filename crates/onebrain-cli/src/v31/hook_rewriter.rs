@@ -104,30 +104,47 @@ fn converge_lifecycle_event(
 
     let mut retained = false;
     let mut removed = false;
+    let mut isolated_runner = None;
     for group in groups.iter_mut() {
         let mut retained_in_group = false;
-        let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
-            continue;
+        let isolate_from_mixed_group = {
+            let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            entries.retain_mut(|entry| {
+                warn_malformed_lifecycle_entry(entry, report);
+                if !is_managed_lifecycle_entry_for_event(entry, event) {
+                    return true;
+                }
+                if retained {
+                    report.record_converged();
+                    removed = true;
+                    return false;
+                }
+                retained = true;
+                retained_in_group = true;
+                if !is_lifecycle_runner(entry) {
+                    write_lifecycle_runner(entry);
+                    report.record_converged();
+                }
+                true
+            });
+            event == POST_TOOL_USE && retained_in_group && entries.len() > 1
         };
-        entries.retain_mut(|entry| {
-            warn_malformed_lifecycle_entry(entry, report);
-            if !is_managed_lifecycle_entry_for_event(entry, event) {
-                return true;
-            }
-            if retained {
-                report.record_converged();
-                removed = true;
-                return false;
-            }
-            retained = true;
-            retained_in_group = true;
-            if !is_lifecycle_runner(entry) {
-                write_lifecycle_runner(entry);
-                report.record_converged();
-            }
-            true
-        });
-        if event == POST_TOOL_USE
+
+        if isolate_from_mixed_group {
+            let entries = group
+                .get_mut("hooks")
+                .and_then(Value::as_array_mut)
+                .expect("mixed hook group has hooks");
+            let runner_index = entries
+                .iter()
+                .position(|entry| is_managed_lifecycle_entry_for_event(entry, event))
+                .expect("retained managed entry remains in its group");
+            isolated_runner = Some(entries.remove(runner_index));
+            removed = true;
+            report.record_converged();
+        } else if event == POST_TOOL_USE
             && retained_in_group
             && group.get("matcher").and_then(Value::as_str) != Some("Write|Edit")
         {
@@ -143,6 +160,12 @@ fn converge_lifecycle_event(
     }
     if removed {
         remove_empty_hook_groups(groups);
+    }
+    if let Some(runner) = isolated_runner {
+        groups.push(serde_json::json!({
+            "matcher": "Write|Edit",
+            "hooks": [runner],
+        }));
     }
 }
 
@@ -372,10 +395,18 @@ mod lifecycle_runner_tests {
             "keep-me"
         );
         assert_eq!(settings["hooks"]["PostToolUse"][0]["group_note"], "keep");
-        assert_eq!(
-            settings["hooks"]["PostToolUse"][0]["hooks"][0]["entry_note"],
-            "keep-me"
-        );
+        let post_tool_use_groups = settings["hooks"]["PostToolUse"].as_array().unwrap();
+        let managed_group = post_tool_use_groups
+            .iter()
+            .find(|group| {
+                group["hooks"].as_array().is_some_and(|entries| {
+                    entries.iter().any(|entry| entry["command"] == "onebrain")
+                })
+            })
+            .expect("dedicated managed group");
+        assert_eq!(managed_group["matcher"], "Write|Edit");
+        assert_eq!(managed_group["hooks"][0]["entry_note"], "keep-me");
+        assert_eq!(managed_group["hooks"].as_array().unwrap().len(), 1);
         assert_eq!(settings["theme"], "dark");
         assert!(settings["hooks"]["Stop"][0]["hooks"]
             .as_array()
@@ -391,7 +422,7 @@ mod lifecycle_runner_tests {
             settings["hooks"]["SessionStart"][0]["hooks"],
             json!([{"type": "command", "command": "welcome-script", "args": []}])
         );
-        assert_eq!(report.converged, 6);
+        assert_eq!(report.converged, 7);
         assert_eq!(report.stale_entries_removed, 1);
 
         let first_pass = settings.clone();
@@ -434,35 +465,76 @@ mod lifecycle_runner_tests {
     }
 
     #[test]
-    fn normalizes_post_tool_use_matcher_and_preserves_group_fields_idempotently() {
+    fn isolates_post_tool_use_runner_from_foreign_hooks_before_normalizing_matcher() {
         let mut settings = json!({
             "hooks": {
-                "PostToolUse": [{
-                    "matcher": "Read",
-                    "group_note": "keep-me",
-                    "hooks": [
-                        {"type": "command", "command": "onebrain", "args": ["hook"]},
-                        {"type": "command", "command": "foreign-indexer", "args": []}
-                    ]
-                }]
+                "PostToolUse": [
+                    {
+                        "matcher": "Read",
+                        "group_note": "keep-me",
+                        "hooks": [
+                            {"type": "command", "command": "onebrain", "args": ["hook"], "entry_note": "keep-runner"},
+                            {"type": "command", "command": "foreign-indexer", "args": [], "foreign_note": "keep-foreign"}
+                        ]
+                    },
+                    {
+                        "matcher": "Write|Edit",
+                        "hooks": [
+                            {"type": "command", "command": "onebrain", "args": ["qmd-reindex"]}
+                        ]
+                    }
+                ]
             }
         });
 
         let first = rewrite_hooks(&mut settings);
 
-        assert_eq!(first.converged, 1);
-        assert_eq!(settings["hooks"]["PostToolUse"][0]["matcher"], "Write|Edit");
-        assert_eq!(settings["hooks"]["PostToolUse"][0]["group_note"], "keep-me");
         assert_eq!(
-            settings["hooks"]["PostToolUse"][0]["hooks"]
-                .as_array()
-                .unwrap()
-                .len(),
+            settings["hooks"]["PostToolUse"].as_array().unwrap().len(),
             2
         );
+        assert_eq!(settings["hooks"]["PostToolUse"][0]["matcher"], "Read");
+        assert_eq!(settings["hooks"]["PostToolUse"][0]["group_note"], "keep-me");
+        assert_eq!(
+            settings["hooks"]["PostToolUse"][0]["hooks"],
+            json!([{
+                "type": "command", "command": "foreign-indexer", "args": [],
+                "foreign_note": "keep-foreign"
+            }])
+        );
+        assert_eq!(settings["hooks"]["PostToolUse"][1]["matcher"], "Write|Edit");
+        assert_eq!(
+            settings["hooks"]["PostToolUse"][1]["hooks"],
+            json!([{
+                "type": "command", "command": "onebrain", "args": ["hook"],
+                "entry_note": "keep-runner"
+            }])
+        );
+        assert!(first.converged >= 1);
         let after_first = settings.clone();
         assert_eq!(rewrite_hooks(&mut settings).total, 0);
         assert_eq!(settings, after_first);
+    }
+
+    #[test]
+    fn normalizes_post_tool_use_matcher_in_place_for_managed_only_group() {
+        let mut settings = json!({"hooks": {"PostToolUse": [{
+            "matcher": "Read",
+            "group_note": "keep-me",
+            "hooks": [
+                {"type": "command", "command": "onebrain", "args": ["hook"]}
+            ]
+        }]}});
+
+        let report = rewrite_hooks(&mut settings);
+
+        assert_eq!(report.converged, 1);
+        assert_eq!(settings["hooks"]["PostToolUse"][0]["matcher"], "Write|Edit");
+        assert_eq!(settings["hooks"]["PostToolUse"][0]["group_note"], "keep-me");
+        assert_eq!(
+            settings["hooks"]["PostToolUse"].as_array().unwrap().len(),
+            1
+        );
     }
 
     #[test]
