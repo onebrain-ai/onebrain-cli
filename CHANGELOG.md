@@ -18,6 +18,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 - `task list --limit N` returns a deterministic bounded result while preserving the full filtered count in `data.total`, keeping startup task payloads small.
 
+### Changed
+- Claude lifecycle registration and `plugin update` migration now converge Stop and configured PostToolUse hooks on one event-dispatching `onebrain hook` runner. Historical direct checkpoint/pending and qmd/search entries are deduplicated without touching foreign hooks; direct checkpoint/search commands remain available to users and child processes.
+
+### Upgrade notes
+Restart active agent sessions after upgrading. Their already-loaded hook registrations cannot use the old `codex-hook` compatibility name, because that alias is intentionally not shipped; new registrations invoke only `onebrain hook`.
+
 ## [3.4.24] — 2026-08-07 — The gates and the surfaces tell the truth
 
 A backlog-clearing release taken deliberately before v3.5, so the gates v3.5 leans on are

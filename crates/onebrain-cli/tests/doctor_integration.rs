@@ -60,7 +60,7 @@ fn write_minimal_vault(dir: &Path) {
     std::fs::create_dir_all(&settings_dir).unwrap();
     std::fs::write(
         settings_dir.join("settings.json"),
-        r#"{"hooks":{"Stop":[{"hooks":[{"command":"onebrain","args":["checkpoint","stop"]}]}]},"permissions":{"allow":["Bash(onebrain *)"]}}"#,
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"onebrain","args":["hook"]}]}]},"permissions":{"allow":["Bash(onebrain *)"]}}"#,
     )
     .unwrap();
 }
@@ -1013,7 +1013,7 @@ fn doctor_fix_text_mode_manual_issues_shows_manual_step_section() {
     let settings_dir = vault.path().join(".claude");
     std::fs::write(
         settings_dir.join("settings.json"),
-        r#"{"hooks":{"Stop":[{"hooks":[{"command":"onebrain","args":["checkpoint","stop"]}]}]},"permissions":{"allow":["Bash(onebrain *)"]}}"#,
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"onebrain","args":["hook"]}]}]},"permissions":{"allow":["Bash(onebrain *)"]}}"#,
     )
     .unwrap();
     let assert = Command::cargo_bin("onebrain")
