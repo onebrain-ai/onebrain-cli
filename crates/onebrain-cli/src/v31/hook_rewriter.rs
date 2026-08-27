@@ -105,6 +105,7 @@ fn converge_lifecycle_event(
     let mut retained = false;
     let mut removed = false;
     for group in groups.iter_mut() {
+        let mut retained_in_group = false;
         let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
             continue;
         };
@@ -119,12 +120,26 @@ fn converge_lifecycle_event(
                 return false;
             }
             retained = true;
+            retained_in_group = true;
             if !is_lifecycle_runner(entry) {
                 write_lifecycle_runner(entry);
                 report.record_converged();
             }
             true
         });
+        if event == POST_TOOL_USE
+            && retained_in_group
+            && group.get("matcher").and_then(Value::as_str) != Some("Write|Edit")
+        {
+            group
+                .as_object_mut()
+                .expect("hook group with hooks is an object")
+                .insert(
+                    "matcher".to_string(),
+                    Value::String("Write|Edit".to_string()),
+                );
+            report.record_converged();
+        }
     }
     if removed {
         remove_empty_hook_groups(groups);
@@ -416,6 +431,38 @@ mod lifecycle_runner_tests {
         assert!(settings["hooks"].get(POST_TOOL_USE).is_none());
         assert_eq!(report.converged, 2);
         assert_eq!(report.stale_entries_removed, 1);
+    }
+
+    #[test]
+    fn normalizes_post_tool_use_matcher_and_preserves_group_fields_idempotently() {
+        let mut settings = json!({
+            "hooks": {
+                "PostToolUse": [{
+                    "matcher": "Read",
+                    "group_note": "keep-me",
+                    "hooks": [
+                        {"type": "command", "command": "onebrain", "args": ["hook"]},
+                        {"type": "command", "command": "foreign-indexer", "args": []}
+                    ]
+                }]
+            }
+        });
+
+        let first = rewrite_hooks(&mut settings);
+
+        assert_eq!(first.converged, 1);
+        assert_eq!(settings["hooks"]["PostToolUse"][0]["matcher"], "Write|Edit");
+        assert_eq!(settings["hooks"]["PostToolUse"][0]["group_note"], "keep-me");
+        assert_eq!(
+            settings["hooks"]["PostToolUse"][0]["hooks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let after_first = settings.clone();
+        assert_eq!(rewrite_hooks(&mut settings).total, 0);
+        assert_eq!(settings, after_first);
     }
 
     #[test]

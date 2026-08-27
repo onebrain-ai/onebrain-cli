@@ -385,6 +385,11 @@ fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
     );
     assert!(config.contains("collection: doctor-it-green"), "{config}");
     std::fs::write(vault.path().join("onebrain.yml"), config).unwrap();
+    std::fs::write(
+        vault.path().join(".claude/settings.json"),
+        r#"{"hooks":{"Stop":[{"matcher":"","hooks":[{"type":"command","command":"onebrain","args":["hook"]}]}],"PostToolUse":[{"matcher":"Write|Edit","hooks":[{"type":"command","command":"onebrain","args":["hook"]}]}]},"permissions":{"allow":["Bash(onebrain *)"]}}"#,
+    )
+    .unwrap();
 
     // Fabricate the downloaded-model dirs BEFORE the reindex: with no model
     // dir on disk, reindex's missing-model reconcile would drop the

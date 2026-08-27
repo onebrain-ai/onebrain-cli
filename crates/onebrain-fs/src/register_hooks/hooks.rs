@@ -243,6 +243,23 @@ pub(crate) fn check_hook_presence(groups: &[Value], spec: &HookSpec) -> Presence
 const HOOK_EVENTS: &[(&str, HookSpec)] = &[("Stop", HookSpec::STOP)];
 const ALLOWED_HOOK_EVENTS: &[&str] = &["Stop", "PostToolUse"];
 
+/// True when the hook actually executes OneBrain, or invokes one of its
+/// retired wrapper scripts. A foreign shell command that merely mentions the
+/// word (for example `echo onebrain checkpoint stop`) is not managed.
+pub(crate) fn is_managed_hook_entry(entry: &Value) -> bool {
+    let Some(command) = entry.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    let executable_is_onebrain = if command == "onebrain" {
+        true
+    } else {
+        command.split_ascii_whitespace().next() == Some("onebrain")
+    };
+    executable_is_onebrain
+        || command.contains("checkpoint-hook.sh")
+        || command.contains("session-init.sh")
+}
+
 /// Outcome per hook event after `apply_hooks`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookStatus {
@@ -288,10 +305,7 @@ pub(crate) fn apply_hooks(settings: &mut Value) -> Vec<(&'static str, HookStatus
             };
             for g in groups.iter_mut() {
                 if let Some(h) = g.get_mut("hooks").and_then(|v| v.as_array_mut()) {
-                    h.retain(|entry| {
-                        let cmd = entry.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                        !cmd.contains("onebrain")
-                    });
+                    h.retain(|entry| !is_managed_hook_entry(entry));
                 }
             }
             groups.retain(|g| {
@@ -546,10 +560,7 @@ pub(crate) fn strip_onebrain_hooks(settings: &mut Value) {
             };
             for g in groups.iter_mut() {
                 if let Some(arr) = g.get_mut("hooks").and_then(|v| v.as_array_mut()) {
-                    arr.retain(|h| {
-                        let cmd = h.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                        !cmd.contains("onebrain")
-                    });
+                    arr.retain(|entry| !is_managed_hook_entry(entry));
                 }
             }
             groups.retain(|g| {

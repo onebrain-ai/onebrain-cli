@@ -10,7 +10,7 @@
 //! All JSON mutation uses `serde_json::Value` so unknown keys at any nesting
 //! depth survive a read/write round trip.
 
-mod hooks;
+pub(crate) mod hooks;
 mod permissions;
 mod qmd;
 pub mod settings;
@@ -47,8 +47,8 @@ pub struct RegisterHooksResult {
     pub ok: bool,
     /// Status for the Stop hook. None when --remove was given.
     pub stop: Option<HookStatus>,
-    /// Status for the qmd PostToolUse hook. None when `qmd_collection` is absent
-    /// from vault.yml (the hook is then stripped silently) or --remove was given.
+    /// Status for the qmd PostToolUse hook. None when `search.collection` is
+    /// absent (the hook is then stripped silently) or --remove was given.
     pub qmd: Option<HookStatus>,
     /// Retained for source compatibility. Always `None`: the shared Stop
     /// lifecycle runner now performs checkpoint and pending reindex together.
@@ -110,10 +110,11 @@ pub fn run(opts: RegisterHooksOptions) -> Result<RegisterHooksResult> {
     }
     result.claude_harness = true;
 
-    // Best-effort qmd_collection — missing vault.yml or unreadable config → None.
-    let qmd_collection = find_vault_root(&vault_dir)
+    // Best-effort search collection — config loading backfills the canonical
+    // field from legacy top-level `qmd_collection` when needed.
+    let search_collection = find_vault_root(&vault_dir)
         .and_then(|root| load_vault_config(&root).ok())
-        .and_then(|cfg| cfg.qmd_collection);
+        .and_then(|cfg| cfg.search.collection);
 
     let path = settings::settings_path(&vault_dir);
     let mut settings_json = settings::read_settings(&path)?;
@@ -136,7 +137,7 @@ pub fn run(opts: RegisterHooksOptions) -> Result<RegisterHooksResult> {
 
     // PostToolUse is useful only when search is configured. Stop always uses
     // the shared runner, which owns both checkpoint and pending reindex.
-    if qmd_collection.is_some() {
+    if search_collection.is_some() {
         result.qmd = Some(qmd::apply_lifecycle_hook(&mut settings_json));
     } else {
         let _stripped = qmd::strip_lifecycle_hook(&mut settings_json);
@@ -348,6 +349,26 @@ mod tests {
         assert_eq!(r.qmd, Some(HookStatus::Added));
         let after = read_back(v.path());
         assert!(after["hooks"]["PostToolUse"].is_array());
+    }
+
+    #[test]
+    fn run_search_collection_set_adds_post_tool_use() {
+        let v = tempdir().unwrap();
+        fs::create_dir_all(v.path().join(".claude")).unwrap();
+        fs::write(
+            v.path().join("onebrain.yml"),
+            "search:\n  collection: ob-1-canonical\n",
+        )
+        .unwrap();
+
+        let result = run(RegisterHooksOptions {
+            vault_dir: Some(v.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(result.qmd, Some(HookStatus::Added));
+        assert!(read_back(v.path())["hooks"]["PostToolUse"].is_array());
     }
 
     #[test]
@@ -935,6 +956,63 @@ mod tests {
         assert_eq!(
             after["hooks"]["Stop"][0]["hooks"][0]["args"],
             json!(["hook"])
+        );
+    }
+
+    #[test]
+    fn run_preserves_foreign_command_containing_onebrain_during_stale_cleanup() {
+        let v = fresh_vault(true, None);
+        let settings_path = v.path().join(".claude/settings.json");
+        fs::write(
+            &settings_path,
+            serde_json::to_string(&json!({
+                "hooks": {"PreCompact": [{"matcher": "", "hooks": [
+                    {"command": "echo onebrain checkpoint stop"},
+                    {"command": "onebrain checkpoint stop"}
+                ]}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        run(RegisterHooksOptions {
+            vault_dir: Some(v.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            read_back(v.path())["hooks"]["PreCompact"][0]["hooks"],
+            json!([{"command": "echo onebrain checkpoint stop"}])
+        );
+    }
+
+    #[test]
+    fn run_remove_preserves_foreign_command_containing_onebrain() {
+        let v = fresh_vault(true, None);
+        let settings_path = v.path().join(".claude/settings.json");
+        fs::write(
+            &settings_path,
+            serde_json::to_string(&json!({
+                "hooks": {"Stop": [{"matcher": "", "hooks": [
+                    {"command": "echo onebrain checkpoint stop"},
+                    {"command": "onebrain", "args": ["hook"]}
+                ]}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        run(RegisterHooksOptions {
+            vault_dir: Some(v.path().to_path_buf()),
+            remove: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            read_back(v.path())["hooks"]["Stop"][0]["hooks"],
+            json!([{"command": "echo onebrain checkpoint stop"}])
         );
     }
 }
