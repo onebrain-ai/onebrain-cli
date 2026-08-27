@@ -154,17 +154,17 @@ pub fn should_show_banner(cli: &Cli, mode: &OutputMode) -> bool {
 }
 
 /// True for commands that participate in Claude Code's hook protocol —
-/// session init, all checkpoint verbs, plus their hidden v3.0 aliases (the
-/// legacy `qmd-reindex` alias now dispatches to native `search reindex`, but
-/// stays banner-suppressed here so un-migrated hooks keep clean stdio). These
-/// commands MUST have a clean stdout (and effectively a clean stderr too —
-/// banners on stderr can confuse log scrapers).
+/// session init, session token, all checkpoint verbs, plus their hidden v3.0
+/// aliases (the legacy `qmd-reindex` alias now dispatches to native `search
+/// reindex`, but stays banner-suppressed here so un-migrated hooks keep clean
+/// stdio). These commands MUST have a clean stdout (and effectively a clean
+/// stderr too — banners on stderr can confuse log scrapers).
 fn is_hook_protocol(cmd: &Cmd) -> bool {
     match cmd {
         Cmd::Hook => true,
-        Cmd::Session(SessionCmd {
-            verb: SessionVerb::Init { .. },
-        }) => true,
+        Cmd::Session(SessionCmd { verb }) => {
+            matches!(verb, SessionVerb::Init { .. } | SessionVerb::Token { .. })
+        }
         Cmd::Checkpoint(CheckpointCmd { verb }) => matches!(
             verb,
             CheckpointVerb::Stop { .. }

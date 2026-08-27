@@ -974,6 +974,18 @@ pub enum SessionVerb {
         #[arg(long, value_name = "TOKEN", hide = true)]
         session_token: Option<String>,
     },
+    /// Resolve-only session token — no vault resolution, no
+    /// `clean_stale_state_file` cleanup, no side effects at all. For
+    /// mid-session token recovery: a caller that already has a live Stop-hook
+    /// cadence counter running under a token and just needs to re-learn what
+    /// that token is, without `session init`'s state-file cleanup silently
+    /// wiping the counter it's trying to recover.
+    #[command(hide = true)]
+    Token {
+        /// Preserve a hook-derived session token instead of re-resolving one.
+        #[arg(long, value_name = "TOKEN", hide = true)]
+        session_token: Option<String>,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────

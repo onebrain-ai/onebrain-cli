@@ -105,6 +105,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 session_token.as_deref(),
                 &mode,
             ),
+            SessionVerb::Token { session_token } => {
+                commands::session_init::run_token(session_token.as_deref(), &mode)
+            }
         },
 
         // ───── Checkpoint ───────────────────────────────────────────

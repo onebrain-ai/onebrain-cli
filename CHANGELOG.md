@@ -18,6 +18,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 - `task list --limit N` returns a deterministic bounded result while preserving the full filtered count in `data.total`, keeping startup task payloads small.
+- `onebrain session token` (hidden), a resolve-only counterpart to `session init` for mid-session token recovery — it resolves the same token through the same chain without `session init`'s `clean_stale_state_file` side effect, which otherwise silently wipes the Stop-hook cadence counter when re-run mid-session.
 
 ### Changed
 - Claude lifecycle registration and `plugin update` migration now converge Stop and configured PostToolUse hooks on one event-dispatching `onebrain hook` runner. Historical direct checkpoint/pending and qmd/search entries are deduplicated without touching foreign hooks; direct checkpoint/search commands remain available to users and child processes.
