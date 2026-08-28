@@ -78,9 +78,12 @@ fn resolve_session_token_opt() -> Option<String> {
 /// The SINGLE source of truth for the run dir (v3.4.13): `commands::daemon` no
 /// longer keeps its own `run_dir()` — it resolves slot paths through
 /// [`resolve_slot`] / [`slot_paths_for_id`] here, so the two can't drift.
-/// Honours `$HOME` on Unix / `%USERPROFILE%` on Windows.
+/// Honours `$HOME` on Unix / `%USERPROFILE%` on Windows — via
+/// [`crate::home::home_dir`], NOT plain `dirs::home_dir()`, whose Windows arm
+/// is a Known Folder API call that ignores `%USERPROFILE%` and would send a
+/// sandboxed child's daemon slots into the real user profile.
 pub(crate) fn run_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("resolve home directory for daemon run dir")?;
+    let home = crate::home::home_dir().context("resolve home directory for daemon run dir")?;
     Ok(home.join(".onebrain").join("run"))
 }
 

@@ -46,11 +46,14 @@ impl Default for GatewayConfig {
 }
 
 /// `~/.onebrain/gateway.yml`. Same home resolution as
-/// `daemon_client::run_dir` (honours `$HOME` / `%USERPROFILE%`); the
-/// `ONEBRAIN_CACHE_DIR` data-dir override is unrelated and deliberately
-/// ignored here.
+/// `daemon_client::run_dir` — [`crate::home::home_dir`], which honours
+/// `$HOME` / `%USERPROFILE%` on BOTH platforms (plain `dirs::home_dir()` does
+/// not: on Windows it is a Known Folder API call that ignores
+/// `%USERPROFILE%`, so a sandboxed child would read the real profile's
+/// config instead of the one it was pointed at). The `ONEBRAIN_CACHE_DIR`
+/// data-dir override is unrelated and deliberately ignored here.
 pub fn gateway_config_path() -> anyhow::Result<PathBuf> {
-    let home = dirs::home_dir().context("resolve home directory for gateway config")?;
+    let home = crate::home::home_dir().context("resolve home directory for gateway config")?;
     Ok(home.join(".onebrain").join("gateway.yml"))
 }
 
@@ -101,6 +104,29 @@ mod tests {
             "missing port must default"
         );
         assert!(sparse.default_vault.is_none());
+    }
+
+    /// Windows-CI regression guard (`gateway_http.rs`'s happy path failed
+    /// here): the config path MUST follow the `$HOME` / `%USERPROFILE%`
+    /// override, because the integration test writes `gateway.yml` into a
+    /// sandbox home and spawns the binary pointed at it. Plain
+    /// `dirs::home_dir()` reads the Known Folder API on Windows and walked
+    /// past the sandbox into the runner's real profile, so no `gateway.yml`
+    /// was ever found, `default_vault` stayed `None`, and every vault-needing
+    /// tool call answered `E_VAULT_NOT_FOUND`. Asserted on both platforms —
+    /// the Unix arm passed all along, and that is exactly why the break only
+    /// ever showed up on `windows-latest`.
+    #[test]
+    fn config_path_follows_the_home_env_override() {
+        let d = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", d.path().as_os_str()),
+            ("USERPROFILE", d.path().as_os_str()),
+        ]);
+        assert_eq!(
+            gateway_config_path().unwrap(),
+            d.path().join(".onebrain").join("gateway.yml"),
+        );
     }
 
     #[test]
