@@ -7,6 +7,7 @@
 //! shutdown shape exactly (Ctrl-C only): `serve.rs` itself has no SIGTERM
 //! handling to copy, so the gateway doesn't add one either.
 
+pub mod auth;
 pub mod config;
 pub mod server;
 
