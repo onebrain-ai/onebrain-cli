@@ -1,6 +1,6 @@
 # OneBrain Gateway — `onebrain gateway run`
 
-`onebrain gateway run` starts a loopback Streamable HTTP MCP server serving a read-only, multi-vault tool pack — the v3.5 Gateway epic's first shipped piece. This page covers what the v3.5 **skeleton** ships today: the `gateway.yml` schema, its defaults, zero-config behavior, and the current (deliberately narrow) security posture. See [`docs/reference/mcp.md`](reference/mcp.md#gateway-streamable-http) for the tool-by-tool reference and [ADR 0019](decisions/0019-native-mcp-server-staged-qmd-cutover.md) for the wider native-MCP architecture this sits alongside.
+`onebrain gateway run` starts a loopback Streamable HTTP MCP server serving a multi-vault tool pack — the v3.5 Gateway epic's shipped-so-far surface. This page covers the `gateway.yml` schema and its defaults, zero-config behavior, OAuth 2.1 authentication, the policy/approval/audit machinery every tool call passes through, and the current (deliberately narrow) security posture. See [`docs/reference/mcp.md`](reference/mcp.md#gateway-streamable-http) for the tool-by-tool reference and [ADR 0019](decisions/0019-native-mcp-server-staged-qmd-cutover.md) for the wider native-MCP architecture this sits alongside.
 
 ```bash
 onebrain gateway run              # bind the configured (or default 7717) port
@@ -14,12 +14,13 @@ onebrain gateway run --port 0     # let the OS assign an ephemeral port
 ## What this skeleton ships
 
 - One loopback HTTP endpoint (`http://127.0.0.1:<port>/mcp`), Streamable HTTP, protocol `2026-07-28` pinned as the negotiation fallback.
-- Four read-only tools — the **Brain pack**: `capabilities`, `brain_tasks`, `brain_get`, `brain_search`.
+- Five tools — the **Brain pack**: four read-only (`capabilities`, `brain_tasks`, `brain_get`, `brain_search`) plus one write tool, `brain_capture` (see [`brain_capture`](#brain_capture) below) — gated by the [policy engine](#policy--approvals) like every other tool.
 - **Multi-vault**: any vault named in `gateway.yml`'s `vaults:` map is reachable by name, per tool call — the first part of the codebase that tracks more than one vault at a time.
 - `brain_search` always routes through the warm per-vault daemon rather than opening a direct search engine itself: a long-lived, multi-vault gateway process must never take an exclusive per-vault engine lock, or one vault's request would starve every other vault's request against the same gateway.
 - **OAuth 2.1 authentication**: `/mcp` requires a Bearer access token — see [Authentication](#authentication) below. The `/.well-known/*` discovery documents and `/register`/`/authorize`/`/token` stay reachable without one (a client with no token yet must be able to bootstrap OAuth before it has one).
+- **Policy, human approval, and an audit trail** for every tool call — see [Policy & approvals](#policy--approvals) below. `capabilities` reports each tool's risk class, the policy mode currently in force, and which approval channels can actually deliver a prompt on this machine right now — see [`capabilities` truthfulness](#capabilities-truthfulness).
 
-**Not yet shipped** (a later PR in the v3.5 epic): a remote tunnel, so a phone or another machine can reach your gateway safely. `capabilities` already lists the roadmapped `developer`/`files`/`mac` packs with `enabled: false` so a caller can see what's coming without probing for tools that don't exist yet.
+**Not yet shipped** (a later PR in the v3.5 epic): a remote tunnel, so a phone or another machine can reach your gateway safely, and the Telegram approval channel (Gateway PR 5 — see [Approval channels](#approval-channels)). `capabilities` already lists the roadmapped `developer`/`files`/`mac` packs with `enabled: false` so a caller can see what's coming without probing for tools that don't exist yet.
 
 ## Zero-config behavior
 
@@ -40,6 +41,7 @@ Machine-level config at `~/.onebrain/gateway.yml` — deliberately **not** per-v
 | `default_vault` | path | unset | Vault served when a tool call omits `vault`. Unset falls through to `$ONEBRAIN_VAULT`, then walk-up from the gateway process's cwd — exactly like an explicit CLI `--vault` flag would win over both of those when it IS set. |
 | `vaults` | map (name → path) | `{}` | Named vaults a tool call may select via its `vault` argument. An unknown name is a JSON-RPC `invalid_params` error listing the known names. |
 | `public_url` | string | unset | The gateway's OAuth issuer base URL, for the still-unshipped remote tunnel (see [Loopback + no remote exposure yet](#loopback--no-remote-exposure-yet)). When set, `gateway run` advertises `public_url` as the issuer in every discovery document (`/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`) and in the `/mcp` 401 `WWW-Authenticate` challenge, instead of `http://127.0.0.1:<bound-port>`. Must be a bare origin — `scheme://host[:port]` — with no path, query, or fragment (a single trailing `/` is trimmed automatically); `http://` is accepted only for a loopback host (`localhost`/`127.0.0.1`), every other host must use `https://`. `gateway run` validates this at startup and refuses to start on an invalid value (naming the `public_url` key in the error) rather than silently falling back to the loopback issuer. Setting this alone does not expose anything remotely — this build still binds `127.0.0.1` only. |
+| `policy` | map | see below | Per-risk-class approval policy — see [Policy & approvals](#policy--approvals). |
 
 All keys are optional; a missing file behaves identically to an empty one.
 
@@ -54,6 +56,91 @@ vaults:
 ```
 
 A `brain_tasks`/`brain_get`/`brain_search` call passing `"vault": "work"` then serves `/Users/you/ob-work`; omitting `vault` serves `default_vault` (`/Users/you/ob-1`).
+
+## Policy & approvals
+
+Every gateway tool call — read or write — passes through a policy gate before it runs: classified into a **risk class**, checked against that class's configured **mode**, and appended to an **audit log** regardless of outcome. A call that needs human approval blocks until one of the **approval channels** below answers it, or it times out.
+
+### `policy` block
+
+```yaml
+policy:
+  read_only: auto            # capabilities, brain_tasks, brain_get, brain_search
+  mutating: ask_once          # brain_capture
+  destructive: ask_always     # no tool is classified destructive yet
+  grant_ttl_minutes: 30       # how long an approval's resulting consent lasts
+  approval_wait_seconds: 300  # how long a blocked call waits for a decision
+```
+
+Every tool call is classified into one of three **risk classes**, and each class has its own **mode**:
+
+| Mode | Behavior |
+|---|---|
+| `auto` | Always allow — no approval, no grant involved. |
+| `ask_once` | Requires approval once per `(client, risk class)` pair; a live grant (see below) satisfies later calls until it expires. |
+| `ask_always` | Always requires approval, even with a live grant — "ask every time." A grant recorded by an earlier approval never satisfies `ask_always`. |
+| `deny` | Always refused — no approval is ever offered. |
+
+The **defaults keep today's behavior safe with zero configuration**: every read-only tool defaults to `auto` (unchanged from before the policy engine existed), while any write tool defaults to `ask_once` and any future destructive tool defaults to `ask_always` — a config nobody wrote never silently auto-allows a write. `read_only`/`mutating`/`destructive` may each be set independently; a partial `policy:` block fills only the keys it omits with these defaults.
+
+A **grant** is recorded the moment a human approves an `ask_once` call — an in-memory `(client_id, risk class) → expires-at` entry, scoped to `grant_ttl_minutes` (default 30). It is **never persisted**: restarting `gateway run` clears every grant, same as it clears every pending approval — a grant is consent for THIS running gateway process, not a standing credential written to disk. `approval_wait_seconds` (default 300 — five minutes) bounds how long a BLOCKED call waits for a first decision before giving up; this is a separate knob from `grant_ttl_minutes`, since "ask me and wait up to five minutes" and "then remember it for a day" are independent choices an operator may want to make separately.
+
+Every tool call is also checked against the OAuth token's own `scope` — a token whose scope doesn't cover the pack a tool belongs to (today, only the `"brain"` pack exists) is denied outright, before the mode above is even consulted, regardless of how permissive that mode is.
+
+### Approval channels
+
+When a call needs approval (`ask_once` with no live grant, or `ask_always`), the gateway registers a pending approval and blocks the tool call until a human answers it — through whichever of these channels responds first:
+
+| Channel | Status | Notes |
+|---|---|---|
+| **Native macOS dialog** | Shipped | A `display dialog` popup (via `osascript`) shown directly on the machine running `gateway run` — Approve/Deny buttons, no browser needed. Available only when this build targets macOS AND `osascript` resolves on `$PATH`; `capabilities` reports the live truth for this machine (see below). |
+| **Operator HTTP surface** (`/approvals`) | Shipped | `GET /approvals` lists every pending call; `POST /approvals/{id}` with `{"decision":"approve"}` or `{"decision":"deny"}` resolves one. Gated by the gateway's **pairing code** via the `X-OneBrain-Pairing` header — the SAME code that pairs a new OAuth client at `/authorize` — never by a connector's OAuth bearer token. This is deliberate: `/approvals` sits OUTSIDE the `/mcp` Bearer layer entirely, so a connector can never satisfy its own approval gate with the very token it's asking permission to keep using. Always available in this build (mounted unconditionally); using it still requires a human who knows the pairing code. |
+| **Telegram bot** | Not yet shipped — Gateway PR 5 | Deferred: a Bot API client (`getUpdates` long-poll + inline Approve/Deny keyboard), reusing `notifications.telegram_chat_id` from `onebrain.yml`. `capabilities` always reports `telegram: false` today. |
+
+Both shipped channels resolve the SAME pending-approval registry — whichever answers first wins, and the other is simply a no-op from then on. If nothing answers within `approval_wait_seconds`, the call fails with a timeout error and no grant is recorded.
+
+### `capabilities` truthfulness
+
+`capabilities` reports, for every tool in every pack: its risk class, and the policy mode CURRENTLY in force for that class (reading straight off the live `gateway.yml` — never a hardcoded default), plus an `approval_channels` object naming which channels can actually deliver an approval prompt **on this machine, right now**:
+
+```json
+"approval_channels": {
+  "native": true,
+  "http": true,
+  "telegram": false,
+  "note": "..."
+}
+```
+
+This exists so a caller is never told a write CAN be approved through a channel that cannot actually carry the prompt to a human — `native` reflects the real, live `osascript`-on-`$PATH` probe (and can be forced off — see the environment variable below), `http` is always `true` in this build (the surface is unconditionally mounted), and `telegram` is always `false` until Gateway PR 5 ships it.
+
+`ONEBRAIN_GATEWAY_DISABLE_NATIVE_APPROVAL` (any value) forces the native channel off regardless of platform — a test-only escape hatch (this crate's own end-to-end test suite sets it on the gateway subprocess it spawns, so CI never pops a real, unattended dialog), not a documented operator-facing config key. An operator who wants the native channel off for real should set `policy.mutating`/`policy.destructive` to `auto` or `deny` instead — that never reaches the approval flow at all, on any channel.
+
+### Audit log
+
+Every tool call — allowed or not — is appended as one JSON line to `~/.onebrain/gateway/audit/YYYY-MM.jsonl` (one file per month, created 0700/0600 like the rest of the gateway's on-disk state). Each line:
+
+```json
+{"ts":1735689600,"client_id":"...","tool":"brain_capture","vault":"t1","args_summary":"capture: title=Some(\"...\") vault=None text_chars=42","decision":"approved","channel":null,"duration_ms":812,"outcome":"ok"}
+```
+
+| Field | Meaning |
+|---|---|
+| `ts` | Unix epoch seconds the call was recorded at. |
+| `client_id` | The calling OAuth client's id. |
+| `tool` | Tool name. |
+| `vault` | Named vault the call resolved, when one was resolvable. |
+| `args_summary` | A **redacted**, one-line description of the call's arguments — e.g. a `brain_capture` call's own note body NEVER appears here, only its character count. |
+| `decision` | `auto` (policy allowed it outright), `approved`/`denied` (a human answered), or `timedout` (nothing answered within `approval_wait_seconds`). |
+| `channel` | Reserved for a future "which channel resolved this" field; always `null` today. |
+| `duration_ms` | Wall-clock time the call took, including any time spent blocked on approval. |
+| `outcome` | `ok` or `error` — whether the tool's own logic succeeded once it was allowed to run. |
+
+Writing an entry never blocks or fails the tool call it describes — by the time an entry exists to write, the call it records has already happened; a write failure (full disk, a yanked permission bit) is logged to the gateway's own process log and otherwise ignored.
+
+### `brain_capture`
+
+The gateway's first WRITE tool: creates a new inbox note (`<inbox-folder>/YYYY-MM-DD-<slug>.md`) from a `title` (optional) and `text` body, classified `RiskClass::Mutating` — so under the default policy it needs a human's `ask_once` approval the first time, then proceeds automatically for `grant_ttl_minutes`. Two independent traversal guards confine every derived path to the vault (syntactic — every path component must be a plain, non-`..`, non-absolute segment — and canonicalization — the resolved parent directory must still live under the canonicalized vault root, catching a symlinked-out folder too), so a crafted `title` can never write outside the vault. The note's filename slug is derived from `title` (falling back to the first words of `text`, then a fixed marker, for empty/punctuation-only/pure-non-ASCII input); a same-day, same-slug collision surfaces as a clean tool error rather than overwriting the existing note. A best-effort reindex request follows the write, so `brain_search` can find the new note without waiting for the vault's next scheduled reindex — a reindex failure never fails the capture itself, since the note is already written by that point.
 
 ## Authentication
 

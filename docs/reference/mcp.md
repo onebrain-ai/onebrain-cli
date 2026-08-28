@@ -269,16 +269,26 @@ A common question for tools like a future `reindex`: can an agent kick off long 
 
 ## Gateway (streamable HTTP)
 
-`onebrain gateway run` is a SEPARATE MCP surface from `onebrain mcp` above: a loopback Streamable HTTP endpoint (not stdio) serving a read-only, multi-vault tool pack instead of the single-vault `query`/`get`/`multi_get`/`status` set. Full config schema, defaults, and the zero-config story live at [`docs/gateway.md`](../gateway.md) — this section is the short pointer for readers who land here first.
+`onebrain gateway run` is a SEPARATE MCP surface from `onebrain mcp` above: a loopback Streamable HTTP endpoint (not stdio) serving a multi-vault tool pack (four read-only tools plus one policy-gated write tool) instead of the single-vault `query`/`get`/`multi_get`/`status` set. Full config schema, defaults, and the zero-config story live at [`docs/gateway.md`](../gateway.md) — this section is the short pointer for readers who land here first.
 
 ```bash
 onebrain gateway run [--port N]
 ```
 
 - **Endpoint**: `http://127.0.0.1:<port>/mcp` — Streamable HTTP (stateless/sessionless mode), protocol `2026-07-28` pinned as the negotiation fallback (an older KNOWN version a client legitimately requests, e.g. `2025-11-25`, is still echoed back). The bound URL prints once to stdout on startup: `gateway listening on http://<bound-addr>/mcp`.
-- **Tools** (the "Brain pack", read-only): `capabilities` (self-description — packs, vaults, default vault), `brain_tasks` (open task listing), `brain_get` (traversal-guarded single-file read), `brain_search` (daemon-routed hybrid search — never opens a direct engine, since one gateway process serves MANY vaults concurrently).
+- **Tools** (the "Brain pack"):
+
+  | Tool | Risk class | Notes |
+  |---|---|---|
+  | `capabilities` | read-only | Self-description — packs, vaults, default vault, each tool's risk class + effective policy mode, and which approval channels (`native`/`http`/`telegram`) can actually deliver a prompt on this machine right now. See [`docs/gateway.md#capabilities-truthfulness`](../gateway.md#capabilities-truthfulness). |
+  | `brain_tasks` | read-only | Open task listing. |
+  | `brain_get` | read-only | Traversal-guarded single-file read. |
+  | `brain_search` | read-only | Daemon-routed hybrid search — never opens a direct engine, since one gateway process serves MANY vaults concurrently. |
+  | `brain_capture` | mutating | Create a new inbox note from `title`/`text` — the gateway's first WRITE tool. Gated by [policy](../gateway.md#policy--approvals): defaults to needing one human approval per client before it proceeds, then remembers that consent for `grant_ttl_minutes`. See [`docs/gateway.md#brain_capture`](../gateway.md#brain_capture). |
+
+- **Policy, approvals, and an audit trail.** Every tool call is classified `read_only`/`mutating`/`destructive` and checked against a per-class mode (`auto`/`ask_once`/`ask_always`/`deny`, configured under `gateway.yml`'s `policy:` block). A call that needs approval blocks until a human answers — via a native macOS dialog and/or the operator `GET`/`POST /approvals` HTTP surface (gated by the gateway's pairing code, never by a connector's own bearer token) — or times out. Every call, allowed or not, is appended to `~/.onebrain/gateway/audit/YYYY-MM.jsonl`. Full details at [`docs/gateway.md#policy--approvals`](../gateway.md#policy--approvals).
 - **Multi-vault**: unlike `onebrain mcp` (one vault per process — `--vault`/env/walk-up), the gateway serves every vault named in `~/.onebrain/gateway.yml`'s `vaults:` map, selected per tool call via each tool's optional `vault` argument; omitting it falls back to the config's `default_vault`, then the normal env/walk-up chain.
-- **OAuth 2.1 authentication.** `/mcp` requires `Authorization: Bearer <access-token>` (a bare request gets a `401` naming the RFC 9728 discovery document to start from). Getting a token is the standard discovery → `/register` (RFC 7591, public clients only) → `/authorize` (consent page gated by a device-pairing code — `onebrain gateway pair` prints/rotates it) → `/token` (PKCE code exchange, rotating refresh tokens) flow; full details at [`docs/gateway.md#authentication`](../gateway.md#authentication). The `/.well-known/*` documents and `/register`/`/authorize`/`/token` themselves stay reachable without a token (bootstrapping).
+- **OAuth 2.1 authentication.** `/mcp` requires `Authorization: Bearer <access-token>` (a bare request gets a `401` naming the RFC 9728 discovery document to start from). Getting a token is the standard discovery → `/register` (RFC 7591, public clients only) → `/authorize` (consent page gated by a device-pairing code — `onebrain gateway pair` prints/rotates it) → `/token` (PKCE code exchange, rotating refresh tokens) flow; full details at [`docs/gateway.md#authentication`](../gateway.md#authentication). The `/.well-known/*` documents and `/register`/`/authorize`/`/token` themselves stay reachable without a token (bootstrapping). The separate operator `/approvals` surface (above) is reachable without a bearer token too, but is NOT public — it has its own pairing-code gate.
 - **Loopback only — no remote exposure yet.** The bind address is still hard-coded to `127.0.0.1`; there is no `--bind`/`$ONEBRAIN_BIND`-style escape hatch like `onebrain serve` has. OAuth authenticates callers, but a remote tunnel (so a phone or another machine can reach the gateway) lands in a later v3.5 PR — until then, never expose this port beyond the local machine.
 - **Config path**: `~/.onebrain/gateway.yml` (machine-level, not per-vault — see [`docs/gateway.md`](../gateway.md)). A missing file is not an error: `gateway run` inside a vault still serves that vault via the normal resolution chain.
 

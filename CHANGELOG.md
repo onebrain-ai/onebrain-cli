@@ -32,6 +32,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   path/query/fragment) — an invalid value fails startup naming the key
   instead of silently resolving to a wrong or insecure issuer. See
   [`docs/gateway.md#gatewayyml-schema`](docs/gateway.md#gatewayyml-schema).
+- Gateway policy engine + human approvals + audit trail (Gateway PR 4): every
+  tool call is classified `read_only`/`mutating`/`destructive` and checked
+  against a per-class mode (`auto`/`ask_once`/`ask_always`/`deny`) under a new
+  `gateway.yml` `policy:` block — read-only tools default to `auto`
+  (unchanged behavior), writes default to `ask_once`, and a future destructive
+  tool would default to `ask_always`. A call that needs approval blocks until
+  a human answers it, through either a native macOS `display dialog` prompt
+  (`osascript`) or the new operator `GET`/`POST /approvals` HTTP surface —
+  gated by the gateway's pairing code, deliberately OUTSIDE the connector
+  Bearer layer, so a connector's own access token can never self-approve its
+  own pending call. An approved `ask_once` call records a TTL-bounded grant
+  (`grant_ttl_minutes`, default 30) so later calls from the same client don't
+  need to ask again. Every tool call — allowed, denied, approved, or timed
+  out — is appended as one JSON line to
+  `~/.onebrain/gateway/audit/YYYY-MM.jsonl` (redacted args summary only,
+  never a raw note body or credential). See
+  [`docs/gateway.md#policy--approvals`](docs/gateway.md#policy--approvals).
+- `brain_capture` — the gateway's first WRITE tool: creates a new inbox note
+  from a `title`/`text`, confined to the vault by two independent traversal
+  guards (a syntactic plain-relative-path check plus post-canonicalization
+  confinement, catching a symlinked-out folder too), gated by the policy
+  engine above (`RiskClass::Mutating`). See
+  [`docs/gateway.md#brain_capture`](docs/gateway.md#brain_capture).
+- `capabilities` now reports each tool's risk class and the policy mode
+  currently in force for it, plus an `approval_channels` object
+  (`native`/`http`/`telegram`) naming which approval channels can actually
+  deliver a prompt on this machine right now — a caller is never told a
+  write can be approved through a channel that cannot carry the prompt to a
+  human. Telegram is not implemented yet (planned for Gateway PR 5) and
+  always reports `false`. See
+  [`docs/gateway.md#capabilities-truthfulness`](docs/gateway.md#capabilities-truthfulness).
 
 ### Changed
 - MCP: rmcp 2.1.0 → 3.0.1 — protocol `2026-07-28` baseline for the remote MCP
