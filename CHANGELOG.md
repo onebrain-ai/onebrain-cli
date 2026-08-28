@@ -16,6 +16,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - MCP: rmcp 2.1.0 → 3.0.1 — protocol `2026-07-28` baseline for the remote MCP
   gateway; stdio server and all 4 tools unchanged; legacy `initialize`
   negotiation (2025-03-26 / 2025-11-25) now guarded by an integration test.
+- README roadmap re-synced to the 2026-08-28 renumber: Gateway v3.5 · Council
+  v3.6 · Studio/Surfaces v3.7 · Terminal v3.8 · Bootstrap v3.9 · cleanup v3.10
+  · bundles v3.11+.
 
 ## [3.4.25] — 2026-08-28 — Keep Codex hooks alive
 
