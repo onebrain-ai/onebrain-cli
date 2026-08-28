@@ -26,6 +26,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   token revokes its whole token family). `onebrain gateway pair [--rotate]`
   prints or rotates the pairing code independent of a running gateway. See
   [`docs/gateway.md#authentication`](docs/gateway.md#authentication).
+- `gateway.yml` gains a `public_url` key: the gateway's OAuth issuer base URL
+  for the still-unshipped remote tunnel. Validated at `gateway run` startup
+  (must be a bare `https://`, or loopback-only `http://`, origin with no
+  path/query/fragment) — an invalid value fails startup naming the key
+  instead of silently resolving to a wrong or insecure issuer. See
+  [`docs/gateway.md#gatewayyml-schema`](docs/gateway.md#gatewayyml-schema).
 
 ### Changed
 - MCP: rmcp 2.1.0 → 3.0.1 — protocol `2026-07-28` baseline for the remote MCP

@@ -26,12 +26,12 @@
 //!
 //! ## Dead-code allow
 //! Same situation as [`crate::commands::daemon_client`]'s own
-//! `#![allow(dead_code)]`. Tasks 1-5 wired an HTTP (or startup-line) caller
-//! for nearly every method here, but a few remain genuinely unreached until
-//! a LATER task: [`store::AuthStore::rotate_pairing_code`] (planned CLI
-//! subcommand to re-mint a pairing code) and
-//! [`store::AuthStore::purge_expired`] (planned periodic sweep — see its own
-//! doc comment). `base64url_nopad`/`constant_time_str_eq` are also re-exported
+//! `#![allow(dead_code)]`. Tasks 1-5 (plus this crate's post-review fix
+//! wave, which wired [`store::AuthStore::purge_expired`] into a
+//! startup-line caller in `gateway::run()`) gave nearly every method here
+//! an HTTP (or startup-line) caller, but [`store::AuthStore::rotate_pairing_code`]
+//! remains genuinely unreached until a LATER task (planned CLI subcommand to
+//! re-mint a pairing code). `base64url_nopad`/`constant_time_str_eq` are also re-exported
 //! but never directly imported outside this module (their only external
 //! callers go through [`core::pkce_s256_matches`] instead). Until every
 //! re-exported item has an external caller, the rest of this module reads as

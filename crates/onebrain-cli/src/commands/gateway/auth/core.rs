@@ -222,15 +222,26 @@ mod tests {
         let mut seen = HashSet::new();
         for _ in 0..1000 {
             let s = mint_secret_32();
+            // Security: never interpolate a minted secret into an assertion
+            // message (CodeQL `rust/cleartext-logging`) — a failing test's
+            // panic message can end up in CI logs. Report the LENGTH, not
+            // the value, for the length check; for the alphabet check,
+            // report only the offending character and its position, never
+            // the whole secret.
             assert_eq!(
                 s.len(),
                 43,
-                "32 random bytes should nopad-encode to 43 chars: {s}"
+                "32 random bytes should nopad-encode to 43 chars, got length {}",
+                s.len()
             );
+            let bad = s
+                .char_indices()
+                .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'));
             assert!(
-                s.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
-                "secret contains a non-base64url char: {s}"
+                bad.is_none(),
+                "secret contains a non-base64url char {:?} at position {}",
+                bad.map(|(_, c)| c),
+                bad.map(|(i, _)| i).unwrap_or(usize::MAX)
             );
             assert!(seen.insert(s), "mint_secret_32 collided within 1000 draws");
         }
@@ -241,15 +252,21 @@ mod tests {
         let mut seen = HashSet::new();
         for _ in 0..1000 {
             let code = mint_pairing_code();
-            assert_eq!(code.len(), 9, "expected XXXX-XXXX (9 chars): {code}");
-            assert_eq!(code.as_bytes()[4], b'-', "dash must sit at index 4: {code}");
+            // Security: same rule as `mint_secret_32`'s test above — a
+            // pairing code is a live credential too, so it must never be
+            // interpolated into an assertion message. `assert_eq!`'s OWN
+            // default failure output already shows the two operands being
+            // compared here (lengths/bytes), which is what these messages
+            // add context to — nothing more is needed.
+            assert_eq!(code.len(), 9, "expected XXXX-XXXX (9 chars)");
+            assert_eq!(code.as_bytes()[4], b'-', "dash must sit at index 4");
             for (i, c) in code.char_indices() {
                 if i == 4 {
                     continue;
                 }
                 assert!(
                     PAIRING_ALPHABET.contains(&(c as u8)),
-                    "char {c:?} at {i} not in the unambiguous pairing alphabet: {code}"
+                    "char {c:?} at position {i} is not in the unambiguous pairing alphabet"
                 );
             }
             assert!(

@@ -210,6 +210,9 @@ pub fn well_known_router(ctx: Arc<AuthCtx>) -> Router {
 /// logic, not by the type. Unknown extra fields (`client_uri`, `contacts`,
 /// `logo_uri`, ...) are silently ignored — RFC 7591 defines many optional
 /// metadata fields this authorization server simply doesn't use yet.
+///
+/// `redirect_uris` is ALSO bounded in length, not just non-empty — see
+/// [`MAX_REDIRECT_URIS_PER_REGISTRATION`].
 #[derive(Debug, Deserialize)]
 struct RegisterRequest {
     #[serde(default)]
@@ -221,6 +224,19 @@ struct RegisterRequest {
     #[serde(default)]
     token_endpoint_auth_method: Option<String>,
 }
+
+/// Cap on `redirect_uris.len()` for a single `POST /register` call (security
+/// review, Important: unbounded growth / DoS). `POST /register` has no
+/// Bearer gate (a client with no token yet must be able to register to get
+/// one, per the module docs), so an anonymous caller could otherwise append
+/// an arbitrarily large `redirect_uris` array to `clients.json` in one
+/// request. 10 is far above any real client's need (a legitimate
+/// integration registers a small, fixed handful of redirect targets) while
+/// still rejecting a deliberately-oversized payload outright. This bounds
+/// only the SIZE of one registration; the separate question of an overall
+/// client-COUNT limit or a rate limiter on `/register` itself is tracked as
+/// a pre-tunnel item, not fixed here.
+const MAX_REDIRECT_URIS_PER_REGISTRATION: usize = 10;
 
 /// `POST {issuer}/register` success body — the exact RFC 7591 §3.2.1 shape
 /// from the task brief. `client_name` is `skip_serializing_if` (omitted
@@ -257,9 +273,25 @@ struct OAuthErrorBody {
 /// per the "no host paths / no secrets in errors" constraint. Shared by
 /// every mutating handler this file gains across Tasks 3-5, not just
 /// `/register`.
+///
+/// **`NO_STORE_HEADERS` (security review, Minor — endpoint-wide invariant):**
+/// every response through here also carries `Cache-Control: no-store` /
+/// `Pragma: no-cache`, matching [`token_error`]'s own headers. Before this
+/// fix, the three `/token` store-I/O 500s that go through THIS function
+/// (`token_authorization_code_grant`'s `consume_code`/`issue_token_pair`
+/// failures and `token_refresh_grant`'s `rotate_refresh` failure) shipped
+/// without the header pair that every other `/token` response has — no
+/// credential is in these particular bodies, so it was never a leak, just an
+/// inconsistency. `oauth_error` is ALSO the error builder for `/register`
+/// and `/authorize`'s error cases, so those responses pick up the same
+/// headers too; that's harmless (an unauthenticated-error response is fine
+/// to mark non-cacheable) and deliberately not special-cased away, since a
+/// caching intermediary should never persist ANY response from this endpoint
+/// family regardless of which route produced it.
 fn oauth_error(status: StatusCode, code: &'static str, description: impl Into<String>) -> Response {
     (
         status,
+        NO_STORE_HEADERS,
         Json(OAuthErrorBody {
             error: code,
             error_description: description.into(),
@@ -327,6 +359,14 @@ fn is_loopback_redirect_uri(uri: &str) -> bool {
 /// not mandate this exact split):
 /// - `redirect_uris` is required and must be non-empty →
 ///   `invalid_redirect_uri` if missing/empty.
+/// - `redirect_uris` may not contain more than
+///   [`MAX_REDIRECT_URIS_PER_REGISTRATION`] entries →
+///   `invalid_redirect_uri` otherwise (security review, Important: an
+///   unauthenticated `POST /register` appending to `clients.json` with no
+///   bound at all is unbounded on-disk growth — this caps the cost of a
+///   single pathological registration; the separate question of an overall
+///   client-COUNT limit / rate limiter is tracked as a pre-tunnel item, not
+///   fixed here).
 /// - `application_type` (SEP-837): absent defaults to `"web"`. `"web"` →
 ///   every URI must start with `https://` (host is intentionally
 ///   unchecked here — exact-match host allowlisting happens later, at
@@ -389,6 +429,15 @@ async fn register_client_handler(
             StatusCode::BAD_REQUEST,
             "invalid_redirect_uri",
             "redirect_uris is required and must be a non-empty array",
+        );
+    }
+    if req.redirect_uris.len() > MAX_REDIRECT_URIS_PER_REGISTRATION {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_redirect_uri",
+            format!(
+                "redirect_uris must not contain more than {MAX_REDIRECT_URIS_PER_REGISTRATION} entries"
+            ),
         );
     }
     for uri in &req.redirect_uris {
@@ -627,9 +676,26 @@ fn loopback_host_and_path(uri: &str) -> Option<(&'static str, &str)> {
 /// result here can only make the displayed text look odd, never bypass
 /// anything. Always run through [`html_escape`] before interpolation, same
 /// as every other value on this page.
+///
+/// **Fix (security review, Important — future auth-code theft):** the
+/// authority-terminating character set used to be `['/', '?', '#']`, missing
+/// `'\\'`. Browsers end the authority component at a backslash exactly like
+/// a forward slash for "special" schemes (`http`/`https`), so a REGISTERED
+/// `redirect_uri` of `https://evil.com\@claude.ai/cb` used to display as
+/// `claude.ai` here — `find` skipped past the backslash to the first real
+/// `/`, leaving `authority == "evil.com\@claude.ai"`, and `rsplit('@')` then
+/// peeled off everything up to the LAST `@` — while the browser actually
+/// navigates to host `evil.com`. A victim who trusted the displayed host,
+/// typed their pairing code, and clicked "Authorize" would hand the
+/// resulting authorization code straight to the attacker. `'\\'` is now in
+/// the terminator set, so the authority ends exactly where a browser would
+/// end it. See the `display_host_extracts_authority_...` test below for the
+/// regression case.
 fn display_host(uri: &str) -> &str {
     let authority = uri.split("://").nth(1).unwrap_or(uri);
-    let end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
+    let end = authority
+        .find(['/', '?', '#', '\\'])
+        .unwrap_or(authority.len());
     let authority = &authority[..end];
     authority.rsplit('@').next().unwrap_or(authority)
 }
@@ -798,6 +864,16 @@ fn append_query(base: &str, pairs: &[(&str, &str)]) -> String {
 /// headers for free from this one call site rather than each setting them
 /// separately, so there is no way for a future edit to add a THIRD
 /// `html_response` caller here and forget them.
+///
+/// **`Referrer-Policy: no-referrer` (security review, Minor):** the consent
+/// page's one legitimate navigation is the "Authorize" submit -> the
+/// browser following the resulting redirect to `redirect_uri`, an origin
+/// this authorization server does not control. Without `Referrer-Policy`, a
+/// browser's default `Referer` behavior would leak this gateway's issuer
+/// host+port (e.g. `http://127.0.0.1:7717/authorize`) to that redirect
+/// target. `no-referrer` suppresses the header entirely on every navigation
+/// away from this page, matching the "don't leak local process details to a
+/// third party" posture the rest of this handler already takes.
 fn html_response(status: StatusCode, html: String) -> Response {
     (
         status,
@@ -805,6 +881,7 @@ fn html_response(status: StatusCode, html: String) -> Response {
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (header::X_FRAME_OPTIONS, "DENY"),
             (header::CONTENT_SECURITY_POLICY, "default-src 'none'"),
+            (header::REFERRER_POLICY, "no-referrer"),
         ],
         html,
     )
@@ -975,8 +1052,8 @@ async fn authorize_get_handler(
 /// path in this file.
 ///
 /// Step 3 (success only): [`AuthStore::issue_code`] — a fresh, single-use
-/// code bound to client_id+redirect_uri+code_challenge+resource+scope,
-/// 60s(-class) TTL — then a 302 with `code`/`state`/`iss`.
+/// code bound to client_id+redirect_uri+code_challenge+resource+scope, a
+/// 600-second (10-minute) TTL — then a 302 with `code`/`state`/`iss`.
 async fn authorize_post_handler(
     State(ctx): State<Arc<AuthCtx>>,
     Form(params): Form<AuthorizeParams>,
@@ -1694,6 +1771,37 @@ mod tests {
         assert_eq!(body["error"], json!("invalid_redirect_uri"));
     }
 
+    /// Code-review finding (Important, unbounded growth / DoS — see
+    /// [`MAX_REDIRECT_URIS_PER_REGISTRATION`]'s doc comment): an
+    /// unauthenticated caller must not be able to balloon `clients.json` via
+    /// one oversized `redirect_uris` array.
+    #[tokio::test]
+    async fn register_rejects_too_many_redirect_uris() {
+        let (_dir, router) = register_router_with_issuer("http://127.0.0.1:7717");
+        let too_many: Vec<String> = (0..=MAX_REDIRECT_URIS_PER_REGISTRATION)
+            .map(|i| format!("https://example.test/cb{i}"))
+            .collect();
+        let (status, body) =
+            post_json(&router, "/register", json!({ "redirect_uris": too_many })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], json!("invalid_redirect_uri"));
+    }
+
+    /// Boundary companion to [`register_rejects_too_many_redirect_uris`]:
+    /// EXACTLY [`MAX_REDIRECT_URIS_PER_REGISTRATION`] entries must still be
+    /// accepted — the cap rejects only what's OVER the limit, not the limit
+    /// itself.
+    #[tokio::test]
+    async fn register_accepts_exactly_the_max_redirect_uris() {
+        let (_dir, router) = register_router_with_issuer("http://127.0.0.1:7717");
+        let at_max: Vec<String> = (0..MAX_REDIRECT_URIS_PER_REGISTRATION)
+            .map(|i| format!("https://example.test/cb{i}"))
+            .collect();
+        let (status, body) =
+            post_json(&router, "/register", json!({ "redirect_uris": at_max })).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    }
+
     #[tokio::test]
     async fn register_rejects_plain_http_for_web_client() {
         let (_dir, router) = register_router_with_issuer("http://127.0.0.1:7717");
@@ -2074,6 +2182,29 @@ mod tests {
             display_host("https://user:pass@example.com/cb"),
             "example.com"
         );
+        // SECURITY (binding, see `display_host`'s doc comment "Fix" note):
+        // a backslash must terminate the authority exactly like a forward
+        // slash does — a browser treats `\` the same as `/` when ending the
+        // authority for a special scheme. Before the fix, `find` skipped
+        // past the backslash to the `/` in `/cb`, so the ATTACKER's host
+        // (`evil.com`) was hidden behind the victim-looking `@claude.ai` and
+        // `rsplit('@')` displayed `claude.ai` instead — exactly backwards
+        // from where the browser actually navigates.
+        assert_eq!(
+            display_host("https://evil.com\\@claude.ai/cb"),
+            "evil.com",
+            "a backslash must terminate the authority — must NEVER display the \
+             victim's expected host when the browser is really navigating to the \
+             attacker's"
+        );
+        // Same host-confusion shape, but the backslash sits before a `?`
+        // instead of a `/` — proves the fix isn't accidentally tied to one
+        // specific following terminator.
+        assert_eq!(
+            display_host("https://evil.com\\@claude.ai?x=1"),
+            "evil.com",
+            "a backslash before a query string must also terminate the authority"
+        );
     }
 
     // ── GET /authorize + POST /authorize (Task 4) ──────────────────────────
@@ -2319,7 +2450,9 @@ mod tests {
     /// happy-path GET) and the error page (an unknown-`client_id` 400) in
     /// one test since both go through the SAME `html_response` call site —
     /// proving one proves the other, but asserting both here means a future
-    /// edit that special-cases either path would still be caught.
+    /// edit that special-cases either path would still be caught. Also
+    /// checks `Referrer-Policy: no-referrer` (security review, Minor) on
+    /// both paths for the same reason.
     #[tokio::test]
     async fn authorize_html_responses_carry_frame_and_csp_headers() {
         let (_dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
@@ -2344,6 +2477,14 @@ mod tests {
             Some("default-src 'none'"),
             "consent form must set a restrictive Content-Security-Policy"
         );
+        assert_eq!(
+            consent_resp
+                .headers()
+                .get(header::REFERRER_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-referrer"),
+            "consent form must set Referrer-Policy: no-referrer"
+        );
 
         let bad_params = valid_params("does-not-exist", "https://claude.ai/cb", "s1");
         let error_resp = get_authorize(&router, &bad_params).await;
@@ -2363,6 +2504,14 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("default-src 'none'"),
             "error page must set a restrictive Content-Security-Policy"
+        );
+        assert_eq!(
+            error_resp
+                .headers()
+                .get(header::REFERRER_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-referrer"),
+            "error page must set Referrer-Policy: no-referrer"
         );
     }
 
@@ -2520,12 +2669,14 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        assert!(location.starts_with("https://claude.ai/cb?"), "{location}");
-        assert!(location.contains("state=s1"), "{location}");
-        assert!(
-            location.contains("iss=http%3A%2F%2F127.0.0.1%3A7717"),
-            "{location}"
-        );
+        // Security: this `location` embeds the just-minted, live
+        // authorization code as its `code=` query parameter (unlike the
+        // `error=invalid_request` redirects tested elsewhere in this file,
+        // which never carry one) — never interpolate it whole into an
+        // assertion/panic message (CodeQL `rust/cleartext-logging`).
+        assert!(location.starts_with("https://claude.ai/cb?"));
+        assert!(location.contains("state=s1"));
+        assert!(location.contains("iss=http%3A%2F%2F127.0.0.1%3A7717"));
 
         let code = location
             .split("code=")
@@ -2537,7 +2688,8 @@ mod tests {
             .to_string();
 
         let issued = ctx.store.lock().unwrap().consume_code(&code).unwrap();
-        let issued = issued.unwrap_or_else(|| panic!("no AuthCode minted for code in {location}"));
+        let issued = issued
+            .unwrap_or_else(|| panic!("no AuthCode minted for the code in the redirect Location"));
         assert_eq!(issued.client_id, client_id);
         assert_eq!(issued.redirect_uri, "https://claude.ai/cb");
         assert_eq!(issued.code_challenge, CODE_CHALLENGE);
@@ -2770,10 +2922,18 @@ mod tests {
         assert_eq!(body["token_type"], "Bearer");
         assert_eq!(body["expires_in"], 3600);
         assert_eq!(body["scope"], "brain");
-        assert!(body["access_token"].as_str().unwrap().len() >= 40, "{body}");
+        // Security: never interpolate the actual token value into an
+        // assertion message (CodeQL `rust/cleartext-logging`) — report only
+        // the length being checked.
+        let access_len = body["access_token"].as_str().unwrap().len();
         assert!(
-            body["refresh_token"].as_str().unwrap().len() >= 40,
-            "{body}"
+            access_len >= 40,
+            "access_token should be >= 40 chars, got length {access_len}"
+        );
+        let refresh_len = body["refresh_token"].as_str().unwrap().len();
+        assert!(
+            refresh_len >= 40,
+            "refresh_token should be >= 40 chars, got length {refresh_len}"
         );
         assert_ne!(body["access_token"], body["refresh_token"]);
 
@@ -3332,6 +3492,49 @@ mod tests {
             err_resp.headers().get(header::PRAGMA).unwrap(),
             "no-cache",
             "error response must ALSO be Pragma: no-cache"
+        );
+    }
+
+    /// Code-review finding (Minor, endpoint-wide invariant — see
+    /// `oauth_error`'s doc comment): the `/token` store-I/O 500s go through
+    /// `oauth_error`, not `token_error`, so they need their own regression
+    /// test to prove they carry the same `Cache-Control`/`Pragma` headers as
+    /// every other `/token` response. All three 500 paths
+    /// (`consume_code`/`issue_token_pair`/`rotate_refresh` failures) share
+    /// this ONE `oauth_error` call site, so exercising `consume_code`'s is
+    /// enough to prove the invariant for the other two — same "one call
+    /// site, one test" reasoning as
+    /// `authorize_html_responses_carry_frame_and_csp_headers`. Corrupts
+    /// `codes.json` on disk (mirrors `store::tests::corrupt_codes_file_is_an_error_not_empty_default`)
+    /// to force `consume_code`'s `Err` branch without touching store
+    /// internals.
+    #[tokio::test]
+    async fn token_store_io_error_response_also_carries_no_store_cache_headers() {
+        let (dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx);
+        std::fs::write(dir.path().join("auth").join("codes.json"), b"{ broken").unwrap();
+
+        let resp = post_token(
+            &router,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", "anything"),
+                ("client_id", "c1"),
+                ("redirect_uri", "https://claude.ai/cb"),
+                ("code_verifier", CODE_VERIFIER),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store",
+            "a /token store-I/O 500 (via the shared oauth_error) must ALSO be Cache-Control: no-store"
+        );
+        assert_eq!(
+            resp.headers().get(header::PRAGMA).unwrap(),
+            "no-cache",
+            "a /token store-I/O 500 must ALSO be Pragma: no-cache"
         );
     }
 

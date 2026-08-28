@@ -57,6 +57,72 @@ fn resolve_issuer(public_url: Option<&str>, bound: SocketAddr) -> String {
     }
 }
 
+/// Validate a configured `public_url` (security review, Important: header
+/// injection + silent-fallback-to-insecure-issuer). Called ONCE at `run()`
+/// startup, before anything else happens (before opening the auth store,
+/// before binding) so a bad value fails FAST with a clear error naming the
+/// `public_url` key — this deliberately never falls back to the loopback
+/// issuer on an invalid value, because a silently-wrong issuer would break
+/// every discovery document (PRM / AS metadata) and the `/mcp` 401
+/// `WWW-Authenticate` challenge in a way that's very hard to debug from the
+/// client side.
+///
+/// Requirements:
+/// - No character that cannot sit inside an HTTP header quoted-string: `"`,
+///   `\\`, or any other ASCII control character (this also rules out
+///   CR/LF, i.e. header/response-splitting through this value) —
+///   `public_url` is echoed verbatim into the `WWW-Authenticate` challenge's
+///   quoted `resource_metadata` parameter
+///   (`auth::middleware::challenge`) and into every discovery document's
+///   URLs.
+/// - An absolute `http://`/`https://` origin — `scheme://host[:port]` —
+///   with NO path, query, or fragment after it. A single trailing `/` is
+///   the one exception (mirrors [`resolve_issuer`]'s own trim): `"https://x.example/"`
+///   is valid, `"https://x.example/mcp"` is not.
+/// - `http://` is accepted ONLY for a loopback host (`localhost` /
+///   `127.0.0.1` — the same definition
+///   `oauth_routes::is_loopback_redirect_uri` uses); every other host must
+///   use `https://`, or the resolved issuer would be silently insecure.
+fn validate_public_url(raw: &str) -> Result<(), String> {
+    if let Some(bad) = raw
+        .chars()
+        .find(|c| matches!(c, '"' | '\\') || c.is_control())
+    {
+        return Err(format!(
+            "contains a character that cannot appear in an HTTP header value: {bad:?}"
+        ));
+    }
+
+    let trimmed = raw.trim_end_matches('/');
+    let Some((scheme, authority)) = trimmed.split_once("://") else {
+        return Err("must be an absolute http:// or https:// URL".to_string());
+    };
+
+    if authority.is_empty() {
+        return Err("is missing a host".to_string());
+    }
+    if authority.contains(['/', '?', '#']) {
+        return Err(
+            "must be a bare origin (scheme://host[:port]) with no path, query, or fragment"
+                .to_string(),
+        );
+    }
+
+    let host = authority.split(':').next().unwrap_or(authority);
+    let is_loopback = host == "localhost" || host == "127.0.0.1";
+
+    match scheme {
+        "https" => Ok(()),
+        "http" if is_loopback => Ok(()),
+        "http" => Err(format!(
+            "must use https:// for a non-loopback host (got http://{authority})"
+        )),
+        other => Err(format!(
+            "has unsupported scheme {other:?} — must be http or https"
+        )),
+    }
+}
+
 /// `onebrain gateway run [--port N]`.
 ///
 /// Loopback hard-coded (`127.0.0.1`) — no bind flag or config key, unlike
@@ -80,10 +146,31 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
     let port = port_flag.unwrap_or(config.port);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let public_url = config.public_url.clone();
+    if let Some(url) = public_url.as_deref() {
+        if let Err(reason) = validate_public_url(url) {
+            anyhow::bail!("gateway.yml `public_url` ({url:?}) is invalid: {reason}");
+        }
+    }
 
     let state = Arc::new(GatewayState { config });
 
     let auth_store = AuthStore::open().context("open gateway auth store")?;
+    // Best-effort startup housekeeping: drop expired auth codes/tokens
+    // before serving. See `AuthStore::purge_expired`'s doc comment for why
+    // a used, family-linked code can outlive its own TTL. Never fatal to
+    // startup: a purge failure only means stale records linger a bit
+    // longer on disk, not that the gateway is unsafe to serve.
+    match auth_store.purge_expired() {
+        Ok(dropped) => {
+            tracing::debug!(
+                dropped,
+                "purged expired gateway auth-store records at startup"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to purge expired gateway auth-store records at startup; continuing");
+        }
+    }
     // The pairing code is printed here — stdout of the foreground `gateway
     // run` process — and NOWHERE else: never logged (the daemon/server log
     // is a longer-lived, potentially shared file), never returned over HTTP.
@@ -189,5 +276,69 @@ mod tests {
     #[test]
     fn resolve_issuer_falls_back_to_bound_loopback_port_when_unset() {
         assert_eq!(resolve_issuer(None, addr(54321)), "http://127.0.0.1:54321");
+    }
+
+    // ── validate_public_url (security review, Important) ───────────────────
+
+    #[test]
+    fn validate_public_url_accepts_a_valid_https_origin() {
+        assert!(validate_public_url("https://gw.example.com").is_ok());
+        assert!(validate_public_url("https://gw.example.com:8443").is_ok());
+    }
+
+    #[test]
+    fn validate_public_url_accepts_and_trims_a_trailing_slash() {
+        assert!(validate_public_url("https://gw.example.com/").is_ok());
+    }
+
+    #[test]
+    fn validate_public_url_rejects_a_path() {
+        let err = validate_public_url("https://gw.example.com/mcp").unwrap_err();
+        assert!(
+            err.contains("path"),
+            "error should name the problem as a path: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_public_url_rejects_query_and_fragment_too() {
+        assert!(validate_public_url("https://gw.example.com?x=1").is_err());
+        assert!(validate_public_url("https://gw.example.com#frag").is_err());
+    }
+
+    #[test]
+    fn validate_public_url_rejects_an_embedded_quote() {
+        let err = validate_public_url("https://gw.example.com\"evil").unwrap_err();
+        assert!(
+            err.contains("cannot appear in an HTTP header"),
+            "error should name the header-injection problem: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_public_url_rejects_embedded_crlf() {
+        assert!(validate_public_url("https://gw.example.com\r\nX-Injected: 1").is_err());
+        assert!(validate_public_url("https://gw.example.com\nX-Injected: 1").is_err());
+    }
+
+    #[test]
+    fn validate_public_url_rejects_non_loopback_http() {
+        let err = validate_public_url("http://gw.example.com").unwrap_err();
+        assert!(
+            err.contains("https"),
+            "error should say https is required: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_public_url_accepts_loopback_http() {
+        assert!(validate_public_url("http://127.0.0.1:7717").is_ok());
+        assert!(validate_public_url("http://localhost:7717").is_ok());
+    }
+
+    #[test]
+    fn validate_public_url_rejects_missing_scheme_and_unsupported_scheme() {
+        assert!(validate_public_url("gw.example.com").is_err());
+        assert!(validate_public_url("ftp://gw.example.com").is_err());
     }
 }

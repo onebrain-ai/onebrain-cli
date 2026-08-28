@@ -650,8 +650,10 @@ impl AuthStore {
     // ── Housekeeping ─────────────────────────────────────────────────────
 
     /// Drop every expired auth code and token from disk. Best-effort garbage
-    /// collection (nothing calls this automatically yet — a later task
-    /// wires it into a periodic sweep); safe to call any time.
+    /// collection, called once at `gateway::run()` startup right after
+    /// `AuthStore::open()` and before the listener starts accepting
+    /// connections (best-effort: a failure there is logged and does NOT
+    /// abort startup); safe to call any time otherwise.
     ///
     /// **`codes.json` retention is NOT simply "past its own `expires`
     /// field."** A USED code that recorded a [`AuthCode::minted_family`] is a
@@ -676,8 +678,12 @@ impl AuthStore {
     /// `tokens.json` retention is unaffected by any of this — each token
     /// already carries its own correct TTL ([`ACCESS_TTL_SECS`] /
     /// [`REFRESH_TTL_SECS`]) directly in its `expires` field.
-    pub fn purge_expired(&self) -> Result<()> {
+    ///
+    /// Returns the total number of dropped records (codes + tokens) so the
+    /// startup caller can log a debug line naming the count.
+    pub fn purge_expired(&self) -> Result<usize> {
         let now = core::now_epoch_secs();
+        let mut dropped = 0usize;
 
         let mut codes = self.load_codes()?;
         let before = codes.len();
@@ -691,6 +697,7 @@ impl AuthStore {
             // rotation. See the doc comment above.
             c.used && c.minted_family.is_some() && now <= c.expires.saturating_add(REFRESH_TTL_SECS)
         });
+        dropped += before - codes.len();
         if codes.len() != before {
             self.save_codes(&codes)?;
         }
@@ -698,11 +705,12 @@ impl AuthStore {
         let mut tokens = self.load_tokens()?;
         let before = tokens.len();
         tokens.retain(|_, t| t.expires > now);
+        dropped += before - tokens.len();
         if tokens.len() != before {
             self.save_tokens(&tokens)?;
         }
 
-        Ok(())
+        Ok(dropped)
     }
 }
 
@@ -1273,7 +1281,11 @@ mod tests {
         );
         store.save_tokens(&tokens).unwrap();
 
-        store.purge_expired().unwrap();
+        assert_eq!(
+            store.purge_expired().unwrap(),
+            2,
+            "must report exactly the 1 expired code + 1 expired token it dropped"
+        );
 
         let codes_after = store.load_codes().unwrap();
         assert!(!codes_after.contains_key("expired"));
@@ -1333,7 +1345,11 @@ mod tests {
         }
         store.save_codes(&codes).unwrap();
 
-        store.purge_expired().unwrap();
+        assert_eq!(
+            store.purge_expired().unwrap(),
+            2,
+            "must report exactly the 2 purged codes (expired_for_good + unused_expired)"
+        );
 
         let after = store.load_codes().unwrap();
         assert!(
@@ -1409,11 +1425,11 @@ mod tests {
         let debug = format!("{rec:?}");
         assert!(
             !debug.contains("SUPER-SECRET-TOKEN-VALUE"),
-            "token leaked into Debug output: {debug}"
+            "token leaked into Debug output"
         );
         assert!(
             !debug.contains("SUPER-SECRET-NEXT-TOKEN"),
-            "rotated_to leaked into Debug output: {debug}"
+            "rotated_to leaked into Debug output"
         );
         // Non-secret fields must still be visible — this is a redaction, not
         // a blackout.
@@ -1439,7 +1455,7 @@ mod tests {
         let debug = format!("{code:?}");
         assert!(
             !debug.contains("SUPER-SECRET-AUTH-CODE"),
-            "code leaked into Debug output: {debug}"
+            "code leaked into Debug output"
         );
         assert!(debug.contains("client-9"), "{debug}");
         assert!(debug.contains("not-actually-secret-challenge"), "{debug}");
@@ -1459,7 +1475,7 @@ mod tests {
         let debug = format!("{state:?}");
         assert!(
             !debug.contains("ABCD-2345"),
-            "pairing code leaked into Debug output: {debug}"
+            "pairing code leaked into Debug output"
         );
         assert!(debug.contains('4'), "{debug}"); // `created: 42` still present
         assert!(debug.contains("<redacted>"), "{debug}");
