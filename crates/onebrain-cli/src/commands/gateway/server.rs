@@ -42,7 +42,9 @@ use onebrain_fs::task::{visit_tasks, TaskHit, TaskScanOptions};
 
 use crate::commands::daemon_client;
 use crate::commands::gateway::auth::middleware::require_bearer;
-use crate::commands::gateway::oauth_routes::{register_router, well_known_router, AuthCtx};
+use crate::commands::gateway::oauth_routes::{
+    authorize_router, register_router, well_known_router, AuthCtx,
+};
 use crate::commands::gateway::GatewayConfig;
 use crate::commands::task_list::{resolve_due_by, resolve_prefixes, TaskCollector};
 
@@ -490,22 +492,26 @@ impl ServerHandler for GatewayServer {
 }
 
 /// Assembles the gateway's full HTTP surface (Gateway PR 3, Task 2 adds
-/// OAuth discovery, Task 3 adds registration): a sessionless (SEP-2567)
-/// Streamable HTTP service mounted at `/mcp`, gated by the [`require_bearer`]
-/// Bearer resource-server check, plus the PUBLIC `/.well-known/*` OAuth
-/// discovery routes ([`well_known_router`]) and the PUBLIC `POST /register`
-/// RFC 7591 registration route ([`register_router`]). The `/mcp` factory
-/// closure builds a fresh [`GatewayServer`] per request (cloning the shared
-/// `state` handle) — sessionless mode never reuses a server instance across
-/// requests, so no mutable per-connection state can leak between callers.
+/// OAuth discovery, Task 3 adds registration, Task 4 adds the consent flow):
+/// a sessionless (SEP-2567) Streamable HTTP service mounted at `/mcp`, gated
+/// by the [`require_bearer`] Bearer resource-server check, plus the PUBLIC
+/// `/.well-known/*` OAuth discovery routes ([`well_known_router`]), the
+/// PUBLIC `POST /register` RFC 7591 registration route ([`register_router`]),
+/// and the PUBLIC `GET`/`POST /authorize` consent flow
+/// ([`authorize_router`]). The `/mcp` factory closure builds a fresh
+/// [`GatewayServer`] per request (cloning the shared `state` handle) —
+/// sessionless mode never reuses a server instance across requests, so no
+/// mutable per-connection state can leak between callers.
 ///
 /// Layer scoping is load-bearing here: `.layer(from_fn_with_state(...))` is
-/// called on the router BEFORE `well_known_router`/`register_router` are
-/// merged in, so the Bearer gate wraps ONLY the `/mcp` nest — a client with
-/// no token yet can still reach the discovery documents AND register a
-/// client, both of which it needs to do before it can obtain one. See
-/// `tests::well_known_routes_are_reachable_without_auth_while_mcp_stays_gated`
-/// and `tests::register_is_reachable_without_auth_on_the_real_router` for the
+/// called on the router BEFORE `well_known_router`/`register_router`/
+/// `authorize_router` are merged in, so the Bearer gate wraps ONLY the `/mcp`
+/// nest — a client with no token yet can still reach the discovery
+/// documents, register itself, AND complete the consent flow, all of which
+/// it needs to do before it can obtain one. See
+/// `tests::well_known_routes_are_reachable_without_auth_while_mcp_stays_gated`,
+/// `tests::register_is_reachable_without_auth_on_the_real_router`, and
+/// `tests::authorize_is_reachable_without_auth_on_the_real_router` for the
 /// proof.
 pub fn build_gateway_router(state: Arc<GatewayState>, auth_ctx: Arc<AuthCtx>) -> axum::Router {
     let config = StreamableHttpServerConfig::default()
@@ -522,7 +528,8 @@ pub fn build_gateway_router(state: Arc<GatewayState>, auth_ctx: Arc<AuthCtx>) ->
     );
     mcp_router
         .merge(well_known_router(auth_ctx.clone()))
-        .merge(register_router(auth_ctx))
+        .merge(register_router(auth_ctx.clone()))
+        .merge(authorize_router(auth_ctx))
 }
 
 #[cfg(test)]
@@ -1225,6 +1232,30 @@ mod tests {
             resp.status(),
             StatusCode::CREATED,
             "/register must be public — no Authorization header was sent"
+        );
+    }
+
+    /// Gateway PR 3, Task 4: `GET /authorize` on the fully-assembled router
+    /// answers with no `Authorization` header at all — proves
+    /// `authorize_router` is merged the same way `well_known_router`/
+    /// `register_router` are (after the Bearer layer is applied to `/mcp`,
+    /// so the layer never wraps it). An unknown `client_id` still 400s (no
+    /// client was registered against this fixture's store) — the point of
+    /// this test is that the response is NOT a 401, proving the route is
+    /// reachable with zero credentials, not that a specific client resolves.
+    #[tokio::test]
+    async fn authorize_is_reachable_without_auth_on_the_real_router() {
+        let (_dir, router, _token) = fixture_router();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/authorize?response_type=code&client_id=nope&redirect_uri=https%3A%2F%2Fx.example%2Fcb&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "/authorize must be public — no Authorization header was sent"
         );
     }
 }
