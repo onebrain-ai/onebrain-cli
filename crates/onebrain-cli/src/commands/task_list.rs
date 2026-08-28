@@ -19,7 +19,7 @@ struct TaskListData {
     total: usize,
 }
 
-struct RankedTask(TaskHit);
+pub(crate) struct RankedTask(TaskHit);
 
 impl PartialEq for RankedTask {
     fn eq(&self, other: &Self) -> bool {
@@ -41,7 +41,7 @@ impl Ord for RankedTask {
     }
 }
 
-struct TaskCollector<'a> {
+pub(crate) struct TaskCollector<'a> {
     all: bool,
     cutoff: Option<&'a str>,
     limit: Option<usize>,
@@ -51,7 +51,7 @@ struct TaskCollector<'a> {
 }
 
 impl<'a> TaskCollector<'a> {
-    fn new(all: bool, cutoff: Option<&'a str>, limit: Option<usize>) -> Self {
+    pub(crate) fn new(all: bool, cutoff: Option<&'a str>, limit: Option<usize>) -> Self {
         Self {
             all,
             cutoff,
@@ -62,7 +62,7 @@ impl<'a> TaskCollector<'a> {
         }
     }
 
-    fn consider(&mut self, task: TaskHit) {
+    pub(crate) fn consider(&mut self, task: TaskHit) {
         if !task_matches(&task, self.all, self.cutoff) {
             return;
         }
@@ -87,7 +87,7 @@ impl<'a> TaskCollector<'a> {
         }
     }
 
-    fn finish(mut self) -> (Vec<TaskHit>, usize) {
+    pub(crate) fn finish(mut self) -> (Vec<TaskHit>, usize) {
         let tasks = if self.limit.is_some() {
             self.selected
                 .into_sorted_vec()
@@ -160,7 +160,7 @@ fn scan_options(folders: &VaultFolders, explicit: &[String]) -> TaskScanOptions 
 
 /// Explicit `--folder` flags win; otherwise scan projects + areas + inbox.
 /// Each prefix is normalized to a trailing-slash form for `scan_tasks`.
-fn resolve_prefixes(folders: &VaultFolders, explicit: &[String]) -> Vec<String> {
+pub(crate) fn resolve_prefixes(folders: &VaultFolders, explicit: &[String]) -> Vec<String> {
     let raw: Vec<&str> = if explicit.is_empty() {
         vec![&folders.projects, &folders.areas, &folders.inbox]
     } else {
@@ -172,7 +172,7 @@ fn resolve_prefixes(folders: &VaultFolders, explicit: &[String]) -> Vec<String> 
 }
 
 /// Resolve `--due-by` into a `YYYY-MM-DD` string. `today` → local date.
-fn resolve_due_by(raw: &str) -> Result<String> {
+pub(crate) fn resolve_due_by(raw: &str) -> Result<String> {
     if raw.eq_ignore_ascii_case("today") {
         return Ok(chrono::Local::now().format("%Y-%m-%d").to_string());
     }

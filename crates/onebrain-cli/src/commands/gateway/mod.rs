@@ -4,5 +4,6 @@
 #![allow(unused_imports)]
 
 pub mod config;
+pub mod server;
 
 pub use config::{gateway_config_path, load_gateway_config, GatewayConfig, DEFAULT_GATEWAY_PORT};
