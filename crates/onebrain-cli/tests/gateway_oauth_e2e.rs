@@ -533,7 +533,7 @@ fn gateway_oauth_full_authorization_code_and_refresh_rotation_flow() {
     captured_bodies.push(("protected resource metadata", prm_body.clone()));
     let prm: serde_json::Value = serde_json::from_str(&prm_body)
         .unwrap_or_else(|e| panic!("PRM was not JSON ({e}): {prm_body}"));
-    assert_eq!(prm["resource"], serde_json::json!(format!("{mcp_url}")));
+    assert_eq!(prm["resource"], serde_json::json!(mcp_url));
     let as_issuer = prm["authorization_servers"][0]
         .as_str()
         .unwrap_or_else(|| panic!("PRM had no authorization_servers[0]: {prm_body}"))
