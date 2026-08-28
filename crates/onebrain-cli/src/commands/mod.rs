@@ -4,6 +4,7 @@ pub mod completions;
 pub mod daemon;
 pub mod daemon_client;
 pub mod doctor;
+pub mod gateway;
 pub mod harness;
 pub mod harness_run;
 pub mod hook;
