@@ -23,6 +23,7 @@
 //! currently up.
 
 pub mod approval;
+pub mod approval_native;
 pub mod approval_routes;
 pub mod audit;
 pub mod auth;

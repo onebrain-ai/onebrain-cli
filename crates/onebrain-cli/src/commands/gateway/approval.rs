@@ -8,6 +8,16 @@
 //! its own doc comment already names; this task ships the registry and its
 //! HTTP surface on their own, fully tested in isolation.
 //!
+//! ## Two resolution channels, one registry (Gateway PR 4, Task 4)
+//!
+//! [`super::approval_routes`]'s `/approvals` HTTP surface is not the only
+//! way a pending approval gets resolved: [`super::approval_native`] adds a
+//! SECOND channel — a native macOS `display dialog` — that calls the exact
+//! same [`Approvals::resolve`] below. Both channels race harmlessly by
+//! construction, purely because `resolve` is first-response-wins (see its
+//! own doc comment) — no coordination between the two channels exists or is
+//! needed anywhere in this module.
+//!
 //! ## Privilege separation — why `/approvals` is a SEPARATE, differently
 //! gated surface (see [`super::approval_routes`] for the actual mounting)
 //!
@@ -177,6 +187,14 @@ impl Approvals {
     /// — there is no different recovery action a caller could safely take
     /// for any of those, so distinguishing them isn't worth the extra
     /// surface.
+    ///
+    /// Called from BOTH resolution channels (Gateway PR 4, Task 4) —
+    /// `approval_routes::resolve_approval` (the operator HTTP surface) and
+    /// [`super::approval_native::prompt`] (the native macOS dialog) — with
+    /// no coordination between them beyond this method's own
+    /// first-response-wins removal-before-send behavior: whichever channel
+    /// answers first wins, and a later answer from the other channel for
+    /// the same `id` simply finds nothing left to resolve.
     pub fn resolve(&self, id: &str, d: Decision) -> bool {
         let removed = {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
