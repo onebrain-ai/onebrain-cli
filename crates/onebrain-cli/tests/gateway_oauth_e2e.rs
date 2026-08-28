@@ -107,14 +107,23 @@ fn wait_for_gateway_url(
         }
         if let Some(status) = child.try_wait().expect("poll gateway child") {
             let err = std::fs::read_to_string(stderr_path).unwrap_or_default();
+            // Security: `out` may already contain the real pairing code by
+            // this point (it's printed before the "gateway listening" line
+            // — see the module docs) — never interpolate it whole into a
+            // panic message (CodeQL `rust/cleartext-logging`). `err` is
+            // safe: stderr only ever carries the fixed "loopback only ..."
+            // notice, never a secret.
             panic!(
                 "onebrain gateway run exited early ({status}) before printing the \
-                 listening line: stdout={out:?} stderr={err:?}"
+                 listening line ({} bytes of stdout captured): stderr={err:?}",
+                out.len()
             );
         }
         assert!(
             Instant::now() < deadline,
-            "onebrain gateway run did not print the listening line within 30s: stdout={out:?}"
+            "onebrain gateway run did not print the listening line within 30s \
+             ({} bytes of stdout captured so far)",
+            out.len()
         );
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -515,9 +524,14 @@ fn gateway_oauth_full_authorization_code_and_refresh_rotation_flow() {
     // `LineWriter` regardless of TTY status, so this line — printed BEFORE
     // the "gateway listening" line — is already on disk too).
     let stdout_so_far = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+    // Security: `stdout_so_far` already contains the real, live pairing
+    // code by design at this point (the very thing this assertion checks
+    // for) — never interpolate it whole into the message (CodeQL
+    // `rust/cleartext-logging`).
     assert!(
         stdout_so_far.contains("pairing code: "),
-        "gateway run must print the pairing-code startup line: {stdout_so_far:?}"
+        "gateway run must print the pairing-code startup line ({} bytes of stdout captured)",
+        stdout_so_far.len()
     );
 
     // ── Step 1: `/mcp` with no token → 401, parse `resource_metadata` ──────
@@ -633,9 +647,12 @@ fn gateway_oauth_full_authorization_code_and_refresh_rotation_flow() {
         status, 200,
         "a wrong pairing code must re-render the form, not redirect: {wrong_body}"
     );
+    // Security: if this ever fails, `wrong_location` holds a Location
+    // header carrying a live, illegitimately-minted authorization code —
+    // never interpolate it into the message (CodeQL `rust/cleartext-logging`).
     assert!(
         wrong_location.is_none(),
-        "a wrong pairing code must mint no code (no Location header): {wrong_location:?}"
+        "a wrong pairing code must mint no code, but a Location header was present"
     );
     captured_bodies.push(("wrong-pairing-code re-render", wrong_body));
 
@@ -651,23 +668,31 @@ fn gateway_oauth_full_authorization_code_and_refresh_rotation_flow() {
     captured_bodies.push(("right-pairing-code redirect body", right_body));
     let location = right_location.unwrap_or_else(|| panic!("302 with no Location header"));
     captured_bodies.push(("right-pairing-code Location header", location.clone()));
+    // Security: `location` embeds the just-minted, live authorization code
+    // as its `code=` query parameter — none of the checks below may
+    // interpolate it whole into a message (CodeQL `rust/cleartext-logging`).
     let query_start = location
         .find('?')
-        .unwrap_or_else(|| panic!("redirect Location had no query string: {location}"));
+        .unwrap_or_else(|| panic!("redirect Location had no query string"));
     assert!(
         location.starts_with(REDIRECT_URI),
-        "must redirect back to the registered redirect_uri: {location}"
+        "must redirect back to the registered redirect_uri"
     );
     let params = parse_query(&location[query_start..]);
     let auth_code = params
         .get("code")
-        .unwrap_or_else(|| panic!("redirect Location had no code param: {location}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "redirect Location had no code param (query keys present: {:?})",
+                params.keys().collect::<Vec<_>>()
+            )
+        })
         .clone();
     assert_eq!(params.get("state").map(String::as_str), Some(STATE));
     assert_eq!(
         params.get("iss").map(String::as_str),
         Some(as_issuer.as_str()),
-        "RFC 9207 iss must name this AS: {location}"
+        "RFC 9207 iss must name this AS"
     );
 
     // ── Step 5: POST /token with the real PKCE verifier → tokens ───────────
@@ -688,13 +713,33 @@ fn gateway_oauth_full_authorization_code_and_refresh_rotation_flow() {
         .unwrap_or_else(|e| panic!("token response was not JSON ({e}): {token_body}"));
     assert_eq!(tokens["token_type"], "Bearer");
     assert_eq!(tokens["scope"], "brain");
+    // Security: never interpolate `token_body` (it carries the live
+    // access/refresh token pair) into a panic message once it's known to be
+    // well-formed JSON — report the top-level keys that WERE present
+    // instead, which is exactly what's useful to localise a missing-field
+    // bug without also leaking a credential (CodeQL `rust/cleartext-logging`).
+    let response_keys = |v: &serde_json::Value| -> Vec<String> {
+        v.as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default()
+    };
     let access_token_1 = tokens["access_token"]
         .as_str()
-        .unwrap_or_else(|| panic!("no access_token: {token_body}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no access_token in token response (keys: {:?})",
+                response_keys(&tokens)
+            )
+        })
         .to_string();
     let refresh_token_1 = tokens["refresh_token"]
         .as_str()
-        .unwrap_or_else(|| panic!("no refresh_token: {token_body}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no refresh_token in token response (keys: {:?})",
+                response_keys(&tokens)
+            )
+        })
         .to_string();
 
     // ── Step 6: `/mcp` initialize + brain_tasks WITH the Bearer token ──────
@@ -749,13 +794,26 @@ fn gateway_oauth_full_authorization_code_and_refresh_rotation_flow() {
     captured_bodies.push(("refresh rotation response", rotate_body.clone()));
     let rotated: serde_json::Value = serde_json::from_str(&rotate_body)
         .unwrap_or_else(|e| panic!("refresh rotation response was not JSON ({e}): {rotate_body}"));
+    // Security: same rule as the first token exchange above — `rotate_body`
+    // carries a live token pair, never interpolate it whole once it's known
+    // to be well-formed JSON.
     let access_token_2 = rotated["access_token"]
         .as_str()
-        .unwrap_or_else(|| panic!("no access_token in rotation response: {rotate_body}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no access_token in rotation response (keys: {:?})",
+                response_keys(&rotated)
+            )
+        })
         .to_string();
     let refresh_token_2 = rotated["refresh_token"]
         .as_str()
-        .unwrap_or_else(|| panic!("no refresh_token in rotation response: {rotate_body}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no refresh_token in rotation response (keys: {:?})",
+                response_keys(&rotated)
+            )
+        })
         .to_string();
     assert_ne!(
         access_token_2, access_token_1,
@@ -804,10 +862,15 @@ fn gateway_oauth_full_authorization_code_and_refresh_rotation_flow() {
     captured_bodies.push(("post-family-revocation /mcp response", after_revoke_body));
 
     // ── Pairing code must NEVER appear in any captured HTTP response body ──
+    // Security: this is the exact check whose failure means the pairing
+    // code leaked — printing `text` on that failure would defeat the point
+    // of the check (CodeQL `rust/cleartext-logging`). Report the body length
+    // instead; the label already names which response leaked it.
     for (label, text) in &captured_bodies {
         assert!(
             !text.contains(&real_pairing_code),
-            "pairing code leaked into the \"{label}\" response body: {text}"
+            "pairing code leaked into the \"{label}\" response body ({} bytes)",
+            text.len()
         );
     }
 
@@ -853,19 +916,34 @@ fn gateway_pair_verb_prints_and_rotates_the_pairing_code() {
         String::from_utf8_lossy(&output.stdout).into_owned()
     };
 
+    // Security: `first`/`second`/`rotated` (this command's stdout) and
+    // `on_disk_after_first`/`on_disk_after_rotate` (the persisted code read
+    // straight off disk) are all live pairing-code material by design —
+    // never interpolate any of them whole into an assertion message
+    // (CodeQL `rust/cleartext-logging`). Every check below keeps its exact
+    // boolean condition; only the diagnostic text changes.
+
     // First call (no `--rotate`) mints the code on first use and prints it.
     let first = run_pair(false);
-    assert!(first.contains("pairing code: "), "{first}");
+    assert!(
+        first.contains("pairing code: "),
+        "stdout missing the \"pairing code: \" prefix"
+    );
     let on_disk_after_first = read_pairing_code(home.path());
     assert!(
         first.contains(&on_disk_after_first),
-        "printed code must match the persisted code: printed={first:?} disk={on_disk_after_first:?}"
+        "printed code did not match the persisted code (printed {} bytes, disk code is {} bytes)",
+        first.trim().len(),
+        on_disk_after_first.len()
     );
 
     // A second call with no `--rotate` is idempotent — same code, both in
     // stdout and on disk.
     let second = run_pair(false);
-    assert!(second.contains(&on_disk_after_first), "{second}");
+    assert!(
+        second.contains(&on_disk_after_first),
+        "a non-rotating call's stdout did not contain the persisted code"
+    );
     assert_eq!(
         read_pairing_code(home.path()),
         on_disk_after_first,
@@ -875,7 +953,10 @@ fn gateway_pair_verb_prints_and_rotates_the_pairing_code() {
     // `--rotate` mints a NEW code, printed and persisted, that differs from
     // the original.
     let rotated = run_pair(true);
-    assert!(rotated.contains("pairing code rotated: "), "{rotated}");
+    assert!(
+        rotated.contains("pairing code rotated: "),
+        "stdout missing the \"pairing code rotated: \" prefix"
+    );
     let on_disk_after_rotate = read_pairing_code(home.path());
     assert_ne!(
         on_disk_after_rotate, on_disk_after_first,
@@ -883,7 +964,6 @@ fn gateway_pair_verb_prints_and_rotates_the_pairing_code() {
     );
     assert!(
         rotated.contains(&on_disk_after_rotate),
-        "printed rotated code must match the persisted code: printed={rotated:?} \
-         disk={on_disk_after_rotate:?}"
+        "printed rotated code did not match the persisted code"
     );
 }
