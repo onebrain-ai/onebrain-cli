@@ -19,11 +19,17 @@
 //! covers, and the `append_on_unwritable_dir_does_not_panic` test below for
 //! the end-to-end proof.
 //!
-//! Log messages in this module deliberately never interpolate a filesystem
-//! path (only fixed, descriptive strings) — the audit dir lives under the
-//! user's home directory, and a path embedded in a `tracing::warn!` that
-//! lands in a shared log file would leak the host username for no
-//! diagnostic benefit `error = %e` doesn't already provide.
+//! Every `tracing::warn!`/`.context(...)` in this module DOES name the exact
+//! path involved, mirroring `auth/store.rs`'s own `ensure_private_dir`/
+//! `write_json_atomic` — this is operator-only diagnostic output (the
+//! gateway's local log, never a client-facing HTTP response), and an
+//! audit-write failure is exactly when an operator needs to know *which*
+//! directory or file failed (disk-full vs. permission-denied vs. wrong
+//! mount all look identical without the path). The "no secret or host path"
+//! constraint elsewhere in this codebase is scoped to client-facing
+//! responses and test/assertion messages (see e.g. `server.rs`'s
+//! `sanitized_internal`), not to operator tracing — PR 3's final security
+//! review blessed exactly this pattern in `auth/store.rs`.
 //!
 //! ## Dead-code allow
 //! Task 1 shipped this module with a blanket `#![allow(dead_code)]` (same
@@ -153,17 +159,26 @@ impl AuditLog {
         }
     }
 
-    /// Serialize `entry` to one JSON line, then open the target month file
-    /// with `.append(true)` (0600 on create) and write it. Fails on:
-    /// serialization (should not happen for this type, but `serde_json`
-    /// still returns `Result`), opening the file (missing/unwritable dir,
-    /// permission denied, etc.), or the write itself. [`Self::append`] is
-    /// the only caller — this exists as a separate method purely so the
-    /// `?`-based control flow can stay ordinary `Result` code, with the
-    /// infallible-conversion wrapping isolated to one place.
+    /// Serialize `entry` to one JSON line, re-assert the dir's 0700 (see the
+    /// inline comment below), then open the target month file with
+    /// `.append(true)` (0600 on create, re-asserted after open too) and
+    /// write it. Fails on: serialization (should not happen for this type,
+    /// but `serde_json` still returns `Result`), the dir re-assert,
+    /// opening the file (missing/unwritable dir, permission denied, etc.),
+    /// or the write itself. [`Self::append`] is the only caller — this
+    /// exists as a separate method purely so the `?`-based control flow can
+    /// stay ordinary `Result` code, with the infallible-conversion wrapping
+    /// isolated to one place.
     fn try_append(&self, entry: &AuditEntry) -> Result<()> {
         let mut line = serde_json::to_string(entry).context("serialize gateway audit log entry")?;
         line.push('\n');
+
+        // Re-assert the dir's 0700 on every call, not just once at
+        // `open_at` time — the gateway is long-lived, so a directory
+        // loosened (or recreated) mid-run should self-heal on the very
+        // next append. Matches `auth/store.rs::write_json_atomic`'s own
+        // cadence, which re-calls `ensure_private_dir` on every write.
+        ensure_private_dir(&self.root)?;
 
         let path = self.root.join(month_file_name(entry.ts));
         let mut opts = OpenOptions::new();
@@ -175,17 +190,17 @@ impl AuditLog {
         }
         let mut file = opts
             .open(&path)
-            .context("open gateway audit log month file")?;
+            .with_context(|| format!("open gateway audit log month file {}", path.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             {
-                tracing::warn!(error = %e, "could not re-assert 0600 on gateway audit log file");
+                tracing::warn!(error = %e, path = %path.display(), "could not re-assert 0600 on gateway audit log file");
             }
         }
         file.write_all(line.as_bytes())
-            .context("write gateway audit log entry")?;
+            .with_context(|| format!("write gateway audit log entry to {}", path.display()))?;
         Ok(())
     }
 }
@@ -218,15 +233,16 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
             .recursive(true)
             .mode(0o700)
             .create(dir)
-            .context("create gateway audit log dir")?;
+            .with_context(|| format!("create gateway audit log dir {}", dir.display()))?;
         if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
-            tracing::warn!(error = %e, "could not re-assert 0700 on gateway audit log dir");
+            tracing::warn!(error = %e, path = %dir.display(), "could not re-assert 0700 on gateway audit log dir");
         }
         Ok(())
     }
     #[cfg(not(unix))]
     {
-        std::fs::create_dir_all(dir).context("create gateway audit log dir")
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create gateway audit log dir {}", dir.display()))
     }
 }
 
@@ -322,6 +338,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn month_file_name_falls_back_on_an_out_of_range_ts_without_panicking() {
+        // u64::MAX doesn't even fit in an i64, let alone a representable
+        // chrono timestamp — proves the fallback path (not the happy path)
+        // without panicking, per the module doc's stated contract.
+        assert_eq!(month_file_name(u64::MAX), "1970-01.jsonl");
+    }
+
     // ── Reopen appends, not truncates ───────────────────────────────────
 
     #[test]
@@ -370,6 +394,31 @@ mod tests {
         assert_eq!(
             file_mode, 0o600,
             "gateway audit log month file must be 0600, was {file_mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_retightens_a_pre_existing_loose_month_file_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("audit");
+        let log = AuditLog::open_at(root.clone()).unwrap();
+
+        // Pre-create the target month file with loose (group/world readable)
+        // permissions, as if something else created it or a prior process
+        // left it loosened.
+        let path = root.join("2023-11.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        log.append(&sample_entry(1_700_000_000, "client-1"));
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "append must re-tighten a pre-existing loose month file to 0600, was {mode:o}"
         );
     }
 
