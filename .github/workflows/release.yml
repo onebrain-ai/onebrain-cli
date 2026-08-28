@@ -227,6 +227,10 @@ jobs:
       # crates/onebrain-search/{Cargo.toml,src/vector.rs} and ADR 0018. The
       # earlier clang-cl compile + prebuild steps are gone; ring / onig_sys
       # still build with the amd64_arm64 arm64 `cl.exe` below.
+      # KNOWN ANNOTATION: this action still declares node20 (latest v1.13.0 and
+      # master alike — ilammy/msvc-dev-cmd#99, #105 track node24), so release
+      # runs emit a "Node.js 20 is deprecated" warning on this job. GitHub
+      # forces it onto node24, where it works. Re-pin when upstream ships.
       - name: Set up amd64_arm64 MSVC cross environment
         if: matrix.target == 'aarch64-pc-windows-msvc'
         uses: ilammy/msvc-dev-cmd@v1
@@ -442,7 +446,10 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
-      - uses: actions/setup-node@v4
+      # v7 runs on the node24 runtime (v4 targeted the deprecated node20 and
+      # tripped deprecation annotations on release runs). v5+ auto-caching is
+      # inert here — no package.json in this repo has a `packageManager` field.
+      - uses: actions/setup-node@v7
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
