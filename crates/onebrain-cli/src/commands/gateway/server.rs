@@ -19,15 +19,8 @@
 //! and `brain_search` (daemon-routed hybrid search — see the `brain_search`
 //! doc comment for why it never falls back to a direct engine).
 //!
-//! ## Dead-code allow
-//! This task (Gateway PR 2, task 2) lands the handler and its tools, but no
-//! CLI verb calls `build_gateway_router`/`GatewayServer::new` yet — the `run`
-//! loop that does arrives in Task 4. Everything below is exercised by this
-//! module's own tests but otherwise unreachable from `main` until then. Same
-//! rationale as `config.rs`'s file-level allow (and `daemon_client.rs`'s
-//! before it): gate the whole module rather than sprinkle per-item
-//! `#[allow]`s across every pub item a future task consumes.
-#![allow(dead_code)]
+//! `build_gateway_router`/`GatewayServer::new` are called from `onebrain
+//! gateway run` (Task 4, `gateway/mod.rs::run`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -189,6 +182,16 @@ fn resolve_under_vault(vault_root: &Path, rel: &str) -> anyhow::Result<PathBuf> 
 fn core_error(err: CoreError) -> ErrorData {
     let code = err.error_code();
     ErrorData::invalid_params(format!("{err} [{code}]"), None)
+}
+
+/// Client-facing internal error: full detail goes to the server log only —
+/// daemon errors embed absolute host paths (e.g. the slot log path
+/// `daemon_client::ensure_running` names on a start timeout), which must
+/// never reach a network client. `context` becomes the ONLY thing the caller
+/// sees on the wire; `err`'s full chain is logged via `tracing` instead.
+fn sanitized_internal(context: &str, err: anyhow::Error) -> ErrorData {
+    tracing::warn!(error = ?err, "{context}");
+    ErrorData::internal_error(format!("{context} — see gateway logs"), None)
 }
 
 /// Resolve which vault a tool call operates on.
@@ -423,7 +426,7 @@ impl GatewayServer {
         })
         .await
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        .map_err(|e| sanitized_internal("search backend unavailable", e))?;
 
         let body = serde_json::to_string_pretty(&hits)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -477,6 +480,34 @@ mod tests {
     use tower::ServiceExt;
 
     const PROTOCOL: &str = "2026-07-28";
+
+    /// Ruling B (Task 4 review): `sanitized_internal` must strip the daemon
+    /// error's full detail — including any absolute host path it embeds,
+    /// e.g. `ensure_running`'s "See <slot log path>" on a start timeout —
+    /// down to a fixed context string plus a pointer at the server-side log,
+    /// never echoing `err`'s own text back to the network client.
+    #[test]
+    fn sanitized_internal_strips_host_detail_from_the_client_facing_message() {
+        let err = anyhow::anyhow!(
+            "daemon did not become ready within 10s; last state: dead. \
+             See /Users/keng/.onebrain/run/daemon-abc123.log"
+        );
+        let data = sanitized_internal("search backend unavailable", err);
+        assert_eq!(
+            data.message.as_ref(),
+            "search backend unavailable — see gateway logs"
+        );
+        assert!(
+            !data.message.contains("/Users/keng/.onebrain"),
+            "client-facing message must not leak the host path: {}",
+            data.message
+        );
+        assert!(
+            !data.message.contains("daemon did not become ready"),
+            "client-facing message must not echo the underlying error text: {}",
+            data.message
+        );
+    }
 
     /// Builds a fixture vault (`onebrain.yml` + one dated task in
     /// `01-projects/x.md`, plus the same line fenced — which must NOT count)
@@ -666,6 +697,34 @@ mod tests {
         );
     }
 
+    /// The SUCCESS half of `resolve_vault_arg`'s `Some(name)` branch (every
+    /// other test either fails on an unknown name or omits `vault` entirely,
+    /// falling through to `default_vault`) — proves a named-vault lookup
+    /// actually resolves and serves the RIGHT vault, not just that an
+    /// unrecognised name is rejected. Passing no `due_by` also exercises
+    /// `brain_tasks`'s cutoff-omitted branch (every other `brain_tasks` test
+    /// sets one).
+    #[tokio::test]
+    async fn brain_tasks_resolves_a_named_vault_with_no_due_by_filter() {
+        let (_dir, router) = fixture_router();
+        let body = call_body(1, "brain_tasks", serde_json::json!({"vault": "t1"}));
+        let resp = post(
+            &router,
+            body,
+            &standard_headers("tools/call", Some("brain_tasks")),
+        )
+        .await;
+        let out = &resp["result"]["structuredContent"];
+        assert_eq!(out["total"], 1, "{resp}");
+        assert!(
+            out["tasks"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("gateway fixture task"),
+            "{resp}"
+        );
+    }
+
     #[tokio::test]
     async fn brain_tasks_unknown_vault_names_known_vaults_in_the_error() {
         let (_dir, router) = fixture_router();
@@ -774,6 +833,15 @@ mod tests {
     /// `mcp.rs`) discards the vault root when joining an absolute `rel`, so
     /// this must be caught by the post-canonicalize `starts_with` check —
     /// must error AND must not leak `/etc/hosts`'s actual contents.
+    ///
+    /// Hardened per Task 4 review: rather than assuming `/etc/hosts` contains
+    /// a specific line (`127.0.0.1`, which isn't guaranteed on every CI
+    /// runner/container base image), read the file's LIVE content at test
+    /// setup and assert the response doesn't contain its actual first
+    /// non-empty line. If the file is unreadable or empty (sandboxed CI, an
+    /// unusual container), skip the content assertion gracefully — the
+    /// traversal-rejection assertion (the actual security property under
+    /// test) still runs unconditionally either way.
     #[tokio::test]
     async fn brain_get_rejects_absolute_path_without_leaking() {
         let (_dir, router) = fixture_with_outside_file();
@@ -788,12 +856,15 @@ mod tests {
             resp.get("error").is_some(),
             "expected a JSON-RPC error: {resp}"
         );
-        // /etc/hosts commonly contains this line on macOS/Linux runners; its
-        // presence in the response would mean the file's content leaked.
-        assert!(
-            !resp.to_string().contains("127.0.0.1"),
-            "content leaked: {resp}"
-        );
+
+        if let Ok(hosts) = std::fs::read_to_string("/etc/hosts") {
+            if let Some(first_line) = hosts.lines().map(str::trim).find(|l| !l.is_empty()) {
+                assert!(
+                    !resp.to_string().contains(first_line),
+                    "content leaked: {resp}"
+                );
+            }
+        }
     }
 
     /// Adversarial: a nested `..` traversal through a real intermediate

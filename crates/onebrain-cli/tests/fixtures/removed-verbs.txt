@@ -1,4 +1,8 @@
 # frozen from b75987559c090dcfe7cdbd48bda54b829e88cc64 — 63 removable verbs (plugin uninstall excluded: hybrid)
+# v3.5 Gateway PR 2: the `gateway` group RETURNED with a real verb (`gateway run` —
+# see cli.rs's GatewayCmd/GatewayVerb). `gateway telegram` below stays on the list —
+# it is still not a real verb (unknown subcommand under the new `gateway` group), so
+# it keeps exiting as unrecognized and dispatch_coverage's parametric test stays green.
 avatar doctor
 avatar pair
 avatar revoke

@@ -1,0 +1,460 @@
+//! `onebrain gateway run` binary integration test — the real-TCP twin of the
+//! oneshot coverage in `commands/gateway/server.rs` (which drives the router
+//! directly via `tower::ServiceExt::oneshot`, no socket). This test spawns
+//! the actual compiled binary, parses the bound URL from its stdout startup
+//! line, and drives the MCP handshake + all four Brain-pack tools over real
+//! HTTP via `ureq`.
+//!
+//! Model: `tests/mcp_stdio.rs`'s sandboxing (tempdir vault + cache + HOME so
+//! `~/.onebrain` and daemon slots never touch the real machine; `KillOnDrop`)
+//! and `tests/serve_bind_order.rs`'s stdout-to-file polling — the gateway
+//! blocks on Ctrl-C after a successful bind (same as `serve`), so `.output()`
+//! would hang forever; stdout is captured to a file this test polls instead.
+//!
+//! Header requirements (see task-2-report.md's discovered-headers section):
+//! `Host` comes free over real TCP (`ureq` sets it from the URL's
+//! authority) — no manual header needed, unlike the oneshot tests' `Request`
+//! builder. SEP-2243's `Mcp-Method`/`Mcp-Name` headers ARE still required on
+//! every non-`initialize` request once `MCP-Protocol-Version: 2026-07-28` is
+//! set, exactly as in the oneshot tests.
+
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use tempfile::tempdir;
+
+/// Kills the spawned gateway on drop so a panicking assertion never leaks an
+/// orphan `onebrain gateway run` process on CI. Copied (not shared) from
+/// `tests/mcp_stdio.rs` per the brief — test files cannot pull in
+/// non-`support` helpers from each other.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn write(root: &Path, rel: &str, body: &str) {
+    let p = root.join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, body).unwrap();
+}
+
+/// Best-effort `onebrain daemon stop --all` in the sandbox HOME, so a daemon
+/// `brain_search` auto-started doesn't linger past the test (it would
+/// idle-exit on its own TTL, but stopping is tidy and frees the port
+/// immediately). Mirrors `tests/mcp_stdio.rs::stop_daemon`.
+fn stop_daemon(cache_dir: &Path, home: &Path) {
+    let _ = Command::new(env!("CARGO_BIN_EXE_onebrain"))
+        .env("ONEBRAIN_CACHE_DIR", cache_dir)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .args(["daemon", "stop", "--all"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Spawn `onebrain gateway run --port 0`, scoped to a sandbox HOME/cache and
+/// a given cwd, with stdout/stderr redirected to files this test polls — the
+/// process blocks on Ctrl-C after a successful bind (same shape as `serve`),
+/// so `.output()` would hang forever waiting for it to exit.
+fn spawn_gateway(
+    cache_dir: &Path,
+    home: &Path,
+    cwd: &Path,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> std::process::Child {
+    let stdout_file = std::fs::File::create(stdout_path).unwrap();
+    let stderr_file = std::fs::File::create(stderr_path).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_onebrain"))
+        .env("ONEBRAIN_CACHE_DIR", cache_dir)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env_remove("ONEBRAIN_VAULT")
+        .current_dir(cwd)
+        .args(["gateway", "run", "--port", "0"])
+        .stdin(Stdio::null())
+        .stdout(stdout_file)
+        .stderr(stderr_file)
+        .spawn()
+        .expect("spawn onebrain gateway run")
+}
+
+/// Bounded poll (30s) for the stable startup line (`gateway listening on
+/// http://<bound-addr>/mcp`), returning the parsed `/mcp` URL. Panics with
+/// the captured stdout/stderr if the process exits early or the deadline
+/// passes first — this is the ONLY way the test learns the OS-assigned port
+/// from `--port 0`.
+fn wait_for_gateway_url(
+    child: &mut std::process::Child,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> String {
+    const PREFIX: &str = "gateway listening on ";
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let out = std::fs::read_to_string(stdout_path).unwrap_or_default();
+        if let Some(line) = out.lines().find(|l| l.starts_with(PREFIX)) {
+            return line[PREFIX.len()..].trim().to_string();
+        }
+        if let Some(status) = child.try_wait().expect("poll gateway child") {
+            let err = std::fs::read_to_string(stderr_path).unwrap_or_default();
+            panic!(
+                "onebrain gateway run exited early ({status}) before printing the \
+                 listening line: stdout={out:?} stderr={err:?}"
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "onebrain gateway run did not print the listening line within 30s: stdout={out:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Bounded poll (10s) that the child has exited after being killed — proves
+/// `kill()` actually reaped the process rather than leaving a zombie/hung
+/// child, without relying on a platform-specific exit-status shape for a
+/// SIGKILL'd process.
+fn assert_exits_after_kill(child: &mut std::process::Child) {
+    child.kill().expect("kill gateway child");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if child.try_wait().expect("poll gateway child").is_some() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "onebrain gateway run did not exit within 10s of being killed"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// A `ureq` agent that never turns a non-2xx HTTP status into an `Err`.
+/// JSON-RPC business-logic errors (unknown vault, traversal rejection) are
+/// carried in the response BODY per the JSON-RPC-over-HTTP convention this
+/// server follows — the oneshot tests in `commands/gateway/server.rs` assert
+/// on `resp["error"]` without caring about HTTP status. Turning
+/// `http_status_as_error` off means this test's `post` helper has one path
+/// for both success and JSON-RPC-error responses.
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .http_status_as_error(false)
+        .build()
+        .into()
+}
+
+/// POST one JSON-RPC `body` to `url` with `extra` headers layered on the
+/// baseline content-type/accept every request needs, and parse the response
+/// as JSON. `Host` comes free over real TCP — see the module doc comment.
+fn post(
+    agent: &ureq::Agent,
+    url: &str,
+    body: &serde_json::Value,
+    extra: &[(&str, &str)],
+) -> serde_json::Value {
+    let mut req = agent
+        .post(url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
+    for (k, v) in extra {
+        req = req.header(*k, *v);
+    }
+    let mut resp = req
+        .send(body.to_string())
+        .unwrap_or_else(|e| panic!("POST {url} failed: {e}"));
+    let text = resp
+        .body_mut()
+        .read_to_string()
+        .unwrap_or_else(|e| panic!("read response body from {url}: {e}"));
+    serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("response from {url} was not JSON ({e}): {text}"))
+}
+
+const PROTOCOL: &str = "2026-07-28";
+
+fn init_body(id: u32, protocol_version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": protocol_version,
+            "capabilities": {},
+            "clientInfo": {"name": "gateway-http-test", "version": "0.0.0"},
+        },
+    })
+}
+
+fn call_body(id: u32, tool: &str, arguments: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments},
+    })
+}
+
+/// SEP-2243 headers required on every non-`initialize` request once
+/// `MCP-Protocol-Version: 2026-07-28` is set — real-TCP twin of
+/// `commands/gateway/server.rs::standard_headers` (test files cannot share
+/// non-`support` helpers, so this is intentionally duplicated, not called).
+fn standard_headers<'a>(method: &'a str, name: Option<&'a str>) -> Vec<(&'a str, &'a str)> {
+    let mut headers = vec![("MCP-Protocol-Version", PROTOCOL), ("Mcp-Method", method)];
+    if let Some(name) = name {
+        headers.push(("Mcp-Name", name));
+    }
+    headers
+}
+
+/// `onebrain gateway run` outside any vault, with an EMPTY sandbox HOME (no
+/// `~/.onebrain/gateway.yml`, so no `default_vault` either): unlike `onebrain
+/// mcp`'s eager `open_engine` guard (which exits 64 before ever starting the
+/// server — see `mcp_without_vault_exits_64_before_any_handshake`), the
+/// gateway resolves a vault PER REQUEST, not at startup, so the server comes
+/// up fine and STAYS UP. A `brain_tasks` call with no `vault` argument then
+/// returns a vault-not-found JSON-RPC error rather than crashing the process
+/// or hanging — asserting exactly that (not an exit code) is the actual
+/// behavior this test protects, hence the name.
+#[test]
+fn gateway_run_outside_vault_brain_tasks_returns_vault_not_found_error() {
+    let neutral = tempdir().unwrap(); // no onebrain.yml anywhere above
+    let cache = tempdir().unwrap();
+    let home = tempdir().unwrap(); // empty — no gateway.yml, no run dir
+
+    let stdout_path = neutral.path().join("gateway-stdout.log");
+    let stderr_path = neutral.path().join("gateway-stderr.log");
+    let mut child = KillOnDrop(spawn_gateway(
+        cache.path(),
+        home.path(),
+        neutral.path(),
+        &stdout_path,
+        &stderr_path,
+    ));
+    let mcp_url = wait_for_gateway_url(&mut child.0, &stdout_path, &stderr_path);
+    let agent = http_agent();
+
+    let init_resp = post(
+        &agent,
+        &mcp_url,
+        &init_body(1, PROTOCOL),
+        &[("MCP-Protocol-Version", PROTOCOL)],
+    );
+    assert_eq!(
+        init_resp["result"]["protocolVersion"], PROTOCOL,
+        "initialize pin: {init_resp}"
+    );
+
+    let resp = post(
+        &agent,
+        &mcp_url,
+        &call_body(2, "brain_tasks", serde_json::json!({})),
+        &standard_headers("tools/call", Some("brain_tasks")),
+    );
+    let message = resp["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a JSON-RPC error (no vault anywhere): {resp}"));
+    assert!(
+        message.contains("E_VAULT_NOT_FOUND"),
+        "expected the vault-not-found E-code in the message: {message}"
+    );
+
+    // The server must still be alive — the error above is per-request
+    // resolution, not a startup failure that would have taken it down.
+    assert!(
+        child.0.try_wait().expect("poll gateway child").is_none(),
+        "server must stay up after a per-request vault-resolution error"
+    );
+
+    assert_exits_after_kill(&mut child.0);
+}
+
+/// Happy path: a fixture vault (note + dated task) named by a machine-level
+/// `~/.onebrain/gateway.yml` (proving config loading end-to-end — the
+/// spawn's cwd is a NEUTRAL tempdir outside the vault, so walk-up discovery
+/// alone could never resolve it; only `default_vault` from the config can).
+/// Drives the full MCP handshake + all four Brain-pack tools over real HTTP.
+#[test]
+fn gateway_run_happy_path_serves_fixture_vault_via_machine_config() {
+    let vault = tempdir().unwrap();
+    write(vault.path(), "onebrain.yml", "folders: {}\n");
+    write(
+        vault.path(),
+        "01-projects/x.md",
+        "- [ ] gateway fixture task 📅 2026-01-01\n",
+    );
+    write(vault.path(), "hello.md", "hello from the fixture vault\n");
+
+    let cache = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    write(
+        home.path(),
+        ".onebrain/gateway.yml",
+        &format!(
+            "default_vault: {v}\nvaults:\n  t1: {v}\n",
+            v = vault.path().display()
+        ),
+    );
+    let cwd = tempdir().unwrap(); // neutral — deliberately NOT inside the vault
+
+    let stdout_path = cwd.path().join("gateway-stdout.log");
+    let stderr_path = cwd.path().join("gateway-stderr.log");
+    let mut child = KillOnDrop(spawn_gateway(
+        cache.path(),
+        home.path(),
+        cwd.path(),
+        &stdout_path,
+        &stderr_path,
+    ));
+    let mcp_url = wait_for_gateway_url(&mut child.0, &stdout_path, &stderr_path);
+    let agent = http_agent();
+
+    // 1. initialize pins 2026-07-28.
+    let resp = post(
+        &agent,
+        &mcp_url,
+        &init_body(1, PROTOCOL),
+        &[("MCP-Protocol-Version", PROTOCOL)],
+    );
+    assert_eq!(resp["result"]["protocolVersion"], PROTOCOL, "pin: {resp}");
+    assert_eq!(resp["result"]["serverInfo"]["name"], "onebrain-gateway");
+
+    // 2. initialize echoes a dual-era client's own requested version.
+    let resp = post(
+        &agent,
+        &mcp_url,
+        &init_body(2, "2025-11-25"),
+        &[("MCP-Protocol-Version", "2025-11-25")],
+    );
+    assert_eq!(
+        resp["result"]["protocolVersion"], "2025-11-25",
+        "echo: {resp}"
+    );
+
+    // 3. tools/list carries all four Brain-pack tools.
+    let list_body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {},
+    });
+    let resp = post(
+        &agent,
+        &mcp_url,
+        &list_body,
+        &standard_headers("tools/list", None),
+    );
+    let names: Vec<&str> = resp["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no tools array: {resp}"))
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    for tool in ["capabilities", "brain_tasks", "brain_get", "brain_search"] {
+        assert!(
+            names.contains(&tool),
+            "tools/list missing `{tool}`: {names:?}"
+        );
+    }
+
+    // 4. brain_tasks surfaces the fixture task via the machine-config-named
+    // default vault.
+    let resp = post(
+        &agent,
+        &mcp_url,
+        &call_body(
+            4,
+            "brain_tasks",
+            serde_json::json!({"due_by": "2026-12-31"}),
+        ),
+        &standard_headers("tools/call", Some("brain_tasks")),
+    );
+    let sc = &resp["result"]["structuredContent"];
+    assert_eq!(sc["total"], 1, "{resp}");
+    assert!(
+        sc["tasks"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("gateway fixture task"),
+        "{resp}"
+    );
+
+    // 5. brain_get round-trips the fixture note.
+    let resp = post(
+        &agent,
+        &mcp_url,
+        &call_body(5, "brain_get", serde_json::json!({"file": "hello.md"})),
+        &standard_headers("tools/call", Some("brain_get")),
+    );
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(text.contains("hello from the fixture vault"), "{resp}");
+
+    // 6. brain_get rejects a traversal attempt.
+    let resp = post(
+        &agent,
+        &mcp_url,
+        &call_body(6, "brain_get", serde_json::json!({"file": "../escape"})),
+        &standard_headers("tools/call", Some("brain_get")),
+    );
+    assert!(
+        resp.get("error").is_some(),
+        "expected a traversal rejection: {resp}"
+    );
+
+    // 7. brain_search round-trips through the real warm daemon it auto-starts.
+    // The fixture vault was never reindexed, so this asserts response SHAPE
+    // and no transport error, not hit content (empty index).
+    let resp = post(
+        &agent,
+        &mcp_url,
+        &call_body(7, "brain_search", serde_json::json!({"query": "vault"})),
+        &standard_headers("tools/call", Some("brain_search")),
+    );
+    assert_eq!(
+        resp["result"]["isError"], false,
+        "brain_search must not be a transport-level failure: {resp}"
+    );
+    let body_text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    let parsed: serde_json::Value = serde_json::from_str(body_text)
+        .unwrap_or_else(|e| panic!("brain_search body was not JSON ({e}): {body_text}"));
+    assert!(
+        parsed.is_object(),
+        "brain_search body should be a JSON object: {parsed}"
+    );
+
+    // The daemon `brain_search` just spawned must live under the SANDBOX
+    // HOME, never a real one on the developer's/CI machine — proves the
+    // gateway's `daemon_client::ensure_running(Some(&vault_path))` call
+    // inherited this process's `$HOME` override rather than escaping it.
+    let run_dir = home.path().join(".onebrain").join("run");
+    let spawned_a_sandboxed_daemon = std::fs::read_dir(&run_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().starts_with("daemon-"))
+        })
+        .unwrap_or(false);
+    assert!(
+        spawned_a_sandboxed_daemon,
+        "brain_search must have spawned its daemon under the sandbox HOME ({}); \
+         found nothing there",
+        run_dir.display()
+    );
+
+    // 8. Kill the server and assert it exits.
+    assert_exits_after_kill(&mut child.0);
+
+    // Cleanup: stop the daemon `brain_search` auto-started so it doesn't
+    // linger past the test (it would idle-exit on its own TTL, but this is
+    // tidy and frees the port immediately).
+    stop_daemon(cache.path(), home.path());
+}

@@ -6,12 +6,8 @@
 //! Missing file is NOT an error: zero-config `onebrain gateway run` inside a
 //! vault serves that vault via the normal env/walk-up resolution chain.
 //!
-//! ## Dead-code allow
-//! This task (Gateway PR 2, task 1) lands only the config loader; the CLI verb
-//! and MCP server that call it arrive in later tasks. Same rationale as
-//! `daemon_client.rs`'s file-level allow: gate the whole module rather than
-//! sprinkle per-item `#[allow]`s across every pub item a future task consumes.
-#![allow(dead_code)]
+//! Consumed by `onebrain gateway run` (Task 4, `gateway/mod.rs::run`), which
+//! loads this config and hands it to [`crate::commands::gateway::server`].
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
