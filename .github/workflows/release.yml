@@ -258,7 +258,7 @@ jobs:
           echo "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$LLD" >> "$GITHUB_ENV"
 
       - name: Fetch the embedded web UI
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: webui-dist
           path: crates/onebrain-cli/webui/
