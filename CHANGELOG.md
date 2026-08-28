@@ -12,6 +12,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [3.5.0] — Unreleased — Gateway
 
+### Changed
 - MCP: rmcp 2.1.0 → 3.0.1 — protocol `2026-07-28` baseline for the remote MCP
   gateway; stdio server and all 4 tools unchanged; legacy `initialize`
   negotiation (2025-03-26 / 2025-11-25) now guarded by an integration test.
