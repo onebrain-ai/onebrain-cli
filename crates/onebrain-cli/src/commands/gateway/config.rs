@@ -29,6 +29,16 @@ pub struct GatewayConfig {
     /// Named vaults a tool call may select via its `vault` argument.
     #[serde(default)]
     pub vaults: BTreeMap<String, PathBuf>,
+    /// Public base URL for the gateway's OAuth issuer (e.g. behind a future
+    /// `cloudflared` tunnel — PR 3's later phase). When set, `gateway run`
+    /// uses `public_url` (trailing slash trimmed) as the OAuth issuer in
+    /// every discovery document and the `/mcp` 401 challenge, instead of
+    /// `http://127.0.0.1:<bound-port>` (see `gateway::resolve_issuer`).
+    /// `None` (the default) keeps loopback-only issuer resolution — this
+    /// build still binds `127.0.0.1` regardless of this setting; nothing is
+    /// exposed remotely by setting it alone.
+    #[serde(default)]
+    pub public_url: Option<String>,
 }
 
 fn default_gateway_port() -> u16 {
@@ -41,6 +51,7 @@ impl Default for GatewayConfig {
             port: default_gateway_port(),
             default_vault: None,
             vaults: BTreeMap::new(),
+            public_url: None,
         }
     }
 }
@@ -83,12 +94,14 @@ mod tests {
         assert_eq!(cfg.port, DEFAULT_GATEWAY_PORT);
         assert!(cfg.default_vault.is_none());
         assert!(cfg.vaults.is_empty());
+        assert!(cfg.public_url.is_none());
     }
 
     #[test]
     fn parses_full_yaml_and_fills_missing_keys_with_defaults() {
         let full: GatewayConfig = serde_yaml::from_str(
-            "port: 8080\ndefault_vault: /tmp/v1\nvaults:\n  ob-1: /tmp/v1\n  work: /tmp/v2\n",
+            "port: 8080\ndefault_vault: /tmp/v1\nvaults:\n  ob-1: /tmp/v1\n  work: /tmp/v2\n\
+             public_url: https://gw.example.com\n",
         )
         .unwrap();
         assert_eq!(full.port, 8080);
@@ -97,6 +110,7 @@ mod tests {
             Some(std::path::Path::new("/tmp/v1"))
         );
         assert_eq!(full.vaults.len(), 2);
+        assert_eq!(full.public_url.as_deref(), Some("https://gw.example.com"));
 
         let sparse: GatewayConfig = serde_yaml::from_str("vaults:\n  ob-1: /tmp/v1\n").unwrap();
         assert_eq!(
@@ -104,6 +118,10 @@ mod tests {
             "missing port must default"
         );
         assert!(sparse.default_vault.is_none());
+        assert!(
+            sparse.public_url.is_none(),
+            "missing public_url must default to None"
+        );
     }
 
     /// Windows-CI regression guard (`gateway_http.rs`'s happy path failed

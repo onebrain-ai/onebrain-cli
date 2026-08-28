@@ -69,7 +69,11 @@ pub struct RegisteredClient {
 /// A single-use authorization code minted by the `/authorize` step (lands in
 /// a later HTTP task) and redeemed by the `/token` step. Persisted in
 /// `codes.json`, keyed by `code`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (not derived) to redact `code` — see the impl
+/// below and the module-level rationale on [`TokenRecord`]'s own redacted
+/// `Debug`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthCode {
     pub code: String,
     pub client_id: String,
@@ -79,6 +83,29 @@ pub struct AuthCode {
     pub scope: String,
     pub expires: u64,
     pub used: bool,
+}
+
+/// Redacts `code` (the bearer secret redeemable at `/token`) — every other
+/// field is either non-secret (`client_id`, `redirect_uri`, `resource`,
+/// `scope`, `expires`, `used`) or, in `code_challenge`'s case, a PKCE S256
+/// hash that is INTENDED to be sent openly in the `/authorize` URL (RFC 7636
+/// — the secret is the verifier, which this store never persists), so it
+/// stays visible for debugging. See [`TokenRecord`]'s `Debug` impl for the
+/// full rationale (this exists so a later `{:?}` in a log path can't leak a
+/// redeemable code).
+impl std::fmt::Debug for AuthCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthCode")
+            .field("code", &"<redacted>")
+            .field("client_id", &self.client_id)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("code_challenge", &self.code_challenge)
+            .field("resource", &self.resource)
+            .field("scope", &self.scope)
+            .field("expires", &self.expires)
+            .field("used", &self.used)
+            .finish()
+    }
 }
 
 /// Auth codes are short-lived by design (RFC 6749 §4.1.2 recommends a code
@@ -105,7 +132,16 @@ pub enum TokenKind {
 /// until this exact token is exchanged during a rotation, at which point it
 /// holds the new refresh token's value — that's the reuse-detection tripwire
 /// (see module docs).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (not derived) — see the impl below: a bare
+/// `#[derive(Debug)]` here would print the raw `token`/`rotated_to` secret
+/// verbatim, and this type is exactly the kind of thing that ends up in a
+/// `tracing::debug!(?record, ...)` somewhere down the line. Redacting at the
+/// `Debug` level (rather than trusting every call site to remember not to
+/// log the field directly) means that mistake can't leak a credential no
+/// matter where it's made (Task 1 review finding, binding Task 2 requirement
+/// B).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenRecord {
     pub token: String,
     pub kind: TokenKind,
@@ -115,6 +151,30 @@ pub struct TokenRecord {
     pub expires: u64,
     pub revoked: bool,
     pub rotated_to: Option<String>,
+}
+
+/// Redacts `token` (the bearer credential itself) and `rotated_to` (which,
+/// when present, holds the NEXT refresh token's raw value — just as much a
+/// live credential as `token`). `family` stays visible: it's an internal
+/// correlation id used only for the reuse-detection cascade (see module
+/// docs), never accepted anywhere as a credential, so printing it doesn't
+/// hand out anything an attacker could authenticate with.
+impl std::fmt::Debug for TokenRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenRecord")
+            .field("token", &"<redacted>")
+            .field("kind", &self.kind)
+            .field("family", &self.family)
+            .field("client_id", &self.client_id)
+            .field("scope", &self.scope)
+            .field("expires", &self.expires)
+            .field("revoked", &self.revoked)
+            .field(
+                "rotated_to",
+                &self.rotated_to.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// 1 hour — a conventional OAuth access-token lifetime; short enough that a
@@ -130,10 +190,22 @@ const REFRESH_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 /// active pairing code at a time; minting a new one (via
 /// [`AuthStore::rotate_pairing_code`]) replaces it outright, invalidating the
 /// old one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written (not derived) to redact `code` — see
+/// [`TokenRecord`]'s `Debug` impl for the full rationale.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingState {
     pub code: String,
     pub created: u64,
+}
+
+impl std::fmt::Debug for PairingState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairingState")
+            .field("code", &"<redacted>")
+            .field("created", &self.created)
+            .finish()
+    }
 }
 
 /// Outcome of [`AuthStore::rotate_refresh`]. See the module docs for the
@@ -1020,6 +1092,74 @@ mod tests {
         let store = AuthStore::open_at(root.clone()).unwrap();
         std::fs::write(root.join("pairing.json"), b"\"unterminated").unwrap();
         assert!(store.verify_pairing("ANYX-CODE").is_err());
+    }
+
+    // ── Redacting Debug (requirement B, Task 2) ──────────────────────────
+
+    #[test]
+    fn token_record_debug_redacts_token_and_rotated_to_but_keeps_other_fields() {
+        let rec = TokenRecord {
+            token: "SUPER-SECRET-TOKEN-VALUE".to_string(),
+            kind: TokenKind::Refresh,
+            family: "fam-123".to_string(),
+            client_id: "client-9".to_string(),
+            scope: "brain".to_string(),
+            expires: 42,
+            revoked: false,
+            rotated_to: Some("SUPER-SECRET-NEXT-TOKEN".to_string()),
+        };
+        let debug = format!("{rec:?}");
+        assert!(
+            !debug.contains("SUPER-SECRET-TOKEN-VALUE"),
+            "token leaked into Debug output: {debug}"
+        );
+        assert!(
+            !debug.contains("SUPER-SECRET-NEXT-TOKEN"),
+            "rotated_to leaked into Debug output: {debug}"
+        );
+        // Non-secret fields must still be visible — this is a redaction, not
+        // a blackout.
+        assert!(debug.contains("fam-123"), "{debug}");
+        assert!(debug.contains("client-9"), "{debug}");
+        assert!(debug.contains("brain"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    #[test]
+    fn auth_code_debug_redacts_code_but_keeps_other_fields() {
+        let code = AuthCode {
+            code: "SUPER-SECRET-AUTH-CODE".to_string(),
+            client_id: "client-9".to_string(),
+            redirect_uri: "https://cb.example/cb".to_string(),
+            code_challenge: "not-actually-secret-challenge".to_string(),
+            resource: "http://127.0.0.1:7717/mcp".to_string(),
+            scope: "brain".to_string(),
+            expires: 42,
+            used: false,
+        };
+        let debug = format!("{code:?}");
+        assert!(
+            !debug.contains("SUPER-SECRET-AUTH-CODE"),
+            "code leaked into Debug output: {debug}"
+        );
+        assert!(debug.contains("client-9"), "{debug}");
+        assert!(debug.contains("not-actually-secret-challenge"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    #[test]
+    fn pairing_state_debug_redacts_code_but_keeps_created() {
+        let state = PairingState {
+            code: "ABCD-2345".to_string(),
+            created: 42,
+        };
+        let debug = format!("{state:?}");
+        assert!(
+            !debug.contains("ABCD-2345"),
+            "pairing code leaked into Debug output: {debug}"
+        );
+        assert!(debug.contains('4'), "{debug}"); // `created: 42` still present
+        assert!(debug.contains("<redacted>"), "{debug}");
     }
 
     // ── Unix permission asserts ──────────────────────────────────────────

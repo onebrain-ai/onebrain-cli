@@ -41,6 +41,8 @@ use onebrain_core::{
 use onebrain_fs::task::{visit_tasks, TaskHit, TaskScanOptions};
 
 use crate::commands::daemon_client;
+use crate::commands::gateway::auth::middleware::require_bearer;
+use crate::commands::gateway::oauth_routes::{well_known_router, AuthCtx};
 use crate::commands::gateway::GatewayConfig;
 use crate::commands::task_list::{resolve_due_by, resolve_prefixes, TaskCollector};
 
@@ -487,12 +489,22 @@ impl ServerHandler for GatewayServer {
     }
 }
 
-/// Assembles the gateway's MCP HTTP surface: a sessionless (SEP-2567)
-/// Streamable HTTP service mounted at `/mcp`. The factory closure builds a
-/// fresh [`GatewayServer`] per request (cloning the shared `state` handle) —
-/// sessionless mode never reuses a server instance across requests, so no
-/// mutable per-connection state can leak between callers.
-pub fn build_gateway_router(state: Arc<GatewayState>) -> axum::Router {
+/// Assembles the gateway's full HTTP surface (Gateway PR 3, Task 2 adds
+/// OAuth): a sessionless (SEP-2567) Streamable HTTP service mounted at
+/// `/mcp`, gated by the [`require_bearer`] Bearer resource-server check, plus
+/// the PUBLIC `/.well-known/*` OAuth discovery routes ([`well_known_router`]).
+/// The `/mcp` factory closure builds a fresh [`GatewayServer`] per request
+/// (cloning the shared `state` handle) — sessionless mode never reuses a
+/// server instance across requests, so no mutable per-connection state can
+/// leak between callers.
+///
+/// Layer scoping is load-bearing here: `.layer(from_fn_with_state(...))` is
+/// called on the router BEFORE the well-known routes are merged in, so the
+/// Bearer gate wraps ONLY the `/mcp` nest — a client with no token yet can
+/// still reach the discovery documents that tell it how to get one. See
+/// `tests::well_known_routes_are_reachable_without_auth_while_mcp_stays_gated`
+/// for the proof.
+pub fn build_gateway_router(state: Arc<GatewayState>, auth_ctx: Arc<AuthCtx>) -> axum::Router {
     let config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true);
@@ -502,19 +514,40 @@ pub fn build_gateway_router(state: Arc<GatewayState>) -> axum::Router {
             Default::default(),
             config,
         );
-    axum::Router::new().nest_service("/mcp", service)
+    let mcp_router = axum::Router::new().nest_service("/mcp", service).layer(
+        axum::middleware::from_fn_with_state(auth_ctx.clone(), require_bearer),
+    );
+    mcp_router.merge(well_known_router(auth_ctx))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
-    use axum::http::Request;
+    use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use std::collections::BTreeMap;
     use tower::ServiceExt;
 
+    use crate::commands::gateway::auth::AuthStore;
+
     const PROTOCOL: &str = "2026-07-28";
+
+    /// Builds an `AuthCtx` with one live access token (client "test-client",
+    /// scope "brain") and a fixed test issuer, so a fixture router's `/mcp`
+    /// can pass its Bearer gate. `root` only needs to be a fresh directory
+    /// the auth store can use — the caller's own vault fixture files live
+    /// alongside it in the SAME tempdir, under a distinct `gateway-auth/`
+    /// subdirectory.
+    fn test_auth_ctx(root: &Path) -> (Arc<AuthCtx>, String) {
+        let store = AuthStore::open_at(root.join("gateway-auth")).unwrap();
+        let (access, _refresh) = store.issue_token_pair("test-client", "brain").unwrap();
+        let ctx = Arc::new(AuthCtx::new(store));
+        ctx.issuer
+            .set("http://127.0.0.1:7717".to_string())
+            .expect("issuer set once on a fresh AuthCtx");
+        (ctx, access.token)
+    }
 
     /// Ruling B (Task 4 review): `sanitized_internal` must strip the daemon
     /// error's full detail — including any absolute host path it embeds,
@@ -585,7 +618,7 @@ mod tests {
     /// Builds a fixture vault (`onebrain.yml` + one dated task in
     /// `01-projects/x.md`, plus the same line fenced — which must NOT count)
     /// and a router whose gateway config names it `t1` and sets it default.
-    fn fixture_router() -> (tempfile::TempDir, axum::Router) {
+    fn fixture_router() -> (tempfile::TempDir, axum::Router, String) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("onebrain.yml"), "folders: {}\n").unwrap();
@@ -607,17 +640,21 @@ mod tests {
             ..GatewayConfig::default()
         };
         let state = Arc::new(GatewayState { config });
-        (dir, build_gateway_router(state))
+        let (auth_ctx, token) = test_auth_ctx(root);
+        (dir, build_gateway_router(state, auth_ctx), token)
     }
 
-    /// POST `body` to `/mcp` with the given extra headers (beyond the
-    /// baseline content-type/accept/host every request needs — the
+    /// POST `body` to `/mcp` with `token` as the `Authorization: Bearer`
+    /// credential, plus the given extra headers (beyond the baseline
+    /// content-type/accept/host/authorization every request needs — the
     /// Streamable HTTP service's DNS-rebinding guard 400s any request with
     /// no `Host` header and no URI authority, and `oneshot` supplies
-    /// neither by default).
+    /// neither by default; `/mcp` now also 401s without a valid bearer
+    /// token, per Gateway PR 3, Task 2).
     async fn post(
         router: &axum::Router,
         body: String,
+        token: &str,
         extra: &[(&str, &str)],
     ) -> serde_json::Value {
         let mut builder = Request::builder()
@@ -625,7 +662,8 @@ mod tests {
             .uri("/mcp")
             .header("host", "localhost")
             .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream");
+            .header("accept", "application/json, text/event-stream")
+            .header("authorization", format!("Bearer {token}"));
         for (name, value) in extra {
             builder = builder.header(*name, *value);
         }
@@ -680,10 +718,11 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_pins_protocol_2026_07_28() {
-        let (_dir, router) = fixture_router();
+        let (_dir, router, token) = fixture_router();
         let resp = post(
             &router,
             init_body(1, PROTOCOL),
+            &token,
             &[("MCP-Protocol-Version", PROTOCOL)],
         )
         .await;
@@ -696,10 +735,11 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_echoes_2025_11_25_dual_era_over_http() {
-        let (_dir, router) = fixture_router();
+        let (_dir, router, token) = fixture_router();
         let resp = post(
             &router,
             init_body(1, "2025-11-25"),
+            &token,
             &[("MCP-Protocol-Version", "2025-11-25")],
         )
         .await;
@@ -708,12 +748,12 @@ mod tests {
 
     #[tokio::test]
     async fn tools_list_contains_capabilities_and_brain_tasks() {
-        let (_dir, router) = fixture_router();
+        let (_dir, router, token) = fixture_router();
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {},
         })
         .to_string();
-        let resp = post(&router, body, &standard_headers("tools/list", None)).await;
+        let resp = post(&router, body, &token, &standard_headers("tools/list", None)).await;
         let tools = resp["result"]["tools"]
             .as_array()
             .unwrap_or_else(|| panic!("no tools array: {resp}"));
@@ -741,11 +781,12 @@ mod tests {
 
     #[tokio::test]
     async fn capabilities_reports_brain_enabled_developer_disabled() {
-        let (_dir, router) = fixture_router();
+        let (_dir, router, token) = fixture_router();
         let body = call_body(1, "capabilities", serde_json::json!({}));
         let resp = post(
             &router,
             body,
+            &token,
             &standard_headers("tools/call", Some("capabilities")),
         )
         .await;
@@ -764,11 +805,12 @@ mod tests {
     /// through the name lookup rather than falling back to the path.
     #[tokio::test]
     async fn capabilities_default_vault_reports_the_matching_name_not_a_raw_path() {
-        let (dir, router) = fixture_router();
+        let (dir, router, token) = fixture_router();
         let body = call_body(1, "capabilities", serde_json::json!({}));
         let resp = post(
             &router,
             body,
+            &token,
             &standard_headers("tools/call", Some("capabilities")),
         )
         .await;
@@ -802,12 +844,14 @@ mod tests {
             ..GatewayConfig::default()
         };
         let state = Arc::new(GatewayState { config });
-        let router = build_gateway_router(state);
+        let (auth_ctx, token) = test_auth_ctx(dir.path());
+        let router = build_gateway_router(state, auth_ctx);
 
         let body = call_body(1, "capabilities", serde_json::json!({}));
         let resp = post(
             &router,
             body,
+            &token,
             &standard_headers("tools/call", Some("capabilities")),
         )
         .await;
@@ -823,7 +867,7 @@ mod tests {
 
     #[tokio::test]
     async fn brain_tasks_counts_the_unfenced_dated_task_only() {
-        let (_dir, router) = fixture_router();
+        let (_dir, router, token) = fixture_router();
         let body = call_body(
             1,
             "brain_tasks",
@@ -832,6 +876,7 @@ mod tests {
         let resp = post(
             &router,
             body,
+            &token,
             &standard_headers("tools/call", Some("brain_tasks")),
         )
         .await;
@@ -857,11 +902,12 @@ mod tests {
     /// sets one).
     #[tokio::test]
     async fn brain_tasks_resolves_a_named_vault_with_no_due_by_filter() {
-        let (_dir, router) = fixture_router();
+        let (_dir, router, token) = fixture_router();
         let body = call_body(1, "brain_tasks", serde_json::json!({"vault": "t1"}));
         let resp = post(
             &router,
             body,
+            &token,
             &standard_headers("tools/call", Some("brain_tasks")),
         )
         .await;
@@ -878,11 +924,12 @@ mod tests {
 
     #[tokio::test]
     async fn brain_tasks_unknown_vault_names_known_vaults_in_the_error() {
-        let (_dir, router) = fixture_router();
+        let (_dir, router, token) = fixture_router();
         let body = call_body(1, "brain_tasks", serde_json::json!({"vault": "nope"}));
         let resp = post(
             &router,
             body,
+            &token,
             &standard_headers("tools/call", Some("brain_tasks")),
         )
         .await;
@@ -906,7 +953,7 @@ mod tests {
     /// exercises the same "canonicalizes fine, then escapes the vault" path
     /// as `../outside.md`, rather than failing earlier for an unrelated
     /// reason (a nonexistent `a/` component).
-    fn fixture_with_outside_file() -> (tempfile::TempDir, axum::Router) {
+    fn fixture_with_outside_file() -> (tempfile::TempDir, axum::Router, String) {
         let workspace = tempfile::tempdir().unwrap();
         let root = workspace.path().join("vault");
         std::fs::create_dir_all(root.join("a")).unwrap();
@@ -922,16 +969,18 @@ mod tests {
             ..GatewayConfig::default()
         };
         let state = Arc::new(GatewayState { config });
-        (workspace, build_gateway_router(state))
+        let (auth_ctx, token) = test_auth_ctx(workspace.path());
+        (workspace, build_gateway_router(state, auth_ctx), token)
     }
 
     #[tokio::test]
     async fn brain_get_round_trips_fixture_note() {
-        let (_dir, router) = fixture_with_outside_file();
+        let (_dir, router, token) = fixture_with_outside_file();
         let body = call_body(1, "brain_get", serde_json::json!({"file": "hello.md"}));
         let resp = post(
             &router,
             body,
+            &token,
             &standard_headers("tools/call", Some("brain_get")),
         )
         .await;
@@ -943,11 +992,12 @@ mod tests {
 
     #[tokio::test]
     async fn brain_get_unknown_file_is_invalid_params() {
-        let (_dir, router) = fixture_with_outside_file();
+        let (_dir, router, token) = fixture_with_outside_file();
         let body = call_body(1, "brain_get", serde_json::json!({"file": "nope.md"}));
         let resp = post(
             &router,
             body,
+            &token,
             &standard_headers("tools/call", Some("brain_get")),
         )
         .await;
@@ -962,11 +1012,12 @@ mod tests {
     /// the sentinel content anywhere in the JSON-RPC response.
     #[tokio::test]
     async fn brain_get_rejects_parent_traversal_without_leaking() {
-        let (_dir, router) = fixture_with_outside_file();
+        let (_dir, router, token) = fixture_with_outside_file();
         let body = call_body(1, "brain_get", serde_json::json!({"file": "../outside.md"}));
         let resp = post(
             &router,
             body,
+            &token,
             &standard_headers("tools/call", Some("brain_get")),
         )
         .await;
@@ -995,11 +1046,12 @@ mod tests {
     /// test) still runs unconditionally either way.
     #[tokio::test]
     async fn brain_get_rejects_absolute_path_without_leaking() {
-        let (_dir, router) = fixture_with_outside_file();
+        let (_dir, router, token) = fixture_with_outside_file();
         let body = call_body(1, "brain_get", serde_json::json!({"file": "/etc/hosts"}));
         let resp = post(
             &router,
             body,
+            &token,
             &standard_headers("tools/call", Some("brain_get")),
         )
         .await;
@@ -1023,7 +1075,7 @@ mod tests {
     /// the plain `../outside.md` case. Must error AND must not leak.
     #[tokio::test]
     async fn brain_get_rejects_nested_traversal_without_leaking() {
-        let (_dir, router) = fixture_with_outside_file();
+        let (_dir, router, token) = fixture_with_outside_file();
         let body = call_body(
             1,
             "brain_get",
@@ -1032,6 +1084,7 @@ mod tests {
         let resp = post(
             &router,
             body,
+            &token,
             &standard_headers("tools/call", Some("brain_get")),
         )
         .await;
@@ -1051,7 +1104,7 @@ mod tests {
     /// daemon-backed happy path is Task 4's binary integration test).
     #[tokio::test]
     async fn brain_search_unknown_vault_names_known_vaults_in_the_error() {
-        let (_dir, router) = fixture_router();
+        let (_dir, router, token) = fixture_router();
         let body = call_body(
             1,
             "brain_search",
@@ -1060,6 +1113,7 @@ mod tests {
         let resp = post(
             &router,
             body,
+            &token,
             &standard_headers("tools/call", Some("brain_search")),
         )
         .await;
@@ -1067,5 +1121,77 @@ mod tests {
             .as_str()
             .unwrap_or_else(|| panic!("expected a JSON-RPC error: {resp}"));
         assert!(message.contains("t1"), "{message}");
+    }
+
+    // ── Gateway PR 3, Task 2: OAuth wiring on the REAL router ────────────
+    //
+    // `middleware.rs`'s own tests cover `require_bearer`'s exact 401 shapes
+    // (no-token vs. bad-token, expired, revoked) against a synthetic `/mcp`
+    // stand-in route; `oauth_routes.rs`'s own tests cover the well-known
+    // documents' exact field sets against a bare `well_known_router()`. What
+    // belongs HERE, against `build_gateway_router`'s real composition (the
+    // actual rmcp `nest_service` + the actual merge with the well-known
+    // routes), is the end-to-end proof that the two are wired together
+    // correctly: the Bearer layer really does cover the real `/mcp` route,
+    // and really does NOT cover the well-known routes once merged in.
+
+    /// `/mcp` on the fully-assembled router 401s with no bearer token —
+    /// confirms the gate is actually attached to the REAL rmcp-backed `/mcp`
+    /// route, not just a synthetic stand-in.
+    #[tokio::test]
+    async fn mcp_without_bearer_token_401s_on_the_real_router() {
+        let (_dir, router, _token) = fixture_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(Body::from(init_body(1, PROTOCOL)))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Layer-scoping proof (Step 2 of the brief): on ONE `build_gateway_router`
+    /// output, every `/.well-known/*` discovery route answers 200 with no
+    /// `Authorization` header at all, while `/mcp` on that SAME router
+    /// instance stays gated — proving the `.merge()` in `build_gateway_router`
+    /// adds the well-known routes WITHOUT the Bearer layer wrapping them
+    /// (the layer is applied to the `/mcp` sub-router before the merge, so it
+    /// can't leak onto routes merged in afterward — but this is the test that
+    /// actually proves it, rather than just asserting it in a comment).
+    #[tokio::test]
+    async fn well_known_routes_are_reachable_without_auth_while_mcp_stays_gated() {
+        let (_dir, router, _token) = fixture_router();
+
+        for path in [
+            "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/oauth-authorization-server",
+        ] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path} must be public");
+        }
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(Body::from(init_body(1, PROTOCOL)))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "/mcp must still be gated on the SAME router instance"
+        );
     }
 }

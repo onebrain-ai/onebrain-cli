@@ -17,6 +17,18 @@
 //! builder. SEP-2243's `Mcp-Method`/`Mcp-Name` headers ARE still required on
 //! every non-`initialize` request once `MCP-Protocol-Version: 2026-07-28` is
 //! set, exactly as in the oneshot tests.
+//!
+//! OAuth (Gateway PR 3, Task 2): `/mcp` now requires `Authorization: Bearer
+//! <token>`. This crate has no library target (bin-only), so this external
+//! test binary can't call `AuthStore::issue_token_pair` directly the way the
+//! in-crate oneshot tests do — instead [`plant_valid_access_token`] writes a
+//! `TokenRecord` straight into the sandboxed `$HOME/.onebrain/gateway/tokens.json`
+//! file, in the exact shape `AuthStore` persists. `AuthStore` re-reads its
+//! files fresh on every call (no in-memory cache — see `store.rs`'s module
+//! docs), so a file planted after the gateway process is already running is
+//! picked up on the next request with no restart needed. This is a
+//! test-only shortcut standing in for the real `/authorize` + `/token`
+//! exchange, which doesn't exist yet (Tasks 4-5).
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -118,6 +130,48 @@ fn wait_for_gateway_url(
     }
 }
 
+/// Plants a live, unexpired, unrevoked ACCESS `TokenRecord` directly into the
+/// sandboxed `$HOME/.onebrain/gateway/tokens.json` — see the module doc
+/// comment for why this test can't just call `AuthStore::issue_token_pair`
+/// (no library target) or drive the real OAuth flow (no `/authorize`/`/token`
+/// routes yet). The directory always exists by the time this is called: the
+/// gateway process's `AuthStore::open()` creates it at the very start of
+/// `run()`, well before it prints the "gateway listening on" line this
+/// test's caller already waited for.
+///
+/// The JSON shape mirrors `commands/gateway/auth/store.rs::TokenRecord`
+/// field-for-field (`kind`/`client_id` etc. use the crate's own
+/// `#[serde(rename_all = "lowercase")]` encoding) — if that shape ever
+/// changes, this helper needs to change with it, same as any other
+/// cross-boundary fixture.
+fn plant_valid_access_token(home: &Path, token: &str) {
+    let dir = home.join(".onebrain").join("gateway");
+    std::fs::create_dir_all(&dir).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut tokens = serde_json::Map::new();
+    tokens.insert(
+        token.to_string(),
+        serde_json::json!({
+            "token": token,
+            "kind": "access",
+            "family": "gateway-http-test-family",
+            "client_id": "gateway-http-test",
+            "scope": "brain",
+            "expires": now + 3600,
+            "revoked": false,
+            "rotated_to": null,
+        }),
+    );
+    std::fs::write(
+        dir.join("tokens.json"),
+        serde_json::to_vec_pretty(&serde_json::Value::Object(tokens)).unwrap(),
+    )
+    .unwrap();
+}
+
 /// Bounded poll (10s) that the child has exited after being killed — proves
 /// `kill()` actually reaped the process rather than leaving a zombie/hung
 /// child, without relying on a platform-specific exit-status shape for a
@@ -152,19 +206,23 @@ fn http_agent() -> ureq::Agent {
         .into()
 }
 
-/// POST one JSON-RPC `body` to `url` with `extra` headers layered on the
-/// baseline content-type/accept every request needs, and parse the response
-/// as JSON. `Host` comes free over real TCP — see the module doc comment.
+/// POST one JSON-RPC `body` to `url` with `token` as the `Authorization:
+/// Bearer` credential, plus `extra` headers layered on the baseline
+/// content-type/accept/authorization every request needs, and parse the
+/// response as JSON. `Host` comes free over real TCP — see the module doc
+/// comment.
 fn post(
     agent: &ureq::Agent,
     url: &str,
+    token: &str,
     body: &serde_json::Value,
     extra: &[(&str, &str)],
 ) -> serde_json::Value {
     let mut req = agent
         .post(url)
         .header("content-type", "application/json")
-        .header("accept", "application/json, text/event-stream");
+        .header("accept", "application/json, text/event-stream")
+        .header("authorization", format!("Bearer {token}"));
     for (k, v) in extra {
         req = req.header(*k, *v);
     }
@@ -240,11 +298,14 @@ fn gateway_run_outside_vault_brain_tasks_returns_vault_not_found_error() {
         &stderr_path,
     ));
     let mcp_url = wait_for_gateway_url(&mut child.0, &stdout_path, &stderr_path);
+    let token = "gateway-http-test-token-outside-vault";
+    plant_valid_access_token(home.path(), token);
     let agent = http_agent();
 
     let init_resp = post(
         &agent,
         &mcp_url,
+        token,
         &init_body(1, PROTOCOL),
         &[("MCP-Protocol-Version", PROTOCOL)],
     );
@@ -256,6 +317,7 @@ fn gateway_run_outside_vault_brain_tasks_returns_vault_not_found_error() {
     let resp = post(
         &agent,
         &mcp_url,
+        token,
         &call_body(2, "brain_tasks", serde_json::json!({})),
         &standard_headers("tools/call", Some("brain_tasks")),
     );
@@ -315,12 +377,15 @@ fn gateway_run_happy_path_serves_fixture_vault_via_machine_config() {
         &stderr_path,
     ));
     let mcp_url = wait_for_gateway_url(&mut child.0, &stdout_path, &stderr_path);
+    let token = "gateway-http-test-token-happy-path";
+    plant_valid_access_token(home.path(), token);
     let agent = http_agent();
 
     // 1. initialize pins 2026-07-28.
     let resp = post(
         &agent,
         &mcp_url,
+        token,
         &init_body(1, PROTOCOL),
         &[("MCP-Protocol-Version", PROTOCOL)],
     );
@@ -331,6 +396,7 @@ fn gateway_run_happy_path_serves_fixture_vault_via_machine_config() {
     let resp = post(
         &agent,
         &mcp_url,
+        token,
         &init_body(2, "2025-11-25"),
         &[("MCP-Protocol-Version", "2025-11-25")],
     );
@@ -346,6 +412,7 @@ fn gateway_run_happy_path_serves_fixture_vault_via_machine_config() {
     let resp = post(
         &agent,
         &mcp_url,
+        token,
         &list_body,
         &standard_headers("tools/list", None),
     );
@@ -367,6 +434,7 @@ fn gateway_run_happy_path_serves_fixture_vault_via_machine_config() {
     let resp = post(
         &agent,
         &mcp_url,
+        token,
         &call_body(
             4,
             "brain_tasks",
@@ -388,6 +456,7 @@ fn gateway_run_happy_path_serves_fixture_vault_via_machine_config() {
     let resp = post(
         &agent,
         &mcp_url,
+        token,
         &call_body(5, "brain_get", serde_json::json!({"file": "hello.md"})),
         &standard_headers("tools/call", Some("brain_get")),
     );
@@ -400,6 +469,7 @@ fn gateway_run_happy_path_serves_fixture_vault_via_machine_config() {
     let resp = post(
         &agent,
         &mcp_url,
+        token,
         &call_body(6, "brain_get", serde_json::json!({"file": "../escape"})),
         &standard_headers("tools/call", Some("brain_get")),
     );
@@ -414,6 +484,7 @@ fn gateway_run_happy_path_serves_fixture_vault_via_machine_config() {
     let resp = post(
         &agent,
         &mcp_url,
+        token,
         &call_body(7, "brain_search", serde_json::json!({"query": "vault"})),
         &standard_headers("tools/call", Some("brain_search")),
     );
