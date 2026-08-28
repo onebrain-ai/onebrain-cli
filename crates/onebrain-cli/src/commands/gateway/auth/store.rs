@@ -652,12 +652,45 @@ impl AuthStore {
     /// Drop every expired auth code and token from disk. Best-effort garbage
     /// collection (nothing calls this automatically yet — a later task
     /// wires it into a periodic sweep); safe to call any time.
+    ///
+    /// **`codes.json` retention is NOT simply "past its own `expires`
+    /// field."** A USED code that recorded a [`AuthCode::minted_family`] is a
+    /// durable security artifact, not disposable state: the `/token`
+    /// handler's RFC 6749 §4.1.2 replay hardening ([`Self::find_code_record`]
+    /// → [`Self::revoke_family`]) depends on that record still being on disk
+    /// to catch a LATE replay of the code, and a refresh token from that
+    /// family can legitimately still be presented for rotation up to
+    /// [`REFRESH_TTL_SECS`] (30 days) after it was minted — far longer than
+    /// the code's own 10-minute [`AUTH_CODE_TTL_SECS`]. If this sweep deleted
+    /// a used, family-linked code the moment its OWN `expires` passed, replay
+    /// hardening would silently degrade to only the ~10-minute window between
+    /// issuance and expiry — with nothing (no test, no error) ever signaling
+    /// that regression once this method gains a caller. So: a used code that
+    /// minted a family is retained until `expires + REFRESH_TTL_SECS`, long
+    /// enough to outlive every token that family could still be rotating. An
+    /// unused code, or a used code that never actually minted a family (e.g.
+    /// one redeemed by a request that failed its bindings/PKCE check before
+    /// `issue_token_pair` ran), keeps the original behavior: purged the
+    /// moment `expires` passes.
+    ///
+    /// `tokens.json` retention is unaffected by any of this — each token
+    /// already carries its own correct TTL ([`ACCESS_TTL_SECS`] /
+    /// [`REFRESH_TTL_SECS`]) directly in its `expires` field.
     pub fn purge_expired(&self) -> Result<()> {
         let now = core::now_epoch_secs();
 
         let mut codes = self.load_codes()?;
         let before = codes.len();
-        codes.retain(|_, c| c.expires > now);
+        codes.retain(|_, c| {
+            if c.expires > now {
+                return true;
+            }
+            // Naturally expired by its own TTL — but a used code that
+            // minted a family stays around until that family's refresh
+            // token could no longer legitimately be presented for
+            // rotation. See the doc comment above.
+            c.used && c.minted_family.is_some() && now <= c.expires.saturating_add(REFRESH_TTL_SECS)
+        });
         if codes.len() != before {
             self.save_codes(&codes)?;
         }
@@ -1250,6 +1283,71 @@ mod tests {
         assert!(!tokens_after.contains_key("expired-tok"));
         assert!(tokens_after.contains_key(&live_access.token));
         assert!(tokens_after.contains_key(&live_refresh.token));
+    }
+
+    /// Pins the fix for a code-review finding: `purge_expired` must NOT
+    /// destroy the RFC 6749 §4.1.2 replay-revoke linkage
+    /// ([`AuthCode::minted_family`]) the moment a USED code's own
+    /// [`AUTH_CODE_TTL_SECS`] passes — the family it minted can still be
+    /// rotating for up to [`REFRESH_TTL_SECS`] after that. Three codes,
+    /// three different fates:
+    /// - a used, family-linked code just past its own `expires` → SURVIVES
+    ///   (equivalent to "a purge run at `expires + 1`").
+    /// - the same shape, but far enough past `expires` that
+    ///   `expires + REFRESH_TTL_SECS` has ALSO elapsed → purged
+    ///   (equivalent to "a purge run at `expires + REFRESH_TTL_SECS + 1`").
+    /// - an unused, naturally-expired code → purged immediately, exactly the
+    ///   pre-fix behavior (unaffected by this change).
+    #[test]
+    fn purge_expired_retains_a_used_replay_linked_code_until_the_family_could_no_longer_rotate() {
+        let (_dir, store) = open_temp();
+        let now = core::now_epoch_secs();
+
+        let survives = AuthCode {
+            code: "used-with-family-just-expired".to_string(),
+            client_id: "c1".to_string(),
+            redirect_uri: "https://cb".to_string(),
+            code_challenge: "chal".to_string(),
+            resource: "res".to_string(),
+            scope: "scope".to_string(),
+            expires: now.saturating_sub(1),
+            used: true,
+            minted_family: Some("fam-1".to_string()),
+        };
+        let expired_for_good = AuthCode {
+            code: "used-with-family-long-gone".to_string(),
+            expires: now.saturating_sub(REFRESH_TTL_SECS + 1),
+            ..survives.clone()
+        };
+        let unused_expired = AuthCode {
+            code: "unused-expired".to_string(),
+            used: false,
+            minted_family: None,
+            expires: now.saturating_sub(1),
+            ..survives.clone()
+        };
+
+        let mut codes = BTreeMap::new();
+        for c in [&survives, &expired_for_good, &unused_expired] {
+            codes.insert(c.code.clone(), c.clone());
+        }
+        store.save_codes(&codes).unwrap();
+
+        store.purge_expired().unwrap();
+
+        let after = store.load_codes().unwrap();
+        assert!(
+            after.contains_key(&survives.code),
+            "a used, family-linked code must survive a purge run just past its own expiry"
+        );
+        assert!(
+            !after.contains_key(&expired_for_good.code),
+            "a used, family-linked code must still be purged once expires + REFRESH_TTL_SECS has passed"
+        );
+        assert!(
+            !after.contains_key(&unused_expired.code),
+            "an unused expired code must be purged immediately, unaffected by this change"
+        );
     }
 
     // ── Corrupt file → error, not a silent default ──────────────────────

@@ -1088,6 +1088,20 @@ struct TokenRequest {
     refresh_token: Option<String>,
 }
 
+/// RFC 6749 §5.1 (a MUST, not a SHOULD): "The authorization server MUST
+/// include the HTTP `Cache-Control` response header field ... with a value
+/// of `no-store` ... and the `Pragma` response header field ... with a value
+/// of `no-cache`." Applied to EVERY `/token` response, success or error
+/// (`token_error` uses this too) — this gateway explicitly supports a
+/// configured `public_url` (`gateway::resolve_issuer`) for a proxy/tunnel
+/// deployment, exactly the kind of caching intermediary RFC 6749 is
+/// protecting against here. `header` is already imported at the top of this
+/// file.
+const NO_STORE_HEADERS: [(header::HeaderName, &str); 2] = [
+    (header::CACHE_CONTROL, "no-store"),
+    (header::PRAGMA, "no-cache"),
+];
+
 /// `POST {issuer}/token` success body — RFC 6749 §5.1, the EXACT shape from
 /// the brief (field order here IS the emitted JSON key order, same
 /// `serde_json` preserves-struct-order convention [`RegisterResponse`]
@@ -1106,6 +1120,7 @@ impl TokenResponse {
     fn from_pair(access: &TokenRecord, refresh: &TokenRecord) -> Response {
         (
             StatusCode::OK,
+            NO_STORE_HEADERS,
             Json(TokenResponse {
                 access_token: access.token.clone(),
                 token_type: "Bearer",
@@ -1140,7 +1155,12 @@ struct TokenErrorBody {
 }
 
 fn token_error(status: StatusCode, code: &'static str) -> Response {
-    (status, Json(TokenErrorBody { error: code })).into_response()
+    (
+        status,
+        NO_STORE_HEADERS,
+        Json(TokenErrorBody { error: code }),
+    )
+        .into_response()
 }
 
 /// The authorization_code grant (RFC 6749 §4.1.3). Synchronous (no `.await`
@@ -1180,6 +1200,27 @@ fn token_error(status: StatusCode, code: &'static str) -> Response {
 /// side effect — the HTTP response is [`token_error`]'s identical
 /// `invalid_grant` body no matter which of these branches fired.
 fn token_authorization_code_grant(ctx: &AuthCtx, req: &TokenRequest) -> Response {
+    // Wire-invisible diagnostic only: the HTTP response for a missing
+    // required parameter is still the identical uniform `invalid_grant`
+    // computed below (adjudicated design choice — see the doc comment
+    // above) — the client never sees this. It's here purely so an
+    // integrator debugging their own client against `tracing`-enabled
+    // server logs can find which field they forgot, without weakening the
+    // no-oracle contract on the wire.
+    for (name, value) in [
+        ("code", req.code.as_deref()),
+        ("client_id", req.client_id.as_deref()),
+        ("redirect_uri", req.redirect_uri.as_deref()),
+        ("code_verifier", req.code_verifier.as_deref()),
+    ] {
+        if value.map(str::is_empty).unwrap_or(true) {
+            tracing::debug!(
+                parameter = name,
+                "POST /token authorization_code grant missing required parameter"
+            );
+        }
+    }
+
     let code = req.code.as_deref().unwrap_or_default();
     let client_id = req.client_id.as_deref().unwrap_or_default();
     let redirect_uri = req.redirect_uri.as_deref().unwrap_or_default();
@@ -1251,13 +1292,19 @@ fn token_authorization_code_grant(ctx: &AuthCtx, req: &TokenRequest) -> Response
     }
 }
 
-/// The refresh_token grant (RFC 6749 §6). `rotate_refresh` already performs
-/// the ENTIRE reuse-detection cascade (spend the presented token, mint a
-/// fresh pair in the same family, OR burn the whole family on replay)
-/// atomically under its own single `ctx.store.lock()` acquisition inside
-/// [`super::auth::store::AuthStore::rotate_refresh`] — there is exactly one
-/// store call here, so the "hold the lock across the full read-modify-write"
-/// discipline is already satisfied by that call alone.
+/// The refresh_token grant (RFC 6749 §6). This function acquires
+/// `ctx.store.lock()` ONCE and makes exactly one call through that guard —
+/// [`super::auth::store::AuthStore::rotate_refresh`], which performs the
+/// ENTIRE reuse-detection cascade (spend the presented token, mint a fresh
+/// pair in the same family, OR burn the whole family on replay) as one
+/// complete load-modify-save pass over `tokens.json`. `AuthStore` itself
+/// holds NO mutex of its own (it's just a `root: PathBuf` — see its struct
+/// doc comment); locking is entirely the CALLER's responsibility, via
+/// `ctx.store: Mutex<AuthStore>`. `rotate_refresh` is not safe to call
+/// without that lock held across it — it is this function holding the guard
+/// for the single call below that satisfies the "hold the lock across the
+/// full read-modify-write" discipline, not any guarantee `rotate_refresh`
+/// provides on its own.
 ///
 /// `ReuseDetected` and `Invalid` deliberately share ONE match arm: both are
 /// "this refresh token doesn't work", and RFC 6749 §5.2's `invalid_grant`
@@ -3154,5 +3201,93 @@ mod tests {
         let router = token_router(ctx);
         let resp = post_token(&router, &[("grant_type", "client_credentials")]).await;
         assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Code-review finding (Important, RFC 6749 §5.1 MUST): every `/token`
+    /// response — success AND error — must carry `Cache-Control: no-store`
+    /// and `Pragma: no-cache`, so a caching intermediary (this gateway
+    /// explicitly supports a configured `public_url` proxy/tunnel
+    /// deployment) never persists a bearer token or a code-exchange error.
+    #[tokio::test]
+    async fn token_responses_carry_no_store_cache_headers_success_and_error() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx.clone());
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+        let resource = format!("{}/mcp", ctx.issuer());
+        let code = issue_test_code(&ctx, &client_id, "https://claude.ai/cb", &resource, "brain");
+
+        let ok_resp = post_token(
+            &router,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", &client_id),
+                ("redirect_uri", "https://claude.ai/cb"),
+                ("code_verifier", CODE_VERIFIER),
+            ],
+        )
+        .await;
+        assert_eq!(ok_resp.status(), StatusCode::OK);
+        assert_eq!(
+            ok_resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store",
+            "success response must be Cache-Control: no-store"
+        );
+        assert_eq!(
+            ok_resp.headers().get(header::PRAGMA).unwrap(),
+            "no-cache",
+            "success response must be Pragma: no-cache"
+        );
+
+        let err_resp = post_token(
+            &router,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", "this-code-was-never-issued"),
+            ],
+        )
+        .await;
+        assert_eq!(err_resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err_resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store",
+            "error response must ALSO be Cache-Control: no-store"
+        );
+        assert_eq!(
+            err_resp.headers().get(header::PRAGMA).unwrap(),
+            "no-cache",
+            "error response must ALSO be Pragma: no-cache"
+        );
+    }
+
+    /// Pins the adjudicated design choice (see
+    /// `token_authorization_code_grant`'s doc comment): a missing REQUIRED
+    /// parameter for the authorization_code grant gets the SAME uniform
+    /// `invalid_grant` as a wrong value — not a separate `invalid_request` —
+    /// so a future refactor can't silently split that behavior in two.
+    /// `code_verifier` is the one omitted here; the same
+    /// `unwrap_or_default()` handling applies identically to `code`/
+    /// `client_id`/`redirect_uri`.
+    #[tokio::test]
+    async fn token_missing_code_verifier_is_invalid_grant_not_invalid_request() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx.clone());
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+        let resource = format!("{}/mcp", ctx.issuer());
+        let code = issue_test_code(&ctx, &client_id, "https://claude.ai/cb", &resource, "brain");
+
+        let resp = post_token(
+            &router,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", &client_id),
+                ("redirect_uri", "https://claude.ai/cb"),
+                // `code_verifier` deliberately omitted.
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await, json!({"error": "invalid_grant"}));
     }
 }
