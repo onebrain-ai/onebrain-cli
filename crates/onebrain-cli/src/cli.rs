@@ -336,6 +336,14 @@ pub enum GatewayVerb {
         #[arg(long)]
         port: Option<u16>,
     },
+    /// Print the current device-pairing code (minting one on first call), or
+    /// mint and print a fresh one with `--rotate`, invalidating the old one.
+    Pair {
+        /// Mint a brand-new pairing code in place of the current one — the
+        /// old code stops working immediately.
+        #[arg(long)]
+        rotate: bool,
+    },
 }
 // ─────────────────────────────────────────────────────────────────────────
 // harness (1-verb · documented exception · wired to legacy)

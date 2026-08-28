@@ -16,8 +16,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `onebrain gateway run` — loopback streamable-HTTP MCP endpoint (`/mcp`, protocol
   `2026-07-28` pinned) serving the read-only Brain pack (`capabilities`,
   `brain_search`, `brain_get`, `brain_tasks`) across vaults from
-  `~/.onebrain/gateway.yml`. No auth yet — loopback only; tunnel + OAuth land
-  later in v3.5.
+  `~/.onebrain/gateway.yml`. Loopback only; a remote tunnel lands later in v3.5.
+- OAuth 2.1 authorization + resource server for the gateway: `/mcp` now requires
+  a Bearer access token. RFC 9728/8414 discovery, RFC 7591 dynamic client
+  registration (public clients only — no client secrets ever minted), an
+  `/authorize` consent page gated by a device-pairing code (5-wrong-attempt/60s
+  lockout), and `/token` authorization-code exchange (PKCE S256, single-use
+  codes) plus rotating refresh tokens with reuse detection (a replayed refresh
+  token revokes its whole token family). `onebrain gateway pair [--rotate]`
+  prints or rotates the pairing code independent of a running gateway. See
+  [`docs/gateway.md#authentication`](docs/gateway.md#authentication).
+- `gateway.yml` gains a `public_url` key: the gateway's OAuth issuer base URL
+  for the still-unshipped remote tunnel. Validated at `gateway run` startup
+  (must be a bare `https://`, or loopback-only `http://`, origin with no
+  path/query/fragment) — an invalid value fails startup naming the key
+  instead of silently resolving to a wrong or insecure issuer. See
+  [`docs/gateway.md#gatewayyml-schema`](docs/gateway.md#gatewayyml-schema).
 
 ### Changed
 - MCP: rmcp 2.1.0 → 3.0.1 — protocol `2026-07-28` baseline for the remote MCP

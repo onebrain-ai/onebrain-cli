@@ -351,6 +351,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         },
         Cmd::Gateway(GatewayCmd { verb }) => match verb {
             GatewayVerb::Run { port } => commands::gateway::run(&mode, port),
+            GatewayVerb::Pair { rotate } => commands::gateway::pair(&mode, rotate),
         },
         Cmd::Note(NoteCmd { verb }) => match verb {
             NoteVerb::Search(args) => commands::note_search::run(vault_flag.clone(), &mode, &args),
