@@ -399,3 +399,142 @@ fn stdio_jsonrpc_handshake_tools_list_and_status_then_clean_exit() {
     // doesn't linger past the test (it would idle-exit anyway, but this is tidy).
     stop_daemon(cache.path(), home.path());
 }
+
+/// Dual-era guard (v3.5 Gateway epic, PR 1): rmcp 3.x targets MCP
+/// `2026-07-28`, but every LOCAL client (Claude Code, Codex, the plugin)
+/// still opens the stdio session with a legacy `initialize` carrying its own
+/// protocol version. The server must negotiate down to the requested version
+/// — echoing it back in the initialize result — or every legacy client
+/// breaks at handshake. One spawned server per version keeps failure
+/// attribution obvious.
+#[test]
+fn initialize_negotiates_the_client_requested_protocol_version() {
+    for requested in ["2024-11-05", "2025-03-26", "2025-11-25"] {
+        let vault = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let home = tempdir().unwrap(); // isolate the daemon run dir
+        write(
+            vault.path(),
+            "onebrain.yml",
+            "search:\n  collection: t-mcp-negotiate\n",
+        );
+
+        let mut child = KillOnDrop(
+            onebrain_mcp(vault.path(), cache.path(), home.path())
+                .spawn()
+                .expect("spawn onebrain mcp"),
+        );
+        let mut stdin = child.0.stdin.take().expect("child stdin");
+        let stdout = child.0.stdout.take().expect("child stdout");
+        let rx = spawn_line_reader(stdout);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+
+        send(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": requested,
+                    "capabilities": {},
+                    "clientInfo": { "name": "onebrain-cli-test", "version": "0.0.0" }
+                }
+            }),
+        );
+        let init_resp = recv_response(&rx, 1, deadline);
+        assert_eq!(
+            init_resp["result"]["protocolVersion"], requested,
+            "server must negotiate down to the client's requested protocol \
+             version ({requested}); got: {init_resp}"
+        );
+
+        // EOF must still produce a clean exit, same bound as the main test.
+        drop(stdin);
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(status) = child.0.try_wait().expect("polling child status") {
+                assert!(
+                    status.success(),
+                    "onebrain mcp did not exit 0 after stdin close: {status:?}"
+                );
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(30) {
+                let _ = child.0.kill();
+                let _ = child.0.wait();
+                stop_daemon(cache.path(), home.path());
+                panic!("onebrain mcp did not exit within 30s of stdin close");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        stop_daemon(cache.path(), home.path());
+    }
+}
+
+/// Companion guard: a protocol version the SDK does not know must fall back
+/// to the SDK default (2025-11-25 in rmcp 3.0.1) rather than erroring or
+/// echoing the unknown string. Later Gateway PRs inherit this fallback
+/// contract; if an rmcp upgrade flips the default, this test flags it.
+#[test]
+fn initialize_with_unknown_protocol_version_falls_back_to_sdk_default() {
+    let vault = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let home = tempdir().unwrap(); // isolate the daemon run dir
+    write(
+        vault.path(),
+        "onebrain.yml",
+        "search:\n  collection: t-mcp-negotiate-unknown\n",
+    );
+
+    let mut child = KillOnDrop(
+        onebrain_mcp(vault.path(), cache.path(), home.path())
+            .spawn()
+            .expect("spawn onebrain mcp"),
+    );
+    let mut stdin = child.0.stdin.take().expect("child stdin");
+    let stdout = child.0.stdout.take().expect("child stdout");
+    let rx = spawn_line_reader(stdout);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+
+    send(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "1990-01-01",
+                "capabilities": {},
+                "clientInfo": { "name": "onebrain-cli-test", "version": "0.0.0" }
+            }
+        }),
+    );
+    let init_resp = recv_response(&rx, 1, deadline);
+    assert_eq!(
+        init_resp["result"]["protocolVersion"], "2025-11-25",
+        "an unknown requested protocol version must fall back to the SDK \
+         default (2025-11-25), not error or echo the unknown string; got: {init_resp}"
+    );
+
+    // EOF must still produce a clean exit, same bound as the main test.
+    drop(stdin);
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.0.try_wait().expect("polling child status") {
+            assert!(
+                status.success(),
+                "onebrain mcp did not exit 0 after stdin close: {status:?}"
+            );
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(30) {
+            let _ = child.0.kill();
+            let _ = child.0.wait();
+            stop_daemon(cache.path(), home.path());
+            panic!("onebrain mcp did not exit within 30s of stdin close");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    stop_daemon(cache.path(), home.path());
+}
