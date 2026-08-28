@@ -119,20 +119,24 @@ Interactive commands print human-readable text; every command also speaks struct
 - [x] **v3.3** — Daemon foundation: `onebrain serve` — embedded web UI over a token-gated vault JSON API.
 - [x] **v3.4** — **Native Search + Warm Daemon** *(complete, v3.4.0–v3.4.13)*: native Rust search replaces qmd (native engine + `onebrain search` verbs · native MCP server · 0 node/python deps, v3.4.5), a **warm daemon** that owns the engine so mcp + CLI coexist across live sessions (v3.4.6) — per-vault daemon slots since v3.4.13, a Tier-2 cross-encoder reranker (`onebrain-rerank-v1`) for calibrated result relevance (v3.4.7), self-documenting `onebrain.yml` + doctor validation (v3.4.8), and the **token-optimization layer** — transform ladder, already-sent ledger with a production-gating read-hook, and `onebrain token gain` telemetry (v3.4.10–v3.4.13) ([milestone](https://github.com/onebrain-ai/onebrain-cli/milestone/4)).
 
-### 🖥️ Phase 1 · Product surfaces — replace Obsidian (v3.5–v3.6)
-- [ ] **v3.5** — **"Desktop + Deeplinks"**: `onebrain desktop` native app + deeplinks + standalone webui file access (`link`/`token`/`desktop` verbs, vault_id, tickets) — the agent hands you a clickable, section-precise webui URL for any vault file; completely replaces Obsidian.
-- [ ] **v3.6** — **Terminal sessions** (mini-epic): run `onebrain`/`claude`/`codex` from a persistent term-server (survives daemon restart · reachable over Tailscale) — in **both** the WebUI and the v3.5 desktop shell. *Builds on v3.5 desktop.*
+### 🛰️ Phase 1 · Remote & review (v3.5–v3.6)
+- [ ] **v3.5** — **"Gateway"** *(in progress — rmcp 3.0.1 / MCP `2026-07-28` baseline merged, [#399](https://github.com/onebrain-ai/onebrain-cli/pull/399))*: **Remote MCP Gateway** — command OneBrain from anywhere through the ChatGPT / Claude apps while a single Mac stays on at home: `onebrain gateway` process (the one exposed surface; daemons stay loopback; outbound Cloudflare Tunnel, no open ports), built-in OAuth 2.1 (DCR + CIMD) with one-time pairing, staged capability packs (**Brain + Developer** first; Files and Mac automation later), approvals over native dialog / WebUI / Telegram, durable tasks that outlive connector timeouts, and a full audit log. First step toward the full Mac agent ([milestone](https://github.com/onebrain-ai/onebrain-cli/milestone/11)).
+- [ ] **v3.6** — **"Council"** — multi-model review: hand one diff to claude + codex + gemini in parallel and get back findings that survived a cross-vendor vote; `council review` report-only first, then planner + implementer with worktree-scoped writes.
 
-### ⚡ Phase 2 · Speed & skills (v3.7–v3.8)
-- [ ] **v3.7** — **Bootstrap + native verbs + skill optimization**: startup / wrapup / daily / tasks → 1 call per ceremony; native settings-merge + vault migrations in `plugin update`; skill-body optimization pass (import content-verbs anchored ~v3.7.x).
-- [ ] **v3.8** *(may not ship)* — **remaining cleanup**: full daemon refactor of surfaces beyond mcp + search + daily-brief precompute — only if not already absorbed by v3.4 + v3.7.
+### 🖥️ Phase 2 · Product surfaces — replace Obsidian (v3.7–v3.8)
+- [ ] **v3.7** — **"Studio + Deeplinks"** (Multiple Surfaces): `onebrain studio` native app + deeplinks + standalone webui file access (`link`/`token`/`studio` verbs, vault_id, tickets) — the agent hands you a clickable, section-precise webui URL for any vault file; completely replaces Obsidian.
+- [ ] **v3.8** — **Terminal sessions** (mini-epic): run `onebrain`/`claude`/`codex` from a persistent term-server (survives daemon restart · reachable over Tailscale) — in **both** the WebUI and the v3.7 Studio shell. *Builds on v3.7 Studio.*
 
-### 📦 Phase 3 · bundles (v3.9–v3.12)
+### ⚡ Phase 3 · Speed & skills (v3.9–v3.10)
+- [ ] **v3.9** — **Bootstrap + native verbs + skill optimization**: startup / wrapup / daily / tasks → 1 call per ceremony; native settings-merge + vault migrations in `plugin update`; skill-body optimization pass (import content-verbs anchored ~v3.9.x).
+- [ ] **v3.10** *(may not ship)* — **remaining cleanup**: full daemon refactor of surfaces beyond mcp + search + daily-brief precompute — only if not already absorbed by v3.4 + v3.9.
+
+### 📦 Phase 4 · bundles (v3.11+)
 - [ ] Bundle CLI (`onebrain bundle …`) · four first-party bundles (`dashboard` · `synthesis` · `research` · `scheduler`) · core skills slimmed 32 → 18 · `onebrain.run/bundles` portal.
 
 ### 🔭 Signal-driven (Tier 2/3)
 - [ ] Broader harness support — Codex, Qwen, and other agentic harnesses beyond today's Claude Code + Gemini CLI.
-- [ ] Tiered memory + behavior tracking · proactive surfacing · daemon background synthesis · Avatar Mesh (one agent identity across machines) · Telegram / MCP gateway · OneBrain Studio · OneBrain Sync (cross-machine continuity for vault + memory + live session — harness-independent, end-to-end encrypted; sync + storage only, no hosted agent runtime).
+- [ ] Tiered memory + behavior tracking · proactive surfacing · daemon background synthesis · Avatar Mesh (one agent identity across machines) · OneBrain Sync (cross-machine continuity for vault + memory + live session — harness-independent, end-to-end encrypted; sync + storage only, no hosted agent runtime).
 
 ### 🏁 v4.0 · breaking
 - [ ] Drop `vault.yml` dual-read (canonical `onebrain.yml` only) · retire the hidden v3.0 aliases.
