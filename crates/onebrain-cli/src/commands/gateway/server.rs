@@ -66,9 +66,11 @@ pub struct CapabilitiesOut {
     /// `config.vaults` keys.
     pub vaults: Vec<String>,
     /// Name of the vault serving `vault`-omitted calls, when resolvable to a
-    /// `config.vaults` entry; otherwise the raw configured path. `None` when
-    /// no `default_vault` is configured (a call would then fall through to
-    /// the env/walk-up chain — see [`resolve_vault_arg`]).
+    /// `config.vaults` entry; otherwise the fixed marker `"(configured)"` —
+    /// NEVER the raw configured path, which would leak a host filesystem
+    /// path to the client. `None` when no `default_vault` is configured (a
+    /// call would then fall through to the env/walk-up chain — see
+    /// [`resolve_vault_arg`]).
     pub default_vault: Option<String>,
 }
 
@@ -176,12 +178,26 @@ fn resolve_under_vault(vault_root: &Path, rel: &str) -> anyhow::Result<PathBuf> 
     Ok(canon)
 }
 
-/// Maps a vault-resolution [`CoreError`] to an MCP `invalid_params` error —
-/// the human message plus the stable `E_*` code, e.g. "no OneBrain vault
-/// found by walking up from /tmp/x [E_VAULT_NOT_FOUND]".
+/// Maps a vault-resolution [`CoreError`] to an MCP `invalid_params` error.
+/// The client-facing message is a FIXED phrase plus the stable `E_*` code —
+/// never `err`'s own `Display` text, which for some variants embeds a host
+/// path (`VaultNotFound { cwd }` names the process cwd, `NotAVault { path }`
+/// names the configured path) that must not reach a network client. The
+/// full error, path included, is logged server-side via `tracing::warn!`
+/// (same pattern as [`sanitized_internal`]).
 fn core_error(err: CoreError) -> ErrorData {
     let code = err.error_code();
-    ErrorData::invalid_params(format!("{err} [{code}]"), None)
+    tracing::warn!(error = ?err, "vault resolution failed [{code}]");
+    let message = match &err {
+        CoreError::VaultNotFound { .. } => {
+            format!("no OneBrain vault resolved for this call [{code}]")
+        }
+        CoreError::NotAVault { .. } => {
+            format!("configured path is not a OneBrain vault [{code}]")
+        }
+        _ => format!("vault resolution failed [{code}]"),
+    };
+    ErrorData::invalid_params(message, None)
 }
 
 /// Client-facing internal error: full detail goes to the server log only —
@@ -235,16 +251,31 @@ fn resolve_vault_arg(
 
 /// The `default_vault` value to report from `capabilities`: the matching
 /// `config.vaults` name when the configured path is a named entry, else the
-/// raw path. Purely a display convenience — `resolve_vault_arg` re-derives
-/// resolution from `config.default_vault` itself, not from this string.
+/// fixed marker `"(configured)"` — the raw path is NEVER returned, since
+/// that would leak a host filesystem path to the client. Purely a display
+/// convenience — `resolve_vault_arg` re-derives resolution from
+/// `config.default_vault` itself, not from this string.
 fn default_vault_display(config: &GatewayConfig) -> Option<String> {
     let path = config.default_vault.as_ref()?;
     let name = config
         .vaults
         .iter()
-        .find(|(_, v)| v.as_path() == path.as_path())
+        .find(|(_, v)| paths_match(path, v))
         .map(|(name, _)| name.clone());
-    Some(name.unwrap_or_else(|| path.display().to_string()))
+    Some(name.unwrap_or_else(|| "(configured)".to_string()))
+}
+
+/// Compares two paths for the purpose of matching `default_vault` against a
+/// `config.vaults` entry. Canonicalizes both sides so a trailing-slash or
+/// `.`-segment mismatch between an otherwise-identical path still matches;
+/// falls back to plain equality when either side can't be canonicalized
+/// (e.g. the path doesn't exist on disk yet) rather than treating that as a
+/// hard mismatch.
+fn paths_match(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
 }
 
 /// The brain pack's own tool names, kept in one place so `capabilities`
@@ -302,7 +333,8 @@ impl GatewayServer {
 
     #[tool(
         name = "capabilities",
-        description = "Report which capability packs and vaults this OneBrain gateway serves. Call this first to plan which brain_* tool fits the job."
+        description = "Report which capability packs and vaults this OneBrain gateway serves. Call this first to plan which brain_* tool fits the job.",
+        annotations(read_only_hint = true)
     )]
     async fn capabilities(&self) -> Result<Json<CapabilitiesOut>, ErrorData> {
         let config = &self.state.config;
@@ -317,7 +349,8 @@ impl GatewayServer {
 
     #[tool(
         name = "brain_tasks",
-        description = "List open vault tasks (Obsidian checkbox lines, fence-aware). Use due_by=\"today\" for the daily view. Read-only."
+        description = "List open vault tasks (Obsidian checkbox lines, fence-aware). Use due_by=\"today\" for the daily view. Read-only.",
+        annotations(read_only_hint = true)
     )]
     async fn brain_tasks(
         &self,
@@ -351,7 +384,7 @@ impl GatewayServer {
             collector.finish()
         })
         .await
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        .map_err(|e| sanitized_internal("internal task failure", e.into()))?;
 
         Ok(Json(BrainTasksOut {
             tasks: tasks.into_iter().map(GatewayTaskHit::from).collect(),
@@ -362,7 +395,8 @@ impl GatewayServer {
 
     #[tool(
         name = "brain_get",
-        description = "Read one vault note by vault-relative path. Read-only."
+        description = "Read one vault note by vault-relative path. Read-only.",
+        annotations(read_only_hint = true)
     )]
     async fn brain_get(
         &self,
@@ -377,7 +411,7 @@ impl GatewayServer {
             let rel_for_resolve = rel.clone();
             tokio::task::spawn_blocking(move || resolve_under_vault(&vault_root, &rel_for_resolve))
                 .await
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+                .map_err(|e| sanitized_internal("internal task failure", e.into()))?
                 // Both of `resolve_under_vault`'s failure modes — canonicalize
                 // fails because nothing exists at the joined path, or it
                 // succeeds but the result escapes `vault_root` — collapse to
@@ -398,7 +432,8 @@ impl GatewayServer {
 
     #[tool(
         name = "brain_search",
-        description = "Search vault notes (hybrid lexical + semantic via the warm daemon). Returns scored hits with paths and snippets."
+        description = "Search vault notes (hybrid lexical + semantic via the warm daemon). Returns scored hits with paths and snippets.",
+        annotations(read_only_hint = true)
     )]
     async fn brain_search(
         &self,
@@ -425,7 +460,7 @@ impl GatewayServer {
             handle.search(&query, "hybrid", top_k, None)
         })
         .await
-        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+        .map_err(|e| sanitized_internal("internal task failure", e.into()))?
         .map_err(|e| sanitized_internal("search backend unavailable", e))?;
 
         let body = serde_json::to_string_pretty(&hits)
@@ -505,6 +540,44 @@ mod tests {
         assert!(
             !data.message.contains("daemon did not become ready"),
             "client-facing message must not echo the underlying error text: {}",
+            data.message
+        );
+    }
+
+    /// Final-review fix (Item 1): `core_error` must never forward a
+    /// `CoreError`'s own `Display` text — `VaultNotFound { cwd }` embeds the
+    /// process cwd and `NotAVault { path }` embeds the configured path, both
+    /// host filesystem details that must not reach a network client. The
+    /// stable `E_*` code must still be present (the binary integration test
+    /// `gateway_run_outside_vault_brain_tasks_returns_vault_not_found_error`
+    /// only substring-matches the code, so this stays compatible).
+    #[test]
+    fn core_error_drops_host_paths_but_keeps_the_e_code() {
+        let cwd = PathBuf::from("/Users/keng/super-secret-cwd");
+        let err = CoreError::VaultNotFound { cwd: cwd.clone() };
+        let code = err.error_code();
+        let data = core_error(err);
+        assert_eq!(
+            data.message.as_ref(),
+            format!("no OneBrain vault resolved for this call [{code}]")
+        );
+        assert!(
+            !data.message.contains("super-secret-cwd"),
+            "must not leak the cwd: {}",
+            data.message
+        );
+
+        let path = PathBuf::from("/Users/keng/another-secret-path");
+        let err = CoreError::NotAVault { path: path.clone() };
+        let code = err.error_code();
+        let data = core_error(err);
+        assert_eq!(
+            data.message.as_ref(),
+            format!("configured path is not a OneBrain vault [{code}]")
+        );
+        assert!(
+            !data.message.contains("another-secret-path"),
+            "must not leak the configured path: {}",
             data.message
         );
     }
@@ -641,14 +714,29 @@ mod tests {
         })
         .to_string();
         let resp = post(&router, body, &standard_headers("tools/list", None)).await;
-        let names: Vec<&str> = resp["result"]["tools"]
+        let tools = resp["result"]["tools"]
             .as_array()
-            .unwrap_or_else(|| panic!("no tools array: {resp}"))
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+            .unwrap_or_else(|| panic!("no tools array: {resp}"));
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"capabilities"), "{names:?}");
         assert!(names.contains(&"brain_tasks"), "{names:?}");
+
+        // Final-review fix (Item 2): every Brain-pack tool is read-only, so
+        // every listed tool must carry `annotations.readOnlyHint == true` —
+        // parsed as JSON (not substring-matched) so a tool that carries the
+        // hint nested somewhere unexpected, or omits it, fails clearly.
+        let expected = ["capabilities", "brain_tasks", "brain_get", "brain_search"];
+        for name in expected {
+            let tool = tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("tools/list missing `{name}`: {names:?}"));
+            assert_eq!(
+                tool["annotations"]["readOnlyHint"],
+                serde_json::Value::Bool(true),
+                "`{name}` must carry readOnlyHint:true: {tool}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -668,6 +756,69 @@ mod tests {
         assert_eq!(brain["enabled"], true, "{resp}");
         let developer = packs.iter().find(|p| p["name"] == "developer").unwrap();
         assert_eq!(developer["enabled"], false, "{resp}");
+    }
+
+    /// Final-review fix (Item 1): `fixture_router`'s `default_vault` is the
+    /// SAME path as its `t1` entry, so `capabilities` must report the name
+    /// `"t1"`, never the raw path — proves `default_vault_display` resolves
+    /// through the name lookup rather than falling back to the path.
+    #[tokio::test]
+    async fn capabilities_default_vault_reports_the_matching_name_not_a_raw_path() {
+        let (dir, router) = fixture_router();
+        let body = call_body(1, "capabilities", serde_json::json!({}));
+        let resp = post(
+            &router,
+            body,
+            &standard_headers("tools/call", Some("capabilities")),
+        )
+        .await;
+        let sc = &resp["result"]["structuredContent"];
+        assert_eq!(sc["default_vault"], "t1", "{resp}");
+        assert!(
+            !resp.to_string().contains(&dir.path().display().to_string()),
+            "capabilities must not leak the raw vault path: {resp}"
+        );
+    }
+
+    /// Final-review fix (Item 1): when `default_vault` does NOT match any
+    /// named `config.vaults` entry, `capabilities` must report the fixed
+    /// marker `"(configured)"` — never the raw configured path.
+    #[tokio::test]
+    async fn capabilities_default_vault_falls_back_to_configured_marker_when_unnamed() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_root = dir.path().join("unnamed-default");
+        std::fs::create_dir_all(&default_root).unwrap();
+        std::fs::write(default_root.join("onebrain.yml"), "folders: {}\n").unwrap();
+
+        let named_root = dir.path().join("named");
+        std::fs::create_dir_all(&named_root).unwrap();
+        std::fs::write(named_root.join("onebrain.yml"), "folders: {}\n").unwrap();
+
+        let mut vaults = BTreeMap::new();
+        vaults.insert("named".to_string(), named_root);
+        let config = GatewayConfig {
+            default_vault: Some(default_root.clone()),
+            vaults,
+            ..GatewayConfig::default()
+        };
+        let state = Arc::new(GatewayState { config });
+        let router = build_gateway_router(state);
+
+        let body = call_body(1, "capabilities", serde_json::json!({}));
+        let resp = post(
+            &router,
+            body,
+            &standard_headers("tools/call", Some("capabilities")),
+        )
+        .await;
+        let sc = &resp["result"]["structuredContent"];
+        assert_eq!(sc["default_vault"], "(configured)", "{resp}");
+        assert!(
+            !resp
+                .to_string()
+                .contains(&default_root.display().to_string()),
+            "capabilities must not leak the raw default_vault path: {resp}"
+        );
     }
 
     #[tokio::test]
