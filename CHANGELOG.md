@@ -1,6 +1,6 @@
 ---
 latest_version: 3.4.25
-released: 2026-08-27
+released: 2026-08-28
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -10,7 +10,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
-## [3.4.25] — 2026-08-27 — Keep Codex hooks alive
+## [3.4.25] — 2026-08-28 — Keep Codex hooks alive
 
 ### Fixed
 - Codex hooks now run through the installed CLI instead of a Python file inside a replaceable versioned plugin cache, so refreshing the plugin cannot break an active task.
