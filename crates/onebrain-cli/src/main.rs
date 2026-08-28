@@ -8,6 +8,7 @@ mod categorized_help;
 mod cli;
 mod commands;
 mod exit;
+mod home;
 mod legacy_output;
 mod migration;
 mod output;

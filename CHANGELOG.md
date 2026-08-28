@@ -12,6 +12,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [3.5.0] — Unreleased — Gateway
 
+### Added
+- `onebrain gateway run` — loopback streamable-HTTP MCP endpoint (`/mcp`, protocol
+  `2026-07-28` pinned) serving the read-only Brain pack (`capabilities`,
+  `brain_search`, `brain_get`, `brain_tasks`) across vaults from
+  `~/.onebrain/gateway.yml`. No auth yet — loopback only; tunnel + OAuth land
+  later in v3.5.
+
 ### Changed
 - MCP: rmcp 2.1.0 → 3.0.1 — protocol `2026-07-28` baseline for the remote MCP
   gateway; stdio server and all 4 tools unchanged; legacy `initialize`

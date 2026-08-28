@@ -13,6 +13,7 @@ User guides for the tool, plus design & internals docs for people reading the so
 | [`platform-support.md`](platform-support.md) | Check which release targets ship full semantic search vs keyword-only. |
 | [`serve.md`](serve.md) | Run the embedded local web UI (`onebrain serve`) — file explorer, reading view, search, agent chat — and understand its security posture. |
 | [`reference/mcp.md`](reference/mcp.md) | Plug OneBrain into Claude Code / Cursor / any MCP client (`onebrain mcp`) — including standalone vault-search use on any Markdown folder. |
+| [`gateway.md`](gateway.md) | Run the loopback multi-vault MCP surface (`onebrain gateway run`) — the `gateway.yml` schema, zero-config behavior, and its current loopback-only, no-auth-yet security posture. |
 | [`why.md`](why.md) | The case for a deterministic vault binary instead of ad-hoc agent shell improvisation. |
 
 ## Design & internals

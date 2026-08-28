@@ -67,9 +67,10 @@ pub(crate) struct DiscoverData {
 }
 
 /// `~/.claude/projects` (or `$CLAUDE_CONFIG_DIR/projects` when set) — the
-/// Claude Code transcript root. Honors `%USERPROFILE%` on Windows explicitly
-/// (rather than solely trusting `dirs::home_dir`, whose Windows resolution
-/// goes through the Known Folder API and isn't guaranteed to observe a
+/// Claude Code transcript root. Resolves home through
+/// [`crate::home::home_dir`], which honors `%USERPROFILE%` on Windows
+/// explicitly (rather than solely trusting `dirs::home_dir`, whose Windows
+/// resolution goes through the Known Folder API and does NOT observe a
 /// test-set env override) so the path handling plan 5.3 asks for is real,
 /// not incidental.
 fn transcripts_root() -> Result<PathBuf> {
@@ -78,22 +79,7 @@ fn transcripts_root() -> Result<PathBuf> {
             return Ok(PathBuf::from(dir).join("projects"));
         }
     }
-    Ok(home_dir()?.join(".claude").join("projects"))
-}
-
-#[cfg(windows)]
-fn home_dir() -> Result<PathBuf> {
-    if let Ok(profile) = std::env::var("USERPROFILE") {
-        if !profile.trim().is_empty() {
-            return Ok(PathBuf::from(profile));
-        }
-    }
-    dirs::home_dir().context("resolve home directory (USERPROFILE unset and no fallback)")
-}
-
-#[cfg(not(windows))]
-fn home_dir() -> Result<PathBuf> {
-    dirs::home_dir().context("resolve home directory")
+    Ok(crate::home::home_dir()?.join(".claude").join("projects"))
 }
 
 /// Recursively list every `*.jsonl` file under `root`. `None`/empty when

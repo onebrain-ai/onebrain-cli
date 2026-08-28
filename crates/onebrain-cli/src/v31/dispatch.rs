@@ -349,6 +349,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             // Hidden internal verb — the detached child's body.
             DaemonVerb::Run { vault } => commands::daemon::run_internal(vault.as_deref()),
         },
+        Cmd::Gateway(GatewayCmd { verb }) => match verb {
+            GatewayVerb::Run { port } => commands::gateway::run(&mode, port),
+        },
         Cmd::Note(NoteCmd { verb }) => match verb {
             NoteVerb::Search(args) => commands::note_search::run(vault_flag.clone(), &mode, &args),
             NoteVerb::List(args) => commands::note_list::run(vault_flag.clone(), &mode, &args),

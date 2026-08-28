@@ -74,7 +74,7 @@ pub enum Cmd {
     // `display_order` clusters commands by domain in `--help`:
     //   1-3  · system / lifecycle (init, update, doctor)
     //   10-13 · vault & session ops (vault, session, checkpoint, harness)
-    //   14-18 · content & serving (serve, note, task, search, mcp)
+    //   14-19 · content & serving (serve, note, task, search, mcp, gateway)
     //   20-23 · config & maintenance (plugin, schedule, config, skill)
     //   99   · clap-managed `help` meta
     //
@@ -114,6 +114,9 @@ pub enum Cmd {
     Checkpoint(CheckpointCmd),
     #[command(hide = true)]
     Daemon(DaemonCmd),
+    /// Serve the OneBrain gateway — MCP over loopback streamable HTTP (Brain pack, read-only).
+    #[command(display_order = 19)]
+    Gateway(GatewayCmd),
     #[command(display_order = 13)]
     Harness(HarnessCmd),
     /// Serve OneBrain over MCP (stdio) — search tools today, more vault tool
@@ -311,6 +314,27 @@ pub enum DaemonVerb {
         /// `$ONEBRAIN_VAULT`.
         #[arg(long)]
         vault: Option<PathBuf>,
+    },
+}
+// ─────────────────────────────────────────────────────────────────────────
+// gateway (v3.5 — loopback MCP-over-HTTP; Brain pack, read-only)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
+pub struct GatewayCmd {
+    #[command(subcommand)]
+    pub verb: GatewayVerb,
+}
+#[derive(Subcommand, Debug)]
+pub enum GatewayVerb {
+    /// Run the gateway in the foreground until Ctrl-C. Binds 127.0.0.1 only
+    /// (no bind flag — remote access isn't offered until auth lands).
+    Run {
+        /// Loopback port to bind. 0 = OS-assigned ephemeral port. Overrides
+        /// `~/.onebrain/gateway.yml`'s `port` (default 7717) when given.
+        #[arg(long)]
+        port: Option<u16>,
     },
 }
 // ─────────────────────────────────────────────────────────────────────────

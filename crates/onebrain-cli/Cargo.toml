@@ -84,7 +84,7 @@ flate2             = { workspace = true }
 # rmcp's `server` feature; the direct dep only exposes the `JsonSchema` derive
 # for the tools' structured (`Json<T>`) outputs.
 # Pinned exactly: the gateway epic's verified facts + dual-era guards were validated against 3.0.1; bump deliberately in a dedicated PR.
-rmcp               = { version = "=3.0.1", features = ["server", "macros", "transport-io"] }
+rmcp               = { version = "=3.0.1", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 schemars           = "1.2.1"
 # `onebrain mcp`'s `multi_get` tool: glob-match vault-relative paths walked via
 # `walkdir` (already a direct dep above). Already in the workspace tree
