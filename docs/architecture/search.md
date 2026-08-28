@@ -352,8 +352,8 @@ and never merged with — the checkpoint Stop hook:
 
 | Trigger | Command | What it does |
 |---|---|---|
-| **PostToolUse** (after Write/Edit) | `onebrain search reindex --lex-only --json` | Lex-now: incremental keyword pass, synchronous but fast, zero embedder interaction. |
-| **Stop** (session end) | `onebrain search reindex --pending-only --json` | Embed-deferred: embeds the accumulated pending docs. In structured mode it **detaches** — re-execs itself as a background child (`ONEBRAIN_EMBED_FOREGROUND=1`, stdio nulled) and returns immediately (`{"detached":true}`), so model load/embed never delays the calling turn. |
+| **PostToolUse** (after Write/Edit) | `onebrain hook` | The shared runner dispatches the lexical reindex: incremental keyword pass, synchronous but fast, zero embedder interaction. |
+| **Stop** (session end) | `onebrain hook` | The shared runner checkpoints once and dispatches the pending embed pass. That child detaches in structured mode (`ONEBRAIN_EMBED_FOREGROUND=1`, stdio nulled), so model load/embed never delays the calling turn. |
 | **Scheduled** (safety net, opt-in) | `onebrain qmd-reindex` (hidden legacy alias → full `search reindex`) | The `MaintenancePlus` schedule preset writes a weekly (Sun 03:00) full reindex entry to `onebrain.yml` (`crates/onebrain-fs/src/init/presets.rs`); `onebrain schedule register` installs it into the OS scheduler. |
 
 Both hook flags share one contract (`run_hook_path`): **never prompt, never mutate config, never
@@ -377,8 +377,8 @@ Additional skip reasons past the gates: `no-pending` (empty worklist), `detach-f
 
 ```mermaid
 flowchart TD
-    W["Claude Code: Write / Edit"] -- PostToolUse --> LO["search reindex --lex-only --json"]
-    S["Claude Code: session Stop"] -- Stop hook --> PO["search reindex --pending-only --json"]
+    W["Claude Code: Write / Edit"] -- PostToolUse --> LO["onebrain hook → lexical reindex"]
+    S["Claude Code: session Stop"] -- Stop hook --> PO["onebrain hook → checkpoint + pending reindex"]
     CRON["OS scheduler (opt-in preset)"] -- "weekly full reindex" --> FULL["search reindex"]
     LO --> G{"gates:<br/>collection? index? model? no marker?"}
     PO --> G

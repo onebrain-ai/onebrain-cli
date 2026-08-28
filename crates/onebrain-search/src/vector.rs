@@ -212,7 +212,8 @@ impl VectorStore {
         }
 
         let mut out = Vec::with_capacity(self.dims);
-        for chunk in mmap[start..end].chunks_exact(4) {
+        let (chunks, _) = mmap[start..end].as_chunks::<4>();
+        for chunk in chunks {
             out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
         Ok(out)

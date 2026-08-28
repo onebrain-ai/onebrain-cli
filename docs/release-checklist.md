@@ -74,15 +74,15 @@ For each of `session init` and `checkpoint orphans .`:
       consistent with `crates/onebrain-cli/src/v31/hook_rewriter.rs`
       report shape · verified by
       `plugin_update_json_envelope_snapshot_dry_run`
-- [ ] Rewriter is idempotent (running twice on the same `settings.json`
-      writes the same bytes) · verified by
-      `v31::hook_rewriter::tests::second_pass_is_a_no_op` +
-      `idempotent_when_json_already_present` (3 tests cover every
-      idempotency edge case: `--json` already present, `--output json`
-      long form, `--output=json` equal form)
-- [ ] Fresh-install scaffold (`onebrain init`) writes hook entries
-      with `--json` baked in · verified by
+- [ ] Rewriter converges every managed Stop/PostToolUse event to one
+      `onebrain hook` entry, preserves foreign hooks, and is byte-idempotent
+      on a second pass · verified by
+      `v31::hook_rewriter::lifecycle_runner_tests`
+- [ ] Fresh-install scaffold (`onebrain init`) writes one generic lifecycle
+      runner per enabled event · verified by
       `register_hooks_fresh_install_snapshot`
+- [ ] Upgrade notes tell users to restart active agent sessions: old session
+      registrations cannot use the intentionally absent `codex-hook` alias.
 
 ## Sign-off
 

@@ -2,12 +2,11 @@
 //! the remaining layers mirror Bun v2.3.3 `resolveSessionToken`.
 //!
 //! Layer order:
-//!   0. CODEX_SESSION_ID (Codex hook `session_id` · hashed from the complete
-//!      value so chats with a shared UUID prefix cannot collide)
-//!   1. CLAUDE_CODE_SESSION_ID (Claude Code's per-session UUID · set by the
-//!      binary regardless of host — terminal, Obsidian, Claude Desktop, IDE,
-//!      agent-teams — and unique per session even when one terminal hosts
-//!      several · strip-then-truncate to 8 chars)
+//!   0. Harness session identity (hashed from the complete value so sessions
+//!      with a shared UUID prefix cannot collide):
+//!      ONEBRAIN_HOOK_SESSION_ID → CODEX_SESSION_ID/CODEX_THREAD_ID
+//!   1. CLAUDE_CODE_SESSION_ID (legacy direct-call compatibility ·
+//!      strip-then-truncate to 8 chars)
 //!   2. WT_SESSION       (Windows Terminal · strip-then-truncate to 8 chars)
 //!   3. TMUX_PANE        (tmux pane id   · strip-then-truncate to 8 chars)
 //!   4. TERM_SESSION_ID  (macOS Terminal · strip-then-truncate to 8 chars)
@@ -17,7 +16,7 @@
 //!   8. PowerShell parent PID (Windows · 3000ms timeout · write to cache · return)
 //!   9. Random 5-digit numeric [10000, 99999] · write to cache · return
 //!
-//! Layers 1–3 are terminal-scoped: they collide when one terminal hosts
+//! Layers 2–4 are terminal-scoped: they collide when one terminal hosts
 //! several sessions (Claude Code agent-teams). Layer 0 is session-scoped, so it
 //! must sit above them — and above the ppid walk-up, which only happens to be
 //! per-session because each session is its own `claude` process.
@@ -49,12 +48,11 @@ pub type ProcLookup = std::sync::Arc<dyn Fn(u32) -> Option<ProcInfo> + Send + Sy
 /// manually to bypass the global env, OS process tree, and `$TMPDIR`.
 #[derive(Clone, Default)]
 pub struct ResolveInputs {
-    /// Codex hook/thread session identity. Highest priority when present.
+    /// Session identity normalized from a hook stdin payload by `onebrain hook`.
+    pub hook_session_id: Option<String>,
+    /// Codex hook/thread session identity retained for direct-call compatibility.
     pub codex_session_id: Option<String>,
-    /// `$CLAUDE_CODE_SESSION_ID` — Claude Code's per-session UUID. Highest
-    /// priority: set by the binary on every host and unique per session even
-    /// when one terminal hosts several (agent-teams), where the terminal-scoped
-    /// vars below would collide.
+    /// `$CLAUDE_CODE_SESSION_ID` — Claude Code's per-session UUID.
     pub claude_code_session_id: Option<String>,
     pub wt_session: Option<String>,
     pub tmux_pane: Option<String>,
@@ -71,6 +69,7 @@ pub struct ResolveInputs {
 impl std::fmt::Debug for ResolveInputs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResolveInputs")
+            .field("hook_session_id", &self.hook_session_id)
             .field("codex_session_id", &self.codex_session_id)
             .field("claude_code_session_id", &self.claude_code_session_id)
             .field("wt_session", &self.wt_session)
@@ -88,6 +87,7 @@ impl ResolveInputs {
     /// Snapshot the real env + process state. Production callers should use this.
     pub fn from_env() -> Self {
         Self {
+            hook_session_id: std::env::var("ONEBRAIN_HOOK_SESSION_ID").ok(),
             codex_session_id: std::env::var("CODEX_SESSION_ID")
                 .ok()
                 .or_else(|| std::env::var("CODEX_THREAD_ID").ok()),
@@ -248,7 +248,13 @@ where
 /// Resolve the session token. Harness chat identities are checked first; the
 /// remaining layers mirror Bun v2.3.3's chain. See module docs for the order.
 pub fn resolve_session_token(inputs: &ResolveInputs) -> Result<SessionToken> {
-    if let Some(raw) = &inputs.codex_session_id {
+    for raw in [
+        inputs.hook_session_id.as_deref(),
+        inputs.codex_session_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
         if !raw.is_empty() {
             let digest = Sha256::digest(raw.as_bytes());
             return Ok(SessionToken::from_clean(
@@ -256,14 +262,9 @@ pub fn resolve_session_token(inputs: &ResolveInputs) -> Result<SessionToken> {
             ));
         }
     }
-    // 0. CLAUDE_CODE_SESSION_ID — Claude Code's own per-session UUID. Set by the
-    //    binary regardless of host (terminal, Obsidian, Claude Desktop, IDE,
-    //    agent-teams) and unique per session, so it stays stable across PID
-    //    churn and disambiguates sessions that share one terminal — which the
-    //    terminal-scoped layers below cannot.
     if let Some(raw) = &inputs.claude_code_session_id {
-        if let Some(t) = SessionToken::sanitize_truncated(raw, 8) {
-            return Ok(t);
+        if let Some(token) = SessionToken::sanitize_truncated(raw, 8) {
+            return Ok(token);
         }
     }
 
@@ -573,7 +574,6 @@ mod tests {
             ..Default::default()
         };
         let token = resolve_session_token(&inputs).unwrap();
-        // strip non-alphanumeric → "b947d3eb3b17..." then slice(0,8)
         assert_eq!(token.as_str(), "b947d3eb");
     }
 

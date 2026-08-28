@@ -14,6 +14,19 @@ fn is_canonical_qmd_entry(entry: &Value) -> bool {
     matches_spec(entry, &HookSpec::REINDEX)
 }
 
+fn is_runner_entry(entry: &Value) -> bool {
+    matches_spec(entry, &HookSpec::RUNNER)
+}
+
+fn is_canonical_runner(entry: &Value) -> bool {
+    entry.get("type").and_then(Value::as_str) == Some("command")
+        && entry.get("command").and_then(Value::as_str) == Some(HookSpec::RUNNER.command)
+        && entry
+            .get("args")
+            .and_then(Value::as_array)
+            .is_some_and(|args| args.as_slice() == [json!("hook")])
+}
+
 /// True when the entry is the pre-v3.1 (no `--json`) shape of the qmd hook.
 /// Used by strip_qmd_hook to clean both shapes.
 fn is_pre_json_qmd_entry(entry: &Value) -> bool {
@@ -109,9 +122,9 @@ fn is_legacy_track2_reindex_entry(entry: &Value) -> bool {
     }
 }
 
-/// Rewrite a legacy-alias qmd entry in place to the canonical new form
-/// (`command: "onebrain", args: ["qmd", "reindex", "--json"]`). Returns true
-/// if the entry was a legacy alias and was rewritten.
+/// Rewrite a legacy-alias qmd entry in place to the historical qmd helper
+/// form. The production lifecycle path subsequently converges it to the
+/// shared runner. Returns true if the entry was a legacy alias and rewritten.
 fn rewrite_legacy_alias_to_canonical(entry: &mut Value) -> bool {
     if !is_legacy_alias_qmd_entry(entry) {
         return false;
@@ -127,8 +140,7 @@ fn rewrite_legacy_alias_to_canonical(entry: &mut Value) -> bool {
         .map(|s| Value::String((*s).to_string()))
         .collect();
     obj.insert("args".into(), Value::Array(args));
-    obj.entry("type".to_string())
-        .or_insert_with(|| Value::String("command".into()));
+    obj.insert("type".into(), Value::String("command".into()));
     true
 }
 
@@ -164,8 +176,7 @@ pub(crate) fn migrate_legacy_qmd_entries(groups: &mut Vec<Value>, keep_canonical
                         .map(|s| Value::String((*s).to_string()))
                         .collect();
                     obj.insert("args".into(), Value::Array(args));
-                    obj.entry("type".to_string())
-                        .or_insert_with(|| Value::String("command".into()));
+                    obj.insert("type".into(), Value::String("command".into()));
                     group_touched = true;
                 } else if rewrite_legacy_alias_to_canonical(entry) {
                     group_touched = true;
@@ -180,8 +191,7 @@ pub(crate) fn migrate_legacy_qmd_entries(groups: &mut Vec<Value>, keep_canonical
                         .map(|s| Value::String((*s).to_string()))
                         .collect();
                     obj.insert("args".into(), Value::Array(args));
-                    obj.entry("type".to_string())
-                        .or_insert_with(|| Value::String("command".into()));
+                    obj.insert("type".into(), Value::String("command".into()));
                     group_touched = true;
                 }
             }
@@ -228,6 +238,15 @@ pub(crate) fn migrate_legacy_qmd_entries(groups: &mut Vec<Value>, keep_canonical
                     if append_json_if_needed(entry, &qmd) {
                         touched = true;
                     }
+                    if is_canonical_qmd_entry(entry)
+                        && entry.get("type").and_then(Value::as_str) != Some("command")
+                    {
+                        entry
+                            .as_object_mut()
+                            .expect("canonical qmd hook is an object")
+                            .insert("type".into(), Value::String("command".into()));
+                        touched = true;
+                    }
                 }
             }
         }
@@ -271,6 +290,7 @@ pub(crate) fn migrate_legacy_qmd_entries(groups: &mut Vec<Value>, keep_canonical
 }
 
 /// Apply the qmd PostToolUse hook for vaults where `qmd_collection` is set.
+#[cfg(test)]
 pub(crate) fn apply_qmd_hook(settings: &mut Value) -> HookStatus {
     let root = settings.as_object_mut().expect("settings is JSON object");
     let hooks_val = root
@@ -311,6 +331,146 @@ pub(crate) fn apply_qmd_hook(settings: &mut Value) -> HookStatus {
     HookStatus::Added
 }
 
+/// Converge PostToolUse on the shared lifecycle runner while retaining the
+/// legacy migration logic above for every historical qmd/reindex spelling.
+pub(crate) fn apply_lifecycle_hook(settings: &mut Value) -> HookStatus {
+    let root = settings.as_object_mut().expect("settings is JSON object");
+    let hooks = root
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !hooks.is_object() {
+        *hooks = Value::Object(Map::new());
+    }
+    let event = hooks
+        .as_object_mut()
+        .unwrap()
+        .entry("PostToolUse".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !event.is_array() {
+        *event = Value::Array(Vec::new());
+    }
+    let groups = event.as_array_mut().unwrap();
+
+    let initial_runner_count = groups
+        .iter()
+        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter(|entry| is_runner_entry(entry))
+        .count();
+    let initially_clean = initial_runner_count == 1
+        && groups.iter().any(|group| {
+            group.get("matcher").and_then(Value::as_str) == Some(QMD_MATCHER)
+                && group
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .is_some_and(|entries| entries.iter().any(is_canonical_runner))
+        });
+    let had_managed = initial_runner_count > 0
+        || groups
+            .iter()
+            .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+            .flatten()
+            .any(|entry| {
+                is_canonical_qmd_entry(entry)
+                    || is_pre_json_qmd_entry(entry)
+                    || is_legacy_alias_qmd_entry(entry)
+                    || is_legacy_qmd_reindex_entry(entry)
+                    || is_legacy_track2_reindex_entry(entry)
+                    || entry
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_legacy_qmd_cmd)
+            });
+
+    let mut changed = migrate_legacy_qmd_entries(groups, true);
+    let mut seen = false;
+    for group in groups.iter_mut() {
+        let mut kept_runner = false;
+        if let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+            entries.retain_mut(|entry| {
+                if !is_runner_entry(entry) && !is_canonical_qmd_entry(entry) {
+                    return true;
+                }
+                if seen {
+                    changed = true;
+                    return false;
+                }
+                seen = true;
+                kept_runner = true;
+                if !is_canonical_runner(entry) {
+                    let object = entry.as_object_mut().expect("managed hook is an object");
+                    object.insert("command".to_string(), Value::String("onebrain".to_string()));
+                    object.insert("args".to_string(), json!(["hook"]));
+                    object.insert("type".to_string(), Value::String("command".to_string()));
+                    changed = true;
+                }
+                true
+            });
+        }
+        if kept_runner && group.get("matcher").and_then(Value::as_str) != Some(QMD_MATCHER) {
+            group
+                .as_object_mut()
+                .expect("hook group is an object")
+                .insert(
+                    "matcher".to_string(),
+                    Value::String(QMD_MATCHER.to_string()),
+                );
+            changed = true;
+        }
+    }
+    groups.retain(|group| {
+        group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| !entries.is_empty())
+    });
+    if !seen {
+        groups.push(json!({
+            "matcher": QMD_MATCHER,
+            "hooks": [HookSpec::RUNNER.to_canonical_entry()],
+        }));
+    }
+
+    if !had_managed {
+        HookStatus::Added
+    } else if initially_clean && !changed {
+        HookStatus::Ok
+    } else {
+        HookStatus::Migrated
+    }
+}
+
+/// Remove every OneBrain-managed PostToolUse lifecycle entry when search is
+/// not configured, including the generic runner from a previous setup.
+pub(crate) fn strip_lifecycle_hook(settings: &mut Value) -> bool {
+    let mut changed = strip_qmd_hook(settings);
+    let Some(groups) = settings
+        .pointer_mut("/hooks/PostToolUse")
+        .and_then(Value::as_array_mut)
+    else {
+        return changed;
+    };
+    for group in groups.iter_mut() {
+        if let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+            let before = entries.len();
+            entries.retain(|entry| !is_runner_entry(entry));
+            changed |= entries.len() != before;
+        }
+    }
+    groups.retain(|group| {
+        group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| !entries.is_empty())
+    });
+    if groups.is_empty() {
+        if let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) {
+            hooks.remove("PostToolUse");
+        }
+    }
+    changed
+}
+
 fn is_embed_entry(entry: &Value) -> bool {
     matches_spec(entry, &HookSpec::EMBED)
 }
@@ -324,6 +484,7 @@ fn is_embed_entry(entry: &Value) -> bool {
 /// entry registered by `hooks::apply_hooks` — those live in a different
 /// group (or, if the caller merged them, are skipped by the `is_embed_entry`
 /// filter below) and are left byte-for-byte untouched.
+#[cfg(test)]
 pub(crate) fn apply_embed_hook(settings: &mut Value) -> HookStatus {
     let root = settings.as_object_mut().expect("settings is JSON object");
     let hooks_val = root
@@ -520,8 +681,8 @@ mod tests {
         assert_eq!(s["hooks"]["PostToolUse"][0]["matcher"], "Write|Edit");
         let entry = &s["hooks"]["PostToolUse"][0]["hooks"][0];
         assert_eq!(entry["command"], "onebrain");
-        // v3.4.5: canonical NEW form `search reindex`, not the legacy
-        // `qmd reindex` / `qmd-reindex` forms.
+        // The legacy qmd helper retains its historical reindex form; the
+        // production lifecycle path below now emits the shared runner.
         assert_eq!(
             entry["args"],
             json!(["search", "reindex", "--lex-only", "--json"])
@@ -754,8 +915,8 @@ mod tests {
         assert_eq!(entries.len(), 1);
     }
 
-    /// Track-2 canonical (`search reindex --json`, no `--lex-only`) is now
-    /// LEGACY — v3.4.5 Track 4 migrates it in place to the new canonical.
+    /// Track-2 qmd helper form (`search reindex --json`, no `--lex-only`) is
+    /// now legacy — the helper migrates it to the latest historical qmd form.
     #[test]
     fn apply_qmd_hook_track2_canonical_migrates_to_lex_only() {
         let mut s = json!({
@@ -808,6 +969,39 @@ mod tests {
             .flat_map(|g| g["hooks"].as_array().unwrap().iter())
             .collect();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn apply_lifecycle_hook_repairs_missing_runner_type() {
+        let mut s = json!({
+            "hooks": {
+                "PostToolUse": [{"matcher": "Write|Edit", "hooks": [
+                    {"command": "onebrain", "args": ["hook"], "note": "keep"}
+                ]}]
+            }
+        });
+
+        let status = apply_lifecycle_hook(&mut s);
+
+        assert_eq!(status, HookStatus::Migrated);
+        assert_eq!(s["hooks"]["PostToolUse"][0]["hooks"][0]["type"], "command");
+        assert_eq!(s["hooks"]["PostToolUse"][0]["hooks"][0]["note"], "keep");
+    }
+
+    #[test]
+    fn apply_lifecycle_hook_repairs_wrong_runner_type() {
+        let mut s = json!({
+            "hooks": {
+                "PostToolUse": [{"matcher": "Write|Edit", "hooks": [
+                    {"type": "shell", "command": "onebrain", "args": ["hook"]}
+                ]}]
+            }
+        });
+
+        let status = apply_lifecycle_hook(&mut s);
+
+        assert_eq!(status, HookStatus::Migrated);
+        assert_eq!(s["hooks"]["PostToolUse"][0]["hooks"][0]["type"], "command");
     }
 
     #[test]

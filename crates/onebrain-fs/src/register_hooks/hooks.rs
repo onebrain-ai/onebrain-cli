@@ -13,6 +13,12 @@ pub(crate) struct HookSpec {
 }
 
 impl HookSpec {
+    /// Shared lifecycle runner. The harness event is read from hook stdin.
+    pub(crate) const RUNNER: HookSpec = HookSpec {
+        command: "onebrain",
+        args: &["hook"],
+    };
+
     // v3.1: hook-protocol commands default to text output for interactive
     // use; machine consumers (Claude Code Stop / PostToolUse hooks) need
     // `--json` to keep getting the structured envelope they parse. Fresh
@@ -23,11 +29,9 @@ impl HookSpec {
         args: &["checkpoint", "stop", "--json"],
     };
 
-    // v3.4.5 Track 2: the canonical reindex hook is the native `search
-    // reindex` subcommand. The v3.0/v3.1 `qmd-reindex` alias, the v3.2–v3.4
-    // `qmd reindex` form, AND the Track-2 `search reindex --json` form (no
-    // `--lex-only`) are recognized as legacy and migrated to this by
-    // `migrate_legacy_qmd_entries`.
+    // Historical qmd registration helper. The production PostToolUse
+    // lifecycle path now uses the shared runner; legacy qmd/reindex forms
+    // are still recognized and migrated by `migrate_legacy_qmd_entries`.
     //
     // v3.4.5 Track 4: `--lex-only` scopes the PostToolUse hook to a
     // lexical-only reindex (fast, no embedding) since it runs synchronously
@@ -200,8 +204,7 @@ pub(crate) fn rewrite_if_shell_form(entry: &mut Value, spec: &HookSpec) -> bool 
         .map(|s| Value::String((*s).to_string()))
         .collect();
     obj.insert("args".into(), Value::Array(args));
-    obj.entry("type".to_string())
-        .or_insert_with(|| Value::String("command".into()));
+    obj.insert("type".into(), Value::String("command".into()));
     true
 }
 
@@ -239,6 +242,23 @@ pub(crate) fn check_hook_presence(groups: &[Value], spec: &HookSpec) -> Presence
 
 const HOOK_EVENTS: &[(&str, HookSpec)] = &[("Stop", HookSpec::STOP)];
 const ALLOWED_HOOK_EVENTS: &[&str] = &["Stop", "PostToolUse"];
+
+/// True when the hook actually executes OneBrain, or invokes one of its
+/// retired wrapper scripts. A foreign shell command that merely mentions the
+/// word (for example `echo onebrain checkpoint stop`) is not managed.
+pub(crate) fn is_managed_hook_entry(entry: &Value) -> bool {
+    let Some(command) = entry.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    let executable_is_onebrain = if command == "onebrain" {
+        true
+    } else {
+        command.split_ascii_whitespace().next() == Some("onebrain")
+    };
+    executable_is_onebrain
+        || command.contains("checkpoint-hook.sh")
+        || command.contains("session-init.sh")
+}
 
 /// Outcome per hook event after `apply_hooks`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,10 +305,7 @@ pub(crate) fn apply_hooks(settings: &mut Value) -> Vec<(&'static str, HookStatus
             };
             for g in groups.iter_mut() {
                 if let Some(h) = g.get_mut("hooks").and_then(|v| v.as_array_mut()) {
-                    h.retain(|entry| {
-                        let cmd = entry.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                        !cmd.contains("onebrain")
-                    });
+                    h.retain(|entry| !is_managed_hook_entry(entry));
                 }
             }
             groups.retain(|g| {
@@ -342,7 +359,21 @@ pub(crate) fn apply_hooks(settings: &mut Value) -> Vec<(&'static str, HookStatus
             }
         }
 
-        let presence = check_hook_presence(groups, spec);
+        let runner_present = groups.iter().any(|group| {
+            group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| matches_spec(entry, &HookSpec::RUNNER))
+                })
+        });
+        let presence = if runner_present {
+            Presence::Found
+        } else {
+            check_hook_presence(groups, spec)
+        };
         let status = match presence {
             Presence::Found => {
                 if rewrote_shell {
@@ -374,8 +405,7 @@ pub(crate) fn apply_hooks(settings: &mut Value) -> Vec<(&'static str, HookStatus
                                     .map(|s| Value::String((*s).to_string()))
                                     .collect();
                                 obj.insert("args".into(), Value::Array(args));
-                                obj.entry("type".to_string())
-                                    .or_insert_with(|| Value::String("command".into()));
+                                obj.insert("type".into(), Value::String("command".into()));
                             }
                         }
                     }
@@ -393,6 +423,122 @@ pub(crate) fn apply_hooks(settings: &mut Value) -> Vec<(&'static str, HookStatus
         results.push((*event, status));
     }
     results
+}
+
+fn is_managed_stop_entry(entry: &Value) -> bool {
+    matches_spec(entry, &HookSpec::RUNNER)
+        || matches_spec(entry, &HookSpec::STOP)
+        || matches_spec(entry, &HookSpec::EMBED)
+        || entry
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|command| command.contains("checkpoint-hook.sh"))
+}
+
+fn is_canonical_runner(entry: &Value) -> bool {
+    entry.get("type").and_then(Value::as_str) == Some("command")
+        && entry.get("command").and_then(Value::as_str) == Some(HookSpec::RUNNER.command)
+        && entry
+            .get("args")
+            .and_then(Value::as_array)
+            .is_some_and(|args| args.as_slice() == [json!("hook")])
+}
+
+fn rewrite_to_runner(entry: &mut Value) {
+    let Some(object) = entry.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "command".to_string(),
+        Value::String(HookSpec::RUNNER.command.to_string()),
+    );
+    object.insert("args".to_string(), json!(["hook"]));
+    object.insert("type".to_string(), Value::String("command".to_string()));
+}
+
+fn converge_stop_entries(settings: &mut Value) -> bool {
+    let hooks = settings
+        .as_object_mut()
+        .expect("settings is a JSON object")
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !hooks.is_object() {
+        *hooks = Value::Object(Map::new());
+    }
+    let stop = hooks
+        .as_object_mut()
+        .unwrap()
+        .entry("Stop".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !stop.is_array() {
+        *stop = Value::Array(Vec::new());
+    }
+    let groups = stop.as_array_mut().unwrap();
+
+    let mut seen = false;
+    let mut changed = false;
+    for group in groups.iter_mut() {
+        let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        entries.retain_mut(|entry| {
+            if !is_managed_stop_entry(entry) {
+                return true;
+            }
+            if seen {
+                changed = true;
+                return false;
+            }
+            seen = true;
+            if !is_canonical_runner(entry) {
+                rewrite_to_runner(entry);
+                changed = true;
+            }
+            true
+        });
+    }
+    groups.retain(|group| {
+        group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| !entries.is_empty())
+    });
+
+    if !seen {
+        groups.push(json!({
+            "matcher": "",
+            "hooks": [HookSpec::RUNNER.to_canonical_entry()],
+        }));
+        changed = true;
+    }
+    changed
+}
+
+/// Register one shared Stop runner and collapse every legacy OneBrain Stop
+/// action into that single entry.
+pub(crate) fn apply_lifecycle_hook(settings: &mut Value) -> HookStatus {
+    let initial: Vec<&Value> = settings
+        .pointer("/hooks/Stop")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter(|entry| is_managed_stop_entry(entry))
+        .collect();
+    let initially_clean = initial.len() == 1 && is_canonical_runner(initial[0]);
+    let initially_missing = initial.is_empty();
+
+    let _ = apply_hooks(settings);
+    let changed = converge_stop_entries(settings);
+
+    if initially_missing {
+        HookStatus::Added
+    } else if initially_clean && !changed {
+        HookStatus::Ok
+    } else {
+        HookStatus::Migrated
+    }
 }
 
 /// Strip OneBrain-managed hook entries from every event. Used by `--remove`.
@@ -414,10 +560,7 @@ pub(crate) fn strip_onebrain_hooks(settings: &mut Value) {
             };
             for g in groups.iter_mut() {
                 if let Some(arr) = g.get_mut("hooks").and_then(|v| v.as_array_mut()) {
-                    arr.retain(|h| {
-                        let cmd = h.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                        !cmd.contains("onebrain")
-                    });
+                    arr.retain(|entry| !is_managed_hook_entry(entry));
                 }
             }
             groups.retain(|g| {
@@ -520,13 +663,13 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_if_shell_form_preserves_existing_type() {
+    fn rewrite_if_shell_form_repairs_existing_type() {
         let mut entry = json!({
             "command": "onebrain checkpoint stop",
             "type": "custom-type",
         });
         assert!(rewrite_if_shell_form(&mut entry, &HookSpec::STOP));
-        assert_eq!(entry["type"], "custom-type");
+        assert_eq!(entry["type"], "command");
     }
 
     #[test]
@@ -623,6 +766,39 @@ mod tests {
         let r = apply_hooks(&mut s);
         assert_eq!(r, vec![("Stop", HookStatus::Ok)]);
         assert_eq!(s["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn apply_lifecycle_hook_repairs_missing_runner_type() {
+        let mut s = json!({
+            "hooks": {
+                "Stop": [{"matcher": "", "hooks": [
+                    {"command": "onebrain", "args": ["hook"], "note": "keep"}
+                ]}]
+            }
+        });
+
+        let status = apply_lifecycle_hook(&mut s);
+
+        assert_eq!(status, HookStatus::Migrated);
+        assert_eq!(s["hooks"]["Stop"][0]["hooks"][0]["type"], "command");
+        assert_eq!(s["hooks"]["Stop"][0]["hooks"][0]["note"], "keep");
+    }
+
+    #[test]
+    fn apply_lifecycle_hook_repairs_wrong_runner_type() {
+        let mut s = json!({
+            "hooks": {
+                "Stop": [{"matcher": "", "hooks": [
+                    {"type": "shell", "command": "onebrain", "args": ["hook"]}
+                ]}]
+            }
+        });
+
+        let status = apply_lifecycle_hook(&mut s);
+
+        assert_eq!(status, HookStatus::Migrated);
+        assert_eq!(s["hooks"]["Stop"][0]["hooks"][0]["type"], "command");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 ---
-latest_version: 3.4.24
-released: 2026-08-07
+latest_version: 3.4.25
+released: 2026-08-28
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,22 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.4.25] — 2026-08-28 — Keep Codex hooks alive
+
+### Fixed
+- Codex hooks now run through the installed CLI instead of a Python file inside a replaceable versioned plugin cache, so refreshing the plugin cannot break an active task.
+- `checkpoint reset` accepts `--session-token <TOKEN>`, so `/wrapup` clears the counter the hook actually incremented instead of a state file resolved from the agent shell's own environment.
+
+### Added
+- `task list --limit N` returns a deterministic bounded result while preserving the full filtered count in `data.total`, keeping startup task payloads small.
+- `onebrain session token` (hidden), a resolve-only counterpart to `session init` for mid-session token recovery — it resolves the same token through the same chain without `session init`'s `clean_stale_state_file` side effect, which otherwise silently wipes the Stop-hook cadence counter when re-run mid-session.
+
+### Changed
+- Claude lifecycle registration and `plugin update` migration now converge Stop and configured PostToolUse hooks on one event-dispatching `onebrain hook` runner. Historical direct checkpoint/pending and qmd/search entries are deduplicated without touching foreign hooks; direct checkpoint/search commands remain available to users and child processes.
+
+### Upgrade notes
+Restart active agent sessions after upgrading. Their already-loaded hook registrations cannot use the old `codex-hook` compatibility name, because that alias is intentionally not shipped; new registrations invoke only `onebrain hook`.
 
 ## [3.4.24] — 2026-08-07 — The gates and the surfaces tell the truth
 

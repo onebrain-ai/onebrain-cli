@@ -91,6 +91,10 @@ pub enum Cmd {
     /// formula and the post-init hint). Writes to stdout.
     #[command(hide = true)]
     Completions(CompletionsArgs),
+    /// Internal cross-harness hook bridge. Kept in the installed CLI so an
+    /// active task does not depend on files inside a replaceable plugin cache.
+    #[command(hide = true)]
+    Hook,
 
     // ───── Resource groups (13 · alphabetical) ─────────────────────────
     // v3.4.24 (#334): the 12 groups whose every verb returned
@@ -245,6 +249,15 @@ pub enum CheckpointVerb {
         /// Vault root override.
         #[arg(long = "vault-dir", value_name = "PATH", hide = true)]
         vault_dir: Option<PathBuf>,
+        /// Reset the cadence state of an ALREADY-RESOLVED session token instead
+        /// of re-deriving one from the environment. `onebrain hook` counts
+        /// cadence under the token it derives from the harness session id
+        /// (`ONEBRAIN_HOOK_SESSION_ID`), which the agent shell running
+        /// `/wrapup` does not have — without this flag the reset lands on a
+        /// different token's state file and the counter survives the wrapup.
+        /// Takes the resolved token verbatim (never re-hashed).
+        #[arg(long, value_name = "TOKEN", hide = true)]
+        session_token: Option<String>,
     },
     /// Find orphan checkpoints needing /wrapup synthesis · used by SessionStart hook.
     Orphans {
@@ -961,6 +974,18 @@ pub enum SessionVerb {
         #[arg(long, value_name = "TOKEN", hide = true)]
         session_token: Option<String>,
     },
+    /// Resolve-only session token — no vault resolution, no
+    /// `clean_stale_state_file` cleanup, no side effects at all. For
+    /// mid-session token recovery: a caller that already has a live Stop-hook
+    /// cadence counter running under a token and just needs to re-learn what
+    /// that token is, without `session init`'s state-file cleanup silently
+    /// wiping the counter it's trying to recover.
+    #[command(hide = true)]
+    Token {
+        /// Preserve a hook-derived session token instead of re-resolving one.
+        #[arg(long, value_name = "TOKEN", hide = true)]
+        session_token: Option<String>,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1072,6 +1097,23 @@ pub struct TaskListArgs {
     /// Include done (`- [x]`) tasks. Default returns open tasks only.
     #[arg(long)]
     pub all: bool,
+    /// Return at most this many tasks after filtering and deterministic sorting.
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = parse_positive_usize
+    )]
+    pub limit: Option<usize>,
+}
+
+fn parse_positive_usize(raw: &str) -> Result<usize, String> {
+    let value = raw
+        .parse::<usize>()
+        .map_err(|_| format!("expected a positive integer, got `{raw}`"))?;
+    if value == 0 {
+        return Err("expected a positive integer, got `0`".into());
+    }
+    Ok(value)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1723,6 +1765,38 @@ mod tests {
     }
 
     #[test]
+    fn generic_hook_parses_without_modes_and_stays_hidden() {
+        assert!(Cli::try_parse_from(["onebrain", "hook"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["onebrain", "codex-hook", "session-start"]).is_err(),
+            "the removed harness-specific hook command must not parse"
+        );
+
+        let command = Cli::command();
+        assert!(
+            command
+                .find_subcommand("hook")
+                .is_some_and(clap::Command::is_hide_set),
+            "internal hook command must stay hidden"
+        );
+    }
+
+    #[test]
+    fn task_list_parses_limit() {
+        let cli = Cli::try_parse_from(["onebrain", "task", "list", "--limit", "5"]).unwrap();
+        match cli.command {
+            Cmd::Task(TaskCmd {
+                verb: TaskVerb::List(args),
+            }) => assert_eq!(args.limit, Some(5)),
+            _ => panic!("expected task list"),
+        }
+        assert!(
+            Cli::try_parse_from(["onebrain", "task", "list", "--limit", "0"]).is_err(),
+            "task list should reject a zero limit"
+        );
+    }
+
+    #[test]
     fn task_list_parses_filters() {
         let cli = Cli::try_parse_from([
             "onebrain",
@@ -1742,6 +1816,7 @@ mod tests {
                 assert_eq!(args.due_by.as_deref(), Some("today"));
                 assert_eq!(args.folder, vec!["01-projects".to_string()]);
                 assert!(args.all);
+                assert_eq!(args.limit, None);
             }
             _ => panic!("expected task list"),
         }

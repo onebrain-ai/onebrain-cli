@@ -6,6 +6,7 @@ pub mod daemon_client;
 pub mod doctor;
 pub mod harness;
 pub mod harness_run;
+pub mod hook;
 pub mod init;
 pub mod mcp;
 pub mod migrate;

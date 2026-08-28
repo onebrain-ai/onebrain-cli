@@ -7,6 +7,7 @@ use onebrain_core::{
     load_vault_config, resolve_vault, CoreError, SessionToken, VaultResolveInputs,
 };
 use onebrain_search::engine::Engine;
+use serde::Serialize;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -41,6 +42,61 @@ pub fn run(
     )?;
     println!("{line}");
     Ok(())
+}
+
+/// Shared token-derivation step for both `session init` and `session token`:
+/// an explicit override is sanitized and used verbatim (never re-hashed,
+/// mirroring `checkpoint reset --session-token`); otherwise the token is
+/// derived from the environment via the standard [`resolve_session_token`]
+/// chain.
+fn resolve_token_or_override(session_token: Option<&str>) -> Result<SessionToken> {
+    match session_token {
+        Some(raw) => SessionToken::sanitize(raw)
+            .context("session token override must contain at least one alphanumeric character"),
+        None => {
+            let inputs = ResolveInputs::from_env();
+            resolve_session_token(&inputs).context("resolve session token")
+        }
+    }
+}
+
+/// `session token` — resolve-only counterpart to `session init`, with NO
+/// side effects: no vault resolution, no `onebrain.yml` load, no search
+/// probe, and — the whole reason this verb exists — no
+/// `clean_stale_state_file` call. Vault-independent by construction (the
+/// token chain reads env/process state only), so it works from any cwd.
+///
+/// Round-3 audit: the plugin's mid-session token-recovery path (re-running
+/// `session init` when the token has fallen out of context) was silently
+/// wiping the Stop-hook cadence counter, because `session init` always runs
+/// `clean_stale_state_file` — which deletes `$TMPDIR/onebrain-{token}.state`
+/// whenever its mtime predates process start, which is always true
+/// mid-session. `session token` resolves the identical token through the
+/// identical [`resolve_session_token`] chain, without ever touching the
+/// state file.
+pub fn run_token(session_token: Option<&str>, mode: &OutputMode) -> Result<()> {
+    let token = resolve_token_or_override(session_token)?;
+    println!("{}", format_token_output(&token, mode));
+    Ok(())
+}
+
+/// JSON/YAML shape for `session token`. Deliberately minimal — one field —
+/// unlike [`SessionInitOutput`], since this verb carries no other metadata.
+#[derive(Debug, Serialize)]
+struct SessionTokenOutput {
+    session_token: String,
+}
+
+fn format_token_output(token: &SessionToken, mode: &OutputMode) -> String {
+    if let OutputMode::Text { .. } = mode {
+        return format!("token={}", token.as_str());
+    }
+    serialize_for_mode(
+        &SessionTokenOutput {
+            session_token: token.to_string(),
+        },
+        mode,
+    )
 }
 
 /// `qmd_count` is injected so the unembedded figure is deterministic in tests
@@ -123,14 +179,7 @@ fn compute_result(
     // Approximate the process start time before any subprocess work.
     let process_start = SystemTime::now();
 
-    let token = match session_token {
-        Some(raw) => SessionToken::sanitize(raw)
-            .context("session token override must contain at least one alphanumeric character")?,
-        None => {
-            let inputs = ResolveInputs::from_env();
-            resolve_session_token(&inputs).context("resolve session token")?
-        }
-    };
+    let token = resolve_token_or_override(session_token)?;
 
     // Best-effort cleanup of an orphaned state file from a prior process —
     // mirrors Bun `cleanStaleStateFile`. Failures emit a stderr warning only;

@@ -55,17 +55,18 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     // NO_COLOR, CI, TERM=dumb). See `banner::should_show_banner` for the
     // full gating table.
     banner::emit_banner(std::io::stderr().lock(), &cli, &mode);
-    // One-time relocation of the native-search state out of the OS-purgeable
-    // cache dir into the persistent data dir (issue #114 · ADR 0021). Runs
-    // before any command touches the search cache; idempotent + cheap (a single
-    // stat once the move is done), so it's safe on every invocation including
-    // the hot-path hook verbs (`session init`, `checkpoint`).
-    migration::migrate_search_cache();
+    // The hook bridge must keep stderr clean and only delegates to another
+    // OneBrain command, which performs this migration in its own process with
+    // stderr suppressed. Every other command migrates here as usual.
+    if !matches!(&cli.command, Cmd::Hook) {
+        migration::migrate_search_cache();
+    }
     let vault_flag = cli.vault.clone();
     let quiet = cli.quiet;
 
     match cli.command {
         // ───── Root verbs ────────────────────────────────────────────
+        Cmd::Hook => commands::hook::run(),
         Cmd::Init(a) => {
             // Item D: `init` uses the global `--vault` flag for target dir
             // (was `--vault-dir` as an init-specific arg). Walk-up discovery
@@ -104,12 +105,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 session_token.as_deref(),
                 &mode,
             ),
+            SessionVerb::Token { session_token } => {
+                commands::session_init::run_token(session_token.as_deref(), &mode)
+            }
         },
 
         // ───── Checkpoint ───────────────────────────────────────────
         Cmd::Checkpoint(CheckpointCmd { verb }) => match verb {
-            CheckpointVerb::Stop { vault_dir } => commands::checkpoint::run("stop", vault_dir),
-            CheckpointVerb::Reset { vault_dir } => commands::checkpoint::run("reset", vault_dir),
+            CheckpointVerb::Stop { vault_dir } => {
+                commands::checkpoint::run("stop", vault_dir, None)
+            }
+            CheckpointVerb::Reset {
+                vault_dir,
+                session_token,
+            } => commands::checkpoint::run("reset", vault_dir, session_token.as_deref()),
             CheckpointVerb::Orphans {
                 logs_folder,
                 session_token,

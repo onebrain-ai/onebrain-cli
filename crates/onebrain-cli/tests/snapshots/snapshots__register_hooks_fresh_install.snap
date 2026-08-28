@@ -12,9 +12,7 @@ expression: text
                         "type": "command",
                         "command": "onebrain",
                         "args": [
-                            "checkpoint",
-                            "stop",
-                            "--json"
+                            "hook"
                         ]
                     }
                 ]

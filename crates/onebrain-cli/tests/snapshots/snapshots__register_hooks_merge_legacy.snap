@@ -12,26 +12,9 @@ expression: text
                     {
                         "command": "onebrain",
                         "args": [
-                            "checkpoint",
-                            "stop",
-                            "--json"
+                            "hook"
                         ],
                         "type": "command"
-                    }
-                ]
-            },
-            {
-                "matcher": "",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": "onebrain",
-                        "args": [
-                            "search",
-                            "reindex",
-                            "--pending-only",
-                            "--json"
-                        ]
                     }
                 ]
             }
@@ -44,10 +27,7 @@ expression: text
                         "type": "command",
                         "command": "onebrain",
                         "args": [
-                            "search",
-                            "reindex",
-                            "--lex-only",
-                            "--json"
+                            "hook"
                         ]
                     }
                 ]

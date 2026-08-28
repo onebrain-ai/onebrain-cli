@@ -112,17 +112,27 @@ static DUE_RE: OnceLock<Regex> = OnceLock::new();
 /// Synchronous + best-effort (unreadable / non-UTF-8 files are skipped); callers
 /// that must stay off the async runtime should wrap this in `spawn_blocking`.
 pub fn scan_tasks(vault_root: &Path, opts: &TaskScanOptions) -> Vec<TaskHit> {
+    let mut tasks = Vec::new();
+    visit_tasks(vault_root, opts, |task| tasks.push(task));
+    tasks
+}
+
+/// Walk `vault_root`'s `.md` notes and pass each dated checkbox line to
+/// `visitor` without retaining prior results. `opts.max` still caps the number
+/// of visited matches, so existing callers can keep the pathological-vault
+/// guard while streaming callers choose a larger bound and control retention.
+pub fn visit_tasks(vault_root: &Path, opts: &TaskScanOptions, mut visitor: impl FnMut(TaskHit)) {
     let task_re = TASK_RE.get_or_init(|| Regex::new(r"^\s*-\s+\[(.)\]\s+(.+?)\s*$").unwrap());
     let due_re = DUE_RE.get_or_init(|| Regex::new(r"\x{1F4C5}\s*(\d{4}-\d{2}-\d{2})").unwrap());
 
-    let mut tasks: Vec<TaskHit> = Vec::new();
+    let mut visited = 0;
     let walker = walkdir::WalkDir::new(vault_root)
         .min_depth(1)
         .into_iter()
         .filter_entry(|e| !is_tooling_dir(e));
 
-    for entry in walker.flatten() {
-        if tasks.len() >= opts.max {
+    'walk: for entry in walker.flatten() {
+        if visited >= opts.max {
             break;
         }
         if !entry.file_type().is_file() {
@@ -157,8 +167,8 @@ pub fn scan_tasks(vault_root: &Path, opts: &TaskScanOptions) -> Vec<TaskHit> {
         };
         let mut fence = FenceState::default();
         for (i, line) in content.lines().enumerate() {
-            if tasks.len() >= opts.max {
-                break;
+            if visited >= opts.max {
+                break 'walk;
             }
             // Checkbox lines inside ``` / ~~~ fences are documentation, not
             // calendar todos — skip them (fixes demo-task pollution).
@@ -173,17 +183,17 @@ pub fn scan_tasks(vault_root: &Path, opts: &TaskScanOptions) -> Vec<TaskHit> {
                 };
                 let status = caps.get(1).map(|m| m.as_str()).unwrap_or(" ");
                 let text_clean = due_re.replace(&text, "").trim().to_string();
-                tasks.push(TaskHit {
+                visitor(TaskHit {
                     file: rel.clone(),
                     line: (i + 1) as u32,
                     text: text_clean,
                     done: status.eq_ignore_ascii_case("x"),
                     due: Some(due),
                 });
+                visited += 1;
             }
         }
     }
-    tasks
 }
 
 #[cfg(test)]
@@ -373,5 +383,27 @@ mod tests {
             },
         );
         assert_eq!(hits.len(), 4);
+    }
+
+    #[test]
+    fn visitor_streams_more_than_default_cap_without_collecting_results() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let body: String = (0..2_501)
+            .map(|i| format!("- [ ] t{i} 📅 2026-06-30\n"))
+            .collect();
+        write(root, "01-projects/many.md", &body);
+        let mut count = 0;
+
+        visit_tasks(
+            root,
+            &TaskScanOptions {
+                include_prefixes: vec!["01-projects/".into()],
+                max: usize::MAX,
+            },
+            |_| count += 1,
+        );
+
+        assert_eq!(count, 2_501);
     }
 }
