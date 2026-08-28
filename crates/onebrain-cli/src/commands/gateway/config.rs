@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use super::policy::PolicyConfig;
+
 pub const DEFAULT_GATEWAY_PORT: u16 = 7717;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +41,15 @@ pub struct GatewayConfig {
     /// exposed remotely by setting it alone.
     #[serde(default)]
     pub public_url: Option<String>,
+    /// Per-risk-class approval policy (Gateway PR 4, Task 2) — see
+    /// [`PolicyConfig`]'s own doc comment for the field meanings and
+    /// defaults. `#[serde(default)]` so an existing `gateway.yml` written
+    /// before this field existed keeps parsing (and gets the safe
+    /// defaults), and a `policy:` block may specify only the sub-fields it
+    /// wants to override (each of `PolicyConfig`'s own fields defaults
+    /// independently).
+    #[serde(default)]
+    pub policy: PolicyConfig,
 }
 
 fn default_gateway_port() -> u16 {
@@ -52,6 +63,7 @@ impl Default for GatewayConfig {
             default_vault: None,
             vaults: BTreeMap::new(),
             public_url: None,
+            policy: PolicyConfig::default(),
         }
     }
 }
@@ -86,6 +98,7 @@ pub(crate) fn load_gateway_config_at(path: &Path) -> anyhow::Result<GatewayConfi
 
 #[cfg(test)]
 mod tests {
+    use super::super::policy::PolicyMode;
     use super::*;
 
     #[test]
@@ -95,6 +108,32 @@ mod tests {
         assert!(cfg.default_vault.is_none());
         assert!(cfg.vaults.is_empty());
         assert!(cfg.public_url.is_none());
+        assert_eq!(cfg.policy.read_only, PolicyMode::Auto);
+        assert_eq!(cfg.policy.mutating, PolicyMode::AskOnce);
+        assert_eq!(cfg.policy.destructive, PolicyMode::AskAlways);
+        assert_eq!(cfg.policy.grant_ttl_minutes, 30);
+    }
+
+    /// `GatewayConfig`'s `Default` impl is hand-written (it does not
+    /// `derive(Default)`) — this is the regression guard the Task 2 brief
+    /// calls out by name: a `policy` field added to the struct but forgotten
+    /// in this impl would silently build a `PolicyConfig` with all-zero /
+    /// first-variant values instead of the safe `PolicyConfig::default()`.
+    /// Comparing field-by-field against `PolicyConfig::default()` directly
+    /// (rather than re-asserting each concrete value, which the test above
+    /// already does) is what actually catches "hand-written Default drifted
+    /// from PolicyConfig::default()", not just "hand-written Default forgot
+    /// the field entirely" (which wouldn't compile).
+    #[test]
+    fn hand_written_default_policy_matches_policy_config_default() {
+        let cfg = GatewayConfig::default();
+        assert_eq!(cfg.policy.read_only, PolicyConfig::default().read_only);
+        assert_eq!(cfg.policy.mutating, PolicyConfig::default().mutating);
+        assert_eq!(cfg.policy.destructive, PolicyConfig::default().destructive);
+        assert_eq!(
+            cfg.policy.grant_ttl_minutes,
+            PolicyConfig::default().grant_ttl_minutes
+        );
     }
 
     #[test]
@@ -122,6 +161,32 @@ mod tests {
             sparse.public_url.is_none(),
             "missing public_url must default to None"
         );
+        assert_eq!(
+            sparse.policy.read_only,
+            PolicyMode::Auto,
+            "missing policy block must default"
+        );
+    }
+
+    /// A `policy:` block parses into `GatewayConfig.policy`, and (mirroring
+    /// `PolicyConfig`'s own `policy_config_parses_from_yaml_and_fills_missing_fields_with_defaults`
+    /// unit test) a PARTIAL `policy:` block fills only the fields it omits —
+    /// proven here at the `GatewayConfig` level, not just `PolicyConfig`'s
+    /// own standalone deserialization, since `#[serde(default)]` on the
+    /// `policy` field only kicks in when the KEY itself is absent, not when
+    /// it's present-but-partial.
+    #[test]
+    fn gateway_config_parses_a_policy_block_and_fills_its_missing_fields() {
+        let cfg: GatewayConfig =
+            serde_yaml::from_str("policy:\n  mutating: deny\n  grant_ttl_minutes: 5\n").unwrap();
+        assert_eq!(cfg.policy.mutating, PolicyMode::Deny);
+        assert_eq!(cfg.policy.grant_ttl_minutes, 5);
+        assert_eq!(
+            cfg.policy.read_only,
+            PolicyMode::Auto,
+            "field omitted from the policy block must still default"
+        );
+        assert_eq!(cfg.policy.destructive, PolicyMode::AskAlways);
     }
 
     /// Windows-CI regression guard (`gateway_http.rs`'s happy path failed

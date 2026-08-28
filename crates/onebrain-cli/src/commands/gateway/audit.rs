@@ -26,16 +26,24 @@
 //! diagnostic benefit `error = %e` doesn't already provide.
 //!
 //! ## Dead-code allow
-//! Same situation as [`super::auth`]'s own `#![allow(dead_code)]` (see that
-//! module's doc comment for the full precedent chain back to
-//! [`crate::commands::daemon_client`]). This task builds the foundation
-//! Tasks 2-6 wire up: [`AuditLog::open`] gets its first real caller when a
-//! later task opens the log inside `gateway::run()`, and `Decision`'s
-//! `Auto`/`Denied`/`Blocked` variants (plus `Outcome::Error`) get theirs when
-//! the approval-gate logic that chooses between them lands. Every item is
-//! already exercised by this module's own unit tests, so none of it is
-//! untested dead code — it just has no caller OUTSIDE this module yet.
-#![allow(dead_code)]
+//! Task 1 shipped this module with a blanket `#![allow(dead_code)]` (same
+//! situation as [`super::auth`]'s own — see that module's doc comment for
+//! the full precedent chain back to [`crate::commands::daemon_client`]):
+//! [`AuditLog::open`] had no caller yet, and `Decision`'s `Auto`/`Denied`/
+//! `Blocked` variants (plus `Outcome::Error`) were never constructed
+//! anywhere reachable from `main` (a `pub` item in a BINARY crate is still
+//! dead-code-linted by reachability from `main`, unlike a library crate's
+//! public API surface).
+//!
+//! Gateway PR 4, Task 2 gave every one of those a real caller:
+//! `gateway::run()` now opens the log via [`AuditLog::open`], and
+//! `server.rs`'s policy-gate wiring constructs `Decision::Auto`/`Denied`/
+//! `Blocked` and `Outcome::Ok`/`Error` on every tool call. The blanket
+//! allow is gone; only `Decision::Approved` and `Decision::TimedOut` still
+//! have no caller outside this module's own tests — they're reserved for
+//! Task 3's interactive approval flow (a human's actual "approve" response,
+//! and a timed-out wait), which is genuinely out of scope here. Each is
+//! allowed individually below, at the variant, rather than blanket again.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -76,8 +84,16 @@ pub struct AuditEntry {
 #[serde(rename_all = "lowercase")]
 pub enum Decision {
     Auto,
+    /// A human approved this specific call through an interactive channel.
+    /// Not constructed outside this module's own tests until Task 3+ ships
+    /// that channel — see the module doc's "Dead-code allow" section.
+    #[allow(dead_code)]
     Approved,
     Denied,
+    /// A pending approval expired with no response. Not constructed outside
+    /// this module's own tests until Task 3+ ships the approval wait/TTL —
+    /// see the module doc's "Dead-code allow" section.
+    #[allow(dead_code)]
     TimedOut,
     Blocked,
 }

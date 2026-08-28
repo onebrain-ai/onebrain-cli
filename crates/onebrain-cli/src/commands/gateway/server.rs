@@ -24,9 +24,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
+use axum::http::request::Parts;
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
     CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
@@ -41,18 +44,40 @@ use onebrain_core::{
 use onebrain_fs::task::{visit_tasks, TaskHit, TaskScanOptions};
 
 use crate::commands::daemon_client;
+use crate::commands::gateway::audit::{AuditEntry, AuditLog, Decision, Outcome};
+use crate::commands::gateway::auth::core::now_epoch_secs;
 use crate::commands::gateway::auth::middleware::require_bearer;
+use crate::commands::gateway::auth::Principal;
 use crate::commands::gateway::oauth_routes::{
     authorize_router, register_router, token_router, well_known_router, AuthCtx,
 };
+use crate::commands::gateway::policy::{self, Grants, PolicyOutcome, RiskClass};
 use crate::commands::gateway::GatewayConfig;
 use crate::commands::task_list::{resolve_due_by, resolve_prefixes, TaskCollector};
 
 /// Machine-level gateway state shared across every request. Sessionless
 /// (§ above), so this is the only state a tool call can read — no per-session
 /// data exists.
+///
+/// `grants`/`audit` are per-PROCESS: a fresh `gateway run` always starts
+/// with zero grants (see [`Grants`]'s own doc comment) and opens the audit
+/// log fresh (append-only — [`GatewayState::new`] takes an already-opened
+/// [`AuditLog`] rather than opening it itself, so tests can point it at a
+/// tempdir instead of the real `~/.onebrain/gateway/audit/`).
 pub struct GatewayState {
     pub config: GatewayConfig,
+    pub grants: Grants,
+    pub audit: AuditLog,
+}
+
+impl GatewayState {
+    pub fn new(config: GatewayConfig, audit: AuditLog) -> Self {
+        Self {
+            config,
+            grants: Grants::new(),
+            audit,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -326,6 +351,134 @@ fn capability_packs() -> Vec<PackInfo> {
     ]
 }
 
+/// Extract the [`Principal`] `auth::middleware::require_bearer` inserted
+/// into the raw HTTP request's extensions before this call ever reached an
+/// rmcp tool handler. `parts` itself is obtained via the
+/// `Extension<http::request::Parts>` extractor — see the vendored crate's
+/// own "Accessing HTTP request data from tool handlers" doc
+/// (`rmcp-3.0.1/src/transport/streamable_http_server/tower.rs`): the
+/// streamable-HTTP service stashes the consumed request's `Parts` into the
+/// rmcp-level context extensions, and axum's OWN `Extension` middleware
+/// layer (a different map — `parts.extensions`, not the rmcp one) is where
+/// `require_bearer` put the `Principal`. Two nested extension maps, two
+/// different `Extension` types with the same name — easy to conflate, so
+/// spelled out here once.
+///
+/// `Principal` should always be present for `/mcp`: `build_gateway_router`
+/// wraps the WHOLE `/mcp` nest in `require_bearer`, which either 401s
+/// (never reaching a tool handler) or inserts `Principal` before calling
+/// `next`. A missing `Principal` here means a route bypassed that layer —
+/// not reachable through `build_gateway_router` today, but this fails
+/// closed with `internal_error` rather than panicking on it.
+fn extract_principal(parts: &Parts) -> Result<Principal, ErrorData> {
+    match parts.extensions.get::<Principal>() {
+        Some(p) => Ok(p.clone()),
+        None => {
+            tracing::warn!(
+                "gateway tool handler ran with no Principal in request extensions — \
+                 require_bearer should make this unreachable for /mcp"
+            );
+            Err(ErrorData::internal_error(
+                "internal error — see gateway logs",
+                None,
+            ))
+        }
+    }
+}
+
+/// Runs the policy check ([`policy::decide`]) for one tool call of risk
+/// class `class`. `Ok(Decision::Auto)` means the call may proceed; `Err`
+/// carries BOTH the [`Decision`] to record in the audit log and the
+/// client-facing [`ErrorData`] to return, for the two ways a call may not
+/// proceed:
+///
+/// - `PolicyOutcome::Deny` (policy `deny`, or a scope/pack mismatch) →
+///   `Decision::Denied`.
+/// - `PolicyOutcome::NeedApproval` → `Decision::Blocked`. This gateway build
+///   (Task 2) has no interactive approval channel to route the request to
+///   yet (that lands in Task 3+) — rather than hang forever or silently
+///   allow, it fails closed with a clear "not yet supported" error. Once an
+///   approval channel exists, THIS is the branch a later task replaces with
+///   an actual register-and-wait call.
+///
+/// All four of today's tools are `RiskClass::ReadOnly`, which defaults to
+/// `PolicyMode::Auto` — so under the DEFAULT `gateway.yml`, every call here
+/// takes the `Allow` path and this function is a no-op pass-through. The
+/// `Deny`/`NeedApproval` branches become reachable the moment an operator
+/// customizes `policy.read_only`, or a future `Mutating`/`Destructive` tool
+/// ships with its own default mode.
+fn policy_gate(
+    state: &GatewayState,
+    principal: &Principal,
+    tool: &str,
+    class: RiskClass,
+) -> Result<Decision, (Decision, ErrorData)> {
+    match policy::decide(&state.config.policy, &state.grants, principal, class) {
+        PolicyOutcome::Allow => Ok(Decision::Auto),
+        PolicyOutcome::Deny => Err((
+            Decision::Denied,
+            ErrorData::invalid_request(format!("gateway policy denies this call [{tool}]"), None),
+        )),
+        PolicyOutcome::NeedApproval => Err((
+            Decision::Blocked,
+            ErrorData::invalid_request(
+                format!(
+                    "this call requires interactive approval, which this gateway build does not yet support [{tool}]"
+                ),
+                None,
+            ),
+        )),
+    }
+}
+
+/// The parts of an audit entry a tool handler knows BEFORE calling
+/// [`policy_gate`] — bundled into one struct purely to keep
+/// [`record_audit`] under clippy's `too_many_arguments` threshold; `tool`/
+/// `vault`/`args_summary` are always determined together, right after a
+/// handler parses its params, so grouping them costs nothing at the call
+/// site.
+struct CallMeta {
+    tool: &'static str,
+    vault: Option<String>,
+    args_summary: String,
+}
+
+/// Build and append one audit-log entry for a completed tool call —
+/// infallible from this caller's view, same as every [`AuditLog::append`]
+/// caller (see that method's doc comment): a write failure here is a
+/// `tracing::warn!` inside `append` itself and never touches `result` or
+/// the response already headed back to the client.
+///
+/// `channel` is always `None` for every entry this task produces — no
+/// interactive approval channel exists yet (see [`policy_gate`]'s doc
+/// comment), so nothing this task wires could ever populate it.
+fn record_audit<T>(
+    state: &GatewayState,
+    principal: &Principal,
+    meta: CallMeta,
+    decision: Decision,
+    started: Instant,
+    result: &Result<T, ErrorData>,
+) {
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let entry = AuditEntry {
+        ts: now_epoch_secs(),
+        client_id: principal.client_id.clone(),
+        tool: meta.tool.to_string(),
+        vault: meta.vault,
+        args_summary: meta.args_summary,
+        decision,
+        channel: None,
+        duration_ms,
+        outcome: if result.is_ok() {
+            Outcome::Ok
+        } else {
+            Outcome::Error
+        },
+    };
+    state.audit.append(&entry);
+}
+
 #[tool_router]
 impl GatewayServer {
     pub fn new(state: Arc<GatewayState>) -> Self {
@@ -340,15 +493,40 @@ impl GatewayServer {
         description = "Report which capability packs and vaults this OneBrain gateway serves. Call this first to plan which brain_* tool fits the job.",
         annotations(read_only_hint = true)
     )]
-    async fn capabilities(&self) -> Result<Json<CapabilitiesOut>, ErrorData> {
-        let config = &self.state.config;
-        Ok(Json(CapabilitiesOut {
-            gateway_version: env!("CARGO_PKG_VERSION").to_string(),
-            protocol_version: ProtocolVersion::V_2026_07_28.as_str().to_string(),
-            packs: capability_packs(),
-            vaults: config.vaults.keys().cloned().collect(),
-            default_vault: default_vault_display(config),
-        }))
+    async fn capabilities(
+        &self,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<Json<CapabilitiesOut>, ErrorData> {
+        let principal = extract_principal(&parts)?;
+        let started = Instant::now();
+        let (decision, result) =
+            match policy_gate(&self.state, &principal, "capabilities", RiskClass::ReadOnly) {
+                Ok(decision) => {
+                    let config = &self.state.config;
+                    let out = CapabilitiesOut {
+                        gateway_version: env!("CARGO_PKG_VERSION").to_string(),
+                        protocol_version: ProtocolVersion::V_2026_07_28.as_str().to_string(),
+                        packs: capability_packs(),
+                        vaults: config.vaults.keys().cloned().collect(),
+                        default_vault: default_vault_display(config),
+                    };
+                    (decision, Ok(Json(out)))
+                }
+                Err((decision, err)) => (decision, Err(err)),
+            };
+        record_audit(
+            &self.state,
+            &principal,
+            CallMeta {
+                tool: "capabilities",
+                vault: None,
+                args_summary: "capabilities: (no arguments)".to_string(),
+            },
+            decision,
+            started,
+            &result,
+        );
+        result
     }
 
     #[tool(
@@ -358,43 +536,78 @@ impl GatewayServer {
     )]
     async fn brain_tasks(
         &self,
+        Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<BrainTasksParams>,
     ) -> Result<Json<BrainTasksOut>, ErrorData> {
-        let resolved = resolve_vault_arg(&self.state, params.vault.as_deref())?;
-        let vault_name = resolved.root.name();
+        let principal = extract_principal(&parts)?;
+        let started = Instant::now();
+        let vault = params.vault.clone();
+        let args_summary = format!(
+            "tasks: due_by={:?} limit={:?} vault={:?}",
+            params.due_by, params.limit, params.vault
+        );
 
-        let vault_config = load_vault_config(&resolved.root).map_err(core_error)?;
+        let (decision, result) =
+            match policy_gate(&self.state, &principal, "brain_tasks", RiskClass::ReadOnly) {
+                Ok(decision) => {
+                    let result: Result<Json<BrainTasksOut>, ErrorData> = async {
+                        let resolved = resolve_vault_arg(&self.state, params.vault.as_deref())?;
+                        let vault_name = resolved.root.name();
 
-        let cutoff = match params.due_by.as_deref() {
-            Some(raw) => Some(
-                resolve_due_by(raw).map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
-            ),
-            None => None,
-        };
-        let limit = Some(params.limit.unwrap_or(20));
-        let include_prefixes = resolve_prefixes(&vault_config.folders, &[]);
-        let root = resolved.root.as_path().to_path_buf();
+                        let vault_config = load_vault_config(&resolved.root).map_err(core_error)?;
 
-        // `visit_tasks` walks the filesystem synchronously — off the async
-        // runtime, mirroring `mcp.rs`'s own filesystem-walk tools
-        // (`expand_multi_get_pattern` via `spawn_blocking`).
-        let (tasks, total) = tokio::task::spawn_blocking(move || {
-            let mut collector = TaskCollector::new(false, cutoff.as_deref(), limit);
-            let opts = TaskScanOptions {
-                include_prefixes,
-                max: usize::MAX,
+                        let cutoff = match params.due_by.as_deref() {
+                            Some(raw) => Some(
+                                resolve_due_by(raw)
+                                    .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
+                            ),
+                            None => None,
+                        };
+                        let limit = Some(params.limit.unwrap_or(20));
+                        let include_prefixes = resolve_prefixes(&vault_config.folders, &[]);
+                        let root = resolved.root.as_path().to_path_buf();
+
+                        // `visit_tasks` walks the filesystem synchronously —
+                        // off the async runtime, mirroring `mcp.rs`'s own
+                        // filesystem-walk tools (`expand_multi_get_pattern`
+                        // via `spawn_blocking`).
+                        let (tasks, total) = tokio::task::spawn_blocking(move || {
+                            let mut collector = TaskCollector::new(false, cutoff.as_deref(), limit);
+                            let opts = TaskScanOptions {
+                                include_prefixes,
+                                max: usize::MAX,
+                            };
+                            visit_tasks(&root, &opts, |task| collector.consider(task));
+                            collector.finish()
+                        })
+                        .await
+                        .map_err(|e| sanitized_internal("internal task failure", e.into()))?;
+
+                        Ok(Json(BrainTasksOut {
+                            tasks: tasks.into_iter().map(GatewayTaskHit::from).collect(),
+                            total,
+                            vault: vault_name,
+                        }))
+                    }
+                    .await;
+                    (decision, result)
+                }
+                Err((decision, err)) => (decision, Err(err)),
             };
-            visit_tasks(&root, &opts, |task| collector.consider(task));
-            collector.finish()
-        })
-        .await
-        .map_err(|e| sanitized_internal("internal task failure", e.into()))?;
 
-        Ok(Json(BrainTasksOut {
-            tasks: tasks.into_iter().map(GatewayTaskHit::from).collect(),
-            total,
-            vault: vault_name,
-        }))
+        record_audit(
+            &self.state,
+            &principal,
+            CallMeta {
+                tool: "brain_tasks",
+                vault,
+                args_summary,
+            },
+            decision,
+            started,
+            &result,
+        );
+        result
     }
 
     #[tool(
@@ -404,34 +617,73 @@ impl GatewayServer {
     )]
     async fn brain_get(
         &self,
+        Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<BrainGetParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let resolved = resolve_vault_arg(&self.state, params.vault.as_deref())?;
-        let vault_root = resolved.root.as_path().to_path_buf();
-        let rel = params.file.clone();
+        let principal = extract_principal(&parts)?;
+        let started = Instant::now();
+        let vault = params.vault.clone();
+        let args_summary = format!("get: {} vault={:?}", params.file, params.vault);
 
-        let resolved_path = {
-            let vault_root = vault_root.clone();
-            let rel_for_resolve = rel.clone();
-            tokio::task::spawn_blocking(move || resolve_under_vault(&vault_root, &rel_for_resolve))
-                .await
-                .map_err(|e| sanitized_internal("internal task failure", e.into()))?
-                // Both of `resolve_under_vault`'s failure modes — canonicalize
-                // fails because nothing exists at the joined path, or it
-                // succeeds but the result escapes `vault_root` — collapse to
-                // the SAME generic message here, deliberately: a distinct
-                // "traversal blocked" vs. "genuinely missing" message would
-                // hand a caller an oracle for probing what exists outside the
-                // vault. Neither branch reaches the file's content either way.
-                .map_err(|_| {
-                    ErrorData::invalid_params(format!("file not found in vault: {rel}"), None)
-                })?
-        };
+        let (decision, result) =
+            match policy_gate(&self.state, &principal, "brain_get", RiskClass::ReadOnly) {
+                Ok(decision) => {
+                    let result: Result<CallToolResult, ErrorData> = async {
+                        let resolved = resolve_vault_arg(&self.state, params.vault.as_deref())?;
+                        let vault_root = resolved.root.as_path().to_path_buf();
+                        let rel = params.file.clone();
 
-        tokio::fs::read_to_string(&resolved_path)
-            .await
-            .map(|text| CallToolResult::success(vec![ContentBlock::text(text)]))
-            .map_err(|e| ErrorData::invalid_params(format!("reading {rel}: {e}"), None))
+                        let resolved_path = {
+                            let vault_root = vault_root.clone();
+                            let rel_for_resolve = rel.clone();
+                            tokio::task::spawn_blocking(move || {
+                                resolve_under_vault(&vault_root, &rel_for_resolve)
+                            })
+                            .await
+                            .map_err(|e| sanitized_internal("internal task failure", e.into()))?
+                            // Both of `resolve_under_vault`'s failure modes —
+                            // canonicalize fails because nothing exists at the
+                            // joined path, or it succeeds but the result
+                            // escapes `vault_root` — collapse to the SAME
+                            // generic message here, deliberately: a distinct
+                            // "traversal blocked" vs. "genuinely missing"
+                            // message would hand a caller an oracle for
+                            // probing what exists outside the vault. Neither
+                            // branch reaches the file's content either way.
+                            .map_err(|_| {
+                                ErrorData::invalid_params(
+                                    format!("file not found in vault: {rel}"),
+                                    None,
+                                )
+                            })?
+                        };
+
+                        tokio::fs::read_to_string(&resolved_path)
+                            .await
+                            .map(|text| CallToolResult::success(vec![ContentBlock::text(text)]))
+                            .map_err(|e| {
+                                ErrorData::invalid_params(format!("reading {rel}: {e}"), None)
+                            })
+                    }
+                    .await;
+                    (decision, result)
+                }
+                Err((decision, err)) => (decision, Err(err)),
+            };
+
+        record_audit(
+            &self.state,
+            &principal,
+            CallMeta {
+                tool: "brain_get",
+                vault,
+                args_summary,
+            },
+            decision,
+            started,
+            &result,
+        );
+        result
     }
 
     #[tool(
@@ -441,35 +693,71 @@ impl GatewayServer {
     )]
     async fn brain_search(
         &self,
+        Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<BrainSearchParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let resolved = resolve_vault_arg(&self.state, params.vault.as_deref())?;
-        let vault_path = resolved.root.as_path().to_path_buf();
-        let query = params.query.clone();
-        let top_k = params.top_k;
+        let principal = extract_principal(&parts)?;
+        let started = Instant::now();
+        let vault = params.vault.clone();
+        let args_summary = format!(
+            "search: {:?} top_k={:?} vault={:?}",
+            params.query, params.top_k, params.vault
+        );
 
-        // The gateway is a long-lived, multi-vault process: it must never
-        // open a direct `redb` engine itself, because that takes an
-        // exclusive per-vault file lock inside a process meant to serve MANY
-        // vaults concurrently — one vault's direct-engine open would starve
-        // every other vault's request against the same gateway. Search
-        // always routes through the warm per-vault daemon; a daemon-start or
-        // daemon-search failure is a hard `internal_error`, never a silent
-        // fallback to a direct engine (unlike `commands/mcp.rs`'s
-        // single-vault stdio server, which legitimately owns that fallback
-        // because it only ever holds one vault's lock for its whole process
-        // lifetime).
-        let hits = tokio::task::spawn_blocking(move || {
-            let handle = daemon_client::ensure_running(Some(&vault_path))?;
-            handle.search(&query, "hybrid", top_k, None)
-        })
-        .await
-        .map_err(|e| sanitized_internal("internal task failure", e.into()))?
-        .map_err(|e| sanitized_internal("search backend unavailable", e))?;
+        let (decision, result) =
+            match policy_gate(&self.state, &principal, "brain_search", RiskClass::ReadOnly) {
+                Ok(decision) => {
+                    let result: Result<CallToolResult, ErrorData> = async {
+                        let resolved = resolve_vault_arg(&self.state, params.vault.as_deref())?;
+                        let vault_path = resolved.root.as_path().to_path_buf();
+                        let query = params.query.clone();
+                        let top_k = params.top_k;
 
-        let body = serde_json::to_string_pretty(&hits)
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
+                        // The gateway is a long-lived, multi-vault process: it
+                        // must never open a direct `redb` engine itself,
+                        // because that takes an exclusive per-vault file lock
+                        // inside a process meant to serve MANY vaults
+                        // concurrently — one vault's direct-engine open would
+                        // starve every other vault's request against the same
+                        // gateway. Search always routes through the warm
+                        // per-vault daemon; a daemon-start or daemon-search
+                        // failure is a hard `internal_error`, never a silent
+                        // fallback to a direct engine (unlike
+                        // `commands/mcp.rs`'s single-vault stdio server, which
+                        // legitimately owns that fallback because it only
+                        // ever holds one vault's lock for its whole process
+                        // lifetime).
+                        let hits = tokio::task::spawn_blocking(move || {
+                            let handle = daemon_client::ensure_running(Some(&vault_path))?;
+                            handle.search(&query, "hybrid", top_k, None)
+                        })
+                        .await
+                        .map_err(|e| sanitized_internal("internal task failure", e.into()))?
+                        .map_err(|e| sanitized_internal("search backend unavailable", e))?;
+
+                        let body = serde_json::to_string_pretty(&hits)
+                            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                        Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
+                    }
+                    .await;
+                    (decision, result)
+                }
+                Err((decision, err)) => (decision, Err(err)),
+            };
+
+        record_audit(
+            &self.state,
+            &principal,
+            CallMeta {
+                tool: "brain_search",
+                vault,
+                args_summary,
+            },
+            decision,
+            started,
+            &result,
+        );
+        result
     }
 }
 
@@ -632,6 +920,16 @@ mod tests {
         );
     }
 
+    /// Where [`fixture_router`] (and the other fixture builders below) open
+    /// the audit log — under the SAME tempdir the caller already gets back,
+    /// at a fixed, well-known subpath (mirrors `test_auth_ctx`'s
+    /// `"gateway-auth"` convention) so a test can reopen/read it back via
+    /// `audit_log_path(dir.path())` without `fixture_router` needing to
+    /// return a fourth value.
+    fn audit_log_path(root: &Path) -> PathBuf {
+        root.join("gateway-audit")
+    }
+
     /// Builds a fixture vault (`onebrain.yml` + one dated task in
     /// `01-projects/x.md`, plus the same line fenced — which must NOT count)
     /// and a router whose gateway config names it `t1` and sets it default.
@@ -656,7 +954,8 @@ mod tests {
             vaults,
             ..GatewayConfig::default()
         };
-        let state = Arc::new(GatewayState { config });
+        let audit = AuditLog::open_at(audit_log_path(root)).unwrap();
+        let state = Arc::new(GatewayState::new(config, audit));
         let (auth_ctx, token) = test_auth_ctx(root);
         (dir, build_gateway_router(state, auth_ctx), token)
     }
@@ -860,7 +1159,8 @@ mod tests {
             vaults,
             ..GatewayConfig::default()
         };
-        let state = Arc::new(GatewayState { config });
+        let audit = AuditLog::open_at(audit_log_path(dir.path())).unwrap();
+        let state = Arc::new(GatewayState::new(config, audit));
         let (auth_ctx, token) = test_auth_ctx(dir.path());
         let router = build_gateway_router(state, auth_ctx);
 
@@ -985,7 +1285,8 @@ mod tests {
             vaults,
             ..GatewayConfig::default()
         };
-        let state = Arc::new(GatewayState { config });
+        let audit = AuditLog::open_at(audit_log_path(workspace.path())).unwrap();
+        let state = Arc::new(GatewayState::new(config, audit));
         let (auth_ctx, token) = test_auth_ctx(workspace.path());
         (workspace, build_gateway_router(state, auth_ctx), token)
     }
@@ -1287,5 +1588,253 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "/token must be public — no Authorization header was sent"
         );
+    }
+
+    // ── Gateway PR 4, Task 2: policy engine + Principal wiring ───────────
+
+    /// Like [`fixture_router`], but lets the caller override
+    /// `policy.read_only` — `fixture_router` always uses the DEFAULT policy
+    /// (`read_only: auto`), which can never exercise the `Deny`/
+    /// `NeedApproval` branches of the Task 2 wiring since all four existing
+    /// tools are `RiskClass::ReadOnly`.
+    fn fixture_router_with_read_only_policy(
+        read_only: policy::PolicyMode,
+    ) -> (tempfile::TempDir, axum::Router, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("onebrain.yml"), "folders: {}\n").unwrap();
+
+        let mut vaults = BTreeMap::new();
+        vaults.insert("t1".to_string(), root.to_path_buf());
+        let config = GatewayConfig {
+            default_vault: Some(root.to_path_buf()),
+            vaults,
+            policy: policy::PolicyConfig {
+                read_only,
+                ..policy::PolicyConfig::default()
+            },
+            ..GatewayConfig::default()
+        };
+        let audit = AuditLog::open_at(audit_log_path(root)).unwrap();
+        let state = Arc::new(GatewayState::new(config, audit));
+        let (auth_ctx, token) = test_auth_ctx(root);
+        (dir, build_gateway_router(state, auth_ctx), token)
+    }
+
+    /// Reads every JSONL line back out of the audit log opened at
+    /// `audit_log_path(root)`, across every month file present (fixture
+    /// tests are short-lived, so in practice this is always exactly one
+    /// file), parsed as loose `serde_json::Value`s in file (hence
+    /// chronological, since month files sort lexically) then line order.
+    fn read_audit_entries(root: &Path) -> Vec<serde_json::Value> {
+        let dir = audit_log_path(root);
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        files.sort();
+        files
+            .into_iter()
+            .flat_map(|f| {
+                std::fs::read_to_string(&f)
+                    .unwrap_or_default()
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// **Step 2 of the brief**: proves the `Extension<http::request::Parts>`
+    /// seam actually delivers the RIGHT `Principal` to an rmcp `#[tool]`
+    /// handler — not a shared/stale value, and not merely that the
+    /// mechanism compiles. `middleware.rs`'s own
+    /// `valid_access_token_passes_through_and_sets_principal` already
+    /// proves `Extension<Principal>` reaches a PLAIN axum handler; this is
+    /// the analogous proof for the REAL rmcp-backed `/mcp` route, which is
+    /// the load-bearing case this whole PR's policy/audit wiring depends
+    /// on.
+    ///
+    /// Mechanism: `capabilities` (the tool `Extension<http::request::Parts>`
+    /// was added to first, per the brief's ordering) is called twice on the
+    /// SAME router/service instance with two DIFFERENT bearer tokens minted
+    /// for two different `client_id`s. Each call's audit-log entry records
+    /// `principal.client_id` as read out of `parts.extensions` inside the
+    /// live handler — if the seam were broken (returning a stale, default,
+    /// or shared value), both entries would show the same `client_id`
+    /// regardless of which token was presented. They don't.
+    #[tokio::test]
+    async fn capabilities_extension_seam_delivers_the_right_principal_per_request() {
+        let (dir, router, token_a) = fixture_router();
+
+        // Mint a second access token for a DIFFERENT client against the
+        // SAME on-disk store `fixture_router`'s `test_auth_ctx` already
+        // opened at `<root>/gateway-auth` — reopening it here is simpler
+        // than threading `AuthCtx` itself out of `fixture_router`, and the
+        // store's persistence is plain file I/O (no exclusive open lock),
+        // same as `middleware.rs`'s own tests reaching under a live store
+        // via its on-disk `tokens.json`.
+        let token_b = {
+            let store = AuthStore::open_at(dir.path().join("gateway-auth")).unwrap();
+            let (access, _refresh) = store.issue_token_pair("client-b", "brain").unwrap();
+            access.token
+        };
+
+        let body_a = call_body(1, "capabilities", serde_json::json!({}));
+        let resp_a = post(
+            &router,
+            body_a,
+            &token_a,
+            &standard_headers("tools/call", Some("capabilities")),
+        )
+        .await;
+        assert!(resp_a.get("error").is_none(), "{resp_a}");
+
+        let body_b = call_body(2, "capabilities", serde_json::json!({}));
+        let resp_b = post(
+            &router,
+            body_b,
+            &token_b,
+            &standard_headers("tools/call", Some("capabilities")),
+        )
+        .await;
+        assert!(resp_b.get("error").is_none(), "{resp_b}");
+
+        let entries = read_audit_entries(dir.path());
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(
+            entries[0]["client_id"], "test-client",
+            "first call's audit entry must carry the FIRST token's own client_id: {entries:?}"
+        );
+        assert_eq!(
+            entries[1]["client_id"], "client-b",
+            "second call's audit entry must carry the SECOND token's own client_id, \
+             proving the handler read THIS request's Principal, not a stale/shared one: {entries:?}"
+        );
+    }
+
+    /// Step 3: every existing tool is `RiskClass::ReadOnly`, which defaults
+    /// to `PolicyMode::Auto` — so under the DEFAULT `gateway.yml`, a call
+    /// must behave EXACTLY as before (this task's "no behavior change"
+    /// requirement) while still producing an audit entry with
+    /// `decision: "auto"` and `outcome: "ok"`.
+    #[tokio::test]
+    async fn brain_tasks_under_default_policy_is_unchanged_and_audited_as_auto() {
+        let (dir, router, token) = fixture_router();
+        let body = call_body(
+            1,
+            "brain_tasks",
+            serde_json::json!({"due_by": "2026-12-31"}),
+        );
+        let resp = post(
+            &router,
+            body,
+            &token,
+            &standard_headers("tools/call", Some("brain_tasks")),
+        )
+        .await;
+        let out = &resp["result"]["structuredContent"];
+        assert_eq!(out["total"], 1, "{resp}");
+
+        let entries = read_audit_entries(dir.path());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["tool"], "brain_tasks");
+        assert_eq!(entries[0]["client_id"], "test-client");
+        assert_eq!(entries[0]["decision"], "auto");
+        assert_eq!(entries[0]["outcome"], "ok");
+        assert!(
+            entries[0]["args_summary"]
+                .as_str()
+                .unwrap()
+                .contains("2026-12-31"),
+            "{entries:?}"
+        );
+    }
+
+    /// A `policy.read_only: deny` config must refuse `capabilities` outright
+    /// — a JSON-RPC error, never the normal structured result — and the
+    /// audit entry must record `decision: "denied"` / `outcome: "error"`.
+    #[tokio::test]
+    async fn capabilities_is_denied_when_policy_read_only_is_deny() {
+        let (dir, router, token) = fixture_router_with_read_only_policy(policy::PolicyMode::Deny);
+        let body = call_body(1, "capabilities", serde_json::json!({}));
+        let resp = post(
+            &router,
+            body,
+            &token,
+            &standard_headers("tools/call", Some("capabilities")),
+        )
+        .await;
+        let message = resp["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a JSON-RPC error: {resp}"));
+        assert!(message.contains("policy denies"), "{message}");
+
+        let entries = read_audit_entries(dir.path());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["decision"], "denied");
+        assert_eq!(entries[0]["outcome"], "error");
+    }
+
+    /// A `policy.read_only: ask_once` config with NO prior grant must fail
+    /// closed — Task 2 wires `decide` and the audit trail, but ships no
+    /// interactive approval channel yet (that's Task 3+), so `NeedApproval`
+    /// must surface as a clear "not yet supported" client error and an
+    /// audit `decision: "blocked"`, never a silent allow and never a hang.
+    #[tokio::test]
+    async fn capabilities_is_blocked_when_policy_needs_approval_with_no_channel_available() {
+        let (dir, router, token) =
+            fixture_router_with_read_only_policy(policy::PolicyMode::AskOnce);
+        let body = call_body(1, "capabilities", serde_json::json!({}));
+        let resp = post(
+            &router,
+            body,
+            &token,
+            &standard_headers("tools/call", Some("capabilities")),
+        )
+        .await;
+        let message = resp["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a JSON-RPC error: {resp}"));
+        assert!(
+            message.contains("requires interactive approval"),
+            "{message}"
+        );
+        assert!(message.contains("does not yet support"), "{message}");
+
+        let entries = read_audit_entries(dir.path());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["decision"], "blocked");
+        assert_eq!(entries[0]["outcome"], "error");
+    }
+
+    /// End-to-end proof of the brief's scope-vs-pack requirement: a token
+    /// whose scope does NOT cover the `"brain"` pack must be denied even
+    /// though `policy.read_only` is the default, most-permissive `auto` —
+    /// the scope check in `decide` runs BEFORE the mode dispatch and wins
+    /// regardless of mode. `policy.rs`'s own `scope_mismatch_denies_even_under_auto`
+    /// unit test proves this for `decide` in isolation; this is the same
+    /// property proven through the real HTTP + rmcp tool-call path.
+    #[tokio::test]
+    async fn capabilities_is_denied_end_to_end_when_token_scope_does_not_cover_the_brain_pack() {
+        let (dir, router, _token) = fixture_router();
+        let store = AuthStore::open_at(dir.path().join("gateway-auth")).unwrap();
+        let (access, _refresh) = store.issue_token_pair("client-c", "other-pack").unwrap();
+
+        let body = call_body(1, "capabilities", serde_json::json!({}));
+        let resp = post(
+            &router,
+            body,
+            &access.token,
+            &standard_headers("tools/call", Some("capabilities")),
+        )
+        .await;
+        let message = resp["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a JSON-RPC error: {resp}"));
+        assert!(message.contains("policy denies"), "{message}");
+
+        let entries = read_audit_entries(dir.path());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["decision"], "denied");
     }
 }

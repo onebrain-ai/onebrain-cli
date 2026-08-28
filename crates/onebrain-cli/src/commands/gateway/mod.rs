@@ -26,6 +26,7 @@ pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod oauth_routes;
+pub mod policy;
 pub mod server;
 
 // `gateway_config_path` / `DEFAULT_GATEWAY_PORT` stay module-internal to
@@ -40,6 +41,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 
+use audit::AuditLog;
 use auth::AuthStore;
 use oauth_routes::AuthCtx;
 
@@ -153,7 +155,15 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
         }
     }
 
-    let state = Arc::new(GatewayState { config });
+    // Opens `~/.onebrain/gateway/audit/` (created 0700 if absent) — Task 1
+    // built this infrastructure with no external caller yet; this is its
+    // first one. A failure here (unwritable home, permission problem) fails
+    // gateway startup outright rather than silently running with no audit
+    // trail — [`AuditLog::append`] is infallible-from-the-caller's-view for
+    // a PER-ENTRY write failure (see its own doc comment), but that's a
+    // different concern from the log not being OPENABLE at all at startup.
+    let audit = AuditLog::open().context("open gateway audit log")?;
+    let state = Arc::new(GatewayState::new(config, audit));
 
     let auth_store = AuthStore::open().context("open gateway auth store")?;
     // Best-effort startup housekeeping: drop expired auth codes/tokens
