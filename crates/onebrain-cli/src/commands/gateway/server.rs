@@ -13,9 +13,11 @@
 //! back (`negotiate_protocol_version` in the vendored crate) — the pin only
 //! changes the FALLBACK, not the negotiation.
 //!
-//! This task ships two tools: `capabilities` (self-description) and
+//! This task ships four tools: `capabilities` (self-description),
 //! `brain_tasks` (open task listing, reusing `task_list.rs`'s scan/filter
-//! composition verbatim). `brain_search`/`brain_get` land in Task 3.
+//! composition verbatim), `brain_get` (traversal-guarded single-file read),
+//! and `brain_search` (daemon-routed hybrid search — see the `brain_search`
+//! doc comment for why it never falls back to a direct engine).
 //!
 //! ## Dead-code allow
 //! This task (Gateway PR 2, task 2) lands the handler and its tools, but no
@@ -27,11 +29,15 @@
 //! `#[allow]`s across every pub item a future task consumes.
 #![allow(dead_code)]
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
@@ -41,6 +47,7 @@ use onebrain_core::{
 };
 use onebrain_fs::task::{visit_tasks, TaskHit, TaskScanOptions};
 
+use crate::commands::daemon_client;
 use crate::commands::gateway::GatewayConfig;
 use crate::commands::task_list::{resolve_due_by, resolve_prefixes, TaskCollector};
 
@@ -122,6 +129,60 @@ impl From<TaskHit> for GatewayTaskHit {
     }
 }
 
+/// Params for the `brain_get` tool.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct BrainGetParams {
+    /// Vault-relative path to the note to read.
+    pub file: String,
+    /// Named vault from the gateway config; omit for the default vault.
+    pub vault: Option<String>,
+}
+
+/// Params for the `brain_search` tool.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct BrainSearchParams {
+    /// Search text.
+    pub query: String,
+    /// Named vault from the gateway config; omit for the default vault.
+    pub vault: Option<String>,
+    /// Max hits returned; omit for the daemon's own default.
+    pub top_k: Option<usize>,
+}
+
+/// Resolves a vault-relative path to an absolute, canonicalized path that is
+/// guaranteed to live under `vault_root` — the traversal guard for
+/// `brain_get`. Canonicalizing both sides (not just comparing the joined
+/// path textually) means `..` segments AND symlinks that point outside the
+/// vault are both caught: `starts_with` runs against the fully resolved
+/// target, so a symlink inside the vault pointing at `/etc/passwd` resolves
+/// to `/etc/passwd` before the check and is rejected exactly like a literal
+/// `../etc/passwd` would be.
+///
+/// Replicated — not called — from `commands/mcp.rs::resolve_under_vault`
+/// (`crates/onebrain-cli/src/commands/mcp.rs:107-124`) per the Task 3 brief:
+/// that function is a plain (non-`pub`) `fn` private to the `mcp` module, so
+/// it isn't reachable from `gateway::server` (a sibling module under
+/// `crate::commands::gateway`, not `crate::commands::mcp`). Kept logically
+/// identical to the source; only this doc comment differs.
+fn resolve_under_vault(vault_root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
+    let root = vault_root
+        .canonicalize()
+        .context("canonicalize vault root")?;
+    // Absolute `rel` inputs (e.g. `/etc/passwd`) are rejected too: `Path::join`
+    // with an absolute path discards `root` entirely and returns the absolute
+    // path unchanged, so the `starts_with(&root)` check below still catches it
+    // (the canonicalized absolute path won't start with the vault root) — but
+    // only for paths outside the vault; an absolute path that happens to fall
+    // *inside* the vault would incorrectly pass, which is why callers should
+    // always pass vault-relative paths, not attacker-controlled absolute ones.
+    let joined = root.join(rel);
+    let canon = joined
+        .canonicalize()
+        .with_context(|| format!("not found: {rel}"))?;
+    anyhow::ensure!(canon.starts_with(&root), "path escapes the vault: {rel}");
+    Ok(canon)
+}
+
 /// Maps a vault-resolution [`CoreError`] to an MCP `invalid_params` error —
 /// the human message plus the stable `E_*` code, e.g. "no OneBrain vault
 /// found by walking up from /tmp/x [E_VAULT_NOT_FOUND]".
@@ -186,7 +247,12 @@ fn default_vault_display(config: &GatewayConfig) -> Option<String> {
 /// The brain pack's own tool names, kept in one place so `capabilities`
 /// can't drift from what `#[tool_router]` actually registers.
 fn brain_pack_tools() -> Vec<String> {
-    vec!["capabilities".to_string(), "brain_tasks".to_string()]
+    vec![
+        "capabilities".to_string(),
+        "brain_tasks".to_string(),
+        "brain_get".to_string(),
+        "brain_search".to_string(),
+    ]
 }
 
 /// The full pack list `capabilities` reports. Only `brain` is enabled this
@@ -289,6 +355,79 @@ impl GatewayServer {
             total,
             vault: vault_name,
         }))
+    }
+
+    #[tool(
+        name = "brain_get",
+        description = "Read one vault note by vault-relative path. Read-only."
+    )]
+    async fn brain_get(
+        &self,
+        Parameters(params): Parameters<BrainGetParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let resolved = resolve_vault_arg(&self.state, params.vault.as_deref())?;
+        let vault_root = resolved.root.as_path().to_path_buf();
+        let rel = params.file.clone();
+
+        let resolved_path = {
+            let vault_root = vault_root.clone();
+            let rel_for_resolve = rel.clone();
+            tokio::task::spawn_blocking(move || resolve_under_vault(&vault_root, &rel_for_resolve))
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+                // Both of `resolve_under_vault`'s failure modes — canonicalize
+                // fails because nothing exists at the joined path, or it
+                // succeeds but the result escapes `vault_root` — collapse to
+                // the SAME generic message here, deliberately: a distinct
+                // "traversal blocked" vs. "genuinely missing" message would
+                // hand a caller an oracle for probing what exists outside the
+                // vault. Neither branch reaches the file's content either way.
+                .map_err(|_| {
+                    ErrorData::invalid_params(format!("file not found in vault: {rel}"), None)
+                })?
+        };
+
+        tokio::fs::read_to_string(&resolved_path)
+            .await
+            .map(|text| CallToolResult::success(vec![ContentBlock::text(text)]))
+            .map_err(|e| ErrorData::invalid_params(format!("reading {rel}: {e}"), None))
+    }
+
+    #[tool(
+        name = "brain_search",
+        description = "Search vault notes (hybrid lexical + semantic via the warm daemon). Returns scored hits with paths and snippets."
+    )]
+    async fn brain_search(
+        &self,
+        Parameters(params): Parameters<BrainSearchParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let resolved = resolve_vault_arg(&self.state, params.vault.as_deref())?;
+        let vault_path = resolved.root.as_path().to_path_buf();
+        let query = params.query.clone();
+        let top_k = params.top_k;
+
+        // The gateway is a long-lived, multi-vault process: it must never
+        // open a direct `redb` engine itself, because that takes an
+        // exclusive per-vault file lock inside a process meant to serve MANY
+        // vaults concurrently — one vault's direct-engine open would starve
+        // every other vault's request against the same gateway. Search
+        // always routes through the warm per-vault daemon; a daemon-start or
+        // daemon-search failure is a hard `internal_error`, never a silent
+        // fallback to a direct engine (unlike `commands/mcp.rs`'s
+        // single-vault stdio server, which legitimately owns that fallback
+        // because it only ever holds one vault's lock for its whole process
+        // lifetime).
+        let hits = tokio::task::spawn_blocking(move || {
+            let handle = daemon_client::ensure_running(Some(&vault_path))?;
+            handle.search(&query, "hybrid", top_k, None)
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let body = serde_json::to_string_pretty(&hits)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
     }
 }
 
@@ -535,6 +674,171 @@ mod tests {
             &router,
             body,
             &standard_headers("tools/call", Some("brain_tasks")),
+        )
+        .await;
+        let message = resp["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a JSON-RPC error: {resp}"));
+        assert!(message.contains("t1"), "{message}");
+    }
+
+    /// Sentinel content for the adversarial `brain_get` tests: a real file
+    /// planted OUTSIDE the vault whose text must never appear in any
+    /// response, no matter how the traversal is spelled.
+    const OUTSIDE_SENTINEL: &str = "TOP-SECRET-OUTSIDE-VAULT-CONTENT-DO-NOT-LEAK";
+
+    /// Like [`fixture_router`], but nests the vault one level inside the
+    /// returned `TempDir` (`<tempdir>/vault/`) and writes a sentinel file at
+    /// `<tempdir>/outside.md`, one level ABOVE the vault root — the fixture
+    /// the brief's adversarial `brain_get` tests need to prove traversal
+    /// attempts both error out AND never leak this file's content. Also
+    /// creates an empty `vault/a/` subdirectory so `a/../../outside.md`
+    /// exercises the same "canonicalizes fine, then escapes the vault" path
+    /// as `../outside.md`, rather than failing earlier for an unrelated
+    /// reason (a nonexistent `a/` component).
+    fn fixture_with_outside_file() -> (tempfile::TempDir, axum::Router) {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("vault");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("onebrain.yml"), "folders: {}\n").unwrap();
+        std::fs::write(root.join("hello.md"), "hello from inside the vault\n").unwrap();
+        std::fs::write(workspace.path().join("outside.md"), OUTSIDE_SENTINEL).unwrap();
+
+        let mut vaults = BTreeMap::new();
+        vaults.insert("t1".to_string(), root.clone());
+        let config = GatewayConfig {
+            default_vault: Some(root),
+            vaults,
+            ..GatewayConfig::default()
+        };
+        let state = Arc::new(GatewayState { config });
+        (workspace, build_gateway_router(state))
+    }
+
+    #[tokio::test]
+    async fn brain_get_round_trips_fixture_note() {
+        let (_dir, router) = fixture_with_outside_file();
+        let body = call_body(1, "brain_get", serde_json::json!({"file": "hello.md"}));
+        let resp = post(
+            &router,
+            body,
+            &standard_headers("tools/call", Some("brain_get")),
+        )
+        .await;
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no text content: {resp}"));
+        assert!(text.contains("hello from inside the vault"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn brain_get_unknown_file_is_invalid_params() {
+        let (_dir, router) = fixture_with_outside_file();
+        let body = call_body(1, "brain_get", serde_json::json!({"file": "nope.md"}));
+        let resp = post(
+            &router,
+            body,
+            &standard_headers("tools/call", Some("brain_get")),
+        )
+        .await;
+        let message = resp["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a JSON-RPC error: {resp}"));
+        assert!(message.contains("file not found in vault"), "{message}");
+    }
+
+    /// Adversarial: `../outside.md` — a single `..` segment climbing out of
+    /// the vault root to a real, existing file. Must error AND must not leak
+    /// the sentinel content anywhere in the JSON-RPC response.
+    #[tokio::test]
+    async fn brain_get_rejects_parent_traversal_without_leaking() {
+        let (_dir, router) = fixture_with_outside_file();
+        let body = call_body(1, "brain_get", serde_json::json!({"file": "../outside.md"}));
+        let resp = post(
+            &router,
+            body,
+            &standard_headers("tools/call", Some("brain_get")),
+        )
+        .await;
+        assert!(
+            resp.get("error").is_some(),
+            "expected a JSON-RPC error: {resp}"
+        );
+        assert!(
+            !resp.to_string().contains(OUTSIDE_SENTINEL),
+            "sentinel content leaked: {resp}"
+        );
+    }
+
+    /// Adversarial: an absolute path. `resolve_under_vault` (mirroring
+    /// `mcp.rs`) discards the vault root when joining an absolute `rel`, so
+    /// this must be caught by the post-canonicalize `starts_with` check —
+    /// must error AND must not leak `/etc/hosts`'s actual contents.
+    #[tokio::test]
+    async fn brain_get_rejects_absolute_path_without_leaking() {
+        let (_dir, router) = fixture_with_outside_file();
+        let body = call_body(1, "brain_get", serde_json::json!({"file": "/etc/hosts"}));
+        let resp = post(
+            &router,
+            body,
+            &standard_headers("tools/call", Some("brain_get")),
+        )
+        .await;
+        assert!(
+            resp.get("error").is_some(),
+            "expected a JSON-RPC error: {resp}"
+        );
+        // /etc/hosts commonly contains this line on macOS/Linux runners; its
+        // presence in the response would mean the file's content leaked.
+        assert!(
+            !resp.to_string().contains("127.0.0.1"),
+            "content leaked: {resp}"
+        );
+    }
+
+    /// Adversarial: a nested `..` traversal through a real intermediate
+    /// directory (`a/../../outside.md`) landing on the same outside file as
+    /// the plain `../outside.md` case. Must error AND must not leak.
+    #[tokio::test]
+    async fn brain_get_rejects_nested_traversal_without_leaking() {
+        let (_dir, router) = fixture_with_outside_file();
+        let body = call_body(
+            1,
+            "brain_get",
+            serde_json::json!({"file": "a/../../outside.md"}),
+        );
+        let resp = post(
+            &router,
+            body,
+            &standard_headers("tools/call", Some("brain_get")),
+        )
+        .await;
+        assert!(
+            resp.get("error").is_some(),
+            "expected a JSON-RPC error: {resp}"
+        );
+        assert!(
+            !resp.to_string().contains(OUTSIDE_SENTINEL),
+            "sentinel content leaked: {resp}"
+        );
+    }
+
+    /// `brain_search` with an unknown vault name errors out of
+    /// `resolve_vault_arg` before any daemon interaction — exercises the
+    /// shared resolver's error path without spawning a daemon (the
+    /// daemon-backed happy path is Task 4's binary integration test).
+    #[tokio::test]
+    async fn brain_search_unknown_vault_names_known_vaults_in_the_error() {
+        let (_dir, router) = fixture_router();
+        let body = call_body(
+            1,
+            "brain_search",
+            serde_json::json!({"query": "anything", "vault": "nope"}),
+        );
+        let resp = post(
+            &router,
+            body,
+            &standard_headers("tools/call", Some("brain_search")),
         )
         .await;
         let message = resp["error"]["message"]
