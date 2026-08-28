@@ -782,10 +782,30 @@ fn append_query(base: &str, pairs: &[(&str, &str)]) -> String {
 /// Wrap an HTML string in a response with the given status. Mirrors
 /// `server/static.rs`'s own `html_response` (private to that module, hence
 /// not reused directly) — same `text/html; charset=utf-8` content type.
+///
+/// **Clickjacking defense in depth (Task 4 security review, binding on this
+/// task):** every response through here also carries `X-Frame-Options: DENY`
+/// and a restrictive `Content-Security-Policy: default-src 'none'`. This is
+/// the ONLY human-facing HTML surface the gateway serves — the consent page
+/// ([`render_consent_form`]) is where a real person types their pairing code
+/// and clicks "Authorize", exactly the interaction an attacker would frame
+/// and clickjack to submit on the victim's behalf. `default-src 'none'` (not
+/// a narrower directive list) is safe here because the page has no inline
+/// `<style>`/`<script>`/images/fonts to allow — see the `xss_*`/`csp_*` tests
+/// below, which would fail loudly if a future edit added one without
+/// updating this policy. Both handlers that render through
+/// [`html_response`] ([`render_consent_form`] and [`error_page`]) get the
+/// headers for free from this one call site rather than each setting them
+/// separately, so there is no way for a future edit to add a THIRD
+/// `html_response` caller here and forget them.
 fn html_response(status: StatusCode, html: String) -> Response {
     (
         status,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::CONTENT_SECURITY_POLICY, "default-src 'none'"),
+        ],
         html,
     )
         .into_response()
@@ -2289,6 +2309,61 @@ mod tests {
             "hidden state field missing: {body}"
         );
         assert!(body.contains("Claude"), "{body}");
+    }
+
+    /// SECURITY (binding, Task 4 security review — see [`html_response`]'s
+    /// doc comment): both HTML-rendering paths through this file — the
+    /// consent form AND the in-page error — must carry `X-Frame-Options:
+    /// DENY` and a restrictive `Content-Security-Policy`, so this one HTML
+    /// surface can't be framed for clickjacking. Checks the consent form (a
+    /// happy-path GET) and the error page (an unknown-`client_id` 400) in
+    /// one test since both go through the SAME `html_response` call site —
+    /// proving one proves the other, but asserting both here means a future
+    /// edit that special-cases either path would still be caught.
+    #[tokio::test]
+    async fn authorize_html_responses_carry_frame_and_csp_headers() {
+        let (_dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+
+        let params = valid_params(&client_id, "https://claude.ai/cb", "s1");
+        let consent_resp = get_authorize(&router, &params).await;
+        assert_eq!(consent_resp.status(), StatusCode::OK);
+        assert_eq!(
+            consent_resp
+                .headers()
+                .get(header::X_FRAME_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("DENY"),
+            "consent form must set X-Frame-Options: DENY"
+        );
+        assert_eq!(
+            consent_resp
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some("default-src 'none'"),
+            "consent form must set a restrictive Content-Security-Policy"
+        );
+
+        let bad_params = valid_params("does-not-exist", "https://claude.ai/cb", "s1");
+        let error_resp = get_authorize(&router, &bad_params).await;
+        assert_eq!(error_resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error_resp
+                .headers()
+                .get(header::X_FRAME_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("DENY"),
+            "error page must set X-Frame-Options: DENY"
+        );
+        assert_eq!(
+            error_resp
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some("default-src 'none'"),
+            "error page must set a restrictive Content-Security-Policy"
+        );
     }
 
     /// SECURITY (binding): a `client_name`/`state` of

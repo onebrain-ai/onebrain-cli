@@ -1,5 +1,5 @@
 //! `onebrain gateway` — loopback MCP-over-HTTP run loop (Gateway PR 2, Task 4;
-//! OAuth resource/authorization-server wiring added Gateway PR 3, Task 2).
+//! OAuth resource/authorization-server wiring added Gateway PR 3, Tasks 2-6).
 //!
 //! `run` wires together `load_gateway_config` + `build_gateway_router` and
 //! hosts the result via [`crate::server::run_server_from_router`] — the SAME
@@ -16,6 +16,11 @@
 //! `on_bind`, after the listener is confirmed up
 //! (`run_server_from_router`'s #278 ordering — see `server/mod.rs:368`), so
 //! every request that reaches a handler observes a set issuer.
+//!
+//! `pair` (Task 6) is the standalone counterpart: it opens the same
+//! `AuthStore` WITHOUT starting a server, so a user can read or rotate the
+//! pairing code from a second terminal — whether or not `gateway run` is
+//! currently up.
 
 pub mod auth;
 pub mod config;
@@ -124,6 +129,40 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
         };
         run_server_from_router(router, addr, on_bind, shutdown).await
     })
+}
+
+/// `onebrain gateway pair [--rotate]`.
+///
+/// Opens the SAME on-disk auth store `run` opens (`AuthStore::open()` —
+/// `~/.onebrain/gateway/pairing.json`), then either reads the current
+/// pairing code (minting one on first call, per [`AuthStore::pairing_code`])
+/// or mints a fresh one in its place (per [`AuthStore::rotate_pairing_code`],
+/// which immediately invalidates the old code) when `--rotate` is given, and
+/// prints the result to stdout — the same channel `run`'s own startup line
+/// uses, and per that module's doc comment, the ONLY place a pairing code is
+/// ever shown (never logged, never returned over HTTP). This lets a user
+/// re-read or rotate the code from a second terminal without restarting (or
+/// even having running) `gateway run` — the pairing code lives in the store,
+/// not in the running process's memory.
+///
+/// `mode` is unused for the same reason `run`'s `_mode` is: this stdout line
+/// is a stable, single-purpose contract, not a structured `--json`/`--yaml`
+/// payload. Accepted for signature parity with `run` and every other verb
+/// handler `dispatch.rs` calls uniformly.
+pub fn pair(_mode: &OutputMode, rotate: bool) -> anyhow::Result<()> {
+    let auth_store = AuthStore::open().context("open gateway auth store")?;
+    if rotate {
+        let code = auth_store
+            .rotate_pairing_code()
+            .context("rotate gateway pairing code")?;
+        println!("pairing code rotated: {code}");
+    } else {
+        let code = auth_store
+            .pairing_code()
+            .context("mint/read gateway pairing code")?;
+        println!("pairing code: {code}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
