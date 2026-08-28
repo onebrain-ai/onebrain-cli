@@ -52,7 +52,10 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::auth::{mint_secret_32, now_epoch_secs, AppType, AuthStore, RegisteredClient};
+use super::auth::{
+    mint_secret_32, now_epoch_secs, pkce_s256_matches, AppType, AuthStore, RegisteredClient,
+    RotateOutcome, TokenRecord, ACCESS_TTL_SECS,
+};
 
 /// Pairing-attempt rate-limiter state: 5 consecutive wrong pairing-code
 /// submissions → 60s lockout, enforced by [`authorize_post_handler`] through
@@ -1052,6 +1055,267 @@ pub fn authorize_router(ctx: Arc<AuthCtx>) -> Router {
             "/authorize",
             get(authorize_get_handler).post(authorize_post_handler),
         )
+        .with_state(ctx)
+}
+
+// ── /token — code exchange + refresh rotation (Task 5) ──────────────────────
+
+/// `POST {issuer}/token` request body — RFC 6749 §4.1.3 (authorization_code)
+/// / §6 (refresh_token). Every field is `Option<String>` (`#[serde(default)]`)
+/// even though several are REQUIRED for a given `grant_type` — same rationale
+/// as [`RegisterRequest`]/[`AuthorizeParams`]: "required" is enforced by this
+/// handler's own logic (see [`token_authorization_code_grant`]), not by the
+/// type, so a missing field never leaks axum's generic extractor-rejection
+/// body instead of this endpoint's own error shape.
+#[derive(Debug, Deserialize, Default)]
+struct TokenRequest {
+    #[serde(default)]
+    grant_type: Option<String>,
+    // authorization_code grant fields.
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    redirect_uri: Option<String>,
+    #[serde(default)]
+    code_verifier: Option<String>,
+    #[serde(default)]
+    resource: Option<String>,
+    // refresh_token grant field.
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
+
+/// `POST {issuer}/token` success body — RFC 6749 §5.1, the EXACT shape from
+/// the brief (field order here IS the emitted JSON key order, same
+/// `serde_json` preserves-struct-order convention [`RegisterResponse`]
+/// relies on). Shared by both grant types — each just hands it the fresh
+/// `(access, refresh)` pair its own store call minted.
+#[derive(Debug, Serialize)]
+struct TokenResponse {
+    access_token: String,
+    token_type: &'static str,
+    expires_in: u64,
+    refresh_token: String,
+    scope: String,
+}
+
+impl TokenResponse {
+    fn from_pair(access: &TokenRecord, refresh: &TokenRecord) -> Response {
+        (
+            StatusCode::OK,
+            Json(TokenResponse {
+                access_token: access.token.clone(),
+                token_type: "Bearer",
+                expires_in: ACCESS_TTL_SECS,
+                refresh_token: refresh.token.clone(),
+                scope: access.scope.clone(),
+            }),
+        )
+            .into_response()
+    }
+}
+
+/// `POST {issuer}/token` error body — the bare RFC 6749 §5.2 shape
+/// (`{"error": "..."}`), deliberately WITHOUT an `error_description` field
+/// (unlike [`OAuthErrorBody`], which `/register` uses). The binding
+/// uniform-failure requirement (see [`token_authorization_code_grant`]'s doc
+/// comment) is that every authorization_code-grant failure — unknown/
+/// expired/reused code, a client_id/redirect_uri/resource mismatch, a bad
+/// PKCE verifier, even a missing required parameter — produces the IDENTICAL
+/// body with nothing that could distinguish which check failed. The simplest
+/// way to guarantee that for good is to not have a describable-text field to
+/// accidentally diverge in the first place. [`token_refresh_grant`] and the
+/// `grant_type` dispatch in [`token_handler`] reuse this same bare shape for
+/// the same reason, even though their RFC 6749 §5.2 codes
+/// (`unsupported_grant_type`) aren't literally covered by that uniformity
+/// requirement — one error body type for this whole endpoint is simpler and
+/// leaves no room for a future edit to quietly reintroduce a leaky
+/// description on just one branch.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct TokenErrorBody {
+    error: &'static str,
+}
+
+fn token_error(status: StatusCode, code: &'static str) -> Response {
+    (status, Json(TokenErrorBody { error: code })).into_response()
+}
+
+/// The authorization_code grant (RFC 6749 §4.1.3). Synchronous (no `.await`
+/// anywhere in this call tree) so the ENTIRE operation — `consume_code`,
+/// the binding/PKCE checks, `issue_token_pair`, and (on the replay path)
+/// `find_code_record`/`revoke_family` — runs under ONE `ctx.store.lock()`
+/// acquisition, satisfying the binding "hold the lock across the full
+/// read-modify-write" discipline (`AuthCtx`'s doc comment) for the whole
+/// grant, not just its individual store calls.
+///
+/// Order of operations matters for two binding properties:
+/// 1. `consume_code` runs UNCONDITIONALLY FIRST, before any binding/PKCE
+///    check — a code is single-use the moment it's presented, regardless of
+///    whether the rest of the request turns out to be valid (this is what
+///    makes "wrong verifier → invalid_grant AND the code is now dead" true:
+///    RFC 6749 intends a presented code to be spent on presentation, not
+///    only on a successful exchange).
+/// 2. Every subsequent failure — client_id mismatch, redirect_uri mismatch,
+///    resource mismatch (checked only when the request itself sent one —
+///    RFC 8707 `resource` is optional at each step), PKCE mismatch — is
+///    combined into ONE boolean and checked with a SINGLE `if` / SINGLE
+///    return statement ([`token_error`] call), rather than four separate
+///    early-return branches. There is exactly one line in this function that
+///    can produce the `invalid_grant` response for a bindings failure, so
+///    there is no way for two different causes to accidentally diverge in
+///    status/body — the uniform-failure, no-oracle contract (task brief) by
+///    construction, not by discipline.
+///
+/// Replay hardening (RFC 6749 §4.1.2 SHOULD): when `consume_code` fails,
+/// this checks — READ-ONLY, via [`super::auth::store::AuthStore::find_code_record`]
+/// — whether the failure was because the code was already `used` (a genuine
+/// replay) as opposed to unknown/never-issued/expired-but-never-used. Only
+/// in the replay case, and only if that earlier successful redemption
+/// actually minted a token family ([`AuthCode::minted_family`], stamped by
+/// [`Self`]'s own success path below via `mark_code_minted_family`), does it
+/// revoke that family. This distinction is used ONLY to decide the internal
+/// side effect — the HTTP response is [`token_error`]'s identical
+/// `invalid_grant` body no matter which of these branches fired.
+fn token_authorization_code_grant(ctx: &AuthCtx, req: &TokenRequest) -> Response {
+    let code = req.code.as_deref().unwrap_or_default();
+    let client_id = req.client_id.as_deref().unwrap_or_default();
+    let redirect_uri = req.redirect_uri.as_deref().unwrap_or_default();
+    let code_verifier = req.code_verifier.as_deref().unwrap_or_default();
+
+    let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
+
+    let consumed = match store.consume_code(code) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "auth code store I/O error during /token");
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "internal error redeeming authorization code",
+            );
+        }
+    };
+
+    let Some(auth_code) = consumed else {
+        // Replay hardening — see the doc comment above. Every branch below
+        // still ends at the exact same `token_error(... "invalid_grant")`
+        // call; only the internal side effect differs.
+        if let Ok(Some(record)) = store.find_code_record(code) {
+            if record.used {
+                if let Some(family) = &record.minted_family {
+                    // Best-effort: a failure here would already be a store
+                    // I/O problem `consume_code` above would also have hit,
+                    // and there is nothing more specific to tell the caller
+                    // either way (still `invalid_grant`).
+                    let _ = store.revoke_family(family);
+                }
+            }
+        }
+        return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    };
+
+    let bindings_ok = client_id == auth_code.client_id
+        && redirect_uri == auth_code.redirect_uri
+        && match req.resource.as_deref() {
+            None => true,
+            Some(r) => r == auth_code.resource,
+        }
+        && pkce_s256_matches(code_verifier, &auth_code.code_challenge);
+
+    if !bindings_ok {
+        return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
+
+    match store.issue_token_pair(&auth_code.client_id, &auth_code.scope) {
+        Ok((access, refresh)) => {
+            // Link this code to the family it minted so a LATER replay can
+            // find and revoke it (see the doc comment above). Best-effort:
+            // the tokens are already valid and returned to the caller either
+            // way; failing to record this link only weakens hardening
+            // against a FUTURE replay of an already-spent code, it never
+            // wrongly trusts anything.
+            let _ = store.mark_code_minted_family(&auth_code.code, &refresh.family);
+            TokenResponse::from_pair(&access, &refresh)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to persist minted token pair");
+            oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "failed to issue tokens",
+            )
+        }
+    }
+}
+
+/// The refresh_token grant (RFC 6749 §6). `rotate_refresh` already performs
+/// the ENTIRE reuse-detection cascade (spend the presented token, mint a
+/// fresh pair in the same family, OR burn the whole family on replay)
+/// atomically under its own single `ctx.store.lock()` acquisition inside
+/// [`super::auth::store::AuthStore::rotate_refresh`] — there is exactly one
+/// store call here, so the "hold the lock across the full read-modify-write"
+/// discipline is already satisfied by that call alone.
+///
+/// `ReuseDetected` and `Invalid` deliberately share ONE match arm: both are
+/// "this refresh token doesn't work", and RFC 6749 §5.2's `invalid_grant`
+/// covers both without distinguishing "reused" from "just wrong" to the
+/// caller — the same no-oracle posture as the authorization_code grant
+/// above, even though `rotate_refresh` itself (correctly) tells the two
+/// apart internally to decide whether to burn the family.
+fn token_refresh_grant(ctx: &AuthCtx, req: &TokenRequest) -> Response {
+    let refresh_token = req.refresh_token.as_deref().unwrap_or_default();
+    let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
+    match store.rotate_refresh(refresh_token) {
+        Ok(RotateOutcome::Rotated { access, refresh }) => {
+            TokenResponse::from_pair(&access, &refresh)
+        }
+        Ok(RotateOutcome::ReuseDetected | RotateOutcome::Invalid) => {
+            token_error(StatusCode::BAD_REQUEST, "invalid_grant")
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "refresh token store I/O error during /token");
+            oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "internal error rotating refresh token",
+            )
+        }
+    }
+}
+
+/// `POST {issuer}/token` — RFC 6749 §4.1.3 (authorization_code) / §6
+/// (refresh_token). No Bearer gate (see the module docs: the client
+/// authenticates itself via the code+PKCE pair or a refresh token here — it
+/// doesn't have a bearer token yet, that's the whole point of this
+/// endpoint).
+///
+/// Content-Type: `application/x-www-form-urlencoded` ONLY (RFC 6749 §4.1.3
+/// — distinct from `/register`'s JSON body). Enforced by the [`Form`]
+/// extractor itself: axum answers `415 Unsupported Media Type` before this
+/// function body ever runs for any other content type (including no
+/// `Content-Type` header at all) — see `axum::extract::Form`'s
+/// `FromRequest` impl, which rejects on content type before attempting to
+/// parse a body. There is no bespoke content-type check to write or get
+/// wrong here.
+async fn token_handler(State(ctx): State<Arc<AuthCtx>>, Form(req): Form<TokenRequest>) -> Response {
+    match req.grant_type.as_deref() {
+        Some("authorization_code") => token_authorization_code_grant(&ctx, &req),
+        Some("refresh_token") => token_refresh_grant(&ctx, &req),
+        _ => token_error(StatusCode::BAD_REQUEST, "unsupported_grant_type"),
+    }
+}
+
+/// The `POST /token` route as its own small `Router` — mirrors
+/// [`register_router`]/[`authorize_router`]'s shape (state applied here,
+/// fully self-contained) so `server::build_gateway_router` can `.merge()` it
+/// in without ever routing it through
+/// [`super::auth::middleware::require_bearer`]: a client exchanging a code
+/// or refresh token for its FIRST/NEXT bearer token cannot present one yet.
+pub fn token_router(ctx: Arc<AuthCtx>) -> Router {
+    Router::new()
+        .route("/token", post(token_handler))
         .with_state(ctx)
 }
 
@@ -2282,5 +2546,612 @@ mod tests {
         let params = valid_params(&client_id, "https://claude.ai/cb", "s1");
         let resp = get_authorize(&router, &params).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── POST /token (Task 5) ──────────────────────────────────────────────
+
+    use super::super::auth::require_bearer;
+    use super::super::auth::AuthCode;
+
+    /// RFC 7636 Appendix B verifier — pairs with `CODE_CHALLENGE` above
+    /// (the SAME appendix's challenge, already used by the `/authorize`
+    /// tests). This is the exact vector `core::tests::RFC7636_VERIFIER` uses.
+    const CODE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+    /// Mint a real, store-backed single-use auth code directly via
+    /// [`AuthStore::issue_code`] (bypassing the HTTP `/authorize` consent
+    /// flow, which Task 4's own test suite already covers end-to-end) —
+    /// bound to `client_id`/`redirect_uri`/[`CODE_CHALLENGE`]/`resource`/
+    /// `scope`, exactly as a real `/authorize` exchange would produce.
+    fn issue_test_code(
+        ctx: &AuthCtx,
+        client_id: &str,
+        redirect_uri: &str,
+        resource: &str,
+        scope: &str,
+    ) -> String {
+        ctx.store
+            .lock()
+            .unwrap()
+            .issue_code(client_id, redirect_uri, CODE_CHALLENGE, resource, scope)
+            .unwrap()
+            .code
+    }
+
+    async fn post_token(router: &Router, pairs: &[(&str, &str)]) -> Response {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/token")
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(Body::from(build_query(pairs)))
+            .unwrap();
+        router.clone().oneshot(req).await.unwrap()
+    }
+
+    async fn body_json(resp: Response) -> Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            panic!(
+                "response was not JSON ({e}): {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
+    }
+
+    /// Write an `AuthCode` directly into `codes.json` under `root` (the
+    /// `AuthStore`'s own root, e.g. `dir.path().join("auth")`), bypassing
+    /// `issue_code`'s fixed TTL — mirrors `store.rs`'s own
+    /// `expired_code_is_rejected` test pattern (and this file's own
+    /// `post_authorize_tampered_redirect_uri...` test, which reads this same
+    /// file) so an expired-code test doesn't need to sleep past a real
+    /// 10-minute window. `AuthStore` deliberately has no public "expire a
+    /// code" API (same reasoning `middleware.rs`'s
+    /// `expired_access_token_401_invalid_token` test gives for tokens.json).
+    fn write_code_direct(root: &std::path::Path, code: &AuthCode) {
+        let path = root.join("codes.json");
+        let mut map: std::collections::BTreeMap<String, AuthCode> = if path.exists() {
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+        } else {
+            std::collections::BTreeMap::new()
+        };
+        map.insert(code.code.clone(), code.clone());
+        std::fs::write(&path, serde_json::to_vec_pretty(&map).unwrap()).unwrap();
+    }
+
+    /// Step 1 happy path (brief): a real minted code + the RFC 7636 vector
+    /// pair → 200 with the exact response shape, AND the code is now dead
+    /// (single-use) even though the first exchange succeeded.
+    #[tokio::test]
+    async fn token_authorization_code_happy_path_issues_pair_and_consumes_code() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx.clone());
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+        let resource = format!("{}/mcp", ctx.issuer());
+        let code = issue_test_code(&ctx, &client_id, "https://claude.ai/cb", &resource, "brain");
+
+        let pairs = [
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", "https://claude.ai/cb"),
+            ("code_verifier", CODE_VERIFIER),
+        ];
+        let resp = post_token(&router, &pairs).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["token_type"], "Bearer");
+        assert_eq!(body["expires_in"], 3600);
+        assert_eq!(body["scope"], "brain");
+        assert!(body["access_token"].as_str().unwrap().len() >= 40, "{body}");
+        assert!(
+            body["refresh_token"].as_str().unwrap().len() >= 40,
+            "{body}"
+        );
+        assert_ne!(body["access_token"], body["refresh_token"]);
+
+        // Single-use: the SAME code, even with everything else correct
+        // again, must now fail.
+        let resp2 = post_token(&router, &pairs).await;
+        assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp2).await, json!({"error": "invalid_grant"}));
+    }
+
+    /// RFC 8707 `resource` omitted from the `/token` request entirely — must
+    /// still succeed (the happy-path test above already covers this
+    /// implicitly by never sending `resource`, but this test makes the
+    /// "checked only when present" contract explicit and pins it against
+    /// regression).
+    #[tokio::test]
+    async fn token_resource_omitted_from_request_still_succeeds() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx.clone());
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+        let resource = format!("{}/mcp", ctx.issuer());
+        let code = issue_test_code(&ctx, &client_id, "https://claude.ai/cb", &resource, "brain");
+
+        let resp = post_token(
+            &router,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", &client_id),
+                ("redirect_uri", "https://claude.ai/cb"),
+                ("code_verifier", CODE_VERIFIER),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Wrong `code_verifier` → `invalid_grant`, AND the code is consumed by
+    /// that failed attempt — a legitimate client retrying with the RIGHT
+    /// verifier afterward must ALSO get `invalid_grant` (single-use is
+    /// enforced on presentation, not on successful verification).
+    #[tokio::test]
+    async fn token_wrong_verifier_is_invalid_grant_and_consumes_the_code() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx.clone());
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+        let resource = format!("{}/mcp", ctx.issuer());
+        let code = issue_test_code(&ctx, &client_id, "https://claude.ai/cb", &resource, "brain");
+
+        let resp = post_token(
+            &router,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", &client_id),
+                ("redirect_uri", "https://claude.ai/cb"),
+                ("code_verifier", "totally-wrong-verifier-value-not-matching"),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await, json!({"error": "invalid_grant"}));
+
+        let retry = post_token(
+            &router,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", &client_id),
+                ("redirect_uri", "https://claude.ai/cb"),
+                ("code_verifier", CODE_VERIFIER),
+            ],
+        )
+        .await;
+        assert_eq!(
+            retry.status(),
+            StatusCode::BAD_REQUEST,
+            "the code must already be dead from the failed attempt above"
+        );
+        assert_eq!(body_json(retry).await, json!({"error": "invalid_grant"}));
+    }
+
+    #[tokio::test]
+    async fn token_client_id_mismatch_is_invalid_grant() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx.clone());
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+        let resource = format!("{}/mcp", ctx.issuer());
+        let code = issue_test_code(&ctx, &client_id, "https://claude.ai/cb", &resource, "brain");
+
+        let resp = post_token(
+            &router,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", "some-other-client-id"),
+                ("redirect_uri", "https://claude.ai/cb"),
+                ("code_verifier", CODE_VERIFIER),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await, json!({"error": "invalid_grant"}));
+    }
+
+    #[tokio::test]
+    async fn token_redirect_uri_mismatch_is_invalid_grant() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx.clone());
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+        let resource = format!("{}/mcp", ctx.issuer());
+        let code = issue_test_code(&ctx, &client_id, "https://claude.ai/cb", &resource, "brain");
+
+        let resp = post_token(
+            &router,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", &client_id),
+                ("redirect_uri", "https://attacker.example/cb"),
+                ("code_verifier", CODE_VERIFIER),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await, json!({"error": "invalid_grant"}));
+    }
+
+    #[tokio::test]
+    async fn token_resource_mismatch_when_present_is_invalid_grant() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx.clone());
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+        let resource = format!("{}/mcp", ctx.issuer());
+        let code = issue_test_code(&ctx, &client_id, "https://claude.ai/cb", &resource, "brain");
+
+        let resp = post_token(
+            &router,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", &client_id),
+                ("redirect_uri", "https://claude.ai/cb"),
+                ("code_verifier", CODE_VERIFIER),
+                ("resource", "http://evil.example/mcp"),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await, json!({"error": "invalid_grant"}));
+    }
+
+    #[tokio::test]
+    async fn token_unknown_code_is_invalid_grant_no_crash() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx.clone());
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+
+        let resp = post_token(
+            &router,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", "this-code-was-never-issued"),
+                ("client_id", &client_id),
+                ("redirect_uri", "https://claude.ai/cb"),
+                ("code_verifier", CODE_VERIFIER),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await, json!({"error": "invalid_grant"}));
+    }
+
+    #[tokio::test]
+    async fn token_expired_code_is_invalid_grant() {
+        let (dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx.clone());
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+        let resource = format!("{}/mcp", ctx.issuer());
+
+        let expired = AuthCode {
+            code: "expired-token-test-code".to_string(),
+            client_id: client_id.clone(),
+            redirect_uri: "https://claude.ai/cb".to_string(),
+            code_challenge: CODE_CHALLENGE.to_string(),
+            resource,
+            scope: "brain".to_string(),
+            expires: now_epoch_secs().saturating_sub(1),
+            used: false,
+            minted_family: None,
+        };
+        write_code_direct(&dir.path().join("auth"), &expired);
+
+        let resp = post_token(
+            &router,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &expired.code),
+                ("client_id", &client_id),
+                ("redirect_uri", "https://claude.ai/cb"),
+                ("code_verifier", CODE_VERIFIER),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await, json!({"error": "invalid_grant"}));
+    }
+
+    /// The RFC 6749 §4.1.2 SHOULD hardening: replaying an ALREADY-USED code
+    /// must revoke every token that first (successful) redemption minted —
+    /// proven here by checking the earlier access token via `check_access`
+    /// after the replay.
+    #[tokio::test]
+    async fn token_reused_code_revokes_previously_issued_tokens() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx.clone());
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+        let resource = format!("{}/mcp", ctx.issuer());
+        let code = issue_test_code(&ctx, &client_id, "https://claude.ai/cb", &resource, "brain");
+
+        let pairs = [
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", "https://claude.ai/cb"),
+            ("code_verifier", CODE_VERIFIER),
+        ];
+        let resp1 = post_token(&router, &pairs).await;
+        assert_eq!(resp1.status(), StatusCode::OK);
+        let body1 = body_json(resp1).await;
+        let access_token = body1["access_token"].as_str().unwrap().to_string();
+
+        assert!(
+            ctx.store
+                .lock()
+                .unwrap()
+                .check_access(&access_token)
+                .unwrap()
+                .is_some(),
+            "sanity: the first-issued access token must be live before the replay"
+        );
+
+        // Replay the SAME (already-used) code.
+        let resp2 = post_token(&router, &pairs).await;
+        assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp2).await, json!({"error": "invalid_grant"}));
+
+        assert!(
+            ctx.store
+                .lock()
+                .unwrap()
+                .check_access(&access_token)
+                .unwrap()
+                .is_none(),
+            "access token from the original exchange must be revoked after a code replay"
+        );
+    }
+
+    /// Refresh rotation chain of 3: each rotation mints a brand-new
+    /// refresh token, and the OLD one is dead the moment the new one exists.
+    #[tokio::test]
+    async fn token_refresh_rotation_chain_of_three() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx.clone());
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+        let resource = format!("{}/mcp", ctx.issuer());
+        let code = issue_test_code(&ctx, &client_id, "https://claude.ai/cb", &resource, "brain");
+
+        let resp = post_token(
+            &router,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", &client_id),
+                ("redirect_uri", "https://claude.ai/cb"),
+                ("code_verifier", CODE_VERIFIER),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut refresh = body_json(resp).await["refresh_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(refresh.clone());
+
+        for i in 0..3 {
+            let resp = post_token(
+                &router,
+                &[("grant_type", "refresh_token"), ("refresh_token", &refresh)],
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "rotation {i}");
+            let body = body_json(resp).await;
+            assert_eq!(body["token_type"], "Bearer");
+            assert_eq!(body["expires_in"], 3600);
+            let new_refresh = body["refresh_token"].as_str().unwrap().to_string();
+            assert!(
+                seen.insert(new_refresh.clone()),
+                "rotation {i} must mint a NEW refresh token, not repeat one"
+            );
+            // NOTE: deliberately NOT replaying `refresh` here — reuse of an
+            // already-rotated token correctly burns the WHOLE family (see
+            // `token_refresh_reuse_kills_whole_family_access_becomes_401`,
+            // which proves exactly that), which would kill `new_refresh`
+            // too and break this chain. That is a SEPARATE property from
+            // "does a straight-line chain of legitimate rotations keep
+            // working", which is what this test is for.
+
+            refresh = new_refresh;
+        }
+    }
+
+    /// Reuse of an already-rotated refresh token kills the WHOLE family —
+    /// including the original access token from the very first exchange —
+    /// and the response is the identical `invalid_grant` uniform failure.
+    /// The dead access token is checked through the REAL `require_bearer`
+    /// middleware (not just `check_access` directly) to prove it is
+    /// genuinely 401-class over HTTP, not merely flipped in the store.
+    #[tokio::test]
+    async fn token_refresh_reuse_kills_whole_family_access_becomes_401() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx.clone());
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+        let resource = format!("{}/mcp", ctx.issuer());
+        let code = issue_test_code(&ctx, &client_id, "https://claude.ai/cb", &resource, "brain");
+
+        let resp = post_token(
+            &router,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", &client_id),
+                ("redirect_uri", "https://claude.ai/cb"),
+                ("code_verifier", CODE_VERIFIER),
+            ],
+        )
+        .await;
+        let body = body_json(resp).await;
+        let original_access = body["access_token"].as_str().unwrap().to_string();
+        let refresh1 = body["refresh_token"].as_str().unwrap().to_string();
+
+        // Legitimate rotation #1.
+        let resp2 = post_token(
+            &router,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh1),
+            ],
+        )
+        .await;
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let body2 = body_json(resp2).await;
+        let refresh2 = body2["refresh_token"].as_str().unwrap().to_string();
+        assert_ne!(refresh1, refresh2);
+
+        // Replay the NOW-SPENT refresh1 — attacker (or a losing race).
+        let resp3 = post_token(
+            &router,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh1),
+            ],
+        )
+        .await;
+        assert_eq!(resp3.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp3).await, json!({"error": "invalid_grant"}));
+
+        // The legitimately-rotated refresh2 must ALSO be dead now (whole
+        // family burned, not just refresh1's own descendants blocked).
+        let resp4 = post_token(
+            &router,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh2),
+            ],
+        )
+        .await;
+        assert_eq!(resp4.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp4).await, json!({"error": "invalid_grant"}));
+
+        // And the ORIGINAL access token from the very first exchange (same
+        // family) is 401-class over the real Bearer gate.
+        let mcp_router = Router::new()
+            .route("/mcp", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                ctx.clone(),
+                require_bearer,
+            ));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {original_access}"),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let mcp_resp = mcp_router.oneshot(req).await.unwrap();
+        assert_eq!(
+            mcp_resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "the original access token must die when its family's refresh token is replayed"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_refresh_unknown_token_is_invalid_grant() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx);
+        let resp = post_token(
+            &router,
+            &[("grant_type", "refresh_token"), ("refresh_token", "nope")],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await, json!({"error": "invalid_grant"}));
+    }
+
+    #[tokio::test]
+    async fn token_refresh_grant_rejects_an_access_token() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx.clone());
+        let (access, _refresh) = ctx
+            .store
+            .lock()
+            .unwrap()
+            .issue_token_pair("client1", "brain")
+            .unwrap();
+
+        let resp = post_token(
+            &router,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &access.token),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await, json!({"error": "invalid_grant"}));
+    }
+
+    #[tokio::test]
+    async fn token_wrong_content_type_is_415() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/token")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"grant_type":"authorization_code"}"#))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn token_missing_content_type_is_415() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/token")
+            .body(Body::from("grant_type=authorization_code"))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn token_unknown_grant_type_is_unsupported_grant_type() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx);
+        let resp = post_token(&router, &[("grant_type", "client_credentials")]).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(resp).await,
+            json!({"error": "unsupported_grant_type"})
+        );
+    }
+
+    #[tokio::test]
+    async fn token_absent_grant_type_is_unsupported_grant_type() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx);
+        let resp = post_token(&router, &[]).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(resp).await,
+            json!({"error": "unsupported_grant_type"})
+        );
+    }
+
+    #[tokio::test]
+    async fn token_router_has_no_auth_gate_of_its_own() {
+        // No `Authorization` header at all — a client with no token yet must
+        // be able to reach `/token` to obtain its first one.
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx);
+        let resp = post_token(&router, &[("grant_type", "client_credentials")]).await;
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

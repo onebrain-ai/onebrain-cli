@@ -50,3 +50,9 @@ pub use store::{
     AppType, AuthCode, AuthStore, PairingState, RegisteredClient, RotateOutcome, TokenKind,
     TokenRecord,
 };
+// `pub(crate)` (not `pub use` above) — `ACCESS_TTL_SECS` is `pub(crate)` in
+// `store`, so re-exporting it any more broadly than crate-visible would be
+// widening its visibility, which `pub use` doesn't allow. `oauth_routes.rs`
+// (the one crate-internal consumer, for `/token`'s `expires_in`) reaches it
+// through this same curated import list either way.
+pub(crate) use store::ACCESS_TTL_SECS;

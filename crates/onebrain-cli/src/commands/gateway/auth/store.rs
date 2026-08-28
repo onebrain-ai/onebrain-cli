@@ -83,6 +83,19 @@ pub struct AuthCode {
     pub scope: String,
     pub expires: u64,
     pub used: bool,
+    /// The token `family` id [`AuthStore::issue_token_pair`] minted when this
+    /// code was successfully redeemed — `None` until then (and forever, if
+    /// this code is never successfully redeemed at all). Stamped by
+    /// [`AuthStore::mark_code_minted_family`] AFTER a `/token` handler's
+    /// `issue_token_pair` call, and read back by
+    /// [`AuthStore::find_code_record`] when that SAME code is presented
+    /// again — a replay of an already-`used` code (RFC 6749 §4.1.2 SHOULD)
+    /// — so the `/token` handler can [`AuthStore::revoke_family`] everything
+    /// that code ever produced. `#[serde(default)]` so an on-disk
+    /// `codes.json` written before this field existed still deserializes
+    /// (as `None`, the correct "nothing minted from this yet" value).
+    #[serde(default)]
+    pub minted_family: Option<String>,
 }
 
 /// Redacts `code` (the bearer secret redeemable at `/token`) — every other
@@ -92,7 +105,9 @@ pub struct AuthCode {
 /// — the secret is the verifier, which this store never persists), so it
 /// stays visible for debugging. See [`TokenRecord`]'s `Debug` impl for the
 /// full rationale (this exists so a later `{:?}` in a log path can't leak a
-/// redeemable code).
+/// redeemable code). `minted_family` also stays visible — like
+/// [`TokenRecord::family`], it's an internal correlation id, never accepted
+/// anywhere as a credential.
 impl std::fmt::Debug for AuthCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthCode")
@@ -104,6 +119,7 @@ impl std::fmt::Debug for AuthCode {
             .field("scope", &self.scope)
             .field("expires", &self.expires)
             .field("used", &self.used)
+            .field("minted_family", &self.minted_family)
             .finish()
     }
 }
@@ -179,8 +195,10 @@ impl std::fmt::Debug for TokenRecord {
 
 /// 1 hour — a conventional OAuth access-token lifetime; short enough that a
 /// leaked access token self-expires quickly, long enough to avoid rotating
-/// on every request.
-const ACCESS_TTL_SECS: u64 = 60 * 60;
+/// on every request. `pub(crate)` (not private) so `/token`'s RFC 6749 §5.1
+/// `expires_in` response field can reference this SAME constant directly
+/// instead of duplicating the number and risking the two drifting apart.
+pub(crate) const ACCESS_TTL_SECS: u64 = 60 * 60;
 /// 30 days — refresh tokens are long-lived by design (that's the point of
 /// having them); rotation + reuse detection is what keeps that safe.
 const REFRESH_TTL_SECS: u64 = 30 * 24 * 60 * 60;
@@ -342,6 +360,7 @@ impl AuthStore {
             scope: scope.to_string(),
             expires: core::now_epoch_secs() + AUTH_CODE_TTL_SECS,
             used: false,
+            minted_family: None,
         };
         let mut codes = self.load_codes()?;
         codes.insert(code_value, auth_code.clone());
@@ -367,6 +386,38 @@ impl AuthStore {
         let consumed = entry.clone();
         self.save_codes(&codes)?;
         Ok(Some(consumed))
+    }
+
+    /// Stamp `family` onto the (already-`used`) code record for `code` —
+    /// called by the `/token` handler right after [`Self::issue_token_pair`]
+    /// mints the pair a successful `consume_code` redemption produced, so a
+    /// LATER replay of this same code can find and
+    /// [`Self::revoke_family`] it (RFC 6749 §4.1.2 SHOULD; see
+    /// [`AuthCode::minted_family`]'s doc comment for the full link). A no-op
+    /// (not an error) if `code` is no longer present in `codes.json` — the
+    /// family it would have linked to already exists independently in
+    /// `tokens.json` and stays valid on its own merits; failing to record
+    /// this link only weakens the replay-hardening for a code that's already
+    /// gone, it never wrongly trusts anything.
+    pub fn mark_code_minted_family(&self, code: &str, family: &str) -> Result<()> {
+        let mut codes = self.load_codes()?;
+        if let Some(entry) = codes.get_mut(code) {
+            entry.minted_family = Some(family.to_string());
+            self.save_codes(&codes)?;
+        }
+        Ok(())
+    }
+
+    /// Look up `code` WITHOUT consuming it, checking expiry, or otherwise
+    /// authorizing anything — the ONLY legitimate caller is the `/token`
+    /// handler's replay-hardening path, AFTER [`Self::consume_code`] has
+    /// already returned `None` for this exact code, to tell a genuine replay
+    /// (`used == true`) apart from unknown/never-issued (`Ok(None)` here
+    /// too, nothing to revoke). Never used to redeem a code a second way —
+    /// see [`AuthCode::minted_family`]'s doc comment for the full flow this
+    /// feeds into.
+    pub fn find_code_record(&self, code: &str) -> Result<Option<AuthCode>> {
+        Ok(self.load_codes()?.get(code).cloned())
     }
 
     // ── Tokens ───────────────────────────────────────────────────────────
@@ -525,6 +576,29 @@ impl AuthStore {
         let mut tokens = self.load_tokens()?;
         if let Some(rec) = tokens.get_mut(token) {
             rec.revoked = true;
+            self.save_tokens(&tokens)?;
+        }
+        Ok(())
+    }
+
+    /// Revoke every token sharing `family` (idempotent: already-revoked
+    /// tokens are left alone, and nothing is written back if `family`
+    /// matches no token at all). This is the SAME "burn the whole family"
+    /// action [`Self::rotate_refresh`]'s reuse-detection branch takes
+    /// inline; exposed here as its own method for the `/token` handler's
+    /// authorization-code replay hardening (RFC 6749 §4.1.2 SHOULD) — see
+    /// [`Self::mark_code_minted_family`]/[`Self::find_code_record`] for how
+    /// that path finds the family to pass in here.
+    pub fn revoke_family(&self, family: &str) -> Result<()> {
+        let mut tokens = self.load_tokens()?;
+        let mut changed = false;
+        for t in tokens.values_mut() {
+            if t.family == family && !t.revoked {
+                t.revoked = true;
+                changed = true;
+            }
+        }
+        if changed {
             self.save_tokens(&tokens)?;
         }
         Ok(())
@@ -757,12 +831,137 @@ mod tests {
             scope: "scope".to_string(),
             expires: core::now_epoch_secs().saturating_sub(1),
             used: false,
+            minted_family: None,
         };
         let mut codes = BTreeMap::new();
         codes.insert(expired.code.clone(), expired.clone());
         store.save_codes(&codes).unwrap();
 
         assert!(store.consume_code(&expired.code).unwrap().is_none());
+    }
+
+    // ── Auth-code replay hardening: minted_family linkage (Task 5) ──────
+
+    #[test]
+    fn find_code_record_returns_none_for_unknown_code() {
+        let (_dir, store) = open_temp();
+        assert!(store.find_code_record("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn fresh_code_has_no_minted_family_until_marked() {
+        let (_dir, store) = open_temp();
+        let issued = store
+            .issue_code("client1", "https://cb", "chal", "res", "scope")
+            .unwrap();
+        assert!(issued.minted_family.is_none());
+
+        let record = store.find_code_record(&issued.code).unwrap().unwrap();
+        assert!(record.minted_family.is_none());
+        assert!(!record.used, "find_code_record must not consume");
+    }
+
+    #[test]
+    fn mark_code_minted_family_then_find_code_record_sees_it() {
+        let (_dir, store) = open_temp();
+        let issued = store
+            .issue_code("client1", "https://cb", "chal", "res", "scope")
+            .unwrap();
+        store.consume_code(&issued.code).unwrap();
+        store
+            .mark_code_minted_family(&issued.code, "fam-abc")
+            .unwrap();
+
+        let record = store.find_code_record(&issued.code).unwrap().unwrap();
+        assert!(record.used, "consume_code must have marked it used");
+        assert_eq!(record.minted_family.as_deref(), Some("fam-abc"));
+    }
+
+    #[test]
+    fn mark_code_minted_family_on_unknown_code_is_a_noop_not_an_error() {
+        let (_dir, store) = open_temp();
+        // Nothing panics or errors, and nothing is created.
+        store
+            .mark_code_minted_family("does-not-exist", "fam-abc")
+            .unwrap();
+        assert!(store.find_code_record("does-not-exist").unwrap().is_none());
+    }
+
+    #[test]
+    fn revoke_family_kills_every_token_sharing_it_and_is_idempotent() {
+        let (_dir, store) = open_temp();
+        let (access, refresh) = store.issue_token_pair("client1", "scope").unwrap();
+        assert!(store.check_access(&access.token).unwrap().is_some());
+
+        store.revoke_family(&access.family).unwrap();
+        assert!(store.check_access(&access.token).unwrap().is_none());
+        assert_eq!(
+            store.rotate_refresh(&refresh.token).unwrap(),
+            RotateOutcome::Invalid,
+            "the refresh half of the family must be dead too"
+        );
+
+        // Calling it again is a harmless no-op (nothing left to flip).
+        store.revoke_family(&access.family).unwrap();
+    }
+
+    #[test]
+    fn revoke_family_does_not_touch_an_unrelated_family() {
+        let (_dir, store) = open_temp();
+        let (access1, _refresh1) = store.issue_token_pair("client1", "scope").unwrap();
+        let (access2, _refresh2) = store.issue_token_pair("client2", "scope").unwrap();
+
+        store.revoke_family(&access1.family).unwrap();
+        assert!(store.check_access(&access1.token).unwrap().is_none());
+        assert!(
+            store.check_access(&access2.token).unwrap().is_some(),
+            "an unrelated family must be untouched"
+        );
+    }
+
+    #[test]
+    fn revoke_family_of_unknown_family_is_a_noop() {
+        let (_dir, store) = open_temp();
+        let (access, _refresh) = store.issue_token_pair("client1", "scope").unwrap();
+        store.revoke_family("no-such-family").unwrap();
+        assert!(
+            store.check_access(&access.token).unwrap().is_some(),
+            "an unrelated (nonexistent) family name must touch nothing"
+        );
+    }
+
+    /// End-to-end proof of the exact replay-hardening flow the `/token`
+    /// handler drives: consume → mint tokens → mark the family → a SECOND
+    /// consume attempt fails (already used) → the handler looks the record
+    /// back up, finds `used && minted_family.is_some()`, and revokes it.
+    #[test]
+    fn replayed_code_flow_end_to_end_revokes_the_family_it_minted() {
+        let (_dir, store) = open_temp();
+        let issued = store
+            .issue_code("client1", "https://cb", "chal", "res", "scope")
+            .unwrap();
+
+        let consumed = store.consume_code(&issued.code).unwrap().unwrap();
+        let (access, _refresh) = store
+            .issue_token_pair(&consumed.client_id, &consumed.scope)
+            .unwrap();
+        store
+            .mark_code_minted_family(&issued.code, &access.family)
+            .unwrap();
+        assert!(store.check_access(&access.token).unwrap().is_some());
+
+        // Replay: consume_code now fails (already used).
+        assert!(store.consume_code(&issued.code).unwrap().is_none());
+        // The handler's reuse-hardening path.
+        let record = store.find_code_record(&issued.code).unwrap().unwrap();
+        assert!(record.used);
+        let family = record.minted_family.expect("family was marked above");
+        store.revoke_family(&family).unwrap();
+
+        assert!(
+            store.check_access(&access.token).unwrap().is_none(),
+            "the access token minted from the replayed code must now be dead"
+        );
     }
 
     // ── Tokens: issuance + check_access on expired/revoked ──────────────
@@ -1019,6 +1218,7 @@ mod tests {
                 scope: "scope".to_string(),
                 expires: core::now_epoch_secs().saturating_sub(1),
                 used: false,
+                minted_family: None,
             },
         );
         store.save_codes(&codes).unwrap();
@@ -1136,6 +1336,7 @@ mod tests {
             scope: "brain".to_string(),
             expires: 42,
             used: false,
+            minted_family: Some("fam-77".to_string()),
         };
         let debug = format!("{code:?}");
         assert!(
@@ -1144,6 +1345,10 @@ mod tests {
         );
         assert!(debug.contains("client-9"), "{debug}");
         assert!(debug.contains("not-actually-secret-challenge"), "{debug}");
+        assert!(
+            debug.contains("fam-77"),
+            "minted_family is a non-secret correlation id and must stay visible: {debug}"
+        );
         assert!(debug.contains("<redacted>"), "{debug}");
     }
 

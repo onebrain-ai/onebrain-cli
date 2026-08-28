@@ -43,7 +43,7 @@ use onebrain_fs::task::{visit_tasks, TaskHit, TaskScanOptions};
 use crate::commands::daemon_client;
 use crate::commands::gateway::auth::middleware::require_bearer;
 use crate::commands::gateway::oauth_routes::{
-    authorize_router, register_router, well_known_router, AuthCtx,
+    authorize_router, register_router, token_router, well_known_router, AuthCtx,
 };
 use crate::commands::gateway::GatewayConfig;
 use crate::commands::task_list::{resolve_due_by, resolve_prefixes, TaskCollector};
@@ -492,26 +492,30 @@ impl ServerHandler for GatewayServer {
 }
 
 /// Assembles the gateway's full HTTP surface (Gateway PR 3, Task 2 adds
-/// OAuth discovery, Task 3 adds registration, Task 4 adds the consent flow):
-/// a sessionless (SEP-2567) Streamable HTTP service mounted at `/mcp`, gated
-/// by the [`require_bearer`] Bearer resource-server check, plus the PUBLIC
-/// `/.well-known/*` OAuth discovery routes ([`well_known_router`]), the
-/// PUBLIC `POST /register` RFC 7591 registration route ([`register_router`]),
-/// and the PUBLIC `GET`/`POST /authorize` consent flow
-/// ([`authorize_router`]). The `/mcp` factory closure builds a fresh
-/// [`GatewayServer`] per request (cloning the shared `state` handle) —
-/// sessionless mode never reuses a server instance across requests, so no
-/// mutable per-connection state can leak between callers.
+/// OAuth discovery, Task 3 adds registration, Task 4 adds the consent flow,
+/// Task 5 adds the token endpoint): a sessionless (SEP-2567) Streamable HTTP
+/// service mounted at `/mcp`, gated by the [`require_bearer`] Bearer
+/// resource-server check, plus the PUBLIC `/.well-known/*` OAuth discovery
+/// routes ([`well_known_router`]), the PUBLIC `POST /register` RFC 7591
+/// registration route ([`register_router`]), the PUBLIC `GET`/`POST
+/// /authorize` consent flow ([`authorize_router`]), and the PUBLIC `POST
+/// /token` code-exchange/refresh-rotation endpoint ([`token_router`]). The
+/// `/mcp` factory closure builds a fresh [`GatewayServer`] per request
+/// (cloning the shared `state` handle) — sessionless mode never reuses a
+/// server instance across requests, so no mutable per-connection state can
+/// leak between callers.
 ///
 /// Layer scoping is load-bearing here: `.layer(from_fn_with_state(...))` is
 /// called on the router BEFORE `well_known_router`/`register_router`/
-/// `authorize_router` are merged in, so the Bearer gate wraps ONLY the `/mcp`
-/// nest — a client with no token yet can still reach the discovery
-/// documents, register itself, AND complete the consent flow, all of which
-/// it needs to do before it can obtain one. See
+/// `authorize_router`/`token_router` are merged in, so the Bearer gate wraps
+/// ONLY the `/mcp` nest — a client with no token yet can still reach the
+/// discovery documents, register itself, complete the consent flow, AND
+/// exchange its code (or rotate a refresh token) for a bearer token, all of
+/// which it needs to do before it can obtain/renew one. See
 /// `tests::well_known_routes_are_reachable_without_auth_while_mcp_stays_gated`,
-/// `tests::register_is_reachable_without_auth_on_the_real_router`, and
-/// `tests::authorize_is_reachable_without_auth_on_the_real_router` for the
+/// `tests::register_is_reachable_without_auth_on_the_real_router`,
+/// `tests::authorize_is_reachable_without_auth_on_the_real_router`, and
+/// `tests::token_is_reachable_without_auth_on_the_real_router` for the
 /// proof.
 pub fn build_gateway_router(state: Arc<GatewayState>, auth_ctx: Arc<AuthCtx>) -> axum::Router {
     let config = StreamableHttpServerConfig::default()
@@ -529,7 +533,8 @@ pub fn build_gateway_router(state: Arc<GatewayState>, auth_ctx: Arc<AuthCtx>) ->
     mcp_router
         .merge(well_known_router(auth_ctx.clone()))
         .merge(register_router(auth_ctx.clone()))
-        .merge(authorize_router(auth_ctx))
+        .merge(authorize_router(auth_ctx.clone()))
+        .merge(token_router(auth_ctx))
 }
 
 #[cfg(test)]
@@ -1256,6 +1261,31 @@ mod tests {
             resp.status(),
             StatusCode::UNAUTHORIZED,
             "/authorize must be public — no Authorization header was sent"
+        );
+    }
+
+    /// Gateway PR 3, Task 5: `POST /token` on the fully-assembled router
+    /// answers with no `Authorization` header at all — proves `token_router`
+    /// is merged the same way `well_known_router`/`register_router`/
+    /// `authorize_router` are (after the Bearer layer is applied to `/mcp`,
+    /// so the layer never wraps it). An unsupported `grant_type` still 400s
+    /// (nothing was set up to succeed here) — the point of this test is that
+    /// the response is NOT a 401, proving the route is reachable with zero
+    /// credentials, not that a specific exchange succeeds.
+    #[tokio::test]
+    async fn token_is_reachable_without_auth_on_the_real_router() {
+        let (_dir, router, _token) = fixture_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/token")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("grant_type=client_credentials"))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "/token must be public — no Authorization header was sent"
         );
     }
 }
