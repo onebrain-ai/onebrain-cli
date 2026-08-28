@@ -150,14 +150,10 @@ impl Approvals {
     /// function's body, so the lock is never even in the neighborhood of an
     /// await point.
     ///
-    /// No production caller yet — `server.rs`'s `policy_gate` doc comment
-    /// names wiring an actual `register`/`wait` call as "Task 3+'s
-    /// interactive approval flow"; THIS task ships the registry and its
-    /// `/approvals` HTTP surface fully tested on their own, but leaves that
-    /// specific wiring for a later task (same "Dead-code allow" situation
-    /// `audit.rs`'s `Decision::Approved`/`TimedOut` document). Exercised
-    /// directly by this module's own unit tests until then.
-    #[allow(dead_code)]
+    /// First given a production caller by Gateway PR 4, Task 5:
+    /// `server::await_approval` calls this from `policy_gate`'s
+    /// `NeedApproval` arm, before firing the native dialog channel and
+    /// `.await`ing [`Self::wait`] on the returned receiver.
     pub fn register(&self, p: PendingApproval) -> oneshot::Receiver<Decision> {
         let (tx, rx) = oneshot::channel();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -218,8 +214,8 @@ impl Approvals {
     /// `pending` so it doesn't linger forever waiting for a decision that
     /// will never come, and [`WaitOutcome::TimedOut`] is returned.
     ///
-    /// No production caller yet — see [`Self::register`]'s doc comment.
-    #[allow(dead_code)]
+    /// First given a production caller by Gateway PR 4, Task 5 — see
+    /// [`Self::register`]'s doc comment.
     pub async fn wait(
         &self,
         id: &str,

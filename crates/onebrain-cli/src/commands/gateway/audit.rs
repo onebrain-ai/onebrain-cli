@@ -41,15 +41,14 @@
 //! dead-code-linted by reachability from `main`, unlike a library crate's
 //! public API surface).
 //!
-//! Gateway PR 4, Task 2 gave every one of those a real caller:
-//! `gateway::run()` now opens the log via [`AuditLog::open`], and
-//! `server.rs`'s policy-gate wiring constructs `Decision::Auto`/`Denied`/
-//! `Blocked` and `Outcome::Ok`/`Error` on every tool call. The blanket
-//! allow is gone; only `Decision::Approved` and `Decision::TimedOut` still
-//! have no caller outside this module's own tests — they're reserved for
-//! Task 3's interactive approval flow (a human's actual "approve" response,
-//! and a timed-out wait), which is genuinely out of scope here. Each is
-//! allowed individually below, at the variant, rather than blanket again.
+//! Gateway PR 4, Task 2 gave most of those a real caller: `gateway::run()`
+//! now opens the log via [`AuditLog::open`], and `server.rs`'s policy-gate
+//! wiring constructs `Decision::Auto`/`Denied`/`Blocked` and
+//! `Outcome::Ok`/`Error` on every tool call. Gateway PR 4, Task 5's
+//! `server::await_approval` gave the last two — `Decision::Approved` (a
+//! human's actual "approve" response) and `Decision::TimedOut` (a pending
+//! approval that expired unanswered) — their own real callers, so the
+//! blanket allow (and every per-variant one) is gone.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -84,24 +83,35 @@ pub struct AuditEntry {
 }
 
 /// How a tool call was allowed (or not) through the gateway's approval
-/// gate. `Serialize`s lowercase (`auto`, `approved`, `denied`, `timedout`,
-/// `blocked`) so the on-disk JSONL stays a stable, greppable wire format.
+/// gate. `Serialize`s lowercase (`auto`, `approved`, `denied`, `timedout`)
+/// so the on-disk JSONL stays a stable, greppable wire format.
+///
+/// `Blocked` (a policy `NeedApproval` result with no approval channel to
+/// route it to) existed here through Gateway PR 4, Task 2, when it was the
+/// ONLY thing a `NeedApproval` outcome could produce — that build had no
+/// [`super::approval::Approvals`] registry yet. Task 5 wired
+/// `server::policy_gate`'s `NeedApproval` arm to the real registry, so
+/// every outcome now resolves to one of the three variants below instead
+/// (`Approved`, `Denied` by a human, or `TimedOut` waiting for one) — the
+/// state `Blocked` named no longer occurs, so the variant was removed
+/// rather than kept as permanently-dead code. A pre-Task-5 audit log may
+/// still contain historical `"blocked"` lines on disk; nothing in this
+/// codebase reads `Decision` back out of the log (it's `Serialize`-only,
+/// operator-inspection-only), so that's harmless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Decision {
     Auto,
-    /// A human approved this specific call through an interactive channel.
-    /// Not constructed outside this module's own tests until Task 3+ ships
-    /// that channel — see the module doc's "Dead-code allow" section.
-    #[allow(dead_code)]
+    /// A human approved this specific call through an interactive channel
+    /// (the native macOS dialog and/or the `/approvals` HTTP surface).
+    /// First constructed outside this module's own tests by Gateway PR 4,
+    /// Task 5's `server::await_approval`.
     Approved,
     Denied,
-    /// A pending approval expired with no response. Not constructed outside
-    /// this module's own tests until Task 3+ ships the approval wait/TTL —
-    /// see the module doc's "Dead-code allow" section.
-    #[allow(dead_code)]
+    /// A pending approval expired with no response. First constructed
+    /// outside this module's own tests by Gateway PR 4, Task 5's
+    /// `server::await_approval`.
     TimedOut,
-    Blocked,
 }
 
 /// Whether the tool call itself succeeded once it was allowed to run.

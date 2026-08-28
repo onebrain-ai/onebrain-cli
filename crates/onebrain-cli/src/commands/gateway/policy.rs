@@ -47,15 +47,18 @@
 //! | `ask_once` | live | `Allow` |
 //! | `ask_once` | expired | `NeedApproval` |
 //!
-//! `server.rs`'s Task 2 wiring only ever reaches `mode = auto` for its four
-//! existing (all `ReadOnly`) tools under the DEFAULT `PolicyConfig` — the
-//! `ask_once`/`ask_always`/`deny` paths are exercised here by this module's
-//! own unit tests, and become reachable end-to-end once a later task ships a
-//! `Mutating`/`Destructive` tool or a customized `gateway.yml` `policy:`
-//! block. When `decide` returns `NeedApproval` today, `server.rs` has no
-//! approval channel to route it to yet (that's Task 3+) — it fails closed
-//! with a client-facing error and an `audit::Decision::Blocked` record,
-//! never a silent allow.
+//! Every read-only tool (`capabilities`/`brain_tasks`/`brain_get`/
+//! `brain_search`) only ever reaches `mode = auto` under the DEFAULT
+//! `PolicyConfig` — the `ask_once`/`ask_always`/`deny` paths are exercised
+//! here by this module's own unit tests, and against a customized
+//! `gateway.yml` `policy:` block by `server.rs`'s own tests. `brain_capture`
+//! (Gateway PR 4, Task 5) is the first `Mutating` tool, so it's also the
+//! first to reach `mode = ask_once` under the DEFAULT config. When `decide`
+//! returns `NeedApproval`, `server.rs`'s `await_approval` registers a
+//! [`super::approval::PendingApproval`] and blocks on a human decision (the
+//! native macOS dialog and/or the `/approvals` HTTP surface) — never a
+//! silent allow, and never an unbounded hang (`PolicyConfig::approval_wait_seconds`
+//! bounds the wait).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -88,10 +91,8 @@ const CURRENT_PACK: &str = "brain";
 #[serde(rename_all = "snake_case")]
 pub enum RiskClass {
     ReadOnly,
-    /// No production tool is classified `Mutating` yet — `brain_capture`
-    /// (Task 5) is the first. Exercised by this module's own unit tests;
-    /// not by any tool handler until then.
-    #[allow(dead_code)]
+    /// `brain_capture` (Gateway PR 4, Task 5) is the first — and, as of
+    /// this task, only — tool classified `Mutating`.
     Mutating,
     /// No production tool is classified `Destructive` yet. Exercised by
     /// this module's own unit tests; not by any tool handler until a
@@ -141,6 +142,20 @@ pub struct PolicyConfig {
     pub destructive: PolicyMode,
     #[serde(default = "default_grant_ttl_minutes")]
     pub grant_ttl_minutes: u64,
+    /// How long a `NeedApproval` call blocks waiting for a human decision
+    /// (`server::await_approval`, Gateway PR 4, Task 5) before giving up —
+    /// deliberately a SEPARATE knob from `grant_ttl_minutes` above: that one
+    /// governs how long an ALREADY-GRANTED consent lasts for FUTURE calls
+    /// (minutes-to-hours scale), while this one bounds how long the
+    /// CURRENT, still-synchronous MCP tool call waits for a first decision
+    /// (seconds-to-minutes scale) — conflating the two into one field would
+    /// make it impossible for an operator to want "ask me and wait up to 5
+    /// minutes" independently of "then remember it for a day". Default 300s
+    /// (5 minutes): long enough for a human to notice the native macOS
+    /// dialog or the `/approvals` HTTP surface and respond, short enough
+    /// that a client isn't left hanging indefinitely.
+    #[serde(default = "default_approval_wait_seconds")]
+    pub approval_wait_seconds: u64,
 }
 
 fn default_read_only() -> PolicyMode {
@@ -155,6 +170,9 @@ fn default_destructive() -> PolicyMode {
 fn default_grant_ttl_minutes() -> u64 {
     30
 }
+fn default_approval_wait_seconds() -> u64 {
+    300
+}
 
 impl Default for PolicyConfig {
     fn default() -> Self {
@@ -163,6 +181,7 @@ impl Default for PolicyConfig {
             mutating: default_mutating(),
             destructive: default_destructive(),
             grant_ttl_minutes: default_grant_ttl_minutes(),
+            approval_wait_seconds: default_approval_wait_seconds(),
         }
     }
 }
@@ -329,6 +348,7 @@ mod tests {
             mutating,
             destructive,
             grant_ttl_minutes: 30,
+            approval_wait_seconds: 300,
         }
     }
 
@@ -341,6 +361,7 @@ mod tests {
         assert_eq!(cfg.mutating, PolicyMode::AskOnce);
         assert_eq!(cfg.destructive, PolicyMode::AskAlways);
         assert_eq!(cfg.grant_ttl_minutes, 30);
+        assert_eq!(cfg.approval_wait_seconds, 300);
     }
 
     #[test]
@@ -366,13 +387,15 @@ mod tests {
     #[test]
     fn policy_config_parses_from_yaml_and_fills_missing_fields_with_defaults() {
         let full: PolicyConfig = serde_yaml::from_str(
-            "read_only: deny\nmutating: auto\ndestructive: ask_once\ngrant_ttl_minutes: 5\n",
+            "read_only: deny\nmutating: auto\ndestructive: ask_once\ngrant_ttl_minutes: 5\n\
+             approval_wait_seconds: 10\n",
         )
         .unwrap();
         assert_eq!(full.read_only, PolicyMode::Deny);
         assert_eq!(full.mutating, PolicyMode::Auto);
         assert_eq!(full.destructive, PolicyMode::AskOnce);
         assert_eq!(full.grant_ttl_minutes, 5);
+        assert_eq!(full.approval_wait_seconds, 10);
 
         let sparse: PolicyConfig = serde_yaml::from_str("mutating: deny\n").unwrap();
         assert_eq!(
@@ -383,6 +406,10 @@ mod tests {
         assert_eq!(sparse.mutating, PolicyMode::Deny);
         assert_eq!(sparse.destructive, PolicyMode::AskAlways);
         assert_eq!(sparse.grant_ttl_minutes, 30);
+        assert_eq!(
+            sparse.approval_wait_seconds, 300,
+            "missing field must default"
+        );
     }
 
     // ── Step 1: decide's table — mode × grant-present × scope-match ─────

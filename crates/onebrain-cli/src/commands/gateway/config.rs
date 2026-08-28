@@ -112,6 +112,7 @@ mod tests {
         assert_eq!(cfg.policy.mutating, PolicyMode::AskOnce);
         assert_eq!(cfg.policy.destructive, PolicyMode::AskAlways);
         assert_eq!(cfg.policy.grant_ttl_minutes, 30);
+        assert_eq!(cfg.policy.approval_wait_seconds, 300);
     }
 
     /// `GatewayConfig`'s `Default` impl is hand-written (it does not
@@ -133,6 +134,10 @@ mod tests {
         assert_eq!(
             cfg.policy.grant_ttl_minutes,
             PolicyConfig::default().grant_ttl_minutes
+        );
+        assert_eq!(
+            cfg.policy.approval_wait_seconds,
+            PolicyConfig::default().approval_wait_seconds
         );
     }
 

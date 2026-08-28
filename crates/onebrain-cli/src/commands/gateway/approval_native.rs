@@ -19,11 +19,11 @@
 //! over HTTP is harmless by construction, not because of anything special
 //! here.
 //!
-//! No production caller wires this into `server.rs`'s `policy_gate` yet —
-//! same "later task" situation `approval.rs`'s own `register`/`wait` doc
-//! comments already name for the HTTP channel's underlying primitives.
-//! [`is_available`] and [`prompt`] are exercised directly by this module's
-//! own unit tests until then.
+//! Wired into `server.rs`'s `policy_gate` by Gateway PR 4, Task 5 —
+//! `server::await_approval` calls [`is_available`]/[`prompt`] right after
+//! [`super::approval::Approvals::register`], the same "later task" this
+//! module's earlier revisions named. [`is_available`] and [`prompt`] are
+//! also exercised directly by this module's own unit tests.
 //!
 //! ## Security: every interpolated value is attacker-influenceable
 //!
@@ -123,10 +123,9 @@ use super::approval::{Approvals, Decision, PendingApproval};
 /// pass this check and then have `osascript` itself fail at prompt-time
 /// (handled by [`prompt`]'s own graceful degradation, not here).
 ///
-/// No production caller yet — same "later task" situation `approval.rs`'s
-/// own `register`/`wait` document (see this module's own doc comment).
-/// Exercised directly by this module's own unit tests until then.
-#[allow(dead_code)]
+/// First given a production caller by Gateway PR 4, Task 5 —
+/// `server::await_approval` calls this to decide whether to fire
+/// [`prompt`] alongside the `/approvals` HTTP channel.
 pub fn is_available() -> bool {
     cfg!(target_os = "macos") && osascript_on_path()
 }
@@ -231,10 +230,14 @@ fn run_dialog(script: &str) -> Option<Decision> {
 /// late or absent dialog answer is harmless by construction, per
 /// [`Approvals::resolve`]'s own first-response-wins doc comment.
 ///
-/// No production caller yet — same "later task" situation `approval.rs`'s
-/// own `register`/`wait` document (see this module's own doc comment).
-/// Exercised directly by this module's own unit tests until then.
-#[allow(dead_code)]
+/// First given a production caller by Gateway PR 4, Task 5 —
+/// `server::await_approval` calls this right after registering a
+/// [`PendingApproval`], handing it `state.approvals.clone()` (an
+/// `Arc<Approvals>` — see [`super::server::GatewayState`]'s own doc comment
+/// for why that field is an `Arc` in the first place: this function's
+/// `spawn_blocking` closure below needs an owned, `'static` handle, and
+/// `Arc<Approvals>` is the minimal thing that provides one without widening
+/// this call to need the whole `GatewayState`).
 pub fn prompt(p: &PendingApproval, approvals: Arc<Approvals>) {
     if !is_available() {
         return;
