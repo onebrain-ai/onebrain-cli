@@ -10,6 +10,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
+## [3.5.0] — Unreleased — Gateway
+
+- MCP: rmcp 2.1.0 → 3.0.1 — protocol `2026-07-28` baseline for the remote MCP
+  gateway; stdio server and all 4 tools unchanged; legacy `initialize`
+  negotiation (2025-03-26 / 2025-11-25) now guarded by an integration test.
+
 ## [3.4.25] — 2026-08-28 — Keep Codex hooks alive
 
 ### Fixed
