@@ -86,8 +86,13 @@ const CURRENT_PACK: &str = "brain";
 /// convention) — Gateway PR 4, Task 3 gave this its first outbound-JSON
 /// caller: `super::approval::PendingApproval::class`, so an operator
 /// reviewing `GET /approvals` can see exactly what class of access a
-/// pending call needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+/// pending call needs. Gateway PR 4, Task 6 gave it a second: `server::
+/// ToolInfo::risk_class`, so a `capabilities` caller can see which class
+/// every tool it might call belongs to, without probing by calling it.
+/// `schemars::JsonSchema` derives for that same reason — `ToolInfo` derives
+/// `JsonSchema` for its own structured-output schema, which requires every
+/// field type to derive it too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskClass {
     ReadOnly,
@@ -104,8 +109,11 @@ pub enum RiskClass {
 /// How the gateway treats calls of one [`RiskClass`]. `Serialize`/
 /// `Deserialize` as lowercase/snake_case (`auto`, `ask_once`, `ask_always`,
 /// `deny`) so `gateway.yml`'s `policy:` block reads the same vocabulary this
-/// module docs use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// module docs use. `schemars::JsonSchema` derives for `server::
+/// ToolInfo::policy_mode` (Gateway PR 4, Task 6) — `capabilities` reports
+/// the EFFECTIVE mode each tool's `RiskClass` resolves to under the live
+/// `gateway.yml`, via [`PolicyConfig::mode_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyMode {
     /// Always allow — no approval, no grant involved.
@@ -187,8 +195,11 @@ impl Default for PolicyConfig {
 }
 
 impl PolicyConfig {
-    /// The [`PolicyMode`] configured for one [`RiskClass`].
-    fn mode_for(&self, class: RiskClass) -> PolicyMode {
+    /// The [`PolicyMode`] configured for one [`RiskClass`]. `pub` (not
+    /// module-private) since Gateway PR 4, Task 6: `server::brain_pack_tools`
+    /// calls this directly to report each tool's EFFECTIVE policy mode from
+    /// `capabilities`, the same lookup [`decide`] itself uses internally.
+    pub fn mode_for(&self, class: RiskClass) -> PolicyMode {
         match class {
             RiskClass::ReadOnly => self.read_only,
             RiskClass::Mutating => self.mutating,

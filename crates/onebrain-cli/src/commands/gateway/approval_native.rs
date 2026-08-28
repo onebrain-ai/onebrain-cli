@@ -75,11 +75,13 @@
 //! ## Availability + failure modes
 //!
 //! [`is_available`] is `cfg!(target_os = "macos")` **and** `osascript`
-//! resolvable on `$PATH`; on every other target it is unconditionally
-//! `false` and [`prompt`] is a no-op that cannot panic (it returns before
-//! ever touching `std::process::Command` — see [`prompt`]'s own doc
-//! comment). On macOS, [`prompt`] degrades gracefully — never panics — on
-//! every failure mode: the user dismissing the dialog without picking a
+//! resolvable on `$PATH` **and** the channel not explicitly disabled (see
+//! "Disabling the channel from outside the process" below); on every other
+//! target, or when disabled, it is unconditionally `false` and [`prompt`] is
+//! a no-op that cannot panic (it returns before ever touching
+//! `std::process::Command` — see [`prompt`]'s own doc comment). On macOS
+//! with the channel enabled, [`prompt`] degrades gracefully — never panics —
+//! on every failure mode: the user dismissing the dialog without picking a
 //! button (a non-zero `osascript` exit), a missing/relocated `osascript`
 //! binary (a spawn `Err`), or the child process being killed out from under
 //! it. All of those collapse to "no decision was produced" and simply skip
@@ -87,6 +89,47 @@
 //! silent operator on the HTTP channel, the pending request's own TTL
 //! (`Approvals::wait`'s timeout) is what eventually resolves it, never this
 //! module.
+//!
+//! ## Disabling the channel from outside the process
+//!
+//! `server::await_approval`'s own `cfg!(test)` guard keeps THIS crate's
+//! `#[cfg(test)] mod tests` (this module's own, `approval.rs`'s,
+//! `server.rs`'s, ...) from ever popping a real dialog — `cfg!(test)` is
+//! baked in at COMPILE time, true only for a test-profile build of code
+//! running inside the SAME test binary. It does nothing for a SEPARATELY
+//! COMPILED, separately spawned `onebrain` binary — exactly what
+//! `tests/gateway_approval_e2e.rs` (Gateway PR 4, Task 6) does: it spawns
+//! the real release/debug `onebrain gateway run` as a subprocess and drives
+//! `brain_capture` through a real `ask_once` policy over real HTTP. That
+//! subprocess is a normal, non-test build (`cfg!(test)` is `false` in it),
+//! so on a macOS CI runner — every macOS box ships `/usr/bin/osascript` —
+//! [`is_available`] would otherwise be `true` and [`prompt`] would fire a
+//! real, blocking, unattended GUI `display dialog`, hanging that test until
+//! the approval TTL expires (or worse, blocking the CI runner itself — the
+//! exact hazard this module's own docs warned about before any caller
+//! reached this code at all).
+//!
+//! [`DISABLE_NATIVE_APPROVAL_ENV`] (`ONEBRAIN_GATEWAY_DISABLE_NATIVE_APPROVAL`)
+//! is the escape hatch: checked FIRST in [`is_available`], before the
+//! platform/`osascript` probe, so setting it to any value unconditionally
+//! forces this channel off regardless of platform. An env var (not a
+//! `gateway.yml` config key) was the deliberate choice here: the e2e test
+//! already spawns the gateway via `std::process::Command`, so setting one
+//! more entry in that same `.env(...)` call is a one-line addition with no
+//! new config schema, no new `gateway.yml` key for a real operator to ever
+//! need to know about (this is a TEST-ONLY escape hatch, not a
+//! product-facing policy switch — an operator who genuinely wants the
+//! native channel off has the real, product-facing lever already:
+//! `policy.mutating: auto`/`deny` never reaches `await_approval` at all, and
+//! the `/approvals` HTTP channel alone still works regardless of this
+//! variable), and it composes for free with the sandboxed-HOME/cache
+//! pattern every gateway integration test already uses (`tests/
+//! gateway_http.rs`, `tests/gateway_oauth_e2e.rs`) without touching
+//! `gateway.yml` parsing at all. `server::capabilities`'s
+//! `approval_channels.native` field (Gateway PR 4, Task 6) reads straight
+//! off [`is_available`], so a disabled channel is reported truthfully too —
+//! never silently, never differently from what `await_approval` itself
+//! observes.
 //!
 //! ## The blocking boundary
 //!
@@ -112,10 +155,26 @@ use std::sync::Arc;
 
 use super::approval::{Approvals, Decision, PendingApproval};
 
+/// Env var that, when set to ANY value (including empty), unconditionally
+/// disables this channel — checked first in [`is_available`], before the
+/// platform/`osascript` probe. See the module docs' "Disabling the channel
+/// from outside the process" section for why this exists and why an env var
+/// (not a `gateway.yml` key) is the right shape for it. `pub` so
+/// `server::capabilities`'s own doc comment can reference the exact name by
+/// path, and so this module is the single source of truth for it — nothing
+/// else in this crate defines this string independently. The e2e test that
+/// actually sets it (`tests/gateway_approval_e2e.rs`) cannot import this
+/// constant (this crate ships no library target for a separately-compiled
+/// integration-test binary to depend on — see that file's own doc comment,
+/// which copies this exact literal deliberately, right next to a comment
+/// pointing back here).
+pub const DISABLE_NATIVE_APPROVAL_ENV: &str = "ONEBRAIN_GATEWAY_DISABLE_NATIVE_APPROVAL";
+
 /// `true` iff a native `display dialog` prompt can plausibly be shown on
-/// this machine: this build targets macOS, and `osascript` resolves to a
-/// real file somewhere on `$PATH`. Pure and synchronous — no subprocess is
-/// spawned to answer this question, only `$PATH` is inspected (via
+/// this machine: [`DISABLE_NATIVE_APPROVAL_ENV`] is NOT set, this build
+/// targets macOS, and `osascript` resolves to a real file somewhere on
+/// `$PATH`. Pure and synchronous — no subprocess is spawned to answer this
+/// question, only the environment and `$PATH` are inspected (via
 /// [`osascript_on_path`]).
 ///
 /// This is a NECESSARY, not sufficient, condition for a dialog to actually
@@ -125,8 +184,15 @@ use super::approval::{Approvals, Decision, PendingApproval};
 ///
 /// First given a production caller by Gateway PR 4, Task 5 —
 /// `server::await_approval` calls this to decide whether to fire
-/// [`prompt`] alongside the `/approvals` HTTP channel.
+/// [`prompt`] alongside the `/approvals` HTTP channel. Gateway PR 4, Task 6
+/// gives it a second: `server::capabilities`'s `approval_channels.native`
+/// field reads this directly, so a caller is told the truth about whether
+/// this channel can actually deliver a prompt right now — including when
+/// it's been disabled via [`DISABLE_NATIVE_APPROVAL_ENV`].
 pub fn is_available() -> bool {
+    if std::env::var_os(DISABLE_NATIVE_APPROVAL_ENV).is_some() {
+        return false;
+    }
     cfg!(target_os = "macos") && osascript_on_path()
 }
 
@@ -438,6 +504,15 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn is_available_is_true_on_macos_with_osascript_on_path() {
+        // Holds the crate-wide `test_env` lock for the read window (an
+        // empty pair list — nothing is actually set) purely to serialize
+        // against `is_available_is_false_when_explicitly_disabled_via_env_var`
+        // below, which DOES mutate `DISABLE_NATIVE_APPROVAL_ENV` under the
+        // same lock: without this, cargo's default parallel test runner
+        // could interleave the two, observing the disable var mid-set and
+        // flaking this assertion for a reason that has nothing to do with
+        // this test's own subject.
+        let _env = crate::test_env::set_vars(&[]);
         assert!(
             is_available(),
             "osascript ships at /usr/bin/osascript on every macOS system, including CI runners"
@@ -448,6 +523,27 @@ mod tests {
     #[test]
     fn is_available_is_false_off_macos() {
         assert!(!is_available());
+    }
+
+    /// The BINDING requirement this whole env var exists for (see the module
+    /// docs' "Disabling the channel from outside the process" section):
+    /// setting [`DISABLE_NATIVE_APPROVAL_ENV`] must force [`is_available`]
+    /// to `false` — unconditionally, regardless of platform (this test runs
+    /// on every CI target, not just macOS, since the override must win
+    /// there too, even though `is_available` would already be `false` off
+    /// macOS for an unrelated reason). This is what lets
+    /// `tests/gateway_approval_e2e.rs`'s spawned gateway subprocess prove it
+    /// never reaches a real `osascript` call under `ask_once` — see that
+    /// file's own doc comment for the full picture (it cannot import this
+    /// constant directly — no library target — so it duplicates the exact
+    /// string literal next to a comment pointing back here).
+    #[test]
+    fn is_available_is_false_when_explicitly_disabled_via_env_var() {
+        let _env = crate::test_env::set_var(DISABLE_NATIVE_APPROVAL_ENV, "1");
+        assert!(
+            !is_available(),
+            "the disable env var must win over even a fully-available macOS + osascript machine"
+        );
     }
 
     // ── Step 2: prompt is a non-panicking no-op off macOS ────────────────

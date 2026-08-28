@@ -58,7 +58,9 @@ use crate::commands::gateway::auth::Principal;
 use crate::commands::gateway::oauth_routes::{
     authorize_router, register_router, token_router, well_known_router, AuthCtx,
 };
-use crate::commands::gateway::policy::{self, GrantKey, Grants, PolicyOutcome, RiskClass};
+use crate::commands::gateway::policy::{
+    self, GrantKey, Grants, PolicyMode, PolicyOutcome, RiskClass,
+};
 use crate::commands::gateway::GatewayConfig;
 use crate::commands::task_list::{resolve_due_by, resolve_prefixes, TaskCollector};
 
@@ -113,6 +115,16 @@ pub struct GatewayServer {
 }
 
 /// Output of the `capabilities` tool.
+///
+/// Gateway PR 4, Task 6 widened this from a bare pack/tool-name listing to a
+/// TRUTHFUL description of what calling each tool would actually do right
+/// now: [`PackInfo::tools`] carries each tool's [`RiskClass`] and the
+/// EFFECTIVE [`PolicyMode`] the live `gateway.yml` resolves it to (see
+/// [`ToolInfo`]), and [`approval_channels`] reports which channels can
+/// actually deliver an interactive approval prompt on THIS running gateway
+/// process — the binding requirement being that a caller must never be told
+/// a write CAN be approved when no channel exists to carry that prompt to a
+/// human.
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct CapabilitiesOut {
     pub gateway_version: String,
@@ -127,13 +139,50 @@ pub struct CapabilitiesOut {
     /// call would then fall through to the env/walk-up chain — see
     /// [`resolve_vault_arg`]).
     pub default_vault: Option<String>,
+    /// Which channels can deliver an interactive approval prompt to a human
+    /// on THIS running gateway process — see [`ApprovalChannels`] and
+    /// [`approval_channels`].
+    pub approval_channels: ApprovalChannels,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct PackInfo {
     pub name: String,
     pub enabled: bool,
-    pub tools: Vec<String>,
+    pub tools: Vec<ToolInfo>,
+    pub note: String,
+}
+
+/// One tool's entry inside [`PackInfo::tools`] — its [`RiskClass`] (the same
+/// classification every `#[tool]` handler passes to [`policy_gate`]) and the
+/// EFFECTIVE [`PolicyMode`] that class resolves to under the gateway's live
+/// `gateway.yml` (via [`policy::PolicyConfig::mode_for`] — the identical
+/// lookup [`policy::decide`] itself performs, so this can never drift from
+/// what actually happens on the next real call). First given a real caller
+/// by Gateway PR 4, Task 6's [`brain_pack_tools`]/[`capability_packs`] —
+/// before this task, `capabilities` reported only a bare tool-name list with
+/// no way to tell whether calling one would need approval at all.
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct ToolInfo {
+    pub name: String,
+    pub risk_class: RiskClass,
+    pub policy_mode: PolicyMode,
+}
+
+/// Which channels can actually resolve a [`policy::PolicyOutcome::NeedApproval`]
+/// call on THIS running gateway process (Gateway PR 4, Task 6) — see
+/// [`approval_channels`]'s doc comment for exactly how each field is
+/// determined and why `http` is unconditionally `true` in this build while
+/// `native`/`telegram` are not.
+#[derive(serde::Serialize, schemars::JsonSchema)]
+pub struct ApprovalChannels {
+    pub native: bool,
+    pub http: bool,
+    pub telegram: bool,
+    /// Human-readable caveats a caller needs to correctly interpret
+    /// `native`/`http`/`telegram` above — e.g. why `telegram` is always
+    /// `false` today. Never a raw host detail (matches every other
+    /// client-facing field in this struct/file).
     pub note: String,
 }
 
@@ -495,28 +544,44 @@ fn paths_match(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// The brain pack's own tool names, kept in one place so `capabilities`
-/// can't drift from what `#[tool_router]` actually registers.
-fn brain_pack_tools() -> Vec<String> {
-    vec![
-        "capabilities".to_string(),
-        "brain_tasks".to_string(),
-        "brain_get".to_string(),
-        "brain_search".to_string(),
-        "brain_capture".to_string(),
+/// The brain pack's own tools, paired with each one's [`RiskClass`] — kept
+/// in one place so `capabilities` can't drift from what `#[tool_router]`
+/// actually registers, and so this list is the SAME `(tool, class)` pairing
+/// every `#[tool]` handler's own `policy_gate` call already uses (not a
+/// second, independently-maintained copy of it).
+///
+/// Gateway PR 4, Task 6 widened this from a bare name list to also resolve
+/// each class's EFFECTIVE [`PolicyMode`] via `policy.mode_for` — the exact
+/// lookup [`policy::decide`] performs — so `capabilities` reports what would
+/// actually happen on the NEXT real call to each tool, not just which risk
+/// bucket it falls into.
+fn brain_pack_tools(policy: &policy::PolicyConfig) -> Vec<ToolInfo> {
+    [
+        ("capabilities", RiskClass::ReadOnly),
+        ("brain_tasks", RiskClass::ReadOnly),
+        ("brain_get", RiskClass::ReadOnly),
+        ("brain_search", RiskClass::ReadOnly),
+        ("brain_capture", RiskClass::Mutating),
     ]
+    .into_iter()
+    .map(|(name, risk_class)| ToolInfo {
+        name: name.to_string(),
+        risk_class,
+        policy_mode: policy.mode_for(risk_class),
+    })
+    .collect()
 }
 
 /// The full pack list `capabilities` reports. Only `brain` is enabled this
 /// task; `developer`/`files`/`mac` are the roadmapped packs (later PRs),
 /// listed disabled so a caller can see what's coming without probing for
 /// tools that don't exist yet.
-fn capability_packs() -> Vec<PackInfo> {
+fn capability_packs(policy: &policy::PolicyConfig) -> Vec<PackInfo> {
     vec![
         PackInfo {
             name: "brain".to_string(),
             enabled: true,
-            tools: brain_pack_tools(),
+            tools: brain_pack_tools(policy),
             note: "Read-only vault search, retrieval, and task listing.".to_string(),
         },
         PackInfo {
@@ -538,6 +603,44 @@ fn capability_packs() -> Vec<PackInfo> {
             note: "Planned — not yet implemented.".to_string(),
         },
     ]
+}
+
+/// Which channels can actually resolve a
+/// [`policy::PolicyOutcome::NeedApproval`] call on THIS running gateway
+/// process (Gateway PR 4, Task 6) — the truthfulness contract this whole
+/// type exists for: a caller must never be told a write CAN be approved when
+/// no channel exists to carry that prompt to a human.
+///
+/// - `native`: [`approval_native::is_available`] — `true` iff this build
+///   targets macOS, `osascript` resolves on `$PATH`, AND the channel has not
+///   been explicitly disabled via
+///   `ONEBRAIN_GATEWAY_DISABLE_NATIVE_APPROVAL` (set by this crate's own
+///   `tests/gateway_approval_e2e.rs` in the environment of the gateway
+///   subprocess it spawns, so that process never pops a real, unattended GUI
+///   dialog on a macOS CI runner — see `approval_native`'s own module docs,
+///   "Disabling the channel from outside the process").
+/// - `http`: the operator `GET`/`POST /approvals` surface
+///   ([`approval_routes::approval_router`]) — unconditionally mounted by
+///   [`build_gateway_router`] on every platform this binary targets, so this
+///   is always `true` in this build. Using it still requires a human who
+///   knows the gateway's pairing code (printed once, to stdout, at `gateway
+///   run` startup) — the same precondition OAuth pairing itself already
+///   assumes; `capabilities` reporting `true` here is not a claim that a
+///   human is actively watching, only that the channel exists and is
+///   reachable.
+/// - `telegram`: not implemented yet — deferred to Gateway PR 5. Always
+///   `false` today; see `note` below and `docs/gateway.md`.
+fn approval_channels() -> ApprovalChannels {
+    ApprovalChannels {
+        native: approval_native::is_available(),
+        http: true,
+        telegram: false,
+        note: "http is always available given the gateway's pairing code (printed once to \
+               stdout at `gateway run` startup); native requires macOS with osascript on \
+               PATH and is unavailable when explicitly disabled; telegram is not \
+               implemented yet — planned for Gateway PR 5."
+            .to_string(),
+    }
 }
 
 /// Extract the [`Principal`] `auth::middleware::require_bearer` inserted
@@ -749,9 +852,21 @@ async fn await_approval(
     // `cfg!(test)` is false in the actually-shipped `onebrain` binary, so
     // production behavior (fire the dialog whenever available) is
     // unaffected; it does NOT protect a separate integration-test binary
-    // that spawns the real compiled binary as a subprocess (none of those
-    // exercise `brain_capture` today — see this task's own report for the
-    // residual note).
+    // that spawns the real compiled binary as a subprocess — Gateway PR 4,
+    // Task 6's `tests/gateway_approval_e2e.rs` is exactly that: it spawns
+    // the real binary and drives `brain_capture` through a real `ask_once`
+    // policy over real HTTP. That test closes the gap a DIFFERENT way,
+    // outside this function entirely: it sets
+    // `ONEBRAIN_GATEWAY_DISABLE_NATIVE_APPROVAL=1` in the spawned process's
+    // environment, which makes `approval_native::is_available()` return
+    // `false` — so the `&&` short-circuits and this line is never reached,
+    // deliberately, not because nothing calls `await_approval` under
+    // `ask_once` any more (something now does, for real, in a separate
+    // process). See `approval_native.rs`'s own module docs ("Disabling the
+    // channel from outside the process") for the full mechanism, and
+    // `docs/coverage.md`'s "Gateway approval flow" residual entry for why
+    // `approval_native::prompt`'s actual body stays uncovered by design —
+    // this line included.
     if !cfg!(test) && approval_native::is_available() {
         approval_native::prompt(&pending, state.approvals.clone());
     }
@@ -892,9 +1007,10 @@ impl GatewayServer {
                 let out = CapabilitiesOut {
                     gateway_version: env!("CARGO_PKG_VERSION").to_string(),
                     protocol_version: ProtocolVersion::V_2026_07_28.as_str().to_string(),
-                    packs: capability_packs(),
+                    packs: capability_packs(&config.policy),
                     vaults: config.vaults.keys().cloned().collect(),
                     default_vault: default_vault_display(config),
+                    approval_channels: approval_channels(),
                 };
                 (decision, Ok(Json(out)))
             }
@@ -1740,6 +1856,159 @@ mod tests {
         assert_eq!(brain["enabled"], true, "{resp}");
         let developer = packs.iter().find(|p| p["name"] == "developer").unwrap();
         assert_eq!(developer["enabled"], false, "{resp}");
+    }
+
+    // ── Gateway PR 4, Task 6: capabilities truthfulness ──────────────────
+
+    /// Every `brain` pack tool must report its real [`RiskClass`] AND the
+    /// EFFECTIVE [`PolicyMode`] the live `gateway.yml` resolves that class
+    /// to — not just a bare name. Uses a custom policy (`mutating: deny`,
+    /// `read_only` left at its `auto` default) so the two risk classes
+    /// resolve to VISIBLY DIFFERENT modes, proving `capabilities` reports
+    /// the per-tool lookup rather than one fixed value copy-pasted onto
+    /// every entry.
+    #[tokio::test]
+    async fn capabilities_reports_risk_class_and_effective_policy_mode_per_tool() {
+        let (_dir, router, _state, token) =
+            fixture_router_with_mutating_policy(policy::PolicyMode::Deny, 300, 30);
+        let body = call_body(1, "capabilities", serde_json::json!({}));
+        let resp = post(
+            &router,
+            body,
+            &token,
+            &standard_headers("tools/call", Some("capabilities")),
+        )
+        .await;
+        let packs = resp["result"]["structuredContent"]["packs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no structuredContent.packs: {resp}"));
+        let brain_tools = packs
+            .iter()
+            .find(|p| p["name"] == "brain")
+            .unwrap_or_else(|| panic!("no brain pack: {resp}"))["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("brain pack has no tools array: {resp}"))
+            .clone();
+
+        let find = |name: &str| {
+            brain_tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| {
+                    panic!("tool {name:?} missing from capabilities: {brain_tools:?}")
+                })
+        };
+
+        let capabilities_tool = find("capabilities");
+        assert_eq!(capabilities_tool["risk_class"], "read_only", "{resp}");
+        assert_eq!(
+            capabilities_tool["policy_mode"], "auto",
+            "read_only tools must report the default auto mode: {resp}"
+        );
+
+        let brain_capture_tool = find("brain_capture");
+        assert_eq!(brain_capture_tool["risk_class"], "mutating", "{resp}");
+        assert_eq!(
+            brain_capture_tool["policy_mode"], "deny",
+            "brain_capture must report THIS config's overridden deny mode, not the default: {resp}"
+        );
+
+        // Every listed tool name is present, so a caller can't be surprised
+        // by a tool `tools/list` advertises that `capabilities` never
+        // mentions.
+        let names: Vec<&str> = brain_tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        for expected in [
+            "capabilities",
+            "brain_tasks",
+            "brain_get",
+            "brain_search",
+            "brain_capture",
+        ] {
+            assert!(names.contains(&expected), "{names:?}");
+        }
+    }
+
+    /// `http` is unconditionally `true` (the `/approvals` surface is always
+    /// mounted by `build_gateway_router` in this build) and `telegram` is
+    /// unconditionally `false` (not implemented yet — Gateway PR 5),
+    /// regardless of policy configuration or platform.
+    #[tokio::test]
+    async fn capabilities_reports_http_channel_true_and_telegram_false() {
+        let (_dir, router, token) = fixture_router();
+        let body = call_body(1, "capabilities", serde_json::json!({}));
+        let resp = post(
+            &router,
+            body,
+            &token,
+            &standard_headers("tools/call", Some("capabilities")),
+        )
+        .await;
+        let channels = &resp["result"]["structuredContent"]["approval_channels"];
+        assert_eq!(channels["http"], true, "{resp}");
+        assert_eq!(channels["telegram"], false, "{resp}");
+        assert!(
+            channels["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("PR 5"),
+            "the note must explain telegram's deferral: {resp}"
+        );
+    }
+
+    /// `capabilities`'s reported `native` availability must match
+    /// `approval_native::is_available()` exactly on THIS machine — the
+    /// binding truthfulness requirement: a caller must never be told a
+    /// channel is available when it isn't (or vice versa). Holds the
+    /// crate-wide `test_env` lock across both reads (the direct call here
+    /// and the one `capabilities`'s own handler makes internally) purely to
+    /// serialize against `approval_native`'s own env-var-mutating tests —
+    /// see that module's identical-purpose guard on
+    /// `is_available_is_true_on_macos_with_osascript_on_path`.
+    #[tokio::test]
+    async fn capabilities_native_channel_matches_approval_native_is_available() {
+        let _env = crate::test_env::set_vars(&[]);
+        let (_dir, router, token) = fixture_router();
+        let expected = approval_native::is_available();
+        let body = call_body(1, "capabilities", serde_json::json!({}));
+        let resp = post(
+            &router,
+            body,
+            &token,
+            &standard_headers("tools/call", Some("capabilities")),
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["structuredContent"]["approval_channels"]["native"], expected,
+            "{resp}"
+        );
+    }
+
+    /// The binding requirement in concrete form: explicitly disabling the
+    /// native channel (the exact mechanism `tests/gateway_approval_e2e.rs`
+    /// relies on to keep its spawned gateway subprocess headless) must make
+    /// `capabilities` report `native: false` — regardless of what platform
+    /// this test itself runs on, and regardless of whether `osascript` is
+    /// really on `$PATH`. A caller must never be told a write CAN be
+    /// approved through a channel that cannot actually deliver the prompt.
+    #[tokio::test]
+    async fn capabilities_reports_native_channel_false_when_explicitly_disabled() {
+        let _env = crate::test_env::set_var(approval_native::DISABLE_NATIVE_APPROVAL_ENV, "1");
+        let (_dir, router, token) = fixture_router();
+        let body = call_body(1, "capabilities", serde_json::json!({}));
+        let resp = post(
+            &router,
+            body,
+            &token,
+            &standard_headers("tools/call", Some("capabilities")),
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["structuredContent"]["approval_channels"]["native"], false,
+            "{resp}"
+        );
     }
 
     /// Final-review fix (Item 1): `fixture_router`'s `default_vault` is the
