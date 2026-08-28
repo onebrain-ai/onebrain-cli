@@ -3,10 +3,10 @@
 //! the register/wait/resolve machinery `server.rs`'s `policy_gate` doc
 //! comment names as "Task 3+'s interactive approval flow", plus the
 //! operator-facing HTTP surface in [`super::approval_routes`] a human uses
-//! to actually decide. `server.rs`'s `policy_gate` itself is NOT rewired to
-//! call `register`/`wait` by this task — that remains the "later task"
-//! its own doc comment already names; this task ships the registry and its
-//! HTTP surface on their own, fully tested in isolation.
+//! to actually decide. Gateway PR 4, Task 5 rewired `server.rs`'s
+//! `policy_gate` to actually call [`Approvals::register`]/[`Approvals::wait`]
+//! from its `NeedApproval` arm (`server::await_approval`) — this module is
+//! no longer a registry with only its own tests for company.
 //!
 //! ## Two resolution channels, one registry (Gateway PR 4, Task 4)
 //!
@@ -35,6 +35,17 @@
 //! prove a connector's live bearer token is explicitly REJECTED on
 //! `/approvals` — the privilege-separation property this whole gate rests
 //! on.
+//!
+//! ## Bounded, so a client cannot fan out unbounded dialogs
+//!
+//! [`Approvals::register`] refuses past [`MAX_PENDING_APPROVALS`] globally or
+//! [`MAX_PENDING_APPROVALS_PER_CLIENT`] for one client — see its own doc
+//! comment. Before Task 5 wired a production caller this was academic;
+//! afterwards a client looping `brain_capture` under the DEFAULT
+//! `mutating: ask_once` (before any grant exists) or under `ask_always`
+//! would otherwise register one pending entry — and fire one real
+//! `osascript` GUI dialog, each pinning a `spawn_blocking` thread — per
+//! in-flight call.
 //!
 //! ## In-memory, per-process — same lifetime discipline as [`super::policy::Grants`]
 //!
@@ -70,7 +81,34 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+use super::auth::core::now_epoch_secs;
 use super::policy::RiskClass;
+
+/// Hard cap on simultaneously-pending approvals across ALL clients. Past
+/// this, [`Approvals::register`] refuses rather than queueing another entry
+/// (and, via `server::await_approval`, another native dialog). Far more than
+/// a human at the console could meaningfully answer, so it never bites a
+/// legitimate operator — it exists purely to bound a client that loops a
+/// gated tool.
+pub const MAX_PENDING_APPROVALS: usize = 16;
+
+/// Same, per `client_id`, so one noisy connector cannot consume the whole
+/// global budget and lock every other client out of ever getting a prompt.
+pub const MAX_PENDING_APPROVALS_PER_CLIENT: usize = 4;
+
+/// Why [`Approvals::register`] refused. Returned (rather than a bare
+/// `Option`) so the operator log can say WHICH limit was hit — the two mean
+/// very different things for an operator: a global limit suggests several
+/// clients or a wedged gateway, a per-client one points at a single
+/// misbehaving connector. Never surfaced to the client, which only ever
+/// sees `server::await_approval`'s single fixed refusal message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterRejected {
+    /// [`MAX_PENDING_APPROVALS`] live entries already exist.
+    Global,
+    /// This `client_id` already has [`MAX_PENDING_APPROVALS_PER_CLIENT`].
+    PerClient,
+}
 
 /// One tool call awaiting a human operator's decision — the record surfaced
 /// by `GET /approvals` and released by `POST /approvals/{id}`.
@@ -86,6 +124,14 @@ pub struct PendingApproval {
     pub id: String,
     pub client_id: String,
     pub tool: String,
+    /// The vault the call named (its own `vault` argument), or `None` for
+    /// the default resolution chain — carried so that resolving this
+    /// approval records the SAME [`super::policy::GrantKey`] the waiter
+    /// would (`approval_routes::resolve_approval` and
+    /// `server::await_approval` must not disagree about a grant's scope).
+    /// Not a secret: it is a `gateway.yml` vault NAME, never a host path,
+    /// and the operator is already shown it inside `summary`.
+    pub vault: Option<String>,
     pub summary: String,
     pub created: u64,
     pub expires: u64,
@@ -101,7 +147,7 @@ pub struct PendingApproval {
 
 /// A human operator's response to one [`PendingApproval`] — deliberately a
 /// DIFFERENT type from `audit::Decision` (`Auto`/`Approved`/`Denied`/
-/// `TimedOut`/`Blocked`, an OUTCOME record) even though the names echo each
+/// `TimedOut`, an OUTCOME record) even though the names echo each
 /// other: this is the human's raw INPUT (`Approve`/`Deny`), which
 /// `approval_routes::resolve_approval` translates into effects (waking the
 /// waiter, and on `Approve`, recording a [`super::policy::Grants`] entry).
@@ -117,13 +163,12 @@ pub enum Decision {
 /// Outcome of [`Approvals::wait`]: either a human [`Decision`], or the TTL
 /// elapsed with no response.
 ///
-/// No production caller yet (see [`Approvals::wait`]'s own doc comment for
-/// why — same "Dead-code allow" situation as `audit::Decision::Approved`/
-/// `TimedOut`, which this eventually feeds into once a later task wires
-/// `server.rs`'s `policy_gate` to actually call [`Approvals::register`]/
-/// [`Approvals::wait`]). Exercised directly by this module's own unit
-/// tests until then.
-#[allow(dead_code)]
+/// Gateway PR 4, Task 5 gave both variants a real production caller:
+/// `server::await_approval` constructs this by `.await`ing [`Approvals::wait`]
+/// and matches on both arms — `Decided` becomes `audit::Decision::Approved`
+/// or `Denied`, `TimedOut` becomes `audit::Decision::TimedOut` — so the
+/// blanket dead-code allow this type used to carry is gone, exactly like
+/// the ones on `register`/`wait`/`audit::Decision::{Approved,TimedOut}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitOutcome {
     Decided(Decision),
@@ -154,11 +199,48 @@ impl Approvals {
     /// `server::await_approval` calls this from `policy_gate`'s
     /// `NeedApproval` arm, before firing the native dialog channel and
     /// `.await`ing [`Self::wait`] on the returned receiver.
-    pub fn register(&self, p: PendingApproval) -> oneshot::Receiver<Decision> {
+    ///
+    /// **Bounded** ([`RegisterRejected`]): refuses once
+    /// [`MAX_PENDING_APPROVALS`] entries exist globally, or
+    /// [`MAX_PENDING_APPROVALS_PER_CLIENT`] exist for `p.client_id`. A
+    /// refusal is a plain `Err` — nothing is inserted, no channel is
+    /// created, and the caller turns it into a policy error instead of
+    /// queueing another human prompt.
+    ///
+    /// Entries already past their own `expires` are dropped FIRST, before
+    /// either count is taken. That matters specifically BECAUSE of the caps:
+    /// [`Self::wait`] only cleans up an entry when its own waiter is still
+    /// polling, so a call whose future was cancelled (client disconnected,
+    /// request timed out upstream) would otherwise leave a pending entry
+    /// behind forever and permanently consume one slot of a now-finite
+    /// budget. Dropping the entry drops its `oneshot::Sender`, which is
+    /// exactly what a still-live waiter reads as [`WaitOutcome::TimedOut`] —
+    /// and by definition such an entry's own TTL has already elapsed, so no
+    /// decision is being thrown away.
+    pub fn register(
+        &self,
+        p: PendingApproval,
+    ) -> Result<oneshot::Receiver<Decision>, RegisterRejected> {
         let (tx, rx) = oneshot::channel();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+
+        let now = now_epoch_secs();
+        pending.retain(|_, (entry, _)| entry.expires > now);
+
+        if pending.len() >= MAX_PENDING_APPROVALS {
+            return Err(RegisterRejected::Global);
+        }
+        if pending
+            .values()
+            .filter(|(entry, _)| entry.client_id == p.client_id)
+            .count()
+            >= MAX_PENDING_APPROVALS_PER_CLIENT
+        {
+            return Err(RegisterRejected::PerClient);
+        }
+
         pending.insert(p.id.clone(), (p, tx));
-        rx
+        Ok(rx)
     }
 
     /// Every currently-pending approval, in arbitrary (`HashMap` iteration)
@@ -243,14 +325,25 @@ impl Default for Approvals {
 mod tests {
     use super::*;
 
+    /// A pending entry whose TTL is comfortably LIVE. That matters:
+    /// [`Approvals::register`] prunes already-expired entries before it
+    /// counts them against the caps, so a fixture with a hardcoded
+    /// past-timestamp `expires` would be silently dropped the moment a
+    /// second entry was registered.
     fn sample(id: &str) -> PendingApproval {
+        sample_for(id, "client-1")
+    }
+
+    fn sample_for(id: &str, client_id: &str) -> PendingApproval {
+        let now = now_epoch_secs();
         PendingApproval {
             id: id.to_string(),
-            client_id: "client-1".to_string(),
+            client_id: client_id.to_string(),
             tool: "brain_capture".to_string(),
+            vault: Some("t1".to_string()),
             summary: "note: Quarterly Plan".to_string(),
-            created: 1_700_000_000,
-            expires: 1_700_000_300,
+            created: now,
+            expires: now + 300,
             class: RiskClass::Mutating,
         }
     }
@@ -260,7 +353,7 @@ mod tests {
     #[tokio::test]
     async fn register_then_resolve_delivers_the_decision() {
         let approvals = Approvals::new();
-        let rx = approvals.register(sample("a1"));
+        let rx = approvals.register(sample("a1")).unwrap();
         assert!(approvals.resolve("a1", Decision::Approve));
         assert_eq!(rx.await.unwrap(), Decision::Approve);
     }
@@ -278,7 +371,7 @@ mod tests {
     #[tokio::test]
     async fn double_resolve_second_call_returns_false_first_decision_stands() {
         let approvals = Approvals::new();
-        let rx = approvals.register(sample("a1"));
+        let rx = approvals.register(sample("a1")).unwrap();
         assert!(approvals.resolve("a1", Decision::Approve));
         assert!(
             !approvals.resolve("a1", Decision::Deny),
@@ -296,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn wait_returns_the_decision_when_resolved_before_the_ttl() {
         let approvals = Approvals::new();
-        let rx = approvals.register(sample("a1"));
+        let rx = approvals.register(sample("a1")).unwrap();
         assert!(approvals.resolve("a1", Decision::Deny));
         let outcome = approvals.wait("a1", rx, Duration::from_secs(5)).await;
         assert_eq!(outcome, WaitOutcome::Decided(Decision::Deny));
@@ -305,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn wait_times_out_and_drops_the_entry_from_pending() {
         let approvals = Approvals::new();
-        let rx = approvals.register(sample("a1"));
+        let rx = approvals.register(sample("a1")).unwrap();
         assert_eq!(approvals.list().len(), 1, "must be pending before the wait");
 
         let outcome = approvals.wait("a1", rx, Duration::from_millis(20)).await;
@@ -330,7 +423,7 @@ mod tests {
     #[test]
     fn list_exposes_exactly_pending_approvals_own_fields() {
         let approvals = Approvals::new();
-        let _rx = approvals.register(sample("a1"));
+        let _rx = approvals.register(sample("a1")).unwrap();
         let listed = approvals.list();
         assert_eq!(listed.len(), 1);
         let p = &listed[0];
@@ -338,13 +431,14 @@ mod tests {
         assert_eq!(p.client_id, "client-1");
         assert_eq!(p.tool, "brain_capture");
         assert_eq!(p.summary, "note: Quarterly Plan");
-        assert_eq!(p.created, 1_700_000_000);
-        assert_eq!(p.expires, 1_700_000_300);
+        assert_eq!(p.vault.as_deref(), Some("t1"));
+        assert!(p.expires > p.created, "{p:?}");
         assert_eq!(p.class, RiskClass::Mutating);
 
-        // Serializes to EXACTLY these 7 fields — a JSON object with no extra
+        // Serializes to EXACTLY these 8 fields — a JSON object with no extra
         // keys, so no token / full note body / host path could sneak in
-        // through a field this struct doesn't have.
+        // through a field this struct doesn't have. (`vault` is a
+        // `gateway.yml` vault NAME, never a path — see its own doc comment.)
         let value = serde_json::to_value(p).unwrap();
         let obj = value.as_object().unwrap();
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
@@ -358,7 +452,8 @@ mod tests {
                 "expires",
                 "id",
                 "summary",
-                "tool"
+                "tool",
+                "vault"
             ]
         );
     }
@@ -366,10 +461,10 @@ mod tests {
     #[tokio::test]
     async fn multiple_pending_approvals_are_independent() {
         let approvals = Approvals::new();
-        let rx1 = approvals.register(sample("a1"));
+        let rx1 = approvals.register(sample("a1")).unwrap();
         let mut second = sample("a2");
         second.client_id = "client-2".to_string();
-        let rx2 = approvals.register(second);
+        let rx2 = approvals.register(second).unwrap();
 
         assert_eq!(approvals.list().len(), 2);
         assert!(approvals.resolve("a2", Decision::Deny));
@@ -379,6 +474,102 @@ mod tests {
         assert!(approvals.resolve("a1", Decision::Approve));
         assert_eq!(rx1.await.unwrap(), Decision::Approve);
         assert!(approvals.list().is_empty());
+    }
+
+    // ── Bounded registration (the pending-approval caps) ─────────────────
+
+    /// One client cannot queue more than
+    /// [`MAX_PENDING_APPROVALS_PER_CLIENT`] prompts — the cap that stops a
+    /// connector looping `brain_capture` from fanning out one blocking
+    /// native dialog per in-flight call.
+    #[test]
+    fn register_refuses_past_the_per_client_cap() {
+        let approvals = Approvals::new();
+        let mut held = Vec::new();
+        for i in 0..MAX_PENDING_APPROVALS_PER_CLIENT {
+            held.push(
+                approvals
+                    .register(sample(&format!("a{i}")))
+                    .unwrap_or_else(|e| panic!("entry {i} must fit under the cap: {e:?}")),
+            );
+        }
+        assert_eq!(
+            approvals.register(sample("one-too-many")).err(),
+            Some(RegisterRejected::PerClient)
+        );
+        assert_eq!(
+            approvals.list().len(),
+            MAX_PENDING_APPROVALS_PER_CLIENT,
+            "a refused registration must insert nothing"
+        );
+
+        // A DIFFERENT client still gets its own budget — the per-client cap
+        // must not be a global one in disguise.
+        assert!(approvals.register(sample_for("other", "client-2")).is_ok());
+    }
+
+    /// And the global cap holds even when every client stays under its own
+    /// per-client budget.
+    #[test]
+    fn register_refuses_past_the_global_cap_across_many_clients() {
+        let approvals = Approvals::new();
+        let mut held = Vec::new();
+        for i in 0..MAX_PENDING_APPROVALS {
+            let client = i / MAX_PENDING_APPROVALS_PER_CLIENT;
+            held.push(
+                approvals
+                    .register(sample_for(&format!("e{i}"), &format!("client-{client}")))
+                    .unwrap_or_else(|e| panic!("entry {i} must fit under the global cap: {e:?}")),
+            );
+        }
+        assert_eq!(approvals.list().len(), MAX_PENDING_APPROVALS);
+        assert_eq!(
+            approvals
+                .register(sample_for("overflow", "fresh-client"))
+                .err(),
+            Some(RegisterRejected::Global),
+            "a brand-new client must still be refused once the GLOBAL cap is reached"
+        );
+    }
+
+    /// The cap must not become a permanent lockout: an entry whose waiter
+    /// went away (a cancelled request) is never cleaned up by
+    /// [`Approvals::wait`], so `register` prunes it once its own TTL has
+    /// elapsed — otherwise a handful of abandoned calls would exhaust a
+    /// now-finite budget for the whole life of the process.
+    #[test]
+    fn register_prunes_expired_entries_so_the_cap_cannot_wedge() {
+        let approvals = Approvals::new();
+        let mut held = Vec::new();
+        for i in 0..MAX_PENDING_APPROVALS_PER_CLIENT - 1 {
+            held.push(approvals.register(sample(&format!("live{i}"))).unwrap());
+        }
+
+        // One entry already past its own TTL whose receiver was dropped —
+        // exactly the shape a cancelled tool call leaves behind, and the
+        // one `wait` can never clean up (its waiter is gone).
+        let now = now_epoch_secs();
+        let mut stale = sample("stale");
+        stale.created = now - 600;
+        stale.expires = now - 300;
+        drop(approvals.register(stale).unwrap());
+        assert_eq!(
+            approvals.list().len(),
+            MAX_PENDING_APPROVALS_PER_CLIENT,
+            "the per-client cap is now full ON PAPER"
+        );
+
+        let _rx = approvals
+            .register(sample("fresh"))
+            .expect("an expired entry must not count against the cap");
+        assert_eq!(
+            approvals.list().len(),
+            MAX_PENDING_APPROVALS_PER_CLIENT,
+            "the stale entry must have been pruned to make room, not stacked on top"
+        );
+        let ids: Vec<String> = approvals.list().into_iter().map(|p| p.id).collect();
+        assert!(!ids.contains(&"stale".to_string()), "{ids:?}");
+        assert!(ids.contains(&"fresh".to_string()), "{ids:?}");
     }
 
     // ── wire shape ───────────────────────────────────────────────────────
@@ -409,7 +600,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wait_does_not_hold_the_lock_across_the_await() {
         let approvals = std::sync::Arc::new(Approvals::new());
-        let rx = approvals.register(sample("a1"));
+        let rx = approvals.register(sample("a1")).unwrap();
 
         let waiter = {
             let approvals = approvals.clone();

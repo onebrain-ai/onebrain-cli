@@ -43,17 +43,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   gated by the gateway's pairing code, deliberately OUTSIDE the connector
   Bearer layer, so a connector's own access token can never self-approve its
   own pending call. An approved `ask_once` call records a TTL-bounded grant
-  (`grant_ttl_minutes`, default 30) so later calls from the same client don't
-  need to ask again. Every tool call — allowed, denied, approved, or timed
+  (`grant_ttl_minutes`, default 30) so later calls from the same client, for
+  the same vault and risk class, don't need to ask again — the vault is part
+  of the consent scope, so approving a write into one vault never authorizes
+  writes into another, and an `ask_always` approval records no grant at all.
+  The pending-approval registry is bounded (16 overall, 4 per client): past
+  either limit a gated call is refused with a policy error instead of
+  queueing another human prompt. Every tool call — allowed, denied, approved, or timed
   out — is appended as one JSON line to
   `~/.onebrain/gateway/audit/YYYY-MM.jsonl` (redacted args summary only,
   never a raw note body or credential). See
   [`docs/gateway.md#policy--approvals`](docs/gateway.md#policy--approvals).
 - `brain_capture` — the gateway's first WRITE tool: creates a new inbox note
-  from a `title`/`text`, confined to the vault by two independent traversal
-  guards (a syntactic plain-relative-path check plus post-canonicalization
-  confinement, catching a symlinked-out folder too), gated by the policy
-  engine above (`RiskClass::Mutating`). See
+  from a `title`/`text`, confined to the vault by three independent guards (a
+  syntactic plain-relative-path check, post-canonicalization confinement that
+  catches a symlinked-out folder, and an equality check that the confined path
+  is exactly the path the write will open), gated by the policy engine above
+  (`RiskClass::Mutating`). An empty `text` is rejected as `invalid_params`;
+  a same-day title collision returns a clean tool error naming the
+  vault-relative path; the follow-up search reindex is detached, so the call
+  returns as soon as the note is on disk rather than waiting on a daemon cold
+  start. See
   [`docs/gateway.md#brain_capture`](docs/gateway.md#brain_capture).
 - `capabilities` now reports each tool's risk class and the policy mode
   currently in force for it, plus an `approval_channels` object

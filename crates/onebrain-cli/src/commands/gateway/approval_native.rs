@@ -27,11 +27,16 @@
 //!
 //! ## Security: every interpolated value is attacker-influenceable
 //!
-//! The dialog text embeds `client_id` (a client picks its own `client_id`
-//! at `/register` — see `oauth_routes::register_client_handler`), the tool
-//! name, and the summary (built from model-supplied tool arguments, per
-//! `audit::AuditEntry::args_summary`'s own doc comment). All three are
-//! untrusted. This is the SAME bug class as PR 3's `/authorize` consent-page
+//! The dialog text embeds `client_id`, the tool name, and the summary
+//! (built from model-supplied tool arguments, per
+//! `audit::AuditEntry::args_summary`'s own doc comment). The summary is
+//! flatly untrusted; the tool name comes from this crate's own `#[tool]`
+//! router. `client_id` is SERVER-minted (`oauth_routes.rs`'s
+//! `register_client_handler` assigns it via `mint_secret_32` — a client
+//! never picks its own, which is the whole reason a grant keyed on it is
+//! unforgeable), so it is charset-bounded in practice; it is escaped here
+//! anyway, because a value being trustworthy today is not the property this
+//! escaping depends on. This is the SAME bug class as PR 3's `/authorize` consent-page
 //! XSS — a different language (AppleScript instead of HTML), the same
 //! discipline: every one of those three values is run through
 //! [`escape_applescript_string`] before it is interpolated into the
@@ -155,9 +160,13 @@ use std::sync::Arc;
 
 use super::approval::{Approvals, Decision, PendingApproval};
 
-/// Env var that, when set to ANY value (including empty), unconditionally
-/// disables this channel — checked first in [`is_available`], before the
-/// platform/`osascript` probe. See the module docs' "Disabling the channel
+/// Env var that, when set to any NON-EMPTY value, unconditionally disables
+/// this channel — checked first in [`is_available`], before the
+/// platform/`osascript` probe. A set-but-EMPTY value counts as unset, and
+/// `=0`/`=false` count as SET (it is a presence switch, not a boolean
+/// parser): both follow `super::env_switch_on`, which is this crate's
+/// existing convention for `ONEBRAIN_NO_DAEMON` and `$ONEBRAIN_BIND`. See
+/// the module docs' "Disabling the channel
 /// from outside the process" section for why this exists and why an env var
 /// (not a `gateway.yml` key) is the right shape for it. `pub` so
 /// `server::capabilities`'s own doc comment can reference the exact name by
@@ -171,7 +180,8 @@ use super::approval::{Approvals, Decision, PendingApproval};
 pub const DISABLE_NATIVE_APPROVAL_ENV: &str = "ONEBRAIN_GATEWAY_DISABLE_NATIVE_APPROVAL";
 
 /// `true` iff a native `display dialog` prompt can plausibly be shown on
-/// this machine: [`DISABLE_NATIVE_APPROVAL_ENV`] is NOT set, this build
+/// this machine: [`DISABLE_NATIVE_APPROVAL_ENV`] is not set to a non-empty
+/// value, this build
 /// targets macOS, and `osascript` resolves to a real file somewhere on
 /// `$PATH`. Pure and synchronous — no subprocess is spawned to answer this
 /// question, only the environment and `$PATH` are inspected (via
@@ -190,7 +200,7 @@ pub const DISABLE_NATIVE_APPROVAL_ENV: &str = "ONEBRAIN_GATEWAY_DISABLE_NATIVE_A
 /// this channel can actually deliver a prompt right now — including when
 /// it's been disabled via [`DISABLE_NATIVE_APPROVAL_ENV`].
 pub fn is_available() -> bool {
-    if std::env::var_os(DISABLE_NATIVE_APPROVAL_ENV).is_some() {
+    if super::env_switch_on(DISABLE_NATIVE_APPROVAL_ENV) {
         return false;
     }
     cfg!(target_os = "macos") && osascript_on_path()
@@ -322,13 +332,15 @@ mod tests {
     use super::*;
 
     fn sample() -> PendingApproval {
+        let now = crate::commands::gateway::auth::core::now_epoch_secs();
         PendingApproval {
             id: "a1".to_string(),
             client_id: "client-1".to_string(),
             tool: "brain_capture".to_string(),
+            vault: Some("t1".to_string()),
             summary: "note: Quarterly Plan".to_string(),
-            created: 1_700_000_000,
-            expires: 1_700_000_300,
+            created: now,
+            expires: now + 300,
             class: crate::commands::gateway::policy::RiskClass::Mutating,
         }
     }
@@ -546,6 +558,23 @@ mod tests {
         );
     }
 
+    /// The switch follows this crate's existing env-switch convention
+    /// (`super::env_switch_on`, the same shape as `ONEBRAIN_NO_DAEMON`):
+    /// a set-but-EMPTY value counts as UNSET, so blanking the key in a
+    /// hook-managed env block neutralizes it without having to remove it.
+    /// Off macOS `is_available()` is `false` for an unrelated reason, so the
+    /// empty-value arm can only be asserted where it would otherwise be
+    /// `true`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn is_available_treats_a_set_but_empty_disable_var_as_unset() {
+        let _env = crate::test_env::set_var(DISABLE_NATIVE_APPROVAL_ENV, "");
+        assert!(
+            is_available(),
+            "an EMPTY value must count as unset, matching ONEBRAIN_NO_DAEMON's convention"
+        );
+    }
+
     // ── Step 2: prompt is a non-panicking no-op off macOS ────────────────
 
     /// Runs ONLY on non-macOS targets (the ubuntu-latest/windows-latest legs
@@ -563,7 +592,7 @@ mod tests {
     fn prompt_is_a_noop_off_macos_and_does_not_panic() {
         let approvals = Arc::new(Approvals::new());
         let p = sample();
-        let _rx = approvals.register(p.clone());
+        let _rx = approvals.register(p.clone()).unwrap();
 
         prompt(&p, approvals.clone());
 

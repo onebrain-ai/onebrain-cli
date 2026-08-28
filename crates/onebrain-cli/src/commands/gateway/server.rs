@@ -339,11 +339,30 @@ fn resolve_under_vault(vault_root: &Path, rel: &str) -> anyhow::Result<PathBuf> 
 ///    SYMLINKED parent (e.g. the inbox folder itself replaced by a symlink
 ///    pointing outside the vault) even though layer 1 already ruled out a
 ///    textual `..` escape.
+/// 3. **Transfer to the actual write**: `new_note`/`append_note` do NOT
+///    take the confined path — they take `(vault_root, rel)` and join them
+///    with zero confinement of their own. So the returned path is finally
+///    asserted to equal `canonical_root.join(rel)`: the write's own join,
+///    with only the root resolved. When those differ, some component of
+///    `rel` was rewritten by symlink resolution — the guard proved a
+///    DIFFERENT path from the one the write will open, so its proof does
+///    not transfer and the call is refused. (Concretely: an inbox that is
+///    a symlink to another directory *inside* the same vault passes layer 2
+///    but is refused here. That is deliberate — fail closed rather than
+///    write through a link the guard did not actually vouch for.)
 ///
-/// Returns the resulting absolute, confined path (informational — proof the
-/// check passed; `brain_capture` still hands `new_note` the original
-/// vault-relative `rel`, since `new_note` needs a relative path to derive
-/// the note's title and its own `NewResult.path`).
+/// Returns that path: it is the exact file the subsequent write will
+/// create, so `capture_note` uses it directly for its same-day collision
+/// check rather than re-deriving one.
+///
+/// **What this does NOT cover, stated plainly:** the parent is canonicalized
+/// BEFORE the write, so a parent swapped for an escaping symlink in the
+/// window between this check and `new_note`'s `create_dir_all`/write is not
+/// caught. Closing that needs `openat`-style handle-relative I/O in
+/// `onebrain-fs`, which this layer cannot reach; it is tracked as fs-layer
+/// hardening. The window requires an attacker who already has write access
+/// inside the vault, which is a strictly larger capability than anything
+/// this gateway grants.
 fn resolve_create_under_vault(vault_root: &Path, rel: &Path) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(
         rel.components()
@@ -372,7 +391,87 @@ fn resolve_create_under_vault(vault_root: &Path, rel: &Path) -> anyhow::Result<P
         "path escapes the vault: {}",
         rel.display()
     );
-    Ok(parent_canon.join(file_name))
+
+    // Layer 3 — see the doc comment. `new_note`/`append_note` will open
+    // `vault_root.join(rel)`; this is that same join with the root resolved.
+    // Making it an ENFORCED equality rather than an inference is what lets
+    // the caller hand those functions the raw `rel` and still know the
+    // guard's proof applies to the file they will actually touch.
+    let confined = parent_canon.join(file_name);
+    anyhow::ensure!(
+        confined == root.join(rel),
+        "derived note path does not resolve to its own vault-relative location: {}",
+        rel.display()
+    );
+    Ok(confined)
+}
+
+/// Env var that, when set to any NON-EMPTY value, disables `brain_capture`'s
+/// best-effort daemon reindex — the SECOND half of the pair
+/// [`approval_native::DISABLE_NATIVE_APPROVAL_ENV`] opened, and it exists
+/// for the same reason: to switch off, FROM OUTSIDE THE PROCESS, a side
+/// effect that is fine in production and unacceptable in a test.
+///
+/// The side effect here is a real subprocess. `capture_note`'s reindex step
+/// calls `daemon_client::ensure_running`, which — when no warm daemon is
+/// already up — spawns `onebrain daemon start`, leaving a genuine `onebrain
+/// daemon __run` process alive on the machine long after the test that
+/// caused it has finished. That was observed for real, not theorized:
+/// `tests/gateway_approval_e2e.rs` left one behind on a developer machine
+/// before this switch existed. A test binary must not leave background
+/// processes running on a developer's box or on CI.
+///
+/// Why not the pre-existing `ONEBRAIN_NO_DAEMON`: that one gates
+/// `search_common::route_to_daemon`, the CLI's PASSIVE "route to a daemon
+/// that already exists" path. It never reaches `ensure_running`, the ACTIVE
+/// spawn-if-absent path this call site (and `brain_search`) uses, so setting
+/// it changes nothing here.
+///
+/// Scope, deliberately: this covers ONLY the BEST-EFFORT reindex. It does
+/// not touch `brain_search`, whose `ensure_running` call is load-bearing —
+/// disabling that would break the tool rather than degrade it, and no test
+/// wants a `brain_search` that silently returns nothing. `tests/gateway_http.rs`
+/// deliberately drives a real daemon for exactly that reason.
+///
+/// Same presence-switch semantics as its sibling (`super::env_switch_on`):
+/// any non-empty value is ON, a set-but-empty value counts as unset.
+pub const DISABLE_DAEMON_REINDEX_ENV: &str = "ONEBRAIN_GATEWAY_DISABLE_DAEMON_REINDEX";
+
+/// `true` iff `capture_note` may dispatch its best-effort daemon reindex.
+///
+/// Two independent off-switches, matching the shape `await_approval` already
+/// uses for the native dialog channel (`!cfg!(test) && is_available()`):
+///
+/// - `cfg!(test)` covers THIS crate's own unit tests. Compile-time, so it is
+///   `false` in the shipped binary and cannot be turned back on by accident.
+/// - [`DISABLE_DAEMON_REINDEX_ENV`] covers everything `cfg!(test)` cannot:
+///   a separately compiled integration-test binary that spawns the real
+///   `onebrain` executable (`tests/gateway_approval_e2e.rs`), where this
+///   crate's own `cfg(test)` is irrelevant because the gateway is a
+///   different, non-test process.
+///
+/// Read fresh on every call, never cached — same discipline as
+/// `approval_native::is_available`, so a test that sets the var mid-process
+/// observes it immediately.
+fn reindex_channel_enabled() -> bool {
+    !cfg!(test) && !super::env_switch_on(DISABLE_DAEMON_REINDEX_ENV)
+}
+
+/// The client-facing same-day collision message for `brain_capture`.
+///
+/// Written here rather than forwarding `onebrain_fs::note::new_note`'s own
+/// `InvalidTarget` text, which reads "file exists: <path> (use --force)" —
+/// `--force` is a CLI flag, and an MCP client has no CLI and no way to pass
+/// one, so that sentence tells a caller to do something impossible. `rel` is
+/// vault-RELATIVE (never a host path), so naming it is safe and is the one
+/// genuinely useful detail: it tells the caller which note already holds
+/// today's slug.
+fn capture_collision_message(rel: &Path) -> String {
+    format!(
+        "capture failed: a note already exists at {} — captures are one note per title per day, \
+         so use a different title",
+        rel.display()
+    )
 }
 
 /// Max characters kept in [`derive_slug`]'s output — bounds the derived note
@@ -544,11 +643,20 @@ fn paths_match(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// The brain pack's own tools, paired with each one's [`RiskClass`] — kept
-/// in one place so `capabilities` can't drift from what `#[tool_router]`
-/// actually registers, and so this list is the SAME `(tool, class)` pairing
-/// every `#[tool]` handler's own `policy_gate` call already uses (not a
-/// second, independently-maintained copy of it).
+/// The brain pack's own tools, paired with each one's [`RiskClass`].
+///
+/// **This is a PARALLEL list, kept in sync by hand.** Each `#[tool]` handler
+/// hardcodes its own `RiskClass` in its `policy_gate` call; nothing in the
+/// type system ties the two together, so adding a tool (or reclassifying
+/// one) means editing both places. `tests::brain_pack_tools_matches_the_tools_the_router_registers`
+/// pins half of that — the NAME set here against the names `#[tool_router]`
+/// actually registers, so a tool added to the router and forgotten here (or
+/// vice versa) fails a test rather than shipping a `capabilities` response
+/// that lies about what exists. The CLASS half stays conventional: a
+/// handler's class is a literal inside an `async fn` body, not reachable
+/// from any test without parsing source, and inventing a registry to make it
+/// reachable would cost more than the drift it prevents. Verify by reading
+/// when you touch either side.
 ///
 /// Gateway PR 4, Task 6 widened this from a bare name list to also resolve
 /// each class's EFFECTIVE [`PolicyMode`] via `policy.mode_for` — the exact
@@ -582,7 +690,14 @@ fn capability_packs(policy: &policy::PolicyConfig) -> Vec<PackInfo> {
             name: "brain".to_string(),
             enabled: true,
             tools: brain_pack_tools(policy),
-            note: "Read-only vault search, retrieval, and task listing.".to_string(),
+            // Must stay truthful about `brain_capture`: this prose sits in
+            // the same `capabilities` payload as a `tools` array reporting
+            // `brain_capture` with `risk_class: mutating`, and the two must
+            // not contradict each other. Pinned by
+            // `tests::brain_pack_note_does_not_claim_the_pack_is_read_only`.
+            note: "Vault search, retrieval, and task listing, plus one write tool \
+                   (brain_capture) that may require approval per gateway policy."
+                .to_string(),
         },
         PackInfo {
             name: "developer".to_string(),
@@ -747,6 +862,12 @@ async fn extract_principal_audited(
 /// `brain_capture` call reaches `NeedApproval` (absent a live grant) even
 /// with zero operator customization.
 ///
+/// `vault` is the call's own `vault` argument (`None` = the default
+/// resolution chain). It is part of the consent scope, not just display:
+/// `policy::decide` keys grants on `(client, vault, class)`, so approving a
+/// write into one vault never authorizes writes into another — see
+/// `policy.rs`'s "Grant scope" section.
+///
 /// `args_summary` is passed through verbatim to become
 /// [`PendingApproval::summary`] if this call needs approval — the SAME
 /// redacted, one-line string every caller already builds for its own audit
@@ -758,16 +879,17 @@ async fn policy_gate(
     principal: &Principal,
     tool: &'static str,
     class: RiskClass,
+    vault: Option<&str>,
     args_summary: &str,
 ) -> Result<Decision, (Decision, ErrorData)> {
-    match policy::decide(&state.config.policy, &state.grants, principal, class) {
+    match policy::decide(&state.config.policy, &state.grants, principal, class, vault) {
         PolicyOutcome::Allow => Ok(Decision::Auto),
         PolicyOutcome::Deny => Err((
             Decision::Denied,
             ErrorData::invalid_request(format!("gateway policy denies this call [{tool}]"), None),
         )),
         PolicyOutcome::NeedApproval => {
-            await_approval(state, principal, tool, class, args_summary).await
+            await_approval(state, principal, tool, class, vault, args_summary).await
         }
     }
 }
@@ -781,7 +903,13 @@ async fn policy_gate(
 ///    crate mints; `summary` is `args_summary` verbatim, `expires` derived
 ///    from [`policy::PolicyConfig::approval_wait_seconds`]) and
 ///    [`Approvals::register`] it — synchronous, no `.await` in its body, so
-///    nothing is held across an await point here.
+///    nothing is held across an await point here. Registration is BOUNDED
+///    ([`approval::RegisterRejected`]): past the global or per-client cap
+///    the call is refused with a policy error instead of queueing another
+///    human prompt. Without that, a client looping `brain_capture` under
+///    the default `ask_once` (before any grant exists) or under
+///    `ask_always` would fan out one blocking `osascript` dialog — each
+///    pinning a `spawn_blocking` thread — per in-flight call.
 /// 2. Fire the native dialog channel via [`approval_native::prompt`] when
 ///    [`approval_native::is_available`] AND this isn't the test binary
 ///    (`cfg!(test)` — see the inline comment at the call site below for why)
@@ -800,11 +928,17 @@ async fn policy_gate(
 ///    lock-do-one-thing-drop-the-guard methods, called either strictly
 ///    BEFORE or strictly AFTER the `.await`, never straddling it.
 /// 4. On `Decision::Approve`: record a [`Grants`] entry for `(client_id,
-///    class)` — config-derived TTL (`grant_ttl_minutes * 60`, mirroring
+///    vault, class)` — config-derived TTL (`grant_ttl_minutes * 60`,
+///    mirroring
 ///    `approval_routes::resolve_approval`'s own identical calculation for
 ///    the HTTP resolution channel) — so a second `ask_once` call from the
-///    same client, same risk class, within that TTL, satisfies `decide` via
-///    `Grants::has` and never reaches this function at all. Recording it
+///    same client, same vault, same risk class, within that TTL, satisfies
+///    `decide` via `Grants::has` and never reaches this function at all.
+///    Nothing is recorded under `PolicyMode::AskAlways`: `decide` ignores
+///    grants in that mode anyway, but "always ask" must never be capable of
+///    leaving standing consent behind for a later refactor to start
+///    honoring (`approval_routes::resolve_approval` carries the same
+///    guard). Recording it
 ///    HERE (not only in `approval_routes::resolve_approval`) is deliberate:
 ///    that HTTP-channel recording only fires when an operator resolves
 ///    through `/approvals`, but an approval can equally arrive through the
@@ -822,6 +956,7 @@ async fn await_approval(
     principal: &Principal,
     tool: &'static str,
     class: RiskClass,
+    vault: Option<&str>,
     args_summary: &str,
 ) -> Result<Decision, (Decision, ErrorData)> {
     let wait_secs = state.config.policy.approval_wait_seconds;
@@ -830,13 +965,35 @@ async fn await_approval(
         id: mint_secret_32(),
         client_id: principal.client_id.clone(),
         tool: tool.to_string(),
+        vault: vault.map(str::to_string),
         summary: args_summary.to_string(),
         created: now,
         expires: now.saturating_add(wait_secs),
         class,
     };
     let id = pending.id.clone();
-    let rx = state.approvals.register(pending.clone());
+    let rx = match state.approvals.register(pending.clone()) {
+        Ok(rx) => rx,
+        Err(rejected) => {
+            // Operator-facing only: which cap was hit tells an operator
+            // whether this is one runaway connector or a wedged gateway.
+            // The client is told nothing beyond "at capacity" — the counts
+            // and their split are not its business.
+            tracing::warn!(
+                ?rejected,
+                client_id = %principal.client_id,
+                tool,
+                "refusing a tool call: the pending-approval registry is at capacity"
+            );
+            return Err((
+                Decision::Denied,
+                ErrorData::invalid_request(
+                    format!("too many approval requests are already pending [{tool}]"),
+                    None,
+                ),
+            ));
+        }
+    };
 
     // `cfg!(test)` guards this crate's OWN unit tests (this module's
     // `#[cfg(test)] mod tests` below) from ever actually reaching
@@ -877,10 +1034,20 @@ async fn await_approval(
         .await
     {
         WaitOutcome::Decided(approval::Decision::Approve) => {
-            let ttl_secs = state.config.policy.grant_ttl_minutes.saturating_mul(60);
-            state
-                .grants
-                .record(GrantKey::new(principal.client_id.clone(), class), ttl_secs);
+            // "Always ask" never leaves standing consent behind — see this
+            // function's doc comment, step 4, and the identical guard in
+            // `approval_routes::resolve_approval`.
+            if state.config.policy.mode_for(class) != PolicyMode::AskAlways {
+                let ttl_secs = state.config.policy.grant_ttl_minutes.saturating_mul(60);
+                state.grants.record(
+                    GrantKey::new(
+                        principal.client_id.clone(),
+                        vault.map(str::to_string),
+                        class,
+                    ),
+                    ttl_secs,
+                );
+            }
             Ok(Decision::Approved)
         }
         WaitOutcome::Decided(approval::Decision::Deny) => Err((
@@ -998,6 +1165,7 @@ impl GatewayServer {
             &principal,
             "capabilities",
             RiskClass::ReadOnly,
+            None,
             &args_summary,
         )
         .await
@@ -1060,6 +1228,7 @@ impl GatewayServer {
             &principal,
             "brain_tasks",
             RiskClass::ReadOnly,
+            params.vault.as_deref(),
             &args_summary,
         )
         .await
@@ -1151,6 +1320,7 @@ impl GatewayServer {
             &principal,
             "brain_get",
             RiskClass::ReadOnly,
+            params.vault.as_deref(),
             &args_summary,
         )
         .await
@@ -1241,6 +1411,7 @@ impl GatewayServer {
             &principal,
             "brain_search",
             RiskClass::ReadOnly,
+            params.vault.as_deref(),
             &args_summary,
         )
         .await
@@ -1334,6 +1505,7 @@ impl GatewayServer {
             &principal,
             "brain_capture",
             RiskClass::Mutating,
+            params.vault.as_deref(),
             &args_summary,
         )
         .await
@@ -1385,6 +1557,25 @@ async fn capture_note(
     state: &Arc<GatewayState>,
     params: &BrainCaptureParams,
 ) -> Result<Json<BrainCaptureOut>, ErrorData> {
+    // A capture with no body writes a titled, empty stub — never what a
+    // caller meant, and afterwards indistinguishable from a capture whose
+    // body was silently lost. This one genuinely IS a bad argument (unlike
+    // the confinement failure below), so `invalid_params`.
+    //
+    // Checked HERE rather than before `policy_gate` so it stays consistent
+    // with every other per-call validation in this file (an unknown `vault`
+    // name is likewise only reported once policy has allowed the call) and
+    // so the attempt still lands in the audit trail. The cost is that under
+    // `ask_once` a human may be asked to approve a call that then fails
+    // validation; moving every validation ahead of the gate would fix that
+    // for all tools at once and is not this fix wave's scope.
+    if params.text.trim().is_empty() {
+        return Err(ErrorData::invalid_params(
+            "capture failed: `text` is empty — a capture needs a note body".to_string(),
+            None,
+        ));
+    }
+
     let resolved = resolve_vault_arg(state, params.vault.as_deref())?;
     let vault_root = resolved.root.as_path().to_path_buf();
     let vault_config = load_vault_config(&resolved.root).map_err(core_error)?;
@@ -1398,13 +1589,41 @@ async fn capture_note(
     // `resolve_under_vault` (canonicalizes the TARGET) can't be reused here.
     // This is filesystem work (canonicalize + create_dir_all), so off the
     // async runtime like every other filesystem call in this file.
-    {
+    //
+    // The guard's returned path is BOUND and used, not discarded: layer 3 of
+    // the guard makes "this is the file the write will open" an enforced
+    // equality rather than an inference, so it is also the correct path to
+    // test for the same-day filename collision — which is how this function
+    // gets to phrase its own collision error instead of forwarding
+    // `onebrain-fs`'s CLI-flavoured one.
+    let already_exists = {
         let vault_root = vault_root.clone();
         let rel_path = rel_path.clone();
-        tokio::task::spawn_blocking(move || resolve_create_under_vault(&vault_root, &rel_path))
-            .await
-            .map_err(|e| sanitized_internal("internal task failure", e.into()))?
-            .map_err(|e| sanitized_internal("failed to prepare note path", e))?;
+        tokio::task::spawn_blocking(move || {
+            let confined = resolve_create_under_vault(&vault_root, &rel_path)?;
+            Ok::<bool, anyhow::Error>(confined.exists())
+        })
+        .await
+        .map_err(|e| sanitized_internal("internal task failure", e.into()))?
+        // A guard rejection is deliberately `internal_error` here, NOT the
+        // `invalid_params` collapse `brain_get` uses for its own traversal
+        // guard. The two differ because the INPUT differs: `brain_get`'s
+        // path comes straight from the caller, so distinguishing "blocked"
+        // from "missing" would hand out an oracle for probing outside the
+        // vault. `brain_capture`'s path is derived by `derive_slug`, which
+        // strips every `/` and `.` — no caller input can select a path
+        // component — so a failure here never means "your argument was
+        // bad"; it means the vault's own inbox no longer resolves inside the
+        // vault, a server-side fault. Both messages are sanitized, so
+        // neither choice leaks an oracle; this one just reports the honest
+        // kind of fault.
+        .map_err(|e| sanitized_internal("failed to prepare note path", e))?
+    };
+    if already_exists {
+        return Err(ErrorData::invalid_request(
+            capture_collision_message(&rel_path),
+            None,
+        ));
     }
 
     // `tags: [capture]` — a proper YAML flow-sequence (matches the vault's
@@ -1416,6 +1635,7 @@ async fn capture_note(
     let frontmatter = vec!["tags=[capture]".to_string()];
     let new_result = {
         let vault_root = vault_root.clone();
+        let rel_for_error = rel_path.clone();
         let rel_path = rel_path.clone();
         tokio::task::spawn_blocking(move || {
             onebrain_fs::note::new_note(&vault_root, &rel_path, None, &frontmatter, false)
@@ -1426,15 +1646,17 @@ async fn capture_note(
             // `InvalidTarget` here is ALWAYS the same-day filename collision
             // (`new_note`'s only reachable `InvalidTarget` site under
             // `template: None` with this call's own well-formed
-            // frontmatter — see `resolve_create_under_vault`'s doc comment)
-            // and its message embeds only the vault-RELATIVE `rel_path`, so
-            // it's safe to hand back to the client directly — a clean,
-            // actionable tool error, never an opaque 500-shaped one. Any
-            // OTHER `FsError` (e.g. `Io`, whose `Display` embeds an
-            // ABSOLUTE host path) is sanitized instead.
+            // frontmatter — see `resolve_create_under_vault`'s doc comment).
+            // The pre-check above normally catches it first; this arm is the
+            // race (a note created between the check and the write). Either
+            // way the client gets THIS crate's message, never `new_note`'s
+            // own — that one ends in "(use --force)", a CLI flag no MCP
+            // client has any way to pass.
             onebrain_fs::FsError::Core(CoreError::InvalidTarget(_)) => {
-                ErrorData::invalid_request(format!("capture failed: {e}"), None)
+                ErrorData::invalid_request(capture_collision_message(&rel_for_error), None)
             }
+            // Any OTHER `FsError` (e.g. `Io`, whose `Display` embeds an
+            // ABSOLUTE host path) is sanitized instead.
             _ => sanitized_internal("failed to write note", e.into()),
         })?
     };
@@ -1466,20 +1688,31 @@ async fn capture_note(
     // nothing happened (which could prompt a retry straight into the
     // same-day filename collision above). A missed reindex here just means
     // `brain_search` lags until the vault's next scheduled/hook reindex.
-    {
+    //
+    // DETACHED: the `JoinHandle` is dropped without `.await`, so the tool
+    // call returns as soon as the note is on disk. `ensure_running` spawns
+    // `onebrain daemon start` and polls it for up to its own 10s
+    // START_TIMEOUT — awaiting that would hold the MCP call open for a full
+    // daemon cold start (or the whole timeout, on failure) AFTER the result
+    // is already fully determined. "Best effort" has to mean best effort in
+    // latency too, not only in error handling. Dropping a `spawn_blocking`
+    // handle does not cancel the task, so the reindex still runs to
+    // completion and its `tracing::warn!`s still reach the operator.
+    if reindex_channel_enabled() {
         let vault_root = vault_root.clone();
         let doc_path = new_result.path.clone();
-        let _ = tokio::task::spawn_blocking(move || match daemon_client::ensure_running(Some(&vault_root)) {
-            Ok(handle) => {
-                if let Err(e) = handle.reindex("paths", &[doc_path]) {
-                    tracing::warn!(error = %e, "brain_capture: best-effort reindex request failed; note is written, brain_search may lag until the next reindex");
+        drop(tokio::task::spawn_blocking(
+            move || match daemon_client::ensure_running(Some(&vault_root)) {
+                Ok(handle) => {
+                    if let Err(e) = handle.reindex("paths", &[doc_path]) {
+                        tracing::warn!(error = %e, "brain_capture: best-effort reindex request failed; note is written, brain_search may lag until the next reindex");
+                    }
                 }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "brain_capture: could not reach daemon for best-effort reindex; note is written, brain_search may lag until the next reindex");
-            }
-        })
-        .await;
+                Err(e) => {
+                    tracing::warn!(error = %e, "brain_capture: could not reach daemon for best-effort reindex; note is written, brain_search may lag until the next reindex");
+                }
+            },
+        ));
     }
 
     Ok(Json(BrainCaptureOut {
@@ -1820,10 +2053,13 @@ mod tests {
         assert!(names.contains(&"capabilities"), "{names:?}");
         assert!(names.contains(&"brain_tasks"), "{names:?}");
 
-        // Final-review fix (Item 2): every Brain-pack tool is read-only, so
-        // every listed tool must carry `annotations.readOnlyHint == true` —
-        // parsed as JSON (not substring-matched) so a tool that carries the
-        // hint nested somewhere unexpected, or omits it, fails clearly.
+        // Final-review fix (Item 2): every READ-ONLY Brain-pack tool must
+        // carry `annotations.readOnlyHint == true` — parsed as JSON (not
+        // substring-matched) so a tool that carries the hint nested
+        // somewhere unexpected, or omits it, fails clearly. `brain_capture`
+        // is deliberately absent from this list: it is the pack's one
+        // `Mutating` tool and carries `readOnlyHint: false`, pinned by
+        // `brain_capture_is_listed_with_read_only_hint_false`.
         let expected = ["capabilities", "brain_tasks", "brain_get", "brain_search"];
         for name in expected {
             let tool = tools
@@ -3089,8 +3325,19 @@ mod tests {
         let root = dir.path();
         std::fs::write(root.join("onebrain.yml"), "folders: {}\n").unwrap();
 
+        // A SECOND named vault, so the multi-vault grant-scoping property
+        // (a grant for one vault must never authorize writes into another)
+        // can be driven end to end. Nested under the same tempdir purely so
+        // one `TempDir` still owns everything the fixture creates; vault
+        // resolution doesn't care, and `inbox_note_count(dir.path())` only
+        // ever looks at the FIRST vault's own `00-inbox`.
+        let second = root.join("vault-two");
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(second.join("onebrain.yml"), "folders: {}\n").unwrap();
+
         let mut vaults = BTreeMap::new();
         vaults.insert("t1".to_string(), root.to_path_buf());
+        vaults.insert("t2".to_string(), second);
         let config = GatewayConfig {
             default_vault: Some(root.to_path_buf()),
             vaults,
@@ -3206,7 +3453,19 @@ mod tests {
             panic!("expected a clean JSON-RPC tool error, not a crash: {resp2}")
         });
         assert!(message.contains("capture failed"), "{message}");
-        assert!(message.contains("file exists"), "{message}");
+        assert!(message.contains("already exists"), "{message}");
+        // The message must be THIS crate's, not `onebrain_fs::note::new_note`'s
+        // own "file exists: <path> (use --force)" — `--force` is a CLI flag no
+        // MCP client can pass, so forwarding it tells the caller to do
+        // something impossible.
+        assert!(
+            !message.contains("--force"),
+            "the client-facing message must not name a CLI flag: {message}"
+        );
+        assert!(
+            message.contains("00-inbox/"),
+            "the vault-relative path is the one useful detail: {message}"
+        );
 
         let path = resp1["result"]["structuredContent"]["path"]
             .as_str()
@@ -3328,7 +3587,7 @@ mod tests {
         assert!(
             state
                 .grants
-                .has(&GrantKey::new("test-client", RiskClass::Mutating)),
+                .has(&GrantKey::new("test-client", None, RiskClass::Mutating)),
             "an Approve must record a grant for (client, class)"
         );
 
@@ -3378,7 +3637,7 @@ mod tests {
         assert!(
             !state
                 .grants
-                .has(&GrantKey::new("test-client", RiskClass::Mutating)),
+                .has(&GrantKey::new("test-client", None, RiskClass::Mutating)),
             "a Deny must never record a grant"
         );
 
@@ -3486,6 +3745,452 @@ mod tests {
         assert_eq!(
             entries[1]["decision"], "auto",
             "the second call's audit entry must show `auto` — it was satisfied by the live grant, not a fresh approval"
+        );
+    }
+
+    // ── Fix wave: the guard's third layer (F1) ───────────────────────────
+
+    /// Layer 3 of [`resolve_create_under_vault`]: the guard's proof only
+    /// transfers to the write if the confined path IS the path the write
+    /// will open. An inbox that is a symlink to another directory INSIDE
+    /// the same vault passes layer 2 (`starts_with(root)` holds — the
+    /// target is in the vault) yet resolves to a different path than
+    /// `root.join(rel)`, which is what `new_note` will join. Fail closed:
+    /// the guard did not vouch for the path the write would actually use.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_create_under_vault_rejects_a_parent_symlinked_elsewhere_inside_the_vault() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let vault_root = workspace.path().join("vault");
+        std::fs::create_dir_all(&vault_root).unwrap();
+        let real_dir = vault_root.join("real-inbox");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        symlink(&real_dir, vault_root.join("00-inbox")).unwrap();
+
+        let rel = Path::new("00-inbox/2026-08-29-hello.md");
+        let err = resolve_create_under_vault(&vault_root, rel).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not resolve to its own vault-relative location"),
+            "{err}"
+        );
+        assert!(
+            !real_dir.join("2026-08-29-hello.md").exists(),
+            "nothing may have been written through the link"
+        );
+    }
+
+    #[test]
+    fn resolve_create_under_vault_returns_the_exact_path_the_write_will_target() {
+        let (_workspace, vault_root, _outside) = vault_with_outside_sentinel();
+        let rel = Path::new("00-inbox/2026-08-29-hello.md");
+        let confined = resolve_create_under_vault(&vault_root, rel).unwrap();
+        assert_eq!(
+            confined,
+            vault_root.canonicalize().unwrap().join(rel),
+            "the returned path must be exactly `new_note`'s own join, root resolved"
+        );
+    }
+
+    // ── Fix wave: the daemon-reindex kill switch (F3) ────────────────────
+
+    /// The in-crate half of the switch: `cfg!(test)` is true inside THIS
+    /// test binary, so no unit test can ever reach
+    /// `daemon_client::ensure_running` from `capture_note` — which is what
+    /// would spawn `onebrain daemon start` against the developer's real
+    /// `$HOME`.
+    #[test]
+    fn reindex_channel_is_disabled_inside_this_test_binary() {
+        assert!(
+            !reindex_channel_enabled(),
+            "a unit test must never be able to spawn a daemon from capture_note"
+        );
+    }
+
+    /// The out-of-process half: the env var must flip the switch off for a
+    /// SEPARATELY COMPILED binary, where `cfg!(test)` is false and therefore
+    /// no protection at all. `cfg!(test)` is true here, so the var's effect
+    /// is asserted on the same predicate `capture_note` reads —
+    /// `super::env_switch_on(DISABLE_DAEMON_REINDEX_ENV)` — rather than on
+    /// `reindex_channel_enabled`, which this binary already forces false.
+    /// `tests/gateway_approval_e2e.rs` is what proves the composed
+    /// behaviour in a real subprocess.
+    #[test]
+    fn daemon_reindex_env_var_follows_the_crate_env_switch_convention() {
+        {
+            let _env = crate::test_env::set_var(DISABLE_DAEMON_REINDEX_ENV, "1");
+            assert!(super::super::env_switch_on(DISABLE_DAEMON_REINDEX_ENV));
+        }
+        {
+            let _env = crate::test_env::set_var(DISABLE_DAEMON_REINDEX_ENV, "");
+            assert!(
+                !super::super::env_switch_on(DISABLE_DAEMON_REINDEX_ENV),
+                "a set-but-empty value must count as unset, like ONEBRAIN_NO_DAEMON"
+            );
+        }
+    }
+
+    /// The observable witness, not just the predicate: a real `brain_capture`
+    /// under `auto` policy, with `$HOME` pointed at an empty tempdir, must
+    /// leave NO daemon runtime state behind. `daemon_client::ensure_running`
+    /// creates `$HOME/.onebrain/run/` (via `resolve_slot` →
+    /// `ensure_private_run_dir`) before it can spawn or even discover
+    /// anything, so the absence of that directory proves the reindex block
+    /// was never entered — the same property the e2e asserts against the
+    /// spawned gateway subprocess, here for this crate's own tests.
+    #[tokio::test]
+    async fn a_unit_test_capture_leaves_no_daemon_runtime_state_under_home() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", home.path().as_os_str()),
+            ("USERPROFILE", home.path().as_os_str()),
+        ]);
+
+        let (dir, router, _state, token) =
+            fixture_router_with_mutating_policy(policy::PolicyMode::Auto, 300, 30);
+        let body = call_body(
+            1,
+            "brain_capture",
+            serde_json::json!({"title": "No Daemon Please", "text": "body"}),
+        );
+        let resp = post(
+            &router,
+            body,
+            &token,
+            &standard_headers("tools/call", Some("brain_capture")),
+        )
+        .await;
+        // The capture itself must have SUCCEEDED — otherwise the absence of
+        // daemon state below would prove nothing (an early failure would
+        // also skip the reindex block).
+        assert!(resp.get("error").is_none(), "{resp}");
+        assert_eq!(inbox_note_count(dir.path()), 1);
+
+        assert!(
+            !home.path().join(".onebrain").join("run").exists(),
+            "capture_note must not have touched the daemon run directory at all"
+        );
+    }
+
+    // ── Fix wave: bounded pending approvals (F4) ─────────────────────────
+
+    /// Past the per-client cap, a gated call is refused with a policy error
+    /// instead of registering yet another pending entry (and, in
+    /// production, firing yet another blocking GUI dialog). Driven by
+    /// pre-filling the registry for the SAME `client_id` the fixture's token
+    /// carries, so the assertion is deterministic rather than racing N
+    /// concurrent in-flight calls.
+    #[tokio::test]
+    async fn brain_capture_is_refused_once_the_pending_approval_cap_is_reached() {
+        let (dir, router, state, token) =
+            fixture_router_with_mutating_policy(policy::PolicyMode::AskOnce, 300, 30);
+
+        let now = now_epoch_secs();
+        let mut held = Vec::new();
+        for i in 0..approval::MAX_PENDING_APPROVALS_PER_CLIENT {
+            held.push(
+                state
+                    .approvals
+                    .register(PendingApproval {
+                        id: format!("filler-{i}"),
+                        client_id: "test-client".to_string(),
+                        tool: "brain_capture".to_string(),
+                        vault: None,
+                        summary: "filler".to_string(),
+                        created: now,
+                        expires: now + 300,
+                        class: RiskClass::Mutating,
+                    })
+                    .unwrap_or_else(|e| panic!("filler {i} must fit under the cap: {e:?}")),
+            );
+        }
+
+        let body = call_body(
+            1,
+            "brain_capture",
+            serde_json::json!({"title": "Over Cap", "text": "should never be written"}),
+        );
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            post(
+                &router,
+                body,
+                &token,
+                &standard_headers("tools/call", Some("brain_capture")),
+            ),
+        )
+        .await
+        .expect("an over-cap call must be refused immediately, never left waiting");
+
+        let message = resp["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a JSON-RPC error: {resp}"));
+        assert!(message.contains("too many approval requests"), "{message}");
+        assert_eq!(
+            state.approvals.list().len(),
+            approval::MAX_PENDING_APPROVALS_PER_CLIENT,
+            "a refused call must not have registered a further pending approval"
+        );
+        assert_eq!(
+            inbox_note_count(dir.path()),
+            0,
+            "a refused call must not write anything"
+        );
+
+        let entries = read_audit_entries(dir.path());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["decision"], "denied", "{entries:?}");
+        assert_eq!(entries[0]["outcome"], "error", "{entries:?}");
+    }
+
+    // ── Fix wave: grants are vault-scoped (F5) ───────────────────────────
+
+    /// Consent scope and grant scope must match: the operator approved a
+    /// write into `t1` (the dialog and `args_summary` both say so), so a
+    /// later write into `t2` must ask again rather than ride the same grant.
+    #[tokio::test]
+    async fn a_grant_earned_for_one_vault_does_not_authorize_another_vault() {
+        let (dir, router, state, token) =
+            fixture_router_with_mutating_policy(policy::PolicyMode::AskOnce, 300, 30);
+
+        let call_router = router.clone();
+        let call_token = token.clone();
+        let handle = tokio::spawn(async move {
+            let body = call_body(
+                1,
+                "brain_capture",
+                serde_json::json!({"title": "Into Vault One", "text": "one", "vault": "t1"}),
+            );
+            post(
+                &call_router,
+                body,
+                &call_token,
+                &standard_headers("tools/call", Some("brain_capture")),
+            )
+            .await
+        });
+        let pending = wait_for_one_pending(&state).await;
+        assert_eq!(
+            pending.vault.as_deref(),
+            Some("t1"),
+            "the pending entry must carry the vault the call named"
+        );
+        assert!(state
+            .approvals
+            .resolve(&pending.id, approval::Decision::Approve));
+        assert!(handle.await.unwrap().get("error").is_none());
+
+        assert!(
+            state.grants.has(&GrantKey::new(
+                "test-client",
+                Some("t1".to_string()),
+                RiskClass::Mutating
+            )),
+            "the approval must have granted (client, t1, Mutating)"
+        );
+        assert!(
+            !state.grants.has(&GrantKey::new(
+                "test-client",
+                Some("t2".to_string()),
+                RiskClass::Mutating
+            )),
+            "and NOTHING for the other vault"
+        );
+
+        // Same client, same risk class, live grant — but a different vault,
+        // so this call must block on a FRESH approval rather than proceed.
+        let call_router = router.clone();
+        let call_token = token.clone();
+        let second = tokio::spawn(async move {
+            let body = call_body(
+                2,
+                "brain_capture",
+                serde_json::json!({"title": "Into Vault Two", "text": "two", "vault": "t2"}),
+            );
+            post(
+                &call_router,
+                body,
+                &call_token,
+                &standard_headers("tools/call", Some("brain_capture")),
+            )
+            .await
+        });
+        let pending2 = wait_for_one_pending(&state).await;
+        assert_eq!(pending2.vault.as_deref(), Some("t2"));
+        assert!(
+            !second.is_finished(),
+            "the cross-vault call must be blocked on a fresh approval, not satisfied by t1's grant"
+        );
+        assert!(state
+            .approvals
+            .resolve(&pending2.id, approval::Decision::Deny));
+        let resp2 = second.await.unwrap();
+        assert!(resp2["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("denied")));
+
+        assert_eq!(
+            inbox_note_count(dir.path()),
+            1,
+            "only the approved vault-one capture may have been written"
+        );
+        assert_eq!(
+            inbox_note_count(&dir.path().join("vault-two")),
+            0,
+            "the denied vault-two capture must have written nothing"
+        );
+    }
+
+    // ── Fix wave: ask_always never leaves standing consent (F12) ─────────
+
+    /// "Always ask" means always ask. `decide` already ignores grants under
+    /// `ask_always`, so this asserts the stronger property: the waiter must
+    /// not RECORD one either, or a later refactor of `decide` would silently
+    /// start honoring consent that was never given for repeat use.
+    #[tokio::test]
+    async fn brain_capture_under_ask_always_records_no_grant_and_asks_every_time() {
+        let (dir, router, state, token) =
+            fixture_router_with_mutating_policy(policy::PolicyMode::AskAlways, 300, 30);
+
+        for (id, title) in [(1u32, "First Always"), (2, "Second Always")] {
+            let call_router = router.clone();
+            let call_token = token.clone();
+            let handle = tokio::spawn(async move {
+                let body = call_body(
+                    id,
+                    "brain_capture",
+                    serde_json::json!({"title": title, "text": "body"}),
+                );
+                post(
+                    &call_router,
+                    body,
+                    &call_token,
+                    &standard_headers("tools/call", Some("brain_capture")),
+                )
+                .await
+            });
+            let pending = wait_for_one_pending(&state).await;
+            assert!(state
+                .approvals
+                .resolve(&pending.id, approval::Decision::Approve));
+            let resp = handle.await.unwrap();
+            assert!(resp.get("error").is_none(), "{resp}");
+
+            assert!(
+                !state
+                    .grants
+                    .has(&GrantKey::new("test-client", None, RiskClass::Mutating)),
+                "an ask_always approval must never leave a grant behind (call {id})"
+            );
+        }
+
+        assert_eq!(
+            inbox_note_count(dir.path()),
+            2,
+            "both approved captures must have been written"
+        );
+        let entries = read_audit_entries(dir.path());
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(
+            entries[1]["decision"], "approved",
+            "the SECOND call must also have been approved by a human, not auto-allowed: {entries:?}"
+        );
+    }
+
+    // ── Fix wave: an empty capture body is invalid_params (F14) ──────────
+
+    #[tokio::test]
+    async fn brain_capture_rejects_an_empty_or_whitespace_only_text() {
+        for text in ["", "   \n\t "] {
+            let (dir, router, _state, token) =
+                fixture_router_with_mutating_policy(policy::PolicyMode::Auto, 300, 30);
+            let body = call_body(
+                1,
+                "brain_capture",
+                serde_json::json!({"title": "Empty Body", "text": text}),
+            );
+            let resp = post(
+                &router,
+                body,
+                &token,
+                &standard_headers("tools/call", Some("brain_capture")),
+            )
+            .await;
+            let message = resp["error"]["message"]
+                .as_str()
+                .unwrap_or_else(|| panic!("expected a JSON-RPC error for {text:?}: {resp}"));
+            assert!(message.contains("`text` is empty"), "{message}");
+            assert_eq!(
+                inbox_note_count(dir.path()),
+                0,
+                "a rejected capture must not leave a titled, bodyless stub behind"
+            );
+        }
+    }
+
+    // ── Fix wave: capabilities tells the truth about the pack (F17/F20) ──
+
+    /// The `brain` pack's prose sits in the same `capabilities` payload as a
+    /// `tools` array reporting `brain_capture` with `risk_class: mutating`.
+    /// It must not contradict it.
+    #[test]
+    fn brain_pack_note_does_not_claim_the_pack_is_read_only() {
+        let packs = capability_packs(&policy::PolicyConfig::default());
+        let brain = packs
+            .iter()
+            .find(|p| p.name == "brain")
+            .unwrap_or_else(|| panic!("no brain pack"));
+        assert!(
+            !brain.note.to_lowercase().contains("read-only"),
+            "the pack note must not call a pack containing a write tool read-only: {}",
+            brain.note
+        );
+        assert!(
+            brain.note.contains("brain_capture"),
+            "the pack note should name the write tool: {}",
+            brain.note
+        );
+        assert!(
+            brain
+                .tools
+                .iter()
+                .any(|t| t.name == "brain_capture" && matches!(t.risk_class, RiskClass::Mutating)),
+            "precondition: the same payload reports brain_capture as mutating"
+        );
+    }
+
+    /// [`brain_pack_tools`] is a hand-maintained parallel list (see its doc
+    /// comment). This pins the half that CAN be checked cheaply: its name
+    /// set must equal the set `#[tool_router]` actually registers, so a tool
+    /// added on one side and forgotten on the other fails here instead of
+    /// shipping a `capabilities` response that lies about what exists.
+    #[tokio::test]
+    async fn brain_pack_tools_matches_the_tools_the_router_registers() {
+        let (_dir, router, token) = fixture_router();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {},
+        })
+        .to_string();
+        let resp = post(&router, body, &token, &standard_headers("tools/list", None)).await;
+        let mut registered: Vec<String> = resp["result"]["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no tools array: {resp}"))
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        registered.sort();
+
+        let mut reported: Vec<String> = brain_pack_tools(&policy::PolicyConfig::default())
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        reported.sort();
+
+        assert_eq!(
+            reported, registered,
+            "capabilities' tool list and the router's registered tools have drifted apart"
         );
     }
 }

@@ -8,7 +8,7 @@ onebrain gateway run --port 0     # let the OS assign an ephemeral port
 ```
 
 - Runs in the foreground until Ctrl-C.
-- Binds **`127.0.0.1` only** — see [Security posture](#security-posture--no-auth-yet) below.
+- Binds **`127.0.0.1` only** — see [Loopback + no remote exposure yet](#loopback--no-remote-exposure-yet) below.
 - The bound URL prints once to stdout on startup: `gateway listening on http://<bound-addr>/mcp`.
 
 ## What this skeleton ships
@@ -77,13 +77,13 @@ Every tool call is classified into one of three **risk classes**, and each class
 | Mode | Behavior |
 |---|---|
 | `auto` | Always allow — no approval, no grant involved. |
-| `ask_once` | Requires approval once per `(client, risk class)` pair; a live grant (see below) satisfies later calls until it expires. |
+| `ask_once` | Requires approval once per `(client, vault, risk class)` triple; a live grant (see below) satisfies later calls until it expires. |
 | `ask_always` | Always requires approval, even with a live grant — "ask every time." A grant recorded by an earlier approval never satisfies `ask_always`. |
 | `deny` | Always refused — no approval is ever offered. |
 
 The **defaults keep today's behavior safe with zero configuration**: every read-only tool defaults to `auto` (unchanged from before the policy engine existed), while any write tool defaults to `ask_once` and any future destructive tool defaults to `ask_always` — a config nobody wrote never silently auto-allows a write. `read_only`/`mutating`/`destructive` may each be set independently; a partial `policy:` block fills only the keys it omits with these defaults.
 
-A **grant** is recorded the moment a human approves an `ask_once` call — an in-memory `(client_id, risk class) → expires-at` entry, scoped to `grant_ttl_minutes` (default 30). It is **never persisted**: restarting `gateway run` clears every grant, same as it clears every pending approval — a grant is consent for THIS running gateway process, not a standing credential written to disk. `approval_wait_seconds` (default 300 — five minutes) bounds how long a BLOCKED call waits for a first decision before giving up; this is a separate knob from `grant_ttl_minutes`, since "ask me and wait up to five minutes" and "then remember it for a day" are independent choices an operator may want to make separately.
+A **grant** is recorded the moment a human approves an `ask_once` call — an in-memory `(client_id, vault, risk class) → expires-at` entry, scoped to `grant_ttl_minutes` (default 30). The **vault is part of the scope**: approving a write into one vault never authorizes writes into another, because that is the consent the human was actually shown (the dialog and the audit summary both name the vault). The **tool is deliberately not** part of it — the modes are named per risk class, and every tool in a class is by definition equally powerful, so consent is per class. An `ask_always` approval records nothing at all: "always ask" must never leave standing consent behind. It is **never persisted**: restarting `gateway run` clears every grant, same as it clears every pending approval — a grant is consent for THIS running gateway process, not a standing credential written to disk. `approval_wait_seconds` (default 300 — five minutes) bounds how long a BLOCKED call waits for a first decision before giving up; this is a separate knob from `grant_ttl_minutes`, since "ask me and wait up to five minutes" and "then remember it for a day" are independent choices an operator may want to make separately. **`approval_wait_seconds: 0` is legal and means "time out immediately"** — fail-CLOSED, so every call needing approval is refused and nothing is ever written. It exists because this repo's own tests set it deliberately; in a real config it is almost always a typo, so `gateway run` logs a startup warning naming the key when it loads one.
 
 Every tool call is also checked against the OAuth token's own `scope` — a token whose scope doesn't cover the pack a tool belongs to (today, only the `"brain"` pack exists) is denied outright, before the mode above is even consulted, regardless of how permissive that mode is.
 
@@ -98,6 +98,8 @@ When a call needs approval (`ask_once` with no live grant, or `ask_always`), the
 | **Telegram bot** | Not yet shipped — Gateway PR 5 | Deferred: a Bot API client (`getUpdates` long-poll + inline Approve/Deny keyboard), reusing `notifications.telegram_chat_id` from `onebrain.yml`. `capabilities` always reports `telegram: false` today. |
 
 Both shipped channels resolve the SAME pending-approval registry — whichever answers first wins, and the other is simply a no-op from then on. If nothing answers within `approval_wait_seconds`, the call fails with a timeout error and no grant is recorded.
+
+The registry is **bounded**: at most 16 pending approvals overall, and at most 4 for any one client. Past either limit a gated call is refused immediately with a policy error (audited as `denied`) instead of queueing another prompt — otherwise a client looping a gated tool would fan out one blocking dialog per in-flight call. The caps are fixed, not configurable: they sit far above what a human at a console could answer, so they only ever bite a runaway client. An entry whose caller has gone away stops counting once its own `approval_wait_seconds` has elapsed, so abandoned calls cannot wedge the limit.
 
 ### `capabilities` truthfulness
 
@@ -114,7 +116,11 @@ Both shipped channels resolve the SAME pending-approval registry — whichever a
 
 This exists so a caller is never told a write CAN be approved through a channel that cannot actually carry the prompt to a human — `native` reflects the real, live `osascript`-on-`$PATH` probe (and can be forced off — see the environment variable below), `http` is always `true` in this build (the surface is unconditionally mounted), and `telegram` is always `false` until Gateway PR 5 ships it.
 
-`ONEBRAIN_GATEWAY_DISABLE_NATIVE_APPROVAL` (any value) forces the native channel off regardless of platform — a test-only escape hatch (this crate's own end-to-end test suite sets it on the gateway subprocess it spawns, so CI never pops a real, unattended dialog), not a documented operator-facing config key. An operator who wants the native channel off for real should set `policy.mutating`/`policy.destructive` to `auto` or `deny` instead — that never reaches the approval flow at all, on any channel.
+`ONEBRAIN_GATEWAY_DISABLE_NATIVE_APPROVAL` (any non-empty value) forces the native channel off regardless of platform — a test-only escape hatch (this crate's own end-to-end test suite sets it on the gateway subprocess it spawns, so CI never pops a real, unattended dialog), not a documented operator-facing config key. An operator who wants the native channel off for real should set `policy.mutating`/`policy.destructive` to `auto` or `deny` instead — that never reaches the approval flow at all, on any channel.
+
+`ONEBRAIN_GATEWAY_DISABLE_DAEMON_REINDEX` (any non-empty value) is its sibling: it switches off `brain_capture`'s best-effort reindex, which would otherwise start a warm daemon subprocess for the vault. Also test-only, for the same reason — a test binary must not leave an `onebrain daemon __run` process behind on a developer machine or a CI runner — and it covers only that best-effort step, never `brain_search`, whose daemon use is load-bearing. Note this is a different switch from the CLI-wide `ONEBRAIN_NO_DAEMON`, which gates only passive routing to an already-running daemon and does not reach either of the gateway's paths.
+
+Both are **presence switches**, matching `ONEBRAIN_NO_DAEMON`'s existing convention: any non-empty value turns them ON, and a set-but-empty value counts as unset. They do not parse booleans — `=0` and `=false` are non-empty, and therefore ON.
 
 ### Audit log
 
@@ -131,7 +137,7 @@ Every tool call — allowed or not — is appended as one JSON line to `~/.onebr
 | `tool` | Tool name. |
 | `vault` | Named vault the call resolved, when one was resolvable. |
 | `args_summary` | A **redacted**, one-line description of the call's arguments — e.g. a `brain_capture` call's own note body NEVER appears here, only its character count. |
-| `decision` | `auto` (policy allowed it outright), `approved`/`denied` (a human answered), or `timedout` (nothing answered within `approval_wait_seconds`). |
+| `decision` | `auto` (policy allowed it outright), `approved` (a human approved it), `denied` (refused — either a human answered "deny", or policy refused it with no human involved at all: a `deny` mode, an OAuth scope/pack mismatch, an unidentifiable caller, or the pending-approval cap being reached), or `timedout` (nothing answered within `approval_wait_seconds`). |
 | `channel` | Reserved for a future "which channel resolved this" field; always `null` today. |
 | `duration_ms` | Wall-clock time the call took, including any time spent blocked on approval. |
 | `outcome` | `ok` or `error` — whether the tool's own logic succeeded once it was allowed to run. |
@@ -140,7 +146,7 @@ Writing an entry never blocks or fails the tool call it describes — by the tim
 
 ### `brain_capture`
 
-The gateway's first WRITE tool: creates a new inbox note (`<inbox-folder>/YYYY-MM-DD-<slug>.md`) from a `title` (optional) and `text` body, classified `RiskClass::Mutating` — so under the default policy it needs a human's `ask_once` approval the first time, then proceeds automatically for `grant_ttl_minutes`. Two independent traversal guards confine every derived path to the vault (syntactic — every path component must be a plain, non-`..`, non-absolute segment — and canonicalization — the resolved parent directory must still live under the canonicalized vault root, catching a symlinked-out folder too), so a crafted `title` can never write outside the vault. The note's filename slug is derived from `title` (falling back to the first words of `text`, then a fixed marker, for empty/punctuation-only/pure-non-ASCII input); a same-day, same-slug collision surfaces as a clean tool error rather than overwriting the existing note. A best-effort reindex request follows the write, so `brain_search` can find the new note without waiting for the vault's next scheduled reindex — a reindex failure never fails the capture itself, since the note is already written by that point.
+The gateway's first WRITE tool: creates a new inbox note (`<inbox-folder>/YYYY-MM-DD-<slug>.md`) from a `title` (optional) and `text` body, classified `RiskClass::Mutating` — so under the default policy it needs a human's `ask_once` approval the first time, then proceeds automatically for `grant_ttl_minutes`. Three independent guards confine every derived path to the vault: **syntactic** (every path component must be a plain, non-`..`, non-absolute segment), **canonicalization** (the resolved parent directory must still live under the canonicalized vault root, catching a symlinked-out folder too), and an **equality check** that the confined path is exactly the path the write will open — the underlying note writer joins the vault root and relative path with no confinement of its own, so anything that resolves elsewhere (even somewhere still inside the vault, via a symlinked inbox) is refused rather than written through a link the guard did not vouch for. So a crafted `title` can never write outside the vault. What the guards do NOT cover, stated plainly: the parent is canonicalized *before* the write, so swapping it for an escaping symlink in the window between the check and the write is not caught — closing that needs handle-relative I/O in the filesystem layer, and it requires an attacker who already has write access inside the vault. The note's filename slug is derived from `title` (falling back to the first words of `text`, then a fixed marker, for empty/punctuation-only/pure-non-ASCII input); a same-day, same-slug collision surfaces as a clean tool error naming the vault-relative path, rather than overwriting the existing note. An empty (or whitespace-only) `text` is rejected as `invalid_params` — a capture with no body would write a titled, empty stub indistinguishable from one whose body was lost. A best-effort reindex request follows the write, so `brain_search` can find the new note without waiting for the vault's next scheduled reindex. That request is **detached**: the tool call returns as soon as the note is on disk and does not wait for the daemon, which may need a full cold start. A reindex failure never fails the capture either — the note is already written by that point; the only consequence is that `brain_search` lags until the next reindex.
 
 ## Authentication
 

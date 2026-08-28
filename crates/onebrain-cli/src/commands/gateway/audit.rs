@@ -35,16 +35,21 @@
 //! Task 1 shipped this module with a blanket `#![allow(dead_code)]` (same
 //! situation as [`super::auth`]'s own — see that module's doc comment for
 //! the full precedent chain back to [`crate::commands::daemon_client`]):
-//! [`AuditLog::open`] had no caller yet, and `Decision`'s `Auto`/`Denied`/
-//! `Blocked` variants (plus `Outcome::Error`) were never constructed
+//! [`AuditLog::open`] had no caller yet, and `Decision`'s `Auto`/`Denied`
+//! variants — plus a since-removed `Blocked` and `Outcome::Error` — were
+//! never constructed
 //! anywhere reachable from `main` (a `pub` item in a BINARY crate is still
 //! dead-code-linted by reachability from `main`, unlike a library crate's
 //! public API surface).
 //!
 //! Gateway PR 4, Task 2 gave most of those a real caller: `gateway::run()`
 //! now opens the log via [`AuditLog::open`], and `server.rs`'s policy-gate
-//! wiring constructs `Decision::Auto`/`Denied`/`Blocked` and
-//! `Outcome::Ok`/`Error` on every tool call. Gateway PR 4, Task 5's
+//! wiring constructs `Decision::Auto`/`Denied` and
+//! `Outcome::Ok`/`Error` on every tool call. (Task 2 also constructed a
+//! `Decision::Blocked`; Task 5 DELETED that variant when it wired
+//! `policy_gate`'s `NeedApproval` arm to a real approval instead of
+//! hardcoding "blocked", so the outcomes that arm can produce today are
+//! `Approved`, `Denied`, and `TimedOut`.) Gateway PR 4, Task 5's
 //! `server::await_approval` gave the last two — `Decision::Approved` (a
 //! human's actual "approve" response) and `Decision::TimedOut` (a pending
 //! approval that expired unanswered) — their own real callers, so the

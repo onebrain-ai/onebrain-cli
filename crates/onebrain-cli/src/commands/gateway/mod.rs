@@ -51,6 +51,26 @@ use oauth_routes::AuthCtx;
 use crate::output::OutputMode;
 use crate::server::run_server_from_router;
 
+/// `true` iff the env var `key` is set to any NON-EMPTY value — the shape
+/// every boolean env switch in this crate already uses
+/// (`search_common::daemon_routing_disabled`'s `ONEBRAIN_NO_DAEMON` and
+/// `serve::bind_env`, both of which treat a set-but-empty value as unset, so
+/// a hook-managed env block can neutralize a switch by blanking it instead
+/// of having to unset the key).
+///
+/// It is a PRESENCE switch, not a boolean parser: `KEY=0` and `KEY=false`
+/// are non-empty and therefore ON, exactly as `ONEBRAIN_NO_DAEMON=0` is.
+/// Callers name their switch so the polarity reads correctly at the call
+/// site (`ONEBRAIN_GATEWAY_DISABLE_*` → set means disabled).
+///
+/// Shared here rather than duplicated per switch: the gateway now has two of
+/// them ([`approval_native::DISABLE_NATIVE_APPROVAL_ENV`] and
+/// [`server::DISABLE_DAEMON_REINDEX_ENV`]) and they must not drift apart on
+/// what "set" means.
+pub(crate) fn env_switch_on(key: &str) -> bool {
+    std::env::var_os(key).is_some_and(|v| !v.is_empty())
+}
+
 /// Resolves the OAuth issuer base URL: the configured `public_url` (trailing
 /// slash trimmed) when set, else `http://127.0.0.1:<bound-port>`. Pure and
 /// unit-tested directly below — the `on_bind` closure that calls it isn't
@@ -156,6 +176,16 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
         if let Err(reason) = validate_public_url(url) {
             anyhow::bail!("gateway.yml `public_url` ({url:?}) is invalid: {reason}");
         }
+    }
+    // Legal-but-almost-certainly-unintended `policy:` values (today: only
+    // `approval_wait_seconds: 0`, which silently refuses every gated call on
+    // an instant timeout). Warnings, never a hard failure — each flagged
+    // value is fail-CLOSED and legitimately used by this repo's own tests.
+    // The rules themselves live in `PolicyConfig::startup_warnings` and are
+    // unit-tested there; this loop only logs them, because `run()` itself is
+    // subprocess-only under coverage.
+    for warning in config.policy.startup_warnings() {
+        tracing::warn!("gateway.yml: {warning}");
     }
 
     // Opens `~/.onebrain/gateway/audit/` (created 0700 if absent) — Task 1

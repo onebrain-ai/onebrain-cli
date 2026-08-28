@@ -32,6 +32,25 @@
 //! correctly the day a `files` pack ships — no change needed to the
 //! membership test itself, only to what gets passed in as `pack`.
 //!
+//! ## Grant scope: `(client, vault, risk class)` — and deliberately NOT the tool
+//!
+//! A grant is keyed by the calling client, the VAULT the call names, and the
+//! call's [`RiskClass`] ([`GrantKey`]). The vault belongs in the key because
+//! the gateway is explicitly multi-vault and the consent a human gives is
+//! always shown to them WITH a vault (`args_summary` and the native dialog
+//! both render `vault=…`): approving one `brain_capture` into `ob-1` must not
+//! silently authorize `Mutating` writes into every other configured vault for
+//! the grant's whole TTL. Consent scope and grant scope have to match.
+//!
+//! The key deliberately stops at the risk CLASS and does not include the tool
+//! name. That is the intended design, not an oversight: the modes are named
+//! per class (`read_only`/`mutating`/`destructive`), the operator's mental
+//! model is "I let this client write to this vault for a while", and
+//! per-tool keys would re-ask for every new tool in a class the operator
+//! already consented to — while buying nothing, since every tool in a class
+//! is by definition equally powerful. Do not narrow this to the tool without
+//! re-opening that decision explicitly.
+//!
 //! ## Decision table
 //!
 //! `decide` checks scope-vs-pack FIRST — a mismatch is `Deny` regardless of
@@ -162,6 +181,18 @@ pub struct PolicyConfig {
     /// (5 minutes): long enough for a human to notice the native macOS
     /// dialog or the `/approvals` HTTP surface and respond, short enough
     /// that a client isn't left hanging indefinitely.
+    ///
+    /// **`0` is legal and means "time out immediately".** It is FAIL-CLOSED,
+    /// not fail-open: `server::await_approval` waits zero seconds, sees no
+    /// answer, and returns `Decision::TimedOut` — so every `ask_once`/
+    /// `ask_always` call is refused and no write ever happens. Tests rely on
+    /// exactly that (`server.rs`'s
+    /// `brain_capture_ask_once_times_out_with_no_file_when_nothing_answers`
+    /// sets it to `0` deliberately), which is why it stays accepted rather
+    /// than being rejected at parse time. In a real `gateway.yml` it is
+    /// almost always a typo, and its effect — every gated tool permanently
+    /// unusable — looks nothing like a config error from the client side, so
+    /// [`PolicyConfig::startup_warnings`] flags it once at startup.
     #[serde(default = "default_approval_wait_seconds")]
     pub approval_wait_seconds: u64,
 }
@@ -206,30 +237,70 @@ impl PolicyConfig {
             RiskClass::Destructive => self.destructive,
         }
     }
+
+    /// Legal-but-almost-certainly-unintended values in a freshly loaded
+    /// `policy:` block, one message per finding; empty for a healthy config.
+    /// `gateway::run` logs each via `tracing::warn!` right after
+    /// `load_gateway_config`, so an operator sees the problem at startup
+    /// rather than discovering it as "every write silently fails" hours
+    /// later. Returned rather than logged here so the RULES stay pure and
+    /// directly unit-testable (`run()` itself is subprocess-only — see
+    /// `docs/coverage.md`'s gateway residual entry).
+    ///
+    /// Deliberately warnings, never errors: every value flagged here is
+    /// fail-CLOSED and legitimately used by this repo's own tests, so
+    /// refusing to start on one would break more than it protects.
+    pub fn startup_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.approval_wait_seconds == 0 {
+            out.push(
+                "policy.approval_wait_seconds is 0 — every call needing approval will time out \
+                 immediately and be refused (fail-closed). Set it to a positive number of \
+                 seconds unless this is deliberate."
+                    .to_string(),
+            );
+        }
+        out
+    }
 }
 
-/// Key identifying one `(client, risk class)` consent grant inside
+/// Key identifying one `(client, vault, risk class)` consent grant inside
 /// [`Grants`]. Fields are deliberately private — build one via [`Self::new`]
 /// (Task 5's approval flow is the one caller expected to construct these
 /// outside this module, once it records a fresh grant after an `ask_once`
 /// approval).
+///
+/// `vault` is the vault NAME the call named (`brain_capture`'s/`brain_get`'s
+/// `vault` argument), or `None` for "whatever the default resolution chain
+/// picks" — the same value the operator was shown as `vault=…` when they
+/// approved. It is deliberately the raw argument rather than a resolved
+/// filesystem path: two different names are never treated as the same vault
+/// (worst case an extra approval prompt), whereas normalizing them could
+/// silently widen a grant, and a host path must never be part of a key that
+/// ends up in operator-facing output. See the module doc's "Grant scope"
+/// section for why the key stops at the risk class and excludes the tool.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GrantKey {
     client_id: String,
+    vault: Option<String>,
     class: RiskClass,
 }
 
 impl GrantKey {
-    pub fn new(client_id: impl Into<String>, class: RiskClass) -> Self {
+    pub fn new(client_id: impl Into<String>, vault: Option<String>, class: RiskClass) -> Self {
         Self {
             client_id: client_id.into(),
+            vault,
             class,
         }
     }
 }
 
-/// In-memory, per-process, TTL-bounded consent grants: `(client, RiskClass)
-/// -> expires-at (Unix epoch seconds)`. Never persisted — a gateway restart
+/// In-memory, per-process, TTL-bounded consent grants: `(client, vault,
+/// RiskClass) -> expires-at (Unix epoch seconds)` — see [`GrantKey`] and the
+/// module doc's "Grant scope" section for why the vault is part of the key
+/// and the tool name deliberately is not.
+/// Never persisted — a gateway restart
 /// clears every grant, which is the intended behavior (a grant is consent
 /// for THIS running gateway, not a standing credential).
 ///
@@ -300,14 +371,20 @@ pub enum PolicyOutcome {
     Deny,
 }
 
-/// Decide whether a tool call of risk class `class`, made by `principal`,
-/// may proceed. See the module docs for the full decision table and the
-/// scope-vs-pack rationale.
+/// Decide whether a tool call of risk class `class` against vault `vault`,
+/// made by `principal`, may proceed. See the module docs for the full
+/// decision table, the scope-vs-pack rationale, and why `vault` is part of
+/// the grant key.
+///
+/// `vault` is the call's own `vault` argument (`None` = the default
+/// resolution chain), passed through verbatim — see [`GrantKey`]'s doc
+/// comment for why the raw name, not a resolved path.
 pub fn decide(
     cfg: &PolicyConfig,
     grants: &Grants,
     principal: &Principal,
     class: RiskClass,
+    vault: Option<&str>,
 ) -> PolicyOutcome {
     if !scope_covers_pack(&principal.scope, CURRENT_PACK) {
         return PolicyOutcome::Deny;
@@ -320,7 +397,11 @@ pub fn decide(
         // or "always" would be a lie.
         PolicyMode::AskAlways => PolicyOutcome::NeedApproval,
         PolicyMode::AskOnce => {
-            let key = GrantKey::new(principal.client_id.clone(), class);
+            let key = GrantKey::new(
+                principal.client_id.clone(),
+                vault.map(str::to_string),
+                class,
+            );
             if grants.has(&key) {
                 PolicyOutcome::Allow
             } else {
@@ -431,13 +512,13 @@ mod tests {
         let grants = Grants::new();
         let p = principal("brain");
         assert_eq!(
-            decide(&cfg, &grants, &p, RiskClass::ReadOnly),
+            decide(&cfg, &grants, &p, RiskClass::ReadOnly, None),
             PolicyOutcome::Allow,
             "auto must allow with no grant"
         );
-        grants.record(GrantKey::new("client-1", RiskClass::ReadOnly), 3600);
+        grants.record(GrantKey::new("client-1", None, RiskClass::ReadOnly), 3600);
         assert_eq!(
-            decide(&cfg, &grants, &p, RiskClass::ReadOnly),
+            decide(&cfg, &grants, &p, RiskClass::ReadOnly, None),
             PolicyOutcome::Allow,
             "auto must allow even with a (irrelevant) live grant present"
         );
@@ -449,7 +530,7 @@ mod tests {
         let grants = Grants::new();
         let p = principal("brain");
         assert_eq!(
-            decide(&cfg, &grants, &p, RiskClass::Mutating),
+            decide(&cfg, &grants, &p, RiskClass::Mutating, None),
             PolicyOutcome::NeedApproval
         );
     }
@@ -459,9 +540,9 @@ mod tests {
         let cfg = cfg_with(PolicyMode::Deny, PolicyMode::AskOnce, PolicyMode::Deny);
         let grants = Grants::new();
         let p = principal("brain");
-        grants.record(GrantKey::new("client-1", RiskClass::Mutating), 3600);
+        grants.record(GrantKey::new("client-1", None, RiskClass::Mutating), 3600);
         assert_eq!(
-            decide(&cfg, &grants, &p, RiskClass::Mutating),
+            decide(&cfg, &grants, &p, RiskClass::Mutating, None),
             PolicyOutcome::Allow
         );
     }
@@ -477,9 +558,9 @@ mod tests {
         // "expires now", and `has` requires `expires > now`, which is false
         // the instant it's recorded. That IS an expired grant for `has`'s
         // purposes, so ttl_secs: 0 is the direct way to construct one here.
-        grants.record(GrantKey::new("client-1", RiskClass::Mutating), 0);
+        grants.record(GrantKey::new("client-1", None, RiskClass::Mutating), 0);
         assert_eq!(
-            decide(&cfg, &grants, &p, RiskClass::Mutating),
+            decide(&cfg, &grants, &p, RiskClass::Mutating, None),
             PolicyOutcome::NeedApproval,
             "an expired grant must not satisfy ask_once"
         );
@@ -490,9 +571,12 @@ mod tests {
         let cfg = cfg_with(PolicyMode::Deny, PolicyMode::Deny, PolicyMode::AskAlways);
         let grants = Grants::new();
         let p = principal("brain");
-        grants.record(GrantKey::new("client-1", RiskClass::Destructive), 3600);
+        grants.record(
+            GrantKey::new("client-1", None, RiskClass::Destructive),
+            3600,
+        );
         assert_eq!(
-            decide(&cfg, &grants, &p, RiskClass::Destructive),
+            decide(&cfg, &grants, &p, RiskClass::Destructive, None),
             PolicyOutcome::NeedApproval,
             "ask_always must ignore a live grant — it means \"ask every time\""
         );
@@ -504,13 +588,13 @@ mod tests {
         let grants = Grants::new();
         let p = principal("brain");
         assert_eq!(
-            decide(&cfg, &grants, &p, RiskClass::ReadOnly),
+            decide(&cfg, &grants, &p, RiskClass::ReadOnly, None),
             PolicyOutcome::Deny
         );
         // Even with a grant present (grants are irrelevant to `deny`).
-        grants.record(GrantKey::new("client-1", RiskClass::ReadOnly), 3600);
+        grants.record(GrantKey::new("client-1", None, RiskClass::ReadOnly), 3600);
         assert_eq!(
-            decide(&cfg, &grants, &p, RiskClass::ReadOnly),
+            decide(&cfg, &grants, &p, RiskClass::ReadOnly, None),
             PolicyOutcome::Deny
         );
     }
@@ -521,7 +605,7 @@ mod tests {
         let grants = Grants::new();
         let p = principal("other-pack");
         assert_eq!(
-            decide(&cfg, &grants, &p, RiskClass::ReadOnly),
+            decide(&cfg, &grants, &p, RiskClass::ReadOnly, None),
             PolicyOutcome::Deny,
             "a scope that doesn't cover the \"brain\" pack must deny even under the most permissive mode"
         );
@@ -533,7 +617,7 @@ mod tests {
         let grants = Grants::new();
         let p = principal("");
         assert_eq!(
-            decide(&cfg, &grants, &p, RiskClass::ReadOnly),
+            decide(&cfg, &grants, &p, RiskClass::ReadOnly, None),
             PolicyOutcome::Deny
         );
     }
@@ -555,28 +639,94 @@ mod tests {
     #[test]
     fn grants_has_is_false_for_an_unrecorded_key() {
         let grants = Grants::new();
-        assert!(!grants.has(&GrantKey::new("nobody", RiskClass::ReadOnly)));
+        assert!(!grants.has(&GrantKey::new("nobody", None, RiskClass::ReadOnly)));
     }
 
     #[test]
-    fn grants_are_scoped_by_both_client_and_risk_class() {
+    fn grants_are_scoped_by_client_vault_and_risk_class() {
         let grants = Grants::new();
-        grants.record(GrantKey::new("client-a", RiskClass::Mutating), 3600);
-        assert!(grants.has(&GrantKey::new("client-a", RiskClass::Mutating)));
+        grants.record(GrantKey::new("client-a", None, RiskClass::Mutating), 3600);
+        assert!(grants.has(&GrantKey::new("client-a", None, RiskClass::Mutating)));
         assert!(
-            !grants.has(&GrantKey::new("client-b", RiskClass::Mutating)),
+            !grants.has(&GrantKey::new("client-b", None, RiskClass::Mutating)),
             "a grant must not leak to a different client"
         );
         assert!(
-            !grants.has(&GrantKey::new("client-a", RiskClass::Destructive)),
+            !grants.has(&GrantKey::new("client-a", None, RiskClass::Destructive)),
             "a grant must not leak to a different risk class for the same client"
+        );
+        assert!(
+            !grants.has(&GrantKey::new(
+                "client-a",
+                Some("ob-2".to_string()),
+                RiskClass::Mutating
+            )),
+            "a grant for the default vault must not leak to a NAMED vault"
+        );
+    }
+
+    /// The property the whole `vault`-in-`GrantKey` change exists for:
+    /// approving one `Mutating` call into vault A must NOT authorize the
+    /// same client's `Mutating` calls into vault B for the grant's TTL.
+    /// Asserted through `decide` itself (not just `Grants::has`), because
+    /// `decide` is what every tool handler actually consults.
+    #[test]
+    fn a_grant_for_one_vault_does_not_satisfy_ask_once_for_another_vault() {
+        let cfg = cfg_with(PolicyMode::Deny, PolicyMode::AskOnce, PolicyMode::Deny);
+        let grants = Grants::new();
+        let p = principal("brain");
+
+        grants.record(
+            GrantKey::new("client-1", Some("vault-a".to_string()), RiskClass::Mutating),
+            3600,
+        );
+        assert_eq!(
+            decide(&cfg, &grants, &p, RiskClass::Mutating, Some("vault-a")),
+            PolicyOutcome::Allow,
+            "the vault the grant was obtained for must be allowed"
+        );
+        assert_eq!(
+            decide(&cfg, &grants, &p, RiskClass::Mutating, Some("vault-b")),
+            PolicyOutcome::NeedApproval,
+            "a grant for vault-a must never satisfy a call against vault-b"
+        );
+        assert_eq!(
+            decide(&cfg, &grants, &p, RiskClass::Mutating, None),
+            PolicyOutcome::NeedApproval,
+            "a grant for a NAMED vault must never satisfy an unnamed (default-vault) call"
+        );
+    }
+
+    /// `approval_wait_seconds: 0` stays LEGAL (tests set it deliberately)
+    /// but must be surfaced at startup — it silently makes every gated call
+    /// fail closed on an instant timeout.
+    #[test]
+    fn startup_warnings_flags_a_zero_approval_wait_and_nothing_else() {
+        assert!(
+            PolicyConfig::default().startup_warnings().is_empty(),
+            "a default config must produce no startup warnings"
+        );
+
+        let cfg = PolicyConfig {
+            approval_wait_seconds: 0,
+            ..PolicyConfig::default()
+        };
+        let warnings = cfg.startup_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("policy.approval_wait_seconds"),
+            "the warning must name the exact config key: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("fail-closed"),
+            "the warning must say which way it fails: {warnings:?}"
         );
     }
 
     #[test]
     fn recording_a_grant_again_replaces_its_expiry() {
         let grants = Grants::new();
-        let key = GrantKey::new("client-a", RiskClass::Mutating);
+        let key = GrantKey::new("client-a", None, RiskClass::Mutating);
         grants.record(key.clone(), 0); // expires immediately
         assert!(!grants.has(&key));
         grants.record(key.clone(), 3600); // re-grant, now live
@@ -594,7 +744,7 @@ mod tests {
     #[test]
     fn record_with_a_massive_ttl_saturates_instead_of_overflowing() {
         let grants = Grants::new();
-        let key = GrantKey::new("client-1", RiskClass::Mutating);
+        let key = GrantKey::new("client-1", None, RiskClass::Mutating);
         grants.record(key.clone(), u64::MAX);
         assert!(
             grants.has(&key),

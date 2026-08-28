@@ -53,6 +53,27 @@
 //! rationale). The literal string here MUST stay in sync with
 //! `approval_native::DISABLE_NATIVE_APPROVAL_ENV` — this test binary has no
 //! library target to import that constant from.
+//!
+//! ## BINDING REQUIREMENT: no stray daemon left running
+//!
+//! A successful `brain_capture` ends with a best-effort reindex that calls
+//! `daemon_client::ensure_running`, which spawns `onebrain daemon start`
+//! when no warm daemon is already up. That is correct in production and
+//! unacceptable here: an earlier revision of this test left a real
+//! `onebrain daemon __run` process alive against its own tempdir vault
+//! after every run, on the developer machine and on CI alike. `cfg!(test)`
+//! cannot help — the gateway under test is a separately compiled,
+//! separately spawned binary — and the pre-existing `ONEBRAIN_NO_DAEMON`
+//! kill switch does not reach this path either (it gates only
+//! `search_common::route_to_daemon`, the PASSIVE routing check, never the
+//! ACTIVE `ensure_running` spawn). `spawn_gateway` therefore also sets
+//! `ONEBRAIN_GATEWAY_DISABLE_DAEMON_REINDEX=1`, the sibling switch
+//! `server::reindex_channel_enabled` reads, and the test ASSERTS the
+//! outcome rather than trusting it: after two successful captures,
+//! `$HOME/.onebrain/run/` must not exist, since `ensure_running` creates
+//! that directory before it can discover or spawn anything. Same sync
+//! caveat as above — the literal must match
+//! `server::DISABLE_DAEMON_REINDEX_ENV`.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -84,8 +105,10 @@ fn write(root: &Path, rel: &str, body: &str) {
 /// process blocks on Ctrl-C after a successful bind, so `.output()` would
 /// hang forever waiting for it to exit.
 ///
-/// `ONEBRAIN_GATEWAY_DISABLE_NATIVE_APPROVAL=1` is the BINDING REQUIREMENT
-/// from this file's own module docs — see there for the full rationale.
+/// `ONEBRAIN_GATEWAY_DISABLE_NATIVE_APPROVAL=1` and
+/// `ONEBRAIN_GATEWAY_DISABLE_DAEMON_REINDEX=1` are the two BINDING
+/// REQUIREMENTS from this file's own module docs — see there for the
+/// rationale behind each.
 fn spawn_gateway(
     cache_dir: &Path,
     home: &Path,
@@ -100,6 +123,7 @@ fn spawn_gateway(
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("ONEBRAIN_GATEWAY_DISABLE_NATIVE_APPROVAL", "1")
+        .env("ONEBRAIN_GATEWAY_DISABLE_DAEMON_REINDEX", "1")
         .env_remove("ONEBRAIN_VAULT")
         .current_dir(cwd)
         .args(["gateway", "run", "--port", "0"])
@@ -859,6 +883,18 @@ fn gateway_ask_once_approval_flow_completes_writes_and_reuses_the_grant() {
         empty_list.as_array().map(Vec::len),
         Some(0),
         "the grant-satisfied second call must never have registered a pending approval: {empty_body}"
+    );
+
+    // ── No stray daemon: the second BINDING REQUIREMENT, asserted ──────
+    // `daemon_client::ensure_running` creates `$HOME/.onebrain/run/` (via
+    // `resolve_slot` -> `ensure_private_run_dir`) before it can discover or
+    // spawn anything at all, so the absence of that directory after two
+    // successful captures proves the reindex block was never entered — and
+    // therefore that no `onebrain daemon __run` process was left behind.
+    assert!(
+        !home.path().join(".onebrain").join("run").exists(),
+        "the gateway must not have spawned or probed a daemon: \
+         ONEBRAIN_GATEWAY_DISABLE_DAEMON_REINDEX did not take effect"
     );
 
     // ── The audit log carries both calls with the right decisions ───────

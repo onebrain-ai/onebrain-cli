@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use super::approval::{self, PendingApproval};
 use super::oauth_routes::AuthCtx;
-use super::policy::GrantKey;
+use super::policy::{GrantKey, PolicyMode};
 use super::server::GatewayState;
 
 /// The operator credential header this whole surface is gated on — see the
@@ -119,12 +119,21 @@ struct ResolveResponse {
 /// [`super::policy::Grants::record`] (Task 2 review, binding requirement A)
 /// — using a config-derived TTL (`PolicyConfig::grant_ttl_minutes * 60`),
 /// not a test's hardcoded value. Approving one call grants the SAME
-/// `(client, class)` pair every subsequent `ask_once` call until that grant
-/// expires — that is the entire point of `ask_once` vs. `ask_always` (see
-/// `policy.rs`'s decision table doc comment). A `Decision::Deny` records
-/// nothing: denial is never "ask less often next time."
+/// `(client, vault, class)` triple every subsequent `ask_once` call until
+/// that grant expires — that is the entire point of `ask_once` vs.
+/// `ask_always` (see `policy.rs`'s decision table doc comment). A
+/// `Decision::Deny` records nothing: denial is never "ask less often next
+/// time."
 ///
-/// The pending entry's `client_id`/`class` are snapshotted from
+/// **Nothing is recorded under `ask_always` either**, whichever channel the
+/// approval arrived through. `decide` already ignores grants in that mode,
+/// so today this only avoids writing an entry nothing reads — but "always
+/// ask" must never be capable of producing standing consent, and leaving a
+/// live grant in the map for a mode whose whole meaning is "ask every time"
+/// is a trap for the next refactor of `decide`. `server::await_approval`
+/// applies the identical guard on the waiter side.
+///
+/// The pending entry's `client_id`/`vault`/`class` are snapshotted from
 /// [`super::approval::Approvals::list`] BEFORE calling
 /// [`super::approval::Approvals::resolve`], because `resolve` REMOVES the
 /// entry as part of its own first-responder-wins contract (see that
@@ -154,10 +163,12 @@ async fn resolve_approval(
 
     if body.decision == approval::Decision::Approve {
         if let Some(p) = snapshot {
-            let ttl_secs = state.config.policy.grant_ttl_minutes.saturating_mul(60);
-            state
-                .grants
-                .record(GrantKey::new(p.client_id, p.class), ttl_secs);
+            if state.config.policy.mode_for(p.class) != PolicyMode::AskAlways {
+                let ttl_secs = state.config.policy.grant_ttl_minutes.saturating_mul(60);
+                state
+                    .grants
+                    .record(GrantKey::new(p.client_id, p.vault, p.class), ttl_secs);
+            }
         }
     }
 
@@ -196,14 +207,20 @@ mod tests {
     use crate::commands::gateway::policy::RiskClass;
     use crate::commands::gateway::GatewayConfig;
 
+    /// A pending entry with a LIVE TTL — `Approvals::register` prunes
+    /// already-expired entries (see its doc comment), so a fixture with a
+    /// hardcoded past `expires` would vanish the moment a second entry was
+    /// registered.
     fn sample_pending(id: &str) -> PendingApproval {
+        let now = crate::commands::gateway::auth::core::now_epoch_secs();
         PendingApproval {
             id: id.to_string(),
             client_id: "client-1".to_string(),
             tool: "brain_capture".to_string(),
+            vault: Some("t1".to_string()),
             summary: "note: Quarterly Plan".to_string(),
-            created: 1_700_000_000,
-            expires: 1_700_000_300,
+            created: now,
+            expires: now + 300,
             class: RiskClass::Mutating,
         }
     }
@@ -315,7 +332,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_without_pairing_header_401s_and_leaves_the_entry_pending() {
         let (_dir, router, state, _code) = fixture();
-        let _rx = state.approvals.register(sample_pending("a1"));
+        let _rx = state.approvals.register(sample_pending("a1")).unwrap();
 
         let resp = post_resolve(&router, "a1", None, "approve").await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -331,7 +348,7 @@ mod tests {
     #[tokio::test]
     async fn approvals_with_correct_pairing_code_lists_pending() {
         let (_dir, router, state, code) = fixture();
-        let _rx = state.approvals.register(sample_pending("a1"));
+        let _rx = state.approvals.register(sample_pending("a1")).unwrap();
 
         let resp = get_approvals(&router, Some(&code)).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -357,7 +374,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_wakes_the_waiter_and_returns_200() {
         let (_dir, router, state, code) = fixture();
-        let rx = state.approvals.register(sample_pending("a1"));
+        let rx = state.approvals.register(sample_pending("a1")).unwrap();
 
         let resp = post_resolve(&router, "a1", Some(&code), "approve").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -404,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn connector_bearer_token_alone_cannot_resolve_an_approval() {
         let (dir, router, state, _code) = fixture();
-        let _rx = state.approvals.register(sample_pending("a1"));
+        let _rx = state.approvals.register(sample_pending("a1")).unwrap();
         let token = connector_bearer_token(dir.path());
 
         let req = HttpRequest::builder()
@@ -433,9 +450,9 @@ mod tests {
         let mut pending = sample_pending("a1");
         pending.client_id = "client-x".to_string();
         pending.class = RiskClass::Mutating;
-        let _rx = state.approvals.register(pending);
+        let _rx = state.approvals.register(pending).unwrap();
 
-        let key = GrantKey::new("client-x", RiskClass::Mutating);
+        let key = GrantKey::new("client-x", Some("t1".to_string()), RiskClass::Mutating);
         assert!(!state.grants.has(&key), "no grant before approval");
 
         let resp = post_resolve(&router, "a1", Some(&code), "approve").await;
@@ -443,7 +460,39 @@ mod tests {
 
         assert!(
             state.grants.has(&key),
-            "approving must record a grant for the SAME (client, class) pair"
+            "approving must record a grant for the SAME (client, vault, class) triple"
+        );
+    }
+
+    /// "Always ask" must never produce standing consent. `decide` already
+    /// ignores grants under `ask_always`, so this is defence in depth — but
+    /// a live grant sitting in the map for that mode is exactly the trap a
+    /// later refactor of `decide` would fall into. The default config has
+    /// `destructive: ask_always`, so a `Destructive` pending entry exercises
+    /// it without a custom config.
+    #[tokio::test]
+    async fn approving_under_ask_always_records_no_grant() {
+        let (_dir, router, state, code) = fixture();
+        assert_eq!(
+            state.config.policy.mode_for(RiskClass::Destructive),
+            PolicyMode::AskAlways,
+            "fixture precondition: the default config must make Destructive ask_always"
+        );
+        let mut pending = sample_pending("a1");
+        pending.client_id = "client-z".to_string();
+        pending.class = RiskClass::Destructive;
+        let _rx = state.approvals.register(pending).unwrap();
+
+        let resp = post_resolve(&router, "a1", Some(&code), "approve").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(
+            !state.grants.has(&GrantKey::new(
+                "client-z",
+                Some("t1".to_string()),
+                RiskClass::Destructive
+            )),
+            "an approval under ask_always must never leave standing consent behind"
         );
     }
 
@@ -453,15 +502,17 @@ mod tests {
         let mut pending = sample_pending("a1");
         pending.client_id = "client-y".to_string();
         pending.class = RiskClass::Destructive;
-        let _rx = state.approvals.register(pending);
+        let _rx = state.approvals.register(pending).unwrap();
 
         let resp = post_resolve(&router, "a1", Some(&code), "deny").await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         assert!(
-            !state
-                .grants
-                .has(&GrantKey::new("client-y", RiskClass::Destructive)),
+            !state.grants.has(&GrantKey::new(
+                "client-y",
+                Some("t1".to_string()),
+                RiskClass::Destructive
+            )),
             "denying must never record a grant"
         );
     }
