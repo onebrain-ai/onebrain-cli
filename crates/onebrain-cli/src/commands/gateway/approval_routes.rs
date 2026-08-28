@@ -16,9 +16,11 @@
 //! (`X-OneBrain-Pairing` header — bearer-style placement, but a DIFFERENT
 //! credential entirely from an OAuth access token) that pairs a brand-new
 //! connector in the first place, verified constant-time via
-//! `AuthStore::verify_pairing` — which itself already calls
-//! `auth::core::constant_time_str_eq` internally, so no new compare logic
-//! is written here at all; this module just reuses both, exactly as
+//! [`super::oauth_routes::AuthCtx::check_pairing_code`] — which wraps
+//! `AuthStore::verify_pairing` (itself already calling
+//! `auth::core::constant_time_str_eq`) in the same brute-force limiter
+//! `POST /authorize` uses, so no new compare logic and no second failure
+//! budget is written here at all; this module just reuses both, exactly as
 //! instructed. A connector's live OAuth bearer token is never even
 //! inspected by this gate (it only ever reads one header,
 //! `X-OneBrain-Pairing`), so it can never satisfy it — proven explicitly by
@@ -43,7 +45,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use super::approval::{self, PendingApproval};
-use super::oauth_routes::AuthCtx;
+use super::oauth_routes::{AuthCtx, PairingCheck};
 use super::policy::{GrantKey, PolicyMode};
 use super::server::GatewayState;
 
@@ -56,16 +58,37 @@ const PAIRING_HEADER: &str = "x-onebrain-pairing";
 
 /// Axum middleware guarding the `/approvals` router: requires the gateway's
 /// current pairing code, presented via [`PAIRING_HEADER`], to
-/// constant-time-match (`AuthStore::verify_pairing`). No token, missing
-/// header, wrong code, or a `AuthStore` I/O error (e.g. a corrupt
+/// constant-time-match — checked through [`AuthCtx::check_pairing_code`],
+/// which wraps `AuthStore::verify_pairing` in the SHARED brute-force
+/// limiter. No token, missing
+/// header, wrong code, a lockout, or an `AuthStore` I/O error (e.g. a corrupt
 /// `pairing.json`) all collapse to the same bare 401 — there is no
 /// different recovery action for an operator to take (re-read the pairing
 /// code and try again) and no reason to hand out which failure mode
-/// occurred.
+/// occurred. In particular a lockout is deliberately indistinguishable from
+/// a wrong code here: telling a guesser they have tripped the limiter tells
+/// them their earlier guesses were being counted.
+///
+/// **Why the shared limiter and not a local one.** This surface is gated on
+/// the very same secret `POST /authorize` checks, and it is the last thing
+/// standing between a caller and self-approval — an attacker needs no OAuth
+/// token at all to reach it, just the port (a second local account, any
+/// unsandboxed process on the box, or anything that reaches a tunnel once
+/// `public_url` is in play). Calling `verify_pairing` directly, as an earlier
+/// revision did, left this surface accepting unlimited, unthrottled, unlogged
+/// guesses at a code `/authorize` rate-limits to five. A SECOND,
+/// separately-counted limiter would have been its own defect: two budgets
+/// over one secret doubles the guess rate an attacker gets, so this shares
+/// `/authorize`'s exact counter, lockout, and log line — see
+/// [`super::oauth_routes::AttemptState`].
 ///
 /// Deliberately NOT `auth::middleware::require_bearer` — see the module
 /// docs. This function reads ONLY [`PAIRING_HEADER`]; the `Authorization`
 /// header, if present at all, is never even looked at.
+///
+/// No `std::sync::Mutex` guard is held across the `next.run(req).await`
+/// below: `check_pairing_code` is synchronous and releases both of its locks
+/// before returning its verdict.
 async fn require_pairing_header(
     State(ctx): State<Arc<AuthCtx>>,
     req: Request,
@@ -79,14 +102,18 @@ async fn require_pairing_header(
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
-    let verified = {
-        let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-        store.verify_pairing(code)
-    };
+    let checked = ctx.check_pairing_code(code);
 
-    match verified {
-        Ok(true) => next.run(req).await,
-        Ok(false) | Err(_) => StatusCode::UNAUTHORIZED.into_response(),
+    match checked {
+        PairingCheck::Accepted => next.run(req).await,
+        PairingCheck::Rejected { .. } | PairingCheck::LockedOut => {
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+        PairingCheck::StoreError(e) => {
+            // Operator-facing only; the client still gets the same bare 401.
+            tracing::error!(error = %e, "pairing store I/O error during an /approvals request");
+            StatusCode::UNAUTHORIZED.into_response()
+        }
     }
 }
 
@@ -234,6 +261,21 @@ mod tests {
     /// SAME store the router's `AuthCtx` shares, so a test can present it
     /// directly.
     fn fixture() -> (tempfile::TempDir, Router, Arc<GatewayState>, String) {
+        let (dir, router, state, _ctx, code) = fixture_with_ctx();
+        (dir, router, state, code)
+    }
+
+    /// [`fixture`] plus the shared [`AuthCtx`] itself, for the tests that
+    /// need to build a SECOND router (the OAuth `/authorize` surface) over
+    /// the very same context — the only way to prove the two surfaces share
+    /// one pairing-attempt budget rather than each keeping their own.
+    fn fixture_with_ctx() -> (
+        tempfile::TempDir,
+        Router,
+        Arc<GatewayState>,
+        Arc<AuthCtx>,
+        String,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let audit = AuditLog::open_at(dir.path().join("gateway-audit")).unwrap();
         let state = Arc::new(GatewayState::new(GatewayConfig::default(), audit));
@@ -246,8 +288,18 @@ mod tests {
             .set("http://127.0.0.1:7717".to_string())
             .unwrap();
 
-        let router = approval_router(state.clone(), auth_ctx);
-        (dir, router, state, pairing_code)
+        let router = approval_router(state.clone(), auth_ctx.clone());
+        (dir, router, state, auth_ctx, pairing_code)
+    }
+
+    /// A pairing code guaranteed NOT to be `real` — same shape (so nothing
+    /// short-circuits on length), different content.
+    fn wrong_code(real: &str) -> &'static str {
+        if real.starts_with('A') {
+            "BBBB-BBBB"
+        } else {
+            "AAAA-AAAA"
+        }
     }
 
     /// Mints a live connector access token against the SAME on-disk auth
@@ -320,12 +372,7 @@ mod tests {
     #[tokio::test]
     async fn approvals_with_wrong_pairing_code_401s() {
         let (_dir, router, _state, code) = fixture();
-        let wrong = if code.starts_with('A') {
-            "BBBB-BBBB"
-        } else {
-            "AAAA-AAAA"
-        };
-        let resp = get_approvals(&router, Some(wrong)).await;
+        let resp = get_approvals(&router, Some(wrong_code(&code))).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -442,6 +489,142 @@ mod tests {
         );
     }
 
+    // ── The pairing gate is brute-force limited, on ONE shared budget ────
+
+    /// The operator surface is the last thing between a caller and
+    /// self-approval, and it needs no OAuth token to reach — so it must not
+    /// accept unlimited guesses at the pairing code. Five wrong codes trip
+    /// the lockout; the sixth submission is rejected even though the code is
+    /// CORRECT, which is the observable difference between "limited" and
+    /// "not limited" (without a limiter the correct code would be accepted).
+    #[tokio::test]
+    async fn repeated_wrong_pairing_codes_lock_out_the_approvals_surface() {
+        let (_dir, router, _state, code) = fixture();
+        let wrong = wrong_code(&code);
+
+        for attempt in 1..=5 {
+            let resp = get_approvals(&router, Some(wrong)).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "attempt {attempt} must be refused"
+            );
+        }
+
+        let resp = get_approvals(&router, Some(&code)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "the CORRECT code inside the lockout window must still be refused — \
+             without a limiter this call would have succeeded"
+        );
+    }
+
+    /// …and it is the SAME budget `POST /authorize` spends, not a second one
+    /// of its own — two independent limiters over one secret would simply
+    /// double the guess rate available to an attacker.
+    ///
+    /// Proven in both directions over one shared [`AuthCtx`]: four failures
+    /// spent on `/approvals` leave `/authorize` one away from its lockout
+    /// (so the FIFTH failure, made on `/authorize`, is the one that trips
+    /// it), and the lockout that `/authorize` then reports also rejects a
+    /// correct code back on `/approvals`.
+    #[tokio::test]
+    async fn the_approvals_gate_shares_one_failure_budget_with_authorize() {
+        use crate::commands::gateway::auth::{mint_secret_32, AppType, RegisteredClient};
+        use crate::commands::gateway::oauth_routes::{authorize_router, LOCKED_OUT_MESSAGE};
+
+        let (_dir, approvals, _state, ctx, code) = fixture_with_ctx();
+        let authorize = authorize_router(ctx.clone());
+        let wrong = wrong_code(&code);
+
+        // A registered client, so `POST /authorize` gets past its own
+        // request validation and actually reaches the pairing check.
+        let redirect_uri = "https://claude.ai/cb";
+        let client_id = mint_secret_32();
+        ctx.store
+            .lock()
+            .unwrap()
+            .register_client(RegisteredClient {
+                client_id: client_id.clone(),
+                client_name: None,
+                redirect_uris: vec![redirect_uri.to_string()],
+                application_type: AppType::Web,
+                created: crate::commands::gateway::auth::core::now_epoch_secs(),
+            })
+            .unwrap();
+
+        let post_authorize = |pairing: String| {
+            let router = authorize.clone();
+            let client_id = client_id.clone();
+            async move {
+                let form = format!(
+                    "response_type=code&client_id={client_id}\
+                     &redirect_uri=https%3A%2F%2Fclaude.ai%2Fcb\
+                     &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM\
+                     &code_challenge_method=S256&state=s1&pairing_code={pairing}"
+                );
+                let req = HttpRequest::builder()
+                    .method("POST")
+                    .uri("/authorize")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(form))
+                    .unwrap();
+                let resp = router.oneshot(req).await.unwrap();
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                String::from_utf8_lossy(&bytes).into_owned()
+            }
+        };
+
+        // Four failures, all spent on the OPERATOR surface.
+        for attempt in 1..=4 {
+            let resp = get_approvals(&approvals, Some(wrong)).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "attempt {attempt}");
+        }
+
+        // The fifth failure lands on /authorize — and trips the lockout,
+        // which can only happen if the four above counted against the same
+        // budget.
+        let body = post_authorize(wrong.to_string()).await;
+        assert!(
+            body.contains(LOCKED_OUT_MESSAGE),
+            "four /approvals failures plus one /authorize failure must reach the \
+             shared five-failure threshold; a per-surface budget would still be at 1"
+        );
+
+        // And the lockout is likewise shared in the other direction.
+        let resp = get_approvals(&approvals, Some(&code)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a lockout tripped on /authorize must also close the /approvals surface"
+        );
+    }
+
+    /// A lockout must not be distinguishable from a plain wrong code here:
+    /// a different status (or body) would tell a guesser their attempts are
+    /// being counted, and would confirm which of their guesses were wrong.
+    #[tokio::test]
+    async fn a_locked_out_approvals_request_is_indistinguishable_from_a_wrong_code() {
+        let (_dir, router, _state, code) = fixture();
+        let wrong = wrong_code(&code);
+
+        let first = get_approvals(&router, Some(wrong)).await;
+        let first_status = first.status();
+        let first_body = first.into_body().collect().await.unwrap().to_bytes();
+
+        for _ in 0..5 {
+            let _ = get_approvals(&router, Some(wrong)).await;
+        }
+
+        let locked = get_approvals(&router, Some(&code)).await;
+        assert_eq!(locked.status(), first_status);
+        assert_eq!(
+            locked.into_body().collect().await.unwrap().to_bytes(),
+            first_body
+        );
+    }
+
     // ── Requirement A: approving wires a real, config-derived-TTL grant ──
 
     #[tokio::test]
@@ -496,12 +679,32 @@ mod tests {
         );
     }
 
+    /// The DENY condition, isolated.
+    ///
+    /// This deliberately uses `Mutating`, which the default config maps to
+    /// `ask_once` — a class where an APPROVE would record a grant (proven
+    /// directly above by
+    /// `approving_records_a_grant_using_the_config_derived_ttl`, which uses
+    /// the same class and the same fixture). An earlier revision used
+    /// `Destructive`, which the default config maps to `ask_always`: the
+    /// inner "never record under ask_always" guard then suppressed the grant
+    /// on its own, so the test passed identically with the decision check
+    /// deleted and proved nothing about denial. With `Mutating`, the
+    /// `decision == Approve` condition is the ONLY thing left that can keep
+    /// this grant out of the map — verified by deleting that condition and
+    /// watching this test, and only this test, fail.
     #[tokio::test]
     async fn denying_does_not_record_a_grant() {
         let (_dir, router, state, code) = fixture();
+        assert_eq!(
+            state.config.policy.mode_for(RiskClass::Mutating),
+            PolicyMode::AskOnce,
+            "fixture precondition: the class under test must NOT be ask_always, or the \
+             ask_always guard would suppress the grant regardless of the decision"
+        );
         let mut pending = sample_pending("a1");
         pending.client_id = "client-y".to_string();
-        pending.class = RiskClass::Destructive;
+        pending.class = RiskClass::Mutating;
         let _rx = state.approvals.register(pending).unwrap();
 
         let resp = post_resolve(&router, "a1", Some(&code), "deny").await;
@@ -511,7 +714,7 @@ mod tests {
             !state.grants.has(&GrantKey::new(
                 "client-y",
                 Some("t1".to_string()),
-                RiskClass::Destructive
+                RiskClass::Mutating
             )),
             "denying must never record a grant"
         );

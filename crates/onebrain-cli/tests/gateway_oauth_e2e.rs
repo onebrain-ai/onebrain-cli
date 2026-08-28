@@ -107,16 +107,21 @@ fn wait_for_gateway_url(
         }
         if let Some(status) = child.try_wait().expect("poll gateway child") {
             let err = std::fs::read_to_string(stderr_path).unwrap_or_default();
-            // Security: `out` may already contain the real pairing code by
-            // this point (it's printed before the "gateway listening" line
-            // — see the module docs) — never interpolate it whole into a
-            // panic message (CodeQL `rust/cleartext-logging`). `err` is
-            // safe: stderr only ever carries the fixed "loopback only ..."
-            // notice, never a secret.
+            // Security: neither stream is interpolated whole into a panic
+            // message (CodeQL `rust/cleartext-logging`). `out` may already
+            // contain the real pairing code by this point (it's printed
+            // before the "gateway listening" line — see the module docs).
+            // `err` is no longer just the fixed "loopback only ..." notice
+            // either: `gateway run` installs a tracing subscriber writing to
+            // stderr, so it now carries operator diagnostics that may
+            // legitimately name host paths. Sizes plus the exit status are
+            // enough to tell a crash from a hang, which is all this panic
+            // has to distinguish.
             panic!(
                 "onebrain gateway run exited early ({status}) before printing the \
-                 listening line ({} bytes of stdout captured): stderr={err:?}",
-                out.len()
+                 listening line ({} bytes of stdout, {} bytes of stderr captured)",
+                out.len(),
+                err.len()
             );
         }
         assert!(

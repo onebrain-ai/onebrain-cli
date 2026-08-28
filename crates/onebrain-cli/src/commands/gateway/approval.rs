@@ -36,16 +36,28 @@
 //! `/approvals` — the privilege-separation property this whole gate rests
 //! on.
 //!
-//! ## Bounded, so a client cannot fan out unbounded dialogs
+//! ## Bounded — but stated precisely: these caps bound CONCURRENT ENTRIES
 //!
 //! [`Approvals::register`] refuses past [`MAX_PENDING_APPROVALS`] globally or
 //! [`MAX_PENDING_APPROVALS_PER_CLIENT`] for one client — see its own doc
 //! comment. Before Task 5 wired a production caller this was academic;
 //! afterwards a client looping `brain_capture` under the DEFAULT
 //! `mutating: ask_once` (before any grant exists) or under `ask_always`
-//! would otherwise register one pending entry — and fire one real
-//! `osascript` GUI dialog, each pinning a `spawn_blocking` thread — per
-//! in-flight call.
+//! would otherwise register one pending entry per in-flight call.
+//!
+//! What the caps bound is the number of entries live in this registry AT
+//! ONCE. They do NOT, on their own, bound how many native dialogs accumulate
+//! on screen over time, and an earlier revision of this doc wrongly claimed
+//! they did: [`Self::wait`] removes a timed-out entry and [`Self::register`]
+//! prunes expired ones before counting, so each timeout frees a slot for a
+//! fresh call — and therefore a fresh prompt — while any earlier prompt that
+//! had no expiry of its own would still be up, still pinning a
+//! `spawn_blocking` thread. Bounding the DIALOGS is a separate mechanism
+//! living in [`super::approval_native`]: every script it emits carries a
+//! `giving up after` clause sized to that entry's own remaining TTL, so a
+//! dialog is reclaimed when its entry is. The two mechanisms compose —
+//! caps bound concurrency, the clause bounds lifetime — and neither
+//! substitutes for the other.
 //!
 //! ## In-memory, per-process — same lifetime discipline as [`super::policy::Grants`]
 //!
@@ -206,6 +218,12 @@ impl Approvals {
     /// refusal is a plain `Err` — nothing is inserted, no channel is
     /// created, and the caller turns it into a policy error instead of
     /// queueing another human prompt.
+    ///
+    /// These caps bound how many entries are live AT ONCE — not how many
+    /// prompts accumulate over the life of the process. See the module docs'
+    /// "Bounded" section: the pruning below deliberately frees a slot on
+    /// every timeout, so bounding a native dialog's LIFETIME is
+    /// [`super::approval_native`]'s `giving up after` clause, not this.
     ///
     /// Entries already past their own `expires` are dropped FIRST, before
     /// either count is taken. That matters specifically BECAUSE of the caps:

@@ -58,17 +58,32 @@ use super::auth::{
     RotateOutcome, TokenRecord, ACCESS_TTL_SECS,
 };
 
-/// Pairing-attempt rate-limiter state: 5 consecutive wrong pairing-code
-/// submissions → 60s lockout, enforced by [`authorize_post_handler`] through
-/// [`AuthCtx::attempts`]. Global (not per-client/per-IP) — there is exactly
+/// Consecutive wrong pairing-code submissions that trip a lockout.
+const MAX_PAIRING_FAILURES: u32 = 5;
+
+/// How long that lockout lasts, in seconds.
+const PAIRING_LOCKOUT_SECS: u64 = 60;
+
+/// Pairing-attempt rate-limiter state: [`MAX_PAIRING_FAILURES`] consecutive
+/// wrong pairing-code submissions → a [`PAIRING_LOCKOUT_SECS`] lockout,
+/// enforced by [`AuthCtx::check_pairing_code`] through [`AuthCtx::attempts`].
+/// Global (not per-client/per-IP) — there is exactly
 /// one pairing code for the whole gateway (a single human at the machine),
 /// so one counter is the right shape, matching [`super::auth::store::PairingState`]'s
 /// own "exactly one active pairing code" design.
 ///
+/// Global also in a second sense that matters: it is one budget across every
+/// SURFACE that checks this one code — `POST /authorize` and the operator
+/// `/approvals` router's `require_pairing_header` alike, both of which route
+/// through [`AuthCtx::check_pairing_code`] rather than calling
+/// `AuthStore::verify_pairing` for themselves. Two limiters over one secret
+/// would just be a slower way to have none.
+///
 /// Both fields are mutated ONLY while holding [`AuthCtx::attempts`]'s lock
-/// across the full read-decide-write sequence in `authorize_post_handler` —
-/// see that handler's doc comment for the exact lock-ordering discipline
-/// (`attempts` locked first, `store` nested inside, never the reverse).
+/// across the full read-decide-write sequence in
+/// [`AuthCtx::check_pairing_code`] — see that method's doc comment for the
+/// exact lock-ordering discipline (`attempts` locked first, `store` nested
+/// inside, never the reverse).
 #[derive(Debug, Default)]
 pub struct AttemptState {
     /// Consecutive WRONG pairing-code submissions since the last correct
@@ -108,10 +123,38 @@ pub struct AuthCtx {
     /// issuer. Oneshot tests set this explicitly before building the router.
     pub issuer: OnceLock<String>,
     /// Pairing-attempt rate-limiter, read and written by
-    /// [`authorize_post_handler`] on every `POST /authorize`. See
-    /// [`AttemptState`]'s doc comment for the field-level rate-limit
+    /// [`Self::check_pairing_code`] on every pairing-code submission — from
+    /// `POST /authorize` and from the operator `/approvals` surface alike.
+    /// See [`AttemptState`]'s doc comment for the field-level rate-limit
     /// semantics and the lock-ordering discipline shared with `store`.
     pub attempts: Mutex<AttemptState>,
+}
+
+/// Outcome of one rate-limited pairing-code submission
+/// ([`AuthCtx::check_pairing_code`]).
+///
+/// Deliberately reports the raw facts and lets each surface choose its own
+/// response: `POST /authorize` re-renders its consent form with a different
+/// message for [`Self::Rejected`] with and without `locked_now`, while
+/// `/approvals` collapses every non-[`Self::Accepted`] outcome to one bare
+/// 401 (it has no page to render and no reason to say which failure it was).
+#[derive(Debug)]
+pub enum PairingCheck {
+    /// The code matched. The limiter has been reset by this call.
+    Accepted,
+    /// The code did not match, and the failure has been counted.
+    /// `locked_now` is `true` iff THIS failure is the one that tripped the
+    /// lockout.
+    Rejected { locked_now: bool },
+    /// A lockout window is in effect, so the submitted code was not even
+    /// compared — a correct code inside the window is rejected exactly like
+    /// a wrong one.
+    LockedOut,
+    /// The pairing store could not be read at all (e.g. a corrupt
+    /// `pairing.json`). Neither accepted nor counted as a failed guess: an
+    /// attacker must never be able to clear or advance the limiter by
+    /// breaking the store.
+    StoreError(anyhow::Error),
 }
 
 impl AuthCtx {
@@ -133,6 +176,75 @@ impl AuthCtx {
             .get()
             .map(String::as_str)
             .unwrap_or("http://127.0.0.1")
+    }
+
+    /// Check one submitted pairing code against the store, under the shared
+    /// brute-force limiter. **The only sanctioned way to check a pairing
+    /// code**: every surface gated on that one secret must come through here
+    /// rather than calling `AuthStore::verify_pairing` directly, so they all
+    /// share one counter and one lockout. `POST /authorize`
+    /// ([`authorize_post_handler`]) and the operator `/approvals` router
+    /// (`super::approval_routes::require_pairing_header`) are today's two
+    /// callers.
+    ///
+    /// Lock ORDER is `attempts` first, `store` nested inside — held as ONE
+    /// continuous critical section across "check lockout → verify code →
+    /// record the result", which is what makes
+    /// "[`MAX_PAIRING_FAILURES`] consecutive failures → a
+    /// [`PAIRING_LOCKOUT_SECS`] lockout, and a CORRECT code inside that
+    /// window still rejected" true even under concurrent submissions (two
+    /// racing wrong submissions can't both slip in under the threshold, and
+    /// a correct-code submission that arrives while locked can't observe a
+    /// lock that a concurrently-expiring window just cleared out from under
+    /// it). `store` is never held while a second `attempts` lock is taken
+    /// anywhere, so this ordering can't deadlock against any other path.
+    ///
+    /// Synchronous and guard-free on return by construction: both guards are
+    /// released before the [`PairingCheck`] is handed back, so an `async`
+    /// caller (the `/approvals` middleware, which then `.await`s
+    /// `next.run(req)`) never holds a `std::sync::Mutex` across an await.
+    ///
+    /// A rejection is logged for the operator — the count and whether it
+    /// tripped the lockout, NEVER the submitted code or the real one.
+    pub fn check_pairing_code(&self, code: &str) -> PairingCheck {
+        let now = now_epoch_secs();
+        let mut attempts = self.attempts.lock().unwrap_or_else(|p| p.into_inner());
+
+        if let Some(until) = attempts.locked_until {
+            if now < until {
+                return PairingCheck::LockedOut;
+            }
+            // Lockout window elapsed naturally — clear it before proceeding.
+            attempts.locked_until = None;
+            attempts.consecutive_failures = 0;
+        }
+
+        let verified = {
+            let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+            store.verify_pairing(code)
+        };
+
+        match verified {
+            Err(e) => PairingCheck::StoreError(e),
+            Ok(false) => {
+                attempts.consecutive_failures += 1;
+                let locked_now = attempts.consecutive_failures >= MAX_PAIRING_FAILURES;
+                if locked_now {
+                    attempts.locked_until = Some(now_epoch_secs() + PAIRING_LOCKOUT_SECS);
+                }
+                tracing::warn!(
+                    consecutive_failures = attempts.consecutive_failures,
+                    locked_out = locked_now,
+                    "rejected an incorrect gateway pairing code"
+                );
+                PairingCheck::Rejected { locked_now }
+            }
+            Ok(true) => {
+                attempts.consecutive_failures = 0;
+                attempts.locked_until = None;
+                PairingCheck::Accepted
+            }
+        }
     }
 }
 
@@ -1010,7 +1122,11 @@ fn render_consent_form(req: &ValidatedAuthorize, notice: Option<&str>) -> Respon
 /// field was wrong, how many attempts remain, nor when a lockout lifts (the
 /// brief's "do not leak remaining-attempts or unlock-time precisely").
 const WRONG_PAIRING_CODE_MESSAGE: &str = "Incorrect pairing code. Please try again.";
-const LOCKED_OUT_MESSAGE: &str = "Too many attempts. Please try again in a minute.";
+/// `pub(super)` so `approval_routes`'s own tests can assert that a lockout
+/// tripped on THIS surface is the same lockout that then rejects a correct
+/// code on `/approvals` — one shared budget, proven across both surfaces
+/// rather than asserted.
+pub(super) const LOCKED_OUT_MESSAGE: &str = "Too many attempts. Please try again in a minute.";
 
 /// `GET {issuer}/authorize` — validates the request and renders the consent
 /// form, or fails per [`AuthorizeError`]'s NoRedirect/Redirect split. Never
@@ -1039,17 +1155,14 @@ async fn authorize_get_handler(
 /// like a fresh GET would (400 page, no redirect, for the two
 /// RFC-6749-critical fields; redirect-with-error for everything else).
 ///
-/// Step 2: the rate-limited pairing check. Lock ORDER is `attempts` first,
-/// `store` nested inside — held as ONE continuous critical section across
-/// "check lockout → verify pairing code → record the result", which is what
-/// makes "5 consecutive failures → 60s lockout, and a CORRECT code inside
-/// that window still gets the generic locked response" true even under
-/// concurrent POSTs (two racing wrong submissions can't both slip in under
-/// the threshold, and a correct-code submission that arrives while locked
-/// can't observe a lock that a concurrently-expiring window just cleared out
-/// from under it). `store` is never held while a second `attempts` lock is
-/// taken elsewhere, so this ordering can't deadlock against any other code
-/// path in this file.
+/// Step 2: the rate-limited pairing check, delegated to
+/// [`AuthCtx::check_pairing_code`] — the one place a pairing code is ever
+/// compared, shared with the operator `/approvals` surface so both spend the
+/// same failure budget. See that method's doc comment for the locking and
+/// concurrency argument; this handler only maps its
+/// [`PairingCheck`] outcome onto the three responses `/authorize` needs
+/// (re-rendered form with a wrong-code message, re-rendered form with the
+/// generic locked-out message, or a 500 page on a store fault).
 ///
 /// Step 3 (success only): [`AuthStore::issue_code`] — a fresh, single-use
 /// code bound to client_id+redirect_uri+code_challenge+resource+scope, a
@@ -1070,56 +1183,30 @@ async fn authorize_post_handler(
         }) => return redirect_with_error(&redirect_uri, error, state.as_deref()),
     };
 
-    let now = now_epoch_secs();
-    let mut attempts = ctx.attempts.lock().unwrap_or_else(|p| p.into_inner());
-
-    if let Some(until) = attempts.locked_until {
-        if now < until {
-            drop(attempts);
+    match ctx.check_pairing_code(params.pairing_code.as_deref().unwrap_or("")) {
+        PairingCheck::Accepted => {}
+        PairingCheck::LockedOut => {
             return render_consent_form(&validated, Some(LOCKED_OUT_MESSAGE));
         }
-        // Lockout window elapsed naturally — clear it before proceeding.
-        attempts.locked_until = None;
-        attempts.consecutive_failures = 0;
-    }
-
-    let pairing_code = params.pairing_code.as_deref().unwrap_or("");
-    let pairing_ok = {
-        let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-        store.verify_pairing(pairing_code)
-    };
-    let pairing_ok = match pairing_ok {
-        Ok(ok) => ok,
-        Err(e) => {
-            drop(attempts);
+        PairingCheck::Rejected { locked_now } => {
+            let message = if locked_now {
+                LOCKED_OUT_MESSAGE
+            } else {
+                WRONG_PAIRING_CODE_MESSAGE
+            };
+            return render_consent_form(&validated, Some(message));
+        }
+        PairingCheck::StoreError(e) => {
             tracing::error!(error = %e, "pairing store I/O error during /authorize");
             return error_page(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal error verifying pairing code",
             );
         }
-    };
-
-    if !pairing_ok {
-        attempts.consecutive_failures += 1;
-        let locked_now = attempts.consecutive_failures >= 5;
-        if locked_now {
-            attempts.locked_until = Some(now_epoch_secs() + 60);
-        }
-        drop(attempts);
-        let message = if locked_now {
-            LOCKED_OUT_MESSAGE
-        } else {
-            WRONG_PAIRING_CODE_MESSAGE
-        };
-        return render_consent_form(&validated, Some(message));
     }
 
-    // Correct code: clear the limiter and mint a fresh auth code.
-    attempts.consecutive_failures = 0;
-    attempts.locked_until = None;
-    drop(attempts);
-
+    // Correct code (the limiter was reset by the check above): mint a fresh
+    // auth code.
     let issued = {
         let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
         store.issue_code(

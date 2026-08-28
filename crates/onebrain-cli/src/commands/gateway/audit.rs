@@ -80,6 +80,14 @@ pub struct AuditEntry {
     /// token, a pairing code, an authorization code, or anything else that
     /// itself needs redaction — the caller (Task 5's approval-gate wiring)
     /// owns getting this right before it ever reaches this struct.
+    ///
+    /// "One-line" is enforced, not merely requested. Handlers interpolate
+    /// RAW caller-supplied parameters into this string, and this log has no
+    /// size cap and no rotation, so `server::record_audit` runs every
+    /// summary through `server::bounded_summary` before constructing an
+    /// entry; a summary that was cut says so, in-band. This module still
+    /// writes whatever it is given verbatim — the bound lives at the single
+    /// recording chokepoint, not here.
     pub args_summary: String,
     pub decision: Decision,
     pub channel: Option<String>,

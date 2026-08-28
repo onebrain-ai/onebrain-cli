@@ -100,9 +100,9 @@ fn spawn_gateway(
 
 /// Bounded poll (30s) for the stable startup line (`gateway listening on
 /// http://<bound-addr>/mcp`), returning the parsed `/mcp` URL. Panics with
-/// the captured stdout/stderr if the process exits early or the deadline
-/// passes first — this is the ONLY way the test learns the OS-assigned port
-/// from `--port 0`.
+/// the captured stdout/stderr SIZES if the process exits early or the
+/// deadline passes first — this is the ONLY way the test learns the
+/// OS-assigned port from `--port 0`.
 fn wait_for_gateway_url(
     child: &mut std::process::Child,
     stdout_path: &Path,
@@ -117,14 +117,27 @@ fn wait_for_gateway_url(
         }
         if let Some(status) = child.try_wait().expect("poll gateway child") {
             let err = std::fs::read_to_string(stderr_path).unwrap_or_default();
+            // Security: neither stream is interpolated whole into a panic
+            // message (CodeQL `rust/cleartext-logging`). `out` already
+            // contains the real pairing code by this point — `gateway run`
+            // prints it before the "gateway listening" line — and `err`
+            // carries the gateway's tracing output, which may legitimately
+            // name host paths. Sizes plus the exit status are enough to tell
+            // a crash from a hang, which is all this panic has to
+            // distinguish. (The sibling harnesses in `gateway_oauth_e2e.rs`
+            // and `gateway_approval_e2e.rs` do the same.)
             panic!(
                 "onebrain gateway run exited early ({status}) before printing the \
-                 listening line: stdout={out:?} stderr={err:?}"
+                 listening line ({} bytes of stdout, {} bytes of stderr captured)",
+                out.len(),
+                err.len()
             );
         }
         assert!(
             Instant::now() < deadline,
-            "onebrain gateway run did not print the listening line within 30s: stdout={out:?}"
+            "onebrain gateway run did not print the listening line within 30s \
+             ({} bytes of stdout captured so far)",
+            out.len()
         );
         std::thread::sleep(Duration::from_millis(25));
     }

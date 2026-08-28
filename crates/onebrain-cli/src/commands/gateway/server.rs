@@ -254,8 +254,10 @@ pub struct BrainCaptureParams {
     /// Note body/content to capture.
     pub text: String,
     /// Optional title. Drives the derived filename's slug; when omitted (or
-    /// when it has no usable ASCII-alphanumeric content) the slug is
-    /// derived from the first words of `text` instead.
+    /// when it has no usable alphanumeric content at all) the slug is
+    /// derived from the first words of `text` instead. Any script works —
+    /// a Thai, Japanese, or Cyrillic title yields a Thai, Japanese, or
+    /// Cyrillic filename, not a fallback.
     pub title: Option<String>,
     /// Named vault from the gateway config; omit for the default vault.
     pub vault: Option<String>,
@@ -325,11 +327,14 @@ fn resolve_under_vault(vault_root: &Path, rel: &str) -> anyhow::Result<PathBuf> 
 ///    `create_dir_all` ever touches a filesystem, regardless of how deep
 ///    the escape attempt is buried. In `brain_capture`'s real call path this
 ///    check is never actually the thing that fires — [`derive_slug`]'s
-///    ASCII-alphanumeric-only sanitization already strips every `/` and `.`
-///    before a path is ever built — but it stands on its own as a second,
-///    independent line of defense against a hypothetical future caller (or
-///    a bug in that sanitization) passing an unsanitized `rel` straight
-///    through.
+///    alphanumerics-only sanitization already strips every `/`, `\` and `.`
+///    before a path is ever built (see [`sanitize_slug`]'s own doc comment
+///    for why that still holds now that the kept charset is Unicode
+///    alphanumerics rather than ASCII ones) — but it stands on its own as a
+///    second, independent line of defense against a hypothetical future
+///    caller (or a bug in that sanitization) passing an unsanitized `rel`
+///    straight through. Widening that charset neither weakened this layer
+///    nor was allowed to lean on it: the two are independent by design.
 /// 2. **Canonicalization, once the syntax is known-safe**: the PARENT
 ///    directory of `rel` (never `rel` itself — the whole reason this
 ///    function exists instead of reusing [`resolve_under_vault`]) is
@@ -480,12 +485,36 @@ fn capture_collision_message(rel: &Path) -> String {
 /// `YYYY-MM-DD-` prefix and `.md` suffix are added back.
 const MAX_SLUG_CHARS: usize = 60;
 
+/// Max BYTES kept in [`derive_slug`]'s output, applied ALONGSIDE
+/// [`MAX_SLUG_CHARS`] — whichever bites first wins.
+///
+/// A character cap alone is not a length bound on a UTF-8 filename:
+/// filesystem name limits are counted in bytes (255 on APFS, ext4, and
+/// NTFS's UTF-8 equivalent), and one `char` can be up to four of them. At
+/// [`MAX_SLUG_CHARS`] four-byte characters the component would reach 254
+/// bytes once `YYYY-MM-DD-` and `.md` are added back — right on the edge of
+/// `ENAMETOOLONG` for input the caller controls. This cap keeps the worst
+/// case at 134 bytes instead, with no effect at all on ASCII titles (60
+/// chars is 60 bytes, well under it).
+const MAX_SLUG_BYTES: usize = 120;
+
 /// Fallback slug [`derive_slug`] falls back to when NEITHER `title` nor
-/// `text` yields any ASCII-alphanumeric content to build one from (e.g. an
-/// empty or punctuation-only title with empty or punctuation-only text) —
-/// so `brain_capture` always has a valid filename to write, never an error,
-/// no matter how degenerate its input.
+/// `text` yields any alphanumeric content to build one from (e.g. an
+/// empty or punctuation-only title with empty or punctuation-only text, or
+/// one made entirely of emoji) — so `brain_capture` always has a valid
+/// filename to write, never an error, no matter how degenerate its input.
+///
+/// Never used bare: [`derive_slug`] appends
+/// [`FALLBACK_DISAMBIGUATOR_CHARS`] random characters to it, so two
+/// fallback captures on the same day get different filenames instead of the
+/// second one failing on a same-day collision. See [`derive_slug`].
 const FALLBACK_SLUG: &str = "capture";
+
+/// How many random characters [`derive_slug`] appends to [`FALLBACK_SLUG`].
+/// Six lowercase base32-ish characters is ~10^9 combinations — far more than
+/// enough to keep a day's fallback captures apart, and short enough that the
+/// filename still reads as a fallback rather than as a hash.
+const FALLBACK_DISAMBIGUATOR_CHARS: usize = 6;
 
 /// How many leading characters of `text` [`derive_slug`] considers when no
 /// usable `title` is given — bounds the cost of scanning an arbitrarily
@@ -494,25 +523,49 @@ const FALLBACK_SLUG: &str = "capture";
 /// [`MAX_SLUG_CHARS`] truncation anyway).
 const TEXT_SLUG_SOURCE_CHARS: usize = 80;
 
-/// Sanitize `raw` into a `[a-z0-9-]` slug (the brief's own vocabulary):
-/// every ASCII letter is lowercased and kept, every ASCII digit is kept, and
-/// every run of one-or-more anything else — punctuation, whitespace, `/`,
-/// `.`, AND any non-ASCII character — collapses to a single `-`. Leading and
-/// trailing `-` are trimmed.
+/// Sanitize `raw` into a slug: every alphanumeric character is lowercased
+/// and kept, and every run of one-or-more anything else — punctuation,
+/// whitespace, `/`, `\`, `.`, control characters, Unicode format characters
+/// — collapses to a single `-`. Leading and trailing `-` are trimmed.
 ///
-/// `char::is_ascii_alphanumeric` (not the wider `char::is_alphanumeric` that
-/// `onebrain_fs::note::new`'s own `slug` helper uses for its
-/// title-case-display kebab-casing) is deliberate here: this slug becomes
-/// part of a FILE PATH inside the vault, so it must never carry raw
-/// non-ASCII bytes. A title that is ENTIRELY non-ASCII unicode (e.g. pure
-/// CJK) sanitizes to an EMPTY string here, not a mangled-but-present one —
-/// exactly what lets [`derive_slug`] correctly fall through to `text`, then
-/// to [`FALLBACK_SLUG`], for that case.
+/// **Unicode alphanumerics, not just ASCII.** An earlier revision kept only
+/// `char::is_ascii_alphanumeric`, which made a Thai, Japanese, Korean, or
+/// Cyrillic title sanitize to the EMPTY string — so every such capture on a
+/// given day derived the identical `YYYY-MM-DD-capture.md` filename and all
+/// but the first failed on a same-day collision. That is unusable for anyone
+/// who does not write in a Latin script, this vault's owner included.
+///
+/// **The confinement argument, re-established for the wider charset** (it
+/// does not simply carry over from the ASCII one):
+///
+/// - `char::is_alphanumeric` is `Alphabetic || Nd || Nl || No`. Every
+///   character this function can EMIT is either `-` or satisfies that
+///   predicate — including after lowercasing, see the next paragraph. So the
+///   output cannot contain `/` or `\` (both `Po`), `.` (`Po`), NUL or any
+///   other control character (`Cc`), a newline (`Cc`), or ANY Unicode format
+///   character (`Cf`) — bidi overrides `U+202A`–`U+202E` and isolates
+///   `U+2066`–`U+2069` in particular are `Cf`, not alphabetic, so they never
+///   survive; like every other non-alphanumeric they collapse into the
+///   separator run. `tests::` below asserts each of those
+///   category claims directly rather than taking them on trust.
+/// - A whole path component of `.` or `..` is therefore unreachable twice
+///   over: `.` cannot be emitted at all, and the component this slug lands
+///   in is always `YYYY-MM-DD-<slug>.md`.
+/// - Lowercasing is applied through `char::to_lowercase` (Unicode, not
+///   `to_ascii_lowercase`) and its OUTPUT is filtered again, because a few
+///   mappings expand into a non-alphanumeric character — `U+0130` (`İ`)
+///   lowercases to `i` + `U+0307`, a combining mark (`Mn`). Filtering after
+///   the mapping is what keeps "every emitted character is alphanumeric" an
+///   invariant rather than an approximation.
+///
+/// `resolve_create_under_vault`'s `Component::Normal` check remains exactly
+/// as it was. It is defense in depth against a future caller passing an
+/// unsanitized path — this widening neither weakens nor replaces it.
 fn sanitize_slug(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
+        if ch.is_alphanumeric() {
+            out.extend(ch.to_lowercase().filter(|c| c.is_alphanumeric()));
         } else if !out.ends_with('-') && !out.is_empty() {
             out.push('-');
         }
@@ -520,27 +573,69 @@ fn sanitize_slug(raw: &str) -> String {
     out.trim_end_matches('-').to_string()
 }
 
+/// Truncate `s` to at most `max_chars` characters AND at most `max_bytes`
+/// bytes, always on a `char` boundary. Both bounds matter: see
+/// [`MAX_SLUG_BYTES`] for why a character cap alone does not bound a UTF-8
+/// filename.
+fn cap_slug(s: &str, max_chars: usize, max_bytes: usize) -> &str {
+    let mut end = 0;
+    for (i, (offset, ch)) in s.char_indices().enumerate() {
+        if i >= max_chars || offset + ch.len_utf8() > max_bytes {
+            break;
+        }
+        end = offset + ch.len_utf8();
+    }
+    &s[..end]
+}
+
 /// Derive the slug portion of `brain_capture`'s note filename
 /// (`<inbox>/YYYY-MM-DD-<slug>.md`): from `title` when it [`sanitize_slug`]s
 /// to something non-empty, else from the first [`TEXT_SLUG_SOURCE_CHARS`]
-/// characters of `text`, else the fixed [`FALLBACK_SLUG`] — so every call
-/// produces SOME valid filename, never an error, regardless of how
-/// degenerate `title`/`text` are (empty, punctuation-only, pure unicode,
-/// arbitrarily long, ...). The result is always non-empty and always
-/// [`MAX_SLUG_CHARS`] characters or fewer.
+/// characters of `text`, else [`FALLBACK_SLUG`] plus a random
+/// disambiguator — so every call produces SOME valid filename, never an
+/// error, regardless of how degenerate `title`/`text` are (empty,
+/// punctuation-only, emoji-only, arbitrarily long, ...). The result is
+/// always non-empty, always [`MAX_SLUG_CHARS`] characters or fewer, and
+/// always [`MAX_SLUG_BYTES`] bytes or fewer.
+///
+/// **The fallback is disambiguated, and only the fallback.** A slug derived
+/// from real input is deterministic, so re-capturing the same title on the
+/// same day still surfaces the deliberate one-note-per-title-per-day
+/// collision error (`capture_collision_message`). But a slug that carries no
+/// caller information — the emoji-only title with an emoji-only body — would
+/// otherwise make EVERY such capture in a day collide with the first, which
+/// is a filename artifact rather than the "you already wrote this note"
+/// signal that error is meant to convey. Appending
+/// [`FALLBACK_DISAMBIGUATOR_CHARS`] random characters (drawn from the same
+/// [`mint_secret_32`] CSPRNG every other opaque id in this crate uses,
+/// filtered to lowercase ASCII alphanumerics so the slug charset is
+/// unchanged) keeps those apart. Deliberately NOT a general
+/// collision-retry loop: what a same-day, same-title recapture should do is
+/// a product question this fix wave should not settle.
 fn derive_slug(title: Option<&str>, text: &str) -> String {
     let from_title = title.map(sanitize_slug).filter(|s| !s.is_empty());
     let candidate = from_title.unwrap_or_else(|| {
         let head: String = text.chars().take(TEXT_SLUG_SOURCE_CHARS).collect();
         sanitize_slug(&head)
     });
-    let capped: String = candidate.chars().take(MAX_SLUG_CHARS).collect();
+    let capped = cap_slug(&candidate, MAX_SLUG_CHARS, MAX_SLUG_BYTES);
     let trimmed = capped.trim_end_matches('-');
-    if trimmed.is_empty() {
-        FALLBACK_SLUG.to_string()
-    } else {
-        trimmed.to_string()
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
     }
+    let disambiguator: String = mint_secret_32()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .take(FALLBACK_DISAMBIGUATOR_CHARS)
+        .collect();
+    if disambiguator.is_empty() {
+        // Unreachable in practice (62 of base64url's 64 characters are
+        // alphanumeric, over 43 of them), but a bare fallback is still a
+        // valid filename, so this degrades rather than failing.
+        return FALLBACK_SLUG.to_string();
+    }
+    format!("{FALLBACK_SLUG}-{disambiguator}")
 }
 
 /// Maps a vault-resolution [`CoreError`] to an MCP `invalid_params` error.
@@ -966,7 +1061,11 @@ async fn await_approval(
         client_id: principal.client_id.clone(),
         tool: tool.to_string(),
         vault: vault.map(str::to_string),
-        summary: args_summary.to_string(),
+        // Bounded here for the same reason `record_audit` bounds its own
+        // copy: this string is shown to a human over `GET /approvals` and
+        // handed to `osascript` as a command-line argument. See
+        // [`bounded_summary`].
+        summary: bounded_summary(args_summary.to_string()),
         created: now,
         expires: now.saturating_add(wait_secs),
         class,
@@ -1067,6 +1166,58 @@ async fn await_approval(
     }
 }
 
+/// Hard ceiling, in BYTES, on a recorded `args_summary`
+/// ([`bounded_summary`]). Generous for the "one-line, human-readable
+/// description" `audit::AuditEntry::args_summary` documents itself as, and
+/// far below anything that could grow the audit log or an approval prompt
+/// out of proportion to the call it describes.
+const MAX_ARGS_SUMMARY_BYTES: usize = 512;
+
+/// Appended when [`bounded_summary`] actually cuts something, so a reader
+/// never mistakes a truncated summary for a complete one — with the original
+/// length, which is itself the interesting signal when a caller sends an
+/// absurd argument.
+const ARGS_SUMMARY_TRUNCATED_SUFFIX: &str = " [truncated";
+
+/// Bound `summary` to [`MAX_ARGS_SUMMARY_BYTES`], marking it when truncation
+/// happened.
+///
+/// Every tool handler interpolates RAW, caller-supplied parameters into its
+/// `args_summary` (`params.file`, `params.query`, `params.title`, …), and
+/// that string is then written verbatim to an audit log with no size cap and
+/// no rotation, and shown verbatim to an operator as an approval prompt.
+/// Without this, a client holding nothing but a valid connector token could
+/// pass a multi-megabyte `file` to `brain_get` — an `auto`, read-only tool
+/// that needs no approval and no grant — have the call fail immediately on
+/// path resolution, and still land the whole payload on disk. Repeat to
+/// fill it.
+///
+/// Applied at the two points where a summary is RECORDED — [`record_audit`]
+/// (the audit entry) and [`await_approval`] ([`PendingApproval::summary`],
+/// which reaches both the operator's `GET /approvals` list and the native
+/// dialog's `osascript` argv, where a multi-megabyte argument would exceed
+/// `ARG_MAX` and silently take that channel down for the call) — rather than
+/// at each construction site. Two chokepoints, both structural: the next
+/// tool added to this file inherits the bound without having to remember it.
+///
+/// Truncation lands on a `char` boundary, so the result is always valid
+/// UTF-8 even when the cut falls inside a multi-byte character.
+fn bounded_summary(summary: String) -> String {
+    if summary.len() <= MAX_ARGS_SUMMARY_BYTES {
+        return summary;
+    }
+    let total = summary.len();
+    let mut end = MAX_ARGS_SUMMARY_BYTES;
+    while end > 0 && !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = summary;
+    out.truncate(end);
+    out.push_str(ARGS_SUMMARY_TRUNCATED_SUFFIX);
+    out.push_str(&format!(", {total} bytes total]"));
+    out
+}
+
 /// The parts of an audit entry a tool handler knows BEFORE calling
 /// [`policy_gate`] — bundled into one struct purely to keep
 /// [`record_audit`] under clippy's `too_many_arguments` threshold; `tool`/
@@ -1123,7 +1274,10 @@ async fn record_audit(
         client_id: client_id.to_string(),
         tool: meta.tool.to_string(),
         vault: meta.vault,
-        args_summary: meta.args_summary,
+        // The single point where a summary becomes a durable, unrotated
+        // on-disk record — so the single point that bounds it. See
+        // [`bounded_summary`].
+        args_summary: bounded_summary(meta.args_summary),
         decision,
         channel: None,
         duration_ms,
@@ -1611,7 +1765,7 @@ async fn capture_note(
         // path comes straight from the caller, so distinguishing "blocked"
         // from "missing" would hand out an oracle for probing outside the
         // vault. `brain_capture`'s path is derived by `derive_slug`, which
-        // strips every `/` and `.` — no caller input can select a path
+        // strips every `/`, `\` and `.` — no caller input can select a path
         // component — so a failure here never means "your argument was
         // bad"; it means the vault's own inbox no longer resolves inside the
         // vault, a server-side fault. Both messages are sanitized, so
@@ -3080,6 +3234,92 @@ mod tests {
         assert_eq!(entries[0]["outcome"], "ok");
     }
 
+    // ── args_summary is bounded before it is recorded (round-2 finding C) ─
+
+    #[test]
+    fn bounded_summary_leaves_an_ordinary_summary_untouched() {
+        let s = "get: \"01-projects/x.md\" vault=None".to_string();
+        assert_eq!(bounded_summary(s.clone()), s);
+        // Exactly at the limit is still untouched — the bound is a ceiling,
+        // not a target.
+        let exact = "a".repeat(MAX_ARGS_SUMMARY_BYTES);
+        assert_eq!(bounded_summary(exact.clone()), exact);
+    }
+
+    #[test]
+    fn bounded_summary_cuts_an_oversized_summary_and_says_so() {
+        let huge = "a".repeat(4 * 1024 * 1024);
+        let bounded = bounded_summary(huge);
+        assert!(
+            bounded.len() < MAX_ARGS_SUMMARY_BYTES + 64,
+            "bounded summary is still {} bytes",
+            bounded.len()
+        );
+        assert!(
+            bounded.contains(ARGS_SUMMARY_TRUNCATED_SUFFIX),
+            "a truncated summary must not read as a complete one: {bounded}"
+        );
+        assert!(
+            bounded.contains("4194304 bytes total"),
+            "the original size is the interesting signal: {bounded}"
+        );
+    }
+
+    /// The cut must land on a `char` boundary — a multi-byte character
+    /// straddling the limit would otherwise produce invalid UTF-8. Built so
+    /// the boundary falls INSIDE a 3-byte character rather than between two.
+    #[test]
+    fn bounded_summary_truncates_on_a_char_boundary() {
+        let head = "a".repeat(MAX_ARGS_SUMMARY_BYTES - 1);
+        let summary = format!("{head}{}", "ก".repeat(100));
+        let bounded = bounded_summary(summary);
+        assert!(bounded.starts_with(&head));
+        assert!(
+            bounded.len() <= MAX_ARGS_SUMMARY_BYTES + ARGS_SUMMARY_TRUNCATED_SUFFIX.len() + 32,
+            "{}",
+            bounded.len()
+        );
+        // Being a `String` at all already proves valid UTF-8; re-deriving it
+        // from the bytes proves the cut itself did not split a character.
+        assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+    }
+
+    /// End to end: a caller passing a multi-megabyte parameter to an
+    /// `auto`, read-only tool — no approval, no grant, the call fails on
+    /// path resolution — must NOT land that payload in the audit log. This
+    /// is the disk-fill path, driven through the real router rather than
+    /// asserted at the helper.
+    #[tokio::test]
+    async fn a_huge_tool_argument_does_not_reach_the_audit_log_verbatim() {
+        let (dir, router, token) = fixture_router();
+        let huge = "A".repeat(1024 * 1024);
+        let body = call_body(1, "brain_get", serde_json::json!({ "file": huge }));
+        let resp = post(
+            &router,
+            body,
+            &token,
+            &standard_headers("tools/call", Some("brain_get")),
+        )
+        .await;
+        assert!(
+            resp.get("error").is_some() || resp["result"]["isError"] == serde_json::json!(true),
+            "the call itself is expected to fail on path resolution: {resp}"
+        );
+
+        let entries = read_audit_entries(dir.path());
+        assert_eq!(entries.len(), 1, "{}", entries.len());
+        let recorded = entries[0]["args_summary"].as_str().unwrap();
+        assert!(
+            recorded.len() < MAX_ARGS_SUMMARY_BYTES + 64,
+            "a 1 MiB argument landed {} bytes in the audit log",
+            recorded.len()
+        );
+        assert!(
+            recorded.contains(ARGS_SUMMARY_TRUNCATED_SUFFIX),
+            "{recorded}"
+        );
+    }
+
     // ── Gateway PR 4, Task 5: brain_capture ──────────────────────────────
     //
     // Step 1: the create-safe guard (`resolve_create_under_vault`) and slug
@@ -3107,14 +3347,55 @@ mod tests {
         assert_eq!(sanitize_slug("!!!???..."), "");
     }
 
+    /// Non-Latin scripts are KEPT, not stripped (round-2 finding E). The
+    /// earlier ASCII-only charset collapsed every one of these to the empty
+    /// string, so every Thai/Japanese/Cyrillic capture in a day derived the
+    /// same fallback filename and all but the first failed on a collision.
     #[test]
-    fn sanitize_slug_strips_non_ascii_unicode_but_keeps_an_ascii_remainder() {
-        assert_eq!(
-            sanitize_slug("日本語"),
-            "",
-            "pure unicode sanitizes to empty"
-        );
-        assert_eq!(sanitize_slug("日本語 Test"), "test");
+    fn sanitize_slug_keeps_unicode_alphanumerics_from_any_script() {
+        assert_eq!(sanitize_slug("日本語"), "日本語");
+        assert_eq!(sanitize_slug("บันทึกการประชุม"), "บันทึกการประชุม");
+        assert_eq!(sanitize_slug("Заметка о встрече"), "заметка-о-встрече");
+        // Mixed scripts compose the same way ASCII words do.
+        assert_eq!(sanitize_slug("日本語 Test"), "日本語-test");
+    }
+
+    /// Two different Thai titles must produce two DIFFERENT slugs — the
+    /// actual defect, stated as the property that was broken.
+    #[test]
+    fn two_different_thai_titles_yield_two_different_slugs() {
+        let a = derive_slug(Some("บันทึกการประชุม"), "ประชุมกับทีมเรื่องงบประมาณ");
+        let b = derive_slug(Some("สรุปงบประมาณ"), "ประชุมกับทีมเรื่องงบประมาณ");
+        assert_ne!(a, b, "a={a} b={b}");
+        assert_ne!(a, FALLBACK_SLUG);
+        assert_ne!(b, FALLBACK_SLUG);
+    }
+
+    /// A Thai `text` with no `title` must also derive a real slug rather
+    /// than falling through to the marker.
+    #[test]
+    fn thai_text_without_a_title_still_derives_a_meaningful_slug() {
+        let slug = derive_slug(None, "ประชุมกับทีมเรื่องงบประมาณ");
+        assert!(slug.starts_with("ประชุม"), "{slug}");
+        assert!(!slug.starts_with(FALLBACK_SLUG), "{slug}");
+    }
+
+    /// Thai TONE marks are `Mn` without `Other_Alphabetic`, so they are not
+    /// alphanumeric and become a separator — the same treatment
+    /// `onebrain_fs::note::new`'s own `slug` helper gives them, so a
+    /// gateway capture and a `onebrain note new` produce the same filename
+    /// for the same title. Pinned so the lossiness is a recorded, deliberate
+    /// property rather than a surprise: the slug stays stable, distinct, and
+    /// confined, which is what a filename needs to be. (Thai VOWEL signs
+    /// carry `Other_Alphabetic` and ARE kept — the assertion above on
+    /// "บันทึกการประชุม" round-tripping proves that half.)
+    #[test]
+    fn thai_tone_marks_become_separators_matching_the_vaults_own_slug_helper() {
+        // U+0E37 (a vowel sign) survives; U+0E48 MAI EK (a tone mark) does
+        // not and collapses to the separator.
+        assert_eq!(sanitize_slug("เรื่อง"), "เรื-อง");
+        assert!('\u{0E37}'.is_alphanumeric(), "vowel signs are kept");
+        assert!(!'\u{0E48}'.is_alphanumeric(), "tone marks are not");
     }
 
     #[test]
@@ -3137,10 +3418,45 @@ mod tests {
     }
 
     #[test]
-    fn derive_slug_falls_back_to_the_fixed_marker_when_title_and_text_are_both_unusable() {
-        assert_eq!(derive_slug(Some("!!!"), ""), FALLBACK_SLUG);
-        assert_eq!(derive_slug(None, "... ??? !!!"), FALLBACK_SLUG);
-        assert_eq!(derive_slug(Some("日本語"), "日本語だけ"), FALLBACK_SLUG);
+    fn derive_slug_falls_back_to_the_marker_when_title_and_text_are_both_unusable() {
+        // Punctuation-only and emoji-only input carry no alphanumerics in
+        // ANY script, so they are the cases that genuinely have nothing to
+        // build a name from. (Pure CJK/Thai/Cyrillic no longer land here —
+        // see the unicode tests above.)
+        for slug in [
+            derive_slug(Some("!!!"), ""),
+            derive_slug(None, "... ??? !!!"),
+            derive_slug(Some("🎉🎊"), "🎈"),
+        ] {
+            assert!(
+                slug.starts_with(&format!("{FALLBACK_SLUG}-")),
+                "expected a disambiguated fallback, got {slug}"
+            );
+        }
+    }
+
+    /// Two fallback captures on the same day must not derive the same
+    /// filename — otherwise the second one fails on a collision that says
+    /// "you already captured this note" when nothing of the sort happened.
+    /// Only the fallback is disambiguated: a slug derived from real input
+    /// stays deterministic, so a genuine same-title recapture still
+    /// collides deliberately (asserted below).
+    #[test]
+    fn repeated_fallback_slugs_do_not_collide_but_real_ones_stay_deterministic() {
+        let a = derive_slug(Some("🎉"), "🎈");
+        let b = derive_slug(Some("🎉"), "🎈");
+        assert_ne!(a, b, "two fallback captures collided: {a}");
+        assert!(a.starts_with(&format!("{FALLBACK_SLUG}-")), "{a}");
+        assert_eq!(
+            a.chars().count(),
+            FALLBACK_SLUG.chars().count() + 1 + FALLBACK_DISAMBIGUATOR_CHARS
+        );
+
+        assert_eq!(
+            derive_slug(Some("My Great Idea"), "x"),
+            derive_slug(Some("My Great Idea"), "y"),
+            "a slug derived from real input must stay deterministic"
+        );
     }
 
     #[test]
@@ -3156,6 +3472,124 @@ mod tests {
         let slug2 = derive_slug(Some(&words), "unused");
         assert!(slug2.chars().count() <= MAX_SLUG_CHARS, "{slug2}");
         assert!(!slug2.ends_with('-'), "{slug2}");
+    }
+
+    /// The length cap must be BYTE-aware, not just char-aware: a filesystem
+    /// name limit counts bytes (255 on APFS/ext4), and a multi-byte script
+    /// at [`MAX_SLUG_CHARS`] characters would otherwise sail past it. Thai
+    /// is three bytes per character, so this is not a hypothetical for this
+    /// vault.
+    #[test]
+    fn a_long_non_ascii_title_is_capped_in_bytes_not_just_characters() {
+        let long_thai = "ก".repeat(500);
+        let slug = derive_slug(Some(&long_thai), "unused");
+        assert!(
+            slug.len() <= MAX_SLUG_BYTES,
+            "{} bytes exceeds the byte cap",
+            slug.len()
+        );
+        assert!(slug.chars().count() <= MAX_SLUG_CHARS);
+        // The cap that actually bit here is the BYTE one — a char-only cap
+        // would have produced 60 * 3 = 180 bytes.
+        assert!(slug.chars().count() < MAX_SLUG_CHARS, "{}", slug.len());
+
+        // …and the whole filename still fits comfortably inside a 255-byte
+        // path component.
+        let file_name = format!("2026-08-29-{slug}.md");
+        assert!(file_name.len() < 255, "{}", file_name.len());
+
+        // Truncation landed on a char boundary (a `String` proves valid
+        // UTF-8; slicing at a bad index would have panicked in `cap_slug`).
+        assert!(std::str::from_utf8(slug.as_bytes()).is_ok());
+    }
+
+    /// The confinement argument, re-established for the WIDER charset
+    /// rather than inherited from the ASCII one.
+    ///
+    /// Two halves, both required:
+    /// 1. The Unicode category claims `sanitize_slug`'s allowlist rests on —
+    ///    asserted directly against `char`'s own predicates, so "bidi
+    ///    overrides are `Cf`, not alphanumeric" is checked, not assumed.
+    /// 2. The resulting invariant over an adversarial corpus: every emitted
+    ///    character is either `-` or alphanumeric, and therefore none of
+    ///    them is a path separator, `.`, NUL, a newline, a control
+    ///    character, or a format character.
+    #[test]
+    fn the_wider_slug_charset_still_cannot_emit_anything_path_significant() {
+        // (1) The category claims themselves.
+        for (name, c) in [
+            ("solidus", '/'),
+            ("reverse solidus", '\\'),
+            ("full stop", '.'),
+            ("nul", '\0'),
+            ("line feed", '\n'),
+            ("carriage return", '\r'),
+            ("right-to-left override U+202E", '\u{202E}'),
+            ("left-to-right override U+202D", '\u{202D}'),
+            ("right-to-left isolate U+2067", '\u{2067}'),
+            ("pop directional isolate U+2069", '\u{2069}'),
+            ("left-to-right mark U+200E", '\u{200E}'),
+            ("zero width space U+200B", '\u{200B}'),
+            ("soft hyphen U+00AD", '\u{00AD}'),
+            ("byte order mark U+FEFF", '\u{FEFF}'),
+            ("combining dot above U+0307", '\u{0307}'),
+        ] {
+            assert!(
+                !c.is_alphanumeric(),
+                "{name} must not pass the slug allowlist"
+            );
+        }
+
+        // (2) The invariant, over titles built to attack it.
+        let long_thai = "ก".repeat(300);
+        let titles: Vec<&str> = vec![
+            "../../etc/cron.d/x",
+            "/etc/passwd",
+            "..",
+            ".",
+            "C:\\Windows\\system32",
+            "a\0b",
+            "line\nbreak\r\n",
+            "\u{202E}gnp.exe",
+            "\u{2066}isolated\u{2069}",
+            "soft\u{00AD}hyphen\u{200B}zwsp\u{FEFF}bom",
+            "\u{0130}stanbul", // lowercases to `i` + a combining mark
+            "บันทึกการประชุม",
+            "日本語のみ",
+            "Заметка",
+            "🎉🎊",
+            &long_thai,
+        ];
+        for title in titles {
+            let slug = derive_slug(Some(title), "fallback body");
+            assert!(!slug.is_empty(), "empty slug for {title:?}");
+            for c in slug.chars() {
+                assert!(
+                    c == '-' || c.is_alphanumeric(),
+                    "slug for {title:?} emitted {c:?} (U+{:04X})",
+                    c as u32
+                );
+                assert!(!c.is_control(), "{title:?} -> {slug:?}");
+                assert!(
+                    !matches!(c, '/' | '\\' | '.' | '\0'),
+                    "{title:?} -> {slug:?}"
+                );
+            }
+            assert_ne!(slug, ".", "{title:?}");
+            assert_ne!(slug, "..", "{title:?}");
+            assert!(slug.len() <= MAX_SLUG_BYTES, "{title:?} -> {}", slug.len());
+
+            // The derived path is a single, plain component — the same
+            // property `resolve_create_under_vault`'s layer 1 enforces
+            // independently.
+            let rel = PathBuf::from("00-inbox").join(format!("2026-08-29-{slug}.md"));
+            assert!(
+                rel.components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_))),
+                "{title:?} produced a non-Normal component: {rel:?}"
+            );
+            assert_eq!(rel.components().count(), 2, "{title:?} -> {rel:?}");
+        }
     }
 
     // ── Step 1b: resolve_create_under_vault, tested directly (raw,
@@ -3268,6 +3702,7 @@ mod tests {
         let root_canon = vault_root.canonicalize().unwrap();
 
         let long_title = "x".repeat(500);
+        let long_thai_title = "ก".repeat(500);
         let titles: Vec<&str> = vec![
             "../../etc/cron.d/x",
             "/etc/x",
@@ -3276,6 +3711,16 @@ mod tests {
             &long_title,
             "日本語のみ",
             "日本語 Mixed Ascii Title",
+            // The widened charset's own corpus: real non-Latin titles now
+            // reach the filesystem as themselves rather than as a fallback,
+            // so the guard must be exercised against them too.
+            "บันทึกการประชุม",
+            "ประชุมกับทีมเรื่องงบประมาณ",
+            "Заметка о встрече",
+            &long_thai_title,
+            "\u{202E}gnp.exe",
+            "\u{0130}stanbul",
+            "🎉🎊",
         ];
 
         for (i, title) in titles.iter().enumerate() {
@@ -3287,6 +3732,11 @@ mod tests {
             assert!(
                 slug.chars().count() <= MAX_SLUG_CHARS,
                 "slug too long for title {title:?}: {slug}"
+            );
+            assert!(
+                slug.len() <= MAX_SLUG_BYTES,
+                "slug too many BYTES for title {title:?}: {} ({slug})",
+                slug.len()
             );
             let rel = PathBuf::from("00-inbox").join(format!("2026-08-{:02}-{slug}.md", i + 1));
             let confined = resolve_create_under_vault(&vault_root, &rel).unwrap_or_else(|e| {
@@ -3415,6 +3865,62 @@ mod tests {
                 .contains("Some captured note body"),
             "the audit trail must never carry the raw note body: {entries:?}"
         );
+    }
+
+    /// The round-2 finding E regression, end to end through the real
+    /// router: two Thai captures on the same day, with DIFFERENT titles,
+    /// must produce two distinct notes.
+    ///
+    /// Before the charset widening both derived the identical
+    /// `00-inbox/YYYY-MM-DD-capture.md`, so the second failed on a same-day
+    /// collision — and under `ask_once` the human had already approved it
+    /// (recording a grant), so every later Thai capture that day failed
+    /// silently-auto-approved. The feature was unusable in the language this
+    /// vault's owner writes in.
+    #[tokio::test]
+    async fn two_thai_captures_on_the_same_day_write_two_distinct_notes() {
+        let (dir, router, _state, token) =
+            fixture_router_with_mutating_policy(policy::PolicyMode::Auto, 300, 30);
+
+        let mut paths = Vec::new();
+        for (title, text) in [
+            ("บันทึกการประชุม", "ประชุมกับทีมเรื่องงบประมาณ"),
+            ("สรุปงบประมาณ", "ตัวเลขงบประมาณไตรมาสสี่"),
+        ] {
+            let body = call_body(
+                1,
+                "brain_capture",
+                serde_json::json!({ "title": title, "text": text }),
+            );
+            let resp = post(
+                &router,
+                body,
+                &token,
+                &standard_headers("tools/call", Some("brain_capture")),
+            )
+            .await;
+            assert!(resp.get("error").is_none(), "{resp}");
+            let path = resp["result"]["structuredContent"]["path"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no path in response: {resp}"))
+                .to_string();
+            assert!(path.starts_with("00-inbox/"), "{path}");
+            assert!(
+                !path.contains(FALLBACK_SLUG),
+                "a Thai title must derive its own slug, not the fallback: {path}"
+            );
+            assert!(
+                dir.path().join(&path).is_file(),
+                "the note must exist on disk at the reported path: {path}"
+            );
+            paths.push(path);
+        }
+
+        assert_ne!(
+            paths[0], paths[1],
+            "two different Thai titles must not collapse to one filename"
+        );
+        assert_eq!(inbox_note_count(dir.path()), 2);
     }
 
     /// Step 2's no-clobber requirement: two captures on the SAME day with

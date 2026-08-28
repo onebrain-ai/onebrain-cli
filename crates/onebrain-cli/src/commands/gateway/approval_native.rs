@@ -136,11 +136,48 @@
 //! never silently, never differently from what `await_approval` itself
 //! observes.
 //!
+//! ## The dialog is TIME-BOUNDED, and why that is load-bearing
+//!
+//! Every script [`build_dialog_script`] emits carries a `giving up after
+//! <n>` clause, where `<n>` is the pending entry's OWN remaining TTL
+//! ([`dialog_timeout_secs`]). Without it the dialog would live forever, and
+//! two things follow that the rest of this design silently assumed away:
+//!
+//! - `super::approval::Approvals::wait` removes a timed-out entry, and
+//!   `super::approval::Approvals::register` prunes expired ones before
+//!   counting them against [`super::approval::MAX_PENDING_APPROVALS`]. That
+//!   pruning is deliberate (it stops an abandoned call wedging a slot), but
+//!   it means the freed slot lets the NEXT call open a FRESH dialog while an
+//!   untimed old one is still on screen. The registry caps bound concurrent
+//!   registry ENTRIES; only this clause bounds accumulated DIALOGS — and
+//!   with each one pinning a [`tokio::task::spawn_blocking`] thread for as
+//!   long as it is up, an unbounded accumulation eventually exhausts tokio's
+//!   blocking pool and starves every other `spawn_blocking` in the gateway
+//!   (`server::record_audit` included, which is awaited on every tool call).
+//! - A human who answers a dialog whose entry already timed out gets no
+//!   feedback: `super::approval::Approvals::resolve` returns `false` for the
+//!   removed id and nothing happens. Self-dismissing at the same deadline the
+//!   waiter uses removes that dead-button window rather than papering over it.
+//!
+//! The leak this closes was fail-SAFE, never fail-open: a stale dialog's
+//! Approve granted nothing, because the entry (and with it every path to
+//! `super::policy::Grants::record`) was already gone.
+//!
+//! [`dialog_timeout_secs`] clamps, and both bounds were established against a
+//! real `osascript`, not from the language reference: `giving up after 0`
+//! means **never give up** (an unbounded dialog — exactly the failure being
+//! fixed, and reachable from a `policy.approval_wait_seconds: 0` typo), and
+//! any value above `i32::MAX` makes `osascript` fail outright with
+//! `Can't make … into type integer (-1700)` — no dialog shown at all, which
+//! would silently take this whole channel offline for a large configured
+//! wait.
+//!
 //! ## The blocking boundary
 //!
 //! `osascript` is a blocking subprocess call — spawning it and waiting for
 //! `.output()` can block for as long as it takes a human to click a button,
-//! which could be indefinite. [`prompt`] therefore does the actual spawn +
+//! bounded now only by the `giving up after` clause above. [`prompt`]
+//! therefore does the actual spawn +
 //! wait entirely inside [`tokio::task::spawn_blocking`], and is itself a
 //! plain (non-`async`) function that returns immediately after handing the
 //! blocking work off — it never blocks the caller's own `.await` path, and
@@ -159,6 +196,24 @@ use std::process::Command;
 use std::sync::Arc;
 
 use super::approval::{Approvals, Decision, PendingApproval};
+use super::auth::core::now_epoch_secs;
+
+/// Floor for the dialog's `giving up after` clause. `0` is NOT a valid
+/// substitute for "expire immediately": a real `osascript` treats `giving up
+/// after 0` as **never give up**, verified directly rather than read off the
+/// language reference. So a degenerate `policy.approval_wait_seconds: 0`
+/// (which `super::policy::PolicyConfig::startup_warnings` already flags)
+/// would otherwise produce the exact unbounded dialog this clause exists to
+/// prevent. One second of overhang past an already-timed-out waiter is
+/// bounded and harmless; forever is not.
+const MIN_DIALOG_TIMEOUT_SECS: u64 = 1;
+
+/// Ceiling for the same clause: `osascript` coerces the operand to an
+/// AppleScript `integer`, and anything above `i32::MAX` fails the coercion
+/// (`Can't make 2.147483648E+9 into type integer. (-1700)`) — a non-zero exit
+/// with no dialog ever shown. Clamping keeps a large configured
+/// `approval_wait_seconds` from silently taking this channel offline.
+const MAX_DIALOG_TIMEOUT_SECS: u64 = i32::MAX as u64;
 
 /// Env var that, when set to any NON-EMPTY value, unconditionally disables
 /// this channel — checked first in [`is_available`], before the
@@ -236,19 +291,39 @@ fn escape_applescript_string(input: &str) -> String {
     out
 }
 
+/// How long `p`'s dialog may stay on screen, in seconds: the entry's OWN
+/// remaining TTL (`expires - now`), clamped into
+/// `MIN_DIALOG_TIMEOUT_SECS..=MAX_DIALOG_TIMEOUT_SECS` for the two
+/// empirically-established `osascript` reasons documented on those constants.
+///
+/// Deriving it from `expires` rather than taking
+/// `super::policy::PolicyConfig::approval_wait_seconds` as a parameter is
+/// deliberate: the dialog then dies at (as near as makes no difference) the
+/// same instant `super::approval::Approvals::wait` gives up on the same id,
+/// with no second copy of that deadline to drift out of sync. `now` is a
+/// parameter, not read inside, so this stays pure and directly testable.
+fn dialog_timeout_secs(p: &PendingApproval, now: u64) -> u64 {
+    p.expires
+        .saturating_sub(now)
+        .clamp(MIN_DIALOG_TIMEOUT_SECS, MAX_DIALOG_TIMEOUT_SECS)
+}
+
 /// Build the `-e` script text handed to `osascript`: a `display dialog`
 /// with an "Approve"/"Deny" button pair (default button "Approve", so a
 /// stray Return key press never silently denies), embedding `p`'s
 /// `client_id`/`tool`/`summary` — every one of them run through
 /// [`escape_applescript_string`] first (see module docs' "Security"
-/// section). Pure and fully unit-testable without ever invoking
+/// section) — and a `giving up after {giving_up_after}` clause so the
+/// dialog can never outlive the pending entry it belongs to (see the module
+/// docs' "The dialog is TIME-BOUNDED" section; [`dialog_timeout_secs`]
+/// produces the value). Pure and fully unit-testable without ever invoking
 /// `osascript`.
-fn build_dialog_script(p: &PendingApproval) -> String {
+fn build_dialog_script(p: &PendingApproval, giving_up_after: u64) -> String {
     let client_id = escape_applescript_string(&p.client_id);
     let tool = escape_applescript_string(&p.tool);
     let summary = escape_applescript_string(&p.summary);
     format!(
-        "display dialog \"OneBrain gateway approval request\\n\\nClient: {client_id}\\nTool: {tool}\\nSummary: {summary}\" with title \"OneBrain Gateway\" buttons {{\"Deny\", \"Approve\"}} default button \"Approve\" with icon caution"
+        "display dialog \"OneBrain gateway approval request\\n\\nClient: {client_id}\\nTool: {tool}\\nSummary: {summary}\" with title \"OneBrain Gateway\" buttons {{\"Deny\", \"Approve\"}} default button \"Approve\" with icon caution giving up after {giving_up_after}"
     )
 }
 
@@ -259,6 +334,14 @@ fn build_dialog_script(p: &PendingApproval) -> String {
 /// labels — an unexpected shape here is treated exactly like every other
 /// failure mode [`prompt`] degrades on: no decision, no resolve, let the
 /// TTL handle it.
+///
+/// That `None` is what makes the `giving up after` clause safe to add: a
+/// dialog that gives up exits ZERO (so [`run_dialog`]'s `status.success()`
+/// check does not catch it) and prints `button returned:, gave up:true` — an
+/// EMPTY button label, which falls through to `None` here, so a self-
+/// dismissed dialog can never be mistaken for a human answer. Captured
+/// byte-for-byte from a real `osascript` and pinned by
+/// `tests::a_gave_up_dialog_yields_no_decision`, not inferred.
 fn decision_from_button_output(stdout: &str) -> Option<Decision> {
     let first_field = stdout.trim().split(',').next()?.trim();
     match first_field.strip_prefix("button returned:")?.trim() {
@@ -299,7 +382,11 @@ fn run_dialog(script: &str) -> Option<Decision> {
 /// On macOS, the actual spawn + wait for a human click runs inside
 /// [`tokio::task::spawn_blocking`] (see the module docs' "The blocking
 /// boundary" section) — this function itself returns immediately after
-/// handing that work off, never blocking its caller's `.await` path. Every
+/// handing that work off, never blocking its caller's `.await` path. That
+/// blocking task is guaranteed to end: the script carries a `giving up
+/// after` clause sized to `p`'s own remaining TTL
+/// ([`dialog_timeout_secs`]), so the dialog — and the pool thread it pins —
+/// is reclaimed no later than the waiter gives up on the same id. Every
 /// failure past that point (dismissed dialog, missing binary, killed
 /// process, unparseable output) is absorbed by [`run_dialog`] returning
 /// `None`, in which case `approvals.resolve` is simply never called — a
@@ -319,7 +406,7 @@ pub fn prompt(p: &PendingApproval, approvals: Arc<Approvals>) {
         return;
     }
     let id = p.id.clone();
-    let script = build_dialog_script(p);
+    let script = build_dialog_script(p, dialog_timeout_secs(p, now_epoch_secs()));
     tokio::task::spawn_blocking(move || {
         if let Some(decision) = run_dialog(&script) {
             approvals.resolve(&id, decision);
@@ -462,7 +549,7 @@ mod tests {
     fn build_dialog_script_embeds_only_the_escaped_form_of_a_malicious_client_id() {
         let mut p = sample();
         p.client_id = r#"" & do shell script "id"#.to_string();
-        let script = build_dialog_script(&p);
+        let script = build_dialog_script(&p, 300);
         assert!(
             !script.contains(r#"" & do shell script "id"#),
             "raw payload leaked unescaped into the script: {script}"
@@ -475,11 +562,75 @@ mod tests {
 
     #[test]
     fn build_dialog_script_has_the_expected_buttons_and_default() {
-        let script = build_dialog_script(&sample());
+        let script = build_dialog_script(&sample(), 300);
         assert!(script.contains("buttons {\"Deny\", \"Approve\"}"));
         assert!(script.contains("default button \"Approve\""));
         assert!(script.contains("Client: client-1"));
         assert!(script.contains("Tool: brain_capture"));
+    }
+
+    // ── The dialog is time-bounded (round-2 finding A) ───────────────────
+
+    /// The whole point: EVERY script this module emits carries a `giving up
+    /// after` clause, so no dialog can outlive the pending entry that
+    /// opened it. Asserted as a suffix, because AppleScript takes the clause
+    /// as a trailing modifier on the `display dialog` command — anywhere
+    /// else and it would not parse.
+    #[test]
+    fn build_dialog_script_always_time_bounds_the_dialog() {
+        let script = build_dialog_script(&sample(), 300);
+        assert!(
+            script.ends_with(" giving up after 300"),
+            "the script must end with the giving-up clause: {script}"
+        );
+    }
+
+    /// The clause tracks the entry's OWN remaining TTL, so the dialog and
+    /// `Approvals::wait` give up on the same id at the same moment.
+    #[test]
+    fn dialog_timeout_tracks_the_entrys_remaining_ttl() {
+        let mut p = sample();
+        p.expires = 1_000;
+        assert_eq!(dialog_timeout_secs(&p, 700), 300);
+        assert_eq!(
+            dialog_timeout_secs(&p, 995),
+            5,
+            "a nearly-elapsed entry must open a correspondingly short dialog"
+        );
+    }
+
+    /// `giving up after 0` means NEVER GIVE UP in real AppleScript (verified
+    /// against `/usr/bin/osascript`, not read off the language reference) —
+    /// the exact unbounded dialog this clause exists to prevent, and
+    /// reachable from a `policy.approval_wait_seconds: 0` typo or from an
+    /// entry whose TTL has already elapsed. The floor must never let a `0`
+    /// reach the script.
+    #[test]
+    fn dialog_timeout_never_emits_zero_which_applescript_reads_as_never_expire() {
+        let mut p = sample();
+        p.expires = 1_000;
+        assert_eq!(dialog_timeout_secs(&p, 1_000), MIN_DIALOG_TIMEOUT_SECS);
+        assert_eq!(
+            dialog_timeout_secs(&p, 9_999),
+            MIN_DIALOG_TIMEOUT_SECS,
+            "an already-expired entry must still produce a POSITIVE timeout"
+        );
+        const { assert!(MIN_DIALOG_TIMEOUT_SECS > 0) };
+        assert!(build_dialog_script(&p, dialog_timeout_secs(&p, 9_999))
+            .ends_with(&format!(" giving up after {MIN_DIALOG_TIMEOUT_SECS}")));
+    }
+
+    /// Above `i32::MAX`, `osascript` refuses the coercion to an AppleScript
+    /// `integer` and exits non-zero WITHOUT showing a dialog at all — which
+    /// would take this channel silently offline for a large configured
+    /// `approval_wait_seconds`. The ceiling keeps the operand coercible.
+    #[test]
+    fn dialog_timeout_is_capped_at_what_applescript_can_coerce_to_an_integer() {
+        let mut p = sample();
+        p.expires = u64::MAX;
+        assert_eq!(dialog_timeout_secs(&p, 0), MAX_DIALOG_TIMEOUT_SECS);
+        assert_eq!(MAX_DIALOG_TIMEOUT_SECS, i32::MAX as u64);
+        assert!(i32::try_from(dialog_timeout_secs(&p, 0)).is_ok());
     }
 
     // ── decision_from_button_output ──────────────────────────────────────
@@ -509,6 +660,24 @@ mod tests {
         assert_eq!(decision_from_button_output(""), None);
         assert_eq!(decision_from_button_output("garbage"), None);
         assert_eq!(decision_from_button_output("button returned:Maybe"), None);
+    }
+
+    /// The load-bearing precondition for the `giving up after` clause: a
+    /// dialog that self-dismisses must NOT be readable as a human decision.
+    ///
+    /// The literal below is the exact stdout a real `/usr/bin/osascript`
+    /// produced for this module's own script with the clause appended —
+    /// captured byte-for-byte, including the empty button label and the
+    /// trailing newline. Note it exits ZERO, so [`run_dialog`]'s
+    /// `status.success()` guard does not filter it out; this parse is the
+    /// only thing that does.
+    #[test]
+    fn a_gave_up_dialog_yields_no_decision() {
+        assert_eq!(
+            decision_from_button_output("button returned:, gave up:true\n"),
+            None,
+            "a self-dismissed dialog must never resolve a pending approval"
+        );
     }
 
     // ── Step 2: is_available on this platform ────────────────────────────

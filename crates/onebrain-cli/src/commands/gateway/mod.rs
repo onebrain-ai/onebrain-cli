@@ -71,6 +71,82 @@ pub(crate) fn env_switch_on(key: &str) -> bool {
     std::env::var_os(key).is_some_and(|v| !v.is_empty())
 }
 
+/// Default `tracing` filter for `gateway run` when `RUST_LOG` says nothing —
+/// the same `info` default [`crate::commands::daemon`]'s `init_tracing` uses,
+/// deliberately not a different one: an operator who already knows how to
+/// turn up the daemon's logging must not have to learn a second convention
+/// for the gateway.
+const DEFAULT_LOG_FILTER: &str = "info";
+
+/// The `tracing` filter [`init_tracing`] installs, read from the same
+/// `RUST_LOG` variable `tracing_subscriber`'s own `try_from_default_env`
+/// reads (named via its `DEFAULT_ENV` constant, so the two can never drift
+/// apart on the variable's spelling).
+fn log_filter() -> tracing_subscriber::EnvFilter {
+    log_filter_from(std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).ok())
+}
+
+/// [`log_filter`]'s decision, as a pure function of the raw `RUST_LOG` value
+/// — so the RUST_LOG-honouring behavior is directly unit-testable without
+/// mutating the process environment (and without [`init_tracing`], which any
+/// one test binary can only meaningfully call once).
+///
+/// A set-but-EMPTY (or whitespace-only) value counts as UNSET and falls back
+/// to [`DEFAULT_LOG_FILTER`]. That is the one place this deviates from
+/// `daemon::init_tracing`, which would hand `""` straight to `EnvFilter` and
+/// silently filter everything out; it follows this crate's own
+/// [`env_switch_on`] convention instead, where blanking a variable is how a
+/// hook-managed env block neutralizes it rather than a request for silence.
+fn log_filter_from(raw: Option<String>) -> tracing_subscriber::EnvFilter {
+    match raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(directives) => tracing_subscriber::EnvFilter::try_new(directives)
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER)),
+        None => tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER),
+    }
+}
+
+/// Install a `tracing` subscriber for the foreground `gateway run` process.
+/// Returns `true` iff THIS call is the one that installed it.
+///
+/// Until this existed, `gateway run` installed no subscriber at all (the only
+/// one in the workspace belonged to `daemon __run`), so every
+/// `tracing::warn!` the gateway emits was discarded — including the ones
+/// several deliberate design decisions rest on being visible: the audit-append
+/// failure path that keeps `path.display()` FOR the operator, the best-effort
+/// reindex that logs a failure instead of propagating it, the pending-approval
+/// cap refusal that tells an operator WHICH cap was hit,
+/// [`policy::PolicyConfig::startup_warnings`]'s degenerate-config flag, the
+/// pairing rate limiter's lockout notice, and every `sanitized_internal` /
+/// `core_error` call whose client-facing message is deliberately stripped of
+/// detail ON THE PROMISE that the full error, host path included, reaches the
+/// operator here.
+///
+/// Follows `daemon::init_tracing`'s conventions rather than inventing new
+/// ones: `RUST_LOG` via `EnvFilter` (defaulting to [`DEFAULT_LOG_FILTER`]),
+/// output to **stderr**, and `try_init` so an already-installed global
+/// subscriber is left alone instead of panicking.
+///
+/// Two things it deliberately does differently, both because this is a
+/// foreground process a human is watching rather than a detached daemon
+/// writing to a log file:
+/// - ANSI is enabled only when stderr is a real terminal (the crate's
+///   existing `std::io::IsTerminal` convention — see `banner.rs`), so a
+///   redirected `2>gateway.log` gets clean text and a terminal gets colour.
+/// - stdout is untouched. `run`'s pairing-code line and the
+///   `gateway listening on …` line are a deliberate plain-`println!` stdout
+///   contract that integration tests parse; routing logs to stderr keeps
+///   them out of it entirely.
+fn init_tracing() -> bool {
+    use std::io::IsTerminal;
+
+    tracing_subscriber::fmt()
+        .with_env_filter(log_filter())
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .try_init()
+        .is_ok()
+}
+
 /// Resolves the OAuth issuer base URL: the configured `public_url` (trailing
 /// slash trimmed) when set, else `http://127.0.0.1:<bound-port>`. Pure and
 /// unit-tested directly below — the `on_bind` closure that calls it isn't
@@ -168,6 +244,13 @@ fn validate_public_url(raw: &str) -> Result<(), String> {
 /// parse regardless of `--json`/`--yaml`. Accepted for signature parity with
 /// the other command handlers, mirroring `serve::run`'s own `_mode` param.
 pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
+    // FIRST, before anything that could want to say something: every
+    // `tracing` call in the gateway is a no-op until a subscriber exists, and
+    // the earliest diagnostics (config warnings, audit/auth store setup) are
+    // among the ones an operator most needs. See `init_tracing`'s own doc
+    // comment for the full list of decisions that depend on this.
+    init_tracing();
+
     let config = load_gateway_config()?;
     let port = port_flag.unwrap_or(config.port);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -303,6 +386,76 @@ mod tests {
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
+    }
+
+    // ── tracing subscriber (round-2 finding D) ────────────────────────────
+
+    /// `RUST_LOG` wins when set — an operator debugging a gateway must be
+    /// able to turn the level up the same way they do for the daemon.
+    #[test]
+    fn log_filter_honours_rust_log_when_set() {
+        assert_eq!(
+            log_filter_from(Some("debug".to_string())).to_string(),
+            "debug"
+        );
+        assert_eq!(
+            log_filter_from(Some("onebrain=trace".to_string())).to_string(),
+            "onebrain=trace"
+        );
+    }
+
+    /// …and falls back to a sensible foreground default when it is unset,
+    /// blank, or unparseable, rather than silently filtering everything out.
+    #[test]
+    fn log_filter_falls_back_to_the_default_level() {
+        assert_eq!(log_filter_from(None).to_string(), DEFAULT_LOG_FILTER);
+        assert_eq!(
+            log_filter_from(Some("   ".to_string())).to_string(),
+            DEFAULT_LOG_FILTER,
+            "a blanked RUST_LOG must not mute the gateway entirely"
+        );
+        // `EnvFilter` accepts almost any bare word as a target directive, so
+        // an unparseable value has to name an invalid LEVEL to actually
+        // fail — which is exactly the typo an operator makes.
+        assert_eq!(
+            log_filter_from(Some("onebrain=verbose".to_string())).to_string(),
+            DEFAULT_LOG_FILTER,
+            "a mistyped level must fall back to the default, not silence the gateway"
+        );
+    }
+
+    /// The variable actually consulted is the one `tracing_subscriber` itself
+    /// names, so this never drifts to a private spelling of `RUST_LOG`.
+    #[test]
+    fn log_filter_reads_the_standard_rust_log_variable() {
+        assert_eq!(tracing_subscriber::EnvFilter::DEFAULT_ENV, "RUST_LOG");
+    }
+
+    /// A global subscriber can only be set once per process, and
+    /// `gateway run` can legitimately be reached from a context that already
+    /// installed one. Installing twice must be a quiet no-op, never a panic.
+    ///
+    /// Deliberately asserts only on the SECOND call: whether the first one
+    /// wins depends on what else in this test binary has already installed a
+    /// subscriber, but once any subscriber is global, every later attempt
+    /// must report `false` and leave it standing.
+    ///
+    /// `RUST_LOG=off` is set for the install: a global subscriber outlives
+    /// the test that set it, and `tracing` writes to the real `stderr`
+    /// handle rather than the one libtest captures, so a default-level
+    /// subscriber installed here would spray this crate's (and tantivy's)
+    /// `info` lines across the whole test binary's output. A unit test must
+    /// not change what the other ~1,700 tests print. The filter is captured
+    /// at install time, so it stays `off` after the env guard restores the
+    /// variable.
+    #[test]
+    fn init_tracing_is_idempotent_and_never_panics_on_a_second_call() {
+        let _env = crate::test_env::set_var("RUST_LOG", "off");
+        let _first = init_tracing();
+        assert!(
+            !init_tracing(),
+            "a second init must not claim to have installed a subscriber"
+        );
     }
 
     #[test]

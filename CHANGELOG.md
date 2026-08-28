@@ -75,12 +75,43 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   [`docs/gateway.md#capabilities-truthfulness`](docs/gateway.md#capabilities-truthfulness).
 
 ### Changed
+- `onebrain gateway run` now installs a `tracing` subscriber (stderr, honouring
+  `RUST_LOG`, default `info`). It previously installed none, so every operator
+  diagnostic the gateway emits — a failed audit write, a degenerate
+  `approval_wait_seconds: 0`, a call refused at the pending-approval cap, the
+  full error behind a deliberately-sanitized client message — went nowhere. The
+  pairing code and `gateway listening on …` lines remain plain stdout, unchanged.
+- Gateway note filenames now keep **Unicode** alphanumerics, so a Thai,
+  Japanese, Korean, or Cyrillic `brain_capture` title produces a filename in
+  that script. Previously any title without ASCII letters sanitized to nothing
+  and fell through to a fixed `capture` slug, so only ONE such capture could
+  succeed per day and every later one failed as a same-day collision. The length
+  cap is now byte-aware as well as character-aware, and a capture that genuinely
+  has no usable text to name it (an emoji-only title and body) gets a short
+  random suffix instead of colliding with every other one that day.
 - MCP: rmcp 2.1.0 → 3.0.1 — protocol `2026-07-28` baseline for the remote MCP
   gateway; stdio server and all 4 tools unchanged; legacy `initialize`
   negotiation (2025-03-26 / 2025-11-25) now guarded by an integration test.
 - README roadmap re-synced to the 2026-08-28 renumber: Gateway v3.5 · Council
   v3.6 · Studio/Surfaces v3.7 · Terminal v3.8 · Bootstrap v3.9 · cleanup v3.10
   · bundles v3.11+.
+
+### Security
+- The operator `/approvals` surface is now rate-limited by the SAME
+  five-failures/60-second lockout `POST /authorize` applies to the pairing code,
+  on one shared counter. It previously verified that code directly, so the one
+  credential standing between a caller and self-approval accepted unlimited,
+  unthrottled, unlogged guesses — reachable with no OAuth token at all.
+- The native macOS approval dialog is now time-bounded (`giving up after`, sized
+  to the call's own remaining `approval_wait_seconds`), so it dismisses itself
+  when the call it belongs to gives up. Previously it stayed up indefinitely: a
+  human could click Approve on a prompt that silently did nothing, and each
+  abandoned dialog pinned a blocking-pool thread until the process exited.
+- `args_summary` is bounded before it is written to the audit log or shown as an
+  approval prompt. Tool handlers interpolate raw caller-supplied parameters into
+  it and the audit log has no size cap or rotation, so a client could previously
+  grow that file by a megabyte per call through a read-only tool needing neither
+  approval nor a grant.
 
 ## [3.4.25] — 2026-08-28 — Keep Codex hooks alive
 
