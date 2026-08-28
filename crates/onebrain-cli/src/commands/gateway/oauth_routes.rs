@@ -241,18 +241,39 @@ fn oauth_error(status: StatusCode, code: &'static str, description: impl Into<St
 /// of `"http://127.0.0.10/cb"` (a DIFFERENT loopback address in the
 /// 127.0.0.0/8 range, not the one this AS accepts) — a naive `starts_with`
 /// would wrongly accept both as "localhost"/"127.0.0.1". So the character
-/// immediately after the host must be end-of-string, `:` (port), or `/`
-/// (path); anything else (a `.` continuing the hostname, a bare digit
-/// continuing the IP) is rejected. The port itself is not further
-/// validated — the brief states port is ignored at authorize-time matching
-/// too, so there is nothing meaningful to check beyond "a `:` follows".
+/// immediately after the host must be end-of-string, `:` (port) followed by
+/// a WELL-FORMED port, or `/` (path); anything else (a `.` continuing the
+/// hostname, a bare digit continuing the IP) is rejected.
+///
+/// **Fix round 1 (security review, Critical):** a `:`-prefixed remainder
+/// used to be accepted outright with no further check on what followed the
+/// colon. Per RFC 3986 §3.2 a URI authority is `[userinfo@]host[:port]`, so
+/// `http://127.0.0.1:80@evil.com/cb` — `rest` == `":80@evil.com/cb"` —
+/// used to pass (`rest.starts_with(':')` is true) even though a real parser
+/// reads this as `userinfo = "127.0.0.1:80"`, `host = "evil.com"`: a
+/// "native" client could register an attacker-controlled redirect disguised
+/// as loopback and exfiltrate the auth code at `/authorize` later. Now a
+/// `:` must be followed by ONE OR MORE ASCII digits (an actual port number,
+/// still unvalidated in VALUE — ignored at authorize-time matching per the
+/// brief, same as before) and then end-of-string or `/` — nothing else, in
+/// particular no `@`. `http://127.0.0.1:` (colon, zero digits) is rejected
+/// too (`digits > 0` below).
 fn is_loopback_redirect_uri(uri: &str) -> bool {
     for host in ["localhost", "127.0.0.1"] {
         let prefix = format!("http://{host}");
-        if let Some(rest) = uri.strip_prefix(prefix.as_str()) {
-            if rest.is_empty() || rest.starts_with(':') || rest.starts_with('/') {
+        let Some(rest) = uri.strip_prefix(prefix.as_str()) else {
+            continue;
+        };
+        if let Some(port_rest) = rest.strip_prefix(':') {
+            let digits = port_rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(port_rest.len());
+            let after_port = &port_rest[digits..];
+            if digits > 0 && (after_port.is_empty() || after_port.starts_with('/')) {
                 return true;
             }
+        } else if rest.is_empty() || rest.starts_with('/') {
+            return true;
         }
     }
     false
@@ -795,6 +816,87 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], json!("invalid_redirect_uri"));
+    }
+
+    /// Fix round 1 (security review, Critical) — userinfo-host confusion:
+    /// `http://127.0.0.1:80@evil.com/cb` is NOT a loopback redirect, even
+    /// though the string starts with `http://127.0.0.1:`. Per RFC 3986 §3.2
+    /// (`[userinfo@]host[:port]`) a real parser reads this as
+    /// `userinfo = "127.0.0.1:80"`, `host = "evil.com"` — the actual
+    /// destination is attacker-controlled. Must be rejected.
+    #[tokio::test]
+    async fn register_rejects_127_0_0_1_userinfo_confusion_for_native_client() {
+        let (_dir, router) = register_router_with_issuer("http://127.0.0.1:7717");
+        let (status, body) = post_json(
+            &router,
+            "/register",
+            json!({
+                "application_type": "native",
+                "redirect_uris": ["http://127.0.0.1:80@evil.com/cb"],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], json!("invalid_redirect_uri"));
+    }
+
+    /// Same userinfo-confusion shape for the `localhost` host form.
+    #[tokio::test]
+    async fn register_rejects_localhost_userinfo_confusion_for_native_client() {
+        let (_dir, router) = register_router_with_issuer("http://127.0.0.1:7717");
+        let (status, body) = post_json(
+            &router,
+            "/register",
+            json!({
+                "application_type": "native",
+                "redirect_uris": ["http://localhost:8080@evil.com/cb"],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], json!("invalid_redirect_uri"));
+    }
+
+    /// Fix round 1 edge case: a `:` with zero digits after it (no port at
+    /// all, just a bare trailing colon) must also be rejected — it's not a
+    /// well-formed port, and accepting it would leave the door open to
+    /// "empty port, then something" shapes.
+    #[tokio::test]
+    async fn register_rejects_bare_trailing_colon_with_no_port_for_native_client() {
+        let (_dir, router) = register_router_with_issuer("http://127.0.0.1:7717");
+        let (status, body) = post_json(
+            &router,
+            "/register",
+            json!({
+                "application_type": "native",
+                "redirect_uris": ["http://127.0.0.1:"],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], json!("invalid_redirect_uri"));
+    }
+
+    /// The happy-path loopback shapes must still all pass after the fix —
+    /// a regression guard that the stricter port parsing didn't collaterally
+    /// reject well-formed URIs.
+    #[tokio::test]
+    async fn register_accepts_well_formed_loopback_shapes_after_userinfo_confusion_fix() {
+        let (_dir, router) = register_router_with_issuer("http://127.0.0.1:7717");
+        let (status, body) = post_json(
+            &router,
+            "/register",
+            json!({
+                "application_type": "native",
+                "redirect_uris": [
+                    "http://127.0.0.1:9999/callback",
+                    "http://localhost/callback",
+                    "http://127.0.0.1",
+                ],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
     }
 
     #[tokio::test]
