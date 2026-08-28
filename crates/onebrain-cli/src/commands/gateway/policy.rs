@@ -78,7 +78,14 @@ const CURRENT_PACK: &str = "brain";
 /// `brain_capture` (Task 5) is `Mutating`. No tool is `Destructive` yet —
 /// the variant exists so `PolicyConfig` has a slot ready for one (e.g. a
 /// future delete/overwrite tool) without another config-shape change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `Serialize`s lowercase/snake_case (matching [`PolicyMode`]'s own
+/// convention) — Gateway PR 4, Task 3 gave this its first outbound-JSON
+/// caller: `super::approval::PendingApproval::class`, so an operator
+/// reviewing `GET /approvals` can see exactly what class of access a
+/// pending call needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RiskClass {
     ReadOnly,
     /// No production tool is classified `Mutating` yet — `brain_capture`
@@ -224,14 +231,24 @@ impl Grants {
     }
 
     /// Record (or replace) a grant for `key`, expiring `ttl_secs` from now.
-    /// No production caller yet — `decide` only ever READS grants via
-    /// [`Self::has`]; recording one happens after a human approves an
-    /// `ask_once` request, which is Task 3+'s interactive approval flow.
-    /// Exercised directly by this module's own unit tests until then.
-    #[allow(dead_code)]
+    ///
+    /// First given a real production caller by Gateway PR 4, Task 3:
+    /// `approval_routes::resolve_approval` calls this on every
+    /// `approval::Decision::Approve` resolution, using a config-derived TTL
+    /// (`PolicyConfig::grant_ttl_minutes * 60`) rather than a test's
+    /// hardcoded value — see that function's doc comment. `decide` only
+    /// ever READS grants via [`Self::has`]; this is the only writer.
+    ///
+    /// Uses `saturating_add`, not a bare `+` (Task 2 review, binding
+    /// requirement A) — now that a production caller can pass an
+    /// operator-configured `ttl_secs`, the arithmetic must not be able to
+    /// panic (debug builds) or silently wrap to a tiny/past expiry (release
+    /// builds) on a pathological config value. Saturating to `u64::MAX`
+    /// instead just means "this grant effectively never expires" — a safe,
+    /// inert failure mode compared to either alternative.
     pub fn record(&self, key: GrantKey, ttl_secs: u64) {
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        map.insert(key, now_epoch_secs() + ttl_secs);
+        map.insert(key, now_epoch_secs().saturating_add(ttl_secs));
     }
 }
 
@@ -526,5 +543,24 @@ mod tests {
         assert!(!grants.has(&key));
         grants.record(key.clone(), 3600); // re-grant, now live
         assert!(grants.has(&key));
+    }
+
+    /// Task 2 review, binding requirement A: `now_epoch_secs() + ttl_secs`
+    /// (a bare `+`) would panic in a debug build the moment a caller passes
+    /// a `ttl_secs` anywhere near `u64::MAX` — exactly the kind of value a
+    /// pathological (or merely very large) `grant_ttl_minutes` config could
+    /// produce once a real caller (Gateway PR 4, Task 3's
+    /// `approval_routes::resolve_approval`) exists. `saturating_add` must
+    /// instead clamp to `u64::MAX` — "never expires" — and the grant must
+    /// still read as live.
+    #[test]
+    fn record_with_a_massive_ttl_saturates_instead_of_overflowing() {
+        let grants = Grants::new();
+        let key = GrantKey::new("client-1", RiskClass::Mutating);
+        grants.record(key.clone(), u64::MAX);
+        assert!(
+            grants.has(&key),
+            "a saturated (still enormous) expiry must still be live"
+        );
     }
 }

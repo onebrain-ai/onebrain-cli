@@ -44,6 +44,8 @@ use onebrain_core::{
 use onebrain_fs::task::{visit_tasks, TaskHit, TaskScanOptions};
 
 use crate::commands::daemon_client;
+use crate::commands::gateway::approval::Approvals;
+use crate::commands::gateway::approval_routes::approval_router;
 use crate::commands::gateway::audit::{AuditEntry, AuditLog, Decision, Outcome};
 use crate::commands::gateway::auth::core::now_epoch_secs;
 use crate::commands::gateway::auth::middleware::require_bearer;
@@ -59,15 +61,23 @@ use crate::commands::task_list::{resolve_due_by, resolve_prefixes, TaskCollector
 /// (§ above), so this is the only state a tool call can read — no per-session
 /// data exists.
 ///
-/// `grants`/`audit` are per-PROCESS: a fresh `gateway run` always starts
-/// with zero grants (see [`Grants`]'s own doc comment) and opens the audit
-/// log fresh (append-only — [`GatewayState::new`] takes an already-opened
+/// `grants`/`audit`/`approvals` are per-PROCESS: a fresh `gateway run`
+/// always starts with zero grants and zero pending approvals (see
+/// [`Grants`]'s and [`Approvals`]'s own doc comments — both are
+/// session-scoped, never persisted) and opens the audit log fresh
+/// (append-only — [`GatewayState::new`] takes an already-opened
 /// [`AuditLog`] rather than opening it itself, so tests can point it at a
 /// tempdir instead of the real `~/.onebrain/gateway/audit/`).
 pub struct GatewayState {
     pub config: GatewayConfig,
     pub grants: Grants,
     pub audit: AuditLog,
+    /// Pending human approvals (Gateway PR 4, Task 3) — the operator-facing
+    /// `/approvals` HTTP surface (`approval_routes.rs`) reads/writes this
+    /// directly via `Arc<GatewayState>`; no tool handler in THIS task calls
+    /// `register`/`wait` yet (see [`policy_gate`]'s doc comment — that
+    /// wiring is a later task).
+    pub approvals: Approvals,
 }
 
 impl GatewayState {
@@ -76,6 +86,7 @@ impl GatewayState {
             config,
             grants: Grants::new(),
             audit,
+            approvals: Approvals::new(),
         }
     }
 }
@@ -386,6 +397,54 @@ fn extract_principal(parts: &Parts) -> Result<Principal, ErrorData> {
     }
 }
 
+/// Fixed placeholder `client_id` recorded by [`extract_principal_audited`]
+/// when a gateway tool handler somehow runs with no [`Principal`] in the
+/// request's extensions — there is no real principal to name. Deliberately
+/// NOT a value any real OAuth client registration could ever produce (RFC
+/// 7591 client ids are opaque random secrets from `core::mint_secret_32`,
+/// never literal angle-bracketed text), so it reads unambiguously as the
+/// marker it is when grepping the audit log.
+const UNKNOWN_PRINCIPAL_CLIENT_ID: &str = "<no-principal>";
+
+/// [`extract_principal`], plus one more thing: on failure, records a
+/// minimal audit entry BEFORE returning the error (Task 3 review, binding
+/// requirement B). The bare `extract_principal(&parts)?` this replaces
+/// (Task 2's original shape, one call per tool handler) returned via `?`
+/// before `record_audit` ever had a `principal` to build an entry from — a
+/// genuine "can't happen" path (see [`extract_principal`]'s own doc
+/// comment: not reachable through `build_gateway_router` today, since
+/// `require_bearer` wraps the WHOLE `/mcp` nest) that nonetheless left ZERO
+/// audit trail if it ever somehow did happen. Now it leaves exactly one
+/// entry: `client_id` = [`UNKNOWN_PRINCIPAL_CLIENT_ID`] (there is no real
+/// principal to name) and `decision` = [`Decision::Denied`] (the call was
+/// refused outright, not asked-about-and-left-blocked).
+async fn extract_principal_audited(
+    state: &Arc<GatewayState>,
+    tool: &'static str,
+    started: Instant,
+    parts: &Parts,
+) -> Result<Principal, ErrorData> {
+    match extract_principal(parts) {
+        Ok(p) => Ok(p),
+        Err(err) => {
+            record_audit(
+                state,
+                UNKNOWN_PRINCIPAL_CLIENT_ID,
+                CallMeta {
+                    tool,
+                    vault: None,
+                    args_summary: format!("{tool}: (no Principal in request extensions)"),
+                },
+                Decision::Denied,
+                started,
+                Outcome::Error,
+            )
+            .await;
+            Err(err)
+        }
+    }
+}
+
 /// Runs the policy check ([`policy::decide`]) for one tool call of risk
 /// class `class`. `Ok(Decision::Auto)` means the call may proceed; `Err`
 /// carries BOTH the [`Decision`] to record in the audit log and the
@@ -443,40 +502,63 @@ struct CallMeta {
     args_summary: String,
 }
 
-/// Build and append one audit-log entry for a completed tool call —
-/// infallible from this caller's view, same as every [`AuditLog::append`]
-/// caller (see that method's doc comment): a write failure here is a
-/// `tracing::warn!` inside `append` itself and never touches `result` or
-/// the response already headed back to the client.
+/// Build and append one audit-log entry for a completed (or, via
+/// [`extract_principal_audited`], a never-actually-started) tool call.
 ///
-/// `channel` is always `None` for every entry this task produces — no
-/// interactive approval channel exists yet (see [`policy_gate`]'s doc
-/// comment), so nothing this task wires could ever populate it.
-fn record_audit<T>(
-    state: &GatewayState,
-    principal: &Principal,
+/// `client_id` is a plain `&str`, not `&Principal` — this function no
+/// longer needs a real [`Principal`] to record an entry, since
+/// [`extract_principal_audited`] is a caller that has none to give it (see
+/// that function's doc comment); `outcome` is likewise passed directly
+/// (`Outcome::Ok`/`Outcome::Error`) rather than derived from a generic
+/// `Result<T, _>` reference, so every caller decides it once at the call
+/// site instead of this function needing a type parameter just to call
+/// `.is_ok()`.
+///
+/// Off-loads the actual blocking file write to
+/// [`tokio::task::spawn_blocking`] (Task 3 review, binding requirement C —
+/// `AuditLog::append` does synchronous filesystem I/O, and every other
+/// filesystem operation in this file already runs off the async runtime the
+/// same way: `brain_tasks`'s `visit_tasks` call and `brain_get`'s
+/// `resolve_under_vault` call). `state` is cloned (an `Arc`, so cheap) into
+/// the blocking closure, which needs `'static` data to hand to
+/// `spawn_blocking`.
+///
+/// Still infallible from the caller's view, same as every
+/// [`AuditLog::append`] caller (see that method's doc comment) — every call
+/// site here `.await`s this to completion (so the entry is guaranteed
+/// written before the tool call's own response goes out), but that await
+/// can never surface an `Err` to unwind: the only NEW failure mode this
+/// wrapping introduces is the spawned blocking task itself panicking, which
+/// — per that same "must never block/fail the tool call it's recording"
+/// contract — collapses to a `tracing::warn!` here too, never a propagated
+/// error.
+async fn record_audit(
+    state: &Arc<GatewayState>,
+    client_id: &str,
     meta: CallMeta,
     decision: Decision,
     started: Instant,
-    result: &Result<T, ErrorData>,
+    outcome: Outcome,
 ) {
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let entry = AuditEntry {
         ts: now_epoch_secs(),
-        client_id: principal.client_id.clone(),
+        client_id: client_id.to_string(),
         tool: meta.tool.to_string(),
         vault: meta.vault,
         args_summary: meta.args_summary,
         decision,
         channel: None,
         duration_ms,
-        outcome: if result.is_ok() {
-            Outcome::Ok
-        } else {
-            Outcome::Error
-        },
+        outcome,
     };
-    state.audit.append(&entry);
+    let state = state.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || state.audit.append(&entry)).await {
+        tracing::warn!(
+            error = %e,
+            "gateway audit-log spawn_blocking task panicked; entry not recorded"
+        );
+    }
 }
 
 #[tool_router]
@@ -497,8 +579,9 @@ impl GatewayServer {
         &self,
         Extension(parts): Extension<Parts>,
     ) -> Result<Json<CapabilitiesOut>, ErrorData> {
-        let principal = extract_principal(&parts)?;
         let started = Instant::now();
+        let principal =
+            extract_principal_audited(&self.state, "capabilities", started, &parts).await?;
         let (decision, result) =
             match policy_gate(&self.state, &principal, "capabilities", RiskClass::ReadOnly) {
                 Ok(decision) => {
@@ -516,7 +599,7 @@ impl GatewayServer {
             };
         record_audit(
             &self.state,
-            &principal,
+            &principal.client_id,
             CallMeta {
                 tool: "capabilities",
                 vault: None,
@@ -524,8 +607,13 @@ impl GatewayServer {
             },
             decision,
             started,
-            &result,
-        );
+            if result.is_ok() {
+                Outcome::Ok
+            } else {
+                Outcome::Error
+            },
+        )
+        .await;
         result
     }
 
@@ -539,8 +627,9 @@ impl GatewayServer {
         Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<BrainTasksParams>,
     ) -> Result<Json<BrainTasksOut>, ErrorData> {
-        let principal = extract_principal(&parts)?;
         let started = Instant::now();
+        let principal =
+            extract_principal_audited(&self.state, "brain_tasks", started, &parts).await?;
         let vault = params.vault.clone();
         let args_summary = format!(
             "tasks: due_by={:?} limit={:?} vault={:?}",
@@ -597,7 +686,7 @@ impl GatewayServer {
 
         record_audit(
             &self.state,
-            &principal,
+            &principal.client_id,
             CallMeta {
                 tool: "brain_tasks",
                 vault,
@@ -605,8 +694,13 @@ impl GatewayServer {
             },
             decision,
             started,
-            &result,
-        );
+            if result.is_ok() {
+                Outcome::Ok
+            } else {
+                Outcome::Error
+            },
+        )
+        .await;
         result
     }
 
@@ -620,8 +714,9 @@ impl GatewayServer {
         Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<BrainGetParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let principal = extract_principal(&parts)?;
         let started = Instant::now();
+        let principal =
+            extract_principal_audited(&self.state, "brain_get", started, &parts).await?;
         let vault = params.vault.clone();
         let args_summary = format!("get: {} vault={:?}", params.file, params.vault);
 
@@ -673,7 +768,7 @@ impl GatewayServer {
 
         record_audit(
             &self.state,
-            &principal,
+            &principal.client_id,
             CallMeta {
                 tool: "brain_get",
                 vault,
@@ -681,8 +776,13 @@ impl GatewayServer {
             },
             decision,
             started,
-            &result,
-        );
+            if result.is_ok() {
+                Outcome::Ok
+            } else {
+                Outcome::Error
+            },
+        )
+        .await;
         result
     }
 
@@ -696,8 +796,9 @@ impl GatewayServer {
         Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<BrainSearchParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let principal = extract_principal(&parts)?;
         let started = Instant::now();
+        let principal =
+            extract_principal_audited(&self.state, "brain_search", started, &parts).await?;
         let vault = params.vault.clone();
         let args_summary = format!(
             "search: {:?} top_k={:?} vault={:?}",
@@ -747,7 +848,7 @@ impl GatewayServer {
 
         record_audit(
             &self.state,
-            &principal,
+            &principal.client_id,
             CallMeta {
                 tool: "brain_search",
                 vault,
@@ -755,8 +856,13 @@ impl GatewayServer {
             },
             decision,
             started,
-            &result,
-        );
+            if result.is_ok() {
+                Outcome::Ok
+            } else {
+                Outcome::Error
+            },
+        )
+        .await;
         result
     }
 }
@@ -781,31 +887,46 @@ impl ServerHandler for GatewayServer {
 
 /// Assembles the gateway's full HTTP surface (Gateway PR 3, Task 2 adds
 /// OAuth discovery, Task 3 adds registration, Task 4 adds the consent flow,
-/// Task 5 adds the token endpoint): a sessionless (SEP-2567) Streamable HTTP
-/// service mounted at `/mcp`, gated by the [`require_bearer`] Bearer
-/// resource-server check, plus the PUBLIC `/.well-known/*` OAuth discovery
-/// routes ([`well_known_router`]), the PUBLIC `POST /register` RFC 7591
+/// Task 5 adds the token endpoint, Gateway PR 4 Task 3 adds the operator
+/// approval surface): a sessionless (SEP-2567) Streamable HTTP service
+/// mounted at `/mcp`, gated by the [`require_bearer`] Bearer resource-server
+/// check, plus the PUBLIC `/.well-known/*` OAuth discovery routes
+/// ([`well_known_router`]), the PUBLIC `POST /register` RFC 7591
 /// registration route ([`register_router`]), the PUBLIC `GET`/`POST
-/// /authorize` consent flow ([`authorize_router`]), and the PUBLIC `POST
-/// /token` code-exchange/refresh-rotation endpoint ([`token_router`]). The
-/// `/mcp` factory closure builds a fresh [`GatewayServer`] per request
-/// (cloning the shared `state` handle) — sessionless mode never reuses a
-/// server instance across requests, so no mutable per-connection state can
-/// leak between callers.
+/// /authorize` consent flow ([`authorize_router`]), the PUBLIC `POST
+/// /token` code-exchange/refresh-rotation endpoint ([`token_router`]), and
+/// the OPERATOR-ONLY `/approvals` surface ([`approval_router`] —
+/// deliberately NOT public and deliberately NOT behind [`require_bearer`]
+/// either; see `approval_routes.rs`'s module docs for why it needs its OWN
+/// third kind of gate). The `/mcp` factory closure builds a fresh
+/// [`GatewayServer`] per request (cloning the shared `state` handle) —
+/// sessionless mode never reuses a server instance across requests, so no
+/// mutable per-connection state can leak between callers.
 ///
 /// Layer scoping is load-bearing here: `.layer(from_fn_with_state(...))` is
 /// called on the router BEFORE `well_known_router`/`register_router`/
-/// `authorize_router`/`token_router` are merged in, so the Bearer gate wraps
-/// ONLY the `/mcp` nest — a client with no token yet can still reach the
-/// discovery documents, register itself, complete the consent flow, AND
-/// exchange its code (or rotate a refresh token) for a bearer token, all of
-/// which it needs to do before it can obtain/renew one. See
+/// `authorize_router`/`token_router`/`approval_router` are merged in, so the
+/// Bearer gate wraps ONLY the `/mcp` nest — a client with no token yet can
+/// still reach the discovery documents, register itself, complete the
+/// consent flow, AND exchange its code (or rotate a refresh token) for a
+/// bearer token, all of which it needs to do before it can obtain/renew
+/// one; `/approvals` similarly stays OUTSIDE the Bearer layer, but for the
+/// opposite reason — not because it's public (it isn't; `approval_router`
+/// carries its own pairing-code gate), but because a connector's bearer
+/// token must never be ABLE to satisfy it (see `approval_routes.rs`'s
+/// module docs). See
 /// `tests::well_known_routes_are_reachable_without_auth_while_mcp_stays_gated`,
 /// `tests::register_is_reachable_without_auth_on_the_real_router`,
-/// `tests::authorize_is_reachable_without_auth_on_the_real_router`, and
-/// `tests::token_is_reachable_without_auth_on_the_real_router` for the
-/// proof.
+/// `tests::authorize_is_reachable_without_auth_on_the_real_router`,
+/// `tests::token_is_reachable_without_auth_on_the_real_router`, and
+/// `tests::approvals_route_is_merged_into_the_real_router_and_ignores_a_connector_bearer_token`
+/// for the proof.
 pub fn build_gateway_router(state: Arc<GatewayState>, auth_ctx: Arc<AuthCtx>) -> axum::Router {
+    // Cloned BEFORE the `move` closure below takes ownership of `state` for
+    // the `/mcp` factory's own per-request `state.clone()` — `approval_router`
+    // needs its own handle on the SAME `Arc<GatewayState>` afterward.
+    let approvals_state = state.clone();
+
     let config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true);
@@ -822,7 +943,8 @@ pub fn build_gateway_router(state: Arc<GatewayState>, auth_ctx: Arc<AuthCtx>) ->
         .merge(well_known_router(auth_ctx.clone()))
         .merge(register_router(auth_ctx.clone()))
         .merge(authorize_router(auth_ctx.clone()))
-        .merge(token_router(auth_ctx))
+        .merge(token_router(auth_ctx.clone()))
+        .merge(approval_router(approvals_state, auth_ctx))
 }
 
 #[cfg(test)]
@@ -1836,5 +1958,109 @@ mod tests {
         let entries = read_audit_entries(dir.path());
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["decision"], "denied");
+    }
+
+    // ── Gateway PR 4, Task 3: /approvals router-merge + audit hardening ──
+
+    /// `GET /approvals` on the fully-assembled router answers 401 with a
+    /// connector's normal bearer token (no `X-OneBrain-Pairing` header) —
+    /// proves `approval_routes::approval_router` really is merged into
+    /// `build_gateway_router`'s output, and that the merge does NOT
+    /// accidentally route it through `require_bearer` (the connector Bearer
+    /// layer that wraps ONLY `/mcp`). The pairing-code-specific 401/200
+    /// details are `approval_routes.rs`'s own tests' job; this is the
+    /// wiring proof, the same role
+    /// `well_known_routes_are_reachable_without_auth_while_mcp_stays_gated`
+    /// plays for the OAuth discovery routes.
+    #[tokio::test]
+    async fn approvals_route_is_merged_into_the_real_router_and_ignores_a_connector_bearer_token() {
+        let (_dir, router, token) = fixture_router();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/approvals")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a connector's own bearer token must not satisfy /approvals' operator gate"
+        );
+    }
+
+    /// Task 3 review, binding requirement B: a gateway tool handler running
+    /// with no `Principal` in the request's extensions (believed
+    /// unreachable through `build_gateway_router` today — `require_bearer`
+    /// wraps the WHOLE `/mcp` nest — but a "can't happen" path is exactly
+    /// what silently rots) must still leave an audit trail rather than
+    /// vanishing via the early `?` return Task 2 originally shipped.
+    /// Exercises `extract_principal_audited` directly, rather than trying
+    /// to smuggle a request past `require_bearer` (which the real router
+    /// makes genuinely impossible) — this is the unit-level proof that the
+    /// HELPER itself does the right thing on the one path nothing upstream
+    /// of it could ever protect against.
+    #[tokio::test]
+    async fn extract_principal_audited_records_an_audit_entry_on_a_missing_principal() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLog::open_at(audit_log_path(dir.path())).unwrap();
+        let state = Arc::new(GatewayState::new(GatewayConfig::default(), audit));
+
+        // A bare `Parts` with nothing in `extensions` — no `require_bearer`
+        // ran, so no `Principal` was ever inserted.
+        let req = Request::builder().uri("/mcp").body(()).unwrap();
+        let (parts, _) = req.into_parts();
+
+        let started = Instant::now();
+        let result = extract_principal_audited(&state, "capabilities", started, &parts).await;
+        assert!(
+            result.is_err(),
+            "must still fail — this does not paper over the missing Principal"
+        );
+
+        let entries = read_audit_entries(dir.path());
+        assert_eq!(
+            entries.len(),
+            1,
+            "the failure must still leave exactly one audit entry: {entries:?}"
+        );
+        assert_eq!(entries[0]["client_id"], UNKNOWN_PRINCIPAL_CLIENT_ID);
+        assert_eq!(entries[0]["tool"], "capabilities");
+        assert_eq!(entries[0]["decision"], "denied");
+        assert_eq!(entries[0]["outcome"], "error");
+    }
+
+    /// Task 3 review, binding requirement C: `record_audit` must do its
+    /// blocking file write via `tokio::task::spawn_blocking`, not directly
+    /// on the async task — and awaiting it to completion must still
+    /// guarantee the entry is on disk before the caller proceeds (the same
+    /// guarantee every OTHER audit test in this file already relies on when
+    /// it reads the log back immediately after an HTTP call returns).
+    #[tokio::test]
+    async fn record_audit_writes_via_spawn_blocking_and_completes_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLog::open_at(audit_log_path(dir.path())).unwrap();
+        let state = Arc::new(GatewayState::new(GatewayConfig::default(), audit));
+
+        record_audit(
+            &state,
+            "client-x",
+            CallMeta {
+                tool: "capabilities",
+                vault: None,
+                args_summary: "capabilities: (no arguments)".to_string(),
+            },
+            Decision::Auto,
+            Instant::now(),
+            Outcome::Ok,
+        )
+        .await;
+
+        let entries = read_audit_entries(dir.path());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["client_id"], "client-x");
+        assert_eq!(entries[0]["decision"], "auto");
+        assert_eq!(entries[0]["outcome"], "ok");
     }
 }

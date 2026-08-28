@@ -22,6 +22,8 @@
 //! pairing code from a second terminal — whether or not `gateway run` is
 //! currently up.
 
+pub mod approval;
+pub mod approval_routes;
 pub mod audit;
 pub mod auth;
 pub mod config;
