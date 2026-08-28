@@ -3,9 +3,10 @@
 //! §3.2 Authorization Server Metadata) + RFC 7591 Dynamic Client
 //! Registration (`POST /register`, Task 3 — public clients only, see
 //! [`register_client_handler`]'s doc comment) + the `/authorize` consent
-//! flow (Task 4, below — see [`authorize_get_handler`]/
-//! [`authorize_post_handler`]'s doc comments). `/token` (Task 5) lands in
-//! this same file next, against this same `AuthCtx`.
+//! flow (Task 4 — see [`authorize_get_handler`]/[`authorize_post_handler`]'s
+//! doc comments) + `POST /token` code exchange and refresh rotation (Task 5,
+//! below — see [`token_authorization_code_grant`]/[`token_refresh_grant`]'s
+//! doc comments), all against this same `AuthCtx`.
 //!
 //! ## `/authorize` — the one human checkpoint (Task 4)
 //! This is the ONLY place in the whole OAuth surface where a human, not a
