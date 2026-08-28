@@ -267,6 +267,20 @@ A common question for tools like a future `reindex`: can an agent kick off long 
 - **Plugin config staging**: the OneBrain plugin's `.mcp.json` registered this server under the config key `qmd` from the **v3.4.1** native-backend swap onward, then renamed it to **`search`** (with a matching agent-instruction update) in the **v3.4.5** epic — plugin PR onebrain-ai/onebrain#208. The example above uses the current `search` key; after the rename the tool namespace is `mcp__plugin_onebrain_search__*`.
 - **MCP protocol version**: the server (rmcp 3.0.1) supports MCP protocol versions through `2026-07-28` and echoes whichever known version the client requests at `initialize`; unknown versions fall back to the SDK default (`2025-11-25`). Cross-era negotiation is guarded by `tests/mcp_stdio.rs::initialize_negotiates_the_client_requested_protocol_version`. The server *implementation* version still always matches `onebrain --version` (reported in initialize's serverInfo).
 
+## Gateway (streamable HTTP)
+
+`onebrain gateway run` is a SEPARATE MCP surface from `onebrain mcp` above: a loopback Streamable HTTP endpoint (not stdio) serving a read-only, multi-vault tool pack instead of the single-vault `query`/`get`/`multi_get`/`status` set. Full config schema, defaults, and the zero-config story live at [`docs/gateway.md`](../gateway.md) — this section is the short pointer for readers who land here first.
+
+```bash
+onebrain gateway run [--port N]
+```
+
+- **Endpoint**: `http://127.0.0.1:<port>/mcp` — Streamable HTTP (stateless/sessionless mode), protocol `2026-07-28` pinned as the negotiation fallback (an older KNOWN version a client legitimately requests, e.g. `2025-11-25`, is still echoed back). The bound URL prints once to stdout on startup: `gateway listening on http://<bound-addr>/mcp`.
+- **Tools** (the "Brain pack", read-only): `capabilities` (self-description — packs, vaults, default vault), `brain_tasks` (open task listing), `brain_get` (traversal-guarded single-file read), `brain_search` (daemon-routed hybrid search — never opens a direct engine, since one gateway process serves MANY vaults concurrently).
+- **Multi-vault**: unlike `onebrain mcp` (one vault per process — `--vault`/env/walk-up), the gateway serves every vault named in `~/.onebrain/gateway.yml`'s `vaults:` map, selected per tool call via each tool's optional `vault` argument; omitting it falls back to the config's `default_vault`, then the normal env/walk-up chain.
+- **Loopback only — no auth yet.** The bind address is hard-coded to `127.0.0.1`; there is no `--bind`/`$ONEBRAIN_BIND`-style escape hatch like `onebrain serve` has, because this build ships no authentication layer. A remote tunnel + OAuth 2.1 land in a later v3.5 PR — until then, never expose this port beyond the local machine.
+- **Config path**: `~/.onebrain/gateway.yml` (machine-level, not per-vault — see [`docs/gateway.md`](../gateway.md)). A missing file is not an error: `gateway run` inside a vault still serves that vault via the normal resolution chain.
+
 ## Roadmap
 
 `onebrain mcp` is designed to grow: future tool groups (notes, tasks, and other vault resources) will mount on this same server surface as they land, following the [gateway vision](../../README.md#roadmap) of one MCP entry point for the whole vault rather than one server per resource type. This page will gain a new per-tool-group section for each as it ships — per the maintenance rule at the top of this page.

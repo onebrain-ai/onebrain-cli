@@ -98,6 +98,14 @@ it is untestable.
 `crates/onebrain-cli/src/server/internal.rs`:
 - A few `spawn_blocking` panic-mapper arms + the reindex/status engine-error `.map_err` arms (fire only on an engine fault).
 
+#### Gateway run loop (v3.5, Task 4 — NOT whole-file-excluded, same policy as the warm daemon)
+
+`crates/onebrain-cli/src/commands/gateway/mod.rs`'s `run()` — the `onebrain gateway run` host fn — fits the exact "foreground blocking listener, never returns in a test" pattern `commands/serve.rs` is whole-file-excluded for. It stays UN-excluded here per the Task 4 review ruling (document the residual instead of hiding it behind an ignore pattern):
+
+- The entire `run()` body (config load, socket/router assembly, building the tokio runtime, and the `shutdown`/`on_bind` closures) shows 0% under `cargo llvm-cov` — a coverage-CAPTURE gap, not an untested-BEHAVIOR gap. `run()` only executes as the real compiled `onebrain` binary spawned by `tests/gateway_http.rs`'s two integration tests (full MCP handshake, all four tools incl. a real daemon-routed `brain_search`, traversal rejection, kill + exit) — proven working end-to-end, but `cargo-llvm-cov` doesn't merge a spawned subprocess's `.profraw` data back into the report (the same reason `daemon.rs::run_internal` is documented as residual above, not merely why `serve.rs` is excluded).
+- `crates/onebrain-cli/src/commands/gateway/config.rs`'s `gateway_config_path()` and `load_gateway_config()` (the real `$HOME`-resolving path) inherit the same subprocess-capture gap — only `run()` calls them; the in-file unit tests deliberately call `load_gateway_config_at` directly against a temp path to stay hermetic. `load_gateway_config_at`'s non-`NotFound` read-error arm (`Err(e) => return Err(e).context(...)`) is additionally residual on its own: it needs a file that exists but is unreadable (e.g. permission-denied), not exercised by any test.
+- `crates/onebrain-cli/src/commands/gateway/server.rs`'s `core_error` and `brain_search`'s daemon-routed body (`spawn_blocking` → `ensure_running` → `handle.search` → `sanitized_internal`/serialize) are both exercised FUNCTIONALLY by `gateway_http.rs` (the outside-vault test hits `core_error`'s `E_VAULT_NOT_FOUND` path; the happy-path test calls `brain_search` against a real spawned daemon and asserts the response shape, plus that the daemon lives under the sandbox `$HOME`) — but, again, only via the subprocess, so they inherit the same capture gap. `sanitized_internal` itself IS unit-tested directly in-process (`sanitized_internal_strips_host_detail_from_the_client_facing_message`), proving the client-facing message-scrubbing contract (Task 4 review ruling B) without needing a live daemon failure.
+
 ## Status (2026-07-05 · v3.4.6)
 
 - **Core (this initiative's target surface, exclusions applied): ~94.99% line** (`scripts/coverage.sh`,
