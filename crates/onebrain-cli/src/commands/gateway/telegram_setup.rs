@@ -222,10 +222,13 @@ fn message_carries_code(update: &TgUpdate, code: &str) -> bool {
 ///    per that module's "scrub chokepoint" docs, but this wizard adds its
 ///    own fixed message on top rather than forwarding ANY dynamic text
 ///    from a failed auth call).
-/// 3. Mint a per-run setup code and print instructions to send it to the
+/// 3. [`drain_backlog`] — hygiene, not security (see its own doc comment)
+///    — and report how many messages it cleared. Runs BEFORE the setup
+///    code is minted or shown (round 3 finding 2 — an earlier revision
+///    inverted this, opening a window where a promptly-sent code could be
+///    silently swallowed by a still-in-progress drain).
+/// 4. Mint a per-run setup code and print instructions to send it to the
 ///    bot.
-/// 4. [`drain_backlog`] — hygiene, not security (see its own doc comment)
-///    — and report how many messages it cleared.
 /// 5. Long-poll `getUpdates` (via [`get_updates_with_retry`], budgeted by
 ///    CALL COUNT rather than an `Instant` deadline — see the loop's own
 ///    comment) until EXACTLY ONE distinct private chat sends a message
@@ -285,10 +288,39 @@ pub(crate) fn run_setup(
         .get_me()
         .map_err(|_| anyhow::anyhow!("token was not accepted by Telegram"))?;
 
+    // H1/C1/I2/round-3 finding 2: clear (and confirm) any backlog that
+    // existed BEFORE this wizard run — see `drain_backlog`'s own doc
+    // comment — BEFORE the setup code is ever shown as something to send.
+    // Ordering matters: printing the code FIRST and draining SECOND (an
+    // earlier revision of this function did exactly that) opens a window
+    // where an operator who sends the code promptly — while the drain is
+    // still paging through a chatty bot's backlog — has their own live
+    // message silently swallowed by a drain call that never inspects
+    // content, then stalls the full wait because it already consumed the
+    // only message that could ever satisfy it. Draining first closes that
+    // window entirely: by the time the code is shown, nothing the operator
+    // sends can land in a backlog snapshot this function still has left to
+    // consume.
+    writeln!(out, "Clearing any earlier messages to this bot…")?;
+    out.flush()?;
+    let (mut offset, cleared) = drain_backlog(&api)?;
+    writeln!(out, "Cleared {cleared} earlier message(s).")?;
+
     // Identity is proven by this code, not by arrival order — see the
     // module docs' "H1" section. Same code-generation shape `gateway pair`
     // already uses; never persisted, never logged, lives only for this run.
     let code = super::auth::mint_pairing_code();
+    // Round 3 finding: `message_carries_code`'s whole design rests on
+    // `contains(&normalize_code(code))` never being vacuously true. An
+    // empty-normalizing `code` (impossible today — `mint_pairing_code`
+    // always returns 8 alphanumeric characters — but never proven so at
+    // this call site) would make EVERY text message match, defeating the
+    // entire point of the code. Guard it here, at the point the code
+    // enters the system, rather than trusting the invariant silently.
+    debug_assert!(
+        !normalize_code(&code).is_empty(),
+        "mint_pairing_code produced a code that normalizes to empty — message_carries_code would match everything"
+    );
     writeln!(
         out,
         "Send this code to @{} in Telegram: {code}",
@@ -296,17 +328,9 @@ pub(crate) fn run_setup(
     )?;
     writeln!(
         out,
-        "(Pressing START also works if this is a brand-new bot, but the code above is what identifies you.)"
+        "(New bot? Press START first, then send the code above — pressing START alone can never be captured, only a message containing the code can.)"
     )?;
     out.flush()?;
-
-    // H1/C1/I2: clear (and confirm) any backlog that existed BEFORE this
-    // wizard run — see `drain_backlog`'s own doc comment — before waiting
-    // for a reply.
-    writeln!(out, "Clearing any earlier messages to this bot…")?;
-    out.flush()?;
-    let (mut offset, cleared) = drain_backlog(&api)?;
-    writeln!(out, "Cleared {cleared} earlier message(s).")?;
 
     writeln!(
         out,
@@ -402,14 +426,23 @@ pub(crate) fn run_setup(
     }
 
     let (chat_id, _from_id) = captured.ok_or_else(|| {
+        // Round 3 finding 1: neither branch names `code` — it was minted
+        // for THIS run only and a fresh run mints a different one, so an
+        // instruction to send THIS run's code after re-running would
+        // guarantee a second failure. Both branches instead point at "the
+        // new code" the next run prints, and — for the group-chat branch
+        // specifically — order the instruction so nothing is sent until
+        // AFTER the new run's own drain has already finished (see the
+        // drain-before-code-print ordering above): re-running first, then
+        // sending, never the reverse.
         if saw_group_message_with_code {
             anyhow::anyhow!(
-                "saw the code in a group chat — Telegram approvals need a private one-to-one chat with the bot; open a DM with @{}, send {code} there, then run this setup again",
+                "saw the code in a group chat — Telegram approvals need a private one-to-one chat with the bot; run this setup again, then send the new code it prints in a DM with @{}",
                 identity.username
             )
         } else {
             anyhow::anyhow!(
-                "no message carrying the code arrived — run this setup again and send {code} to @{}",
+                "no message carrying the code arrived — run this setup again and send the new code it prints to @{}",
                 identity.username
             )
         }
