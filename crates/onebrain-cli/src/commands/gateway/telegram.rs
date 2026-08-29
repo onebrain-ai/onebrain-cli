@@ -19,18 +19,28 @@
 //! poller is still up — loses the exchange and returns immediately, since
 //! one poller already sees every callback for this bot's single configured
 //! `chat_id` regardless of how many approvals are pending. The thread exits
-//! on its own once a poll cycle observes [`super::approval::Approvals::list`]
-//! empty — no pending approvals left to answer — rather than running for
-//! the life of the process; because each `getUpdates` call is a real
-//! `timeout`-second long poll, the thread can linger up to that long past
-//! the LAST approval resolving before it notices and exits. That lingering
-//! window is bounded (never more than one long-poll cycle) and deliberate,
-//! not a leak: a single named, self-terminating thread is easy to reason
-//! about and easy to spot in a process listing, unlike a thread that either
-//! never exits or gets leaked on every call. `polling` resets to `false`
-//! through a `Drop` guard owned by the thread's own closure, so a panic
-//! inside the poll loop can't wedge the flag and permanently block a later
-//! `ensure_polling` call from ever spawning a replacement.
+//! on its own once a poll cycle observes no LIVE (non-expired)
+//! [`super::approval::Approvals::list`] entries left to answer — see
+//! [`poll_loop`]'s own doc comment for exactly what "live" excludes (Task 5
+//! review, F3) — rather than running for the life of the process; because
+//! each `getUpdates` call is a real `timeout`-second long poll
+//! ([`POLL_TIMEOUT_SECS`] = **25 seconds**, the brief's own binding figure),
+//! the thread can linger up to **25 seconds** past the LAST live approval
+//! going away before it notices and exits. That lingering window is bounded
+//! (never more than one long-poll cycle) and deliberate, not a leak: a
+//! single named, self-terminating thread is easy to reason about and easy
+//! to spot in a process listing, unlike a thread that either never exits or
+//! gets leaked on every call. A per-cycle floor ([`MIN_CYCLE_INTERVAL`])
+//! additionally paces any cycle that returns FASTER than that — an
+//! instant-answering `getUpdates` (a misbehaving proxy, or simply a very
+//! chatty chat) must never turn this loop into a hot spin; the floor never
+//! makes the worst-case 25-second linger any worse, since it only adds
+//! delay to cycles that already came back quickly. `polling` resets to
+//! `false` through a `Drop` guard owned by the thread's own closure, so a
+//! panic inside the poll loop can't wedge the flag and permanently block a
+//! later `ensure_polling` call from ever spawning a replacement — see
+//! [`poll_loop`]'s own doc comment for how that guard interacts with the
+//! exit/reclaim race it also closes (Task 5 review, F1).
 //!
 //! ## `is_available`: configured-ness, not liveness
 //! [`is_available`] answers a purely local question — does `gateway.yml`
@@ -77,12 +87,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+use sha2::{Digest, Sha256};
+
 use super::approval::{Approvals, Decision, PendingApproval, ResolvedVia};
-use super::auth::core::now_epoch_secs;
+use super::auth::core::{base64url_nopad, now_epoch_secs};
 use super::config::TelegramConfig;
 use super::telegram_api::{BotApi, TgUpdate};
 
@@ -115,11 +127,18 @@ const DEFAULT_API_BASE: &str = "https://api.telegram.org";
 const CALLBACK_DATA_MAX_BYTES: usize = 64;
 
 /// `getUpdates` long-poll `timeout` (seconds) [`TelegramChannel::ensure_polling`]
-/// sends on every call — at `telegram_api.rs`'s own documented long-poll
-/// ceiling (35 seconds), chosen to minimize the request volume this channel
-/// puts on the real Telegram API (a shorter timeout would mean more frequent
-/// empty round trips while nothing is happening) while staying safely clear
-/// of [`BotApi`]'s own end-to-end HTTP timeout. Not configurable per call —
+/// sends on every call — **25**, not the full 35-second ceiling
+/// `telegram_api.rs`'s own `debug_assert!` enforces (Task 5 review, F6: an
+/// earlier revision of this doc wrongly said "35" here). 25 leaves 10
+/// seconds of headroom below `BotApi`'s own end-to-end `HTTP_TIMEOUT`
+/// (ceiling + 5 = 40 seconds): a legitimate long-poll response that takes
+/// slightly longer than the requested `timeout` to arrive (network
+/// jitter, Telegram's own processing) still has room to complete before
+/// `HTTP_TIMEOUT` would kill the connection out from under it, rather than
+/// racing the two timeouts against each other with only 5 seconds between
+/// them. Also chosen to minimize the request volume this channel puts on
+/// the real Telegram API (a shorter timeout would mean more frequent empty
+/// round trips while nothing is happening). Not configurable per call —
 /// see [`TelegramChannel::ensure_polling`]'s own doc comment for why a
 /// single hardcoded value is the right shape here.
 const POLL_TIMEOUT_SECS: u32 = 25;
@@ -129,9 +148,25 @@ const POLL_TIMEOUT_SECS: u32 = 25;
 /// loop hammering the API once a second.
 const POLL_ERROR_BACKOFF: Duration = Duration::from_secs(2);
 
+/// Floor on how often a SUCCESSFUL poll cycle may repeat (Task 5 review,
+/// F2): if a cycle's `getUpdates` call plus its update handling together
+/// took less than this, [`poll_loop`] sleeps out the remainder before
+/// starting the next cycle. `getUpdates` is a real long poll in
+/// production, so a genuinely idle chat already paces itself at
+/// [`POLL_TIMEOUT_SECS`]; this floor exists for the case that DOESN'T
+/// pace itself — an instant-answering `getUpdates` (this module's own test
+/// mock, before this fix, was exactly that: answering unscripted calls
+/// immediately let a live poller spin as fast as the loopback round trip
+/// allowed, confirmed the hard way as a genuine CPU-melting hang during
+/// this task's own test development). An `Ok` cycle with zero updates is
+/// still a completely ordinary, non-error outcome (see [`poll_loop`]'s own
+/// doc comment on the Task 1 #6 empty-result-streak semantics) — this
+/// floor paces it, it does not flag it as unusual.
+const MIN_CYCLE_INTERVAL: Duration = Duration::from_secs(1);
+
 /// `true` iff the Telegram approval channel is CONFIGURED on this running
 /// gateway process: `cfg.bot_token` is non-empty, `cfg.chat_id` is
-/// non-zero, and [`DISABLE_TELEGRAM_APPROVAL_ENV`] is not set.
+/// POSITIVE, and [`DISABLE_TELEGRAM_APPROVAL_ENV`] is not set.
 ///
 /// This reports configured-ness, not liveness — it never makes a network
 /// call. Whether the configured token is actually VALID (a live `getMe`
@@ -145,10 +180,27 @@ const POLL_ERROR_BACKOFF: Duration = Duration::from_secs(2);
 /// [`super::server::ApprovalChannels`] field answers from purely local
 /// state. Mirrors [`super::approval_native::is_available`]'s own
 /// local-state-only shape for the same reason.
+///
+/// **Positive, not merely non-zero** (Task 5 review, F4): Telegram's own id
+/// convention gives private (one-to-one, human-to-bot) chats POSITIVE ids
+/// and gives groups/supergroups/channels NEGATIVE ones — this channel's
+/// whole design (see [`TelegramChannel`]'s own doc comment) resolves ONE
+/// `chat_id` and treats a button press's `from_id` matching that SAME
+/// number as the entire authorization check, which only makes sense for a
+/// private chat with exactly one human on the other end. A `chat_id`
+/// pointing at a group would silently configure a DEAD channel: prompts
+/// would post into the group, but no individual group member's `from_id`
+/// ever equals the group's own negative `chat_id`, so `handle_update`
+/// would refuse every single button press as "not authorized" — with
+/// `capabilities` still truthfully reporting `telegram: true` (the config
+/// IS present) and nothing anywhere logging why it never actually works.
+/// Rejecting `chat_id <= 0` here — before any of that — turns a silent,
+/// hard-to-diagnose dead channel into an honest "not configured", the same
+/// signal an operator already knows how to act on.
 pub fn is_available(cfg: &TelegramConfig) -> bool {
     !super::env_switch_on(DISABLE_TELEGRAM_APPROVAL_ENV)
         && !cfg.bot_token.is_empty()
-        && cfg.chat_id != 0
+        && cfg.chat_id > 0
 }
 
 /// Telegram Bot API base URL: [`TELEGRAM_API_BASE_ENV`] when set to a
@@ -243,6 +295,11 @@ pub struct TelegramChannel {
     /// full lifecycle, including the `Drop`-guard reset that keeps a panic
     /// from wedging this flag `true` forever.
     polling: Arc<AtomicBool>,
+    /// [`token_key`] of `cfg.bot_token`, computed once here rather than
+    /// re-derived on every poll cycle — see that function's own doc comment
+    /// for why [`poll_loop`]'s persisted-offset file must be keyed by bot
+    /// identity at all (Task 5 review, F9).
+    token_key: String,
 }
 
 impl TelegramChannel {
@@ -251,14 +308,33 @@ impl TelegramChannel {
     /// (no poller thread up yet — [`Self::ensure_polling`] is what starts
     /// one). Cheap and side-effect-free — no network call happens here
     /// (mirrors [`BotApi::new`]'s own doc comment: it only builds the
-    /// reusable `ureq` agent).
+    /// reusable `ureq` agent) — [`token_key`]'s own SHA-256 call is
+    /// negligible next to that.
     pub fn new(cfg: &TelegramConfig) -> Self {
         Self {
             chat_id: cfg.chat_id,
             api: Arc::new(BotApi::new(&cfg.bot_token, &api_base())),
             sent: Arc::new(Mutex::new(HashMap::new())),
             polling: Arc::new(AtomicBool::new(false)),
+            token_key: token_key(&cfg.bot_token),
         }
+    }
+
+    /// `true` iff this channel's poller thread is currently up — the SAME
+    /// `polling` flag [`Self::ensure_polling`] itself gates on, exposed
+    /// read-only and ONLY under `#[cfg(test)]`. `polling` is a private
+    /// field for a reason (nothing outside this module has legitimate
+    /// business inspecting it in production), but `server.rs`'s own tests
+    /// — a DIFFERENT module, so ordinary Rust privacy does not already
+    /// grant them access the way it does for this module's own `mod tests`
+    /// — need a way to wait out a real poller thread before their test
+    /// function returns (Task 5 review, F7). `pub(crate)` rather than
+    /// fully `pub`: this crate's own tests are the only legitimate caller,
+    /// and the whole point is that this is NOT part of the type's real
+    /// public API.
+    #[cfg(test)]
+    pub(crate) fn is_polling(&self) -> bool {
+        self.polling.load(Ordering::Acquire)
     }
 
     /// Sends `pending` as a Telegram message with two inline buttons —
@@ -439,16 +515,20 @@ impl TelegramChannel {
     ///    it forever. Then calls [`handle_update`] for the callback
     ///    validation/resolution flow — see that function's own doc comment
     ///    for the exact rules.
-    /// 3. Checks [`Approvals::list`]: empty means no pending approval could
-    ///    possibly still need this poller, so the loop — and the thread —
-    ///    ends. Non-empty loops back to step 1.
+    /// 3. Decides whether to keep going — see [`poll_loop`]'s own doc
+    ///    comment for the exact exit/reclaim logic (Task 5 review, F1 and
+    ///    F3): no LIVE pending approval left means the loop, and the
+    ///    thread, end; anything live loops back to step 1.
     ///
     /// The thread's closure owns a small `Drop` guard around `polling`
     /// (constructed first thing, before the loop) that resets the flag to
     /// `false` unconditionally when the closure returns OR unwinds — so a
     /// panic mid-loop still frees a later `ensure_polling` call to spawn a
     /// replacement, rather than leaving `polling` wedged `true` forever with
-    /// no thread actually running to ever flip it back.
+    /// no thread actually running to ever flip it back. See [`poll_loop`]'s
+    /// own doc comment for how that guard is DISARMED on the one exit path
+    /// where storing `false` here would be wrong (handing off to a
+    /// freshly-spawned replacement thread that already owns `true`).
     pub fn ensure_polling(&self, approvals: Arc<Approvals>) {
         if self
             .polling
@@ -460,10 +540,11 @@ impl TelegramChannel {
 
         let api = Arc::clone(&self.api);
         let chat_id = self.chat_id;
+        let token_key = self.token_key.clone();
         let polling = Arc::clone(&self.polling);
         let spawned = std::thread::Builder::new()
             .name("tg-approval-poll".to_string())
-            .spawn(move || poll_loop(&api, chat_id, &approvals, polling));
+            .spawn(move || poll_loop(&api, chat_id, &token_key, &approvals, polling));
         if let Err(e) = spawned {
             // Couldn't even start the thread (extremely unlikely — OS
             // resource exhaustion). No `Drop` guard ever ran to reset the
@@ -480,32 +561,135 @@ impl TelegramChannel {
 /// The body of the [`TelegramChannel::ensure_polling`] thread — see that
 /// method's own doc comment for the full loop contract. A free function
 /// (not a `TelegramChannel` method) because it only needs `api`/`chat_id`/
-/// `approvals`, never `sent`, and taking exactly those parameters makes it
-/// directly unit-testable without a full `TelegramChannel` in scope.
-fn poll_loop(api: &BotApi, chat_id: i64, approvals: &Approvals, polling: Arc<AtomicBool>) {
+/// `token_key`/`approvals`, never `sent`, and taking exactly those
+/// parameters makes it directly unit-testable without a full
+/// `TelegramChannel` in scope.
+///
+/// ## The exit/reclaim race (Task 5 review, F1)
+///
+/// A naive "check [`Approvals::list`], then stop" exit has a lost-wakeup
+/// window: this thread could decide there is nothing live left, but
+/// before its `Drop` guard actually stores `polling = false`, a NEW
+/// approval could register and call [`TelegramChannel::ensure_polling`] —
+/// which finds `polling` still (momentarily) `true`, loses the
+/// `compare_exchange`, and returns WITHOUT spawning a replacement. This
+/// thread then finishes exiting and stores `false` anyway — and now
+/// NOTHING is polling for the new approval's button press, dead until
+/// some LATER, unrelated approval happens to nudge the poller again. This
+/// is not a rare edge case: it opens every time a burst of approvals
+/// settles down to the last one, ordinary use.
+///
+/// The fix below closes the window without a mutex around the whole
+/// decision: when a cycle finds nothing live, it stores `polling = false`
+/// ITSELF (rather than leaving that solely to the `Drop` guard at
+/// function return) and immediately re-checks.
+/// - Still nothing live: genuinely done. The `Drop` guard is disarmed (its
+///   job is already done — an extra `store(false)` on top would be
+///   harmless, but pointless) and the function returns.
+/// - Something showed up in that exact gap: try to reclaim ownership via
+///   this thread's OWN `compare_exchange(false, true, ..)`. Win (nobody
+///   else touched the flag yet) → loop again, serving the new work from
+///   the SAME thread. Lose (a concurrent `ensure_polling` call already
+///   reclaimed the flag and is spawning its own replacement) → disarm the
+///   `Drop` guard and return; the replacement thread now legitimately owns
+///   `polling = true`, and this thread must NOT flip it back to `false`
+///   out from under it.
+///
+/// Either way, no wakeup is lost, and `compare_exchange`'s own atomicity
+/// means at most one thread can ever WIN ownership of `polling = true` at
+/// a time — never two pollers running concurrently. A fully deterministic
+/// reproduction of the exact race window would need a test-only
+/// synchronization hook inside this loop (to pause it mid-decision on
+/// command); that was judged out of proportion to this fix and was not
+/// added — the Task 5 review-round report states this explicitly rather
+/// than leaving it implicit.
+fn poll_loop(
+    api: &BotApi,
+    chat_id: i64,
+    token_key: &str,
+    approvals: &Approvals,
+    polling: Arc<AtomicBool>,
+) {
     /// Resets `polling` to `false` on drop — panic-safe, see
     /// [`TelegramChannel::ensure_polling`]'s own doc comment for why this
     /// must be unconditional (unwind included) rather than a plain
-    /// end-of-loop store.
-    struct ReleaseOnDrop(Arc<AtomicBool>);
-    impl Drop for ReleaseOnDrop {
-        fn drop(&mut self) {
-            self.0.store(false, Ordering::Release);
+    /// end-of-loop store. `armed` starts `true` and is flipped `false`
+    /// (via [`Self::disarm`]) on exactly the one exit path where storing
+    /// `false` here would be wrong — see this function's own doc comment,
+    /// "The exit/reclaim race".
+    struct ReleaseOnDrop {
+        flag: Arc<AtomicBool>,
+        armed: bool,
+    }
+    impl ReleaseOnDrop {
+        fn disarm(&mut self) {
+            self.armed = false;
         }
     }
-    let _release = ReleaseOnDrop(polling);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            if self.armed {
+                self.flag.store(false, Ordering::Release);
+            }
+        }
+    }
+    let mut release = ReleaseOnDrop {
+        flag: Arc::clone(&polling),
+        armed: true,
+    };
 
-    let mut offset = read_offset();
+    let mut offset = read_offset(token_key);
     let mut error_streak: u32 = 0;
 
     loop {
+        let cycle_start = Instant::now();
+
         match api.get_updates(offset, POLL_TIMEOUT_SECS) {
             Ok(updates) => {
                 error_streak = 0;
+                // Batch-persist ONCE per `getUpdates` call (Task 5 review,
+                // F2), not once per update inside it: an unauthenticated
+                // stranger spamming this bot's DM in one burst would
+                // otherwise drive one disk write per message, unbounded by
+                // anything this loop controls. Safe regardless of where a
+                // crash lands relative to this write, because `Approvals`
+                // is entirely in-memory and per-process (see that type's
+                // own doc comment) — a crash-and-restart always starts
+                // EVERY approval fresh anyway, so replaying an
+                // already-handled update against a freshly-empty registry
+                // on restart is a harmless no-op (`Approvals::resolve`
+                // just returns `false`, answered as the ordinary "too
+                // late" case `handle_update` already handles). A crash
+                // between `persist_offset` and the next cycle would only
+                // ever mean "a few already-seen updates get re-fetched and
+                // re-handled on restart" — never "an approval gets
+                // resolved twice" or "an offset write races a decision
+                // that depends on it" — so batching the write is a pure
+                // efficiency win with no new crash-window hazard.
+                let new_offset = updates.last().map(|u| u.update_id + 1);
                 for update in updates {
-                    offset = Some(update.update_id + 1);
-                    persist_offset(update.update_id + 1);
                     handle_update(api, chat_id, approvals, update);
+                }
+                if let Some(o) = new_offset {
+                    persist_offset(token_key, o);
+                    offset = Some(o);
+                }
+
+                // Cycle floor (Task 5 review, F2): a cycle that came back
+                // in under a second didn't really long-poll — pace it so
+                // an instant-answering `getUpdates` can never turn this
+                // into a hot loop (this module's own test mock, before
+                // this fix, was exactly that kind of instant-answering
+                // peer, and reproduced the hazard for real: a poller
+                // spinning as fast as the loopback round trip allowed).
+                // Never fires on a genuine ~25s long poll (elapsed already
+                // exceeds the floor by then), so this can only ever ADD
+                // delay to a cycle that was already fast, never lengthen
+                // one that was already slow — the worst-case linger this
+                // module's own docs promise stays bounded at
+                // `POLL_TIMEOUT_SECS`.
+                if let Some(remaining) = MIN_CYCLE_INTERVAL.checked_sub(cycle_start.elapsed()) {
+                    std::thread::sleep(remaining);
                 }
             }
             Err(e) => {
@@ -517,10 +701,48 @@ fn poll_loop(api: &BotApi, chat_id: i64, approvals: &Approvals, polling: Arc<Ato
             }
         }
 
-        if approvals.list().is_empty() {
-            break;
+        if no_live_approvals(approvals) {
+            // See this function's own doc comment, "The exit/reclaim
+            // race": relinquish `polling` BEFORE the final recheck, not
+            // after, so a concurrent `ensure_polling` racing this exact
+            // moment can correctly tell whether it actually needs to spawn
+            // a replacement.
+            polling.store(false, Ordering::Release);
+            if no_live_approvals(approvals) {
+                release.disarm();
+                return;
+            }
+            if polling
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                // Someone else's `ensure_polling` call already reclaimed
+                // the flag and is spawning its own replacement — hand off.
+                // Our own `Drop` guard must not store `false` behind that
+                // thread's back.
+                release.disarm();
+                return;
+            }
+            // Reclaimed it ourselves — fall through and loop again.
         }
     }
+}
+
+/// `true` iff [`Approvals::list`] has no entry whose TTL hasn't already
+/// elapsed (Task 5 review, F3). Plain `Approvals::list().is_empty()` is
+/// NOT the right exit signal on its own: [`Approvals::register`] only
+/// prunes expired entries lazily, on the NEXT `register` call — an
+/// abandoned approval (the tool call that registered it was cancelled, so
+/// nothing ever calls [`Approvals::wait`] for it either, per that method's
+/// own doc comment on cancelled futures) sits in the registry, visible to
+/// `list()`, until some UNRELATED later `register` call happens to sweep
+/// it. Without this filter, [`poll_loop`]'s exit check could see that one
+/// stale, un-prunable entry forever and never exit — directly
+/// contradicting the module doc's "bounded... not a leak" claim for the
+/// poller thread itself.
+fn no_live_approvals(approvals: &Approvals) -> bool {
+    let now = now_epoch_secs();
+    approvals.list().iter().all(|p| p.expires <= now)
 }
 
 /// Handles one Telegram [`super::telegram_api::TgUpdate`] the poll loop
@@ -576,6 +798,25 @@ fn handle_update(api: &BotApi, chat_id: i64, approvals: &Approvals, update: TgUp
         return;
     }
 
+    // Task 5 review, F4: `from_id` (checked above) is the real, sufficient
+    // authorization boundary — a legitimate button press's OWN sender
+    // matching the configured `chat_id` (this channel is a private,
+    // one-human chat; see `TelegramChannel`'s own doc comment). This
+    // `debug_assert!` is not a second security check on top of that — it's
+    // a defensive internal-consistency check that forecloses a future
+    // regression where this channel's messages start getting fired to the
+    // wrong chat (a bug that would otherwise surface only as confused
+    // operators, not a loud failure). Deliberately tolerant of `None`:
+    // `TgCallback::chat_id` is `Option` because Telegram itself omits the
+    // originating message (and so its chat id) when that message has
+    // become too old or otherwise inaccessible — a legitimate, if stale,
+    // button press can carry `chat_id: None`, and asserting equality
+    // against it unconditionally would panic on that entirely normal case.
+    debug_assert!(
+        callback.chat_id.is_none_or(|c| c == chat_id),
+        "telegram callback's own chat_id disagreed with the configured chat_id"
+    );
+
     let Some((decision, id)) = parse_callback_data(&callback.data) else {
         tracing::warn!(
             approval_id = %short_id(&callback.data),
@@ -602,6 +843,13 @@ fn handle_update(api: &BotApi, chat_id: i64, approvals: &Approvals, update: TgUp
 /// id after the colon, or (with no callers in this crate, but theoretically
 /// reachable from a stale/foreign button press) a stray callback this bot
 /// never sent.
+///
+/// This is the security boundary between "arbitrary remote input Telegram
+/// handed us" and "an id we'll pass to [`super::approval::Approvals::resolve`]"
+/// — Task 5 review, F5 added `tests::parse_callback_data_table` as DIRECT
+/// coverage of every malformed shape this function has to reject, rather
+/// than relying only on the end-to-end poller tests to exercise it
+/// incidentally.
 fn parse_callback_data(data: &str) -> Option<(Decision, &str)> {
     if let Some(id) = data.strip_prefix("a:") {
         return (!id.is_empty()).then_some((Decision::Approve, id));
@@ -614,55 +862,89 @@ fn parse_callback_data(data: &str) -> Option<(Decision, &str)> {
 
 // ── getUpdates offset persistence ───────────────────────────────────────
 //
-// `~/.onebrain/gateway/telegram.offset` — a single decimal `i64`, nothing
-// else. Path derivation follows `gateway.yml`'s own convention exactly
-// ([`crate::home::home_dir`], never `dirs::` — see that module's own doc
-// comment for why: `dirs::home_dir()` ignores `%USERPROFILE%` on Windows,
-// which would let a sandboxed test process reach past its tempdir into the
-// real profile). Written 0600 / dir 0700, mirroring `audit.rs`'s own
-// file-permission discipline (see that module's doc comment) — duplicated
-// here rather than imported, per this crate's established "one private
-// copy per module" convention (this module's own docs already do the same
-// for its mock-server test fixture).
+// `~/.onebrain/gateway/telegram-<token_key>.offset` — a single decimal
+// `i64`, nothing else. Path derivation follows `gateway.yml`'s own
+// convention exactly ([`crate::home::home_dir`], never `dirs::` — see that
+// module's own doc comment for why: `dirs::home_dir()` ignores
+// `%USERPROFILE%` on Windows, which would let a sandboxed test process
+// reach past its tempdir into the real profile). Written 0600 / dir 0700,
+// mirroring `audit.rs`'s own file-permission discipline (see that module's
+// doc comment) — duplicated here rather than imported, per this crate's
+// established "one private copy per module" convention (this module's own
+// docs already do the same for its mock-server test fixture).
 
-/// `~/.onebrain/gateway/telegram.offset`. `Err` only if home resolution
-/// itself fails (an unset `$HOME`/`%USERPROFILE%` with no OS fallback) —
-/// callers treat that the same as "file absent".
-fn offset_file_path() -> Result<PathBuf> {
+/// A short (8-character), non-reversible digest of a Telegram bot token —
+/// the first 6 bytes of `SHA-256(token)`, base64url-encoded (reusing
+/// [`super::auth::core::base64url_nopad`] rather than hand-rolling a
+/// second encoder — zero new deps either way, since `sha2` is already a
+/// workspace dependency `auth/core.rs` itself uses for PKCE). Used ONLY to
+/// key [`offset_file_path`] by bot identity (Task 5 review, F9): without
+/// this, the SAME `~/.onebrain/gateway/` directory would persist an offset
+/// under a fixed filename regardless of WHICH bot token minted it. If an
+/// operator ever rotates `gateway.yml`'s `telegram.bot_token` (a new
+/// `@BotFather` token, or simply a different bot), `getUpdates`'s offset is
+/// a cursor scoped to the bot that issued it — replaying the OLD bot's
+/// high-water offset against the NEW bot's own update stream makes
+/// Telegram return nothing (any offset at or above its current cursor
+/// reads as "no updates"), silently killing the whole channel with no
+/// warning anywhere: `capabilities` still reports `telegram: true`, prompts
+/// still send, and every button press just... does nothing. Keying the
+/// filename by token sidesteps this: a rotated token gets its own fresh
+/// offset file (and therefore `None` → no offset → a normal cold start)
+/// instead of inheriting a stale one.
+///
+/// Deliberately NOT reversible to the original token — never embed the
+/// token itself, or anything an attacker could feasibly invert back to it,
+/// in a filename that could end up in a log line, a backup listing, or a
+/// support screenshot. 6 bytes of SHA-256 is far more collision resistance
+/// than this purely-cosmetic key needs (it only has to disambiguate the
+/// operator's own past tokens from each other, not resist a deliberate
+/// attacker) while staying short enough for a readable filename.
+fn token_key(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    base64url_nopad(&digest[..6])
+}
+
+/// `~/.onebrain/gateway/telegram-<token_key>.offset`. `Err` only if home
+/// resolution itself fails (an unset `$HOME`/`%USERPROFILE%` with no OS
+/// fallback) — callers treat that the same as "file absent".
+fn offset_file_path(token_key: &str) -> Result<PathBuf> {
     let home = crate::home::home_dir().context("resolve home directory for telegram offset")?;
     Ok(home
         .join(".onebrain")
         .join("gateway")
-        .join("telegram.offset"))
+        .join(format!("telegram-{token_key}.offset")))
 }
 
-/// Reads the persisted `getUpdates` offset. `None` covers every reason
-/// there might not be one to read: no prior run (file never written), the
-/// file was removed, its content doesn't parse as an `i64`, or home
+/// Reads the persisted `getUpdates` offset for the bot identified by
+/// `token_key` ([`token_key`]). `None` covers every reason there might not
+/// be one to read: no prior run under THIS bot token (file never written),
+/// the file was removed, its content doesn't parse as an `i64`, or home
 /// resolution itself failed — all of these mean the same thing to
 /// [`poll_loop`]'s caller: start `getUpdates` with no offset, exactly like
 /// a fresh bot.
-fn read_offset() -> Option<i64> {
-    let path = offset_file_path().ok()?;
+fn read_offset(token_key: &str) -> Option<i64> {
+    let path = offset_file_path(token_key).ok()?;
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// Persists `offset` to [`offset_file_path`]. Infallible from the caller's
-/// view, same shape as `audit::AuditLog::append` (see that method's own doc
-/// comment for the rationale): a write failure here must never stop the
-/// poll loop — the WORST case of a lost offset write is Telegram re-sending
-/// an already-seen update on the next `getUpdates` call, which
+/// Persists `offset` to [`offset_file_path`] for the bot identified by
+/// `token_key`. Infallible from the caller's view, same shape as
+/// `audit::AuditLog::append` (see that method's own doc comment for the
+/// rationale): a write failure here must never stop the poll loop — the
+/// WORST case of a lost offset write is Telegram re-sending an
+/// already-seen update on the next `getUpdates` call, which
 /// [`handle_update`] handles safely either way (a stale `resolve` call for
 /// an already-resolved id is just first-response-wins's normal `false`
 /// case).
-fn persist_offset(offset: i64) {
-    if let Err(e) = try_persist_offset(offset) {
+fn persist_offset(token_key: &str, offset: i64) {
+    if let Err(e) = try_persist_offset(token_key, offset) {
         tracing::warn!(error = %e, "telegram: failed to persist the getUpdates offset");
     }
 }
 
-fn try_persist_offset(offset: i64) -> Result<()> {
-    let path = offset_file_path()?;
+fn try_persist_offset(token_key: &str, offset: i64) -> Result<()> {
+    let path = offset_file_path(token_key)?;
     if let Some(dir) = path.parent() {
         ensure_private_dir(dir)?;
     }
@@ -718,16 +1000,26 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
     }
 }
 
-/// First 8 characters of an approval id — enough for an operator to
+/// First 8 CHARACTERS (not bytes) of a string — enough for an operator to
 /// correlate a log line with `GET /approvals`'s own listing (matching a
-/// prefix) without ever logging the WHOLE minted secret. Approval ids come
-/// from `mint_secret_32` (Base64url, ASCII-only, so a byte-index slice
-/// never lands mid-character) — the same value this crate's own CodeQL
-/// guard already documents as never safe to interpolate whole into a log
-/// line or assertion message (`auth/core.rs`'s `mint_secret_32` tests, Task
-/// 4 review F6).
-fn short_id(id: &str) -> &str {
-    id.get(..8).unwrap_or(id)
+/// prefix) without ever logging the whole thing. Originally written for
+/// approval ids alone (`mint_secret_32`'s Base64url, ASCII-only output, for
+/// which a byte-index slice never lands mid-character) but Task 5 review
+/// finding F8 caught that this module now ALSO feeds it `callback.data` —
+/// remote, Telegram-controlled input that carries no such guarantee. The
+/// original `id.get(..8)` byte-index slice fails closed on ASCII (safe) but
+/// fails OPEN on a non-ASCII string whose byte 8 lands mid-character: `.get`
+/// returns `None` for a non-boundary index, and the old `.unwrap_or(id)`
+/// fallback logged the ENTIRE string in that case — for attacker-controlled
+/// input, defeating the whole point of truncating at all. `.chars().take(8)`
+/// has no such failure mode: it always stops at 8 CHARACTERS regardless of
+/// how many bytes those characters occupy, so there is no boundary to land
+/// on badly and no fallback path that can silently widen to the whole
+/// string. Returns an owned `String` (not `&str`) since truncating by
+/// `char` can only be expressed as a fresh allocation, not a sub-slice of
+/// the original.
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
 }
 
 #[cfg(test)]
@@ -774,9 +1066,23 @@ mod tests {
             "a zero chat_id alone must not be available"
         );
 
+        // Task 5 review, F4: a NEGATIVE chat_id is a group/supergroup/
+        // channel id under Telegram's own convention, never a private
+        // chat — this channel's whole design needs a private chat (see
+        // `is_available`'s own doc comment), so this must be rejected the
+        // same as zero, not silently accepted as "configured."
+        let group_chat = TelegramConfig {
+            bot_token: "T".to_string(),
+            chat_id: -1_001_234_567_890,
+        };
+        assert!(
+            !is_available(&group_chat),
+            "a negative (group/channel) chat_id must not be available"
+        );
+
         assert!(
             is_available(&configured()),
-            "a non-empty bot_token, non-zero chat_id, and unset disable switch must be available"
+            "a non-empty bot_token, positive chat_id, and unset disable switch must be available"
         );
 
         drop(_env);
@@ -908,25 +1214,20 @@ mod tests {
         // implemented" error with no obvious cause) and, worse, an actual
         // held-lock-across-await hazard at runtime.
         let scripted = state.responses.lock().unwrap().get(&method).cloned();
+        // Task 5 review, F2 ride-along: this used to sleep 50ms before
+        // answering an UNSCRIPTED `getUpdates` call, standing in for real
+        // Telegram long-poll pacing (this mock never actually waits for a
+        // new update to exist, so nothing else paced it). That sleep is
+        // now REDUNDANT: production's own `poll_loop` paces every
+        // successful cycle to `MIN_CYCLE_INTERVAL` regardless of how fast
+        // the peer answers, so a mock that answers instantly can no longer
+        // turn a live poller into a hot loop — the production fix
+        // subsumes the workaround. Removed rather than kept "for realism"
+        // to avoid two independent knobs claiming to solve the same
+        // problem.
         let resp = match queued {
             Some(v) => v,
-            None => match scripted {
-                Some(v) => v,
-                None => {
-                    // No test scripted this call at all. For `getUpdates`
-                    // specifically, answering INSTANTLY would let a real
-                    // `ensure_polling` poller spin at unbounded speed for as
-                    // long as its approval stays unresolved — this mock
-                    // doesn't implement genuine Telegram-style long polling
-                    // (it never actually waits for a new update to exist),
-                    // so nothing else paces it. A short, deliberate delay
-                    // here stands in for that pacing.
-                    if method == "getUpdates" {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    serde_json::json!({ "ok": true, "result": null })
-                }
-            },
+            None => scripted.unwrap_or_else(|| serde_json::json!({ "ok": true, "result": null })),
         };
 
         state.in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -995,60 +1296,126 @@ mod tests {
         }
     }
 
-    /// Polls `state`'s recorded requests until at least `n` have arrived (up
-    /// to ~2s). Needed because `fire`/`note_outcome` hand their real work
-    /// off to `tokio::task::spawn_blocking` and return immediately — the
-    /// same "wait for the async background call to actually happen" shape
+    /// Bound every wait helper below against, in real elapsed time rather
+    /// than a fixed iteration count — Task 5 review, F2 gave `poll_loop` a
+    /// 1-second-per-cycle floor (`MIN_CYCLE_INTERVAL`), so a wait that
+    /// needs to observe a SECOND poll cycle (not just the first) can take
+    /// several real seconds even in the ordinary, non-flaky case. 20s is
+    /// generous enough to comfortably cover a handful of floored cycles
+    /// plus scheduling jitter on a loaded CI runner, while still failing a
+    /// genuinely broken test in well under a minute.
+    const WAIT_BOUND: Duration = Duration::from_secs(20);
+
+    /// Polls `state`'s recorded requests until at least `n` have arrived.
+    /// Needed because `fire`/`note_outcome` hand their real work off to
+    /// `tokio::task::spawn_blocking` and return immediately — the same
+    /// "wait for the async background call to actually happen" shape
     /// `server.rs`'s own `wait_for_one_pending` uses for the analogous
     /// reason.
     async fn wait_for_requests(state: &MockState, n: usize) -> Vec<(String, Value)> {
-        for _ in 0..200 {
+        let deadline = Instant::now() + WAIT_BOUND;
+        loop {
             let requests = state.requests();
             if requests.len() >= n {
                 return requests;
             }
+            assert!(
+                Instant::now() < deadline,
+                "fewer than {n} request(s) arrived within the poll window: {requests:?}"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("fewer than {n} request(s) arrived within the poll window");
     }
 
-    /// Waits (bounded, ~3s) for the FIRST recorded request whose method is
-    /// `method`, regardless of how many OTHER requests (e.g. background
-    /// `getUpdates` polling with nothing to report) landed before or after
-    /// it — Gateway PR 5, Task 5's poller tests script a specific method
-    /// they care about without needing to predict every OTHER call's exact
+    /// Waits for the FIRST recorded request whose method is `method`,
+    /// regardless of how many OTHER requests (e.g. background `getUpdates`
+    /// polling with nothing to report) landed before or after it —
+    /// Gateway PR 5, Task 5's poller tests script a specific method they
+    /// care about without needing to predict every OTHER call's exact
     /// position among the full request log.
     async fn wait_for_request_method(state: &MockState, method: &str) -> Value {
-        for _ in 0..300 {
+        let deadline = Instant::now() + WAIT_BOUND;
+        loop {
             if let Some((_, body)) = state.requests().into_iter().find(|(m, _)| m == method) {
                 return body;
             }
+            assert!(
+                Instant::now() < deadline,
+                "no {method} request arrived within the poll window: {:?}",
+                state.requests()
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!(
-            "no {method} request arrived within the poll window: {:?}",
-            state.requests()
-        );
     }
 
-    /// Waits (bounded, ~3s) for `channel`'s [`TelegramChannel::ensure_polling`]
-    /// thread to have actually exited — i.e. for `polling` to read `false`
-    /// again — rather than merely for the thread's last OBSERVABLE side
-    /// effect (an `answerCallbackQuery` call, say) to have landed. Reaches
-    /// the private field directly: `mod tests` is a child of this module,
-    /// so this is ordinary Rust visibility, not a reach around
-    /// encapsulation — and the whole point of
-    /// `the_poller_exits_when_no_approvals_remain` below is to prove the
-    /// flag genuinely resets (so a LATER `ensure_polling` call can really
-    /// respawn a thread), not just to infer it from indirect evidence.
+    /// Waits for `channel`'s [`TelegramChannel::ensure_polling`] thread to
+    /// have actually exited — i.e. for [`TelegramChannel::is_polling`] to
+    /// read `false` again — rather than merely for the thread's last
+    /// OBSERVABLE side effect (an `answerCallbackQuery` call, say) to have
+    /// landed.
+    ///
+    /// Polls the flag instead of `JoinHandle::join`ing the thread because
+    /// there IS no handle to join: `ensure_polling` deliberately drops it
+    /// (see that method's own doc comment — the thread is fire-and-forget
+    /// by design, matching `fire`/`note_outcome`'s own dropped
+    /// `spawn_blocking` handles). Polling `is_polling()` is still a
+    /// faithful stand-in for "the thread is completely done," not merely
+    /// "about to be": `polling`'s `false` store is the VERY LAST thing
+    /// `poll_loop`'s `Drop` guard (or, on the reclaim path, the loop body
+    /// itself) does before the thread function returns — nothing in this
+    /// module ever observes `false` and then has more work left to do
+    /// beyond an already-armed guard's own drop. Uses
+    /// `TelegramChannel::is_polling` — a `#[cfg(test)]`-only accessor,
+    /// since `polling` itself is a private field this module happens to
+    /// share visibility into (being `mod tests`, a child module) but
+    /// `server.rs`'s OWN tests (Task 5 review, F7) do not, hence the
+    /// accessor existing at all.
     async fn wait_for_polling_false(channel: &TelegramChannel) {
-        for _ in 0..300 {
-            if !channel.polling.load(Ordering::Acquire) {
+        let deadline = Instant::now() + WAIT_BOUND;
+        loop {
+            if !channel.is_polling() {
                 return;
             }
+            assert!(
+                Instant::now() < deadline,
+                "the telegram poller did not exit within the poll window"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("the telegram poller did not exit within the poll window");
+    }
+
+    /// Table test for [`parse_callback_data`] (Task 5 review, F5) — direct,
+    /// mock-free coverage of the exact security boundary between "raw
+    /// remote input" and "an id this module will pass to
+    /// `Approvals::resolve`": every malformed shape must be rejected, and
+    /// only the two well-formed shapes must parse, id-with-embedded-colon
+    /// included (nothing about this format forbids a `:` inside the id
+    /// itself — `strip_prefix` only ever looks at the FIRST one).
+    #[test]
+    fn parse_callback_data_table() {
+        assert_eq!(
+            parse_callback_data("a:appr-1"),
+            Some((Decision::Approve, "appr-1"))
+        );
+        assert_eq!(
+            parse_callback_data("d:appr-1"),
+            Some((Decision::Deny, "appr-1"))
+        );
+        assert_eq!(parse_callback_data("x:appr-1"), None, "unknown prefix");
+        assert_eq!(parse_callback_data("a:"), None, "empty id after the colon");
+        assert_eq!(parse_callback_data("a"), None, "no colon at all");
+        assert_eq!(parse_callback_data(""), None, "empty input");
+        assert_eq!(
+            parse_callback_data("a:has:embedded:colons"),
+            Some((Decision::Approve, "has:embedded:colons")),
+            "only the FIRST colon is a delimiter; the id may contain more"
+        );
+        let oversized = format!("a:{}", "x".repeat(10_000));
+        assert_eq!(
+            parse_callback_data(&oversized),
+            Some((Decision::Approve, &oversized[2..])),
+            "no length cap on this side — Telegram itself bounds callback_data"
+        );
     }
 
     /// A pending approval whose TTL is comfortably live — mirrors
@@ -1269,11 +1636,15 @@ mod tests {
 
         wait_for_polling_false(&channel).await;
 
+        // Task 5 review, F9: the offset file is keyed by a digest of the
+        // bot token (`token_key`, a private function this test module can
+        // call directly — same-module visibility), so the exact filename
+        // depends on `configured()`'s own `bot_token` ("T").
         let offset_path = home
             .path()
             .join(".onebrain")
             .join("gateway")
-            .join("telegram.offset");
+            .join(format!("telegram-{}.offset", token_key("T")));
         let content = std::fs::read_to_string(&offset_path).unwrap_or_else(|e| {
             panic!("offset file not written at {}: {e}", offset_path.display())
         });
@@ -1435,7 +1806,7 @@ mod tests {
         let channel = TelegramChannel::new(&configured());
         channel.ensure_polling(approvals.clone());
         assert!(
-            channel.polling.load(Ordering::Acquire),
+            channel.is_polling(),
             "polling must already read true synchronously, right after ensure_polling returns"
         );
 
@@ -1450,7 +1821,7 @@ mod tests {
         let rx2 = approvals.register(pending2.clone()).unwrap();
         channel.ensure_polling(approvals.clone());
         assert!(
-            channel.polling.load(Ordering::Acquire),
+            channel.is_polling(),
             "a fresh ensure_polling call after the first thread exited must respawn one"
         );
         assert!(approvals.resolve(&pending2.id, Decision::Deny, ResolvedVia::Http));
@@ -1468,9 +1839,7 @@ mod tests {
     async fn ensure_polling_never_double_spawns() {
         let state = MockState::default();
         // Widens the window a hypothetical double-spawn bug would need to
-        // land a second, genuinely concurrent `getUpdates` inside — and
-        // incidentally paces this test's own poll cycles to something
-        // sleeping past a couple of them can reliably observe.
+        // land a second, genuinely concurrent `getUpdates` inside.
         state.set_delay("getUpdates", Duration::from_millis(80));
         let server = MockServer::start(state.clone());
         // ONE combined `set_vars` call — `crate::test_env`'s `ENV_LOCK` is a
@@ -1499,7 +1868,11 @@ mod tests {
         channel.ensure_polling(approvals.clone());
 
         wait_for_requests(&state, 1).await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        // Long enough to span a few of `poll_loop`'s own `MIN_CYCLE_INTERVAL`
+        // (1s)-floored cycles, not just the first — the double-spawn
+        // hazard this test guards against would show up on ANY cycle, not
+        // only the first one.
+        tokio::time::sleep(Duration::from_millis(3_500)).await;
 
         assert_eq!(
             state.max_in_flight(),
@@ -1534,11 +1907,13 @@ mod tests {
             ("USERPROFILE", home.path().as_os_str()),
         ]);
 
+        // Task 5 review, F9: keyed by `token_key("T")` — `configured()`'s
+        // own `bot_token` — matching production's own derivation exactly.
         let offset_path = home
             .path()
             .join(".onebrain")
             .join("gateway")
-            .join("telegram.offset");
+            .join(format!("telegram-{}.offset", token_key("T")));
         std::fs::create_dir_all(offset_path.parent().unwrap()).unwrap();
         std::fs::write(&offset_path, "999").unwrap();
 
@@ -1556,6 +1931,80 @@ mod tests {
         );
 
         assert!(approvals.resolve(&pending.id, Decision::Approve, ResolvedVia::Http));
+        wait_for_polling_false(&channel).await;
+    }
+
+    /// Task 5 review, F3: an expired-but-not-yet-pruned entry must NOT keep
+    /// the poller alive forever. `Approvals::register` only prunes expired
+    /// entries lazily (on the NEXT `register` call, per that method's own
+    /// doc comment) — an abandoned approval (its own tool call cancelled,
+    /// so nothing ever calls `Approvals::wait` for it either) sits in the
+    /// registry, visible to `Approvals::list`, with no further `register`
+    /// call ever coming along to sweep it in this test. Before this fix,
+    /// `poll_loop`'s exit check (`list().is_empty()`) would have seen that
+    /// one stale entry forever and never exited.
+    #[tokio::test]
+    async fn an_expired_unpruned_entry_does_not_keep_the_poller_alive() {
+        let state = MockState::default();
+        let server = MockServer::start(state.clone());
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            (TELEGRAM_API_BASE_ENV, server.base.as_str().as_ref()),
+            ("HOME", home.path().as_os_str()),
+            ("USERPROFILE", home.path().as_os_str()),
+        ]);
+
+        let approvals = Arc::new(Approvals::new());
+
+        // A SHORT-lived entry (expires ~1s from now) rather than one
+        // constructed already-expired: `Approvals::register` prunes
+        // existing entries BEFORE inserting a new one, so an
+        // already-past-`expires` entry registered first would just get
+        // swept the moment the SECOND `register` call below runs —
+        // defeating this test's whole premise before the poller ever sees
+        // it. A short-but-still-live TTL at registration time survives
+        // that second `register` call (it hasn't expired YET), then
+        // genuinely expires a moment later with no THIRD `register` call
+        // ever coming along to prune it — a faithful stand-in for an
+        // abandoned approval whose own tool call was cancelled.
+        let now = now_epoch_secs();
+        let mut stale = sample_pending("appr-poll-stale");
+        stale.created = now;
+        stale.expires = now + 1;
+        let _stale_rx = approvals.register(stale).unwrap();
+
+        let live = sample_pending("appr-poll-live");
+        let live_rx = approvals.register(live.clone()).unwrap();
+
+        let channel = TelegramChannel::new(&configured());
+        channel.ensure_polling(approvals.clone());
+
+        assert!(approvals.resolve(&live.id, Decision::Approve, ResolvedVia::Http));
+        assert_eq!(
+            live_rx.await.unwrap(),
+            (Decision::Approve, ResolvedVia::Http)
+        );
+
+        // Precondition: the stale entry is still sitting in the registry
+        // right after resolving `live` — nothing else has called
+        // `register` to prune it (`Approvals::list` itself never prunes).
+        assert_eq!(
+            approvals.list().len(),
+            1,
+            "the not-yet-expired entry must still be sitting in the registry"
+        );
+
+        // Wait past the stale entry's own TTL WITHOUT ever calling
+        // `register` again, so nothing but this fix could ever notice it's
+        // gone. The poller's own first cycle or two will have already
+        // observed it as still-live (its `expires` genuinely hadn't
+        // passed yet) and looped instead of exiting — proving the fix
+        // isn't a fluke of the entry never being checked at all.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+        // Despite `list()` still reporting the stale entry, the poller
+        // must exit: `no_live_approvals` filters it out by its own past
+        // `expires`, not by `list()` being empty.
         wait_for_polling_false(&channel).await;
     }
 }

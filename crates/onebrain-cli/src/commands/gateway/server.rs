@@ -5132,32 +5132,29 @@ mod tests {
     ) -> axum::Json<serde_json::Value> {
         let method = params.get("method").cloned().unwrap_or_default();
         state.requests.lock().unwrap().push((method.clone(), body));
-        let scripted = state.responses.lock().unwrap().get(&method).cloned();
-        let resp = match scripted {
-            Some(v) => v,
-            None => {
-                // Gateway PR 5, Task 5: none of THIS file's tests script a
-                // `getUpdates` response — they only care about `sendMessage`/
-                // `editMessageText` — but `await_approval` now calls
-                // `TelegramChannel::ensure_polling` right after `fire`
-                // whenever `state.telegram` is `Some`, which every caller of
-                // `fixture_router_with_mutating_policy_and_telegram` is. An
-                // unscripted `getUpdates` answering INSTANTLY would let that
-                // real background poller spin at unbounded speed against
-                // this mock for as long as the fixture's pending approval
-                // stays unresolved — CPU-melting and, worse, capable of
-                // starving the very async tasks these tests are waiting on.
-                // A short, deliberate delay here is the test-harness-side
-                // half of a real Telegram long poll (`timeout` is honored by
-                // the REAL API; this mock ignores it entirely) — cheap
-                // enough not to slow any test down meaningfully, but enough
-                // to keep an un-scripted poller's request rate sane.
-                if method == "getUpdates" {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                serde_json::json!({ "ok": true, "result": null })
-            }
-        };
+        // Gateway PR 5, Task 5: none of THIS file's tests script a
+        // `getUpdates` response — they only care about `sendMessage`/
+        // `editMessageText` — but `await_approval` now calls
+        // `TelegramChannel::ensure_polling` right after `fire` whenever
+        // `state.telegram` is `Some`, which every caller of
+        // `fixture_router_with_mutating_policy_and_telegram` is. Task 5
+        // review, F2 ride-along: this used to sleep 50ms before answering
+        // an unscripted `getUpdates` call specifically to keep that real
+        // background poller's request rate sane (this mock never
+        // implements genuine long-poll pacing on its own). That sleep is
+        // now REDUNDANT: production's own `poll_loop` paces every
+        // successful cycle to `telegram::MIN_CYCLE_INTERVAL` regardless of
+        // how fast the peer answers, so a mock that answers instantly can
+        // no longer turn a live poller into a hot loop — removed rather
+        // than kept "for realism," to avoid two independent knobs claiming
+        // to solve the same problem.
+        let resp = state
+            .responses
+            .lock()
+            .unwrap()
+            .get(&method)
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({ "ok": true, "result": null }));
         axum::Json(resp)
     }
 
@@ -5254,7 +5251,12 @@ mod tests {
         state: &TelegramMockState,
         method: &str,
     ) -> serde_json::Value {
-        for _ in 0..200 {
+        // Widened from ~2s (Task 5 review, F2): `TelegramChannel::ensure_polling`'s
+        // `poll_loop` now paces every successful cycle to at least
+        // `telegram::MIN_CYCLE_INTERVAL` (1s), so a request that only shows
+        // up on a SECOND poll cycle can take a couple of real seconds to
+        // arrive even in the ordinary, non-flaky case.
+        for _ in 0..2000 {
             if let Some((_, body)) = state.requests().into_iter().find(|(m, _)| m == method) {
                 return body;
             }
@@ -5264,6 +5266,38 @@ mod tests {
             "no {method} telegram request arrived within the poll window: {:?}",
             state.requests()
         );
+    }
+
+    /// Waits for the Telegram poller `state.telegram` (if any) started to
+    /// have actually exited (Task 5 review, F7) — the same
+    /// `TelegramChannel::is_polling` flag `telegram.rs`'s own
+    /// `wait_for_polling_false` polls, reached here via a `pub(crate)`
+    /// accessor since `TelegramChannel::polling` itself is private to a
+    /// DIFFERENT module (`server.rs`'s `mod tests` is not a descendant of
+    /// `telegram.rs`'s module tree, so ordinary Rust visibility does not
+    /// already grant access the way it does within `telegram.rs`'s own
+    /// tests). Before this fix, none of the three Telegram outcome tests
+    /// below waited this out at all: their detached poller thread kept
+    /// running for up to ~2s past the test function's own return, with the
+    /// REAL `$HOME` restored (the `test_env` guard drops when the test
+    /// function returns) — harmless only by luck (the mock server is also
+    /// gone by then, so the thread's `getUpdates` calls just fail and
+    /// eventually give up), not by design.
+    async fn wait_for_telegram_poller_to_exit(state: &Arc<GatewayState>) {
+        let Some(channel) = state.telegram.as_ref() else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if !channel.is_polling() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the telegram poller did not exit within the poll window"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Shared setup for the three Telegram outcome-wording tests below:
@@ -5297,9 +5331,33 @@ mod tests {
     /// Callers must fold `HOME`/`USERPROFILE` into their OWN single
     /// `crate::test_env::set_vars` call instead, alongside
     /// `TELEGRAM_API_BASE_ENV` — see the call sites below.
+    ///
+    /// `home` (Task 5 review, ride-along b) is a REQUIRED parameter, not
+    /// merely something the doc comment above asks callers to remember: a
+    /// caller who forgets to redirect `$HOME`/`%USERPROFILE%` before
+    /// calling this fixture would otherwise find out only if a real
+    /// poller happened to touch the filesystem in some observable way —
+    /// this makes the mistake a loud, immediate assertion failure instead.
+    /// This function still doesn't SET the env itself (would deadlock, see
+    /// above) — it VERIFIES the caller already did, using the exact same
+    /// resolution [`crate::home::home_dir`] itself performs, so this check
+    /// can never drift from what the poller would actually resolve.
     fn fixture_router_with_mutating_policy_and_telegram(
         approval_wait_seconds: u64,
+        home: &Path,
     ) -> (tempfile::TempDir, axum::Router, Arc<GatewayState>, String) {
+        assert_eq!(
+            crate::home::home_dir()
+                .expect("HOME/USERPROFILE must already be redirected before calling this fixture")
+                .canonicalize()
+                .expect("the redirected home must exist"),
+            home.canonicalize()
+                .expect("the `home` tempdir passed to this fixture must exist"),
+            "caller must redirect $HOME/%USERPROFILE% to `home` — via ONE combined \
+             `crate::test_env::set_vars` call, alongside TELEGRAM_API_BASE_ENV — before \
+             calling this fixture, or a live poller it can trigger would touch the real home"
+        );
+
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("onebrain.yml"), "folders: {}\n").unwrap();
@@ -5365,7 +5423,8 @@ mod tests {
             ("USERPROFILE", home.path().as_os_str()),
         ]);
 
-        let (_dir, router, state, token) = fixture_router_with_mutating_policy_and_telegram(300);
+        let (_dir, router, state, token) =
+            fixture_router_with_mutating_policy_and_telegram(300, home.path());
 
         let call_router = router.clone();
         let call_token = token.clone();
@@ -5407,6 +5466,11 @@ mod tests {
                 .contains("✅ Approved via http"),
             "the edit must name the channel that actually answered: {body}"
         );
+
+        // Task 5 review, F7: wait out the real poller `await_approval`'s
+        // Telegram nudge started, rather than leaving its thread running
+        // past this test function's own return.
+        wait_for_telegram_poller_to_exit(&state).await;
     }
 
     /// Task 4 review, F4: pins the SECOND of the three exact outcome
@@ -5431,7 +5495,8 @@ mod tests {
             ("USERPROFILE", home.path().as_os_str()),
         ]);
 
-        let (_dir, router, state, token) = fixture_router_with_mutating_policy_and_telegram(300);
+        let (_dir, router, state, token) =
+            fixture_router_with_mutating_policy_and_telegram(300, home.path());
 
         let call_router = router.clone();
         let call_token = token.clone();
@@ -5471,6 +5536,10 @@ mod tests {
                 .contains("⛔ Denied via http"),
             "{body}"
         );
+
+        // Task 5 review, F7: wait out the real poller, same as the
+        // `Approve` test above.
+        wait_for_telegram_poller_to_exit(&state).await;
     }
 
     /// Task 4 review, F4: pins the THIRD exact outcome string — the
@@ -5498,7 +5567,8 @@ mod tests {
             ("USERPROFILE", home.path().as_os_str()),
         ]);
 
-        let (_dir, router, _state, token) = fixture_router_with_mutating_policy_and_telegram(1);
+        let (_dir, router, state, token) =
+            fixture_router_with_mutating_policy_and_telegram(1, home.path());
 
         let body = call_body(
             1,
@@ -5526,5 +5596,10 @@ mod tests {
                 .contains("⏰ Expired — no one answered in time"),
             "{body}"
         );
+
+        // Task 5 review, F7: wait out the real poller — this test's
+        // `approval_wait_seconds: 1` means it started one too, right after
+        // `fire`, exactly like the other two tests above.
+        wait_for_telegram_poller_to_exit(&state).await;
     }
 }
