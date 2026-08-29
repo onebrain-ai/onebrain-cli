@@ -1226,8 +1226,20 @@ async fn await_approval(
     // fixture configures `telegram` unless it explicitly means to, and
     // `TelegramChannel::fire` itself never blocks or panics regardless, so
     // there is no real-GUI-dialog-style hazard to guard against here).
+    //
+    // Gateway PR 5, Task 5: `ensure_polling` right after `fire` is the nudge
+    // that gives the receive side (the `getUpdates` long-poll thread that
+    // watches for this prompt's button press) its first production caller —
+    // see `TelegramChannel::ensure_polling`'s own doc comment for the full
+    // one-thread-per-process lifecycle. Cheap and idempotent to call on
+    // every `NeedApproval` reaching this point: the first caller (per
+    // process) actually spawns the thread, every later one is a
+    // `compare_exchange` no-op, so there is no cost to calling it
+    // unconditionally alongside `fire` rather than trying to track whether a
+    // poller is already known to be up.
     if let Some(t) = &state.telegram {
         t.fire(&pending);
+        t.ensure_polling(state.approvals.clone());
     }
 
     match state
@@ -5120,13 +5132,32 @@ mod tests {
     ) -> axum::Json<serde_json::Value> {
         let method = params.get("method").cloned().unwrap_or_default();
         state.requests.lock().unwrap().push((method.clone(), body));
-        let resp = state
-            .responses
-            .lock()
-            .unwrap()
-            .get(&method)
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({ "ok": true, "result": null }));
+        let scripted = state.responses.lock().unwrap().get(&method).cloned();
+        let resp = match scripted {
+            Some(v) => v,
+            None => {
+                // Gateway PR 5, Task 5: none of THIS file's tests script a
+                // `getUpdates` response — they only care about `sendMessage`/
+                // `editMessageText` — but `await_approval` now calls
+                // `TelegramChannel::ensure_polling` right after `fire`
+                // whenever `state.telegram` is `Some`, which every caller of
+                // `fixture_router_with_mutating_policy_and_telegram` is. An
+                // unscripted `getUpdates` answering INSTANTLY would let that
+                // real background poller spin at unbounded speed against
+                // this mock for as long as the fixture's pending approval
+                // stays unresolved — CPU-melting and, worse, capable of
+                // starving the very async tasks these tests are waiting on.
+                // A short, deliberate delay here is the test-harness-side
+                // half of a real Telegram long poll (`timeout` is honored by
+                // the REAL API; this mock ignores it entirely) — cheap
+                // enough not to slow any test down meaningfully, but enough
+                // to keep an un-scripted poller's request rate sane.
+                if method == "getUpdates" {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                serde_json::json!({ "ok": true, "result": null })
+            }
+        };
         axum::Json(resp)
     }
 
@@ -5209,6 +5240,32 @@ mod tests {
         panic!("fewer than {n} telegram request(s) arrived within the poll window");
     }
 
+    /// Waits for the FIRST recorded request whose method is `method`,
+    /// regardless of its position among every other request `tg_state` has
+    /// seen. Gateway PR 5, Task 5: once `await_approval` nudges
+    /// `TelegramChannel::ensure_polling` right after `fire`, a live
+    /// Telegram-configured fixture's mock server also receives background
+    /// `getUpdates` traffic interleaved with `sendMessage`/
+    /// `editMessageText` — so a fixed positional index (`requests[1]`) can
+    /// no longer be trusted to mean "the second request KIND this test
+    /// cares about". Bounded the same way every other poll helper in this
+    /// file is.
+    async fn wait_for_telegram_request_method(
+        state: &TelegramMockState,
+        method: &str,
+    ) -> serde_json::Value {
+        for _ in 0..200 {
+            if let Some((_, body)) = state.requests().into_iter().find(|(m, _)| m == method) {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "no {method} telegram request arrived within the poll window: {:?}",
+            state.requests()
+        );
+    }
+
     /// Shared setup for the three Telegram outcome-wording tests below:
     /// mirrors [`fixture_router_with_mutating_policy`]'s shape
     /// (`policy.mutating: ask_once`, so `brain_capture` reaches
@@ -5218,6 +5275,28 @@ mod tests {
     /// `crate::commands::gateway::telegram::TELEGRAM_API_BASE_ENV` at it
     /// BEFORE calling this — `TelegramChannel::new` resolves the API base
     /// at construction time, inside this function.
+    ///
+    /// Gateway PR 5, Task 5: `await_approval` now calls
+    /// `TelegramChannel::ensure_polling` right after `fire` whenever
+    /// `state.telegram` is `Some` — which every caller of this fixture's
+    /// `state` is. That poller persists the `getUpdates` offset under
+    /// `$HOME`/`%USERPROFILE%` (`telegram::persist_offset` →
+    /// `crate::home::home_dir`, never `dirs::`), so a real approval flow
+    /// driven through this fixture needs BOTH pointed at a tempdir — or it
+    /// would spawn a background thread touching the developer's or CI
+    /// runner's ACTUAL `~/.onebrain/gateway/telegram.offset`. This fixture
+    /// deliberately does NOT set that env itself, though: `crate::test_env`'s
+    /// `ENV_LOCK` is a plain, NON-reentrant `std::sync::Mutex`, and every
+    /// caller below already holds it (via their own
+    /// `crate::test_env::set_var(TELEGRAM_API_BASE_ENV, ..)` call, made
+    /// before calling this fixture) — a second, nested
+    /// `crate::test_env::set_vars` call from inside this function, on the
+    /// SAME thread, would try to re-acquire that same lock and deadlock
+    /// immediately (verified the hard way: an earlier revision of this
+    /// fixture did exactly that, and every test using it hung forever).
+    /// Callers must fold `HOME`/`USERPROFILE` into their OWN single
+    /// `crate::test_env::set_vars` call instead, alongside
+    /// `TELEGRAM_API_BASE_ENV` — see the call sites below.
     fn fixture_router_with_mutating_policy_and_telegram(
         approval_wait_seconds: u64,
     ) -> (tempfile::TempDir, axum::Router, Arc<GatewayState>, String) {
@@ -5273,10 +5352,18 @@ mod tests {
             serde_json::json!({ "ok": true, "result": { "message_id": 99 } }),
         );
         let tg_server = TelegramMockServer::start(tg_state.clone());
-        let _env = crate::test_env::set_var(
-            crate::commands::gateway::telegram::TELEGRAM_API_BASE_ENV,
-            tg_server.base.as_str(),
-        );
+        // ONE combined `set_vars` call — see `fixture_router_with_mutating_policy_and_telegram`'s
+        // own doc comment for why a SECOND, nested call (e.g. inside that
+        // fixture) would deadlock on `test_env`'s non-reentrant lock.
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            (
+                crate::commands::gateway::telegram::TELEGRAM_API_BASE_ENV,
+                tg_server.base.as_str().as_ref(),
+            ),
+            ("HOME", home.path().as_os_str()),
+            ("USERPROFILE", home.path().as_os_str()),
+        ]);
 
         let (_dir, router, state, token) = fixture_router_with_mutating_policy_and_telegram(300);
 
@@ -5311,15 +5398,13 @@ mod tests {
         let resp = handle.await.unwrap();
         assert!(resp.get("error").is_none(), "{resp}");
 
-        let requests = wait_for_telegram_requests(&tg_state, 2).await;
-        let (method, body) = &requests[1];
-        assert_eq!(method, "editMessageText");
+        let body = wait_for_telegram_request_method(&tg_state, "editMessageText").await;
         assert_eq!(body["message_id"], 99, "{body}");
         assert!(
             body["text"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("Approved via http"),
+                .contains("✅ Approved via http"),
             "the edit must name the channel that actually answered: {body}"
         );
     }
@@ -5336,10 +5421,15 @@ mod tests {
             serde_json::json!({ "ok": true, "result": { "message_id": 100 } }),
         );
         let tg_server = TelegramMockServer::start(tg_state.clone());
-        let _env = crate::test_env::set_var(
-            crate::commands::gateway::telegram::TELEGRAM_API_BASE_ENV,
-            tg_server.base.as_str(),
-        );
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            (
+                crate::commands::gateway::telegram::TELEGRAM_API_BASE_ENV,
+                tg_server.base.as_str().as_ref(),
+            ),
+            ("HOME", home.path().as_os_str()),
+            ("USERPROFILE", home.path().as_os_str()),
+        ]);
 
         let (_dir, router, state, token) = fixture_router_with_mutating_policy_and_telegram(300);
 
@@ -5372,15 +5462,13 @@ mod tests {
         let resp = handle.await.unwrap();
         assert!(resp.get("error").is_some(), "{resp}");
 
-        let requests = wait_for_telegram_requests(&tg_state, 2).await;
-        let (method, body) = &requests[1];
-        assert_eq!(method, "editMessageText");
+        let body = wait_for_telegram_request_method(&tg_state, "editMessageText").await;
         assert_eq!(body["message_id"], 100, "{body}");
         assert!(
             body["text"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("Denied via http"),
+                .contains("⛔ Denied via http"),
             "{body}"
         );
     }
@@ -5400,10 +5488,15 @@ mod tests {
             serde_json::json!({ "ok": true, "result": { "message_id": 101 } }),
         );
         let tg_server = TelegramMockServer::start(tg_state.clone());
-        let _env = crate::test_env::set_var(
-            crate::commands::gateway::telegram::TELEGRAM_API_BASE_ENV,
-            tg_server.base.as_str(),
-        );
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            (
+                crate::commands::gateway::telegram::TELEGRAM_API_BASE_ENV,
+                tg_server.base.as_str().as_ref(),
+            ),
+            ("HOME", home.path().as_os_str()),
+            ("USERPROFILE", home.path().as_os_str()),
+        ]);
 
         let (_dir, router, _state, token) = fixture_router_with_mutating_policy_and_telegram(1);
 
@@ -5424,9 +5517,7 @@ mod tests {
             .unwrap_or_else(|| panic!("expected a JSON-RPC error: {resp}"));
         assert!(message.contains("timed out"), "{message}");
 
-        let requests = wait_for_telegram_requests(&tg_state, 2).await;
-        let (method, body) = &requests[1];
-        assert_eq!(method, "editMessageText");
+        let body = wait_for_telegram_request_method(&tg_state, "editMessageText").await;
         assert_eq!(body["message_id"], 101, "{body}");
         assert!(
             body["text"]

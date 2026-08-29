@@ -180,18 +180,23 @@ pub enum Decision {
 /// wired first. [`Self::as_str`] gives the exact lowercase wire value
 /// `audit::AuditEntry::channel` records.
 ///
-/// `Telegram` has no production caller yet — Gateway PR 5, Task 5 is what
-/// finally calls `Approvals::resolve` from the Telegram long-poll handler,
-/// the same "later task" shape `telegram.rs::api_base`'s own doc comment
-/// already uses for its own not-yet-wired piece of this same PR.
+/// Gateway PR 5, Task 5 gave `Telegram` its own production caller:
+/// [`super::telegram::TelegramChannel::ensure_polling`]'s long-poll handler
+/// calls [`Approvals::resolve`] with `via: ResolvedVia::Telegram` once a
+/// human taps an inline Approve/Deny button and the callback passes its
+/// `from_id` check — see that method's own doc comment for the full
+/// validation flow. The per-variant `#[allow(dead_code)]` this variant used
+/// to carry (the same "later task" shape `telegram.rs::api_base`'s own doc
+/// comment still uses for a different not-yet-wired piece of this PR) is
+/// gone now that a real caller exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedVia {
     /// The operator `/approvals` HTTP surface (`approval_routes::resolve_approval`).
     Http,
     /// The native macOS `display dialog` channel (`approval_native::prompt`).
     Native,
-    /// The Telegram approval channel — no caller until Gateway PR 5, Task 5.
-    #[allow(dead_code)] // Task 5 wires the Telegram long-poll resolve call site.
+    /// The Telegram approval channel (`telegram::TelegramChannel::ensure_polling`,
+    /// Gateway PR 5, Task 5).
     Telegram,
 }
 
