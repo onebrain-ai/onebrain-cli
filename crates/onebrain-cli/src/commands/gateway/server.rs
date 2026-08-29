@@ -48,7 +48,9 @@ use onebrain_core::{
 use onebrain_fs::task::{visit_tasks, TaskHit, TaskScanOptions};
 
 use crate::commands::daemon_client;
-use crate::commands::gateway::approval::{self, Approvals, PendingApproval, WaitOutcome};
+use crate::commands::gateway::approval::{
+    self, Approvals, PendingApproval, ResolvedVia, WaitOutcome,
+};
 use crate::commands::gateway::approval_native;
 use crate::commands::gateway::approval_routes::approval_router;
 use crate::commands::gateway::audit::{AuditEntry, AuditLog, Decision, Outcome};
@@ -949,6 +951,9 @@ async fn extract_principal_audited(
                     args_summary: format!("{tool}: (no Principal in request extensions)"),
                 },
                 Decision::Denied,
+                // No approval flow was ever reached here — there is no
+                // channel to name.
+                None,
                 started,
                 Outcome::Error,
             )
@@ -959,16 +964,26 @@ async fn extract_principal_audited(
 }
 
 /// Runs the policy check ([`policy::decide`]) for one tool call of risk
-/// class `class`. `Ok(Decision::Auto)` or `Ok(Decision::Approved)` means the
-/// call may proceed; `Err` carries BOTH the [`Decision`] to record in the
-/// audit log and the client-facing [`ErrorData`] to return, for the three
-/// ways a call may not proceed:
+/// class `class`. `Ok((Decision::Auto | Decision::Approved, channel))` means
+/// the call may proceed; `Err((Decision, channel, ErrorData))` carries the
+/// [`Decision`] to record in the audit log, the SAME `channel`, and the
+/// client-facing [`ErrorData`] to return, for the three ways a call may not
+/// proceed:
 ///
 /// - `PolicyOutcome::Deny` (policy `deny`, or a scope/pack mismatch) →
 ///   `Decision::Denied`, immediately, no waiting.
 /// - `PolicyOutcome::NeedApproval` → delegates to [`await_approval`], which
 ///   registers a [`PendingApproval`] and blocks on a human decision (or a
 ///   timeout) — see that function's own doc comment for the full flow.
+///
+/// `channel` (`Option<`[`ResolvedVia`]`>`) names WHICH approval channel
+/// answered — `Some` iff a human actually did, `None` otherwise. It
+/// originates in exactly one place: [`WaitOutcome::Decided`]'s second field,
+/// read inside [`await_approval`]'s own match on [`Approvals::wait`]. Every
+/// other arm — `Allow` and `Deny` here, plus `await_approval`'s own
+/// `TimedOut` and registry-full arms — produces `None` directly, because
+/// none of those ever reach a channel to name. This function never
+/// constructs a `Some` itself; it only ever forwards `await_approval`'s.
 ///
 /// Every read-only tool (`capabilities`/`brain_tasks`/`brain_get`/
 /// `brain_search`) is `RiskClass::ReadOnly`, which defaults to
@@ -998,11 +1013,14 @@ async fn policy_gate(
     class: RiskClass,
     vault: Option<&str>,
     args_summary: &str,
-) -> Result<Decision, (Decision, ErrorData)> {
+) -> Result<(Decision, Option<ResolvedVia>), (Decision, Option<ResolvedVia>, ErrorData)> {
     match policy::decide(&state.config.policy, &state.grants, principal, class, vault) {
-        PolicyOutcome::Allow => Ok(Decision::Auto),
+        // Neither `Allow` nor `Deny` ever reaches an approval channel — no
+        // human answered, so there is no channel to record.
+        PolicyOutcome::Allow => Ok((Decision::Auto, None)),
         PolicyOutcome::Deny => Err((
             Decision::Denied,
+            None,
             ErrorData::invalid_request(format!("gateway policy denies this call [{tool}]"), None),
         )),
         PolicyOutcome::NeedApproval => {
@@ -1064,10 +1082,17 @@ async fn policy_gate(
 ///    channel produced the decision, is the only way both channels reliably
 ///    honor "ask once". A second write to the same `(client, class)` key
 ///    from the HTTP channel (when that IS how it was resolved) is
-///    idempotent — `Grants::record` replaces, never accumulates.
-/// 5. On `Decision::Deny` or a timeout: no grant, no side effect beyond the
-///    audit trail `policy_gate`'s caller records — a denied or timed-out
-///    call never reaches the tool's own logic.
+///    idempotent — `Grants::record` replaces, never accumulates. Gateway PR
+///    5, Task 3: this is also where `Ok`'s `channel` is born — the SAME
+///    `ResolvedVia` [`WaitOutcome::Decided`] carried, reported back to
+///    `policy_gate`'s caller for `record_audit`.
+/// 5. On `Decision::Deny`: no grant, no side effect beyond the audit trail
+///    `policy_gate`'s caller records — a denied call never reaches the
+///    tool's own logic. Which channel delivered the denial is still
+///    reported (`Err`'s `channel`, the same `ResolvedVia` as step 4's) — a
+///    human answered either way. On a timeout: same "no side effect", but
+///    `channel` is `None` — nothing answered, so there is no channel to
+///    name.
 async fn await_approval(
     state: &Arc<GatewayState>,
     principal: &Principal,
@@ -1075,7 +1100,7 @@ async fn await_approval(
     class: RiskClass,
     vault: Option<&str>,
     args_summary: &str,
-) -> Result<Decision, (Decision, ErrorData)> {
+) -> Result<(Decision, Option<ResolvedVia>), (Decision, Option<ResolvedVia>, ErrorData)> {
     let wait_secs = state.config.policy.approval_wait_seconds;
     let now = now_epoch_secs();
     let pending = PendingApproval {
@@ -1108,6 +1133,8 @@ async fn await_approval(
             );
             return Err((
                 Decision::Denied,
+                // Refused before any channel could ever be reached.
+                None,
                 ErrorData::invalid_request(
                     format!("too many approval requests are already pending [{tool}]"),
                     None,
@@ -1154,7 +1181,7 @@ async fn await_approval(
         .wait(&id, rx, Duration::from_secs(wait_secs))
         .await
     {
-        WaitOutcome::Decided(approval::Decision::Approve) => {
+        WaitOutcome::Decided(approval::Decision::Approve, via) => {
             // "Always ask" never leaves standing consent behind — see this
             // function's doc comment, step 4, and the identical guard in
             // `approval_routes::resolve_approval`.
@@ -1169,10 +1196,11 @@ async fn await_approval(
                     ttl_secs,
                 );
             }
-            Ok(Decision::Approved)
+            Ok((Decision::Approved, Some(via)))
         }
-        WaitOutcome::Decided(approval::Decision::Deny) => Err((
+        WaitOutcome::Decided(approval::Decision::Deny, via) => Err((
             Decision::Denied,
+            Some(via),
             ErrorData::invalid_request(
                 format!("this call was denied by the gateway operator [{tool}]"),
                 None,
@@ -1180,6 +1208,8 @@ async fn await_approval(
         )),
         WaitOutcome::TimedOut => Err((
             Decision::TimedOut,
+            // Nothing answered, so there is no channel to name.
+            None,
             ErrorData::invalid_request(
                 format!("approval request timed out with no response [{tool}]"),
                 None,
@@ -1264,6 +1294,14 @@ struct CallMeta {
 /// site instead of this function needing a type parameter just to call
 /// `.is_ok()`.
 ///
+/// `channel` is [`super::approval::ResolvedVia::as_str`]'s output, or
+/// `None` — the caller's own `policy_gate`/`await_approval` match already
+/// knows which case it's in (`Auto`/policy `Deny`/`TimedOut` never reached a
+/// channel; `Approved`/a human `Deny` always did), so this function just
+/// records whatever it's handed rather than re-deriving it (Gateway PR 5,
+/// Task 3 — this hardcoded `channel: None` before every call site named a
+/// channel explicitly).
+///
 /// Off-loads the actual blocking file write to
 /// [`tokio::task::spawn_blocking`] (Task 3 review, binding requirement C —
 /// `AuditLog::append` does synchronous filesystem I/O, and every other
@@ -1287,6 +1325,7 @@ async fn record_audit(
     client_id: &str,
     meta: CallMeta,
     decision: Decision,
+    channel: Option<&'static str>,
     started: Instant,
     outcome: Outcome,
 ) {
@@ -1301,7 +1340,13 @@ async fn record_audit(
         // [`bounded_summary`].
         args_summary: bounded_summary(meta.args_summary),
         decision,
-        channel: None,
+        // `Some` only when a human actually answered through a channel
+        // (`ResolvedVia::as_str`, via `await_approval`'s `WaitOutcome::
+        // Decided` arm) — `None` for `Auto` (no gate reached), a policy
+        // `Deny` (no gate reached either), and `TimedOut` (nothing
+        // answered). Gateway PR 5, Task 3 — every caller below now decides
+        // this explicitly instead of this function hardcoding `None`.
+        channel: channel.map(str::to_string),
         duration_ms,
         outcome,
     };
@@ -1336,7 +1381,7 @@ impl GatewayServer {
         let principal =
             extract_principal_audited(&self.state, "capabilities", started, &parts).await?;
         let args_summary = "capabilities: (no arguments)".to_string();
-        let (decision, result) = match policy_gate(
+        let (decision, channel, result) = match policy_gate(
             &self.state,
             &principal,
             "capabilities",
@@ -1346,7 +1391,7 @@ impl GatewayServer {
         )
         .await
         {
-            Ok(decision) => {
+            Ok((decision, channel)) => {
                 let config = &self.state.config;
                 let out = CapabilitiesOut {
                     gateway_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1356,9 +1401,9 @@ impl GatewayServer {
                     default_vault: default_vault_display(config),
                     approval_channels: approval_channels(config),
                 };
-                (decision, Ok(Json(out)))
+                (decision, channel, Ok(Json(out)))
             }
-            Err((decision, err)) => (decision, Err(err)),
+            Err((decision, channel, err)) => (decision, channel, Err(err)),
         };
         record_audit(
             &self.state,
@@ -1369,6 +1414,7 @@ impl GatewayServer {
                 args_summary,
             },
             decision,
+            channel.map(ResolvedVia::as_str),
             started,
             if result.is_ok() {
                 Outcome::Ok
@@ -1399,7 +1445,7 @@ impl GatewayServer {
             params.due_by, params.limit, params.vault
         );
 
-        let (decision, result) = match policy_gate(
+        let (decision, channel, result) = match policy_gate(
             &self.state,
             &principal,
             "brain_tasks",
@@ -1409,7 +1455,7 @@ impl GatewayServer {
         )
         .await
         {
-            Ok(decision) => {
+            Ok((decision, channel)) => {
                 let result: Result<Json<BrainTasksOut>, ErrorData> = async {
                     let resolved = resolve_vault_arg(&self.state, params.vault.as_deref())?;
                     let vault_name = resolved.root.name();
@@ -1450,9 +1496,9 @@ impl GatewayServer {
                     }))
                 }
                 .await;
-                (decision, result)
+                (decision, channel, result)
             }
-            Err((decision, err)) => (decision, Err(err)),
+            Err((decision, channel, err)) => (decision, channel, Err(err)),
         };
 
         record_audit(
@@ -1464,6 +1510,7 @@ impl GatewayServer {
                 args_summary,
             },
             decision,
+            channel.map(ResolvedVia::as_str),
             started,
             if result.is_ok() {
                 Outcome::Ok
@@ -1491,7 +1538,7 @@ impl GatewayServer {
         let vault = params.vault.clone();
         let args_summary = format!("get: {} vault={:?}", params.file, params.vault);
 
-        let (decision, result) = match policy_gate(
+        let (decision, channel, result) = match policy_gate(
             &self.state,
             &principal,
             "brain_get",
@@ -1501,7 +1548,7 @@ impl GatewayServer {
         )
         .await
         {
-            Ok(decision) => {
+            Ok((decision, channel)) => {
                 let result: Result<CallToolResult, ErrorData> = async {
                     let resolved = resolve_vault_arg(&self.state, params.vault.as_deref())?;
                     let vault_root = resolved.root.as_path().to_path_buf();
@@ -1538,9 +1585,9 @@ impl GatewayServer {
                         .map_err(|e| ErrorData::invalid_params(format!("reading {rel}: {e}"), None))
                 }
                 .await;
-                (decision, result)
+                (decision, channel, result)
             }
-            Err((decision, err)) => (decision, Err(err)),
+            Err((decision, channel, err)) => (decision, channel, Err(err)),
         };
 
         record_audit(
@@ -1552,6 +1599,7 @@ impl GatewayServer {
                 args_summary,
             },
             decision,
+            channel.map(ResolvedVia::as_str),
             started,
             if result.is_ok() {
                 Outcome::Ok
@@ -1582,7 +1630,7 @@ impl GatewayServer {
             params.query, params.top_k, params.vault
         );
 
-        let (decision, result) = match policy_gate(
+        let (decision, channel, result) = match policy_gate(
             &self.state,
             &principal,
             "brain_search",
@@ -1592,7 +1640,7 @@ impl GatewayServer {
         )
         .await
         {
-            Ok(decision) => {
+            Ok((decision, channel)) => {
                 let result: Result<CallToolResult, ErrorData> = async {
                     let resolved = resolve_vault_arg(&self.state, params.vault.as_deref())?;
                     let vault_path = resolved.root.as_path().to_path_buf();
@@ -1626,9 +1674,9 @@ impl GatewayServer {
                     Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
                 }
                 .await;
-                (decision, result)
+                (decision, channel, result)
             }
-            Err((decision, err)) => (decision, Err(err)),
+            Err((decision, channel, err)) => (decision, channel, Err(err)),
         };
 
         record_audit(
@@ -1640,6 +1688,7 @@ impl GatewayServer {
                 args_summary,
             },
             decision,
+            channel.map(ResolvedVia::as_str),
             started,
             if result.is_ok() {
                 Outcome::Ok
@@ -1676,7 +1725,7 @@ impl GatewayServer {
             params.text.chars().count()
         );
 
-        let (decision, result) = match policy_gate(
+        let (decision, channel, result) = match policy_gate(
             &self.state,
             &principal,
             "brain_capture",
@@ -1686,8 +1735,10 @@ impl GatewayServer {
         )
         .await
         {
-            Ok(decision) => (decision, capture_note(&self.state, &params).await),
-            Err((decision, err)) => (decision, Err(err)),
+            Ok((decision, channel)) => {
+                (decision, channel, capture_note(&self.state, &params).await)
+            }
+            Err((decision, channel, err)) => (decision, channel, Err(err)),
         };
 
         record_audit(
@@ -1699,6 +1750,7 @@ impl GatewayServer {
                 args_summary,
             },
             decision,
+            channel.map(ResolvedVia::as_str),
             started,
             if result.is_ok() {
                 Outcome::Ok
@@ -2979,14 +3031,22 @@ mod tests {
     /// is also overridable — a `NeedApproval` test with nothing resolving it
     /// needs a SHORT one (e.g. `0`, an instant timeout), while a `Deny` test
     /// never reaches `await_approval` at all, so the value is irrelevant
-    /// there.
+    /// there. Also writes `hello.md` into the vault root (same content
+    /// `fixture_with_outside_file` uses), so a `brain_get` test can round
+    /// trip a real file through this same read-only-policy fixture rather
+    /// than needing a THIRD near-duplicate fixture just to combine "a
+    /// read-only tool other than `capabilities`" with "a policy override".
+    /// Returns the `Arc<GatewayState>` too (unlike an earlier revision) —
+    /// `state.approvals` is how a `NeedApproval` test resolves out of band,
+    /// the same shape [`fixture_router_with_mutating_policy`] already uses.
     fn fixture_router_with_read_only_policy(
         read_only: policy::PolicyMode,
         approval_wait_seconds: u64,
-    ) -> (tempfile::TempDir, axum::Router, String) {
+    ) -> (tempfile::TempDir, axum::Router, Arc<GatewayState>, String) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("onebrain.yml"), "folders: {}\n").unwrap();
+        std::fs::write(root.join("hello.md"), "hello from inside the vault\n").unwrap();
 
         let mut vaults = BTreeMap::new();
         vaults.insert("t1".to_string(), root.to_path_buf());
@@ -3003,7 +3063,8 @@ mod tests {
         let audit = AuditLog::open_at(audit_log_path(root)).unwrap();
         let state = Arc::new(GatewayState::new(config, audit));
         let (auth_ctx, token) = test_auth_ctx(root);
-        (dir, build_gateway_router(state, auth_ctx), token)
+        let router = build_gateway_router(state.clone(), auth_ctx);
+        (dir, router, state, token)
     }
 
     /// Reads every JSONL line back out of the audit log opened at
@@ -3125,6 +3186,10 @@ mod tests {
         assert_eq!(entries[0]["tool"], "brain_tasks");
         assert_eq!(entries[0]["client_id"], "test-client");
         assert_eq!(entries[0]["decision"], "auto");
+        assert!(
+            entries[0]["channel"].is_null(),
+            "an Auto decision never reached an approval channel: {entries:?}"
+        );
         assert_eq!(entries[0]["outcome"], "ok");
         assert!(
             entries[0]["args_summary"]
@@ -3140,7 +3205,7 @@ mod tests {
     /// audit entry must record `decision: "denied"` / `outcome: "error"`.
     #[tokio::test]
     async fn capabilities_is_denied_when_policy_read_only_is_deny() {
-        let (dir, router, token) =
+        let (dir, router, _state, token) =
             fixture_router_with_read_only_policy(policy::PolicyMode::Deny, 300);
         let body = call_body(1, "capabilities", serde_json::json!({}));
         let resp = post(
@@ -3171,7 +3236,7 @@ mod tests {
     /// and never hang forever regardless.
     #[tokio::test]
     async fn capabilities_times_out_when_policy_needs_approval_and_nothing_answers() {
-        let (dir, router, token) =
+        let (dir, router, _state, token) =
             fixture_router_with_read_only_policy(policy::PolicyMode::AskOnce, 0);
         let body = call_body(1, "capabilities", serde_json::json!({}));
         let resp = post(
@@ -3189,7 +3254,65 @@ mod tests {
         let entries = read_audit_entries(dir.path());
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["decision"], "timedout");
+        assert!(
+            entries[0]["channel"].is_null(),
+            "nothing answered, so there is no channel to record: {entries:?}"
+        );
         assert_eq!(entries[0]["outcome"], "error");
+    }
+
+    /// Task 3 review, F3: every read-only tool reaches `await_approval`
+    /// exactly the same way `capabilities` does above — this fixture's
+    /// `policy.read_only: ask_once` proves it for `brain_get` too, not just
+    /// the one tool the other read-only approval tests happen to use.
+    /// Resolving the pending entry over the (simulated, out-of-band) HTTP
+    /// channel — the same shape `brain_capture`'s own HTTP-approve test uses
+    /// — and asserting `channel: "http"` here is the one test that pins
+    /// `channel.map(ResolvedVia::as_str)` at `brain_get`'s own
+    /// `record_audit` call site: a regression that dropped the channel back
+    /// to `None` for `brain_get` specifically (while leaving `brain_capture`
+    /// correct) would pass every other test in this file and fail only this
+    /// one.
+    #[tokio::test]
+    async fn brain_get_approved_over_http_is_audited_with_the_http_channel() {
+        let (dir, router, state, token) =
+            fixture_router_with_read_only_policy(policy::PolicyMode::AskOnce, 300);
+
+        let call_router = router.clone();
+        let call_token = token.clone();
+        let handle = tokio::spawn(async move {
+            let body = call_body(1, "brain_get", serde_json::json!({"file": "hello.md"}));
+            post(
+                &call_router,
+                body,
+                &call_token,
+                &standard_headers("tools/call", Some("brain_get")),
+            )
+            .await
+        });
+
+        let pending = wait_for_one_pending(&state).await;
+        assert!(state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Approve,
+            approval::ResolvedVia::Http
+        ));
+
+        let resp = handle.await.unwrap();
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no text content: {resp}"));
+        assert!(text.contains("hello from inside the vault"), "{resp}");
+
+        let entries = read_audit_entries(dir.path());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["tool"], "brain_get");
+        assert_eq!(entries[0]["decision"], "approved");
+        assert_eq!(
+            entries[0]["channel"], "http",
+            "brain_get's own record_audit call site must report the channel too: {entries:?}"
+        );
+        assert_eq!(entries[0]["outcome"], "ok");
     }
 
     /// End-to-end proof of the brief's scope-vs-pack requirement: a token
@@ -3315,6 +3438,7 @@ mod tests {
                 args_summary: "capabilities: (no arguments)".to_string(),
             },
             Decision::Auto,
+            None,
             Instant::now(),
             Outcome::Ok,
         )
@@ -4232,9 +4356,11 @@ mod tests {
             !handle.is_finished(),
             "the call must still be blocked, not yet returned"
         );
-        assert!(state
-            .approvals
-            .resolve(&pending.id, approval::Decision::Approve));
+        assert!(state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Approve,
+            approval::ResolvedVia::Http
+        ));
 
         let resp = handle.await.unwrap();
         assert!(resp.get("error").is_none(), "{resp}");
@@ -4256,6 +4382,10 @@ mod tests {
         let entries = read_audit_entries(dir.path());
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["decision"], "approved");
+        assert_eq!(
+            entries[0]["channel"], "http",
+            "the channel that answered this approval must be recorded: {entries:?}"
+        );
         assert_eq!(entries[0]["outcome"], "ok");
     }
 
@@ -4282,9 +4412,11 @@ mod tests {
         });
 
         let pending = wait_for_one_pending(&state).await;
-        assert!(state
-            .approvals
-            .resolve(&pending.id, approval::Decision::Deny));
+        assert!(state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Deny,
+            approval::ResolvedVia::Http
+        ));
 
         let resp = handle.await.unwrap();
         let message = resp["error"]["message"]
@@ -4306,6 +4438,10 @@ mod tests {
         let entries = read_audit_entries(dir.path());
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["decision"], "denied");
+        assert_eq!(
+            entries[0]["channel"], "http",
+            "a human Deny must still be recorded with the channel that answered: {entries:?}"
+        );
         assert_eq!(entries[0]["outcome"], "error");
     }
 
@@ -4338,6 +4474,10 @@ mod tests {
         let entries = read_audit_entries(dir.path());
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["decision"], "timedout");
+        assert!(
+            entries[0]["channel"].is_null(),
+            "nothing answered, so there is no channel to record: {entries:?}"
+        );
         assert_eq!(entries[0]["outcome"], "error");
     }
 
@@ -4366,9 +4506,11 @@ mod tests {
             .await
         });
         let pending = wait_for_one_pending(&state).await;
-        assert!(state
-            .approvals
-            .resolve(&pending.id, approval::Decision::Approve));
+        assert!(state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Approve,
+            approval::ResolvedVia::Http
+        ));
         let resp1 = handle.await.unwrap();
         assert!(resp1.get("error").is_none(), "{resp1}");
 
@@ -4639,9 +4781,11 @@ mod tests {
             Some("t1"),
             "the pending entry must carry the vault the call named"
         );
-        assert!(state
-            .approvals
-            .resolve(&pending.id, approval::Decision::Approve));
+        assert!(state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Approve,
+            approval::ResolvedVia::Http
+        ));
         assert!(handle.await.unwrap().get("error").is_none());
 
         assert!(
@@ -4685,9 +4829,11 @@ mod tests {
             !second.is_finished(),
             "the cross-vault call must be blocked on a fresh approval, not satisfied by t1's grant"
         );
-        assert!(state
-            .approvals
-            .resolve(&pending2.id, approval::Decision::Deny));
+        assert!(state.approvals.resolve(
+            &pending2.id,
+            approval::Decision::Deny,
+            approval::ResolvedVia::Http
+        ));
         let resp2 = second.await.unwrap();
         assert!(resp2["error"]["message"]
             .as_str()
@@ -4734,9 +4880,11 @@ mod tests {
                 .await
             });
             let pending = wait_for_one_pending(&state).await;
-            assert!(state
-                .approvals
-                .resolve(&pending.id, approval::Decision::Approve));
+            assert!(state.approvals.resolve(
+                &pending.id,
+                approval::Decision::Approve,
+                approval::ResolvedVia::Http
+            ));
             let resp = handle.await.unwrap();
             assert!(resp.get("error").is_none(), "{resp}");
 

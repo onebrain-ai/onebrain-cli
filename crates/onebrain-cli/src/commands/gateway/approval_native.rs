@@ -195,7 +195,7 @@
 use std::process::Command;
 use std::sync::Arc;
 
-use super::approval::{Approvals, Decision, PendingApproval};
+use super::approval::{Approvals, Decision, PendingApproval, ResolvedVia};
 use super::auth::core::now_epoch_secs;
 
 /// Floor for the dialog's `giving up after` clause. `0` is NOT a valid
@@ -369,6 +369,19 @@ fn run_dialog(script: &str) -> Option<Decision> {
     decision_from_button_output(&String::from_utf8_lossy(&output.stdout))
 }
 
+/// Resolve `id` with `d`, tagged [`ResolvedVia::Native`] — the ONLY way this
+/// module ever calls [`Approvals::resolve`], because this module IS the
+/// native channel. Pulled out of [`prompt`]'s `spawn_blocking` closure
+/// (Gateway PR 5, Task 3 review) so the channel tag itself is a plain,
+/// synchronous, directly-callable function `tests::` can exercise — driving
+/// `prompt` end-to-end would require a real, blocking `osascript` GUI
+/// dialog, exactly the hazard this module's own docs forbid in a test. This
+/// keeps the untested residue inside [`prompt`]'s closure to a one-line
+/// delegation, visible at the call site rather than duplicated into a test.
+fn resolve_as_native(approvals: &Approvals, id: &str, d: Decision) -> bool {
+    approvals.resolve(id, d, ResolvedVia::Native)
+}
+
 /// Show a native macOS approval dialog for `p` and, on an explicit
 /// Approve/Deny click, resolve it via `approvals.resolve` — the second
 /// channel this module adds (see module docs). A no-op, returning
@@ -409,7 +422,7 @@ pub fn prompt(p: &PendingApproval, approvals: Arc<Approvals>) {
     let script = build_dialog_script(p, dialog_timeout_secs(p, now_epoch_secs()));
     tokio::task::spawn_blocking(move || {
         if let Some(decision) = run_dialog(&script) {
-            approvals.resolve(&id, decision);
+            resolve_as_native(&approvals, &id, decision);
         }
     });
 }
@@ -677,6 +690,44 @@ mod tests {
             decision_from_button_output("button returned:, gave up:true\n"),
             None,
             "a self-dismissed dialog must never resolve a pending approval"
+        );
+    }
+
+    // ── Gateway PR 5, Task 3: this channel resolves as ResolvedVia::Native ─
+
+    /// [`prompt`]'s `spawn_blocking` closure calls [`resolve_as_native`] once
+    /// [`run_dialog`] yields a real button press — never anything else,
+    /// since this module IS the native channel. Driving `prompt` itself
+    /// end-to-end would require a real, blocking `osascript` GUI dialog
+    /// (exactly the hazard this module's own docs forbid in a test), so this
+    /// calls [`resolve_as_native`] — the same function `prompt`'s closure
+    /// calls, not `Approvals::resolve` directly — and proves, through the
+    /// waiter's own [`super::approval::WaitOutcome`], that the registry saw
+    /// [`ResolvedVia::Native`] — not [`ResolvedVia::Http`] or any other
+    /// channel. Calling `resolve_as_native` rather than re-deriving
+    /// `ResolvedVia::Native` inline is the point: a regression that changed
+    /// the tag `prompt` actually sends (e.g. a copy-paste from another
+    /// channel's call site) would fail HERE, not just prove the registry can
+    /// carry the value.
+    #[tokio::test]
+    async fn the_native_channels_resolve_call_is_tagged_resolved_via_native() {
+        use super::super::approval::WaitOutcome;
+        use std::time::Duration;
+
+        let approvals = Approvals::new();
+        let p = sample();
+        let rx = approvals.register(p.clone()).unwrap();
+
+        // Exactly what `prompt`'s closure calls once `run_dialog` returns a
+        // decision.
+        assert!(resolve_as_native(&approvals, &p.id, Decision::Approve));
+
+        let outcome = approvals.wait(&p.id, rx, Duration::from_secs(5)).await;
+        assert_eq!(
+            outcome,
+            WaitOutcome::Decided(Decision::Approve, ResolvedVia::Native),
+            "the native dialog channel must resolve as ResolvedVia::Native, \
+             not any other channel: {outcome:?}"
         );
     }
 
