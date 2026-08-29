@@ -38,6 +38,13 @@ IGNORE_REGEX='(src/main\.rs|commands/(serve|update|qmd_reindex|harness_run|searc
 # "Residual unreachable lines" in docs/coverage.md). Achieved after un-exclude +
 # the new daemon logic tests: ≈94.99% line. 94 sits just under that. Ratchet UP from
 # here as the remaining reachable gaps close.
+#
+# Considered and DECLINED at v3.5 Gateway PR 4 (2026-08-29, measured 94.53% line on
+# macOS): 94 is the correct floor and stays. The next integer, 95, is ABOVE the
+# achieved %, so it would fail CI outright; a fractional 94.5 would leave ~0.03 points
+# of headroom, which is exactly the platform/measurement jitter this comment says to
+# absorb. Bump this only when a run comfortably clears the next integer — that is the
+# ratchet's own rule, not a reason to skip it.
 CORE_LINE_THRESHOLD="${CORE_LINE_THRESHOLD:-94}"
 
 mode="${1:---summary-only}"
