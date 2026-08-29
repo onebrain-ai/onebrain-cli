@@ -450,18 +450,15 @@ pub(crate) fn run_setup(
 
     let clobbered_comments = write_telegram_config(gateway_dir, &token, chat_id)?;
 
-    api.send_message(
+    let send_result = api.send_message(
         chat_id,
         "OneBrain gateway connected. Approval requests will appear here.",
         None,
-    )
-    .map_err(|e| {
-        anyhow::anyhow!(
-            "gateway.yml saved (chat_id {chat_id}), but the confirmation message failed to send: {e}"
-        )
-    })?;
+    );
 
-    writeln!(out, "Telegram gateway connected (chat_id {chat_id}).")?;
+    if send_result.is_ok() {
+        writeln!(out, "Telegram gateway connected (chat_id {chat_id}).")?;
+    }
     // Whole-branch review, Important 2: `gateway run` reads `gateway.yml`
     // ONCE, at startup, and freezes `GatewayState.telegram` for the life of
     // the process (see `super::mod::load_gateway_config`'s single call
@@ -474,6 +471,15 @@ pub(crate) fn run_setup(
     // `false`, nothing is logged, and the call times out five minutes
     // later. Deliberately NOT a hot reload, which is a design change and
     // out of scope for this fix.
+    //
+    // Printed unconditionally — ABOVE the confirmation-send outcome check
+    // below — because it depends only on `gateway.yml` now carrying a
+    // `telegram:` block, which is already true the moment
+    // `write_telegram_config` returns. A running gateway needs restarting
+    // whether or not the Telegram-side confirmation message happens to get
+    // through; gating this notice on `send_result` would silently drop it
+    // on exactly the "config saved, confirmation send failed" path, which
+    // has its own test (`setup_send_confirmation_failure_restates_the_saved_chat_id`).
     writeln!(
         out,
         "If `onebrain gateway run` is already running, restart it — it reads gateway.yml only at startup, so the Telegram channel stays off in that process until you do."
@@ -490,6 +496,13 @@ pub(crate) fn run_setup(
             "Note: rewriting the existing telegram: block reformatted gateway.yml and dropped its comments."
         )?;
     }
+
+    send_result.map_err(|e| {
+        anyhow::anyhow!(
+            "gateway.yml saved (chat_id {chat_id}), but the confirmation message failed to send: {e}"
+        )
+    })?;
+
     Ok(())
 }
 
@@ -506,15 +519,6 @@ fn render_telegram_block(bot_token: &str, chat_id: i64) -> String {
     format!("telegram:\n  bot_token: '{escaped}'\n  chat_id: {chat_id}\n")
 }
 
-/// `true` iff `content` has a line whose first non-whitespace character is
-/// `#` — a whole-line YAML comment.
-///
-/// Deliberately conservative: it does NOT try to find trailing `#` comments
-/// after a value, because `#` inside a quoted scalar is not a comment and
-/// telling those apart needs a real YAML scanner. Only ever used to decide
-/// whether to WARN (see [`write_telegram_config`]'s fallback path), so
-/// under-reporting a file whose only comments are trailing ones costs a
-/// warning, never correctness.
 /// `true` iff `content` parses as a single YAML document whose `telegram:`
 /// block carries exactly the `bot_token`/`chat_id` just written — the
 /// self-check [`write_telegram_config`]'s append path gates on before it
@@ -531,6 +535,15 @@ fn appended_reads_back(content: &str, bot_token: &str, chat_id: i64) -> bool {
     }
 }
 
+/// `true` iff `content` has a line whose first non-whitespace character is
+/// `#` — a whole-line YAML comment.
+///
+/// Deliberately conservative: it does NOT try to find trailing `#` comments
+/// after a value, because `#` inside a quoted scalar is not a comment and
+/// telling those apart needs a real YAML scanner. Only ever used to decide
+/// whether to WARN (see [`write_telegram_config`]'s fallback path), so
+/// under-reporting a file whose only comments are trailing ones costs a
+/// warning, never correctness.
 fn has_comment_line(content: &str) -> bool {
     content.lines().any(|l| l.trim_start().starts_with('#'))
 }
@@ -1582,6 +1595,7 @@ mod tests {
             serde_json::json!({ "ok": false, "description": "blocked by user" }),
         );
 
+        let out = running.out.clone();
         let err = running.join().unwrap_err();
         let rendered = err.to_string();
 
@@ -1589,6 +1603,15 @@ mod tests {
         assert!(
             gateway_dir.join("gateway.yml").exists(),
             "config must already be saved before the confirmation send is even attempted"
+        );
+        // Minor (final re-review): a running gateway still needs restarting
+        // even when the confirmation send itself failed — the config is
+        // already saved by this point (asserted above). The notice must not
+        // be gated on `send_result`, or this exact path goes silent.
+        let printed = out.text();
+        assert!(
+            printed.contains("restart it") && printed.contains("only at startup"),
+            "the wizard must tell the operator to restart a running gateway even when the confirmation send fails: {printed}"
         );
     }
 

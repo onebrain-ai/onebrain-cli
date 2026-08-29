@@ -485,6 +485,17 @@ impl TelegramChannel {
         }
     }
 
+    /// How many entries — live prompts AND [`SentSlot::Resolved`]
+    /// tombstones alike — [`Self::sent`] currently holds. `#[cfg(test)]`
+    /// only, same reasoning as [`Self::is_polling`] directly below: the
+    /// map is private for good reason, but a test proving the resolve-
+    /// before-send race leaves nothing behind (whole-branch review,
+    /// Important 1) has no other way to say so.
+    #[cfg(test)]
+    fn sent_len(&self) -> usize {
+        self.sent.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
     /// `true` iff this channel's poller thread is currently up — the SAME
     /// `polling` flag [`Self::ensure_polling`] itself gates on, exposed
     /// read-only and ONLY under `#[cfg(test)]`. `polling` is a private
@@ -497,17 +508,6 @@ impl TelegramChannel {
     /// fully `pub`: this crate's own tests are the only legitimate caller,
     /// and the whole point is that this is NOT part of the type's real
     /// public API.
-    /// How many entries — live prompts AND [`SentSlot::Resolved`]
-    /// tombstones alike — [`Self::sent`] currently holds. `#[cfg(test)]`
-    /// only, same reasoning as [`Self::is_polling`] directly below: the
-    /// map is private for good reason, but a test proving the resolve-
-    /// before-send race leaves nothing behind (whole-branch review,
-    /// Important 1) has no other way to say so.
-    #[cfg(test)]
-    fn sent_len(&self) -> usize {
-        self.sent.lock().unwrap_or_else(|e| e.into_inner()).len()
-    }
-
     #[cfg(test)]
     pub(crate) fn is_polling(&self) -> bool {
         // `SeqCst` for consistency with every other access to `polling` in
