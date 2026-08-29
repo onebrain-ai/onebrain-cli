@@ -147,7 +147,7 @@ impl GatewayState {
         // once, not on every client request.
         if telegram::chat_id_is_misconfigured(&config.telegram) {
             tracing::warn!(
-                "telegram.bot_token is set but telegram.chat_id is not a positive                  private-chat id — Telegram approvals disabled"
+                "telegram.bot_token is set but telegram.chat_id is not a positive private-chat id — Telegram approvals disabled"
             );
         }
 

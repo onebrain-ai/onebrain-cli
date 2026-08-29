@@ -2371,7 +2371,7 @@ mod tests {
         let final_outcome = tokio::time::timeout(Duration::from_secs(20), final_rx)
             .await
             .expect(
-                "the poller never answered the final callback — it is wedged,                  which is exactly the F1 lost-wakeup failure mode this soak guards against",
+                "the poller never answered the final callback — it is wedged, which is exactly the F1 lost-wakeup failure mode this soak guards against",
             )
             .unwrap();
         assert_eq!(final_outcome, (Decision::Approve, ResolvedVia::Telegram));
