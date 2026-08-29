@@ -769,6 +769,36 @@ mod tests {
         responses: Arc<Mutex<HashMap<String, JsonValue>>>,
         queued: Arc<Mutex<HashMap<String, VecDeque<JsonValue>>>>,
         requests: Arc<Mutex<Vec<(String, JsonValue)>>>,
+        /// The wait-loop STARVATION GATE (whole-branch review, final wave).
+        ///
+        /// `run_setup`'s wait loop is budgeted by CALL COUNT
+        /// (`MAX_WAIT_SECS / WAIT_POLL_SECS` = 12 iterations), not by
+        /// wall-clock — a deliberate, adjudicated choice that makes the
+        /// wizard deterministic against a real long-polling Telegram. But
+        /// this mock answers INSTANTLY, so those 12 iterations elapse in
+        /// well under a millisecond, while `wait_for_printed_code` only
+        /// notices the printed code on a 2ms poll. A test therefore raced
+        /// the wizard for the right to script the code-carrying response,
+        /// and lost about 5% of the time even on an idle machine — the
+        /// wizard burned its whole budget against default-empty replies and
+        /// returned "no message carrying the code arrived" before the test
+        /// thread ever queued anything.
+        ///
+        /// While this is `true`, a `getUpdates` call that finds NOTHING
+        /// scripted — neither a queued response nor a standing
+        /// `set_response` — blocks inside the handler instead of being
+        /// served an empty default. That converts the race into a
+        /// happens-before edge: the wizard provably cannot consume a single
+        /// budget iteration until the test has finished queueing and
+        /// released the gate. Drain calls are unaffected because every
+        /// `start_run_setup` test queues its full drain sequence, so those
+        /// calls are never starved and pass straight through.
+        ///
+        /// Armed by [`start_run_setup`], released by [`RunningSetup::join`]
+        /// — never by hand, so it cannot be forgotten. Default `false`
+        /// leaves the tests that call `run_setup` directly (the drain-only
+        /// and clean-timeout ones) behaving exactly as before.
+        hold_starved_getupdates: Arc<AtomicBool>,
     }
 
     impl MockState {
@@ -786,6 +816,32 @@ mod tests {
                 .entry(method.to_string())
                 .or_default()
                 .push_back(body);
+        }
+
+        /// Arm the starvation gate — see [`MockState::hold_starved_getupdates`].
+        fn arm_starvation_gate(&self) {
+            self.hold_starved_getupdates.store(true, Ordering::SeqCst);
+        }
+
+        /// Release it, letting a blocked (or future) starved `getUpdates`
+        /// be served the ordinary empty default again. Idempotent.
+        fn release_starvation_gate(&self) {
+            self.hold_starved_getupdates.store(false, Ordering::SeqCst);
+        }
+
+        /// `true` iff a `getUpdates` right now would find nothing scripted
+        /// — the exact condition the gate holds on. Read under its own
+        /// short-lived locks so no guard is ever alive across an `.await`
+        /// in the handler's polling loop.
+        fn getupdates_is_starved(&self) -> bool {
+            let queued_empty = self
+                .queued
+                .lock()
+                .unwrap()
+                .get("getUpdates")
+                .is_none_or(|q| q.is_empty());
+            let no_standing = !self.responses.lock().unwrap().contains_key("getUpdates");
+            queued_empty && no_standing
         }
 
         fn requests(&self) -> Vec<(String, JsonValue)> {
@@ -816,6 +872,22 @@ mod tests {
         Json(body): Json<JsonValue>,
     ) -> Json<JsonValue> {
         let method = params.get("method").cloned().unwrap_or_default();
+
+        // Starvation gate — see `MockState::hold_starved_getupdates`. Held
+        // BEFORE the request is recorded, so a gated call does not inflate
+        // `calls("getUpdates")` while it waits. Bounded so a test that
+        // forgets to release fails loudly on its own assertions instead of
+        // hanging the whole binary.
+        if method == "getUpdates" {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while state.hold_starved_getupdates.load(Ordering::SeqCst)
+                && state.getupdates_is_starved()
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+
         state.requests.lock().unwrap().push((method.clone(), body));
 
         let queued = state
@@ -1005,14 +1077,38 @@ mod tests {
     struct RunningSetup {
         code: String,
         out: SharedOutput,
+        state: MockState,
         handle: std::thread::JoinHandle<anyhow::Result<()>>,
+    }
+
+    impl RunningSetup {
+        /// Release the starvation gate, then join the wizard thread and
+        /// hand back its `Result`.
+        ///
+        /// Releasing HERE rather than in each test is the whole point: by
+        /// the time a test calls this it has necessarily finished queueing
+        /// every response it scripted against `code`, so the release is
+        /// ordered strictly after that queueing — and no test can forget
+        /// to do it, because joining is the only way to get the result.
+        fn join(self) -> anyhow::Result<()> {
+            self.state.release_starvation_gate();
+            self.handle.join().expect("run_setup thread panicked")
+        }
     }
 
     /// Spawns `run_setup` against `server_base`/`gateway_dir`, waits for it
     /// to print its setup code, and returns it (plus the output buffer and
     /// join handle) so the caller can queue the mock response(s) that
     /// reference it before joining.
-    fn start_run_setup(server_base: &str, gateway_dir: &Path, token_line: &str) -> RunningSetup {
+    fn start_run_setup(
+        state: &MockState,
+        server_base: &str,
+        gateway_dir: &Path,
+        token_line: &str,
+    ) -> RunningSetup {
+        // Armed BEFORE the wizard thread exists, so there is no window in
+        // which an unguarded starved `getUpdates` could be served.
+        state.arm_starvation_gate();
         let out = SharedOutput::default();
         let base = server_base.to_string();
         let dir = gateway_dir.to_path_buf();
@@ -1021,7 +1117,12 @@ mod tests {
         let handle =
             std::thread::spawn(move || run_setup(&mut input, &mut out_writer, &base, &dir));
         let code = wait_for_printed_code(&out);
-        RunningSetup { code, out, handle }
+        RunningSetup {
+            code,
+            out,
+            state: state.clone(),
+            handle,
+        }
     }
 
     // ── Tests ────────────────────────────────────────────────────────
@@ -1037,13 +1138,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let gateway_dir = root.path().join("home").join(".onebrain");
 
-        let running = start_run_setup(&server.base, &gateway_dir, "123456:ABCDEF-token\n");
+        let running = start_run_setup(&state, &server.base, &gateway_dir, "123456:ABCDEF-token\n");
         state.queue_response(
             "getUpdates",
             serde_json::json!({ "ok": true, "result": [coded_message(10, 555, 555, &running.code)] }),
         );
 
-        running.handle.join().unwrap().unwrap();
+        // Cloned before `join` consumes `running` — the buffer is shared,
+        // so this still observes everything the wizard printed.
+        let out = running.out.clone();
+        running.join().unwrap();
 
         let gateway_yml = gateway_dir.join("gateway.yml");
         let content = std::fs::read_to_string(&gateway_yml).unwrap();
@@ -1072,7 +1176,7 @@ mod tests {
             "OneBrain gateway connected. Approval requests will appear here."
         );
 
-        let printed = running.out.text();
+        let printed = out.text();
         assert!(printed.contains("555"), "{printed}");
         // Whole-branch review, Important 2: `gateway run` freezes its
         // Telegram config at startup, and `docs/gateway.md` teaches the
@@ -1181,13 +1285,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let gateway_dir = root.path().join("home").join(".onebrain");
 
-        let running = start_run_setup(&server.base, &gateway_dir, "123456:ABCDEF-token\n");
+        let running = start_run_setup(&state, &server.base, &gateway_dir, "123456:ABCDEF-token\n");
         state.queue_response(
             "getUpdates",
             serde_json::json!({ "ok": true, "result": [coded_message(20, 555, 555, &running.code)] }),
         );
 
-        running.handle.join().unwrap().unwrap();
+        running.join().unwrap();
 
         let content = std::fs::read_to_string(gateway_dir.join("gateway.yml")).unwrap();
         let parsed: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
@@ -1218,7 +1322,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let gateway_dir = root.path().join("home").join(".onebrain");
 
-        let running = start_run_setup(&server.base, &gateway_dir, "123456:ABCDEF-token\n");
+        let running = start_run_setup(&state, &server.base, &gateway_dir, "123456:ABCDEF-token\n");
         state.queue_response(
             "getUpdates",
             serde_json::json!({
@@ -1230,7 +1334,7 @@ mod tests {
             }),
         );
 
-        running.handle.join().unwrap().unwrap();
+        running.join().unwrap();
 
         let content = std::fs::read_to_string(gateway_dir.join("gateway.yml")).unwrap();
         let parsed: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
@@ -1251,7 +1355,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let gateway_dir = root.path().join("home").join(".onebrain");
 
-        let running = start_run_setup(&server.base, &gateway_dir, "123456:ABCDEF-token\n");
+        let running = start_run_setup(&state, &server.base, &gateway_dir, "123456:ABCDEF-token\n");
         state.queue_response(
             "getUpdates",
             serde_json::json!({ "ok": true, "result": [coded_message(30, -100123456, 555, &running.code)] }),
@@ -1261,22 +1365,31 @@ mod tests {
             serde_json::json!({ "ok": true, "result": [coded_message(31, 555, 555, &running.code)] }),
         );
 
-        running.handle.join().unwrap().unwrap();
+        running.join().unwrap();
 
         let content = std::fs::read_to_string(gateway_dir.join("gateway.yml")).unwrap();
         let parsed: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
         // The chat_id capture succeeding at all already proves the group
         // message didn't terminate the wizard (a bail! there would leave
-        // no config on disk to read). `>=`, not `==`: the test thread
-        // queues both scripted responses only AFTER discovering the code
-        // (there is no way to know it sooner), so the wait loop can race
-        // ahead and consume a few harmless default-empty responses first —
-        // never fewer than this floor, but not a fixed count either.
+        // no config on disk to read).
         assert_eq!(parsed["telegram"]["chat_id"].as_i64(), Some(555));
-        assert!(
-            state.calls("getUpdates") >= 4,
-            "expected at least drain + the group-message cycle + the successful cycle + its post-capture confirm, got {}",
-            state.calls("getUpdates")
+        // EXACTLY four, not "at least" (whole-branch review, final wave).
+        // An earlier revision asserted `>= 4` and explained that the test
+        // thread can only queue its responses AFTER discovering the code,
+        // so the wait loop was free to race ahead and burn some
+        // default-empty cycles first. That tolerance was the flake: the
+        // same race could burn the ENTIRE 12-iteration budget and fail the
+        // test outright, about 5% of the time. The starvation gate (see
+        // `MockState::hold_starved_getupdates`) removes the race rather
+        // than widening its window, which makes this count deterministic —
+        // drain, the group-message cycle, the successful cycle, and the
+        // post-capture confirm. Asserting the exact number is what keeps
+        // the gate honest: if it ever stops holding, this fails loudly
+        // instead of going back to flaking.
+        assert_eq!(
+            state.calls("getUpdates"),
+            4,
+            "drain + group cycle + success cycle + post-capture confirm"
         );
     }
 
@@ -1294,14 +1407,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let gateway_dir = root.path().join("home").join(".onebrain");
 
-        let running = start_run_setup(&server.base, &gateway_dir, "123456:ABCDEF-token\n");
+        let running = start_run_setup(&state, &server.base, &gateway_dir, "123456:ABCDEF-token\n");
         let code = running.code.clone();
         state.set_response(
             "getUpdates",
             serde_json::json!({ "ok": true, "result": [coded_message(99, -1009999, 555, &code)] }),
         );
 
-        let err = running.handle.join().unwrap().unwrap_err();
+        let err = running.join().unwrap_err();
         let rendered = err.to_string();
 
         assert!(
@@ -1326,7 +1439,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let gateway_dir = root.path().join("home").join(".onebrain");
 
-        let running = start_run_setup(&server.base, &gateway_dir, "123456:ABCDEF-token\n");
+        let running = start_run_setup(&state, &server.base, &gateway_dir, "123456:ABCDEF-token\n");
         state.queue_response(
             "getUpdates",
             serde_json::json!({
@@ -1338,7 +1451,7 @@ mod tests {
             }),
         );
 
-        let err = running.handle.join().unwrap().unwrap_err();
+        let err = running.join().unwrap_err();
         let rendered = err.to_string();
 
         assert!(rendered.contains('2'), "{rendered}");
@@ -1459,7 +1572,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let gateway_dir = root.path().join("home").join(".onebrain");
 
-        let running = start_run_setup(&server.base, &gateway_dir, "123456:ABCDEF-token\n");
+        let running = start_run_setup(&state, &server.base, &gateway_dir, "123456:ABCDEF-token\n");
         state.queue_response(
             "getUpdates",
             serde_json::json!({ "ok": true, "result": [coded_message(1, 555, 555, &running.code)] }),
@@ -1469,7 +1582,7 @@ mod tests {
             serde_json::json!({ "ok": false, "description": "blocked by user" }),
         );
 
-        let err = running.handle.join().unwrap().unwrap_err();
+        let err = running.join().unwrap_err();
         let rendered = err.to_string();
 
         assert!(rendered.contains("555"), "{rendered}");
