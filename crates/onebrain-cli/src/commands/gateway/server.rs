@@ -471,11 +471,18 @@ fn reindex_channel_enabled() -> bool {
 /// vault-RELATIVE (never a host path), so naming it is safe and is the one
 /// genuinely useful detail: it tells the caller which note already holds
 /// today's slug.
+///
+/// Rendered through [`onebrain_fs::note::to_slash`], NOT `Path::display()`:
+/// `display()` uses the OS-native separator, so the same collision would name
+/// `00-inbox/x.md` to a client on unix and `00-inbox\x.md` on Windows. The
+/// success path already returns `to_slash`ed paths, so `display()` here would
+/// hand one client two different spellings of the same note depending on which
+/// machine the gateway happens to run on.
 fn capture_collision_message(rel: &Path) -> String {
     format!(
         "capture failed: a note already exists at {} — captures are one note per title per day, \
          so use a different title",
-        rel.display()
+        onebrain_fs::note::to_slash(rel)
     )
 }
 
@@ -3232,6 +3239,33 @@ mod tests {
         assert_eq!(entries[0]["client_id"], "client-x");
         assert_eq!(entries[0]["decision"], "auto");
         assert_eq!(entries[0]["outcome"], "ok");
+    }
+
+    // ── the collision message renders paths OS-independently ─────────────
+
+    /// Pins the separator on ALL platforms, not just the one that caught it.
+    ///
+    /// `capture_collision_message` originally used `Path::display()`, which is
+    /// the OS-native separator — so this read `00-inbox/x.md` on unix and
+    /// `00-inbox\x.md` on Windows, while the success path returned a
+    /// `to_slash`ed `/` everywhere. The end-to-end collision test asserts
+    /// `00-inbox/`, but on unix `display()` satisfies that too, so only
+    /// Windows CI ever failed. Building the path from components here means a
+    /// regression fails on every platform instead of waiting for CI.
+    #[test]
+    fn the_collision_message_names_the_path_with_forward_slashes_on_every_os() {
+        let rel: PathBuf = ["00-inbox", "2026-08-29-duplicate-title.md"]
+            .iter()
+            .collect();
+        let message = capture_collision_message(&rel);
+        assert!(
+            message.contains("00-inbox/2026-08-29-duplicate-title.md"),
+            "the vault-relative path must use `/` on every platform: {message}"
+        );
+        assert!(
+            !message.contains('\\'),
+            "no native separator may reach a client-facing message: {message}"
+        );
     }
 
     // ── args_summary is bounded before it is recorded (round-2 finding C) ─
