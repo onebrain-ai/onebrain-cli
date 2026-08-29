@@ -31,6 +31,7 @@ pub mod config;
 pub mod oauth_routes;
 pub mod policy;
 pub mod server;
+pub mod telegram;
 pub mod telegram_api;
 
 // `gateway_config_path` / `DEFAULT_GATEWAY_PORT` stay module-internal to

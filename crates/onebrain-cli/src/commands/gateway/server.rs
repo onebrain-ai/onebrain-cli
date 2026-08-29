@@ -61,6 +61,7 @@ use crate::commands::gateway::oauth_routes::{
 use crate::commands::gateway::policy::{
     self, GrantKey, Grants, PolicyMode, PolicyOutcome, RiskClass,
 };
+use crate::commands::gateway::telegram;
 use crate::commands::gateway::GatewayConfig;
 use crate::commands::task_list::{resolve_due_by, resolve_prefixes, TaskCollector};
 
@@ -845,17 +846,30 @@ fn capability_packs(policy: &policy::PolicyConfig) -> Vec<PackInfo> {
 ///   assumes; `capabilities` reporting `true` here is not a claim that a
 ///   human is actively watching, only that the channel exists and is
 ///   reachable.
-/// - `telegram`: not implemented yet — deferred to Gateway PR 5. Always
-///   `false` today; see `note` below and `docs/gateway.md`.
-fn approval_channels() -> ApprovalChannels {
+/// - `telegram`: [`telegram::is_available`] — `true` iff `gateway.yml`
+///   carries a non-empty `telegram.bot_token` and a non-zero
+///   `telegram.chat_id`, AND the channel has not been explicitly disabled
+///   via `ONEBRAIN_GATEWAY_DISABLE_TELEGRAM_APPROVAL`. Like `native` above,
+///   this reports CONFIGURED-ness, not liveness: it never makes a network
+///   call to Telegram. Validating that the token is actually good (a live
+///   `getMe` call) is a setup-time concern for a later Gateway PR 5 task's
+///   pairing wizard — a human is already watching then and can act on a
+///   bad-token error immediately. Re-probing Telegram on every
+///   `capabilities` call would add real latency, and a real failure mode (a
+///   transient Telegram outage), to a field every other channel here
+///   answers from purely local state, so that probe is deliberately NOT
+///   done per call. See [`telegram::is_available`]'s own doc comment for
+///   the identical rationale spelled out at the source.
+fn approval_channels(config: &GatewayConfig) -> ApprovalChannels {
     ApprovalChannels {
         native: approval_native::is_available(),
         http: true,
-        telegram: false,
+        telegram: telegram::is_available(&config.telegram),
         note: "http is always available given the gateway's pairing code (printed once to \
                stdout at `gateway run` startup); native requires macOS with osascript on \
-               PATH and is unavailable when explicitly disabled; telegram is not \
-               implemented yet — planned for Gateway PR 5."
+               PATH and is unavailable when explicitly disabled; telegram reports whether \
+               gateway.yml has bot_token/chat_id configured, not whether Telegram is \
+               currently reachable."
             .to_string(),
     }
 }
@@ -1339,7 +1353,7 @@ impl GatewayServer {
                     packs: capability_packs(&config.policy),
                     vaults: config.vaults.keys().cloned().collect(),
                     default_vault: default_vault_display(config),
-                    approval_channels: approval_channels(),
+                    approval_channels: approval_channels(config),
                 };
                 (decision, Ok(Json(out)))
             }
@@ -1972,6 +1986,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::commands::gateway::auth::AuthStore;
+    use crate::commands::gateway::config::TelegramConfig;
 
     const PROTOCOL: &str = "2026-07-28";
 
@@ -2089,6 +2104,31 @@ mod tests {
         let config = GatewayConfig {
             default_vault: Some(root.to_path_buf()),
             vaults,
+            ..GatewayConfig::default()
+        };
+        let audit = AuditLog::open_at(audit_log_path(root)).unwrap();
+        let state = Arc::new(GatewayState::new(config, audit));
+        let (auth_ctx, token) = test_auth_ctx(root);
+        (dir, build_gateway_router(state, auth_ctx), token)
+    }
+
+    /// Same fixture shape as [`fixture_router`], but with `telegram`
+    /// carrying the given [`TelegramConfig`] instead of the default
+    /// "not configured" one — for tests that need `capabilities` to see a
+    /// configured Telegram channel.
+    fn fixture_router_with_telegram(
+        telegram: TelegramConfig,
+    ) -> (tempfile::TempDir, axum::Router, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("onebrain.yml"), "folders: {}\n").unwrap();
+
+        let mut vaults = BTreeMap::new();
+        vaults.insert("t1".to_string(), root.to_path_buf());
+        let config = GatewayConfig {
+            default_vault: Some(root.to_path_buf()),
+            vaults,
+            telegram,
             ..GatewayConfig::default()
         };
         let audit = AuditLog::open_at(audit_log_path(root)).unwrap();
@@ -2329,9 +2369,12 @@ mod tests {
     }
 
     /// `http` is unconditionally `true` (the `/approvals` surface is always
-    /// mounted by `build_gateway_router` in this build) and `telegram` is
-    /// unconditionally `false` (not implemented yet — Gateway PR 5),
-    /// regardless of policy configuration or platform.
+    /// mounted by `build_gateway_router` in this build); `telegram` is
+    /// `false` here because `fixture_router`'s config carries no
+    /// `telegram:` block, so `telegram::is_available` sees an empty
+    /// `bot_token` and a zero `chat_id` — see
+    /// `capabilities_reports_telegram_true_only_when_configured` below for
+    /// the case where it's configured.
     #[tokio::test]
     async fn capabilities_reports_http_channel_true_and_telegram_false() {
         let (_dir, router, token) = fixture_router();
@@ -2350,8 +2393,50 @@ mod tests {
             channels["note"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("PR 5"),
-            "the note must explain telegram's deferral: {resp}"
+                .contains("telegram"),
+            "the note must mention the telegram channel: {resp}"
+        );
+    }
+
+    /// The Task 2 truthfulness contract for `telegram`, proven end to end
+    /// through the real router (not just `telegram::is_available` directly
+    /// — `telegram.rs`'s own unit tests already cover the pure function):
+    /// a `gateway.yml` carrying both `telegram.bot_token` and
+    /// `telegram.chat_id` makes `capabilities` report `telegram: true`; the
+    /// default config (neither field set) reports `false`. Mirrors
+    /// `capabilities_native_channel_matches_approval_native_is_available`'s
+    /// own "drive the real router" shape.
+    #[tokio::test]
+    async fn capabilities_reports_telegram_true_only_when_configured() {
+        let (_dir, router, token) = fixture_router_with_telegram(TelegramConfig {
+            bot_token: "T".to_string(),
+            chat_id: 5,
+        });
+        let body = call_body(1, "capabilities", serde_json::json!({}));
+        let resp = post(
+            &router,
+            body,
+            &token,
+            &standard_headers("tools/call", Some("capabilities")),
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["structuredContent"]["approval_channels"]["telegram"], true,
+            "{resp}"
+        );
+
+        let (_dir2, router2, token2) = fixture_router();
+        let body2 = call_body(1, "capabilities", serde_json::json!({}));
+        let resp2 = post(
+            &router2,
+            body2,
+            &token2,
+            &standard_headers("tools/call", Some("capabilities")),
+        )
+        .await;
+        assert_eq!(
+            resp2["result"]["structuredContent"]["approval_channels"]["telegram"], false,
+            "{resp2}"
         );
     }
 

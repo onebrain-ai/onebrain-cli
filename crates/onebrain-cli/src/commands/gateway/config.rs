@@ -19,6 +19,31 @@ use super::policy::PolicyConfig;
 
 pub const DEFAULT_GATEWAY_PORT: u16 = 7717;
 
+/// Telegram bot credentials for the approval-prompt channel (Gateway PR 5).
+/// This task (Task 2) only adds the config shape and the
+/// [`super::telegram::is_available`] gate that reads it — a setup wizard
+/// (a later Gateway PR 5 task) is what actually populates these fields and
+/// validates the token against the live Telegram API.
+///
+/// Both fields default to the empty/zero value, which
+/// [`super::telegram::is_available`] treats as "not configured": Telegram
+/// never assigns a bot an empty token or a chat the id `0`, so the plain
+/// default doubles as an unambiguous "unset" sentinel — no `Option`
+/// wrapper needed on either field.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TelegramConfig {
+    /// Bot token minted by `@BotFather` (`/newbot`). Never logged or
+    /// echoed back to a client — see `telegram_api.rs`'s "scrub
+    /// chokepoint" module docs for how every Telegram API error this
+    /// crate can produce is scrubbed of it.
+    #[serde(default)]
+    pub bot_token: String,
+    /// Telegram chat id the approval bot sends prompts to and reads
+    /// button-press callbacks from.
+    #[serde(default)]
+    pub chat_id: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
     /// Loopback port to serve on. 0 = OS-assigned ephemeral port.
@@ -50,6 +75,14 @@ pub struct GatewayConfig {
     /// independently).
     #[serde(default)]
     pub policy: PolicyConfig,
+    /// Telegram approval-channel credentials (Gateway PR 5, Task 2) — see
+    /// [`TelegramConfig`]'s own doc comment for the field meanings and the
+    /// "not configured" default. `#[serde(default)]` so an existing
+    /// `gateway.yml` written before this field existed keeps parsing (and
+    /// gets the "not configured" default) instead of failing to
+    /// deserialize.
+    #[serde(default)]
+    pub telegram: TelegramConfig,
 }
 
 fn default_gateway_port() -> u16 {
@@ -64,6 +97,7 @@ impl Default for GatewayConfig {
             vaults: BTreeMap::new(),
             public_url: None,
             policy: PolicyConfig::default(),
+            telegram: TelegramConfig::default(),
         }
     }
 }
@@ -113,6 +147,14 @@ mod tests {
         assert_eq!(cfg.policy.destructive, PolicyMode::AskAlways);
         assert_eq!(cfg.policy.grant_ttl_minutes, 30);
         assert_eq!(cfg.policy.approval_wait_seconds, 300);
+        assert!(
+            cfg.telegram.bot_token.is_empty(),
+            "default telegram.bot_token must be empty (== not configured)"
+        );
+        assert_eq!(
+            cfg.telegram.chat_id, 0,
+            "default telegram.chat_id must be zero (== not configured)"
+        );
     }
 
     /// `GatewayConfig`'s `Default` impl is hand-written (it does not
@@ -192,6 +234,28 @@ mod tests {
             "field omitted from the policy block must still default"
         );
         assert_eq!(cfg.policy.destructive, PolicyMode::AskAlways);
+    }
+
+    /// A `telegram:` block parses into `GatewayConfig.telegram`, and a
+    /// missing block still yields the "not configured" default — same shape
+    /// as `gateway_config_parses_a_policy_block_and_fills_its_missing_fields`
+    /// above, for the field this task (Gateway PR 5, Task 2) adds.
+    #[test]
+    fn gateway_config_parses_a_telegram_block_and_defaults_when_absent() {
+        let cfg: GatewayConfig =
+            serde_yaml::from_str("telegram:\n  bot_token: T\n  chat_id: 5\n").unwrap();
+        assert_eq!(cfg.telegram.bot_token, "T");
+        assert_eq!(cfg.telegram.chat_id, 5);
+
+        let sparse: GatewayConfig = serde_yaml::from_str("vaults:\n  ob-1: /tmp/v1\n").unwrap();
+        assert!(
+            sparse.telegram.bot_token.is_empty(),
+            "missing telegram block must default to an empty bot_token"
+        );
+        assert_eq!(
+            sparse.telegram.chat_id, 0,
+            "missing telegram block must default to a zero chat_id"
+        );
     }
 
     /// Windows-CI regression guard (`gateway_http.rs`'s happy path failed
