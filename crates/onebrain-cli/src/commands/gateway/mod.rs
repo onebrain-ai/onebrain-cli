@@ -494,6 +494,30 @@ mod tests {
         );
     }
 
+    /// The ADVERSARIAL case the blanket-`trace` test above does not cover
+    /// (Task 1 fix wave, minor deferred; discharged as the whole-branch
+    /// review's Minor 3 ride-along): an operator naming `ureq` EXPLICITLY,
+    /// at the same specificity as the floor itself. The floor is appended
+    /// LAST and `EnvFilter` resolves same-specificity directives
+    /// last-parsed-wins, so `ureq=info` still governs the `ureq` target.
+    /// That mechanism was verified empirically against the pinned
+    /// `tracing-subscriber` during Task 1 but was never pinned by a test —
+    /// and it is the DIRECT guard for this branch's most consequential
+    /// leak vector: at `trace`, `ureq` logs the full request path, and
+    /// `telegram_api`'s paths embed the live bot token.
+    ///
+    /// Asserted on the resolved filter's own `Display`: the floor is
+    /// present, and no `ureq=trace` survives anywhere in it.
+    #[test]
+    fn log_filter_floors_an_explicit_ureq_trace_override() {
+        let filter = log_filter_from(Some("ureq=trace".to_string())).to_string();
+        assert!(filter.contains(UREQ_LOG_FLOOR), "{filter}");
+        assert!(
+            !filter.contains("ureq=trace"),
+            "an explicitly requested ureq=trace must not survive the floor: {filter}"
+        );
+    }
+
     /// The variable actually consulted is the one `tracing_subscriber` itself
     /// names, so this never drifts to a private spelling of `RUST_LOG`.
     #[test]

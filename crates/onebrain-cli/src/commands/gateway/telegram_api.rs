@@ -57,17 +57,24 @@
 //! violation of this contract fails loudly in tests/debug builds instead of
 //! silently risking a local timeout in release.
 //!
-//! ## Dead-code allow
-//! Same situation as [`super::auth`]'s own `#![allow(dead_code)]` (see that
-//! module's doc comment for the full precedent chain): Task 1 gave `BotApi`
-//! no external caller at all. Gateway PR 5, Task 4 gives `new`/
-//! `send_message`/`edit_message_text` a real one — [`super::telegram::TelegramChannel`]
-//! — but `get_me`/`get_updates`/`answer_callback_query` (and the
-//! `BotIdentity`/`TgUpdate`/`TgCallback` types that exist only for them)
-//! stay unreachable from `main` until Task 5's callback-polling flow wires
-//! them up. This attribute now covers only that remaining slice. The tests
-//! below exercise every path, so none of it is untested dead code.
-#![allow(dead_code)]
+//! ## No dead-code allow (whole-branch review, Minor 3)
+//! This module carried a blanket `#![allow(dead_code)]` while it was being
+//! built out: Task 1 landed `BotApi` with no external caller at all, Task 4
+//! wired up `new`/`send_message`/`edit_message_text`, and `get_me`/
+//! `get_updates`/`answer_callback_query` (plus the `BotIdentity`/
+//! `TgUpdate`/`TgCallback` types that exist for them) stayed unreachable
+//! from `main` until Task 5's poller and Task 6's setup wizard. As of Task
+//! 6 every item here has a real production caller, so the allow is gone.
+//!
+//! It matters that it stays gone. This module is the secret-hygiene
+//! chokepoint for the whole Telegram channel: [`scrub`] is the ONLY
+//! constructor of a [`TgError`], and [`strip_token`] is what keeps a live
+//! bot token out of an error an operator — or a client — might see. Under
+//! a blanket allow, deleting `strip_token`'s call site in [`BotApi::call`],
+//! or the last caller of a [`scrub`] arm, would pass clippy and CI in
+//! silence: the exact "deletable without failure" class this branch's Task
+//! 1 review raised as blocking. Without it, the compiler is the one holding
+//! that line.
 
 use std::fmt;
 use std::time::Duration;

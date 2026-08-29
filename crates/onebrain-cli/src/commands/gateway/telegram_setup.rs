@@ -448,7 +448,7 @@ pub(crate) fn run_setup(
         }
     })?;
 
-    write_telegram_config(gateway_dir, &token, chat_id)?;
+    let clobbered_comments = write_telegram_config(gateway_dir, &token, chat_id)?;
 
     api.send_message(
         chat_id,
@@ -462,29 +462,131 @@ pub(crate) fn run_setup(
     })?;
 
     writeln!(out, "Telegram gateway connected (chat_id {chat_id}).")?;
+    // Whole-branch review, Important 2: `gateway run` reads `gateway.yml`
+    // ONCE, at startup, and freezes `GatewayState.telegram` for the life of
+    // the process (see `super::mod::load_gateway_config`'s single call
+    // site). `docs/gateway.md` explicitly teaches the "gateway already
+    // running, run this from a second terminal" pattern for `gateway pair`,
+    // so an operator following the same habit here would otherwise get two
+    // success messages — this line, and "OneBrain gateway connected" pushed
+    // to their phone — and then silence: the next blocked call sends no
+    // prompt, `capabilities.approval_channels.telegram` still reports
+    // `false`, nothing is logged, and the call times out five minutes
+    // later. Deliberately NOT a hot reload, which is a design change and
+    // out of scope for this fix.
+    writeln!(
+        out,
+        "If `onebrain gateway run` is already running, restart it — it reads gateway.yml only at startup, so the Telegram channel stays off in that process until you do."
+    )?;
+    // Minor 4: `write_telegram_config` could not append textually (the
+    // file already carried a `telegram:` key), so it round-tripped the
+    // whole document through `serde_yaml` and the operator's own comments
+    // are gone. Say so on the terminal rather than letting a hand-annotated
+    // config lose its annotations silently — see that function's own doc
+    // comment for why the fallback path exists at all.
+    if clobbered_comments {
+        writeln!(
+            out,
+            "Note: rewriting the existing telegram: block reformatted gateway.yml and dropped its comments."
+        )?;
+    }
     Ok(())
 }
 
-/// Read-modify-write `gateway_dir.join("gateway.yml")`'s `telegram:` block
-/// via a raw [`serde_yaml::Value`] — NOT the typed
-/// [`super::config::GatewayConfig`], because that struct's `bot_token`
-/// field is `#[serde(skip_serializing)]` (see that field's own doc
-/// comment): serializing the typed struct back out would silently DROP the
-/// token this wizard just captured. The raw-`Value` round-trip also
-/// preserves every OTHER top-level key already in the file (`port`,
-/// `vaults`, `policy`, …) untouched — exactly the brief's "preserving
-/// unknown keys" requirement.
+/// Renders the `telegram:` block this wizard writes, as literal YAML text.
+/// One definition for both of [`write_telegram_config`]'s paths, so the
+/// appended block and the round-tripped one can never drift in shape.
+///
+/// `bot_token` is single-quoted (with YAML's own `''` escape applied) so a
+/// token is emitted as an unambiguous string no matter what characters
+/// `@BotFather` ever puts in one — `chat_id` is an `i64` and needs no such
+/// care.
+fn render_telegram_block(bot_token: &str, chat_id: i64) -> String {
+    let escaped = bot_token.replace('\'', "''");
+    format!("telegram:\n  bot_token: '{escaped}'\n  chat_id: {chat_id}\n")
+}
+
+/// `true` iff `content` has a line whose first non-whitespace character is
+/// `#` — a whole-line YAML comment.
+///
+/// Deliberately conservative: it does NOT try to find trailing `#` comments
+/// after a value, because `#` inside a quoted scalar is not a comment and
+/// telling those apart needs a real YAML scanner. Only ever used to decide
+/// whether to WARN (see [`write_telegram_config`]'s fallback path), so
+/// under-reporting a file whose only comments are trailing ones costs a
+/// warning, never correctness.
+/// `true` iff `content` parses as a single YAML document whose `telegram:`
+/// block carries exactly the `bot_token`/`chat_id` just written — the
+/// self-check [`write_telegram_config`]'s append path gates on before it
+/// commits to that path. Parses with the same `serde_yaml::from_str` entry
+/// point `config.rs` itself uses, so "reads back" means the same thing here
+/// as it will when `gateway run` next loads the file.
+fn appended_reads_back(content: &str, bot_token: &str, chat_id: i64) -> bool {
+    match serde_yaml::from_str::<serde_yaml::Value>(content) {
+        Ok(v) => {
+            v["telegram"]["bot_token"].as_str() == Some(bot_token)
+                && v["telegram"]["chat_id"].as_i64() == Some(chat_id)
+        }
+        Err(_) => false,
+    }
+}
+
+fn has_comment_line(content: &str) -> bool {
+    content.lines().any(|l| l.trim_start().starts_with('#'))
+}
+
+/// Write `gateway_dir.join("gateway.yml")`'s `telegram:` block, preserving
+/// as much of an existing hand-edited file as the situation allows.
+/// Returns `true` iff the write went through the comment-destroying
+/// fallback path below, so the caller can say so on the terminal.
+///
+/// **Preferred path — textual append** (whole-branch review, Minor 4).
+/// When the file already exists, parses as a root mapping, and carries no
+/// `telegram:` key yet, the rendered block is APPENDED to the file's exact
+/// existing bytes. `gateway.yml` is a documented, hand-edited operator
+/// surface (`docs/gateway.md`'s schema table), and an operator who
+/// annotated their `policy:` block should not lose those annotations to one
+/// `telegram setup` run. Appending a fresh top-level key at column 0 is
+/// safe precisely because the existing content already parsed as a complete
+/// root mapping: a multi-document file, a non-mapping root, or anything
+/// malformed is rejected before this point, never appended to.
+///
+/// **Fallback path — raw [`serde_yaml::Value`] round-trip.** Used when the
+/// file is absent (nothing to preserve) or ALREADY has a `telegram:` key
+/// (re-pairing, or rotating a token): replacing a key in place textually
+/// would mean editing YAML with string surgery, which is exactly the
+/// fragility the append path avoids by only ever adding. This path goes
+/// through a raw `Value` — NOT the typed [`super::config::GatewayConfig`],
+/// because that struct's `bot_token` field is `#[serde(skip_serializing)]`
+/// (see that field's own doc comment): serializing the typed struct back
+/// out would silently DROP the token this wizard just captured. It
+/// preserves every other top-level key already in the file (`port`,
+/// `vaults`, `policy`, …) — the brief's "preserving unknown keys"
+/// requirement — but not comments or layout, which is what the returned
+/// flag exists to disclose.
 ///
 /// Creates `gateway_dir` (0700) and the file itself (0600) via
-/// [`write_private_yaml`] if neither exists yet — this is the FIRST writer
+/// [`write_private_yaml`] on either path — this is the FIRST writer
 /// `gateway.yml` has ever had in this crate (every earlier task only read
-/// it; see `config.rs`'s own module doc comment).
-fn write_telegram_config(gateway_dir: &Path, bot_token: &str, chat_id: i64) -> anyhow::Result<()> {
+/// it; see `config.rs`'s own module doc comment) — so the append path is an
+/// atomic whole-file replacement too, never an `O_APPEND` handle that could
+/// widen the mode or leave a half-written file behind.
+fn write_telegram_config(
+    gateway_dir: &Path,
+    bot_token: &str,
+    chat_id: i64,
+) -> anyhow::Result<bool> {
     let path = gateway_dir.join("gateway.yml");
 
-    let mut mapping = match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            let value: serde_yaml::Value = serde_yaml::from_str(&content)
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(content) => Some(content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+
+    let mut mapping = match existing.as_deref() {
+        Some(content) => {
+            let value: serde_yaml::Value = serde_yaml::from_str(content)
                 .with_context(|| format!("parse existing {}", path.display()))?;
             match value {
                 serde_yaml::Value::Mapping(m) => m,
@@ -495,9 +597,36 @@ fn write_telegram_config(gateway_dir: &Path, bot_token: &str, chat_id: i64) -> a
                 ),
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_yaml::Mapping::new(),
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        None => serde_yaml::Mapping::new(),
     };
+
+    let telegram_key = serde_yaml::Value::String("telegram".to_string());
+
+    if let Some(content) = existing.as_deref() {
+        if !mapping.contains_key(&telegram_key) {
+            let mut appended = content.to_string();
+            if !appended.is_empty() && !appended.ends_with('\n') {
+                appended.push('\n');
+            }
+            appended.push_str(&render_telegram_block(bot_token, chat_id));
+            // Only actually TAKE the append path if the result reads back
+            // as what we meant. Appending a top-level key is safe for
+            // ordinary YAML but not for every file that parses as a single
+            // mapping: a document ending with an explicit `...` marker, for
+            // one, would turn the appended block into a SECOND document,
+            // which `config.rs`'s own loader then refuses outright — the
+            // wizard would have quietly broken a config it was asked to
+            // extend. Verifying, rather than trying to enumerate every such
+            // shape, keeps the preferred path fail-SAFE: anything it cannot
+            // produce correctly falls through to the round-trip below,
+            // which rebuilds the document from parsed values and cannot
+            // have the problem.
+            if appended_reads_back(&appended, bot_token, chat_id) {
+                write_private_yaml(&path, appended.as_bytes())?;
+                return Ok(false);
+            }
+        }
+    }
 
     let mut telegram = serde_yaml::Mapping::new();
     telegram.insert(
@@ -508,14 +637,12 @@ fn write_telegram_config(gateway_dir: &Path, bot_token: &str, chat_id: i64) -> a
         serde_yaml::Value::String("chat_id".to_string()),
         serde_yaml::Value::Number(chat_id.into()),
     );
-    mapping.insert(
-        serde_yaml::Value::String("telegram".to_string()),
-        serde_yaml::Value::Mapping(telegram),
-    );
+    mapping.insert(telegram_key, serde_yaml::Value::Mapping(telegram));
 
     let rendered = serde_yaml::to_string(&serde_yaml::Value::Mapping(mapping))
         .context("serialize gateway.yml")?;
-    write_private_yaml(&path, rendered.as_bytes())
+    write_private_yaml(&path, rendered.as_bytes())?;
+    Ok(existing.as_deref().is_some_and(has_comment_line))
 }
 
 /// Create `dir` with owner-only (0700) permissions on Unix, re-asserting
@@ -945,7 +1072,25 @@ mod tests {
             "OneBrain gateway connected. Approval requests will appear here."
         );
 
-        assert!(running.out.text().contains("555"));
+        let printed = running.out.text();
+        assert!(printed.contains("555"), "{printed}");
+        // Whole-branch review, Important 2: `gateway run` freezes its
+        // Telegram config at startup, and `docs/gateway.md` teaches the
+        // "run this from a second terminal while the gateway is up"
+        // pattern for `gateway pair`. Without this line an operator who
+        // applies the same habit here gets two success messages and a
+        // channel that stays dead until the next restart, with nothing
+        // anywhere saying so.
+        assert!(
+            printed.contains("restart it") && printed.contains("only at startup"),
+            "the wizard must tell the operator to restart a running gateway: {printed}"
+        );
+        // The append path leaves nothing to warn about (this file did not
+        // exist before the run, so no comments were at risk).
+        assert!(
+            !printed.contains("dropped its comments"),
+            "a first-time write must not claim it dropped anything: {printed}"
+        );
     }
 
     #[test]
@@ -1364,5 +1509,136 @@ mod tests {
         );
         assert_eq!(parsed["telegram"]["bot_token"].as_str(), Some("tok-123"));
         assert_eq!(parsed["telegram"]["chat_id"].as_i64(), Some(555));
+    }
+
+    /// Whole-branch review, Minor 4: `gateway.yml` is a documented,
+    /// hand-edited operator surface, and a `serde_yaml::Value` round-trip
+    /// of the whole document silently drops every comment in it. The
+    /// FIRST-time write — an existing annotated file with no `telegram:`
+    /// key yet, which is the shape an operator following the docs actually
+    /// has — appends textually instead, so the annotations survive
+    /// byte-for-byte and nothing is warned about.
+    #[test]
+    fn write_telegram_config_appends_to_an_annotated_file_without_touching_its_comments() {
+        let root = tempfile::tempdir().unwrap();
+        let gateway_dir = root.path().join(".onebrain");
+        std::fs::create_dir_all(&gateway_dir).unwrap();
+        let original =
+            "# my gateway\nport: 9999\npolicy:\n  # writes need a human\n  mutating: ask_always\n";
+        std::fs::write(gateway_dir.join("gateway.yml"), original).unwrap();
+
+        let clobbered = write_telegram_config(&gateway_dir, "tok-123", 555).unwrap();
+        assert!(!clobbered, "the append path must not report comment loss");
+
+        let content = std::fs::read_to_string(gateway_dir.join("gateway.yml")).unwrap();
+        assert!(
+            content.starts_with(original),
+            "the existing bytes must be preserved verbatim: {content}"
+        );
+        assert!(content.contains("# my gateway"), "{content}");
+        assert!(content.contains("# writes need a human"), "{content}");
+
+        // …and the result is still valid YAML carrying both the old keys
+        // and the new block.
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        assert_eq!(parsed["port"].as_i64(), Some(9999), "{content}");
+        assert_eq!(
+            parsed["policy"]["mutating"].as_str(),
+            Some("ask_always"),
+            "{content}"
+        );
+        assert_eq!(parsed["telegram"]["bot_token"].as_str(), Some("tok-123"));
+        assert_eq!(parsed["telegram"]["chat_id"].as_i64(), Some(555));
+    }
+
+    /// A file that ALREADY has a `telegram:` key (re-pairing, or rotating a
+    /// token) cannot be appended to — replacing a key in place would mean
+    /// string surgery on YAML. That write goes through the `serde_yaml`
+    /// round-trip, comments and all, so the function REPORTS it and
+    /// `run_setup` prints a note rather than losing the operator's
+    /// annotations silently.
+    #[test]
+    fn write_telegram_config_reports_the_rewrite_that_drops_comments() {
+        let root = tempfile::tempdir().unwrap();
+        let gateway_dir = root.path().join(".onebrain");
+        std::fs::create_dir_all(&gateway_dir).unwrap();
+        std::fs::write(
+            gateway_dir.join("gateway.yml"),
+            "# keep me\nport: 9999\ntelegram:\n  bot_token: 'old'\n  chat_id: 111\n",
+        )
+        .unwrap();
+
+        let clobbered = write_telegram_config(&gateway_dir, "tok-new", 555).unwrap();
+        assert!(
+            clobbered,
+            "rewriting a commented file must be reported, not silent"
+        );
+
+        let content = std::fs::read_to_string(gateway_dir.join("gateway.yml")).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        assert_eq!(parsed["port"].as_i64(), Some(9999), "{content}");
+        assert_eq!(parsed["telegram"]["bot_token"].as_str(), Some("tok-new"));
+        assert_eq!(parsed["telegram"]["chat_id"].as_i64(), Some(555));
+
+        // A rewrite of an UNCOMMENTED file has nothing to disclose.
+        std::fs::write(
+            gateway_dir.join("gateway.yml"),
+            "port: 9999\ntelegram:\n  bot_token: 'old'\n  chat_id: 111\n",
+        )
+        .unwrap();
+        assert!(
+            !write_telegram_config(&gateway_dir, "tok-new", 555).unwrap(),
+            "a file with no comments has nothing to warn about"
+        );
+    }
+
+    /// A file the append path CANNOT safely extend must fall through to
+    /// the round-trip, not silently produce a `gateway.yml` the gateway can
+    /// no longer load. An explicit `...` document-end marker is the case:
+    /// the source parses fine as one document, but a top-level key appended
+    /// after the marker starts a SECOND one, and `serde_yaml` refuses a
+    /// multi-document file on the next read. The append path's own
+    /// read-back check catches that and defers.
+    #[test]
+    fn write_telegram_config_falls_back_when_appending_would_break_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        let gateway_dir = root.path().join(".onebrain");
+        std::fs::create_dir_all(&gateway_dir).unwrap();
+        std::fs::write(gateway_dir.join("gateway.yml"), "port: 9999\n...\n").unwrap();
+
+        write_telegram_config(&gateway_dir, "tok-123", 555).unwrap();
+
+        // The decisive assertion: the result is still ONE loadable
+        // document carrying both the old key and the new block.
+        let content = std::fs::read_to_string(gateway_dir.join("gateway.yml")).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        assert_eq!(parsed["port"].as_i64(), Some(9999), "{content}");
+        assert_eq!(
+            parsed["telegram"]["chat_id"].as_i64(),
+            Some(555),
+            "{content}"
+        );
+    }
+
+    /// The token is emitted as a quoted scalar, so a token carrying YAML
+    /// metacharacters round-trips as the same string rather than
+    /// reinterpreting as structure. Uses an obviously-fake value — no real
+    /// token shape appears in this suite.
+    #[test]
+    fn write_telegram_config_quotes_the_token_it_appends() {
+        let root = tempfile::tempdir().unwrap();
+        let gateway_dir = root.path().join(".onebrain");
+        std::fs::create_dir_all(&gateway_dir).unwrap();
+        std::fs::write(gateway_dir.join("gateway.yml"), "port: 9999\n").unwrap();
+
+        write_telegram_config(&gateway_dir, "not-a-real: token #with'quote", 555).unwrap();
+
+        let content = std::fs::read_to_string(gateway_dir.join("gateway.yml")).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["telegram"]["bot_token"].as_str(),
+            Some("not-a-real: token #with'quote"),
+            "{content}"
+        );
     }
 }

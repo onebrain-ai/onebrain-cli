@@ -148,6 +148,23 @@ const POLL_TIMEOUT_SECS: u32 = 25;
 /// loop hammering the API once a second.
 const POLL_ERROR_BACKOFF: Duration = Duration::from_secs(2);
 
+/// How long a [`SentSlot::Resolved`] tombstone stays in
+/// [`TelegramChannel::sent`] before [`TelegramChannel::fire`]'s sweep may
+/// reclaim it (see [`SentSlot`]'s own doc comment for what a tombstone is
+/// and why it exists).
+///
+/// This is a garbage-collection bound, NOT a correctness one: `fire` looks
+/// its OWN id up (and removes it) BEFORE running the sweep, so a tombstone
+/// is honoured even if it has technically aged out by the time the send it
+/// was left for finally returns. What this value actually bounds is the
+/// leftover case nothing ever consumes — a tombstone written for an id
+/// whose `sendMessage` then FAILED, so no success path ever arrives to
+/// claim it. 120 seconds is comfortably longer than `telegram_api`'s own
+/// end-to-end `HTTP_TIMEOUT` (40 seconds), which is the longest a send can
+/// possibly stay in flight, so an unclaimed tombstone is always genuinely
+/// unclaimable by the time it expires.
+const TOMBSTONE_TTL_SECS: u64 = 120;
+
 /// Floor on how often a SUCCESSFUL poll cycle may repeat (Task 5 review,
 /// F2), in milliseconds — an `AtomicU64` rather than a plain `const`
 /// specifically so `#[cfg(test)]` callers can dial it down (Task 5 review
@@ -311,6 +328,80 @@ struct Sent {
     expires: u64,
 }
 
+/// One entry in [`TelegramChannel::sent`], in one of its two states.
+///
+/// [`Self::Live`] is the ordinary one: [`TelegramChannel::fire`]'s
+/// `sendMessage` returned, the prompt is on the operator's phone with two
+/// tappable buttons, and a later [`TelegramChannel::note_outcome`] will
+/// find it and edit those buttons away.
+///
+/// [`Self::Resolved`] — a TOMBSTONE — exists for the opposite ORDER, which
+/// is not a corner case (whole-branch review, Important 1). `fire` inserts
+/// from inside a `tokio::task::spawn_blocking` closure, i.e. only once
+/// `sendMessage` has round-tripped to Telegram; `note_outcome` runs
+/// synchronously on `server::await_approval`'s own task the moment the
+/// approval resolves. Nothing orders those two against each other, and
+/// `policy.approval_wait_seconds: 0` — documented as legal, warned-but-not-
+/// refused at startup — makes the inverted order the ONLY order: the wait
+/// times out before any send can return, so EVERY gated call would post a
+/// prompt whose buttons were never cleared. A slow send plus an operator
+/// answering at the Mac does the same non-deterministically.
+///
+/// The tombstone closes it: `note_outcome` finding no entry leaves the
+/// outcome text behind instead of returning empty-handed, and `fire`'s
+/// success path — which by then holds the `message_id` that did not exist
+/// when `note_outcome` ran — claims it and issues the edit immediately,
+/// rather than inserting a [`Self::Live`] entry nobody will ever come back
+/// for. Tapping a stale button was always SAFE (`Approvals::resolve`
+/// returns `false` and the tapper gets "too late"), but a prompt that
+/// stays tappable forever is the stale-control class PR 4 closed for the
+/// native dialog, and `docs/gateway.md` asserts unconditionally that a
+/// Telegram-side approver never sees one.
+enum SentSlot {
+    Live(Sent),
+    /// `outcome` is the exact string [`TelegramChannel::note_outcome`] was
+    /// given (`server::await_approval` composes all three — see its own doc
+    /// comment); `expires` is a [`TOMBSTONE_TTL_SECS`] stamp of this
+    /// tombstone's own, NOT the approval's, since the approval this belongs
+    /// to has already resolved.
+    Resolved {
+        outcome: String,
+        expires: u64,
+    },
+}
+
+impl SentSlot {
+    /// When this entry becomes sweepable — [`Sent::expires`] (the
+    /// approval's own TTL, carried verbatim) for a live prompt, the
+    /// tombstone's own [`TOMBSTONE_TTL_SECS`] stamp otherwise. One
+    /// accessor so [`TelegramChannel::fire`]'s sweep stays a single
+    /// `retain` over both shapes.
+    fn expires(&self) -> u64 {
+        match self {
+            Self::Live(s) => s.expires,
+            Self::Resolved { expires, .. } => *expires,
+        }
+    }
+}
+
+/// Drop every entry in [`TelegramChannel::sent`] whose own
+/// [`SentSlot::expires`] has already passed — the map's whole bound (Task 4
+/// review, F1; see [`TelegramChannel::sent`]'s doc comment for why entries
+/// can be orphaned at all, and [`SentSlot`]'s for the two shapes this
+/// covers).
+///
+/// One function rather than two copies because BOTH inserters must run it,
+/// and for different reasons: [`TelegramChannel::fire`] sweeps on its
+/// success path (the original F1 case, a cancelled tool call whose live
+/// prompt nobody will ever edit), and [`TelegramChannel::note_outcome`]
+/// sweeps when it leaves a tombstone (a gateway whose sends ALL fail never
+/// reaches `fire`'s success path at all, so without this its unclaimable
+/// tombstones would grow one per gated call, unswept).
+fn sweep_expired(sent: &mut HashMap<String, SentSlot>) {
+    let now = now_epoch_secs();
+    sent.retain(|_, s| s.expires() > now);
+}
+
 /// The Telegram approval channel (Gateway PR 5, Task 4): sends an approval
 /// prompt with inline Approve/Deny buttons ([`Self::fire`]) and edits it
 /// once the approval resolves, from WHATEVER channel resolved it
@@ -353,12 +444,15 @@ pub struct TelegramChannel {
     /// entries plus one TTL window of not-yet-swept stragglers — never
     /// unbounded — at the cost of an orphan surviving up to one more
     /// `fire` call's worth of time past its own approval resolving. The
-    /// SAME sweep also closes the send/resolve race for free: if `fire`'s
-    /// `spawn_blocking` insert lands AFTER `note_outcome` already ran for
-    /// the same id (found nothing, since the insert hadn't happened yet),
-    /// the resulting orphan carries the SAME `expires` stamp and is swept
-    /// on the next `fire` call, at no extra cost.
-    sent: Arc<Mutex<HashMap<String, Sent>>>,
+    /// The sweep bounds the MAP. It does not, on its own, close the
+    /// send/resolve RACE — an earlier revision of this doc claimed it did,
+    /// which conflated the two: sweeping an orphaned entry reclaims the
+    /// map slot but never edits the message that entry pointed at, so the
+    /// prompt on the operator's phone kept its live Approve/Deny buttons
+    /// for good. [`SentSlot::Resolved`] is what actually closes that (see
+    /// its own doc comment); the sweep applies to tombstones too, so they
+    /// cannot accumulate either.
+    sent: Arc<Mutex<HashMap<String, SentSlot>>>,
     /// `true` iff the [`Self::ensure_polling`] thread is currently up. Every
     /// call `compare_exchange`s this from `false` to `true` — the winner
     /// spawns the thread, every loser (this flag was already `true`) returns
@@ -403,6 +497,17 @@ impl TelegramChannel {
     /// fully `pub`: this crate's own tests are the only legitimate caller,
     /// and the whole point is that this is NOT part of the type's real
     /// public API.
+    /// How many entries — live prompts AND [`SentSlot::Resolved`]
+    /// tombstones alike — [`Self::sent`] currently holds. `#[cfg(test)]`
+    /// only, same reasoning as [`Self::is_polling`] directly below: the
+    /// map is private for good reason, but a test proving the resolve-
+    /// before-send race leaves nothing behind (whole-branch review,
+    /// Important 1) has no other way to say so.
+    #[cfg(test)]
+    fn sent_len(&self) -> usize {
+        self.sent.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
     #[cfg(test)]
     pub(crate) fn is_polling(&self) -> bool {
         // `SeqCst` for consistency with every other access to `polling` in
@@ -434,12 +539,27 @@ impl TelegramChannel {
     /// redundant); `client_id`/`tool` add only a small, fixed amount on top
     /// of that bound, nowhere near Telegram's 4096-character message limit.
     ///
+    /// **If the approval already resolved while this send was in flight**
+    /// (whole-branch review, Important 1 — see [`SentSlot`]'s own doc
+    /// comment for why that is the NORMAL order under
+    /// `policy.approval_wait_seconds: 0`, not a corner case), the success
+    /// path finds the [`SentSlot::Resolved`] tombstone
+    /// [`Self::note_outcome`] left behind, issues the outcome edit right
+    /// there — still inside the same `spawn_blocking` closure, so the
+    /// caller is no more blocked than by the send itself — and inserts
+    /// NOTHING. Without that, the message Telegram delivered a moment
+    /// after the resolution would keep its Approve/Deny buttons for the
+    /// life of the process.
+    ///
     /// Never blocks the caller and never returns a `Result` — see the
     /// module docs' "fire-and-forget by construction" section. A send
-    /// failure is a `tracing::warn!` and `sent` simply never gains an entry
-    /// for this id, which makes a later [`Self::note_outcome`] call for the
-    /// same id a harmless no-op (nothing to edit — there was never a
-    /// message to edit in the first place).
+    /// failure is a `tracing::warn!` and `sent` simply never gains a
+    /// [`SentSlot::Live`] entry for this id, which makes a later
+    /// [`Self::note_outcome`] call for the same id a harmless no-op
+    /// (nothing to edit — there was never a message to edit in the first
+    /// place); a tombstone left by a `note_outcome` that already ran is
+    /// reclaimed by the sweep instead, since no success path will ever
+    /// arrive to claim it.
     pub fn fire(&self, pending: &PendingApproval) {
         let api = Arc::clone(&self.api);
         let sent = Arc::clone(&self.sent);
@@ -476,23 +596,54 @@ impl TelegramChannel {
             ];
             match api.send_message(chat_id, &text, Some(&keyboard)) {
                 Ok(message_id) => {
-                    let mut sent = sent.lock().unwrap_or_else(|e| e.into_inner());
-                    // Task 4 review, F1: sweep out anything already past
-                    // its own TTL before inserting — see `Self::sent`'s own
-                    // doc comment for why (a cancelled tool-call future
-                    // runs none of `await_approval`'s `WaitOutcome` arms,
-                    // so `note_outcome` would otherwise never run for that
-                    // id) and for the bound this gives the map.
-                    let now = now_epoch_secs();
-                    sent.retain(|_, s| s.expires > now);
-                    sent.insert(
-                        id,
-                        Sent {
-                            message_id,
-                            text,
-                            expires,
-                        },
-                    );
+                    let tombstone = {
+                        let mut sent = sent.lock().unwrap_or_else(|e| e.into_inner());
+                        // Whole-branch review, Important 1: claim this id's
+                        // own slot FIRST, before the sweep below, so a
+                        // tombstone is honoured on its merits rather than on
+                        // its age — see `TOMBSTONE_TTL_SECS`. A `Live` entry
+                        // here is unreachable (only this closure inserts one,
+                        // and ids are unique per approval); treated as "no
+                        // tombstone" rather than asserted, since the whole
+                        // point of this map is that nothing here may ever
+                        // panic the caller's tool call.
+                        let claimed = match sent.remove(&id) {
+                            Some(SentSlot::Resolved { outcome, .. }) => Some(outcome),
+                            _ => None,
+                        };
+                        // Task 4 review, F1: sweep out anything already past
+                        // its own TTL before inserting — see `Self::sent`'s own
+                        // doc comment for why (a cancelled tool-call future
+                        // runs none of `await_approval`'s `WaitOutcome` arms,
+                        // so `note_outcome` would otherwise never run for that
+                        // id) and for the bound this gives the map.
+                        sweep_expired(&mut sent);
+                        if claimed.is_none() {
+                            sent.insert(
+                                id.clone(),
+                                SentSlot::Live(Sent {
+                                    message_id,
+                                    text: text.clone(),
+                                    expires,
+                                }),
+                            );
+                        }
+                        claimed
+                    };
+                    // Outside the lock, deliberately: this is a real
+                    // blocking network call, and the sync `Mutex` above
+                    // guards a map every other approval's `fire`/
+                    // `note_outcome` also needs.
+                    if let Some(outcome) = tombstone {
+                        let edited_text = format!("{outcome}\n\n{text}");
+                        if let Err(e) = api.edit_message_text(chat_id, message_id, &edited_text) {
+                            tracing::warn!(
+                                error = %e,
+                                approval_id = %short_id(&id),
+                                "telegram: failed to edit an approval that resolved before its prompt was sent"
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -513,9 +664,23 @@ impl TelegramChannel {
     /// it. Removes the entry from `sent` FIRST, so at most one edit is
     /// ever attempted per approval — a second call for the same
     /// `approval_id` (however that could happen; nothing in this crate
-    /// calls it twice for one id today) finds nothing and is a silent
-    /// no-op, same as a `fire` that never succeeded (or one whose entry
-    /// [`Self::fire`]'s own sweep already reclaimed as an orphan).
+    /// calls it twice for one id today) finds no live entry and is a
+    /// silent no-op, same as one whose entry [`Self::fire`]'s own sweep
+    /// already reclaimed as an orphan.
+    ///
+    /// **Finding nothing is not the same as having nothing to do**
+    /// (whole-branch review, Important 1). [`Self::fire`] inserts from
+    /// inside a `spawn_blocking` closure, so an approval that resolves
+    /// before its own `sendMessage` returns reaches this method BEFORE the
+    /// entry it would edit exists — and the message Telegram delivers a
+    /// moment later would then keep its live Approve/Deny buttons forever.
+    /// So an absent entry leaves a [`SentSlot::Resolved`] tombstone
+    /// carrying `outcome` (see that variant's own doc comment for the full
+    /// reasoning, including why `approval_wait_seconds: 0` makes this the
+    /// ONLY order rather than a rare one); `fire`'s success path claims it
+    /// and issues the edit itself. A `fire` whose send outright FAILED
+    /// leaves that tombstone unclaimed, which is harmless — there is no
+    /// message to edit — and the sweep reclaims it.
     ///
     /// `outcome` is composed entirely by the caller
     /// (`server::await_approval`) — this method has no opinion on wording,
@@ -527,13 +692,45 @@ impl TelegramChannel {
     /// failure is a `tracing::warn!`; the approval itself already resolved
     /// (or timed out) independent of whether this edit lands.
     pub fn note_outcome(&self, approval_id: &str, outcome: &str) {
-        let removed = {
+        let live = {
             let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
-            sent.remove(approval_id)
+            match sent.remove(approval_id) {
+                Some(SentSlot::Live(s)) => Some(s),
+                // A tombstone is already standing for this id — a repeat
+                // call. Put it back rather than dropping it: the in-flight
+                // `fire` it was left for has not returned yet, and it is
+                // the only thing that will ever clear that prompt's
+                // buttons. The FIRST call's wording wins, matching the
+                // at-most-one-edit guarantee above.
+                Some(tombstone) => {
+                    sent.insert(approval_id.to_string(), tombstone);
+                    None
+                }
+                // Whole-branch review, Important 1: nothing to edit YET.
+                // Leave the outcome behind for `fire`'s success path to
+                // pick up — see [`SentSlot::Resolved`]'s own doc comment.
+                None => {
+                    // Sweep on THIS insert too, not only on `fire`'s (see
+                    // [`sweep_expired`]): `fire` only sweeps on its SUCCESS
+                    // path, so a gateway whose sends all fail — a revoked
+                    // token, Telegram down — would otherwise gain one
+                    // never-claimed tombstone per gated call with nothing
+                    // ever running the sweep that reclaims them.
+                    sweep_expired(&mut sent);
+                    sent.insert(
+                        approval_id.to_string(),
+                        SentSlot::Resolved {
+                            outcome: outcome.to_string(),
+                            expires: now_epoch_secs().saturating_add(TOMBSTONE_TTL_SECS),
+                        },
+                    );
+                    None
+                }
+            }
         };
         let Some(Sent {
             message_id, text, ..
-        }) = removed
+        }) = live
         else {
             return;
         };
@@ -1788,6 +1985,118 @@ mod tests {
             state.requests().len(),
             2,
             "a second note_outcome for the same id must not edit again"
+        );
+    }
+
+    /// The map's whole bound, over BOTH slot shapes (Task 4 review, F1;
+    /// whole-branch review, Important 1 added tombstones to it). A pure
+    /// function over an owned map, so this needs no clock injection and no
+    /// mock: it pins that `expires` is read from whichever variant an entry
+    /// actually is, and that the comparison is strictly-past, not
+    /// past-or-equal.
+    #[test]
+    fn sweep_expired_drops_both_shapes_once_past_their_own_stamp() {
+        let now = now_epoch_secs();
+        let live = |expires| {
+            SentSlot::Live(Sent {
+                message_id: 1,
+                text: "t".to_string(),
+                expires,
+            })
+        };
+        let tomb = |expires| SentSlot::Resolved {
+            outcome: "o".to_string(),
+            expires,
+        };
+
+        let mut map = HashMap::from([
+            ("live-fresh".to_string(), live(now + 60)),
+            ("live-stale".to_string(), live(now - 1)),
+            ("tomb-fresh".to_string(), tomb(now + 60)),
+            ("tomb-stale".to_string(), tomb(now - 1)),
+        ]);
+        sweep_expired(&mut map);
+
+        let mut kept: Vec<&str> = map.keys().map(String::as_str).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["live-fresh", "tomb-fresh"], "{kept:?}");
+    }
+
+    /// Whole-branch review, Important 1: a resolution that BEATS the
+    /// in-flight `sendMessage` must still clear the prompt's buttons.
+    ///
+    /// `fire` inserts into `sent` only once `sendMessage` returns, from
+    /// inside its `spawn_blocking` closure; `note_outcome` runs
+    /// synchronously the moment the approval resolves. Delaying the mock's
+    /// `sendMessage` by 300ms and resolving immediately forces that
+    /// inverted order deterministically — which is not merely a slow-
+    /// network hypothetical: `policy.approval_wait_seconds: 0` is
+    /// documented as legal, and under it the wait times out before EVERY
+    /// send can return, so every gated call would otherwise post a prompt
+    /// whose buttons nothing ever cleared.
+    ///
+    /// Uses the timeout wording specifically (`server::await_approval`'s
+    /// `WaitOutcome::TimedOut` arm) because that is the arm
+    /// `approval_wait_seconds: 0` actually takes.
+    #[tokio::test]
+    async fn a_resolution_that_beats_the_send_still_clears_the_buttons() {
+        let state = MockState::default();
+        state.set_response(
+            "sendMessage",
+            serde_json::json!({ "ok": true, "result": { "message_id": 909 } }),
+        );
+        state.set_delay("sendMessage", Duration::from_millis(300));
+        let server = MockServer::start(state.clone());
+        let _env = crate::test_env::set_var(TELEGRAM_API_BASE_ENV, server.base.as_str());
+
+        let channel = TelegramChannel::new(&configured());
+        let pending = sample_pending("appr-race");
+        channel.fire(&pending);
+        // Synchronous, and the mock will not answer the send for another
+        // 300ms — so this provably lands while `fire`'s closure is still
+        // waiting on the wire, with `sent` still empty.
+        channel.note_outcome("appr-race", "⏰ Expired — no one answered in time");
+        assert_eq!(
+            channel.sent_len(),
+            1,
+            "note_outcome must leave a tombstone behind when there is nothing to edit yet"
+        );
+
+        let requests = wait_for_requests(&state, 2).await;
+        assert_eq!(requests[0].0, "sendMessage", "{requests:?}");
+        let (method, body) = &requests[1];
+        assert_eq!(method, "editMessageText", "{requests:?}");
+        assert_eq!(body["chat_id"], 5, "{body}");
+        assert_eq!(body["message_id"], 909, "{body}");
+        let text = body["text"].as_str().unwrap_or_default();
+        assert!(text.contains("Expired — no one answered in time"), "{body}");
+        assert!(
+            text.contains(&pending.summary),
+            "the edit must still carry the original summary text: {body}"
+        );
+        // `edit_message_text` sends an explicit EMPTY keyboard — omitting
+        // the field would leave Telegram's own buttons in place (Task 4
+        // review, carried finding #10), which is the whole point here.
+        assert_eq!(
+            body["reply_markup"]["inline_keyboard"]
+                .as_array()
+                .map(Vec::len),
+            Some(0),
+            "the edit must clear the inline keyboard, not just the text: {body}"
+        );
+
+        // Exactly one edit, and nothing left in the map to sweep later.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            state.requests().len(),
+            2,
+            "exactly one edit must land: {:?}",
+            state.requests()
+        );
+        assert_eq!(
+            channel.sent_len(),
+            0,
+            "the claimed tombstone must not be replaced by a live entry nobody will edit"
         );
     }
 
