@@ -98,15 +98,32 @@ pub struct GatewayState {
     /// every OTHER caller (`Approvals`'s own methods all take `&self`) keeps
     /// working unchanged through `Deref`.
     pub approvals: Arc<Approvals>,
+    /// The Telegram approval channel (Gateway PR 5, Task 4) — `Some` iff
+    /// [`telegram::is_available`] found `config.telegram` configured (and
+    /// not disabled) at construction time, built exactly once here rather
+    /// than per-call: [`telegram::TelegramChannel`] holds a reusable
+    /// `ureq` agent and its own `sent`-message-id map, both of which need
+    /// to live for the whole process, not one tool call. `await_approval`
+    /// reads this directly off `&Arc<GatewayState>`, firing
+    /// [`telegram::TelegramChannel::fire`]/[`telegram::TelegramChannel::note_outcome`]
+    /// with the exact same `if let Some(..) = &state.telegram` guard shape
+    /// `approval_native::is_available()` already uses for the native
+    /// channel — `None` here (the default, unconfigured `gateway.yml`)
+    /// makes both calls unconditionally no-ops, never a special case the
+    /// caller has to think about.
+    pub telegram: Option<Arc<telegram::TelegramChannel>>,
 }
 
 impl GatewayState {
     pub fn new(config: GatewayConfig, audit: AuditLog) -> Self {
+        let telegram = telegram::is_available(&config.telegram)
+            .then(|| Arc::new(telegram::TelegramChannel::new(&config.telegram)));
         Self {
             config,
             grants: Grants::new(),
             audit,
             approvals: Arc::new(Approvals::new()),
+            telegram,
         }
     }
 }
@@ -1052,7 +1069,12 @@ async fn policy_gate(
 ///    `spawn_blocking` and returns immediately); a late or absent answer
 ///    from this channel is harmless by construction, since
 ///    [`Approvals::resolve`] is first-response-wins (see that method's own
-///    doc comment).
+///    doc comment). Gateway PR 5, Task 4 adds a second, symmetric fire
+///    right after it: [`telegram::TelegramChannel::fire`] whenever
+///    `state.telegram` is `Some` (built once at startup — see
+///    [`GatewayState`]'s own doc comment) — equally non-blocking, equally
+///    harmless if late or never answered, no `cfg!(test)` guard needed
+///    since no unit-test fixture configures `telegram` unless it means to.
 /// 3. `.await` [`Approvals::wait`] for up to `approval_wait_seconds`. Per
 ///    that method's own doc comment, it never holds the `pending` lock
 ///    across this `.await` — the lock is only taken (inside `register`,
@@ -1085,14 +1107,21 @@ async fn policy_gate(
 ///    idempotent — `Grants::record` replaces, never accumulates. Gateway PR
 ///    5, Task 3: this is also where `Ok`'s `channel` is born — the SAME
 ///    `ResolvedVia` [`WaitOutcome::Decided`] carried, reported back to
-///    `policy_gate`'s caller for `record_audit`.
+///    `policy_gate`'s caller for `record_audit`. Task 4: also where
+///    [`telegram::TelegramChannel::note_outcome`] fires, closing the loop
+///    for Telegram regardless of WHICH channel actually answered — an
+///    approval resolved over `/approvals` or the native dialog still gets
+///    its Telegram message edited so a stale Approve button can't linger.
 /// 5. On `Decision::Deny`: no grant, no side effect beyond the audit trail
 ///    `policy_gate`'s caller records — a denied call never reaches the
 ///    tool's own logic. Which channel delivered the denial is still
 ///    reported (`Err`'s `channel`, the same `ResolvedVia` as step 4's) — a
 ///    human answered either way. On a timeout: same "no side effect", but
 ///    `channel` is `None` — nothing answered, so there is no channel to
-///    name.
+///    name. Both arms call `note_outcome` too, same as step 4 — a Deny or a
+///    timeout still closes the Telegram message's loop, just with a
+///    different outcome string (see the call sites below for the three
+///    exact strings).
 async fn await_approval(
     state: &Arc<GatewayState>,
     principal: &Principal,
@@ -1176,6 +1205,15 @@ async fn await_approval(
         approval_native::prompt(&pending, state.approvals.clone());
     }
 
+    // Gateway PR 5, Task 4: the Telegram sibling of the native fire above,
+    // symmetric guard (`Option::is_some`, not `cfg!(test)` — no unit-test
+    // fixture configures `telegram` unless it explicitly means to, and
+    // `TelegramChannel::fire` itself never blocks or panics regardless, so
+    // there is no real-GUI-dialog-style hazard to guard against here).
+    if let Some(t) = &state.telegram {
+        t.fire(&pending);
+    }
+
     match state
         .approvals
         .wait(&id, rx, Duration::from_secs(wait_secs))
@@ -1196,25 +1234,44 @@ async fn await_approval(
                     ttl_secs,
                 );
             }
+            // Closes the loop for Telegram regardless of which channel
+            // actually answered — an operator who approved over `/approvals`
+            // or the native dialog still gets the Telegram message edited so
+            // its buttons stop being live (see
+            // `telegram_api::BotApi::edit_message_text`'s own doc comment
+            // for why that requires an explicit empty keyboard).
+            if let Some(t) = &state.telegram {
+                t.note_outcome(&id, &format!("✅ Approved via {}", via.as_str()));
+            }
             Ok((Decision::Approved, Some(via)))
         }
-        WaitOutcome::Decided(approval::Decision::Deny, via) => Err((
-            Decision::Denied,
-            Some(via),
-            ErrorData::invalid_request(
-                format!("this call was denied by the gateway operator [{tool}]"),
+        WaitOutcome::Decided(approval::Decision::Deny, via) => {
+            if let Some(t) = &state.telegram {
+                t.note_outcome(&id, &format!("⛔ Denied via {}", via.as_str()));
+            }
+            Err((
+                Decision::Denied,
+                Some(via),
+                ErrorData::invalid_request(
+                    format!("this call was denied by the gateway operator [{tool}]"),
+                    None,
+                ),
+            ))
+        }
+        WaitOutcome::TimedOut => {
+            if let Some(t) = &state.telegram {
+                t.note_outcome(&id, "⏰ Expired — no one answered in time");
+            }
+            Err((
+                Decision::TimedOut,
+                // Nothing answered, so there is no channel to name.
                 None,
-            ),
-        )),
-        WaitOutcome::TimedOut => Err((
-            Decision::TimedOut,
-            // Nothing answered, so there is no channel to name.
-            None,
-            ErrorData::invalid_request(
-                format!("approval request timed out with no response [{tool}]"),
-                None,
-            ),
-        )),
+                ErrorData::invalid_request(
+                    format!("approval request timed out with no response [{tool}]"),
+                    None,
+                ),
+            ))
+        }
     }
 }
 
@@ -2035,7 +2092,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use tower::ServiceExt;
 
     use crate::commands::gateway::auth::AuthStore;
@@ -5001,6 +5058,232 @@ mod tests {
         assert_eq!(
             reported, registered,
             "capabilities' tool list and the router's registered tools have drifted apart"
+        );
+    }
+
+    // ── Gateway PR 5, Task 4: Telegram outcome edits close the loop ──────
+    //
+    // A THIRD copy of the mock-Bot-API-server pattern `telegram_api.rs`
+    // (Task 1) and `telegram.rs` (Task 4) each already carry their own copy
+    // of — see `telegram_api.rs`'s `MockServer` doc comment for the full
+    // rationale (a real bound socket, since `TelegramChannel`'s `BotApi` is
+    // a real blocking `ureq` client that no in-process `axum::Router`
+    // caller, including this file's own `oneshot`-based `post` helper, can
+    // intercept). Named distinctly (`Telegram*`) rather than reusing
+    // `MockServer`/`MockState` — this file already has many other
+    // differently-shaped fixtures, and a bare "Mock" name would be
+    // ambiguous a few thousand lines down from here.
+
+    #[derive(Clone, Default)]
+    struct TelegramMockState {
+        responses: std::sync::Arc<std::sync::Mutex<HashMap<String, serde_json::Value>>>,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    impl TelegramMockState {
+        fn set_response(&self, method: &str, body: serde_json::Value) {
+            self.responses
+                .lock()
+                .unwrap()
+                .insert(method.to_string(), body);
+        }
+
+        fn requests(&self) -> Vec<(String, serde_json::Value)> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    // `axum::Json` fully-qualified throughout this handler — the bare name
+    // `Json` in this module's scope already resolves to `rmcp`'s OWN
+    // wrapper type (`use rmcp::handler::server::wrapper::Json` at this
+    // file's top, pulled in here via `use super::*;`), not `axum::Json`.
+    async fn telegram_mock_handler(
+        axum::extract::Path(params): axum::extract::Path<HashMap<String, String>>,
+        axum::extract::State(state): axum::extract::State<TelegramMockState>,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> axum::Json<serde_json::Value> {
+        let method = params.get("method").cloned().unwrap_or_default();
+        state.requests.lock().unwrap().push((method.clone(), body));
+        let resp = state
+            .responses
+            .lock()
+            .unwrap()
+            .get(&method)
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({ "ok": true, "result": null }));
+        axum::Json(resp)
+    }
+
+    struct TelegramMockServer {
+        base: String,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl TelegramMockServer {
+        fn start(state: TelegramMockState) -> Self {
+            use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let port = std::sync::Arc::new(AtomicU16::new(0));
+            let stop_thread = stop.clone();
+            let port_thread = port.clone();
+            let join = std::thread::spawn(move || {
+                let mock_router = axum::Router::new()
+                    .route(
+                        "/{bot_and_token}/{method}",
+                        axum::routing::post(telegram_mock_handler),
+                    )
+                    .with_state(state);
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    port_thread.store(listener.local_addr().unwrap().port(), Ordering::SeqCst);
+                    let server = axum::serve(listener, mock_router);
+                    let graceful = server.with_graceful_shutdown(async move {
+                        while !stop_thread.load(Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    });
+                    let _ = graceful.await;
+                });
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let bound = loop {
+                let p = port.load(std::sync::atomic::Ordering::SeqCst);
+                if p != 0 {
+                    break p;
+                }
+                assert!(Instant::now() < deadline, "server never bound");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            Self {
+                base: format!("http://127.0.0.1:{bound}"),
+                stop,
+                join: Some(join),
+            }
+        }
+    }
+
+    impl Drop for TelegramMockServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(j) = self.join.take() {
+                let _ = j.join();
+            }
+        }
+    }
+
+    /// Same bounded-poll shape as [`wait_for_one_pending`], needed for the
+    /// same reason: `TelegramChannel::fire`/`note_outcome` hand their real
+    /// work off to `tokio::task::spawn_blocking` and return immediately.
+    async fn wait_for_telegram_requests(
+        state: &TelegramMockState,
+        n: usize,
+    ) -> Vec<(String, serde_json::Value)> {
+        for _ in 0..200 {
+            let requests = state.requests();
+            if requests.len() >= n {
+                return requests;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("fewer than {n} telegram request(s) arrived within the poll window");
+    }
+
+    /// End-to-end proof that `await_approval`'s `note_outcome` calls are
+    /// unconditional on every `WaitOutcome::Decided` arm — not just the arm
+    /// whose `ResolvedVia` happens to be `Telegram` (which has no caller
+    /// until Task 5's poller exists at all). An approval resolved over the
+    /// operator `/approvals` HTTP surface must still edit away the
+    /// Telegram prompt `state.telegram`'s `fire` sent for the SAME pending
+    /// approval, with the wording naming the channel that actually
+    /// answered (`"via http"`), not Telegram itself.
+    #[tokio::test]
+    async fn an_approval_resolved_by_http_still_edits_the_telegram_message() {
+        let tg_state = TelegramMockState::default();
+        tg_state.set_response(
+            "sendMessage",
+            serde_json::json!({ "ok": true, "result": { "message_id": 99 } }),
+        );
+        let tg_server = TelegramMockServer::start(tg_state.clone());
+        let _env = crate::test_env::set_var(
+            crate::commands::gateway::telegram::TELEGRAM_API_BASE_ENV,
+            tg_server.base.as_str(),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("onebrain.yml"), "folders: {}\n").unwrap();
+
+        let mut vaults = BTreeMap::new();
+        vaults.insert("t1".to_string(), root.to_path_buf());
+        let config = GatewayConfig {
+            default_vault: Some(root.to_path_buf()),
+            vaults,
+            policy: policy::PolicyConfig {
+                mutating: policy::PolicyMode::AskOnce,
+                approval_wait_seconds: 300,
+                ..policy::PolicyConfig::default()
+            },
+            telegram: TelegramConfig {
+                bot_token: "T".to_string(),
+                chat_id: 5,
+            },
+            ..GatewayConfig::default()
+        };
+        let audit = AuditLog::open_at(audit_log_path(root)).unwrap();
+        let state = Arc::new(GatewayState::new(config, audit));
+        assert!(
+            state.telegram.is_some(),
+            "precondition: this fixture's config must make telegram available"
+        );
+        let (auth_ctx, token) = test_auth_ctx(root);
+        let router = build_gateway_router(state.clone(), auth_ctx);
+
+        let call_router = router.clone();
+        let call_token = token.clone();
+        let handle = tokio::spawn(async move {
+            let body = call_body(
+                1,
+                "brain_capture",
+                serde_json::json!({"title": "Telegram Loop", "text": "note body"}),
+            );
+            post(
+                &call_router,
+                body,
+                &call_token,
+                &standard_headers("tools/call", Some("brain_capture")),
+            )
+            .await
+        });
+
+        let pending = wait_for_one_pending(&state).await;
+        // Precondition: `fire` must have already sent the prompt before the
+        // approval can be resolved, or there would be nothing to edit.
+        wait_for_telegram_requests(&tg_state, 1).await;
+
+        assert!(state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Approve,
+            approval::ResolvedVia::Http
+        ));
+
+        let resp = handle.await.unwrap();
+        assert!(resp.get("error").is_none(), "{resp}");
+
+        let requests = wait_for_telegram_requests(&tg_state, 2).await;
+        let (method, body) = &requests[1];
+        assert_eq!(method, "editMessageText");
+        assert_eq!(body["message_id"], 99, "{body}");
+        assert!(
+            body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("via http"),
+            "the edit must name the channel that actually answered: {body}"
         );
     }
 }

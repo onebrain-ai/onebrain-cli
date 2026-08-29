@@ -56,10 +56,13 @@
 //!
 //! ## Dead-code allow
 //! Same situation as [`super::auth`]'s own `#![allow(dead_code)]` (see that
-//! module's doc comment for the full precedent chain): Task 1 gives
-//! `BotApi` no external caller — `mod.rs` only adds `pub mod telegram_api;`
-//! — so every method here is unreachable from `main` until a later Gateway
-//! PR 5 task wires the poller/approval-delivery flow through it. The tests
+//! module's doc comment for the full precedent chain): Task 1 gave `BotApi`
+//! no external caller at all. Gateway PR 5, Task 4 gives `new`/
+//! `send_message`/`edit_message_text` a real one — [`super::telegram::TelegramChannel`]
+//! — but `get_me`/`get_updates`/`answer_callback_query` (and the
+//! `BotIdentity`/`TgUpdate`/`TgCallback` types that exist only for them)
+//! stay unreachable from `main` until Task 5's callback-polling flow wires
+//! them up. This attribute now covers only that remaining slice. The tests
 //! below exercise every path, so none of it is untested dead code.
 #![allow(dead_code)]
 
@@ -304,9 +307,32 @@ impl BotApi {
             .ok_or_else(|| scrub("sendMessage", &synthetic("missing message_id in response")))
     }
 
-    /// Edits a previously sent message's text. No `reply_markup` is ever
-    /// sent — this signature has no keyboard parameter, so any inline
-    /// keyboard the original message carried is removed by the edit.
+    /// Edits a previously sent message's text and clears any inline
+    /// keyboard it carried.
+    ///
+    /// Gateway PR 5, Task 1 review carried an unverified claim here: that
+    /// simply omitting `reply_markup` from an `editMessageText` call
+    /// removes the keyboard, because this method's signature has no
+    /// keyboard parameter. Task 4 checked that against the real Bot API
+    /// docs (`core.telegram.org/bots/api#editmessagetext`) and it does NOT
+    /// hold — `editMessageText`'s `reply_markup` field description is
+    /// silent on omission, but the docs deliberately ship a SEPARATE
+    /// `editMessageReplyMarkup` method "to edit only the reply markup",
+    /// which only makes sense if every other edit method treats an omitted
+    /// `reply_markup` as "leave whatever is already there", not "clear
+    /// it" — an edit endpoint patches the fields you send, it doesn't
+    /// reset the ones you don't. Community consensus among bot developers
+    /// (widely reported as a gotcha independent of this codebase) agrees:
+    /// omitting the field on `editMessageText` keeps the existing inline
+    /// keyboard live. For this module's caller
+    /// ([`super::telegram::TelegramChannel::note_outcome`]) that would have
+    /// been the exact "stale control" bug class PR 4 already fixed once for
+    /// the native dialog channel — a resolved approval whose Telegram
+    /// message still shows a tappable Approve button. So this method now
+    /// sends an EXPLICIT empty `reply_markup: {"inline_keyboard":[]}` on
+    /// every edit — the one shape of "no keyboard" the Bot API cannot
+    /// mistake for "unchanged", since an empty value was actually sent, not
+    /// omitted.
     pub fn edit_message_text(
         &self,
         chat_id: i64,
@@ -317,6 +343,7 @@ impl BotApi {
             "chat_id": chat_id,
             "message_id": message_id,
             "text": text,
+            "reply_markup": { "inline_keyboard": [] },
         });
         self.call("editMessageText", body)?;
         Ok(())
@@ -597,6 +624,36 @@ mod tests {
                 { "text": "✅ Approve", "callback_data": "a:X" },
                 { "text": "⛔ Deny", "callback_data": "d:X" }
             ]])
+        );
+    }
+
+    /// Task 4 fix: an omitted `reply_markup` on `editMessageText` does NOT
+    /// clear an existing inline keyboard on the real Bot API (see this
+    /// method's own doc comment for the verification) — so the request
+    /// this module sends must carry an EXPLICIT empty `inline_keyboard`,
+    /// not simply lack the field. Pins the exact JSON shape rather than
+    /// just "the call succeeds", so a future edit that reverts to omitting
+    /// the field entirely fails this test, not just a manual Telegram
+    /// check nobody runs in CI.
+    #[test]
+    fn edit_message_text_always_clears_the_inline_keyboard() {
+        let state = MockState::default();
+        let server = MockServer::start(state.clone());
+        let api = BotApi::new("test-token-abc", &server.base);
+
+        api.edit_message_text(555, 4242, "resolved").unwrap();
+
+        let requests = state.requests();
+        assert_eq!(requests.len(), 1);
+        let (method, body) = &requests[0];
+        assert_eq!(method.as_str(), "editMessageText");
+        assert_eq!(body["chat_id"], 555);
+        assert_eq!(body["message_id"], 4242);
+        assert_eq!(body["text"], "resolved");
+        assert_eq!(
+            body["reply_markup"]["inline_keyboard"],
+            serde_json::json!([]),
+            "an explicit empty keyboard must be sent, not merely an omitted field: {body}"
         );
     }
 
