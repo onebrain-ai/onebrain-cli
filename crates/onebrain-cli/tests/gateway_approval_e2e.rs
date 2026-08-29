@@ -81,6 +81,8 @@ use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
 
+mod support;
+
 // ── Copied from `gateway_oauth_e2e.rs` (see module docs: not shared) ───────
 
 /// Kills the spawned gateway on drop so a panicking assertion never leaks an
@@ -136,6 +138,16 @@ fn spawn_gateway(
 
 /// Bounded poll (30s) for the stable startup line (`gateway listening on
 /// http://<bound-addr>/mcp`), returning the parsed `/mcp` URL.
+///
+/// On a startup failure this panics with a REDACTED tail of the gateway's
+/// stderr, never with stdout in any form and never with either stream raw —
+/// see `gateway_http.rs::wait_for_gateway_url` for the full reasoning (the
+/// capture files are deleted during this panic's own unwind, so a byte count
+/// would leave no diagnostic anywhere; stdout carries the pairing code;
+/// stderr carries host paths). All three gateway harnesses share one
+/// redactor, [`support::redacted_capture_tail`], and
+/// `gateway_http.rs::gateway_startup_failure_panic_carries_a_redacted_stderr_tail`
+/// pins it against a real constructed failure.
 fn wait_for_gateway_url(
     child: &mut std::process::Child,
     stdout_path: &Path,
@@ -150,28 +162,20 @@ fn wait_for_gateway_url(
         }
         if let Some(status) = child.try_wait().expect("poll gateway child") {
             let err = std::fs::read_to_string(stderr_path).unwrap_or_default();
-            // Security: neither stream is interpolated whole into a panic
-            // message (CodeQL `rust/cleartext-logging`). `out` may already
-            // contain the real pairing code by this point (it's printed
-            // before the "gateway listening" line). `err` is no longer just
-            // the fixed "loopback only ..." notice either: `gateway run`
-            // installs a tracing subscriber writing to stderr, so it now
-            // carries operator diagnostics that may legitimately name host
-            // paths. Sizes plus the exit status are enough to tell a crash
-            // from a hang, which is all this panic has to distinguish.
             panic!(
                 "onebrain gateway run exited early ({status}) before printing the \
-                 listening line ({} bytes of stdout, {} bytes of stderr captured)",
-                out.len(),
-                err.len()
+                 listening line; redacted stderr tail:\n{}",
+                support::redacted_capture_tail(&err)
             );
         }
-        assert!(
-            Instant::now() < deadline,
-            "onebrain gateway run did not print the listening line within 30s \
-             ({} bytes of stdout captured so far)",
-            out.len()
-        );
+        if Instant::now() >= deadline {
+            let err = std::fs::read_to_string(stderr_path).unwrap_or_default();
+            panic!(
+                "onebrain gateway run did not print the listening line within 30s; \
+                 redacted stderr tail:\n{}",
+                support::redacted_capture_tail(&err)
+            );
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
 }
@@ -441,16 +445,28 @@ fn post_token(agent: &ureq::Agent, url: &str, pairs: &[(&str, &str)]) -> (u16, S
 /// `$HOME/.onebrain/gateway/pairing.json` — see `gateway_oauth_e2e.rs`'s own
 /// doc comment for why this is a legitimate shortcut (this test IS the
 /// machine's owner in the scenario it simulates), copied verbatim here.
+///
+/// **Nothing derived from the file's CONTENTS reaches a panic message, and
+/// neither does its path.** `raw` here IS the pairing code: a partially
+/// written `pairing.json` leaves `{"code":"ABCD-EFGH"` on disk, `serde_json`
+/// rejects it, and interpolating `raw` would put a live credential in the CI
+/// log. What is reported instead is the `io::Error`/`serde_json::Error`
+/// itself (kind, and line/column for the parse) plus, for a shape mismatch,
+/// the top-level KEY NAMES — enough to tell "no file" from "truncated file"
+/// from "the on-disk shape changed", none of it secret.
 fn read_pairing_code(home: &Path) -> String {
     let path = home.join(".onebrain").join("gateway").join("pairing.json");
     let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read pairing.json at {}: {e}", path.display()));
+        .unwrap_or_else(|e| panic!("read the sandbox gateway pairing.json: {e}"));
     let json: serde_json::Value = serde_json::from_str(&raw)
-        .unwrap_or_else(|e| panic!("pairing.json was not JSON ({e}): {raw}"));
-    json["code"]
-        .as_str()
-        .unwrap_or_else(|| panic!("pairing.json had no string \"code\" field: {raw}"))
-        .to_string()
+        .unwrap_or_else(|e| panic!("the sandbox gateway pairing.json was not JSON: {e}"));
+    json["code"].as_str().map(str::to_string).unwrap_or_else(|| {
+        let keys: Vec<&str> = json
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        panic!("the sandbox gateway pairing.json had no string \"code\" field; top-level keys: {keys:?}")
+    })
 }
 
 // ── New for this test: /approvals HTTP surface + audit-log reading ────────

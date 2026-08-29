@@ -36,6 +36,8 @@ use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
 
+mod support;
+
 /// Kills the spawned gateway on drop so a panicking assertion never leaks an
 /// orphan `onebrain gateway run` process on CI. Copied (not shared) from
 /// `tests/mcp_stdio.rs` per the brief — test files cannot pull in
@@ -99,10 +101,32 @@ fn spawn_gateway(
 }
 
 /// Bounded poll (30s) for the stable startup line (`gateway listening on
-/// http://<bound-addr>/mcp`), returning the parsed `/mcp` URL. Panics with
-/// the captured stdout/stderr SIZES if the process exits early or the
+/// http://<bound-addr>/mcp`), returning the parsed `/mcp` URL. Panics with a
+/// REDACTED tail of the captured stderr if the process exits early or the
 /// deadline passes first — this is the ONLY way the test learns the
 /// OS-assigned port from `--port 0`.
+///
+/// **Why the panic has to carry the stderr, and why it has to redact it.**
+/// The capture files live inside a `tempfile::TempDir` that is dropped —
+/// and deleted — during this panic's own unwind, so whatever is not in the
+/// message is gone by the time a human reads the failure; a byte count
+/// leaves no way forward but to patch the test and re-run CI. But the
+/// streams cannot be interpolated raw either (CodeQL
+/// `rust/cleartext-logging`, and this branch's own "no host path or secret
+/// in any test message" rule): `out` already contains the real pairing code
+/// by this point — `gateway run` prints it before the "gateway listening"
+/// line — and `err` carries the gateway's tracing output, which
+/// legitimately names host paths.
+///
+/// So: stdout is never emitted in any form (it is the one place the pairing
+/// code is ever shown), and stderr goes through
+/// [`support::redacted_capture_tail`], which collapses every path-shaped and
+/// pairing-code-shaped token to a placeholder and bounds the result. The
+/// sibling harnesses in `gateway_oauth_e2e.rs` and `gateway_approval_e2e.rs`
+/// do exactly the same, through the same helper.
+/// `gateway_startup_failure_panic_carries_a_redacted_stderr_tail` below pins
+/// the behavior against a REAL constructed startup failure, not a
+/// hand-written string.
 fn wait_for_gateway_url(
     child: &mut std::process::Child,
     stdout_path: &Path,
@@ -117,28 +141,20 @@ fn wait_for_gateway_url(
         }
         if let Some(status) = child.try_wait().expect("poll gateway child") {
             let err = std::fs::read_to_string(stderr_path).unwrap_or_default();
-            // Security: neither stream is interpolated whole into a panic
-            // message (CodeQL `rust/cleartext-logging`). `out` already
-            // contains the real pairing code by this point — `gateway run`
-            // prints it before the "gateway listening" line — and `err`
-            // carries the gateway's tracing output, which may legitimately
-            // name host paths. Sizes plus the exit status are enough to tell
-            // a crash from a hang, which is all this panic has to
-            // distinguish. (The sibling harnesses in `gateway_oauth_e2e.rs`
-            // and `gateway_approval_e2e.rs` do the same.)
             panic!(
                 "onebrain gateway run exited early ({status}) before printing the \
-                 listening line ({} bytes of stdout, {} bytes of stderr captured)",
-                out.len(),
-                err.len()
+                 listening line; redacted stderr tail:\n{}",
+                support::redacted_capture_tail(&err)
             );
         }
-        assert!(
-            Instant::now() < deadline,
-            "onebrain gateway run did not print the listening line within 30s \
-             ({} bytes of stdout captured so far)",
-            out.len()
-        );
+        if Instant::now() >= deadline {
+            let err = std::fs::read_to_string(stderr_path).unwrap_or_default();
+            panic!(
+                "onebrain gateway run did not print the listening line within 30s; \
+                 redacted stderr tail:\n{}",
+                support::redacted_capture_tail(&err)
+            );
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
 }
@@ -541,4 +557,165 @@ fn gateway_run_happy_path_serves_fixture_vault_via_machine_config() {
     // linger past the test (it would idle-exit on its own TTL, but this is
     // tidy and frees the port immediately).
     stop_daemon(cache.path(), home.path());
+}
+
+// ── The startup-failure diagnostic itself ────────────────────────────────
+
+/// The panic `wait_for_gateway_url` raises when the gateway dies at startup
+/// must be ACTIONABLE and REDACTED at the same time, and this proves both
+/// against a REAL failure rather than a hand-written stderr string.
+///
+/// The failure is constructed the same shape CI hits: `gateway run`'s very
+/// first store call (`AuditLog::open()` → `~/.onebrain/gateway/audit`) cannot
+/// create its directory, so `run()` returns an `anyhow` error, the binary
+/// prints it to stderr and exits 1 before ever reaching the "gateway
+/// listening" line. Here that is forced by planting a regular FILE at
+/// `$HOME/.onebrain/gateway`, which no `create_dir_all` can turn into a
+/// directory. (CI's own version is a permissions failure on the same call —
+/// the point is only that the diagnostic lives in stderr and the capture
+/// files are deleted during the unwind.)
+///
+/// `catch_unwind` deliberately leaves the default panic hook installed, so
+/// the redacted message is printed to the test log as well: setting a no-op
+/// hook would be process-global and would swallow a genuine panic from a
+/// concurrently-running test in this same binary. A "thread panicked" line
+/// in this test's output is expected, and its content is the thing under
+/// test.
+#[test]
+fn gateway_startup_failure_panic_carries_a_redacted_stderr_tail() {
+    let cache = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    // A regular file exactly where the audit/auth store's directory must go.
+    write(home.path(), ".onebrain/gateway", "not a directory\n");
+    let cwd = tempdir().unwrap();
+
+    let stdout_path = cwd.path().join("gateway-stdout.log");
+    let stderr_path = cwd.path().join("gateway-stderr.log");
+    let mut child = KillOnDrop(spawn_gateway(
+        cache.path(),
+        home.path(),
+        cwd.path(),
+        &stdout_path,
+        &stderr_path,
+    ));
+
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for_gateway_url(&mut child.0, &stdout_path, &stderr_path)
+    }))
+    .expect_err("gateway run must fail to start with a file in place of its store dir");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_else(|| panic!("panic payload was not a String"));
+
+    // 1. Actionable: it says the process died, and it carries the gateway's
+    //    OWN words about why — not a byte count.
+    assert!(
+        message.contains("exited early"),
+        "expected the early-exit panic, got: {message}"
+    );
+    assert!(
+        message.contains("gateway audit log") || message.contains("gateway auth store"),
+        "the panic must carry the gateway's own failure text: {message}"
+    );
+    assert!(
+        !message.contains("<empty>"),
+        "the stderr tail must not be empty for a startup failure: {message}"
+    );
+
+    // 2. Redacted. Negative control FIRST: the raw stderr really did name
+    //    the sandbox path, so what follows is proof the redactor removed
+    //    something that was there — not proof that there was nothing to
+    //    remove. (The capture file is still readable here only because
+    //    `catch_unwind` stopped the unwind inside this test, leaving `cwd`
+    //    alive; in the real harness this same `TempDir` is gone by the time
+    //    anyone sees the panic, which is the whole reason the message has to
+    //    carry the diagnostic itself.)
+    let raw_stderr = std::fs::read_to_string(&stderr_path).expect("read captured stderr");
+    assert!(
+        raw_stderr.contains(&home.path().display().to_string()),
+        "precondition: the gateway's own stderr must name the sandbox HOME, \
+         otherwise this test proves nothing about redaction"
+    );
+    assert!(
+        message.contains("<path>"),
+        "the failure text names a path, so redaction must have fired: {message}"
+    );
+    for sandbox in [home.path(), cwd.path(), cache.path()] {
+        let rendered = sandbox.display().to_string();
+        assert!(
+            !message.contains(&rendered),
+            "sandbox path leaked into the panic message: {message}"
+        );
+        // The tempdir's own basename is distinctive (`.tmpXXXXXX`); catching
+        // it catches a leak through a differently-canonicalized prefix
+        // (`/var` vs `/private/var` on macOS) that the full-path check above
+        // would miss.
+        let base = sandbox
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("tempdir has a basename");
+        assert!(
+            !message.contains(base),
+            "sandbox tempdir name leaked into the panic message: {message}"
+        );
+    }
+    // Strongest form: after redaction nothing path-shaped is left at all.
+    assert!(
+        !message.contains('/') && !message.contains('\\'),
+        "a path separator survived redaction: {message}"
+    );
+}
+
+/// Supplementary unit pins on the shared redactor, kept in this binary (not
+/// in `tests/support/mod.rs`) so they run once rather than once per test
+/// binary that pulls that module in. The constructed-failure test above is
+/// the primary guarantee; these fix the exact shapes.
+#[test]
+fn redacted_capture_tail_replaces_paths_and_pairing_codes_and_keeps_the_rest() {
+    use support::redacted_capture_tail as tail;
+
+    assert_eq!(
+        tail("Error: create gateway auth store dir /var/folders/t/x: oops"),
+        "Error: create gateway auth store dir <path> oops"
+    );
+    assert_eq!(tail("path=/home/runner/.onebrain"), "path=<path>");
+    assert_eq!(tail("opening \"/tmp/a b\""), "opening \"<path> b\"");
+    assert_eq!(tail("C:\\Users\\runner\\x"), "C:<path>");
+    assert_eq!(tail("\\\\server\\share"), "<path>");
+    // The shape the delimiter-preconditioned first draft silently missed:
+    // a host path glued to a preceding word. Redacted here, at the cost of
+    // over-redacting things like `and/or` — see `path_start`.
+    assert_eq!(tail("under/Users/alice/x"), "under<path>");
+
+    // A pairing code cannot reach stderr today, but the shape is redacted
+    // anyway — see the helper's own doc comment.
+    assert_eq!(tail("code ABCD-2345 here"), "code <code> here");
+    assert_eq!(tail("abcd-2345"), "abcd-2345");
+    assert_eq!(tail("ABCDE-234"), "ABCDE-234");
+
+    // Ordinary diagnostic text — the part worth keeping — survives intact.
+    assert_eq!(
+        tail("2026-08-29T12:00:00.123456Z WARN gateway: not a directory (os error 20)"),
+        "2026-08-29T12:00:00.123456Z WARN gateway: not a directory (os error 20)"
+    );
+}
+
+#[test]
+fn redacted_capture_tail_is_bounded_and_marks_an_empty_stream() {
+    use support::{redacted_capture_tail as tail, CAPTURE_TAIL_BYTES, CAPTURE_TAIL_LINES};
+
+    assert_eq!(tail(""), "<empty>");
+
+    let many = (0..100)
+        .map(|i| format!("line{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let out = tail(&many);
+    assert_eq!(out.lines().count(), CAPTURE_TAIL_LINES);
+    assert!(out.starts_with("line88"), "{out}");
+
+    let out = tail(&"x".repeat(10_000));
+    assert!(out.starts_with("[…] "), "{out}");
+    assert!(out.len() < CAPTURE_TAIL_BYTES + 16, "{}", out.len());
 }

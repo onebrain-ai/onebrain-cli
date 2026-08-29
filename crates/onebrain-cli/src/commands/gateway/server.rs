@@ -3381,21 +3381,57 @@ mod tests {
     }
 
     /// Thai TONE marks are `Mn` without `Other_Alphabetic`, so they are not
-    /// alphanumeric and become a separator — the same treatment
-    /// `onebrain_fs::note::new`'s own `slug` helper gives them, so a
-    /// gateway capture and a `onebrain note new` produce the same filename
-    /// for the same title. Pinned so the lossiness is a recorded, deliberate
-    /// property rather than a surprise: the slug stays stable, distinct, and
-    /// confined, which is what a filename needs to be. (Thai VOWEL signs
-    /// carry `Other_Alphabetic` and ARE kept — the assertion above on
-    /// "บันทึกการประชุม" round-tripping proves that half.)
+    /// alphanumeric and become a separator. Pinned so the lossiness is a
+    /// recorded, deliberate property rather than a surprise: the slug stays
+    /// stable, distinct, and confined, which is what a filename needs to be.
+    /// (Thai VOWEL signs carry `Other_Alphabetic` and ARE kept — the
+    /// assertion above on "บันทึกการประชุม" round-tripping proves that half.)
+    ///
+    /// **This is charset parity with `onebrain_fs::note::new`'s own `slug`
+    /// helper, not filename parity — an earlier version of this comment
+    /// claimed the latter and was wrong.** Both helpers gate on
+    /// `char::is_alphanumeric`, so both treat a tone mark as a separator.
+    /// They are still separate helpers producing different output, and
+    /// `note::new` does not derive a filename from a title at all: the
+    /// caller supplies the relative path, `note::new` derives the *title*
+    /// from that path's stem, and its `slug` only fills the `{{slug}}`
+    /// template variable. See `docs/gateway.md`'s `brain_capture` section
+    /// for the full list of differences; the next test pins the one that is
+    /// observable from this side.
     #[test]
-    fn thai_tone_marks_become_separators_matching_the_vaults_own_slug_helper() {
+    fn thai_tone_marks_are_not_alphanumeric_so_they_become_separators() {
         // U+0E37 (a vowel sign) survives; U+0E48 MAI EK (a tone mark) does
         // not and collapses to the separator.
         assert_eq!(sanitize_slug("เรื่อง"), "เรื-อง");
         assert!('\u{0E37}'.is_alphanumeric(), "vowel signs are kept");
         assert!(!'\u{0E48}'.is_alphanumeric(), "tone marks are not");
+    }
+
+    /// One of the ways this slug helper deliberately DIFFERS from
+    /// `onebrain_fs::note::new`'s: it re-filters the output of Unicode
+    /// lowercasing, so `İ` (U+0130) contributes a bare `i`. The filesystem
+    /// helper does `out.extend(ch.to_lowercase())` with no second filter, so
+    /// the combining mark U+0307 that mapping also produces survives there.
+    ///
+    /// The fs helper is private to its own crate (and out of scope for this
+    /// branch), so what this pins is the half that is observable here: the
+    /// mapping really does expand to more than one `char`, and this helper
+    /// really does drop the non-alphanumeric part of it. Without the second
+    /// filter, "every emitted character is alphanumeric" would be an
+    /// approximation rather than an invariant.
+    #[test]
+    fn lowercasing_output_is_re_filtered_so_dotted_capital_i_leaves_no_combining_mark() {
+        let expanded: Vec<char> = '\u{0130}'.to_lowercase().collect();
+        assert_eq!(
+            expanded,
+            vec!['i', '\u{0307}'],
+            "precondition: U+0130 lowercases to more than one char"
+        );
+        assert!(
+            !'\u{0307}'.is_alphanumeric(),
+            "the combining mark is what the second filter exists to drop"
+        );
+        assert_eq!(sanitize_slug("\u{0130}stanbul"), "istanbul");
     }
 
     #[test]
