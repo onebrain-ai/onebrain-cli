@@ -48,8 +48,11 @@
 //! The agent's single [`HTTP_TIMEOUT`] is set a few seconds ABOVE
 //! [`LONG_POLL_CEILING_SECS`] so a `getUpdates` call that's genuinely
 //! waiting out Telegram's long-poll window doesn't get killed by this
-//! client's own end-to-end timeout first — callers are expected to keep
-//! `timeout_secs` at or below the ceiling.
+//! client's own end-to-end timeout first. `timeout_secs` is NOT clamped —
+//! it's sent to Telegram exactly as given — but `get_updates` opens with a
+//! `debug_assert!` pinning that callers stay at or below the ceiling, so a
+//! violation of this contract fails loudly in tests/debug builds instead of
+//! silently risking a local timeout in release.
 //!
 //! ## Dead-code allow
 //! Same situation as [`super::auth`]'s own `#![allow(dead_code)]` (see that
@@ -252,11 +255,21 @@ impl BotApi {
     /// Long-polls `getUpdates`. `offset` is Telegram's own cursor — see
     /// [`TgUpdate`]'s docs for why the caller must advance it past every
     /// `update_id` returned, including entries with both fields `None`.
+    ///
+    /// `timeout_secs` is sent to Telegram uncapped (never clamped — a
+    /// caller-adjudicated design choice, see the module docs), but a
+    /// `debug_assert!` turns a violation of the documented
+    /// [`LONG_POLL_CEILING_SECS`] contract into a test-time failure instead
+    /// of a silent release-mode local timeout.
     pub fn get_updates(
         &self,
         offset: Option<i64>,
         timeout_secs: u32,
     ) -> Result<Vec<TgUpdate>, TgError> {
+        debug_assert!(
+            timeout_secs <= LONG_POLL_CEILING_SECS,
+            "getUpdates timeout exceeds the long-poll ceiling"
+        );
         let mut body = serde_json::json!({ "timeout": timeout_secs });
         if let Some(o) = offset {
             body["offset"] = serde_json::json!(o);
@@ -395,6 +408,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     /// Shared state for the mock Bot API server: canned per-method
     /// responses, plus every `(method, body)` it actually received — so a
@@ -482,11 +496,19 @@ mod tests {
                     let _ = graceful.await;
                 });
             });
+            // Bounded, mirroring `daemon_client.rs`'s own
+            // `start_live_server` precedent exactly (finding, Task 1 fix
+            // wave): an unbounded wait here means a sandbox that refuses
+            // loopback binds panics the SERVER thread while this thread
+            // spins forever on `port == 0`, hanging the whole test binary
+            // instead of failing one test.
+            let deadline = Instant::now() + Duration::from_secs(5);
             let bound = loop {
                 let p = port.load(Ordering::SeqCst);
                 if p != 0 {
                     break p;
                 }
+                assert!(Instant::now() < deadline, "server never bound");
                 std::thread::sleep(Duration::from_millis(10));
             };
             Self {
@@ -503,6 +525,43 @@ mod tests {
             if let Some(j) = self.join.take() {
                 let _ = j.join();
             }
+        }
+    }
+
+    // ── scrub: direct, pure-function coverage (security review finding,
+    // Task 1 fix wave) ──────────────────────────────────────────────────
+    //
+    // The mock-server tests below only ever produce `ureq::Error` variants
+    // whose `Display` is already host/token-free by construction
+    // (`StatusCode`, `Io`, `ConnectionFailed`, and the `Other` this module
+    // synthesizes itself) — so they never actually exercise `scrub`'s
+    // catch-all arm, and a naive `scrub` that forwarded `ureq::Error`'s own
+    // `Display` verbatim would still pass every one of them. `BadUri`,
+    // `RequireHttpsOnly`, and `ConnectProxyFailed` all carry the offending
+    // URI (bot token included) directly in their `Display`; this test
+    // constructs each of them by hand and calls `scrub` directly — no mock
+    // server, no network — to pin that the catch-all arm never lets that
+    // text through.
+
+    #[test]
+    fn scrub_never_leaks_the_uri_from_variants_that_embed_it() {
+        let leaky_url = "https://api.telegram.org/botSECRETTOK123/sendMessage".to_string();
+        let cases: [ureq::Error; 3] = [
+            ureq::Error::BadUri(leaky_url.clone()),
+            ureq::Error::RequireHttpsOnly(leaky_url.clone()),
+            ureq::Error::ConnectProxyFailed(leaky_url.clone()),
+        ];
+        for e in &cases {
+            let rendered = scrub("sendMessage", e).to_string();
+            assert!(
+                !rendered.contains("SECRETTOK123"),
+                "{e:?} rendered as {rendered:?}"
+            );
+            assert!(
+                !rendered.contains("api.telegram.org"),
+                "{e:?} rendered as {rendered:?}"
+            );
+            assert!(rendered.contains("sendMessage"), "{rendered}");
         }
     }
 
@@ -615,6 +674,34 @@ mod tests {
         assert!(rendered.contains("sendMessage"), "{rendered}");
         assert!(!rendered.contains("SECRETTOK123"), "{rendered}");
         assert!(!rendered.contains("http"), "{rendered}");
+    }
+
+    /// Security review finding (Task 1 fix wave): `an_api_level_error_...`
+    /// above uses a `description` ("Bad Request") that contains no token,
+    /// so it never actually exercises `strip_token` — deleting that
+    /// function entirely would leave that test green. Telegram CAN echo
+    /// caller-identifying text back in a `description` (e.g. an
+    /// "unauthorized" message naming the bot), so this scripts the mock
+    /// with a description that embeds the token and asserts it comes back
+    /// redacted rather than verbatim.
+    #[test]
+    fn an_api_level_error_description_containing_the_token_is_redacted() {
+        let state = MockState::default();
+        state.set_response(
+            "sendMessage",
+            serde_json::json!({
+                "ok": false,
+                "description": "unauthorized for bot SECRETTOK123"
+            }),
+        );
+        let server = MockServer::start(state);
+        let api = BotApi::new("SECRETTOK123", &server.base);
+
+        let err = api.send_message(1, "hi", None).unwrap_err();
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("[redacted]"), "{rendered}");
+        assert!(!rendered.contains("SECRETTOK123"), "{rendered}");
     }
 
     #[test]
