@@ -33,6 +33,7 @@ pub mod policy;
 pub mod server;
 pub mod telegram;
 pub mod telegram_api;
+pub mod telegram_setup;
 
 // `gateway_config_path` / `DEFAULT_GATEWAY_PORT` stay module-internal to
 // `config.rs` (used there by `load_gateway_config` + its own tests) — no
@@ -40,6 +41,7 @@ pub mod telegram_api;
 // Task 4's dead-code-allow removal).
 pub use config::{load_gateway_config, GatewayConfig};
 pub use server::{build_gateway_router, GatewayState};
+pub use telegram_setup::telegram_setup;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
