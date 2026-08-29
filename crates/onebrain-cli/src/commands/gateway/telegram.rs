@@ -630,7 +630,10 @@ fn parse_callback_data(data: &str) -> Option<(Decision, &str)> {
 /// callers treat that the same as "file absent".
 fn offset_file_path() -> Result<PathBuf> {
     let home = crate::home::home_dir().context("resolve home directory for telegram offset")?;
-    Ok(home.join(".onebrain").join("gateway").join("telegram.offset"))
+    Ok(home
+        .join(".onebrain")
+        .join("gateway")
+        .join("telegram.offset"))
 }
 
 /// Reads the persisted `getUpdates` offset. `None` covers every reason
@@ -1393,7 +1396,10 @@ mod tests {
         channel.ensure_polling(approvals.clone());
 
         let ack = wait_for_request_method(&state, "answerCallbackQuery").await;
-        assert_eq!(ack["text"], "too late — already decided or expired", "{ack}");
+        assert_eq!(
+            ack["text"], "too late — already decided or expired",
+            "{ack}"
+        );
 
         wait_for_polling_false(&channel).await;
     }
@@ -1434,10 +1440,7 @@ mod tests {
         );
 
         assert!(approvals.resolve(&pending.id, Decision::Approve, ResolvedVia::Http));
-        assert_eq!(
-            rx.await.unwrap(),
-            (Decision::Approve, ResolvedVia::Http)
-        );
+        assert_eq!(rx.await.unwrap(), (Decision::Approve, ResolvedVia::Http));
 
         wait_for_polling_false(&channel).await;
 
